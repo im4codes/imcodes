@@ -976,8 +976,18 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
       return;
     }
 
-    const content = await fsReadFileRaw(real, 'utf-8');
-    try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', content }); } catch { /* ignore */ }
+    // Image files: send as base64 so the web UI can render them
+    const ext = nodePath.extname(real).toLowerCase().slice(1);
+    const IMAGE_MIME: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', ico: 'image/x-icon', bmp: 'image/bmp', svg: 'image/svg+xml' };
+    const mimeType = IMAGE_MIME[ext];
+    if (mimeType) {
+      const buf = await fsReadFileRaw(real);
+      const content = buf.toString('base64');
+      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', content, encoding: 'base64', mimeType }); } catch { /* ignore */ }
+    } else {
+      const content = await fsReadFileRaw(real, 'utf-8');
+      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', content }); } catch { /* ignore */ }
+    }
   } catch (err) {
     try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
   }
