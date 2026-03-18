@@ -24,6 +24,7 @@ export default defineWorkspace([
         'server/test/bind-rebind.test.ts',
         'server/test/auth-security.test.ts',
         'server/test/proxy-addr.test.ts',
+        'server/test/password-auth.test.ts',
         '**/node_modules/**',
       ],
       environment: 'node',
