@@ -40,7 +40,7 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
     setError(null);
     try {
       const AuthSession = (await import('../plugins/auth-session.js')).default;
-      let url = `${serverUrl}?native_callback=${encodeURIComponent('imcodes://auth')}`;
+      let url = `${serverUrl}?native_callback=${encodeURIComponent('imcodes://auth')}&_t=${Date.now()}`;
       if (action) url += `&action=${action}`;
       const result = await AuthSession.start({ url, callbackScheme: 'imcodes' });
       const parsed = new URL(result.url);

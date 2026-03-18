@@ -2,6 +2,20 @@
 
 A chat interface built for talking to AI coding agents. Not Slack, not Discord, not Telegram — something actually designed for the job.
 
+## Screenshots
+
+### Desktop
+
+| Dashboard & Multi-Agent | Chat View | Multi-Agent Discussion | File Browser & Diff |
+|---|---|---|---|
+| ![Dashboard](landing/imcodes0.png) | ![Chat](landing/imcodes1.png) | ![Discussion](landing/imcodes2.png) | ![Files](landing/imcodes3.png) |
+
+### Mobile
+
+| Chat View | Gemini CLI | Terminal | Agent Selector | Source Diff |
+|---|---|---|---|---|
+| ![Chat](landing/imcodes-m1.png) | ![Gemini](landing/imcodes-m2.png) | ![Terminal](landing/imcodes-m3.png) | ![Agents](landing/imcodes-m4.png) | ![Diff](landing/imcodes-m0.png) |
+
 ## Why
 
 Every existing chat tool is built for humans talking to humans. When you're working with Claude Code, Codex, or Gemini CLI, you need terminal output, diff views, session management, multi-agent coordination — none of which fit into a 4096-char message box with emoji reactions.

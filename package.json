@@ -1,6 +1,6 @@
 {
   "name": "imcodes",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "A chat interface for AI coding agents — control Claude Code, Codex, Gemini CLI, OpenCode from browser and mobile",
   "license": "MIT",
   "repository": {
