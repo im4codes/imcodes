@@ -4,6 +4,7 @@ import { ServerList } from '../components/ServerList.js';
 import { GettingStarted } from '../components/GettingStarted.js';
 import { LanguageSwitcher } from '../components/LanguageSwitcher.js';
 import { PasskeyManager } from '../components/PasskeyManager.js';
+import { DeleteAccount } from '../components/DeleteAccount.js';
 import { apiFetch } from '../api.js';
 
 interface Props {
@@ -73,6 +74,7 @@ export function DashboardPage({ onSelectServer, onLogout, onServersLoaded }: Pro
           )}
           <ApiKeyManager keys={keys} onKeysChanged={loadData} />
           <PasskeyManager />
+          <DeleteAccount onDeleted={onLogout} />
         </>
       )}
     </div>

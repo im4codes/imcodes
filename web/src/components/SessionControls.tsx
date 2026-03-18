@@ -552,7 +552,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>
       </div>
     </div>
-    <VoiceOverlay open={voiceOpen} onClose={() => setVoiceOpen(false)} onSend={handleVoiceSend} />
+    <VoiceOverlay open={voiceOpen} onClose={() => setVoiceOpen(false)} onSend={handleVoiceSend} initialText={divRef.current?.textContent ?? ''} />
     </>
   );
 }

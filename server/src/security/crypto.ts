@@ -4,7 +4,10 @@
  * AES-256-GCM format is compatible: base64(iv[12] || ciphertext || authTag[16]).
  */
 
-import { createHash, createHmac, randomBytes, createCipheriv, createDecipheriv, timingSafeEqual as nodeTimingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, createCipheriv, createDecipheriv, timingSafeEqual as nodeTimingSafeEqual, scrypt as scryptCb } from 'node:crypto';
+import { promisify } from 'node:util';
+
+const scryptAsync = promisify(scryptCb);
 
 export function randomHex(bytes: number): string {
   return randomBytes(bytes).toString('hex');
@@ -107,4 +110,23 @@ export function timingSafeEqual(a: string, b: string): boolean {
   const bufA = Buffer.from(a, 'utf8');
   const bufB = Buffer.from(b, 'utf8');
   return nodeTimingSafeEqual(bufA, bufB);
+}
+
+// ── Password hashing (scrypt) ───────────────────────────────────────────────
+// Format: salt_hex:derived_hex  (32-byte salt, 64-byte derived key)
+
+export async function hashPassword(password: string): Promise<string> {
+  const salt = randomBytes(32);
+  const derived = (await scryptAsync(password, salt, 64)) as Buffer;
+  return `${salt.toString('hex')}:${derived.toString('hex')}`;
+}
+
+export async function verifyPassword(password: string, stored: string): Promise<boolean> {
+  const [saltHex, derivedHex] = stored.split(':');
+  if (!saltHex || !derivedHex) return false;
+  const salt = Buffer.from(saltHex, 'hex');
+  const expected = Buffer.from(derivedHex, 'hex');
+  const actual = (await scryptAsync(password, salt, 64)) as Buffer;
+  if (expected.length !== actual.length) return false;
+  return nodeTimingSafeEqual(expected, actual);
 }

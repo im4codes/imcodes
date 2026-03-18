@@ -158,7 +158,8 @@
     "error": "无法连接到服务器，请检查地址后重试。",
     "errorNotHttps": "服务器地址必须使用 HTTPS",
     "changeServer": "更换服务器",
-    "addServer": "+ 添加服务器"
+    "addServer": "+ 添加服务器",
+    "httpWarning": "警告：HTTP 连接不安全。非本地服务器请使用 HTTPS。"
   },
   "passkey": {
     "title": "Passkey 管理",
@@ -170,6 +171,14 @@
     "added": "添加于",
     "last_used": "最近使用",
     "device_name_placeholder": "设备名称（可选）"
+  },
+  "account": {
+    "delete_title": "删除账号",
+    "delete_warning": "此操作不可撤销。你的所有服务器、会话、API 密钥、Passkey 和其他数据将被永久删除。",
+    "delete_btn": "删除账号",
+    "delete_confirm_prompt": "输入 DELETE 确认删除账号：",
+    "delete_confirm": "永久删除",
+    "delete_error": "删除账号失败，请重试。"
   },
   "voice": {
     "listening": "识别中...",

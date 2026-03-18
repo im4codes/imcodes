@@ -5,6 +5,10 @@ import type { PgDatabase } from './client.js';
 export interface DbUser {
   id: string;
   created_at: number;
+  username: string | null;
+  password_hash: string | null;
+  display_name: string | null;
+  password_must_change: boolean | null;
 }
 
 export interface DbPlatformIdentity {
@@ -75,11 +79,15 @@ export interface QuickData {
 export async function createUser(db: PgDatabase, id: string): Promise<DbUser> {
   const now = Date.now();
   await db.prepare('INSERT INTO users (id, created_at) VALUES (?, ?)').bind(id, now).run();
-  return { id, created_at: now };
+  return { id, created_at: now, username: null, password_hash: null, display_name: null, password_must_change: null };
 }
 
 export async function getUserById(db: PgDatabase, id: string): Promise<DbUser | null> {
   return db.prepare('SELECT * FROM users WHERE id = ?').bind(id).first<DbUser>();
+}
+
+export async function getUserByUsername(db: PgDatabase, username: string): Promise<DbUser | null> {
+  return db.prepare('SELECT * FROM users WHERE username = ?').bind(username).first<DbUser>();
 }
 
 // ── Platform identities ───────────────────────────────────────────────────

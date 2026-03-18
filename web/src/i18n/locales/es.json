@@ -158,7 +158,8 @@
     "error": "No se puede alcanzar el servidor. Verifica la URL e intenta de nuevo.",
     "errorNotHttps": "La URL del servidor debe usar HTTPS",
     "changeServer": "Cambiar servidor",
-    "addServer": "+ Agregar servidor"
+    "addServer": "+ Agregar servidor",
+    "httpWarning": "Advertencia: las conexiones HTTP no son seguras. Usa HTTPS para servidores que no sean localhost."
   },
   "passkey": {
     "title": "Passkeys",
@@ -170,6 +171,14 @@
     "added": "Agregada",
     "last_used": "último uso",
     "device_name_placeholder": "Nombre del dispositivo (opcional)"
+  },
+  "account": {
+    "delete_title": "Eliminar cuenta",
+    "delete_warning": "Esta accion es permanente. Todos tus servidores, sesiones, claves API, passkeys y otros datos seran eliminados permanentemente.",
+    "delete_btn": "Eliminar cuenta",
+    "delete_confirm_prompt": "Escribe DELETE para confirmar la eliminacion de la cuenta:",
+    "delete_confirm": "Eliminar permanentemente",
+    "delete_error": "Error al eliminar la cuenta. Por favor, intentalo de nuevo."
   },
   "voice": {
     "listening": "Escuchando...",

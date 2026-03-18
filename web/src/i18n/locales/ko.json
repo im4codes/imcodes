@@ -158,7 +158,8 @@
     "error": "서버에 연결할 수 없습니다. URL을 확인하고 다시 시도하세요.",
     "errorNotHttps": "서버 URL은 HTTPS를 사용해야 합니다",
     "changeServer": "서버 변경",
-    "addServer": "+ 서버 추가"
+    "addServer": "+ 서버 추가",
+    "httpWarning": "경고: HTTP 연결은 안전하지 않습니다. localhost가 아닌 서버에는 HTTPS를 사용하세요."
   },
   "passkey": {
     "title": "패스키 관리",
@@ -170,6 +171,14 @@
     "added": "추가됨",
     "last_used": "최근 사용",
     "device_name_placeholder": "기기 이름 (선택)"
+  },
+  "account": {
+    "delete_title": "계정 삭제",
+    "delete_warning": "이 작업은 되돌릴 수 없습니다. 모든 서버, 세션, API 키, 패스키 및 기타 데이터가 영구적으로 삭제됩니다.",
+    "delete_btn": "계정 삭제",
+    "delete_confirm_prompt": "계정 삭제를 확인하려면 DELETE를 입력하세요:",
+    "delete_confirm": "영구 삭제",
+    "delete_error": "계정 삭제에 실패했습니다. 다시 시도해 주세요."
   },
   "voice": {
     "listening": "인식 중...",

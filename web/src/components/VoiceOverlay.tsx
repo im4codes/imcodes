@@ -6,11 +6,12 @@ interface Props {
   open: boolean;
   onClose: () => void;
   onSend: (text: string) => void;
+  initialText?: string;
 }
 
 const BAR_COUNT = 48;
 
-export function VoiceOverlay({ open, onClose, onSend }: Props) {
+export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
   const { t } = useTranslation();
   const [listening, setListening] = useState(false);
   const [hasText, setHasText] = useState(false);
@@ -28,12 +29,13 @@ export function VoiceOverlay({ open, onClose, onSend }: Props) {
 
   useEffect(() => {
     if (!open) return;
-    if (taRef.current) { taRef.current.value = ''; taRef.current.focus(); }
-    setHasText(false);
+    const init = initialText ?? '';
+    if (taRef.current) { taRef.current.value = init; taRef.current.focus(); }
+    setHasText(!!init.trim());
     setMaxH('66vh');
     setListening(false);
     listeningRef.current = false;
-    insertPosRef.current = 0;
+    insertPosRef.current = init.length;
     voiceLenRef.current = 0;
     restartingRef.current = false;
     setBars(Array(BAR_COUNT).fill(2));

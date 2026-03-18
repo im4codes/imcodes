@@ -60,6 +60,10 @@ export interface EnvConfig {
   // FCM push notifications (Android)
   FCM_SERVER_KEY?: string;
 
+  // Password auth
+  /** Default admin password when auto-creating admin user. Default: 'imcodes' */
+  DEFAULT_ADMIN_PASSWORD?: string;
+
   // Landing page
   /** Host that serves the landing page instead of the app (e.g. im.codes). */
   LANDING_HOST?: string;
@@ -104,6 +108,7 @@ export function loadEnv(): EnvConfig {
     APNS_TEAM_ID: process.env.APNS_TEAM_ID,
     APNS_BUNDLE_ID: process.env.APNS_BUNDLE_ID ?? 'app.imcodes',
     FCM_SERVER_KEY: process.env.FCM_SERVER_KEY,
+    DEFAULT_ADMIN_PASSWORD: process.env.DEFAULT_ADMIN_PASSWORD,
     LANDING_HOST: process.env.LANDING_HOST,
     NODE_ENV: process.env.NODE_ENV,
     ENVIRONMENT: process.env.ENVIRONMENT,

@@ -158,7 +158,8 @@
     "error": "Cannot reach server. Check the URL and try again.",
     "errorNotHttps": "Server URL must use HTTPS",
     "changeServer": "Change Server",
-    "addServer": "+ Add Server"
+    "addServer": "+ Add Server",
+    "httpWarning": "Warning: HTTP connections are not secure. Use HTTPS for non-localhost servers."
   },
   "passkey": {
     "title": "Passkeys",
@@ -170,6 +171,14 @@
     "added": "Added",
     "last_used": "last used",
     "device_name_placeholder": "Device label (optional)"
+  },
+  "account": {
+    "delete_title": "Delete Account",
+    "delete_warning": "This action is permanent. All your servers, sessions, API keys, passkeys, and other data will be permanently deleted.",
+    "delete_btn": "Delete Account",
+    "delete_confirm_prompt": "Type DELETE to confirm account deletion:",
+    "delete_confirm": "Permanently Delete",
+    "delete_error": "Failed to delete account. Please try again."
   },
   "voice": {
     "listening": "Listening...",

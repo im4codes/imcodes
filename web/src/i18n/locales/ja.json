@@ -158,7 +158,8 @@
     "error": "サーバーに接続できません。URLを確認して再試行してください。",
     "errorNotHttps": "サーバーURLはHTTPSを使用する必要があります",
     "changeServer": "サーバーを変更",
-    "addServer": "+ サーバーを追加"
+    "addServer": "+ サーバーを追加",
+    "httpWarning": "警告：HTTP接続は安全ではありません。localhost以外のサーバーにはHTTPSを使用してください。"
   },
   "passkey": {
     "title": "パスキー管理",
@@ -170,6 +171,14 @@
     "added": "追加日",
     "last_used": "最終使用",
     "device_name_placeholder": "デバイス名（任意）"
+  },
+  "account": {
+    "delete_title": "アカウントを削除",
+    "delete_warning": "この操作は元に戻せません。すべてのサーバー、セッション、APIキー、パスキー、その他のデータが完全に削除されます。",
+    "delete_btn": "アカウントを削除",
+    "delete_confirm_prompt": "アカウント削除を確認するには DELETE と入力してください：",
+    "delete_confirm": "完全に削除",
+    "delete_error": "アカウントの削除に失敗しました。もう一度お試しください。"
   },
   "voice": {
     "listening": "音声認識中...",
