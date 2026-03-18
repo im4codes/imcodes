@@ -1,0 +1,59 @@
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      PROXY_DOMAIN: "${PROXY_DOMAIN}"
+      UPSTREAM_URL: "${UPSTREAM_URL}"
+      ADMIN_EMAIL: "${ADMIN_EMAIL}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - server
+
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    environment:
+      DATABASE_URL: "postgresql://imcodes:${POSTGRES_PASSWORD}@postgres:5432/imcodes"
+      JWT_SIGNING_KEY: "${JWT_SIGNING_KEY}"
+      BOT_ENCRYPTION_KEY: "${BOT_ENCRYPTION_KEY}"
+      SERVER_URL: "${SERVER_URL}"
+      ALLOWED_ORIGINS: "${ALLOWED_ORIGINS}"
+      TRUSTED_PROXIES: "127.0.0.1,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16"
+      BIND_HOST: "0.0.0.0"
+      PORT: "3000"
+      NODE_ENV: "production"
+      GITHUB_CLIENT_ID: "${GITHUB_CLIENT_ID:-}"
+      GITHUB_CLIENT_SECRET: "${GITHUB_CLIENT_SECRET:-}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: imcodes
+      POSTGRES_USER: imcodes
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U imcodes -d imcodes"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

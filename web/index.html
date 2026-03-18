@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#0a0e1a" />
+    <title>IM.codes</title>
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <style>
+      /* ── IM.codes Splash ── */
+      :root { --splash-bg: #0a0e1a; }
+      body { margin: 0; background: var(--splash-bg); }
+
+      #splash {
+        position: fixed; inset: 0; z-index: 9999;
+        display: flex; align-items: center; justify-content: center; flex-direction: column;
+        background: var(--splash-bg);
+        font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'JetBrains Mono', monospace;
+        overflow: hidden;
+        transition: opacity 0.5s ease, visibility 0.5s ease;
+      }
+      #splash.splash-exit { opacity: 0; visibility: hidden; pointer-events: none; }
+
+      /* Scanline overlay */
+      #splash::before {
+        content: ''; position: absolute; inset: 0; z-index: 1; pointer-events: none;
+        background: repeating-linear-gradient(
+          0deg,
+          transparent,
+          transparent 2px,
+          rgba(0, 255, 180, 0.015) 2px,
+          rgba(0, 255, 180, 0.015) 4px
+        );
+      }
+
+      /* Grid background */
+      #splash::after {
+        content: ''; position: absolute; inset: 0; z-index: 0; pointer-events: none;
+        background-image:
+          linear-gradient(rgba(0, 255, 180, 0.03) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(0, 255, 180, 0.03) 1px, transparent 1px);
+        background-size: 60px 60px;
+        animation: gridPulse 4s ease-in-out infinite;
+      }
+
+      @keyframes gridPulse {
+        0%, 100% { opacity: 0.3; }
+        50% { opacity: 0.7; }
+      }
+
+      /* Logo container */
+      .splash-logo {
+        position: relative; z-index: 2;
+        display: flex; align-items: baseline; gap: 0;
+        font-size: clamp(42px, 10vw, 72px);
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        line-height: 1;
+      }
+
+      /* "IM" — glitch decode */
+      .splash-im {
+        color: #e0f0ff;
+        text-shadow:
+          0 0 20px rgba(96, 165, 250, 0.5),
+          0 0 60px rgba(96, 165, 250, 0.2);
+        animation: glitchIn 0.8s ease-out both;
+      }
+
+      /* "." — cursor blink then stay */
+      .splash-dot {
+        color: #00ffb4;
+        text-shadow:
+          0 0 12px rgba(0, 255, 180, 0.8),
+          0 0 40px rgba(0, 255, 180, 0.3);
+        animation: dotAppear 0.15s ease-out 0.7s both;
+      }
+
+      /* "codes" — type out */
+      .splash-codes {
+        color: #94a3b8;
+        overflow: hidden;
+        white-space: nowrap;
+        width: 0;
+        animation: typeOut 0.5s steps(5, end) 0.85s forwards;
+      }
+
+      /* Subtitle */
+      .splash-sub {
+        position: relative; z-index: 2;
+        margin-top: 16px;
+        font-size: 13px;
+        color: #475569;
+        letter-spacing: 0.2em;
+        text-transform: uppercase;
+        opacity: 0;
+        animation: fadeUp 0.6s ease-out 1.4s forwards;
+      }
+
+      /* Progress beam */
+      .splash-beam {
+        position: absolute; bottom: 0; left: 0; right: 0; height: 2px;
+        z-index: 2; overflow: hidden;
+      }
+      .splash-beam::after {
+        content: ''; position: absolute; top: 0; left: -40%; width: 40%; height: 100%;
+        background: linear-gradient(90deg, transparent, #00ffb4, transparent);
+        animation: beamSweep 1.5s ease-in-out infinite;
+      }
+
+      /* Horizontal scan line */
+      .splash-scan {
+        position: absolute; left: 0; right: 0; height: 1px;
+        z-index: 3; pointer-events: none;
+        background: linear-gradient(90deg, transparent 10%, rgba(0, 255, 180, 0.15) 50%, transparent 90%);
+        animation: scanDown 3s linear infinite;
+      }
+
+      @keyframes glitchIn {
+        0% { opacity: 0; transform: translateX(-8px) skewX(-5deg); filter: blur(4px); }
+        30% { opacity: 1; transform: translateX(3px) skewX(2deg); filter: blur(0); }
+        50% { transform: translateX(-1px) skewX(-1deg); }
+        100% { transform: translateX(0) skewX(0); }
+      }
+
+      @keyframes dotAppear {
+        0% { opacity: 0; transform: scale(0); }
+        100% { opacity: 1; transform: scale(1); }
+      }
+
+      @keyframes typeOut {
+        0% { width: 0; }
+        100% { width: 2.8em; }
+      }
+
+      @keyframes fadeUp {
+        0% { opacity: 0; transform: translateY(8px); }
+        100% { opacity: 1; transform: translateY(0); }
+      }
+
+      @keyframes beamSweep {
+        0% { left: -40%; }
+        100% { left: 100%; }
+      }
+
+      @keyframes scanDown {
+        0% { top: -2%; }
+        100% { top: 102%; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="splash">
+      <div class="splash-scan"></div>
+      <div class="splash-logo">
+        <span class="splash-im">IM</span><span class="splash-dot">.</span><span class="splash-codes">codes</span>
+      </div>
+      <div class="splash-sub">initializing</div>
+      <div class="splash-beam"></div>
+    </div>
+    <div id="app"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

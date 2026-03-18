@@ -1,0 +1,13 @@
+src/
+test/
+worker/
+web/
+mobile/
+openspec/
+.env*
+*.test.ts
+*.spec.ts
+tsconfig.json
+vitest.config.ts
+.github/
+coverage/

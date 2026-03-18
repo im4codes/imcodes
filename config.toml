@@ -1,0 +1,8 @@
+
+[notify]
+"agent-turn-complete" = """
+#!/bin/bash
+mkdir -p "/tmp/imcodes/signals"
+echo '{"session":"deck_cd_brain","timestamp":"'$(date +%s%3N)'","agentType":"codex"}' > "/tmp/imcodes/signals/deck_cd_brain.idle.json.tmp"
+mv "/tmp/imcodes/signals/deck_cd_brain.idle.json.tmp" "/tmp/imcodes/signals/deck_cd_brain.idle.json"
+"""

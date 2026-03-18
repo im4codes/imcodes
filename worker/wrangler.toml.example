@@ -1,0 +1,42 @@
+# Copy this to wrangler.toml and fill in your D1 database ID.
+# Set secrets with: wrangler secret put <NAME>
+#
+# Required secrets (never put values here — use `wrangler secret put`):
+#
+#   wrangler secret put JWT_SIGNING_KEY      # HMAC-SHA256 key for signing JWTs
+#   wrangler secret put BOT_ENCRYPTION_KEY   # AES-256 key for encrypting bot credentials in D1
+#
+# Platform bot credentials (Telegram, Discord, Feishu) are stored per-user in D1,
+# encrypted with BOT_ENCRYPTION_KEY. Users register their own bots via POST /api/bot.
+# No platform-specific secrets are needed here.
+
+name = "imcodes-worker"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "imcodes"
+database_id = "YOUR_D1_DATABASE_ID"
+
+[[durable_objects.bindings]]
+name = "DAEMON_BRIDGE"
+class_name = "DaemonBridge"
+
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiter"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["DaemonBridge", "RateLimiter"]
+
+[vars]
+ENVIRONMENT = "production"
+WORKER_URL = "https://your-worker.workers.dev"
+
+[[triggers.crons]]
+cron = "*/5 * * * *"
+[[triggers.crons]]
+cron = "* * * * *"
