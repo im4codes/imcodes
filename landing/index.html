@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IM.codes — chat interface for AI coding agents</title>
+<meta name="description" content="Talk to Claude Code, Codex, Gemini CLI from your browser or phone. Terminal streaming, multi-agent coordination, sub-sessions.">
+<style>
+:root {
+  --bg: #0a0a0a;
+  --fg: #c8c8c8;
+  --dim: #555;
+  --accent: #22c55e;
+  --accent2: #3b82f6;
+  --border: #1a1a1a;
+  --code-bg: #111;
+  --font: 'SF Mono', 'Cascadia Code', 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.7;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.container { max-width: 720px; margin: 0 auto; padding: 60px 24px 80px; }
+
+header { margin-bottom: 48px; }
+h1 { font-size: 20px; font-weight: 600; color: #fff; margin-bottom: 8px; }
+h1 span { color: var(--accent); }
+.tagline { color: var(--dim); font-size: 13px; }
+
+.prompt::before { content: '$ '; color: var(--accent); }
+.prompt { color: #fff; margin-bottom: 4px; }
+.output { color: var(--dim); margin-bottom: 20px; padding-left: 18px; }
+
+section { margin-bottom: 40px; }
+h2 {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  margin-bottom: 16px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.arch {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 20px;
+  font-size: 13px;
+  overflow-x: auto;
+  white-space: pre;
+  line-height: 1.5;
+}
+.arch .label { color: var(--accent2); }
+.arch .arrow { color: var(--dim); }
+.arch .proto { color: var(--accent); }
+
+.features {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px;
+}
+@media (max-width: 540px) { .features { grid-template-columns: 1fr; } }
+.feat {
+  padding: 12px 14px;
+  border-radius: 4px;
+}
+.feat-name { color: #fff; font-size: 13px; }
+.feat-desc { color: var(--dim); font-size: 12px; margin-top: 2px; }
+
+.install-block {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 16px 20px;
+  position: relative;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.install-block:hover { border-color: #333; }
+.install-block code { color: #fff; font-size: 14px; }
+.install-block code span { color: var(--accent); }
+.install-block .copy-hint {
+  position: absolute;
+  right: 16px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--dim);
+  font-size: 11px;
+  transition: color 0.15s;
+}
+.install-block:hover .copy-hint { color: var(--fg); }
+
+.steps { list-style: none; counter-reset: step; }
+.steps li {
+  counter-increment: step;
+  padding: 6px 0;
+  padding-left: 28px;
+  position: relative;
+  color: var(--fg);
+}
+.steps li::before {
+  content: counter(step);
+  position: absolute;
+  left: 0;
+  color: var(--dim);
+  font-size: 12px;
+  width: 20px;
+  text-align: right;
+}
+.steps code {
+  background: var(--code-bg);
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 13px;
+  color: #fff;
+}
+
+.agents {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+.agent-tag {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--fg);
+}
+
+.reqs { color: var(--dim); font-size: 13px; }
+.reqs li { padding: 3px 0; list-style: none; }
+.reqs li::before { content: '→ '; color: var(--accent); }
+
+footer {
+  margin-top: 48px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+  color: var(--dim);
+  font-size: 12px;
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.cursor {
+  display: inline-block;
+  width: 8px;
+  height: 15px;
+  background: var(--accent);
+  margin-left: 2px;
+  animation: blink 1s step-end infinite;
+  vertical-align: text-bottom;
+}
+@keyframes blink { 50% { opacity: 0; } }
+</style>
+</head>
+<body>
+<div class="container">
+
+<header>
+  <h1>IM<span>.</span>codes</h1>
+  <div class="tagline">a chat interface for AI coding agents</div>
+</header>
+
+<section>
+  <div class="prompt">imcodes bind https://app.im.codes/bind/&lt;key&gt;<span class="cursor"></span></div>
+  <div class="output">bound to app.im.codes &middot; daemon started &middot; registered as system service</div>
+</section>
+
+<section>
+  <h2>what</h2>
+  <p style="color:var(--fg); margin-bottom:16px;">
+    Talk to your AI coding agents from a browser or phone. Not Slack, not Discord &mdash;
+    something built for the job. Live terminal output, structured chat, multi-agent coordination.
+  </p>
+  <div class="features">
+    <div class="feat"><div class="feat-name">remote control</div><div class="feat-desc">browser &amp; mobile, no SSH/VPN</div></div>
+    <div class="feat"><div class="feat-name">terminal + chat</div><div class="feat-desc">raw CLI or structured view</div></div>
+    <div class="feat"><div class="feat-name">sub-sessions</div><div class="feat-desc">spawn parallel agents on the fly</div></div>
+    <div class="feat"><div class="feat-name">multi-agent</div><div class="feat-desc">agents discuss &amp; review each other</div></div>
+    <div class="feat"><div class="feat-name">real-time stream</div><div class="feat-desc">live output, no polling</div></div>
+    <div class="feat"><div class="feat-name">push notifications</div><div class="feat-desc">know when agents need attention</div></div>
+    <div class="feat"><div class="feat-name">multi-server</div><div class="feat-desc">manage agents across machines</div></div>
+    <div class="feat"><div class="feat-name">self-hosted</div><div class="feat-desc">your infra, your data</div></div>
+  </div>
+</section>
+
+<section>
+  <h2>architecture</h2>
+  <div class="arch"><span class="label">You</span> <span class="arrow">(browser / mobile)</span>
+ <span class="arrow">│</span> <span class="proto">WebSocket</span>
+<span class="label">Server</span> <span class="arrow">(self-hosted, relays connections)</span>
+ <span class="arrow">│</span> <span class="proto">WebSocket</span>
+<span class="label">Daemon</span> <span class="arrow">(your machine, manages sessions)</span>
+ <span class="arrow">│</span> <span class="proto">tmux</span>
+<span class="label">Agents</span> <span class="arrow">(Claude Code / Codex / Gemini CLI / OpenCode)</span></div>
+</section>
+
+<section>
+  <h2>install</h2>
+  <div class="install-block" onclick="copy(this)">
+    <code><span>$</span> npm install -g imcodes</code>
+    <div class="copy-hint">click to copy</div>
+  </div>
+</section>
+
+<section>
+  <h2>quick start</h2>
+  <ol class="steps">
+    <li>Use <a href="https://app.im.codes">app.im.codes</a> or self-host the server</li>
+    <li>Run <code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code></li>
+    <li>Open the dashboard &mdash; your agents are live</li>
+  </ol>
+</section>
+
+<section>
+  <h2>supported agents</h2>
+  <div class="agents">
+    <a class="agent-tag" href="https://github.com/anthropics/claude-code">Claude Code</a>
+    <a class="agent-tag" href="https://github.com/openai/codex">Codex</a>
+    <a class="agent-tag" href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>
+    <a class="agent-tag" href="https://github.com/opencode-ai/opencode">OpenCode</a>
+    <span class="agent-tag">Shell</span>
+  </div>
+</section>
+
+<section>
+  <h2>requirements</h2>
+  <ul class="reqs">
+    <li>macOS or Linux (<a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> on Windows)</li>
+    <li>Node.js &ge; 20</li>
+    <li>tmux</li>
+  </ul>
+</section>
+
+<section>
+  <h2>about</h2>
+  <p style="color:var(--dim); font-size:13px;">
+    Personal project. Built almost entirely by
+    <a href="https://github.com/anthropics/claude-code">Claude Code</a>,
+    with contributions from
+    <a href="https://github.com/openai/codex">Codex</a> and
+    <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>.
+  </p>
+</section>
+
+<footer>
+  <span>MIT &middot; <a href="https://github.com/im4codes/imcodes">source</a></span>
+  <span><a href="https://app.im.codes">app.im.codes</a></span>
+</footer>
+
+</div>
+<script>
+function copy(el) {
+  navigator.clipboard.writeText('npm install -g imcodes');
+  const hint = el.querySelector('.copy-hint');
+  hint.textContent = 'copied!';
+  setTimeout(() => hint.textContent = 'click to copy', 1500);
+}
+</script>
+</body>
+</html>
