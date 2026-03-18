@@ -47,7 +47,6 @@ public class AuthSessionPlugin: CAPPlugin, CAPBridgedPlugin {
             }
 
             session.presentationContextProvider = self
-            // Ephemeral: don't ask "allow X to sign in?" and don't persist cookies
             session.prefersEphemeralWebBrowserSession = true
             self?.session = session
             session.start()

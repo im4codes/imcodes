@@ -142,9 +142,11 @@ export function App() {
   }, []);
 
   // Dismiss splash after minimum display time (let animation play)
+  // Skip splash entirely for native auth callback — needs to render immediately
   useEffect(() => {
     const splash = document.getElementById('splash');
     if (!splash) { setSplashDone(true); return; }
+    if (nativeCallback) { splash.remove(); setSplashDone(true); return; }
     const minMs = 1800; // let full animation play on all platforms
     const t = setTimeout(() => {
       splash.classList.add('splash-exit');

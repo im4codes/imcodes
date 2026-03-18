@@ -181,6 +181,9 @@ export function buildApp(env: Env) {
     const host = (c.get('resolvedHost' as never) as string | null) ?? c.req.header('host') ?? '';
     const bare = host.replace(/:\d+$/, '');
     if (bare !== landingHost) return next();
+    // Skip landing for native auth callbacks — serve the web app instead
+    const url = new URL(c.req.url);
+    if (url.searchParams.has('native_callback')) return next();
 
     const reqPath = new URL(c.req.url).pathname;
     const filePath = join(LANDING_DIST, reqPath === '/' ? 'index.html' : reqPath);
