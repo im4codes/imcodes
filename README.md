@@ -38,7 +38,7 @@ The daemon runs on your dev machine and manages agent sessions through tmux. The
 ## Install
 
 ```bash
-npm install -g @imcodes/imcodes
+npm install -g imcodes
 ```
 
 ## Quick Start

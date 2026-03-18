@@ -886,8 +886,8 @@ echo "=== imcodes upgrade started at $(date) ===" >> "$LOG"
 sleep 3
 
 # Attempt npm install — if it fails we still restart to keep the daemon alive
-echo "Installing @imcodes/imcodes@latest..." >> "$LOG"
-if npm install -g @imcodes/imcodes@latest >> "$LOG" 2>&1; then
+echo "Installing imcodes@latest..." >> "$LOG"
+if npm install -g imcodes@latest >> "$LOG" 2>&1; then
   echo "Install succeeded." >> "$LOG"
 else
   echo "Install FAILED (exit $?). Will restart on existing version." >> "$LOG"
