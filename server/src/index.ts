@@ -48,6 +48,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // Docker: /app/dist/index.js → /app/web/dist
 // Dev:    server/dist/index.js → web/dist (two levels up from server/dist)
 const WEB_DIST = process.env.WEB_DIST_PATH ?? join(__dirname, '..', '..', 'web', 'dist');
+const LANDING_DIST = process.env.LANDING_DIST_PATH ?? join(__dirname, '..', '..', 'landing');
 
 // ── Daemon connection protection ──────────────────────────────────────────────
 const daemonConnectLimiter = new MemoryRateLimiter();
@@ -172,6 +173,35 @@ export function buildApp(env: Env) {
       "frame-ancestors 'none'",
     ].join('; '),
   };
+
+  // Landing page — served when request host matches LANDING_HOST env var
+  const landingHost = env.LANDING_HOST;
+  app.get('*', async (c, next) => {
+    if (!landingHost) return next();
+    const host = (c.get('resolvedHost' as never) as string | null) ?? c.req.header('host') ?? '';
+    const bare = host.replace(/:\d+$/, '');
+    if (bare !== landingHost) return next();
+
+    const reqPath = new URL(c.req.url).pathname;
+    const filePath = join(LANDING_DIST, reqPath === '/' ? 'index.html' : reqPath);
+    try {
+      const s = await stat(filePath);
+      if (s.isFile()) {
+        const ext = filePath.split('.').pop() ?? '';
+        const mime: Record<string, string> = {
+          html: 'text/html', js: 'application/javascript', css: 'text/css',
+          png: 'image/png', jpg: 'image/jpeg', svg: 'image/svg+xml',
+          ico: 'image/x-icon',
+        };
+        const content = await readFile(filePath);
+        return new Response(content, {
+          headers: { 'Content-Type': mime[ext] ?? 'application/octet-stream', ...SECURITY_HEADERS },
+        });
+      }
+    } catch { /* fall through to landing index */ }
+    const html = await readFile(join(LANDING_DIST, 'index.html'));
+    return new Response(html, { headers: { 'Content-Type': 'text/html', ...SECURITY_HEADERS } });
+  });
 
   // Static file serving + SPA fallback
   app.get('*', async (c) => {

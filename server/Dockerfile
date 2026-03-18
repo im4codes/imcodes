@@ -41,9 +41,13 @@ COPY --from=builder /app/server/src/db/migrations ./dist/db/migrations
 # Copy web static files
 COPY --from=builder /app/web/dist ./web/dist
 
+# Copy landing page
+COPY landing/ ./landing/
+
 EXPOSE 3000
 
 ENV NODE_ENV=production
 ENV WEB_DIST_PATH=/app/web/dist
+ENV LANDING_DIST_PATH=/app/landing
 
 CMD ["node", "dist/index.js"]
