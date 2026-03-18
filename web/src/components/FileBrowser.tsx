@@ -270,6 +270,7 @@ export function FileBrowser({
   const [showHidden, setShowHidden] = useState(false);
   const [preview, setPreview] = useState<PreviewState>({ status: 'idle' });
   const [showDiff, setShowDiff] = useState(false);
+  const [lightbox, setLightbox] = useState<string | null>(null);
   const [modifiedFiles, setModifiedFiles] = useState<Map<string, string>>(new Map()); // path → git code
   // Panel view: 'files' shows tree + changes section; 'changes' shows only changed files
   const [panelView, setPanelView] = useState<'files' | 'changes'>('files');
@@ -679,7 +680,7 @@ export function FileBrowser({
         )}
         {preview.status === 'image' && (
           <div class="fb-preview-image">
-            <img src={preview.dataUrl} alt={preview.path.split('/').pop() ?? ''} />
+            <img src={preview.dataUrl} alt={preview.path.split('/').pop() ?? ''} onClick={() => setLightbox(preview.dataUrl)} style={{ cursor: 'zoom-in' }} />
           </div>
         )}
         {preview.status === 'ok' && !showDiff && (
@@ -816,6 +817,13 @@ export function FileBrowser({
     </div>
   );
 
+  const lightboxOverlay = lightbox ? (
+    <div class="fb-lightbox" onClick={() => setLightbox(null)}>
+      <img src={lightbox} onClick={(e) => e.stopPropagation()} />
+      <button class="fb-lightbox-close" onClick={() => setLightbox(null)}>✕</button>
+    </div>
+  ) : null;
+
   if (layout === 'panel') {
     const tabs = changesRootPath ? (
       <div class="fb-panel-tabs">
@@ -829,51 +837,60 @@ export function FileBrowser({
 
     if (panelView === 'changes' && changesRootPath) {
       return (
-        <div class="fb-panel">
-          {tabs}
-          {previewPane ? (
-            <div class="fb-body fb-body-split">
-              <div class="fb-tree fb-tree-split">{changesSection}</div>
-              {previewPane}
-            </div>
-          ) : (
-            <div class="fb-body">{changesSection ?? <div class="fb-preview-msg">{t('file_browser.no_changes')}</div>}</div>
-          )}
-        </div>
+        <>
+          {lightboxOverlay}
+          <div class="fb-panel">
+            {tabs}
+            {previewPane ? (
+              <div class="fb-body fb-body-split">
+                <div class="fb-tree fb-tree-split">{changesSection}</div>
+                {previewPane}
+              </div>
+            ) : (
+              <div class="fb-body">{changesSection ?? <div class="fb-preview-msg">{t('file_browser.no_changes')}</div>}</div>
+            )}
+          </div>
+        </>
       );
     }
 
     return (
-      <div class="fb-panel">
-        {tabs}
-        {breadcrumb}
-        <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}${changesRootPath && changesFiles.length > 0 ? ' fb-body-with-changes' : ''}`}>
-          <div class={`fb-files-and-changes${hasPreview ? ' fb-tree-split' : ''}`}>
-            {tree}
-            {changesSection}
+      <>
+        {lightboxOverlay}
+        <div class="fb-panel">
+          {tabs}
+          {breadcrumb}
+          <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}${changesRootPath && changesFiles.length > 0 ? ' fb-body-with-changes' : ''}`}>
+            <div class={`fb-files-and-changes${hasPreview ? ' fb-tree-split' : ''}`}>
+              {tree}
+              {changesSection}
+            </div>
+            {previewPane}
           </div>
-          {previewPane}
+          {footer}
         </div>
-        {footer}
-      </div>
+      </>
     );
   }
 
   return (
-    <div class="fb-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose?.(); }}>
-      <div class={`fb-modal${hasPreview ? ' fb-modal-wide' : ''}`} onClick={(e) => e.stopPropagation()}>
-        <div class="fb-header">
-          <span>{title}</span>
-          <button class="fb-close" onClick={onClose}>✕</button>
+    <>
+      {lightboxOverlay}
+      <div class="fb-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose?.(); }}>
+        <div class={`fb-modal${hasPreview ? ' fb-modal-wide' : ''}`} onClick={(e) => e.stopPropagation()}>
+          <div class="fb-header">
+            <span>{title}</span>
+            <button class="fb-close" onClick={onClose}>✕</button>
+          </div>
+          {breadcrumb}
+          <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}`}>
+            {tree}
+            {previewPane}
+          </div>
+          {footer}
         </div>
-        {breadcrumb}
-        <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}`}>
-          {tree}
-          {previewPane}
-        </div>
-        {footer}
       </div>
-    </div>
+    </>
   );
 }
 
