@@ -193,6 +193,7 @@ jobs:
     needs: [docker]
     permissions:
       id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -201,15 +202,13 @@ jobs:
           cache: 'npm'
           registry-url: 'https://registry.npmjs.org'
       - run: npm ci
-      - name: Install web deps (needed for prepublishOnly test:web)
+      - name: Install web deps
         run: npm ci
         working-directory: web
       - run: npm run build
       - name: Set version
         run: npm version ${{ needs.docker.outputs.npm_version }} --no-git-tag-version
       - run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # ── Build & push Docker image ─────────────────────────────────────────────
 
