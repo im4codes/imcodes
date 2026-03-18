@@ -17,7 +17,6 @@ export function ServerSetupPage({ onConnect }: Props) {
   useEffect(() => {
     getServerList().then((list) => {
       setServers(list);
-      if (list.length === 0) setAdding(true); // show input immediately on first launch
     });
   }, []);
 
