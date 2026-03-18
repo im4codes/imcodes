@@ -1,11 +1,11 @@
 import { Hono } from 'hono';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
-import { createUser, getUserById } from '../db/queries.js';
-import { randomHex, sha256Hex, signJwt, verifyJwt } from '../security/crypto.js';
+import { createUser, getUserById, getUserByUsername } from '../db/queries.js';
+import { randomHex, sha256Hex, signJwt, verifyJwt, hashPassword, verifyPassword } from '../security/crypto.js';
 import { checkIdempotency, recordIdempotency } from '../security/replay.js';
 import { logAudit } from '../security/audit.js';
-import { checkAuthLockout } from '../security/lockout.js';
+import { checkAuthLockout, recordAuthFailure } from '../security/lockout.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { z } from 'zod';
@@ -336,6 +336,186 @@ authRoutes.post('/refresh', async (c) => {
   }
 
   return c.json({ accessToken, refreshToken: newRefresh });
+});
+
+// DELETE /api/auth/user/me — permanently delete the authenticated user and all associated data
+authRoutes.delete('/user/me', async (c) => {
+  const userId = await resolveUserId(c);
+  if (!userId) return c.json({ error: 'unauthorized' }, 401);
+
+  const user = await getUserById(c.env.DB, userId);
+  if (!user) return c.json({ error: 'not_found' }, 404);
+
+  const db = c.env.DB;
+
+  // 1. Passkey credentials
+  await db.prepare('DELETE FROM passkey_credentials WHERE user_id = ?').bind(userId).run();
+  // 2. Passkey challenges
+  await db.prepare('DELETE FROM passkey_challenges WHERE user_id = ?').bind(userId).run();
+  // 3. API keys
+  await db.prepare('DELETE FROM api_keys WHERE user_id = ?').bind(userId).run();
+  // 4. Refresh tokens
+  await db.prepare('DELETE FROM refresh_tokens WHERE user_id = ?').bind(userId).run();
+  // 5. Push tokens
+  await db.prepare('DELETE FROM push_tokens WHERE user_id = ?').bind(userId).run();
+  // 6. Push subscriptions
+  await db.prepare('DELETE FROM push_subscriptions WHERE user_id = ?').bind(userId).run();
+
+  // 7. Get server IDs for cascade deleting server-scoped data
+  const serverRows = await db.prepare('SELECT id FROM servers WHERE user_id = ?').bind(userId).all<{ id: string }>();
+  const serverIds = serverRows.results.map((r) => r.id);
+
+  if (serverIds.length > 0) {
+    for (const sid of serverIds) {
+      // Discussion rounds → discussions (CASCADE should handle rounds, but be explicit)
+      await db.prepare('DELETE FROM discussion_rounds WHERE discussion_id IN (SELECT id FROM discussions WHERE server_id = ?)').bind(sid).run();
+      await db.prepare('DELETE FROM discussions WHERE server_id = ?').bind(sid).run();
+      // Sub-sessions
+      await db.prepare('DELETE FROM sub_sessions WHERE server_id = ?').bind(sid).run();
+      // Channel bindings
+      await db.prepare('DELETE FROM channel_bindings WHERE server_id = ?').bind(sid).run();
+      // Sessions
+      await db.prepare('DELETE FROM sessions WHERE server_id = ?').bind(sid).run();
+      // Cron jobs
+      await db.prepare('DELETE FROM cron_jobs WHERE server_id = ?').bind(sid).run();
+    }
+  }
+
+  // 8. Platform bots
+  await db.prepare('DELETE FROM platform_bots WHERE user_id = ?').bind(userId).run();
+  // 9. Servers
+  await db.prepare('DELETE FROM servers WHERE user_id = ?').bind(userId).run();
+  // 10. Pending binds
+  await db.prepare('DELETE FROM pending_binds WHERE user_id = ?').bind(userId).run();
+  // 11. Platform identities
+  await db.prepare('DELETE FROM platform_identities WHERE user_id = ?').bind(userId).run();
+  // 12. User preferences
+  await db.prepare('DELETE FROM user_preferences WHERE user_id = ?').bind(userId).run();
+  // 13. User quick data
+  await db.prepare('DELETE FROM user_quick_data WHERE user_id = ?').bind(userId).run();
+  // 14. Idempotency records
+  await db.prepare('DELETE FROM idempotency_records WHERE user_id = ?').bind(userId).run();
+  // 15. Team memberships (not owned teams — those are separate)
+  await db.prepare('DELETE FROM team_members WHERE user_id = ?').bind(userId).run();
+  // 16. Audit log entries (keep? delete for GDPR compliance)
+  await db.prepare('DELETE FROM audit_log WHERE user_id = ?').bind(userId).run();
+  // 17. Delete user
+  await db.prepare('DELETE FROM users WHERE id = ?').bind(userId).run();
+
+  // Clear session cookies
+  deleteCookie(c, 'rcc_session', { path: '/' });
+  deleteCookie(c, 'rcc_refresh', { path: '/' });
+  deleteCookie(c, 'rcc_csrf', { path: '/' });
+
+  const ip = c.get('clientIp' as never) as string ?? 'unknown';
+  logger.info({ userId, ip }, '[auth] account deleted');
+
+  return c.json({ ok: true });
+});
+
+// ── Password auth ─────────────────────────────────────────────────────────
+
+// POST /api/auth/password/login — authenticate with username + password
+const passwordLoginSchema = z.object({
+  username: z.string().min(1),
+  password: z.string().min(1),
+});
+
+authRoutes.post('/password/login', async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const parsed = passwordLoginSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+
+  const { username, password } = parsed.data;
+  const ip = c.get('clientIp' as never) as string ?? 'unknown';
+
+  // Per-IP lockout check
+  const ipLockout = await checkAuthLockout(c.env.DB, `ip:${ip}`);
+  if (ipLockout.locked) {
+    return c.json({ error: 'too_many_attempts', retryAfterMs: ipLockout.lockedUntil ? ipLockout.lockedUntil - Date.now() : 0 }, 429);
+  }
+
+  const user = await getUserByUsername(c.env.DB, username);
+  if (!user || !user.password_hash) {
+    await recordAuthFailure(c.env.DB, `ip:${ip}`);
+    return c.json({ error: 'invalid_credentials' }, 401);
+  }
+
+  // Per-user lockout check
+  const userLockout = await checkAuthLockout(c.env.DB, `user:${user.id}`);
+  if (userLockout.locked) {
+    return c.json({ error: 'too_many_attempts', retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0 }, 429);
+  }
+
+  const valid = await verifyPassword(password, user.password_hash);
+  if (!valid) {
+    await recordAuthFailure(c.env.DB, `ip:${ip}`);
+    await recordAuthFailure(c.env.DB, `user:${user.id}`);
+    return c.json({ error: 'invalid_credentials' }, 401);
+  }
+
+  // Issue access (4h) + refresh (30d) tokens
+  const accessToken = signJwt({ sub: user.id, type: 'web' }, c.env.JWT_SIGNING_KEY, 4 * 3600);
+  const refreshRaw = randomHex(32);
+  const refreshHash = sha256Hex(refreshRaw);
+  const familyId = randomHex(16);
+  const refreshId = randomHex(16);
+  await c.env.DB.prepare(
+    'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+  ).bind(refreshId, user.id, refreshHash, familyId, Date.now() + 30 * 24 * 3600 * 1000, Date.now()).run();
+
+  const isSecure = c.env.NODE_ENV === 'production';
+  setCookie(c, 'rcc_session', accessToken, {
+    httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 4 * 3600,
+  });
+  setCookie(c, 'rcc_refresh', refreshRaw, {
+    httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400,
+  });
+  setCookie(c, 'rcc_csrf', randomHex(32), {
+    httpOnly: false, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 86400,
+  });
+
+  await logAudit({ userId: user.id, action: 'auth.password_login', ip }, c.env.DB);
+
+  return c.json({
+    ok: true,
+    passwordMustChange: !!user.password_must_change,
+    accessToken,
+    refreshToken: refreshRaw,
+  });
+});
+
+// POST /api/auth/password/change — change password (requires auth)
+const passwordChangeSchema = z.object({
+  oldPassword: z.string().min(1),
+  newPassword: z.string().min(8),
+});
+
+authRoutes.post('/password/change', async (c) => {
+  const userId = await resolveUserId(c);
+  if (!userId) return c.json({ error: 'unauthorized' }, 401);
+
+  const body = await c.req.json().catch(() => null);
+  const parsed = passwordChangeSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+
+  const { oldPassword, newPassword } = parsed.data;
+
+  const user = await getUserById(c.env.DB, userId);
+  if (!user || !user.password_hash) return c.json({ error: 'no_password_set' }, 400);
+
+  const valid = await verifyPassword(oldPassword, user.password_hash);
+  if (!valid) return c.json({ error: 'invalid_old_password' }, 401);
+
+  const newHash = await hashPassword(newPassword);
+  await c.env.DB.prepare(
+    'UPDATE users SET password_hash = ?, password_must_change = false WHERE id = ?',
+  ).bind(newHash, userId).run();
+
+  const ip = c.get('clientIp' as never) as string ?? 'unknown';
+  await logAudit({ userId, action: 'auth.password_change', ip }, c.env.DB);
+
+  return c.json({ ok: true });
 });
 
 // POST /api/auth/logout — clear session cookies + invalidate refresh tokens

@@ -13,6 +13,7 @@ export function ServerSetupPage({ onConnect }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const [inputUrl, setInputUrl] = useState('');
+  const [httpWarning, setHttpWarning] = useState(false);
 
   useEffect(() => {
     getServerList().then((list) => {
@@ -49,6 +50,13 @@ export function ServerSetupPage({ onConnect }: Props) {
       setError(t('serverSetup.errorNotHttps'));
       return;
     }
+    // Warn if using HTTP on a non-localhost host
+    try {
+      const parsed = new URL(trimmed);
+      setHttpWarning(parsed.protocol === 'http:' && parsed.hostname !== 'localhost' && parsed.hostname !== '127.0.0.1');
+    } catch {
+      setHttpWarning(false);
+    }
     setError(null);
     if (!servers.includes(trimmed)) {
       setServers((prev) => [...prev, trimmed]);
@@ -75,6 +83,12 @@ export function ServerSetupPage({ onConnect }: Props) {
         {error && (
           <div style={{ color: '#f87171', marginBottom: 12, textAlign: 'center', fontSize: 14 }}>
             {error}
+          </div>
+        )}
+
+        {httpWarning && (
+          <div style={{ color: '#fbbf24', marginBottom: 12, textAlign: 'center', fontSize: 13 }}>
+            {t('serverSetup.httpWarning')}
           </div>
         )}
 

@@ -158,7 +158,8 @@
     "error": "無法連接到伺服器，請確認地址後重試。",
     "errorNotHttps": "伺服器地址必須使用 HTTPS",
     "changeServer": "更換伺服器",
-    "addServer": "+ 新增伺服器"
+    "addServer": "+ 新增伺服器",
+    "httpWarning": "警告：HTTP 連線不安全。非本地伺服器請使用 HTTPS。"
   },
   "passkey": {
     "title": "Passkey 管理",
@@ -170,6 +171,14 @@
     "added": "新增於",
     "last_used": "最近使用",
     "device_name_placeholder": "裝置名稱（可選）"
+  },
+  "account": {
+    "delete_title": "刪除帳號",
+    "delete_warning": "此操作無法復原。你的所有伺服器、Session、API 金鑰、Passkey 和其他資料將被永久刪除。",
+    "delete_btn": "刪除帳號",
+    "delete_confirm_prompt": "輸入 DELETE 確認刪除帳號：",
+    "delete_confirm": "永久刪除",
+    "delete_error": "刪除帳號失敗，請重試。"
   },
   "voice": {
     "listening": "辨識中...",

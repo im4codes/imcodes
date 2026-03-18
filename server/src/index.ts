@@ -14,9 +14,10 @@ import { fileURLToPath } from 'node:url';
 import { stat, readFile } from 'node:fs/promises';
 import type { IncomingMessage } from 'node:http';
 
-import { loadEnv, type Env } from './env.js';
-import { createDatabase } from './db/client.js';
+import { loadEnv, type Env, type EnvConfig } from './env.js';
+import { createDatabase, type PgDatabase } from './db/client.js';
 import { runMigrations } from './db/migrate.js';
+import { randomHex, hashPassword } from './security/crypto.js';
 import { authRoutes } from './routes/auth.js';
 import { githubAuthRoutes } from './routes/github-auth.js';
 import { bindRoutes } from './routes/bind.js';
@@ -344,6 +345,24 @@ function scheduleCrons(env: Env) {
   logger.info({}, 'Cron jobs scheduled');
 }
 
+// ── Default admin ─────────────────────────────────────────────────────────────
+
+async function ensureDefaultAdmin(db: PgDatabase, envConfig: EnvConfig): Promise<void> {
+  const row = await db.prepare('SELECT COUNT(*) AS cnt FROM users').bind().first<{ cnt: number }>();
+  if (row && Number(row.cnt) > 0) return;
+
+  const userId = randomHex(16);
+  const password = envConfig.DEFAULT_ADMIN_PASSWORD ?? 'imcodes';
+  const passwordHash = await hashPassword(password);
+  const now = Date.now();
+
+  await db.prepare(
+    'INSERT INTO users (id, username, password_hash, display_name, password_must_change, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+  ).bind(userId, 'admin', passwordHash, 'Admin', true, now).run();
+
+  logger.info({ username: 'admin' }, 'Default admin account created (password_must_change=true)');
+}
+
 // ── Startup ───────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -370,6 +389,7 @@ async function main() {
   }
 
   await runMigrations(db);
+  await ensureDefaultAdmin(db, envConfig);
 
   const app = buildApp(env);
 
