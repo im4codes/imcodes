@@ -6,15 +6,22 @@ A chat interface built for talking to AI coding agents. Not Slack, not Discord, 
 
 ### Desktop
 
-| Dashboard & Multi-Agent | Chat View | Multi-Agent Discussion | File Browser & Diff |
-|---|---|---|---|
-| ![Dashboard](landing/imcodes0.png) | ![Chat](landing/imcodes1.png) | ![Discussion](landing/imcodes2.png) | ![Files](landing/imcodes3.png) |
+<p>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes0.png"><img src="landing/imcodes0.png" width="24%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes1.png"><img src="landing/imcodes1.png" width="24%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes2.png"><img src="landing/imcodes2.png" width="24%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes3.png"><img src="landing/imcodes3.png" width="24%" /></a>
+</p>
 
 ### Mobile
 
-| Chat View | Gemini CLI | Terminal | Agent Selector | Source Diff |
-|---|---|---|---|---|
-| ![Chat](landing/imcodes-m1.png) | ![Gemini](landing/imcodes-m2.png) | ![Terminal](landing/imcodes-m3.png) | ![Agents](landing/imcodes-m4.png) | ![Diff](landing/imcodes-m0.png) |
+<p>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m1.png"><img src="landing/imcodes-m1.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m2.png"><img src="landing/imcodes-m2.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m3.png"><img src="landing/imcodes-m3.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m4.png"><img src="landing/imcodes-m4.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m0.png"><img src="landing/imcodes-m0.png" width="18%" /></a>
+</p>
 
 ## Why
 
