@@ -1,0 +1,38 @@
+node_modules/
+dist/
+coverage/
+*.log
+.env
+.env.*
+!.env.example
+*.local
+
+# Secrets — never commit
+wrangler.toml
+.dev.vars
+*.pem
+*.key
+
+# Build outputs
+web/dist/
+worker/dist/
+mobile/ios/
+mobile/android/
+
+# Deploy script with server-specific info
+scripts/deploy.sh
+
+# Discussion and plans (private)
+docs/plan/
+
+# Server deployment config — contains IPs, domains, env var values (private)
+docs/*.local.md
+
+# Agent memory and skills (private)
+.claude/
+.codex/
+
+# System
+.DS_Store
+Thumbs.db
+openspec/

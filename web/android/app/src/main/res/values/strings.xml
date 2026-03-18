@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">IM.codes</string>
+    <string name="title_activity_main">IM.codes</string>
+    <string name="package_name">com.im.codes</string>
+    <string name="custom_url_scheme">com.im.codes</string>
+</resources>

@@ -1,0 +1,57 @@
+import { promises as fs } from 'fs';
+import path from 'path';
+import type { AgentDriver, LaunchOptions } from './base.js';
+import type { AgentStatus } from '../detect.js';
+import { detectStatus } from '../detect.js';
+
+export class OpenCodeDriver implements AgentDriver {
+  readonly type = 'opencode' as const;
+  readonly promptChar = '>';
+  readonly spinnerChars = ['|', '/', '-', '\\'];
+
+  buildLaunchCommand(_sessionName: string, opts?: LaunchOptions): string {
+    const cwd = opts?.cwd ? `cd ${JSON.stringify(opts.cwd)} && ` : '';
+    if (opts?.fresh) {
+      return `${cwd}opencode`;
+    }
+    // Default: resume last conversation; fall back to fresh if no history
+    return `${cwd}opencode -c || opencode`;
+  }
+
+  buildResumeCommand(_sessionName: string, opts?: LaunchOptions): string {
+    return this.buildLaunchCommand(_sessionName, opts);
+  }
+
+  detectStatus(lines: string[]): AgentStatus {
+    return detectStatus(lines, 'opencode');
+  }
+
+  isOverlay(lines: string[]): boolean {
+    return false;
+  }
+
+  /**
+   * Ensure the project directory has opencode.json with full permissions.
+   * Called before launching the session.
+   */
+  async ensurePermissions(cwd: string): Promise<void> {
+    const configPath = path.join(cwd, 'opencode.json');
+    try {
+      await fs.access(configPath);
+    } catch {
+      await fs.writeFile(
+        configPath,
+        JSON.stringify({ permission: { '*': 'allow' } }, null, 2)
+      );
+    }
+  }
+
+  async captureLastResponse(
+    capturePane: () => Promise<string[]>,
+    _sendKeys: (keys: string) => Promise<void>,
+    _showBuffer: () => Promise<string>,
+  ): Promise<string> {
+    const lines = await capturePane();
+    return lines.join('\n');
+  }
+}

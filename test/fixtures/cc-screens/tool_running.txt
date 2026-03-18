@@ -1,0 +1,5 @@
+  imcodes v0.1.0
+
+  ● Read file src/auth/middleware.ts
+
+⠸ Running tool...

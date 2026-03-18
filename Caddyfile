@@ -1,0 +1,26 @@
+{
+    email {$ADMIN_EMAIL:admin@imcodes.cc}
+}
+
+{$PROXY_DOMAIN} {
+    # 匹配中国大陆 IP
+    @china {
+        import /etc/caddy/china_ips.caddy
+    }
+
+    # 如果是中国大陆 IP，进行加速转发
+    handle @china {
+        reverse_proxy {$UPSTREAM_URL} {
+            header_up Host {upstream_hostport}
+            header_up X-Forwarded-Host {host}
+            header_up X-Forwarded-Proto {scheme}
+            header_up Connection {>Connection}
+            header_up Upgrade {>Upgrade}
+        }
+    }
+
+    # 如果是非大陆 IP，直接跳转到主站
+    handle {
+        redir {$UPSTREAM_URL}{uri}
+    }
+}

@@ -1,0 +1,166 @@
+diff --git a/node_modules/@capgo/capacitor-speech-recognition/.swiftpm/xcode/xcuserdata/k.xcuserdatad/xcschemes/xcschememanagement.plist b/node_modules/@capgo/capacitor-speech-recognition/.swiftpm/xcode/xcuserdata/k.xcuserdatad/xcschemes/xcschememanagement.plist
+new file mode 100644
+index 0000000..b7055bb
+--- /dev/null
++++ b/node_modules/@capgo/capacitor-speech-recognition/.swiftpm/xcode/xcuserdata/k.xcuserdatad/xcschemes/xcschememanagement.plist
+@@ -0,0 +1,14 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++	<key>SchemeUserState</key>
++	<dict>
++		<key>CapgoCapacitorSpeechRecognition.xcscheme_^#shared#^_</key>
++		<dict>
++			<key>orderHint</key>
++			<integer>8</integer>
++		</dict>
++	</dict>
++</dict>
++</plist>
+diff --git a/node_modules/@capgo/capacitor-speech-recognition/android/src/main/java/app/capgo/speechrecognition/SpeechRecognitionPlugin.java b/node_modules/@capgo/capacitor-speech-recognition/android/src/main/java/app/capgo/speechrecognition/SpeechRecognitionPlugin.java
+index 2eb8aec..d14ee21 100644
+--- a/node_modules/@capgo/capacitor-speech-recognition/android/src/main/java/app/capgo/speechrecognition/SpeechRecognitionPlugin.java
++++ b/node_modules/@capgo/capacitor-speech-recognition/android/src/main/java/app/capgo/speechrecognition/SpeechRecognitionPlugin.java
+@@ -41,6 +41,7 @@ public class SpeechRecognitionPlugin extends Plugin implements Constants {
+     private final ReentrantLock lock = new ReentrantLock();
+     private boolean listening = false;
+     private JSONArray previousPartialResults = new JSONArray();
++    private long lastLevelTime = 0;
+ 
+     @Override
+     public void load() {
+@@ -310,7 +311,16 @@ public class SpeechRecognitionPlugin extends Plugin implements Constants {
+         }
+ 
+         @Override
+-        public void onRmsChanged(float rmsdB) {}
++        public void onRmsChanged(float rmsdB) {
++            long now = System.currentTimeMillis();
++            if (now - lastLevelTime < 66) return; // throttle to ~15fps
++            lastLevelTime = now;
++            // Android rmsdB is typically -2 to 10+, map to 0..1
++            float level = Math.max(0f, Math.min(1f, (rmsdB + 2f) / 12f));
++            JSObject ret = new JSObject();
++            ret.put("level", level);
++            notifyListeners("audioLevel", ret);
++        }
+ 
+         @Override
+         public void onBufferReceived(byte[] buffer) {}
+diff --git a/node_modules/@capgo/capacitor-speech-recognition/ios/Sources/SpeechRecognitionPlugin/SpeechRecognitionPlugin.swift b/node_modules/@capgo/capacitor-speech-recognition/ios/Sources/SpeechRecognitionPlugin/SpeechRecognitionPlugin.swift
+index 51823fa..19eb934 100644
+--- a/node_modules/@capgo/capacitor-speech-recognition/ios/Sources/SpeechRecognitionPlugin/SpeechRecognitionPlugin.swift
++++ b/node_modules/@capgo/capacitor-speech-recognition/ios/Sources/SpeechRecognitionPlugin/SpeechRecognitionPlugin.swift
+@@ -32,6 +32,14 @@ public final class SpeechRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
+     private var activeCall: CAPPluginCall?
+     private var currentOptions: RecognitionOptions?
+     private var hasInstalledTap = false
++    private var usingSpeechAnalyzer = false
++
++    // iOS 26+ SpeechAnalyzer properties
++    private var analyzerTask: Task<(), Error>?
++    private var inputContinuation: Any?
++
++    // Audio level metering — throttled to ~15 fps
++    private var lastLevelTime: CFTimeInterval = 0
+ 
+     private let maxDefaultResults = 5
+ 
+@@ -42,7 +50,7 @@ public final class SpeechRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
+     }
+ 
+     @objc func start(_ call: CAPPluginCall) {
+-        if self.audioEngine.isRunning || recognitionTask != nil {
++        if self.audioEngine.isRunning || recognitionTask != nil || usingSpeechAnalyzer {
+             CAPLog.print("[SpeechRecognition] Attempted to start while already running")
+             call.reject("Speech recognition is already running.")
+             return
+@@ -76,7 +84,9 @@ public final class SpeechRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
+             }
+ 
+             DispatchQueue.main.async {
+-                self.beginRecognition(call: call, options: options)
++                // Always use legacy SFSpeechRecognizer for now — it has lower latency
++                // and doesn't require model downloads. SpeechAnalyzer can be enabled later.
++                self.beginLegacyRecognition(call: call, options: options)
+             }
+         }
+     }
+@@ -88,7 +98,7 @@ public final class SpeechRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
+     }
+ 
+     @objc func isListening(_ call: CAPPluginCall) {
+-        call.resolve(["listening": audioEngine.isRunning])
++        call.resolve(["listening": audioEngine.isRunning || usingSpeechAnalyzer])
+     }
+ 
+     @objc func getSupportedLanguages(_ call: CAPPluginCall) {
+@@ -129,7 +139,11 @@ public final class SpeechRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
+         }
+     }
+ 
+-    private func beginRecognition(call: CAPPluginCall, options: RecognitionOptions) {
++    // MARK: - SFSpeechRecognizer (all iOS versions)
++
++    private func beginLegacyRecognition(call: CAPPluginCall, options: RecognitionOptions) {
++        CAPLog.print("[SpeechRecognition] Using SFSpeechRecognizer")
++
+         guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: options.language)) else {
+             call.reject("Unsupported locale: \(options.language)")
+             cleanupRecognition(notifyStop: false)
+@@ -154,6 +168,7 @@ public final class SpeechRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
+ 
+         let recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
+         recognitionRequest.shouldReportPartialResults = options.partialResults
++        recognitionRequest.taskHint = .dictation
+         if #available(iOS 16.0, *) {
+             recognitionRequest.addsPunctuation = options.addPunctuation
+         }
+@@ -164,6 +179,7 @@ public final class SpeechRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
+         inputNode.removeTap(onBus: 0)
+         inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
+             self?.recognitionRequest?.append(buffer)
++            self?.emitAudioLevel(buffer: buffer)
+         }
+         hasInstalledTap = true
+ 
+@@ -207,6 +223,38 @@ public final class SpeechRecognitionPlugin: CAPPlugin, CAPBridgedPlugin {
+         }
+     }
+ 
++    // MARK: - Audio level metering
++
++    private func emitAudioLevel(buffer: AVAudioPCMBuffer) {
++        let now = CACurrentMediaTime()
++        // Throttle to ~15 fps (every 66ms)
++        guard now - lastLevelTime > 0.066 else { return }
++        lastLevelTime = now
++
++        guard let channelData = buffer.floatChannelData else { return }
++        let frames = Int(buffer.frameLength)
++        guard frames > 0 else { return }
++
++        // Calculate RMS
++        var sum: Float = 0
++        let data = channelData[0]
++        for i in 0..<frames {
++            let sample = data[i]
++            sum += sample * sample
++        }
++        let rms = sqrtf(sum / Float(frames))
++
++        // Convert to 0..1 range (dB scale, -60dB to 0dB mapped to 0..1)
++        let db = 20.0 * log10f(max(rms, 1e-6))
++        let level = max(0, min(1, (db + 50) / 50))
++
++        DispatchQueue.main.async { [weak self] in
++            self?.notifyListeners("audioLevel", data: ["level": level])
++        }
++    }
++
++    // MARK: - Shared helpers
++
+     private func configureAudioSession() throws {
+         let session = AVAudioSession.sharedInstance()
+         try session.setCategory(.playAndRecord, options: [.defaultToSpeaker, .duckOthers])

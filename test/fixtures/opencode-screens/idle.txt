@@ -1,0 +1,5 @@
+OpenCode v0.1.0
+
+Project: my-project
+
+λ

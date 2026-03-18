@@ -1,0 +1,7 @@
+Codex 0.1.0
+
+Working directory: /home/user/projects/my-project
+
+I'll implement the feature you requested.
+
+Starting with the core logic... ⠋

@@ -1,0 +1,8 @@
+
+  imcodes v0.1.0
+
+  my-project — /home/user/projects/my-project
+
+  > What would you like me to do?
+
+❯
