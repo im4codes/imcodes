@@ -1,0 +1,8 @@
+  imcodes v0.1.0
+
+  ╔═══════════════════════════════════╗
+  ║  Claude wants to write a file     ║
+  ║  src/auth/middleware.ts           ║
+  ║                                   ║
+  ║  Allow | Deny                     ║
+  ╚═══════════════════════════════════╝

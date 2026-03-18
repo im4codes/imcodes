@@ -1,0 +1,51 @@
+daemon:
+  pollInterval: 2000       # ms between status polls
+  signalCheckInterval: 100 # ms to check signal files
+  streamFps: 10            # tmux capture FPS when viewers connected
+  streamIdleFps: 1         # FPS when no viewers
+  maxRestarts: 3           # max restarts before marking error
+  restartWindow: 300000    # ms window for restart counting (5 min)
+  heartbeatInterval: 30000 # ms WebSocket heartbeat
+  reconnectBase: 1000      # ms initial reconnect backoff
+  reconnectMax: 60000      # ms max reconnect backoff
+
+agents:
+  defaultType: claude-code
+  supportedTypes:
+    - claude-code
+    - codex
+    - opencode
+
+sessions:
+  storePath: ~/.imcodes/sessions.json
+  signalDir: /tmp/imcodes/signals
+
+projects:
+  storePath: ~/.imcodes/projects.json
+
+autofix:
+  defaultCoder: claude-code
+  defaultAuditor: codex
+  maxDiscussionRounds: 3
+  autoMerge: false
+
+tracker:
+  type: github                      # github | gitlab
+  apiUrl: ''                        # empty = hosted (github.com / gitlab.com); set for Enterprise/self-hosted
+  tokenEnv: TRACKER_TOKEN           # env var holding the API token
+  repo: ''                          # GitHub: "owner/repo"; GitLab: leave empty, use projectId
+  projectId: ''                     # GitLab only: numeric ID or "namespace/project-path"
+  baseBranch: main                  # branch to create feature branches from
+
+memory:
+  claudeMemUrl: ${CLAUDE_MEM_URL:-http://localhost:37777}
+  mem0Url: ${MEM0_URL:-http://localhost:37778}
+
+server:
+  cfWorkerUrl: ${CF_WORKER_URL}
+  apiKey: ${CF_API_KEY}
+  credentialsPath: ~/.imcodes/server.json
+
+log:
+  level: info
+  pretty: false

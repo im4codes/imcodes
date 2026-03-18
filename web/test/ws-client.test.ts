@@ -1,0 +1,243 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { WsClient } from '../src/ws-client.js';
+import type { MessageHandler } from '../src/ws-client.js';
+
+// Mock WebSocket implementation
+class MockWebSocket {
+  static OPEN = 1;
+  static CLOSED = 3;
+
+  readyState = MockWebSocket.OPEN;
+  url: string;
+  private listeners: Record<string, Array<(ev: unknown) => void>> = {};
+
+  constructor(url: string) {
+    this.url = url;
+  }
+
+  addEventListener(type: string, fn: (ev: unknown) => void) {
+    if (!this.listeners[type]) this.listeners[type] = [];
+    this.listeners[type].push(fn);
+  }
+
+  send = vi.fn();
+
+  close(code?: number, reason?: string) {
+    this.readyState = MockWebSocket.CLOSED;
+    this.emit('close', { code, reason });
+  }
+
+  /** Test helper: trigger an event */
+  emit(type: string, data?: unknown) {
+    for (const fn of this.listeners[type] ?? []) fn(data);
+  }
+}
+
+/** Flush the microtask queue so the async openSocket() completes after the mocked fetch. */
+const flushAsync = () => new Promise<void>((r) => setTimeout(r, 0));
+
+describe('WsClient', () => {
+  let MockWS: typeof MockWebSocket;
+  let lastWs: MockWebSocket | null;
+
+  beforeEach(() => {
+    lastWs = null;
+    MockWS = class extends MockWebSocket {
+      constructor(url: string) {
+        super(url);
+        lastWs = this;
+      }
+    };
+    vi.stubGlobal('WebSocket', MockWS);
+
+    // openSocket() fetches a ws-ticket before creating the WebSocket.
+    // Provide a minimal mock so the fetch resolves immediately.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ ticket: 'test-ticket' }),
+      }),
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.clearAllTimers();
+  });
+
+  it('can be instantiated with baseUrl and serverId', () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    expect(client).toBeInstanceOf(WsClient);
+  });
+
+  it('starts disconnected before connect() is called', () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    expect(client.connected).toBe(false);
+  });
+
+  it('opens a WebSocket on connect()', async () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await flushAsync();
+    expect(lastWs).not.toBeNull();
+  });
+
+  it('builds the correct WebSocket URL with ws:// and ticket', async () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await flushAsync();
+    expect(lastWs!.url).toContain('ws://localhost:8787');
+    expect(lastWs!.url).toContain('/api/server/srv-1/terminal');
+    expect(lastWs!.url).toContain('ticket=test-ticket');
+  });
+
+  it('sets connected=true after WebSocket open event', async () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await flushAsync();
+    lastWs!.emit('open');
+    expect(client.connected).toBe(true);
+  });
+
+  it('dispatches terminal.diff messages to registered handlers', async () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn<Parameters<MessageHandler>>();
+    client.onMessage(handler);
+    client.connect();
+    await flushAsync();
+    lastWs!.emit('open');
+
+    // open dispatches a synthetic session.event — clear it
+    handler.mockClear();
+
+    const msg = { type: 'terminal.diff', diff: { sessionName: 's1', timestamp: 1, lines: [], cols: 80, rows: 24 } };
+    lastWs!.emit('message', { data: JSON.stringify(msg) });
+
+    expect(handler).toHaveBeenCalledOnce();
+    expect(handler).toHaveBeenCalledWith(msg);
+  });
+
+  it('does not dispatch pong messages to handlers', async () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn();
+    client.onMessage(handler);
+    client.connect();
+    await flushAsync();
+    lastWs!.emit('open');
+
+    // open dispatches a synthetic session.event — clear it
+    handler.mockClear();
+
+    lastWs!.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('unregisters a handler when the returned cleanup is called', async () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn();
+    const unsub = client.onMessage(handler);
+    unsub();
+
+    client.connect();
+    await flushAsync();
+    lastWs!.emit('open');
+    lastWs!.emit('message', { data: JSON.stringify({ type: 'session.event', event: 'x', session: 's', state: 'idle' }) });
+
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('disconnect() sets connected=false and closes the socket', async () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await flushAsync();
+    lastWs!.emit('open');
+    expect(client.connected).toBe(true);
+
+    client.disconnect();
+    expect(client.connected).toBe(false);
+  });
+
+  it('schedules reconnect after WebSocket closes', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    // Flush the fetch promise with fake timers active
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+
+    const firstWs = lastWs;
+    firstWs!.emit('close');
+
+    // After close, reconnectAttempt should increment and a new socket opens after delay
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(lastWs).not.toBe(firstWs);
+
+    vi.useRealTimers();
+  });
+
+  it('send() throws when not connected', () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    expect(() => client.send({ type: 'ping' })).toThrow('WebSocket not connected');
+  });
+
+  // ── fsListDir ─────────────────────────────────────────────────────────
+
+  describe('fsListDir', () => {
+    async function connectClient(): Promise<WsClient> {
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await flushAsync();
+      lastWs!.emit('open');
+      return client;
+    }
+
+    it('sends fs.ls message with path and requestId', async () => {
+      const client = await connectClient();
+      const requestId = client.fsListDir('/home/user/projects');
+      expect(lastWs!.send).toHaveBeenCalled();
+      const msg = JSON.parse(lastWs!.send.mock.calls.at(-1)[0]);
+      expect(msg.type).toBe('fs.ls');
+      expect(msg.path).toBe('/home/user/projects');
+      expect(msg.requestId).toBe(requestId);
+      expect(msg.includeFiles).toBe(false);
+      client.disconnect();
+    });
+
+    it('sets includeFiles=true when requested', async () => {
+      const client = await connectClient();
+      client.fsListDir('/home/user', true);
+      const msg = JSON.parse(lastWs!.send.mock.calls.at(-1)[0]);
+      expect(msg.includeFiles).toBe(true);
+      client.disconnect();
+    });
+
+    it('returns a unique UUID as requestId', async () => {
+      const client = await connectClient();
+      const id1 = client.fsListDir('/home/user/a');
+      const id2 = client.fsListDir('/home/user/b');
+      expect(id1).not.toBe(id2);
+      expect(typeof id1).toBe('string');
+      client.disconnect();
+    });
+
+    it('fs.ls_response is dispatched to onMessage handlers', async () => {
+      const client = await connectClient();
+      const handler = vi.fn();
+      client.onMessage(handler);
+      const requestId = client.fsListDir('/home/user');
+      const responseMsg = {
+        type: 'fs.ls_response',
+        requestId,
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        entries: [{ name: 'projects', isDir: true, hidden: false }],
+      };
+      lastWs!.emit('message', { data: JSON.stringify(responseMsg) });
+      expect(handler).toHaveBeenCalledWith(expect.objectContaining({ type: 'fs.ls_response', requestId }));
+      client.disconnect();
+    });
+  });
+});

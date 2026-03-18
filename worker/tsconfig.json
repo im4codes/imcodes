@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022"],
+    "types": ["@cloudflare/workers-types"],
+    "strict": true,
+    "noUnusedLocals": true,
+    "noImplicitReturns": true,
+    "outDir": "dist",
+    "rootDir": ".",
+    "paths": {
+      "~/*": ["./*"]
+    }
+  },
+  "include": ["src/**/*", "durable-objects/**/*"],
+  "exclude": ["node_modules", "dist", "test"]
+}
