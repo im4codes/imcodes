@@ -21,16 +21,20 @@ export async function getServerUrl(): Promise<string | null> {
   return value; // null = not configured yet → show ServerSetupPage
 }
 
-/** Returns the saved list of server URLs. Never includes duplicates. */
+/** Returns the saved list of server URLs. Always includes DEFAULT_SERVER_URL first. */
 export async function getServerList(): Promise<string[]> {
   if (!isNative()) return [];
   try {
     const { Preferences } = await import('@capacitor/preferences');
     const { value } = await Preferences.get({ key: PREFS_SERVER_LIST_KEY });
-    if (!value) return [];
-    return JSON.parse(value) as string[];
+    const saved = value ? JSON.parse(value) as string[] : [];
+    // Ensure default server is always present at the top
+    if (!saved.includes(DEFAULT_SERVER_URL)) {
+      return [DEFAULT_SERVER_URL, ...saved];
+    }
+    return saved;
   } catch {
-    return [];
+    return [DEFAULT_SERVER_URL];
   }
 }
 
@@ -43,9 +47,9 @@ export async function addServerToList(url: string): Promise<void> {
   await Preferences.set({ key: PREFS_SERVER_LIST_KEY, value: JSON.stringify([...list, url]) });
 }
 
-/** Remove a URL from the saved server list. */
+/** Remove a URL from the saved server list. Cannot remove the default server. */
 export async function removeServerFromList(url: string): Promise<void> {
-  if (!isNative()) return;
+  if (!isNative() || url === DEFAULT_SERVER_URL) return;
   const list = await getServerList();
   const updated = list.filter((u) => u !== url);
   const { Preferences } = await import('@capacitor/preferences');
