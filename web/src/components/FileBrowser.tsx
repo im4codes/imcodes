@@ -226,6 +226,7 @@ type PreviewState =
   | { status: 'idle' }
   | { status: 'loading'; path: string }
   | { status: 'ok'; path: string; content: string; html: string; isMarkdown: boolean; diff?: string; diffHtml?: string }
+  | { status: 'image'; path: string; dataUrl: string }
   | { status: 'error'; path: string; error: string };
 
 const REQUEST_TIMEOUT_MS = 5_000;
@@ -360,6 +361,13 @@ export function FileBrowser({
             : msg.error === 'forbidden_path' ? 'file_browser.preview_error'
             : 'file_browser.preview_error';
           setPreview({ status: 'error', path: filePath, error: t(errKey) });
+          return;
+        }
+
+        // Image files: render as <img> from base64
+        if (msg.encoding === 'base64' && msg.mimeType) {
+          const dataUrl = `data:${msg.mimeType};base64,${msg.content ?? ''}`;
+          setPreview({ status: 'image', path: filePath, dataUrl });
           return;
         }
 
@@ -668,6 +676,11 @@ export function FileBrowser({
         )}
         {preview.status === 'error' && (
           <div class="fb-preview-msg fb-preview-error">{preview.error}</div>
+        )}
+        {preview.status === 'image' && (
+          <div class="fb-preview-image">
+            <img src={preview.dataUrl} alt={preview.path.split('/').pop() ?? ''} />
+          </div>
         )}
         {preview.status === 'ok' && !showDiff && (
           preview.isMarkdown

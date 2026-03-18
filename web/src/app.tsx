@@ -902,11 +902,28 @@ export function App() {
   }, [handleLogout]);
 
   const handleSelectServer = useCallback(async (serverId: string, serverName?: string) => {
+    // Save current active session for the server we're leaving
+    const prevServer = localStorage.getItem('rcc_server');
+    const currentSession = localStorage.getItem('rcc_session');
+    if (prevServer && currentSession) {
+      localStorage.setItem(`rcc_session_${prevServer}`, currentSession);
+    } else if (prevServer) {
+      localStorage.removeItem(`rcc_session_${prevServer}`);
+    }
+
     localStorage.setItem('rcc_server', serverId);
     if (serverName) { localStorage.setItem('rcc_server_name', serverName); setSelectedServerName(serverName); }
     setSessions([]);
     setSessionsLoaded(false);
-    setActiveSession(null);
+
+    // Restore previously selected session for this server
+    const savedSession = localStorage.getItem(`rcc_session_${serverId}`);
+    if (savedSession) {
+      setActiveSession(savedSession);
+      localStorage.setItem('rcc_session', savedSession);
+    } else {
+      setActiveSession(null);
+    }
     setSelectedServerId(serverId);
     setShowMobileServerMenu(false);
     // Immediately load sessions from D1

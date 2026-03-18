@@ -47,7 +47,7 @@ export type ServerMessage =
   | { type: 'discussion.list'; discussions: Array<{ id: string; topic: string; state: string; currentRound: number; maxRounds: number; currentSpeaker?: string; conclusion?: string; filePath?: string }> }
   | { type: 'daemon.stats'; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number }
   | { type: 'fs.ls_response'; requestId: string; path: string; resolvedPath?: string; status: 'ok' | 'error'; entries?: FsEntry[]; error?: string }
-  | { type: 'fs.read_response'; requestId: string; path: string; resolvedPath?: string; status: 'ok' | 'error'; content?: string; error?: string }
+  | { type: 'fs.read_response'; requestId: string; path: string; resolvedPath?: string; status: 'ok' | 'error'; content?: string; encoding?: 'base64'; mimeType?: string; error?: string }
   | { type: 'fs.git_status_response'; requestId: string; path: string; resolvedPath?: string; status: 'ok' | 'error'; files?: GitStatusEntry[]; error?: string }
   | { type: 'fs.git_diff_response'; requestId: string; path: string; resolvedPath?: string; status: 'ok' | 'error'; diff?: string; error?: string };
 
