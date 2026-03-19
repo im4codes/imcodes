@@ -104,7 +104,7 @@ export async function startProject(config: ProjectConfig): Promise<void> {
   }
 }
 
-/** Stop all sessions for a project. */
+/** Stop all sessions for a project and remove them from the store. */
 export async function stopProject(projectName: string): Promise<void> {
   const sessions = storeSessions(projectName);
   for (const s of sessions) {
@@ -115,6 +115,17 @@ export async function stopProject(projectName: string): Promise<void> {
     removeSession(s.name);
     emitSessionPersist(null, s.name);
     emitSessionEvent('stopped', s.name, 'stopped');
+  }
+}
+
+/** Kill tmux sessions and watchers for a project but keep store records (for restart). */
+export async function teardownProject(projectName: string): Promise<void> {
+  const sessions = storeSessions(projectName);
+  for (const s of sessions) {
+    stopWatching(s.name);
+    stopCodexWatching(s.name);
+    stopGeminiWatching(s.name);
+    await killSession(s.name).catch(() => {});
   }
 }
 

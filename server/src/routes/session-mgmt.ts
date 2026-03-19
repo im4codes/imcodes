@@ -53,12 +53,12 @@ sessionMgmtRoutes.put('/:id/sessions/:name', async (c) => {
     return c.json({ error: 'invalid_json' }, 400);
   }
 
-  const { projectName, projectRole, agentType, projectDir, state } = body;
+  const { projectName, projectRole, agentType, agentVersion, projectDir, state } = body;
   if (!projectName || !projectRole || !agentType || !projectDir || !state) {
     return c.json({ error: 'missing_fields' }, 400);
   }
 
-  await upsertDbSession(c.env.DB, randomHex(16), serverId, sessionName, projectName, projectRole, agentType, projectDir, state);
+  await upsertDbSession(c.env.DB, randomHex(16), serverId, sessionName, projectName, projectRole, agentType, projectDir, state, agentVersion);
   return c.json({ ok: true });
 });
 

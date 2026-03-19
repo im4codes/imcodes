@@ -9,6 +9,7 @@ import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
 
 interface DaemonStats {
+  daemonVersion?: string | null;
   cpu: number;
   memUsed: number;
   memTotal: number;
@@ -150,7 +151,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onNewDiscus
     if (!ws) return;
     return ws.onMessage((msg) => {
       if (msg.type === 'daemon.stats') {
-        setStats({ cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal, load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime });
+        setStats({ daemonVersion: msg.daemonVersion, cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal, load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime });
       }
     });
   }, [ws]);
@@ -201,7 +202,13 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onNewDiscus
             </button>
             <span class="subcard-toolbar-label">Sub-sessions ({subSessions.length})</span>
             {stats && (
-              <span class="daemon-stats-inline" title={`Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`}>
+              <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`}>
+                {stats.daemonVersion && (
+                  <>
+                    <span style={{ color: '#94a3b8' }}>v{stats.daemonVersion}</span>
+                    <span style={{ color: '#94a3b8' }}> · </span>
+                  </>
+                )}
                 <span style={{ color: stats.cpu > 80 ? '#f87171' : stats.cpu > 50 ? '#fbbf24' : '#4ade80' }}>
                   CPU {stats.cpu}%
                 </span>
@@ -212,6 +219,10 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onNewDiscus
                 <span style={{ color: '#94a3b8' }}> · </span>
                 <span style={{ color: '#a78bfa' }}>
                   Load {stats.load1}
+                </span>
+                <span style={{ color: '#94a3b8' }}> · </span>
+                <span style={{ color: '#94a3b8' }}>
+                  {formatUptime(stats.uptime)}
                 </span>
               </span>
             )}

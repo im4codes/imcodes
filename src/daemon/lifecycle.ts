@@ -47,6 +47,7 @@ async function persistSessionToWorker(
         projectName: record.projectName,
         projectRole: record.role,
         agentType: record.agentType,
+        agentVersion: record.agentVersion,
         projectDir: record.projectDir,
         state: record.state,
       }),

@@ -28,6 +28,8 @@ export interface SessionRecord {
   codexSessionId?: string;
   /** Gemini session UUID obtained from stream-json init event, used for `gemini --resume <UUID>`. */
   geminiSessionId?: string;
+  /** Parent main session name (e.g. `deck_proj_brain`) — links sub-sessions to their parent. */
+  parentSession?: string;
 }
 
 export interface SessionStore {

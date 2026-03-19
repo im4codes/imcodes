@@ -65,17 +65,78 @@ program
 
 program
   .command('status')
-  .description('Show all active sessions')
+  .description('Show daemon status and all active sessions')
   .option('--project <name>', 'Filter by project')
-  .action(async (opts: { project?: string }) => {
+  .option('--json', 'Output as JSON')
+  .action(async (opts: { project?: string; json?: boolean }) => {
+    const { loadCredentials } = await import('./bind/bind-flow.js');
+    const { listSessions: tmuxList } = await import('./agent/tmux.js');
+    const { DAEMON_VERSION } = await import('./util/version.js');
+
     await loadStore();
     const sessions = listSessions(opts.project);
+    const creds = await loadCredentials();
+    const liveTmux = await tmuxList().catch(() => [] as string[]);
+    const liveSet = new Set(liveTmux);
+
+    // Check daemon process status
+    let daemonPid: string | null = null;
+    let daemonRunning = false;
+    try {
+      const out = execSync('systemctl --user show imcodes --property=MainPID --value 2>/dev/null', { encoding: 'utf8' }).trim();
+      if (out && out !== '0') { daemonPid = out; daemonRunning = true; }
+    } catch { /* not using systemd or not installed */ }
+    if (!daemonRunning) {
+      try {
+        const out = execSync('pgrep -f "imcodes start" 2>/dev/null', { encoding: 'utf8' }).trim();
+        if (out) { daemonPid = out.split('\n')[0]; daemonRunning = true; }
+      } catch { /* not running */ }
+    }
+
+    if (opts.json) {
+      console.log(JSON.stringify({
+        daemon: { version, running: daemonRunning, pid: daemonPid, server: creds ? { url: creds.workerUrl, serverId: creds.serverId } : null },
+        sessions: sessions.map((s) => ({ ...s, tmuxAlive: liveSet.has(s.name) })),
+      }, null, 2));
+      return;
+    }
+
+    // Daemon info
+    console.log(`\x1b[1mIM.codes Daemon v${version}\x1b[0m`);
+    console.log(`  Status:  ${daemonRunning ? `\x1b[32mrunning\x1b[0m (pid ${daemonPid})` : '\x1b[31mstopped\x1b[0m'}`);
+    if (creds) {
+      console.log(`  Server:  ${creds.workerUrl}`);
+      console.log(`  ID:      ${creds.serverId}`);
+    } else {
+      console.log(`  Server:  \x1b[33mnot bound\x1b[0m (run \`imcodes bind <url>\`)`);
+    }
+    console.log();
+
     if (sessions.length === 0) {
       console.log('No sessions found.');
       return;
     }
+
+    // Group by project
+    const byProject = new Map<string, typeof sessions>();
     for (const s of sessions) {
-      console.log(`${s.name}  ${s.agentType.padEnd(12)}  ${s.state}  restarts=${s.restarts}`);
+      const key = s.name.startsWith('deck_sub_') ? '(sub-sessions)' : s.projectName;
+      if (!byProject.has(key)) byProject.set(key, []);
+      byProject.get(key)!.push(s);
+    }
+
+    for (const [project, group] of byProject) {
+      console.log(`\x1b[1m${project}\x1b[0m`);
+      for (const s of group) {
+        const alive = liveSet.has(s.name);
+        const stateColor = s.state === 'running' || s.state === 'idle' ? (alive ? '\x1b[32m' : '\x1b[33m') : s.state === 'error' ? '\x1b[31m' : '\x1b[90m';
+        const tmuxTag = alive ? '' : ' \x1b[33m(no tmux)\x1b[0m';
+        const ver = s.agentVersion ? ` ${s.agentVersion}` : '';
+        const parent = s.parentSession ? ` \x1b[90m← ${s.parentSession}\x1b[0m` : '';
+        const restarts = s.restarts > 0 ? ` \x1b[33mrestarts=${s.restarts}\x1b[0m` : '';
+        console.log(`  ${s.name.padEnd(35)} ${s.agentType.padEnd(12)}${ver.padEnd(10)} ${stateColor}${s.state}\x1b[0m${tmuxTag}${restarts}${parent}`);
+      }
+      console.log();
     }
   });
 

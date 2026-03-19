@@ -27,6 +27,7 @@ export interface DbServer {
   token_hash: string;
   last_heartbeat_at: number | null;
   status: string;
+  daemon_version: string | null;
   created_at: number;
 }
 
@@ -60,6 +61,7 @@ export interface DbSession {
   project_name: string;
   role: string;
   agent_type: string;
+  agent_version: string | null;
   project_dir: string;
   state: string;
   label: string | null;
@@ -134,15 +136,19 @@ export async function createServer(
     .prepare('INSERT INTO servers (id, user_id, name, token_hash, status, created_at, bound_with_key_id) VALUES (?, ?, ?, ?, ?, ?, ?)')
     .bind(id, userId, name, tokenHash, 'offline', now, keyId ?? null)
     .run();
-  return { id, user_id: userId, team_id: null, name, token_hash: tokenHash, last_heartbeat_at: null, status: 'offline', created_at: now };
+  return { id, user_id: userId, team_id: null, name, token_hash: tokenHash, last_heartbeat_at: null, status: 'offline', daemon_version: null, created_at: now };
 }
 
 export async function getServerById(db: PgDatabase, id: string): Promise<DbServer | null> {
   return db.prepare('SELECT * FROM servers WHERE id = ?').bind(id).first<DbServer>();
 }
 
-export async function updateServerHeartbeat(db: PgDatabase, id: string): Promise<void> {
-  await db.prepare('UPDATE servers SET last_heartbeat_at = ?, status = ? WHERE id = ?').bind(Date.now(), 'online', id).run();
+export async function updateServerHeartbeat(db: PgDatabase, id: string, daemonVersion?: string | null): Promise<void> {
+  if (daemonVersion) {
+    await db.prepare('UPDATE servers SET last_heartbeat_at = ?, status = ?, daemon_version = ? WHERE id = ?').bind(Date.now(), 'online', daemonVersion, id).run();
+  } else {
+    await db.prepare('UPDATE servers SET last_heartbeat_at = ?, status = ? WHERE id = ?').bind(Date.now(), 'online', id).run();
+  }
 }
 
 export async function updateServerStatus(db: PgDatabase, id: string, status: string): Promise<void> {
@@ -256,20 +262,22 @@ export async function upsertDbSession(
   agentType: string,
   projectDir: string,
   state: string,
+  agentVersion?: string | null,
 ): Promise<void> {
   const now = Date.now();
   await db
     .prepare(
-      `INSERT INTO sessions (id, server_id, name, project_name, role, agent_type, project_dir, state, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO sessions (id, server_id, name, project_name, role, agent_type, agent_version, project_dir, state, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(server_id, name) DO UPDATE SET
          role = excluded.role,
          agent_type = excluded.agent_type,
+         agent_version = excluded.agent_version,
          project_dir = excluded.project_dir,
          state = excluded.state,
          updated_at = excluded.updated_at`,
     )
-    .bind(id, serverId, name, projectName, role, agentType, projectDir, state, now, now)
+    .bind(id, serverId, name, projectName, role, agentType, agentVersion ?? null, projectDir, state, now, now)
     .run();
 }
 

@@ -80,6 +80,7 @@ export function useSubSessions(
       cwd: s.cwd,
       ccSessionId: s.ccSessionId,
       geminiSessionId: s.geminiSessionId,
+      parentSession: s.parentSession,
     })));
   }, [connected, ws, subSessions]);
 
@@ -137,7 +138,7 @@ export function useSubSessions(
       };
       setSubSessions((prev) => [...prev, sub]);
       // Ask daemon to start it
-      ws?.subSessionStart(sub.id, type, shellBin, cwd, ccSessionId);
+      ws?.subSessionStart(sub.id, type, shellBin, cwd, ccSessionId, activeSession);
       return sub;
     } catch {
       return null;

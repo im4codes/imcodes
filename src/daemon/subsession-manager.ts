@@ -25,6 +25,7 @@ export interface SubSessionRecord {
   codexSessionId?: string | null;
   codexModel?: string | null;
   geminiSessionId?: string | null;
+  parentSession?: string | null;
   fresh?: boolean;
   _fileSnapshot?: Set<string>;
   _onGeminiDiscovered?: (sessionId: string) => void;
@@ -66,6 +67,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     name: sessionName, projectName: sessionName, agentType: sub.type, agentVersion, role: 'w1', state: 'running',
     projectDir: sub.cwd ?? '', ccSessionId: sub.ccSessionId ?? undefined,
     codexSessionId: sub.codexSessionId ?? undefined,
+    parentSession: sub.parentSession ?? undefined,
     restarts: 0, restartTimestamps: [], createdAt: Date.now(), updatedAt: Date.now()
   });
 
@@ -139,6 +141,7 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         name: sessionName, projectName: sessionName, agentType: sub.type, agentVersion: stored?.agentVersion ?? await getAgentVersion(sub.type as AgentType, sub.shellBin ?? undefined), role: 'w1', state: 'running',
         projectDir: sub.cwd ?? '', ccSessionId: sub.ccSessionId ?? undefined,
         codexSessionId: stored?.codexSessionId,
+        parentSession: sub.parentSession ?? stored?.parentSession,
         restarts: 0, restartTimestamps: [], createdAt: Date.now(), updatedAt: Date.now()
       });
     }
