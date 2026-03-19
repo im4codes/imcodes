@@ -2,7 +2,7 @@
  * Handle commands from the web UI and inbound chat messages via ServerLink.
  * Commands arrive as JSON objects with a `type` field.
  */
-import { startProject, stopProject, type ProjectConfig } from '../agent/session-manager.js';
+import { startProject, stopProject, teardownProject, type ProjectConfig } from '../agent/session-manager.js';
 import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey } from '../agent/tmux.js';
 import { listSessions, getSession } from '../store/session-store.js';
 import { routeMessage, type InboundMessage, type RouterContext } from '../router/message-router.js';
@@ -277,6 +277,11 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
   }
 
   try {
+    // If project already has sessions, teardown first (keep store records)
+    const existing = listSessions(project);
+    if (existing.length > 0) {
+      await teardownProject(project);
+    }
     const config: ProjectConfig = {
       name: project,
       dir,
@@ -313,7 +318,8 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
   }
 
   try {
-    await stopProject(project);
+    // Teardown: kill tmux + watchers but keep store records so they survive failures
+    await teardownProject(project);
     const config: ProjectConfig = {
       name: project,
       dir: brain.projectDir,
@@ -650,6 +656,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     shellBin: cmd.shellBin as string | null | undefined,
     cwd: cmd.cwd as string | null | undefined,
     ccSessionId: cmd.ccSessionId as string | null | undefined,
+    parentSession: cmd.parentSession as string | null | undefined,
     geminiSessionId,
     fresh: type === 'gemini' && !geminiSessionId,
     _fileSnapshot: fileSnapshot,

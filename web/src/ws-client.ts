@@ -201,15 +201,15 @@ export class WsClient {
 
   // ── Sub-session commands ──────────────────────────────────────────────────
 
-  subSessionStart(id: string, sessionType: string, shellBin?: string, cwd?: string, ccSessionId?: string): void {
-    this.send({ type: 'subsession.start', id, sessionType, shellBin, cwd, ccSessionId });
+  subSessionStart(id: string, sessionType: string, shellBin?: string, cwd?: string, ccSessionId?: string, parentSession?: string | null): void {
+    this.send({ type: 'subsession.start', id, sessionType, shellBin, cwd, ccSessionId, parentSession });
   }
 
   subSessionStop(sessionName: string): void {
     this.send({ type: 'subsession.stop', sessionName });
   }
 
-  subSessionRebuildAll(subSessions: Array<{ id: string; type: string; shellBin?: string | null; cwd?: string | null; ccSessionId?: string | null; geminiSessionId?: string | null }>): void {
+  subSessionRebuildAll(subSessions: Array<{ id: string; type: string; shellBin?: string | null; cwd?: string | null; ccSessionId?: string | null; geminiSessionId?: string | null; parentSession?: string | null }>): void {
     this.send({ type: 'subsession.rebuild_all', subSessions });
   }
 

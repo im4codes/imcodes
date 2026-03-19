@@ -415,13 +415,17 @@ export function App() {
     activeSession,
   );
 
-  // Auto-create a shell sub-session when switching to a session with none
+  // Auto-create a shell sub-session when switching to a session with none.
+  // Only update the ref after we've acted (created or confirmed existing) —
+  // otherwise a race between activeSession changing and loadedServerId syncing
+  // causes the ref to advance before conditions are met, skipping auto-creation.
   const prevActiveSessionRef = useRef<string | null>(null);
   useEffect(() => {
     const prev = prevActiveSessionRef.current;
-    prevActiveSessionRef.current = activeSession;
     if (!activeSession || activeSession === prev) return;
     if (!connected || loadedServerId !== selectedServerId) return;
+    // Conditions met — mark this session as handled
+    prevActiveSessionRef.current = activeSession;
     if (visibleSubSessions.length > 0) return;
     void getUserPref('default_shell').then((saved) => {
       const shell = (typeof saved === 'string' && saved) ? saved : '/bin/bash';

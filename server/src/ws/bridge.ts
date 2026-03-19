@@ -241,7 +241,7 @@ export class WsBridge {
         logger.info({ serverId: this.serverId }, 'Daemon authenticated');
         onAuthenticated?.();
 
-        updateServerHeartbeat(db, this.serverId).catch((err) =>
+        updateServerHeartbeat(db, this.serverId, this.daemonVersion).catch((err) =>
           logger.error({ err }, 'Failed to update heartbeat on auth'),
         );
 

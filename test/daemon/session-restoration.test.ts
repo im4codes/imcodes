@@ -66,6 +66,10 @@ vi.mock('../../src/daemon/gemini-watcher.js', () => ({
 // and called internally. We provide valid data instead.
 
 vi.mock('child_process', () => ({
+  exec: vi.fn((_cmd: string, _opts: unknown, cb?: Function) => {
+    if (cb) cb(null, { stdout: '', stderr: '' });
+    return { stdout: { on: vi.fn() }, on: vi.fn(), kill: vi.fn() };
+  }),
   spawn: vi.fn().mockReturnValue({
     stdout: { on: vi.fn() },
     on: vi.fn(),
