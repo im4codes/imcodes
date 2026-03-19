@@ -15,6 +15,7 @@ RUN cd web && npm ci --ignore-scripts
 COPY server/ ./server/
 COPY web/ ./web/
 COPY src/shared/ ./src/shared/
+COPY shared/ ./shared/
 
 # Build web (BUILD_TIME arg ensures cache is busted on each CI run)
 ARG BUILD_TIME
