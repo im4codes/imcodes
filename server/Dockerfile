@@ -34,11 +34,11 @@ WORKDIR /app
 COPY server/package.json server/package-lock.json* ./
 RUN npm ci --omit=dev --ignore-scripts
 
-# Copy compiled server
+# Copy compiled server (rootDir=".." puts output under dist/server/src/ and dist/shared/)
 COPY --from=builder /app/server/dist ./dist
 
 # Copy server src/db/migrations (needed at runtime for runMigrations)
-COPY --from=builder /app/server/src/db/migrations ./dist/db/migrations
+COPY --from=builder /app/server/src/db/migrations ./dist/server/src/db/migrations
 
 # Copy web static files
 COPY --from=builder /app/web/dist ./web/dist
@@ -52,4 +52,4 @@ ENV NODE_ENV=production
 ENV WEB_DIST_PATH=/app/web/dist
 ENV LANDING_DIST_PATH=/app/landing
 
-CMD ["node", "dist/index.js"]
+CMD ["node", "dist/server/src/index.js"]
