@@ -13,6 +13,13 @@ const config: CapacitorConfig = {
     // cleartext: true,
   },
   plugins: {
+    CapacitorUpdater: {
+      autoUpdate: false,           // we use manual mode in update-manager.ts
+      autoDeleteFailed: true,
+      autoDeletePrevious: true,
+      resetWhenUpdate: true,
+      statsUrl: '',                // disable stats reporting to Capgo cloud
+    },
     PushNotifications: {
       presentationOptions: ['badge', 'sound', 'alert'],
     },

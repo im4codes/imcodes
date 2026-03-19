@@ -1,6 +1,8 @@
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
 FROM node:22-alpine AS builder
 
+RUN apk add --no-cache zip
+
 WORKDIR /app
 
 # Install deps for server
@@ -21,6 +23,16 @@ COPY shared/ ./shared/
 ARG BUILD_TIME
 ENV BUILD_TIME=${BUILD_TIME}
 RUN cd web && npm run build
+
+# Generate OTA update bundle + manifest
+ARG OTA_VERSION=0
+RUN mkdir -p /app/updates \
+ && cd web/dist && zip -r /app/updates/bundle.zip . \
+ && cd /app \
+ && SHA=$(sha256sum /app/updates/bundle.zip | cut -d' ' -f1) \
+ && printf '{"version":%s,"sha256":"%s","url":"/api/updates/bundle.zip","buildTime":"%s"}\n' \
+      "${OTA_VERSION}" "${SHA}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      > /app/updates/manifest.json
 
 # Build server TypeScript
 RUN cd server && npm run build
@@ -46,10 +58,14 @@ COPY --from=builder /app/web/dist ./web/dist
 # Copy landing page
 COPY landing/ ./landing/
 
+# Copy OTA update bundle
+COPY --from=builder /app/updates ./updates
+
 EXPOSE 3000
 
 ENV NODE_ENV=production
 ENV WEB_DIST_PATH=/app/web/dist
 ENV LANDING_DIST_PATH=/app/landing
+ENV UPDATES_DIST_PATH=/app/updates
 
 CMD ["node", "dist/server/src/index.js"]

@@ -50,6 +50,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // Dev:    server/dist/index.js → web/dist (two levels up from server/dist)
 const WEB_DIST = process.env.WEB_DIST_PATH ?? join(__dirname, '..', '..', 'web', 'dist');
 const LANDING_DIST = process.env.LANDING_DIST_PATH ?? join(__dirname, '..', '..', 'landing');
+const UPDATES_DIST = process.env.UPDATES_DIST_PATH ?? join(__dirname, '..', '..', 'updates');
 
 // ── Daemon connection protection ──────────────────────────────────────────────
 const daemonConnectLimiter = new MemoryRateLimiter();
@@ -205,6 +206,22 @@ export function buildApp(env: Env) {
     } catch { /* fall through to landing index */ }
     const html = await readFile(join(LANDING_DIST, 'index.html'));
     return new Response(html, { headers: { 'Content-Type': 'text/html', ...SECURITY_HEADERS } });
+  });
+
+  // OTA update assets (manifest + bundle zip)
+  app.get('/api/updates/:file', async (c) => {
+    const file = c.req.param('file');
+    if (file !== 'manifest.json' && file !== 'bundle.zip') {
+      return c.json({ error: 'not_found' }, 404);
+    }
+    const filePath = join(UPDATES_DIST, file);
+    try {
+      const content = await readFile(filePath);
+      const mime = file.endsWith('.json') ? 'application/json' : 'application/zip';
+      return new Response(content, { headers: { 'Content-Type': mime, 'Cache-Control': 'no-cache' } });
+    } catch {
+      return c.json({ error: 'not_found' }, 404);
+    }
   });
 
   // Static file serving + SPA fallback

@@ -112,6 +112,10 @@ export function App() {
       StatusBar.setStyle({ style: Style.Dark });
       StatusBar.setBackgroundColor({ color: '#0f172a' });
     }).catch(() => {});
+    // Start OTA update manager (checks for web bundle updates)
+    import('./update-manager.js').then(({ initUpdateManager }) => {
+      initUpdateManager();
+    }).catch(() => {});
     (async () => {
       try {
         const url = await getServerUrl();

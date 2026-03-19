@@ -23,6 +23,7 @@
     "@capacitor/splash-screen": "^8.0.1",
     "@capacitor/status-bar": "^8.0.1",
     "@capgo/capacitor-speech-recognition": "^8.0.10",
+    "@capgo/capacitor-updater": "^8.43.11",
     "@simplewebauthn/browser": "^10.0.0",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/addon-web-links": "^0.11.0",

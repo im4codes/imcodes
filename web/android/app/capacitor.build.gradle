@@ -16,6 +16,7 @@ dependencies {
     implementation project(':capacitor-splash-screen')
     implementation project(':capacitor-status-bar')
     implementation project(':capgo-capacitor-speech-recognition')
+    implementation project(':capgo-capacitor-updater')
     implementation project(':aparajita-capacitor-biometric-auth')
 
 }
