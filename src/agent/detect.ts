@@ -106,6 +106,9 @@ const GEMINI_TOOL_PATTERNS = [
   /\bRunning\b/i,
   /\bExecuting\b/i,
   /tool_use/i,
+  // Gemini CLI displays tool calls as ">tool_name args ✓/✗" or "··· N more"
+  /^\s*>\s*\w+.*[✓✗]/m,
+  /···\s*\d+\s*more/,
 ];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -187,6 +190,9 @@ export function detectStatus(
       if (matchesAny(tail, GEMINI_THINKING_PATTERNS)) return 'thinking';
       if (matchesAny(tail, GEMINI_TOOL_PATTERNS)) return 'tool_running';
       if (geminiHasSpinner) return 'streaming';
+      // No idle prompt visible and no spinner caught → assume working
+      // (Gemini tool output flickers too fast for polling to reliably capture)
+      if (!matchesAny(tail, GEMINI_IDLE_PATTERNS)) return 'thinking';
       break;
     }
 

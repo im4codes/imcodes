@@ -801,7 +801,7 @@ function InlineText({ text, onPathClick }: { text: string; onPathClick?: (p: str
             {li > 0 && <br />}
             {segments.map((seg, si) => {
               switch (seg.type) {
-                case 'code': return <code key={si} class="chat-inline-code">{seg.content}</code>;
+                case 'code': return <code key={si} class="chat-inline-code">{splitPaths(seg.content, onPathClick)}</code>;
                 case 'bold': return <strong key={si}>{seg.content}</strong>;
                 case 'italic': return <em key={si}>{seg.content}</em>;
                 default: return <span key={si}>{splitPaths(seg.content, onPathClick)}</span>;

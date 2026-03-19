@@ -504,18 +504,51 @@ export async function startWatchingFile(sessionName: string, filePath: string): 
 
   await activateFile(sessionName, state, filePath);
 
-  state.pollTimer = setInterval(() => { void drainNewLines(sessionName, state); }, 2000);
+  state.pollTimer = setInterval(() => {
+    void (async () => {
+      await drainNewLines(sessionName, state);
+      // Periodically check if CC restarted with a new session-id
+      const latest = await findLatestJsonl(state.projectDir);
+      if (latest && latest !== state.activeFile) {
+        const isNewer = await checkNewer(latest, state.activeFile);
+        if (isNewer) {
+          logger.info({ sessionName, old: state.activeFile, new: latest }, 'jsonl-watcher: CC restarted (poll), switching to new JSONL');
+          releaseFiles(sessionName);
+          preClaimFile(sessionName, latest);
+          state.activeFile = latest;
+          state.fileOffset = 0;
+          await drainNewLines(sessionName, state);
+        }
+      }
+    })();
+  }, 2000);
   void watchFile(sessionName, state, filePath);
 }
 
 async function watchFile(sessionName: string, state: WatcherState, filePath: string): Promise<void> {
   try {
-    const watcher = watch(dirname(filePath), { persistent: false, signal: state.abort.signal });
-    const fileName = basename(filePath);
+    const dir = dirname(filePath);
+    const watcher = watch(dir, { persistent: false, signal: state.abort.signal });
     for await (const event of watcher as AsyncIterable<FileChangeInfo<string>>) {
       if (state.stopped) break;
-      if (event.filename !== fileName) continue;
-      await drainNewLines(sessionName, state);
+      if (typeof event.filename !== 'string' || !event.filename.endsWith('.jsonl')) continue;
+
+      const changedFile = join(dir, event.filename);
+
+      if (changedFile === state.activeFile) {
+        await drainNewLines(sessionName, state);
+      } else {
+        // A different JSONL file changed — check if it's newer (CC restarted with new session-id)
+        const isNewer = await checkNewer(changedFile, state.activeFile);
+        if (isNewer) {
+          logger.info({ sessionName, old: state.activeFile, new: changedFile }, 'jsonl-watcher: CC restarted, switching to new JSONL');
+          releaseFiles(sessionName);
+          preClaimFile(sessionName, changedFile);
+          state.activeFile = changedFile;
+          state.fileOffset = 0;
+          await drainNewLines(sessionName, state);
+        }
+      }
     }
   } catch (err) {
     if (!state.stopped) {

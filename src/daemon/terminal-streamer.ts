@@ -21,6 +21,7 @@ import { getSession, upsertSession } from '../store/session-store.js';
 import { processRawPtyData, resetParser } from './terminal-parser.js';
 import { isWatching } from './jsonl-watcher.js';
 import { isWatching as isCodexWatching } from './codex-watcher.js';
+import { isWatching as isGeminiWatching } from './gemini-watcher.js';
 import logger from '../util/logger.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import type { TerminalDiff, TerminalHistory } from '../shared/transport/terminal.js';
@@ -465,6 +466,9 @@ export class TerminalStreamer {
       const sess = getSession(sessionName);
       if (sess?.agentType === 'codex' && isCodexWatching(sessionName)) {
         return; // Codex has stronger structured idle signals via JSONL/hook
+      }
+      if (sess?.agentType === 'gemini' && isGeminiWatching(sessionName)) {
+        return; // Gemini has stronger structured idle signals via JSON watcher
       }
       if (!currentlyIdle) {
         this.idleState.set(sessionName, true);

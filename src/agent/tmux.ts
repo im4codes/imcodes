@@ -1,4 +1,5 @@
 import { exec as execCb, execFile as execFileCb } from 'child_process';
+import { createHash } from 'crypto';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as fsp from 'fs/promises';
@@ -41,32 +42,84 @@ export async function capturePaneHistory(session: string, lines = 1000): Promise
   return tmuxExec(`capture-pane -e -p -t ${session} -S -${lines} -E -1`);
 }
 
+export interface SendKeysOptions {
+  /** Use chunked send-keys -l instead of paste-buffer for large text (for agents that don't support bracketed paste). */
+  chunked?: boolean;
+}
+
 /** Send a string of keys to a tmux pane (newline = Enter). */
 /**
  * Send text then Enter to a tmux session.
  * For small strings, uses `send-keys -l`.
- * For large strings, uses `load-buffer -` (stdin) + `paste-buffer` to avoid shell/arg limits.
+ * For large strings, uses `load-buffer -` (stdin) + `paste-buffer` (bracketed paste).
+ * Set `chunked: true` for agents that don't handle bracketed paste (Codex, Gemini, etc.)
+ * — text is split into chunks and sent via `send-keys -l`.
  */
-export async function sendKeys(session: string, keys: string): Promise<void> {
-  if (keys.length > 8000) {
-    // Large string: use unique named tmux buffer to avoid ARG_MAX limits and concurrent overwrites
-    const bufferName = `buf_${session}_${Date.now()}`;
-    const { spawn } = await import('child_process');
-    const proc = spawn('tmux', ['load-buffer', '-b', bufferName, '-']);
-    proc.stdin.write(keys);
-    proc.stdin.end();
-    await new Promise<void>((resolve, reject) => {
-      proc.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`tmux load-buffer failed with code ${code}`))));
-      proc.on('error', reject);
-    });
-    await tmuxExec(`paste-buffer -p -t ${session} -b ${bufferName}`);
-    await tmuxExec(`delete-buffer -b ${bufferName}`).catch(() => {});
+export async function sendKeys(session: string, keys: string, opts?: SendKeysOptions): Promise<void> {
+  if (keys.length > 4000 || keys.includes('\n')) {
+    if (opts?.chunked) {
+      if (keys.length > 100) {
+        // Write to temp file and send a short reference — much more reliable than chunked send-keys
+        const hash = createHash('md5').update(session).digest('hex').slice(0, 8);
+        const filePath = `/tmp/imcodes-${hash}.md`;
+        await fsp.writeFile(filePath, keys, 'utf-8');
+        const escaped = filePath.replace(/'/g, "'\\''");
+        await tmuxExec(`send-keys -t ${session} -l -- 'see ${escaped}'`);
+      } else {
+        await sendKeysChunked(session, keys);
+      }
+    } else {
+      // Use buffer for large strings or multi-line text (send-keys -l treats \n as Enter, breaking input)
+      const bufferName = `buf_${session}_${Date.now()}`;
+      const { spawn } = await import('child_process');
+      const proc = spawn('tmux', ['load-buffer', '-b', bufferName, '-']);
+      proc.stdin.write(keys);
+      proc.stdin.end();
+      await new Promise<void>((resolve, reject) => {
+        proc.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`tmux load-buffer failed with code ${code}`))));
+        proc.on('error', reject);
+      });
+      await tmuxExec(`paste-buffer -p -t ${session} -b ${bufferName}`);
+      await tmuxExec(`delete-buffer -b ${bufferName}`).catch(() => {});
+    }
   } else {
     const escaped = keys.replace(/'/g, "'\\''");
     await tmuxExec(`send-keys -t ${session} -l -- '${escaped}'`);
   }
-  await new Promise<void>((r) => setTimeout(r, 80));
+  // Scale delay with text length; chunked mode needs ~3x longer for agents to settle
+  const base = 80 + Math.floor(keys.length / 10) * 5;
+  const delay = Math.min(opts?.chunked ? base * 3 : base, opts?.chunked ? 10000 : 1000);
+  await new Promise<void>((r) => setTimeout(r, delay));
   await tmuxExec(`send-keys -t ${session} Enter`);
+}
+
+const CHUNK_SIZE = 800;
+/** Inter-chunk delay (ms). Agents without bracketed paste need time to consume each chunk. */
+const CHUNK_DELAY_MS = 50;
+/** Inter-line delay (ms). Enter key needs extra settle time for non-bracketed-paste agents. */
+const LINE_DELAY_MS = 120;
+
+/** Send large text in chunks via send-keys -l, splitting newlines into separate Enter keys. */
+async function sendKeysChunked(session: string, text: string): Promise<void> {
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    // Send line in chunks to avoid shell arg limits
+    for (let offset = 0; offset < line.length; offset += CHUNK_SIZE) {
+      const chunk = line.slice(offset, offset + CHUNK_SIZE);
+      const escaped = chunk.replace(/'/g, "'\\''");
+      await tmuxExec(`send-keys -t ${session} -l -- '${escaped}'`);
+      // Delay between chunks so the agent can consume input
+      if (offset + CHUNK_SIZE < line.length) {
+        await new Promise<void>((r) => setTimeout(r, CHUNK_DELAY_MS));
+      }
+    }
+    // Send Enter between lines (but not after the last — the caller sends final Enter)
+    if (i < lines.length - 1) {
+      await tmuxExec(`send-keys -t ${session} Enter`);
+      await new Promise<void>((r) => setTimeout(r, LINE_DELAY_MS));
+    }
+  }
 }
 
 /** @deprecated Use sendKeys — kept as alias for backward compat. */
@@ -191,6 +244,26 @@ const XTERM_KEY_MAP: Record<string, string> = {
   '\x1b[23~': 'F11','\x1b[24~': 'F12',
 };
 
+// ── Ctrl+C rate limiting ──────────────────────────────────────────────────────
+// Rapid Ctrl+C (>2 within 3s) can kill the session. Track per-session timestamps.
+const ctrlCHistory = new Map<string, number[]>();
+const CTRL_C_WINDOW_MS = 3000;
+const CTRL_C_MAX = 2;
+
+function isCtrlCRateLimited(session: string): boolean {
+  const now = Date.now();
+  let times = ctrlCHistory.get(session);
+  if (!times) {
+    times = [];
+    ctrlCHistory.set(session, times);
+  }
+  // Prune old entries
+  while (times.length > 0 && now - times[0] > CTRL_C_WINDOW_MS) times.shift();
+  if (times.length >= CTRL_C_MAX) return true;
+  times.push(now);
+  return false;
+}
+
 /**
  * Send raw terminal input to a tmux session.
  * Maps xterm escape sequences to tmux key names; literal text uses -l flag.
@@ -208,6 +281,8 @@ export async function sendRawInput(session: string, data: string): Promise<void>
   if (data.length === 1) {
     const code = data.charCodeAt(0);
     if (code >= 1 && code <= 26) {
+      // Rate-limit Ctrl+C to prevent session kill
+      if (code === 3 && isCtrlCRateLimited(session)) return;
       const letter = String.fromCharCode(code + 96); // 1→'a', 2→'b', ...
       await tmuxExec(`send-keys -t ${session} C-${letter}`);
       return;

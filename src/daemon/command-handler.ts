@@ -359,20 +359,24 @@ async function handleStop(cmd: Record<string, unknown>): Promise<void> {
  * - codex: strip `!` and send the shell command directly (Codex has no `!` prefix)
  * - others: send as-is
  */
+/** Agents that don't support bracketed paste and need chunked send-keys. */
+const CHUNKED_AGENTS = new Set(['codex', 'gemini', 'opencode', 'shell', 'script']);
+
 async function sendShellAwareCommand(sessionName: string, text: string, agentType: string): Promise<void> {
+  const opts = CHUNKED_AGENTS.has(agentType) ? { chunked: true } : undefined;
   if (text.startsWith('!')) {
     const shellCmd = text.slice(1).trimStart();
     if (agentType === 'codex') {
       // Codex: just send the shell command without `!`
-      await sendKeysDelayedEnter(sessionName, shellCmd);
+      await sendKeysDelayedEnter(sessionName, shellCmd, opts);
     } else {
       // claude-code (and others): send `!` first to enter shell mode, then the command
-      await sendKeysDelayedEnter(sessionName, '!');
+      await sendKeysDelayedEnter(sessionName, '!', opts);
       await new Promise((r) => setTimeout(r, 300));
-      await sendKeysDelayedEnter(sessionName, shellCmd);
+      await sendKeysDelayedEnter(sessionName, shellCmd, opts);
     }
   } else {
-    await sendKeysDelayedEnter(sessionName, text);
+    await sendKeysDelayedEnter(sessionName, text, opts);
   }
 }
 

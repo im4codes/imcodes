@@ -139,15 +139,23 @@ async function terminalThinkingCheck(sessionName: string, state: WatcherState): 
   const status = detectStatus(lines, 'gemini');
 
   if (status === 'idle') {
-    // Terminal shows idle — if we previously thought it was running, emit idle
-    if (state.emittedRunning) {
-      state.emittedRunning = false;
-      if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
-      timelineEmitter.emit(sessionName, 'session.state', { state: 'idle' });
+    // Terminal shows idle — debounce before emitting to avoid flicker
+    // (Gemini briefly shows ">" between tool calls while still working)
+    if (state.emittedRunning && !state.idleDebounceTimer) {
+      state.idleDebounceTimer = setTimeout(() => {
+        state.idleDebounceTimer = undefined;
+        if (!state.stopped && state.emittedRunning) {
+          state.emittedRunning = false;
+          state._terminalThinkingEmitted = false;
+          timelineEmitter.emit(sessionName, 'session.state', { state: 'idle' });
+        }
+      }, 3000);
     }
-    state._terminalThinkingEmitted = false;
     return;
   }
+
+  // Terminal shows activity — cancel any pending idle debounce
+  if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
 
   // Terminal shows activity (thinking/streaming/tool_running) — emit running + thinking
   if (!state.emittedRunning) {

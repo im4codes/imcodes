@@ -255,7 +255,10 @@ export async function startup(): Promise<DaemonContext> {
         }
       },
       sendToSession: async (sessionName, text) => {
-        await sendKeys(sessionName, text);
+        const agentType = (await import('../store/session-store.js')).getSession(sessionName)?.agentType;
+        const chunkedAgents = new Set(['codex', 'gemini', 'opencode', 'shell', 'script']);
+        const opts = agentType && chunkedAgents.has(agentType) ? { chunked: true } : undefined;
+        await sendKeys(sessionName, text, opts);
       },
       persistBinding,
       removeBinding,
