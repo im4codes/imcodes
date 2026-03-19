@@ -12,6 +12,8 @@ const execAsync = promisify(exec);
 import { timelineEmitter } from './timeline-emitter.js';
 import { readProjectMemory, buildCodexMemoryEntry } from './memory-inject.js';
 import logger from '../util/logger.js';
+import { updateSessionState } from '../store/session-store.js';
+import { resolveContextWindow } from '../util/model-context.js';
 
 // ── Codex SQLite helpers ────────────────────────────────────────────────────────
 
@@ -118,6 +120,7 @@ function normalizePath(p: string): string { return p.replace(/\/+$/, ''); }
 // ── JSONL parsing ──────────────────────────────────────────────────────────────
 
 const finalAnswerBuffers = new Map<string, { text: string; timer: ReturnType<typeof setTimeout> }>();
+const sessionStates = new Map<string, 'running' | 'idle'>();
 const FINAL_ANSWER_DEBOUNCE_MS = 600;
 
 function flushFinalAnswer(sessionName: string): void {
@@ -125,6 +128,19 @@ function flushFinalAnswer(sessionName: string): void {
   if (!buf) return;
   finalAnswerBuffers.delete(sessionName);
   timelineEmitter.emit(sessionName, 'assistant.text', { text: buf.text, streaming: false }, { source: 'daemon', confidence: 'high' });
+}
+
+function emitSessionState(sessionName: string, state: 'running' | 'idle'): void {
+  if (sessionStates.get(sessionName) === state) return;
+  sessionStates.set(sessionName, state);
+  const emitted = timelineEmitter.emit(sessionName, 'session.state', { state }, { source: 'daemon', confidence: 'high' });
+  if (emitted) updateSessionState(sessionName, state);
+}
+
+export function resetParseStateForTests(): void {
+  for (const { timer } of finalAnswerBuffers.values()) clearTimeout(timer);
+  finalAnswerBuffers.clear();
+  sessionStates.clear();
 }
 
 export function parseLine(sessionName: string, line: string, model?: string): void {
@@ -136,6 +152,7 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
     const pl = raw.payload;
     if (!pl) return;
     if (pl.type === 'function_call') {
+      emitSessionState(sessionName, 'running');
       const name = String(pl.name ?? 'tool');
       let input = pl.arguments ?? '';
       try {
@@ -148,9 +165,11 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
       const errMsg = pl.error;
       timelineEmitter.emit(sessionName, 'tool.result', { ...(errMsg ? { error: errMsg } : {}) }, { source: 'daemon', confidence: 'high' });
     } else if (pl.type === 'reasoning') {
+      emitSessionState(sessionName, 'running');
       // Codex reasoning — content is encrypted, emit empty thinking event to show activity
       timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'high' });
     } else if (pl.type === 'custom_tool_call') {
+      emitSessionState(sessionName, 'running');
       // Codex custom tools (e.g. apply_patch)
       const name = String(pl.name ?? 'tool');
       const input = typeof pl.input === 'string' ? pl.input.slice(0, 200) : '';
@@ -163,6 +182,7 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
       } catch {}
       timelineEmitter.emit(sessionName, 'tool.result', { ...(error ? { error } : {}) }, { source: 'daemon', confidence: 'high' });
     } else if (pl.type === 'web_search_call') {
+      emitSessionState(sessionName, 'running');
       const action = pl.action;
       const actionType = action?.type ?? 'search';
       const query = action?.query ?? action?.url ?? '';
@@ -181,10 +201,15 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
       timelineEmitter.emit(sessionName, 'usage.update', {
         inputTokens: last.input_tokens,
         cacheTokens: last.cached_input_tokens ?? 0,
-        contextWindow: pl.info.model_context_window ?? 1000000,
+        contextWindow: resolveContextWindow(pl.info.model_context_window, model),
         ...(model ? { model } : {}),
       }, { source: 'daemon', confidence: 'high' });
     }
+  } else if (pl.type === 'task_started') {
+    emitSessionState(sessionName, 'running');
+  } else if (pl.type === 'task_complete') {
+    flushFinalAnswer(sessionName);
+    emitSessionState(sessionName, 'idle');
   } else if (pl.type === 'user_message') {
     flushFinalAnswer(sessionName);
     if (pl.message?.trim()) timelineEmitter.emit(sessionName, 'user.message', { text: pl.message }, { source: 'daemon', confidence: 'high' });
@@ -192,12 +217,14 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
     const text = pl.message;
     if (!text?.trim()) return;
     if (pl.phase === 'final_answer') {
+      emitSessionState(sessionName, 'running');
       // Buffer and debounce — emit only once when streaming stops
       const existing = finalAnswerBuffers.get(sessionName);
       if (existing) clearTimeout(existing.timer);
       const timer = setTimeout(() => flushFinalAnswer(sessionName), FINAL_ANSWER_DEBOUNCE_MS);
       finalAnswerBuffers.set(sessionName, { text, timer });
     } else if (pl.phase === 'commentary') {
+      emitSessionState(sessionName, 'running');
       timelineEmitter.emit(sessionName, 'assistant.thinking', { text }, { source: 'daemon', confidence: 'high' });
     }
   }
@@ -451,6 +478,12 @@ export function stopWatching(sessionName: string): void {
   state.stopped = true; state.abort.abort();
   if (state.pollTimer) clearInterval(state.pollTimer);
   watchers.delete(sessionName);
+  sessionStates.delete(sessionName);
+  const finalAnswer = finalAnswerBuffers.get(sessionName);
+  if (finalAnswer) {
+    clearTimeout(finalAnswer.timer);
+    finalAnswerBuffers.delete(sessionName);
+  }
   for (const [fp, sn] of claimedFiles) { if (sn === sessionName) claimedFiles.delete(fp); }
 }
 

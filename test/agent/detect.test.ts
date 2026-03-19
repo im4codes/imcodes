@@ -46,6 +46,15 @@ describe('detectStatus() — Codex', () => {
     const status = detectStatus(lines, 'codex');
     expect(['streaming', 'thinking']).toContain(status);
   });
+
+  it('does not treat context_pct as idle without a prompt', () => {
+    const status = detectStatus([
+      'Codex 0.113.0',
+      'Working directory: /redacted/project',
+      'context_pct: 42',
+    ], 'codex');
+    expect(status).not.toBe('idle');
+  });
 });
 
 describe('detectStatus() — OpenCode', () => {

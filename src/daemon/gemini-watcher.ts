@@ -6,6 +6,8 @@ import { watch, readdir, stat, readFile } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
 import { timelineEmitter } from './timeline-emitter.js';
+import { capturePane } from '../agent/tmux.js';
+import { detectStatus } from '../agent/detect.js';
 import logger from '../util/logger.js';
 
 const GEMINI_TMP_DIR = join(homedir(), '.gemini', 'tmp');
@@ -110,6 +112,7 @@ export interface WatcherState {
   emittedRunning?: boolean;
   idleDebounceTimer?: ReturnType<typeof setTimeout>;
   _lastRotationCheck?: number;
+  _terminalThinkingEmitted?: boolean;
 }
 
 const watchers = new Map<string, WatcherState>();
@@ -118,6 +121,43 @@ const claimedFiles = new Map<string, string>(); // filePath → sessionName
 export function preClaimFile(sessionName: string, filePath: string): void {
   for (const [fp, sn] of claimedFiles) { if (sn === sessionName) { claimedFiles.delete(fp); break; } }
   claimedFiles.set(filePath, sessionName);
+}
+
+// ── Terminal-based thinking detection ─────────────────────────────────────────
+// Supplements JSON watching: when the JSON file hasn't changed but the terminal
+// shows activity (spinner, "esc to cancel"), emit assistant.thinking so the
+// web UI chat mode reflects that Gemini is working.
+
+async function terminalThinkingCheck(sessionName: string, state: WatcherState): Promise<void> {
+  let lines: string[];
+  try {
+    lines = await capturePane(sessionName);
+  } catch {
+    return; // session may not exist yet
+  }
+
+  const status = detectStatus(lines, 'gemini');
+
+  if (status === 'idle') {
+    // Terminal shows idle — if we previously thought it was running, emit idle
+    if (state.emittedRunning) {
+      state.emittedRunning = false;
+      if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
+      timelineEmitter.emit(sessionName, 'session.state', { state: 'idle' });
+    }
+    state._terminalThinkingEmitted = false;
+    return;
+  }
+
+  // Terminal shows activity (thinking/streaming/tool_running) — emit running + thinking
+  if (!state.emittedRunning) {
+    state.emittedRunning = true;
+    timelineEmitter.emit(sessionName, 'session.state', { state: 'running' });
+  }
+  if (!state._terminalThinkingEmitted) {
+    state._terminalThinkingEmitted = true;
+    timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'terminal-parse', confidence: 'medium' });
+  }
 }
 
 // ── Core poll logic ────────────────────────────────────────────────────────────
@@ -144,7 +184,12 @@ export async function pollTick(sessionName: string, state: WatcherState): Promis
   const conv = await readConversation(state.activeFile!);
   if (!conv) return;
 
-  if (conv.lastUpdated === state.lastUpdated && conv.messages.length === state.seenCount) return;
+  if (conv.lastUpdated === state.lastUpdated && conv.messages.length === state.seenCount) {
+    // JSON unchanged — supplement with terminal-based detection.
+    // Gemini CLI may be thinking/working without writing to JSON yet.
+    await terminalThinkingCheck(sessionName, state);
+    return;
+  }
 
   const lastIdx = conv.messages.length - 1;
   const isUpdate = conv.messages.length === state.seenCount && lastIdx >= 0;
@@ -154,6 +199,7 @@ export async function pollTick(sessionName: string, state: WatcherState): Promis
   state.lastUpdated = conv.lastUpdated;
 
   if (!state.emittedRunning) { state.emittedRunning = true; timelineEmitter.emit(sessionName, 'session.state', { state: 'running' }); }
+  state._terminalThinkingEmitted = false; // Reset: JSON has content now, terminal-based thinking no longer needed
 
   for (let i = 0; i < messagesToProcess.length; i++) {
     const msg = messagesToProcess[i];

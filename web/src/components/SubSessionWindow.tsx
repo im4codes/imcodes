@@ -8,6 +8,7 @@ import { getActiveThinkingTs } from '../thinking-utils.js';
 import { recordCost, getSessionCost, getWeeklyCost, getMonthlyCost, formatCost } from '../cost-tracker.js';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
+import { resolveContextWindow } from '../model-context.js';
 import { SessionControls } from './SessionControls.js';
 import { useTimeline } from '../hooks/useTimeline.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
@@ -299,7 +300,7 @@ export function SubSessionWindow({
 
       {/* Usage footer — context bar + cost */}
       {lastUsage && (() => {
-        const ctx = lastUsage.contextWindow || 1_000_000;
+        const ctx = resolveContextWindow(lastUsage.contextWindow, lastUsage.model);
         const total = lastUsage.inputTokens + lastUsage.cacheTokens;
         const totalPct = Math.min(100, total / ctx * 100);
         const cachePct = Math.min(totalPct, lastUsage.cacheTokens / ctx * 100);

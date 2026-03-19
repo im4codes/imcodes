@@ -165,7 +165,10 @@ export async function readSubSessionResponse(sessionName: string): Promise<{ sta
   if (!(await sessionExists(sessionName))) return { status: 'idle', response: '' };
   const { getSession } = await import('../store/session-store.js');
   const record = getSession(sessionName);
-  const status = detectStatus(lines, (record?.agentType ?? 'shell') as any);
+  const agentType = (record?.agentType ?? 'shell') as AgentType;
+  const status = (agentType === 'codex' || agentType === 'gemini') && record?.state
+    ? (record.state === 'idle' ? 'idle' : 'thinking')
+    : detectStatus(lines, agentType);
   if (status !== 'idle') return { status: 'working' };
   const events = timelineStore.read(sessionName);
   const lastUserMsgIdx = events.map((e) => e.type).lastIndexOf('user.message');

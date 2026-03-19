@@ -9,11 +9,11 @@
     "noUnusedLocals": true,
     "noImplicitReturns": true,
     "outDir": "dist",
-    "rootDir": ".",
+    "rootDir": "..",
     "paths": {
       "~/*": ["./*"]
     }
   },
-  "include": ["src/**/*", "durable-objects/**/*"],
+  "include": ["src/**/*", "durable-objects/**/*", "../shared/**/*"],
   "exclude": ["node_modules", "dist", "test"]
 }

@@ -1,0 +1,12 @@
+{"timestamp":"2026-03-19T11:36:41.000Z","type":"session_meta","payload":{"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","cwd":"/redacted/project","cli_version":"0.113.0","source":"cli","model_provider":"openai"}}
+{"timestamp":"2026-03-19T11:36:41.010Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}
+{"timestamp":"2026-03-19T11:36:41.020Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}
+{"timestamp":"2026-03-19T11:36:41.030Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-simple"}}
+{"timestamp":"2026-03-19T11:36:41.040Z","type":"turn_context","payload":{"cwd":"/redacted/project"}}
+{"timestamp":"2026-03-19T11:36:41.050Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}
+{"timestamp":"2026-03-19T11:36:41.060Z","type":"event_msg","payload":{"type":"user_message","message":"[redacted user prompt]","images":[],"local_images":[]}}
+{"timestamp":"2026-03-19T11:36:41.070Z","type":"response_item","payload":{"type":"reasoning"}}
+{"timestamp":"2026-03-19T11:36:41.080Z","type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"[redacted final answer]"}}
+{"timestamp":"2026-03-19T11:36:41.090Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}
+{"timestamp":"2026-03-19T11:36:41.100Z","type":"event_msg","payload":{"type":"token_count","info":{}}}
+{"timestamp":"2026-03-19T11:36:41.110Z","type":"event_msg","payload":{"type":"task_complete"}}
