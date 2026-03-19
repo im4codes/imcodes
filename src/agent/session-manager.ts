@@ -1,4 +1,4 @@
-import { newSession, killSession, sessionExists, listSessions as tmuxListSessions, sendKeys, sendKey, capturePane, showBuffer, getPaneId, getPaneCwd, getPaneStartCommand, cleanupOrphanFifos } from './tmux.js';
+import { newSession, killSession, sessionExists, isPaneAlive, respawnPane, listSessions as tmuxListSessions, sendKeys, sendKey, capturePane, showBuffer, getPaneId, getPaneCwd, getPaneStartCommand, cleanupOrphanFifos } from './tmux.js';
 import { ClaudeCodeDriver } from './drivers/claude-code.js';
 import { CodexDriver } from './drivers/codex.js';
 import { OpenCodeDriver } from './drivers/opencode.js';
@@ -18,7 +18,7 @@ import {
 } from '../store/session-store.js';
 import logger from '../util/logger.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
-import { startWatching, startWatchingFile, stopWatching, isWatching, claudeProjectDir } from '../daemon/jsonl-watcher.js';
+import { startWatching, startWatchingFile, stopWatching, isWatching, claudeProjectDir, ensureClaudeSessionFile, findJsonlPathBySessionId } from '../daemon/jsonl-watcher.js';
 import { startWatching as startCodexWatching, startWatchingSpecificFile as startCodexWatchingFile, startWatchingById as startCodexWatchingById, stopWatching as stopCodexWatching, isWatching as isCodexWatching, findRolloutPathByUuid, extractNewRolloutUuid, ensureSessionFile as ensureCodexSessionFile } from '../daemon/codex-watcher.js';
 import { startWatching as startGeminiWatching, startWatchingLatest as startGeminiWatchingLatest, stopWatching as stopGeminiWatching, isWatching as isGeminiWatching } from '../daemon/gemini-watcher.js';
 import { randomUUID } from 'node:crypto';
@@ -29,7 +29,7 @@ import { getAgentVersion } from './agent-version.js';
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
 function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string): void {
   if (ccSessionId) {
-    const jsonlPath = join(claudeProjectDir(projectDir), `${ccSessionId}.jsonl`);
+    const jsonlPath = findJsonlPathBySessionId(projectDir, ccSessionId);
     startWatchingFile(sessionName, jsonlPath).catch((e) =>
       logger.warn({ err: e, session: sessionName }, 'jsonl-watcher startWatchingFile failed'),
     );
@@ -37,6 +37,49 @@ function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: s
     startWatching(sessionName, projectDir).catch((e) =>
       logger.warn({ err: e, session: sessionName }, 'jsonl-watcher start failed'),
     );
+  }
+}
+
+function startStructuredWatcher(
+  name: string,
+  agentType: AgentType,
+  projectDir: string,
+  ids?: { ccSessionId?: string; codexSessionId?: string; geminiSessionId?: string },
+): void {
+  if (agentType === 'claude-code') {
+    startCCWatcher(name, projectDir, ids?.ccSessionId);
+  } else if (agentType === 'codex') {
+    if (ids?.codexSessionId) {
+      findRolloutPathByUuid(ids.codexSessionId).then((rolloutPath) => {
+        if (rolloutPath) {
+          startCodexWatchingFile(name, rolloutPath).catch((e) =>
+            logger.warn({ err: e, session: name }, 'codex-watcher startWatchingSpecificFile failed'),
+          );
+        } else {
+          startCodexWatching(name, projectDir).catch((e) =>
+            logger.warn({ err: e, session: name }, 'codex-watcher start failed (uuid fallback)'),
+          );
+        }
+      }).catch(() => {
+        startCodexWatching(name, projectDir).catch((e) =>
+          logger.warn({ err: e, session: name }, 'codex-watcher start failed'),
+        );
+      });
+    } else {
+      startCodexWatching(name, projectDir).catch((e) =>
+        logger.warn({ err: e, session: name }, 'codex-watcher start failed'),
+      );
+    }
+  } else if (agentType === 'gemini') {
+    if (ids?.geminiSessionId) {
+      startGeminiWatching(name, ids.geminiSessionId).catch((e) =>
+        logger.warn({ err: e, session: name }, 'gemini-watcher start failed'),
+      );
+    } else {
+      startGeminiWatchingLatest(name).catch((e) =>
+        logger.warn({ err: e, session: name }, 'gemini-watcher start latest failed'),
+      );
+    }
   }
 }
 
@@ -134,6 +177,29 @@ export async function initOnStartup(): Promise<void> {
   await cleanupOrphanFifos();
 }
 
+/** Extract ccSessionId from tmux pane start command (supports both --session-id and --resume). */
+async function extractCcSessionIdFromPane(sessionName: string): Promise<string | undefined> {
+  try {
+    const cmd = await getPaneStartCommand(sessionName);
+    const match = cmd.match(/(?:--session-id|--resume)\s+([0-9a-f-]{36})/);
+    return match?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
+/** Infer agent type from tmux pane start command. */
+async function inferAgentTypeFromPane(sessionName: string): Promise<AgentType> {
+  try {
+    const cmd = await getPaneStartCommand(sessionName);
+    if (/\bclaude\b/.test(cmd)) return 'claude-code';
+    if (/\bcodex\b/.test(cmd)) return 'codex';
+    if (/\bgemini\b/.test(cmd)) return 'gemini';
+    if (/\bopencode\b/.test(cmd)) return 'opencode';
+  } catch { /* tmux query failed */ }
+  return 'claude-code'; // last-resort default
+}
+
 // Pattern for valid imcodes session names: deck_{project}_{brain|wN}
 const DECK_SESSION_RE = /^deck_(.+)_(brain|w\d+)$/;
 
@@ -150,55 +216,66 @@ export async function restoreFromStore(): Promise<void> {
     // Handling them here would fall back to directory scan (startWatching), stealing the main
     // session's JSONL file since sub-sessions have no ccSessionId in the session-store.
     if (s.name.startsWith('deck_sub_')) continue;
-    if (!live.includes(s.name)) {
-      logger.info({ session: s.name }, 'Missing on restore, restarting');
-      await restartSession(s);
-    } else if (s.agentType === 'claude-code' && s.projectDir && !isWatching(s.name)) {
-      let ccId = s.ccSessionId;
-      // If ccSessionId missing in store, extract from tmux pane start command (--session-id <UUID>)
-      if (!ccId) {
-        try {
-          const cmd = await getPaneStartCommand(s.name);
-          const match = cmd.match(/--session-id\s+([0-9a-f-]{36})/);
-          if (match) {
-            ccId = match[1];
-            upsertSession({ ...s, ccSessionId: ccId });
-            logger.info({ session: s.name, ccSessionId: ccId }, 'Recovered ccSessionId from tmux');
-          }
-        } catch { /* tmux query failed */ }
+
+    // Always backfill missing CC session UUID from the tmux pane command, even if
+    // a watcher is already active. Otherwise sessions.json can stay permanently
+    // dirty for long-lived sessions that started before the fix.
+    let hydrated = s;
+    if (s.agentType === 'claude-code' && s.projectDir && !s.ccSessionId) {
+      const ccId = await extractCcSessionIdFromPane(s.name);
+      if (ccId) {
+        hydrated = { ...s, ccSessionId: ccId };
+        upsertSession(hydrated);
+        emitSessionPersist(hydrated, s.name);
+        logger.info({ session: s.name, ccSessionId: ccId }, 'Backfilled missing ccSessionId from tmux');
       }
-      startCCWatcher(s.name, s.projectDir, ccId);
-    } else if (s.agentType === 'codex' && s.projectDir && !isCodexWatching(s.name)) {
-      if (s.codexSessionId) {
-        findRolloutPathByUuid(s.codexSessionId).then((rolloutPath) => {
+    }
+
+    if (!live.includes(s.name)) {
+      logger.info({ session: hydrated.name }, 'Missing on restore, restarting');
+      await restartSession(hydrated);
+    } else if (live.includes(s.name) && !(await isPaneAlive(s.name))) {
+      // Session exists (remain-on-exit) but process is dead — respawn instead of creating a new session
+      logger.info({ session: hydrated.name }, 'Pane dead on restore, respawning');
+      await respawnSession(hydrated);
+    } else if (hydrated.agentType === 'claude-code' && hydrated.projectDir && !isWatching(hydrated.name)) {
+      if (hydrated.ccSessionId) {
+        startCCWatcher(hydrated.name, hydrated.projectDir, hydrated.ccSessionId);
+      } else {
+        logger.warn({ session: hydrated.name }, 'Live Claude session has no recoverable ccSessionId; forcing respawn onto a freshly seeded UUID');
+        await respawnSession(hydrated);
+      }
+    } else if (hydrated.agentType === 'codex' && hydrated.projectDir && !isCodexWatching(hydrated.name)) {
+      if (hydrated.codexSessionId) {
+        findRolloutPathByUuid(hydrated.codexSessionId).then((rolloutPath) => {
           if (rolloutPath) {
-            startCodexWatchingFile(s.name, rolloutPath).catch((e) =>
-              logger.warn({ err: e, session: s.name }, 'codex-watcher startWatchingSpecificFile failed (restore)'),
+            startCodexWatchingFile(hydrated.name, rolloutPath).catch((e) =>
+              logger.warn({ err: e, session: hydrated.name }, 'codex-watcher startWatchingSpecificFile failed (restore)'),
             );
           } else {
-            startCodexWatching(s.name, s.projectDir).catch((e) =>
-              logger.warn({ err: e, session: s.name }, 'codex-watcher start failed (restore uuid fallback)'),
+            startCodexWatching(hydrated.name, hydrated.projectDir).catch((e) =>
+              logger.warn({ err: e, session: hydrated.name }, 'codex-watcher start failed (restore uuid fallback)'),
             );
           }
         }).catch(() => {
-          startCodexWatching(s.name, s.projectDir).catch((e) =>
-            logger.warn({ err: e, session: s.name }, 'codex-watcher start failed (restore)'),
+          startCodexWatching(hydrated.name, hydrated.projectDir).catch((e) =>
+            logger.warn({ err: e, session: hydrated.name }, 'codex-watcher start failed (restore)'),
           );
         });
       } else {
-        startCodexWatching(s.name, s.projectDir).catch((e) =>
-          logger.warn({ err: e, session: s.name }, 'codex-watcher start failed (restore)'),
+        startCodexWatching(hydrated.name, hydrated.projectDir).catch((e) =>
+          logger.warn({ err: e, session: hydrated.name }, 'codex-watcher start failed (restore)'),
         );
       }
-    } else if (s.agentType === 'gemini' && !isGeminiWatching(s.name)) {
-      if (s.geminiSessionId) {
-        startGeminiWatching(s.name, s.geminiSessionId).catch((e) =>
-          logger.warn({ err: e, session: s.name }, 'gemini-watcher start failed (restore)'),
+    } else if (hydrated.agentType === 'gemini' && !isGeminiWatching(hydrated.name)) {
+      if (hydrated.geminiSessionId) {
+        startGeminiWatching(hydrated.name, hydrated.geminiSessionId).catch((e) =>
+          logger.warn({ err: e, session: hydrated.name }, 'gemini-watcher start failed (restore)'),
         );
       } else {
         // Fallback: watch latest for orphans/incomplete records
-        startGeminiWatching(s.name, '').catch((e) =>
-          logger.warn({ err: e, session: s.name }, 'gemini-watcher start latest failed (restore)'),
+        startGeminiWatching(hydrated.name, '').catch((e) =>
+          logger.warn({ err: e, session: hydrated.name }, 'gemini-watcher start latest failed (restore)'),
         );
       }
     }
@@ -214,18 +291,25 @@ export async function restoreFromStore(): Promise<void> {
     const projectName = match[1];
     const role = match[2] as 'brain' | `w${number}`;
 
-    // Infer metadata from tmux pane
-    const [projectDir, paneId] = await Promise.all([
+    // Infer metadata from tmux pane — agent type, UUID, cwd
+    const [projectDir, paneId, agentType] = await Promise.all([
       getPaneCwd(name).catch(() => ''),
       getPaneId(name).catch(() => undefined as string | undefined),
+      inferAgentTypeFromPane(name),
     ]);
+
+    // Extract session UUID from pane command if it's a CC session
+    let ccSessionId: string | undefined;
+    if (agentType === 'claude-code') {
+      ccSessionId = await extractCcSessionIdFromPane(name);
+    }
 
     const record: SessionRecord = {
       name,
       projectName,
       role,
-      agentType: 'claude-code', // default; most common
-      agentVersion: await getAgentVersion('claude-code'),
+      agentType,
+      agentVersion: await getAgentVersion(agentType),
       projectDir,
       state: 'running',
       restarts: 0,
@@ -233,19 +317,18 @@ export async function restoreFromStore(): Promise<void> {
       createdAt: Date.now(),
       updatedAt: Date.now(),
       ...(paneId ? { paneId } : {}),
+      ...(ccSessionId ? { ccSessionId } : {}),
     };
 
     upsertSession(record);
     emitSessionPersist(record, name);
     emitSessionEvent('started', name, 'running');
-    if (record.agentType === 'claude-code' && projectDir) {
-      startCCWatcher(name, projectDir, record.ccSessionId);
-    } else if (record.agentType === 'codex' && projectDir) {
-      startCodexWatching(name, projectDir).catch((e) =>
-        logger.warn({ err: e, session: name }, 'codex-watcher start failed (discover)'),
-      );
+    if (agentType === 'claude-code' && projectDir) {
+      startStructuredWatcher(name, agentType, projectDir, { ccSessionId });
+    } else if (projectDir) {
+      startStructuredWatcher(name, agentType, projectDir);
     }
-    logger.info({ session: name, projectDir }, 'Discovered unregistered tmux session, registered');
+    logger.info({ session: name, projectDir, agentType }, 'Discovered unregistered tmux session, registered');
   }
 }
 
@@ -285,6 +368,74 @@ export async function restartSession(record: SessionRecord): Promise<boolean> {
     codexSessionId: record.codexSessionId,
   });
 
+  return true;
+}
+
+/**
+ * Respawn a dead pane in an existing tmux session (remain-on-exit).
+ * Avoids creating a new tmux session — just restarts the process inside the existing one.
+ */
+export async function respawnSession(record: SessionRecord): Promise<boolean> {
+  const now = Date.now();
+  const windowStart = now - RESTART_WINDOW_MS;
+  const recentRestarts = record.restartTimestamps.filter((t) => t > windowStart);
+
+  if (recentRestarts.length >= MAX_RESTARTS) {
+    logger.error({ session: record.name }, 'Restart loop detected — marking as error');
+    updateSessionState(record.name, 'error');
+    emitSessionEvent('error', record.name, 'error');
+    return false;
+  }
+
+  const driver = getDriver(record.agentType as AgentType);
+  let ccSessionId = record.ccSessionId;
+  const projectDir = record.projectDir;
+
+  if (record.agentType === 'claude-code' && !ccSessionId) {
+    ccSessionId = randomUUID();
+    record = { ...record, ccSessionId };
+    upsertSession(record);
+    emitSessionPersist(record, record.name);
+    logger.info({ session: record.name, ccSessionId }, 'Allocated missing ccSessionId before respawn');
+  }
+
+  if (record.agentType === 'claude-code' && ccSessionId) {
+    await ensureClaudeSessionFile(ccSessionId, projectDir).catch((e) =>
+      logger.warn({ err: e, session: record.name, ccSessionId }, 'Failed to ensure Claude seed session file before respawn'),
+    );
+  }
+
+  // Build the resume command (same logic as launchSession)
+  let cmd: string;
+  if (record.agentType === 'claude-code' && ccSessionId) {
+    const jsonlPath = findJsonlPathBySessionId(projectDir, ccSessionId);
+    if (existsSync(jsonlPath)) {
+      cmd = driver.buildResumeCommand(record.name, { cwd: projectDir, ccSessionId }) ?? driver.buildLaunchCommand(record.name, { cwd: projectDir, ccSessionId });
+    } else {
+      cmd = driver.buildLaunchCommand(record.name, { cwd: projectDir, ccSessionId });
+    }
+  } else {
+    cmd = driver.buildResumeCommand(record.name, { cwd: projectDir, ccSessionId, codexSessionId: record.codexSessionId }) ?? driver.buildLaunchCommand(record.name, { cwd: projectDir, ccSessionId, codexSessionId: record.codexSessionId });
+  }
+
+  await respawnPane(record.name, cmd);
+
+  const updated: SessionRecord = {
+    ...record,
+    restarts: record.restarts + 1,
+    restartTimestamps: [...recentRestarts, now],
+    state: 'running',
+    updatedAt: now,
+  };
+  upsertSession(updated);
+
+  startStructuredWatcher(record.name, record.agentType as AgentType, projectDir, {
+    ccSessionId,
+    codexSessionId: record.codexSessionId,
+    geminiSessionId: record.geminiSessionId,
+  });
+
+  logger.info({ session: record.name, agentType: record.agentType }, 'Respawned dead pane');
   return true;
 }
 
@@ -339,6 +490,12 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     // If exists and no stored UUID: ccSessionId stays undefined → fall back to dir scan
   }
 
+  if (agentType === 'claude-code' && ccSessionId) {
+    await ensureClaudeSessionFile(ccSessionId, projectDir).catch((e) =>
+      logger.warn({ err: e, session: name, ccSessionId }, 'Failed to ensure Claude seed session file'),
+    );
+  }
+
   // For Codex sessions: resolve codexSessionId from opts or store.
   // If the stored UUID's rollout file no longer exists on disk, clear it so we
   // launch fresh and capture a new UUID (avoids an infinite resume-crash loop).
@@ -387,7 +544,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     // For CC sessions with an existing JSONL file: use --resume instead of --session-id.
     // Claude 2.1+ rejects --session-id when the UUID already has a JSONL on disk ("already in use").
     let launchCmd: string;
-    if (agentType === 'claude-code' && ccSessionId && !fresh) {
+    if (agentType === 'claude-code' && ccSessionId) {
       const jsonlPath = join(claudeProjectDir(projectDir), `${ccSessionId}.jsonl`);
       if (existsSync(jsonlPath)) {
         launchCmd = driver.buildResumeCommand(name, { cwd: projectDir, ccSessionId }) ?? driver.buildLaunchCommand(name, { cwd: projectDir, fresh, ccSessionId, codexSessionId, geminiSessionId });
@@ -444,50 +601,26 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     };
     upsertSession(record);
     emitSessionPersist(record, name);
+  } else {
+    const existing = getSession(name);
+    if (existing) {
+      const merged: SessionRecord = {
+        ...existing,
+        ...(paneId ? { paneId } : {}),
+        ...(ccSessionId ? { ccSessionId } : {}),
+        ...(codexSessionId ? { codexSessionId } : {}),
+        ...(geminiSessionId ? { geminiSessionId } : {}),
+        updatedAt: Date.now(),
+      };
+      upsertSession(merged);
+      emitSessionPersist(merged, name);
+    }
   }
 
   emitSessionEvent('started', name, 'running');
 
   // Start structured-event watchers for supported agent types
-  if (agentType === 'claude-code') {
-    startCCWatcher(name, projectDir, ccSessionId);
-  } else if (agentType === 'codex') {
-    if (codexSessionId) {
-      // UUID already known — watch the specific file
-      findRolloutPathByUuid(codexSessionId).then((rolloutPath) => {
-        if (rolloutPath) {
-          startCodexWatchingFile(name, rolloutPath).catch((e) =>
-            logger.warn({ err: e, session: name }, 'codex-watcher startWatchingSpecificFile failed'),
-          );
-        } else {
-          // UUID known but file not found yet — fall back to dir scan
-          startCodexWatching(name, projectDir).catch((e) =>
-            logger.warn({ err: e, session: name }, 'codex-watcher start failed (uuid fallback)'),
-          );
-        }
-      }).catch(() => {
-        startCodexWatching(name, projectDir).catch((e) =>
-          logger.warn({ err: e, session: name }, 'codex-watcher start failed'),
-        );
-      });
-    } else {
-      // No UUID — use dir scan
-      startCodexWatching(name, projectDir).catch((e) =>
-        logger.warn({ err: e, session: name }, 'codex-watcher start failed'),
-      );
-    }
-  } else if (agentType === 'gemini') {
-    if (geminiSessionId) {
-      startGeminiWatching(name, geminiSessionId).catch((e) =>
-        logger.warn({ err: e, session: name }, 'gemini-watcher start failed'),
-      );
-    } else {
-      // resolveSessionId failed — fall back to watching the most recently modified file
-      startGeminiWatchingLatest(name).catch((e) =>
-        logger.warn({ err: e, session: name }, 'gemini-watcher start latest failed'),
-      );
-    }
-  }
+  startStructuredWatcher(name, agentType, projectDir, { ccSessionId, codexSessionId, geminiSessionId });
 
   // Auto-dismiss startup prompts (trust folder, settings errors, update dialogs)
   if (driver.postLaunch) {

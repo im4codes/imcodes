@@ -4,6 +4,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   storeListSessions: vi.fn(),
+  storeUpsertSession: vi.fn(),
   tmuxListSessions: vi.fn(),
   jsonlStartWatching: vi.fn().mockResolvedValue(undefined),
   jsonlStartWatchingFile: vi.fn().mockResolvedValue(undefined),
@@ -15,11 +16,12 @@ const mocks = vi.hoisted(() => ({
   geminiIsWatching: vi.fn().mockReturnValue(false),
   restartSession: vi.fn().mockResolvedValue(true),
   newSession: vi.fn().mockResolvedValue(undefined),
+  respawnPane: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
   listSessions: mocks.storeListSessions,
-  upsertSession: vi.fn(),
+  upsertSession: mocks.storeUpsertSession,
   getSession: vi.fn((name) => {
     const all = mocks.storeListSessions() || [];
     return all.find(s => s.name === name);
@@ -32,10 +34,15 @@ vi.mock('../../src/agent/tmux.js', () => ({
     const live = await mocks.tmuxListSessions();
     return live.includes(name);
   }),
+  isPaneAlive: vi.fn().mockResolvedValue(true),
+  respawnPane: mocks.respawnPane,
   getPaneCwd: vi.fn().mockResolvedValue('/proj'),
   getPaneId: vi.fn().mockResolvedValue('%1'),
+  getPaneStartCommand: vi.fn().mockResolvedValue('claude --dangerously-skip-permissions'),
   cleanupOrphanFifos: vi.fn(),
   newSession: mocks.newSession,
+  capturePane: vi.fn().mockResolvedValue([]),
+  sendKey: vi.fn(),
 }));
 
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
@@ -43,6 +50,8 @@ vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
   startWatchingFile: mocks.jsonlStartWatchingFile,
   isWatching: mocks.jsonlIsWatching,
   preClaimFile: vi.fn(),
+  findJsonlPathBySessionId: (d: string, id: string) => `/mock/${d}/${id}.jsonl`,
+  ensureClaudeSessionFile: vi.fn().mockResolvedValue(undefined),
   claudeProjectDir: (d: string) => `/mock/${d}`,
 }));
 
@@ -172,5 +181,24 @@ describe('Session Restoration (all agents)', () => {
     await restoreFromStore();
 
     expect(mocks.jsonlStartWatching).not.toHaveBeenCalled();
+  });
+
+  it('forces respawn instead of directory scan for live Claude sessions with no recoverable ccSessionId', async () => {
+    mocks.storeListSessions.mockReturnValue([
+      {
+        name: 'deck_proj_brain',
+        agentType: 'claude-code',
+        projectDir: '/proj',
+        state: 'running',
+        restartTimestamps: [],
+      },
+    ]);
+    mocks.tmuxListSessions.mockResolvedValue(['deck_proj_brain']);
+
+    await restoreFromStore();
+
+    expect(mocks.jsonlStartWatching).not.toHaveBeenCalled();
+    expect(mocks.jsonlStartWatchingFile).toHaveBeenCalledTimes(1);
+    expect(mocks.respawnPane).toHaveBeenCalledTimes(1);
   });
 });

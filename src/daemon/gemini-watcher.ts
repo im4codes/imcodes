@@ -9,6 +9,7 @@ import { timelineEmitter } from './timeline-emitter.js';
 import { capturePane } from '../agent/tmux.js';
 import { detectStatus } from '../agent/detect.js';
 import logger from '../util/logger.js';
+import { updateSessionState } from '../store/session-store.js';
 
 const GEMINI_TMP_DIR = join(homedir(), '.gemini', 'tmp');
 const POLL_INTERVAL_MS = 500; // Snappy updates
@@ -113,6 +114,7 @@ export interface WatcherState {
   idleDebounceTimer?: ReturnType<typeof setTimeout>;
   _lastRotationCheck?: number;
   _terminalThinkingEmitted?: boolean;
+  lastConversationStatus?: 'running' | 'idle' | null;
 }
 
 const watchers = new Map<string, WatcherState>();
@@ -142,14 +144,14 @@ async function terminalThinkingCheck(sessionName: string, state: WatcherState): 
     // Terminal shows idle — debounce before emitting to avoid flicker
     // (Gemini briefly shows ">" between tool calls while still working)
     if (state.emittedRunning && !state.idleDebounceTimer) {
-      state.idleDebounceTimer = setTimeout(() => {
-        state.idleDebounceTimer = undefined;
-        if (!state.stopped && state.emittedRunning) {
-          state.emittedRunning = false;
-          state._terminalThinkingEmitted = false;
-          timelineEmitter.emit(sessionName, 'session.state', { state: 'idle' });
-        }
-      }, 3000);
+        state.idleDebounceTimer = setTimeout(() => {
+          state.idleDebounceTimer = undefined;
+          if (!state.stopped && state.emittedRunning) {
+            state.emittedRunning = false;
+            state._terminalThinkingEmitted = false;
+            emitSessionState(sessionName, 'idle');
+          }
+        }, 3000);
     }
     return;
   }
@@ -160,12 +162,41 @@ async function terminalThinkingCheck(sessionName: string, state: WatcherState): 
   // Terminal shows activity (thinking/streaming/tool_running) — emit running + thinking
   if (!state.emittedRunning) {
     state.emittedRunning = true;
-    timelineEmitter.emit(sessionName, 'session.state', { state: 'running' });
+    emitSessionState(sessionName, 'running');
   }
   if (!state._terminalThinkingEmitted) {
     state._terminalThinkingEmitted = true;
     timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'terminal-parse', confidence: 'medium' });
   }
+}
+
+function emitSessionState(sessionName: string, next: 'running' | 'idle'): void {
+  const emitted = timelineEmitter.emit(sessionName, 'session.state', { state: next });
+  if (emitted) updateSessionState(sessionName, next);
+}
+
+function hasPendingTools(msg: any): boolean {
+  return !!msg.toolCalls?.some((tc: any) => !tc.status || (tc.status !== 'success' && tc.status !== 'error'));
+}
+
+function hasGeminiContent(msg: any): boolean {
+  return typeof msg.content === 'string' && msg.content.trim().length > 0;
+}
+
+function inferConversationStatus(conv: any): 'running' | 'idle' | null {
+  const messages = Array.isArray(conv?.messages) ? conv.messages : [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (!msg || typeof msg !== 'object') continue;
+    if (msg.type === 'info') continue;
+    if (msg.type === 'user') return 'running';
+    if (msg.type !== 'gemini') continue;
+    if (hasPendingTools(msg)) return 'running';
+    if (msg.thoughts?.length && !hasGeminiContent(msg)) return 'running';
+    if (hasGeminiContent(msg)) return 'idle';
+    return 'running';
+  }
+  return null;
 }
 
 // ── Core poll logic ────────────────────────────────────────────────────────────
@@ -191,8 +222,14 @@ export async function pollTick(sessionName: string, state: WatcherState): Promis
 
   const conv = await readConversation(state.activeFile!);
   if (!conv) return;
+  const conversationStatus = inferConversationStatus(conv);
+  state.lastConversationStatus = conversationStatus;
 
   if (conv.lastUpdated === state.lastUpdated && conv.messages.length === state.seenCount) {
+    if (conversationStatus === 'idle') {
+      state.emittedRunning = false;
+      return;
+    }
     // JSON unchanged — supplement with terminal-based detection.
     // Gemini CLI may be thinking/working without writing to JSON yet.
     await terminalThinkingCheck(sessionName, state);
@@ -205,8 +242,6 @@ export async function pollTick(sessionName: string, state: WatcherState): Promis
 
   state.seenCount = conv.messages.length;
   state.lastUpdated = conv.lastUpdated;
-
-  if (!state.emittedRunning) { state.emittedRunning = true; timelineEmitter.emit(sessionName, 'session.state', { state: 'running' }); }
   state._terminalThinkingEmitted = false; // Reset: JSON has content now, terminal-based thinking no longer needed
 
   for (let i = 0; i < messagesToProcess.length; i++) {
@@ -216,25 +251,33 @@ export async function pollTick(sessionName: string, state: WatcherState): Promis
     const ts = msg.timestamp ? new Date(msg.timestamp).getTime() : Date.now();
     const hist = { ts: isNaN(ts) ? Date.now() : ts, idPrefix: `g:${sessionName}:${msgIdx}:`, counts: new Map() };
     parseMessage(sessionName, msg, hist, isUpdate);
-    const hasContent = typeof msg.content === 'string' && msg.content.trim().length > 0;
-    const hasPendingTools = msg.toolCalls?.some((tc: any) => !tc.status || (tc.status !== 'success' && tc.status !== 'error'));
-    if (msg.type === 'gemini' && hasContent && !hasPendingTools) {
-      if (isUpdate) {
-        // Still streaming: reset debounce — only emit idle after updates stop
-        if (state.idleDebounceTimer) clearTimeout(state.idleDebounceTimer);
-        state.idleDebounceTimer = setTimeout(() => {
-          state.idleDebounceTimer = undefined;
-          if (!state.stopped) {
-            state.emittedRunning = false;
-            timelineEmitter.emit(sessionName, 'session.state', { state: 'idle' });
-          }
-        }, 1500);
-      } else {
-        // New complete message: emit idle immediately
-        if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
-        state.emittedRunning = false;
-        timelineEmitter.emit(sessionName, 'session.state', { state: 'idle' });
-      }
+  }
+
+  if (conversationStatus === 'running') {
+    if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
+    if (!state.emittedRunning) {
+      state.emittedRunning = true;
+      emitSessionState(sessionName, 'running');
+    }
+    return;
+  }
+
+  if (conversationStatus === 'idle') {
+    const touchedGeminiMessage = messagesToProcess.some((msg: any) => msg?.type === 'gemini');
+    if (isUpdate && touchedGeminiMessage) {
+      // Still receiving updates for the same Gemini message: wait for writes to settle.
+      if (state.idleDebounceTimer) clearTimeout(state.idleDebounceTimer);
+      state.idleDebounceTimer = setTimeout(() => {
+        state.idleDebounceTimer = undefined;
+        if (!state.stopped) {
+          state.emittedRunning = false;
+          emitSessionState(sessionName, 'idle');
+        }
+      }, 1500);
+    } else {
+      if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
+      state.emittedRunning = false;
+      emitSessionState(sessionName, 'idle');
     }
   }
 }
@@ -250,7 +293,15 @@ export async function startWatching(sessionName: string, sessionUuid: string): P
   if (found) {
     state.activeFile = found; claimedFiles.set(found, sessionName);
     const conv = await readConversation(found);
-    if (conv) { state.seenCount = conv.messages.length; state.lastUpdated = conv.lastUpdated; }
+    if (conv) {
+      state.seenCount = conv.messages.length;
+      state.lastUpdated = conv.lastUpdated;
+      state.lastConversationStatus = inferConversationStatus(conv);
+      if (state.lastConversationStatus === 'idle') {
+        state.emittedRunning = false;
+        emitSessionState(sessionName, 'idle');
+      }
+    }
   }
 
   state.pollTimer = setInterval(() => {

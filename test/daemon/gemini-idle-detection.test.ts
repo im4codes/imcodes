@@ -102,4 +102,36 @@ describe('Gemini Idle Detection (Direct pollTick test)', () => {
     
     expect(states).toContain('idle');
   });
+
+  it('emits idle when a trailing info message arrives after a completed Gemini reply', async () => {
+    state.seenCount = 1;
+    state.lastUpdated = '2026-03-14T10:00:01Z';
+    state.emittedRunning = false;
+
+    const conv = {
+      lastUpdated: '2026-03-14T10:00:03Z',
+      messages: [
+        {
+          type: 'gemini',
+          content: 'All done.',
+          timestamp: '2026-03-14T10:00:02Z'
+        },
+        {
+          type: 'info',
+          content: 'Gemini CLI update available!',
+          timestamp: '2026-03-14T10:00:03Z'
+        }
+      ]
+    };
+    vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify(conv));
+
+    await pollTick(sid, state);
+
+    const states = vi.mocked(timelineEmitter.emit).mock.calls
+      .filter(c => c[1] === 'session.state')
+      .map(c => (c[2] as any).state);
+
+    expect(states).toContain('idle');
+    expect(states).not.toContain('running');
+  });
 });

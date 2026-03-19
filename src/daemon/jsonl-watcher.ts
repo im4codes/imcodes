@@ -13,13 +13,14 @@
  *   - stopWatching(sessionName) when it stops
  */
 
-import { watch, readdir, stat, open } from 'fs/promises';
+import { watch, readdir, stat, open, mkdir, writeFile } from 'fs/promises';
 import type { FileChangeInfo } from 'fs/promises';
 import { join, dirname, basename } from 'path';
 import { homedir } from 'os';
 import { timelineEmitter } from './timeline-emitter.js';
 import logger from '../util/logger.js';
 import { resolveContextWindow } from '../util/model-context.js';
+import { readProjectMemory } from './memory-inject.js';
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
@@ -32,6 +33,58 @@ function claudeProjectKey(absPath: string): string {
 export function claudeProjectDir(workDir: string): string {
   const key = claudeProjectKey(workDir);
   return join(homedir(), '.claude', 'projects', key);
+}
+
+/** Deterministic path for a Claude Code transcript file by cwd + session UUID. */
+export function findJsonlPathBySessionId(workDir: string, sessionId: string): string {
+  return join(claudeProjectDir(workDir), `${sessionId}.jsonl`);
+}
+
+function buildSeedText(cwd: string, memory: string | null): string {
+  if (memory?.trim()) {
+    return [
+      `Restored/bootstrapped Claude Code session for project: ${cwd}`,
+      '',
+      memory.trim(),
+    ].join('\n');
+  }
+  return [
+    `Restored/bootstrapped Claude Code session for project: ${cwd}`,
+    '',
+    'This is an automatically created seed transcript so the session can resume deterministically.',
+  ].join('\n');
+}
+
+/**
+ * Ensure a minimally valid Claude Code transcript file exists so `claude --resume <uuid>`
+ * has a deterministic landing point even on a cold start.
+ */
+export async function ensureClaudeSessionFile(sessionId: string, cwd: string): Promise<string> {
+  const filePath = findJsonlPathBySessionId(cwd, sessionId);
+  try {
+    await stat(filePath);
+    return filePath;
+  } catch { /* create below */ }
+
+  const dir = dirname(filePath);
+  await mkdir(dir, { recursive: true });
+
+  const timestamp = new Date().toISOString();
+  const memory = await readProjectMemory(cwd).catch(() => null);
+  const seedLine = JSON.stringify({
+    type: 'user',
+    message: {
+      role: 'user',
+      content: buildSeedText(cwd, memory),
+    },
+    timestamp,
+    cwd,
+    sessionId,
+    version: '2.1.79',
+  });
+  await writeFile(filePath, seedLine + '\n', 'utf8');
+  logger.info({ sessionId, filePath, hasMemory: !!memory }, 'jsonl-watcher: created Claude seed transcript');
+  return filePath;
 }
 
 /** Find the most recently modified .jsonl file in a directory. */
@@ -70,6 +123,31 @@ interface ContentBlock {
   input?: Record<string, unknown>;
   content?: unknown;
   is_error?: boolean;
+}
+
+function emitUserStringContent(
+  sessionName: string,
+  text: string,
+  stableId?: (suffix: string) => string,
+  ts?: number,
+): void {
+  if (!text.trim()) return;
+  timelineEmitter.emit(sessionName, 'user.message', {
+    text,
+  }, { source: 'daemon', confidence: 'high', ...(stableId ? { eventId: stableId('um') } : {}), ...(ts ? { ts } : {}) });
+}
+
+function emitAssistantStringContent(
+  sessionName: string,
+  text: string,
+  stableId?: (suffix: string) => string,
+  ts?: number,
+): void {
+  if (!text.trim()) return;
+  timelineEmitter.emit(sessionName, 'assistant.text', {
+    text,
+    streaming: false,
+  }, { source: 'daemon', confidence: 'high', ...(stableId ? { eventId: stableId('at') } : {}), ...(ts ? { ts } : {}) });
 }
 
 /**
@@ -179,9 +257,13 @@ function parseLine(sessionName: string, line: string, lineByteOffset?: number): 
   const msg = raw['message'] as Record<string, unknown> | undefined;
   if (!msg) return;
   const content = msg['content'];
-  if (!Array.isArray(content)) return;
 
   if (raw['type'] === 'assistant') {
+    if (typeof content === 'string') {
+      emitAssistantStringContent(sessionName, content, stableId, ts);
+      return;
+    }
+    if (!Array.isArray(content)) return;
     for (const block of content as ContentBlock[]) {
       if (block.type === 'text' && block.text) {
         timelineEmitter.emit(sessionName, 'assistant.text', {
@@ -223,11 +305,14 @@ function parseLine(sessionName: string, line: string, lineByteOffset?: number): 
   }
 
   if (raw['type'] === 'user') {
+    if (typeof content === 'string') {
+      emitUserStringContent(sessionName, content, stableId, ts);
+      return;
+    }
+    if (!Array.isArray(content)) return;
     for (const block of content as ContentBlock[]) {
       if (block.type === 'text' && block.text?.trim()) {
-        timelineEmitter.emit(sessionName, 'user.message', {
-          text: block.text,
-        }, { source: 'daemon', confidence: 'high', ...(stableId ? { eventId: stableId('um') } : {}), ...(ts ? { ts } : {}) });
+        emitUserStringContent(sessionName, block.text, stableId, ts);
       } else if (block.type === 'tool_result') {
         const error = block.is_error ? String(block.content ?? 'error') : undefined;
         timelineEmitter.emit(sessionName, 'tool.result', {
@@ -253,6 +338,8 @@ function extractToolInput(tool: string, input?: Record<string, unknown>): string
 
 // ── Per-session watcher state ─────────────────────────────────────────────────
 
+type WatcherStatus = 'waiting_for_file' | 'active' | 'degraded' | 'stopped';
+
 interface WatcherState {
   projectDir: string;
   activeFile: string | null;
@@ -260,6 +347,10 @@ interface WatcherState {
   abort: AbortController;
   stopped: boolean;
   pollTimer?: ReturnType<typeof setInterval>;
+  /** Partial line buffer — incomplete last line carried over between drainNewLines calls. */
+  pendingPartialLine: string;
+  /** Watcher health status — distinguishes registered-but-not-working from truly active. */
+  status: WatcherStatus;
 }
 
 const watchers = new Map<string, WatcherState>();
@@ -335,16 +426,18 @@ async function emitRecentHistory(sessionName: string, filePath: string): Promise
       }
     }
 
-    // Track absolute byte offset in file for stable eventId generation.
-    // Stable IDs ensure duplicate re-emissions across daemon restarts are
-    // deduplicated by the browser's mergeEvents (which deduplicates by eventId).
+    // Collect all parseable events first, then take the LAST N — not first N.
+    // This ensures the most recent history is always returned, not the oldest
+    // within the 256KB tail chunk.
+    interface HistoryEntry { lineBytePos: number; raw: Record<string, unknown>; }
+    const allEntries: HistoryEntry[] = [];
+
     let bytePos = size - readSize;
     for (let i = 0; i < startIdx; i++) {
-      bytePos += Buffer.byteLength(lines[i], 'utf8') + 1; // +1 for \n
+      bytePos += Buffer.byteLength(lines[i], 'utf8') + 1;
     }
 
-    let count = 0;
-    for (let i = startIdx; i < lines.length && count < HISTORY_LINES; i++) {
+    for (let i = startIdx; i < lines.length; i++) {
       const lineBytePos = bytePos;
       bytePos += Buffer.byteLength(lines[i], 'utf8') + 1;
 
@@ -355,44 +448,55 @@ async function emitRecentHistory(sessionName: string, filePath: string): Promise
 
       const msg = raw['message'] as Record<string, unknown> | undefined;
       const content = msg?.['content'];
-      if (!Array.isArray(content)) continue;
+      if (!(Array.isArray(content) || typeof content === 'string')) continue;
+      allEntries.push({ lineBytePos, raw });
+    }
 
+    // Take last HISTORY_LINES entries
+    const recentEntries = allEntries.slice(-HISTORY_LINES);
+
+    for (const { lineBytePos, raw } of recentEntries) {
       let blockIdx = 0;
       const stableId = (suffix: string) => `cc:${sessionName}:${lineBytePos}:${suffix}:${blockIdx++}`;
 
       if (raw['type'] === 'assistant') {
-        for (const block of content as ContentBlock[]) {
+        const msg = raw['message'] as Record<string, unknown> | undefined;
+        const content = msg?.['content'] as ContentBlock[] | string;
+        if (typeof content === 'string') {
+          emitAssistantStringContent(sessionName, content, stableId);
+          continue;
+        }
+        for (const block of content) {
           if (block.type === 'text' && block.text) {
             timelineEmitter.emit(sessionName, 'assistant.text', {
               text: block.text, streaming: false,
             }, { source: 'daemon', confidence: 'high', eventId: stableId('at') });
-            count++;
           } else if (block.type === 'thinking') {
             timelineEmitter.emit(sessionName, 'assistant.thinking', {
               text: block.thinking,
             }, { source: 'daemon', confidence: 'high', eventId: stableId('th') });
-            count++;
           } else if (block.type === 'tool_use' && block.name) {
             const input = extractToolInput(block.name, block.input);
             timelineEmitter.emit(sessionName, 'tool.call', {
               tool: block.name, ...(input ? { input } : {}),
             }, { source: 'daemon', confidence: 'high', eventId: stableId('tc') });
-            count++;
           }
         }
       } else if (raw['type'] === 'user') {
-        for (const block of content as ContentBlock[]) {
+        const msg = raw['message'] as Record<string, unknown> | undefined;
+        const content = msg?.['content'] as ContentBlock[] | string;
+        if (typeof content === 'string') {
+          emitUserStringContent(sessionName, content, stableId);
+          continue;
+        }
+        for (const block of content) {
           if (block.type === 'text' && block.text?.trim()) {
-            timelineEmitter.emit(sessionName, 'user.message', {
-              text: block.text,
-            }, { source: 'daemon', confidence: 'high', eventId: stableId('um') });
-            count++;
+            emitUserStringContent(sessionName, block.text, stableId);
           } else if (block.type === 'tool_result') {
             const error = block.is_error ? String(block.content ?? 'error') : undefined;
             timelineEmitter.emit(sessionName, 'tool.result', {
               ...(error ? { error } : {}),
             }, { source: 'daemon', confidence: 'high', eventId: stableId('tr') });
-            count++;
           }
         }
       }
@@ -424,6 +528,7 @@ async function emitRecentHistory(sessionName: string, filePath: string): Promise
  */
 async function activateFile(sessionName: string, state: WatcherState, filePath: string): Promise<void> {
   preClaimFile(sessionName, filePath);
+  state.pendingPartialLine = '';
   try {
     const s = await stat(filePath);
     state.activeFile = filePath;
@@ -442,13 +547,19 @@ export async function startWatching(sessionName: string, workDir: string): Promi
   const state: WatcherState = {
     projectDir, activeFile: null, fileOffset: 0,
     abort: new AbortController(), stopped: false,
+    pendingPartialLine: '', status: 'waiting_for_file',
   };
   watchers.set(sessionName, state);
+
+  logger.warn({ session: sessionName }, 'jsonl-watcher: falling back to directory scan (no ccSessionId)');
 
   // Find the current active JSONL file; only claim an unclaimed one.
   const latest = await findLatestJsonl(projectDir);
   if (latest && canClaim(sessionName, latest)) {
     await activateFile(sessionName, state, latest);
+    state.status = 'active';
+  } else {
+    state.status = 'degraded';
   }
 
   // Poll every 2s (uses pollTick so it can re-acquire a file if the claim changes).
@@ -456,9 +567,14 @@ export async function startWatching(sessionName: string, workDir: string): Promi
   void watchDir(sessionName, state);
 }
 
-/** Returns true if a JSONL watcher is active for this session. */
+/** Returns true if a JSONL watcher is registered for this session. */
 export function isWatching(sessionName: string): boolean {
   return watchers.has(sessionName);
+}
+
+/** Returns the watcher's health status, or null if no watcher exists. */
+export function watcherStatus(sessionName: string): WatcherStatus | null {
+  return watchers.get(sessionName)?.status ?? null;
 }
 
 /** Stop watching and release all file handles for a session. */
@@ -466,6 +582,7 @@ export function stopWatching(sessionName: string): void {
   const state = watchers.get(sessionName);
   if (!state) return;
   state.stopped = true;
+  state.status = 'stopped';
   state.abort.abort();
   if (state.pollTimer) clearInterval(state.pollTimer);
   watchers.delete(sessionName);
@@ -486,6 +603,7 @@ export async function startWatchingFile(sessionName: string, filePath: string): 
   const state: WatcherState = {
     projectDir: dirname(filePath), activeFile: null, fileOffset: 0,
     abort: new AbortController(), stopped: false,
+    pendingPartialLine: '', status: 'waiting_for_file',
   };
   watchers.set(sessionName, state);
 
@@ -500,28 +618,22 @@ export async function startWatchingFile(sessionName: string, filePath: string): 
       await new Promise((r) => setTimeout(r, 1000));
     }
   }
-  if (!appeared || state.stopped) return;
+  if (!appeared || state.stopped) {
+    // Timeout or stopped — clean up to avoid phantom watcher
+    logger.warn({ sessionName, filePath }, 'jsonl-watcher: file never appeared, cleaning up phantom watcher');
+    state.stopped = true;
+    state.status = 'stopped';
+    watchers.delete(sessionName);
+    releaseFiles(sessionName);
+    return;
+  }
 
   await activateFile(sessionName, state, filePath);
+  state.status = 'active';
 
-  state.pollTimer = setInterval(() => {
-    void (async () => {
-      await drainNewLines(sessionName, state);
-      // Periodically check if CC restarted with a new session-id
-      const latest = await findLatestJsonl(state.projectDir);
-      if (latest && latest !== state.activeFile) {
-        const isNewer = await checkNewer(latest, state.activeFile);
-        if (isNewer) {
-          logger.info({ sessionName, old: state.activeFile, new: latest }, 'jsonl-watcher: CC restarted (poll), switching to new JSONL');
-          releaseFiles(sessionName);
-          preClaimFile(sessionName, latest);
-          state.activeFile = latest;
-          state.fileOffset = 0;
-          await drainNewLines(sessionName, state);
-        }
-      }
-    })();
-  }, 2000);
+  // startWatchingFile watches a SPECIFIC file — no rotation logic.
+  // If CC restarts, a new sub-session watcher will be created.
+  state.pollTimer = setInterval(() => { void drainNewLines(sessionName, state); }, 2000);
   void watchFile(sessionName, state, filePath);
 }
 
@@ -535,19 +647,9 @@ async function watchFile(sessionName: string, state: WatcherState, filePath: str
 
       const changedFile = join(dir, event.filename);
 
+      // startWatchingFile watches a SPECIFIC file — only drain our own file, ignore others.
       if (changedFile === state.activeFile) {
         await drainNewLines(sessionName, state);
-      } else {
-        // A different JSONL file changed — check if it's newer (CC restarted with new session-id)
-        const isNewer = await checkNewer(changedFile, state.activeFile);
-        if (isNewer) {
-          logger.info({ sessionName, old: state.activeFile, new: changedFile }, 'jsonl-watcher: CC restarted, switching to new JSONL');
-          releaseFiles(sessionName);
-          preClaimFile(sessionName, changedFile);
-          state.activeFile = changedFile;
-          state.fileOffset = 0;
-          await drainNewLines(sessionName, state);
-        }
       }
     }
   } catch (err) {
@@ -591,15 +693,12 @@ async function watchDir(sessionName: string, state: WatcherState): Promise<void>
       if (changedFile !== state.activeFile) {
         if (!canClaim(sessionName, changedFile)) continue; // claimed by another session
         const isNewer = await checkNewer(changedFile, state.activeFile);
-        if (isNewer) {
+        if (isNewer || !state.activeFile) {
           logger.debug({ sessionName, file: event.filename }, 'jsonl-watcher: switching to new JSONL file');
-          preClaimFile(sessionName, changedFile);
-          state.activeFile = changedFile;
-          state.fileOffset = 0;
-        } else if (!state.activeFile) {
-          preClaimFile(sessionName, changedFile);
-          state.activeFile = changedFile;
-          state.fileOffset = 0;
+          // Use activateFile for consistent claim/history-replay/offset init
+          state.pendingPartialLine = '';
+          await activateFile(sessionName, state, changedFile);
+          state.status = 'active';
         } else {
           continue; // older file, ignore
         }
@@ -646,12 +745,14 @@ async function pollTick(sessionName: string, state: WatcherState): Promise<void>
         .filter((x): x is { fp: string; mtime: number } => x !== null)
         .sort((a, b) => b.mtime - a.mtime)[0];
       if (best) {
-        preClaimFile(sessionName, best.fp);
-        state.activeFile = best.fp;
         try {
-          state.fileOffset = (await stat(best.fp)).size;
-          await emitRecentHistory(sessionName, best.fp);
-        } catch { state.fileOffset = 0; }
+          await activateFile(sessionName, state, best.fp);
+          state.status = 'active';
+        } catch {
+          state.activeFile = null;
+          state.fileOffset = 0;
+          state.status = 'degraded';
+        }
       }
     } catch { /* ignore */ }
   }
@@ -679,13 +780,25 @@ async function drainNewLines(sessionName: string, state: WatcherState): Promise<
     if (bytesRead === 0) return;
 
     const chunkStartOffset = state.fileOffset;
+    // Always advance fileOffset by what we read — pending partial is held in memory,
+    // not re-read from the file.
     state.fileOffset += bytesRead;
 
     const chunk = buf.subarray(0, bytesRead).toString('utf8');
-    const lines = chunk.split('\n');
+    // Prepend any partial line carried over from the previous drain
+    const fullChunk = state.pendingPartialLine + chunk;
+    const lines = fullChunk.split('\n');
 
-    // Track byte offset of each line for stable eventId generation
-    let lineByteOffset = chunkStartOffset;
+    // The last element is either '' (if chunk ended with \n) or an incomplete line.
+    // Only process complete lines; carry the rest over.
+    state.pendingPartialLine = lines.pop()!;
+
+    // Calculate byte offset for stable eventId generation.
+    // The first line spans from where the previous pending partial began in the file.
+    // pendingPartialLine bytes were already read in a prior drain, so we subtract them.
+    const prevPendingByteLen = Buffer.byteLength(fullChunk.slice(0, fullChunk.length - chunk.length), 'utf8');
+    let lineByteOffset = chunkStartOffset - prevPendingByteLen;
+
     for (const line of lines) {
       if (state.stopped) break;
       parseLine(sessionName, line, lineByteOffset);

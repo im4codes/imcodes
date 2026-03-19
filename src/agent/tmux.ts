@@ -148,6 +148,9 @@ export async function newSession(name: string, command?: string, opts?: NewSessi
   // via $SHELL -c internally.
   const cmdArg = command ? `-- '${command.replace(/'/g, "'\\''")}'` : '';
   await tmuxExec(`new-session -d -s ${name} ${cwdArg} ${envArgs} ${cmdArg}`.trim());
+  // Keep the tmux session alive after the process exits so daemon restarts
+  // can detect it and reconnect instead of launching a fresh session.
+  await tmuxExec(`set-option -t ${name} remain-on-exit on`);
 }
 
 /** Kill a tmux session by name. Does not throw if it doesn't exist. */
@@ -176,6 +179,21 @@ export async function listSessions(): Promise<string[]> {
 export async function sessionExists(name: string): Promise<boolean> {
   const sessions = await listSessions();
   return sessions.includes(name);
+}
+
+/** Check if the pane process in a tmux session is still alive (not dead from remain-on-exit). */
+export async function isPaneAlive(name: string): Promise<boolean> {
+  try {
+    const raw = await tmuxExec(`list-panes -t ${name} -F '#{pane_dead}'`);
+    return raw.trim() === '0';
+  } catch {
+    return false;
+  }
+}
+
+/** Respawn a dead pane (remain-on-exit) with a new command. */
+export async function respawnPane(name: string, command: string): Promise<void> {
+  await tmuxExec(`respawn-pane -t ${name} -k '${command.replace(/'/g, "'\\''")}'`);
 }
 
 /** Resize a tmux session window to the given dimensions. */

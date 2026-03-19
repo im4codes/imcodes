@@ -30,6 +30,8 @@ vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
   stopWatching: vi.fn(),
   isWatching: isWatchingMock,
   claudeProjectDir: (dir: string) => `/mock-claude-projects/${dir.replace(/\//g, '-')}`,
+  findJsonlPathBySessionId: (dir: string, id: string) => `/mock-claude-projects/${dir.replace(/\//g, '-')}/${id}.jsonl`,
+  ensureClaudeSessionFile: vi.fn().mockResolvedValue('/mock/seed.jsonl'),
 }));
 
 vi.mock('../../src/daemon/codex-watcher.js', () => ({
@@ -120,6 +122,7 @@ describe('startSubSession — ccSessionId stored in session-store', () => {
     newSessionMock.mockResolvedValue(undefined);
     getDriverMock.mockReturnValue({
       buildLaunchCommand: () => 'claude --dangerously-skip-permissions --session-id test-id',
+      buildResumeCommand: () => 'claude --dangerously-skip-permissions --resume test-id',
       postLaunch: undefined,
     });
   });
@@ -156,7 +159,7 @@ describe('startSubSession — ccSessionId stored in session-store', () => {
     expect(startWatching).not.toHaveBeenCalled();
   });
 
-  it('does NOT call startWatchingFile when ccSessionId is absent', async () => {
+  it('auto-generates ccSessionId when absent and still calls startWatchingFile', async () => {
     await startSubSession({
       id: 'sub789',
       type: 'claude-code',
@@ -164,11 +167,14 @@ describe('startSubSession — ccSessionId stored in session-store', () => {
       ccSessionId: null,
     });
 
-    expect(startWatchingFile).not.toHaveBeenCalled();
-    expect(startWatching).not.toHaveBeenCalled();
+    // Codex's fix: CC sub-sessions always get a UUID via randomUUID()
+    expect(startWatchingFile).toHaveBeenCalledWith(
+      'deck_sub_sub789',
+      expect.stringContaining('.jsonl'),
+    );
   });
 
-  it('upsertSession has no ccSessionId when ccSessionId is null', async () => {
+  it('upsertSession always has ccSessionId for claude-code (auto-generated if null)', async () => {
     await startSubSession({
       id: 'sub999',
       type: 'claude-code',
@@ -177,8 +183,9 @@ describe('startSubSession — ccSessionId stored in session-store', () => {
     });
 
     const call = vi.mocked(upsertSession).mock.calls[0]?.[0] as Record<string, unknown>;
-    // ccSessionId should be undefined (not null, not the string 'null')
-    expect(call.ccSessionId).toBeUndefined();
+    // Should be a valid UUID string, not undefined or null
+    expect(typeof call.ccSessionId).toBe('string');
+    expect(call.ccSessionId).toMatch(/^[0-9a-f-]{36}$/);
   });
 });
 

@@ -34,6 +34,8 @@ vi.mock('../../src/agent/tmux.js', () => ({
   newSession: vi.fn().mockResolvedValue(undefined),
   killSession: vi.fn().mockResolvedValue(undefined),
   sessionExists: vi.fn().mockResolvedValue(true),
+  isPaneAlive: vi.fn().mockResolvedValue(true),
+  respawnPane: vi.fn().mockResolvedValue(undefined),
   capturePane: vi.fn().mockResolvedValue([]),
   sendKey: vi.fn(),
   sendKeys: vi.fn(),
@@ -42,6 +44,7 @@ vi.mock('../../src/agent/tmux.js', () => ({
   resizeSession: vi.fn(),
   getPaneCwd: vi.fn().mockResolvedValue('/proj'),
   getPaneId: vi.fn().mockResolvedValue('%1'),
+  getPaneStartCommand: vi.fn().mockResolvedValue('claude --dangerously-skip-permissions'),
   showBuffer: vi.fn().mockResolvedValue(''),
   cleanupOrphanFifos: vi.fn().mockResolvedValue(undefined),
 }));
@@ -51,6 +54,8 @@ vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
   startWatchingFile: startWatchingFileMock,
   stopWatching: vi.fn(),
   isWatching: isWatchingMock,
+  findJsonlPathBySessionId: (dir: string, id: string) => `/mock/${dir}/${id}.jsonl`,
+  ensureClaudeSessionFile: vi.fn().mockResolvedValue(undefined),
   claudeProjectDir: (dir: string) => `/mock/${dir}`,
 }));
 

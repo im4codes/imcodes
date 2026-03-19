@@ -1,6 +1,6 @@
 import { loadStore, flushStore, listSessions, upsertSession, removeSession } from '../store/session-store.js';
-import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, restartSession, initOnStartup } from '../agent/session-manager.js';
-import { sessionExists } from '../agent/tmux.js';
+import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, restartSession, respawnSession, initOnStartup } from '../agent/session-manager.js';
+import { sessionExists, isPaneAlive } from '../agent/tmux.js';
 import { detectMemoryBackend } from '../memory/detector.js';
 import { ServerLink } from './server-link.js';
 import { handleWebCommand, setRouterContext } from './command-handler.js';
@@ -318,17 +318,20 @@ const HEALTH_POLL_MS = 30_000;
 let healthTimer: ReturnType<typeof setInterval> | null = null;
 let hookServer: http.Server | null = null;
 
-/** Periodically check all running sessions; restart any that have disappeared. */
+/** Periodically check all running sessions; restart any that have disappeared or died. */
 function startHealthPoller(): void {
   healthTimer = setInterval(async () => {
     const sessions = listSessions();
     for (const s of sessions) {
       if (s.state === 'stopped' || s.state === 'error') continue;
       try {
-        const alive = await sessionExists(s.name);
-        if (!alive) {
+        const exists = await sessionExists(s.name);
+        if (!exists) {
           logger.warn({ session: s.name }, 'Session missing, attempting restart');
           await restartSession(s);
+        } else if (!(await isPaneAlive(s.name))) {
+          logger.warn({ session: s.name }, 'Pane dead, respawning');
+          await respawnSession(s);
         }
       } catch (err) {
         logger.warn({ session: s.name, err }, 'Health check error');

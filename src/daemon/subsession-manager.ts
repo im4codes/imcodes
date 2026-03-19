@@ -10,11 +10,12 @@ import { getDriver } from '../agent/session-manager.js';
 import type { AgentType } from '../agent/detect.js';
 import { timelineStore } from './timeline-store.js';
 import { timelineEmitter } from './timeline-emitter.js';
-import { upsertSession, getSession } from '../store/session-store.js';
+import { upsertSession, getSession, removeSession } from '../store/session-store.js';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import logger from '../util/logger.js';
 import { getAgentVersion } from '../agent/agent-version.js';
+import { randomUUID } from 'node:crypto';
 
 export interface SubSessionRecord {
   id: string;
@@ -41,6 +42,10 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
 
   if (await sessionExists(sessionName)) return;
 
+  if (agentType === 'claude-code') {
+    sub.ccSessionId = sub.ccSessionId ?? randomUUID();
+  }
+
   // For Codex: generate explicit UUID before launch, then pre-create the session
   // file so `codex resume <uuid>` finds it immediately and the watcher starts fast.
   if (agentType === 'codex') {
@@ -50,7 +55,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     await ensureSessionFile(sub.codexSessionId, sub.cwd ?? process.cwd()).catch(() => {});
   }
 
-  const launchCmd = driver.buildLaunchCommand(sessionName, {
+  let launchCmd = driver.buildLaunchCommand(sessionName, {
     cwd: sub.cwd ?? undefined,
     ...(sub.shellBin ? { shellBin: sub.shellBin } : {}),
     ...(sub.ccSessionId ? { ccSessionId: sub.ccSessionId } : {}),
@@ -59,6 +64,17 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     ...(sub.geminiSessionId ? { geminiSessionId: sub.geminiSessionId } : {}),
     ...(sub.fresh ? { fresh: true } : {}),
   } as any);
+
+  if (agentType === 'claude-code' && sub.ccSessionId && sub.cwd) {
+    const { ensureClaudeSessionFile } = await import('./jsonl-watcher.js');
+    await ensureClaudeSessionFile(sub.ccSessionId, sub.cwd).catch((e) =>
+      logger.warn({ err: e, sessionName, ccSessionId: sub.ccSessionId }, 'Failed to ensure Claude seed session file for sub-session'),
+    );
+    launchCmd = driver.buildResumeCommand(sessionName, {
+      cwd: sub.cwd ?? undefined,
+      ccSessionId: sub.ccSessionId ?? undefined,
+    } as any) ?? launchCmd;
+  }
 
   await newSession(sessionName, launchCmd, { cwd: sub.cwd ?? undefined });
   timelineEmitter.emit(sessionName, 'session.state', { state: 'started' });
@@ -109,10 +125,11 @@ export async function stopSubSession(sessionName: string): Promise<void> {
   (await import('./jsonl-watcher.js')).stopWatching(sessionName);
   (await import('./codex-watcher.js')).stopWatching(sessionName);
   (await import('./gemini-watcher.js')).stopWatching(sessionName);
+  removeSession(sessionName);
 }
 
 export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promise<void> {
-  const { startWatchingFile, claudeProjectDir, isWatching } = await import('./jsonl-watcher.js');
+  const { startWatchingFile, claudeProjectDir, ensureClaudeSessionFile, isWatching } = await import('./jsonl-watcher.js');
   const { startWatchingById, isWatching: isCodexWatching, isFileClaimedByOther } = await import('./codex-watcher.js');
   const { startWatching: startGeminiWatching, startWatchingDiscovered: startGeminiWatchingDiscovered, isWatching: isGeminiWatching } = await import('./gemini-watcher.js');
 
@@ -123,8 +140,12 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
       await startSubSession(sub).catch(() => {});
     } else {
       const stored = getSession(sessionName);
-      if (sub.type === 'claude-code' && sub.ccSessionId && sub.cwd && !isWatching(sessionName)) {
-        startWatchingFile(sessionName, path.join(claudeProjectDir(sub.cwd), `${sub.ccSessionId}.jsonl`));
+      const effectiveCcSessionId = sub.ccSessionId ?? stored?.ccSessionId;
+      if (sub.type === 'claude-code' && effectiveCcSessionId && sub.cwd && !isWatching(sessionName)) {
+        await ensureClaudeSessionFile(effectiveCcSessionId, sub.cwd).catch((e) =>
+          logger.warn({ err: e, sessionName, ccSessionId: effectiveCcSessionId }, 'Failed to ensure Claude seed session file during sub-session rebuild'),
+        );
+        startWatchingFile(sessionName, path.join(claudeProjectDir(sub.cwd), `${effectiveCcSessionId}.jsonl`));
       } else if (sub.type === 'codex' && !isCodexWatching(sessionName)) {
         const uuid = stored?.codexSessionId;
         if (uuid && !isFileClaimedByOther(sessionName, uuid)) {
@@ -139,10 +160,14 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
       }
       upsertSession({
         name: sessionName, projectName: sessionName, agentType: sub.type, agentVersion: stored?.agentVersion ?? await getAgentVersion(sub.type as AgentType, sub.shellBin ?? undefined), role: 'w1', state: 'running',
-        projectDir: sub.cwd ?? '', ccSessionId: sub.ccSessionId ?? undefined,
+        projectDir: sub.cwd ?? '', ccSessionId: effectiveCcSessionId ?? undefined,
         codexSessionId: stored?.codexSessionId,
         parentSession: sub.parentSession ?? stored?.parentSession,
-        restarts: 0, restartTimestamps: [], createdAt: Date.now(), updatedAt: Date.now()
+        // Preserve existing diagnostic fields instead of resetting
+        restarts: stored?.restarts ?? 0,
+        restartTimestamps: stored?.restartTimestamps ?? [],
+        createdAt: stored?.createdAt ?? Date.now(),
+        updatedAt: Date.now(),
       });
     }
   }
