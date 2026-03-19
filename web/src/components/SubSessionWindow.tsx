@@ -106,12 +106,15 @@ export function SubSessionWindow({
     saveLocal(sub.id, geom, viewMode);
   }, [sub.id, geom, viewMode]);
 
-  // Scroll to bottom whenever switching to chat view
+  // Scroll to bottom whenever switching to chat view;
+  // force a full terminal refresh when switching to terminal view.
   useEffect(() => {
     if (viewMode === 'chat') {
       setTimeout(() => chatScrollRef.current?.(), 50);
+    } else if (viewMode === 'terminal' && ws && connected) {
+      try { ws.sendSnapshotRequest(sub.sessionName); } catch { /* ignore */ }
     }
-  }, [viewMode]);
+  }, [viewMode, ws, connected, sub.sessionName]);
 
   // Re-subscribe terminal on mount so the server sends a fresh snapshot.
   // SubSessionWindow unmounts on minimize, so without this the remounted
