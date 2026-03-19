@@ -4,7 +4,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const {
   upsertSessionMock, startWatchingMock, startWatchingFileMock,
-  isWatchingMock, sessionExistsMock, newSessionMock, getDriverMock,
+  isWatchingMock, sessionExistsMock, newSessionMock, getDriverMock, getSessionMock,
+  capturePaneMock, timelineReadMock,
 } = vi.hoisted(() => ({
   upsertSessionMock: vi.fn(),
   startWatchingMock: vi.fn().mockResolvedValue(undefined),
@@ -13,11 +14,14 @@ const {
   sessionExistsMock: vi.fn().mockResolvedValue(false),
   newSessionMock: vi.fn().mockResolvedValue(undefined),
   getDriverMock: vi.fn(),
+  getSessionMock: vi.fn(() => null),
+  capturePaneMock: vi.fn().mockResolvedValue([]),
+  timelineReadMock: vi.fn(() => []),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
   upsertSession: upsertSessionMock,
-  getSession: vi.fn(() => null),
+  getSession: getSessionMock,
 }));
 
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
@@ -38,7 +42,7 @@ vi.mock('../../src/agent/tmux.js', () => ({
   newSession: newSessionMock,
   killSession: vi.fn().mockResolvedValue(undefined),
   sessionExists: sessionExistsMock,
-  capturePane: vi.fn().mockResolvedValue([]),
+  capturePane: capturePaneMock,
   sendKey: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -47,10 +51,10 @@ vi.mock('../../src/agent/session-manager.js', () => ({
 }));
 
 vi.mock('../../src/daemon/timeline-store.js', () => ({
-  timelineStore: { read: vi.fn(() => []), append: vi.fn() },
+  timelineStore: { read: timelineReadMock, append: vi.fn() },
 }));
 
-import { subSessionName, detectShells, startSubSession } from '../../src/daemon/subsession-manager.js';
+import { subSessionName, detectShells, startSubSession, readSubSessionResponse } from '../../src/daemon/subsession-manager.js';
 import { upsertSession } from '../../src/store/session-store.js';
 import { startWatchingFile, startWatching } from '../../src/daemon/jsonl-watcher.js';
 
@@ -175,5 +179,44 @@ describe('startSubSession — ccSessionId stored in session-store', () => {
     const call = vi.mocked(upsertSession).mock.calls[0]?.[0] as Record<string, unknown>;
     // ccSessionId should be undefined (not null, not the string 'null')
     expect(call.ccSessionId).toBeUndefined();
+  });
+});
+
+describe('readSubSessionResponse()', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionExistsMock.mockResolvedValue(true);
+    capturePaneMock.mockResolvedValue(['still running']);
+    timelineReadMock.mockReturnValue([
+      { type: 'user.message', payload: { text: 'hi' } },
+      { type: 'assistant.text', payload: { text: 'done' } },
+    ]);
+  });
+
+  it('uses stored structured state for codex instead of terminal prompt detection', async () => {
+    getSessionMock.mockReturnValue({ agentType: 'codex', state: 'running' });
+    capturePaneMock.mockResolvedValue(['>']);
+
+    const result = await readSubSessionResponse('deck_sub_1');
+
+    expect(result).toEqual({ status: 'working' });
+  });
+
+  it('returns idle response for codex when stored state is idle', async () => {
+    getSessionMock.mockReturnValue({ agentType: 'codex', state: 'idle' });
+    capturePaneMock.mockResolvedValue(['still running looking pane']);
+
+    const result = await readSubSessionResponse('deck_sub_2');
+
+    expect(result).toEqual({ status: 'idle', response: 'done' });
+  });
+
+  it('still falls back to terminal detection for shell sessions', async () => {
+    getSessionMock.mockReturnValue({ agentType: 'shell', state: 'running' });
+    capturePaneMock.mockResolvedValue(['$']);
+
+    const result = await readSubSessionResponse('deck_sub_3');
+
+    expect(result).toEqual({ status: 'idle', response: 'done' });
   });
 });

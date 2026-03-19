@@ -4,21 +4,15 @@
  */
 import type { TerminalDiff } from './types.js';
 import { apiFetch } from './api.js';
+import type { TimelineEvent } from '../../src/shared/timeline/types.js';
+import type {
+  FsLsResponse,
+  FsReadResponse,
+  FsGitStatusResponse,
+  FsGitDiffResponse,
+} from '../../src/shared/transport/fs.js';
 
 export type MessageHandler = (msg: ServerMessage) => void;
-
-export interface TimelineEvent {
-  eventId: string;
-  sessionId: string;
-  ts: number;
-  seq: number;
-  epoch: number;
-  source: 'daemon' | 'hook' | 'terminal-parse';
-  confidence: 'high' | 'medium' | 'low';
-  type: string;
-  payload: Record<string, unknown>;
-  hidden?: boolean;
-}
 
 export type ServerMessage =
   | { type: 'terminal.diff'; diff: TerminalDiff }
@@ -46,23 +40,23 @@ export type ServerMessage =
   | { type: 'discussion.error'; discussionId?: string; requestId?: string; error: string }
   | { type: 'discussion.list'; discussions: Array<{ id: string; topic: string; state: string; currentRound: number; maxRounds: number; currentSpeaker?: string; conclusion?: string; filePath?: string }> }
   | { type: 'daemon.stats'; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number }
-  | { type: 'fs.ls_response'; requestId: string; path: string; resolvedPath?: string; status: 'ok' | 'error'; entries?: FsEntry[]; error?: string }
-  | { type: 'fs.read_response'; requestId: string; path: string; resolvedPath?: string; status: 'ok' | 'error'; content?: string; encoding?: 'base64'; mimeType?: string; error?: string }
-  | { type: 'fs.git_status_response'; requestId: string; path: string; resolvedPath?: string; status: 'ok' | 'error'; files?: GitStatusEntry[]; error?: string }
-  | { type: 'fs.git_diff_response'; requestId: string; path: string; resolvedPath?: string; status: 'ok' | 'error'; diff?: string; error?: string };
+  | FsLsResponse
+  | FsReadResponse
+  | FsGitStatusResponse
+  | FsGitDiffResponse;
 
-export interface FsEntry {
-  name: string;
-  isDir: boolean;
-  hidden: boolean;
-}
+export type {
+  TimelineEvent,
+} from '../../src/shared/timeline/types.js';
 
-export interface GitStatusEntry {
-  /** Absolute resolved path */
-  path: string;
-  /** Git porcelain status code: M, A, D, ??, etc. */
-  code: string;
-}
+export type {
+  FsEntry,
+  GitStatusEntry,
+  FsLsResponse,
+  FsReadResponse,
+  FsGitStatusResponse,
+  FsGitDiffResponse,
+} from '../../src/shared/transport/fs.js';
 
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30000;

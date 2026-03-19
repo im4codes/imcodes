@@ -5,6 +5,8 @@
  */
 import { useRef, useState, useCallback, useMemo } from 'preact/hooks';
 import { ChatView } from './ChatView.js';
+import { resolveContextWindow } from '../model-context.js';
+import { shortModelLabel } from '../model-label.js';
 import { TerminalView } from './TerminalView.js';
 import { useTimeline } from '../hooks/useTimeline.js';
 import type { WsClient } from '../ws-client.js';
@@ -65,24 +67,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, onOpen, onDiff, onH
     return null;
   }, [events]);
 
-  // Short model label for display (e.g. "claude-opus-4-6" → "opus", "gemini-3-flash-preview" → "flash")
-  const modelLabel = useMemo(() => {
-    const m = lastUsage?.model;
-    if (!m) return null;
-    const lower = m.toLowerCase();
-    if (lower.includes('opus')) return 'opus';
-    if (lower.includes('sonnet')) return 'sonnet';
-    if (lower.includes('haiku')) return 'haiku';
-    if (lower.includes('flash')) return 'flash';
-    if (lower.includes('pro')) return 'pro';
-    if (lower.includes('o4-mini') || lower.includes('o4mini')) return 'o4-mini';
-    if (lower.includes('o3')) return 'o3';
-    if (lower.includes('gpt-4o')) return 'gpt-4o';
-    if (lower.includes('gpt-4.1')) return 'gpt-4.1';
-    // fallback: last segment after dash
-    const parts = m.split('-');
-    return parts[parts.length - 1] ?? m;
-  }, [lastUsage]);
+  const modelLabel = useMemo(() => shortModelLabel(lastUsage?.model), [lastUsage]);
 
   // Per-card width override (persisted in localStorage)
   const [localW, setLocalW] = useState(() => loadCardW(sub.id, cardW));
@@ -150,7 +135,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, onOpen, onDiff, onH
         {sub.state === 'running' && <span class="subcard-running">●</span>}
         {modelLabel && <span class="subcard-model">{modelLabel}</span>}
         {lastUsage && (() => {
-          const ctx = lastUsage.contextWindow || 1_000_000;
+          const ctx = resolveContextWindow(lastUsage.contextWindow, lastUsage.model);
           const total = lastUsage.inputTokens + lastUsage.cacheTokens;
           const totalPct = Math.min(100, total / ctx * 100);
           const cachePct = Math.min(totalPct, lastUsage.cacheTokens / ctx * 100);

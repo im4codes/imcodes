@@ -21,6 +21,8 @@ import { useTimeline } from './hooks/useTimeline.js';
 import { useSwipeBack } from './hooks/useSwipeBack.js';
 import { getActiveThinkingTs } from './thinking-utils.js';
 import { WsClient } from './ws-client.js';
+import { resolveContextWindow } from './model-context.js';
+import { shortModelLabel } from './model-label.js';
 import { configure as configureApi, apiFetch, onAuthExpired, getUserPref, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { getAuthKey, clearAuthKey } from './biometric-auth.js';
@@ -571,7 +573,7 @@ export function App() {
           stripped.includes('opus') ? 'opus' :
           stripped.includes('sonnet') ? 'sonnet' :
           stripped.includes('haiku') ? 'haiku' : null;
-        const gptMatch = stripped.match(/\b(gpt-5\.\d+(?:-\w+)?)\b/);
+        const gptMatch = stripped.match(/\b(gpt-5(?:\.\d+)?(?:-\w+)?)\b/);
         const geminiMatch = stripped.match(/\b(gemini[- ]\d[\w.-]*)\b/);
         const detected = claudeModel ?? (gptMatch ? gptMatch[1] : null) ?? (geminiMatch ? geminiMatch[1] : null);
         if (detected) {
@@ -608,7 +610,7 @@ export function App() {
             modelStr.includes('opus') ? 'opus' :
             modelStr.includes('sonnet') ? 'sonnet' :
             modelStr.includes('haiku') ? 'haiku' : null;
-          const gptM = modelStr.match(/\b(gpt-5\.\d+(?:-\w+)?)\b/);
+          const gptM = modelStr.match(/\b(gpt-5(?:\.\d+)?(?:-\w+)?)\b/);
           const gemM = modelStr.match(/\b(gemini[- ]\d[\w.-]*)\b/);
           const det = claudeM ?? (gptM ? gptM[1] : null) ?? (gemM ? gemM[1] : null);
           if (det) {
@@ -1233,7 +1235,7 @@ export function App() {
             )}
 
             {lastUsage && (() => {
-              const ctx = lastUsage.contextWindow || 1_000_000;
+              const ctx = resolveContextWindow(lastUsage.contextWindow, lastUsage.model);
               const total = lastUsage.inputTokens + lastUsage.cacheTokens;
               const totalPct = Math.min(100, total / ctx * 100);
               const cachePct = Math.min(totalPct, lastUsage.cacheTokens / ctx * 100);
@@ -1259,7 +1261,7 @@ export function App() {
                         {' '}{trans('chat.thinking_running', { sec: Math.max(0, Math.round((thinkingNow - activeThinkingTs) / 1000)) })}
                       </span>
                     )}
-                    {lastUsage.model && <span class="session-usage-tokens" style={{ color: '#818cf8', marginLeft: 'auto' }}>{(() => { const m = lastUsage.model.toLowerCase(); if (m.includes('opus')) return 'opus'; if (m.includes('sonnet')) return 'sonnet'; if (m.includes('haiku')) return 'haiku'; if (m.includes('flash')) return 'flash'; const gpt = m.match(/gpt-5\.\d+(?:-\w+)?/); if (gpt) return gpt[0]; const gem = m.match(/gemini[- ]\d[\w.-]*/); if (gem) return gem[0]; return lastUsage.model.split('-').pop(); })()}</span>}
+                    {lastUsage.model && <span class="session-usage-tokens" style={{ color: '#818cf8', marginLeft: 'auto' }}>{shortModelLabel(lastUsage.model)}</span>}
                   </div>
                 </div>
               );

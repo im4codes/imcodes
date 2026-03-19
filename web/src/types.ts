@@ -45,11 +45,4 @@ export interface ServerInfo {
   lastSeen?: number;
 }
 
-export interface TerminalDiff {
-  sessionName: string;
-  timestamp: number;
-  lines: Array<[number, string]>;
-  cols: number;
-  rows: number;
-  fullFrame?: boolean;
-}
+export type { TerminalDiff } from '../../src/shared/transport/terminal.js';

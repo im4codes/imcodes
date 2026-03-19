@@ -51,9 +51,8 @@ const CC_PERMISSION_PATTERNS = [
 // ─── Codex patterns ────────────────────────────────────────────────────────────
 
 const CODEX_IDLE_PATTERNS = [
-  />\s*$/m,                            // > prompt
-  /›\s*$/m,                            // › prompt (alternate)
-  /context_pct:\s*\d+/,               // context indicator (idle state)
+  /^\s*>\s*$/m,                        // line that is ONLY ">" — Codex prompt
+  /^\s*›\s*$/m,                        // line that is ONLY "›" — alternate prompt
 ];
 
 const CODEX_SPINNER_CHARS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
@@ -100,6 +99,7 @@ const GEMINI_SPINNER_CHARS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '
 const GEMINI_THINKING_PATTERNS = [
   /\bThinking\b/i,
   /\bGenerating\b/i,
+  /esc to cancel/i,            // "(esc to cancel, 2m 44s)" — clear working indicator
 ];
 
 const GEMINI_TOOL_PATTERNS = [
@@ -166,7 +166,7 @@ export function detectStatus(
       // No idle prompt visible and no spinner caught → assume working
       // (Codex working text flickers too fast for polling to reliably capture)
       if (!matchesAny(tail, CODEX_IDLE_PATTERNS)) return 'thinking';
-      break;
+      return 'thinking';
     }
 
     case 'opencode':
@@ -179,15 +179,16 @@ export function detectStatus(
       }
       break;
 
-    case 'gemini':
-      if (matchesAny(tail, GEMINI_IDLE_PATTERNS) && !hasSpinner(lines, GEMINI_SPINNER_CHARS))
+    case 'gemini': {
+      const geminiHasSpinner = hasSpinner(lines, GEMINI_SPINNER_CHARS);
+      if (matchesAny(tail, GEMINI_IDLE_PATTERNS) && !geminiHasSpinner)
         return 'idle';
-      if (matchesAny(text, GEMINI_TOOL_PATTERNS)) return 'tool_running';
-      if (hasSpinner(lines, GEMINI_SPINNER_CHARS)) {
-        if (matchesAny(text, GEMINI_THINKING_PATTERNS)) return 'thinking';
-        return 'streaming';
-      }
+      // Use tail (not full text) to avoid matching stale output from previous turns
+      if (matchesAny(tail, GEMINI_THINKING_PATTERNS)) return 'thinking';
+      if (matchesAny(tail, GEMINI_TOOL_PATTERNS)) return 'tool_running';
+      if (geminiHasSpinner) return 'streaming';
       break;
+    }
 
     case 'shell':
       // Shell idle: last non-empty line ends with a common prompt char

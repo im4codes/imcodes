@@ -1,0 +1,16 @@
+{"timestamp":"2026-02-28T02:39:16.000Z","type":"session_meta","payload":{"id":"abcabcab-def0-1234-5678-999999999999","cwd":"/redacted/project","cli_version":"0.113.0","source":"cli","model_provider":"openai"}}
+{"timestamp":"2026-02-28T02:39:16.010Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}
+{"timestamp":"2026-02-28T02:39:16.020Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}
+{"timestamp":"2026-02-28T02:39:16.030Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-aborted"}}
+{"timestamp":"2026-02-28T02:39:16.040Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}
+{"timestamp":"2026-02-28T02:39:16.050Z","type":"event_msg","payload":{"type":"user_message","message":"[redacted user prompt]","images":[],"local_images":[]}}
+{"timestamp":"2026-02-28T02:39:16.060Z","type":"turn_context","payload":{"cwd":"/redacted/project"}}
+{"timestamp":"2026-02-28T02:39:16.070Z","type":"event_msg","payload":{"type":"token_count","info":{}}}
+{"timestamp":"2026-02-28T02:39:16.080Z","type":"response_item","payload":{"type":"reasoning"}}
+{"timestamp":"2026-02-28T02:39:16.090Z","type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"[redacted commentary]"}}
+{"timestamp":"2026-02-28T02:39:16.100Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}
+{"timestamp":"2026-02-28T02:39:16.110Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"rg -n \\\"needle\\\" src\",\"workdir\":\"/redacted/project\"}","call_id":"call_abort"}}
+{"timestamp":"2026-02-28T02:39:16.120Z","type":"event_msg","payload":{"type":"token_count","info":{}}}
+{"timestamp":"2026-02-28T02:39:16.130Z","type":"response_item","payload":{"type":"function_call_output","output":"[redacted output]","call_id":"call_abort"}}
+{"timestamp":"2026-02-28T02:39:16.140Z","type":"turn_context","payload":{"cwd":"/redacted/project"}}
+{"timestamp":"2026-02-28T02:39:16.150Z","type":"event_msg","payload":{"type":"turn_aborted"}}

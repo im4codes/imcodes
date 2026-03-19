@@ -19,6 +19,7 @@ import { join, dirname, basename } from 'path';
 import { homedir } from 'os';
 import { timelineEmitter } from './timeline-emitter.js';
 import logger from '../util/logger.js';
+import { resolveContextWindow } from '../util/model-context.js';
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
@@ -214,7 +215,7 @@ function parseLine(sessionName: string, line: string, lineByteOffset?: number): 
       timelineEmitter.emit(sessionName, 'usage.update', {
         inputTokens: usage.input_tokens + (usage.cache_creation_input_tokens ?? 0),
         cacheTokens: usage.cache_read_input_tokens ?? 0,
-        contextWindow: 1_000_000,
+        contextWindow: resolveContextWindow(undefined, model),
         ...(model ? { model } : {}),
       }, { source: 'daemon', confidence: 'high' });
     }
@@ -327,7 +328,7 @@ async function emitRecentHistory(sessionName: string, filePath: string): Promise
           lastUsagePayload = {
             inputTokens: usage.input_tokens + (usage.cache_creation_input_tokens ?? 0),
             cacheTokens: usage.cache_read_input_tokens ?? 0,
-            contextWindow: 1_000_000,
+            contextWindow: resolveContextWindow(undefined, model),
             ...(model ? { model } : {}),
           };
         }

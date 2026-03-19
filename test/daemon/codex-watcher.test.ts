@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { mkdtemp, writeFile, mkdir, rm } from 'fs/promises';
+import { readFileSync } from 'fs';
 
 // ── Mock timelineEmitter ──────────────────────────────────────────────────────
 
@@ -17,7 +18,7 @@ vi.mock('../../src/util/logger.js', () => ({
   default: { debug: vi.fn(), warn: vi.fn(), info: vi.fn(), error: vi.fn() },
 }));
 
-import { parseLine, readCwd, startWatching, stopWatching, isWatching } from '../../src/daemon/codex-watcher.js';
+import { parseLine, readCwd, startWatching, stopWatching, isWatching, resetParseStateForTests } from '../../src/daemon/codex-watcher.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -84,10 +85,36 @@ function functionCallOutputLine(output: string, callId = 'call_abc123'): string 
   });
 }
 
+function loadRolloutFixture(name: string): string[] {
+  const path = join(__dirname, '../fixtures/codex-rollouts', `${name}.jsonl`);
+  return readFileSync(path, 'utf-8').trim().split('\n');
+}
+
+function fixtureLabels(name: string): string[] {
+  return loadRolloutFixture(name).map((line) => {
+    const obj = JSON.parse(line);
+    const payload = obj.payload ?? {};
+    if (obj.type === 'event_msg') {
+      return payload.type === 'agent_message'
+        ? `event_msg:${payload.type}:${payload.phase}`
+        : `event_msg:${payload.type}`;
+    }
+    if (obj.type === 'response_item') return `response_item:${payload.type}`;
+    return obj.type;
+  });
+}
+
+function replayFixture(sessionName: string, name: string): void {
+  for (const line of loadRolloutFixture(name)) parseLine(sessionName, line);
+}
+
 // ── parseLine ─────────────────────────────────────────────────────────────────
 
 describe('parseLine — user_message', () => {
-  beforeEach(() => vi.mocked(timelineEmitter.emit).mockClear());
+  beforeEach(() => {
+    resetParseStateForTests();
+    vi.mocked(timelineEmitter.emit).mockClear();
+  });
 
   it('emits user.message for user_message event', () => {
     parseLine('session-a', userMessageLine('hello world'));
@@ -118,6 +145,7 @@ describe('parseLine — user_message', () => {
 
 describe('parseLine — agent_message', () => {
   beforeEach(() => {
+    resetParseStateForTests();
     vi.mocked(timelineEmitter.emit).mockClear();
     vi.useFakeTimers();
   });
@@ -125,11 +153,10 @@ describe('parseLine — agent_message', () => {
 
   it('emits assistant.text only after debounce (no immediate streaming)', () => {
     parseLine('session-b', agentMessageLine('Here is my answer', 'final_answer'));
-    // No immediate emit — buffered for debounce
-    expect(timelineEmitter.emit).not.toHaveBeenCalled();
-    vi.runAllTimers();
-    // Single emit after debounce
     expect(timelineEmitter.emit).toHaveBeenCalledOnce();
+    expect(vi.mocked(timelineEmitter.emit).mock.calls[0][1]).toBe('session.state');
+    vi.runAllTimers();
+    expect(timelineEmitter.emit).toHaveBeenCalledTimes(2);
     expect(timelineEmitter.emit).toHaveBeenCalledWith(
       'session-b',
       'assistant.text',
@@ -142,11 +169,9 @@ describe('parseLine — agent_message', () => {
     parseLine('session-b', agentMessageLine('Work', 'final_answer'));
     parseLine('session-b', agentMessageLine('Working', 'final_answer'));
     parseLine('session-b', agentMessageLine('Working on it', 'final_answer'));
-    // No immediate emits
-    expect(timelineEmitter.emit).not.toHaveBeenCalled();
+    expect(vi.mocked(timelineEmitter.emit).mock.calls.map((c) => c[1])).toEqual(['session.state']);
     vi.runAllTimers();
-    // Only last value emitted
-    expect(timelineEmitter.emit).toHaveBeenCalledOnce();
+    expect(timelineEmitter.emit).toHaveBeenCalledTimes(2);
     expect(timelineEmitter.emit).toHaveBeenCalledWith(
       'session-b',
       'assistant.text',
@@ -158,7 +183,7 @@ describe('parseLine — agent_message', () => {
   it('emits assistant.thinking for commentary phase', () => {
     parseLine('session-b', agentMessageLine('Working on it...', 'commentary'));
     vi.runAllTimers();
-    expect(timelineEmitter.emit).toHaveBeenCalledOnce();
+    expect(timelineEmitter.emit).toHaveBeenCalledTimes(2);
     expect(timelineEmitter.emit).toHaveBeenCalledWith(
       'session-b',
       'assistant.thinking',
@@ -175,7 +200,10 @@ describe('parseLine — agent_message', () => {
 });
 
 describe('parseLine — ignored line types', () => {
-  beforeEach(() => vi.mocked(timelineEmitter.emit).mockClear());
+  beforeEach(() => {
+    resetParseStateForTests();
+    vi.mocked(timelineEmitter.emit).mockClear();
+  });
 
   it('ignores token_count events', () => {
     parseLine('session-c', tokenCountLine());
@@ -205,7 +233,10 @@ describe('parseLine — ignored line types', () => {
 });
 
 describe('parseLine — session isolation', () => {
-  beforeEach(() => vi.mocked(timelineEmitter.emit).mockClear());
+  beforeEach(() => {
+    resetParseStateForTests();
+    vi.mocked(timelineEmitter.emit).mockClear();
+  });
 
   it('passes correct sessionName to each emit', () => {
     parseLine('deck_proj_brain', userMessageLine('msg1'));
@@ -223,6 +254,7 @@ describe('readCwd', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
+    resetParseStateForTests();
     tmpDir = await mkdtemp(join(tmpdir(), 'codex-watcher-test-'));
   });
 
@@ -303,6 +335,7 @@ describe('startWatching — file-based integration', () => {
   let sessionDir: string;
 
   beforeEach(async () => {
+    resetParseStateForTests();
     tmpDir = await mkdtemp(join(tmpdir(), 'codex-int-'));
     // Simulate ~/.codex/sessions/YYYY/MM/DD layout
     const now = new Date();
@@ -348,11 +381,11 @@ describe('startWatching — file-based integration', () => {
     vi.runAllTimers();
     vi.useRealTimers();
 
-    // user.message + commentary (thinking) + final_answer debounced (no duplicate streaming)
-    expect(timelineEmitter.emit).toHaveBeenCalledTimes(3);
+    expect(timelineEmitter.emit).toHaveBeenCalledTimes(4);
     expect(vi.mocked(timelineEmitter.emit).mock.calls[0][1]).toBe('user.message');
-    expect(vi.mocked(timelineEmitter.emit).mock.calls[1][1]).toBe('assistant.thinking'); // commentary
-    expect(vi.mocked(timelineEmitter.emit).mock.calls[2][1]).toBe('assistant.text');    // final debounced
+    expect(vi.mocked(timelineEmitter.emit).mock.calls[1][1]).toBe('session.state');
+    expect(vi.mocked(timelineEmitter.emit).mock.calls[2][1]).toBe('assistant.thinking');
+    expect(vi.mocked(timelineEmitter.emit).mock.calls[3][1]).toBe('assistant.text');
   });
 
   it('multiple sessions with different workDirs are isolated', async () => {
@@ -374,11 +407,14 @@ describe('startWatching — file-based integration', () => {
 // ── parseLine — function_call / function_call_output (Codex tool calls) ────────
 
 describe('parseLine — function_call (Codex tool calls)', () => {
-  beforeEach(() => vi.mocked(timelineEmitter.emit).mockClear());
+  beforeEach(() => {
+    resetParseStateForTests();
+    vi.mocked(timelineEmitter.emit).mockClear();
+  });
 
   it('emits tool.call for function_call with cmd arg', () => {
     parseLine('session-f', functionCallLine('exec_command', { cmd: 'git status', workdir: '/project' }));
-    expect(timelineEmitter.emit).toHaveBeenCalledOnce();
+    expect(timelineEmitter.emit).toHaveBeenCalledTimes(2);
     expect(timelineEmitter.emit).toHaveBeenCalledWith(
       'session-f',
       'tool.call',
@@ -399,7 +435,7 @@ describe('parseLine — function_call (Codex tool calls)', () => {
 
   it('emits tool.call with raw args string when no known summary field', () => {
     parseLine('session-f', functionCallLine('custom_tool', { x: 1, y: 2 }));
-    const call = vi.mocked(timelineEmitter.emit).mock.calls[0];
+    const call = vi.mocked(timelineEmitter.emit).mock.calls[1];
     expect(call[1]).toBe('tool.call');
     expect(call[2]).toMatchObject({ tool: 'custom_tool' });
     // input should be the raw JSON string
@@ -421,25 +457,28 @@ describe('parseLine — function_call (Codex tool calls)', () => {
     parseLine('session-f', functionCallLine('exec_command', { cmd: 'ls' }, 'call_xyz'));
     parseLine('session-f', functionCallOutputLine('file1\nfile2', 'call_xyz'));
     const calls = vi.mocked(timelineEmitter.emit).mock.calls;
-    expect(calls[0][1]).toBe('tool.call');
-    expect(calls[1][1]).toBe('tool.result');
-    expect(calls[0][2]).not.toHaveProperty('callId');
+    expect(calls[1][1]).toBe('tool.call');
+    expect(calls[2][1]).toBe('tool.result');
     expect(calls[1][2]).not.toHaveProperty('callId');
+    expect(calls[2][2]).not.toHaveProperty('callId');
   });
 
   it('emits tool.call for each consecutive function_call independently', () => {
     parseLine('session-f', functionCallLine('read_file', { path: '/a' }, 'call_1'));
     parseLine('session-f', functionCallLine('read_file', { path: '/b' }, 'call_2'));
-    expect(timelineEmitter.emit).toHaveBeenCalledTimes(2);
-    expect(vi.mocked(timelineEmitter.emit).mock.calls[0][2]).toMatchObject({ input: '/a' });
-    expect(vi.mocked(timelineEmitter.emit).mock.calls[1][2]).toMatchObject({ input: '/b' });
+    expect(timelineEmitter.emit).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(timelineEmitter.emit).mock.calls[1][2]).toMatchObject({ input: '/a' });
+    expect(vi.mocked(timelineEmitter.emit).mock.calls[2][2]).toMatchObject({ input: '/b' });
   });
 });
 
 // ── Edge cases ────────────────────────────────────────────────────────────────
 
 describe('parseLine — edge cases', () => {
-  beforeEach(() => vi.mocked(timelineEmitter.emit).mockClear());
+  beforeEach(() => {
+    resetParseStateForTests();
+    vi.mocked(timelineEmitter.emit).mockClear();
+  });
 
   it('handles multi-line message text (newlines in content)', () => {
     const msg = 'line one\nline two\nline three';
@@ -458,7 +497,12 @@ describe('parseLine — edge cases', () => {
       payload: { type: 'task_started', turn_id: 'abc' },
     });
     parseLine('session-e', line);
-    expect(timelineEmitter.emit).not.toHaveBeenCalled();
+    expect(timelineEmitter.emit).toHaveBeenCalledWith(
+      'session-e',
+      'session.state',
+      { state: 'running' },
+      { source: 'daemon', confidence: 'high' },
+    );
   });
 
   it('handles task_complete event without emitting', () => {
@@ -467,7 +511,12 @@ describe('parseLine — edge cases', () => {
       payload: { type: 'task_complete' },
     });
     parseLine('session-e', line);
-    expect(timelineEmitter.emit).not.toHaveBeenCalled();
+    expect(timelineEmitter.emit).toHaveBeenCalledWith(
+      'session-e',
+      'session.state',
+      { state: 'idle' },
+      { source: 'daemon', confidence: 'high' },
+    );
   });
 
   it('handles turn_aborted event without emitting', () => {
@@ -483,5 +532,105 @@ describe('parseLine — edge cases', () => {
     const line = JSON.stringify({ type: 'event_msg' });
     expect(() => parseLine('session-e', line)).not.toThrow();
     expect(timelineEmitter.emit).not.toHaveBeenCalled();
+  });
+});
+
+describe('sanitized Codex rollout fixtures', () => {
+  beforeEach(() => {
+    resetParseStateForTests();
+    vi.mocked(timelineEmitter.emit).mockClear();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.runOnlyPendingTimers();
+    vi.useRealTimers();
+  });
+
+  it('simple-complete fixture preserves the common complete-turn boundary', () => {
+    expect(fixtureLabels('simple-complete')).toEqual([
+      'session_meta',
+      'response_item:message',
+      'response_item:message',
+      'event_msg:task_started',
+      'turn_context',
+      'response_item:message',
+      'event_msg:user_message',
+      'response_item:reasoning',
+      'event_msg:agent_message:final_answer',
+      'response_item:message',
+      'event_msg:token_count',
+      'event_msg:task_complete',
+    ]);
+
+    replayFixture('session-fixture-simple', 'simple-complete');
+    vi.runAllTimers();
+
+    const events = vi.mocked(timelineEmitter.emit).mock.calls.map((c) => c[1]);
+    expect(events).toEqual([
+      'session.state',
+      'user.message',
+      'assistant.thinking',
+      'assistant.text',
+      'session.state',
+    ]);
+    expect(vi.mocked(timelineEmitter.emit).mock.calls[0][2]).toEqual({ state: 'running' });
+    expect(vi.mocked(timelineEmitter.emit).mock.calls.at(-1)?.[2]).toEqual({ state: 'idle' });
+  });
+
+  it('tools-complete fixture preserves commentary/tools/final/task_complete sequence', () => {
+    const labels = fixtureLabels('tools-complete');
+    expect(labels).toContain('event_msg:task_started');
+    expect(labels).toContain('event_msg:agent_message:commentary');
+    expect(labels).toContain('response_item:function_call');
+    expect(labels).toContain('response_item:function_call_output');
+    expect(labels.at(-1)).toBe('event_msg:task_complete');
+
+    replayFixture('session-fixture-tools', 'tools-complete');
+    vi.runAllTimers();
+
+    const calls = vi.mocked(timelineEmitter.emit).mock.calls;
+    expect(calls[0][1]).toBe('session.state');
+    expect(calls[0][2]).toEqual({ state: 'running' });
+    expect(calls.filter((c) => c[1] === 'tool.call')).toHaveLength(3);
+    expect(calls.filter((c) => c[1] === 'tool.result')).toHaveLength(3);
+    expect(calls.filter((c) => c[1] === 'assistant.thinking').length).toBeGreaterThanOrEqual(4);
+    expect(calls.at(-2)?.[1]).toBe('assistant.text');
+    expect(calls.at(-1)?.[1]).toBe('session.state');
+    expect(calls.at(-1)?.[2]).toEqual({ state: 'idle' });
+  });
+
+  it('final-answer-no-task-complete fixture documents the fallback candidate shape', () => {
+    const labels = fixtureLabels('final-answer-no-task-complete');
+    expect(labels).not.toContain('event_msg:task_complete');
+    expect(labels.at(-3)).toBe('event_msg:agent_message:final_answer');
+    expect(labels.at(-2)).toBe('response_item:message');
+    expect(labels.at(-1)).toBe('event_msg:token_count');
+
+    replayFixture('session-fixture-fallback', 'final-answer-no-task-complete');
+    vi.runAllTimers();
+
+    const events = vi.mocked(timelineEmitter.emit).mock.calls.map((c) => c[1]);
+    expect(events).toEqual(['session.state', 'user.message', 'assistant.thinking', 'assistant.text']);
+  });
+
+  it('aborted-mid-turn fixture documents incomplete work that must not look complete', () => {
+    const labels = fixtureLabels('aborted-mid-turn');
+    expect(labels).toContain('event_msg:turn_aborted');
+    expect(labels).not.toContain('event_msg:task_complete');
+    expect(labels).not.toContain('event_msg:agent_message:final_answer');
+
+    replayFixture('session-fixture-aborted', 'aborted-mid-turn');
+    vi.runAllTimers();
+
+    const events = vi.mocked(timelineEmitter.emit).mock.calls.map((c) => c[1]);
+    expect(events).toEqual([
+      'session.state',
+      'user.message',
+      'assistant.thinking',
+      'assistant.thinking',
+      'tool.call',
+      'tool.result',
+    ]);
   });
 });

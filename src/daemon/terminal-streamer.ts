@@ -23,36 +23,14 @@ import { isWatching } from './jsonl-watcher.js';
 import { isWatching as isCodexWatching } from './codex-watcher.js';
 import logger from '../util/logger.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import type { TerminalDiff, TerminalHistory } from '../shared/transport/terminal.js';
 
 const IDLE_THRESHOLD_MS = 5_000; // 5s without raw bytes → idle (Stop hook fires immediately; this is fallback)
 const MAX_RAW_BUFFER = 256 * 1024; // 256KB per-subscriber snapshot-pending buffer
 const REBIND_DELAYS_MS = [1000, 2000, 4000, 8000, 16000, 30000];
 const MAX_REBIND_ATTEMPTS = 5;
 
-export interface TerminalDiff {
-  sessionName: string;
-  timestamp: number;
-  /** Changed line ranges: [lineIndex, content][] */
-  lines: Array<[number, string]>;
-  /** Full frame width/height (cols x rows) */
-  cols: number;
-  rows: number;
-  /** Per-session monotonic frame counter */
-  frameSeq: number;
-  /** True when first frame after subscribe or snapshot_request */
-  fullFrame: boolean;
-  /** True only when fullFrame was triggered by terminal.snapshot_request (not subscribe) */
-  snapshotRequested: boolean;
-  /** True when screen scrolled up by k lines */
-  scrolled: boolean;
-  /** Number of new lines at the bottom when scrolled (0 when not scrolled) */
-  newLineCount: number;
-}
-
-export interface TerminalHistory {
-  sessionName: string;
-  content: string;
-}
+export type { TerminalDiff, TerminalHistory } from '../shared/transport/terminal.js';
 
 export interface StreamSubscriber {
   sessionName: string;
@@ -484,10 +462,13 @@ export class TerminalStreamer {
     const timer = setTimeout(() => {
       this.idleTimers.delete(sessionName);
       const currentlyIdle = this.idleState.get(sessionName) ?? false;
+      const sess = getSession(sessionName);
+      if (sess?.agentType === 'codex' && isCodexWatching(sessionName)) {
+        return; // Codex has stronger structured idle signals via JSONL/hook
+      }
       if (!currentlyIdle) {
         this.idleState.set(sessionName, true);
         timelineEmitter.emit(sessionName, 'session.state', { state: 'idle' });
-        const sess = getSession(sessionName);
         if (sess) upsertSession({ ...sess, state: 'idle', updatedAt: Date.now() });
       }
     }, IDLE_THRESHOLD_MS);
