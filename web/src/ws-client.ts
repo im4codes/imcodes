@@ -24,7 +24,7 @@ export type ServerMessage =
   | { type: 'session.notification'; session: string; project: string; title: string; message: string }
   | { type: 'session.tool'; session: string; tool: string | null }
   | { type: 'daemon.reconnected' }
-  | { type: 'session_list'; sessions: Array<{ name: string; project: string; role: string; agentType: string; state: string }> }
+  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string }> }
   | { type: 'outbound'; platform: string; channelId: string; content: string }
   | { type: 'timeline.event'; event: TimelineEvent }
   | { type: 'timeline.replay'; sessionName: string; requestId?: string; events: TimelineEvent[]; truncated: boolean; epoch: number }
@@ -39,7 +39,7 @@ export type ServerMessage =
   | { type: 'discussion.done'; discussionId: string; filePath: string; conclusion: string }
   | { type: 'discussion.error'; discussionId?: string; requestId?: string; error: string }
   | { type: 'discussion.list'; discussions: Array<{ id: string; topic: string; state: string; currentRound: number; maxRounds: number; currentSpeaker?: string; conclusion?: string; filePath?: string }> }
-  | { type: 'daemon.stats'; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number }
+  | { type: 'daemon.stats'; daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number }
   | FsLsResponse
   | FsReadResponse
   | FsGitStatusResponse

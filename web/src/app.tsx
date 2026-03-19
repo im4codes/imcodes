@@ -405,7 +405,7 @@ export function App() {
   }, []);
 
   const wsRef = useRef<WsClient | null>(null);
-  const [daemonStats, setDaemonStats] = useState<{ cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number } | null>(null);
+  const [daemonStats, setDaemonStats] = useState<{ daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number } | null>(null);
 
   // ── Sub-sessions ───────────────────────────────────────────────────────────
   const { subSessions, visibleSubSessions, loadedServerId, create: createSubSession, close: closeSubSession, restart: restartSubSession, rename: renameSubSession } = useSubSessions(
@@ -556,6 +556,7 @@ export function App() {
             project: s.project,
             role: s.role as SessionInfo['role'],
             agentType: s.agentType,
+            agentVersion: s.agentVersion,
             state: s.state as SessionInfo['state'],
             projectDir: existing?.projectDir,
           };
@@ -718,7 +719,7 @@ export function App() {
     ws.onLatency((ms) => setLatencyMs(ms));
     const unsubStats = ws.onMessage((msg) => {
       if (msg.type === 'daemon.stats') {
-        setDaemonStats({ cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal, load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime });
+        setDaemonStats({ daemonVersion: msg.daemonVersion, cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal, load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime });
       }
     });
     setConnecting(true);
@@ -1059,6 +1060,11 @@ export function App() {
         <div style={{ flex: 1 }} />
         {daemonStats && connected && (
           <div class="sidebar-stats">
+            {daemonStats.daemonVersion && (
+              <div class="sidebar-stats-row">
+                <span style={{ color: '#94a3b8' }}>Daemon {daemonStats.daemonVersion}</span>
+              </div>
+            )}
             <div class="sidebar-stats-row">
               <span style={{ color: daemonStats.cpu > 80 ? '#f87171' : daemonStats.cpu > 50 ? '#fbbf24' : '#4ade80' }}>
                 CPU {daemonStats.cpu}%

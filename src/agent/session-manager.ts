@@ -24,6 +24,7 @@ import { startWatching as startGeminiWatching, startWatchingLatest as startGemin
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { existsSync } from 'node:fs';
+import { getAgentVersion } from './agent-version.js';
 
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
 function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string): void {
@@ -200,6 +201,7 @@ export async function restoreFromStore(): Promise<void> {
       projectName,
       role,
       agentType: 'claude-code', // default; most common
+      agentVersion: await getAgentVersion('claude-code'),
       projectDir,
       state: 'running',
       restarts: 0,
@@ -283,6 +285,7 @@ interface LaunchOpts {
 export async function launchSession(opts: LaunchOpts): Promise<void> {
   const { name, projectName, role, agentType, projectDir, skipStore, extraEnv, fresh } = opts;
   const driver = getDriver(agentType);
+  const agentVersion = await getAgentVersion(agentType);
 
   // Configure agent-specific hooks/signals
   if (agentType === 'claude-code') {
@@ -403,6 +406,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       projectName,
       role,
       agentType,
+      agentVersion,
       projectDir,
       state: 'running',
       restarts: existing?.restarts ?? 0,
@@ -526,4 +530,3 @@ export async function startAutoFixProject(config: AutoFixProjectConfig): Promise
 
   return { coderSession, auditorSession };
 }
-

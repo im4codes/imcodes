@@ -14,6 +14,7 @@ import { upsertSession, getSession } from '../store/session-store.js';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import logger from '../util/logger.js';
+import { getAgentVersion } from '../agent/agent-version.js';
 
 export interface SubSessionRecord {
   id: string;
@@ -35,6 +36,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   const sessionName = subSessionName(sub.id);
   const agentType = sub.type as AgentType;
   const driver = getDriver(agentType);
+  const agentVersion = await getAgentVersion(agentType, sub.shellBin ?? undefined);
 
   if (await sessionExists(sessionName)) return;
 
@@ -61,7 +63,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   timelineEmitter.emit(sessionName, 'session.state', { state: 'started' });
 
   upsertSession({
-    name: sessionName, projectName: sessionName, agentType: sub.type, role: 'w1', state: 'running',
+    name: sessionName, projectName: sessionName, agentType: sub.type, agentVersion, role: 'w1', state: 'running',
     projectDir: sub.cwd ?? '', ccSessionId: sub.ccSessionId ?? undefined,
     codexSessionId: sub.codexSessionId ?? undefined,
     restarts: 0, restartTimestamps: [], createdAt: Date.now(), updatedAt: Date.now()
@@ -134,7 +136,7 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         }
       }
       upsertSession({
-        name: sessionName, projectName: sessionName, agentType: sub.type, role: 'w1', state: 'running',
+        name: sessionName, projectName: sessionName, agentType: sub.type, agentVersion: stored?.agentVersion ?? await getAgentVersion(sub.type as AgentType, sub.shellBin ?? undefined), role: 'w1', state: 'running',
         projectDir: sub.cwd ?? '', ccSessionId: sub.ccSessionId ?? undefined,
         codexSessionId: stored?.codexSessionId,
         restarts: 0, restartTimestamps: [], createdAt: Date.now(), updatedAt: Date.now()
