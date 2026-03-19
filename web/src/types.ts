@@ -33,6 +33,7 @@ export interface SessionInfo {
   project: string;
   role: 'brain' | `w${number}`;
   agentType: string;
+  agentVersion?: string;
   state: 'running' | 'idle' | 'stopped' | 'error' | 'unknown';
   label?: string | null;
   projectDir?: string;

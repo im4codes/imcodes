@@ -13,6 +13,7 @@ export interface SessionRecord {
   projectName: string;
   role: 'brain' | `w${number}`;
   agentType: string;
+  agentVersion?: string;
   projectDir: string;
   state: SessionState;
   restarts: number;

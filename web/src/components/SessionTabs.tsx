@@ -238,7 +238,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
                 aria-selected={isActive}
                 onClick={() => { onSelect(s.name); if (hasAlert) onAlertDismiss?.(s.name); }}
                 onContextMenu={(e) => openCtx(e, s)}
-                title={`${s.agentType} — ${s.state}${isPinned ? ' (pinned)' : ''}`}
+                title={`${s.agentType}${s.agentVersion ? ` ${s.agentVersion}` : ''} — ${s.state}${isPinned ? ' (pinned)' : ''}`}
               >
                 {isPinned && <span class="tab-pin">📌</span>}
                 {agentBadge(s.agentType)}

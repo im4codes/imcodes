@@ -126,6 +126,7 @@ export class WsBridge {
 
   private daemonWs: WebSocket | null = null;
   private authenticated = false;
+  private daemonVersion: string | null = null;
   private browserSockets = new Set<WebSocket>();
   private queue: string[] = [];
   private authTimer: ReturnType<typeof setTimeout> | null = null;
@@ -236,6 +237,7 @@ export class WsBridge {
         }
 
         this.authenticated = true;
+        this.daemonVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : null;
         logger.info({ serverId: this.serverId }, 'Daemon authenticated');
         onAuthenticated?.();
 
@@ -509,7 +511,10 @@ export class WsBridge {
     }
 
     if (type === 'session_list') {
-      this.broadcastToBrowsers(JSON.stringify(msg));
+      this.broadcastToBrowsers(JSON.stringify({
+        ...msg,
+        daemonVersion: typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion,
+      }));
       return;
     }
 
@@ -647,8 +652,10 @@ export class WsBridge {
 
     // ── Daemon stats: extract from heartbeat or standalone, broadcast to browsers ─
     if (type === 'daemon.stats' || (type === 'heartbeat' && msg.cpu !== undefined)) {
+      if (typeof msg.daemonVersion === 'string') this.daemonVersion = msg.daemonVersion;
       this.broadcastToBrowsers(JSON.stringify({
         type: 'daemon.stats',
+        daemonVersion: typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion,
         cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal,
         load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime,
       }));

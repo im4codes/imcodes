@@ -1,6 +1,7 @@
 import os from 'node:os';
 import type { TimelineEvent } from './timeline-event.js';
 import logger from '../util/logger.js';
+import { DAEMON_VERSION } from '../util/version.js';
 
 /** Collect lightweight system stats for daemon.stats messages. */
 function collectSystemStats(): { cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number } {
@@ -44,6 +45,7 @@ export class ServerLink {
   private readonly workerUrl: string;
   private readonly serverId: string;
   private readonly token: string;
+  readonly daemonVersion = DAEMON_VERSION;
 
   constructor(opts: ServerLinkOpts) {
     this.workerUrl = opts.workerUrl;
@@ -70,7 +72,7 @@ export class ServerLink {
       this.lastPong = Date.now();
       // Send auth handshake immediately — server closes the socket if this is not
       // the first message or if credentials are invalid (5s timeout enforced server-side).
-      ws.send(JSON.stringify({ type: 'auth', serverId: this.serverId, token: this.token }));
+      ws.send(JSON.stringify({ type: 'auth', serverId: this.serverId, token: this.token, daemonVersion: this.daemonVersion }));
       this.startHeartbeat();
       this.startWatchdog();
     });
@@ -150,13 +152,13 @@ export class ServerLink {
   private startHeartbeat(): void {
     this.heartbeatTimer = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
-        this.send({ type: 'heartbeat', ...collectSystemStats() });
+        this.send({ type: 'heartbeat', daemonVersion: this.daemonVersion, ...collectSystemStats() });
       }
     }, HEARTBEAT_MS);
     // Stats updates more frequently than heartbeat
     this.statsTimer = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
-        this.send({ type: 'daemon.stats', ...collectSystemStats() });
+        this.send({ type: 'daemon.stats', daemonVersion: this.daemonVersion, ...collectSystemStats() });
       }
     }, STATS_MS);
   }

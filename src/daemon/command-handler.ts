@@ -467,11 +467,12 @@ function handleGetSessions(serverLink: ServerLink): void {
       project: s.projectName,
       role: s.role,
       agentType: s.agentType,
+      agentVersion: s.agentVersion,
       state: s.state,
       projectDir: s.projectDir,
     }));
   try {
-    serverLink.send({ type: 'session_list', sessions });
+    serverLink.send({ type: 'session_list', daemonVersion: serverLink.daemonVersion, sessions });
   } catch {
     // not connected
   }
