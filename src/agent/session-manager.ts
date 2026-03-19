@@ -1,4 +1,4 @@
-import { newSession, killSession, sessionExists, listSessions as tmuxListSessions, sendKeys, sendKey, capturePane, showBuffer, getPaneId, getPaneCwd, cleanupOrphanFifos } from './tmux.js';
+import { newSession, killSession, sessionExists, listSessions as tmuxListSessions, sendKeys, sendKey, capturePane, showBuffer, getPaneId, getPaneCwd, getPaneStartCommand, cleanupOrphanFifos } from './tmux.js';
 import { ClaudeCodeDriver } from './drivers/claude-code.js';
 import { CodexDriver } from './drivers/codex.js';
 import { OpenCodeDriver } from './drivers/opencode.js';
@@ -154,7 +154,20 @@ export async function restoreFromStore(): Promise<void> {
       logger.info({ session: s.name }, 'Missing on restore, restarting');
       await restartSession(s);
     } else if (s.agentType === 'claude-code' && s.projectDir && !isWatching(s.name)) {
-      startCCWatcher(s.name, s.projectDir, s.ccSessionId);
+      let ccId = s.ccSessionId;
+      // If ccSessionId missing in store, extract from tmux pane start command (--session-id <UUID>)
+      if (!ccId) {
+        try {
+          const cmd = await getPaneStartCommand(s.name);
+          const match = cmd.match(/--session-id\s+([0-9a-f-]{36})/);
+          if (match) {
+            ccId = match[1];
+            upsertSession({ ...s, ccSessionId: ccId });
+            logger.info({ session: s.name, ccSessionId: ccId }, 'Recovered ccSessionId from tmux');
+          }
+        } catch { /* tmux query failed */ }
+      }
+      startCCWatcher(s.name, s.projectDir, ccId);
     } else if (s.agentType === 'codex' && s.projectDir && !isCodexWatching(s.name)) {
       if (s.codexSessionId) {
         findRolloutPathByUuid(s.codexSessionId).then((rolloutPath) => {

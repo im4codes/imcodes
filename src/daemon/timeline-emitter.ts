@@ -3,7 +3,7 @@
  * Singleton: import { timelineEmitter } from './timeline-emitter.js'
  */
 
-import { randomUUID } from 'crypto';
+import { createHash } from 'crypto';
 import type { TimelineEvent, TimelineEventType, TimelineSource, TimelineConfidence } from './timeline-event.js';
 import { timelineStore } from './timeline-store.js';
 
@@ -46,10 +46,16 @@ export class TimelineEmitter {
     const seq = (this.seqMap.get(sessionId) ?? 0) + 1;
     this.seqMap.set(sessionId, seq);
 
+    const ts = opts?.ts ?? Date.now();
+    const eventId = opts?.eventId ?? createHash('sha1')
+      .update(`${sessionId}\0${type}\0${ts}\0${JSON.stringify(payload)}`)
+      .digest('hex')
+      .slice(0, 24);
+
     const event: TimelineEvent = {
-      eventId: opts?.eventId ?? randomUUID(),
+      eventId,
       sessionId,
-      ts: opts?.ts ?? Date.now(),
+      ts,
       seq,
       epoch: this.epoch,
       source: opts?.source ?? 'daemon',

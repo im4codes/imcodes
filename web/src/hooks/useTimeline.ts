@@ -20,7 +20,7 @@ sharedDb.open().catch(() => {});
 const eventsCache = new Map<string, TimelineEvent[]>();
 
 const MAX_MEMORY_EVENTS = 500;
-const ECHO_WINDOW_MS = 2000;
+const ECHO_WINDOW_MS = 500;
 // Dedup window for user.message from JSONL vs web-UI-sent: JSONL watcher polls every 2s,
 // so the same message can arrive twice (once from command-handler, once from JSONL).
 // 5s is enough to catch the JSONL delay without hiding legitimate repeated messages.

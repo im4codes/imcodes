@@ -157,6 +157,12 @@ export async function getPaneCwd(session: string): Promise<string> {
   return raw.trim();
 }
 
+/** Get the start command of the first pane of a session. */
+export async function getPaneStartCommand(session: string): Promise<string> {
+  const raw = await tmuxExec(`display-message -p -t ${session} '#{pane_start_command}'`);
+  return raw.trim();
+}
+
 /** Delete the tmux paste buffer (clipboard cleanup after CC /copy). */
 export async function deleteBuffer(): Promise<void> {
   try {

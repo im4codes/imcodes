@@ -55,7 +55,7 @@ describe('TimelineEmitter — seq counter', () => {
     expect(event.confidence).toBe('medium');
     expect(event.epoch).toBe(emitter.epoch);
     expect(typeof event.eventId).toBe('string');
-    expect(event.eventId).toHaveLength(36); // UUID
+    expect(event.eventId).toHaveLength(24); // sha1 hex prefix
   });
 
   it('defaults source to daemon and confidence to high', () => {
