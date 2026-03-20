@@ -162,6 +162,13 @@ export async function startup(): Promise<DaemonContext> {
     try { serverLink.send({ type: 'session_event', event, session, state }); } catch { /* not connected */ }
   });
 
+  // Wire timeline idle events → P2P orchestrator (covers all agent types: CC, codex, gemini, etc.)
+  timelineEmitter.on((e) => {
+    if (e.type === 'session.state' && (e.payload as Record<string, unknown>).state === 'idle') {
+      notifySessionIdle(e.sessionId);
+    }
+  });
+
   // Wire session persist → D1 via Worker API
   if (creds) {
     setSessionPersistCallback(async (record, name) => {
