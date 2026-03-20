@@ -599,7 +599,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               atJustClosedRef.current = true;
               setTimeout(() => { atJustClosedRef.current = false; }, 100);
               setHasText(true);
-              divRef.current?.focus();
+              // Move cursor to end
+              const sel = window.getSelection();
+              const range = document.createRange();
+              range.selectNodeContents(divRef.current!);
+              range.collapse(false);
+              sel?.removeAllRanges();
+              sel?.addRange(range);
             }}
             onSelectAgent={(session, mode) => {
               const text = divRef.current?.textContent ?? '';
@@ -612,7 +618,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               atJustClosedRef.current = true;
               setTimeout(() => { atJustClosedRef.current = false; }, 100);
               setHasText(true);
-              divRef.current?.focus();
+              // Move cursor to end
+              const sel = window.getSelection();
+              const range = document.createRange();
+              range.selectNodeContents(divRef.current!);
+              range.collapse(false);
+              sel?.removeAllRanges();
+              sel?.addRange(range);
             }}
             onClose={() => { setAtPickerOpen(false); setAtPickerStage('choose'); }}
             onStageChange={setAtPickerStage}
