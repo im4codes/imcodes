@@ -148,7 +148,7 @@ afterEach(async () => {
   _setIdlePollMs(3_000); // restore default
   // Clean up temp files
   const { rm } = await import('node:fs/promises');
-  await rm(join(tmpdir(), 'imcodes-p2p'), { recursive: true, force: true }).catch(() => {});
+  await rm('/tmp/imcodes-p2p', { recursive: true, force: true }).catch(() => {});
 });
 
 // =============================================================================

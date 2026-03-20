@@ -8,7 +8,6 @@
 
 import { stat, writeFile, readFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { sendKeysDelayedEnter } from '../agent/tmux.js';
 import { detectStatus } from '../agent/detect.js';
@@ -67,7 +66,7 @@ export function listP2pRuns(): P2pRun[] { return [...activeRuns.values()]; }
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
-const P2P_TMP_DIR = join(tmpdir(), 'imcodes-p2p');
+const P2P_TMP_DIR = '/tmp/imcodes-p2p';
 let IDLE_POLL_MS = 3_000;
 
 /** Override poll interval for tests. */
@@ -383,27 +382,31 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
 async function waitForIdle(run: P2pRun, session: string, serverLink: ServerLink | null): Promise<void> {
   logger.info({ runId: run.id, session }, 'P2P: waiting for target session to become idle');
 
-  // Quick check: already idle?
-  try {
-    const lines = await capturePane(session);
-    const record = getSession(session);
-    const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
-    if (detectStatus(lines, agentType) === 'idle') {
-      logger.info({ runId: run.id, session }, 'P2P: target already idle, proceeding immediately');
+  // Dual strategy: hook event (instant for CC) + polling fallback (for codex/gemini/shell)
+  let idleEventFired = false;
+  const idlePromise = waitForIdleEvent(session, run.timeoutMs).then((ok) => { idleEventFired = ok; });
+
+  const deadline = Date.now() + run.timeoutMs;
+  while (Date.now() < deadline) {
+    if (run._cancelled) return;
+    if (idleEventFired) {
+      logger.info({ runId: run.id, session }, 'P2P: target idle (via hook event), proceeding');
       return;
     }
-  } catch { /* proceed to wait */ }
-
-  // Event-driven wait: resolve on idle hook callback or timeout
-  const gotIdle = await waitForIdleEvent(session, run.timeoutMs);
-  if (run._cancelled) return;
-
-  if (gotIdle) {
-    logger.info({ runId: run.id, session }, 'P2P: target idle (via hook event), proceeding');
-    return;
+    // Poll fallback
+    try {
+      const lines = await capturePane(session);
+      const record = getSession(session);
+      const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
+      if (detectStatus(lines, agentType) === 'idle') {
+        logger.info({ runId: run.id, session }, 'P2P: target idle (via poll), proceeding');
+        return;
+      }
+    } catch { /* ignore */ }
+    await sleep(IDLE_POLL_MS);
   }
 
-  // Timeout
+  void idlePromise;
   if (!run._cancelled) {
     failRun(run, 'timed_out', `Target ${session} never became idle after ${run.timeoutMs}ms`, serverLink);
   }
