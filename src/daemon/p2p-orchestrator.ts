@@ -10,7 +10,7 @@ import { stat, writeFile, readFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { sendKeysDelayedEnter } from '../agent/tmux.js';
-import { detectStatus } from '../agent/detect.js';
+import { detectStatus, detectStatusAsync } from '../agent/detect.js';
 import { capturePane } from '../agent/tmux.js';
 import { getSession, type SessionRecord } from '../store/session-store.js';
 import { getP2pMode, type P2pMode } from '../shared/p2p-modes.js';
@@ -358,12 +358,11 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
         }
         return;
       }
-      // Fallback: poll detectStatus
+      // Fallback: poll via unified detectStatusAsync (includes cursor check)
       try {
-        const lines = await capturePane(session);
         const record = getSession(session);
         const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
-        if (detectStatus(lines, agentType) === 'idle') {
+        if (await detectStatusAsync(session, agentType) === 'idle') {
           if (run.remainingTargets.length > 0 || session !== run.initiatorSession) {
             transition(run, 'awaiting_next_hop', serverLink);
           }
@@ -398,12 +397,11 @@ async function waitForIdle(run: P2pRun, session: string, serverLink: ServerLink 
       logger.info({ runId: run.id, session }, 'P2P: target idle (via hook event), proceeding');
       return;
     }
-    // Poll fallback
+    // Poll fallback via unified detectStatusAsync (includes cursor check)
     try {
-      const lines = await capturePane(session);
       const record = getSession(session);
       const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
-      if (detectStatus(lines, agentType) === 'idle') {
+      if (await detectStatusAsync(session, agentType) === 'idle') {
         logger.info({ runId: run.id, session }, 'P2P: target idle (via poll), proceeding');
         return;
       }

@@ -53,7 +53,6 @@ const CC_PERMISSION_PATTERNS = [
 const CODEX_IDLE_PATTERNS = [
   /^\s*>\s*$/m,                        // line that is ONLY ">" — Codex prompt
   /^\s*›\s*$/m,                        // line that is ONLY "›" — alternate prompt
-  /gpt-[\d.]+ \w+ · \d+% left/,       // "gpt-5.4 medium · 59% left" — status bar only shown when idle
 ];
 
 const CODEX_SPINNER_CHARS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
@@ -135,7 +134,9 @@ function matchesAny(text: string, patterns: RegExp[]): boolean {
 /** Detect agent status from a captured pane snapshot. */
 export function detectStatus(
   lines: string[],
-  agentType: AgentType
+  agentType: AgentType,
+  /** Optional: content of the line where the cursor is. For codex, cursor on "›" line = idle. */
+  cursorLine?: string,
 ): AgentStatus {
   const text = lines.join('\n');
   const tail = lines.slice(-10).join('\n');
@@ -159,6 +160,9 @@ export function detectStatus(
 
     case 'codex': {
       const codexHasSpinner = hasSpinner(lines, CODEX_SPINNER_CHARS) || CC_SPINNER_LINE.test(tail);
+      // Cursor on ">" or "›" line = codex is at input prompt = idle
+      if (cursorLine !== undefined && /^\s*[>›]/.test(cursorLine) && !codexHasSpinner)
+        return 'idle';
       if (matchesAny(tail, CODEX_IDLE_PATTERNS) && !codexHasSpinner)
         return 'idle';
       if (codexHasSpinner) {
@@ -253,4 +257,20 @@ export async function detectStatusMulti(
   }
 
   return best;
+}
+
+/**
+ * Unified async idle detection: capturePane + getCursorLine + detectStatus.
+ * Use this instead of calling detectStatus directly when accurate idle
+ * detection is needed (especially for codex where cursor position matters).
+ */
+export async function detectStatusAsync(
+  session: string,
+  agentType: AgentType,
+): Promise<AgentStatus> {
+  const { capturePane, getCursorLine } = await import('./tmux.js');
+  const lines = await capturePane(session);
+  let cursorLine: string | undefined;
+  try { cursorLine = await getCursorLine(session); } catch { /* ignore */ }
+  return detectStatus(lines, agentType, cursorLine);
 }

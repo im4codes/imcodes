@@ -42,6 +42,16 @@ export async function capturePaneHistory(session: string, lines = 1000): Promise
   return tmuxExec(`capture-pane -e -p -t ${session} -S -${lines} -E -1`);
 }
 
+/**
+ * Get the content of the line where the cursor is currently positioned.
+ * Useful for detecting if an agent is at an input prompt (cursor on ">" or "›" line).
+ */
+export async function getCursorLine(session: string): Promise<string> {
+  const cursorY = parseInt(await tmuxExec(`display-message -t ${session} -p "#{cursor_y}"`), 10);
+  const lines = (await tmuxExec(`capture-pane -p -t ${session}`)).split('\n');
+  return lines[cursorY] ?? '';
+}
+
 export interface SendKeysOptions {
   /** Use chunked send-keys -l instead of paste-buffer for large text (for agents that don't support bracketed paste). */
   chunked?: boolean;
