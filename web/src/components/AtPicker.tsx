@@ -11,13 +11,14 @@ interface SessionEntry {
   agentType: string;
   state: string;
   label?: string | null;
+  parentSession?: string | null;
   isSelf?: boolean;
 }
 
 interface AtPickerProps {
   query: string;
   sessions: SessionEntry[];
-  mainSession: string;
+  rootSession: string;
   wsClient: any;
   projectDir?: string;
   onSelectFile: (path: string) => void;
@@ -143,7 +144,7 @@ const backBtnStyle: Record<string, string | number> = {
 export function AtPicker({
   query,
   sessions,
-  mainSession,
+  rootSession,
   wsClient,
   projectDir,
   onSelectFile,
@@ -167,7 +168,7 @@ export function AtPicker({
     const seen = new Map<string, SessionEntry>();
     for (const s of sessions) {
       if (s.agentType === 'shell' || s.agentType === 'script') continue;
-      if (mainSession && !s.name.startsWith(`${mainSession}_`) && s.name !== mainSession) continue;
+      if (rootSession && s.name !== rootSession && s.parentSession !== rootSession) continue;
       const existing = seen.get(s.name);
       if (!existing) {
         seen.set(s.name, s);
@@ -189,7 +190,7 @@ export function AtPicker({
         };
       })
       .filter((a) => !query || a.shortName.toLowerCase().includes(query.toLowerCase()) || a.session.toLowerCase().includes(query.toLowerCase()));
-  }, [sessions, query, mainSession]);
+  }, [sessions, query, rootSession]);
 
   // Debounced file search — only when in files category
   useEffect(() => {

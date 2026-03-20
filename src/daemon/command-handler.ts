@@ -28,6 +28,7 @@ import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, type P2pTarget } from './p2p-orchestrator.js';
 import { handleFileUpload, handleFileDownload, initFileTransfer, startCleanupTimer, createProjectFileHandle, lookupAttachment } from './file-transfer-handler.js';
+import { FILE_TRANSFER_LIMITS } from '../shared/transport/file-transfer.js';
 
 // ── Common MIME map for file metadata ────────────────────────────────────────
 
@@ -1042,7 +1043,7 @@ sleep 60 && rm -rf "${scriptDir}" &
 
 // ── File system browser ────────────────────────────────────────────────────
 
-const FS_ALLOWED_ROOTS = [homedir()];
+const FS_ALLOWED_ROOTS = [homedir(), FILE_TRANSFER_LIMITS.UPLOAD_DIR];
 
 // ── P2P cancel/status handlers ────────────────────────────────────────────
 

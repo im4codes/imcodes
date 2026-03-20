@@ -57,6 +57,22 @@ const makeSession = (overrides: Partial<SessionInfo> = {}): SessionInfo => ({
   ...overrides,
 });
 
+const mainSession = makeSession({
+  name: 'deck_my-project_brain',
+  project: 'my-project',
+  role: 'brain',
+  label: 'brain',
+});
+
+const subSession = (name: string, label: string): SessionInfo =>
+  makeSession({
+    name,
+    project: 'my-project',
+    role: label,
+    label,
+    agentType: 'codex',
+  });
+
 describe('SessionControls', () => {
   afterEach(() => {
     cleanup();
@@ -201,11 +217,11 @@ describe('SessionControls', () => {
     render(
       <SessionControls
         ws={ws as any}
-        activeSession={makeSession({ name: 'deck_my-project_brain', project: 'my-project' })}
+        activeSession={mainSession}
         quickData={makeQuickData() as any}
-        sessions={[
-          makeSession({ name: 'deck_my-project_brain', project: 'my-project', role: 'brain', label: 'brain' }),
-          makeSession({ name: 'deck_my-project_w1', project: 'my-project', role: 'w1', label: 'w1' }),
+        sessions={[mainSession]}
+        subSessions={[
+          { sessionName: 'deck_sub_w1', type: 'codex', label: 'w1', state: 'idle', parentSession: 'deck_my-project_brain' },
         ]}
       />,
     );
@@ -229,7 +245,7 @@ describe('SessionControls', () => {
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
       sessionName: 'deck_my-project_brain',
-      text: '@@discuss(deck_my-project_w1, audit) please review',
+      text: '@@discuss(deck_sub_w1, audit) please review',
     });
 
     getSelectionSpy.mockRestore();
@@ -240,11 +256,11 @@ describe('SessionControls', () => {
     render(
       <SessionControls
         ws={ws as any}
-        activeSession={makeSession({ name: 'deck_my-project_brain', project: 'my-project' })}
+        activeSession={mainSession}
         quickData={makeQuickData() as any}
-        sessions={[
-          makeSession({ name: 'deck_my-project_brain', project: 'my-project', role: 'brain', label: 'brain' }),
-          makeSession({ name: 'deck_my-project_w1', project: 'my-project', role: 'w1', label: 'Worker Alpha' }),
+        sessions={[mainSession]}
+        subSessions={[
+          { sessionName: 'deck_sub_worker-alpha', type: 'codex', label: 'Worker Alpha', state: 'idle', parentSession: 'deck_my-project_brain' },
         ]}
       />,
     );
@@ -259,7 +275,38 @@ describe('SessionControls', () => {
     fireEvent.click(screen.getByText('Worker Alpha'));
     fireEvent.click(screen.getByText('audit'));
 
-    expect(input.textContent).toBe('@@discuss(deck_my-project_w1, audit) ');
+    expect(input.textContent).toBe('@@discuss(deck_sub_worker-alpha, audit) ');
+    getSelectionSpy.mockRestore();
+  });
+
+  it('when active session is a sub-session, agent picker still shows same-root peers', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={subSession('deck_sub_w2', 'w2')}
+        quickData={makeQuickData() as any}
+        sessions={[mainSession]}
+        subSessions={[
+          { sessionName: 'deck_sub_w1', type: 'codex', label: 'w1', state: 'idle', parentSession: 'deck_my-project_brain' },
+          { sessionName: 'deck_sub_w2', type: 'codex', label: 'w2', state: 'idle', parentSession: 'deck_my-project_brain' },
+          { sessionName: 'deck_sub_other', type: 'codex', label: 'other', state: 'idle', parentSession: 'deck_other_brain' },
+        ]}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    const getSelectionSpy = vi.spyOn(window, 'getSelection').mockImplementation(() => ({
+      anchorOffset: input.textContent?.length ?? 0,
+    }) as any);
+
+    input.textContent = '@';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByText('agents'));
+
+    expect(screen.getByText('brain')).toBeDefined();
+    expect(screen.getByText('w1')).toBeDefined();
+    expect(screen.getByText('w2')).toBeDefined();
+    expect(screen.queryByText('other')).toBeNull();
+
     getSelectionSpy.mockRestore();
   });
 

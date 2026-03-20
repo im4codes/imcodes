@@ -34,12 +34,13 @@ describe('AtPicker', () => {
       <AtPicker
         query=""
         sessions={[
-          { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle' },
-          { name: 'deck_proj_worker1', agentType: 'codex', state: 'idle' },
-          { name: 'deck_other_worker9', agentType: 'codex', state: 'idle' },
-          { name: 'deck_other_brain', agentType: 'claude-code', state: 'idle' },
+          { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle', parentSession: null },
+          { name: 'deck_sub_worker1', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain' },
+          { name: 'deck_sub_worker2', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain' },
+          { name: 'deck_sub_other9', agentType: 'codex', state: 'idle', parentSession: 'deck_other_brain' },
+          { name: 'deck_other_brain', agentType: 'claude-code', state: 'idle', parentSession: null },
         ]}
-        mainSession="deck_proj"
+        rootSession="deck_proj_brain"
         wsClient={wsClient as any}
         projectDir="/tmp/proj"
         onSelectFile={vi.fn()}
@@ -70,7 +71,8 @@ describe('AtPicker', () => {
 
     expect(screen.getByText('brain')).toBeDefined();
     expect(screen.getByText('worker1')).toBeDefined();
-    expect(screen.queryByText('worker9')).toBeNull();
+    expect(screen.getByText('worker2')).toBeDefined();
+    expect(screen.queryByText('other9')).toBeNull();
   });
 
   it('Escape from agents step returns to category chooser', () => {
@@ -97,9 +99,9 @@ describe('AtPicker', () => {
       <AtPicker
         query=""
         sessions={[
-          { name: 'deck_other_worker9', agentType: 'codex', state: 'idle' },
+          { name: 'deck_sub_other9', agentType: 'codex', state: 'idle', parentSession: 'deck_other_brain' },
         ]}
-        mainSession="deck_proj"
+        rootSession="deck_proj_brain"
         wsClient={wsClient as any}
         projectDir="/tmp/proj"
         onSelectFile={vi.fn()}

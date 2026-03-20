@@ -1070,7 +1070,7 @@ export function App() {
           <div class="sidebar-stats">
             {daemonStats.daemonVersion && (
               <div class="sidebar-stats-row">
-                <span style={{ color: '#94a3b8' }}>Daemon {daemonStats.daemonVersion}</span>
+                <span style={{ color: '#94a3b8' }}>Daemon v{daemonStats.daemonVersion}</span>
               </div>
             )}
             <div class="sidebar-stats-row">
@@ -1171,7 +1171,7 @@ export function App() {
                   {connected ? '● Online' : connecting ? (<><span class="connecting-dot" />{' Connecting'}</>) : '○ Offline'}
                 </span>
                 <span style={{ fontSize: 9, color: '#475569' }}>
-                  {(() => { try { const d = new Date(__BUILD_TIME__); return `${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
+                  {(() => { try { const d = new Date(__BUILD_TIME__); return `v${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
                 </span>
               </div>
             </div>

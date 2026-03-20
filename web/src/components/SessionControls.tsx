@@ -194,6 +194,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setHasText(true);
   };
 
+  const activeSub = (subSessions ?? []).find((s) => s.sessionName === activeSession?.name);
+  const rootSession = activeSub?.parentSession || activeSession?.name || '';
+
   const buildAgentToken = (session: string, mode: string) => `@@discuss(${session}, ${mode})`;
 
   const handleSend = useCallback(() => {
@@ -557,6 +560,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 agentType: s.agentType,
                 state: s.state,
                 label: s.label ?? null,
+                parentSession: null,
                 isSelf: s.name === activeSession.name,
               })),
               // Sub-sessions
@@ -565,10 +569,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 agentType: s.type,
                 state: s.state,
                 label: s.label ?? null,
+                parentSession: s.parentSession ?? null,
                 isSelf: s.sessionName === activeSession.name,
               })),
             ]}
-            mainSession={activeSession.project ? `deck_${activeSession.project}` : activeSession.name.replace(/_[^_]+$/, '')}
+            rootSession={rootSession}
             wsClient={ws}
             projectDir={activeSession.projectDir ?? ''}
             onSelectFile={(path) => {
