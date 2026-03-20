@@ -125,6 +125,9 @@ interface ContentBlock {
   is_error?: boolean;
 }
 
+/** Patterns for system-injected messages that should not display as user messages. */
+const SYSTEM_INJECT_RE = /<task-notification>|<system-reminder>|<command-name>|<local-command-/;
+
 function emitUserStringContent(
   sessionName: string,
   text: string,
@@ -132,6 +135,14 @@ function emitUserStringContent(
   ts?: number,
 ): void {
   if (!text.trim()) return;
+  // System-injected messages: don't show as user message, emit working signal instead
+  if (SYSTEM_INJECT_RE.test(text)) {
+    timelineEmitter.emit(sessionName, 'agent.status', {
+      status: 'processing',
+      label: 'Processing system event...',
+    }, { source: 'daemon', confidence: 'high' });
+    return;
+  }
   timelineEmitter.emit(sessionName, 'user.message', {
     text,
   }, { source: 'daemon', confidence: 'high', ...(stableId ? { eventId: stableId('um') } : {}), ...(ts ? { ts } : {}) });
