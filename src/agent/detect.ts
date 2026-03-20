@@ -53,6 +53,8 @@ const CC_PERMISSION_PATTERNS = [
 const CODEX_IDLE_PATTERNS = [
   /^\s*>\s*$/m,                        // line that is ONLY ">" — Codex prompt
   /^\s*›\s*$/m,                        // line that is ONLY "›" — alternate prompt
+  /^\s*›\s+Use\s+\/skills/m,          // "› Use /skills to list..." — idle prompt with hint
+  /gpt-[\d.]+ \w+ · \d+% left/,       // "gpt-5.4 medium · 59% left" — status bar when idle
 ];
 
 const CODEX_SPINNER_CHARS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
