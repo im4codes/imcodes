@@ -265,14 +265,18 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
     });
 
     // Wait for target to be idle
+    logger.info({ runId: run.id, target: target.session, mode: target.mode, hop: i + 1, totalHops }, 'P2P: Phase 2 — waiting for target idle before dispatch');
     await waitForIdle(run, target.session, serverLink);
     if (run._cancelled) return;
 
+    logger.info({ runId: run.id, target: target.session, status: run.status }, 'P2P: Phase 2 — target idle, dispatching hop');
     await dispatchHop(run, target.session, hopPrompt, serverLink);
+    logger.info({ runId: run.id, target: target.session, status: run.status }, 'P2P: Phase 2 — hop dispatch returned');
     if (run._cancelled || isTerminal(run.status)) return;
   }
 
   // ── Phase 3: Initiator summary ──
+  logger.info({ runId: run.id, status: run.status }, 'P2P: Phase 3 — initiator summary');
   if (run._cancelled) return;
   const summaryPrompt = buildHopPrompt(run, modeConfig, {
     session: run.initiatorSession,
