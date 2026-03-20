@@ -12,7 +12,8 @@ import logger from '../util/logger.js';
 import { updateSessionState } from '../store/session-store.js';
 
 const GEMINI_TMP_DIR = join(homedir(), '.gemini', 'tmp');
-const POLL_INTERVAL_MS = 500; // Snappy updates
+const POLL_INTERVAL_MS = 1500; // Balanced: responsive enough without causing state flicker
+const IDLE_LOCK_MS = 2000;    // After emitting idle, ignore terminal noise for this long
 const RETRY_DELAY_MS = 100;
 
 // ── Path helpers ───────────────────────────────────────────────────────────────
@@ -110,8 +111,11 @@ export interface WatcherState {
   abort: AbortController;
   stopped: boolean;
   pollTimer?: ReturnType<typeof setInterval>;
-  emittedRunning?: boolean;
+  /** Current emitted state — single source of truth for what was last sent to timeline. */
+  currentState?: 'running' | 'idle';
   idleDebounceTimer?: ReturnType<typeof setTimeout>;
+  /** Timestamp of last idle emit — used for idle lock (ignore terminal noise shortly after idle). */
+  lastIdleEmitTs?: number;
   _lastRotationCheck?: number;
   _terminalThinkingEmitted?: boolean;
   lastConversationStatus?: 'running' | 'idle' | null;
@@ -141,17 +145,15 @@ async function terminalThinkingCheck(sessionName: string, state: WatcherState): 
   const status = detectStatus(lines, 'gemini');
 
   if (status === 'idle') {
-    // Terminal shows idle — debounce before emitting to avoid flicker
-    // (Gemini briefly shows ">" between tool calls while still working)
-    if (state.emittedRunning && !state.idleDebounceTimer) {
-        state.idleDebounceTimer = setTimeout(() => {
-          state.idleDebounceTimer = undefined;
-          if (!state.stopped && state.emittedRunning) {
-            state.emittedRunning = false;
-            state._terminalThinkingEmitted = false;
-            emitSessionState(sessionName, 'idle');
-          }
-        }, 3000);
+    // Terminal shows idle — debounce before transitioning
+    if (state.currentState === 'running' && !state.idleDebounceTimer) {
+      state.idleDebounceTimer = setTimeout(() => {
+        state.idleDebounceTimer = undefined;
+        if (!state.stopped) {
+          state._terminalThinkingEmitted = false;
+          transitionState(sessionName, state, 'idle');
+        }
+      }, 3000);
     }
     return;
   }
@@ -159,18 +161,24 @@ async function terminalThinkingCheck(sessionName: string, state: WatcherState): 
   // Terminal shows activity — cancel any pending idle debounce
   if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
 
-  // Terminal shows activity (thinking/streaming/tool_running) — emit running + thinking
-  if (!state.emittedRunning) {
-    state.emittedRunning = true;
-    emitSessionState(sessionName, 'running');
-  }
+  // Terminal shows activity — transition to running (idle lock will prevent flicker)
+  transitionState(sessionName, state, 'running');
   if (!state._terminalThinkingEmitted) {
     state._terminalThinkingEmitted = true;
     timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'terminal-parse', confidence: 'medium' });
   }
 }
 
-function emitSessionState(sessionName: string, next: 'running' | 'idle'): void {
+/**
+ * Unified state transition — all idle/running changes MUST go through here.
+ * Prevents flicker by deduplicating and enforcing idle lock.
+ */
+function transitionState(sessionName: string, state: WatcherState, next: 'running' | 'idle'): void {
+  if (state.currentState === next) return; // already in this state
+  // Idle lock: don't transition to running if we just emitted idle (terminal noise)
+  if (next === 'running' && state.lastIdleEmitTs && (Date.now() - state.lastIdleEmitTs) < IDLE_LOCK_MS) return;
+  state.currentState = next;
+  if (next === 'idle') state.lastIdleEmitTs = Date.now();
   timelineEmitter.emit(sessionName, 'session.state', { state: next });
   updateSessionState(sessionName, next);
 }
@@ -227,7 +235,8 @@ export async function pollTick(sessionName: string, state: WatcherState): Promis
 
   if (conv.lastUpdated === state.lastUpdated && conv.messages.length === state.seenCount) {
     if (conversationStatus === 'idle') {
-      state.emittedRunning = false;
+      // JSON unchanged + idle — transition through unified function (respects dedup + lock)
+      transitionState(sessionName, state, 'idle');
       return;
     }
     // JSON unchanged — supplement with terminal-based detection.
@@ -255,10 +264,7 @@ export async function pollTick(sessionName: string, state: WatcherState): Promis
 
   if (conversationStatus === 'running') {
     if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
-    if (!state.emittedRunning) {
-      state.emittedRunning = true;
-      emitSessionState(sessionName, 'running');
-    }
+    transitionState(sessionName, state, 'running');
     return;
   }
 
@@ -269,15 +275,11 @@ export async function pollTick(sessionName: string, state: WatcherState): Promis
       if (state.idleDebounceTimer) clearTimeout(state.idleDebounceTimer);
       state.idleDebounceTimer = setTimeout(() => {
         state.idleDebounceTimer = undefined;
-        if (!state.stopped) {
-          state.emittedRunning = false;
-          emitSessionState(sessionName, 'idle');
-        }
+        if (!state.stopped) transitionState(sessionName, state, 'idle');
       }, 1500);
     } else {
       if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
-      state.emittedRunning = false;
-      emitSessionState(sessionName, 'idle');
+      transitionState(sessionName, state, 'idle');
     }
   }
 }
@@ -298,8 +300,7 @@ export async function startWatching(sessionName: string, sessionUuid: string): P
       state.lastUpdated = conv.lastUpdated;
       state.lastConversationStatus = inferConversationStatus(conv);
       if (state.lastConversationStatus === 'idle') {
-        state.emittedRunning = false;
-        emitSessionState(sessionName, 'idle');
+        transitionState(sessionName, state, 'idle');
       }
     }
   }
