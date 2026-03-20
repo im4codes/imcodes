@@ -52,6 +52,8 @@ export interface P2pRun {
   userText: string;
   timeoutMs: number;
   resultSummary: string | null;
+  /** Sessions whose hops were skipped (timeout, sendKeys failure, idle without file change). */
+  skippedHops: string[];
   error: string | null;
   createdAt: string;
   updatedAt: string;
@@ -176,6 +178,7 @@ export async function startP2pRun(
     userText,
     timeoutMs: modeConfig?.defaultTimeoutMs ?? 300_000,
     resultSummary: null,
+    skippedHops: [],
     error: null,
     createdAt: now,
     updatedAt: now,
@@ -318,10 +321,14 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
   transition(run, 'completed', serverLink);
 
   // Emit discussion result to initiator session timeline (summary only, not full content)
+  const skippedNote = run.skippedHops.length > 0
+    ? `\n\n**Warning**: ${run.skippedHops.length} hop(s) skipped: ${run.skippedHops.join(', ')}`
+    : '';
   timelineEmitter.emit(run.initiatorSession, 'assistant.text', {
-    text: `**P2P Discussion Complete** (${run.id})\n\nFile: \`${run.contextFilePath}\`\n\n${run.resultSummary ?? '(no summary)'}`,
+    text: `**P2P Discussion Complete** (${run.id})${skippedNote}\n\nFile: \`${run.contextFilePath}\`\n\n${run.resultSummary ?? '(no summary)'}`,
     p2pRunId: run.id,
     p2pDiscussionId: run.discussionId,
+    skippedHops: run.skippedHops,
   }, { source: 'daemon' });
 
   // Keep in memory for a bit so status queries work, then clean up
@@ -357,6 +364,7 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
         continue;
       }
       logger.warn({ runId: run.id, session, err }, 'P2P: hop dispatch failed after retry, skipping');
+      run.skippedHops.push(session);
       return; // skip this hop, don't fail the whole run
     }
 
@@ -419,6 +427,7 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
         }
         // Max retries exhausted — skip this hop
         logger.warn({ runId: run.id, session }, 'P2P: agent idle without file change after retry, skipping hop');
+        run.skippedHops.push(session);
         if (sandboxLocalPath) await copyBackFromSandbox(run, sandboxLocalPath).catch(() => {});
         if (run.remainingTargets.length > 0 || session !== run.initiatorSession) {
           transition(run, 'awaiting_next_hop', serverLink);
@@ -435,6 +444,7 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
     // Timeout — copy back whatever we got and skip (don't fail the whole run)
     if (sandboxLocalPath) await copyBackFromSandbox(run, sandboxLocalPath).catch(() => {});
     logger.warn({ runId: run.id, session }, 'P2P: hop timed out, skipping to next');
+    run.skippedHops.push(session);
     if (run.remainingTargets.length > 0 || session !== run.initiatorSession) {
       transition(run, 'awaiting_next_hop', serverLink);
     }

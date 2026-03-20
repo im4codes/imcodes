@@ -81,7 +81,7 @@ export async function sendKeys(session: string, keys: string, opts?: SendKeysOpt
     const hash = createHash('md5').update(session + Date.now()).digest('hex').slice(0, 8);
     const fileName = `.imcodes-prompt-${hash}.md`;
     const filePath = opts?.cwd ? path.join(opts.cwd, fileName) : `/tmp/${fileName}`;
-    await fsp.writeFile(filePath, keys, 'utf-8');
+    await fsp.writeFile(filePath, keys, { encoding: 'utf-8', mode: 0o600 });
     const instruction = `Read and execute all instructions in @${filePath}`;
     const escaped = instruction.replace(/'/g, "'\\''");
     await tmuxExec(`send-keys -t ${session} -l -- '${escaped}'`);
