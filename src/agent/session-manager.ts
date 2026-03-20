@@ -214,18 +214,22 @@ export async function restoreFromStore(): Promise<void> {
     // Sub-sessions (deck_sub_*): skip restart/respawn (managed by rebuildSubSessions),
     // but still restore watchers if the tmux session is alive.
     if (s.name.startsWith('deck_sub_')) {
-      if (!live.includes(s.name)) continue; // dead sub-session, skip
-      // Restore watcher for live sub-sessions
+      const isLive = live.includes(s.name);
+      logger.info({ session: s.name, agentType: s.agentType, isLive, codexSessionId: s.codexSessionId ?? null }, 'Restoring sub-session watcher');
+      if (!isLive) continue;
       if (s.agentType === 'claude-code' && s.ccSessionId && s.projectDir && !isWatching(s.name)) {
         startCCWatcher(s.name, s.projectDir, s.ccSessionId);
       } else if (s.agentType === 'codex' && s.codexSessionId && !isCodexWatching(s.name)) {
         findRolloutPathByUuid(s.codexSessionId).then((rolloutPath) => {
+          logger.info({ session: s.name, rolloutPath }, 'Sub-session codex watcher: rollout lookup result');
           if (rolloutPath) {
-            startCodexWatchingFile(s.name, rolloutPath).catch(() => {});
+            startCodexWatchingFile(s.name, rolloutPath).catch((e) =>
+              logger.warn({ err: e, session: s.name }, 'Sub-session codex watcher startFile failed'));
           } else {
-            startCodexWatchingById(s.name, s.codexSessionId!).catch(() => {});
+            startCodexWatchingById(s.name, s.codexSessionId!).catch((e) =>
+              logger.warn({ err: e, session: s.name }, 'Sub-session codex watcher startById failed'));
           }
-        }).catch(() => {});
+        }).catch((e) => logger.warn({ err: e, session: s.name }, 'Sub-session codex watcher findRollout failed'));
       } else if (s.agentType === 'gemini' && !isGeminiWatching(s.name)) {
         if (s.geminiSessionId) {
           startGeminiWatching(s.name, s.geminiSessionId);
