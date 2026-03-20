@@ -24,7 +24,14 @@
     "thinking_running": "Pensando · {{sec}}s",
     "thinking_done": "Pensó {{sec}}s",
     "show_file_panel": "Abrir panel de archivos",
-    "hide_file_panel": "Cerrar panel de archivos"
+    "hide_file_panel": "Cerrar panel de archivos",
+    "tool_fold_more": "... {{count}} líneas ...",
+    "tool_fold_collapse": "colapsar",
+    "tool_group_more": "··· {{count}} más",
+    "tool_group_collapse": "▲ colapsar",
+    "new_folder": "Nueva carpeta",
+    "new_folder_name": "Nombre de carpeta",
+    "create": "Crear"
   },
   "session": {
     "restart": "↺ Reiniciar",

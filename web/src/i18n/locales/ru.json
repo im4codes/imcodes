@@ -24,7 +24,14 @@
     "thinking_running": "Думаю · {{sec}}s",
     "thinking_done": "Думал {{sec}}s",
     "show_file_panel": "Открыть панель файлов",
-    "hide_file_panel": "Закрыть панель файлов"
+    "hide_file_panel": "Закрыть панель файлов",
+    "tool_fold_more": "... {{count}} строк ...",
+    "tool_fold_collapse": "свернуть",
+    "tool_group_more": "··· ещё {{count}}",
+    "tool_group_collapse": "▲ свернуть",
+    "new_folder": "Новая папка",
+    "new_folder_name": "Имя папки",
+    "create": "Создать"
   },
   "session": {
     "restart": "↺ Перезапустить",

@@ -75,6 +75,7 @@ const BROWSER_WHITELIST = new Set([
   'fs.git_status',
   'fs.git_diff',
   'file.search',
+  'fs.mkdir',
   'p2p.cancel',
   'p2p.status',
 ]);

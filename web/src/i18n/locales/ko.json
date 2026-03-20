@@ -24,7 +24,14 @@
     "thinking_running": "생각 중 · {{sec}}s",
     "thinking_done": "{{sec}}s 동안 생각함",
     "show_file_panel": "파일 패널 열기",
-    "hide_file_panel": "파일 패널 닫기"
+    "hide_file_panel": "파일 패널 닫기",
+    "tool_fold_more": "... {{count}}줄 ...",
+    "tool_fold_collapse": "접기",
+    "tool_group_more": "··· {{count}}개 더",
+    "tool_group_collapse": "▲ 접기",
+    "new_folder": "새 폴더",
+    "new_folder_name": "폴더 이름",
+    "create": "만들기"
   },
   "session": {
     "restart": "↺ 재시작",

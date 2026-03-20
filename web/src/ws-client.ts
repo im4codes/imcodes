@@ -293,6 +293,13 @@ export class WsClient {
     return requestId;
   }
 
+  /** Create a directory on the daemon. Returns requestId. */
+  fsMkdir(path: string): string {
+    const requestId = crypto.randomUUID();
+    this.send({ type: 'fs.mkdir', path, requestId });
+    return requestId;
+  }
+
   /** Request git status for a directory. Returns requestId. */
   fsGitStatus(path: string): string {
     const requestId = crypto.randomUUID();

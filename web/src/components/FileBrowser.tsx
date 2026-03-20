@@ -276,6 +276,8 @@ export function FileBrowser({
   const [showDiff, setShowDiff] = useState(false);
   const [lightbox, setLightbox] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [newFolderParent, setNewFolderParent] = useState<string | null>(null);
+  const [newFolderName, setNewFolderName] = useState('');
   const [modifiedFiles, setModifiedFiles] = useState<Map<string, string>>(new Map()); // path → git code
   // Panel view: 'files' shows tree + changes section; 'changes' shows only changed files
   const [panelView, setPanelView] = useState<'files' | 'changes'>('files');
@@ -840,8 +842,56 @@ export function FileBrowser({
         <input type="checkbox" checked={showHidden} onChange={(e) => setShowHidden((e.target as HTMLInputElement).checked)} />
         {' ·'}
       </label>
+      <button
+        class="fb-new-folder-btn"
+        title={t('chat.new_folder')}
+        onClick={() => { setNewFolderParent(currentLabel); setNewFolderName(''); }}
+      >+</button>
     </div>
   );
+
+  const newFolderDialog = newFolderParent !== null ? (
+    <div class="fb-new-folder-bar">
+      <input
+        type="text"
+        placeholder={t('chat.new_folder_name')}
+        value={newFolderName}
+        onInput={(e) => setNewFolderName((e.target as HTMLInputElement).value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' && newFolderName.trim()) {
+            const fullPath = `${newFolderParent}/${newFolderName.trim()}`;
+            ws.fsMkdir(fullPath);
+            // Refresh parent after a short delay
+            setTimeout(() => {
+              loadedRef.current.delete(newFolderParent!);
+              toggleExpand(newFolderParent!);
+              toggleExpand(newFolderParent!);
+            }, 300);
+            setNewFolderParent(null);
+          }
+          if (e.key === 'Escape') setNewFolderParent(null);
+        }}
+        autoFocus
+      />
+      <button
+        class="btn btn-primary"
+        style={{ padding: '4px 10px', fontSize: 12 }}
+        disabled={!newFolderName.trim()}
+        onClick={() => {
+          if (!newFolderName.trim()) return;
+          const fullPath = `${newFolderParent}/${newFolderName.trim()}`;
+          ws.fsMkdir(fullPath);
+          setTimeout(() => {
+            loadedRef.current.delete(newFolderParent!);
+            toggleExpand(newFolderParent!);
+            toggleExpand(newFolderParent!);
+          }, 300);
+          setNewFolderParent(null);
+        }}
+      >{t('chat.create')}</button>
+      <button class="fb-close" onClick={() => setNewFolderParent(null)} style={{ fontSize: 12 }}>✕</button>
+    </div>
+  ) : null;
 
   const lightboxOverlay = lightbox ? (
     <div class="fb-lightbox" onClick={() => setLightbox(null)}>
@@ -886,6 +936,7 @@ export function FileBrowser({
         <div class="fb-panel">
           {tabs}
           {breadcrumb}
+          {newFolderDialog}
           <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}${changesRootPath && changesFiles.length > 0 ? ' fb-body-with-changes' : ''}`}>
             <div class={`fb-files-and-changes${hasPreview ? ' fb-tree-split' : ''}`}>
               {tree}

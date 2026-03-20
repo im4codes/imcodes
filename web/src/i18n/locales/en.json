@@ -24,7 +24,14 @@
     "thinking_running": "Thinking · {{sec}}s",
     "thinking_done": "Thought for {{sec}}s",
     "show_file_panel": "Open file panel",
-    "hide_file_panel": "Close file panel"
+    "hide_file_panel": "Close file panel",
+    "tool_fold_more": "... {{count}} lines ...",
+    "tool_fold_collapse": "collapse",
+    "tool_group_more": "··· {{count}} more",
+    "tool_group_collapse": "▲ collapse",
+    "new_folder": "New folder",
+    "new_folder_name": "Folder name",
+    "create": "Create"
   },
   "session": {
     "restart": "↺ Restart",

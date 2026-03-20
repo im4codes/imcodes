@@ -552,6 +552,7 @@ export function ChatView({ events, loading, refreshing, sessionState, sessionId,
 
 /** Collapsible group of consecutive tool events. Shows first and last, folds middle. */
 function ToolCallGroup({ events, onPathClick }: { events: TimelineEvent[]; onPathClick?: (p: string) => void }) {
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const first = events[0];
   const last = events.length > 1 ? events[events.length - 1] : null;
@@ -566,18 +567,40 @@ function ToolCallGroup({ events, onPathClick }: { events: TimelineEvent[]; onPat
             middle.map((ev) => <ChatEvent key={ev.eventId} event={ev} onPathClick={onPathClick} />)
           ) : (
             <button class="chat-tool-fold-btn" onClick={() => setExpanded(true)}>
-              ··· {middle.length} more
+              {t('chat.tool_group_more', { count: middle.length })}
             </button>
           )
         )}
         {last && <ChatEvent event={last} onPathClick={onPathClick} />}
         {expanded && middle.length > 0 && (
           <button class="chat-tool-fold-btn" onClick={() => setExpanded(false)}>
-            ▲ collapse
+            {t('chat.tool_group_collapse')}
           </button>
         )}
       </div>
     </div>
+  );
+}
+
+function ToolInputFold({ lines, onPathClick }: { lines: string[]; onPathClick?: (p: string) => void }) {
+  const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  if (expanded) {
+    return (
+      <span class="chat-tool-input">
+        {' '}{splitPaths(lines.join('\n'), onPathClick)}
+        <button class="chat-tool-fold-inline" onClick={() => setExpanded(false)}>{' '}{t('chat.tool_fold_collapse')}</button>
+      </span>
+    );
+  }
+  const first = lines[0];
+  const last = lines[lines.length - 1];
+  return (
+    <span class="chat-tool-input">
+      {' '}{splitPaths(first, onPathClick)}
+      <button class="chat-tool-fold-inline" onClick={() => setExpanded(true)}>{` ${t('chat.tool_fold_more', { count: lines.length - 2 })} `}</button>
+      {splitPaths(last, onPathClick)}
+    </span>
   );
 }
 
@@ -626,14 +649,22 @@ function ChatEvent({ event, nextTs, onPathClick, serverId }: { event: TimelineEv
       );
     }
 
-    case 'tool.call':
+    case 'tool.call': {
+      const toolInput = event.payload.input ? String(event.payload.input) : '';
+      const inputLines = toolInput.split('\n');
+      const needsFold = inputLines.length > 3;
       return (
         <div class="chat-event chat-tool">
           <span class="chat-tool-icon">{'>'}</span>
           <span class="chat-tool-name">{String(event.payload.tool ?? 'tool')}</span>
-          {event.payload.input ? <span class="chat-tool-input">{' '}{splitPaths(String(event.payload.input), onPathClick)}</span> : null}
+          {toolInput && (
+            needsFold
+              ? <ToolInputFold lines={inputLines} onPathClick={onPathClick} />
+              : <span class="chat-tool-input">{' '}{splitPaths(toolInput, onPathClick)}</span>
+          )}
         </div>
       );
+    }
 
     case 'tool.result': {
       // Standalone tool.result (not merged) — still rendered for cases without a preceding call

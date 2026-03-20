@@ -286,6 +286,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'fs.git_diff':
       void handleFsGitDiff(cmd, serverLink);
       break;
+    case 'fs.mkdir':
+      void handleFsMkdir(cmd, serverLink);
+      break;
     case 'p2p.cancel':
       void handleP2pCancel(cmd, serverLink);
       break;
@@ -1293,6 +1296,39 @@ async function handleFsGitDiff(cmd: Record<string, unknown>, serverLink: ServerL
     try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', diff }); } catch { /* ignore */ }
   } catch (err) {
     try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
+  }
+}
+
+/** fs.mkdir — create a directory */
+async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const rawPath = cmd.path as string | undefined;
+  const requestId = cmd.requestId as string | undefined;
+  if (!rawPath || !requestId) return;
+
+  const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
+  const resolved = nodePath.resolve(expanded);
+
+  // Check parent directory is in allowed roots
+  const parent = nodePath.dirname(resolved);
+  try {
+    const realParent = await fsRealpath(parent);
+    const allowed = FS_ALLOWED_ROOTS.some((root) => realParent === root || realParent.startsWith(root + nodePath.sep));
+    if (!allowed) {
+      try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
+      return;
+    }
+  } catch {
+    try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: 'parent_not_found' }); } catch { /* ignore */ }
+    return;
+  }
+
+  try {
+    const { mkdir } = await import('fs/promises');
+    await mkdir(resolved, { recursive: true });
+    const real = await fsRealpath(resolved);
+    try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, resolvedPath: real, status: 'ok' }); } catch { /* ignore */ }
+  } catch (err) {
+    try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
   }
 }
 

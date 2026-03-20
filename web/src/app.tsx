@@ -546,7 +546,10 @@ export function App() {
           setSessions((prev) => {
             const existing = prev.find((s) => s.name === msg.session);
             if (!existing && msg.session) {
-              return [...prev, { name: msg.session, project: '', role: 'brain', agentType: 'unknown', state: msg.state as SessionInfo['state'] }];
+              // Parse project name from session name pattern: deck_{project}_{role}
+              const parts = msg.session.split('_');
+              const project = parts.length >= 3 && parts[0] === 'deck' ? parts.slice(1, -1).join('_') : msg.session;
+              return [...prev, { name: msg.session, project, role: 'brain', agentType: 'unknown', state: msg.state as SessionInfo['state'] }];
             }
             return prev.map((s) => s.name === msg.session ? { ...s, state: msg.state as SessionInfo['state'] } : s);
           });

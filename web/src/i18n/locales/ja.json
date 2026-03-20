@@ -24,7 +24,14 @@
     "thinking_running": "考え中 · {{sec}}s",
     "thinking_done": "{{sec}}s 考えた",
     "show_file_panel": "ファイルパネルを開く",
-    "hide_file_panel": "ファイルパネルを閉じる"
+    "hide_file_panel": "ファイルパネルを閉じる",
+    "tool_fold_more": "... {{count}} 行 ...",
+    "tool_fold_collapse": "折りたたむ",
+    "tool_group_more": "··· あと {{count}} 件",
+    "tool_group_collapse": "▲ 折りたたむ",
+    "new_folder": "新しいフォルダ",
+    "new_folder_name": "フォルダ名",
+    "create": "作成"
   },
   "session": {
     "restart": "↺ 再起動",
