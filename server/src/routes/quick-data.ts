@@ -22,7 +22,21 @@ quickDataRoutes.get('/', async (c) => {
   return c.json({ data });
 });
 
-/** PUT /api/quick-data — replace user's quick data */
+/** Merge two string arrays: deduplicate, preserve order (incoming first), cap at max. */
+function mergeArrays(incoming: string[], existing: string[], max: number): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const s of [...incoming, ...existing]) {
+    if (!seen.has(s)) {
+      seen.add(s);
+      result.push(s);
+      if (result.length >= max) break;
+    }
+  }
+  return result;
+}
+
+/** PUT /api/quick-data — merge with existing data (not replace) */
 quickDataRoutes.put('/', async (c) => {
   const userId = c.get('userId' as never) as string;
 
@@ -38,6 +52,24 @@ quickDataRoutes.put('/', async (c) => {
     return c.json({ error: 'invalid_data', detail: parsed.error.flatten() }, 400);
   }
 
-  await upsertQuickData(c.env.DB, userId, parsed.data);
+  // Read existing data and merge to avoid cross-device overwrites
+  const existing = await getQuickData(c.env.DB, userId);
+  const merged = {
+    history: mergeArrays(parsed.data.history, existing.history ?? [], 50),
+    sessionHistory: { ...existing.sessionHistory, ...parsed.data.sessionHistory } as Record<string, string[]>,
+    commands: mergeArrays(parsed.data.commands, existing.commands ?? [], 200),
+    phrases: mergeArrays(parsed.data.phrases, existing.phrases ?? [], 200),
+  };
+
+  // Merge per-session histories too
+  for (const [key, arr] of Object.entries(existing.sessionHistory ?? {})) {
+    if (merged.sessionHistory[key]) {
+      merged.sessionHistory[key] = mergeArrays(merged.sessionHistory[key], arr, 50);
+    } else {
+      merged.sessionHistory[key] = arr;
+    }
+  }
+
+  await upsertQuickData(c.env.DB, userId, merged);
   return c.json({ ok: true });
 });

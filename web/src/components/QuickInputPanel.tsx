@@ -55,7 +55,9 @@ let _debounceTimer: ReturnType<typeof setTimeout> | null = null;
 function scheduleSave(data: QuickData): void {
   if (_debounceTimer) clearTimeout(_debounceTimer);
   _debounceTimer = setTimeout(() => {
-    apiFetch('/api/quick-data', { method: 'PUT', body: JSON.stringify({ data }) }).catch(() => {/* ignore */});
+    apiFetch('/api/quick-data', { method: 'PUT', body: JSON.stringify({ data }) }).catch((err) => {
+      console.error('[quick-data] save failed:', err);
+    });
   }, 2000);
 }
 
