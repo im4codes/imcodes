@@ -317,19 +317,31 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
 // ── Wait for target session to be idle ────────────────────────────────────
 
 async function waitForIdle(run: P2pRun, session: string, serverLink: ServerLink | null): Promise<void> {
+  logger.info({ runId: run.id, session }, 'P2P: waiting for target session to become idle');
   const deadline = Date.now() + run.timeoutMs;
+  let pollCount = 0;
   while (Date.now() < deadline) {
     if (run._cancelled) return;
     try {
       const lines = await capturePane(session);
       const record = getSession(session);
       const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
-      if (detectStatus(lines, agentType) === 'idle') return;
-    } catch { /* ignore */ }
+      const status = detectStatus(lines, agentType);
+      if (status === 'idle') {
+        logger.info({ runId: run.id, session, pollCount }, 'P2P: target session is idle, proceeding');
+        return;
+      }
+      if (pollCount % 10 === 0) {
+        logger.debug({ runId: run.id, session, status, pollCount }, 'P2P: target not idle yet');
+      }
+    } catch (err) {
+      logger.debug({ runId: run.id, session, err: String(err) }, 'P2P: capturePane/detectStatus failed');
+    }
+    pollCount++;
     await sleep(IDLE_POLL_MS);
   }
   if (!run._cancelled) {
-    failRun(run, 'timed_out', `Target ${session} never became idle`, serverLink);
+    failRun(run, 'timed_out', `Target ${session} never became idle after ${run.timeoutMs}ms`, serverLink);
   }
 }
 
