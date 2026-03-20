@@ -126,7 +126,7 @@ interface ContentBlock {
 }
 
 /** Patterns for system-injected messages that should not display as user messages. */
-const SYSTEM_INJECT_RE = /<task-notification|<system-reminder|<command-name>|<command-message>|<local-command-|<bash-input>|<bash-stdout>|<bash-stderr>/;
+const SYSTEM_INJECT_RE = /<task-notification|<system-reminder|<command-name>|<command-message>|<local-command-|<bash-input>|<bash-stdout>|<bash-stderr>|--- P2P Collaboration Instructions ---/;
 
 function emitUserStringContent(
   sessionName: string,
