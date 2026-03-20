@@ -11,6 +11,8 @@ interface SessionEntry {
   name: string;
   agentType: string;
   state: string;
+  label?: string | null;
+  isSelf?: boolean;
 }
 
 interface AtPickerProps {
@@ -27,7 +29,7 @@ interface AtPickerProps {
 
 type PickerItem =
   | { kind: 'file'; path: string; basename: string; dir: string }
-  | { kind: 'agent'; session: string; shortName: string; agentType: string; busy: boolean };
+  | { kind: 'agent'; session: string; shortName: string; agentType: string; busy: boolean; isSelf: boolean };
 
 const MODES = ['audit', 'review', 'brainstorm', 'discuss'] as const;
 
@@ -118,7 +120,6 @@ const modeBtnHoverStyle: Record<string, string | number> = {
 export function AtPicker({
   query,
   sessions,
-  mainSession,
   wsClient,
   projectDir,
   onSelectFile,
@@ -135,24 +136,23 @@ export function AtPicker({
   const requestIdRef = useRef<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Filter agents by mainSession prefix
+  // Show all sessions as agents — label or short name, mark self
   const agents = useMemo(() => {
-    const prefix = mainSession + '_';
     return sessions
-      .filter((s) => s.name.startsWith(prefix))
       .map((s) => {
         const parts = s.name.split('_');
-        const shortName = parts[parts.length - 1];
+        const shortName = s.label || parts[parts.length - 1] || s.name;
         return {
           kind: 'agent' as const,
           session: s.name,
           shortName,
           agentType: s.agentType,
           busy: s.state !== 'idle',
+          isSelf: !!s.isSelf,
         };
       })
-      .filter((a) => !query || a.shortName.toLowerCase().includes(query.toLowerCase()));
-  }, [sessions, mainSession, query]);
+      .filter((a) => !query || a.shortName.toLowerCase().includes(query.toLowerCase()) || a.session.toLowerCase().includes(query.toLowerCase()));
+  }, [sessions, query]);
 
   // Build flat item list for keyboard nav
   const items = useMemo<PickerItem[]>(() => {
@@ -316,7 +316,12 @@ export function AtPicker({
     );
   }
 
-  if (items.length === 0 && !query) return null;
+  if (items.length === 0 && query) return (
+    <div ref={containerRef} style={containerStyle}>
+      <div style={{ ...itemStyle, color: '#64748b', justifyContent: 'center' }}>No results</div>
+    </div>
+  );
+  if (items.length === 0) return null;
 
   let flatIdx = 0;
 
@@ -365,6 +370,7 @@ export function AtPicker({
               >
                 <span style={{ fontWeight: 500 }}>{a.shortName}</span>
                 <span style={dimStyle}>{a.agentType}</span>
+                {a.isSelf && <span style={{ ...dimStyle, color: '#60a5fa', fontSize: 10, marginLeft: 4 }}>(You)</span>}
                 {a.busy && <span style={busyDotStyle} title="Busy" />}
               </div>
             );
@@ -372,12 +378,7 @@ export function AtPicker({
         </>
       )}
 
-      {/* Empty state */}
-      {items.length === 0 && query && (
-        <div style={{ ...itemStyle, color: '#64748b', justifyContent: 'center' }}>
-          No results
-        </div>
-      )}
+      {/* Empty state handled above */}
     </div>
   );
 }

@@ -42,6 +42,8 @@ interface Props {
   onMobileFileBrowserClose?: () => void;
   /** All sessions — for @ picker agent list. */
   sessions?: SessionInfo[];
+  /** Sub-sessions — for @ picker agent list (includes deck_sub_*). */
+  subSessions?: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
 }
 
 type MenuAction = 'restart' | 'new' | 'stop';
@@ -81,7 +83,7 @@ function loadCodexModel(): CodexModelChoice | null {
   return null;
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions }: Props) {
   const { t } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -482,7 +484,24 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         {atPickerOpen && ws && activeSession && (
           <AtPicker
             query={atQuery}
-            sessions={(sessions ?? []).map(s => ({ name: s.name, agentType: s.agentType, state: s.state }))}
+            sessions={[
+              // Main sessions
+              ...(sessions ?? []).map(s => ({
+                name: s.name,
+                agentType: s.agentType,
+                state: s.state,
+                label: s.label ?? null,
+                isSelf: s.name === activeSession.name,
+              })),
+              // Sub-sessions
+              ...(subSessions ?? []).map(s => ({
+                name: s.sessionName,
+                agentType: s.type,
+                state: s.state,
+                label: s.label ?? null,
+                isSelf: s.sessionName === activeSession.name,
+              })),
+            ]}
             mainSession={activeSession.project ? `deck_${activeSession.project}` : activeSession.name.replace(/_[^_]+$/, '')}
             wsClient={ws}
             projectDir={activeSession.projectDir ?? ''}
