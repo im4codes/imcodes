@@ -496,6 +496,12 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       } catch { /* not connected */ }
     } catch (err) {
       logger.error({ sessionName, err }, 'P2P run start failed');
+      const errMsg = err instanceof Error ? err.message : String(err);
+      // Emit error ack so the message exits pending state in the UI
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
+      try {
+        serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg });
+      } catch { /* not connected */ }
     }
     return;
   }

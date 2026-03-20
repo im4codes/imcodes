@@ -419,7 +419,16 @@ function isTerminal(status: P2pRunStatus): boolean {
 }
 
 function extractMainSession(sessionName: string): string {
-  // deck_myapp_brain → deck_myapp, deck_sub_xxx → deck_sub
+  // Sub-sessions (deck_sub_*) don't follow the deck_{project}_{role} pattern.
+  // Look up the parent session from the store to resolve the correct domain.
+  if (sessionName.startsWith('deck_sub_')) {
+    const record = getSession(sessionName);
+    if (record?.parentSession) {
+      return extractMainSession(record.parentSession);
+    }
+    // No parent found — fall through to name-based extraction
+  }
+  // deck_myapp_brain → deck_myapp
   const parts = sessionName.split('_');
   if (parts.length >= 3) return parts.slice(0, -1).join('_');
   return sessionName;
