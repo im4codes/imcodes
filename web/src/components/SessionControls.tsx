@@ -91,6 +91,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [menuOpen, setMenuOpen] = useState(false);
   const [atPickerOpen, setAtPickerOpen] = useState(false);
   const [atQuery, setAtQuery] = useState('');
+  const atJustClosedRef = useRef(false);
   const [modelOpen, setModelOpen] = useState(false);
   const [quickOpen, setQuickOpen] = useState(false);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
@@ -214,6 +215,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     // When @ picker is open, let it handle Enter/Arrow/Escape — don't send or navigate history
     if (atPickerOpen && (e.key === 'Enter' || e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'Escape')) {
       // AtPicker's document-level keydown handler will handle these
+      return;
+    }
+    // Block Enter right after picker closes (prevents accidental send from the same Enter that selected)
+    if (e.key === 'Enter' && atJustClosedRef.current) {
+      e.preventDefault();
+      atJustClosedRef.current = false;
       return;
     }
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
@@ -511,11 +518,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             wsClient={ws}
             projectDir={activeSession.projectDir ?? ''}
             onSelectFile={(path) => {
-              // Replace @query with @path in input
               const text = divRef.current?.textContent ?? '';
               const before = text.replace(/@[^\s@]*$/, '');
               divRef.current!.textContent = `${before}@${path} `;
               setAtPickerOpen(false);
+              atJustClosedRef.current = true;
+              setTimeout(() => { atJustClosedRef.current = false; }, 100);
               setHasText(true);
               divRef.current?.focus();
             }}
@@ -524,6 +532,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               const before = text.replace(/@[^\s@]*$/, '');
               divRef.current!.textContent = `${before}@@cx(${session}, ${mode}) `;
               setAtPickerOpen(false);
+              atJustClosedRef.current = true;
+              setTimeout(() => { atJustClosedRef.current = false; }, 100);
               setHasText(true);
               divRef.current?.focus();
             }}
