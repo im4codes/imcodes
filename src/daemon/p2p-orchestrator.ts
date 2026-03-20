@@ -6,8 +6,8 @@
  * Completion = file grew + agent idle.
  */
 
-import { stat, writeFile, readFile, mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { stat, writeFile, readFile, mkdir, copyFile, unlink } from 'node:fs/promises';
+import { join, basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { sendKeysDelayedEnter } from '../agent/tmux.js';
 import { detectStatus, detectStatusAsync } from '../agent/detect.js';
@@ -16,6 +16,7 @@ import { getSession, type SessionRecord } from '../store/session-store.js';
 import { getP2pMode, type P2pMode } from '../shared/p2p-modes.js';
 import logger from '../util/logger.js';
 import type { ServerLink } from './server-link.js';
+import { timelineEmitter } from './timeline-emitter.js';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -47,6 +48,8 @@ export interface P2pRun {
   mode: string;
   status: P2pRunStatus;
   contextFilePath: string;
+  /** Original user request text — used in Phase 3 so initiator can execute final instructions. */
+  userText: string;
   timeoutMs: number;
   resultSummary: string | null;
   error: string | null;
@@ -69,9 +72,12 @@ export function listP2pRuns(): P2pRun[] { return [...activeRuns.values()]; }
 import { homedir } from 'node:os';
 const P2P_DIR = join(homedir(), '.imcodes', 'discussions');
 let IDLE_POLL_MS = 3_000;
+let GRACE_PERIOD_DEFAULT_MS = 30_000;
 
 /** Override poll interval for tests. */
 export function _setIdlePollMs(ms: number): void { IDLE_POLL_MS = ms; }
+/** Override grace period for tests. */
+export function _setGracePeriodMs(ms: number): void { GRACE_PERIOD_DEFAULT_MS = ms; }
 
 // ── Idle event registry (callback-driven, no polling) ─────────────────────
 
@@ -167,6 +173,7 @@ export async function startP2pRun(
     mode,
     status: 'queued',
     contextFilePath,
+    userText,
     timeoutMs: modeConfig?.defaultTimeoutMs ?? 300_000,
     resultSummary: null,
     error: null,
@@ -257,127 +264,187 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
     const target = targets[i];
     const hopLabel = `${shortName(target.session)} — ${capitalize(target.mode)} (hop ${i + 1}/${totalHops})`;
     const hopModeConfig = getP2pMode(target.mode) ?? modeConfig;
+
+    // For sandboxed agents: copy discussion file into project dir
+    const sandboxed = isSandboxedSession(target.session);
+    let sandboxLocalPath: string | null = null;
+    if (sandboxed) {
+      sandboxLocalPath = await copyToSandbox(run, target.session);
+      logger.info({ runId: run.id, target: target.session, sandboxLocalPath }, 'P2P: sandboxed agent — using project-local temp file');
+    }
+
     const hopPrompt = buildHopPrompt(run, hopModeConfig, {
       session: target.session,
       sectionHeader: hopLabel,
       instruction: `Read the full context file and provide your ${target.mode} analysis. Append your output to the file.`,
       isInitial: false,
+      filePath: sandboxLocalPath ?? undefined,
     });
 
-    // Wait for target to be idle
-    logger.info({ runId: run.id, target: target.session, mode: target.mode, hop: i + 1, totalHops }, 'P2P: Phase 2 — waiting for target idle before dispatch');
-    await waitForIdle(run, target.session, serverLink);
-    if (run._cancelled) return;
-
-    logger.info({ runId: run.id, target: target.session, status: run.status }, 'P2P: Phase 2 — target idle, dispatching hop');
-    await dispatchHop(run, target.session, hopPrompt, serverLink);
+    // Dispatch immediately — agent will queue the message and process after current task
+    logger.info({ runId: run.id, target: target.session, mode: target.mode, hop: i + 1, totalHops }, 'P2P: Phase 2 — dispatching hop');
+    await dispatchHop(run, target.session, hopPrompt, serverLink, sandboxLocalPath);
     logger.info({ runId: run.id, target: target.session, status: run.status }, 'P2P: Phase 2 — hop dispatch returned');
     if (run._cancelled || isTerminal(run.status)) return;
   }
 
-  // ── Phase 3: Initiator summary ──
+  // ── Phase 3: Initiator summary + execute user instructions ──
   logger.info({ runId: run.id, status: run.status }, 'P2P: Phase 3 — initiator summary');
   if (run._cancelled) return;
+  const summaryInstruction = [
+    'Read the complete context file with all participants\' contributions. Synthesize a final summary. Append it to the file.',
+    '',
+    'After writing the summary, execute the user\'s original request based on the discussion results.',
+    `Original user request: "${run.userText}"`,
+    'If the user requested output to a specific file (e.g. a plan document), generate that file now using the discussion consensus.',
+  ].join('\n');
   const summaryPrompt = buildHopPrompt(run, modeConfig, {
     session: run.initiatorSession,
     sectionHeader: `${shortName(run.initiatorSession)} — Summary`,
-    instruction: 'Read the complete context file with all participants\' contributions. Synthesize a final summary. Append it to the file.',
+    instruction: summaryInstruction,
     isInitial: false,
   });
   await dispatchHop(run, run.initiatorSession, summaryPrompt, serverLink);
   if (run._cancelled || isTerminal(run.status)) return;
 
   // ── Done ──
+  let fullContent = '';
   try {
-    const content = await readFile(run.contextFilePath, 'utf8');
-    run.resultSummary = content.slice(-2000); // last 2000 chars as summary
+    fullContent = await readFile(run.contextFilePath, 'utf8');
+    run.resultSummary = fullContent.slice(-2000); // last 2000 chars as summary
   } catch { /* ignore */ }
 
   run.completedAt = new Date().toISOString();
   transition(run, 'completed', serverLink);
+
+  // Emit discussion result to initiator session timeline (summary only, not full content)
+  timelineEmitter.emit(run.initiatorSession, 'assistant.text', {
+    text: `**P2P Discussion Complete** (${run.id})\n\nFile: \`${run.contextFilePath}\`\n\n${run.resultSummary ?? '(no summary)'}`,
+    p2pRunId: run.id,
+    p2pDiscussionId: run.discussionId,
+  }, { source: 'daemon' });
+
   // Keep in memory for a bit so status queries work, then clean up
   setTimeout(() => activeRuns.delete(run.id), 60_000);
 }
 
 // ── Single hop dispatch + wait ────────────────────────────────────────────
 
-async function dispatchHop(run: P2pRun, session: string, prompt: string, serverLink: ServerLink | null): Promise<void> {
+async function dispatchHop(run: P2pRun, session: string, prompt: string, serverLink: ServerLink | null, sandboxLocalPath?: string | null): Promise<void> {
   run.currentTargetSession = session;
   run.remainingTargets = run.remainingTargets.filter((t) => t.session !== session);
   transition(run, 'dispatched', serverLink);
 
-  // Record file size before dispatch
-  let sizeBefore = 0;
-  try {
-    sizeBefore = (await stat(run.contextFilePath)).size;
-  } catch { /* file should exist */ }
+  const watchPath = sandboxLocalPath ?? run.contextFilePath;
+  const MAX_RETRIES = 1;
 
-  // Send the prompt to the agent
-  try {
-    await sendKeysDelayedEnter(session, prompt);
-  } catch (err) {
-    failRun(run, 'dispatch_failed', `sendKeys failed: ${err}`, serverLink);
-    return;
-  }
-
-  // Wait for: file grows + agent idle
-  // Uses dual strategy: poll for file growth + idle, AND listen for idle hook event.
-  // Whichever fires first wins.
-  const deadline = Date.now() + run.timeoutMs;
-  let fileGrew = false;
-  let idleEventReceived = false;
-
-  // Start listening for idle event immediately
-  const idlePromise = waitForIdleEvent(session, run.timeoutMs).then((ok) => {
-    idleEventReceived = ok;
-  });
-
-  while (Date.now() < deadline) {
-    if (run._cancelled) return;
-    await sleep(IDLE_POLL_MS);
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     if (run._cancelled) return;
 
-    // Check file growth
-    if (!fileGrew) {
-      try {
-        const currentSize = (await stat(run.contextFilePath)).size;
-        if (currentSize > sizeBefore) {
-          fileGrew = true;
-          if (run.status === 'dispatched') {
-            transition(run, 'running', serverLink);
-          }
-        }
-      } catch { /* ignore */ }
+    // Record file size before dispatch
+    let sizeBefore = 0;
+    try { sizeBefore = (await stat(watchPath)).size; } catch { /* file should exist */ }
+
+    // Send the prompt (sendKeys auto-handles long text; pass cwd for sandboxed agents)
+    const sessionRecord = getSession(session);
+    const sendOpts = isSandboxedSession(session) ? { cwd: sessionRecord?.projectDir } : undefined;
+    try {
+      await sendKeysDelayedEnter(session, prompt, sendOpts);
+      // Emit prompt content to timeline for debug/tracking visibility
+      timelineEmitter.emit(session, 'user.message', {
+        text: prompt,
+        p2pRunId: run.id,
+        source: 'p2p-orchestrator',
+      }, { source: 'daemon' });
+    } catch (err) {
+      if (attempt < MAX_RETRIES) {
+        logger.warn({ runId: run.id, session, attempt }, 'P2P: sendKeys failed, will retry');
+        await sleep(2_000);
+        continue;
+      }
+      logger.warn({ runId: run.id, session, err }, 'P2P: hop dispatch failed after retry, skipping');
+      return; // skip this hop, don't fail the whole run
     }
 
-    // Check idle — either via hook event or poll
-    if (fileGrew) {
-      if (idleEventReceived) {
+    // Wait for completion: file growth + idle
+    // Grace period: agent needs time to receive prompt, parse it, and start working.
+    // Don't check idle-without-growth until after this period.
+    const GRACE_PERIOD_MS = GRACE_PERIOD_DEFAULT_MS;
+    const dispatchTime = Date.now();
+    const deadline = dispatchTime + run.timeoutMs;
+    let fileGrew = false;
+    let idleDetected = false;
+    let idleEventReceived = false;
+
+    const idlePromise = waitForIdleEvent(session, run.timeoutMs).then((ok) => { idleEventReceived = ok; });
+
+    while (Date.now() < deadline) {
+      if (run._cancelled) return;
+      await sleep(IDLE_POLL_MS);
+      if (run._cancelled) return;
+
+      // Check file growth
+      if (!fileGrew) {
+        try {
+          const currentSize = (await stat(watchPath)).size;
+          if (currentSize > sizeBefore) {
+            fileGrew = true;
+            if (run.status === 'dispatched') transition(run, 'running', serverLink);
+          }
+        } catch { /* ignore */ }
+      }
+
+      // Check idle (via event or poll) — but only after grace period or if file already grew
+      const pastGrace = (Date.now() - dispatchTime) > GRACE_PERIOD_MS;
+      if (!idleDetected && (pastGrace || fileGrew)) {
+        if (idleEventReceived) {
+          idleDetected = true;
+        } else {
+          try {
+            const record = getSession(session);
+            const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
+            if (await detectStatusAsync(session, agentType) === 'idle') idleDetected = true;
+          } catch { /* ignore */ }
+        }
+      }
+
+      // Success: file grew AND agent is idle
+      if (fileGrew && idleDetected) {
+        if (sandboxLocalPath) await copyBackFromSandbox(run, sandboxLocalPath);
         if (run.remainingTargets.length > 0 || session !== run.initiatorSession) {
           transition(run, 'awaiting_next_hop', serverLink);
         }
         return;
       }
-      // Fallback: poll via unified detectStatusAsync (includes cursor check)
-      try {
-        const record = getSession(session);
-        const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
-        if (await detectStatusAsync(session, agentType) === 'idle') {
-          if (run.remainingTargets.length > 0 || session !== run.initiatorSession) {
-            transition(run, 'awaiting_next_hop', serverLink);
-          }
-          return;
+
+      // Idle but file didn't grow (only check after grace period) → agent ignored the prompt
+      if (idleDetected && !fileGrew && pastGrace) {
+        if (attempt < MAX_RETRIES) {
+          logger.warn({ runId: run.id, session, attempt }, 'P2P: agent went idle without writing to file, retrying');
+          break; // break inner loop to retry outer loop
         }
-      } catch { /* ignore */ }
+        // Max retries exhausted — skip this hop
+        logger.warn({ runId: run.id, session }, 'P2P: agent idle without file change after retry, skipping hop');
+        if (sandboxLocalPath) await copyBackFromSandbox(run, sandboxLocalPath).catch(() => {});
+        if (run.remainingTargets.length > 0 || session !== run.initiatorSession) {
+          transition(run, 'awaiting_next_hop', serverLink);
+        }
+        return;
+      }
     }
-  }
 
-  // Cleanup: the idle event listener will auto-timeout
-  void idlePromise;
+    void idlePromise;
 
-  // Timeout
-  if (!run._cancelled) {
-    failRun(run, 'timed_out', `Hop timed out after ${run.timeoutMs}ms`, serverLink);
+    // If we got here from break (retry), continue to next attempt
+    if (idleDetected && !fileGrew && attempt < MAX_RETRIES) continue;
+
+    // Timeout — copy back whatever we got and skip (don't fail the whole run)
+    if (sandboxLocalPath) await copyBackFromSandbox(run, sandboxLocalPath).catch(() => {});
+    logger.warn({ runId: run.id, session }, 'P2P: hop timed out, skipping to next');
+    if (run.remainingTargets.length > 0 || session !== run.initiatorSession) {
+      transition(run, 'awaiting_next_hop', serverLink);
+    }
+    return;
   }
 }
 
@@ -427,6 +494,37 @@ async function waitForIdle(run: P2pRun, session: string, serverLink: ServerLink 
   }
 }
 
+// ── Sandbox detection ─────────────────────────────────────────────────────
+
+/** Agents that can only read/write files within their project directory. */
+const SANDBOXED_AGENTS = new Set(['gemini']);
+
+function isSandboxedSession(session: string): boolean {
+  const record = getSession(session);
+  return SANDBOXED_AGENTS.has(record?.agentType ?? '');
+}
+
+/**
+ * For sandboxed agents: copy the discussion file into the project dir,
+ * return the local temp path. After the hop, copyBackFromSandbox() merges it back.
+ */
+async function copyToSandbox(run: P2pRun, session: string): Promise<string | null> {
+  const record = getSession(session);
+  if (!record?.projectDir) return null;
+  const localPath = join(record.projectDir, `.p2p-${run.id}.md`);
+  await copyFile(run.contextFilePath, localPath);
+  return localPath;
+}
+
+async function copyBackFromSandbox(run: P2pRun, localPath: string): Promise<void> {
+  try {
+    await copyFile(localPath, run.contextFilePath);
+    await unlink(localPath);
+  } catch (err) {
+    logger.warn({ err, localPath }, 'P2P: failed to copy back from sandbox temp file');
+  }
+}
+
 // ── Prompt construction ───────────────────────────────────────────────────
 
 interface HopOpts {
@@ -434,10 +532,13 @@ interface HopOpts {
   sectionHeader: string;
   instruction: string;
   isInitial: boolean;
+  /** Override file path for sandboxed agents (project-local temp file). */
+  filePath?: string;
 }
 
 function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: HopOpts): string {
   const parts: string[] = [];
+  const filePath = opts.filePath ?? run.contextFilePath;
 
   // Mode role prompt
   if (mode?.prompt) {
@@ -446,14 +547,14 @@ function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: HopOpts): 
 
   // System instructions for P2P collaboration — must be extremely clear and actionable
   parts.push(`\n[P2P TASK — YOU MUST ACT ON THIS IMMEDIATELY]`);
-  parts.push(`This is an automated P2P Quick Discussion task (run: ${run.id}). Do NOT reply conversationally. Execute the steps below NOW.`);
+  parts.push(`This is a P2P Quick Discussion task (run: ${run.id}). Do NOT reply conversationally. Execute the steps below NOW.`);
   parts.push(``);
-  parts.push(`Step 1: Read the context file: ${run.contextFilePath}`);
+  parts.push(`Step 1: Read the context file: ${filePath}`);
   parts.push(`Step 2: ${opts.instruction}`);
   parts.push(`Step 3: Append your analysis to the SAME file under the heading "## ${opts.sectionHeader}"`);
   parts.push(``);
   parts.push(`CRITICAL RULES:`);
-  parts.push(`- Write output to the FILE at ${run.contextFilePath}, NOT to the chat/screen.`);
+  parts.push(`- Write output to the FILE at ${filePath}, NOT to the chat/screen.`);
   parts.push(`- Use your file editing tools (Edit/Write/Bash) to append to the file.`);
   parts.push(`- Do NOT ask the user for confirmation. Just do it.`);
   parts.push(`- After writing, say "Done" and nothing else.`);

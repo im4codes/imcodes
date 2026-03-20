@@ -53,54 +53,56 @@ export async function getCursorLine(session: string): Promise<string> {
 }
 
 export interface SendKeysOptions {
-  /** Use chunked send-keys -l instead of paste-buffer for large text (for agents that don't support bracketed paste). */
+  /** @deprecated No longer needed — long text handling is automatic. */
   chunked?: boolean;
+  /** Project directory — used to place temp files inside the project for sandboxed agents (Gemini). */
+  cwd?: string;
 }
 
-/** Send a string of keys to a tmux pane (newline = Enter). */
 /**
  * Send text then Enter to a tmux session.
- * For small strings, uses `send-keys -l`.
- * For large strings, uses `load-buffer -` (stdin) + `paste-buffer` (bracketed paste).
- * Set `chunked: true` for agents that don't handle bracketed paste (Codex, Gemini, etc.)
- * — text is split into chunks and sent via `send-keys -l`.
+ *
+ * **Default (no cwd)** — for CC and agents that handle bracketed paste:
+ * - Short text (≤200, single line): `send-keys -l`
+ * - Long text: `load-buffer` + `paste-buffer` (bracketed paste, content sent directly)
+ *
+ * **With cwd** — for sandboxed agents (Gemini) that can't handle paste-buffer or /tmp:
+ * - Write to temp file in project dir, send "read <path>" instruction
+ * - 60s auto-cleanup
+ *
+ * Always sends Enter after text. Long text gets a 3s safety-net Enter.
  */
 export async function sendKeys(session: string, keys: string, opts?: SendKeysOptions): Promise<void> {
-  if (keys.length > 4000 || keys.includes('\n')) {
-    if (opts?.chunked) {
-      if (keys.length > 100) {
-        // Write to temp file and send a short reference — much more reliable than chunked send-keys
-        const hash = createHash('md5').update(session).digest('hex').slice(0, 8);
-        const filePath = `/tmp/imcodes-${hash}.md`;
-        await fsp.writeFile(filePath, keys, 'utf-8');
-        const escaped = filePath.replace(/'/g, "'\\''");
-        await tmuxExec(`send-keys -t ${session} -l -- 'see ${escaped}'`);
-      } else {
-        await sendKeysChunked(session, keys);
-      }
-    } else {
-      // Use buffer for large strings or multi-line text (send-keys -l treats \n as Enter, breaking input)
-      const bufferName = `buf_${session}_${Date.now()}`;
-      const { spawn } = await import('child_process');
-      const proc = spawn('tmux', ['load-buffer', '-b', bufferName, '-']);
-      proc.stdin.write(keys);
-      proc.stdin.end();
-      await new Promise<void>((resolve, reject) => {
-        proc.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`tmux load-buffer failed with code ${code}`))));
-        proc.on('error', reject);
-      });
-      await tmuxExec(`paste-buffer -p -t ${session} -b ${bufferName}`);
-      await tmuxExec(`delete-buffer -b ${bufferName}`).catch(() => {});
-    }
+  const isLong = keys.length > 200 || keys.includes('\n');
+
+  if (isLong) {
+    // Write to temp file + send read instruction
+    // With cwd: file in project dir (Gemini sandbox), without: /tmp (CC etc.)
+    const hash = createHash('md5').update(session + Date.now()).digest('hex').slice(0, 8);
+    const fileName = `.imcodes-prompt-${hash}.md`;
+    const filePath = opts?.cwd ? path.join(opts.cwd, fileName) : `/tmp/${fileName}`;
+    await fsp.writeFile(filePath, keys, 'utf-8');
+    const instruction = `Read and execute all instructions in @${filePath}`;
+    const escaped = instruction.replace(/'/g, "'\\''");
+    await tmuxExec(`send-keys -t ${session} -l -- '${escaped}'`);
+    setTimeout(() => fsp.unlink(filePath).catch(() => {}), 120_000);
   } else {
+    // Short text: simple send-keys
     const escaped = keys.replace(/'/g, "'\\''");
     await tmuxExec(`send-keys -t ${session} -l -- '${escaped}'`);
   }
-  // Scale delay with text length; chunked mode needs ~3x longer for agents to settle
-  const base = 80 + Math.floor(keys.length / 10) * 5;
-  const delay = Math.min(opts?.chunked ? base * 3 : base, opts?.chunked ? 10000 : 1000);
+
+  // Delay before Enter
+  const delay = isLong ? 500 : Math.min(80 + Math.floor(keys.length / 10) * 5, 1000);
   await new Promise<void>((r) => setTimeout(r, delay));
   await tmuxExec(`send-keys -t ${session} Enter`);
+
+  // Safety net: 3s delayed Enter for long text (empty-line Enter is a no-op)
+  if (isLong) {
+    setTimeout(async () => {
+      try { await tmuxExec(`send-keys -t ${session} Enter`); } catch { /* ignore */ }
+    }, 3_000);
+  }
 }
 
 const CHUNK_SIZE = 800;

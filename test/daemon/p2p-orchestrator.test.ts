@@ -34,6 +34,7 @@ vi.mock('../../src/store/session-store.js', () => ({
 
 vi.mock('../../src/agent/detect.js', () => ({
   detectStatus: detectStatusMock,
+  detectStatusAsync: detectStatusMock, // same mock — returns status string
 }));
 
 vi.mock('../../src/util/logger.js', () => ({
@@ -53,6 +54,7 @@ import {
   getP2pRun,
   listP2pRuns,
   _setIdlePollMs,
+  _setGracePeriodMs,
   type P2pRun,
   type P2pRunStatus,
   notifySessionIdle,
@@ -124,6 +126,7 @@ async function makeTempDir(): Promise<string> {
 beforeEach(() => {
   vi.clearAllMocks();
   _setIdlePollMs(50); // fast polling for tests
+  _setGracePeriodMs(100); // short grace period for tests
   // Default: agent is idle immediately
   detectStatusMock.mockReturnValue('idle');
   capturePaneMock.mockResolvedValue(['$']);
@@ -146,6 +149,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
   vi.useRealTimers();
   _setIdlePollMs(3_000); // restore default
+  _setGracePeriodMs(30_000); // restore default
   // Clean up temp files
   const { rm } = await import('node:fs/promises');
   const { homedir } = await import('node:os');
@@ -406,8 +410,8 @@ describe('Group 10: State Machine Transitions', () => {
     if (hopResolve) hopResolve();
   });
 
-  it('dispatched → timed_out when timeout elapses without file growth', async () => {
-    // Agent never becomes idle, file never grows — but don't write to context file
+  it('dispatched → hop skipped on timeout, chain still completes', async () => {
+    // Agent never becomes idle, file never grows — hop times out and is skipped
     detectStatusMock.mockReturnValue('thinking');
     sendKeysDelayedEnterMock.mockResolvedValue(undefined); // no file write
 
@@ -416,10 +420,9 @@ describe('Group 10: State Machine Transitions', () => {
       if (msg.run?.status) transitions.push(msg.run.status);
     });
 
-    // Override the mode to have a very short timeout
     const { BUILT_IN_MODES: modes } = await import('../../src/shared/p2p-modes.js');
     const original = modes[0].defaultTimeoutMs;
-    modes[0].defaultTimeoutMs = 200; // 200ms timeout
+    modes[0].defaultTimeoutMs = 300; // short timeout
 
     const run = await startP2pRun(
       'deck_proj_brain',
@@ -429,15 +432,17 @@ describe('Group 10: State Machine Transitions', () => {
       serverLinkMock as any,
     );
 
-    // Wait for timeout to fire
-    await waitForStatus(run.id, 'timed_out', 3_000);
+    // Hop timeout no longer fails the run — it skips. Chain may still complete or timeout on summary.
+    await waitForStatus(run.id, ['completed', 'awaiting_next_hop'], 5_000);
 
-    modes[0].defaultTimeoutMs = original; // restore
+    modes[0].defaultTimeoutMs = original;
 
-    expect(transitions).toContain('timed_out');
+    // Should NOT be timed_out (hops are skipped, not failed)
+    expect(transitions).not.toContain('timed_out');
   }, 10_000);
 
-  it('running → failed with session_crashed (dispatch_failed via sendKeys error)', async () => {
+  it('sendKeys failure retries once then skips hop (chain continues)', async () => {
+    // sendKeys always fails — hop is retried once then skipped
     sendKeysDelayedEnterMock.mockRejectedValue(new Error('tmux session not found'));
 
     let transitions: P2pRunStatus[] = [];
@@ -453,40 +458,15 @@ describe('Group 10: State Machine Transitions', () => {
       serverLinkMock as any,
     );
 
-    await waitForStatus(run.id, 'failed', 5_000);
+    // Chain should still complete (skipped hops don't fail the run)
+    await waitForStatus(run.id, ['completed', 'awaiting_next_hop'], 30_000);
 
-    expect(transitions).toContain('failed');
-    const finalRun = getP2pRun(run.id);
-    if (finalRun) {
-      expect(finalRun.error).toContain('dispatch_failed');
-    }
-  });
-
-  it('running → failed with dispatch_failed', async () => {
-    // sendKeys fails on the first hop
-    sendKeysDelayedEnterMock.mockRejectedValueOnce(new Error('connection refused'));
-
-    let transitions: P2pRunStatus[] = [];
-    serverLinkMock.send.mockImplementation((msg: any) => {
-      if (msg.run?.status) transitions.push(msg.run.status);
-    });
-
-    const run = await startP2pRun(
-      'deck_proj_brain',
-      [{ session: 'deck_proj_w1', mode: 'review' }],
-      'review',
-      [],
-      serverLinkMock as any,
-    );
-
-    await waitForStatus(run.id, 'failed', 5_000);
-
-    expect(transitions).toContain('failed');
-    const finalRun = getP2pRun(run.id);
-    if (finalRun) {
-      expect(finalRun.error).toContain('dispatch_failed');
-    }
-  });
+    // Should NOT be 'failed' — hop skipped, chain continues
+    expect(transitions).not.toContain('failed');
+    // sendKeys called at least 2x for the failing hop (original + retry)
+    const failingCalls = sendKeysDelayedEnterMock.mock.calls.length;
+    expect(failingCalls).toBeGreaterThanOrEqual(2);
+  }, 45_000);
 
   it('awaiting_next_hop → cancelled when cancel between hops', async () => {
     let hopCount = 0;
@@ -739,8 +719,8 @@ describe('Group 11: Bookend Chain Flow', () => {
 // =============================================================================
 
 describe('Group 12: Completion Detection', () => {
-  it('file unchanged + agent idle → NOT complete (times out)', async () => {
-    // Agent is idle but sendKeys doesn't write to file → no file growth → timeout
+  it('file unchanged + agent idle → retry once then skip hop', async () => {
+    // Agent is idle but sendKeys doesn't write to file → idle without growth → retry → skip
     detectStatusMock.mockReturnValue('idle');
     sendKeysDelayedEnterMock.mockResolvedValue(undefined); // no file write
 
@@ -749,10 +729,9 @@ describe('Group 12: Completion Detection', () => {
       if (msg.run?.status) transitions.push(msg.run.status);
     });
 
-    // Use very short timeout
     const { BUILT_IN_MODES: modes } = await import('../../src/shared/p2p-modes.js');
     const original = modes[0].defaultTimeoutMs;
-    modes[0].defaultTimeoutMs = 300;
+    modes[0].defaultTimeoutMs = 500;
 
     const run = await startP2pRun(
       'deck_proj_brain',
@@ -762,13 +741,15 @@ describe('Group 12: Completion Detection', () => {
       serverLinkMock as any,
     );
 
-    await waitForStatus(run.id, 'timed_out', 5_000);
+    // Hop skipped, chain continues to completion
+    await waitForStatus(run.id, ['completed', 'awaiting_next_hop'], 10_000);
     modes[0].defaultTimeoutMs = original;
 
-    expect(transitions).toContain('timed_out');
-  }, 10_000);
+    // sendKeys should be called >= 2x for the failing hop (attempt + retry)
+    expect(sendKeysDelayedEnterMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+  }, 15_000);
 
-  it('file grew + agent still working → NOT complete (times out eventually)', async () => {
+  it('file grew + agent still working → hop times out and is skipped', async () => {
     // Agent is always working, file grows on dispatch
     detectStatusMock.mockReturnValue('thinking');
 
@@ -787,9 +768,6 @@ describe('Group 12: Completion Detection', () => {
 
     const { BUILT_IN_MODES: modes } = await import('../../src/shared/p2p-modes.js');
     const original = modes[0].defaultTimeoutMs;
-    // Use a longer timeout (2s) to ensure at least several poll cycles run before timeout.
-    // The previous 500ms value was too tight for CI environments with high CPU load,
-    // where sleep(50ms) can drift significantly.
     modes[0].defaultTimeoutMs = 2_000;
 
     const run = await startP2pRun(
@@ -800,20 +778,18 @@ describe('Group 12: Completion Detection', () => {
       serverLinkMock as any,
     );
 
-    await waitForStatus(run.id, 'timed_out', 10_000);
+    // Hop timeout skips instead of failing — chain continues
+    await waitForStatus(run.id, ['completed', 'awaiting_next_hop'], 15_000);
     modes[0].defaultTimeoutMs = original;
 
-    // File grew but agent never idle → should time out, never complete.
-    // 'running' should appear if the poll detected file growth before timeout;
-    // on very slow CI it may skip straight from dispatched → timed_out.
-    expect(transitions).not.toContain('completed');
-    expect(transitions).toContain('timed_out');
-    // If running was detected, it should come after dispatched
+    // File grew but agent never idle → hop skipped, chain continues
+    expect(transitions).not.toContain('timed_out');
+    // running should appear if file growth was detected
     const runIdx = transitions.indexOf('running');
     if (runIdx >= 0) {
       expect(transitions.indexOf('dispatched')).toBeLessThan(runIdx);
     }
-  }, 15_000);
+  }, 20_000);
 
   it('file grew + agent idle → hop complete', async () => {
     // Agent becomes idle immediately, file grows on dispatch
@@ -838,6 +814,41 @@ describe('Group 12: Completion Detection', () => {
     const final = await waitForStatus(run.id, 'completed', 15_000);
     expect(final?.status).toBe('completed');
   });
+
+  it('idle without file growth → retries prompt once then succeeds on retry', async () => {
+    // First attempt: agent goes idle without writing. Second attempt: agent writes.
+    let callCount = 0;
+    sendKeysDelayedEnterMock.mockImplementation(async (_session: string, _prompt: string) => {
+      callCount++;
+      if (callCount <= 2) {
+        // First 2 calls (attempt 0 for initiator + attempt 0 for w1): no file write
+        return;
+      }
+      // Subsequent calls: write to file (retry succeeds)
+      const runs = listP2pRuns();
+      const run = runs[runs.length - 1];
+      if (run) {
+        const current = await readFile(run.contextFilePath, 'utf8');
+        await writeFile(run.contextFilePath, current + `\n## Call ${callCount}\n\nDone.`, 'utf8');
+      }
+    });
+
+    detectStatusMock.mockReturnValue('idle');
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'audit code',
+      [],
+      serverLinkMock as any,
+    );
+
+    const final = await waitForStatus(run.id, 'completed', 15_000);
+    // Chain should eventually complete (retries succeed)
+    expect(final?.status).toBe('completed');
+    // Should have more calls than a normal 3-hop chain due to retries
+    expect(callCount).toBeGreaterThan(3);
+  }, 20_000);
 
   it('file grew after cancel → ignored', async () => {
     detectStatusMock.mockReturnValue('thinking');
@@ -868,7 +879,7 @@ describe('Group 12: Completion Detection', () => {
     expect(finalRun).toBeUndefined(); // deleted from activeRuns on cancel
   });
 
-  it('timeout fires before file growth → timed_out', async () => {
+  it('timeout fires before file growth → hop skipped, chain continues', async () => {
     detectStatusMock.mockReturnValue('thinking');
     sendKeysDelayedEnterMock.mockResolvedValue(undefined); // no file write
 
@@ -889,10 +900,11 @@ describe('Group 12: Completion Detection', () => {
       serverLinkMock as any,
     );
 
-    await waitForStatus(run.id, 'timed_out', 5_000);
+    await waitForStatus(run.id, ['completed', 'awaiting_next_hop'], 5_000);
     modes[0].defaultTimeoutMs = original;
 
-    expect(transitions).toContain('timed_out');
+    // Hop skipped, not failed
+    expect(transitions).not.toContain('timed_out');
   });
 });
 
@@ -1299,5 +1311,131 @@ describe('P2P Modes', () => {
       expect(['findings-first', 'summary-first', 'free-form']).toContain(mode.resultStyle);
       expect(mode.maxOutputChars).toBeGreaterThan(0);
     }
+  });
+});
+
+// =============================================================================
+// Group 16: Gemini Idle Pattern
+// =============================================================================
+
+describe('Group 16: Gemini Idle Pattern', () => {
+  it('detects "Type your message or @" as Gemini idle', async () => {
+    const { detectStatus } = await import('../../src/agent/detect.js');
+    // Simulate Gemini pane output with the new prompt
+    const lines = [
+      '✦ Done',
+      '',
+      '                                                                ? for shortcuts',
+      '────────────────────────────────────────────────────────────────────────────',
+      ' YOLO ctrl+y                                                   1 GEMINI.md file',
+      ' *   Type your message or @path/to/file',
+    ];
+    const status = detectStatus(lines, 'gemini');
+    expect(status).toBe('idle');
+  });
+
+  it('detects bare ">" as Gemini idle (legacy)', async () => {
+    const { detectStatus } = await import('../../src/agent/detect.js');
+    const lines = ['Some output', '', '>'];
+    const status = detectStatus(lines, 'gemini');
+    expect(status).toBe('idle');
+  });
+});
+
+// =============================================================================
+// Group 17: Grace Period Behavior
+// =============================================================================
+
+describe('Group 17: Grace Period Behavior', () => {
+  it('idle without file growth is NOT triggered during grace period', async () => {
+    // Agent is idle immediately but file never grows
+    // With a long grace period, the hop should NOT be skipped quickly
+    detectStatusMock.mockReturnValue('idle');
+    sendKeysDelayedEnterMock.mockResolvedValue(undefined); // no file write
+
+    _setGracePeriodMs(5_000); // 5s grace period
+    const { BUILT_IN_MODES: modes } = await import('../../src/shared/p2p-modes.js');
+    const original = modes[0].defaultTimeoutMs;
+    modes[0].defaultTimeoutMs = 2_000; // 2s timeout (less than grace period)
+
+    const transitions: P2pRunStatus[] = [];
+    serverLinkMock.send.mockImplementation((msg: any) => {
+      if (msg.run?.status) transitions.push(msg.run.status);
+    });
+
+    const startTime = Date.now();
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'audit',
+      [],
+      serverLinkMock as any,
+    );
+
+    await waitForStatus(run.id, ['completed', 'awaiting_next_hop'], 10_000);
+    const elapsed = Date.now() - startTime;
+
+    modes[0].defaultTimeoutMs = original;
+    _setGracePeriodMs(100); // restore test default
+
+    // Should have taken at least ~2s (timeout) not been skipped instantly
+    // The hop times out rather than being skipped by idle-without-growth
+    expect(elapsed).toBeGreaterThan(1_500);
+  }, 15_000);
+
+  it('idle-without-growth IS detected after grace period expires', async () => {
+    detectStatusMock.mockReturnValue('idle');
+    sendKeysDelayedEnterMock.mockResolvedValue(undefined);
+
+    _setGracePeriodMs(100); // very short grace
+    const { BUILT_IN_MODES: modes } = await import('../../src/shared/p2p-modes.js');
+    const original = modes[0].defaultTimeoutMs;
+    modes[0].defaultTimeoutMs = 10_000;
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'audit',
+      [],
+      serverLinkMock as any,
+    );
+
+    // Should complete quickly — grace period is only 100ms, then idle-without-growth detected
+    await waitForStatus(run.id, ['completed', 'awaiting_next_hop'], 5_000);
+
+    modes[0].defaultTimeoutMs = original;
+    _setGracePeriodMs(100);
+
+    // sendKeys called >= 2x (attempt + retry)
+    expect(sendKeysDelayedEnterMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+  }, 10_000);
+});
+
+// =============================================================================
+// Group 18: Completion Event
+// =============================================================================
+
+describe('Group 18: Completion Event', () => {
+  it('resultSummary is capped at 2000 chars', async () => {
+    sendKeysDelayedEnterMock.mockImplementation(async () => {
+      const runs = listP2pRuns();
+      const run = runs[runs.length - 1];
+      if (run) {
+        const current = await readFile(run.contextFilePath, 'utf8');
+        await writeFile(run.contextFilePath, current + '\n' + 'X'.repeat(5000), 'utf8');
+      }
+    });
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'audit code',
+      [],
+      serverLinkMock as any,
+    );
+
+    const final = await waitForStatus(run.id, 'completed', 15_000);
+    expect(final?.resultSummary).toBeDefined();
+    expect(final!.resultSummary!.length).toBeLessThanOrEqual(2000);
   });
 });

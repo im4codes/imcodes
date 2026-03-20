@@ -269,10 +269,9 @@ export async function startup(): Promise<DaemonContext> {
         }
       },
       sendToSession: async (sessionName, text) => {
-        const agentType = (await import('../store/session-store.js')).getSession(sessionName)?.agentType;
-        const chunkedAgents = new Set(['codex', 'gemini', 'opencode', 'shell', 'script']);
-        const opts = agentType && chunkedAgents.has(agentType) ? { chunked: true } : undefined;
-        await sendKeys(sessionName, text, opts);
+        const record = (await import('../store/session-store.js')).getSession(sessionName);
+        const cwd = record?.agentType === 'gemini' ? record?.projectDir : undefined;
+        await sendKeys(sessionName, text, cwd ? { cwd } : undefined);
       },
       persistBinding,
       removeBinding,

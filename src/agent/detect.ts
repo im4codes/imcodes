@@ -92,6 +92,7 @@ const OC_TOOL_PATTERNS = [
 const GEMINI_IDLE_PATTERNS = [
   /^\s*>\s*$/m,                        // line that is ONLY ">" — the REPL prompt
   /^\s*❯\s*$/m,                        // line that is ONLY "❯" — alternate prompt
+  /Type your message or @/m,           // Gemini CLI input prompt (newer versions)
 ];
 
 const GEMINI_SPINNER_CHARS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];

@@ -425,11 +425,13 @@ async function handleStop(cmd: Record<string, unknown>): Promise<void> {
  * - codex: strip `!` and send the shell command directly (Codex has no `!` prefix)
  * - others: send as-is
  */
-/** Agents that don't support bracketed paste and need chunked send-keys. */
-const CHUNKED_AGENTS = new Set(['codex', 'gemini', 'opencode', 'shell', 'script']);
+/** Agents with sandboxed file access — temp files must be in project dir. */
+const SANDBOXED_AGENTS = new Set(['gemini']);
 
 async function sendShellAwareCommand(sessionName: string, text: string, agentType: string): Promise<void> {
-  const opts = CHUNKED_AGENTS.has(agentType) ? { chunked: true } : undefined;
+  const record = getSession(sessionName);
+  const cwd = SANDBOXED_AGENTS.has(agentType) ? record?.projectDir : undefined;
+  const opts = cwd ? { cwd } : undefined;
   if (text.startsWith('!')) {
     const shellCmd = text.slice(1).trimStart();
     if (agentType === 'codex') {
