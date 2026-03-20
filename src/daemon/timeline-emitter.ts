@@ -4,8 +4,12 @@
  */
 
 import { createHash } from 'crypto';
+import { readFileSync } from 'fs';
 import type { TimelineEvent, TimelineEventType, TimelineSource, TimelineConfidence } from './timeline-event.js';
 import { timelineStore } from './timeline-store.js';
+
+/** Pattern matching temp file instruction: "Read and execute all instructions in @<path>" */
+const TEMP_FILE_RE = /^Read and execute all instructions in @(.+\.imcodes-prompt-[0-9a-f]+\.md)$/;
 
 const MAX_BUFFER = 500;
 
@@ -40,11 +44,22 @@ export class TimelineEmitter {
     // Deduplicate user.message — skip if same session + same text within 5s
     if (type === 'user.message') {
       const text = String(payload.text ?? '');
+
+      // Resolve temp file references: replace instruction with actual file content
+      const tempMatch = text.match(TEMP_FILE_RE);
+      if (tempMatch) {
+        try {
+          const content = readFileSync(tempMatch[1], 'utf-8');
+          payload = { ...payload, text: content, tempFile: tempMatch[1] };
+        } catch { /* file already cleaned up or unreadable — keep original text */ }
+      }
+
       const key = sessionId;
+      const resolvedText = String(payload.text ?? '');
       const prev = this.recentUserMsg.get(key);
       const now = Date.now();
-      if (prev && prev.text === text && now - prev.ts < 5_000) return null;
-      this.recentUserMsg.set(key, { text, ts: now });
+      if (prev && prev.text === resolvedText && now - prev.ts < 5_000) return null;
+      this.recentUserMsg.set(key, { text: resolvedText, ts: now });
     }
 
     const seq = (this.seqMap.get(sessionId) ?? 0) + 1;
