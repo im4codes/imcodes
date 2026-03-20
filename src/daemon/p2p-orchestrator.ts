@@ -350,14 +350,20 @@ function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: HopOpts): 
     parts.push(mode.prompt);
   }
 
-  // System instructions for P2P collaboration
-  parts.push(`\n--- P2P Collaboration Instructions ---`);
-  parts.push(`You are participating in a P2P Quick Discussion (run: ${run.id}).`);
-  parts.push(`Read the context file at: ${run.contextFilePath}`);
-  parts.push(`Then append your output to that same file under the section header: ## ${opts.sectionHeader}`);
-  parts.push(`${opts.instruction}`);
-  parts.push(`IMPORTANT: Write your output to the FILE, not to the screen. Use a tool like Write/Bash to append to the file.`);
-  parts.push(`--- End Instructions ---`);
+  // System instructions for P2P collaboration — must be extremely clear and actionable
+  parts.push(`\n[P2P TASK — YOU MUST ACT ON THIS IMMEDIATELY]`);
+  parts.push(`This is an automated P2P Quick Discussion task (run: ${run.id}). Do NOT reply conversationally. Execute the steps below NOW.`);
+  parts.push(``);
+  parts.push(`Step 1: Read the context file: ${run.contextFilePath}`);
+  parts.push(`Step 2: ${opts.instruction}`);
+  parts.push(`Step 3: Append your analysis to the SAME file under the heading "## ${opts.sectionHeader}"`);
+  parts.push(``);
+  parts.push(`CRITICAL RULES:`);
+  parts.push(`- Write output to the FILE at ${run.contextFilePath}, NOT to the chat/screen.`);
+  parts.push(`- Use your file editing tools (Edit/Write/Bash) to append to the file.`);
+  parts.push(`- Do NOT ask the user for confirmation. Just do it.`);
+  parts.push(`- After writing, say "Done" and nothing else.`);
+  parts.push(`[END P2P TASK]`);
 
   return parts.join('\n');
 }
