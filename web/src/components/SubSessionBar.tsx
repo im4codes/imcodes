@@ -200,7 +200,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onNewDiscus
             >
               ⚙
             </button>
-            <span class="subcard-toolbar-label">Sub-sessions ({subSessions.length})</span>
+            <span class="subcard-toolbar-label">Subs ({subSessions.length})</span>
             {stats && (
               <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`}>
                 {stats.daemonVersion && (

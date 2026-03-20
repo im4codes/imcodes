@@ -51,6 +51,10 @@
 	<string>IM.codes uses speech recognition to convert your voice to text commands.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>IM.codes needs microphone access for voice input.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>IM.codes needs camera access to take photos for upload.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>IM.codes needs photo library access to select files for upload.</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>

@@ -115,6 +115,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   // File upload state
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadError, setUploadError] = useState<string | null>(null);
 
   // Keep external inputRef in sync so parent can call .focus()
@@ -309,11 +310,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const handleFileUpload = useCallback(async (files: FileList | null) => {
     if (!files || files.length === 0 || !serverId) return;
     setUploading(true);
+    setUploadProgress(0);
     setUploadError(null);
     const paths: string[] = [];
     for (const file of Array.from(files)) {
       try {
-        const result = await uploadFile(serverId, file);
+        const result = await uploadFile(serverId, file, (pct) => setUploadProgress(pct));
         if (result.attachment?.daemonPath) {
           paths.push('@' + result.attachment.daemonPath + ' ');
         }
@@ -503,6 +505,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           </div>
         )}
       </div>}
+
+      {/* Upload progress bar */}
+      {uploading && (
+        <div style={{ margin: '0 8px 4px', height: 18, display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ flex: 1, height: 4, background: 'rgba(255,255,255,0.1)', borderRadius: 2, overflow: 'hidden' }}>
+            <div style={{ width: `${uploadProgress}%`, height: '100%', background: '#3b82f6', borderRadius: 2, transition: 'width 0.2s ease' }} />
+          </div>
+          <span style={{ fontSize: 11, color: '#94a3b8', minWidth: 32 }}>{uploadProgress}%</span>
+        </div>
+      )}
 
       {/* Upload error banner */}
       {uploadError && (

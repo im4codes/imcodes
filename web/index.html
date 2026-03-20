@@ -48,14 +48,19 @@
         50% { opacity: 0.7; }
       }
 
-      /* Logo container */
+      /* Logo container — two-line layout */
       .splash-logo {
         position: relative; z-index: 2;
-        display: flex; align-items: baseline; gap: 0;
-        font-size: clamp(42px, 10vw, 72px);
+        display: flex; flex-direction: column; align-items: center; gap: 0;
         font-weight: 700;
         letter-spacing: -0.02em;
         line-height: 1;
+      }
+
+      /* Top line: "IM." */
+      .splash-top {
+        display: flex; align-items: baseline;
+        font-size: clamp(56px, 14vw, 96px);
       }
 
       /* "IM" — glitch decode */
@@ -76,13 +81,16 @@
         animation: dotAppear 0.15s ease-out 0.7s both;
       }
 
-      /* "codes" — type out */
+      /* Bottom line: "codes" — type out */
       .splash-codes {
+        display: inline-block;
+        font-size: clamp(40px, 10vw, 68px);
         color: #94a3b8;
         overflow: hidden;
         white-space: nowrap;
         width: 0;
         animation: typeOut 0.5s steps(5, end) 0.85s forwards;
+        margin-top: 4px;
       }
 
       /* Subtitle */
@@ -130,7 +138,7 @@
 
       @keyframes typeOut {
         0% { width: 0; }
-        100% { width: 2.8em; }
+        100% { width: 3.4em; }
       }
 
       @keyframes fadeUp {
@@ -153,7 +161,8 @@
     <div id="splash">
       <div class="splash-scan"></div>
       <div class="splash-logo">
-        <span class="splash-im">IM</span><span class="splash-dot">.</span><span class="splash-codes">codes</span>
+        <div class="splash-top"><span class="splash-im">IM</span><span class="splash-dot">.</span></div>
+        <span class="splash-codes">codes</span>
       </div>
       <div class="splash-sub">initializing</div>
       <div class="splash-beam"></div>

@@ -381,19 +381,43 @@ export interface AttachmentRefResponse {
 export async function uploadFile(
   serverId: string,
   file: File,
+  onProgress?: (pct: number) => void,
 ): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
   const form = new FormData();
   form.append('file', file);
-  // Use rawFetch to avoid Content-Type override (browser sets multipart boundary)
-  const res = await rawFetch(`/api/server/${serverId}/upload`, {
-    method: 'POST',
-    body: form,
+
+  // Use XHR for upload progress reporting
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${_baseUrl}/api/server/${serverId}/upload`);
+
+    // Auth headers (same as rawFetch)
+    if (_apiKey) {
+      xhr.setRequestHeader('Authorization', `Bearer ${_apiKey}`);
+    } else {
+      xhr.withCredentials = true;
+      const csrf = document.cookie.match(/csrf_token=([^;]+)/)?.[1];
+      if (csrf) xhr.setRequestHeader('X-CSRF-Token', csrf);
+    }
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) {
+        onProgress(Math.round((e.loaded / e.total) * 100));
+      }
+    };
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try { resolve(JSON.parse(xhr.responseText)); }
+        catch { reject(new ApiError(xhr.status, 'Invalid JSON response')); }
+      } else {
+        reject(new ApiError(xhr.status, xhr.responseText));
+      }
+    };
+
+    xhr.onerror = () => reject(new ApiError(0, 'Network error'));
+    xhr.send(form);
   });
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new ApiError(res.status, body);
-  }
-  return res.json() as Promise<{ ok: boolean; attachment: AttachmentRefResponse }>;
 }
 
 export async function downloadAttachment(serverId: string, attachmentId: string): Promise<void> {
