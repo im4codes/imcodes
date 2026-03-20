@@ -62,7 +62,7 @@ import { getP2pMode, BUILT_IN_MODES } from '../../src/shared/p2p-modes.js';
 // parseAtTokens is not exported from command-handler, so we replicate its logic
 // here for isolated testing. The regexes and logic are copied verbatim.
 
-const CX_TOKEN_RE = /@@cx\(([^,]+),\s*([^)]+)\)/g;
+const DISCUSS_TOKEN_RE = /@@discuss\(([^,]+),\s*([^)]+)\)/g;
 const FILE_TOKEN_RE = /@((?:[a-zA-Z0-9_.\-/]+\/)*[a-zA-Z0-9_.\-]+\.[a-zA-Z0-9]+)/g;
 
 interface ParsedTokens {
@@ -74,10 +74,10 @@ interface ParsedTokens {
 function parseAtTokens(text: string): ParsedTokens {
   const agents: Array<{ session: string; mode: string }> = [];
   const files: string[] = [];
-  for (const m of text.matchAll(CX_TOKEN_RE)) {
+  for (const m of text.matchAll(DISCUSS_TOKEN_RE)) {
     agents.push({ session: m[1].trim(), mode: m[2].trim() });
   }
-  let withoutCx = text.replace(CX_TOKEN_RE, '');
+  let withoutCx = text.replace(DISCUSS_TOKEN_RE, '');
   for (const m of withoutCx.matchAll(FILE_TOKEN_RE)) {
     files.push(m[1]);
   }
@@ -1090,8 +1090,8 @@ describe('Group 14: Error Handling', () => {
 
 describe('Group 15: Token Parser + File Search', () => {
   describe('parseAtTokens', () => {
-    it('extracts @@cx tokens', () => {
-      const result = parseAtTokens('hello @@cx(deck_proj_w1, audit) world');
+    it('extracts @@discuss tokens', () => {
+      const result = parseAtTokens('hello @@discuss(deck_proj_w1, audit) world');
       expect(result.agents).toEqual([{ session: 'deck_proj_w1', mode: 'audit' }]);
       expect(result.cleanText).toBe('hello world');
     });
@@ -1105,7 +1105,7 @@ describe('Group 15: Token Parser + File Search', () => {
 
     it('handles mixed tokens', () => {
       const result = parseAtTokens(
-        'review @@cx(deck_proj_w1, audit) @src/auth.ts and @@cx(deck_proj_w2, review) @lib/utils.ts please',
+        'review @@discuss(deck_proj_w1, audit) @src/auth.ts and @@discuss(deck_proj_w2, review) @lib/utils.ts please',
       );
 
       expect(result.agents).toEqual([
@@ -1116,14 +1116,14 @@ describe('Group 15: Token Parser + File Search', () => {
       expect(result.cleanText).toBe('review and please');
     });
 
-    it('does not partially match @@cx tokens as @file tokens', () => {
-      const result = parseAtTokens('test @@cx(deck_proj_w1, audit) only');
-      // The @@cx token should not produce a file match
+    it('does not partially match @@discuss tokens as @file tokens', () => {
+      const result = parseAtTokens('test @@discuss(deck_proj_w1, audit) only');
+      // The @@discuss token should not produce a file match
       expect(result.files).toEqual([]);
     });
 
-    it('handles multiple @@cx tokens', () => {
-      const result = parseAtTokens('@@cx(deck_proj_w1, audit) @@cx(deck_proj_w2, review)');
+    it('handles multiple @@discuss tokens', () => {
+      const result = parseAtTokens('@@discuss(deck_proj_w1, audit) @@discuss(deck_proj_w2, review)');
       expect(result.agents).toHaveLength(2);
       expect(result.agents[0].mode).toBe('audit');
       expect(result.agents[1].mode).toBe('review');

@@ -30,7 +30,7 @@ import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, type P2pTarget } fro
 
 // ── @@ token parsing ─────────────────────────────────────────────────────────
 
-const CX_TOKEN_RE = /@@cx\(([^,]+),\s*([^)]+)\)/g;
+const DISCUSS_TOKEN_RE = /@@discuss\(([^,]+),\s*([^)]+)\)/g;
 const FILE_TOKEN_RE = /@((?:[a-zA-Z0-9_.\-/]+\/)*[a-zA-Z0-9_.\-]+\.[a-zA-Z0-9]+)/g;
 
 interface ParsedTokens {
@@ -43,12 +43,12 @@ function parseAtTokens(text: string): ParsedTokens {
   const agents: P2pTarget[] = [];
   const files: string[] = [];
 
-  for (const m of text.matchAll(CX_TOKEN_RE)) {
+  for (const m of text.matchAll(DISCUSS_TOKEN_RE)) {
     agents.push({ session: m[1].trim(), mode: m[2].trim() });
   }
 
-  // Remove @@cx tokens first so @file regex doesn't partially match them
-  let withoutCx = text.replace(CX_TOKEN_RE, '');
+  // Remove @@discuss tokens first so @file regex doesn't partially match them
+  let withoutCx = text.replace(DISCUSS_TOKEN_RE, '');
   for (const m of withoutCx.matchAll(FILE_TOKEN_RE)) {
     files.push(m[1]);
   }

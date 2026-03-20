@@ -229,7 +229,7 @@ describe('SessionControls', () => {
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
       sessionName: 'deck_my-project_brain',
-      text: '@@cx(deck_my-project_w1, audit) please review',
+      text: '@@discuss(deck_my-project_w1, audit) please review',
     });
 
     getSelectionSpy.mockRestore();
@@ -259,7 +259,7 @@ describe('SessionControls', () => {
     fireEvent.click(screen.getByText('Worker Alpha'));
     fireEvent.click(screen.getByText('audit'));
 
-    expect(input.textContent).toBe('@@cx(deck_my-project_w1, audit) ');
+    expect(input.textContent).toBe('@@discuss(deck_my-project_w1, audit) ');
     getSelectionSpy.mockRestore();
   });
 });

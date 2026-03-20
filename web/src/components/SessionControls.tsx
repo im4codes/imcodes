@@ -187,7 +187,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setHasText(true);
   };
 
-  const buildAgentToken = (session: string, mode: string) => `@@cx(${session}, ${mode})`;
+  const buildAgentToken = (session: string, mode: string) => `@@discuss(${session}, ${mode})`;
 
   const handleSend = useCallback(() => {
     const text = getText();
