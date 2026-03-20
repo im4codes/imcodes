@@ -191,6 +191,20 @@
     "error": "음성 오류: {{error}}"
   },
   "p2p": {
+    "picker": {
+      "back": "뒤로",
+      "files": "파일",
+      "agents": "에이전트",
+      "search_project_files": "프로젝트 파일 검색",
+      "quick_discussion_with_agent": "에이전트와 빠른 토론",
+      "select_mode": "모드 선택",
+      "type_to_search": "입력하여 검색",
+      "keep_typing": "계속 입력하세요...",
+      "no_files_found": "파일을 찾을 수 없습니다",
+      "no_agents_available": "사용 가능한 에이전트가 없습니다",
+      "you": "나",
+      "busy": "사용 중"
+    },
     "mode": {
       "audit": "감사",
       "review": "리뷰",

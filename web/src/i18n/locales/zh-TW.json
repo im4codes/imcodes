@@ -191,6 +191,20 @@
     "error": "語音錯誤：{{error}}"
   },
   "p2p": {
+    "picker": {
+      "back": "返回",
+      "files": "檔案",
+      "agents": "代理",
+      "search_project_files": "搜尋專案檔案",
+      "quick_discussion_with_agent": "與代理快速討論",
+      "select_mode": "選擇模式",
+      "type_to_search": "輸入以搜尋",
+      "keep_typing": "繼續輸入...",
+      "no_files_found": "找不到檔案",
+      "no_agents_available": "沒有可用代理",
+      "you": "你",
+      "busy": "忙碌"
+    },
     "mode": {
       "audit": "稽核",
       "review": "審查",

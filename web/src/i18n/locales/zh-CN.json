@@ -191,6 +191,20 @@
     "error": "语音错误：{{error}}"
   },
   "p2p": {
+    "picker": {
+      "back": "返回",
+      "files": "文件",
+      "agents": "智能体",
+      "search_project_files": "搜索项目文件",
+      "quick_discussion_with_agent": "与智能体快速讨论",
+      "select_mode": "选择模式",
+      "type_to_search": "输入以搜索",
+      "keep_typing": "继续输入...",
+      "no_files_found": "未找到文件",
+      "no_agents_available": "没有可用智能体",
+      "you": "你",
+      "busy": "忙碌"
+    },
     "mode": {
       "audit": "审计",
       "review": "审查",

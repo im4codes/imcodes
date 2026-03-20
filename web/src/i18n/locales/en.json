@@ -191,6 +191,20 @@
     "error": "Voice error: {{error}}"
   },
   "p2p": {
+    "picker": {
+      "back": "Back",
+      "files": "Files",
+      "agents": "Agents",
+      "search_project_files": "Search project files",
+      "quick_discussion_with_agent": "Quick Discussion with an agent",
+      "select_mode": "Select Mode",
+      "type_to_search": "type to search",
+      "keep_typing": "Keep typing...",
+      "no_files_found": "No files found",
+      "no_agents_available": "No agents available",
+      "you": "You",
+      "busy": "Busy"
+    },
     "mode": {
       "audit": "Audit",
       "review": "Review",

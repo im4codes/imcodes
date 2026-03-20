@@ -191,6 +191,20 @@
     "error": "Ошибка голоса: {{error}}"
   },
   "p2p": {
+    "picker": {
+      "back": "Назад",
+      "files": "Файлы",
+      "agents": "Агенты",
+      "search_project_files": "Искать файлы проекта",
+      "quick_discussion_with_agent": "Быстрое обсуждение с агентом",
+      "select_mode": "Выбрать режим",
+      "type_to_search": "введите для поиска",
+      "keep_typing": "Продолжайте ввод...",
+      "no_files_found": "Файлы не найдены",
+      "no_agents_available": "Нет доступных агентов",
+      "you": "Вы",
+      "busy": "Занят"
+    },
     "mode": {
       "audit": "Аудит",
       "review": "Обзор",

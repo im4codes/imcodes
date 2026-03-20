@@ -142,6 +142,7 @@ const backBtnStyle: Record<string, string | number> = {
 export function AtPicker({
   query,
   sessions,
+  mainSession,
   wsClient,
   projectDir,
   onSelectFile,
@@ -164,6 +165,7 @@ export function AtPicker({
     const seen = new Map<string, SessionEntry>();
     for (const s of sessions) {
       if (s.agentType === 'shell' || s.agentType === 'script') continue;
+      if (mainSession && !s.name.startsWith(`${mainSession}_`) && s.name !== mainSession) continue;
       const existing = seen.get(s.name);
       if (!existing) {
         seen.set(s.name, s);
@@ -185,7 +187,7 @@ export function AtPicker({
         };
       })
       .filter((a) => !query || a.shortName.toLowerCase().includes(query.toLowerCase()) || a.session.toLowerCase().includes(query.toLowerCase()));
-  }, [sessions, query]);
+  }, [sessions, query, mainSession]);
 
   // Debounced file search — only when in files category
   useEffect(() => {
@@ -321,9 +323,9 @@ export function AtPicker({
     const agentItem = agents.find((a) => a.session === modeAgent);
     return (
       <div ref={containerRef} style={containerStyle}>
-        <div style={backBtnStyle} onClick={() => setModeAgent(null)}>← Back</div>
+        <div style={backBtnStyle} onClick={() => setModeAgent(null)}>← {t('p2p.picker.back')}</div>
         <div style={groupLabelStyle}>
-          {agentItem ? `${agentItem.shortName} — ` : ''}Select Mode
+          {agentItem ? `${agentItem.shortName} — ` : ''}{t('p2p.picker.select_mode')}
         </div>
         <div style={modeContainerStyle}>
           {MODES.map((mode, idx) => (
@@ -353,8 +355,8 @@ export function AtPicker({
           onMouseEnter={() => setHighlightIdx(0)}
         >
           <span style={{ fontSize: 16 }}>📁</span>
-          <span style={{ fontWeight: 500 }}>Files</span>
-          <span style={dimStyle}>Search project files</span>
+          <span style={{ fontWeight: 500 }}>{t('p2p.picker.files')}</span>
+          <span style={dimStyle}>{t('p2p.picker.search_project_files')}</span>
         </div>
         <div
           data-hl={highlightIdx === 1 ? 'true' : undefined}
@@ -363,8 +365,8 @@ export function AtPicker({
           onMouseEnter={() => setHighlightIdx(1)}
         >
           <span style={{ fontSize: 16 }}>🤖</span>
-          <span style={{ fontWeight: 500 }}>Agents</span>
-          <span style={dimStyle}>Quick Discussion with an agent</span>
+          <span style={{ fontWeight: 500 }}>{t('p2p.picker.agents')}</span>
+          <span style={dimStyle}>{t('p2p.picker.quick_discussion_with_agent')}</span>
         </div>
       </div>
     );
@@ -374,11 +376,13 @@ export function AtPicker({
   if (category === 'files') {
     return (
       <div ref={containerRef} style={containerStyle}>
-        <div style={backBtnStyle} onClick={() => { setCategory('choose'); setHighlightIdx(0); }}>← Back</div>
-        <div style={groupLabelStyle}>Files {query ? `— "${query}"` : '— type to search'}</div>
+        <div style={backBtnStyle} onClick={() => { setCategory('choose'); setHighlightIdx(0); }}>← {t('p2p.picker.back')}</div>
+        <div style={groupLabelStyle}>
+          {t('p2p.picker.files')} {query ? `— "${query}"` : `— ${t('p2p.picker.type_to_search')}`}
+        </div>
         {fileResults.length === 0 && query && (
           <div style={{ ...itemStyle, color: '#64748b', justifyContent: 'center' }}>
-            {query.length < 2 ? 'Keep typing...' : 'No files found'}
+            {query.length < 2 ? t('p2p.picker.keep_typing') : t('p2p.picker.no_files_found')}
           </div>
         )}
         {fileResults.map((f, idx) => {
@@ -403,10 +407,10 @@ export function AtPicker({
   // ── Agents list ──
   return (
     <div ref={containerRef} style={containerStyle}>
-      <div style={backBtnStyle} onClick={() => { setCategory('choose'); setHighlightIdx(0); }}>← Back</div>
-      <div style={groupLabelStyle}>Agents</div>
+      <div style={backBtnStyle} onClick={() => { setCategory('choose'); setHighlightIdx(0); }}>← {t('p2p.picker.back')}</div>
+      <div style={groupLabelStyle}>{t('p2p.picker.agents')}</div>
       {agents.length === 0 && (
-        <div style={{ ...itemStyle, color: '#64748b', justifyContent: 'center' }}>No agents available</div>
+        <div style={{ ...itemStyle, color: '#64748b', justifyContent: 'center' }}>{t('p2p.picker.no_agents_available')}</div>
       )}
       {agents.map((a, idx) => {
         const hl = idx === highlightIdx;
@@ -420,8 +424,8 @@ export function AtPicker({
           >
             <span style={{ fontWeight: 500 }}>{a.shortName}</span>
             <span style={dimStyle}>{a.agentType}</span>
-            {a.isSelf && <span style={{ color: '#60a5fa', fontSize: 10, marginLeft: 4 }}>(You)</span>}
-            {a.busy && <span style={busyDotStyle} title="Busy" />}
+            {a.isSelf && <span style={{ color: '#60a5fa', fontSize: 10, marginLeft: 4 }}>({t('p2p.picker.you')})</span>}
+            {a.busy && <span style={busyDotStyle} title={t('p2p.picker.busy')} />}
           </div>
         );
       })}
