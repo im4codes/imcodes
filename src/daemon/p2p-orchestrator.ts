@@ -386,7 +386,15 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
 async function waitForIdle(run: P2pRun, session: string, serverLink: ServerLink | null): Promise<void> {
   logger.info({ runId: run.id, session }, 'P2P: waiting for target session to become idle');
 
-  // Dual strategy: hook event (instant for CC) + polling fallback (for codex/gemini/shell)
+  // 1. Check store state first — if already idle, proceed immediately
+  const record = getSession(session);
+  if (record?.state === 'idle') {
+    logger.info({ runId: run.id, session }, 'P2P: target already idle (store), proceeding');
+    return;
+  }
+
+  // 2. Wait for idle event (timeline listener fires notifySessionIdle on any state change to idle)
+  //    with polling fallback via detectStatusAsync (cursor-based for codex)
   let idleEventFired = false;
   const idlePromise = waitForIdleEvent(session, run.timeoutMs).then((ok) => { idleEventFired = ok; });
 
@@ -394,15 +402,19 @@ async function waitForIdle(run: P2pRun, session: string, serverLink: ServerLink 
   while (Date.now() < deadline) {
     if (run._cancelled) return;
     if (idleEventFired) {
-      logger.info({ runId: run.id, session }, 'P2P: target idle (via hook event), proceeding');
+      logger.info({ runId: run.id, session }, 'P2P: target idle (via event), proceeding');
       return;
     }
-    // Poll fallback via unified detectStatusAsync (includes cursor check)
+    // Poll fallback
     try {
-      const record = getSession(session);
-      const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
+      const r = getSession(session);
+      if (r?.state === 'idle') {
+        logger.info({ runId: run.id, session }, 'P2P: target idle (store poll), proceeding');
+        return;
+      }
+      const agentType = (r?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
       if (await detectStatusAsync(session, agentType) === 'idle') {
-        logger.info({ runId: run.id, session }, 'P2P: target idle (via poll), proceeding');
+        logger.info({ runId: run.id, session }, 'P2P: target idle (detectStatusAsync), proceeding');
         return;
       }
     } catch { /* ignore */ }

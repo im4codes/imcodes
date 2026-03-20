@@ -26,11 +26,12 @@ export class TimelineEmitter {
     payload: Record<string, unknown>,
     opts?: { source?: TimelineSource; confidence?: TimelineConfidence; eventId?: string; ts?: number },
   ): TimelineEvent | null {
-    // Deduplicate session.state — skip if state unchanged
+    // session.state: track last state per session for external queries, but do NOT
+    // dedup here. Each source (codex-watcher, terminal-streamer, hook-server) does
+    // its own dedup. Deduping in the emitter caused store updates and idle callbacks
+    // to be silently skipped when a second source emitted the same state.
     if (type === 'session.state') {
-      const state = String(payload.state ?? '');
-      if (this.lastSessionState.get(sessionId) === state) return null;
-      this.lastSessionState.set(sessionId, state);
+      this.lastSessionState.set(sessionId, String(payload.state ?? ''));
     }
 
     // Deduplicate user.message — skip if same session + same text within 5s

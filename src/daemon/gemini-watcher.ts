@@ -171,8 +171,8 @@ async function terminalThinkingCheck(sessionName: string, state: WatcherState): 
 }
 
 function emitSessionState(sessionName: string, next: 'running' | 'idle'): void {
-  const emitted = timelineEmitter.emit(sessionName, 'session.state', { state: next });
-  if (emitted) updateSessionState(sessionName, next);
+  timelineEmitter.emit(sessionName, 'session.state', { state: next });
+  updateSessionState(sessionName, next);
 }
 
 function hasPendingTools(msg: any): boolean {

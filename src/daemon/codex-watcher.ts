@@ -133,8 +133,8 @@ function flushFinalAnswer(sessionName: string): void {
 function emitSessionState(sessionName: string, state: 'running' | 'idle'): void {
   if (sessionStates.get(sessionName) === state) return;
   sessionStates.set(sessionName, state);
-  const emitted = timelineEmitter.emit(sessionName, 'session.state', { state }, { source: 'daemon', confidence: 'high' });
-  if (emitted) updateSessionState(sessionName, state);
+  timelineEmitter.emit(sessionName, 'session.state', { state }, { source: 'daemon', confidence: 'high' });
+  updateSessionState(sessionName, state);
 }
 
 export function resetParseStateForTests(): void {
