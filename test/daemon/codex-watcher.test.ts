@@ -420,15 +420,20 @@ describe('startWatching — file-based integration', () => {
     await writeFile(file1, [sessionMetaLine(join(tmpDir, 'proj-a'))].join('\n') + '\n');
     await startWatchingSpecificFile('session-int', file1);
 
+    // Ensure file2 has a strictly newer mtime (CI filesystems may have low mtime resolution)
+    await new Promise((r) => setTimeout(r, 100));
+
     await writeFile(file2, [
       sessionMetaLine(join(tmpDir, 'proj-a')),
       userMessageLine('followed after rollover'),
     ].join('\n') + '\n');
 
+    // fs.watch notification can be slow on CI — use a generous timeout
     await waitUntil(() =>
       vi.mocked(timelineEmitter.emit).mock.calls.some(
         (call) => call[0] === 'session-int' && call[1] === 'user.message' && (call[2] as any).text === 'followed after rollover',
       ),
+      8000,
     );
   });
 });
