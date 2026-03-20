@@ -91,7 +91,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [menuOpen, setMenuOpen] = useState(false);
   const [atPickerOpen, setAtPickerOpen] = useState(false);
   const [atQuery, setAtQuery] = useState('');
+  const [atPickerStage, setAtPickerStage] = useState<'choose' | 'files' | 'agents' | 'mode'>('choose');
   const atJustClosedRef = useRef(false);
+  const atSelectionLockRef = useRef(false);
+  const atSelectionSnapshotRef = useRef('');
   const [modelOpen, setModelOpen] = useState(false);
   const [quickOpen, setQuickOpen] = useState(false);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
@@ -197,6 +200,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     onSend?.(activeSession.name, text);
     if (divRef.current) divRef.current.textContent = '';
     setHasText(false);
+    atSelectionLockRef.current = false;
+    atSelectionSnapshotRef.current = '';
     histIdxRef.current = -1;
     draftRef.current = '';
   }, [ws, activeSession, quickData, onSend]);
@@ -218,7 +223,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       return;
     }
     // Block Enter right after picker closes (prevents accidental send from the same Enter that selected)
-    if (e.key === 'Enter' && atJustClosedRef.current) {
+    if (e.key === 'Enter' && (atJustClosedRef.current || atSelectionLockRef.current)) {
       e.preventDefault();
       atJustClosedRef.current = false;
       return;
@@ -521,7 +526,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               const text = divRef.current?.textContent ?? '';
               const before = text.replace(/@[^\s@]*$/, '');
               divRef.current!.textContent = `${before}@${path} `;
+              atSelectionSnapshotRef.current = divRef.current!.textContent;
+              atSelectionLockRef.current = true;
               setAtPickerOpen(false);
+              setAtPickerStage('choose');
               atJustClosedRef.current = true;
               setTimeout(() => { atJustClosedRef.current = false; }, 100);
               setHasText(true);
@@ -531,13 +539,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               const text = divRef.current?.textContent ?? '';
               const before = text.replace(/@[^\s@]*$/, '');
               divRef.current!.textContent = `${before}@@cx(${session}, ${mode}) `;
+              atSelectionSnapshotRef.current = divRef.current!.textContent;
+              atSelectionLockRef.current = true;
               setAtPickerOpen(false);
+              setAtPickerStage('choose');
               atJustClosedRef.current = true;
               setTimeout(() => { atJustClosedRef.current = false; }, 100);
               setHasText(true);
               divRef.current?.focus();
             }}
-            onClose={() => setAtPickerOpen(false)}
+            onClose={() => { setAtPickerOpen(false); setAtPickerStage('choose'); }}
+            onStageChange={setAtPickerStage}
             visible={true}
           />
         )}
@@ -557,18 +569,46 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           spellcheck={false}
           onFocus={handleFocus}
           onInput={() => {
-            setHasText(!!(divRef.current?.textContent?.trim()));
+            const currentText = divRef.current?.textContent ?? '';
+            setHasText(!!currentText.trim());
+            if (atSelectionLockRef.current && currentText !== atSelectionSnapshotRef.current) {
+              atSelectionLockRef.current = false;
+              atSelectionSnapshotRef.current = currentText;
+            }
             // Detect @ for picker
-            const text = divRef.current?.textContent ?? '';
+            const text = currentText;
             const sel = window.getSelection();
             const cursorPos = sel?.anchorOffset ?? text.length;
             const beforeCursor = text.slice(0, cursorPos);
             const atMatch = beforeCursor.match(/@([^\s@]*)$/);
             if (atMatch) {
-              setAtPickerOpen(true);
-              setAtQuery(atMatch[1]);
+              const query = atMatch[1];
+              if (!atPickerOpen) {
+                if (query.length === 0) {
+                  setAtPickerOpen(true);
+                  setAtPickerStage('choose');
+                  setAtQuery('');
+                } else {
+                  setAtPickerOpen(false);
+                  setAtPickerStage('choose');
+                  setAtQuery('');
+                }
+              } else if (atPickerStage === 'choose') {
+                if (query.length === 0) {
+                  setAtPickerOpen(true);
+                  setAtQuery('');
+                } else {
+                  setAtPickerOpen(false);
+                  setAtPickerStage('choose');
+                  setAtQuery('');
+                }
+              } else {
+                setAtPickerOpen(true);
+                setAtQuery(query);
+              }
             } else {
               setAtPickerOpen(false);
+              setAtPickerStage('choose');
               setAtQuery('');
             }
           }}

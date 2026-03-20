@@ -5,6 +5,10 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, cleanup } from '@testing-library/preact';
 
+if (!HTMLElement.prototype.scrollIntoView) {
+  HTMLElement.prototype.scrollIntoView = vi.fn();
+}
+
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, _opts?: Record<string, unknown>) => {
@@ -27,6 +31,7 @@ const makeWs = () => ({
   sendInput: vi.fn(),
   connected: true,
   subSessionSetModel: vi.fn(),
+  onMessage: vi.fn(() => () => {}),
 });
 
 const makeQuickData = () => ({
@@ -170,5 +175,63 @@ describe('SessionControls', () => {
     fireEvent.input(input);
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: true });
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it('closes @ picker if user keeps typing without making a selection', () => {
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    const getSelectionSpy = vi.spyOn(window, 'getSelection').mockImplementation(() => ({
+      anchorOffset: input.textContent?.length ?? 0,
+    }) as any);
+
+    input.textContent = '@';
+    fireEvent.input(input);
+    expect(screen.getByText('files')).toBeDefined();
+
+    input.textContent = '@hello';
+    fireEvent.input(input);
+    expect(screen.queryByText('files')).toBeNull();
+    expect(screen.queryByText('agents')).toBeNull();
+
+    getSelectionSpy.mockRestore();
+  });
+
+  it('does not send immediately after selecting agent and mode; sends after further editing', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'deck_my-project_brain', project: 'my-project' })}
+        quickData={makeQuickData() as any}
+        sessions={[
+          makeSession({ name: 'deck_my-project_brain', project: 'my-project', role: 'brain', label: 'brain' }),
+          makeSession({ name: 'deck_my-project_w1', project: 'my-project', role: 'w1', label: 'w1' }),
+        ]}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    const getSelectionSpy = vi.spyOn(window, 'getSelection').mockImplementation(() => ({
+      anchorOffset: input.textContent?.length ?? 0,
+    }) as any);
+
+    input.textContent = '@';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByText('agents'));
+    fireEvent.click(screen.getByText('w1'));
+    fireEvent.click(screen.getByText('audit'));
+
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    input.textContent = `${input.textContent}please review`;
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      sessionName: 'deck_my-project_brain',
+      text: '@@cx(deck_my-project_w1, audit) please review',
+    });
+
+    getSelectionSpy.mockRestore();
   });
 });

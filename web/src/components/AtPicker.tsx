@@ -23,6 +23,7 @@ interface AtPickerProps {
   onSelectFile: (path: string) => void;
   onSelectAgent: (session: string, mode: string) => void;
   onClose: () => void;
+  onStageChange?: (stage: 'choose' | 'files' | 'agents' | 'mode') => void;
   visible: boolean;
 }
 
@@ -148,6 +149,7 @@ export function AtPicker({
   onSelectFile,
   onSelectAgent,
   onClose,
+  onStageChange,
   visible,
 }: AtPickerProps) {
   const { t } = useTranslation();
@@ -247,6 +249,15 @@ export function AtPicker({
       setModeAgent(null);
     }
   }, [visible]);
+
+  useEffect(() => {
+    if (!visible) return;
+    if (modeAgent !== null) {
+      onStageChange?.('mode');
+      return;
+    }
+    onStageChange?.(category);
+  }, [visible, category, modeAgent, onStageChange]);
 
   // Keyboard handler
   const handleKeyDown = useCallback(
