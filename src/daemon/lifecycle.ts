@@ -287,7 +287,7 @@ export async function startup(): Promise<DaemonContext> {
       const record = listSessions().find((s) => s.name === payload.session);
       const projectName = record?.projectName ?? payload.session;
       if (payload.event === 'idle') {
-        notifySessionIdle(payload.session);
+        // notifySessionIdle is handled by the unified timeline listener below
         serverLink.send({ type: 'session.idle', session: payload.session, project: projectName, agentType: payload.agentType });
       } else if (payload.event === 'notification') {
         serverLink.send({ type: 'session.notification', session: payload.session, project: projectName, title: payload.title, message: payload.message });
