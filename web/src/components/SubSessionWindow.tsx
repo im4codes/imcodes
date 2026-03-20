@@ -33,6 +33,7 @@ interface Props {
   onFocus: () => void;
   sessions?: SessionInfo[];
   subSessions?: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
+  serverId?: string;
 }
 
 type ViewMode = 'terminal' | 'chat';
@@ -60,7 +61,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, zIndex, onFocus, sessions, subSessions,
+  sub, ws, connected, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, zIndex, onFocus, sessions, subSessions, serverId,
 }: Props) {
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const swipeBackRef = useSwipeBack(isMobile ? onMinimize : null);
@@ -299,6 +300,7 @@ export function SubSessionWindow({
             onScrollBottomFn={onChatScrollBottomFn}
             ws={ws}
             workdir={sub.cwd ?? null}
+            serverId={serverId}
           />
         )}
       </div>
@@ -361,6 +363,7 @@ export function SubSessionWindow({
           activeThinking={!!activeThinkingTs}
           sessions={sessions}
           subSessions={subSessions}
+          serverId={serverId}
         />
       </div>
     </div>

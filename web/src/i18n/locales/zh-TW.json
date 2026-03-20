@@ -211,5 +211,16 @@
       "brainstorm": "腦力激盪",
       "discuss": "討論"
     }
+  },
+  "upload": {
+    "upload_file": "上傳檔案",
+    "uploading": "上傳中...",
+    "upload_failed": "上傳失敗",
+    "file_too_large": "檔案過大（最大 {{max}}MB）",
+    "download_file": "下載",
+    "downloading": "下載中...",
+    "preview_unavailable": "無法預覽",
+    "download_expired": "下載連結已過期",
+    "daemon_offline": "守護程序離線"
   }
 }

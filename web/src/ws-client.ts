@@ -280,9 +280,9 @@ export class WsClient {
   }
 
   /** Request a directory listing from the daemon. Returns the requestId for matching the response. */
-  fsListDir(path: string, includeFiles = false): string {
+  fsListDir(path: string, includeFiles = false, includeMetadata = false): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'fs.ls', path, requestId, includeFiles });
+    this.send({ type: 'fs.ls', path, requestId, includeFiles, includeMetadata });
     return requestId;
   }
 

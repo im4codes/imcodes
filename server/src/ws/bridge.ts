@@ -164,6 +164,16 @@ export class WsBridge {
   private pendingFileSearchRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
 
   /**
+   * File transfer correlation: requestId → { resolve, reject, timer }.
+   * Used by HTTP upload/download handlers to await daemon responses.
+   */
+  private pendingFileTransfers = new Map<string, {
+    resolve: (msg: Record<string, unknown>) => void;
+    reject: (err: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
+
+  /**
    * Per-session daemon subscription reference count.
    * Forward terminal.subscribe to daemon only on 0→1.
    * Forward terminal.unsubscribe to daemon only on 1→0 (including on browser disconnect).
@@ -307,6 +317,7 @@ export class WsBridge {
       if (this.daemonWs === ws) {
         this.daemonWs = null;
         this.authenticated = false;
+        this.rejectAllPendingFileTransfers('daemon_disconnected');
         updateServerStatus(db, this.serverId, 'offline').catch((err) =>
           logger.error({ err }, 'Failed to mark server offline'),
         );
@@ -316,6 +327,7 @@ export class WsBridge {
 
     ws.on('error', (err) => {
       logger.error({ serverId: this.serverId, err }, 'Daemon WS error');
+      this.rejectAllPendingFileTransfers('daemon_error');
     });
   }
 
@@ -517,6 +529,18 @@ export class WsBridge {
           }
         }
       }
+      return;
+    }
+
+    // ── File transfer responses: resolve HTTP handler Promises ─────────────────
+    if (type === 'file.upload_done' || type === 'file.upload_error') {
+      const requestId = msg.uploadId as string | undefined;
+      if (requestId) this.resolveFileTransfer(requestId, msg);
+      return;
+    }
+    if (type === 'file.download_done' || type === 'file.download_error') {
+      const requestId = msg.downloadId as string | undefined;
+      if (requestId) this.resolveFileTransfer(requestId, msg);
       return;
     }
 
@@ -888,6 +912,63 @@ export class WsBridge {
         this.queue.push(message);
       }
     }
+  }
+
+  // ── File transfer correlation ──────────────────────────────────────────────
+
+  /** Returns true if the daemon WebSocket is connected and authenticated. */
+  isDaemonConnected(): boolean {
+    return !!(this.daemonWs && this.authenticated);
+  }
+
+  /**
+   * Send a file transfer request to daemon and await the correlated response.
+   * Rejects if daemon is offline or the request times out.
+   */
+  sendFileTransferRequest(requestId: string, message: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {
+    if (!this.isDaemonConnected()) {
+      return Promise.reject(new Error('daemon_offline'));
+    }
+    return new Promise<Record<string, unknown>>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingFileTransfers.delete(requestId);
+        reject(new Error('timeout'));
+      }, timeoutMs);
+
+      this.pendingFileTransfers.set(requestId, { resolve, reject, timer });
+
+      try {
+        this.daemonWs!.send(JSON.stringify(message));
+      } catch (err) {
+        this.pendingFileTransfers.delete(requestId);
+        clearTimeout(timer);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
+  }
+
+  /**
+   * Reject all pending file transfer requests (e.g. when daemon disconnects).
+   */
+  private rejectAllPendingFileTransfers(reason: string): void {
+    for (const [, pending] of this.pendingFileTransfers) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error(reason));
+    }
+    this.pendingFileTransfers.clear();
+  }
+
+  /**
+   * Try to resolve a pending file transfer request.
+   * Returns true if a matching pending request was found and resolved.
+   */
+  resolveFileTransfer(requestId: string, msg: Record<string, unknown>): boolean {
+    const pending = this.pendingFileTransfers.get(requestId);
+    if (!pending) return false;
+    clearTimeout(pending.timer);
+    this.pendingFileTransfers.delete(requestId);
+    pending.resolve(msg);
+    return true;
   }
 
   // ── Push notifications ──────────────────────────────────────────────────────

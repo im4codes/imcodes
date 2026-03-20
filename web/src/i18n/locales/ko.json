@@ -211,5 +211,16 @@
       "brainstorm": "브레인스토밍",
       "discuss": "토론"
     }
+  },
+  "upload": {
+    "upload_file": "파일 업로드",
+    "uploading": "업로드 중...",
+    "upload_failed": "업로드 실패",
+    "file_too_large": "파일이 너무 큽니다 (최대 {{max}}MB)",
+    "download_file": "다운로드",
+    "downloading": "다운로드 중...",
+    "preview_unavailable": "미리보기 불가",
+    "download_expired": "다운로드 링크 만료",
+    "daemon_offline": "데몬 오프라인"
   }
 }

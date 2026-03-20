@@ -4,6 +4,7 @@ import { sessionExists, isPaneAlive } from '../agent/tmux.js';
 import { detectMemoryBackend } from '../memory/detector.js';
 import { ServerLink } from './server-link.js';
 import { handleWebCommand, setRouterContext } from './command-handler.js';
+import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { timelineStore } from './timeline-store.js';
 import { startHookServer } from './hook-server.js';
@@ -116,6 +117,11 @@ export async function startup(): Promise<DaemonContext> {
 
   await initOnStartup();
   logger.info('Startup cleanup done');
+
+  // Initialize file transfer: create upload dir + clean expired files
+  await initFileTransfer();
+  startCleanupTimer();
+  logger.info('File transfer initialized');
 
   // Clean up old timeline files (>7 days)
   timelineStore.cleanup();

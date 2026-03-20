@@ -1229,7 +1229,7 @@ export function App() {
 
             {/* Chat view for active session in chat mode */}
             {activeSession && viewMode === 'chat' && (
-              <ChatView events={timelineEvents} loading={timelineLoading} refreshing={timelineRefreshing} sessionId={activeSession} sessionState={activeSessionInfo?.state} onScrollBottomFn={setChatScrollFn} workdir={activeSessionInfo?.projectDir} ws={connected ? wsRef.current : null} />
+              <ChatView events={timelineEvents} loading={timelineLoading} refreshing={timelineRefreshing} sessionId={activeSession} sessionState={activeSessionInfo?.state} onScrollBottomFn={setChatScrollFn} workdir={activeSessionInfo?.projectDir} ws={connected ? wsRef.current : null} serverId={selectedServerId ?? undefined} />
             )}
 
             {!activeSession && !sessionsLoaded && (
@@ -1280,7 +1280,7 @@ export function App() {
                 </div>
               );
             })()}
-            <SessionControls ws={wsRef.current} activeSession={activeSessionInfo} inputRef={inputRef} onAfterAction={focusTerminal} onSend={(_name, text) => { addOptimisticUserMessage(text); scrollActiveToBottom(); }} onStopProject={handleStopProject} onRenameSession={() => activeSession && setRenameRequest(activeSession)} sessionDisplayName={activeSessionInfo?.project ?? null} quickData={quickData} detectedModel={activeSession ? detectedModels.get(activeSession) : undefined} hideShortcuts={false} activeThinking={!!activeThinkingTs} mobileFileBrowserOpen={showMobileFileBrowser} onMobileFileBrowserClose={() => setShowMobileFileBrowser(false)} sessions={sessions} subSessions={subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession }))} />
+            <SessionControls ws={wsRef.current} activeSession={activeSessionInfo} inputRef={inputRef} onAfterAction={focusTerminal} onSend={(_name, text) => { addOptimisticUserMessage(text); scrollActiveToBottom(); }} onStopProject={handleStopProject} onRenameSession={() => activeSession && setRenameRequest(activeSession)} sessionDisplayName={activeSessionInfo?.project ?? null} quickData={quickData} detectedModel={activeSession ? detectedModels.get(activeSession) : undefined} hideShortcuts={false} activeThinking={!!activeThinkingTs} mobileFileBrowserOpen={showMobileFileBrowser} onMobileFileBrowserClose={() => setShowMobileFileBrowser(false)} sessions={sessions} subSessions={subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession }))} serverId={selectedServerId ?? undefined} />
 
             {/* Sub-session bar */}
             {selectedServerId && (
@@ -1346,6 +1346,7 @@ export function App() {
           onFocus={() => bringSubToFront(sub.id)}
           sessions={sessions}
           subSessions={subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession }))}
+          serverId={selectedServerId ?? undefined}
         />
       ))}
 

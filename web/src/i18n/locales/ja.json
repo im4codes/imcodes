@@ -211,5 +211,16 @@
       "brainstorm": "ブレインストーミング",
       "discuss": "ディスカッション"
     }
+  },
+  "upload": {
+    "upload_file": "ファイルをアップロード",
+    "uploading": "アップロード中...",
+    "upload_failed": "アップロード失敗",
+    "file_too_large": "ファイルが大きすぎます（最大 {{max}}MB）",
+    "download_file": "ダウンロード",
+    "downloading": "ダウンロード中...",
+    "preview_unavailable": "プレビューできません",
+    "download_expired": "ダウンロードリンクの期限切れ",
+    "daemon_offline": "デーモンがオフラインです"
   }
 }

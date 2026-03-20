@@ -27,6 +27,8 @@ interface Props {
   onInsertPath?: (path: string) => void;
   /** Session working directory — used to resolve relative paths clicked in chat */
   workdir?: string | null;
+  /** Server ID for file transfer download API. */
+  serverId?: string;
 }
 
 /** A merged view item — either a single event, merged assistant text, or collapsed tool group. */
@@ -202,7 +204,7 @@ function readPanelOpen(id: string | null | undefined): boolean {
   try { return localStorage.getItem(panelOpenKey(id)) === '1'; } catch { return false; }
 }
 
-export function ChatView({ events, loading, refreshing, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir }: Props) {
+export function ChatView({ events, loading, refreshing, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId }: Props) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -451,7 +453,7 @@ export function ChatView({ events, loading, refreshing, sessionState, sessionId,
             ) : item.type === 'tool-group' ? (
               <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={onPathClick} />
             ) : (
-              <ChatEvent key={item.key} event={item.event!} nextTs={nextTs} onPathClick={onPathClick} />
+              <ChatEvent key={item.key} event={item.event!} nextTs={nextTs} onPathClick={onPathClick} serverId={serverId} />
             );
           })}
           <div ref={bottomRef} />
@@ -579,13 +581,46 @@ function ToolCallGroup({ events, onPathClick }: { events: TimelineEvent[]; onPat
   );
 }
 
-function ChatEvent({ event, nextTs, onPathClick }: { event: TimelineEvent; nextTs?: number; onPathClick?: (p: string) => void }) {
+function AttachmentDownloadButton({ att, serverId }: { att: { id: string; originalName?: string; size?: number }; serverId: string }) {
+  const { t } = useTranslation();
+  const [error, setError] = useState<string | null>(null);
+  const label = att.originalName || att.id;
+  const sizeLabel = att.size ? ` (${(att.size / 1024).toFixed(0)}KB)` : '';
+  return (
+    <button
+      class="chat-attachment-dl"
+      style={error ? { color: '#ef4444' } : undefined}
+      onClick={() => {
+        setError(null);
+        import('../api.js').then(({ downloadAttachment }) => {
+          downloadAttachment(serverId, att.id).catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (msg.includes('daemon_offline') || msg.includes('503')) setError(t('upload.daemon_offline'));
+            else if (msg.includes('410') || msg.includes('expired')) setError(t('upload.download_expired'));
+            else if (msg.includes('404')) setError(t('upload.download_expired'));
+            else setError(t('upload.upload_failed'));
+            setTimeout(() => setError(null), 5000);
+          });
+        });
+      }}
+      title={error || label}
+    >
+      {error ? `\u{26A0} ${error}` : `\u{1F4CE} ${label}${sizeLabel}`}
+    </button>
+  );
+}
+
+function ChatEvent({ event, nextTs, onPathClick, serverId }: { event: TimelineEvent; nextTs?: number; onPathClick?: (p: string) => void; serverId?: string }) {
   switch (event.type) {
     case 'user.message': {
       const userText = String(event.payload.text ?? '');
+      const attachments = event.payload.attachments as Array<{ id: string; originalName?: string; mime?: string; size?: number }> | undefined;
       return (
         <div class={`chat-event chat-user${event.payload.pending ? ' chat-pending' : ''}`}>
           <div class="chat-bubble-content">{splitPaths(userText, onPathClick)}</div>
+          {attachments && serverId && attachments.map((att) => (
+            <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} />
+          ))}
           {!event.payload.pending && <ChatTime ts={event.ts} />}
         </div>
       );

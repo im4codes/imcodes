@@ -27,6 +27,23 @@ import { exec as execCb } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, type P2pTarget } from './p2p-orchestrator.js';
+import { handleFileUpload, handleFileDownload, initFileTransfer, startCleanupTimer, createProjectFileHandle, lookupAttachment } from './file-transfer-handler.js';
+
+// ── Common MIME map for file metadata ────────────────────────────────────────
+
+const MIME_MAP: Record<string, string> = {
+  ts: 'text/typescript', tsx: 'text/typescript', js: 'text/javascript', jsx: 'text/javascript',
+  mjs: 'text/javascript', cjs: 'text/javascript', json: 'application/json', md: 'text/markdown',
+  txt: 'text/plain', html: 'text/html', css: 'text/css', xml: 'text/xml', yaml: 'text/yaml',
+  yml: 'text/yaml', toml: 'text/toml', sh: 'text/x-shellscript', py: 'text/x-python',
+  rb: 'text/x-ruby', go: 'text/x-go', rs: 'text/x-rust', java: 'text/x-java',
+  kt: 'text/x-kotlin', swift: 'text/x-swift', c: 'text/x-c', cpp: 'text/x-c++',
+  h: 'text/x-c', hpp: 'text/x-c++', sql: 'text/x-sql', lua: 'text/x-lua',
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+  webp: 'image/webp', svg: 'image/svg+xml', ico: 'image/x-icon', bmp: 'image/bmp',
+  pdf: 'application/pdf', zip: 'application/zip', gz: 'application/gzip',
+  tar: 'application/x-tar', wasm: 'application/wasm',
+};
 
 // ── @@ token parsing ─────────────────────────────────────────────────────────
 
@@ -274,6 +291,12 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'p2p.status':
       void handleP2pStatus(cmd, serverLink);
       break;
+    case 'file.upload':
+      void handleFileUpload(cmd, serverLink);
+      break;
+    case 'file.download':
+      void handleFileDownload(cmd, serverLink);
+      break;
     case 'auth_ok':
     case 'heartbeat':
     case 'heartbeat_ack':
@@ -474,21 +497,36 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   }
 
   // Preserve raw @file references for normal sends.
-  // Eagerly expanding local file content here rewrites a short path-based request
-  // into a large multi-line payload, which then gets re-written again by the tmux
-  // transport layer into a /tmp/imcodes-*.md indirection. For normal sends, keep
-  // the user's original @path semantics and let the agent decide how to consume it.
   const finalText = text;
+
+  // Build attachment refs for any uploaded files referenced in the message
+  const attachments: Array<{ id: string; originalName?: string; mime?: string; size?: number; daemonPath: string }> = [];
+  if (tokens.files.length > 0) {
+    const record = getSession(sessionName);
+    const projectDir = record?.projectDir ?? '';
+    for (const fp of tokens.files) {
+      const absPath = nodePath.isAbsolute(fp) ? fp : nodePath.join(projectDir, fp);
+      const entry = lookupAttachment(absPath);
+      if (entry) {
+        attachments.push({
+          id: entry.id,
+          originalName: entry.originalName,
+          mime: entry.mime,
+          size: entry.size,
+          daemonPath: entry.daemonPath,
+        });
+      }
+    }
+  }
 
   // Serialized write via per-session mutex
   const release = await getMutex(sessionName).acquire();
-  // Always use delayed-Enter: Codex TUI has paste-burst detection that treats
-  // rapid character sequences (including trailing \r) as pastes. The small delay
-  // has no visible downside for other agents, so apply it universally.
   try {
     const agentType = getSession(sessionName)?.agentType ?? 'unknown';
     await sendShellAwareCommand(sessionName, finalText, agentType);
-    timelineEmitter.emit(sessionName, 'user.message', { text });
+    const payload: Record<string, unknown> = { text };
+    if (attachments.length > 0) payload.attachments = attachments;
+    timelineEmitter.emit(sessionName, 'user.message', payload);
     // Emit accepted ack (accepted_legacy for fallback IDs so callers can distinguish)
     const status = isLegacy ? 'accepted_legacy' : 'accepted';
     timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
@@ -1086,6 +1124,7 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
   const rawPath = cmd.path as string | undefined;
   const requestId = cmd.requestId as string | undefined;
   const includeFiles = cmd.includeFiles === true;
+  const includeMetadata = cmd.includeMetadata === true;
   if (!rawPath || !requestId) return;
 
   const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
@@ -1100,14 +1139,30 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
     }
 
     const dirents = await fsReaddir(real, { withFileTypes: true });
-    const entries = dirents
-      .filter((d) => d.isDirectory() || (includeFiles && d.isFile()))
-      .map((d) => ({ name: d.name, isDir: d.isDirectory(), hidden: d.name.startsWith('.') }))
-      .sort((a, b) => {
-        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-        if (a.hidden !== b.hidden) return a.hidden ? 1 : -1;
-        return a.name.localeCompare(b.name);
-      });
+    const filtered = dirents.filter((d) => d.isDirectory() || (includeFiles && d.isFile()));
+
+    const entries = await Promise.all(filtered.map(async (d) => {
+      const entry: Record<string, unknown> = { name: d.name, isDir: d.isDirectory(), hidden: d.name.startsWith('.') };
+      if (includeMetadata && !d.isDirectory()) {
+        try {
+          const filePath = nodePath.join(real, d.name);
+          const fileStat = await fsStat(filePath);
+          entry.size = fileStat.size;
+          const ext = nodePath.extname(d.name).toLowerCase().slice(1);
+          entry.mime = MIME_MAP[ext] || undefined;
+          // Generate a short-lived download handle
+          const handle = createProjectFileHandle(filePath, d.name, entry.mime as string | undefined, fileStat.size);
+          entry.downloadId = handle.id;
+        } catch { /* stat failed, skip metadata */ }
+      }
+      return entry;
+    }));
+
+    entries.sort((a, b) => {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      if (a.hidden !== b.hidden) return (a.hidden ? 1 : 0) - (b.hidden ? 1 : 0);
+      return (a.name as string).localeCompare(b.name as string);
+    });
 
     try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', entries }); } catch { /* ignore */ }
   } catch (err) {
@@ -1141,18 +1196,28 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
     const mimeType = IMAGE_MIME[ext];
     const sizeLimit = mimeType ? 5 * 1024 * 1024 : FS_READ_SIZE_LIMIT;
 
+    // Always generate a download handle so the file can be downloaded even if preview fails
+    const fileName = nodePath.basename(real);
+    const handle = createProjectFileHandle(real, fileName, mimeType || MIME_MAP[ext], stats.size);
+
     if (stats.size > sizeLimit) {
-      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'file_too_large' }); } catch { /* ignore */ }
+      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'file_too_large', previewReason: 'too_large', downloadId: handle.id }); } catch { /* ignore */ }
       return;
     }
 
     if (mimeType) {
       const buf = await fsReadFileRaw(real);
       const content = buf.toString('base64');
-      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', content, encoding: 'base64', mimeType }); } catch { /* ignore */ }
+      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', content, encoding: 'base64', mimeType, downloadId: handle.id }); } catch { /* ignore */ }
     } else {
       const content = await fsReadFileRaw(real, 'utf-8');
-      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', content }); } catch { /* ignore */ }
+      // Check for binary content
+      const sample = content.slice(0, 8192);
+      if (sample.includes('\0')) {
+        try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'binary_file', previewReason: 'binary', downloadId: handle.id }); } catch { /* ignore */ }
+        return;
+      }
+      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', content, downloadId: handle.id }); } catch { /* ignore */ }
     }
   } catch (err) {
     try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }

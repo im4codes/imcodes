@@ -211,5 +211,16 @@
       "brainstorm": "头脑风暴",
       "discuss": "讨论"
     }
+  },
+  "upload": {
+    "upload_file": "上传文件",
+    "uploading": "上传中...",
+    "upload_failed": "上传失败",
+    "file_too_large": "文件过大（最大 {{max}}MB）",
+    "download_file": "下载",
+    "downloading": "下载中...",
+    "preview_unavailable": "无法预览",
+    "download_expired": "下载链接已过期",
+    "daemon_offline": "守护进程离线"
   }
 }

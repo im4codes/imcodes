@@ -138,7 +138,7 @@ describe('FileBrowser', () => {
     render(
       <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath="~/projects" onConfirm={vi.fn()} onClose={vi.fn()} />,
     );
-    expect(fsListDir).toHaveBeenCalledWith('~/projects', false);
+    expect(fsListDir).toHaveBeenCalledWith('~/projects', false, false);
   });
 
   it('does NOT include files for dir-only mode', () => {

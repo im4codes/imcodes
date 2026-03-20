@@ -262,4 +262,29 @@ describe('SessionControls', () => {
     expect(input.textContent).toBe('@@discuss(deck_my-project_w1, audit) ');
     getSelectionSpy.mockRestore();
   });
+
+  // ── File upload tests ─────────────────────────────────────────────────────
+
+  it('shows upload button when serverId is provided', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession()}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+    expect(screen.getByTitle('upload_file')).toBeDefined();
+  });
+
+  it('does not show upload button when serverId is missing', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession()}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(screen.queryByTitle('upload_file')).toBeNull();
+  });
 });

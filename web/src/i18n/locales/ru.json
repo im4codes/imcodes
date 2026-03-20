@@ -211,5 +211,16 @@
       "brainstorm": "Мозговой штурм",
       "discuss": "Обсуждение"
     }
+  },
+  "upload": {
+    "upload_file": "Загрузить файл",
+    "uploading": "Загрузка...",
+    "upload_failed": "Ошибка загрузки",
+    "file_too_large": "Файл слишком большой (макс. {{max}}МБ)",
+    "download_file": "Скачать",
+    "downloading": "Скачивание...",
+    "preview_unavailable": "Предпросмотр недоступен",
+    "download_expired": "Ссылка на скачивание истекла",
+    "daemon_offline": "Демон недоступен"
   }
 }

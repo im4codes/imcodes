@@ -35,6 +35,7 @@ import hljsTs from 'highlight.js/lib/languages/typescript';
 import hljsXml from 'highlight.js/lib/languages/xml';
 import hljsYaml from 'highlight.js/lib/languages/yaml';
 import { marked } from 'marked';
+import { downloadAttachment } from '../api.js';
 
 // Register languages
 hljs.registerLanguage('bash', hljsBash);
@@ -209,6 +210,8 @@ export interface FileBrowserProps {
   changesRootPath?: string;
   /** Increment to trigger a rate-limited git-changes refresh (min 5s between refreshes) */
   refreshTrigger?: number;
+  /** Server ID for file transfer download API. If provided, enables download buttons. */
+  serverId?: string;
   onConfirm: (paths: string[]) => void;
   onClose?: () => void;
 }
@@ -225,9 +228,9 @@ type FsNode = {
 type PreviewState =
   | { status: 'idle' }
   | { status: 'loading'; path: string }
-  | { status: 'ok'; path: string; content: string; html: string; isMarkdown: boolean; diff?: string; diffHtml?: string }
-  | { status: 'image'; path: string; dataUrl: string }
-  | { status: 'error'; path: string; error: string };
+  | { status: 'ok'; path: string; content: string; html: string; isMarkdown: boolean; diff?: string; diffHtml?: string; downloadId?: string }
+  | { status: 'image'; path: string; dataUrl: string; downloadId?: string }
+  | { status: 'error'; path: string; error: string; downloadId?: string };
 
 const REQUEST_TIMEOUT_MS = 5_000;
 
@@ -251,6 +254,7 @@ export function FileBrowser({
   hideFooter = false,
   changesRootPath,
   refreshTrigger,
+  serverId,
   onConfirm,
   onClose,
 }: FileBrowserProps) {
@@ -271,6 +275,7 @@ export function FileBrowser({
   const [preview, setPreview] = useState<PreviewState>({ status: 'idle' });
   const [showDiff, setShowDiff] = useState(false);
   const [lightbox, setLightbox] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const [modifiedFiles, setModifiedFiles] = useState<Map<string, string>>(new Map()); // path → git code
   // Panel view: 'files' shows tree + changes section; 'changes' shows only changed files
   const [panelView, setPanelView] = useState<'files' | 'changes'>('files');
@@ -357,24 +362,26 @@ export function FileBrowser({
         if (!filePath) return;
         pendingReadRef.current.delete(msg.requestId);
 
+        const dlId = msg.downloadId;
+
         if (msg.status === 'error') {
           const errKey = msg.error === 'file_too_large' ? 'file_browser.preview_too_large'
             : msg.error === 'forbidden_path' ? 'file_browser.preview_error'
             : 'file_browser.preview_error';
-          setPreview({ status: 'error', path: filePath, error: t(errKey) });
+          setPreview({ status: 'error', path: filePath, error: t(errKey), downloadId: dlId });
           return;
         }
 
         // Image files: render as <img> from base64
         if (msg.encoding === 'base64' && msg.mimeType) {
           const dataUrl = `data:${msg.mimeType};base64,${msg.content ?? ''}`;
-          setPreview({ status: 'image', path: filePath, dataUrl });
+          setPreview({ status: 'image', path: filePath, dataUrl, downloadId: dlId });
           return;
         }
 
         const content = msg.content ?? '';
         if (isBinaryContent(content)) {
-          setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_binary') });
+          setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_binary'), downloadId: dlId });
           return;
         }
 
@@ -383,7 +390,7 @@ export function FileBrowser({
         setPreview((prev) => {
           // Merge diff if already fetched
           const existing = prev.status === 'ok' && prev.path === filePath ? prev : null;
-          return { status: 'ok', path: filePath, content, html, isMarkdown, diff: existing?.diff, diffHtml: existing?.diffHtml };
+          return { status: 'ok', path: filePath, content, html, isMarkdown, diff: existing?.diff, diffHtml: existing?.diffHtml, downloadId: dlId };
         });
         return;
       }
@@ -449,7 +456,7 @@ export function FileBrowser({
     if (inFlight) return;
 
     setData((prev) => updateNode(prev, nodePath, { isLoading: true }));
-    const requestId = ws.fsListDir(nodePath, includeFiles);
+    const requestId = ws.fsListDir(nodePath, includeFiles, !!serverId);
     pendingRef.current.set(requestId, nodePath);
     // Fetch git status for this directory
     const gitId = ws.fsGitStatus(nodePath);
@@ -664,6 +671,25 @@ export function FileBrowser({
             title="Toggle diff view"
           >
             {showDiff ? t('file_browser.view_source') : t('file_browser.view_diff')}
+          </button>
+        )}
+        {(preview.status === 'ok' || preview.status === 'image' || preview.status === 'error') && serverId && preview.downloadId && (
+          <button
+            class="fb-diff-toggle"
+            title={downloadError || t('upload.download_file')}
+            style={downloadError ? { color: '#ef4444' } : undefined}
+            onClick={() => {
+              setDownloadError(null);
+              void downloadAttachment(serverId, preview.downloadId!).catch((err) => {
+                const msg = err instanceof Error ? err.message : String(err);
+                if (msg.includes('daemon_offline')) setDownloadError(t('upload.daemon_offline'));
+                else if (msg.includes('410') || msg.includes('expired')) setDownloadError(t('upload.download_expired'));
+                else setDownloadError(t('upload.upload_failed'));
+                setTimeout(() => setDownloadError(null), 5000);
+              });
+            }}
+          >
+            {downloadError || t('upload.download_file')}
           </button>
         )}
         <button class="fb-close" onClick={() => setPreview({ status: 'idle' })}>✕</button>

@@ -10,6 +10,7 @@ import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
+import { uploadFile } from '../api.js';
 
 interface Props {
   ws: WsClient | null;
@@ -44,6 +45,8 @@ interface Props {
   sessions?: SessionInfo[];
   /** Sub-sessions — for @ picker agent list (includes deck_sub_*). */
   subSessions?: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
+  /** Server ID — required for file upload. */
+  serverId?: string;
 }
 
 type MenuAction = 'restart' | 'new' | 'stop';
@@ -83,7 +86,7 @@ function loadCodexModel(): CodexModelChoice | null {
   return null;
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId }: Props) {
   const { t } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -109,6 +112,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   // History navigation state
   const histIdxRef = useRef(-1);   // -1 = not navigating; 0 = most recent
   const draftRef = useRef('');      // saved unsent text while navigating
+  // File upload state
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
 
   // Keep external inputRef in sync so parent can call .focus()
   useEffect(() => {
@@ -296,6 +303,39 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setHasText(!!(divRef.current?.textContent?.trim()));
   };
 
+  const handleFileUpload = useCallback(async (files: FileList | null) => {
+    if (!files || files.length === 0 || !serverId) return;
+    setUploading(true);
+    setUploadError(null);
+    const paths: string[] = [];
+    for (const file of Array.from(files)) {
+      try {
+        const result = await uploadFile(serverId, file);
+        if (result.attachment?.daemonPath) {
+          paths.push('@' + result.attachment.daemonPath + ' ');
+        }
+      } catch (err) {
+        console.error('[upload] failed:', err);
+        const body = err instanceof Error ? err.message : String(err);
+        if (body.includes('daemon_offline')) {
+          setUploadError(t('upload.daemon_offline'));
+        } else if (body.includes('file_too_large')) {
+          setUploadError(t('upload.file_too_large', { max: 20 }));
+        } else {
+          setUploadError(t('upload.upload_failed'));
+        }
+        // Auto-dismiss error after 5s
+        setTimeout(() => setUploadError(null), 5000);
+      }
+    }
+    setUploading(false);
+    if (paths.length > 0) {
+      appendToInput(paths);
+      atJustClosedRef.current = true;
+      setTimeout(() => { atJustClosedRef.current = false; }, 200);
+    }
+  }, [serverId, appendToInput, t]);
+
   const handleShortcut = (data: string) => {
     if (!ws || !activeSession) return;
     ws.sendInput(activeSession.name, data);
@@ -461,6 +501,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         )}
       </div>}
 
+      {/* Upload error banner */}
+      {uploadError && (
+        <div style={{ padding: '4px 12px', fontSize: 12, color: '#ef4444', background: 'rgba(239,68,68,0.1)', borderRadius: 4, margin: '0 8px 4px' }}>
+          {uploadError}
+        </div>
+      )}
+
       {/* Main input row */}
       <div class="controls">
         {/* Quick input trigger — left of input */}
@@ -617,6 +664,29 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           onKeyDown={handleKeyDown}
           onPaste={handlePaste}
         />
+        {serverId && (
+          <>
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                const input = e.target as HTMLInputElement;
+                void handleFileUpload(input.files);
+                input.value = '';
+              }}
+            />
+            <button
+              class="btn btn-voice"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={inputDisabled || uploading}
+              title={uploading ? t('upload.uploading') : t('upload.upload_file')}
+            >
+              {uploading ? '...' : '\u{1F4CE}'}
+            </button>
+          </>
+        )}
         {VoiceInput.isAvailable() && (
           <button
             class="btn btn-voice"

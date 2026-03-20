@@ -211,5 +211,16 @@
       "brainstorm": "Brainstorm",
       "discuss": "Discuss"
     }
+  },
+  "upload": {
+    "upload_file": "Upload file",
+    "uploading": "Uploading...",
+    "upload_failed": "Upload failed",
+    "file_too_large": "File too large (max {{max}}MB)",
+    "download_file": "Download",
+    "downloading": "Downloading...",
+    "preview_unavailable": "Preview unavailable",
+    "download_expired": "Download link expired",
+    "daemon_offline": "Daemon is offline"
   }
 }

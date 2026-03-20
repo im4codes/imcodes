@@ -141,7 +141,7 @@ export function stopProactiveRefresh(): void {
 
 async function rawFetch(path: string, opts: RequestInit = {}): Promise<Response> {
   const headers = new Headers(opts.headers);
-  if (!headers.has('Content-Type') && opts.body) {
+  if (!headers.has('Content-Type') && opts.body && !(opts.body instanceof FormData)) {
     headers.set('Content-Type', 'application/json');
   }
   if (_apiKey) {
@@ -361,4 +361,61 @@ export async function listPasskeys(): Promise<{ credentials: PasskeyCredential[]
 
 export async function deletePasskey(credentialId: string): Promise<void> {
   await apiFetch(`/api/auth/passkey/credentials/${credentialId}`, { method: 'DELETE' });
+}
+
+// ── File transfer API ─────────────────────────────────────────────────────
+
+export interface AttachmentRefResponse {
+  id: string;
+  source: string;
+  serverId: string;
+  daemonPath: string;
+  originalName?: string;
+  mime?: string;
+  size?: number;
+  createdAt: string;
+  expiresAt?: string;
+  downloadable: boolean;
+}
+
+export async function uploadFile(
+  serverId: string,
+  file: File,
+): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
+  const form = new FormData();
+  form.append('file', file);
+  // Use rawFetch to avoid Content-Type override (browser sets multipart boundary)
+  const res = await rawFetch(`/api/server/${serverId}/upload`, {
+    method: 'POST',
+    body: form,
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new ApiError(res.status, body);
+  }
+  return res.json() as Promise<{ ok: boolean; attachment: AttachmentRefResponse }>;
+}
+
+export async function downloadAttachment(serverId: string, attachmentId: string): Promise<void> {
+  const res = await rawFetch(`/api/server/${serverId}/uploads/${attachmentId}/download`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new ApiError(res.status, body);
+  }
+  const blob = await res.blob();
+  const disposition = res.headers.get('Content-Disposition');
+  let filename = attachmentId;
+  if (disposition) {
+    const match = disposition.match(/filename="?(.+?)"?$/);
+    if (match) filename = match[1];
+  }
+  // Trigger browser download
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
