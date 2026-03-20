@@ -1,6 +1,10 @@
 /**
- * OTA update manager — checks for web bundle updates from the self-hosted server,
- * downloads in the background, and applies on next cold start.
+ * OTA update manager — checks for web bundle updates from the self-hosted server.
+ *
+ * Strategy:
+ * - On cold start: check + download + apply immediately (user sees splash briefly)
+ * - On resume from background: download only, apply on next cold start
+ *   (avoids jarring reload mid-use)
  *
  * Uses @capgo/capacitor-updater in manual mode so we can point at the
  * user's configured server URL (not a hardcoded Capgo endpoint).
@@ -29,16 +33,17 @@ export async function initUpdateManager(): Promise<void> {
   // Notify the plugin the app loaded successfully — prevents rollback
   await CapacitorUpdater.notifyAppReady();
 
-  // Check now + on every foreground resume
-  checkForUpdate().catch(() => {});
+  // Cold start: check + apply immediately
+  checkForUpdate(true).catch(() => {});
 
+  // Resume: download only, apply on next cold start
   const { App } = await import('@capacitor/app');
   App.addListener('appStateChange', ({ isActive }) => {
-    if (isActive) checkForUpdate().catch(() => {});
+    if (isActive) checkForUpdate(false).catch(() => {});
   });
 }
 
-async function checkForUpdate(): Promise<void> {
+async function checkForUpdate(applyNow: boolean): Promise<void> {
   const serverUrl = await getServerUrl();
   if (!serverUrl) return;
 
@@ -67,23 +72,28 @@ async function checkForUpdate(): Promise<void> {
     ? manifest.url
     : `${serverUrl}${manifest.url}`;
 
-  // Download in background
+  // Download
   try {
     const bundle = await CapacitorUpdater.download({
       url: bundleUrl,
       version: String(manifest.version),
     });
 
-    // Set as next bundle — will activate on next cold start
-    await CapacitorUpdater.set({ id: bundle.id });
-
-    // Record the version so we don't re-download
+    // Record version so we don't re-download
     await Preferences.set({
       key: PREFS_OTA_VERSION_KEY,
       value: String(manifest.version),
     });
 
-    console.log(`[OTA] Downloaded v${manifest.version}, will apply on next restart`);
+    if (applyNow) {
+      // Cold start: apply immediately (triggers WebView reload)
+      await CapacitorUpdater.set({ id: bundle.id });
+      console.log(`[OTA] v${manifest.version} applied`);
+    } else {
+      // Resume: just set as next — applies on next cold start
+      await CapacitorUpdater.set({ id: bundle.id });
+      console.log(`[OTA] v${manifest.version} downloaded, will apply on next launch`);
+    }
   } catch (err) {
     console.warn('[OTA] Download failed:', err);
   }

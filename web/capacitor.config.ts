@@ -15,6 +15,7 @@ const config: CapacitorConfig = {
   plugins: {
     CapacitorUpdater: {
       autoUpdate: false,           // we use manual mode in update-manager.ts
+      directUpdate: false,         // we handle apply timing ourselves
       autoDeleteFailed: true,
       autoDeletePrevious: true,
       resetWhenUpdate: true,
