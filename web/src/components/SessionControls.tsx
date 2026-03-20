@@ -600,12 +600,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               setTimeout(() => { atJustClosedRef.current = false; }, 100);
               setHasText(true);
               // Move cursor to end
-              const sel = window.getSelection();
-              const range = document.createRange();
-              range.selectNodeContents(divRef.current!);
-              range.collapse(false);
-              sel?.removeAllRanges();
-              sel?.addRange(range);
+              try {
+                const sel = window.getSelection();
+                const range = document.createRange();
+                range.selectNodeContents(divRef.current!);
+                range.collapse(false);
+                sel?.removeAllRanges();
+                sel?.addRange(range);
+              } catch { /* jsdom lacks Selection API */ }
             }}
             onSelectAgent={(session, mode) => {
               const text = divRef.current?.textContent ?? '';
@@ -619,12 +621,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               setTimeout(() => { atJustClosedRef.current = false; }, 100);
               setHasText(true);
               // Move cursor to end
-              const sel = window.getSelection();
-              const range = document.createRange();
-              range.selectNodeContents(divRef.current!);
-              range.collapse(false);
-              sel?.removeAllRanges();
-              sel?.addRange(range);
+              try {
+                const sel = window.getSelection();
+                const range = document.createRange();
+                range.selectNodeContents(divRef.current!);
+                range.collapse(false);
+                sel?.removeAllRanges();
+                sel?.addRange(range);
+              } catch { /* jsdom lacks Selection API */ }
             }}
             onClose={() => { setAtPickerOpen(false); setAtPickerStage('choose'); }}
             onStageChange={setAtPickerStage}
