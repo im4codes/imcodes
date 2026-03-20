@@ -429,6 +429,8 @@ export async function startWatchingById(sessionName: string, uuid: string, model
           const found = join(dir, match);
           state.activeFile = found; state.workDir = dir;
           claimedFiles.set(found, sessionName);
+          await emitRecentHistory(sessionName, found, model);
+          try { state.fileOffset = (await stat(found)).size; } catch { state.fileOffset = 0; }
           startPoll(sessionName, state);
           void watchDir(sessionName, state, dir);
           return;
@@ -494,7 +496,10 @@ async function watchDir(sessionName: string, state: WatcherState, dir: string): 
     const watcher = watch(dir, { persistent: false, signal: state.abort.signal });
     for await (const event of watcher as any) {
       if (state.stopped) break;
-      if (event.filename?.startsWith('rollout-')) await drainNewLines(sessionName, state);
+      if (!event.filename?.startsWith('rollout-') || !event.filename.endsWith('.jsonl')) continue;
+      const changedPath = join(dir, event.filename);
+      await maybeSwitchActiveFile(sessionName, state, changedPath);
+      await drainNewLines(sessionName, state);
     }
   } catch {}
 }
@@ -502,6 +507,26 @@ async function watchDir(sessionName: string, state: WatcherState, dir: string): 
 async function checkNewer(a: string, b: string | null): Promise<boolean> {
   if (!b) return true;
   try { return (await stat(a)).mtimeMs > (await stat(b)).mtimeMs; } catch { return false; }
+}
+
+async function maybeSwitchActiveFile(sessionName: string, state: WatcherState, candidatePath: string): Promise<void> {
+  if (state.stopped || !candidatePath || candidatePath === state.activeFile) return;
+  if (isFileClaimedByOther(sessionName, candidatePath)) return;
+
+  const currentUuid = state.activeFile ? extractUuidFromPath(state.activeFile) : null;
+  const candidateUuid = extractUuidFromPath(candidatePath);
+
+  // Follow rollover/rotation for the same Codex session file. This handles
+  // same-directory file replacement, not just cross-date directory changes.
+  if (currentUuid && candidateUuid && candidateUuid !== currentUuid) return;
+
+  if (!(await checkNewer(candidatePath, state.activeFile))) return;
+
+  logger.info({ sessionName, old: state.activeFile, new: candidatePath }, 'codex-watcher: switched active rollout file');
+  if (state.activeFile) claimedFiles.delete(state.activeFile);
+  state.activeFile = candidatePath;
+  state.fileOffset = 0;
+  claimedFiles.set(candidatePath, sessionName);
 }
 
 async function drainNewLines(sessionName: string, state: WatcherState): Promise<void> {

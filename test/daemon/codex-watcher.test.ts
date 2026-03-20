@@ -18,7 +18,7 @@ vi.mock('../../src/util/logger.js', () => ({
   default: { debug: vi.fn(), warn: vi.fn(), info: vi.fn(), error: vi.fn() },
 }));
 
-import { parseLine, readCwd, startWatching, stopWatching, isWatching, resetParseStateForTests } from '../../src/daemon/codex-watcher.js';
+import { parseLine, readCwd, startWatching, startWatchingSpecificFile, stopWatching, isWatching, resetParseStateForTests } from '../../src/daemon/codex-watcher.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -106,6 +106,15 @@ function fixtureLabels(name: string): string[] {
 
 function replayFixture(sessionName: string, name: string): void {
   for (const line of loadRolloutFixture(name)) parseLine(sessionName, line);
+}
+
+async function waitUntil(fn: () => boolean, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fn()) return;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  throw new Error('waitUntil timeout');
 }
 
 // ── parseLine ─────────────────────────────────────────────────────────────────
@@ -401,6 +410,26 @@ describe('startWatching — file-based integration', () => {
     expect(calls[0][2]).toEqual({ text: 'msg from A' });
     expect(calls[1][0]).toBe('session-proj-b');
     expect(calls[1][2]).toEqual({ text: 'msg from B' });
+  });
+
+  it('switches to a newer same-directory rollout file and keeps emitting text', async () => {
+    const uuid = '12345678-1234-1234-1234-123456789abc';
+    const file1 = join(sessionDir, `rollout-2026-03-13T10-00-00-${uuid}.jsonl`);
+    const file2 = join(sessionDir, `rollout-2026-03-13T10-05-00-${uuid}.jsonl`);
+
+    await writeFile(file1, [sessionMetaLine(join(tmpDir, 'proj-a'))].join('\n') + '\n');
+    await startWatchingSpecificFile('session-int', file1);
+
+    await writeFile(file2, [
+      sessionMetaLine(join(tmpDir, 'proj-a')),
+      userMessageLine('followed after rollover'),
+    ].join('\n') + '\n');
+
+    await waitUntil(() =>
+      vi.mocked(timelineEmitter.emit).mock.calls.some(
+        (call) => call[0] === 'session-int' && call[1] === 'user.message' && (call[2] as any).text === 'followed after rollover',
+      ),
+    );
   });
 });
 
