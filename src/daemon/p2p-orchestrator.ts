@@ -350,12 +350,6 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
     const sendOpts = isSandboxedSession(session) ? { cwd: sessionRecord?.projectDir } : undefined;
     try {
       await sendKeysDelayedEnter(session, prompt, sendOpts);
-      // Emit prompt content to timeline for debug/tracking visibility
-      timelineEmitter.emit(session, 'user.message', {
-        text: prompt,
-        p2pRunId: run.id,
-        source: 'p2p-orchestrator',
-      }, { source: 'daemon' });
     } catch (err) {
       if (attempt < MAX_RETRIES) {
         logger.warn({ runId: run.id, session, attempt }, 'P2P: sendKeys failed, will retry');

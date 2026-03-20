@@ -86,6 +86,11 @@ export async function sendKeys(session: string, keys: string, opts?: SendKeysOpt
     const escaped = instruction.replace(/'/g, "'\\''");
     await tmuxExec(`send-keys -t ${session} -l -- '${escaped}'`);
     setTimeout(() => fsp.unlink(filePath).catch(() => {}), 120_000);
+
+    // Emit full prompt content to timeline so chat history shows what was actually sent
+    import('../daemon/timeline-emitter.js').then(({ timelineEmitter }) => {
+      timelineEmitter.emit(session, 'user.message', { text: keys, tempFile: filePath }, { source: 'daemon' });
+    }).catch(() => { /* timeline not available, e.g. in tests */ });
   } else {
     // Short text: simple send-keys
     const escaped = keys.replace(/'/g, "'\\''");
