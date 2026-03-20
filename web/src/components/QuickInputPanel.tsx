@@ -78,13 +78,19 @@ export function useQuickData(): UseQuickDataResult {
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
-    apiFetch<{ data: QuickData }>('/api/quick-data').then((res) => {
-      // Ensure sessionHistory exists for older data blobs
-      const d = res.data;
-      if (!d.sessionHistory) d.sessionHistory = {};
-      setData(d);
-      setLoaded(true);
-    }).catch(() => { setLoaded(true); });
+    const fetchData = () => {
+      apiFetch<{ data: QuickData }>('/api/quick-data').then((res) => {
+        const d = res.data;
+        if (!d.sessionHistory) d.sessionHistory = {};
+        setData(d);
+        setLoaded(true);
+      }).catch(() => { setLoaded(true); });
+    };
+    fetchData();
+    // Re-fetch when app resumes from background (mobile) or tab becomes visible
+    const onVisibility = () => { if (document.visibilityState === 'visible') fetchData(); };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
   }, []);
 
   const update = (next: QuickData) => {
