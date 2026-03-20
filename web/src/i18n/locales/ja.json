@@ -49,6 +49,7 @@
   },
   "server": {
     "upgrade_daemon": "↑ Daemonをアップグレード",
+    "upgrade_all": "↑ 全デバイス更新",
     "delete": "✕ サーバーを削除",
     "upgrade_sent": "「{{name}}」にアップグレードコマンドを送信しました。Daemonは最新バージョンをインストールして再起動します。",
     "upgrade_failed": "アップグレードコマンドの送信に失敗しました。Daemonがオフラインの可能性があります。",

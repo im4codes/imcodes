@@ -6,11 +6,12 @@ interface Props {
   y: number;
   onRename: () => void;
   onUpgrade: () => void;
+  onUpgradeAll?: () => void;
   onDelete: () => void;
   onClose: () => void;
 }
 
-export function ServerContextMenu({ x, y, onRename, onUpgrade, onDelete, onClose }: Props) {
+export function ServerContextMenu({ x, y, onRename, onUpgrade, onUpgradeAll, onDelete, onClose }: Props) {
   const { t } = useTranslation();
   const ref = useRef<HTMLDivElement>(null);
 
@@ -40,6 +41,11 @@ export function ServerContextMenu({ x, y, onRename, onUpgrade, onDelete, onClose
       <button class="server-ctx-item" onClick={() => { onClose(); onUpgrade(); }}>
         {t('server.upgrade_daemon')}
       </button>
+      {onUpgradeAll && (
+        <button class="server-ctx-item" onClick={() => { onClose(); onUpgradeAll(); }}>
+          {t('server.upgrade_all')}
+        </button>
+      )}
       <div class="menu-divider" />
       <button class="server-ctx-item server-ctx-item-danger" onClick={() => { onClose(); onDelete(); }}>
         {t('server.delete')}

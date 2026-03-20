@@ -249,6 +249,19 @@ export function App() {
     }
   }, [trans]);
 
+  const handleUpgradeAll = useCallback(async () => {
+    const results: string[] = [];
+    for (const server of servers) {
+      try {
+        await apiFetch(`/api/server/${server.id}/upgrade`, { method: 'POST' });
+        results.push(`✓ ${server.name}`);
+      } catch {
+        results.push(`✗ ${server.name}`);
+      }
+    }
+    alert(results.join('\n'));
+  }, [servers]);
+
   const handleDeleteServer = useCallback(async (server: ServerInfo) => {
     try {
       await apiFetch(`/api/server/${server.id}`, { method: 'DELETE' });
@@ -1384,6 +1397,7 @@ export function App() {
           y={serverCtxMenu.y}
           onRename={() => handleRenameServer(serverCtxMenu.server)}
           onUpgrade={() => handleUpgradeDaemon(serverCtxMenu.server)}
+          onUpgradeAll={servers.length > 1 ? handleUpgradeAll : undefined}
           onDelete={() => setDeleteTarget(serverCtxMenu.server)}
           onClose={() => setServerCtxMenu(null)}
         />

@@ -49,6 +49,7 @@
   },
   "server": {
     "upgrade_daemon": "↑ Upgrade Daemon",
+    "upgrade_all": "↑ Upgrade All Devices",
     "delete": "✕ Delete server",
     "upgrade_sent": "Upgrade command sent to \"{{name}}\". The daemon will install the latest version and restart.",
     "upgrade_failed": "Failed to send upgrade command. The daemon may be offline.",

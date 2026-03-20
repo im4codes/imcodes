@@ -49,6 +49,7 @@
   },
   "server": {
     "upgrade_daemon": "↑ 升級 Daemon",
+    "upgrade_all": "↑ 升級全部裝置",
     "delete": "✕ 刪除伺服器",
     "upgrade_sent": "升級指令已傳送至「{{name}}」，Daemon 將安裝最新版本並重新啟動。",
     "upgrade_failed": "傳送升級指令失敗，Daemon 可能已離線。",
