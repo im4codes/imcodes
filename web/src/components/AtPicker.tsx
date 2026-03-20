@@ -136,9 +136,10 @@ export function AtPicker({
   const requestIdRef = useRef<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Show all sessions as agents — label or short name, mark self
+  // Show all sessions as agents — exclude shell/script (can't do P2P), label or short name, mark self
   const agents = useMemo(() => {
     return sessions
+      .filter((s) => s.agentType !== 'shell' && s.agentType !== 'script')
       .map((s) => {
         const parts = s.name.split('_');
         const shortName = s.label || parts[parts.length - 1] || s.name;

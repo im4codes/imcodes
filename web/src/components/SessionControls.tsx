@@ -211,6 +211,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [ws, activeSession, quickData, onSend]);
 
   const handleKeyDown = (e: KeyboardEvent) => {
+    // When @ picker is open, let it handle Enter/Arrow/Escape — don't send or navigate history
+    if (atPickerOpen && (e.key === 'Enter' || e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'Escape')) {
+      // AtPicker's document-level keydown handler will handle these
+      return;
+    }
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       handleSend();

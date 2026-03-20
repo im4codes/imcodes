@@ -74,6 +74,9 @@ const BROWSER_WHITELIST = new Set([
   'fs.read',
   'fs.git_status',
   'fs.git_diff',
+  'file.search',
+  'p2p.cancel',
+  'p2p.status',
 ]);
 
 // ── Terminal forwarding queue (per (session, browser)) ────────────────────────
@@ -158,6 +161,7 @@ export class WsBridge {
 
   /** Per-request fs.git_diff pending map. */
   private pendingFsGitDiffRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
+  private pendingFileSearchRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
 
   /**
    * Per-session daemon subscription reference count.
@@ -382,6 +386,13 @@ export class WsBridge {
         this.pendingFsGitDiffRequests.set(reqId, { socket: ws, timer });
       }
 
+      // Track file.search requests for single-cast response routing
+      if (msg.type === 'file.search' && typeof msg.requestId === 'string') {
+        const reqId = msg.requestId;
+        const timer = setTimeout(() => this.pendingFileSearchRequests.delete(reqId), 30_000);
+        this.pendingFileSearchRequests.set(reqId, { socket: ws, timer });
+      }
+
       // Track terminal subscriptions for binary routing + ref-counted daemon forwarding
       if (msg.type === 'terminal.subscribe' && typeof msg.session === 'string') {
         const sessionName = msg.session;
@@ -485,6 +496,22 @@ export class WsBridge {
         if (pending) {
           clearTimeout(pending.timer);
           this.pendingFsGitDiffRequests.delete(requestId);
+          if (pending.socket.readyState === WebSocket.OPEN) {
+            pending.socket.send(JSON.stringify(msg));
+          }
+        }
+      }
+      return;
+    }
+
+    // ── file.search_response: single-cast back to requesting browser ─────────
+    if (type === 'file.search_response') {
+      const requestId = msg.requestId as string | undefined;
+      if (requestId) {
+        const pending = this.pendingFileSearchRequests.get(requestId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.pendingFileSearchRequests.delete(requestId);
           if (pending.socket.readyState === WebSocket.OPEN) {
             pending.socket.send(JSON.stringify(msg));
           }
