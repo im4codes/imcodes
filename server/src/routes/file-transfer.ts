@@ -6,8 +6,8 @@ import type { Env } from '../env.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { randomHex } from '../security/crypto.js';
-import { FILE_TRANSFER_LIMITS } from '../../../src/shared/transport/file-transfer.js';
-import type { AttachmentRef, FileUploadRequest, FileDownloadRequest } from '../../../src/shared/transport/file-transfer.js';
+import { FILE_TRANSFER_LIMITS } from '../../../shared/transport/file-transfer.js';
+import type { AttachmentRef, FileUploadRequest, FileDownloadRequest } from '../../../shared/transport/file-transfer.js';
 import logger from '../util/logger.js';
 import * as path from 'node:path';
 
