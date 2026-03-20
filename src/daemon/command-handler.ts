@@ -473,23 +473,12 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     return;
   }
 
-  // Inline file contents for @file tokens (no agent)
-  let finalText = text;
-  if (tokens.files.length > 0) {
-    const record = getSession(sessionName);
-    const projectDir = record?.projectDir ?? '';
-    const fileParts: string[] = [];
-    for (const fp of tokens.files) {
-      try {
-        const absPath = nodePath.isAbsolute(fp) ? fp : nodePath.join(projectDir, fp);
-        const content = await fsReadFileRaw(absPath, 'utf8');
-        fileParts.push(`\n--- ${fp} ---\n${content.slice(0, 50_000)}\n---\n`);
-      } catch { /* ignore */ }
-    }
-    if (fileParts.length > 0) {
-      finalText = tokens.cleanText + fileParts.join('');
-    }
-  }
+  // Preserve raw @file references for normal sends.
+  // Eagerly expanding local file content here rewrites a short path-based request
+  // into a large multi-line payload, which then gets re-written again by the tmux
+  // transport layer into a /tmp/imcodes-*.md indirection. For normal sends, keep
+  // the user's original @path semantics and let the agent decide how to consume it.
+  const finalText = text;
 
   // Serialized write via per-session mutex
   const release = await getMutex(sessionName).acquire();
