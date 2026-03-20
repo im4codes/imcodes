@@ -31,6 +31,7 @@ interface Props {
   onRename: () => void;
   zIndex: number;
   onFocus: () => void;
+  sessions?: SessionInfo[];
 }
 
 type ViewMode = 'terminal' | 'chat';
@@ -58,7 +59,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, zIndex, onFocus,
+  sub, ws, connected, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, zIndex, onFocus, sessions,
 }: Props) {
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const swipeBackRef = useSwipeBack(isMobile ? onMinimize : null);
@@ -357,6 +358,7 @@ export function SubSessionWindow({
           onRenameSession={onRename}
           sessionDisplayName={sub.label ?? agentTag}
           activeThinking={!!activeThinkingTs}
+          sessions={sessions}
         />
       </div>
     </div>

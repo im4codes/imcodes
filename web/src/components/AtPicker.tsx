@@ -18,6 +18,7 @@ interface AtPickerProps {
   sessions: SessionEntry[];
   mainSession: string;
   wsClient: any;
+  projectDir?: string;
   onSelectFile: (path: string) => void;
   onSelectAgent: (session: string, mode: string) => void;
   onClose: () => void;
@@ -119,6 +120,7 @@ export function AtPicker({
   sessions,
   mainSession,
   wsClient,
+  projectDir,
   onSelectFile,
   onSelectAgent,
   onClose,
@@ -173,7 +175,7 @@ export function AtPicker({
       const reqId = crypto.randomUUID();
       requestIdRef.current = reqId;
       try {
-        wsClient.send({ type: 'file.search', requestId: reqId, query });
+        wsClient.send({ type: 'file.search', requestId: reqId, query, projectDir });
       } catch {
         // WS not connected
       }

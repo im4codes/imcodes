@@ -9,6 +9,7 @@ import { FileBrowser } from './FileBrowser.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
+import { AtPicker } from './AtPicker.js';
 
 interface Props {
   ws: WsClient | null;
@@ -39,6 +40,8 @@ interface Props {
   /** Mobile: open full-screen file browser overlay. */
   mobileFileBrowserOpen?: boolean;
   onMobileFileBrowserClose?: () => void;
+  /** All sessions — for @ picker agent list. */
+  sessions?: SessionInfo[];
 }
 
 type MenuAction = 'restart' | 'new' | 'stop';
@@ -78,12 +81,14 @@ function loadCodexModel(): CodexModelChoice | null {
   return null;
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions }: Props) {
   const { t } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
   const [voiceOpen, setVoiceOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [atPickerOpen, setAtPickerOpen] = useState(false);
+  const [atQuery, setAtQuery] = useState('');
   const [modelOpen, setModelOpen] = useState(false);
   const [quickOpen, setQuickOpen] = useState(false);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
@@ -473,6 +478,36 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           />
         </div>
 
+        {/* @ mention picker */}
+        {atPickerOpen && ws && activeSession && (
+          <AtPicker
+            query={atQuery}
+            sessions={(sessions ?? []).map(s => ({ name: s.name, agentType: s.agentType, state: s.state }))}
+            mainSession={activeSession.project ? `deck_${activeSession.project}` : activeSession.name.replace(/_[^_]+$/, '')}
+            wsClient={ws}
+            projectDir={activeSession.projectDir ?? ''}
+            onSelectFile={(path) => {
+              // Replace @query with @path in input
+              const text = divRef.current?.textContent ?? '';
+              const before = text.replace(/@[^\s@]*$/, '');
+              divRef.current!.textContent = `${before}@${path} `;
+              setAtPickerOpen(false);
+              setHasText(true);
+              divRef.current?.focus();
+            }}
+            onSelectAgent={(session, mode) => {
+              const text = divRef.current?.textContent ?? '';
+              const before = text.replace(/@[^\s@]*$/, '');
+              divRef.current!.textContent = `${before}@@cx(${session}, ${mode}) `;
+              setAtPickerOpen(false);
+              setHasText(true);
+              divRef.current?.focus();
+            }}
+            onClose={() => setAtPickerOpen(false)}
+            visible={true}
+          />
+        )}
+
         {/*
           contenteditable div — iOS does NOT show the password/keychain autofill bar
           for contenteditable elements, unlike <input> or <textarea>.
@@ -487,7 +522,22 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           data-placeholder={placeholder}
           spellcheck={false}
           onFocus={handleFocus}
-          onInput={() => setHasText(!!(divRef.current?.textContent?.trim()))}
+          onInput={() => {
+            setHasText(!!(divRef.current?.textContent?.trim()));
+            // Detect @ for picker
+            const text = divRef.current?.textContent ?? '';
+            const sel = window.getSelection();
+            const cursorPos = sel?.anchorOffset ?? text.length;
+            const beforeCursor = text.slice(0, cursorPos);
+            const atMatch = beforeCursor.match(/@([^\s@]*)$/);
+            if (atMatch) {
+              setAtPickerOpen(true);
+              setAtQuery(atMatch[1]);
+            } else {
+              setAtPickerOpen(false);
+              setAtQuery('');
+            }
+          }}
           onKeyDown={handleKeyDown}
           onPaste={handlePaste}
         />
