@@ -5,6 +5,7 @@ import { detectMemoryBackend } from '../memory/detector.js';
 import { ServerLink } from './server-link.js';
 import { handleWebCommand, setRouterContext } from './command-handler.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
+import { notifySessionIdle } from './p2p-orchestrator.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { timelineStore } from './timeline-store.js';
 import { startHookServer } from './hook-server.js';
@@ -279,6 +280,7 @@ export async function startup(): Promise<DaemonContext> {
       const record = listSessions().find((s) => s.name === payload.session);
       const projectName = record?.projectName ?? payload.session;
       if (payload.event === 'idle') {
+        notifySessionIdle(payload.session);
         serverLink.send({ type: 'session.idle', session: payload.session, project: projectName, agentType: payload.agentType });
       } else if (payload.event === 'notification') {
         serverLink.send({ type: 'session.notification', session: payload.session, project: projectName, title: payload.title, message: payload.message });

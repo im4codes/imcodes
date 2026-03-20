@@ -55,6 +55,7 @@ import {
   _setIdlePollMs,
   type P2pRun,
   type P2pRunStatus,
+  notifySessionIdle,
 } from '../../src/daemon/p2p-orchestrator.js';
 import { getP2pMode, BUILT_IN_MODES } from '../../src/shared/p2p-modes.js';
 
@@ -127,6 +128,7 @@ beforeEach(() => {
   detectStatusMock.mockReturnValue('idle');
   capturePaneMock.mockResolvedValue(['$']);
   // When sendKeys is called, simulate the agent writing to the context file
+  // then firing an idle hook after a short delay
   sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
     // Extract the context file path from the prompt and append a section
     const pathMatch = prompt.match(/\/tmp\/imcodes-p2p\/[^\s]+\.md/);
@@ -134,6 +136,8 @@ beforeEach(() => {
       const { appendFile } = await import('node:fs/promises');
       await appendFile(pathMatch[0], `\n## Output from ${session}\n\nSome analysis.\n`);
     }
+    // Simulate idle hook firing after agent finishes (small delay for file poll to detect growth)
+    setTimeout(() => notifySessionIdle(session), 150);
   });
   getSessionMock.mockReturnValue({ agentType: 'claude-code', projectDir: '/tmp/proj' });
 });

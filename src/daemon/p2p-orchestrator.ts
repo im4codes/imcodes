@@ -73,6 +73,52 @@ let IDLE_POLL_MS = 3_000;
 /** Override poll interval for tests. */
 export function _setIdlePollMs(ms: number): void { IDLE_POLL_MS = ms; }
 
+// ── Idle event registry (callback-driven, no polling) ─────────────────────
+
+type IdleResolver = () => void;
+const idleWaiters = new Map<string, Set<IdleResolver>>();
+
+/**
+ * Called by lifecycle hook when a session becomes idle.
+ * Resolves any P2P waiters for that session immediately.
+ */
+export function notifySessionIdle(sessionName: string): void {
+  const waiters = idleWaiters.get(sessionName);
+  if (waiters && waiters.size > 0) {
+    logger.info({ session: sessionName, waiters: waiters.size }, 'P2P: idle event received, resolving waiters');
+    for (const resolve of waiters) resolve();
+    waiters.clear();
+  }
+}
+
+function waitForIdleEvent(session: string, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let resolved = false;
+    const timer = setTimeout(() => {
+      if (!resolved) { resolved = true; cleanup(); resolve(false); }
+    }, timeoutMs);
+
+    const resolver: IdleResolver = () => {
+      if (!resolved) { resolved = true; clearTimeout(timer); cleanup(); resolve(true); }
+    };
+
+    function cleanup() {
+      const set = idleWaiters.get(session);
+      if (set) {
+        set.delete(resolver);
+        if (set.size === 0) idleWaiters.delete(session);
+      }
+    }
+
+    let set = idleWaiters.get(session);
+    if (!set) {
+      set = new Set();
+      idleWaiters.set(session, set);
+    }
+    set.add(resolver);
+  });
+}
+
 // ── Start a P2P run ───────────────────────────────────────────────────────
 
 export async function startP2pRun(
@@ -271,8 +317,16 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
   }
 
   // Wait for: file grows + agent idle
+  // Uses dual strategy: poll for file growth + idle, AND listen for idle hook event.
+  // Whichever fires first wins.
   const deadline = Date.now() + run.timeoutMs;
   let fileGrew = false;
+  let idleEventReceived = false;
+
+  // Start listening for idle event immediately
+  const idlePromise = waitForIdleEvent(session, run.timeoutMs).then((ok) => {
+    idleEventReceived = ok;
+  });
 
   while (Date.now() < deadline) {
     if (run._cancelled) return;
@@ -280,25 +334,32 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
     if (run._cancelled) return;
 
     // Check file growth
-    try {
-      const currentSize = (await stat(run.contextFilePath)).size;
-      if (currentSize > sizeBefore) {
-        fileGrew = true;
-        if (run.status === 'dispatched') {
-          transition(run, 'running', serverLink);
+    if (!fileGrew) {
+      try {
+        const currentSize = (await stat(run.contextFilePath)).size;
+        if (currentSize > sizeBefore) {
+          fileGrew = true;
+          if (run.status === 'dispatched') {
+            transition(run, 'running', serverLink);
+          }
         }
-      }
-    } catch { /* ignore */ }
+      } catch { /* ignore */ }
+    }
 
-    // Check agent idle
+    // Check idle — either via hook event or poll
     if (fileGrew) {
+      if (idleEventReceived) {
+        if (run.remainingTargets.length > 0 || session !== run.initiatorSession) {
+          transition(run, 'awaiting_next_hop', serverLink);
+        }
+        return;
+      }
+      // Fallback: poll detectStatus
       try {
         const lines = await capturePane(session);
         const record = getSession(session);
         const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
-        const status = detectStatus(lines, agentType);
-        if (status === 'idle') {
-          // Hop complete
+        if (detectStatus(lines, agentType) === 'idle') {
           if (run.remainingTargets.length > 0 || session !== run.initiatorSession) {
             transition(run, 'awaiting_next_hop', serverLink);
           }
@@ -307,6 +368,9 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
       } catch { /* ignore */ }
     }
   }
+
+  // Cleanup: the idle event listener will auto-timeout
+  void idlePromise;
 
   // Timeout
   if (!run._cancelled) {
@@ -318,28 +382,28 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
 
 async function waitForIdle(run: P2pRun, session: string, serverLink: ServerLink | null): Promise<void> {
   logger.info({ runId: run.id, session }, 'P2P: waiting for target session to become idle');
-  const deadline = Date.now() + run.timeoutMs;
-  let pollCount = 0;
-  while (Date.now() < deadline) {
-    if (run._cancelled) return;
-    try {
-      const lines = await capturePane(session);
-      const record = getSession(session);
-      const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
-      const status = detectStatus(lines, agentType);
-      if (status === 'idle') {
-        logger.info({ runId: run.id, session, pollCount }, 'P2P: target session is idle, proceeding');
-        return;
-      }
-      if (pollCount % 10 === 0) {
-        logger.debug({ runId: run.id, session, status, pollCount }, 'P2P: target not idle yet');
-      }
-    } catch (err) {
-      logger.debug({ runId: run.id, session, err: String(err) }, 'P2P: capturePane/detectStatus failed');
+
+  // Quick check: already idle?
+  try {
+    const lines = await capturePane(session);
+    const record = getSession(session);
+    const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
+    if (detectStatus(lines, agentType) === 'idle') {
+      logger.info({ runId: run.id, session }, 'P2P: target already idle, proceeding immediately');
+      return;
     }
-    pollCount++;
-    await sleep(IDLE_POLL_MS);
+  } catch { /* proceed to wait */ }
+
+  // Event-driven wait: resolve on idle hook callback or timeout
+  const gotIdle = await waitForIdleEvent(session, run.timeoutMs);
+  if (run._cancelled) return;
+
+  if (gotIdle) {
+    logger.info({ runId: run.id, session }, 'P2P: target idle (via hook event), proceeding');
+    return;
   }
+
+  // Timeout
   if (!run._cancelled) {
     failRun(run, 'timed_out', `Target ${session} never became idle after ${run.timeoutMs}ms`, serverLink);
   }
