@@ -1,7 +1,6 @@
 /**
  * AtPicker — dropdown autocomplete for @-mentions.
- * Two groups: Files (searched via WS file.search) and Agents (filtered from sessions).
- * Supports keyboard navigation and mode sub-picker for agents.
+ * Two-step: first pick category (Files / Agents), then search/select within that category.
  */
 import { useState, useEffect, useRef, useCallback, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
@@ -27,9 +26,7 @@ interface AtPickerProps {
   visible: boolean;
 }
 
-type PickerItem =
-  | { kind: 'file'; path: string; basename: string; dir: string }
-  | { kind: 'agent'; session: string; shortName: string; agentType: string; busy: boolean; isSelf: boolean };
+type Category = 'choose' | 'files' | 'agents';
 
 const MODES = ['audit', 'review', 'brainstorm', 'discuss'] as const;
 
@@ -42,7 +39,7 @@ const containerStyle: Record<string, string | number> = {
   bottom: '100%',
   left: 0,
   right: 0,
-  maxHeight: 256,
+  maxHeight: 280,
   overflowY: 'auto',
   background: '#1e293b',
   border: '1px solid #334155',
@@ -50,6 +47,21 @@ const containerStyle: Record<string, string | number> = {
   boxShadow: '0 -4px 12px rgba(0,0,0,0.4)',
   zIndex: 50,
   padding: '4px 0',
+};
+
+const categoryStyle: Record<string, string | number> = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  padding: '10px 14px',
+  cursor: 'pointer',
+  fontSize: 14,
+  color: '#e2e8f0',
+};
+
+const categoryHighlightStyle: Record<string, string | number> = {
+  ...categoryStyle,
+  background: '#334155',
 };
 
 const groupLabelStyle: Record<string, string | number> = {
@@ -117,6 +129,16 @@ const modeBtnHoverStyle: Record<string, string | number> = {
   color: '#93c5fd',
 };
 
+const backBtnStyle: Record<string, string | number> = {
+  padding: '4px 10px',
+  fontSize: 11,
+  color: '#60a5fa',
+  cursor: 'pointer',
+  display: 'flex',
+  alignItems: 'center',
+  gap: 4,
+};
+
 export function AtPicker({
   query,
   sessions,
@@ -128,6 +150,7 @@ export function AtPicker({
   visible,
 }: AtPickerProps) {
   const { t } = useTranslation();
+  const [category, setCategory] = useState<Category>('choose');
   const [fileResults, setFileResults] = useState<Array<{ path: string; basename: string; dir: string }>>([]);
   const [highlightIdx, setHighlightIdx] = useState(0);
   const [modeAgent, setModeAgent] = useState<string | null>(null);
@@ -136,15 +159,24 @@ export function AtPicker({
   const requestIdRef = useRef<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Show all sessions as agents — exclude shell/script (can't do P2P), label or short name, mark self
+  // Deduplicate sessions by name, keep isSelf flag, exclude shell/script
   const agents = useMemo(() => {
-    return sessions
-      .filter((s) => s.agentType !== 'shell' && s.agentType !== 'script')
+    const seen = new Map<string, SessionEntry>();
+    for (const s of sessions) {
+      if (s.agentType === 'shell' || s.agentType === 'script') continue;
+      const existing = seen.get(s.name);
+      if (!existing) {
+        seen.set(s.name, s);
+      } else if (s.isSelf && !existing.isSelf) {
+        // Prefer the one with isSelf
+        seen.set(s.name, s);
+      }
+    }
+    return [...seen.values()]
       .map((s) => {
         const parts = s.name.split('_');
         const shortName = s.label || parts[parts.length - 1] || s.name;
         return {
-          kind: 'agent' as const,
           session: s.name,
           shortName,
           agentType: s.agentType,
@@ -155,18 +187,10 @@ export function AtPicker({
       .filter((a) => !query || a.shortName.toLowerCase().includes(query.toLowerCase()) || a.session.toLowerCase().includes(query.toLowerCase()));
   }, [sessions, query]);
 
-  // Build flat item list for keyboard nav
-  const items = useMemo<PickerItem[]>(() => {
-    const list: PickerItem[] = [];
-    for (const f of fileResults) list.push({ kind: 'file', ...f });
-    for (const a of agents) list.push(a);
-    return list;
-  }, [fileResults, agents]);
-
-  // Debounced file search
+  // Debounced file search — only when in files category
   useEffect(() => {
-    if (!visible || !query || query.length < 1) {
-      setFileResults([]);
+    if (!visible || category !== 'files' || !query || query.length < 1) {
+      if (category !== 'files') setFileResults([]);
       return;
     }
 
@@ -185,14 +209,14 @@ export function AtPicker({
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [query, visible, wsClient]);
+  }, [query, visible, wsClient, category, projectDir]);
 
   // Listen for file search responses
   useEffect(() => {
     if (!wsClient) return;
     const handler = (msg: ServerMessage) => {
       if (msg.type === 'file.search_response' && msg.requestId === requestIdRef.current) {
-        const results = (msg.results ?? []).slice(0, 10).map((p: string) => {
+        const results = (msg.results ?? []).slice(0, 15).map((p: string) => {
           const lastSlash = p.lastIndexOf('/');
           return {
             path: p,
@@ -207,71 +231,74 @@ export function AtPicker({
     return unsub;
   }, [wsClient]);
 
-  // Reset highlight when items change
+  // Reset when visibility or category changes
   useEffect(() => {
     setHighlightIdx(0);
     setModeAgent(null);
-  }, [query, visible]);
+  }, [query, visible, category]);
+
+  // Reset to category chooser when picker opens
+  useEffect(() => {
+    if (visible) {
+      setCategory('choose');
+      setFileResults([]);
+      setModeAgent(null);
+    }
+  }, [visible]);
 
   // Keyboard handler
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
       if (!visible) return;
 
-      // In mode sub-picker
+      // Mode sub-picker
       if (modeAgent !== null) {
-        if (e.key === 'Escape') {
+        if (e.key === 'Escape') { e.preventDefault(); setModeAgent(null); return; }
+        if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); setModeHighlight((h) => (h - 1 + MODES.length) % MODES.length); return; }
+        if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); setModeHighlight((h) => (h + 1) % MODES.length); return; }
+        if (e.key === 'Enter') { e.preventDefault(); onSelectAgent(modeAgent, MODES[modeHighlight]); setModeAgent(null); return; }
+        return;
+      }
+
+      // Category chooser
+      if (category === 'choose') {
+        if (e.key === 'Escape') { e.preventDefault(); onClose(); return; }
+        if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
           e.preventDefault();
-          setModeAgent(null);
-          return;
-        }
-        if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
-          e.preventDefault();
-          setModeHighlight((h) => (h - 1 + MODES.length) % MODES.length);
-          return;
-        }
-        if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
-          e.preventDefault();
-          setModeHighlight((h) => (h + 1) % MODES.length);
+          setHighlightIdx((h) => (h === 0 ? 1 : 0));
           return;
         }
         if (e.key === 'Enter') {
           e.preventDefault();
-          onSelectAgent(modeAgent, MODES[modeHighlight]);
-          setModeAgent(null);
+          setCategory(highlightIdx === 0 ? 'files' : 'agents');
+          setHighlightIdx(0);
           return;
         }
         return;
       }
 
+      // Files or Agents list
+      const count = category === 'files' ? fileResults.length : agents.length;
       if (e.key === 'Escape') {
         e.preventDefault();
-        onClose();
+        setCategory('choose');
+        setHighlightIdx(0);
         return;
       }
-      if (e.key === 'ArrowUp') {
+      if (e.key === 'ArrowUp') { e.preventDefault(); setHighlightIdx((h) => (h - 1 + count) % count); return; }
+      if (e.key === 'ArrowDown') { e.preventDefault(); setHighlightIdx((h) => (h + 1) % count); return; }
+      if (e.key === 'Enter' && count > 0) {
         e.preventDefault();
-        setHighlightIdx((h) => (h - 1 + items.length) % items.length);
-        return;
-      }
-      if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        setHighlightIdx((h) => (h + 1) % items.length);
-        return;
-      }
-      if (e.key === 'Enter' && items.length > 0) {
-        e.preventDefault();
-        const item = items[highlightIdx];
-        if (!item) return;
-        if (item.kind === 'file') {
-          onSelectFile(item.path);
+        if (category === 'files') {
+          const f = fileResults[highlightIdx];
+          if (f) onSelectFile(f.path);
         } else {
-          setModeAgent(item.session);
-          setModeHighlight(0);
+          const a = agents[highlightIdx];
+          if (a) { setModeAgent(a.session); setModeHighlight(0); }
         }
       }
     },
-    [visible, items, highlightIdx, modeAgent, modeHighlight, onClose, onSelectFile, onSelectAgent],
+    [visible, category, highlightIdx, fileResults, agents, modeAgent, modeHighlight, onClose, onSelectFile, onSelectAgent],
   );
 
   useEffect(() => {
@@ -289,13 +316,14 @@ export function AtPicker({
 
   if (!visible) return null;
 
-  // Mode sub-picker overlay
+  // ── Mode sub-picker ──
   if (modeAgent !== null) {
     const agentItem = agents.find((a) => a.session === modeAgent);
     return (
       <div ref={containerRef} style={containerStyle}>
+        <div style={backBtnStyle} onClick={() => setModeAgent(null)}>← Back</div>
         <div style={groupLabelStyle}>
-          {agentItem ? `${agentItem.shortName} - ` : ''}Select Mode
+          {agentItem ? `${agentItem.shortName} — ` : ''}Select Mode
         </div>
         <div style={modeContainerStyle}>
           {MODES.map((mode, idx) => (
@@ -303,10 +331,7 @@ export function AtPicker({
               key={mode}
               type="button"
               style={idx === modeHighlight ? modeBtnHoverStyle : modeBtnStyle}
-              onClick={() => {
-                onSelectAgent(modeAgent, mode);
-                setModeAgent(null);
-              }}
+              onClick={() => { onSelectAgent(modeAgent, mode); setModeAgent(null); }}
               onMouseEnter={() => setModeHighlight(idx)}
             >
               {t(`p2p.mode.${mode}`, mode.charAt(0).toUpperCase() + mode.slice(1))}
@@ -317,69 +342,89 @@ export function AtPicker({
     );
   }
 
-  if (items.length === 0 && query) return (
-    <div ref={containerRef} style={containerStyle}>
-      <div style={{ ...itemStyle, color: '#64748b', justifyContent: 'center' }}>No results</div>
-    </div>
-  );
-  if (items.length === 0) return null;
+  // ── Category chooser ──
+  if (category === 'choose') {
+    return (
+      <div ref={containerRef} style={containerStyle}>
+        <div
+          data-hl={highlightIdx === 0 ? 'true' : undefined}
+          style={highlightIdx === 0 ? categoryHighlightStyle : categoryStyle}
+          onClick={() => { setCategory('files'); setHighlightIdx(0); }}
+          onMouseEnter={() => setHighlightIdx(0)}
+        >
+          <span style={{ fontSize: 16 }}>📁</span>
+          <span style={{ fontWeight: 500 }}>Files</span>
+          <span style={dimStyle}>Search project files</span>
+        </div>
+        <div
+          data-hl={highlightIdx === 1 ? 'true' : undefined}
+          style={highlightIdx === 1 ? categoryHighlightStyle : categoryStyle}
+          onClick={() => { setCategory('agents'); setHighlightIdx(0); }}
+          onMouseEnter={() => setHighlightIdx(1)}
+        >
+          <span style={{ fontSize: 16 }}>🤖</span>
+          <span style={{ fontWeight: 500 }}>Agents</span>
+          <span style={dimStyle}>Quick Discussion with an agent</span>
+        </div>
+      </div>
+    );
+  }
 
-  let flatIdx = 0;
+  // ── Files list ──
+  if (category === 'files') {
+    return (
+      <div ref={containerRef} style={containerStyle}>
+        <div style={backBtnStyle} onClick={() => { setCategory('choose'); setHighlightIdx(0); }}>← Back</div>
+        <div style={groupLabelStyle}>Files {query ? `— "${query}"` : '— type to search'}</div>
+        {fileResults.length === 0 && query && (
+          <div style={{ ...itemStyle, color: '#64748b', justifyContent: 'center' }}>
+            {query.length < 2 ? 'Keep typing...' : 'No files found'}
+          </div>
+        )}
+        {fileResults.map((f, idx) => {
+          const hl = idx === highlightIdx;
+          return (
+            <div
+              key={f.path}
+              data-hl={hl ? 'true' : undefined}
+              style={hl ? itemHighlightStyle : itemStyle}
+              onClick={() => onSelectFile(f.path)}
+              onMouseEnter={() => setHighlightIdx(idx)}
+            >
+              <span style={{ fontWeight: 500, color: '#e2e8f0' }}>{f.basename}</span>
+              <span style={dimStyle}>{f.dir}</span>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
 
+  // ── Agents list ──
   return (
     <div ref={containerRef} style={containerStyle}>
-      {/* File results group */}
-      {fileResults.length > 0 && (
-        <>
-          <div style={groupLabelStyle}>Files</div>
-          {fileResults.map((f) => {
-            const idx = flatIdx++;
-            const hl = idx === highlightIdx;
-            return (
-              <div
-                key={f.path}
-                data-hl={hl ? 'true' : undefined}
-                style={hl ? itemHighlightStyle : itemStyle}
-                onClick={() => onSelectFile(f.path)}
-                onMouseEnter={() => setHighlightIdx(idx)}
-              >
-                <span style={{ fontWeight: 500, color: '#e2e8f0' }}>{f.basename}</span>
-                <span style={dimStyle}>{f.dir}</span>
-              </div>
-            );
-          })}
-        </>
+      <div style={backBtnStyle} onClick={() => { setCategory('choose'); setHighlightIdx(0); }}>← Back</div>
+      <div style={groupLabelStyle}>Agents</div>
+      {agents.length === 0 && (
+        <div style={{ ...itemStyle, color: '#64748b', justifyContent: 'center' }}>No agents available</div>
       )}
-
-      {/* Agents group */}
-      {agents.length > 0 && (
-        <>
-          <div style={groupLabelStyle}>Agents</div>
-          {agents.map((a) => {
-            const idx = flatIdx++;
-            const hl = idx === highlightIdx;
-            return (
-              <div
-                key={a.session}
-                data-hl={hl ? 'true' : undefined}
-                style={hl ? itemHighlightStyle : itemStyle}
-                onClick={() => {
-                  setModeAgent(a.session);
-                  setModeHighlight(0);
-                }}
-                onMouseEnter={() => setHighlightIdx(idx)}
-              >
-                <span style={{ fontWeight: 500 }}>{a.shortName}</span>
-                <span style={dimStyle}>{a.agentType}</span>
-                {a.isSelf && <span style={{ ...dimStyle, color: '#60a5fa', fontSize: 10, marginLeft: 4 }}>(You)</span>}
-                {a.busy && <span style={busyDotStyle} title="Busy" />}
-              </div>
-            );
-          })}
-        </>
-      )}
-
-      {/* Empty state handled above */}
+      {agents.map((a, idx) => {
+        const hl = idx === highlightIdx;
+        return (
+          <div
+            key={a.session}
+            data-hl={hl ? 'true' : undefined}
+            style={hl ? itemHighlightStyle : itemStyle}
+            onClick={() => { setModeAgent(a.session); setModeHighlight(0); }}
+            onMouseEnter={() => setHighlightIdx(idx)}
+          >
+            <span style={{ fontWeight: 500 }}>{a.shortName}</span>
+            <span style={dimStyle}>{a.agentType}</span>
+            {a.isSelf && <span style={{ color: '#60a5fa', fontSize: 10, marginLeft: 4 }}>(You)</span>}
+            {a.busy && <span style={busyDotStyle} title="Busy" />}
+          </div>
+        );
+      })}
     </div>
   );
 }
