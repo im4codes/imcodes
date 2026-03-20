@@ -66,7 +66,8 @@ export function listP2pRuns(): P2pRun[] { return [...activeRuns.values()]; }
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
-const P2P_TMP_DIR = '/tmp/imcodes-p2p';
+import { homedir } from 'node:os';
+const P2P_DIR = join(homedir(), '.imcodes', 'discussions');
 let IDLE_POLL_MS = 3_000;
 
 /** Override poll interval for tests. */
@@ -142,8 +143,8 @@ export async function startP2pRun(
   const now = new Date().toISOString();
 
   // Create temp context file
-  await mkdir(P2P_TMP_DIR, { recursive: true });
-  const contextFilePath = join(P2P_TMP_DIR, `${runId}.md`);
+  await mkdir(P2P_DIR, { recursive: true });
+  const contextFilePath = join(P2P_DIR, `${runId}.md`);
 
   let seed = `# P2P Discussion: ${runId}\n\n`;
   seed += `## User Request\n\n${userText}\n\n`;

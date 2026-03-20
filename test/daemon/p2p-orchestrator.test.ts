@@ -131,7 +131,7 @@ beforeEach(() => {
   // then firing an idle hook after a short delay
   sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
     // Extract the context file path from the prompt and append a section
-    const pathMatch = prompt.match(/\/tmp\/imcodes-p2p\/[^\s]+\.md/);
+    const pathMatch = prompt.match(/\/[^\s]*\.imcodes\/discussions\/[^\s]+\.md/);
     if (pathMatch) {
       const { appendFile } = await import('node:fs/promises');
       await appendFile(pathMatch[0], `\n## Output from ${session}\n\nSome analysis.\n`);
@@ -148,7 +148,9 @@ afterEach(async () => {
   _setIdlePollMs(3_000); // restore default
   // Clean up temp files
   const { rm } = await import('node:fs/promises');
-  await rm('/tmp/imcodes-p2p', { recursive: true, force: true }).catch(() => {});
+  const { homedir } = await import('node:os');
+  const { join } = await import('node:path');
+  await rm(join(homedir(), '.imcodes', 'discussions'), { recursive: true, force: true }).catch(() => {});
 });
 
 // =============================================================================
@@ -771,7 +773,7 @@ describe('Group 12: Completion Detection', () => {
     detectStatusMock.mockReturnValue('thinking');
 
     sendKeysDelayedEnterMock.mockImplementation(async (_session: string, prompt: string) => {
-      const pathMatch = prompt.match(/\/tmp\/imcodes-p2p\/[^\s]+\.md/);
+      const pathMatch = prompt.match(/\/[^\s]*\.imcodes\/discussions\/[^\s]+\.md/);
       if (pathMatch) {
         const { appendFile } = await import('node:fs/promises');
         await appendFile(pathMatch[0], '\n## Growing\nContent.\n');
