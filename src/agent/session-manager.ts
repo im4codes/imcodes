@@ -211,11 +211,28 @@ export async function restoreFromStore(): Promise<void> {
   // 1. Restart store sessions missing from tmux; start jsonl-watcher for live ones
   for (const s of all) {
     if (s.state === 'stopped') continue;
-    // Sub-sessions (deck_sub_*) are managed by rebuildSubSessions triggered by the browser.
-    // Their JSONL watcher uses a specific file path via startWatchingFile.
-    // Handling them here would fall back to directory scan (startWatching), stealing the main
-    // session's JSONL file since sub-sessions have no ccSessionId in the session-store.
-    if (s.name.startsWith('deck_sub_')) continue;
+    // Sub-sessions (deck_sub_*): skip restart/respawn (managed by rebuildSubSessions),
+    // but still restore watchers if the tmux session is alive.
+    if (s.name.startsWith('deck_sub_')) {
+      if (!live.includes(s.name)) continue; // dead sub-session, skip
+      // Restore watcher for live sub-sessions
+      if (s.agentType === 'claude-code' && s.ccSessionId && s.projectDir && !isWatching(s.name)) {
+        startCCWatcher(s.name, s.projectDir, s.ccSessionId);
+      } else if (s.agentType === 'codex' && s.codexSessionId && !isCodexWatching(s.name)) {
+        findRolloutPathByUuid(s.codexSessionId).then((rolloutPath) => {
+          if (rolloutPath) {
+            startCodexWatchingFile(s.name, rolloutPath).catch(() => {});
+          } else {
+            startCodexWatchingById(s.name, s.codexSessionId!).catch(() => {});
+          }
+        }).catch(() => {});
+      } else if (s.agentType === 'gemini' && !isGeminiWatching(s.name)) {
+        if (s.geminiSessionId) {
+          startGeminiWatching(s.name, s.geminiSessionId);
+        }
+      }
+      continue;
+    }
 
     // Always backfill missing CC session UUID from the tmux pane command, even if
     // a watcher is already active. Otherwise sessions.json can stay permanently
