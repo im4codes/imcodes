@@ -189,5 +189,13 @@
     "send": "Send",
     "mic_permission_failed": "Failed to start — check microphone/speech permissions in Settings",
     "error": "Voice error: {{error}}"
+  },
+  "p2p": {
+    "mode": {
+      "audit": "Audit",
+      "review": "Review",
+      "brainstorm": "Brainstorm",
+      "discuss": "Discuss"
+    }
   }
 }

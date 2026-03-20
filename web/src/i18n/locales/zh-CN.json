@@ -189,5 +189,13 @@
     "send": "发送",
     "mic_permission_failed": "启动失败 — 请在设置中检查麦克风/语音识别权限",
     "error": "语音错误：{{error}}"
+  },
+  "p2p": {
+    "mode": {
+      "audit": "审计",
+      "review": "审查",
+      "brainstorm": "头脑风暴",
+      "discuss": "讨论"
+    }
   }
 }

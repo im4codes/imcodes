@@ -552,6 +552,73 @@ export async function getDiscussionRounds(db: PgDatabase, discussionId: string):
   return rows.results ?? [];
 }
 
+// ── P2P orchestration runs ────────────────────────────────────────────────
+
+export interface DbOrchestrationRun {
+  id: string;
+  discussion_id: string;
+  server_id: string;
+  main_session: string;
+  initiator_session: string;
+  current_target_session: string | null;
+  final_return_session: string;
+  remaining_targets: string; // JSON
+  mode_key: string;
+  status: string;
+  request_message_id: string | null;
+  callback_message_id: string | null;
+  context_ref: string; // JSON
+  timeout_ms: number;
+  result_summary: string | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
+export async function upsertOrchestrationRun(db: PgDatabase, r: DbOrchestrationRun): Promise<void> {
+  await db.prepare(`
+    INSERT INTO discussion_orchestration_runs
+      (id, discussion_id, server_id, main_session, initiator_session, current_target_session, final_return_session,
+       remaining_targets, mode_key, status, request_message_id, callback_message_id, context_ref, timeout_ms,
+       result_summary, error, created_at, updated_at, completed_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?, ?, ?, ?::jsonb, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT (id) DO UPDATE SET
+      current_target_session = EXCLUDED.current_target_session,
+      remaining_targets = EXCLUDED.remaining_targets,
+      status = EXCLUDED.status,
+      callback_message_id = EXCLUDED.callback_message_id,
+      result_summary = EXCLUDED.result_summary,
+      error = EXCLUDED.error,
+      updated_at = EXCLUDED.updated_at,
+      completed_at = EXCLUDED.completed_at
+  `).bind(
+    r.id, r.discussion_id, r.server_id, r.main_session, r.initiator_session, r.current_target_session, r.final_return_session,
+    r.remaining_targets, r.mode_key, r.status, r.request_message_id, r.callback_message_id, r.context_ref, r.timeout_ms,
+    r.result_summary, r.error, r.created_at, r.updated_at, r.completed_at,
+  ).run();
+}
+
+export async function getOrchestrationRunsByDiscussion(db: PgDatabase, discussionId: string): Promise<DbOrchestrationRun[]> {
+  const rows = await db
+    .prepare('SELECT * FROM discussion_orchestration_runs WHERE discussion_id = ? ORDER BY created_at DESC')
+    .bind(discussionId)
+    .all<DbOrchestrationRun>();
+  return rows.results ?? [];
+}
+
+export async function getOrchestrationRunById(db: PgDatabase, id: string): Promise<DbOrchestrationRun | null> {
+  return db.prepare('SELECT * FROM discussion_orchestration_runs WHERE id = ?').bind(id).first<DbOrchestrationRun>();
+}
+
+export async function getActiveOrchestrationRuns(db: PgDatabase, serverId: string): Promise<DbOrchestrationRun[]> {
+  const rows = await db
+    .prepare("SELECT * FROM discussion_orchestration_runs WHERE server_id = ? AND status IN ('dispatched','running','awaiting_next_hop','queued')")
+    .bind(serverId)
+    .all<DbOrchestrationRun>();
+  return rows.results ?? [];
+}
+
 // ── Audit log ─────────────────────────────────────────────────────────────
 
 export async function writeAuditLog(

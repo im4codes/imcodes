@@ -189,5 +189,13 @@
     "send": "傳送",
     "mic_permission_failed": "啟動失敗 — 請在設定中檢查麥克風/語音辨識權限",
     "error": "語音錯誤：{{error}}"
+  },
+  "p2p": {
+    "mode": {
+      "audit": "稽核",
+      "review": "審查",
+      "brainstorm": "腦力激盪",
+      "discuss": "討論"
+    }
   }
 }

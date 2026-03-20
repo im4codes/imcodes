@@ -16,7 +16,7 @@ import type { PgDatabase } from '../db/client.js';
 import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
 import { sha256Hex } from '../security/crypto.js';
-import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, updateSubSession } from '../db/queries.js';
+import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, updateSubSession, upsertOrchestrationRun } from '../db/queries.js';
 import logger from '../util/logger.js';
 
 const AUTH_TIMEOUT_MS = 5000;
@@ -647,6 +647,28 @@ export class WsBridge {
       type === 'discussion.list'
     ) {
       this.broadcastToBrowsers(JSON.stringify(msg));
+      return;
+    }
+
+    // ── P2P orchestration run persistence + broadcast ────────────────────────
+    if (type === 'p2p.run_save' && this.db) {
+      void upsertOrchestrationRun(this.db, msg.run as any).catch(() => {});
+      this.broadcastToBrowsers(JSON.stringify({ type: 'p2p.run_update', run: msg.run }));
+      return;
+    }
+    if (type === 'p2p.run_complete' && this.db) {
+      const run = msg.run as any;
+      run.status = 'completed';
+      run.completed_at = new Date().toISOString();
+      void upsertOrchestrationRun(this.db, run).catch(() => {});
+      this.broadcastToBrowsers(JSON.stringify({ type: 'p2p.run_update', run }));
+      return;
+    }
+    if (type === 'p2p.run_error' && this.db) {
+      const run = msg.run as any;
+      run.updated_at = new Date().toISOString();
+      void upsertOrchestrationRun(this.db, run).catch(() => {});
+      this.broadcastToBrowsers(JSON.stringify({ type: 'p2p.run_update', run }));
       return;
     }
 

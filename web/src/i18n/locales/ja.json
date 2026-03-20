@@ -189,5 +189,13 @@
     "send": "送信",
     "mic_permission_failed": "開始に失敗しました — 設定でマイク/音声認識の権限を確認してください",
     "error": "音声エラー：{{error}}"
+  },
+  "p2p": {
+    "mode": {
+      "audit": "監査",
+      "review": "レビュー",
+      "brainstorm": "ブレインストーミング",
+      "discuss": "ディスカッション"
+    }
   }
 }

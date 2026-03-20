@@ -26,6 +26,36 @@ import * as nodePath from 'node:path';
 import { exec as execCb } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
+import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, type P2pTarget } from './p2p-orchestrator.js';
+
+// ── @@ token parsing ─────────────────────────────────────────────────────────
+
+const CX_TOKEN_RE = /@@cx\(([^,]+),\s*([^)]+)\)/g;
+const FILE_TOKEN_RE = /@((?:[a-zA-Z0-9_.\-/]+\/)*[a-zA-Z0-9_.\-]+\.[a-zA-Z0-9]+)/g;
+
+interface ParsedTokens {
+  agents: P2pTarget[];
+  files: string[];
+  cleanText: string;
+}
+
+function parseAtTokens(text: string): ParsedTokens {
+  const agents: P2pTarget[] = [];
+  const files: string[] = [];
+
+  for (const m of text.matchAll(CX_TOKEN_RE)) {
+    agents.push({ session: m[1].trim(), mode: m[2].trim() });
+  }
+
+  // Remove @@cx tokens first so @file regex doesn't partially match them
+  let withoutCx = text.replace(CX_TOKEN_RE, '');
+  for (const m of withoutCx.matchAll(FILE_TOKEN_RE)) {
+    files.push(m[1]);
+  }
+
+  const cleanText = withoutCx.replace(FILE_TOKEN_RE, '').replace(/\s+/g, ' ').trim();
+  return { agents, files, cleanText };
+}
 
 // ── Binary frame packing ─────────────────────────────────────────────────────
 
@@ -223,6 +253,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'daemon.upgrade':
       void handleDaemonUpgrade();
       break;
+    case 'file.search':
+      void handleFileSearch(cmd, serverLink);
+      break;
     case 'fs.ls':
       void handleFsList(cmd, serverLink);
       break;
@@ -234,6 +267,12 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       break;
     case 'fs.git_diff':
       void handleFsGitDiff(cmd, serverLink);
+      break;
+    case 'p2p.cancel':
+      void handleP2pCancel(cmd, serverLink);
+      break;
+    case 'p2p.status':
+      void handleP2pStatus(cmd, serverLink);
       break;
     case 'auth_ok':
     case 'heartbeat':
@@ -405,6 +444,53 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   }
   dedup.add(effectiveId);
 
+  // Check for P2P tokens
+  const tokens = parseAtTokens(text);
+
+  if (tokens.agents.length > 0) {
+    // P2P Quick Discussion — delegate to orchestrator
+    try {
+      const fileContents: Array<{ path: string; content: string }> = [];
+      const record = getSession(sessionName);
+      const projectDir = record?.projectDir ?? '';
+      for (const fp of tokens.files) {
+        try {
+          const absPath = nodePath.isAbsolute(fp) ? fp : nodePath.join(projectDir, fp);
+          const content = await fsReadFileRaw(absPath, 'utf8');
+          fileContents.push({ path: fp, content: content.slice(0, 50_000) }); // cap at 50KB
+        } catch { /* ignore unreadable files */ }
+      }
+      const run = await startP2pRun(sessionName, tokens.agents, tokens.cleanText, fileContents, serverLink);
+      const status = isLegacy ? 'accepted_legacy' : 'accepted';
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
+      try {
+        serverLink.send({ type: 'command.ack', commandId: effectiveId, status, session: sessionName });
+        serverLink.send({ type: 'p2p.run_started', runId: run.id, session: sessionName });
+      } catch { /* not connected */ }
+    } catch (err) {
+      logger.error({ sessionName, err }, 'P2P run start failed');
+    }
+    return;
+  }
+
+  // Inline file contents for @file tokens (no agent)
+  let finalText = text;
+  if (tokens.files.length > 0) {
+    const record = getSession(sessionName);
+    const projectDir = record?.projectDir ?? '';
+    const fileParts: string[] = [];
+    for (const fp of tokens.files) {
+      try {
+        const absPath = nodePath.isAbsolute(fp) ? fp : nodePath.join(projectDir, fp);
+        const content = await fsReadFileRaw(absPath, 'utf8');
+        fileParts.push(`\n--- ${fp} ---\n${content.slice(0, 50_000)}\n---\n`);
+      } catch { /* ignore */ }
+    }
+    if (fileParts.length > 0) {
+      finalText = tokens.cleanText + fileParts.join('');
+    }
+  }
+
   // Serialized write via per-session mutex
   const release = await getMutex(sessionName).acquire();
   // Always use delayed-Enter: Codex TUI has paste-burst detection that treats
@@ -412,7 +498,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // has no visible downside for other agents, so apply it universally.
   try {
     const agentType = getSession(sessionName)?.agentType ?? 'unknown';
-    await sendShellAwareCommand(sessionName, text, agentType);
+    await sendShellAwareCommand(sessionName, finalText, agentType);
     timelineEmitter.emit(sessionName, 'user.message', { text });
     // Emit accepted ack (accepted_legacy for fallback IDs so callers can distinguish)
     const status = isLegacy ? 'accepted_legacy' : 'accepted';
@@ -930,6 +1016,82 @@ sleep 60 && rm -rf "${scriptDir}" &
 // ── File system browser ────────────────────────────────────────────────────
 
 const FS_ALLOWED_ROOTS = [homedir()];
+
+// ── P2P cancel/status handlers ────────────────────────────────────────────
+
+async function handleP2pCancel(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const runId = cmd.runId as string | undefined;
+  if (!runId) return;
+  const ok = await cancelP2pRun(runId, serverLink);
+  try { serverLink.send({ type: 'p2p.cancel_response', runId, ok }); } catch { /* ignore */ }
+}
+
+async function handleP2pStatus(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const runId = cmd.runId as string | undefined;
+  if (runId) {
+    const run = getP2pRun(runId);
+    try { serverLink.send({ type: 'p2p.status_response', runId, run: run ?? null }); } catch { /* ignore */ }
+  } else {
+    const runs = listP2pRuns();
+    try { serverLink.send({ type: 'p2p.status_response', runs }); } catch { /* ignore */ }
+  }
+}
+
+// ── File search for @ picker ──────────────────────────────────────────────
+
+const FILE_SEARCH_EXCLUDES = new Set([
+  'node_modules', '.git', 'venv', '__pycache__', '.venv',
+  'dist', 'build', '.next', '.nuxt', 'vendor', 'target',
+]);
+
+const FILE_SEARCH_MAX = 20;
+
+async function handleFileSearch(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const query = (cmd.query as string ?? '').trim().toLowerCase();
+  const projectDir = cmd.projectDir as string | undefined;
+  const requestId = cmd.requestId as string | undefined;
+  if (!requestId || !projectDir) return;
+
+  try {
+    const results: Array<{ path: string; basename: string }> = [];
+    const queryBase = query.split('/').pop() ?? query;
+
+    async function walk(dir: string, rel: string): Promise<void> {
+      if (results.length >= 200) return; // hard cap during walk
+      let entries: import('fs').Dirent[];
+      try {
+        entries = await fsReaddir(dir, { withFileTypes: true });
+      } catch { return; }
+      for (const entry of entries) {
+        if (FILE_SEARCH_EXCLUDES.has(entry.name)) continue;
+        const relPath = rel ? `${rel}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          if (entry.name.startsWith('.') && entry.name !== '.github') continue;
+          await walk(nodePath.join(dir, entry.name), relPath);
+        } else if (entry.isFile()) {
+          if (!query || relPath.toLowerCase().includes(query)) {
+            results.push({ path: relPath, basename: entry.name });
+          }
+        }
+      }
+    }
+
+    await walk(projectDir, '');
+
+    // Sort: basename match first, then path match
+    results.sort((a, b) => {
+      const aBase = a.basename.toLowerCase().includes(queryBase) ? 0 : 1;
+      const bBase = b.basename.toLowerCase().includes(queryBase) ? 0 : 1;
+      if (aBase !== bBase) return aBase - bBase;
+      return a.path.localeCompare(b.path);
+    });
+
+    const top = results.slice(0, FILE_SEARCH_MAX).map((r) => r.path);
+    try { serverLink.send({ type: 'file.search_response', requestId, results: top }); } catch { /* ignore */ }
+  } catch (err) {
+    try { serverLink.send({ type: 'file.search_response', requestId, results: [], error: String(err) }); } catch { /* ignore */ }
+  }
+}
 
 async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawPath = cmd.path as string | undefined;

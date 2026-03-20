@@ -189,5 +189,13 @@
     "send": "Enviar",
     "mic_permission_failed": "Error al iniciar — verifica los permisos de micrófono/reconocimiento de voz en Ajustes",
     "error": "Error de voz: {{error}}"
+  },
+  "p2p": {
+    "mode": {
+      "audit": "Auditoría",
+      "review": "Revisión",
+      "brainstorm": "Lluvia de ideas",
+      "discuss": "Discusión"
+    }
   }
 }

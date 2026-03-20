@@ -189,5 +189,13 @@
     "send": "보내기",
     "mic_permission_failed": "시작 실패 — 설정에서 마이크/음성 인식 권한을 확인하세요",
     "error": "음성 오류: {{error}}"
+  },
+  "p2p": {
+    "mode": {
+      "audit": "감사",
+      "review": "리뷰",
+      "brainstorm": "브레인스토밍",
+      "discuss": "토론"
+    }
   }
 }

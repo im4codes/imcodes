@@ -197,8 +197,8 @@ async function waitForResponse(
     if (fileGrew && isIdle) {
       // Small grace period to ensure file write is fully flushed
       await new Promise<void>((r) => setTimeout(r, 1000));
-      const content = await readFile(filePath, 'utf8');
-      return content.slice(previousSize).trim();
+      const content = await readFile(filePath);
+      return content.subarray(previousSize).toString('utf8').trim();
     }
 
     // Activity-based timeout: only count idle time with no file growth
@@ -215,8 +215,8 @@ async function waitForResponse(
 
   // Timeout — if file grew, return what we have even if agent isn't idle
   if (fileGrew) {
-    const content = await readFile(filePath, 'utf8');
-    const newContent = content.slice(previousSize).trim();
+    const content = await readFile(filePath);
+    const newContent = content.subarray(previousSize).toString('utf8').trim();
     if (newContent.length > 0) {
       logger.warn({ sessionName, filePath }, 'Agent not idle at timeout but file has content, using it');
       return newContent;

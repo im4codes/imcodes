@@ -43,6 +43,11 @@ export type ServerMessage =
   | FsLsResponse
   | FsReadResponse
   | FsGitStatusResponse
+  | { type: 'file.search_response'; requestId: string; results: string[]; error?: string }
+  | { type: 'p2p.run_update'; run: any }
+  | { type: 'p2p.run_started'; runId: string; session: string }
+  | { type: 'p2p.cancel_response'; runId: string; ok: boolean }
+  | { type: 'p2p.status_response'; runId?: string; run?: any; runs?: any[] }
   | FsGitDiffResponse;
 
 export type {
