@@ -734,3 +734,162 @@ describe('progress event subtypes', () => {
     expect(events.length).toBeGreaterThanOrEqual(1);
   });
 });
+
+// ── System-injected message filtering ──────────────────────────────────────
+
+describe('system-injected message filtering', () => {
+  it('filters <task-notification> and emits agent.status processing instead', async () => {
+    const filePath = join(testDir, 'test.jsonl');
+    await writeFile(filePath, '');
+    await startWatchingFile('test_session', filePath);
+    await new Promise((r) => setTimeout(r, 200));
+
+    await appendFile(filePath, jsonlLine({
+      type: 'user',
+      timestamp: new Date().toISOString(),
+      message: { content: [{ type: 'text', text: '<task-notification>\n<task-id>abc123</task-id>\n<status>completed</status>\n<summary>Background command done</summary>\n</task-notification>' }] },
+    }));
+    await new Promise((r) => setTimeout(r, 2500));
+
+    // Should NOT appear as user.message
+    const userMsgs = emittedEvents.filter((e) => e.type === 'user.message' && String(e.payload.text).includes('task-notification'));
+    expect(userMsgs).toHaveLength(0);
+
+    // Should emit agent.status processing
+    const statusEvents = emittedEvents.filter((e) => e.type === 'agent.status' && e.payload.status === 'processing');
+    expect(statusEvents.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('filters <system-reminder> and emits agent.status processing instead', async () => {
+    const filePath = join(testDir, 'test.jsonl');
+    await writeFile(filePath, '');
+    await startWatchingFile('test_session', filePath);
+    await new Promise((r) => setTimeout(r, 200));
+
+    await appendFile(filePath, jsonlLine({
+      type: 'user',
+      timestamp: new Date().toISOString(),
+      message: { content: [{ type: 'text', text: '<system-reminder>\nThe following tools are available...\n</system-reminder>' }] },
+    }));
+    await new Promise((r) => setTimeout(r, 2500));
+
+    const userMsgs = emittedEvents.filter((e) => e.type === 'user.message' && String(e.payload.text).includes('system-reminder'));
+    expect(userMsgs).toHaveLength(0);
+
+    const statusEvents = emittedEvents.filter((e) => e.type === 'agent.status' && e.payload.status === 'processing');
+    expect(statusEvents.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('filters <command-name> slash commands', async () => {
+    const filePath = join(testDir, 'test.jsonl');
+    await writeFile(filePath, '');
+    await startWatchingFile('test_session', filePath);
+    await new Promise((r) => setTimeout(r, 200));
+
+    await appendFile(filePath, jsonlLine({
+      type: 'user',
+      timestamp: new Date().toISOString(),
+      message: { content: [{ type: 'text', text: '<command-name>/commit</command-name>\n<command-message>commit</command-message>\n<command-args></command-args>' }] },
+    }));
+    await new Promise((r) => setTimeout(r, 2500));
+
+    const userMsgs = emittedEvents.filter((e) => e.type === 'user.message' && String(e.payload.text).includes('command-name'));
+    expect(userMsgs).toHaveLength(0);
+  });
+
+  it('filters <local-command-caveat> local commands', async () => {
+    const filePath = join(testDir, 'test.jsonl');
+    await writeFile(filePath, '');
+    await startWatchingFile('test_session', filePath);
+    await new Promise((r) => setTimeout(r, 200));
+
+    await appendFile(filePath, jsonlLine({
+      type: 'user',
+      timestamp: new Date().toISOString(),
+      message: { content: [{ type: 'text', text: '<local-command-caveat>Caveat: local command output</local-command-caveat>\n<local-command-stdout>Model set to opus</local-command-stdout>' }] },
+    }));
+    await new Promise((r) => setTimeout(r, 2500));
+
+    const userMsgs = emittedEvents.filter((e) => e.type === 'user.message' && String(e.payload.text).includes('local-command'));
+    expect(userMsgs).toHaveLength(0);
+  });
+
+  it('filters <bash-input> / <bash-stdout> / <bash-stderr>', async () => {
+    const filePath = join(testDir, 'test.jsonl');
+    await writeFile(filePath, '');
+    await startWatchingFile('test_session', filePath);
+    await new Promise((r) => setTimeout(r, 200));
+
+    await appendFile(filePath, jsonlLine({
+      type: 'user',
+      timestamp: new Date().toISOString(),
+      message: { content: [{ type: 'text', text: '<bash-input>ls -la</bash-input>\n<bash-stdout>total 42\n</bash-stdout>' }] },
+    }));
+    await new Promise((r) => setTimeout(r, 2500));
+
+    const userMsgs = emittedEvents.filter((e) => e.type === 'user.message' && String(e.payload.text).includes('bash-input'));
+    expect(userMsgs).toHaveLength(0);
+  });
+
+  it('filters <command-message> tags', async () => {
+    const filePath = join(testDir, 'test.jsonl');
+    await writeFile(filePath, '');
+    await startWatchingFile('test_session', filePath);
+    await new Promise((r) => setTimeout(r, 200));
+
+    await appendFile(filePath, jsonlLine({
+      type: 'user',
+      timestamp: new Date().toISOString(),
+      message: { content: [{ type: 'text', text: '<command-message>model</command-message>' }] },
+    }));
+    await new Promise((r) => setTimeout(r, 2500));
+
+    const userMsgs = emittedEvents.filter((e) => e.type === 'user.message' && String(e.payload.text).includes('command-message'));
+    expect(userMsgs).toHaveLength(0);
+  });
+
+  it('filters string-form user content with system tags', async () => {
+    const filePath = join(testDir, 'test.jsonl');
+    await writeFile(filePath, '');
+    await startWatchingFile('test_session', filePath);
+    await new Promise((r) => setTimeout(r, 200));
+
+    // String content (not array blocks) — real CC format
+    await appendFile(filePath, jsonlLine({
+      type: 'user',
+      timestamp: new Date().toISOString(),
+      message: { role: 'user', content: '<system-reminder>\nToday is 2026-03-20.\n</system-reminder>' },
+    }));
+    await new Promise((r) => setTimeout(r, 2500));
+
+    const userMsgs = emittedEvents.filter((e) => e.type === 'user.message' && String(e.payload.text).includes('system-reminder'));
+    expect(userMsgs).toHaveLength(0);
+  });
+
+  it('does NOT filter normal user messages', async () => {
+    const filePath = join(testDir, 'test.jsonl');
+    await writeFile(filePath, '');
+    await startWatchingFile('test_session', filePath);
+    await new Promise((r) => setTimeout(r, 200));
+
+    await appendFile(filePath, userMessage('Hello, please review this code'));
+    await new Promise((r) => setTimeout(r, 2500));
+
+    const userMsgs = emittedEvents.filter((e) => e.type === 'user.message' && e.payload.text === 'Hello, please review this code');
+    expect(userMsgs.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('does NOT filter user messages that mention XML tags in natural text', async () => {
+    const filePath = join(testDir, 'test.jsonl');
+    await writeFile(filePath, '');
+    await startWatchingFile('test_session', filePath);
+    await new Promise((r) => setTimeout(r, 200));
+
+    // User talks ABOUT task-notification but it's not a real system inject
+    await appendFile(filePath, userMessage('What does the task-notification XML look like?'));
+    await new Promise((r) => setTimeout(r, 2500));
+
+    const userMsgs = emittedEvents.filter((e) => e.type === 'user.message' && String(e.payload.text).includes('task-notification'));
+    expect(userMsgs.length).toBeGreaterThanOrEqual(1);
+  });
+});
