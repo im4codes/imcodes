@@ -234,4 +234,32 @@ describe('SessionControls', () => {
 
     getSelectionSpy.mockRestore();
   });
+
+  it('inserts session-name-based token even when display label has spaces', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'deck_my-project_brain', project: 'my-project' })}
+        quickData={makeQuickData() as any}
+        sessions={[
+          makeSession({ name: 'deck_my-project_brain', project: 'my-project', role: 'brain', label: 'brain' }),
+          makeSession({ name: 'deck_my-project_w1', project: 'my-project', role: 'w1', label: 'Worker Alpha' }),
+        ]}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    const getSelectionSpy = vi.spyOn(window, 'getSelection').mockImplementation(() => ({
+      anchorOffset: input.textContent?.length ?? 0,
+    }) as any);
+
+    input.textContent = '@';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByText('agents'));
+    fireEvent.click(screen.getByText('Worker Alpha'));
+    fireEvent.click(screen.getByText('audit'));
+
+    expect(input.textContent).toBe('@@cx(deck_my-project_w1, audit) ');
+    getSelectionSpy.mockRestore();
+  });
 });

@@ -1096,6 +1096,7 @@ describe('Group 15: Token Parser + File Search', () => {
       expect(result.cleanText).toBe('hello world');
     });
 
+
     it('extracts @file tokens', () => {
       const result = parseAtTokens('check @src/index.ts please');
       expect(result.files).toEqual(['src/index.ts']);

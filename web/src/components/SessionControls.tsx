@@ -187,6 +187,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setHasText(true);
   };
 
+  const buildAgentToken = (session: string, mode: string) => `@@cx(${session}, ${mode})`;
+
   const handleSend = useCallback(() => {
     const text = getText();
     if (!text || !ws || !activeSession) return;
@@ -538,7 +540,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             onSelectAgent={(session, mode) => {
               const text = divRef.current?.textContent ?? '';
               const before = text.replace(/@[^\s@]*$/, '');
-              divRef.current!.textContent = `${before}@@cx(${session}, ${mode}) `;
+              divRef.current!.textContent = `${before}${buildAgentToken(session, mode)} `;
               atSelectionSnapshotRef.current = divRef.current!.textContent;
               atSelectionLockRef.current = true;
               setAtPickerOpen(false);
