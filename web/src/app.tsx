@@ -1322,7 +1322,6 @@ export function App() {
       {showDiscussionsPage && selectedServerId && (
         <div ref={discussionsSwipeRef} style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)' }}>
           <DiscussionsPage
-            serverId={selectedServerId}
             ws={wsRef.current}
             onBack={() => setShowDiscussionsPage(false)}
           />

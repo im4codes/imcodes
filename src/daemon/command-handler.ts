@@ -48,6 +48,40 @@ const MIME_MAP: Record<string, string> = {
 
 // ── @@ token parsing ─────────────────────────────────────────────────────────
 
+/**
+ * Expand @@all — find all active sessions in the same domain as the initiator.
+ *
+ * Rules:
+ * - If initiator is a main session (deck_{project}_{role}):
+ *   select its direct sub-sessions + same-project main sessions
+ * - If initiator is a sub-session (deck_sub_*):
+ *   select its siblings (same parentSession) + parent
+ * - Always skip: initiator itself, stopped sessions
+ */
+function expandAllTargets(initiatorName: string, mode: string): P2pTarget[] {
+  const initiator = getSession(initiatorName);
+  const all = listSessions();
+  const targets: P2pTarget[] = [];
+
+  for (const s of all) {
+    if (s.name === initiatorName) continue;
+    if (s.state === 'stopped') continue;
+
+    if (initiatorName.startsWith('deck_sub_')) {
+      // Initiator is a sub-session → select siblings (same parent) + parent
+      const isSibling = s.parentSession && s.parentSession === initiator?.parentSession;
+      const isParent = s.name === initiator?.parentSession;
+      if (isSibling || isParent) targets.push({ session: s.name, mode });
+    } else {
+      // Initiator is a main session → select its sub-sessions + same-project peers
+      const isChild = s.parentSession === initiatorName;
+      const isSameProject = !s.name.startsWith('deck_sub_') && initiator?.projectName && s.projectName === initiator.projectName;
+      if (isChild || isSameProject) targets.push({ session: s.name, mode });
+    }
+  }
+  return targets;
+}
+
 const DISCUSS_TOKEN_RE = /@@discuss\(([^,]+),\s*([^)]+)\)/g;
 const ALL_TOKEN_RE = /@@all\(([^)]+)\)/g;
 const FILE_TOKEN_RE = /@((?:[a-zA-Z0-9_.\-/]+\/)*[a-zA-Z0-9_.\-]+\.[a-zA-Z0-9]+)/g;
@@ -493,22 +527,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // Check for P2P tokens
   const tokens = parseAtTokens(text);
 
-  // @@all(mode) — expand to all active sub-sessions in the same domain
+  // @@all(mode) — expand to all active sessions in the same domain
   if (tokens.expandAll && tokens.agents.length === 0) {
     const mode = tokens.expandAll.mode;
-    const initiator = getSession(sessionName);
-    const allSessions = listSessions();
-    for (const s of allSessions) {
-      if (s.name === sessionName) continue; // skip initiator
-      if (s.state === 'stopped') continue; // skip stopped
-      // Same domain: sub-sessions whose parent matches, or siblings of the same project
-      const isSubOfInitiator = s.parentSession === sessionName;
-      const isSibling = s.parentSession && s.parentSession === initiator?.parentSession;
-      const isSameProject = !s.name.startsWith('deck_sub_') && initiator?.projectName && s.projectName === initiator.projectName;
-      if (isSubOfInitiator || isSibling || isSameProject) {
-        tokens.agents.push({ session: s.name, mode });
-      }
-    }
+    tokens.agents.push(...expandAllTargets(sessionName, mode));
     if (tokens.agents.length === 0) {
       logger.warn({ sessionName }, '@@all: no active sessions found in same domain');
       timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: 'No active sessions found for @@all' });

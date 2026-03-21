@@ -9,7 +9,6 @@ interface P2pDiscussion {
 }
 
 interface Props {
-  serverId: string;
   ws: WsClient | null;
   onBack: () => void;
 }
