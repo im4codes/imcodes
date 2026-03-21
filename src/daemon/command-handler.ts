@@ -63,9 +63,12 @@ function expandAllTargets(initiatorName: string, mode: string): P2pTarget[] {
   const all = listSessions();
   const targets: P2pTarget[] = [];
 
+  const NON_DISCUSSABLE = new Set(['shell', 'script']);
+
   for (const s of all) {
     if (s.name === initiatorName) continue;
     if (s.state === 'stopped') continue;
+    if (NON_DISCUSSABLE.has(s.agentType ?? '')) continue;
 
     if (initiatorName.startsWith('deck_sub_')) {
       // Initiator is a sub-session → select siblings (same parent) + parent
