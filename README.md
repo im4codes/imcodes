@@ -38,8 +38,10 @@ This is a personal project. I haven't written any code myself — it was built a
 - **Multi-server, multi-session** — Manage agents across machines from one dashboard.
 - **Real-time streaming** — Live terminal output, no message limits, no rate throttling.
 - **Sub-sessions** — Spawn additional agents from within a session. Run parallel tasks with full visibility.
-- **Multi-agent discussions** — Agents discuss, review each other's work, reach conclusions.
+- **P2P multi-agent discussions** — Route a topic through multiple agents in sequence. Each agent reads prior contributions and adds their own. Supports discuss, audit, review, and brainstorm modes. Works across Claude Code, Codex, and Gemini CLI — including sandboxed agents.
+- **File upload & download** — Upload files from browser or phone (including camera). Files are relayed to the daemon and referenced in chat with `@path`. Download project files directly from the built-in file browser.
 - **Push notifications** — Get notified on your phone when an agent needs attention.
+- **OTA updates** — Daemon self-upgrades via npm. Trigger from the web UI for one device or all devices at once.
 - **Fully customizable** — It's your UI. Add whatever you need — diff viewers, approval flows, custom scripts.
 
 ## Architecture
