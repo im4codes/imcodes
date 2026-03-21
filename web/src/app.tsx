@@ -353,6 +353,8 @@ export function App() {
   const [renameRequest, setRenameRequest] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
+  const [daemonOnline, setDaemonOnline] = useState(false);
+  const sessionListRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [idleAlerts, setIdleAlerts] = useState<Set<string>>(new Set());
   const [activeTools, setActiveTools] = useState<Map<string, string>>(new Map());
@@ -557,8 +559,19 @@ export function App() {
           setConnecting(false);
           ws.requestSessionList();
           ws.discussionList();
+          // Timeout: if session_list never arrives, stop blocking the UI
+          if (sessionListRetryRef.current) clearTimeout(sessionListRetryRef.current);
+          sessionListRetryRef.current = setTimeout(() => {
+            setSessionsLoaded((prev) => {
+              if (!prev) {
+                // session_list never arrived — unblock the UI with empty state
+                return true;
+              }
+              return prev;
+            });
+          }, 8000);
         }
-        if (msg.event === 'disconnected') { setConnected(false); setConnecting(true); }
+        if (msg.event === 'disconnected') { setConnected(false); setConnecting(true); setDaemonOnline(false); }
         if (msg.session && !msg.session.startsWith('deck_sub_')) {
           setSessions((prev) => {
             const existing = prev.find((s) => s.name === msg.session);
@@ -574,6 +587,8 @@ export function App() {
       }
       if (msg.type === 'session_list') {
         // Daemon is connected — mark this server as online now
+        setDaemonOnline(true);
+        if (sessionListRetryRef.current) { clearTimeout(sessionListRetryRef.current); sessionListRetryRef.current = null; }
         setServers((prev) => prev.map((s) =>
           s.id === selectedServerId ? { ...s, lastHeartbeatAt: Date.now() } : s,
         ));
@@ -776,7 +791,12 @@ export function App() {
           }, 30_000);
         }
       }
+      if (msg.type === 'daemon.disconnected') {
+        // Daemon went offline — keep existing session data visible, just update status
+        setDaemonOnline(false);
+      }
       if (msg.type === 'daemon.reconnected') {
+        setDaemonOnline(true);
         // Daemon process (re)started — all its subscriptions are gone.
         // Re-subscribe all sessions immediately so terminals resume without a page refresh.
         for (const s of sessionsRef.current) {
@@ -812,8 +832,10 @@ export function App() {
       wsRef.current = null;
       setConnected(false);
       setConnecting(false);
+      setDaemonOnline(false);
       setLatencyMs(null);
       setDaemonStats(null);
+      if (sessionListRetryRef.current) { clearTimeout(sessionListRetryRef.current); sessionListRetryRef.current = null; }
     };
   }, [auth, selectedServerId]);
 
@@ -1272,8 +1294,8 @@ export function App() {
                 <button class="view-toggle" onClick={toggleViewMode}>
                   {viewMode === 'chat' ? '⌨' : '💬'}
                 </button>
-                <span class={`badge ${connected ? 'badge-online' : connecting ? 'badge-connecting' : 'badge-offline'}`} style={{ fontSize: 10 }}>
-                  {connected ? '● Online' : connecting ? (<><span class="connecting-dot" />{' Connecting'}</>) : '○ Offline'}
+                <span class={`badge ${connected ? (daemonOnline ? 'badge-online' : 'badge-connecting') : connecting ? 'badge-connecting' : 'badge-offline'}`} style={{ fontSize: 10 }}>
+                  {connected ? (daemonOnline ? '● Online' : (<><span class="connecting-dot" />{' Daemon Offline'}</>)) : connecting ? (<><span class="connecting-dot" />{' Connecting'}</>) : '○ Offline'}
                 </span>
                 <span style={{ fontSize: 9, color: '#475569' }}>
                   {(() => { try { const d = new Date(__BUILD_TIME__); return `v${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
@@ -1340,7 +1362,7 @@ export function App() {
             {!activeSession && !sessionsLoaded && (
               <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#475569', flexDirection: 'column', gap: 12 }}>
                 <div class="spinner" />
-                <div>Connecting...</div>
+                <div>{connected ? 'Waiting for daemon...' : 'Connecting...'}</div>
               </div>
             )}
             {!activeSession && sessionsLoaded && (

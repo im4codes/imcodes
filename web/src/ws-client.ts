@@ -24,6 +24,7 @@ export type ServerMessage =
   | { type: 'session.notification'; session: string; project: string; title: string; message: string }
   | { type: 'session.tool'; session: string; tool: string | null }
   | { type: 'daemon.reconnected' }
+  | { type: 'daemon.disconnected' }
   | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string }> }
   | { type: 'outbound'; platform: string; channelId: string; content: string }
   | { type: 'timeline.event'; event: TimelineEvent }

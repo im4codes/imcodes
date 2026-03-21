@@ -31,17 +31,19 @@ function renderTokens(
   tokens: Token[],
   onPathClick?: (p: string) => void,
   onUrlClick?: (url: string) => void,
+  inLink = false,
 ): h.JSX.Element[] {
-  return tokens.map((token, i) => renderToken(token, i, onPathClick, onUrlClick));
+  return tokens.map((token, i) => renderToken(token, i, onPathClick, onUrlClick, inLink));
 }
 
 function renderInlineTokens(
   tokens: Token[] | undefined,
   onPathClick?: (p: string) => void,
   onUrlClick?: (url: string) => void,
+  inLink = false,
 ): h.JSX.Element[] {
   if (!tokens || tokens.length === 0) return [];
-  return renderTokens(tokens, onPathClick, onUrlClick);
+  return renderTokens(tokens, onPathClick, onUrlClick, inLink);
 }
 
 function renderToken(
@@ -49,42 +51,44 @@ function renderToken(
   key: number,
   onPathClick?: (p: string) => void,
   onUrlClick?: (url: string) => void,
+  inLink = false,
 ): h.JSX.Element {
   switch (token.type) {
     case 'heading': {
       const t = token as Tokens.Heading;
       const Tag = `h${t.depth}` as keyof h.JSX.IntrinsicElements;
-      return <Tag key={key} class="chat-heading">{renderInlineTokens(t.tokens, onPathClick, onUrlClick)}</Tag>;
+      return <Tag key={key} class="chat-heading">{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink)}</Tag>;
     }
 
     case 'paragraph': {
       const t = token as Tokens.Paragraph;
-      return <p key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick)}</p>;
+      return <p key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink)}</p>;
     }
 
     case 'text': {
       const t = token as Tokens.Text;
       // Text tokens may have sub-tokens (e.g. from inline parsing)
       if ('tokens' in t && t.tokens && t.tokens.length > 0) {
-        return <span key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick)}</span>;
+        return <span key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink)}</span>;
       }
-      // Plain text — apply path/URL detection
+      // Plain text — apply path/URL detection IF NOT already inside a link
+      if (inLink) return <span key={key}>{t.raw}</span>;
       return <span key={key}>{splitPathsAndUrlsInternal(t.raw, onPathClick, onUrlClick)}</span>;
     }
 
     case 'strong': {
       const t = token as Tokens.Strong;
-      return <strong key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick)}</strong>;
+      return <strong key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink)}</strong>;
     }
 
     case 'em': {
       const t = token as Tokens.Em;
-      return <em key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick)}</em>;
+      return <em key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink)}</em>;
     }
 
     case 'del': {
       const t = token as Tokens.Del;
-      return <del key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick)}</del>;
+      return <del key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink)}</del>;
     }
 
     case 'codespan': {
@@ -112,7 +116,7 @@ function renderToken(
             onClick={() => onPathClick?.(t.href)}
             title={t.href}
           >
-            {renderInlineTokens(t.tokens, onPathClick, onUrlClick)}
+            {renderInlineTokens(t.tokens, onPathClick, onUrlClick, true)}
           </span>
         );
       }
@@ -127,7 +131,7 @@ function renderToken(
             onUrlClick?.(t.href);
           }}
         >
-          {renderInlineTokens(t.tokens, onPathClick, onUrlClick)}
+          {renderInlineTokens(t.tokens, onPathClick, onUrlClick, true)}
         </a>
       );
     }

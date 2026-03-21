@@ -182,6 +182,48 @@ describe('WsClient', () => {
     expect(() => client.send({ type: 'ping' })).toThrow('WebSocket not connected');
   });
 
+  // ── daemon.disconnected / daemon.reconnected dispatch ──────────────────
+
+  describe('daemon lifecycle messages', () => {
+    async function connectClient(): Promise<WsClient> {
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await flushAsync();
+      lastWs!.emit('open');
+      return client;
+    }
+
+    it('dispatches daemon.disconnected to handlers', async () => {
+      const client = await connectClient();
+      const handler = vi.fn();
+      client.onMessage(handler);
+      handler.mockClear();
+
+      lastWs!.emit('message', { data: JSON.stringify({ type: 'daemon.disconnected' }) });
+      expect(handler).toHaveBeenCalledWith({ type: 'daemon.disconnected' });
+      client.disconnect();
+    });
+
+    it('dispatches daemon.reconnected to handlers', async () => {
+      const client = await connectClient();
+      const handler = vi.fn();
+      client.onMessage(handler);
+      handler.mockClear();
+
+      lastWs!.emit('message', { data: JSON.stringify({ type: 'daemon.reconnected' }) });
+      expect(handler).toHaveBeenCalledWith({ type: 'daemon.reconnected' });
+      client.disconnect();
+    });
+
+    it('stays connected (browser WS alive) even when daemon.disconnected arrives', async () => {
+      const client = await connectClient();
+      lastWs!.emit('message', { data: JSON.stringify({ type: 'daemon.disconnected' }) });
+      // The browser WebSocket should still be connected
+      expect(client.connected).toBe(true);
+      client.disconnect();
+    });
+  });
+
   // ── fsListDir ─────────────────────────────────────────────────────────
 
   describe('fsListDir', () => {

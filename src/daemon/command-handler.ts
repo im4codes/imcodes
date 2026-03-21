@@ -554,7 +554,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       for (const fp of tokens.files) {
         try {
           const absPath = nodePath.isAbsolute(fp) ? fp : nodePath.join(projectDir, fp);
+          // Check for binary content by reading a sample first
           const content = await fsReadFileRaw(absPath, 'utf8');
+          const sample = content.slice(0, 8192);
+          if (sample.includes('\0')) {
+            logger.warn({ path: fp }, 'P2P: skipping binary file');
+            continue;
+          }
           fileContents.push({ path: fp, content: content.slice(0, 50_000) }); // cap at 50KB
         } catch { /* ignore unreadable files */ }
       }

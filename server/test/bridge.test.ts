@@ -408,6 +408,197 @@ describe('WsBridge', () => {
     });
   });
 
+  // ── Daemon disconnect notification ─────────────────────────────────────────
+
+  describe('daemon disconnect broadcasts daemon.disconnected to browsers', () => {
+    it('sends daemon.disconnected when daemon socket closes', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      browserWs.sent.length = 0;
+
+      // Daemon disconnects
+      daemonWs.emit('close');
+      await flushAsync();
+
+      const disconnectMsg = browserWs.sentStrings.find((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === 'daemon.disconnected'; } catch { return false; }
+      });
+      expect(disconnectMsg).toBeDefined();
+    });
+
+    it('does NOT send daemon.disconnected when a replaced daemon closes', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs1 = new MockWs();
+      bridge.handleDaemonConnection(daemonWs1 as never, makeDb('valid-hash'), {} as never);
+      daemonWs1.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      // New daemon replaces old one (closes daemonWs1)
+      const daemonWs2 = new MockWs();
+      bridge.handleDaemonConnection(daemonWs2 as never, makeDb('valid-hash'), {} as never);
+      browserWs.sent.length = 0;
+
+      // Old daemon's close fires — but bridge.daemonWs is now daemonWs2, so guard prevents broadcast
+      daemonWs1.emit('close');
+      await flushAsync();
+
+      const disconnectMsg = browserWs.sentStrings.find((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === 'daemon.disconnected'; } catch { return false; }
+      });
+      // The close of the replaced daemon should NOT trigger daemon.disconnected because
+      // bridge.daemonWs !== daemonWs1 (it's already daemonWs2)
+      expect(disconnectMsg).toBeUndefined();
+    });
+
+    it('sends daemon.reconnected after daemon re-authenticates', async () => {
+      const bridge = WsBridge.get(serverId);
+
+      const daemonWs1 = new MockWs();
+      bridge.handleDaemonConnection(daemonWs1 as never, makeDb('valid-hash'), {} as never);
+      daemonWs1.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      // Daemon disconnects
+      daemonWs1.emit('close');
+      await flushAsync();
+      browserWs.sent.length = 0;
+
+      // New daemon connects and authenticates
+      const daemonWs2 = new MockWs();
+      bridge.handleDaemonConnection(daemonWs2 as never, makeDb('valid-hash'), {} as never);
+      daemonWs2.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const reconnectMsg = browserWs.sentStrings.find((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === 'daemon.reconnected'; } catch { return false; }
+      });
+      expect(reconnectMsg).toBeDefined();
+    });
+  });
+
+  // ── Daemon rapid reconnect (flapping) does not crash ────────────────────
+
+  describe('daemon rapid reconnect (flapping) resilience', () => {
+    it('survives 10 rapid daemon reconnects without crashing', async () => {
+      const bridge = WsBridge.get(serverId);
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      for (let i = 0; i < 10; i++) {
+        const dws = new MockWs();
+        bridge.handleDaemonConnection(dws as never, makeDb('valid-hash'), {} as never);
+        dws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+        await flushAsync();
+        dws.emit('close');
+        await flushAsync();
+      }
+
+      // Bridge is still functional — connect a final daemon and verify it works
+      const finalDaemon = new MockWs();
+      bridge.handleDaemonConnection(finalDaemon as never, makeDb('valid-hash'), {} as never);
+      finalDaemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      expect(bridge.isAuthenticated).toBe(true);
+      expect(bridge.browserCount).toBe(1);
+    });
+
+    it('browser receives daemon.reconnected after each reconnect cycle', async () => {
+      const bridge = WsBridge.get(serverId);
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      let reconnectCount = 0;
+      let disconnectCount = 0;
+
+      for (let i = 0; i < 5; i++) {
+        browserWs.sent.length = 0;
+        const dws = new MockWs();
+        bridge.handleDaemonConnection(dws as never, makeDb('valid-hash'), {} as never);
+        dws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+        await flushAsync();
+
+        reconnectCount += browserWs.sentStrings.filter((s) => {
+          try { return (JSON.parse(s) as { type: string }).type === 'daemon.reconnected'; } catch { return false; }
+        }).length;
+
+        browserWs.sent.length = 0;
+        dws.emit('close');
+        await flushAsync();
+
+        disconnectCount += browserWs.sentStrings.filter((s) => {
+          try { return (JSON.parse(s) as { type: string }).type === 'daemon.disconnected'; } catch { return false; }
+        }).length;
+      }
+
+      expect(reconnectCount).toBe(5);
+      expect(disconnectCount).toBe(5);
+    });
+
+    it('rapid replace without auth does not crash or leak', async () => {
+      const bridge = WsBridge.get(serverId);
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      // Rapid daemon connections that never authenticate
+      for (let i = 0; i < 20; i++) {
+        const dws = new MockWs();
+        bridge.handleDaemonConnection(dws as never, makeDb('valid-hash'), {} as never);
+        // Don't send auth — immediately replaced by next iteration
+      }
+
+      // Final daemon authenticates successfully
+      const finalDaemon = new MockWs();
+      bridge.handleDaemonConnection(finalDaemon as never, makeDb('valid-hash'), {} as never);
+      finalDaemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      expect(bridge.isAuthenticated).toBe(true);
+    });
+  });
+
+  // ── Whitelist completeness ────────────────────────────────────────────────
+
+  describe('browser→daemon whitelist completeness', () => {
+    async function setupBridge() {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      return { daemonWs, browserWs };
+    }
+
+    it('forwards subsession.set_model to daemon', async () => {
+      const { daemonWs, browserWs } = await setupBridge();
+      browserWs.emit('message', JSON.stringify({ type: 'subsession.set_model', sessionName: 's', model: 'gpt-4' }));
+      await flushAsync();
+      expect(daemonWs.sentStrings.some((s) => s.includes('subsession.set_model'))).toBe(true);
+    });
+
+    it('forwards ask.answer to daemon', async () => {
+      const { daemonWs, browserWs } = await setupBridge();
+      browserWs.emit('message', JSON.stringify({ type: 'ask.answer', sessionName: 's', answer: 'yes' }));
+      await flushAsync();
+      expect(daemonWs.sentStrings.some((s) => s.includes('ask.answer'))).toBe(true);
+    });
+  });
+
   // ── P0: session-scoped privacy routing ────────────────────────────────────
   // These tests verify that session-private messages (timeline history/replay,
   // notifications, tool state, command acks) are NEVER broadcast to browsers

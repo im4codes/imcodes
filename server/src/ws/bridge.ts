@@ -80,6 +80,8 @@ const BROWSER_WHITELIST = new Set([
   'p2p.status',
   'p2p.list_discussions',
   'p2p.read_discussion',
+  'subsession.set_model',
+  'ask.answer',
 ]);
 
 // ── Terminal forwarding queue (per (session, browser)) ────────────────────────
@@ -321,6 +323,7 @@ export class WsBridge {
         this.daemonWs = null;
         this.authenticated = false;
         this.rejectAllPendingFileTransfers('daemon_disconnected');
+        this.broadcastToBrowsers(JSON.stringify({ type: 'daemon.disconnected' }));
         updateServerStatus(db, this.serverId, 'offline').catch((err) =>
           logger.error({ err }, 'Failed to mark server offline'),
         );
@@ -885,8 +888,8 @@ export class WsBridge {
 
       return false;
     } catch (err) {
-      logger.warn({ serverId: this.serverId, sessionName, err }, 'verifySessionOwnership: db error — allowing');
-      return true; // fail-open to avoid breaking on transient DB issues
+      logger.warn({ serverId: this.serverId, sessionName, err }, 'verifySessionOwnership: db error — denying');
+      return false; // fail-closed: deny on transient DB errors to prevent unauthorized access
     }
   }
 
