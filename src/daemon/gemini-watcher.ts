@@ -119,6 +119,8 @@ export interface WatcherState {
   _lastRotationCheck?: number;
   _terminalThinkingEmitted?: boolean;
   lastConversationStatus?: 'running' | 'idle' | null;
+  /** Consecutive poll ticks where JSON inferred idle. Prevents tool-call gap false idles. */
+  idleConfirmCount?: number;
 }
 
 const watchers = new Map<string, WatcherState>();
@@ -145,7 +147,15 @@ async function terminalThinkingCheck(sessionName: string, state: WatcherState): 
   const status = detectStatus(lines, 'gemini');
 
   if (status === 'idle') {
-    // Terminal shows idle — debounce before transitioning
+    // Strong idle: both JSON and terminal agree on idle — skip confirm count, transition faster
+    if (state.lastConversationStatus === 'idle') {
+      state.idleConfirmCount = 2; // force past threshold
+      if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
+      state._terminalThinkingEmitted = false;
+      transitionState(sessionName, state, 'idle');
+      return;
+    }
+    // Terminal shows idle but JSON doesn't — debounce before transitioning
     if (state.currentState === 'running' && !state.idleDebounceTimer) {
       state.idleDebounceTimer = setTimeout(() => {
         state.idleDebounceTimer = undefined;
@@ -245,10 +255,14 @@ export async function pollTick(sessionName: string, state: WatcherState): Promis
 
   if (conv.lastUpdated === state.lastUpdated && conv.messages.length === state.seenCount) {
     if (conversationStatus === 'idle') {
-      // JSON unchanged + idle — but respect any pending debounce from a recent update
-      if (!state.idleDebounceTimer) transitionState(sessionName, state, 'idle');
+      state.idleConfirmCount = (state.idleConfirmCount ?? 0) + 1;
+      // Require consecutive idle confirmations to prevent tool-call gap false idles
+      if (state.idleConfirmCount >= 2 && !state.idleDebounceTimer) {
+        transitionState(sessionName, state, 'idle');
+      }
       return;
     }
+    state.idleConfirmCount = 0;
     // JSON unchanged — supplement with terminal-based detection.
     // Gemini CLI may be thinking/working without writing to JSON yet.
     await terminalThinkingCheck(sessionName, state);
@@ -273,21 +287,26 @@ export async function pollTick(sessionName: string, state: WatcherState): Promis
   }
 
   if (conversationStatus === 'running') {
+    state.idleConfirmCount = 0;
     if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
     transitionState(sessionName, state, 'running');
     return;
   }
 
   if (conversationStatus === 'idle') {
+    state.idleConfirmCount = (state.idleConfirmCount ?? 0) + 1;
     const touchedGeminiMessage = messagesToProcess.some((msg: any) => msg?.type === 'gemini');
     if (isUpdate && touchedGeminiMessage) {
       // Still receiving updates for the same Gemini message: wait for writes to settle.
-      if (state.idleDebounceTimer) clearTimeout(state.idleDebounceTimer);
-      state.idleDebounceTimer = setTimeout(() => {
-        state.idleDebounceTimer = undefined;
-        if (!state.stopped) transitionState(sessionName, state, 'idle');
-      }, 1500);
-    } else {
+      // Only transition after consecutive idle confirmations.
+      if (state.idleConfirmCount >= 2) {
+        if (state.idleDebounceTimer) clearTimeout(state.idleDebounceTimer);
+        state.idleDebounceTimer = setTimeout(() => {
+          state.idleDebounceTimer = undefined;
+          if (!state.stopped) transitionState(sessionName, state, 'idle');
+        }, 1500);
+      }
+    } else if (state.idleConfirmCount >= 2) {
       if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
       transitionState(sessionName, state, 'idle');
     }

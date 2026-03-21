@@ -80,7 +80,7 @@ describe('Gemini Idle Detection (Direct pollTick test)', () => {
     expect(states).not.toContain('idle');
   });
 
-  it('emits idle ONLY when content is present and all tools finished', async () => {
+  it('emits idle ONLY when content is present and all tools finished (after consecutive confirmation)', async () => {
     const conv = {
       lastUpdated: '2026-03-14T10:00:02Z',
       messages: [
@@ -94,19 +94,21 @@ describe('Gemini Idle Detection (Direct pollTick test)', () => {
     };
     vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify(conv));
 
+    // First poll: idle confirm count = 1 (not enough)
+    await pollTick(sid, state);
+    // Second poll (unchanged JSON): idle confirm count = 2 → emit idle
     await pollTick(sid, state);
 
     const states = vi.mocked(timelineEmitter.emit).mock.calls
       .filter(c => c[1] === 'session.state')
       .map(c => (c[2] as any).state);
-    
+
     expect(states).toContain('idle');
   });
 
-  it('emits idle when a trailing info message arrives after a completed Gemini reply', async () => {
+  it('emits idle when a trailing info message arrives after a completed Gemini reply (after consecutive confirmation)', async () => {
     state.seenCount = 1;
     state.lastUpdated = '2026-03-14T10:00:01Z';
-    state.emittedRunning = false;
 
     const conv = {
       lastUpdated: '2026-03-14T10:00:03Z',
@@ -125,6 +127,9 @@ describe('Gemini Idle Detection (Direct pollTick test)', () => {
     };
     vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify(conv));
 
+    // First poll: processes new messages, idle confirm = 1
+    await pollTick(sid, state);
+    // Second poll (unchanged JSON): idle confirm = 2 → emit idle
     await pollTick(sid, state);
 
     const states = vi.mocked(timelineEmitter.emit).mock.calls
