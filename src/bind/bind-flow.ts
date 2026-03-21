@@ -233,7 +233,7 @@ Description=IM.codes Daemon
 After=network.target
 
 [Service]
-ExecStart=${nodeExec} ${script} start
+ExecStart=${nodeExec} ${script} start --foreground
 Restart=always
 RestartSec=5
 Environment=PATH=${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}
