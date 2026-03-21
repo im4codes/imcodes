@@ -20,12 +20,45 @@ const program = new Command()
 
 program
   .command('start')
-  .description('Start the daemon (connect to CF server, restore sessions)')
-  .action(async () => {
-    await startup();
-    logger.info('Daemon running. Press Ctrl+C to stop.');
-    // Keep process alive — signal handlers in lifecycle.ts handle exit
-    await new Promise(() => {});
+  .description('Start the daemon via system service (launchd/systemd)')
+  .option('--foreground', 'Run in foreground (for service managers, not manual use)')
+  .action(async (opts: { foreground?: boolean }) => {
+    if (opts.foreground) {
+      // Called by launchd/systemd plist/unit — run inline
+      await startup();
+      logger.info('Daemon running. Press Ctrl+C to stop.');
+      await new Promise(() => {});
+      return;
+    }
+
+    // Interactive: delegate to system service to avoid duplicate processes
+    const platform = process.platform;
+    if (platform === 'darwin') {
+      const plist = resolve(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
+      if (!existsSync(plist)) {
+        console.error(`No service installed. Run 'imcodes service install' first, or use 'imcodes start --foreground'.`);
+        process.exit(1);
+      }
+      try { execSync(`launchctl unload "${plist}" 2>/dev/null`, { stdio: 'pipe' }); } catch { /* may not be loaded */ }
+      execSync(`launchctl load "${plist}"`, { stdio: 'inherit' });
+      console.log('Daemon started via launchctl.');
+    } else if (platform === 'linux') {
+      const userService = existsSync(resolve(homedir(), '.config/systemd/user/imcodes.service'));
+      if (userService) {
+        execSync('systemctl --user start imcodes', { stdio: 'inherit' });
+      } else {
+        try { execSync('sudo systemctl start imcodes', { stdio: 'inherit' }); } catch {
+          console.error(`No service installed. Run 'imcodes service install' first, or use 'imcodes start --foreground'.`);
+          process.exit(1);
+        }
+      }
+      console.log('Daemon started via systemd.');
+    } else {
+      // Fallback: run inline
+      await startup();
+      logger.info('Daemon running. Press Ctrl+C to stop.');
+      await new Promise(() => {});
+    }
   });
 
 program
