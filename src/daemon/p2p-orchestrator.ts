@@ -581,20 +581,18 @@ function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: HopOpts): 
     parts.push(mode.prompt);
   }
 
-  // Prompt: direct and assertive — agents (especially Codex) need clear, unambiguous instructions.
+  // Prompt: direct and assertive. File path mentioned exactly ONCE to prevent
+  // Claude Code from parsing two paths and executing the task twice.
   parts.push(``);
   parts.push(`P2P collaborative discussion task (run ${run.id}).`);
   parts.push(``);
-  parts.push(`File: ${filePath}`);
-  parts.push(``);
-  parts.push(`Do exactly these 3 steps:`);
-  parts.push(`1. Read the entire file at ${filePath}`);
+  parts.push(`Do exactly these 3 steps on the file ${filePath}:`);
+  parts.push(`1. Read it`);
   parts.push(`2. ${opts.instruction}`);
-  parts.push(`3. Append your analysis to that SAME file under the heading "## ${opts.sectionHeader}"`);
+  parts.push(`3. Append your output under the heading "## ${opts.sectionHeader}"`);
   parts.push(``);
-  parts.push(`Important: your output MUST be written to the file, NOT printed to chat.`);
-  parts.push(`Do not ask questions. Do not summarize what you plan to do. Just read, analyze, write to file.`);
-  parts.push(`When finished writing to the file, say only "Done".`);
+  parts.push(`Important: write output to the file, NOT to chat. Do not ask questions. Just do it.`);
+  parts.push(`When done, say only "Done".`);
 
   return parts.join('\n');
 }
