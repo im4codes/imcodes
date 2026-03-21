@@ -54,7 +54,7 @@ interface ServerInfo {
 function isServerOnline(s: ServerInfo): boolean {
   if (s.status === 'offline') return false;
   if (!s.lastHeartbeatAt) return false;
-  return Date.now() - s.lastHeartbeatAt < 2 * 60 * 1000;
+  return Date.now() - s.lastHeartbeatAt < 60_000; // 60s — heartbeat is 5s, allow for network jitter
 }
 
 export function App() {
@@ -298,7 +298,7 @@ export function App() {
   // Periodically refresh server list so lastHeartbeatAt stays current
   useEffect(() => {
     if (!auth) return;
-    const id = setInterval(() => { loadServers(); }, 90_000);
+    const id = setInterval(() => { loadServers(); }, 30_000);
     return () => clearInterval(id);
   }, [auth, loadServers]);
 

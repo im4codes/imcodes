@@ -14,7 +14,7 @@ function collectSystemStats(): { cpu: number; memUsed: number; memTotal: number;
   return { cpu, memUsed: memTotal - memFree, memTotal, load1: +load1.toFixed(2), load5: +load5.toFixed(2), load15: +load15.toFixed(2), uptime: os.uptime() };
 }
 
-const HEARTBEAT_MS = 30_000;
+const HEARTBEAT_MS = 5_000;
 const STATS_MS = 5_000; // daemon.stats update interval (separate from heartbeat)
 const INITIAL_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
