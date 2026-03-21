@@ -8,10 +8,41 @@ import { bindFlow } from './bind/bind-flow.js';
 import logger from './util/logger.js';
 import { execSync } from 'child_process';
 import { homedir } from 'os';
-import { existsSync, realpathSync, readFileSync } from 'fs';
+import { existsSync, realpathSync, readFileSync, writeFileSync } from 'fs';
 import { resolve, join, dirname } from 'path';
 
 const { version } = JSON.parse(readFileSync(join(__dirname, '../package.json'), 'utf8')) as { version: string };
+
+/** Ensure plist/systemd service uses --foreground. Patches in-place if missing. */
+function ensureServiceForeground(): void {
+  const platform = process.platform;
+  if (platform === 'darwin') {
+    const plist = resolve(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
+    if (!existsSync(plist)) return;
+    const content = readFileSync(plist, 'utf8');
+    if (content.includes('--foreground')) return;
+    // Inject --foreground after <string>start</string>
+    const patched = content.replace(
+      /(<string>start<\/string>)\s*(<\/array>)/,
+      '$1\n    <string>--foreground</string>\n  $2',
+    );
+    if (patched !== content) {
+      writeFileSync(plist, patched, 'utf8');
+      console.log('Patched plist: added --foreground');
+    }
+  } else if (platform === 'linux') {
+    const svc = resolve(homedir(), '.config/systemd/user/imcodes.service');
+    if (!existsSync(svc)) return;
+    const content = readFileSync(svc, 'utf8');
+    if (content.includes('--foreground')) return;
+    const patched = content.replace(/^(ExecStart=.*imcodes start)$/m, '$1 --foreground');
+    if (patched !== content) {
+      writeFileSync(svc, patched, 'utf8');
+      try { execSync('systemctl --user daemon-reload', { stdio: 'ignore' }); } catch { /* ok */ }
+      console.log('Patched systemd service: added --foreground');
+    }
+  }
+}
 
 const program = new Command()
   .name('imcodes')
@@ -23,6 +54,10 @@ program
   .description('Start the daemon via system service (launchd/systemd)')
   .option('--foreground', 'Run in foreground (for service managers, not manual use)')
   .action(async (opts: { foreground?: boolean }) => {
+    if (!opts.foreground) {
+      // Before delegating to service manager, ensure service file has --foreground
+      ensureServiceForeground();
+    }
     if (opts.foreground) {
       // Called by launchd/systemd plist/unit — run inline.
       // Global error handlers: daemon must NEVER crash from unhandled errors.
@@ -213,6 +248,7 @@ program
       .description('Rebuild and restart the imcodes daemon service')
       .option('--no-build', 'Skip rebuild step')
       .action(async (opts: { build: boolean }) => {
+        ensureServiceForeground();
         const realScript = realpathSync(process.argv[1]);
         const projectRoot = resolve(realScript, '../..'); // dist/index.js → project root
 
@@ -259,6 +295,7 @@ program
   .command('restart')
   .description('Restart the imcodes daemon service')
   .action(() => {
+    ensureServiceForeground();
     const platform = process.platform;
     if (platform === 'darwin') {
       const plist = resolve(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');

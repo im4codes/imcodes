@@ -185,6 +185,7 @@ async function installLaunchAgent(): Promise<void> {
     <string>${nodeExec}</string>
     <string>${script}</string>
     <string>start</string>
+    <string>--foreground</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
