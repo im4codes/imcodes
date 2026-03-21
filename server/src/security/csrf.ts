@@ -26,6 +26,10 @@ export function csrfMiddleware() {
     // Safe methods pass through
     if (SAFE_METHODS.has(method)) { await next(); return; }
 
+    // Passkey endpoints use challenge-response which is inherently CSRF-safe
+    const path = new URL(c.req.url).pathname;
+    if (path.startsWith('/api/auth/passkey/')) { await next(); return; }
+
     // Bearer auth (API key, daemon, CLI) skips CSRF — not a browser session
     const authHeader = c.req.header('Authorization');
     if (authHeader?.startsWith('Bearer ')) { await next(); return; }
@@ -49,7 +53,6 @@ export function csrfMiddleware() {
       const csrfCookie = getCookie(c, 'rcc_csrf');
       const csrfHeader = c.req.header('X-CSRF-Token');
       if (!csrfCookie || !csrfHeader || csrfCookie !== csrfHeader) {
-        const path = new URL(c.req.url).pathname;
         logger.warn({ path, hasCookie: !!csrfCookie, hasHeader: !!csrfHeader }, '[csrf] token mismatch — rejecting');
         return c.json({ error: 'csrf_rejected', reason: 'token_mismatch' }, 403);
       }
