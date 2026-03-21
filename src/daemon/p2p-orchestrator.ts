@@ -354,7 +354,9 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
 
     // Send the prompt (sendKeys auto-handles long text; pass cwd for sandboxed agents)
     const sessionRecord = getSession(session);
-    const sendOpts = isSandboxedSession(session) ? { cwd: sessionRecord?.projectDir } : undefined;
+    // Gemini: use ~/.gemini/tmp for temp files (Gemini can't read /tmp or .gitignored project files)
+    const geminiTmpDir = isSandboxedSession(session) ? join(homedir(), '.gemini', 'tmp') : undefined;
+    const sendOpts = geminiTmpDir ? { cwd: geminiTmpDir } : undefined;
     try {
       await sendKeysDelayedEnter(session, prompt, sendOpts);
     } catch (err) {
@@ -512,10 +514,11 @@ function isSandboxedSession(session: string): boolean {
  * For sandboxed agents: copy the discussion file into the project dir,
  * return the local temp path. After the hop, copyBackFromSandbox() merges it back.
  */
-async function copyToSandbox(run: P2pRun, session: string): Promise<string | null> {
-  const record = getSession(session);
-  if (!record?.projectDir) return null;
-  const localPath = join(record.projectDir, `.p2p-${run.id}.md`);
+async function copyToSandbox(run: P2pRun, _session: string): Promise<string | null> {
+  // Use ~/.gemini/tmp for sandboxed agents (Gemini can't read .gitignored project files or /tmp)
+  const tmpDir = join(homedir(), '.gemini', 'tmp');
+  await mkdir(tmpDir, { recursive: true });
+  const localPath = join(tmpDir, `.p2p-${run.id}.md`);
   await copyFile(run.contextFilePath, localPath);
   return localPath;
 }
