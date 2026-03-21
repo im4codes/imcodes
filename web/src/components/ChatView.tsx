@@ -307,7 +307,11 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
   // On session change, reset scroll position to bottom
   useEffect(() => {
     autoScrollRef.current = true;
+    hasInitialScrolledRef.current = false;
     setShowScrollBtn(false);
+    // Force scroll to bottom on tab switch — the auto-scroll effect may not fire
+    // if no new events arrived while this tab was inactive.
+    requestAnimationFrame(() => scrollToBottom());
   }, [sessionId]);
 
   // On mobile: when keyboard opens, viewport shrinks and scrollTop can reset to 0.

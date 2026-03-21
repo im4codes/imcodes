@@ -76,12 +76,18 @@ export function listP2pRuns(): P2pRun[] { return [...activeRuns.values()]; }
 import { homedir } from 'node:os';
 const P2P_DIR = join(homedir(), '.imcodes', 'discussions');
 let IDLE_POLL_MS = 3_000;
-let GRACE_PERIOD_DEFAULT_MS = 30_000;
+let GRACE_PERIOD_DEFAULT_MS = 60_000;
+let MIN_PROCESSING_MS = 15_000; // Don't trust idle detection until 15s after dispatch
+let FILE_SETTLE_CYCLES = 3; // File must stop growing for 3 poll cycles (9s) to be "settled"
 
 /** Override poll interval for tests. */
 export function _setIdlePollMs(ms: number): void { IDLE_POLL_MS = ms; }
 /** Override grace period for tests. */
 export function _setGracePeriodMs(ms: number): void { GRACE_PERIOD_DEFAULT_MS = ms; }
+/** Override min processing time for tests. */
+export function _setMinProcessingMs(ms: number): void { MIN_PROCESSING_MS = ms; }
+/** Override file settle cycles for tests. */
+export function _setFileSettleCycles(n: number): void { FILE_SETTLE_CYCLES = n; }
 
 // ── Idle event registry (callback-driven, no polling) ─────────────────────
 
@@ -101,8 +107,14 @@ export function notifySessionIdle(sessionName: string): void {
   }
 }
 
-function waitForIdleEvent(session: string, timeoutMs: number): Promise<boolean> {
-  return new Promise((resolve) => {
+interface IdleWaiterHandle {
+  promise: Promise<boolean>;
+  cancel: () => void;
+}
+
+function waitForIdleEvent(session: string, timeoutMs: number): IdleWaiterHandle {
+  let cancelFn: () => void = () => {};
+  const promise = new Promise<boolean>((resolve) => {
     let resolved = false;
     const timer = setTimeout(() => {
       if (!resolved) { resolved = true; cleanup(); resolve(false); }
@@ -110,6 +122,10 @@ function waitForIdleEvent(session: string, timeoutMs: number): Promise<boolean> 
 
     const resolver: IdleResolver = () => {
       if (!resolved) { resolved = true; clearTimeout(timer); cleanup(); resolve(true); }
+    };
+
+    cancelFn = () => {
+      if (!resolved) { resolved = true; clearTimeout(timer); cleanup(); resolve(false); }
     };
 
     function cleanup() {
@@ -127,6 +143,7 @@ function waitForIdleEvent(session: string, timeoutMs: number): Promise<boolean> 
     }
     set.add(resolver);
   });
+  return { promise, cancel: cancelFn };
 }
 
 // ── Start a P2P run ───────────────────────────────────────────────────────
@@ -342,21 +359,27 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
 
 async function dispatchHop(run: P2pRun, session: string, prompt: string, serverLink: ServerLink | null, sandboxLocalPath?: string | null): Promise<void> {
   run.currentTargetSession = session;
-  run.remainingTargets = run.remainingTargets.filter((t) => t.session !== session);
+  // Don't remove from remainingTargets yet — defer until hop actually completes
   transition(run, 'dispatched', serverLink);
 
   const watchPath = sandboxLocalPath ?? run.contextFilePath;
   const MAX_RETRIES = 1;
 
+  /** Helper: clean up hop state on every exit path */
+  const finishHop = (skipped: boolean) => {
+    run.currentTargetSession = null;
+    run.remainingTargets = run.remainingTargets.filter((t) => t.session !== session);
+    if (skipped) run.skippedHops.push(session);
+  };
+
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    if (run._cancelled) return;
+    if (run._cancelled) { finishHop(false); return; }
 
     // Record file size before dispatch
     let sizeBefore = 0;
     try { sizeBefore = (await stat(watchPath)).size; } catch { /* file should exist */ }
 
     // Send the prompt (sendKeys auto-handles long text; pass cwd for sandboxed agents)
-    const sessionRecord = getSession(session);
     // Gemini: use ~/.gemini/tmp for temp files (Gemini can't read /tmp or .gitignored project files)
     const geminiTmpDir = isSandboxedSession(session) ? join(homedir(), '.gemini', 'tmp') : undefined;
     const sendOpts = geminiTmpDir ? { cwd: geminiTmpDir } : undefined;
@@ -369,9 +392,14 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
         continue;
       }
       logger.warn({ runId: run.id, session, err }, 'P2P: hop dispatch failed after retry, skipping');
-      run.skippedHops.push(session);
-      return; // skip this hop, don't fail the whole run
+      finishHop(true);
+      return;
     }
+
+    // Register idle waiter AFTER sendKeys completes — prevents pre-prompt idle from resolving it
+    let idleEventReceived = false;
+    const idleWaiter = waitForIdleEvent(session, run.timeoutMs);
+    idleWaiter.promise.then((ok) => { idleEventReceived = ok; });
 
     // Wait for completion: file settled (stopped growing) + agent idle.
     // Uses file-settle window + idle confirmation to avoid premature hop completion
@@ -382,14 +410,11 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
     let fileGrew = false;
     let lastSize = sizeBefore;
     let lastGrowthAt = 0;
-    let idleEventReceived = false;
-
-    const idlePromise = waitForIdleEvent(session, run.timeoutMs).then((ok) => { idleEventReceived = ok; });
 
     while (Date.now() < deadline) {
-      if (run._cancelled) return;
+      if (run._cancelled) { idleWaiter.cancel(); finishHop(false); return; }
       await sleep(IDLE_POLL_MS);
-      if (run._cancelled) return;
+      if (run._cancelled) { idleWaiter.cancel(); finishHop(false); return; }
 
       // Check file growth — track last growth time for settle detection
       try {
@@ -406,10 +431,15 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
         }
       } catch { /* ignore */ }
 
+      // Don't trust idle detection until MIN_PROCESSING_MS after dispatch
+      const canCheckIdle = (Date.now() - dispatchTime) > MIN_PROCESSING_MS;
+      if (!canCheckIdle) continue;
+
       const pastGrace = (Date.now() - dispatchTime) > GRACE_PERIOD_MS;
 
-      // File must have settled: grew AND stopped growing for ≥ 1 poll cycle
-      const fileSettled = fileGrew && lastGrowthAt > 0 && (Date.now() - lastGrowthAt) >= IDLE_POLL_MS;
+      // File must have settled: grew AND stopped growing for multiple poll cycles
+      const settleMs = IDLE_POLL_MS * FILE_SETTLE_CYCLES;
+      const fileSettled = fileGrew && lastGrowthAt > 0 && (Date.now() - lastGrowthAt) >= settleMs;
 
       // Check idle — only when file has settled (or past grace with no growth)
       if (fileSettled || (pastGrace && !fileGrew)) {
@@ -455,8 +485,10 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
               continue;
             }
           } catch { /* ignore */ }
+          idleWaiter.cancel();
           if (sandboxLocalPath) await copyBackFromSandbox(run, sandboxLocalPath);
-          if (run.remainingTargets.length > 0 || session !== run.initiatorSession) {
+          finishHop(false);
+          if (run.remainingTargets.length > 0 || session !== run.finalReturnSession) {
             transition(run, 'awaiting_next_hop', serverLink);
           }
           return;
@@ -466,12 +498,14 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
         if (!fileGrew && pastGrace && idleConfirmed) {
           if (attempt < MAX_RETRIES) {
             logger.warn({ runId: run.id, session, attempt }, 'P2P: agent went idle without writing to file, retrying');
+            idleWaiter.cancel();
             break; // break inner loop to retry outer loop
           }
           logger.warn({ runId: run.id, session }, 'P2P: agent idle without file change after retry, skipping hop');
-          run.skippedHops.push(session);
+          idleWaiter.cancel();
           if (sandboxLocalPath) await copyBackFromSandbox(run, sandboxLocalPath).catch(() => {});
-          if (run.remainingTargets.length > 0 || session !== run.initiatorSession) {
+          finishHop(true);
+          if (run.remainingTargets.length > 0 || session !== run.finalReturnSession) {
             transition(run, 'awaiting_next_hop', serverLink);
           }
           return;
@@ -479,7 +513,7 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
       }
     }
 
-    void idlePromise;
+    idleWaiter.cancel();
 
     // If we got here from break (retry), continue to next attempt
     if (!fileGrew && attempt < MAX_RETRIES) continue;
@@ -487,57 +521,11 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
     // Timeout — copy back whatever we got and skip (don't fail the whole run)
     if (sandboxLocalPath) await copyBackFromSandbox(run, sandboxLocalPath).catch(() => {});
     logger.warn({ runId: run.id, session }, 'P2P: hop timed out, skipping to next');
-    run.skippedHops.push(session);
-    if (run.remainingTargets.length > 0 || session !== run.initiatorSession) {
+    finishHop(true);
+    if (run.remainingTargets.length > 0 || session !== run.finalReturnSession) {
       transition(run, 'awaiting_next_hop', serverLink);
     }
     return;
-  }
-}
-
-// ── Wait for target session to be idle ────────────────────────────────────
-
-async function waitForIdle(run: P2pRun, session: string, serverLink: ServerLink | null): Promise<void> {
-  logger.info({ runId: run.id, session }, 'P2P: waiting for target session to become idle');
-
-  // 1. Check store state first — if already idle, proceed immediately
-  const record = getSession(session);
-  if (record?.state === 'idle') {
-    logger.info({ runId: run.id, session }, 'P2P: target already idle (store), proceeding');
-    return;
-  }
-
-  // 2. Wait for idle event (timeline listener fires notifySessionIdle on any state change to idle)
-  //    with polling fallback via detectStatusAsync (cursor-based for codex)
-  let idleEventFired = false;
-  const idlePromise = waitForIdleEvent(session, run.timeoutMs).then((ok) => { idleEventFired = ok; });
-
-  const deadline = Date.now() + run.timeoutMs;
-  while (Date.now() < deadline) {
-    if (run._cancelled) return;
-    if (idleEventFired) {
-      logger.info({ runId: run.id, session }, 'P2P: target idle (via event), proceeding');
-      return;
-    }
-    // Poll fallback
-    try {
-      const r = getSession(session);
-      if (r?.state === 'idle') {
-        logger.info({ runId: run.id, session }, 'P2P: target idle (store poll), proceeding');
-        return;
-      }
-      const agentType = (r?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
-      if (await detectStatusAsync(session, agentType) === 'idle') {
-        logger.info({ runId: run.id, session }, 'P2P: target idle (detectStatusAsync), proceeding');
-        return;
-      }
-    } catch { /* ignore */ }
-    await sleep(IDLE_POLL_MS);
-  }
-
-  void idlePromise;
-  if (!run._cancelled) {
-    failRun(run, 'timed_out', `Target ${session} never became idle after ${run.timeoutMs}ms`, serverLink);
   }
 }
 

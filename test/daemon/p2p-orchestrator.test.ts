@@ -55,6 +55,8 @@ import {
   listP2pRuns,
   _setIdlePollMs,
   _setGracePeriodMs,
+  _setMinProcessingMs,
+  _setFileSettleCycles,
   type P2pRun,
   type P2pRunStatus,
   notifySessionIdle,
@@ -127,6 +129,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   _setIdlePollMs(50); // fast polling for tests
   _setGracePeriodMs(100); // short grace period for tests
+  _setMinProcessingMs(0); // disable min processing guard for tests
+  _setFileSettleCycles(1); // single cycle settle for tests
   // Default: agent is idle immediately
   detectStatusMock.mockReturnValue('idle');
   capturePaneMock.mockResolvedValue(['$']);
@@ -149,7 +153,9 @@ afterEach(async () => {
   vi.restoreAllMocks();
   vi.useRealTimers();
   _setIdlePollMs(3_000); // restore default
-  _setGracePeriodMs(30_000); // restore default
+  _setGracePeriodMs(60_000); // restore default
+  _setMinProcessingMs(15_000); // restore default
+  _setFileSettleCycles(3); // restore default
   // Clean up temp files
   const { rm } = await import('node:fs/promises');
   const { homedir } = await import('node:os');
