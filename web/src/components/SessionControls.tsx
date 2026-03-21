@@ -66,7 +66,7 @@ const P2P_MODE_COLORS: Record<P2pMode, string> = { solo: '#6b7280', audit: '#f59
 const SHORTCUTS: Array<{ label: string; title: string; data: string; wide?: boolean }> = [
   { label: 'Esc',  title: 'Escape',     data: '\x1b' },
   { label: '^C',   title: 'Ctrl+C',     data: '\x03' },
-  { label: '^B',   title: 'Ctrl+B',     data: '\x02' },
+  { label: '^B²',  title: 'Ctrl+B ×2',  data: '\x02\x02' },
   { label: '↑',    title: 'Up arrow',   data: '\x1b[A' },
   { label: '↓',    title: 'Down arrow', data: '\x1b[B' },
   { label: '↵',    title: 'Enter',      data: '\r', wide: true },
