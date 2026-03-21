@@ -138,6 +138,22 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
     prevSubIdsRef.current = currIds;
   }, [subSessions]); // orderedIds deliberately omitted to avoid loops
 
+  // Auto-initialize orderedIds from server order when empty or incomplete
+  useEffect(() => {
+    if (subSessions.length === 0) return;
+    const currentIds = subSessions.map((s) => s.id);
+    const hasAll = currentIds.every((id) => orderedIdsRef.current.includes(id));
+    if (!hasAll) {
+      setOrderedIds((prev) => {
+        const known = prev.filter((id) => currentIds.includes(id));
+        const newOnes = currentIds.filter((id) => !known.includes(id));
+        const merged = [...known, ...newOnes];
+        save('rcc_subcard_order', merged);
+        return merged;
+      });
+    }
+  }, [subSessions]);
+
   // Merge server order with persisted order: keep known positions, append new sessions at end
   const orderedSessions = useMemo(() => {
     const known = orderedIds.filter((id) => subSessions.some((s) => s.id === id));
