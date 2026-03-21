@@ -193,9 +193,8 @@ export function TerminalView({ sessionName, ws, connected, onDiff, onHistory, on
     window.addEventListener('focus', onWindowFocus);
     document.addEventListener('visibilitychange', onVisibilityChange);
 
-    const observer = new ResizeObserver((entries) => {
+    const handleResize = (rect?: DOMRectReadOnly) => {
       // Skip when container is hidden (display:none → dimensions are 0)
-      const rect = entries[0]?.contentRect;
       if (!rect || rect.width === 0 || rect.height === 0) return;
       fittingRef.current = true;
       fitAddon.fit();
@@ -206,8 +205,18 @@ export function TerminalView({ sessionName, ws, connected, onDiff, onHistory, on
       // NOTE: do NOT repaint linesRef.current here — xterm reflows on resize natively,
       // and repainting with stale diff buffer clobbers live PTY output (especially on mobile
       // where viewport resizes frequently due to address bar / keyboard show/hide).
+    };
+
+    const observer = new ResizeObserver((entries) => {
+      handleResize(entries[0]?.contentRect);
     });
-    if (containerRef.current) observer.observe(containerRef.current);
+    const containerEl = containerRef.current;
+    if (containerEl) {
+      observer.observe(containerEl);
+      // Also observe the immediate wrapper so late layout changes (for example when the
+      // sub-session bar mounts after a tab switch) still trigger a fit/snap cycle.
+      if (containerEl.parentElement) observer.observe(containerEl.parentElement);
+    }
 
     return () => {
       if (fitTimer) clearTimeout(fitTimer);

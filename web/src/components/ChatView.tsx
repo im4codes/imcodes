@@ -396,6 +396,26 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
     setShowScrollBtn(!atBottom);
   };
 
+  // Keep the active chat pinned to bottom when layout changes reduce available height
+  // (for example, when the sub-session bar appears after tab switch).
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+
+    let prevClientHeight = el.clientHeight;
+    const ro = new ResizeObserver(() => {
+      const nextClientHeight = el.clientHeight;
+      if (nextClientHeight === prevClientHeight) return;
+      prevClientHeight = nextClientHeight;
+      if (!preview && autoScrollRef.current) {
+        requestAnimationFrame(() => scrollToBottom());
+      }
+    });
+
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [preview]);
+
   // Show selection popup menu when text is selected within the chat view
   useEffect(() => {
     const onSelChange = () => {
