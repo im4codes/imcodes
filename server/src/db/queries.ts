@@ -349,11 +349,12 @@ export interface DbSubSession {
   cc_session_id: string | null;
   gemini_session_id: string | null;
   parent_session: string | null;
+  sort_order: number | null;
 }
 
 export async function getSubSessionsByServer(db: PgDatabase, serverId: string): Promise<DbSubSession[]> {
   const result = await db
-    .prepare('SELECT * FROM sub_sessions WHERE server_id = ? AND closed_at IS NULL ORDER BY created_at ASC')
+    .prepare('SELECT * FROM sub_sessions WHERE server_id = ? AND closed_at IS NULL ORDER BY sort_order ASC NULLS LAST, created_at ASC')
     .bind(serverId)
     .all<DbSubSession>();
   return result.results;
@@ -385,20 +386,21 @@ export async function createSubSession(
     )
     .bind(id, serverId, type, shellBin, cwd, label, ccSessionId, geminiSessionId, parentSession, now, now)
     .run();
-  return { id, server_id: serverId, type, shell_bin: shellBin, cwd, label, closed_at: null, cc_session_id: ccSessionId, gemini_session_id: geminiSessionId, parent_session: parentSession, created_at: now, updated_at: now };
+  return { id, server_id: serverId, type, shell_bin: shellBin, cwd, label, closed_at: null, cc_session_id: ccSessionId, gemini_session_id: geminiSessionId, parent_session: parentSession, sort_order: null, created_at: now, updated_at: now };
 }
 
 export async function updateSubSession(
   db: PgDatabase,
   id: string,
   serverId: string,
-  fields: { label?: string | null; closed_at?: number | null; gemini_session_id?: string | null },
+  fields: { label?: string | null; closed_at?: number | null; gemini_session_id?: string | null; sort_order?: number | null },
 ): Promise<void> {
   const parts: string[] = [];
   const vals: unknown[] = [];
   if ('label' in fields) { parts.push('label = ?'); vals.push(fields.label ?? null); }
   if ('closed_at' in fields) { parts.push('closed_at = ?'); vals.push(fields.closed_at ?? null); }
   if ('gemini_session_id' in fields) { parts.push('gemini_session_id = ?'); vals.push(fields.gemini_session_id ?? null); }
+  if ('sort_order' in fields) { parts.push('sort_order = ?'); vals.push(fields.sort_order ?? null); }
   if (parts.length === 0) return;
   parts.push('updated_at = ?');
   vals.push(Date.now(), id, serverId);
@@ -406,6 +408,16 @@ export async function updateSubSession(
     .prepare(`UPDATE sub_sessions SET ${parts.join(', ')} WHERE id = ? AND server_id = ?`)
     .bind(...vals)
     .run();
+}
+
+export async function reorderSubSessions(db: PgDatabase, serverId: string, ids: string[]): Promise<void> {
+  const now = Date.now();
+  for (let i = 0; i < ids.length; i++) {
+    await db
+      .prepare('UPDATE sub_sessions SET sort_order = ?, updated_at = ? WHERE id = ? AND server_id = ?')
+      .bind(i, now, ids[i], serverId)
+      .run();
+  }
 }
 
 export async function deleteSubSession(db: PgDatabase, id: string, serverId: string): Promise<void> {

@@ -8,6 +8,7 @@ import type { SubSession } from '../hooks/useSubSessions.js';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
 import { isVisuallyBusy } from '../thinking-utils.js';
+import { reorderSubSessions } from '../api.js';
 
 interface DaemonStats {
   daemonVersion?: string | null;
@@ -43,6 +44,7 @@ interface Props {
   connected: boolean;
   onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void;
   onHistory: (sessionName: string, apply: (c: string) => void) => void;
+  serverId?: string;
 }
 
 const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -85,7 +87,7 @@ function formatUptime(seconds: number): string {
   return d > 0 ? `${d}d ${h}h` : `${h}h`;
 }
 
-export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscussions, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory }: Props) {
+export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscussions, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId }: Props) {
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
   const [collapsed, setCollapsed] = useState(isMobile);
   const [showSizePanel, setShowSizePanel] = useState(false);
@@ -97,6 +99,18 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
   const dragIdRef = useRef<string | null>(null);
   const orderedIdsRef = useRef(orderedIds);
   orderedIdsRef.current = orderedIds;
+  const reorderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Debounced server sync for sub-session order
+  const syncOrderToServer = (ids: string[]) => {
+    // Always save to localStorage as fallback
+    save('rcc_subcard_order', ids);
+    // Debounce server sync
+    if (reorderTimerRef.current) clearTimeout(reorderTimerRef.current);
+    reorderTimerRef.current = setTimeout(() => {
+      if (serverId) reorderSubSessions(serverId, ids).catch(() => {});
+    }, 500);
+  };
   const prevSubIdsRef = useRef<string[]>([]);
   const removedPositionsRef = useRef<Map<string, number>>(new Map());
 
@@ -130,7 +144,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
             }
           }
         }
-        save('rcc_subcard_order', next);
+        syncOrderToServer(next);
         return next;
       });
     }
@@ -148,7 +162,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
         const known = prev.filter((id) => currentIds.includes(id));
         const newOnes = currentIds.filter((id) => !known.includes(id));
         const merged = [...known, ...newOnes];
-        save('rcc_subcard_order', merged);
+        syncOrderToServer(merged);
         return merged;
       });
     }
@@ -410,7 +424,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
                 dragIdRef.current = null;
                 (e.currentTarget as HTMLElement).style.opacity = '';
                 setOrderedIds((current) => {
-                  save('rcc_subcard_order', current);
+                  syncOrderToServer(current);
                   return current;
                 });
               }}

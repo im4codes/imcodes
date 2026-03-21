@@ -6,6 +6,7 @@ import {
   createSubSession,
   updateSubSession,
   deleteSubSession,
+  reorderSubSessions,
 } from '../db/queries.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
 
@@ -63,6 +64,26 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
 
   const sessionName = `deck_sub_${id}`;
   return c.json({ id: sub.id, sessionName, subSession: sub }, 201);
+});
+
+/** PATCH /api/server/:id/sub-sessions/reorder — set sort_order for all sub-sessions (must be before :subId route) */
+subSessionRoutes.patch('/:id/sub-sessions/reorder', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  if (role !== 'owner' && role !== 'admin') return c.json({ error: 'forbidden' }, 403);
+
+  let body: { ids: string[] };
+  try {
+    body = await c.req.json() as typeof body;
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400);
+  }
+
+  if (!Array.isArray(body.ids) || body.ids.length === 0) return c.json({ error: 'ids required' }, 400);
+
+  await reorderSubSessions(c.env.DB, serverId, body.ids);
+  return c.json({ ok: true });
 });
 
 /** PATCH /api/server/:id/sub-sessions/:subId — update label or close */

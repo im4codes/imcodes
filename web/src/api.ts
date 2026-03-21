@@ -288,6 +288,13 @@ export async function patchSubSession(
   });
 }
 
+export async function reorderSubSessions(serverId: string, ids: string[]): Promise<void> {
+  await apiFetch(`/api/server/${serverId}/sub-sessions/reorder`, {
+    method: 'PATCH',
+    body: JSON.stringify({ ids }),
+  });
+}
+
 export async function deleteSubSession(serverId: string, subId: string): Promise<void> {
   await apiFetch(`/api/server/${serverId}/sub-sessions/${subId}`, { method: 'DELETE' });
 }

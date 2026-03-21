@@ -1360,6 +1360,7 @@ export function App() {
                 connected={connected}
                 onDiff={registerDiffApplyer}
                 onHistory={registerHistoryApplyer}
+                serverId={selectedServerId}
               />
             )}
           </>
