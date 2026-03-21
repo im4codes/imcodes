@@ -43,13 +43,13 @@ export function getActiveThinkingTs(events: Array<{ type: string; ts: number; pa
  * Unified "visual busy" derivation — single source of truth for all running animations.
  * Use this instead of ad-hoc conditions in each component.
  *
- * An agent is visually busy when:
- * - session.state === 'running', OR
- * - activeThinking is true AND session.state is NOT 'idle'
- *   (prevents animation flicker when thinking lingers briefly after idle)
+ * Only authoritative session.state drives the main animation (scan-sweep, subcard pulse).
+ * activeThinking is intentionally NOT used here — it's a derivative signal that can linger
+ * after the agent stops (e.g., Gemini idle confirmation takes 3+s). Using it caused ghost
+ * animations on the main session input bar. activeThinking should only drive text labels
+ * and thinking timers, not high-visibility animations.
  */
-export function isVisuallyBusy(sessionState: string | undefined, activeThinking: boolean): boolean {
-  if (sessionState === 'running') return true;
-  if (activeThinking && sessionState !== 'idle') return true;
-  return false;
+export function isVisuallyBusy(sessionState: string | undefined, _activeThinking: boolean): boolean {
+  if (!sessionState || sessionState === 'idle' || sessionState === 'stopped') return false;
+  return sessionState === 'running';
 }
