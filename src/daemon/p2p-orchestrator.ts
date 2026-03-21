@@ -581,21 +581,20 @@ function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: HopOpts): 
     parts.push(mode.prompt);
   }
 
-  // Prompt phrased as a normal user request — avoids triggering injection detection.
-  // The agent receives this as direct user input in its tmux session, so it should
-  // read as a straightforward task, not an override of system instructions.
+  // Prompt: direct and assertive — agents (especially Codex) need clear, unambiguous instructions.
   parts.push(``);
-  parts.push(`I'm running a collaborative P2P discussion (run ${run.id}) across multiple agent sessions.`);
-  parts.push(`Your part: read a shared discussion file at ${filePath}, then append your contribution.`);
+  parts.push(`P2P collaborative discussion task (run ${run.id}).`);
   parts.push(``);
-  parts.push(`Here's what I need you to do:`);
+  parts.push(`File: ${filePath}`);
   parts.push(``);
-  parts.push(`1. Read the file at ${filePath}`);
+  parts.push(`Do exactly these 3 steps:`);
+  parts.push(`1. Read the entire file at ${filePath}`);
   parts.push(`2. ${opts.instruction}`);
-  parts.push(`3. Append your output to the same file under the heading "## ${opts.sectionHeader}"`);
+  parts.push(`3. Append your analysis to that SAME file under the heading "## ${opts.sectionHeader}"`);
   parts.push(``);
-  parts.push(`Please write your output directly to the file (using Edit or Write tools), not to the chat.`);
-  parts.push(`No need to ask me for confirmation — go ahead and write to the file, then say "Done".`);
+  parts.push(`Important: your output MUST be written to the file, NOT printed to chat.`);
+  parts.push(`Do not ask questions. Do not summarize what you plan to do. Just read, analyze, write to file.`);
+  parts.push(`When finished writing to the file, say only "Done".`);
 
   return parts.join('\n');
 }
