@@ -205,6 +205,7 @@
     "error": "Error de voz: {{error}}"
   },
   "p2p": {
+    "mode_solo": "Solo",
     "picker": {
       "back": "Atrás",
       "files": "Archivos",

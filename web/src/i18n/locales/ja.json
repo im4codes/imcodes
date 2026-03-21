@@ -205,6 +205,7 @@
     "error": "音声エラー：{{error}}"
   },
   "p2p": {
+    "mode_solo": "Solo",
     "picker": {
       "back": "戻る",
       "files": "ファイル",

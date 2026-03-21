@@ -53,10 +53,14 @@ interface Props {
 type MenuAction = 'restart' | 'new' | 'stop';
 type ModelChoice = 'opus' | 'sonnet' | 'haiku';
 type CodexModelChoice = 'gpt-5.4' | 'gpt-5.4-mini' | 'gpt-5.2';
+type P2pMode = 'solo' | 'audit' | 'review' | 'brainstorm' | 'discuss';
 
 const MODEL_STORAGE_KEY = 'imcodes-model';
 const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const CODEX_MODELS: CodexModelChoice[] = ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.2'];
+const P2P_MODES: P2pMode[] = ['solo', 'audit', 'review', 'brainstorm', 'discuss'];
+const P2P_MODE_LABELS: Record<P2pMode, string> = { solo: 'Solo', audit: 'Audit', review: 'Review', brainstorm: 'Brainstorm', discuss: 'Discuss' };
+const P2P_MODE_COLORS: Record<P2pMode, string> = { solo: '#6b7280', audit: '#f59e0b', review: '#3b82f6', brainstorm: '#a78bfa', discuss: '#22c55e' };
 
 // Enter moved after ↓ arrow
 const SHORTCUTS: Array<{ label: string; title: string; data: string; wide?: boolean }> = [
@@ -101,11 +105,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const atSelectionSnapshotRef = useRef('');
   const [modelOpen, setModelOpen] = useState(false);
   const [quickOpen, setQuickOpen] = useState(false);
+  const [p2pMode, setP2pMode] = useState<P2pMode>('solo');
+  const [p2pOpen, setP2pOpen] = useState(false);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
   const [confirm, setConfirm] = useState<MenuAction | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef<HTMLDivElement>(null);
+  const p2pRef = useRef<HTMLDivElement>(null);
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Internal ref for contenteditable — also written to the external inputRef
@@ -146,9 +153,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const isClaudeCode = activeSession?.agentType === 'claude-code';
   const isCodex = activeSession?.agentType === 'codex';
 
+  // Reset P2P mode on session change
+  useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
+
   // Close menus when clicking outside
   useEffect(() => {
-    if (!menuOpen && !modelOpen) return;
+    if (!menuOpen && !modelOpen && !p2pOpen) return;
     const handleClick = (e: MouseEvent) => {
       if (menuOpen && menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setMenuOpen(false);
@@ -156,6 +166,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       }
       if (modelOpen && modelRef.current && !modelRef.current.contains(e.target as Node)) {
         setModelOpen(false);
+      }
+      if (p2pOpen && p2pRef.current && !p2pRef.current.contains(e.target as Node)) {
+        setP2pOpen(false);
       }
     };
     document.addEventListener('mousedown', handleClick);
@@ -203,8 +216,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     session === '__all__' ? `@@all(${mode})` : `@@discuss(${session}, ${mode})`;
 
   const handleSend = useCallback(() => {
-    const text = getText();
+    let text = getText();
     if (!text || !ws || !activeSession) return;
+    // Auto-prepend @@all(mode) when P2P mode is active and user hasn't typed @@ manually
+    if (p2pMode !== 'solo' && !text.includes('@@')) {
+      text = `@@all(${p2pMode}) ${text}`;
+    }
     quickData.recordHistory(text, activeSession.name);
     try {
       ws.sendSessionCommand('send', { sessionName: activeSession.name, text });
@@ -506,6 +523,32 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             )}
           </div>
         )}
+        {/* P2P mode selector */}
+        <div class="shortcuts-model" ref={p2pRef}>
+          <button
+            class="shortcut-btn"
+            onClick={() => setP2pOpen((o) => !o)}
+            disabled={disabled}
+            title={p2pMode === 'solo' ? t('p2p.mode_solo') : `P2P: ${P2P_MODE_LABELS[p2pMode]}`}
+            style={{ color: P2P_MODE_COLORS[p2pMode], fontSize: 10, fontWeight: p2pMode !== 'solo' ? 600 : 400 }}
+          >
+            {p2pMode === 'solo' ? t('p2p.mode_solo') : `P2P:${P2P_MODE_LABELS[p2pMode]}`}
+          </button>
+          {p2pOpen && (
+            <div class="menu-dropdown">
+              {P2P_MODES.map((m) => (
+                <button
+                  key={m}
+                  class={`menu-item ${p2pMode === m ? 'menu-item-active' : ''}`}
+                  onClick={() => { setP2pMode(m); setP2pOpen(false); }}
+                  style={{ color: P2P_MODE_COLORS[m] }}
+                >
+                  {p2pMode === m ? '● ' : '○ '}{P2P_MODE_LABELS[m]}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
       </div>}
 
       {/* Upload progress bar */}
@@ -736,8 +779,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           class="btn btn-primary"
           onClick={handleSend}
           disabled={inputDisabled || !hasText || !connected}
+          style={p2pMode !== 'solo' ? { background: P2P_MODE_COLORS[p2pMode], borderColor: P2P_MODE_COLORS[p2pMode] } : undefined}
         >
-          {t('common.send')}
+          {p2pMode !== 'solo' ? `${P2P_MODE_LABELS[p2pMode]}` : t('common.send')}
         </button>
 
         {/* Menu button */}
