@@ -9,7 +9,7 @@ Extend IM.codes P2P from local-only multi-agent discussions to cross-user shared
 
 Since IM.codes is **self-hosted**, independent servers cannot communicate directly. A **Federation Hub** (`app.im.codes`) acts as a central relay — routing jobs, settling credits, and brokering trust between isolated self-hosted instances.
 
-Three phases: **Team Share** (same server, no Hub) → **Job Board** (cross-server via Hub) → **Auto-Claim** (autonomous acceptance).
+Four phases: **Phase 0: Agent Sharing** (direct capability sharing) → **Phase 1: Team Share** (same server) → **Phase 2: Job Board** (cross-server via Hub) → **Phase 3: Auto-Claim** (autonomous).
 
 ## 1. Core Abstractions
 
@@ -188,7 +188,65 @@ interface HubJob extends SharedJob {
    - Initiator's local agent does a quick consistency check
    - Credits released only after verification passes
 
-## 5. Phase 1: Team Share
+## 5. Phase 0: Agent Sharing (Internal / Direct)
+
+**Scope**: Share your agent capability with specific users. No marketplace, no credits — just "I have Codex, you can use it."
+
+**Key principle**: Share **capability**, not a raw session. Auto-spawn ephemeral worker per request.
+
+### Data Model
+
+```typescript
+interface SharedAgent {
+  id: string;
+  ownerServerId: string;
+  ownerUserId: string;
+  kind: 'shared-agent';
+  agentType: AgentType;             // 'codex' | 'claude-code' | 'gemini'
+  supportsModes: string[];          // ['audit', 'review', 'discuss']
+  maxConcurrent: number;            // max simultaneous workers
+  activeCount: number;
+  status: 'available' | 'busy' | 'offline' | 'disabled';
+  grantScope: 'explicit-users' | 'team';
+  grantedTo: string[];              // authorized user IDs
+  executionPolicy: 'spawn_ephemeral' | 'warm_pool' | 'queue_existing';
+  sandboxPolicy: 'payload-only' | 'repo-readonly' | 'interactive-local';
+  defaultProjectDir?: string;
+  expiresAt?: string;
+}
+```
+
+### Implementation Steps
+
+#### Step 0A: Directed Capability Sharing
+- [ ] Server DB: `shared_agents` + `shared_agent_grants` tables
+- [ ] Web UI: "Share Agent" button → select agent type, modes, max concurrent, sandbox, grant to user IDs
+- [ ] Provider daemon: advertise shared capabilities via heartbeat
+- [ ] Receiver: query available shared agents granted to them
+
+#### Step 0B: Remote Execution (Manual)
+- [ ] Receiver selects shared agent → server routes request to provider daemon
+- [ ] Provider daemon: auto-spawn ephemeral sub-session (payload-only sandbox)
+- [ ] Inject job payload → agent executes → return result → destroy session
+- [ ] Result relayed back to receiver via server
+
+#### Step 0C: P2P Integration
+- [ ] AtPicker: show shared agents as `Shared Codex · from Alice` (separate from local sessions)
+- [ ] `expandAllTargets()`: include shared agents as `kind: 'shared'` ExecutorRef
+- [ ] P2P orchestrator: dispatch to shared executor via server routing (not local tmux)
+
+#### Step 0D: Queue / Concurrency
+- [ ] `maxConcurrent` enforcement on provider daemon
+- [ ] Busy → queue or reject with "provider busy" message
+- [ ] Optional warm pool: pre-spawned idle workers for faster response
+
+### NOT in Phase 0
+- ~~Credits / billing~~
+- ~~Public discovery / marketplace~~
+- ~~Auto-claim~~
+- ~~Federation Hub~~
+
+## 6. Phase 1: Team Share
 
 **Scope**: Same server, cross-daemon P2P routing.
 
@@ -215,7 +273,7 @@ interface HubJob extends SharedJob {
 - ~~Auto-claim~~
 - ~~Firecracker / Docker isolation~~
 
-## 6. Phase 2: Job Board (via Federation Hub)
+## 7. Phase 2: Job Board (via Federation Hub)
 
 **Scope**: Public task marketplace across self-hosted servers, routed through Hub.
 
@@ -246,7 +304,7 @@ interface HubJob extends SharedJob {
 - Credits locked at `claimed`, released at `completed` or refunded at `failed`/`cancelled`
 - No withdrawal (credits = internal incentive points, not currency)
 
-## 7. Phase 3A: Assisted Claim
+## 8. Phase 3A: Assisted Claim
 
 **Scope**: Daemon suggests matching tasks, user confirms.
 
@@ -255,7 +313,7 @@ interface HubJob extends SharedJob {
 - [ ] One-click accept → claim + sandbox provision + execute
 - [ ] Web: notification badge for available matching tasks
 
-## 8. Phase 3B: Auto-Claim
+## 9. Phase 3B: Auto-Claim
 
 **Scope**: Fully autonomous task acceptance.
 
@@ -274,7 +332,7 @@ interface HubJob extends SharedJob {
 - [ ] Rate limiting: max claims per hour, cooldown on failures
 - [ ] Reputation system: provider score based on completion rate, quality, speed
 
-## 9. Failure & Settlement Semantics
+## 10. Failure & Settlement Semantics
 
 | Scenario | Action |
 |----------|--------|
@@ -287,7 +345,7 @@ interface HubJob extends SharedJob {
 | Result fails verification | Credits refunded, reputation -2 |
 | Successful completion | Credits transferred, reputation +1 |
 
-## 10. Risks & Mitigations
+## 11. Risks & Mitigations
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
@@ -299,7 +357,7 @@ interface HubJob extends SharedJob {
 | Large context causes bandwidth issues | Medium | Virtual workspace manifest (hash→lazy fetch) |
 | Job board spam | Low | Min credits bid + rate limiting |
 
-## 11. Migration Path (Current → Phase 1)
+## 12. Migration Path (Current → Phase 1)
 
 Minimal changes to existing code:
 
