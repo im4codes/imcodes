@@ -30,6 +30,7 @@ interface DiscussionSummary {
   currentSpeaker?: string;
   conclusion?: string;
   filePath?: string;
+  fileId?: string;
 }
 
 interface Props {
@@ -38,6 +39,7 @@ interface Props {
   onOpen: (id: string) => void;
   onNew: () => void;
   onViewDiscussions?: () => void;
+  onViewDiscussion?: (fileId: string) => void;
   discussions?: DiscussionSummary[];
   onStopDiscussion?: (id: string) => void;
   ws: WsClient | null;
@@ -87,7 +89,7 @@ function formatUptime(seconds: number): string {
   return d > 0 ? `${d}d ${h}h` : `${h}h`;
 }
 
-export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscussions, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId }: Props) {
+export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscussions, onViewDiscussion, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId }: Props) {
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
   const [collapsed, setCollapsed] = useState(isMobile);
   const [showSizePanel, setShowSizePanel] = useState(false);
@@ -337,12 +339,12 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
               ? Math.round(((d.currentRound - 1) * 100) / d.maxRounds)
               : 0;
             return (
-              <div key={d.id} class={`discussion-card ${d.state}`}>
+              <div key={d.id} class={`discussion-card ${d.state}`} style={{ cursor: d.fileId ? 'pointer' : undefined }} onClick={() => { if (d.fileId && onViewDiscussion) onViewDiscussion(d.fileId); }}>
                 <div class="discussion-card-header">
                   <div class="discussion-card-title">⚖️ {d.topic || 'Discussion'}</div>
                   <div class="discussion-card-actions">
                     {isActive && onStopDiscussion && (
-                      <button class="btn btn-sm btn-danger" onClick={() => onStopDiscussion(d.id)}>Stop</button>
+                      <button class="btn btn-sm btn-danger" onClick={(e: Event) => { e.stopPropagation(); onStopDiscussion(d.id); }}>Stop</button>
                     )}
                   </div>
                 </div>

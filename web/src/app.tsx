@@ -368,7 +368,8 @@ export function App() {
 
   // ── Discussions ─────────────────────────────────────────────────────────────
   const [showDiscussionsPage, setShowDiscussionsPage] = useState(false);
-  const discussionsSwipeRef = useSwipeBack(useCallback(() => setShowDiscussionsPage(false), []));
+  const [discussionInitialId, setDiscussionInitialId] = useState<string | null>(null);
+  const discussionsSwipeRef = useSwipeBack(useCallback(() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }, []));
   const [showDiscussionDialog, setShowDiscussionDialog] = useState(false);
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [discussionPrefs, _setDiscussionPrefs] = useState<DiscussionPrefs | null>(null);
@@ -382,6 +383,8 @@ export function App() {
     currentSpeaker?: string;
     conclusion?: string;
     filePath?: string;
+    /** Discussion file ID for navigation (P2P runs use discussion_id, not run id) */
+    fileId?: string;
   }>>([]);
 
   const bringSubToFront = useCallback((id: string) => {
@@ -746,6 +749,9 @@ export function App() {
 
         setDiscussions((prev) => {
           const existing = prev.find((d) => d.id === id);
+          // discussion_id is the file-level ID (maps to ~/.imcodes/discussions/${discussion_id}.md)
+          // run.id is the execution-level ID — use discussion_id for navigation
+          const fileId = r.discussion_id ? String(r.discussion_id) : r.id;
           const entry = {
             id,
             topic: `P2P ${mode} · ${initiatorLabel}`,
@@ -755,6 +761,7 @@ export function App() {
             currentSpeaker: currentTarget,
             conclusion: state === 'done' ? (r.result_summary ?? undefined) : undefined,
             filePath: undefined,
+            fileId,
           };
           if (existing) {
             return prev.map((d) => d.id === id ? { ...d, ...entry } : d);
@@ -1387,7 +1394,8 @@ export function App() {
                 openIds={openSubIds}
                 onOpen={toggleSubSession}
                 onNew={() => setShowSubDialog(true)}
-                onViewDiscussions={() => setShowDiscussionsPage(true)}
+                onViewDiscussions={() => { setDiscussionInitialId(null); setShowDiscussionsPage(true); }}
+                onViewDiscussion={(fileId) => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); }}
                 discussions={discussions.filter((d) => d.state !== 'done' && d.state !== 'failed')}
                 onStopDiscussion={(id) => wsRef.current?.discussionStop(id)}
                 ws={wsRef.current}
@@ -1405,7 +1413,8 @@ export function App() {
         <div ref={discussionsSwipeRef} style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)' }}>
           <DiscussionsPage
             ws={wsRef.current}
-            onBack={() => setShowDiscussionsPage(false)}
+            onBack={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }}
+            initialSelectedId={discussionInitialId}
           />
         </div>
       )}

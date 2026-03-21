@@ -11,11 +11,13 @@ interface P2pDiscussion {
 interface Props {
   ws: WsClient | null;
   onBack: () => void;
+  /** Pre-select a discussion file by ID on open (e.g. from clicking a P2P progress card). */
+  initialSelectedId?: string | null;
 }
 
-export function DiscussionsPage({ ws, onBack }: Props) {
+export function DiscussionsPage({ ws, onBack, initialSelectedId }: Props) {
   const [discussions, setDiscussions] = useState<P2pDiscussion[]>([]);
-  const [selected, setSelected] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(initialSelectedId ?? null);
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -26,6 +28,17 @@ export function DiscussionsPage({ ws, onBack }: Props) {
   }, [ws]);
 
   useEffect(() => { loadList(); }, [loadList]);
+
+  // Auto-select initialSelectedId once list is loaded
+  const initialAppliedRef = { current: false };
+  useEffect(() => {
+    if (initialAppliedRef.current || !initialSelectedId || discussions.length === 0) return;
+    const match = discussions.find((d) => d.id === initialSelectedId || d.id.includes(initialSelectedId));
+    if (match && selected !== match.id) {
+      initialAppliedRef.current = true;
+      selectDiscussion(match.id);
+    }
+  }, [discussions, initialSelectedId]);
 
   useEffect(() => {
     if (!ws) return;
