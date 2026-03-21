@@ -55,6 +55,7 @@ export function useTimeline(
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
+  const loadingOlderRef = useRef(false); // Synchronous guard against duplicate pagination requests
   const epochRef = useRef<number>(0);
   const seqRef = useRef<number>(0);
   const replayRequestIdRef = useRef<string | null>(null);
@@ -67,6 +68,9 @@ export function useTimeline(
     if (!sessionId) {
       setEvents([]);
       setLoading(false);
+      setLoadingOlder(false);
+      loadingOlderRef.current = false;
+      olderRequestIdRef.current = null;
       epochRef.current = 0;
       seqRef.current = 0;
       historyLoadedRef.current = null;
@@ -74,6 +78,9 @@ export function useTimeline(
     }
 
     setRefreshing(false);
+    setLoadingOlder(false);
+    loadingOlderRef.current = false;
+    olderRequestIdRef.current = null;
     historyLoadedRef.current = null;
 
     let cancelled = false;
@@ -160,10 +167,11 @@ export function useTimeline(
 
   // Load older events (backward pagination)
   const loadOlderEvents = useCallback(() => {
-    if (!ws?.connected || !sessionId || loadingOlder) return;
+    if (!ws?.connected || !sessionId || loadingOlderRef.current) return;
     const cached = eventsCache.get(sessionId);
     if (!cached || cached.length === 0) return;
     const oldestTs = Math.min(...cached.map((e) => e.ts));
+    loadingOlderRef.current = true; // Synchronous guard — prevents duplicate requests from rapid clicks
     setLoadingOlder(true);
     olderRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500, undefined, oldestTs);
   }, [ws, sessionId, loadingOlder]);
@@ -266,6 +274,7 @@ export function useTimeline(
         // Handle backward pagination response
         if (msg.requestId && msg.requestId === olderRequestIdRef.current) {
           olderRequestIdRef.current = null;
+          loadingOlderRef.current = false;
           if (msg.events.length > 0) {
             mergeEvents(msg.events);
             sharedDb?.putEvents(msg.events).catch(() => {});

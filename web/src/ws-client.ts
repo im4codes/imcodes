@@ -468,7 +468,10 @@ export class WsClient {
     if (state.retryTimer) clearTimeout(state.retryTimer);
     state.retryTimer = setTimeout(() => {
       const s = this.resetState.get(session);
-      if (s) s.retryTimer = null;
+      if (s) {
+        s.retryTimer = null;
+        s.retryCount = 0; // Reset on resubscribe — next reset starts fresh
+      }
       if (!this._destroyed && this._connected) {
         this.subscribeTerminal(session);
       }

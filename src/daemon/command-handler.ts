@@ -554,14 +554,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       for (const fp of tokens.files) {
         try {
           const absPath = nodePath.isAbsolute(fp) ? fp : nodePath.join(projectDir, fp);
-          // Check for binary content by reading a sample first
+          // Check for binary content (null bytes anywhere in the capped content)
           const content = await fsReadFileRaw(absPath, 'utf8');
-          const sample = content.slice(0, 8192);
-          if (sample.includes('\0')) {
+          const capped = content.slice(0, 50_000);
+          if (capped.includes('\0')) {
             logger.warn({ path: fp }, 'P2P: skipping binary file');
             continue;
           }
-          fileContents.push({ path: fp, content: content.slice(0, 50_000) }); // cap at 50KB
+          fileContents.push({ path: fp, content: capped }); // cap at 50KB
         } catch { /* ignore unreadable files */ }
       }
       const run = await startP2pRun(sessionName, tokens.agents, tokens.cleanText, fileContents, serverLink);
@@ -786,9 +786,12 @@ function handleTimelineReplay(cmd: Record<string, unknown>, serverLink: ServerLi
 function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: ServerLink): void {
   const sessionName = cmd.sessionName as string | undefined;
   const requestId = cmd.requestId as string | undefined;
-  const limit = (cmd.limit as number | undefined) ?? 200;
-  const afterTs = cmd.afterTs as number | undefined;
-  const beforeTs = cmd.beforeTs as number | undefined;
+  const rawLimit = cmd.limit;
+  const limit = typeof rawLimit === 'number' && Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 2000) : 200;
+  const rawAfterTs = cmd.afterTs;
+  const afterTs = typeof rawAfterTs === 'number' && Number.isFinite(rawAfterTs) ? rawAfterTs : undefined;
+  const rawBeforeTs = cmd.beforeTs;
+  const beforeTs = typeof rawBeforeTs === 'number' && Number.isFinite(rawBeforeTs) ? rawBeforeTs : undefined;
 
   if (!sessionName) {
     logger.warn('timeline.history_request: missing sessionName');
