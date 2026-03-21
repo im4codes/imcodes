@@ -716,10 +716,12 @@ export function App() {
       }
       if (msg.type === 'discussion.list') {
         // Merge live discussions from daemon with existing DB history
+        // Preserve active P2P entries (p2p_ prefix) — they come from p2p.run_update, not discussion.list
         setDiscussions((prev) => {
           const liveIds = new Set(msg.discussions.map((d: { id: string }) => d.id));
           const dbHistory = prev.filter((d) => !liveIds.has(d.id) && (d.state === 'done' || d.state === 'failed'));
-          return [...msg.discussions, ...dbHistory];
+          const activeP2p = prev.filter((d) => d.id.startsWith('p2p_') && d.state !== 'done' && d.state !== 'failed');
+          return [...msg.discussions, ...dbHistory, ...activeP2p];
         });
       }
       // ── P2P Quick Discussion progress → map to discussions state ──────────
@@ -729,7 +731,8 @@ export function App() {
         const totalCount = r.total_count ?? 3;
         const remainingCount = r.remaining_count ?? 0;
         const status = String(r.status ?? '');
-        const currentTarget = r.current_target_session ? String(r.current_target_session).split('_').pop() : undefined;
+        const currentTarget = r.current_target_label ?? (r.current_target_session ? String(r.current_target_session).split('_').pop() : undefined);
+        const initiatorLabel = r.initiator_label ?? 'brain';
         const mode = r.mode_key ?? 'discuss';
 
         // Map P2P status to discussion state
@@ -745,7 +748,7 @@ export function App() {
           const existing = prev.find((d) => d.id === id);
           const entry = {
             id,
-            topic: `P2P ${mode}`,
+            topic: `P2P ${mode} · ${initiatorLabel}`,
             state,
             currentRound,
             maxRounds: totalCount,
@@ -758,6 +761,13 @@ export function App() {
           }
           return [...prev, entry];
         });
+
+        // Auto-cleanup completed/failed P2P entries after 30s
+        if (state === 'done' || state === 'failed') {
+          setTimeout(() => {
+            setDiscussions((prev) => prev.filter((d) => d.id !== id));
+          }, 30_000);
+        }
       }
       if (msg.type === 'daemon.reconnected') {
         // Daemon process (re)started — all its subscriptions are gone.

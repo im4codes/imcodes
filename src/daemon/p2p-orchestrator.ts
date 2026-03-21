@@ -650,6 +650,20 @@ function pushState(run: P2pRun, serverLink: ServerLink | null): void {
         total_count: run.totalTargets + 2, // +2 for Phase 1 (initial) + Phase 3 (summary)
         remaining_count: run.remainingTargets.length,
         skipped_hops: run.skippedHops,
+        // Agent metadata for display
+        current_target_label: (() => {
+          if (!run.currentTargetSession) return null;
+          const rec = getSession(run.currentTargetSession);
+          const name = shortName(run.currentTargetSession);
+          const agentType = rec?.agentType ?? '';
+          return agentType ? `${name} (${agentType})` : name;
+        })(),
+        initiator_label: (() => {
+          const rec = getSession(run.initiatorSession);
+          const name = shortName(run.initiatorSession);
+          const agentType = rec?.agentType ?? '';
+          return agentType ? `${name} (${agentType})` : name;
+        })(),
       },
     });
   } catch { /* not connected */ }

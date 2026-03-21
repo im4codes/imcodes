@@ -82,6 +82,8 @@ function expandAllTargets(initiatorName: string, mode: string): P2pTarget[] {
       if (isChild || isSameProject) targets.push({ session: s.name, mode });
     }
   }
+  // Sort deterministically by session name for predictable ordering
+  targets.sort((a, b) => a.session.localeCompare(b.session));
   return targets;
 }
 
