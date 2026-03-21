@@ -144,8 +144,14 @@ export async function startup(): Promise<DaemonContext> {
     await syncSessionsFromWorker(workerUrl!, serverId, token);
   }
 
-  await restoreFromStore();
-  logger.info('Sessions reconciled');
+  try {
+    await restoreFromStore();
+    logger.info('Sessions reconciled');
+  } catch (err) {
+    // restoreFromStore must NEVER crash the daemon — log and continue.
+    // Sessions may not be restored, but daemon stays alive for WS/heartbeat.
+    logger.error({ err }, 'restoreFromStore failed — daemon continues without session restore');
+  }
 
   let serverLink: ServerLink | null = null;
   if (creds) {

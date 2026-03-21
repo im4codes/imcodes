@@ -24,7 +24,14 @@ program
   .option('--foreground', 'Run in foreground (for service managers, not manual use)')
   .action(async (opts: { foreground?: boolean }) => {
     if (opts.foreground) {
-      // Called by launchd/systemd plist/unit — run inline
+      // Called by launchd/systemd plist/unit — run inline.
+      // Global error handlers: daemon must NEVER crash from unhandled errors.
+      process.on('uncaughtException', (err) => {
+        logger.error({ err }, 'Uncaught exception — daemon stays alive');
+      });
+      process.on('unhandledRejection', (err) => {
+        logger.error({ err }, 'Unhandled rejection — daemon stays alive');
+      });
       await startup();
       logger.info('Daemon running. Press Ctrl+C to stop.');
       await new Promise(() => {});
