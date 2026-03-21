@@ -14,6 +14,7 @@ import { updateSessionState } from '../store/session-store.js';
 const GEMINI_TMP_DIR = join(homedir(), '.gemini', 'tmp');
 const POLL_INTERVAL_MS = 1500; // Balanced: responsive enough without causing state flicker
 const IDLE_LOCK_MS = 2000;    // After emitting idle, ignore terminal noise for this long
+const RUNNING_LOCK_MS = 5000; // After emitting running, don't transition to idle (tool-call gaps)
 const RETRY_DELAY_MS = 100;
 
 // ── Path helpers ───────────────────────────────────────────────────────────────
@@ -116,6 +117,8 @@ export interface WatcherState {
   idleDebounceTimer?: ReturnType<typeof setTimeout>;
   /** Timestamp of last idle emit — used for idle lock (ignore terminal noise shortly after idle). */
   lastIdleEmitTs?: number;
+  /** Timestamp of last running emit — used for running lock (ignore tool-gap idles). */
+  lastRunningEmitTs?: number;
   _lastRotationCheck?: number;
   _terminalThinkingEmitted?: boolean;
   lastConversationStatus?: 'running' | 'idle' | null;
@@ -147,12 +150,12 @@ async function terminalThinkingCheck(sessionName: string, state: WatcherState): 
   const status = detectStatus(lines, 'gemini');
 
   if (status === 'idle') {
-    // Strong idle: both JSON and terminal agree on idle — skip confirm count, transition faster
+    // Strong idle: both JSON and terminal agree on idle — skip confirm count + running lock
     if (state.lastConversationStatus === 'idle') {
       state.idleConfirmCount = 2; // force past threshold
       if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
       state._terminalThinkingEmitted = false;
-      transitionState(sessionName, state, 'idle');
+      transitionState(sessionName, state, 'idle', true); // force bypasses running lock
       return;
     }
     // Terminal shows idle but JSON doesn't — debounce before transitioning
@@ -191,14 +194,19 @@ async function terminalThinkingCheck(sessionName: string, state: WatcherState): 
 
 /**
  * Unified state transition — all idle/running changes MUST go through here.
- * Prevents flicker by deduplicating and enforcing idle lock.
+ * Prevents flicker by deduplicating and enforcing bidirectional locks.
  */
-function transitionState(sessionName: string, state: WatcherState, next: 'running' | 'idle'): void {
+function transitionState(sessionName: string, state: WatcherState, next: 'running' | 'idle', force = false): void {
   if (state.currentState === next) return; // already in this state
-  // Idle lock: don't transition to running if we just emitted idle (terminal noise)
-  if (next === 'running' && state.lastIdleEmitTs && (Date.now() - state.lastIdleEmitTs) < IDLE_LOCK_MS) return;
+  if (!force) {
+    // Idle lock: don't transition to running if we just emitted idle (terminal noise)
+    if (next === 'running' && state.lastIdleEmitTs && (Date.now() - state.lastIdleEmitTs) < IDLE_LOCK_MS) return;
+    // Running lock: don't transition to idle if we just emitted running (tool-call gaps)
+    if (next === 'idle' && state.lastRunningEmitTs && (Date.now() - state.lastRunningEmitTs) < RUNNING_LOCK_MS) return;
+  }
   state.currentState = next;
   if (next === 'idle') state.lastIdleEmitTs = Date.now();
+  if (next === 'running') state.lastRunningEmitTs = Date.now();
   timelineEmitter.emit(sessionName, 'session.state', { state: next });
   updateSessionState(sessionName, next);
 }
