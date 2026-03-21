@@ -68,9 +68,7 @@ export function useTimeline(
     if (!sessionId) {
       setEvents([]);
       setLoading(false);
-      setLoadingOlder(false);
-      loadingOlderRef.current = false;
-      olderRequestIdRef.current = null;
+      resetOlderState();
       epochRef.current = 0;
       seqRef.current = 0;
       historyLoadedRef.current = null;
@@ -78,9 +76,7 @@ export function useTimeline(
     }
 
     setRefreshing(false);
-    setLoadingOlder(false);
-    loadingOlderRef.current = false;
-    olderRequestIdRef.current = null;
+    resetOlderState();
     historyLoadedRef.current = null;
 
     let cancelled = false;
@@ -165,15 +161,26 @@ export function useTimeline(
     });
   }, [sessionId]);
 
+  const olderTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const resetOlderState = useCallback(() => {
+    loadingOlderRef.current = false;
+    olderRequestIdRef.current = null;
+    if (olderTimeoutRef.current) { clearTimeout(olderTimeoutRef.current); olderTimeoutRef.current = null; }
+    setLoadingOlder(false);
+  }, []);
+
   // Load older events (backward pagination)
   const loadOlderEvents = useCallback(() => {
     if (!ws?.connected || !sessionId || loadingOlderRef.current) return;
     const cached = eventsCache.get(sessionId);
     if (!cached || cached.length === 0) return;
     const oldestTs = Math.min(...cached.map((e) => e.ts));
-    loadingOlderRef.current = true; // Synchronous guard — prevents duplicate requests from rapid clicks
+    loadingOlderRef.current = true;
     setLoadingOlder(true);
     olderRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500, undefined, oldestTs);
+    // Timeout: if response never arrives (packet loss, disconnect), reset after 10s
+    if (olderTimeoutRef.current) clearTimeout(olderTimeoutRef.current);
+    olderTimeoutRef.current = setTimeout(resetOlderState, 10_000);
   }, [ws, sessionId, loadingOlder]);
 
   // Append a single event, dedup by eventId
@@ -273,13 +280,11 @@ export function useTimeline(
 
         // Handle backward pagination response
         if (msg.requestId && msg.requestId === olderRequestIdRef.current) {
-          olderRequestIdRef.current = null;
-          loadingOlderRef.current = false;
+          resetOlderState();
           if (msg.events.length > 0) {
             mergeEvents(msg.events);
             sharedDb?.putEvents(msg.events).catch(() => {});
           }
-          setLoadingOlder(false);
           return;
         }
 
@@ -330,6 +335,10 @@ export function useTimeline(
           const afterTs = cached && cached.length > 0 ? Math.max(...cached.map((e) => e.ts)) : undefined;
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500, afterTs);
         }
+      }
+      // ── Browser WS disconnected: reset in-flight pagination to prevent stuck state ──
+      if (msg.type === 'session.event' && (msg as { event: string }).event === 'disconnected') {
+        if (loadingOlderRef.current) resetOlderState();
       }
       // ── Browser WS reconnected: fill gaps since last seen seq ──
       if (msg.type === 'session.event' && (msg as { event: string }).event === 'connected') {

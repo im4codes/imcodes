@@ -419,7 +419,17 @@ export class WsClient {
     if (data.length < 3 + nameLen) return;
     const sessionName = new TextDecoder().decode(data.slice(3, 3 + nameLen));
     const ptyData = data.slice(3 + nameLen);
+    // Data flowing → stream recovered. Reset retry counter so future resets get full budget.
+    this.confirmStreamRecovery(sessionName);
     this._terminalRawHandlers.get(sessionName)?.forEach((h) => h(ptyData));
+  }
+
+  /** Called when data arrives for a session — confirms stream is healthy, resets retry budget. */
+  private confirmStreamRecovery(session: string): void {
+    const state = this.resetState.get(session);
+    if (state && state.retryCount > 0) {
+      state.retryCount = 0;
+    }
   }
 
   /**
@@ -468,10 +478,9 @@ export class WsClient {
     if (state.retryTimer) clearTimeout(state.retryTimer);
     state.retryTimer = setTimeout(() => {
       const s = this.resetState.get(session);
-      if (s) {
-        s.retryTimer = null;
-        s.retryCount = 0; // Reset on resubscribe — next reset starts fresh
-      }
+      if (s) s.retryTimer = null;
+      // retryCount is NOT reset here — only reset when data actually flows
+      // (confirmStreamRecovery called from handleRawFrame on first received frame)
       if (!this._destroyed && this._connected) {
         this.subscribeTerminal(session);
       }
