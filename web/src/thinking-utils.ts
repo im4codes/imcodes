@@ -4,8 +4,8 @@
  * thinking sequence (so the elapsed timer doesn't reset when multiple thinking
  * events arrive for the same turn).
  *
- * Only assistant.text and user.message end thinking.
- * All other event types (tool calls, state changes, hooks, status) are skipped.
+ * Only assistant.text, user.message, and session.state=idle end thinking.
+ * Tool calls, status updates, and other events are skipped (don't end thinking).
  */
 
 const THINKING_SKIP_TYPES = new Set([
@@ -13,7 +13,6 @@ const THINKING_SKIP_TYPES = new Set([
   'usage.update',
   'tool.call',
   'tool.result',
-  'session.state',
   'mode.state',
   'terminal.snapshot',
   'command.ack',
@@ -29,10 +28,28 @@ export function getActiveThinkingTs(events: Array<{ type: string; ts: number; pa
       thinkingTs = e.ts;
       continue;
     }
-    // session.state=idle means agent finished — end thinking
-    if (e.type === 'session.state' && e.payload?.state === 'idle') break;
+    // session.state: idle = agent finished (end thinking), running = skip (don't end thinking)
+    if (e.type === 'session.state') {
+      if (e.payload?.state === 'idle') break;
+      continue;
+    }
     if (THINKING_SKIP_TYPES.has(e.type)) continue;
     break; // assistant.text / user.message / ask.question — thinking ended
   }
   return thinkingTs;
+}
+
+/**
+ * Unified "visual busy" derivation — single source of truth for all running animations.
+ * Use this instead of ad-hoc conditions in each component.
+ *
+ * An agent is visually busy when:
+ * - session.state === 'running', OR
+ * - activeThinking is true AND session.state is NOT 'idle'
+ *   (prevents animation flicker when thinking lingers briefly after idle)
+ */
+export function isVisuallyBusy(sessionState: string | undefined, activeThinking: boolean): boolean {
+  if (sessionState === 'running') return true;
+  if (activeThinking && sessionState !== 'idle') return true;
+  return false;
 }

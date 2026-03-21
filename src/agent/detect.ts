@@ -196,9 +196,9 @@ export function detectStatus(
       if (matchesAny(tail, GEMINI_THINKING_PATTERNS)) return 'thinking';
       if (matchesAny(tail, GEMINI_TOOL_PATTERNS)) return 'tool_running';
       if (geminiHasSpinner) return 'streaming';
-      // No idle prompt visible and no spinner caught → assume working
-      // (Gemini tool output flickers too fast for polling to reliably capture)
-      if (!matchesAny(tail, GEMINI_IDLE_PATTERNS)) return 'thinking';
+      // No idle prompt visible and no clear working signal → default to idle.
+      // JSON is the authoritative source for Gemini; terminal detection is supplementary.
+      // Being conservative (idle) prevents state oscillation from prompt redraws.
       break;
     }
 

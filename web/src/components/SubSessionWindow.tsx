@@ -4,7 +4,7 @@
  */
 import { useState, useRef, useCallback, useEffect, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { getActiveThinkingTs } from '../thinking-utils.js';
+import { getActiveThinkingTs, isVisuallyBusy } from '../thinking-utils.js';
 import { recordCost, getSessionCost, getWeeklyCost, getMonthlyCost, formatCost } from '../cost-tracker.js';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
@@ -254,7 +254,7 @@ export function SubSessionWindow({
     : { position: 'fixed', left: geom.x, top: geom.y, width: geom.w, height: geom.h, zIndex };
 
   return (
-    <div ref={swipeBackRef} class={`subsession-window${(sub.state !== 'idle' && sub.state !== 'stopped' && (sub.state === 'running' || activeThinkingTs)) ? ' subcard-running-pulse' : ''}`} style={style} onMouseDown={onFocus}>
+    <div ref={swipeBackRef} class={`subsession-window${isVisuallyBusy(sub.state, !!activeThinkingTs) ? ' subcard-running-pulse' : ''}`} style={style} onMouseDown={onFocus}>
       {/* 8-direction resize handles (desktop only) */}
       {!isMobile && (['n','s','e','w','ne','nw','se','sw'] as ResizeDir[]).map((dir) => (
         <div key={dir} class={`resize-handle resize-${dir}`} onMouseDown={onResizeMouseDown(dir)} />

@@ -12,6 +12,7 @@ import { useTimeline } from '../hooks/useTimeline.js';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
+import { getActiveThinkingTs, isVisuallyBusy } from '../thinking-utils.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
@@ -57,6 +58,8 @@ export function SubSessionCard({ sub, ws, connected, isOpen, onOpen, onDiff, onH
   const label = sub.label ? `${sub.label} · ${agentTag}` : agentTag;
   const icon = TYPE_ICON[sub.type] ?? '⚡';
   const badge = STATE_BADGE[sub.state];
+
+  const busy = useMemo(() => isVisuallyBusy(sub.state, !!getActiveThinkingTs(events)), [events, sub.state]);
 
   const lastUsage = useMemo(() => {
     for (let i = events.length - 1; i >= 0; i--) {
@@ -123,7 +126,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, onOpen, onDiff, onH
 
   return (
     <div
-      class={`subcard${isOpen ? ' subcard-open' : ''}${sub.state === 'running' ? ' subcard-running-pulse' : ''}`}
+      class={`subcard${isOpen ? ' subcard-open' : ''}${busy ? ' subcard-running-pulse' : ''}`}
       style={{ width: effectiveW, height: cardH, minWidth: effectiveW, position: 'relative' }}
       onClick={() => { if (!draggingRef.current) onOpen(); }}
     >
@@ -132,7 +135,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, onOpen, onDiff, onH
         <span class="subcard-icon">{icon}</span>
         <span class="subcard-label">{label}</span>
         {badge && <span class="subcard-badge">{badge}</span>}
-        {sub.state === 'running' && <span class="subcard-running">●</span>}
+        {busy && <span class="subcard-running">●</span>}
         {modelLabel && <span class="subcard-model">{modelLabel}</span>}
         {lastUsage && (() => {
           const ctx = resolveContextWindow(lastUsage.contextWindow, lastUsage.model);

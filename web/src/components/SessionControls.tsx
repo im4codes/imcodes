@@ -11,6 +11,7 @@ import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
 import { uploadFile } from '../api.js';
+import { isVisuallyBusy } from '../thinking-utils.js';
 
 interface Props {
   ws: WsClient | null;
@@ -435,7 +436,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         />
       </div>
     )}
-    <div class={`controls-wrapper${(activeSession?.state === 'running' || activeThinking) ? ' controls-wrapper-running' : ''}`}>
+    <div class={`controls-wrapper${isVisuallyBusy(activeSession?.state, !!activeThinking) ? ' controls-wrapper-running' : ''}`}>
       {/* Shortcut row — hidden in chat mode */}
       {!hideShortcuts && <div class="shortcuts-row">
         <div class="shortcuts">

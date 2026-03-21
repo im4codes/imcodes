@@ -98,7 +98,8 @@ body {
 .controls-wrapper { background: #1e293b; border-top: 1px solid #334155; flex-shrink: 0; }
 @keyframes scan-sweep { 0% { left: -60%; } 100% { left: 130%; } }
 .controls-wrapper { position: relative; }
-.controls-wrapper-running::before { content: ''; position: absolute; top: -1px; left: -60%; width: 60%; height: 2px; background: linear-gradient(90deg, transparent, #00e5ff, #818cf8, #00e5ff, transparent); animation: scan-sweep 3s linear infinite; z-index: 1; }
+.controls-wrapper::before { content: ''; position: absolute; top: -1px; left: -60%; width: 60%; height: 2px; background: linear-gradient(90deg, transparent, #00e5ff, #818cf8, #00e5ff, transparent); z-index: 1; opacity: 0; transition: opacity 0.3s ease-out; }
+.controls-wrapper-running::before { animation: scan-sweep 3s linear infinite; opacity: 1; }
 .shortcuts-row { display: flex; align-items: center; border-bottom: 1px solid #1e3250; }
 .shortcuts { display: flex; gap: 4px; padding: 4px 8px; overflow-x: auto; scrollbar-width: none; flex: 1; min-width: 0; }
 .shortcuts::-webkit-scrollbar { display: none; }
@@ -467,7 +468,8 @@ body {
 .subcard:hover { border-color: #475569; box-shadow: 0 2px 12px rgba(0,0,0,0.4); }
 .subcard-open { border-color: #3b82f6; box-shadow: 0 0 8px rgba(59,130,246,0.3); }
 @keyframes subcard-sci-fi { 0% { border-color: #334155; box-shadow: 0 0 4px #00e5ff22; } 40% { border-color: #00e5ff; box-shadow: 0 0 12px #00e5ff88, 0 0 24px #00e5ff33; } 70% { border-color: #818cf8; box-shadow: 0 0 12px #818cf888, 0 0 24px #818cf833; } 100% { border-color: #334155; box-shadow: 0 0 4px #00e5ff22; } }
-.subcard-running-pulse { animation: subcard-sci-fi 3.6s ease-in-out infinite; transition: border-color 0s, box-shadow 0s; }
+.subcard-running-pulse { animation: subcard-sci-fi 3.6s ease-in-out infinite; }
+.subcard:not(.subcard-running-pulse) { transition: border-color 0.3s ease-out, box-shadow 0.3s ease-out; }
 
 .subcard-header { display: flex; align-items: center; gap: 6px; padding: 5px 10px; background: #1a2233; border-bottom: 1px solid #1e293b; flex-shrink: 0; font-size: 12px; color: #94a3b8; }
 .subcard-icon { font-size: 13px; }

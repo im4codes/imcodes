@@ -158,10 +158,20 @@ async function terminalThinkingCheck(sessionName: string, state: WatcherState): 
     return;
   }
 
-  // Terminal shows activity — cancel any pending idle debounce
-  if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
+  // Terminal shows activity — but only transition state if JSON hasn't already settled on idle.
+  // JSON is the authoritative source; terminal is supplementary for thinking hints only.
+  if (state.lastConversationStatus === 'idle') {
+    // JSON says idle — terminal may show residual activity (prompt redraw, lingering "esc to cancel").
+    // Emit thinking hint for UI but do NOT change session.state — prevents idle/running oscillation.
+    if (!state._terminalThinkingEmitted) {
+      state._terminalThinkingEmitted = true;
+      timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'terminal-parse', confidence: 'low' });
+    }
+    return;
+  }
 
-  // Terminal shows activity — transition to running (idle lock will prevent flicker)
+  // JSON is not idle (running or unknown) — terminal activity confirms running state
+  if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
   transitionState(sessionName, state, 'running');
   if (!state._terminalThinkingEmitted) {
     state._terminalThinkingEmitted = true;
@@ -235,8 +245,8 @@ export async function pollTick(sessionName: string, state: WatcherState): Promis
 
   if (conv.lastUpdated === state.lastUpdated && conv.messages.length === state.seenCount) {
     if (conversationStatus === 'idle') {
-      // JSON unchanged + idle — transition through unified function (respects dedup + lock)
-      transitionState(sessionName, state, 'idle');
+      // JSON unchanged + idle — but respect any pending debounce from a recent update
+      if (!state.idleDebounceTimer) transitionState(sessionName, state, 'idle');
       return;
     }
     // JSON unchanged — supplement with terminal-based detection.

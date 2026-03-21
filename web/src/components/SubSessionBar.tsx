@@ -7,6 +7,7 @@ import { SubSessionCard } from './SubSessionCard.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
+import { isVisuallyBusy } from '../thinking-utils.js';
 
 interface DaemonStats {
   daemonVersion?: string | null;
@@ -284,7 +285,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
             return (
               <button
                 key={sub.id}
-                class={`subsession-card${isOpen ? ' open' : ''} mobile${sub.state === 'running' ? ' subcard-running-pulse' : ''}`}
+                class={`subsession-card${isOpen ? ' open' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
                 onClick={() => onOpen(sub.id)}
                 title={label}
               >
