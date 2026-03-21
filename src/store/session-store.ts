@@ -54,22 +54,25 @@ export async function loadStore(): Promise<SessionStore> {
   return store;
 }
 
-/** After loadStore, detect actual state of each session from terminal. */
+/** After loadStore, detect actual state of each session from terminal and emit corrections. */
 async function probeSessionStates(): Promise<void> {
   const { detectStatusAsync } = await import('../agent/detect.js');
+  const { timelineEmitter } = await import('../daemon/timeline-emitter.js');
   for (const s of Object.values(store.sessions)) {
     if (s.state !== 'running') continue;
+    let newState: 'idle' | 'running' = 'running';
     try {
       const status = await detectStatusAsync(s.name, s.agentType as import('../agent/detect.js').AgentType);
-      const newState = status === 'idle' ? 'idle' : 'running';
-      if (newState !== s.state) {
-        s.state = newState;
-        s.updatedAt = Date.now();
-      }
+      newState = status === 'idle' ? 'idle' : 'running';
     } catch {
       // tmux session may not exist — mark idle
-      s.state = 'idle';
+      newState = 'idle';
+    }
+    if (newState !== s.state) {
+      s.state = newState;
       s.updatedAt = Date.now();
+      // Emit to timeline so frontend gets the corrected state
+      timelineEmitter.emit(s.name, 'session.state', { state: newState });
     }
   }
   scheduleWrite();

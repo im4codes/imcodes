@@ -54,6 +54,13 @@ export class TimelineEmitter {
       this.lastSessionState.set(sessionId, state);
     }
 
+    // When a user sends a message, reset session state tracking so the next idle
+    // after the agent responds is always emitted (even if state was already 'idle').
+    // Without this, pure-text replies (no tool_start→running) cause idle to be deduped.
+    if (type === 'user.message') {
+      this.lastSessionState.delete(sessionId);
+    }
+
     // Deduplicate user.message — skip if same session + same text within 5s
     if (type === 'user.message') {
       const text = String(payload.text ?? '');
