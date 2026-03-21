@@ -44,6 +44,13 @@ export async function loadStore(): Promise<SessionStore> {
   try {
     const raw = await readFile(STORE_PATH, 'utf8');
     store = JSON.parse(raw) as SessionStore;
+    // Reset all session states to idle on daemon startup.
+    // Actual states will be re-detected by watchers/hooks once they start.
+    // Without this, stale "running" states from before restart persist and
+    // cause UI animations to trigger when agents are actually idle.
+    for (const s of Object.values(store.sessions)) {
+      if (s.state === 'running') s.state = 'idle';
+    }
   } catch {
     store = { sessions: {} };
   }
