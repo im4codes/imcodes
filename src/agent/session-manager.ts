@@ -254,11 +254,17 @@ export async function restoreFromStore(): Promise<void> {
 
     if (!live.includes(s.name)) {
       logger.info({ session: hydrated.name }, 'Missing on restore, restarting');
-      await restartSession(hydrated);
+      try { await restartSession(hydrated); } catch (err) {
+        logger.error({ err, session: hydrated.name }, 'Failed to restart session on restore — skipping (tmux may be unavailable)');
+        updateSessionState(hydrated.name, 'error');
+      }
     } else if (live.includes(s.name) && !(await isPaneAlive(s.name))) {
       // Session exists (remain-on-exit) but process is dead — respawn instead of creating a new session
       logger.info({ session: hydrated.name }, 'Pane dead on restore, respawning');
-      await respawnSession(hydrated);
+      try { await respawnSession(hydrated); } catch (err) {
+        logger.error({ err, session: hydrated.name }, 'Failed to respawn session on restore — skipping');
+        updateSessionState(hydrated.name, 'error');
+      }
     } else if (hydrated.agentType === 'claude-code' && hydrated.projectDir && !isWatching(hydrated.name)) {
       if (hydrated.ccSessionId) {
         startCCWatcher(hydrated.name, hydrated.projectDir, hydrated.ccSessionId);

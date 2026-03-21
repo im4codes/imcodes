@@ -162,7 +162,12 @@ export async function newSession(name: string, command?: string, opts?: NewSessi
   await tmuxExec(`new-session -d -s ${name} ${cwdArg} ${envArgs} ${cmdArg}`.trim());
   // Keep the tmux session alive after the process exits so daemon restarts
   // can detect it and reconnect instead of launching a fresh session.
-  await tmuxExec(`set-option -t ${name} remain-on-exit on`);
+  try {
+    await tmuxExec(`set-option -t ${name} remain-on-exit on`);
+  } catch {
+    // Non-fatal: session was created but remain-on-exit couldn't be set
+    // (e.g., session exited immediately). The session still works.
+  }
 }
 
 /** Kill a tmux session by name. Does not throw if it doesn't exist. */
