@@ -370,14 +370,15 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
       return; // skip this hop, don't fail the whole run
     }
 
-    // Wait for completion: file growth + idle
-    // Grace period: agent needs time to receive prompt, parse it, and start working.
-    // Don't check idle-without-growth until after this period.
+    // Wait for completion: file settled (stopped growing) + agent idle.
+    // Uses file-settle window + idle confirmation to avoid premature hop completion
+    // caused by transient idle events (tool call gaps, status flicker).
     const GRACE_PERIOD_MS = GRACE_PERIOD_DEFAULT_MS;
     const dispatchTime = Date.now();
     const deadline = dispatchTime + run.timeoutMs;
     let fileGrew = false;
-    let idleDetected = false;
+    let lastSize = sizeBefore;
+    let lastGrowthAt = 0;
     let idleEventReceived = false;
 
     const idlePromise = waitForIdleEvent(session, run.timeoutMs).then((ok) => { idleEventReceived = ok; });
@@ -387,61 +388,86 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
       await sleep(IDLE_POLL_MS);
       if (run._cancelled) return;
 
-      // Check file growth
-      if (!fileGrew) {
-        try {
-          const currentSize = (await stat(watchPath)).size;
-          if (currentSize > sizeBefore) {
+      // Check file growth — track last growth time for settle detection
+      try {
+        const currentSize = (await stat(watchPath)).size;
+        if (currentSize > lastSize) {
+          lastSize = currentSize;
+          lastGrowthAt = Date.now();
+          if (!fileGrew) {
             fileGrew = true;
             if (run.status === 'dispatched') transition(run, 'running', serverLink);
           }
-        } catch { /* ignore */ }
-      }
+          // Reset idle flag: transient idle before this growth doesn't count
+          idleEventReceived = false;
+        }
+      } catch { /* ignore */ }
 
-      // Check idle (via event or poll) — but only after grace period or if file already grew
       const pastGrace = (Date.now() - dispatchTime) > GRACE_PERIOD_MS;
-      if (!idleDetected && (pastGrace || fileGrew)) {
+
+      // File must have settled: grew AND stopped growing for ≥ 1 poll cycle
+      const fileSettled = fileGrew && lastGrowthAt > 0 && (Date.now() - lastGrowthAt) >= IDLE_POLL_MS;
+
+      // Check idle — only when file has settled (or past grace with no growth)
+      if (fileSettled || (pastGrace && !fileGrew)) {
+        let idleConfirmed = false;
         if (idleEventReceived) {
-          idleDetected = true;
-        } else {
+          // Event-based: confirm agent is STILL idle right now (not a stale event)
           try {
             const record = getSession(session);
             const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
-            if (await detectStatusAsync(session, agentType) === 'idle') idleDetected = true;
+            idleConfirmed = await detectStatusAsync(session, agentType) === 'idle';
+          } catch { idleConfirmed = true; /* if detection fails, trust event */ }
+        } else {
+          // Poll fallback
+          try {
+            const record = getSession(session);
+            const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
+            idleConfirmed = await detectStatusAsync(session, agentType) === 'idle';
           } catch { /* ignore */ }
         }
-      }
 
-      // Success: file grew AND agent is idle
-      if (fileGrew && idleDetected) {
-        if (sandboxLocalPath) await copyBackFromSandbox(run, sandboxLocalPath);
-        if (run.remainingTargets.length > 0 || session !== run.initiatorSession) {
-          transition(run, 'awaiting_next_hop', serverLink);
+        // Success: file settled AND agent confirmed idle
+        if (fileSettled && idleConfirmed) {
+          // Final confirmation: file size unchanged after idle check
+          try {
+            const finalSize = (await stat(watchPath)).size;
+            if (finalSize > lastSize) {
+              // Agent wrote more while we were checking — keep waiting
+              lastSize = finalSize;
+              lastGrowthAt = Date.now();
+              idleEventReceived = false;
+              continue;
+            }
+          } catch { /* ignore */ }
+          if (sandboxLocalPath) await copyBackFromSandbox(run, sandboxLocalPath);
+          if (run.remainingTargets.length > 0 || session !== run.initiatorSession) {
+            transition(run, 'awaiting_next_hop', serverLink);
+          }
+          return;
         }
-        return;
-      }
 
-      // Idle but file didn't grow (only check after grace period) → agent ignored the prompt
-      if (idleDetected && !fileGrew && pastGrace) {
-        if (attempt < MAX_RETRIES) {
-          logger.warn({ runId: run.id, session, attempt }, 'P2P: agent went idle without writing to file, retrying');
-          break; // break inner loop to retry outer loop
+        // Idle but file never grew (past grace) → agent ignored the prompt
+        if (!fileGrew && pastGrace && idleConfirmed) {
+          if (attempt < MAX_RETRIES) {
+            logger.warn({ runId: run.id, session, attempt }, 'P2P: agent went idle without writing to file, retrying');
+            break; // break inner loop to retry outer loop
+          }
+          logger.warn({ runId: run.id, session }, 'P2P: agent idle without file change after retry, skipping hop');
+          run.skippedHops.push(session);
+          if (sandboxLocalPath) await copyBackFromSandbox(run, sandboxLocalPath).catch(() => {});
+          if (run.remainingTargets.length > 0 || session !== run.initiatorSession) {
+            transition(run, 'awaiting_next_hop', serverLink);
+          }
+          return;
         }
-        // Max retries exhausted — skip this hop
-        logger.warn({ runId: run.id, session }, 'P2P: agent idle without file change after retry, skipping hop');
-        run.skippedHops.push(session);
-        if (sandboxLocalPath) await copyBackFromSandbox(run, sandboxLocalPath).catch(() => {});
-        if (run.remainingTargets.length > 0 || session !== run.initiatorSession) {
-          transition(run, 'awaiting_next_hop', serverLink);
-        }
-        return;
       }
     }
 
     void idlePromise;
 
     // If we got here from break (retry), continue to next attempt
-    if (idleDetected && !fileGrew && attempt < MAX_RETRIES) continue;
+    if (!fileGrew && attempt < MAX_RETRIES) continue;
 
     // Timeout — copy back whatever we got and skip (don't fail the whole run)
     if (sandboxLocalPath) await copyBackFromSandbox(run, sandboxLocalPath).catch(() => {});
