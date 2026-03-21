@@ -56,26 +56,27 @@ export async function loadStore(): Promise<SessionStore> {
 
 /** After loadStore, detect actual state of each session from terminal and emit corrections. */
 async function probeSessionStates(): Promise<void> {
-  const { detectStatusAsync } = await import('../agent/detect.js');
-  const { timelineEmitter } = await import('../daemon/timeline-emitter.js');
-  for (const s of Object.values(store.sessions)) {
-    if (s.state !== 'running') continue;
-    let newState: 'idle' | 'running' = 'running';
-    try {
-      const status = await detectStatusAsync(s.name, s.agentType as import('../agent/detect.js').AgentType);
-      newState = status === 'idle' ? 'idle' : 'running';
-    } catch {
-      // tmux session may not exist — mark idle
-      newState = 'idle';
+  try {
+    const { detectStatusAsync } = await import('../agent/detect.js');
+    const { timelineEmitter } = await import('../daemon/timeline-emitter.js');
+    for (const s of Object.values(store.sessions)) {
+      if (s.state !== 'running') continue;
+      let newState: 'idle' | 'running' = 'running';
+      try {
+        const status = await detectStatusAsync(s.name, s.agentType as import('../agent/detect.js').AgentType);
+        newState = status === 'idle' ? 'idle' : 'running';
+      } catch {
+        // tmux session may not exist — mark idle
+        newState = 'idle';
+      }
+      if (newState !== s.state) {
+        s.state = newState;
+        s.updatedAt = Date.now();
+        try { timelineEmitter.emit(s.name, 'session.state', { state: newState }); } catch { /* emitter may not be ready */ }
+      }
     }
-    if (newState !== s.state) {
-      s.state = newState;
-      s.updatedAt = Date.now();
-      // Emit to timeline so frontend gets the corrected state
-      timelineEmitter.emit(s.name, 'session.state', { state: newState });
-    }
-  }
-  scheduleWrite();
+    scheduleWrite();
+  } catch { /* probeSessionStates is best-effort — don't crash daemon */ }
 }
 
 function scheduleWrite(): void {
