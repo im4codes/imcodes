@@ -44,17 +44,35 @@ export async function loadStore(): Promise<SessionStore> {
   try {
     const raw = await readFile(STORE_PATH, 'utf8');
     store = JSON.parse(raw) as SessionStore;
-    // Reset all session states to idle on daemon startup.
-    // Actual states will be re-detected by watchers/hooks once they start.
-    // Without this, stale "running" states from before restart persist and
-    // cause UI animations to trigger when agents are actually idle.
-    for (const s of Object.values(store.sessions)) {
-      if (s.state === 'running') s.state = 'idle';
-    }
   } catch {
     store = { sessions: {} };
   }
+  // Probe actual state of each session via terminal detection.
+  // Without this, stale "running" states from before daemon restart persist
+  // and cause UI animations to trigger for idle agents.
+  void probeSessionStates();
   return store;
+}
+
+/** After loadStore, detect actual state of each session from terminal. */
+async function probeSessionStates(): Promise<void> {
+  const { detectStatusAsync } = await import('../agent/detect.js');
+  for (const s of Object.values(store.sessions)) {
+    if (s.state !== 'running') continue;
+    try {
+      const status = await detectStatusAsync(s.name, s.agentType as import('../agent/detect.js').AgentType);
+      const newState = status === 'idle' ? 'idle' : 'running';
+      if (newState !== s.state) {
+        s.state = newState;
+        s.updatedAt = Date.now();
+      }
+    } catch {
+      // tmux session may not exist — mark idle
+      s.state = 'idle';
+      s.updatedAt = Date.now();
+    }
+  }
+  scheduleWrite();
 }
 
 function scheduleWrite(): void {
