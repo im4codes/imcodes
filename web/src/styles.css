@@ -830,6 +830,19 @@ body {
 .chat-table th, .chat-table td { border: 1px solid #334155; padding: 4px 10px; text-align: left; white-space: nowrap; }
 .chat-table th { background: #1e293b; color: #e2e8f0; font-weight: 600; }
 .chat-table td { color: #cbd5e1; }
+/* Markdown headings in chat */
+.chat-rich-text h1, .chat-rich-text h2, .chat-rich-text h3, .chat-rich-text h4, .chat-rich-text h5, .chat-rich-text h6 { margin: 8px 0 4px; color: #e2e8f0; line-height: 1.3; }
+.chat-rich-text h1 { font-size: 1.3em; } .chat-rich-text h2 { font-size: 1.15em; } .chat-rich-text h3 { font-size: 1.05em; }
+.chat-rich-text h4, .chat-rich-text h5, .chat-rich-text h6 { font-size: 1em; }
+/* Lists in chat */
+.chat-list { margin: 4px 0; padding-left: 20px; }
+.chat-list li { margin: 2px 0; }
+/* Blockquote in chat */
+.chat-blockquote { margin: 6px 0; padding: 4px 12px; border-left: 3px solid #475569; color: #94a3b8; }
+/* Horizontal rule in chat */
+.chat-hr { border: none; border-top: 1px solid #334155; margin: 8px 0; }
+/* Paragraphs in chat rich text */
+.chat-rich-text p { margin: 4px 0; }
 /* browse button next to inputs */
 .input-with-browse { display: flex; gap: 6px; }
 .input-with-browse .input, .input-with-browse input { flex: 1; min-width: 0; }

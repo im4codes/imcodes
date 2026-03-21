@@ -9,6 +9,7 @@ import { useTranslation } from 'react-i18next';
 import type { TimelineEvent, WsClient } from '../ws-client.js';
 import { getActiveThinkingTs } from '../thinking-utils.js';
 import { FileBrowser } from './FileBrowser.js';
+import { ChatMarkdown } from './ChatMarkdown.js';
 
 interface Props {
   events: TimelineEvent[];
@@ -449,7 +450,7 @@ export function ChatView({ events, loading, refreshing, sessionState, sessionId,
             const onUrlClick = !preview ? (url: string) => setPendingUrl(url) : undefined;
             return item.type === 'assistant-block' ? (
               <div key={item.key} class="chat-event chat-assistant">
-                <RichText text={item.text!} onPathClick={onPathClick} onUrlClick={onUrlClick} />
+                <ChatMarkdown text={item.text!} onPathClick={onPathClick} onUrlClick={onUrlClick} />
                 <ChatTime ts={item.lastTs ?? item.ts ?? 0} />
               </div>
             ) : item.type === 'tool-group' ? (
@@ -799,93 +800,7 @@ function ChatTime({ ts }: { ts: number }) {
   );
 }
 
-// ── Lightweight Markdown renderer ─────────────────────────────────────────
-
-interface TextSegment {
-  type: 'text' | 'code' | 'bold' | 'italic';
-  content: string;
-}
-
-/** Parse inline markdown: `code`, **bold**, *italic* */
-function parseInline(text: string): TextSegment[] {
-  const segments: TextSegment[] = [];
-  const regex = /`([^`]+)`|\*\*(.+?)\*\*|\*(.+?)\*/g;
-  let last = 0;
-  let match: RegExpExecArray | null;
-  while ((match = regex.exec(text)) !== null) {
-    if (match.index > last) segments.push({ type: 'text', content: text.slice(last, match.index) });
-    if (match[1] !== undefined) segments.push({ type: 'code', content: match[1] });
-    else if (match[2] !== undefined) segments.push({ type: 'bold', content: match[2] });
-    else if (match[3] !== undefined) segments.push({ type: 'italic', content: match[3] });
-    last = match.index + match[0].length;
-  }
-  if (last < text.length) segments.push({ type: 'text', content: text.slice(last) });
-  return segments;
-}
-
-interface CodeBlock { type: 'code-block'; lang: string; code: string }
-interface TextBlock { type: 'text-block'; text: string }
-interface TableBlock { type: 'table-block'; headers: string[]; rows: string[][] }
-type Block = CodeBlock | TextBlock | TableBlock;
-
-/** Detect GFM table: consecutive lines starting with |, second line is separator (|---|---|). */
-function tryParseTable(lines: string[]): { table: TableBlock; consumed: number } | null {
-  if (lines.length < 2) return null;
-  // Header row must have |
-  if (!lines[0].includes('|')) return null;
-  // Separator row: all cells match /^[-: ]+$/
-  const sepLine = lines[1].trim().replace(/^\||\|$/g, '');
-  if (!/^[\s|:-]+$/.test(sepLine) || !sepLine.includes('-')) return null;
-
-  const parseCells = (line: string): string[] =>
-    line.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
-
-  const headers = parseCells(lines[0]);
-  const rows: string[][] = [];
-  let i = 2;
-  while (i < lines.length && lines[i].includes('|')) {
-    rows.push(parseCells(lines[i]));
-    i++;
-  }
-  if (headers.length === 0) return null;
-  return { table: { type: 'table-block', headers, rows }, consumed: i };
-}
-
-/** Split text into code blocks, table blocks, and text blocks. */
-function parseBlocks(text: string): Block[] {
-  const blocks: Block[] = [];
-  const regex = /```(\w*)\n([\s\S]*?)```/g;
-  let last = 0;
-  let match: RegExpExecArray | null;
-  while ((match = regex.exec(text)) !== null) {
-    if (match.index > last) blocks.push({ type: 'text-block', text: text.slice(last, match.index) });
-    blocks.push({ type: 'code-block', lang: match[1] || '', code: match[2].replace(/\n$/, '') });
-    last = match.index + match[0].length;
-  }
-  if (last < text.length) blocks.push({ type: 'text-block', text: text.slice(last) });
-
-  // Second pass: split text blocks that contain GFM tables
-  const result: Block[] = [];
-  for (const block of blocks) {
-    if (block.type !== 'text-block') { result.push(block); continue; }
-    const lines = block.text.split('\n');
-    let textBuf: string[] = [];
-    let i = 0;
-    while (i < lines.length) {
-      const tableResult = tryParseTable(lines.slice(i));
-      if (tableResult) {
-        if (textBuf.length > 0) { result.push({ type: 'text-block', text: textBuf.join('\n') }); textBuf = []; }
-        result.push(tableResult.table);
-        i += tableResult.consumed;
-      } else {
-        textBuf.push(lines[i]);
-        i++;
-      }
-    }
-    if (textBuf.length > 0) result.push({ type: 'text-block', text: textBuf.join('\n') });
-  }
-  return result;
-}
+// ── Markdown rendering delegated to ChatMarkdown.tsx ──────────────────────
 
 // ── URL detection (must run BEFORE path detection) ────────────────────────
 const URL_REGEX = /https?:\/\/[^\s<>"\])}]+/g;
@@ -968,61 +883,3 @@ function splitPathsAndUrls(
   return parts.length ? parts : [<span>{text}</span>];
 }
 
-/** Render inline segments as JSX. */
-function InlineText({ text, onPathClick, onUrlClick }: { text: string; onPathClick?: (p: string) => void; onUrlClick?: (url: string) => void }) {
-  const lines = text.split('\n');
-  return (
-    <span>
-      {lines.map((line, li) => {
-        const segments = parseInline(line);
-        return (
-          <span key={li}>
-            {li > 0 && <br />}
-            {segments.map((seg, si) => {
-              switch (seg.type) {
-                case 'code': return <code key={si} class="chat-inline-code">{splitPathsAndUrls(seg.content, onPathClick, onUrlClick)}</code>;
-                case 'bold': return <strong key={si}>{seg.content}</strong>;
-                case 'italic': return <em key={si}>{seg.content}</em>;
-                default: return <span key={si}>{splitPathsAndUrls(seg.content, onPathClick, onUrlClick)}</span>;
-              }
-            })}
-          </span>
-        );
-      })}
-    </span>
-  );
-}
-
-/** Render markdown text with code blocks, tables, and inline formatting. */
-function RichText({ text, onPathClick, onUrlClick }: { text: string; onPathClick?: (p: string) => void; onUrlClick?: (url: string) => void }) {
-  const blocks = parseBlocks(text);
-  return (
-    <div class="chat-rich-text">
-      {blocks.map((block, i) => {
-        if (block.type === 'code-block') {
-          return (
-            <div key={i} class="chat-code-block">
-              {block.lang && <div class="chat-code-lang">{block.lang}</div>}
-              <pre><code>{block.code}</code></pre>
-            </div>
-          );
-        }
-        if (block.type === 'table-block') {
-          return (
-            <table key={i} class="chat-table">
-              <thead>
-                <tr>{block.headers.map((h, hi) => <th key={hi}>{h}</th>)}</tr>
-              </thead>
-              <tbody>
-                {block.rows.map((row, ri) => (
-                  <tr key={ri}>{row.map((cell, ci) => <td key={ci}>{cell}</td>)}</tr>
-                ))}
-              </tbody>
-            </table>
-          );
-        }
-        return <InlineText key={i} text={block.text} onPathClick={onPathClick} onUrlClick={onUrlClick} />;
-      })}
-    </div>
-  );
-}
