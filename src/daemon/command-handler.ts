@@ -1160,7 +1160,7 @@ sleep 60 && rm -rf "${scriptDir}" &
 
 // ── File system browser ────────────────────────────────────────────────────
 
-const FS_ALLOWED_ROOTS = [homedir(), FILE_TRANSFER_LIMITS.UPLOAD_DIR];
+const FS_ALLOWED_ROOTS = [homedir(), FILE_TRANSFER_LIMITS.UPLOAD_DIR, '/tmp', '/private/tmp'];
 
 // ── P2P cancel/status handlers ────────────────────────────────────────────
 
