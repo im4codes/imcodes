@@ -59,7 +59,7 @@ const MODEL_STORAGE_KEY = 'imcodes-model';
 const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const CODEX_MODELS: CodexModelChoice[] = ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.2'];
 const P2P_MODES: P2pMode[] = ['solo', 'audit', 'review', 'brainstorm', 'discuss'];
-const P2P_MODE_LABELS: Record<P2pMode, string> = { solo: 'Solo', audit: 'Audit', review: 'Review', brainstorm: 'Brainstorm', discuss: 'Discuss' };
+const P2P_MODE_I18N: Record<P2pMode, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss' };
 const P2P_MODE_COLORS: Record<P2pMode, string> = { solo: '#6b7280', audit: '#f59e0b', review: '#3b82f6', brainstorm: '#a78bfa', discuss: '#22c55e' };
 
 // Enter moved after ↓ arrow
@@ -106,6 +106,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [modelOpen, setModelOpen] = useState(false);
   const [quickOpen, setQuickOpen] = useState(false);
   const [p2pMode, setP2pMode] = useState<P2pMode>('solo');
+  const [p2pExcludeSameType, setP2pExcludeSameType] = useState(false);
   const [p2pOpen, setP2pOpen] = useState(false);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
@@ -215,13 +216,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const buildAgentToken = (session: string, mode: string) =>
     session === '__all__' ? `@@all(${mode})` : `@@discuss(${session}, ${mode})`;
 
+  /** Unified message preprocessing — applies P2P mode to any outgoing message. */
+  const prepareMessage = useCallback((text: string): string => {
+    if (p2pMode === 'solo' || text.includes('@@')) return text;
+    const flag = p2pExcludeSameType ? `, exclude-same-type` : '';
+    return `@@all(${p2pMode}${flag}) ${text}`;
+  }, [p2pMode, p2pExcludeSameType]);
+
   const handleSend = useCallback(() => {
     let text = getText();
     if (!text || !ws || !activeSession) return;
-    // Auto-prepend @@all(mode) when P2P mode is active and user hasn't typed @@ manually
-    if (p2pMode !== 'solo' && !text.includes('@@')) {
-      text = `@@all(${p2pMode}) ${text}`;
-    }
+    text = prepareMessage(text);
     quickData.recordHistory(text, activeSession.name);
     try {
       ws.sendSessionCommand('send', { sessionName: activeSession.name, text });
@@ -238,15 +243,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     draftRef.current = '';
   }, [ws, activeSession, quickData, onSend]);
 
-  // Voice overlay send handler — puts text into input and sends
+  // Voice overlay send handler — applies same P2P mode as text send
   const handleVoiceSend = useCallback((voiceText: string) => {
     if (!ws || !activeSession) return;
-    quickData.recordHistory(voiceText, activeSession.name);
+    const text = prepareMessage(voiceText);
+    quickData.recordHistory(text, activeSession.name);
     try {
-      ws.sendSessionCommand('send', { sessionName: activeSession.name, text: voiceText });
+      ws.sendSessionCommand('send', { sessionName: activeSession.name, text });
     } catch { return; }
-    onSend?.(activeSession.name, voiceText);
-  }, [ws, activeSession, quickData, onSend]);
+    onSend?.(activeSession.name, text);
+  }, [ws, activeSession, quickData, onSend, prepareMessage]);
 
   const handleKeyDown = (e: KeyboardEvent) => {
     // When @ picker is open, let it handle Enter/Arrow/Escape — don't send or navigate history
@@ -529,10 +535,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             class="shortcut-btn"
             onClick={() => setP2pOpen((o) => !o)}
             disabled={disabled}
-            title={p2pMode === 'solo' ? t('p2p.mode_solo') : `P2P: ${P2P_MODE_LABELS[p2pMode]}`}
+            title={p2pMode === 'solo' ? t('p2p.mode_solo') : `P2P: ${t(P2P_MODE_I18N[p2pMode])}`}
             style={{ color: P2P_MODE_COLORS[p2pMode], fontSize: 10, fontWeight: p2pMode !== 'solo' ? 600 : 400 }}
           >
-            {p2pMode === 'solo' ? t('p2p.mode_solo') : `P2P:${P2P_MODE_LABELS[p2pMode]}`}
+            {p2pMode === 'solo' ? t('p2p.mode_solo') : `P2P:${t(P2P_MODE_I18N[p2pMode])}`}
           </button>
           {p2pOpen && (
             <div class="menu-dropdown">
@@ -540,12 +546,24 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 <button
                   key={m}
                   class={`menu-item ${p2pMode === m ? 'menu-item-active' : ''}`}
-                  onClick={() => { setP2pMode(m); setP2pOpen(false); }}
+                  onClick={() => { setP2pMode(m); if (m === 'solo') setP2pExcludeSameType(false); setP2pOpen(false); }}
                   style={{ color: P2P_MODE_COLORS[m] }}
                 >
-                  {p2pMode === m ? '● ' : '○ '}{P2P_MODE_LABELS[m]}
+                  {p2pMode === m ? '● ' : '○ '}{t(P2P_MODE_I18N[m])}
                 </button>
               ))}
+              {p2pMode !== 'solo' && (
+                <>
+                  <div class="menu-divider" />
+                  <button
+                    class="menu-item"
+                    onClick={() => setP2pExcludeSameType((v) => !v)}
+                    style={{ fontSize: 11 }}
+                  >
+                    {p2pExcludeSameType ? '☑' : '☐'} {t('p2p.exclude_same_type')}
+                  </button>
+                </>
+              )}
             </div>
           )}
         </div>
@@ -781,7 +799,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           disabled={inputDisabled || !hasText || !connected}
           style={p2pMode !== 'solo' ? { background: P2P_MODE_COLORS[p2pMode], borderColor: P2P_MODE_COLORS[p2pMode] } : undefined}
         >
-          {p2pMode !== 'solo' ? `${P2P_MODE_LABELS[p2pMode]}` : t('common.send')}
+          {p2pMode !== 'solo' ? `${t(P2P_MODE_I18N[p2pMode])}` : t('common.send')}
         </button>
 
         {/* Menu button */}

@@ -206,6 +206,11 @@
   },
   "p2p": {
     "mode_solo": "Solo",
+    "mode_audit": "審查",
+    "mode_review": "評審",
+    "mode_brainstorm": "腦力激盪",
+    "mode_discuss": "討論",
+    "exclude_same_type": "排除同類型",
     "picker": {
       "back": "返回",
       "files": "檔案",

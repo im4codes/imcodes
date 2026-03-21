@@ -206,6 +206,11 @@
   },
   "p2p": {
     "mode_solo": "Solo",
+    "mode_audit": "审查",
+    "mode_review": "评审",
+    "mode_brainstorm": "头脑风暴",
+    "mode_discuss": "讨论",
+    "exclude_same_type": "排除同类型",
     "picker": {
       "back": "返回",
       "files": "文件",

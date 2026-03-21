@@ -206,6 +206,11 @@
   },
   "p2p": {
     "mode_solo": "Solo",
+    "mode_audit": "Аудит",
+    "mode_review": "Обзор",
+    "mode_brainstorm": "Мозговой штурм",
+    "mode_discuss": "Обсуждение",
+    "exclude_same_type": "Исключить тот же тип",
     "picker": {
       "back": "Назад",
       "files": "Файлы",

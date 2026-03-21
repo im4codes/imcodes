@@ -206,6 +206,11 @@
   },
   "p2p": {
     "mode_solo": "Solo",
+    "mode_audit": "Audit",
+    "mode_review": "Review",
+    "mode_brainstorm": "Brainstorm",
+    "mode_discuss": "Discuss",
+    "exclude_same_type": "Exclude same type",
     "picker": {
       "back": "Back",
       "files": "Files",

@@ -206,6 +206,11 @@
   },
   "p2p": {
     "mode_solo": "Solo",
+    "mode_audit": "監査",
+    "mode_review": "レビュー",
+    "mode_brainstorm": "ブレスト",
+    "mode_discuss": "ディスカッション",
+    "exclude_same_type": "同タイプを除外",
     "picker": {
       "back": "戻る",
       "files": "ファイル",

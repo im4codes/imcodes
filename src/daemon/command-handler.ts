@@ -58,7 +58,7 @@ const MIME_MAP: Record<string, string> = {
  *   select its siblings (same parentSession) + parent
  * - Always skip: initiator itself, stopped sessions
  */
-function expandAllTargets(initiatorName: string, mode: string): P2pTarget[] {
+function expandAllTargets(initiatorName: string, mode: string, excludeSameType = false): P2pTarget[] {
   const initiator = getSession(initiatorName);
   const all = listSessions();
   const targets: P2pTarget[] = [];
@@ -69,6 +69,7 @@ function expandAllTargets(initiatorName: string, mode: string): P2pTarget[] {
     if (s.name === initiatorName) continue;
     if (s.state === 'stopped') continue;
     if (NON_DISCUSSABLE.has(s.agentType ?? '')) continue;
+    if (excludeSameType && initiator?.agentType && s.agentType === initiator.agentType) continue;
 
     if (initiatorName.startsWith('deck_sub_')) {
       // Initiator is a sub-session → select siblings (same parent) + parent
@@ -87,7 +88,11 @@ function expandAllTargets(initiatorName: string, mode: string): P2pTarget[] {
   return targets;
 }
 
+// Session names: alphanumeric + underscore only (matches deck_{project}_{role} and deck_sub_{id} patterns)
+const SESSION_NAME_RE = /[a-zA-Z0-9_]+/;
+const VALID_MODES = new Set(['audit', 'review', 'brainstorm', 'discuss']);
 const DISCUSS_TOKEN_RE = /@@discuss\(([^,]+),\s*([^)]+)\)/g;
+// @@all(mode) or @@all(mode, exclude-same-type)
 const ALL_TOKEN_RE = /@@all\(([^)]+)\)/g;
 const FILE_TOKEN_RE = /@((?:[a-zA-Z0-9_.\-/]+\/)*[a-zA-Z0-9_.\-]+\.[a-zA-Z0-9]+)/g;
 
@@ -96,23 +101,34 @@ interface ParsedTokens {
   files: string[];
   cleanText: string;
   /** True if @@all was used — caller must expand with active sessions. */
-  expandAll?: { mode: string };
+  expandAll?: { mode: string; excludeSameType?: boolean };
 }
 
 function parseAtTokens(text: string): ParsedTokens {
   const agents: P2pTarget[] = [];
   const files: string[] = [];
-  let expandAll: { mode: string } | undefined;
+  let expandAll: { mode: string; excludeSameType?: boolean } | undefined;
 
-  // Check for @@all(mode) first
+  // Check for @@all(mode[, flags]) first
   const allMatch = ALL_TOKEN_RE.exec(text);
   if (allMatch) {
-    expandAll = { mode: allMatch[1].trim() };
+    const parts = allMatch[1].split(',').map((s) => s.trim());
+    const mode = parts[0];
+    const excludeSameType = parts.includes('exclude-same-type');
+    if (VALID_MODES.has(mode)) {
+      expandAll = { mode, excludeSameType };
+    }
   }
   ALL_TOKEN_RE.lastIndex = 0; // reset regex state
 
+  // Validate session names and modes in @@discuss tokens
+  const validSessions = new Set(listSessions().map((s) => s.name));
   for (const m of text.matchAll(DISCUSS_TOKEN_RE)) {
-    agents.push({ session: m[1].trim(), mode: m[2].trim() });
+    const session = m[1].trim();
+    const mode = m[2].trim();
+    if (SESSION_NAME_RE.test(session) && validSessions.has(session) && VALID_MODES.has(mode)) {
+      agents.push({ session, mode });
+    }
   }
 
   // Remove @@all and @@discuss tokens first so @file regex doesn't partially match them
@@ -535,7 +551,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // @@all(mode) — expand to all active sessions in the same domain
   if (tokens.expandAll && tokens.agents.length === 0) {
     const mode = tokens.expandAll.mode;
-    tokens.agents.push(...expandAllTargets(sessionName, mode));
+    tokens.agents.push(...expandAllTargets(sessionName, mode, tokens.expandAll.excludeSameType));
     if (tokens.agents.length === 0) {
       logger.warn({ sessionName }, '@@all: no active sessions found in same domain');
       timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: 'No active sessions found for @@all' });
