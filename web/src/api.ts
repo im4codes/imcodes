@@ -41,15 +41,32 @@ function getCsrfToken(): string | null {
   return match ? decodeURIComponent(match[1]) : null;
 }
 
-// Single-flight lock: at most one refresh in progress at a time.
+// Single-flight lock: at most one refresh in progress at a time (per tab).
 let refreshPromise: Promise<boolean> | null = null;
 
+// Cross-tab mutex: prevent multiple tabs from refreshing simultaneously.
+// Uses BroadcastChannel to coordinate — only one tab refreshes at a time.
+const _refreshChannel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('imcodes-auth-refresh') : null;
+let _crossTabRefreshLocked = false;
+_refreshChannel?.addEventListener('message', (e) => {
+  if (e.data === 'refresh-start') _crossTabRefreshLocked = true;
+  if (e.data === 'refresh-done') {
+    _crossTabRefreshLocked = false;
+    _lastRefreshAt = Date.now(); // other tab refreshed successfully
+  }
+});
+
 // Track the last successful refresh timestamp to rate-limit proactive refreshes.
-// This prevents the double-refresh on startup (auth state changes twice) and
-// excessive token rotation from frequent visibility-change events.
 let _lastRefreshAt = 0;
 
 async function doRefresh(): Promise<boolean> {
+  // If another tab is refreshing, wait briefly for it to finish
+  if (_crossTabRefreshLocked) {
+    await new Promise((r) => setTimeout(r, 1500));
+    if (_crossTabRefreshLocked) return true; // still locked, assume other tab handled it
+    return true; // other tab finished
+  }
+  _refreshChannel?.postMessage('refresh-start');
   const hasCsrf = !!getCsrfToken();
   const hasSession = document.cookie.includes('rcc_session');
   const hasRefresh = document.cookie.includes('rcc_refresh');
@@ -67,9 +84,11 @@ async function doRefresh(): Promise<boolean> {
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     console.warn(`[auth] doRefresh FAILED: ${res.status}: ${body}`);
+    _refreshChannel?.postMessage('refresh-done');
   } else {
     _lastRefreshAt = Date.now();
     console.warn(`[auth] doRefresh OK — token refreshed`);
+    _refreshChannel?.postMessage('refresh-done');
   }
   return res.ok;
 }
@@ -105,12 +124,10 @@ export function startProactiveRefresh(): void {
   // Native app uses Bearer API key — no cookie session to refresh.
   if (_apiKey) return;
   stopProactiveRefresh();
-  // Refresh immediately, but only if we haven't refreshed recently.
-  // This prevents the double-refresh when auth state updates twice on startup
-  // (once from localStorage, again after /api/auth/user/me verification).
-  void refreshSessionIfStale().then((ok) => {
-    if (!ok) scheduleRetry();
-  });
+  // Don't refresh immediately on startup — /me endpoint validates the session.
+  // First proactive refresh happens after PROACTIVE_REFRESH_MS (15 min).
+  // Immediate refresh on startup caused race conditions with /me and other
+  // concurrent requests, especially in multi-tab scenarios.
   _refreshTimerId = setInterval(() => {
     void refreshSession().then((ok) => {
       if (!ok) scheduleRetry();
@@ -195,8 +212,19 @@ export async function apiFetch<T = unknown>(
         await new Promise((r) => setTimeout(r, 1000));
       }
     }
-    // Both attempts failed — session truly expired
-    console.warn(`[auth] LOGOUT: refresh failed twice for ${path}, triggering onAuthExpired`);
+    // Both refresh attempts failed — but verify session is truly expired before logout.
+    // Another tab may have refreshed successfully and our cookies are now valid.
+    try {
+      const verifyRes = await rawFetch('/api/auth/user/me');
+      if (verifyRes.ok) {
+        console.warn(`[auth] refresh failed but /me succeeded — session still valid, retrying original request`);
+        _lastRefreshAt = Date.now();
+        const retryRes = await rawFetch(path, opts);
+        if (!retryRes.ok) throw new ApiError(retryRes.status, await retryRes.text().catch(() => ''));
+        return retryRes.json() as Promise<T>;
+      }
+    } catch { /* /me also failed — truly expired */ }
+    console.warn(`[auth] LOGOUT: refresh failed twice + /me failed for ${path}, triggering onAuthExpired`);
     _onAuthExpired?.(`401 on ${path} — refresh failed twice`);
     throw new ApiError(401, 'session_expired');
   }

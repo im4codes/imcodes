@@ -329,9 +329,9 @@ authRoutes.post('/refresh', async (c) => {
     setCookie(c, 'rcc_refresh', newRefresh, {
       httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400,
     });
-    setCookie(c, 'rcc_csrf', randomHex(32), {
-      httpOnly: false, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 86400,
-    });
+    // Don't rotate CSRF token on refresh — only set on login.
+    // Rotating on every refresh causes race conditions in multi-tab scenarios:
+    // tab A refreshes → new CSRF cookie → tab B's next request has stale CSRF header → 403.
     return c.json({ ok: true });
   }
 
