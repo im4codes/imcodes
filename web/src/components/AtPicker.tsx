@@ -332,12 +332,13 @@ export function AtPicker({
 
   // ── Mode sub-picker ──
   if (modeAgent !== null) {
-    const agentItem = agents.find((a) => a.session === modeAgent);
+    const isAll = modeAgent === '__all__';
+    const agentItem = isAll ? null : agents.find((a) => a.session === modeAgent);
     return (
       <div ref={containerRef} style={containerStyle}>
         <div style={backBtnStyle} onClick={() => setModeAgent(null)}>← {t('p2p.picker.back')}</div>
         <div style={groupLabelStyle}>
-          {agentItem ? `${agentItem.shortName} — ` : ''}{t('p2p.picker.select_mode')}
+          {isAll ? `${t('p2p.picker.all_agents', 'All Agents')} — ` : agentItem ? `${agentItem.shortName} — ` : ''}{t('p2p.picker.select_mode')}
         </div>
         <div style={modeContainerStyle}>
           {MODES.map((mode, idx) => (
@@ -345,7 +346,14 @@ export function AtPicker({
               key={mode}
               type="button"
               style={idx === modeHighlight ? modeBtnHoverStyle : modeBtnStyle}
-              onClick={() => { onSelectAgent(modeAgent, mode); setModeAgent(null); }}
+              onClick={() => {
+                if (isAll) {
+                  onSelectAgent('__all__', mode);
+                } else {
+                  onSelectAgent(modeAgent, mode);
+                }
+                setModeAgent(null);
+              }}
               onMouseEnter={() => setModeHighlight(idx)}
             >
               {t(`p2p.mode.${mode}`, mode.charAt(0).toUpperCase() + mode.slice(1))}
@@ -417,6 +425,8 @@ export function AtPicker({
   }
 
   // ── Agents list ──
+  const nonSelfAgents = agents.filter(a => !a.isSelf);
+  const showAll = nonSelfAgents.length > 1;
   return (
     <div ref={containerRef} style={containerStyle}>
       <div style={backBtnStyle} onClick={() => { setCategory('choose'); setHighlightIdx(0); }}>← {t('p2p.picker.back')}</div>
@@ -424,15 +434,27 @@ export function AtPicker({
       {agents.length === 0 && (
         <div style={{ ...itemStyle, color: '#64748b', justifyContent: 'center' }}>{t('p2p.picker.no_agents_available')}</div>
       )}
+      {showAll && (
+        <div
+          data-hl={highlightIdx === 0 ? 'true' : undefined}
+          style={highlightIdx === 0 ? itemHighlightStyle : itemStyle}
+          onClick={() => { setModeAgent('__all__'); setModeHighlight(0); }}
+          onMouseEnter={() => setHighlightIdx(0)}
+        >
+          <span style={{ fontWeight: 500, color: '#22c55e' }}>⚡ {t('p2p.picker.all_agents', 'All Agents')}</span>
+          <span style={dimStyle}>{nonSelfAgents.length} {t('p2p.picker.sessions', 'sessions')}</span>
+        </div>
+      )}
       {agents.map((a, idx) => {
-        const hl = idx === highlightIdx;
+        const adjustedIdx = showAll ? idx + 1 : idx;
+        const hl = adjustedIdx === highlightIdx;
         return (
           <div
             key={a.session}
             data-hl={hl ? 'true' : undefined}
             style={hl ? itemHighlightStyle : itemStyle}
             onClick={() => { setModeAgent(a.session); setModeHighlight(0); }}
-            onMouseEnter={() => setHighlightIdx(idx)}
+            onMouseEnter={() => setHighlightIdx(adjustedIdx)}
           >
             <span style={{ fontWeight: 500 }}>{a.shortName}</span>
             <span style={dimStyle}>{a.agentType}</span>

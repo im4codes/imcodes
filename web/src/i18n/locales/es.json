@@ -206,6 +206,8 @@
       "search_project_files": "Buscar archivos del proyecto",
       "quick_discussion_with_agent": "Discusión rápida con un agente",
       "select_mode": "Seleccionar modo",
+      "all_agents": "Todos los Agentes",
+      "sessions": "sesiones",
       "type_to_search": "escribe para buscar",
       "keep_typing": "Sigue escribiendo...",
       "no_files_found": "No se encontraron archivos",

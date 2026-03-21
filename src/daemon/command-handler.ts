@@ -49,30 +49,41 @@ const MIME_MAP: Record<string, string> = {
 // ── @@ token parsing ─────────────────────────────────────────────────────────
 
 const DISCUSS_TOKEN_RE = /@@discuss\(([^,]+),\s*([^)]+)\)/g;
+const ALL_TOKEN_RE = /@@all\(([^)]+)\)/g;
 const FILE_TOKEN_RE = /@((?:[a-zA-Z0-9_.\-/]+\/)*[a-zA-Z0-9_.\-]+\.[a-zA-Z0-9]+)/g;
 
 interface ParsedTokens {
   agents: P2pTarget[];
   files: string[];
   cleanText: string;
+  /** True if @@all was used — caller must expand with active sessions. */
+  expandAll?: { mode: string };
 }
 
 function parseAtTokens(text: string): ParsedTokens {
   const agents: P2pTarget[] = [];
   const files: string[] = [];
+  let expandAll: { mode: string } | undefined;
+
+  // Check for @@all(mode) first
+  const allMatch = ALL_TOKEN_RE.exec(text);
+  if (allMatch) {
+    expandAll = { mode: allMatch[1].trim() };
+  }
+  ALL_TOKEN_RE.lastIndex = 0; // reset regex state
 
   for (const m of text.matchAll(DISCUSS_TOKEN_RE)) {
     agents.push({ session: m[1].trim(), mode: m[2].trim() });
   }
 
-  // Remove @@discuss tokens first so @file regex doesn't partially match them
-  let withoutCx = text.replace(DISCUSS_TOKEN_RE, '');
+  // Remove @@all and @@discuss tokens first so @file regex doesn't partially match them
+  let withoutCx = text.replace(ALL_TOKEN_RE, '').replace(DISCUSS_TOKEN_RE, '');
   for (const m of withoutCx.matchAll(FILE_TOKEN_RE)) {
     files.push(m[1]);
   }
 
   const cleanText = withoutCx.replace(FILE_TOKEN_RE, '').replace(/\s+/g, ' ').trim();
-  return { agents, files, cleanText };
+  return { agents, files, cleanText, expandAll };
 }
 
 // ── Binary frame packing ─────────────────────────────────────────────────────
@@ -475,6 +486,31 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
 
   // Check for P2P tokens
   const tokens = parseAtTokens(text);
+
+  // @@all(mode) — expand to all active sub-sessions in the same domain
+  if (tokens.expandAll && tokens.agents.length === 0) {
+    const mode = tokens.expandAll.mode;
+    const initiator = getSession(sessionName);
+    const allSessions = listSessions();
+    for (const s of allSessions) {
+      if (s.name === sessionName) continue; // skip initiator
+      if (s.state === 'stopped') continue; // skip stopped
+      // Same domain: sub-sessions whose parent matches, or siblings of the same project
+      const isSubOfInitiator = s.parentSession === sessionName;
+      const isSibling = s.parentSession && s.parentSession === initiator?.parentSession;
+      const isSameProject = !s.name.startsWith('deck_sub_') && initiator?.projectName && s.projectName === initiator.projectName;
+      if (isSubOfInitiator || isSibling || isSameProject) {
+        tokens.agents.push({ session: s.name, mode });
+      }
+    }
+    if (tokens.agents.length === 0) {
+      logger.warn({ sessionName }, '@@all: no active sessions found in same domain');
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: 'No active sessions found for @@all' });
+      try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: 'no_sessions' }); } catch {}
+      return;
+    }
+    logger.info({ sessionName, targets: tokens.agents.map(a => a.session) }, '@@all expanded');
+  }
 
   if (tokens.agents.length > 0) {
     // P2P Quick Discussion — delegate to orchestrator

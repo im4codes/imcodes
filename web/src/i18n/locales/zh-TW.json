@@ -206,6 +206,8 @@
       "search_project_files": "搜尋專案檔案",
       "quick_discussion_with_agent": "與代理快速討論",
       "select_mode": "選擇模式",
+      "all_agents": "全部 Agent",
+      "sessions": "個會話",
       "type_to_search": "輸入以搜尋",
       "keep_typing": "繼續輸入...",
       "no_files_found": "找不到檔案",

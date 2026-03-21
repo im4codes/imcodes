@@ -206,6 +206,8 @@
       "search_project_files": "Искать файлы проекта",
       "quick_discussion_with_agent": "Быстрое обсуждение с агентом",
       "select_mode": "Выбрать режим",
+      "all_agents": "Все агенты",
+      "sessions": "сессий",
       "type_to_search": "введите для поиска",
       "keep_typing": "Продолжайте ввод...",
       "no_files_found": "Файлы не найдены",

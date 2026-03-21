@@ -206,6 +206,8 @@
       "search_project_files": "プロジェクトファイルを検索",
       "quick_discussion_with_agent": "エージェントとクイックディスカッション",
       "select_mode": "モードを選択",
+      "all_agents": "全エージェント",
+      "sessions": "セッション",
       "type_to_search": "入力して検索",
       "keep_typing": "入力を続けてください...",
       "no_files_found": "ファイルが見つかりません",

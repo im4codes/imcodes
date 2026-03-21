@@ -198,7 +198,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const activeSub = (subSessions ?? []).find((s) => s.sessionName === activeSession?.name);
   const rootSession = activeSub?.parentSession || activeSession?.name || '';
 
-  const buildAgentToken = (session: string, mode: string) => `@@discuss(${session}, ${mode})`;
+  const buildAgentToken = (session: string, mode: string) =>
+    session === '__all__' ? `@@all(${mode})` : `@@discuss(${session}, ${mode})`;
 
   const handleSend = useCallback(() => {
     const text = getText();
