@@ -76,8 +76,8 @@ export function listP2pRuns(): P2pRun[] { return [...activeRuns.values()]; }
 import { homedir } from 'node:os';
 const P2P_DIR = join(homedir(), '.imcodes', 'discussions');
 let IDLE_POLL_MS = 3_000;
-let GRACE_PERIOD_DEFAULT_MS = 60_000;
-let MIN_PROCESSING_MS = 15_000; // Don't trust idle detection until 15s after dispatch
+let GRACE_PERIOD_DEFAULT_MS = 180_000; // 3 min — complex analysis (subagent research + write) takes time
+let MIN_PROCESSING_MS = 30_000; // Don't trust idle detection until 30s after dispatch
 let FILE_SETTLE_CYCLES = 3; // File must stop growing for 3 poll cycles (9s) to be "settled"
 
 /** Override poll interval for tests. */
@@ -581,18 +581,20 @@ function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: HopOpts): 
     parts.push(mode.prompt);
   }
 
-  // Prompt: direct and assertive. File path mentioned exactly ONCE to prevent
+  // Prompt: assertive and unambiguous. File path mentioned exactly ONCE to prevent
   // Claude Code from parsing two paths and executing the task twice.
+  // Stronger phrasing needed for Gemini/Codex to execute reliably.
   parts.push(``);
-  parts.push(`P2P collaborative discussion task (run ${run.id}).`);
+  parts.push(`[P2P Discussion Task — run ${run.id}]`);
   parts.push(``);
-  parts.push(`Do exactly these 3 steps on the file ${filePath}:`);
-  parts.push(`1. Read it`);
+  parts.push(`Execute these steps NOW on ${filePath}:`);
+  parts.push(`1. Read the file`);
   parts.push(`2. ${opts.instruction}`);
-  parts.push(`3. Append your output under the heading "## ${opts.sectionHeader}"`);
+  parts.push(`3. Append your output under "## ${opts.sectionHeader}"`);
   parts.push(``);
-  parts.push(`Important: write output to the file, NOT to chat. Do not ask questions. Just do it.`);
-  parts.push(`When done, say only "Done".`);
+  parts.push(`Rules: ALL output goes to the file. Do NOT print analysis to chat.`);
+  parts.push(`Do NOT ask for confirmation. Do NOT explain your plan. Execute immediately.`);
+  parts.push(`After writing to the file, respond with only: Done`);
 
   return parts.join('\n');
 }

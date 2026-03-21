@@ -153,8 +153,8 @@ afterEach(async () => {
   vi.restoreAllMocks();
   vi.useRealTimers();
   _setIdlePollMs(3_000); // restore default
-  _setGracePeriodMs(60_000); // restore default
-  _setMinProcessingMs(15_000); // restore default
+  _setGracePeriodMs(180_000); // restore default
+  _setMinProcessingMs(30_000); // restore default
   _setFileSettleCycles(3); // restore default
   // Clean up temp files
   const { rm } = await import('node:fs/promises');
