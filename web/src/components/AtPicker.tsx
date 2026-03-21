@@ -292,7 +292,9 @@ export function AtPicker({
       }
 
       // Files or Agents list
-      const count = category === 'files' ? fileResults.length : agents.length;
+      const nonSelfCount = agents.filter(a => !a.isSelf).length;
+      const hasAllRow = category === 'agents' && nonSelfCount > 1;
+      const count = category === 'files' ? fileResults.length : agents.length + (hasAllRow ? 1 : 0);
       if (e.key === 'Escape') {
         e.preventDefault();
         setCategory('choose');
@@ -306,8 +308,11 @@ export function AtPicker({
         if (category === 'files') {
           const f = fileResults[highlightIdx];
           if (f) onSelectFile(f.path);
+        } else if (hasAllRow && highlightIdx === 0) {
+          setModeAgent('__all__'); setModeHighlight(0);
         } else {
-          const a = agents[highlightIdx];
+          const agentIdx = hasAllRow ? highlightIdx - 1 : highlightIdx;
+          const a = agents[agentIdx];
           if (a) { setModeAgent(a.session); setModeHighlight(0); }
         }
       }
