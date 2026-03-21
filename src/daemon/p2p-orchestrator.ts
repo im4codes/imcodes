@@ -45,6 +45,8 @@ export interface P2pRun {
   currentTargetSession: string | null;
   finalReturnSession: string;
   remainingTargets: P2pTarget[];
+  /** Total number of hop targets (excluding initiator phases). Fixed at creation time. */
+  totalTargets: number;
   mode: string;
   status: P2pRunStatus;
   contextFilePath: string;
@@ -172,6 +174,7 @@ export async function startP2pRun(
     currentTargetSession: null,
     finalReturnSession: initiatorSession,
     remainingTargets: targets,
+    totalTargets: targets.length,
     mode,
     status: 'queued',
     contextFilePath,
@@ -643,6 +646,10 @@ function pushState(run: P2pRun, serverLink: ServerLink | null): void {
         created_at: run.createdAt,
         updated_at: run.updatedAt,
         completed_at: run.completedAt,
+        // UI-ready progress fields (avoids client-side JSON parsing)
+        total_count: run.totalTargets + 2, // +2 for Phase 1 (initial) + Phase 3 (summary)
+        remaining_count: run.remainingTargets.length,
+        skipped_hops: run.skippedHops,
       },
     });
   } catch { /* not connected */ }

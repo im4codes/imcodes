@@ -722,6 +722,43 @@ export function App() {
           return [...msg.discussions, ...dbHistory];
         });
       }
+      // ── P2P Quick Discussion progress → map to discussions state ──────────
+      if (msg.type === 'p2p.run_update' && msg.run) {
+        const r = msg.run as Record<string, any>;
+        const id = `p2p_${r.id}`;
+        const totalCount = r.total_count ?? 3;
+        const remainingCount = r.remaining_count ?? 0;
+        const status = String(r.status ?? '');
+        const currentTarget = r.current_target_session ? String(r.current_target_session).split('_').pop() : undefined;
+        const mode = r.mode_key ?? 'discuss';
+
+        // Map P2P status to discussion state
+        const state = (status === 'completed') ? 'done'
+          : (status === 'failed' || status === 'timed_out' || status === 'cancelled') ? 'failed'
+          : (status === 'running' || status === 'awaiting_next_hop') ? 'running'
+          : 'setup';
+
+        // Current round = total - remaining (Phase 1 counts as round 1)
+        const currentRound = Math.max(1, totalCount - remainingCount - (status === 'completed' ? 0 : 1));
+
+        setDiscussions((prev) => {
+          const existing = prev.find((d) => d.id === id);
+          const entry = {
+            id,
+            topic: `P2P ${mode}`,
+            state,
+            currentRound,
+            maxRounds: totalCount,
+            currentSpeaker: currentTarget,
+            conclusion: state === 'done' ? (r.result_summary ?? undefined) : undefined,
+            filePath: undefined,
+          };
+          if (existing) {
+            return prev.map((d) => d.id === id ? { ...d, ...entry } : d);
+          }
+          return [...prev, entry];
+        });
+      }
       if (msg.type === 'daemon.reconnected') {
         // Daemon process (re)started — all its subscriptions are gone.
         // Re-subscribe all sessions immediately so terminals resume without a page refresh.
