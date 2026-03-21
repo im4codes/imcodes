@@ -631,6 +631,14 @@ export async function getActiveOrchestrationRuns(db: PgDatabase, serverId: strin
   return rows.results ?? [];
 }
 
+export async function getRecentOrchestrationRuns(db: PgDatabase, serverId: string, limit = 50): Promise<DbOrchestrationRun[]> {
+  const rows = await db
+    .prepare('SELECT * FROM discussion_orchestration_runs WHERE server_id = ? ORDER BY updated_at DESC LIMIT ?')
+    .bind(serverId, limit)
+    .all<DbOrchestrationRun>();
+  return rows.results ?? [];
+}
+
 // ── Audit log ─────────────────────────────────────────────────────────────
 
 export async function writeAuditLog(

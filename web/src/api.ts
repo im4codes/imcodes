@@ -299,6 +299,29 @@ export async function deleteSubSession(serverId: string, subId: string): Promise
   await apiFetch(`/api/server/${serverId}/sub-sessions/${subId}`, { method: 'DELETE' });
 }
 
+export interface P2pRunData {
+  id: string;
+  status: string;
+  mode_key: string;
+  initiator_session: string;
+  current_target_session: string | null;
+  remaining_targets: string;
+  total_count?: number;
+  remaining_count?: number;
+  current_target_label?: string | null;
+  initiator_label?: string | null;
+  result_summary: string | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
+export async function listP2pRuns(serverId: string): Promise<P2pRunData[]> {
+  const res = await apiFetch<{ runs: P2pRunData[] }>(`/api/server/${serverId}/p2p/runs`);
+  return res.runs ?? [];
+}
+
 // ── User preferences ───────────────────────────────────────────────────────
 
 export async function getUserPref(key: string): Promise<unknown | null> {

@@ -23,7 +23,7 @@ import { getActiveThinkingTs } from './thinking-utils.js';
 import { WsClient } from './ws-client.js';
 import { resolveContextWindow } from './model-context.js';
 import { shortModelLabel } from './model-label.js';
-import { configure as configureApi, apiFetch, onAuthExpired, getUserPref, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey } from './api.js';
+import { configure as configureApi, apiFetch, onAuthExpired, getUserPref, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, listP2pRuns } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { getAuthKey, clearAuthKey } from './biometric-auth.js';
 import { initPushNotifications } from './push-notifications.js';
@@ -1032,6 +1032,40 @@ export function App() {
         const history = dbDiscussions.filter((d) => !liveIds.has(d.id));
         return [...live, ...history];
       });
+    } catch { /* ignore */ }
+    // Load P2P orchestration run history from DB (hydrate on cold start)
+    try {
+      const runs = await listP2pRuns(serverId);
+      if (runs.length > 0) {
+        setDiscussions((prev) => {
+          const existingIds = new Set(prev.map((d) => d.id));
+          const mapped = runs
+            .filter((r) => !existingIds.has(`p2p_${r.id}`))
+            .map((r) => {
+              const status = String(r.status ?? '');
+              const state = (status === 'completed') ? 'done'
+                : (status === 'failed' || status === 'timed_out' || status === 'cancelled') ? 'failed'
+                : (status === 'running' || status === 'awaiting_next_hop') ? 'running'
+                : 'setup';
+              const totalCount = r.total_count ?? 3;
+              const remainingCount = r.remaining_count ?? 0;
+              const currentTarget = r.current_target_label ?? (r.current_target_session ? String(r.current_target_session).split('_').pop() : undefined);
+              const initiatorLabel = r.initiator_label ?? 'brain';
+              const mode = r.mode_key ?? 'discuss';
+              return {
+                id: `p2p_${r.id}`,
+                topic: `P2P ${mode} · ${initiatorLabel}`,
+                state,
+                currentRound: Math.max(1, totalCount - remainingCount - (status === 'completed' ? 0 : 1)),
+                maxRounds: totalCount,
+                currentSpeaker: currentTarget,
+                conclusion: state === 'done' ? (r.result_summary ?? undefined) : undefined,
+                filePath: undefined,
+              };
+            });
+          return [...prev, ...mapped];
+        });
+      }
     } catch { /* ignore */ }
   }, [setActiveSession]);
 

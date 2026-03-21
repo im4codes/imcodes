@@ -6,6 +6,7 @@ import {
   getDiscussionRounds,
   getOrchestrationRunsByDiscussion,
   getOrchestrationRunById,
+  getRecentOrchestrationRuns,
 } from '../db/queries.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
 
@@ -50,6 +51,17 @@ discussionRoutes.get('/:id/discussions/:discussionId/runs', async (c) => {
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
 
   const runs = await getOrchestrationRunsByDiscussion(c.env.DB, discussionId);
+  return c.json({ runs });
+});
+
+/** GET /api/server/:id/p2p/runs — list recent P2P orchestration runs */
+discussionRoutes.get('/:id/p2p/runs', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+
+  const runs = await getRecentOrchestrationRuns(c.env.DB, serverId, 50);
   return c.json({ runs });
 });
 
