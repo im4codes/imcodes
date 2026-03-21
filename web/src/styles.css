@@ -401,6 +401,8 @@ body {
 .chat-tool-group { display: flex; flex-direction: column; gap: 2px; }
 .chat-tool-group .chat-event { margin: 0; }
 .chat-tool-group-indent { margin-left: 6px; display: flex; flex-direction: column; gap: 2px; }
+.chat-tool-block-fold.collapsed { position: relative; }
+.chat-tool-block-fold.collapsed::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 20px; background: linear-gradient(transparent, #0a0e1a); pointer-events: none; }
 .chat-tool-fold-btn { background: none; border: 1px dashed #334155; color: #64748b; font-size: 11px; padding: 2px 10px; cursor: pointer; border-radius: 4px; text-align: center; }
 .chat-tool-fold-btn:hover { color: #94a3b8; border-color: #475569; }
 .chat-tool-fold-inline { background: none; border: none; color: #64748b; font-size: 11px; cursor: pointer; padding: 0 2px; }

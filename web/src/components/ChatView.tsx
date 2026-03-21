@@ -570,6 +570,37 @@ export function ChatView({ events, loading, refreshing, sessionState, sessionId,
   );
 }
 
+/** Unified tool block fold — collapses any tool content exceeding ~3 lines (54px). */
+function ToolBlockFold({ children }: { children: preact.ComponentChildren }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [overflows, setOverflows] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const { t } = useTranslation();
+
+  useEffect(() => {
+    if (!ref.current) return;
+    setOverflows(ref.current.scrollHeight > 60);
+  }, [children]);
+
+  return (
+    <div class={`chat-tool-block-fold${!expanded && overflows ? ' collapsed' : ''}`}>
+      <div ref={ref} class="chat-tool-block-fold-content" style={!expanded && overflows ? { maxHeight: 54, overflow: 'hidden' } : undefined}>
+        {children}
+      </div>
+      {overflows && !expanded && (
+        <button class="chat-tool-fold-btn" onClick={() => setExpanded(true)}>
+          {'··· more'}
+        </button>
+      )}
+      {overflows && expanded && (
+        <button class="chat-tool-fold-btn" onClick={() => setExpanded(false)}>
+          {t('chat.tool_fold_collapse')}
+        </button>
+      )}
+    </div>
+  );
+}
+
 /** Collapsible group of consecutive tool events. Shows first and last, folds middle. */
 function ToolCallGroup({ events, onPathClick }: { events: TimelineEvent[]; onPathClick?: (p: string) => void }) {
   const { t } = useTranslation();
@@ -602,27 +633,7 @@ function ToolCallGroup({ events, onPathClick }: { events: TimelineEvent[]; onPat
   );
 }
 
-function ToolInputFold({ lines, onPathClick }: { lines: string[]; onPathClick?: (p: string) => void }) {
-  const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(false);
-  if (expanded) {
-    return (
-      <span class="chat-tool-input">
-        {' '}{splitPathsAndUrls(lines.join('\n'), onPathClick)}
-        <button class="chat-tool-fold-inline" onClick={() => setExpanded(false)}>{' '}{t('chat.tool_fold_collapse')}</button>
-      </span>
-    );
-  }
-  const first = lines[0];
-  const last = lines[lines.length - 1];
-  return (
-    <span class="chat-tool-input">
-      {' '}{splitPathsAndUrls(first, onPathClick)}
-      <button class="chat-tool-fold-inline" onClick={() => setExpanded(true)}>{` ${t('chat.tool_fold_more', { count: lines.length - 2 })} `}</button>
-      {splitPathsAndUrls(last, onPathClick)}
-    </span>
-  );
-}
+// ToolInputFold removed — replaced by unified ToolBlockFold (CSS max-height based)
 
 function AttachmentDownloadButton({ att, serverId }: { att: { id: string; originalName?: string; size?: number }; serverId: string }) {
   const { t } = useTranslation();
@@ -671,18 +682,14 @@ function ChatEvent({ event, nextTs, onPathClick, serverId }: { event: TimelineEv
 
     case 'tool.call': {
       const toolInput = event.payload.input ? String(event.payload.input) : '';
-      const inputLines = toolInput.split('\n');
-      const needsFold = inputLines.length > 3;
       return (
-        <div class="chat-event chat-tool">
-          <span class="chat-tool-icon">{'>'}</span>
-          <span class="chat-tool-name">{String(event.payload.tool ?? 'tool')}</span>
-          {toolInput && (
-            needsFold
-              ? <ToolInputFold lines={inputLines} onPathClick={onPathClick} />
-              : <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInput, onPathClick)}</span>
-          )}
-        </div>
+        <ToolBlockFold>
+          <div class="chat-event chat-tool">
+            <span class="chat-tool-icon">{'>'}</span>
+            <span class="chat-tool-name">{String(event.payload.tool ?? 'tool')}</span>
+            {toolInput && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInput, onPathClick)}</span>}
+          </div>
+        </ToolBlockFold>
       );
     }
 
