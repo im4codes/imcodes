@@ -813,7 +813,7 @@ function ChatTime({ ts }: { ts: number }) {
 const URL_REGEX = /https?:\/\/[^\s<>"\])}]+/g;
 
 // Matches absolute paths (/foo/bar) and relative paths (docs/file.md, src/components/Foo.tsx).
-const PATH_REGEX = /(\/[\w.\-~][\w.\-~/]*|(?<![:/\w])[a-zA-Z_~][\w.\-~]*(?:\/[\w.\-~]+)+)/g;
+const PATH_REGEX = /(\.{1,2}\/[\w.\-~/]+|\/[\w.\-~][\w.\-~/]*|(?<![:/\w])[a-zA-Z_~][\w.\-~]*(?:\/[\w.\-~]+)+)/g;
 
 /** Split a plain-text segment into URL tokens, path tokens, and plain text. */
 function splitPathsAndUrls(

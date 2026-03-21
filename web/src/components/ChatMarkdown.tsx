@@ -214,7 +214,7 @@ function renderToken(
 // ── URL/Path detection (inline within text tokens) ──────────────────────────
 
 const URL_REGEX_INLINE = /https?:\/\/[^\s<>"\])}]+/g;
-const PATH_REGEX_INLINE = /(\/[\w.\-~][\w.\-~/]*|(?<![:/\w])[a-zA-Z_~][\w.\-~]*(?:\/[\w.\-~]+)+)/g;
+const PATH_REGEX_INLINE = /(\.{1,2}\/[\w.\-~/]+|\/[\w.\-~][\w.\-~/]*|(?<![:/\w])[a-zA-Z_~][\w.\-~]*(?:\/[\w.\-~]+)+)/g;
 
 function splitPathsAndUrlsInternal(
   text: string,
