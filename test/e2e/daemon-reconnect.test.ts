@@ -139,10 +139,13 @@ describe.skipIf(SKIP)('Daemon reconnect resilience (e2e)', () => {
     const name = sessionName('w1');
     createdSessions.push(name);
 
-    // Create a session that exits immediately (pane dies, session may linger with remain-on-exit)
-    await newSession(name, 'bash -c "exit 0"', { cwd: tmpdir() });
+    // Create a session, persist it, then kill it so the store has a record
+    // but the tmux session is gone — simulating a crash while daemon was down.
+    await newSession(name, 'bash', { cwd: tmpdir() });
     upsertSession(makeRecord('w1', { agentType: 'shell' }));
-    await wait(500);
+    await wait(300);
+    await killSession(name);
+    await wait(200);
 
     // restoreFromStore handles missing/dead sessions without crashing
     // The key assertion: this does NOT throw
