@@ -106,7 +106,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [modelOpen, setModelOpen] = useState(false);
   const [quickOpen, setQuickOpen] = useState(false);
   const [p2pMode, setP2pMode] = useState<P2pMode>('solo');
-  const [p2pExcludeSameType, setP2pExcludeSameType] = useState(false);
+  const [p2pExcludeSameType, setP2pExcludeSameType] = useState(true);
   const [p2pOpen, setP2pOpen] = useState(false);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
