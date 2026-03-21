@@ -31,7 +31,11 @@
     "tool_group_collapse": "▲ 收起",
     "new_folder": "新建文件夹",
     "new_folder_name": "文件夹名称",
-    "create": "创建"
+    "create": "创建",
+    "external_link_title": "打开外部链接",
+    "external_link_warning": "此链接由 AI 代理生成。访问外部网站的风险由您自行承担。",
+    "external_link_cancel": "取消",
+    "external_link_open": "打开链接"
   },
   "session": {
     "restart": "↺ 重启",

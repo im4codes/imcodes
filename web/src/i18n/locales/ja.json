@@ -31,7 +31,11 @@
     "tool_group_collapse": "▲ 折りたたむ",
     "new_folder": "新しいフォルダ",
     "new_folder_name": "フォルダ名",
-    "create": "作成"
+    "create": "作成",
+    "external_link_title": "外部リンクを開く",
+    "external_link_warning": "このリンクはAIエージェントによって生成されました。外部サイトへのアクセスに伴うリスクはご自身の責任となります。",
+    "external_link_cancel": "キャンセル",
+    "external_link_open": "リンクを開く"
   },
   "session": {
     "restart": "↺ 再起動",

@@ -211,6 +211,7 @@ export function ChatView({ events, loading, refreshing, sessionState, sessionId,
   const [fileBrowserPath, setFileBrowserPath] = useState<string | null>(null);
   const [selMenu, setSelMenu] = useState<SelectionMenu | null>(null);
   const [copied, setCopied] = useState(false);
+  const [pendingUrl, setPendingUrl] = useState<string | null>(null);
 
   const autoScrollRef = useRef(true);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
@@ -445,9 +446,10 @@ export function ChatView({ events, loading, refreshing, sessionState, sessionId,
             const nextItem = viewItems[idx + 1];
             const nextTs = nextItem?.ts ?? nextItem?.event?.ts;
             const onPathClick = ws && !preview ? (p: string) => setFileBrowserPath(p) : undefined;
+            const onUrlClick = !preview ? (url: string) => setPendingUrl(url) : undefined;
             return item.type === 'assistant-block' ? (
               <div key={item.key} class="chat-event chat-assistant">
-                <RichText text={item.text!} onPathClick={onPathClick} />
+                <RichText text={item.text!} onPathClick={onPathClick} onUrlClick={onUrlClick} />
                 <ChatTime ts={item.lastTs ?? item.ts ?? 0} />
               </div>
             ) : item.type === 'tool-group' ? (
@@ -521,6 +523,23 @@ export function ChatView({ events, loading, refreshing, sessionState, sessionId,
           </div>
         </>
       )}
+      {/* External link confirm dialog */}
+      {pendingUrl && (
+        <div class="dialog-overlay" onClick={() => setPendingUrl(null)}>
+          <div class="dialog-box" onClick={(e: Event) => e.stopPropagation()}>
+            <div class="dialog-title">{t('chat.external_link_title')}</div>
+            <p style={{ fontSize: 13, color: '#94a3b8', margin: '8px 0', wordBreak: 'break-all' }}>{pendingUrl}</p>
+            <p style={{ fontSize: 12, color: '#f59e0b', margin: '8px 0' }}>{t('chat.external_link_warning')}</p>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 12 }}>
+              <button class="dialog-btn" onClick={() => setPendingUrl(null)}>{t('chat.external_link_cancel')}</button>
+              <button class="dialog-btn dialog-btn-primary" onClick={() => {
+                window.open(pendingUrl, '_blank', 'noopener,noreferrer');
+                setPendingUrl(null);
+              }}>{t('chat.external_link_open')}</button>
+            </div>
+          </div>
+        </div>
+      )}
       {fileBrowserPath && ws && (
         <FileBrowser
           ws={ws}
@@ -588,7 +607,7 @@ function ToolInputFold({ lines, onPathClick }: { lines: string[]; onPathClick?: 
   if (expanded) {
     return (
       <span class="chat-tool-input">
-        {' '}{splitPaths(lines.join('\n'), onPathClick)}
+        {' '}{splitPathsAndUrls(lines.join('\n'), onPathClick)}
         <button class="chat-tool-fold-inline" onClick={() => setExpanded(false)}>{' '}{t('chat.tool_fold_collapse')}</button>
       </span>
     );
@@ -597,9 +616,9 @@ function ToolInputFold({ lines, onPathClick }: { lines: string[]; onPathClick?: 
   const last = lines[lines.length - 1];
   return (
     <span class="chat-tool-input">
-      {' '}{splitPaths(first, onPathClick)}
+      {' '}{splitPathsAndUrls(first, onPathClick)}
       <button class="chat-tool-fold-inline" onClick={() => setExpanded(true)}>{` ${t('chat.tool_fold_more', { count: lines.length - 2 })} `}</button>
-      {splitPaths(last, onPathClick)}
+      {splitPathsAndUrls(last, onPathClick)}
     </span>
   );
 }
@@ -640,7 +659,7 @@ function ChatEvent({ event, nextTs, onPathClick, serverId }: { event: TimelineEv
       const attachments = event.payload.attachments as Array<{ id: string; originalName?: string; mime?: string; size?: number }> | undefined;
       return (
         <div class={`chat-event chat-user${event.payload.pending ? ' chat-pending' : ''}`}>
-          <div class="chat-bubble-content">{splitPaths(userText, onPathClick)}</div>
+          <div class="chat-bubble-content">{splitPathsAndUrls(userText, onPathClick)}</div>
           {attachments && serverId && attachments.map((att) => (
             <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} />
           ))}
@@ -660,7 +679,7 @@ function ChatEvent({ event, nextTs, onPathClick, serverId }: { event: TimelineEv
           {toolInput && (
             needsFold
               ? <ToolInputFold lines={inputLines} onPathClick={onPathClick} />
-              : <span class="chat-tool-input">{' '}{splitPaths(toolInput, onPathClick)}</span>
+              : <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInput, onPathClick)}</span>
           )}
         </div>
       );
@@ -806,9 +825,33 @@ function parseInline(text: string): TextSegment[] {
 
 interface CodeBlock { type: 'code-block'; lang: string; code: string }
 interface TextBlock { type: 'text-block'; text: string }
-type Block = CodeBlock | TextBlock;
+interface TableBlock { type: 'table-block'; headers: string[]; rows: string[][] }
+type Block = CodeBlock | TextBlock | TableBlock;
 
-/** Split text into code blocks and text blocks. */
+/** Detect GFM table: consecutive lines starting with |, second line is separator (|---|---|). */
+function tryParseTable(lines: string[]): { table: TableBlock; consumed: number } | null {
+  if (lines.length < 2) return null;
+  // Header row must have |
+  if (!lines[0].includes('|')) return null;
+  // Separator row: all cells match /^[-: ]+$/
+  const sepLine = lines[1].trim().replace(/^\||\|$/g, '');
+  if (!/^[\s|:-]+$/.test(sepLine) || !sepLine.includes('-')) return null;
+
+  const parseCells = (line: string): string[] =>
+    line.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
+
+  const headers = parseCells(lines[0]);
+  const rows: string[][] = [];
+  let i = 2;
+  while (i < lines.length && lines[i].includes('|')) {
+    rows.push(parseCells(lines[i]));
+    i++;
+  }
+  if (headers.length === 0) return null;
+  return { table: { type: 'table-block', headers, rows }, consumed: i };
+}
+
+/** Split text into code blocks, table blocks, and text blocks. */
 function parseBlocks(text: string): Block[] {
   const blocks: Block[] = [];
   const regex = /```(\w*)\n([\s\S]*?)```/g;
@@ -820,43 +863,113 @@ function parseBlocks(text: string): Block[] {
     last = match.index + match[0].length;
   }
   if (last < text.length) blocks.push({ type: 'text-block', text: text.slice(last) });
-  return blocks;
+
+  // Second pass: split text blocks that contain GFM tables
+  const result: Block[] = [];
+  for (const block of blocks) {
+    if (block.type !== 'text-block') { result.push(block); continue; }
+    const lines = block.text.split('\n');
+    let textBuf: string[] = [];
+    let i = 0;
+    while (i < lines.length) {
+      const tableResult = tryParseTable(lines.slice(i));
+      if (tableResult) {
+        if (textBuf.length > 0) { result.push({ type: 'text-block', text: textBuf.join('\n') }); textBuf = []; }
+        result.push(tableResult.table);
+        i += tableResult.consumed;
+      } else {
+        textBuf.push(lines[i]);
+        i++;
+      }
+    }
+    if (textBuf.length > 0) result.push({ type: 'text-block', text: textBuf.join('\n') });
+  }
+  return result;
 }
 
+// ── URL detection (must run BEFORE path detection) ────────────────────────
+const URL_REGEX = /https?:\/\/[^\s<>"\])}]+/g;
+
 // Matches absolute paths (/foo/bar) and relative paths (docs/file.md, src/components/Foo.tsx).
-// Relative paths must start with a letter/underscore/tilde and contain at least one slash segment.
-// Negative lookbehind avoids matching inside URLs (http://...) or after other path chars.
 const PATH_REGEX = /(\/[\w.\-~][\w.\-~/]*|(?<![:/\w])[a-zA-Z_~][\w.\-~]*(?:\/[\w.\-~]+)+)/g;
 
-/** Split a plain-text segment into runs of path and non-path text. */
-function splitPaths(text: string, onPathClick?: (p: string) => void): h.JSX.Element[] {
-  if (!onPathClick) return [<span>{text}</span>];
+/** Split a plain-text segment into URL tokens, path tokens, and plain text. */
+function splitPathsAndUrls(
+  text: string,
+  onPathClick?: (p: string) => void,
+  onUrlClick?: (url: string) => void,
+): h.JSX.Element[] {
+  if (!onPathClick && !onUrlClick) return [<span>{text}</span>];
+
+  // Step 1: Split by URLs first (URLs take priority over path detection)
   const parts: preact.JSX.Element[] = [];
   let last = 0;
   let m: RegExpExecArray | null;
-  PATH_REGEX.lastIndex = 0;
-  while ((m = PATH_REGEX.exec(text)) !== null) {
-    const path = m[1];
-    if (path.length < 3) continue; // skip lone /
-    if (m.index > last) parts.push(<span key={`t${last}`}>{text.slice(last, m.index)}</span>);
-    parts.push(
-      <span
-        key={`p${m.index}`}
-        class="chat-path-link"
-        onClick={() => onPathClick(path)}
-        title={path}
-      >
-        {path}
-      </span>,
-    );
-    last = m.index + m[0].length;
+  URL_REGEX.lastIndex = 0;
+
+  interface TextChunk { type: 'text' | 'url'; value: string; start: number }
+  const chunks: TextChunk[] = [];
+
+  while ((m = URL_REGEX.exec(text)) !== null) {
+    if (m.index > last) chunks.push({ type: 'text', value: text.slice(last, m.index), start: last });
+    // Strip trailing punctuation that likely isn't part of the URL
+    let url = m[0];
+    while (url.length > 1 && /[.,;:!?)}\]>]$/.test(url)) url = url.slice(0, -1);
+    chunks.push({ type: 'url', value: url, start: m.index });
+    last = m.index + url.length;
+    URL_REGEX.lastIndex = last; // adjust for stripped chars
   }
-  if (last < text.length) parts.push(<span key={`t${last}`}>{text.slice(last)}</span>);
+  if (last < text.length) chunks.push({ type: 'text', value: text.slice(last), start: last });
+
+  // Step 2: For text chunks, apply path detection. URL chunks render as links.
+  for (const chunk of chunks) {
+    if (chunk.type === 'url') {
+      parts.push(
+        <a
+          key={`u${chunk.start}`}
+          class="chat-external-link"
+          href={chunk.value}
+          title={chunk.value}
+          onClick={(e: Event) => {
+            e.preventDefault();
+            onUrlClick?.(chunk.value);
+          }}
+        >
+          {chunk.value}
+        </a>,
+      );
+    } else if (onPathClick) {
+      // Apply path detection only on non-URL text
+      let pathLast = 0;
+      PATH_REGEX.lastIndex = 0;
+      let pm: RegExpExecArray | null;
+      while ((pm = PATH_REGEX.exec(chunk.value)) !== null) {
+        const path = pm[1];
+        if (path.length < 3) continue;
+        if (pm.index > pathLast) parts.push(<span key={`t${chunk.start + pathLast}`}>{chunk.value.slice(pathLast, pm.index)}</span>);
+        parts.push(
+          <span
+            key={`p${chunk.start + pm.index}`}
+            class="chat-path-link"
+            onClick={() => onPathClick(path)}
+            title={path}
+          >
+            {path}
+          </span>,
+        );
+        pathLast = pm.index + pm[0].length;
+      }
+      if (pathLast < chunk.value.length) parts.push(<span key={`t${chunk.start + pathLast}`}>{chunk.value.slice(pathLast)}</span>);
+    } else {
+      parts.push(<span key={`t${chunk.start}`}>{chunk.value}</span>);
+    }
+  }
+
   return parts.length ? parts : [<span>{text}</span>];
 }
 
 /** Render inline segments as JSX. */
-function InlineText({ text, onPathClick }: { text: string; onPathClick?: (p: string) => void }) {
+function InlineText({ text, onPathClick, onUrlClick }: { text: string; onPathClick?: (p: string) => void; onUrlClick?: (url: string) => void }) {
   const lines = text.split('\n');
   return (
     <span>
@@ -867,10 +980,10 @@ function InlineText({ text, onPathClick }: { text: string; onPathClick?: (p: str
             {li > 0 && <br />}
             {segments.map((seg, si) => {
               switch (seg.type) {
-                case 'code': return <code key={si} class="chat-inline-code">{splitPaths(seg.content, onPathClick)}</code>;
+                case 'code': return <code key={si} class="chat-inline-code">{splitPathsAndUrls(seg.content, onPathClick, onUrlClick)}</code>;
                 case 'bold': return <strong key={si}>{seg.content}</strong>;
                 case 'italic': return <em key={si}>{seg.content}</em>;
-                default: return <span key={si}>{splitPaths(seg.content, onPathClick)}</span>;
+                default: return <span key={si}>{splitPathsAndUrls(seg.content, onPathClick, onUrlClick)}</span>;
               }
             })}
           </span>
@@ -880,21 +993,36 @@ function InlineText({ text, onPathClick }: { text: string; onPathClick?: (p: str
   );
 }
 
-/** Render markdown text with code blocks and inline formatting. */
-function RichText({ text, onPathClick }: { text: string; onPathClick?: (p: string) => void }) {
+/** Render markdown text with code blocks, tables, and inline formatting. */
+function RichText({ text, onPathClick, onUrlClick }: { text: string; onPathClick?: (p: string) => void; onUrlClick?: (url: string) => void }) {
   const blocks = parseBlocks(text);
   return (
     <div class="chat-rich-text">
-      {blocks.map((block, i) =>
-        block.type === 'code-block' ? (
-          <div key={i} class="chat-code-block">
-            {block.lang && <div class="chat-code-lang">{block.lang}</div>}
-            <pre><code>{block.code}</code></pre>
-          </div>
-        ) : (
-          <InlineText key={i} text={block.text} onPathClick={onPathClick} />
-        ),
-      )}
+      {blocks.map((block, i) => {
+        if (block.type === 'code-block') {
+          return (
+            <div key={i} class="chat-code-block">
+              {block.lang && <div class="chat-code-lang">{block.lang}</div>}
+              <pre><code>{block.code}</code></pre>
+            </div>
+          );
+        }
+        if (block.type === 'table-block') {
+          return (
+            <table key={i} class="chat-table">
+              <thead>
+                <tr>{block.headers.map((h, hi) => <th key={hi}>{h}</th>)}</tr>
+              </thead>
+              <tbody>
+                {block.rows.map((row, ri) => (
+                  <tr key={ri}>{row.map((cell, ci) => <td key={ci}>{cell}</td>)}</tr>
+                ))}
+              </tbody>
+            </table>
+          );
+        }
+        return <InlineText key={i} text={block.text} onPathClick={onPathClick} onUrlClick={onUrlClick} />;
+      })}
     </div>
   );
 }

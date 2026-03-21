@@ -823,6 +823,13 @@ body {
 /* inline path links in chat */
 .chat-path-link { color: #818cf8; cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
 .chat-path-link:hover { color: #a5b4fc; }
+.chat-external-link { color: #60a5fa; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.chat-external-link:hover { color: #93c5fd; }
+/* GFM tables in chat */
+.chat-table { border-collapse: collapse; margin: 8px 0; font-size: 13px; width: auto; max-width: 100%; overflow-x: auto; display: block; }
+.chat-table th, .chat-table td { border: 1px solid #334155; padding: 4px 10px; text-align: left; white-space: nowrap; }
+.chat-table th { background: #1e293b; color: #e2e8f0; font-weight: 600; }
+.chat-table td { color: #cbd5e1; }
 /* browse button next to inputs */
 .input-with-browse { display: flex; gap: 6px; }
 .input-with-browse .input, .input-with-browse input { flex: 1; min-width: 0; }

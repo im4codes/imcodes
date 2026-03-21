@@ -31,7 +31,11 @@
     "tool_group_collapse": "▲ 收起",
     "new_folder": "新建資料夾",
     "new_folder_name": "資料夾名稱",
-    "create": "建立"
+    "create": "建立",
+    "external_link_title": "開啟外部連結",
+    "external_link_warning": "此連結由 AI 代理產生。造訪外部網站的風險由您自行承擔。",
+    "external_link_cancel": "取消",
+    "external_link_open": "開啟連結"
   },
   "session": {
     "restart": "↺ 重新啟動",

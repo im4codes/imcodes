@@ -31,7 +31,11 @@
     "tool_group_collapse": "▲ 접기",
     "new_folder": "새 폴더",
     "new_folder_name": "폴더 이름",
-    "create": "만들기"
+    "create": "만들기",
+    "external_link_title": "외부 링크 열기",
+    "external_link_warning": "이 링크는 AI 에이전트가 생성했습니다. 외부 웹사이트 방문에 따른 위험은 본인 책임입니다.",
+    "external_link_cancel": "취소",
+    "external_link_open": "링크 열기"
   },
   "session": {
     "restart": "↺ 재시작",

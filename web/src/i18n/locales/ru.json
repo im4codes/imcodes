@@ -31,7 +31,11 @@
     "tool_group_collapse": "▲ свернуть",
     "new_folder": "Новая папка",
     "new_folder_name": "Имя папки",
-    "create": "Создать"
+    "create": "Создать",
+    "external_link_title": "Открыть внешнюю ссылку",
+    "external_link_warning": "Эта ссылка была сгенерирована ИИ-агентом. Вы несёте ответственность за риски, связанные с посещением внешних сайтов.",
+    "external_link_cancel": "Отмена",
+    "external_link_open": "Открыть ссылку"
   },
   "session": {
     "restart": "↺ Перезапустить",
