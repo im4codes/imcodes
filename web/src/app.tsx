@@ -370,7 +370,8 @@ export function App() {
   const [showDiscussionsPage, setShowDiscussionsPage] = useState(false);
   const discussionsSwipeRef = useSwipeBack(useCallback(() => setShowDiscussionsPage(false), []));
   const [showDiscussionDialog, setShowDiscussionDialog] = useState(false);
-  const [discussionPrefs, setDiscussionPrefs] = useState<DiscussionPrefs | null>(null);
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const [discussionPrefs, _setDiscussionPrefs] = useState<DiscussionPrefs | null>(null);
   const [pendingQuestion, setPendingQuestion] = useState<PendingQuestion | null>(null);
   const [discussions, setDiscussions] = useState<Array<{
     id: string;
@@ -1305,12 +1306,6 @@ export function App() {
                 openIds={openSubIds}
                 onOpen={toggleSubSession}
                 onNew={() => setShowSubDialog(true)}
-                onNewDiscussion={() => {
-                  void getUserPref('discussion_prefs').then((prefs) => {
-                    setDiscussionPrefs(prefs as DiscussionPrefs | null);
-                    setShowDiscussionDialog(true);
-                  });
-                }}
                 onViewDiscussions={() => setShowDiscussionsPage(true)}
                 discussions={discussions.filter((d) => d.state !== 'done' && d.state !== 'failed')}
                 onStopDiscussion={(id) => wsRef.current?.discussionStop(id)}

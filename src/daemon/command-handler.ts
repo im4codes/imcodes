@@ -270,6 +270,12 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'discussion.status':
       handleDiscussionStatus(cmd, serverLink);
       break;
+    case 'p2p.list_discussions':
+      void handleP2pListDiscussions(cmd, serverLink);
+      break;
+    case 'p2p.read_discussion':
+      void handleP2pReadDiscussion(cmd, serverLink);
+      break;
     case 'discussion.stop':
       void handleDiscussionStop(cmd);
       break;
@@ -898,6 +904,43 @@ async function handleAskAnswer(cmd: Record<string, unknown>): Promise<void> {
   await sendKey(sessionName, 'Escape');
   await new Promise<void>((r) => setTimeout(r, 150));
   await sendKeys(sessionName, answer);
+}
+
+// ── P2P discussion file listing ────────────────────────────────────────────
+
+async function handleP2pListDiscussions(_cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const dir = nodePath.join(homedir(), '.imcodes', 'discussions');
+  try {
+    const entries = await fsReaddir(dir);
+    const files = entries.filter(e => e.endsWith('.md')).sort().reverse(); // newest first
+    const discussions: Array<{ id: string; fileName: string; preview: string; mtime: number }> = [];
+    for (const f of files.slice(0, 50)) { // cap at 50
+      try {
+        const fullPath = nodePath.join(dir, f);
+        const s = await fsStat(fullPath);
+        const content = await fsReadFileRaw(fullPath, 'utf8');
+        // Extract first non-empty line after "## User Request" as preview
+        const reqMatch = content.match(/## User Request\s*\n+(.+)/);
+        const preview = reqMatch?.[1]?.trim().slice(0, 120) || f;
+        discussions.push({ id: f.replace('.md', ''), fileName: f, preview, mtime: s.mtimeMs });
+      } catch { /* skip unreadable */ }
+    }
+    serverLink.send({ type: 'p2p.list_discussions_response', discussions });
+  } catch {
+    serverLink.send({ type: 'p2p.list_discussions_response', discussions: [] });
+  }
+}
+
+async function handleP2pReadDiscussion(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const id = cmd.id as string | undefined;
+  if (!id) { serverLink.send({ type: 'p2p.read_discussion_response', error: 'missing_id' }); return; }
+  const filePath = nodePath.join(homedir(), '.imcodes', 'discussions', `${id}.md`);
+  try {
+    const content = await fsReadFileRaw(filePath, 'utf8');
+    serverLink.send({ type: 'p2p.read_discussion_response', id, content });
+  } catch {
+    serverLink.send({ type: 'p2p.read_discussion_response', id, error: 'not_found' });
+  }
 }
 
 // ── Discussion handlers ────────────────────────────────────────────────────

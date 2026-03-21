@@ -78,6 +78,8 @@ const BROWSER_WHITELIST = new Set([
   'fs.mkdir',
   'p2p.cancel',
   'p2p.status',
+  'p2p.list_discussions',
+  'p2p.read_discussion',
 ]);
 
 // ── Terminal forwarding queue (per (session, browser)) ────────────────────────
@@ -733,6 +735,12 @@ export class WsBridge {
         cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal,
         load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime,
       }));
+      return;
+    }
+
+    // ── P2P discussion list/read responses → broadcast to browsers ────────────
+    if (type === 'p2p.list_discussions_response' || type === 'p2p.read_discussion_response') {
+      this.broadcastToBrowsers(JSON.stringify(msg));
       return;
     }
 

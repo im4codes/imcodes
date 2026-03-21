@@ -35,7 +35,6 @@ interface Props {
   openIds: Set<string>;
   onOpen: (id: string) => void;
   onNew: () => void;
-  onNewDiscussion?: () => void;
   onViewDiscussions?: () => void;
   discussions?: DiscussionSummary[];
   onStopDiscussion?: (id: string) => void;
@@ -85,7 +84,7 @@ function formatUptime(seconds: number): string {
   return d > 0 ? `${d}d ${h}h` : `${h}h`;
 }
 
-export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onNewDiscussion, onViewDiscussions, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory }: Props) {
+export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscussions, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory }: Props) {
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
   const [collapsed, setCollapsed] = useState(isMobile);
   const [showSizePanel, setShowSizePanel] = useState(false);
@@ -229,14 +228,9 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onNewDiscus
           </>
         )}
         <button class="subcard-toolbar-add" onClick={onNew} title="New sub-session">+</button>
-        {onNewDiscussion && (
-          <button class="subcard-toolbar-btn" onClick={onNewDiscussion} title="Start discussion" style={{ marginLeft: 4, fontSize: 13 }}>
-            ⚖️
-          </button>
-        )}
         {onViewDiscussions && (
-          <button class="subcard-toolbar-btn" onClick={onViewDiscussions} title="View discussions" style={{ marginLeft: 2, fontSize: 11 }}>
-            History
+          <button class="subcard-toolbar-btn" onClick={onViewDiscussions} title="P2P discussions" style={{ marginLeft: 4, fontSize: 11 }}>
+            📋
           </button>
         )}
       </div>

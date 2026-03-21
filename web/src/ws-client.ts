@@ -48,6 +48,8 @@ export type ServerMessage =
   | { type: 'p2p.run_started'; runId: string; session: string }
   | { type: 'p2p.cancel_response'; runId: string; ok: boolean }
   | { type: 'p2p.status_response'; runId?: string; run?: any; runs?: any[] }
+  | { type: 'p2p.list_discussions_response'; discussions: Array<{ id: string; fileName: string; preview: string; mtime: number }> }
+  | { type: 'p2p.read_discussion_response'; id?: string; content?: string; error?: string }
   | FsGitDiffResponse;
 
 export type {
