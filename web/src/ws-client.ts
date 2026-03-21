@@ -318,10 +318,11 @@ export class WsClient {
   }
 
   /** Request full timeline history for a session (used on first load / daemon reconnect).
-   *  afterTs: client's latest known event timestamp — server returns only newer events. */
-  sendTimelineHistoryRequest(sessionName: string, limit = 500, afterTs?: number): string {
+   *  afterTs: client's latest known event timestamp — server returns only newer events.
+   *  beforeTs: for backward pagination — server returns only older events. */
+  sendTimelineHistoryRequest(sessionName: string, limit = 500, afterTs?: number, beforeTs?: number): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'timeline.history_request', sessionName, requestId, limit, ...(afterTs !== undefined ? { afterTs } : {}) });
+    this.send({ type: 'timeline.history_request', sessionName, requestId, limit, ...(afterTs !== undefined ? { afterTs } : {}), ...(beforeTs !== undefined ? { beforeTs } : {}) });
     return requestId;
   }
 

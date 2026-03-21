@@ -45,7 +45,7 @@ class TimelineStore {
    * Read events for a session, optionally filtering by epoch, afterSeq, and afterTs.
    * Returns events sorted by ts ascending.
    */
-  read(sessionName: string, opts?: { epoch?: number; afterSeq?: number; afterTs?: number; limit?: number }): TimelineEvent[] {
+  read(sessionName: string, opts?: { epoch?: number; afterSeq?: number; afterTs?: number; beforeTs?: number; limit?: number }): TimelineEvent[] {
     const filePath = this.filePath(sessionName);
     let raw: string;
     try {
@@ -65,6 +65,7 @@ class TimelineStore {
         if (opts?.epoch !== undefined && event.epoch !== opts.epoch) continue;
         if (opts?.afterSeq !== undefined && event.seq <= opts.afterSeq) continue;
         if (opts?.afterTs !== undefined && event.ts <= opts.afterTs) continue;
+        if (opts?.beforeTs !== undefined && event.ts >= opts.beforeTs) continue;
         events.push(event);
         if (opts?.limit && events.length >= opts.limit) break;
       } catch { /* skip corrupt lines */ }

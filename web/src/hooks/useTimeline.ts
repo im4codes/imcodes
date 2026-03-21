@@ -19,7 +19,7 @@ sharedDb.open().catch(() => {});
 // render immediately from in-memory state without waiting for IDB or network.
 const eventsCache = new Map<string, TimelineEvent[]>();
 
-const MAX_MEMORY_EVENTS = 500;
+const MAX_MEMORY_EVENTS = 2000;
 const ECHO_WINDOW_MS = 500;
 // Dedup window for user.message from JSONL vs web-UI-sent: JSONL watcher polls every 2s,
 // so the same message can arrive twice (once from command-handler, once from JSONL).
@@ -39,8 +39,12 @@ export interface UseTimelineResult {
   loading: boolean;
   /** True while gap-filling after a cache hit — content is visible but may be stale */
   refreshing: boolean;
+  /** True while loading older events via backward pagination */
+  loadingOlder: boolean;
   /** Immediately inject a pending user message (optimistic UI). */
   addOptimisticUserMessage: (text: string) => void;
+  /** Load older events before the earliest currently loaded event. */
+  loadOlderEvents: () => void;
 }
 
 export function useTimeline(
@@ -50,10 +54,12 @@ export function useTimeline(
   const [events, setEvents] = useState<TimelineEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const epochRef = useRef<number>(0);
   const seqRef = useRef<number>(0);
   const replayRequestIdRef = useRef<string | null>(null);
   const historyRequestIdRef = useRef<string | null>(null);
+  const olderRequestIdRef = useRef<string | null>(null);
   const historyLoadedRef = useRef<string | null>(null); // tracks which session has been loaded
 
   // Reset on session change
@@ -152,6 +158,16 @@ export function useTimeline(
     });
   }, [sessionId]);
 
+  // Load older events (backward pagination)
+  const loadOlderEvents = useCallback(() => {
+    if (!ws?.connected || !sessionId || loadingOlder) return;
+    const cached = eventsCache.get(sessionId);
+    if (!cached || cached.length === 0) return;
+    const oldestTs = Math.min(...cached.map((e) => e.ts));
+    setLoadingOlder(true);
+    olderRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500, undefined, oldestTs);
+  }, [ws, sessionId, loadingOlder]);
+
   // Append a single event, dedup by eventId
   const appendEvent = useCallback((event: TimelineEvent) => {
     setEvents((prev) => {
@@ -210,6 +226,7 @@ export function useTimeline(
         // against already-confirmed events (JSONL watcher re-emits same text ~2s later).
         if (event.type === 'user.message' && event.payload.text) {
           const text = String(event.payload.text).trim();
+          let skipAppend = false;
           setEvents((prev) => {
             // Remove pending version of this message (optimistic UI cleanup)
             const withoutPending = prev.filter(
@@ -227,9 +244,10 @@ export function useTimeline(
                 Math.abs(e.ts - event.ts) < USER_MSG_DEDUP_WINDOW_MS &&
                 String(e.payload.text ?? '').trim() === text,
             );
-            if (isDup) event.hidden = true;
+            if (isDup) skipAppend = true;
             return prev;
           });
+          if (skipAppend) return;
         }
 
         // Update epoch tracker — don't clear events on epoch change;
@@ -244,6 +262,18 @@ export function useTimeline(
       // ── History response (full load from daemon file store) ──
       if (msg.type === 'timeline.history') {
         if (msg.sessionName !== sessionId) return;
+
+        // Handle backward pagination response
+        if (msg.requestId && msg.requestId === olderRequestIdRef.current) {
+          olderRequestIdRef.current = null;
+          if (msg.events.length > 0) {
+            mergeEvents(msg.events);
+            sharedDb?.putEvents(msg.events).catch(() => {});
+          }
+          setLoadingOlder(false);
+          return;
+        }
+
         if (msg.requestId && msg.requestId !== historyRequestIdRef.current) return;
         historyRequestIdRef.current = null;
         historyLoadedRef.current = sessionId;
@@ -306,5 +336,5 @@ export function useTimeline(
     return unsub;
   }, [ws, sessionId, appendEvent, mergeEvents]);
 
-  return { events, loading, refreshing, addOptimisticUserMessage };
+  return { events, loading, refreshing, loadingOlder, addOptimisticUserMessage, loadOlderEvents };
 }

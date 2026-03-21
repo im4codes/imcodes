@@ -21,6 +21,8 @@
     "syncing": "↻ Sincronizando...",
     "no_events": "Sin eventos aún",
     "session_state": "Sesión {{state}}",
+    "load_older": "Cargar mensajes anteriores",
+    "loading_older": "Cargando...",
     "thinking_running": "Pensando · {{sec}}s",
     "thinking_done": "Pensó {{sec}}s",
     "show_file_panel": "Abrir panel de archivos",

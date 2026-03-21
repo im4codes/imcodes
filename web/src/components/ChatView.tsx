@@ -16,6 +16,10 @@ interface Props {
   loading: boolean;
   /** True while gap-filling new events after a cache hit */
   refreshing?: boolean;
+  /** True while loading older events via backward pagination */
+  loadingOlder?: boolean;
+  /** Called when user wants to load older messages */
+  onLoadOlder?: () => void;
   sessionState?: string;
   sessionId?: string | null;
   /** Receives a function that forces the chat list to scroll to the bottom. */
@@ -205,7 +209,7 @@ function readPanelOpen(id: string | null | undefined): boolean {
   try { return localStorage.getItem(panelOpenKey(id)) === '1'; } catch { return false; }
 }
 
-export function ChatView({ events, loading, refreshing, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId }: Props) {
+export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId }: Props) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -441,6 +445,18 @@ export function ChatView({ events, loading, refreshing, sessionState, sessionId,
           {viewItems.length === 0 && (
             <div class="chat-loading">
               {sessionState ? t('chat.session_state', { state: sessionState }) : t('chat.no_events')}
+            </div>
+          )}
+          {!preview && onLoadOlder && viewItems.length > 0 && (
+            <div style={{ textAlign: 'center', padding: '8px 0' }}>
+              <button
+                class="btn btn-sm"
+                style={{ fontSize: 11, opacity: 0.7 }}
+                onClick={onLoadOlder}
+                disabled={loadingOlder}
+              >
+                {loadingOlder ? t('chat.loading_older') : t('chat.load_older')}
+              </button>
             </div>
           )}
           {viewItems.map((item, idx) => {

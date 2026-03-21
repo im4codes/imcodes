@@ -21,6 +21,8 @@
     "syncing": "↻ 同步最新消息...",
     "no_events": "暂无消息",
     "session_state": "会话 {{state}}",
+    "load_older": "加载更早的消息",
+    "loading_older": "加载中...",
     "thinking_running": "思考中 · {{sec}}s",
     "thinking_done": "思考了 {{sec}}s",
     "show_file_panel": "打开文件面板",

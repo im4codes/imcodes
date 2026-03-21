@@ -21,6 +21,8 @@
     "syncing": "↻ 同期中...",
     "no_events": "イベントはまだありません",
     "session_state": "セッション {{state}}",
+    "load_older": "古いメッセージを読み込む",
+    "loading_older": "読み込み中...",
     "thinking_running": "考え中 · {{sec}}s",
     "thinking_done": "{{sec}}s 考えた",
     "show_file_panel": "ファイルパネルを開く",

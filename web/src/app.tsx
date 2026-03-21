@@ -520,7 +520,7 @@ export function App() {
   }, [activeSession, defaultViewMode]);
 
   // Timeline events for chat view
-  const { events: timelineEvents, loading: timelineLoading, refreshing: timelineRefreshing, addOptimisticUserMessage } = useTimeline(activeSession, wsRef.current);
+  const { events: timelineEvents, loading: timelineLoading, refreshing: timelineRefreshing, loadingOlder: timelineLoadingOlder, addOptimisticUserMessage, loadOlderEvents } = useTimeline(activeSession, wsRef.current);
 
   // Extract latest usage from timeline for the context bar in SessionControls
   const lastUsage = useMemo(() => {
@@ -1356,7 +1356,7 @@ export function App() {
 
             {/* Chat view for active session in chat mode */}
             {activeSession && viewMode === 'chat' && (
-              <ChatView events={timelineEvents} loading={timelineLoading} refreshing={timelineRefreshing} sessionId={activeSession} sessionState={activeSessionInfo?.state} onScrollBottomFn={setChatScrollFn} workdir={activeSessionInfo?.projectDir} ws={connected ? wsRef.current : null} serverId={selectedServerId ?? undefined} />
+              <ChatView events={timelineEvents} loading={timelineLoading} refreshing={timelineRefreshing} loadingOlder={timelineLoadingOlder} onLoadOlder={loadOlderEvents} sessionId={activeSession} sessionState={activeSessionInfo?.state} onScrollBottomFn={setChatScrollFn} workdir={activeSessionInfo?.projectDir} ws={connected ? wsRef.current : null} serverId={selectedServerId ?? undefined} />
             )}
 
             {!activeSession && !sessionsLoaded && (

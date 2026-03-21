@@ -788,6 +788,7 @@ function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: ServerL
   const requestId = cmd.requestId as string | undefined;
   const limit = (cmd.limit as number | undefined) ?? 200;
   const afterTs = cmd.afterTs as number | undefined;
+  const beforeTs = cmd.beforeTs as number | undefined;
 
   if (!sessionName) {
     logger.warn('timeline.history_request: missing sessionName');
@@ -796,9 +797,9 @@ function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: ServerL
 
   // Read more than requested so dedup doesn't shrink the set too aggressively.
   // Do NOT filter by epoch — history should include events across daemon restarts.
-  // Filter by afterTs when provided: client already has events up to that timestamp.
+  // Filter by afterTs/beforeTs when provided for forward/backward pagination.
   const readLimit = Math.min(limit * 4, 2000);
-  const events = timelineStore.read(sessionName, { limit: readLimit, afterTs });
+  const events = timelineStore.read(sessionName, { limit: readLimit, afterTs, beforeTs });
 
   // Deduplicate consecutive session.state events — keep only the last in each run.
   // This prevents idle↔running oscillation storms from crowding out user.message events.
