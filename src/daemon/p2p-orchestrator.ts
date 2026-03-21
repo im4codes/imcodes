@@ -414,19 +414,31 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
       // Check idle — only when file has settled (or past grace with no growth)
       if (fileSettled || (pastGrace && !fileGrew)) {
         let idleConfirmed = false;
+        const record = getSession(session);
+        const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
+
+        // For agents with structured watchers (Gemini), prefer session store state
+        // over raw terminal detection — the watcher has idle confirmation logic that
+        // prevents false idles during tool-call gaps.
+        const useStoreState = agentType === 'gemini';
+
         if (idleEventReceived) {
-          // Event-based: confirm agent is STILL idle right now (not a stale event)
+          // Event-based: confirm agent is STILL idle right now
           try {
-            const record = getSession(session);
-            const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
-            idleConfirmed = await detectStatusAsync(session, agentType) === 'idle';
+            if (useStoreState) {
+              idleConfirmed = record?.state === 'idle';
+            } else {
+              idleConfirmed = await detectStatusAsync(session, agentType) === 'idle';
+            }
           } catch { idleConfirmed = true; /* if detection fails, trust event */ }
         } else {
           // Poll fallback
           try {
-            const record = getSession(session);
-            const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
-            idleConfirmed = await detectStatusAsync(session, agentType) === 'idle';
+            if (useStoreState) {
+              idleConfirmed = record?.state === 'idle';
+            } else {
+              idleConfirmed = await detectStatusAsync(session, agentType) === 'idle';
+            }
           } catch { /* ignore */ }
         }
 
