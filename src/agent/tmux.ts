@@ -182,7 +182,7 @@ export async function listSessions(): Promise<string[]> {
   } catch (e: any) {
     // tmux returns 1 if there are no sessions
     const err = String(e.stderr || e.message || '');
-    if (err.includes('no sessions') || err.includes('no server running')) return [];
+    if (err.includes('no sessions') || err.includes('no server running') || err.includes('No such file or directory') || err.includes('error connecting')) return [];
     throw e;
   }
 }
