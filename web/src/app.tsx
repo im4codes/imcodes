@@ -1397,7 +1397,16 @@ export function App() {
                 onViewDiscussions={() => { setDiscussionInitialId(null); setShowDiscussionsPage(true); }}
                 onViewDiscussion={(fileId) => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); }}
                 discussions={discussions.filter((d) => d.state !== 'done' && d.state !== 'failed')}
-                onStopDiscussion={(id) => wsRef.current?.discussionStop(id)}
+                onStopDiscussion={(id) => {
+                  if (id.startsWith('p2p_')) {
+                    // P2P runs use p2p.cancel with the actual run ID (strip p2p_ prefix)
+                    wsRef.current?.send({ type: 'p2p.cancel', runId: id.slice(4) });
+                    // Remove from UI immediately
+                    setDiscussions((prev) => prev.filter((d) => d.id !== id));
+                  } else {
+                    wsRef.current?.discussionStop(id);
+                  }
+                }}
                 ws={wsRef.current}
                 connected={connected}
                 onDiff={registerDiffApplyer}
