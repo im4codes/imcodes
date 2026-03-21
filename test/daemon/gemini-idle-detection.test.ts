@@ -80,7 +80,7 @@ describe('Gemini Idle Detection (Direct pollTick test)', () => {
     expect(states).not.toContain('idle');
   });
 
-  it('emits idle ONLY when content is present and all tools finished (after consecutive confirmation)', async () => {
+  it('emits idle ONLY after JSON stops changing (new data always = running)', async () => {
     const conv = {
       lastUpdated: '2026-03-14T10:00:02Z',
       messages: [
@@ -94,9 +94,11 @@ describe('Gemini Idle Detection (Direct pollTick test)', () => {
     };
     vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify(conv));
 
-    // First poll: idle confirm count = 1 (not enough)
+    // Poll 1: new data → running (never idle on new data path)
     await pollTick(sid, state);
-    // Second poll (unchanged JSON): idle confirm count = 2 → emit idle
+    // Poll 2: unchanged JSON → idle confirm = 1
+    await pollTick(sid, state);
+    // Poll 3: unchanged JSON → idle confirm = 2 → emit idle
     await pollTick(sid, state);
 
     const states = vi.mocked(timelineEmitter.emit).mock.calls
@@ -106,7 +108,7 @@ describe('Gemini Idle Detection (Direct pollTick test)', () => {
     expect(states).toContain('idle');
   });
 
-  it('emits idle when a trailing info message arrives after a completed Gemini reply (after consecutive confirmation)', async () => {
+  it('emits idle after trailing info message once JSON settles', async () => {
     state.seenCount = 1;
     state.lastUpdated = '2026-03-14T10:00:01Z';
 
@@ -127,9 +129,11 @@ describe('Gemini Idle Detection (Direct pollTick test)', () => {
     };
     vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify(conv));
 
-    // First poll: processes new messages, idle confirm = 1
+    // Poll 1: new data → running
     await pollTick(sid, state);
-    // Second poll (unchanged JSON): idle confirm = 2 → emit idle
+    // Poll 2: unchanged → idle confirm = 1
+    await pollTick(sid, state);
+    // Poll 3: unchanged → idle confirm = 2 → emit idle
     await pollTick(sid, state);
 
     const states = vi.mocked(timelineEmitter.emit).mock.calls
@@ -137,6 +141,5 @@ describe('Gemini Idle Detection (Direct pollTick test)', () => {
       .map(c => (c[2] as any).state);
 
     expect(states).toContain('idle');
-    expect(states).not.toContain('running');
   });
 });

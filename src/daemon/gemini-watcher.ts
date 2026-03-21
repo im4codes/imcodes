@@ -14,7 +14,8 @@ import { updateSessionState } from '../store/session-store.js';
 const GEMINI_TMP_DIR = join(homedir(), '.gemini', 'tmp');
 const POLL_INTERVAL_MS = 1500; // Balanced: responsive enough without causing state flicker
 const IDLE_LOCK_MS = 2000;    // After emitting idle, ignore terminal noise for this long
-const RUNNING_LOCK_MS = 5000; // After emitting running, don't transition to idle (tool-call gaps)
+// Running lock removed — the "new data = always running" rule (pollTick new-data path)
+// now prevents tool-gap idle transitions more reliably than a time-based lock.
 const RETRY_DELAY_MS = 100;
 
 // ── Path helpers ───────────────────────────────────────────────────────────────
@@ -117,8 +118,6 @@ export interface WatcherState {
   idleDebounceTimer?: ReturnType<typeof setTimeout>;
   /** Timestamp of last idle emit — used for idle lock (ignore terminal noise shortly after idle). */
   lastIdleEmitTs?: number;
-  /** Timestamp of last running emit — used for running lock (ignore tool-gap idles). */
-  lastRunningEmitTs?: number;
   _lastRotationCheck?: number;
   _terminalThinkingEmitted?: boolean;
   lastConversationStatus?: 'running' | 'idle' | null;
@@ -201,12 +200,9 @@ function transitionState(sessionName: string, state: WatcherState, next: 'runnin
   if (!force) {
     // Idle lock: don't transition to running if we just emitted idle (terminal noise)
     if (next === 'running' && state.lastIdleEmitTs && (Date.now() - state.lastIdleEmitTs) < IDLE_LOCK_MS) return;
-    // Running lock: don't transition to idle if we just emitted running (tool-call gaps)
-    if (next === 'idle' && state.lastRunningEmitTs && (Date.now() - state.lastRunningEmitTs) < RUNNING_LOCK_MS) return;
   }
   state.currentState = next;
   if (next === 'idle') state.lastIdleEmitTs = Date.now();
-  if (next === 'running') state.lastRunningEmitTs = Date.now();
   timelineEmitter.emit(sessionName, 'session.state', { state: next });
   updateSessionState(sessionName, next);
 }
@@ -294,30 +290,18 @@ export async function pollTick(sessionName: string, state: WatcherState): Promis
     parseMessage(sessionName, msg, hist, isUpdate);
   }
 
+  // JSON just changed → agent is actively working.
+  // Always reset idle confirm count and transition to running.
+  // NEVER transition to idle on the "new data" path — tool-call gaps
+  // briefly show idle in JSON, but more data will arrive shortly.
+  // Only the "unchanged JSON" path (above) can transition to idle.
+  state.idleConfirmCount = 0;
+  if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
   if (conversationStatus === 'running') {
-    state.idleConfirmCount = 0;
-    if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
     transitionState(sessionName, state, 'running');
-    return;
-  }
-
-  if (conversationStatus === 'idle') {
-    state.idleConfirmCount = (state.idleConfirmCount ?? 0) + 1;
-    const touchedGeminiMessage = messagesToProcess.some((msg: any) => msg?.type === 'gemini');
-    if (isUpdate && touchedGeminiMessage) {
-      // Still receiving updates for the same Gemini message: wait for writes to settle.
-      // Only transition after consecutive idle confirmations.
-      if (state.idleConfirmCount >= 2) {
-        if (state.idleDebounceTimer) clearTimeout(state.idleDebounceTimer);
-        state.idleDebounceTimer = setTimeout(() => {
-          state.idleDebounceTimer = undefined;
-          if (!state.stopped) transitionState(sessionName, state, 'idle');
-        }, 1500);
-      }
-    } else if (state.idleConfirmCount >= 2) {
-      if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
-      transitionState(sessionName, state, 'idle');
-    }
+  } else {
+    // JSON says idle but just changed — treat as running (tool gap)
+    transitionState(sessionName, state, 'running');
   }
 }
 
