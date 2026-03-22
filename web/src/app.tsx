@@ -1,4 +1,15 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
+
+/** Map P2P orchestrator status to UI display state (shared logic, no hardcoded strings). */
+const P2P_DONE = new Set(['completed']);
+const P2P_FAILED = new Set(['failed', 'timed_out', 'cancelled']);
+const P2P_RUNNING = new Set(['running', 'awaiting_next_hop', 'dispatched']);
+function mapP2pState(status: string): 'done' | 'failed' | 'running' | 'setup' {
+  if (P2P_DONE.has(status)) return 'done';
+  if (P2P_FAILED.has(status)) return 'failed';
+  if (P2P_RUNNING.has(status)) return 'running';
+  return 'setup';
+}
 import { useTranslation } from 'react-i18next';
 import { LanguageSwitcher } from './components/LanguageSwitcher.js';
 import { LoginPage } from './pages/LoginPage.js';
@@ -792,10 +803,7 @@ export function App() {
         const mode = r.mode_key ?? 'discuss';
 
         // Map P2P status to discussion state
-        const state = (status === 'completed') ? 'done'
-          : (status === 'failed' || status === 'timed_out' || status === 'cancelled') ? 'failed'
-          : (status === 'running' || status === 'awaiting_next_hop' || status === 'dispatched') ? 'running'
-          : 'setup';
+        const state = mapP2pState(status);
 
         // Current round = total - remaining (Phase 1 counts as round 1)
         const currentRound = Math.max(1, totalCount - remainingCount);
@@ -1147,7 +1155,7 @@ export function App() {
               const status = String(r.status ?? '');
               const state = (status === 'completed') ? 'done'
                 : (status === 'failed' || status === 'timed_out' || status === 'cancelled') ? 'failed'
-                : (status === 'running' || status === 'awaiting_next_hop') ? 'running'
+                : (status === 'running' || status === 'awaiting_next_hop' || status === 'dispatched') ? 'running'
                 : 'setup';
               const totalCount = r.total_count ?? 3;
               const remainingCount = r.remaining_count ?? 0;
