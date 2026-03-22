@@ -17,6 +17,8 @@ import { AskQuestionDialog, type PendingQuestion } from './components/AskQuestio
 import { ServerContextMenu, DeleteServerDialog } from './components/ServerContextMenu.js';
 import { DiscussionsPage } from './pages/DiscussionsPage.js';
 import { RepoPage } from './pages/RepoPage.js';
+import { SettingsPage } from './pages/SettingsPage.js';
+import { AdminPage } from './pages/AdminPage.js';
 import { useSubSessions } from './hooks/useSubSessions.js';
 import { useTimeline } from './hooks/useTimeline.js';
 import { useSwipeBack } from './hooks/useSwipeBack.js';
@@ -24,7 +26,7 @@ import { getActiveThinkingTs } from './thinking-utils.js';
 import { WsClient } from './ws-client.js';
 import { resolveContextWindow } from './model-context.js';
 import { shortModelLabel } from './model-label.js';
-import { configure as configureApi, apiFetch, onAuthExpired, getUserPref, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, listP2pRuns } from './api.js';
+import { configure as configureApi, apiFetch, onAuthExpired, getUserPref, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, listP2pRuns, fetchMe } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { getAuthKey, clearAuthKey } from './biometric-auth.js';
 import { initPushNotifications } from './push-notifications.js';
@@ -379,6 +381,21 @@ export function App() {
   const [repoContexts, setRepoContexts] = useState<Map<string, any>>(new Map());
   const repoContextsRef = useRef(repoContexts);
   repoContextsRef.current = repoContexts;
+
+  // ── Settings / Admin ────────────────────────────────────────────────────────
+  const [showSettingsPage, setShowSettingsPage] = useState(false);
+  const [showAdminPage, setShowAdminPage] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [userDisplayName, setUserDisplayName] = useState<string | null>(null);
+
+  // Fetch current user info on auth
+  useEffect(() => {
+    if (!auth) { setIsAdmin(false); setUserDisplayName(null); return; }
+    fetchMe().then((me) => {
+      setIsAdmin(me.is_admin);
+      setUserDisplayName(me.display_name);
+    }).catch(() => {});
+  }, [auth]);
 
   // ── Discussions ─────────────────────────────────────────────────────────────
   const [showDiscussionsPage, setShowDiscussionsPage] = useState(false);
@@ -1254,7 +1271,23 @@ export function App() {
     <div class="layout">
       {/* Sidebar — server list */}
       <aside class="sidebar">
-        <div class="sidebar-header">IM.codes</div>
+        <div class="sidebar-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <span>IM.codes</span>
+          <span style={{ display: 'flex', gap: '4px' }}>
+            {isAdmin && (
+              <button
+                onClick={() => setShowAdminPage(true)}
+                title="Admin"
+                style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '14px', padding: '2px 4px', color: '#94a3b8' }}
+              >&#x1f6e1;</button>
+            )}
+            <button
+              onClick={() => setShowSettingsPage(true)}
+              title="Settings"
+              style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '14px', padding: '2px 4px', color: '#94a3b8' }}
+            >&#x2699;</button>
+          </span>
+        </div>
         <div class="server-list">
           {servers.map((server) => {
             const online = isServerOnline(server);
@@ -1539,6 +1572,22 @@ export function App() {
       {showRepoPage && wsRef.current && activeSessionInfo?.projectDir && (
         <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)' }}>
           <RepoPage ws={wsRef.current} projectDir={activeSessionInfo.projectDir} onBack={() => setShowRepoPage(false)} />
+        </div>
+      )}
+
+      {showSettingsPage && (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)' }}>
+          <SettingsPage
+            displayName={userDisplayName}
+            onBack={() => setShowSettingsPage(false)}
+            onDisplayNameChanged={(name) => setUserDisplayName(name)}
+          />
+        </div>
+      )}
+
+      {showAdminPage && (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)' }}>
+          <AdminPage onBack={() => setShowAdminPage(false)} />
         </div>
       )}
 

@@ -34,7 +34,7 @@ async function resolveUserId(c: AnyAuthContext): Promise<string | null> {
     const jwt = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
     if (jwt && typeof jwt.sub === 'string' && jwt.type !== 'ws-ticket') {
       const user = await getUserById(c.env.DB, jwt.sub);
-      if (user) return user.id;
+      if (user && user.status === 'active') return user.id;
     }
   }
 
@@ -43,10 +43,10 @@ async function resolveUserId(c: AnyAuthContext): Promise<string | null> {
   const bearerToken = auth.slice(7);
 
   // Try JWT first (web session tokens) — reject single-use ws-ticket tokens
-  const jwt = verifyJwt(bearerToken, c.env.JWT_SIGNING_KEY);
-  if (jwt && typeof jwt.sub === 'string' && jwt.type !== 'ws-ticket') {
-    const user = await getUserById(c.env.DB, jwt.sub);
-    if (user) return user.id;
+  const jwtBearer = verifyJwt(bearerToken, c.env.JWT_SIGNING_KEY);
+  if (jwtBearer && typeof jwtBearer.sub === 'string' && jwtBearer.type !== 'ws-ticket') {
+    const user = await getUserById(c.env.DB, jwtBearer.sub);
+    if (user && user.status === 'active') return user.id;
   }
 
   // Fall back to API key check
@@ -54,7 +54,10 @@ async function resolveUserId(c: AnyAuthContext): Promise<string | null> {
   const row = await c.env.DB.prepare(
     'SELECT user_id FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL',
   ).bind(keyHash).first<{ user_id: string }>();
-  if (row) return row.user_id;
+  if (row) {
+    const apiKeyUser = await getUserById(c.env.DB, row.user_id);
+    if (apiKeyUser && apiKeyUser.status === 'active') return row.user_id;
+  }
 
   return null;
 }
@@ -483,6 +486,29 @@ authRoutes.post('/password/login', async (c) => {
     accessToken,
     refreshToken: refreshRaw,
   });
+});
+
+// PATCH /api/auth/user/me — update display name
+const patchMeSchema = z.object({
+  displayName: z.string().min(1).max(100).optional(),
+});
+
+authRoutes.patch('/user/me', async (c) => {
+  const userId = await resolveUserId(c);
+  if (!userId) return c.json({ error: 'unauthorized' }, 401);
+
+  const body = await c.req.json().catch(() => null);
+  const parsed = patchMeSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+
+  if (parsed.data.displayName !== undefined) {
+    await c.env.DB.prepare('UPDATE users SET display_name = ? WHERE id = ?')
+      .bind(parsed.data.displayName, userId)
+      .run();
+  }
+
+  const user = await getUserById(c.env.DB, userId);
+  return c.json(user);
 });
 
 // POST /api/auth/password/change — change password (requires auth)

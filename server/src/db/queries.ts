@@ -9,6 +9,8 @@ export interface DbUser {
   password_hash: string | null;
   display_name: string | null;
   password_must_change: boolean | null;
+  is_admin: boolean;
+  status: 'active' | 'pending' | 'disabled';
 }
 
 export interface DbPlatformIdentity {
@@ -81,7 +83,7 @@ export interface QuickData {
 export async function createUser(db: PgDatabase, id: string): Promise<DbUser> {
   const now = Date.now();
   await db.prepare('INSERT INTO users (id, created_at) VALUES (?, ?)').bind(id, now).run();
-  return { id, created_at: now, username: null, password_hash: null, display_name: null, password_must_change: null };
+  return { id, created_at: now, username: null, password_hash: null, display_name: null, password_must_change: null, is_admin: false, status: 'active' };
 }
 
 export async function getUserById(db: PgDatabase, id: string): Promise<DbUser | null> {
@@ -90,6 +92,41 @@ export async function getUserById(db: PgDatabase, id: string): Promise<DbUser | 
 
 export async function getUserByUsername(db: PgDatabase, username: string): Promise<DbUser | null> {
   return db.prepare('SELECT * FROM users WHERE username = ?').bind(username).first<DbUser>();
+}
+
+export async function listAllUsers(db: PgDatabase): Promise<DbUser[]> {
+  const result = await db.prepare('SELECT * FROM users ORDER BY created_at ASC').bind().all<DbUser>();
+  return result.results ?? [];
+}
+
+export async function updateUserStatus(db: PgDatabase, userId: string, status: 'active' | 'pending' | 'disabled'): Promise<void> {
+  await db.prepare('UPDATE users SET status = ? WHERE id = ?').bind(status, userId).run();
+}
+
+export async function deleteUser(db: PgDatabase, userId: string): Promise<void> {
+  await db.prepare('DELETE FROM users WHERE id = ?').bind(userId).run();
+}
+
+export async function countActiveAdmins(db: PgDatabase): Promise<number> {
+  const row = await db.prepare("SELECT COUNT(*) as cnt FROM users WHERE is_admin = TRUE AND status = 'active'").bind().first<{ cnt: number }>();
+  return Number(row?.cnt ?? 0);
+}
+
+export async function getSetting(db: PgDatabase, key: string): Promise<string | null> {
+  const row = await db.prepare('SELECT value FROM settings WHERE key = ?').bind(key).first<{ value: string }>();
+  return row?.value ?? null;
+}
+
+export async function setSetting(db: PgDatabase, key: string, value: string): Promise<void> {
+  await db.prepare('INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
+    .bind(key, value, Date.now()).run();
+}
+
+export async function getAllSettings(db: PgDatabase): Promise<Record<string, string>> {
+  const result = await db.prepare('SELECT key, value FROM settings').bind().all<{ key: string; value: string }>();
+  const map: Record<string, string> = {};
+  for (const row of result.results ?? []) map[row.key] = row.value;
+  return map;
 }
 
 // ── Platform identities ───────────────────────────────────────────────────

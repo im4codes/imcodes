@@ -350,6 +350,71 @@ export async function listP2pRuns(serverId: string): Promise<P2pRunData[]> {
   return res.runs ?? [];
 }
 
+// ── Current user (me) ──────────────────────────────────────────────────────
+
+export interface MeResponse {
+  id: string;
+  username: string | null;
+  display_name: string | null;
+  is_admin: boolean;
+  status: string;
+}
+
+export async function fetchMe(): Promise<MeResponse> {
+  return apiFetch<MeResponse>('/api/auth/user/me');
+}
+
+export async function updateDisplayName(displayName: string): Promise<MeResponse> {
+  return apiFetch<MeResponse>('/api/auth/user/me', {
+    method: 'PATCH',
+    body: JSON.stringify({ displayName }),
+  });
+}
+
+// ── Admin API ─────────────────────────────────────────────────────────────
+
+export interface AdminUser {
+  id: string;
+  username: string | null;
+  displayName: string | null;
+  isAdmin: boolean;
+  status: string;
+  createdAt: number;
+}
+
+export async function fetchAdminUsers(): Promise<AdminUser[]> {
+  const res = await apiFetch<{ users: AdminUser[] }>('/api/admin/users');
+  return res.users;
+}
+
+export async function approveUser(id: string): Promise<void> {
+  await apiFetch(`/api/admin/users/${id}/approve`, { method: 'POST' });
+}
+
+export async function disableUser(id: string): Promise<void> {
+  await apiFetch(`/api/admin/users/${id}/disable`, { method: 'POST' });
+}
+
+export async function deleteAdminUser(id: string): Promise<void> {
+  await apiFetch(`/api/admin/users/${id}`, { method: 'DELETE' });
+}
+
+export interface AdminSettings {
+  [key: string]: string;
+}
+
+export async function fetchAdminSettings(): Promise<AdminSettings> {
+  const res = await apiFetch<{ settings: AdminSettings }>('/api/admin/settings');
+  return res.settings;
+}
+
+export async function updateAdminSettings(settings: AdminSettings): Promise<void> {
+  await apiFetch('/api/admin/settings', {
+    method: 'PUT',
+    body: JSON.stringify(settings),
+  });
+}
+
 // ── User preferences ───────────────────────────────────────────────────────
 
 export async function getUserPref(key: string): Promise<unknown | null> {

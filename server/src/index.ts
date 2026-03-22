@@ -20,6 +20,7 @@ import { runMigrations } from './db/migrate.js';
 import { randomHex, hashPassword } from './security/crypto.js';
 import { authRoutes } from './routes/auth.js';
 import { githubAuthRoutes } from './routes/github-auth.js';
+import { adminRoutes } from './routes/admin.js';
 import { bindRoutes } from './routes/bind.js';
 import { serverRoutes } from './routes/server.js';
 import { webhookRoutes } from './routes/webhook.js';
@@ -148,6 +149,7 @@ export function buildApp(env: Env) {
   app.route('/api/server', fileTransferRoutes);
   app.route('/api/preferences', preferencesRoutes);
   app.route('/api/auth/passkey', passkeyRoutes);
+  app.route('/api/admin', adminRoutes);
 
   app.get('/health', (c) => c.json({ ok: true, ts: Date.now() }));
 
@@ -377,8 +379,8 @@ async function ensureDefaultAdmin(db: PgDatabase, envConfig: EnvConfig): Promise
   const now = Date.now();
 
   await db.prepare(
-    'INSERT INTO users (id, username, password_hash, display_name, password_must_change, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-  ).bind(userId, 'admin', passwordHash, 'Admin', true, now).run();
+    'INSERT INTO users (id, username, password_hash, display_name, password_must_change, is_admin, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+  ).bind(userId, 'admin', passwordHash, 'Admin', true, true, 'active', now).run();
 
   logger.info({ username: 'admin' }, 'Default admin account created (password_must_change=true)');
 }

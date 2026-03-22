@@ -159,6 +159,15 @@ const registerBeginSchema = z.object({
 
 passkeyRoutes.post('/register/begin', async (c) => {
   const existingUserId = await resolveAuthedUserId(c);
+
+  // Check if registration is enabled (skip for existing users adding a new passkey)
+  if (!existingUserId) {
+    const { getSetting } = await import('../db/queries.js');
+    const regEnabled = await getSetting(c.env.DB, 'registration_enabled');
+    if (regEnabled === 'false') {
+      return c.json({ error: 'registration_disabled' }, 403);
+    }
+  }
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const parsed = registerBeginSchema.safeParse(body);
   const displayName = parsed.data?.displayName ?? 'IM.codes User';
@@ -247,6 +256,12 @@ passkeyRoutes.post('/register/complete', async (c) => {
   if (!userId) {
     userId = randomHex(16);
     await createUser(c.env.DB, userId);
+    // Check if new registrations require admin approval
+    const { getSetting, updateUserStatus } = await import('../db/queries.js');
+    const requireApproval = await getSetting(c.env.DB, 'require_approval');
+    if (requireApproval === 'true') {
+      await updateUserStatus(c.env.DB, userId, 'pending');
+    }
   }
 
   const now = Date.now();
