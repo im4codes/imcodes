@@ -122,7 +122,7 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
     setError(null);
     try {
       const res = await passwordLogin(username.trim(), password);
-      if (res.mustChange) {
+      if (res.passwordMustChange) {
         setMode('change_password');
       } else {
         onLogin?.();
@@ -145,7 +145,7 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
       setError(t('login.passwords_mismatch'));
       return;
     }
-    if (newPassword.length < 6) {
+    if (newPassword.length < 8) {
       setError(t('login.password_too_short'));
       return;
     }

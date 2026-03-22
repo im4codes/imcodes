@@ -171,7 +171,7 @@
     "confirm_password_placeholder": "确认新密码",
     "change_password_btn": "修改密码",
     "passwords_mismatch": "两次输入的密码不一致",
-    "password_too_short": "密码至少需要 6 个字符"
+    "password_too_short": "密码至少需要 8 个字符"
   },
   "serverSetup": {
     "title": "选择服务器",

@@ -171,7 +171,7 @@
     "confirm_password_placeholder": "確認新密碼",
     "change_password_btn": "變更密碼",
     "passwords_mismatch": "兩次輸入的密碼不一致",
-    "password_too_short": "密碼至少需要 6 個字元"
+    "password_too_short": "密碼至少需要 8 個字元"
   },
   "serverSetup": {
     "title": "選擇伺服器",

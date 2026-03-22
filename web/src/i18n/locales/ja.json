@@ -171,7 +171,7 @@
     "confirm_password_placeholder": "新しいパスワードを確認",
     "change_password_btn": "パスワードを変更",
     "passwords_mismatch": "パスワードが一致しません",
-    "password_too_short": "パスワードは6文字以上で入力してください"
+    "password_too_short": "パスワードは8文字以上で入力してください"
   },
   "serverSetup": {
     "title": "サーバーを選択",
