@@ -96,6 +96,31 @@ export function useSubSessions(
       let sessionName: string | undefined;
       let state: string | undefined;
 
+      // Sub-session created by daemon (e.g., discussion orchestrator)
+      if (msg.type === 'subsession.created') {
+        const m = msg as any;
+        if (m.id) {
+          setSubSessions((prev) => {
+            // Don't add if already exists
+            if (prev.some((s) => s.id === m.id)) return prev;
+            const now = Date.now();
+            return [...prev, {
+              id: m.id,
+              serverId: '',
+              type: m.sessionType || 'shell',
+              sessionName: m.sessionName || `deck_sub_${m.id}`,
+              cwd: m.cwd || null,
+              label: m.label || null,
+              parentSession: m.parentSession || null,
+              createdAt: now,
+              updatedAt: now,
+              state: (m.state || 'running') as SubSession['state'],
+            }];
+          });
+        }
+        return;
+      }
+
       // Sub-session removed by daemon (stopped/cleaned up server-side)
       if (msg.type === 'subsession.removed') {
         const removedId = (msg as any).id as string;

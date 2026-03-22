@@ -47,6 +47,7 @@ export type ServerMessage =
   | { type: 'file.search_response'; requestId: string; results: string[]; error?: string }
   | { type: 'p2p.run_update'; run: any }
   | { type: 'p2p.conflict'; existingRunId: string; initiatorSession: string; commandId: string }
+  | { type: 'subsession.created'; id: string; sessionName: string; sessionType: string; cwd?: string; label?: string; parentSession?: string; state?: string }
   | { type: 'subsession.removed'; id: string; sessionName: string }
   | { type: 'p2p.run_started'; runId: string; session: string }
   | { type: 'p2p.cancel_response'; runId: string; ok: boolean }

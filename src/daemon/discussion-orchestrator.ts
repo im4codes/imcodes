@@ -317,6 +317,7 @@ async function runDiscussion(
         cwd: d.cwd || null,
         label: `Discussion: ${p.roleLabel}`,
         ccSessionId,
+        parentSession: null, // discussion sub-sessions are standalone
       });
     }
   }
@@ -559,7 +560,7 @@ export async function startDiscussion(
 
   discussions.set(opts.id, discussion);
 
-  void runDiscussion(discussion, onUpdate).catch((e) => {
+  void runDiscussion(discussion, onUpdate).catch(async (e) => {
     discussion.state = 'failed';
     discussion.error = e instanceof Error ? e.message : String(e);
     onUpdate({ type: 'discussion.error', discussionId: discussion.id, error: discussion.error });
@@ -569,6 +570,13 @@ export async function startDiscussion(
       filePath: discussion.filePath || null, error: discussion.error,
       startedAt: discussion.startedAt, finishedAt: Date.now(),
     });
+    // Clean up sub-sessions on failure (same as success path)
+    for (const p of discussion.participants) {
+      if (!p.reused) {
+        await stopSubSession(p.sessionName).catch(() => {});
+        onUpdate({ type: 'subsession.close', id: p.subSessionId });
+      }
+    }
     logger.error({ err: e, discussionId: discussion.id }, 'Discussion failed');
   });
 
@@ -607,6 +615,7 @@ export async function stopDiscussion(id: string): Promise<void> {
   d.state = 'failed';
   d.error = 'stopped by user';
   for (const p of d.participants) {
+    // stopSubSession with serverLink=null — DB cleanup relies on bridge handling subsession.close
     await stopSubSession(p.sessionName).catch(() => {});
   }
 }

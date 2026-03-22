@@ -656,7 +656,19 @@ export class WsBridge {
         (msg.label as string) || null,
         (msg.ccSessionId as string) || null,
         (msg.geminiSessionId as string) || null,
-      ).catch((e) => logger.error({ err: e, id: msg.id }, 'Failed to sync sub-session to DB'));
+      ).then(() => {
+        // Notify browsers so sub-session appears immediately without page refresh
+        this.broadcastToBrowsers(JSON.stringify({
+          type: 'subsession.created',
+          id: msg.id,
+          sessionName: `deck_sub_${msg.id}`,
+          sessionType: msg.sessionType,
+          cwd: msg.cwd || null,
+          label: msg.label || null,
+          parentSession: msg.parentSession || null,
+          state: 'running',
+        }));
+      }).catch((e) => logger.error({ err: e, id: msg.id }, 'Failed to sync sub-session to DB'));
       return;
     }
     if (type === 'subsession.update_gemini_id' && this.db) {
