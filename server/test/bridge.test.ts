@@ -993,4 +993,127 @@ describe('WsBridge', () => {
       expect(JSON.parse(browser2.sentStrings[0]).type).toBe('repo.detect_response');
     });
   });
+
+  // ── Sub-session sync + P2P conflict relay ─────────────────────────────────
+
+  describe('sub-session sync and P2P conflict relay', () => {
+    async function setupAuthBridge() {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      browserWs.sent.length = 0;
+
+      return { bridge, daemonWs, browserWs };
+    }
+
+    it('subsession.sync from daemon → persists to DB + broadcasts subsession.created to browsers', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'subsession.sync',
+        id: 'sub-123',
+        sessionType: 'claude-code',
+        shellBin: '/bin/bash',
+        cwd: '/home/user/project',
+        label: 'worker-1',
+        ccSessionId: 'cc-abc',
+        parentSession: 'deck_myapp_brain',
+      }));
+      await flushAsync();
+
+      // Browser should receive subsession.created broadcast
+      expect(browserWs.sentStrings.length).toBeGreaterThan(0);
+      const msg = JSON.parse(browserWs.sentStrings[0]);
+      expect(msg.type).toBe('subsession.created');
+      expect(msg.id).toBe('sub-123');
+      expect(msg.sessionName).toBe('deck_sub_sub-123');
+      expect(msg.sessionType).toBe('claude-code');
+      expect(msg.cwd).toBe('/home/user/project');
+      expect(msg.label).toBe('worker-1');
+      expect(msg.parentSession).toBe('deck_myapp_brain');
+      expect(msg.state).toBe('running');
+    });
+
+    it('subsession.closed from daemon → updates DB + broadcasts subsession.removed to browsers', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'subsession.closed',
+        id: 'sub-456',
+        sessionName: 'deck_sub_sub-456',
+      }));
+      await flushAsync();
+
+      // Browser should receive subsession.removed broadcast
+      expect(browserWs.sentStrings.length).toBeGreaterThan(0);
+      const msg = JSON.parse(browserWs.sentStrings[0]);
+      expect(msg.type).toBe('subsession.removed');
+      expect(msg.id).toBe('sub-456');
+      expect(msg.sessionName).toBe('deck_sub_sub-456');
+    });
+
+    it('subsession.closed without id → no broadcast', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'subsession.closed',
+        // no id
+        sessionName: 'deck_sub_missing',
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings).toHaveLength(0);
+    });
+
+    it('p2p.conflict from daemon → broadcasts to all browsers', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browser1 = new MockWs();
+      const browser2 = new MockWs();
+      bridge.handleBrowserConnection(browser1 as never, 'user-1', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(browser2 as never, 'user-2', makeDb('valid-hash'));
+      browser1.sent.length = 0;
+      browser2.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'p2p.conflict',
+        topic: 'review code',
+        existingRunId: 'run-old',
+      }));
+      await flushAsync();
+
+      // Both browsers should receive the p2p.conflict message
+      expect(browser1.sentStrings.length).toBeGreaterThan(0);
+      expect(browser2.sentStrings.length).toBeGreaterThan(0);
+      const msg1 = JSON.parse(browser1.sentStrings[0]);
+      const msg2 = JSON.parse(browser2.sentStrings[0]);
+      expect(msg1.type).toBe('p2p.conflict');
+      expect(msg1.topic).toBe('review code');
+      expect(msg2.type).toBe('p2p.conflict');
+    });
+
+    it('p2p.conflict is not session-scoped — reaches unsubscribed browsers', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+      // browserWs is not subscribed to any session
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'p2p.conflict',
+        topic: 'refactor',
+        existingRunId: 'run-x',
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings.length).toBeGreaterThan(0);
+      expect(JSON.parse(browserWs.sentStrings[0]).type).toBe('p2p.conflict');
+    });
+  });
 });

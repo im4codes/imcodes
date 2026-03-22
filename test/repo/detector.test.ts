@@ -32,6 +32,21 @@ describe('parseRemoteUrl', () => {
     expect(result).toEqual({ host: 'git.corp.example.com', owner: 'team', repo: 'internal-tool' });
   });
 
+  it('parses SSH alias format (e.g. github-work)', () => {
+    const result = parseRemoteUrl('git@github-work:org/repo.git');
+    expect(result).toEqual({ host: 'github-work', owner: 'org', repo: 'repo' });
+  });
+
+  it('parses SSH alias with hyphenated host and nested owner', () => {
+    const result = parseRemoteUrl('git@gitlab-personal:myteam/backend.git');
+    expect(result).toEqual({ host: 'gitlab-personal', owner: 'myteam', repo: 'backend' });
+  });
+
+  it('parses SSH alias without .git suffix', () => {
+    const result = parseRemoteUrl('git@github-work:org/repo');
+    expect(result).toEqual({ host: 'github-work', owner: 'org', repo: 'repo' });
+  });
+
   it('returns null for invalid URL', () => {
     expect(parseRemoteUrl('not-a-url')).toBeNull();
     expect(parseRemoteUrl('')).toBeNull();

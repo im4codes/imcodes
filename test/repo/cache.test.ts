@@ -118,6 +118,51 @@ describe('RepoCache', () => {
     });
   });
 
+  describe('force refresh (invalidate + re-get)', () => {
+    it('get() returns null for previously cached entries after invalidate', () => {
+      const keyIssues = RepoCache.buildKey('/proj', 'issues');
+      const keyPrs = RepoCache.buildKey('/proj', 'prs');
+      const keyDetect = RepoCache.buildKey('/proj', 'detect');
+
+      cache.set(keyIssues, { items: [1, 2] }, '/proj');
+      cache.set(keyPrs, { items: [3] }, '/proj');
+      cache.set(keyDetect, { platform: 'github' }, '/proj');
+
+      // Verify all are cached
+      expect(cache.get(keyIssues)).toBeTruthy();
+      expect(cache.get(keyPrs)).toBeTruthy();
+      expect(cache.get(keyDetect)).toBeTruthy();
+
+      // Force refresh: invalidate all for project
+      cache.invalidate('/proj');
+
+      // All entries for this project must return null
+      expect(cache.get(keyIssues)).toBeNull();
+      expect(cache.get(keyPrs)).toBeNull();
+      expect(cache.get(keyDetect)).toBeNull();
+    });
+
+    it('invalidate clears entries with params too', () => {
+      const key = RepoCache.buildKey('/proj', 'issues', { state: 'open', page: 2 });
+      cache.set(key, { items: [10] }, '/proj');
+      expect(cache.get(key)).toEqual({ items: [10] });
+
+      cache.invalidate('/proj');
+      expect(cache.get(key)).toBeNull();
+    });
+
+    it('new data can be set after invalidate', () => {
+      const key = RepoCache.buildKey('/proj', 'issues');
+      cache.set(key, 'old-data', '/proj');
+      cache.invalidate('/proj');
+      expect(cache.get(key)).toBeNull();
+
+      // Simulate re-fetch after force refresh
+      cache.set(key, 'fresh-data', '/proj');
+      expect(cache.get(key)).toBe('fresh-data');
+    });
+  });
+
   describe('shared entries', () => {
     it('two consumers reading same key get same cached data', () => {
       cache.set(RepoCache.buildKey('/proj', 'issues'), { items: [1] }, '/proj');
