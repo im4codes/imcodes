@@ -77,7 +77,7 @@ export function listP2pRuns(): P2pRun[] { return [...activeRuns.values()]; }
 function resolveP2pDir(session: string): string {
   const record = getSession(session);
   const cwd = record?.projectDir || process.cwd();
-  return join(cwd, 'imc_files', 'discussions');
+  return join(cwd, '.imc', 'discussions');
 }
 let IDLE_POLL_MS = 3_000;
 let GRACE_PERIOD_DEFAULT_MS = 180_000; // 3 min — complex analysis (subagent research + write) takes time
@@ -176,6 +176,18 @@ export async function startP2pRun(
   // Create temp context file under project dir
   const p2pDir = resolveP2pDir(initiatorSession);
   await mkdir(p2pDir, { recursive: true });
+
+  // Auto-add .imc/ to .gitignore if not already present
+  const projectDir = p2pDir.replace(/\/\.imc\/discussions$/, '');
+  try {
+    const gitignorePath = join(projectDir, '.gitignore');
+    const content = await readFile(gitignorePath, 'utf8').catch(() => '');
+    if (!content.includes('.imc/') && !content.includes('.imc\n')) {
+      const line = content.endsWith('\n') || content === '' ? '.imc/\n' : '\n.imc/\n';
+      await writeFile(gitignorePath, content + line);
+    }
+  } catch { /* best effort */ }
+
   const contextFilePath = join(p2pDir, `${runId}.md`);
 
   let seed = `# P2P Discussion: ${runId}\n\n`;

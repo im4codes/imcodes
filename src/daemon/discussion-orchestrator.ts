@@ -333,7 +333,7 @@ async function runDiscussion(
   }
 
   // 2. Generate semantic title via LLM, then create discussion file
-  const discussDir = path.join(d.cwd || process.cwd(), 'imc_files', 'discussions');
+  const discussDir = path.join(d.cwd || process.cwd(), '.imc', 'discussions');
   await mkdir(discussDir, { recursive: true });
   const titleAgent = d.participants[d.verdictParticipantIdx];
   const titleFile = path.join(discussDir, `title-${d.id.slice(0, 8)}.txt`);
