@@ -1229,18 +1229,9 @@ export function App() {
 
   const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
 
-  // Show full-screen connecting indicator while waiting for initial WS + session data.
-  // Prevents the "black screen" gap between splash and layout on slow networks.
-  if (auth && selectedServerId && !sessionsLoaded && !connected && servers.length === 0) {
-    return (
-      <div style={{ position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0a0e1a', flexDirection: 'column', gap: 16 }}>
-        <div class="spinner" style={{ width: 32, height: 32 }} />
-        <div style={{ color: '#64748b', fontSize: 14 }}>{connecting ? trans('common.reconnecting') : trans('common.loading')}</div>
-      </div>
-    );
-  }
-
   // ── Auto-detect repo for active session (with retry) ───────────────────
+  // IMPORTANT: This useEffect MUST be before any conditional returns to avoid
+  // React hooks ordering violation (hooks cannot be called conditionally).
   useEffect(() => {
     const ws = wsRef.current;
     const dir = activeSessionInfo?.projectDir;
@@ -1266,6 +1257,17 @@ export function App() {
 
     return () => { clearTimeout(initialTimer); clearInterval(interval); };
   }, [activeSessionInfo?.projectDir, connected]);
+
+  // Show full-screen connecting indicator while waiting for initial WS + session data.
+  // Prevents the "black screen" gap between splash and layout on slow networks.
+  if (auth && selectedServerId && !sessionsLoaded && !connected && servers.length === 0) {
+    return (
+      <div style={{ position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0a0e1a', flexDirection: 'column', gap: 16 }}>
+        <div class="spinner" style={{ width: 32, height: 32 }} />
+        <div style={{ color: '#64748b', fontSize: 14 }}>{connecting ? trans('common.reconnecting') : trans('common.loading')}</div>
+      </div>
+    );
+  }
 
   return (
     <div class="layout">
