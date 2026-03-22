@@ -813,6 +813,13 @@ export function App() {
           // discussion_id is the file-level ID (maps to ~/.imcodes/discussions/${discussion_id}.md)
           // run.id is the execution-level ID — use discussion_id for navigation
           const fileId = r.discussion_id ? String(r.discussion_id) : r.id;
+          // Parse node list for segmented progress display
+          const nodes = Array.isArray(r.all_nodes) ? r.all_nodes.map((n: any) => ({
+            label: String(n.label ?? ''),
+            agentType: String(n.agentType ?? ''),
+            status: String(n.status ?? 'pending') as 'done' | 'active' | 'pending' | 'skipped',
+          })) : undefined;
+
           const entry = {
             id,
             topic: `P2P ${mode} · ${initiatorLabel}`,
@@ -823,6 +830,7 @@ export function App() {
             conclusion: state === 'done' ? (r.result_summary ?? undefined) : undefined,
             filePath: undefined,
             fileId,
+            nodes,
           };
           if (existing) {
             return prev.map((d) => d.id === id ? { ...d, ...entry } : d);

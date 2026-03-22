@@ -21,6 +21,12 @@ interface DaemonStats {
   uptime: number;
 }
 
+interface P2pNode {
+  label: string;
+  agentType: string;
+  status: 'done' | 'active' | 'pending' | 'skipped';
+}
+
 interface DiscussionSummary {
   id: string;
   topic: string;
@@ -31,6 +37,7 @@ interface DiscussionSummary {
   conclusion?: string;
   filePath?: string;
   fileId?: string;
+  nodes?: P2pNode[];
 }
 
 interface Props {
@@ -350,45 +357,61 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
         <div class="discussion-panel">
           {discussions.map((d) => {
             const isActive = d.state !== 'done' && d.state !== 'failed';
-            const progress = d.maxRounds > 0
-              ? Math.round(((d.currentRound - 1) * 100) / d.maxRounds)
-              : 0;
+            const nodes = d.nodes ?? [];
+            const doneCount = nodes.filter(n => n.status === 'done').length;
+            const totalNodes = nodes.length || d.maxRounds;
+            const progressPct = totalNodes > 0 ? Math.round((doneCount / totalNodes) * 100) : 0;
+
             return (
               <div key={d.id} class={`discussion-card ${d.state}`} style={{ cursor: d.fileId ? 'pointer' : undefined }} onClick={() => { if (d.fileId && onViewDiscussion) onViewDiscussion(d.fileId); }}>
-                <div class="discussion-card-header">
-                  <div class="discussion-card-title">⚖️ {d.topic || 'Discussion'}</div>
+                {/* Segmented progress bar on TOP of card */}
+                {nodes.length > 0 && (
+                  <div style={{ display: 'flex', gap: 1, height: 3, borderRadius: 2, overflow: 'hidden' }}>
+                    {nodes.map((n, i) => (
+                      <div key={i} style={{
+                        flex: 1,
+                        background: n.status === 'done' ? '#22c55e' : n.status === 'active' ? '#3b82f6' : n.status === 'skipped' ? '#ef4444' : '#334155',
+                        transition: 'background 0.3s',
+                      }} title={`${n.label} (${n.agentType}) — ${n.status}`} />
+                    ))}
+                  </div>
+                )}
+                {nodes.length === 0 && isActive && (
+                  <div class="discussion-progress-bar" style={{ height: 3, borderRadius: 2 }}>
+                    <div class="discussion-progress-fill" style={{ width: `${progressPct}%` }} />
+                  </div>
+                )}
+
+                <div class="discussion-card-header" style={{ padding: '6px 10px' }}>
+                  <div class="discussion-card-title" style={{ fontSize: 12 }}>⚖️ {d.topic || 'Discussion'}</div>
                   <div class="discussion-card-actions">
                     {isActive && onStopDiscussion && (
-                      <button class="btn btn-sm btn-danger" onClick={(e: Event) => { e.stopPropagation(); onStopDiscussion(d.id); }}>Stop</button>
+                      <button class="btn btn-sm btn-danger" style={{ fontSize: 10, padding: '1px 6px' }} onClick={(e: Event) => { e.stopPropagation(); onStopDiscussion(d.id); }}>Stop</button>
                     )}
                   </div>
                 </div>
-                <div class="discussion-card-body">
-                  {(d.state === 'setup' || d.state === 'running' || d.state === 'verdict') && (
-                    <>
-                      <div class="discussion-progress-bar">
-                        <div class="discussion-progress-fill" style={{ width: `${d.state === 'setup' ? 0 : d.state === 'verdict' ? 95 : progress}%` }} />
-                      </div>
-                      <div class="discussion-status">
-                        {d.state === 'setup' && 'Initializing...'}
-                        {d.state === 'running' && (
-                          <>
-                            Round {d.currentRound}/{d.maxRounds}
-                            {d.currentSpeaker && <> — <strong>{d.currentSpeaker}</strong> speaking...</>}
-                          </>
-                        )}
-                        {d.state === 'verdict' && 'Summarizing...'}
-                      </div>
-                    </>
-                  )}
+
+                {/* Node list — shows each participant with type and status */}
+                {nodes.length > 0 && isActive && (
+                  <div style={{ padding: '2px 10px 6px', display: 'flex', flexWrap: 'wrap', gap: '3px 8px', fontSize: 10, color: '#94a3b8' }}>
+                    {nodes.map((n, i) => (
+                      <span key={i} style={{
+                        color: n.status === 'done' ? '#22c55e' : n.status === 'active' ? '#60a5fa' : n.status === 'skipped' ? '#f87171' : '#475569',
+                        fontWeight: n.status === 'active' ? 600 : 400,
+                      }}>
+                        {n.status === 'done' ? '✓' : n.status === 'active' ? '▸' : n.status === 'skipped' ? '✕' : '○'}{' '}
+                        {n.label} <span style={{ opacity: 0.6 }}>({n.agentType})</span>
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                <div class="discussion-card-body" style={{ padding: nodes.length > 0 ? '0 10px 6px' : undefined }}>
                   {d.state === 'done' && (
                     <>
                       <div class="discussion-status done">✓ Complete</div>
                       {d.conclusion && (
                         <div class="discussion-conclusion">{d.conclusion}</div>
-                      )}
-                      {d.filePath && (
-                        <div class="discussion-filepath">{d.filePath}</div>
                       )}
                     </>
                   )}
