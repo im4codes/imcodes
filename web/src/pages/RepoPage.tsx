@@ -93,15 +93,27 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
 
   // ── Detect on mount ──────────────────────────────────────────────────────
 
+  const detectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const doDetect = useCallback(() => {
     setDetectLoading(true);
     setDetectError(null);
     const rid = ws.repoDetect(projectDir);
     detectReqRef.current = rid;
     pendingRef.current.add(rid);
+
+    // Timeout: if no response within 10s, show error with debug info
+    if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current);
+    detectTimeoutRef.current = setTimeout(() => {
+      if (detectReqRef.current === rid && pendingRef.current.has(rid)) {
+        pendingRef.current.delete(rid);
+        setDetectError(`Detect timeout — no response from daemon after 10s`);
+        setDetectLoading(false);
+      }
+    }, 10_000);
   }, [ws, projectDir]);
 
-  useEffect(() => { doDetect(); }, [doDetect]);
+  useEffect(() => { doDetect(); return () => { if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current); }; }, [doDetect]);
 
   // ── Tab data fetching ────────────────────────────────────────────────────
 
@@ -142,6 +154,7 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
       if (msg.type === 'repo.detect_response') {
         if (msg.requestId !== detectReqRef.current) return;
         pendingRef.current.delete(msg.requestId);
+        if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current);
         setContext(mapDetectToContext((msg as any).context ?? msg));
         setDetectLoading(false);
         return;
@@ -160,6 +173,7 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
         pendingRef.current.delete(msg.requestId);
         // Could be detect error or tab error
         if (msg.requestId === detectReqRef.current) {
+          if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current);
           setDetectError(msg.error);
           setDetectLoading(false);
         } else {
