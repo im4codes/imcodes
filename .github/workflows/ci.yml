@@ -170,9 +170,11 @@ jobs:
       - run: npm ci
       - name: Install glab
         run: |
-          GLAB_VERSION=$(curl -s https://gitlab.com/api/v4/projects/34675721/releases/permalink/latest | python3 -c "import sys,json;print(json.load(sys.stdin)['tag_name'].lstrip('v'))")
-          curl -sLO "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_amd64.deb"
+          GLAB_VERSION=$(gh api repos/gitlab-org/cli/releases/latest -q '.tag_name' | sed 's/^v//')
+          gh release download "v${GLAB_VERSION}" --repo gitlab-org/cli --pattern "glab_${GLAB_VERSION}_linux_amd64.deb"
           sudo dpkg -i "glab_${GLAB_VERSION}_linux_amd64.deb"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Authenticate glab
         if: env.GITLAB_TOKEN != ''
         run: glab auth login --hostname gitlab.com --token "$GITLAB_TOKEN"
