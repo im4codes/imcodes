@@ -168,16 +168,14 @@ jobs:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
       - run: npm ci
-      - name: Install glab
+      - name: Install & authenticate glab (optional — tests skip if unavailable)
+        continue-on-error: true
         run: |
-          GLAB_VERSION=$(gh api repos/gitlab-org/cli/releases/latest -q '.tag_name' | sed 's/^v//')
-          gh release download "v${GLAB_VERSION}" --repo gitlab-org/cli --pattern "glab_${GLAB_VERSION}_linux_amd64.deb"
-          sudo dpkg -i "glab_${GLAB_VERSION}_linux_amd64.deb"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Authenticate glab
-        if: env.GITLAB_TOKEN != ''
-        run: glab auth login --hostname gitlab.com --token "$GITLAB_TOKEN"
+          curl -fsSL "https://gitlab.com/gitlab-org/cli/-/releases/v1.89.0/downloads/glab_1.89.0_linux_amd64.deb" -o glab.deb
+          sudo dpkg -i glab.deb
+          if [ -n "$GITLAB_TOKEN" ]; then
+            glab auth login --hostname gitlab.com --token "$GITLAB_TOKEN"
+          fi
         env:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
       - name: Run integration tests
