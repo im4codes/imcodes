@@ -6,7 +6,7 @@
  * but bridge expects repo.list_issues_response — causing silent message drops.
  */
 import { describe, it, expect } from 'vitest';
-import { REPO_MSG, REPO_RELAY_TYPES } from '../../src/shared/repo-types.js';
+import { REPO_MSG, REPO_RELAY_TYPES } from '../../shared/repo-types.js';
 
 describe('Repo message type contract', () => {
   it('REPO_MSG constants are non-empty strings', () => {

@@ -84,3 +84,5 @@ The web project uses `i18next` with `react-i18next` for internationalization.
 - Server secrets (`JWT_SIGNING_KEY`, `BOT_ENCRYPTION_KEY`) are set via environment variables, never committed.
 - E2E tests require tmux. They are auto-skipped when `SKIP_TMUX_TESTS=1` or inside a Claude Code session (`CLAUDECODE` env var set).
 - The server TypeScript project is stricter (`noUnusedLocals`, `noImplicitReturns`). Both daemon and server projects must compile cleanly.
+- **Shared code between daemon and server**: Use `shared/` directory (NOT `src/shared/`). Server tsconfig includes `../shared/**/*`. Import path from server: `../../../shared/foo.js`. Import path from daemon/test: `../../shared/foo.js`. The `shared/` dir is copied into Docker image by `Dockerfile` (`COPY shared/ ./shared/`). **NEVER** import across project boundaries with `../../../src/` paths — they break at runtime in Docker.
+- **Web tsconfig is stricter** than daemon (`noUnusedLocals`). The Docker build runs `cd web && npm run build` which will fail on unused variables/imports that pass `npx tsc --noEmit` in daemon. Always run `cd web && npx tsc --noEmit` before pushing.

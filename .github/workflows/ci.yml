@@ -112,6 +112,12 @@ jobs:
       - name: Run server-native tests (auth-flow, proxy-addr — require server/node_modules)
         run: npm test
         working-directory: server
+      - name: Build server for runtime check
+        run: npm run build
+        working-directory: server
+      - name: Runtime import smoke test (catches import path errors that tsc misses)
+        run: node -e "import('./dist/src/index.js').then(() => { console.log('Server module loaded OK'); process.exit(0); }).catch(e => { console.error('IMPORT FAILED:', e.message); process.exit(1); })"
+        working-directory: server
 
   # ── Server DB integration tests (testcontainers + real PostgreSQL) ─────────
 

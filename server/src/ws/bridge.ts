@@ -16,7 +16,7 @@ import type { PgDatabase } from '../db/client.js';
 import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
 import { sha256Hex } from '../security/crypto.js';
-import { REPO_RELAY_TYPES } from '../../../src/shared/repo-types.js';
+import { REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, updateSubSession, upsertOrchestrationRun } from '../db/queries.js';
 import logger from '../util/logger.js';
 
