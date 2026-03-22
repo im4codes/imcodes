@@ -413,6 +413,20 @@ export async function passkeyLoginCompleteNative(
   });
 }
 
+export async function passwordLogin(username: string, password: string): Promise<{ mustChange?: boolean }> {
+  return apiFetch('/api/auth/password/login', {
+    method: 'POST',
+    body: JSON.stringify({ username, password }),
+  });
+}
+
+export async function passwordChange(currentPassword: string, newPassword: string): Promise<void> {
+  await apiFetch('/api/auth/password/change', {
+    method: 'POST',
+    body: JSON.stringify({ currentPassword, newPassword }),
+  });
+}
+
 export async function listPasskeys(): Promise<{ credentials: PasskeyCredential[] }> {
   return apiFetch('/api/auth/passkey/credentials');
 }

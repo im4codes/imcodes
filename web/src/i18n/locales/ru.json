@@ -160,7 +160,18 @@
     "display_name_placeholder": "Ваше имя (напр.: Alice)",
     "device_name_placeholder": "Название устройства (необязательно, напр.: MacBook Pro)",
     "or": "или",
-    "github_signin": "Войти через GitHub"
+    "github_signin": "Войти через GitHub",
+    "password_signin": "Войти с паролем",
+    "username_placeholder": "Имя пользователя",
+    "password_placeholder": "Пароль",
+    "signin": "Войти",
+    "invalid_credentials": "Неверное имя пользователя или пароль",
+    "must_change_password": "Необходимо сменить пароль перед продолжением",
+    "new_password_placeholder": "Новый пароль",
+    "confirm_password_placeholder": "Подтвердите новый пароль",
+    "change_password_btn": "Сменить пароль",
+    "passwords_mismatch": "Пароли не совпадают",
+    "password_too_short": "Пароль должен содержать не менее 6 символов"
   },
   "serverSetup": {
     "title": "Выбор сервера",

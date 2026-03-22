@@ -160,7 +160,18 @@
     "display_name_placeholder": "이름 (예: Alice)",
     "device_name_placeholder": "기기 이름 (선택, 예: MacBook Pro)",
     "or": "또는",
-    "github_signin": "GitHub로 로그인"
+    "github_signin": "GitHub로 로그인",
+    "password_signin": "비밀번호로 로그인",
+    "username_placeholder": "사용자 이름",
+    "password_placeholder": "비밀번호",
+    "signin": "로그인",
+    "invalid_credentials": "사용자 이름 또는 비밀번호가 올바르지 않습니다",
+    "must_change_password": "계속하려면 비밀번호를 변경해야 합니다",
+    "new_password_placeholder": "새 비밀번호",
+    "confirm_password_placeholder": "새 비밀번호 확인",
+    "change_password_btn": "비밀번호 변경",
+    "passwords_mismatch": "비밀번호가 일치하지 않습니다",
+    "password_too_short": "비밀번호는 최소 6자 이상이어야 합니다"
   },
   "serverSetup": {
     "title": "서버 선택",

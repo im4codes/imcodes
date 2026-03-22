@@ -160,7 +160,18 @@
     "display_name_placeholder": "Your name (e.g. Alice)",
     "device_name_placeholder": "Device label (optional, e.g. MacBook Pro)",
     "or": "or",
-    "github_signin": "Sign in with GitHub"
+    "github_signin": "Sign in with GitHub",
+    "password_signin": "Sign in with Password",
+    "username_placeholder": "Username",
+    "password_placeholder": "Password",
+    "signin": "Sign In",
+    "invalid_credentials": "Invalid username or password",
+    "must_change_password": "You must change your password before continuing",
+    "new_password_placeholder": "New password",
+    "confirm_password_placeholder": "Confirm new password",
+    "change_password_btn": "Change Password",
+    "passwords_mismatch": "Passwords do not match",
+    "password_too_short": "Password must be at least 6 characters"
   },
   "serverSetup": {
     "title": "Choose a Server",

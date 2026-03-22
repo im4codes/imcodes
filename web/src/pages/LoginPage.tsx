@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { startRegistration, startAuthentication } from '@simplewebauthn/browser';
-import { passkeyLoginBegin, passkeyLoginComplete, passkeyRegisterBegin, passkeyRegisterComplete } from '../api.js';
+import { passkeyLoginBegin, passkeyLoginComplete, passkeyRegisterBegin, passkeyRegisterComplete, passwordLogin, passwordChange } from '../api.js';
 import { isNative } from '../native.js';
 
 interface Props {
@@ -13,9 +13,13 @@ interface Props {
 
 export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }: Props) {
   const { t } = useTranslation();
-  const [mode, setMode] = useState<'buttons' | 'register'>('buttons');
+  const [mode, setMode] = useState<'buttons' | 'register' | 'password' | 'change_password'>('buttons');
   const [displayName, setDisplayName] = useState('');
   const [deviceName, setDeviceName] = useState('');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [passkeySupported, setPasskeySupported] = useState(false);
@@ -112,6 +116,52 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
     }
   };
 
+  const handlePasswordLogin = async () => {
+    if (!username.trim() || !password) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await passwordLogin(username.trim(), password);
+      if (res.mustChange) {
+        setMode('change_password');
+      } else {
+        onLogin?.();
+        window.location.reload();
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('invalid_credentials')) {
+        setError(t('login.invalid_credentials'));
+      } else {
+        setError(msg);
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleChangePassword = async () => {
+    if (!newPassword || newPassword !== confirmPassword) {
+      setError(t('login.passwords_mismatch'));
+      return;
+    }
+    if (newPassword.length < 6) {
+      setError(t('login.password_too_short'));
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      await passwordChange(password, newPassword);
+      onLogin?.();
+      window.location.reload();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <div class="login-page">
       <div class="login-card">
@@ -161,17 +211,100 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
             )}
 
             {!isNative() && (
-              <button
-                class="btn btn-ghost"
-                style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}
-                onClick={handleGithub}
-              >
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/>
-                </svg>
-                {t('login.github_signin')}
-              </button>
+              <>
+                <button
+                  class="btn btn-ghost"
+                  style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginBottom: 10 }}
+                  onClick={handleGithub}
+                >
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/>
+                  </svg>
+                  {t('login.github_signin')}
+                </button>
+
+                <button
+                  class="btn btn-ghost"
+                  style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}
+                  onClick={() => { setMode('password'); setError(null); }}
+                >
+                  {t('login.password_signin')}
+                </button>
+              </>
             )}
+          </>
+        )}
+
+        {mode === 'password' && (
+          <>
+            <input
+              class="input"
+              style={{ width: '100%', marginBottom: 10, boxSizing: 'border-box' }}
+              type="text"
+              placeholder={t('login.username_placeholder')}
+              value={username}
+              onInput={(e) => setUsername((e.target as HTMLInputElement).value)}
+              autoFocus
+            />
+            <input
+              class="input"
+              style={{ width: '100%', marginBottom: 16, boxSizing: 'border-box' }}
+              type="password"
+              placeholder={t('login.password_placeholder')}
+              value={password}
+              onInput={(e) => setPassword((e.target as HTMLInputElement).value)}
+              onKeyDown={(e) => e.key === 'Enter' && handlePasswordLogin()}
+            />
+            <button
+              class="btn btn-primary"
+              style={{ width: '100%', marginBottom: 10 }}
+              onClick={handlePasswordLogin}
+              disabled={loading || !username.trim() || !password}
+            >
+              {loading ? t('common.loading') : t('login.signin')}
+            </button>
+            <button
+              class="btn btn-ghost"
+              style={{ width: '100%' }}
+              onClick={() => { setMode('buttons'); setError(null); }}
+              disabled={loading}
+            >
+              {t('common.cancel')}
+            </button>
+          </>
+        )}
+
+        {mode === 'change_password' && (
+          <>
+            <p style={{ color: '#f59e0b', fontSize: 14, marginBottom: 16, textAlign: 'center' }}>
+              {t('login.must_change_password')}
+            </p>
+            <input
+              class="input"
+              style={{ width: '100%', marginBottom: 10, boxSizing: 'border-box' }}
+              type="password"
+              placeholder={t('login.new_password_placeholder')}
+              value={newPassword}
+              onInput={(e) => setNewPassword((e.target as HTMLInputElement).value)}
+              autoFocus
+            />
+            <input
+              class="input"
+              style={{ width: '100%', marginBottom: 16, boxSizing: 'border-box' }}
+              type="password"
+              placeholder={t('login.confirm_password_placeholder')}
+              value={confirmPassword}
+              onInput={(e) => setConfirmPassword((e.target as HTMLInputElement).value)}
+              onKeyDown={(e) => e.key === 'Enter' && handleChangePassword()}
+            />
+            <button
+              class="btn btn-primary"
+              style={{ width: '100%' }}
+              onClick={handleChangePassword}
+              disabled={loading || !newPassword || newPassword !== confirmPassword}
+            >
+              {loading ? t('common.loading') : t('login.change_password_btn')}
+            </button>
           </>
         )}
 
