@@ -789,7 +789,7 @@ export function App() {
           : 'setup';
 
         // Current round = total - remaining (Phase 1 counts as round 1)
-        const currentRound = Math.max(1, totalCount - remainingCount - (status === 'completed' ? 0 : 1));
+        const currentRound = Math.max(1, totalCount - remainingCount);
 
         setDiscussions((prev) => {
           const existing = prev.find((d) => d.id === id);
@@ -817,7 +817,7 @@ export function App() {
         if (state === 'done' || state === 'failed') {
           setTimeout(() => {
             setDiscussions((prev) => prev.filter((d) => d.id !== id));
-          }, 30_000);
+          }, 120_000);
         }
       }
       if (msg.type === 'repo.detected' || msg.type === 'repo.detect_response') {
@@ -1149,7 +1149,7 @@ export function App() {
                 id: `p2p_${r.id}`,
                 topic: `P2P ${mode} · ${initiatorLabel}`,
                 state,
-                currentRound: Math.max(1, totalCount - remainingCount - (status === 'completed' ? 0 : 1)),
+                currentRound: Math.max(1, totalCount - remainingCount),
                 maxRounds: totalCount,
                 currentSpeaker: currentTarget,
                 conclusion: state === 'done' ? (r.result_summary ?? undefined) : undefined,

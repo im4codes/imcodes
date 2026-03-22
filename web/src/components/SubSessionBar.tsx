@@ -364,22 +364,22 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
                   </div>
                 </div>
                 <div class="discussion-card-body">
-                  {d.state === 'setup' && (
-                    <div class="discussion-status">Setting up agents...</div>
-                  )}
-                  {d.state === 'running' && (
+                  {(d.state === 'setup' || d.state === 'running' || d.state === 'verdict') && (
                     <>
                       <div class="discussion-progress-bar">
-                        <div class="discussion-progress-fill" style={{ width: `${progress}%` }} />
+                        <div class="discussion-progress-fill" style={{ width: `${d.state === 'setup' ? 0 : d.state === 'verdict' ? 95 : progress}%` }} />
                       </div>
                       <div class="discussion-status">
-                        Round {d.currentRound}/{d.maxRounds}
-                        {d.currentSpeaker && <> — <strong>{d.currentSpeaker}</strong> speaking...</>}
+                        {d.state === 'setup' && 'Initializing...'}
+                        {d.state === 'running' && (
+                          <>
+                            Round {d.currentRound}/{d.maxRounds}
+                            {d.currentSpeaker && <> — <strong>{d.currentSpeaker}</strong> speaking...</>}
+                          </>
+                        )}
+                        {d.state === 'verdict' && 'Summarizing...'}
                       </div>
                     </>
-                  )}
-                  {d.state === 'verdict' && (
-                    <div class="discussion-status">⚖️ Generating verdict...</div>
                   )}
                   {d.state === 'done' && (
                     <>

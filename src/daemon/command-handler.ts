@@ -613,6 +613,27 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   if (tokens.agents.length > 0) {
     // P2P Quick Discussion — delegate to orchestrator
     try {
+      // ── Concurrency guard: check for active P2P runs on same initiator ──
+      const forceNew = !!(cmd as Record<string, unknown>).force;
+      if (!forceNew) {
+        const TERMINAL_STATUSES = new Set(['completed', 'failed', 'timed_out', 'cancelled']);
+        const existingRun = listP2pRuns().find(
+          (r) => r.initiatorSession === sessionName && !TERMINAL_STATUSES.has(r.status),
+        );
+        if (existingRun) {
+          logger.info({ sessionName, existingRunId: existingRun.id }, 'P2P conflict: active run already exists');
+          try {
+            serverLink.send({
+              type: 'p2p.conflict',
+              existingRunId: existingRun.id,
+              initiatorSession: sessionName,
+              commandId: effectiveId,
+            });
+          } catch { /* not connected */ }
+          return;
+        }
+      }
+
       const fileContents: Array<{ path: string; content: string }> = [];
       const record = getSession(sessionName);
       const projectDir = record?.projectDir ?? '';

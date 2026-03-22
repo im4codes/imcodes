@@ -7,7 +7,7 @@ import { repoCache, RepoCache } from '../repo/cache.js';
 import { ServerLink } from './server-link.js';
 import { handleWebCommand, setRouterContext } from './command-handler.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
-import { notifySessionIdle } from './p2p-orchestrator.js';
+import { notifySessionIdle, listP2pRuns } from './p2p-orchestrator.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { timelineStore } from './timeline-store.js';
 import { startHookServer } from './hook-server.js';
@@ -175,6 +175,12 @@ export async function startup(): Promise<DaemonContext> {
         if (cached) {
           try { serverLink.send({ type: 'repo.detected', projectDir: dir, context: cached }); } catch { /* ignore */ }
         }
+      }
+      // Re-broadcast active P2P runs so browsers get state after reconnect
+      for (const run of listP2pRuns()) {
+        const TERMINAL = new Set(['completed', 'failed', 'timed_out', 'cancelled']);
+        if (TERMINAL.has(run.status)) continue;
+        try { serverLink.send({ type: 'p2p.run_save', run }); } catch { /* ignore */ }
       }
     }, 3_000); // delay to ensure WS auth handshake completes first
   }
