@@ -88,11 +88,15 @@ async function detectPlatform(host: string): Promise<RepoPlatform> {
     } catch { /* not a gh host or gh not installed */ }
   }
 
+  // 4. glab: parse `glab auth status` output for all authenticated hosts (supports self-hosted GitLab)
   try {
-    // glab doesn't have --hostname, check config
-    const { stdout } = await execFileAsync('glab', ['config', 'get', 'host'], { timeout: 5000 });
-    if (stdout.trim() === host || stdout.trim() === resolved) return 'gitlab';
-  } catch { /* not a glab host or glab not installed */ }
+    const { stderr, stdout } = await execFileAsync('glab', ['auth', 'status'], { timeout: 5000 });
+    // glab outputs host lines to both stdout and stderr depending on version
+    const output = (stdout + '\n' + stderr).toLowerCase();
+    for (const h of hostsToTry) {
+      if (output.includes(h.toLowerCase())) return 'gitlab';
+    }
+  } catch { /* glab not installed or not authenticated */ }
 
   return 'unknown';
 }
@@ -151,7 +155,10 @@ async function checkAuth(platform: RepoPlatform, host: string): Promise<boolean>
     if (platform === 'github') {
       await execFileAsync('gh', ['auth', 'status', '--hostname', host], { timeout: 5000 });
     } else {
-      await execFileAsync('glab', ['auth', 'status'], { timeout: 5000 });
+      // glab: verify the specific host is authenticated (supports self-hosted)
+      const { stdout, stderr } = await execFileAsync('glab', ['auth', 'status'], { timeout: 5000 });
+      const output = (stdout + '\n' + stderr).toLowerCase();
+      if (!output.includes(host.toLowerCase())) return false;
     }
     return true;
   } catch {
