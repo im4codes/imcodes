@@ -794,7 +794,7 @@ export function App() {
         // Map P2P status to discussion state
         const state = (status === 'completed') ? 'done'
           : (status === 'failed' || status === 'timed_out' || status === 'cancelled') ? 'failed'
-          : (status === 'running' || status === 'awaiting_next_hop') ? 'running'
+          : (status === 'running' || status === 'awaiting_next_hop' || status === 'dispatched') ? 'running'
           : 'setup';
 
         // Current round = total - remaining (Phase 1 counts as round 1)
