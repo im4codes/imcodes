@@ -436,7 +436,9 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
         // Case-insensitive to handle agents that change heading capitalization.
         if (sectionHeader && !headingFound && currentSize > sizeBefore) {
           const content = await readFile(watchPath, 'utf8');
-          if (content.toLowerCase().includes(`## ${sectionHeader}`.toLowerCase())) {
+          // Normalize: case-insensitive + dash variants (em-dash, en-dash, double-hyphen)
+          const norm = (s: string) => s.toLowerCase().replace(/[–—]/g, '-').replace(/--/g, '-');
+          if (norm(content).includes(norm(`## ${sectionHeader}`))) {
             headingFound = true;
             headingFoundAt = Date.now();
             if (!fileGrew) {
@@ -450,6 +452,21 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
       // Heading fast-path: once heading is found, wait 2s for final writes then complete
       if (headingFound && (Date.now() - headingFoundAt) >= 2_000) {
         logger.info({ runId: run.id, session, sectionHeader }, 'P2P: heading found in file, completing hop');
+        idleWaiter.cancel();
+        finishHop(false);
+        if (run.remainingTargets.length > 0 || session !== run.finalReturnSession) {
+          transition(run, 'awaiting_next_hop', serverLink);
+        }
+        return;
+      }
+
+      // Content-growth fallback: if file grew significantly and settled, treat as complete
+      // even without heading match (covers agents that use different heading format)
+      const settleForGrowth = IDLE_POLL_MS * FILE_SETTLE_CYCLES;
+      if (!headingFound && fileGrew && (lastSize - sizeBefore) > 500 &&
+          lastGrowthAt > 0 && (Date.now() - lastGrowthAt) >= settleForGrowth &&
+          (Date.now() - dispatchTime) > MIN_PROCESSING_MS) {
+        logger.info({ runId: run.id, session, growth: lastSize - sizeBefore }, 'P2P: content growth fallback — completing hop without heading');
         idleWaiter.cancel();
         finishHop(false);
         if (run.remainingTargets.length > 0 || session !== run.finalReturnSession) {
