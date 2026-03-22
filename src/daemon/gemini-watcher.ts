@@ -111,7 +111,11 @@ export interface WatcherState {
   seenCount: number;
   lastUpdated: string;
   abort: AbortController;
+  /** Separate AbortController for the current fs.watch — aborted on rotation without killing the session. */
+  watchAbort: AbortController;
   stopped: boolean;
+  /** Re-entrancy guard — prevents overlapping pollTick executions. */
+  polling: boolean;
   pollTimer?: ReturnType<typeof setInterval>;
   /** Current emitted state — single source of truth for what was last sent to timeline. */
   currentState?: 'running' | 'idle';
@@ -123,6 +127,8 @@ export interface WatcherState {
   lastConversationStatus?: 'running' | 'idle' | null;
   /** Consecutive poll ticks where JSON inferred idle. Prevents tool-call gap false idles. */
   idleConfirmCount?: number;
+  /** Last known mtime of activeFile — used as cheap change check before full read. */
+  _lastMtimeMs?: number;
 }
 
 const watchers = new Map<string, WatcherState>();
@@ -233,7 +239,7 @@ function inferConversationStatus(conv: any): 'running' | 'idle' | null {
 
 // ── Core poll logic ────────────────────────────────────────────────────────────
 
-async function readConversation(filePath: string): Promise<any | null> {
+async function readConversation(filePath: string, sessionName?: string): Promise<any | null> {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const raw = await readFile(filePath, 'utf8');
@@ -243,16 +249,51 @@ async function readConversation(filePath: string): Promise<any | null> {
       if (attempt < 2) await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
     }
   }
+  // All retries exhausted — log so we can diagnose tracking failures
+  logger.warn({ sessionName, filePath }, 'gemini-watcher: readConversation exhausted retries');
   return null;
 }
 
 export async function pollTick(sessionName: string, state: WatcherState): Promise<void> {
+  // Re-entrancy guard — prevent overlapping pollTick from fs.watch + poll timer
+  if (state.polling) return;
+  state.polling = true;
+  try {
+    await pollTickInner(sessionName, state);
+  } finally {
+    state.polling = false;
+  }
+}
+
+async function pollTickInner(sessionName: string, state: WatcherState): Promise<void> {
   if (!state.activeFile) {
     const found = state.sessionUuid ? await findSessionFile(state.sessionUuid) : await findLatestSessionFile();
     if (found) { state.activeFile = found; claimedFiles.set(found, sessionName); } else return;
   }
 
-  const conv = await readConversation(state.activeFile!);
+  // Cheap change check: skip full read if file mtime hasn't changed
+  try {
+    const s = await stat(state.activeFile!);
+    if (state._lastMtimeMs !== undefined && s.mtimeMs === state._lastMtimeMs) {
+      // File unchanged on disk — still run idle detection logic but skip expensive read/parse.
+      // Only applies to the "unchanged" path; new files always get a full read.
+      if (state.lastConversationStatus === 'idle') {
+        state.idleConfirmCount = (state.idleConfirmCount ?? 0) + 1;
+        if (state.idleConfirmCount >= 2 && !state.idleDebounceTimer) {
+          transitionState(sessionName, state, 'idle');
+        }
+        return;
+      }
+      state.idleConfirmCount = 0;
+      await terminalThinkingCheck(sessionName, state);
+      return;
+    }
+    state._lastMtimeMs = s.mtimeMs;
+  } catch {
+    // stat failed — fall through to full read attempt
+  }
+
+  const conv = await readConversation(state.activeFile!, sessionName);
   if (!conv) return;
   const conversationStatus = inferConversationStatus(conv);
   state.lastConversationStatus = conversationStatus;
@@ -305,17 +346,49 @@ export async function pollTick(sessionName: string, state: WatcherState): Promis
   }
 }
 
+// ── File rotation helper ────────────────────────────────────────────────────────
+
+/**
+ * Switch to a new active file after rotation. Resets tracking state and restarts
+ * the fs.watch on the new file's directory.
+ */
+function activateFile(sessionName: string, state: WatcherState, newFile: string): void {
+  // Clean up old file claim
+  if (state.activeFile) claimedFiles.delete(state.activeFile);
+
+  // Abort the old fs.watch watcher (separate from session abort)
+  state.watchAbort.abort();
+  state.watchAbort = new AbortController();
+
+  // Switch file and reset tracking counters
+  state.activeFile = newFile;
+  claimedFiles.set(newFile, sessionName);
+  state.seenCount = 0;
+  state.lastUpdated = '';
+  state._lastMtimeMs = undefined;
+  state._terminalThinkingEmitted = false;
+  state.idleConfirmCount = 0;
+  if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
+
+  // Start fresh watcher on new file's directory
+  void watchGeminiDir(sessionName, state);
+}
+
 // ── Public API ─────────────────────────────────────────────────────────────────
 
 export async function startWatching(sessionName: string, sessionUuid: string): Promise<void> {
   if (watchers.has(sessionName)) stopWatching(sessionName);
-  const state: WatcherState = { sessionUuid, activeFile: null, seenCount: 0, lastUpdated: '', abort: new AbortController(), stopped: false };
+  const state: WatcherState = {
+    sessionUuid, activeFile: null, seenCount: 0, lastUpdated: '',
+    abort: new AbortController(), watchAbort: new AbortController(),
+    stopped: false, polling: false,
+  };
   watchers.set(sessionName, state);
 
   const found = await findSessionFile(sessionUuid);
   if (found) {
     state.activeFile = found; claimedFiles.set(found, sessionName);
-    const conv = await readConversation(found);
+    const conv = await readConversation(found, sessionName);
     if (conv) {
       state.seenCount = conv.messages.length;
       state.lastUpdated = conv.lastUpdated;
@@ -328,15 +401,21 @@ export async function startWatching(sessionName: string, sessionUuid: string): P
 
   state.pollTimer = setInterval(() => {
     void (async () => {
+      // Periodic rotation check (every 30s)
       const now = Date.now();
       if (now - (state._lastRotationCheck || 0) > 30000 && state.sessionUuid) {
         state._lastRotationCheck = now;
         const currentFile = await findSessionFile(state.sessionUuid);
         if (currentFile && currentFile !== state.activeFile) {
-          logger.info({ sessionName, new: currentFile }, 'gemini-watcher: date rotation detected');
-          if (state.activeFile) claimedFiles.delete(state.activeFile);
-          state.activeFile = currentFile; claimedFiles.set(currentFile, sessionName);
-          void watchGeminiDir(sessionName, state);
+          logger.info({ sessionName, newFile: currentFile, oldFile: state.activeFile }, 'gemini-watcher: date rotation detected');
+          activateFile(sessionName, state, currentFile);
+          // Re-read initial state from the new file
+          const conv = await readConversation(currentFile, sessionName);
+          if (conv) {
+            state.seenCount = conv.messages.length;
+            state.lastUpdated = conv.lastUpdated;
+            state.lastConversationStatus = inferConversationStatus(conv);
+          }
         }
       }
       await pollTick(sessionName, state);
@@ -356,7 +435,11 @@ export async function startWatchingDiscovered(
   onDiscovered?: (uuid: string) => void,
 ): Promise<void> {
   if (watchers.has(sessionName)) stopWatching(sessionName);
-  const state: WatcherState = { sessionUuid: '', activeFile: null, seenCount: 0, lastUpdated: '', abort: new AbortController(), stopped: false };
+  const state: WatcherState = {
+    sessionUuid: '', activeFile: null, seenCount: 0, lastUpdated: '',
+    abort: new AbortController(), watchAbort: new AbortController(),
+    stopped: false, polling: false,
+  };
   watchers.set(sessionName, state);
 
   state.pollTimer = setInterval(() => {
@@ -374,7 +457,7 @@ export async function startWatchingDiscovered(
             const fullPath = join(chatsDir, entry);
             if (!snapshot.has(fullPath) && !claimedFiles.has(fullPath)) {
               // Discovered!
-              const conv = await readConversation(fullPath);
+              const conv = await readConversation(fullPath, sessionName);
               if (conv && conv.sessionId) {
                 state.activeFile = fullPath;
                 claimedFiles.set(fullPath, sessionName);
@@ -416,7 +499,9 @@ export async function snapshotSessionFiles(): Promise<Set<string>> {
 export function stopWatching(sessionName: string): void {
   const state = watchers.get(sessionName);
   if (!state) return;
-  state.stopped = true; state.abort.abort();
+  state.stopped = true;
+  state.abort.abort();       // kills session-level resources
+  state.watchAbort.abort();  // kills current fs.watch
   if (state.pollTimer) clearInterval(state.pollTimer);
   if (state.idleDebounceTimer) clearTimeout(state.idleDebounceTimer);
   watchers.delete(sessionName);
@@ -428,10 +513,16 @@ async function watchGeminiDir(sessionName: string, state: WatcherState): Promise
   const dir = state.activeFile.substring(0, state.activeFile.lastIndexOf('/'));
   const filename = state.activeFile.substring(state.activeFile.lastIndexOf('/') + 1);
   try {
-    const watcher = watch(dir, { persistent: false, signal: state.abort.signal });
+    // Use the per-watcher AbortController so rotation can kill just this watcher
+    const watcher = watch(dir, { persistent: false, signal: state.watchAbort.signal });
     for await (const event of watcher as any) {
       if (state.stopped) break;
       if (event.filename === filename) await pollTick(sessionName, state);
     }
-  } catch {}
+  } catch (err: any) {
+    // AbortError is expected on rotation/stop — only log unexpected errors
+    if (err?.name !== 'AbortError' && !state.stopped) {
+      logger.warn({ sessionName, err }, 'gemini-watcher: fs.watch error');
+    }
+  }
 }
