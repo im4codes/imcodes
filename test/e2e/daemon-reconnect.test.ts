@@ -26,6 +26,7 @@ import {
 } from '../../src/agent/tmux.js';
 import {
   loadStore,
+  flushStore,
   upsertSession,
   getSession,
   removeSession,
@@ -167,8 +168,8 @@ describe.skipIf(SKIP)('Daemon reconnect resilience (e2e)', () => {
     expect(stored!.role).toBe('w2');
     expect(stored!.state).toBe('idle');
 
-    // Force flush and reload the store to simulate daemon restart
-    await wait(600); // debounce is 500ms
+    // Force flush (not timing-dependent) and reload to simulate daemon restart
+    await flushStore();
     await loadStore();
 
     const reloaded = getSession(name);
