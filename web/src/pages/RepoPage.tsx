@@ -383,12 +383,10 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
   const renderTabContent = (key: TabKey) => {
     // Show spinner while detect is in progress (tabs can't fetch without context)
     if (detectLoading) return renderSpinner();
+    // Detect failed — show retry prompt (header already shows the error text)
     if (detectError) return (
-      <div style={{ padding: 24, textAlign: 'center', color: '#f87171', fontSize: 13 }}>
-        {detectError}
-        <div style={{ marginTop: 8 }}>
-          <button class="btn btn-sm" onClick={doDetect}>{t('repo.retry')}</button>
-        </div>
+      <div style={{ padding: 24, textAlign: 'center', color: '#94a3b8', fontSize: 13 }}>
+        <button class="btn btn-sm" onClick={doDetect}>{t('repo.retry')}</button>
       </div>
     );
     const tab = tabs[key];
