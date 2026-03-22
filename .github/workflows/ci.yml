@@ -172,7 +172,7 @@ jobs:
         run: |
           curl -sL "https://gitlab.com/gitlab-org/cli/-/releases/permalink/latest/downloads/glab_$(uname -s)_$(uname -m).tar.gz" | sudo tar -xz -C /usr/local/bin glab
       - name: Authenticate glab
-        if: ${{ secrets.GITLAB_TOKEN != '' }}
+        if: env.GITLAB_TOKEN != ''
         run: glab auth login --hostname gitlab.com --token "$GITLAB_TOKEN"
         env:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
