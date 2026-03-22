@@ -5,7 +5,7 @@ export default defineWorkspace([
     test: {
       name: 'daemon',
       include: ['src/**/*.test.ts', 'test/**/*.test.ts'],
-      exclude: ['test/e2e/**', '**/node_modules/**'],
+      exclude: ['test/e2e/**', 'test/**/*.integration.test.ts', '**/node_modules/**'],
       environment: 'node',
       globals: false,
     },

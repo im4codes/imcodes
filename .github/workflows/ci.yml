@@ -155,6 +155,32 @@ jobs:
       - name: Run other e2e tests
         run: npm run test:e2e
 
+  # ── Repo provider integration tests (gh/glab against public repos) ────────
+
+  repo-integration-tests:
+    name: Repo Provider Integration Tests
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+          cache: 'npm'
+      - run: npm ci
+      - name: Install glab
+        run: |
+          curl -sL "https://gitlab.com/gitlab-org/cli/-/releases/permalink/latest/downloads/glab_$(uname -s)_$(uname -m).tar.gz" | sudo tar -xz -C /usr/local/bin glab
+      - name: Authenticate glab
+        if: ${{ secrets.GITLAB_TOKEN != '' }}
+        run: glab auth login --hostname gitlab.com --token "$GITLAB_TOKEN"
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+      - name: Run integration tests
+        run: npm run test:integration
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   # ── Coverage ──────────────────────────────────────────────────────────────
 
   coverage:

@@ -27,6 +27,7 @@
     "test:server": "vitest run --project server",
     "test:web": "vitest run --project web",
     "test:e2e": "vitest run --project e2e",
+    "test:integration": "vitest run --workspace vitest.integration.config.ts",
     "test:coverage": "vitest run --coverage",
     "test:watch": "vitest",
     "lint": "eslint src/",

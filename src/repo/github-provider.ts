@@ -119,7 +119,7 @@ export class GitHubProvider implements RepoProvider {
         execFileAsync('gh', [
           'api',
           `/repos/${this.owner}/${this.repo}/branches?per_page=100`,
-          '-q', `[.[] | {name, lastCommitDate: (.commit.commit.committer.date | fromdateiso8601)}]`,
+          '-q', `[.[] | {name, lastCommitDate: (.commit.commit.committer.date // null | if . then fromdateiso8601 else null end)}]`,
         ], { cwd: this.projectDir, timeout: 15000 }),
 
         execFileAsync('git', [
