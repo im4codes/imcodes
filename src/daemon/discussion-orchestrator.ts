@@ -6,7 +6,6 @@
 import { sessionExists, sendKeysDelayedEnter } from '../agent/tmux.js';
 import { startSubSession, stopSubSession } from './subsession-manager.js';
 import { writeFile, readFile, mkdir } from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import logger from '../util/logger.js';
 import type { AgentType } from '../agent/detect.js';
@@ -122,6 +121,7 @@ function buildRoundPrompt(
       `IMPORTANT: Append your response to the SAME file: ${discussionFilePath}`,
       `Start with this exact header line: ${sectionHeader}`,
       'Then write your response below it. Keep it concise.',
+      'After writing to the file, print a brief response summary of what you wrote.',
     ].join('\n');
   }
 
@@ -140,6 +140,7 @@ function buildRoundPrompt(
     `IMPORTANT: Append your response to the SAME file: ${discussionFilePath}`,
     `Start with this exact header line: ${sectionHeader}`,
     'Then write your response below it. Keep it concise.',
+    'After writing to the file, print a brief response summary of what you wrote.',
   ].join('\n');
 }
 
@@ -332,7 +333,7 @@ async function runDiscussion(
   }
 
   // 2. Generate semantic title via LLM, then create discussion file
-  const discussDir = path.join(os.tmpdir(), 'imcodes-discussions');
+  const discussDir = path.join(d.cwd || process.cwd(), 'imc_files', 'discussions');
   await mkdir(discussDir, { recursive: true });
   const titleAgent = d.participants[d.verdictParticipantIdx];
   const titleFile = path.join(discussDir, `title-${d.id.slice(0, 8)}.txt`);
@@ -474,6 +475,13 @@ async function runDiscussion(
       onUpdate({ type: 'subsession.close', id: p.subSessionId });
     }
   }
+
+  // Clean up discussion file and title file after completion
+  const { unlink } = await import('node:fs/promises');
+  setTimeout(async () => {
+    try { await unlink(d.filePath); } catch { /* already deleted or missing */ }
+    try { await unlink(titleFile); } catch { /* already deleted or missing */ }
+  }, 60_000);
 
   logger.info({ discussionId: d.id, rounds: d.maxRounds }, 'Discussion completed');
 }

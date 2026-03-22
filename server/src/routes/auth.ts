@@ -442,6 +442,7 @@ authRoutes.delete('/user/me', async (c) => {
 const passwordLoginSchema = z.object({
   username: z.string().min(1),
   password: z.string().min(1),
+  native: z.boolean().optional(),
 });
 
 authRoutes.post('/password/login', async (c) => {
@@ -449,7 +450,7 @@ authRoutes.post('/password/login', async (c) => {
   const parsed = passwordLoginSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
-  const { username, password } = parsed.data;
+  const { username, password, native } = parsed.data;
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
 
   // Per-IP lockout check
@@ -505,11 +506,25 @@ authRoutes.post('/password/login', async (c) => {
 
   await logAudit({ userId: user.id, action: 'auth.password_login', ip }, c.env.DB);
 
+  // Native apps need a long-lived API key (cookies don't work in Capacitor).
+  let apiKey: string | undefined;
+  let keyId: string | undefined;
+  if (native) {
+    const rawKey = `deck_${randomHex(32)}`;
+    keyId = randomHex(16);
+    const keyHash = sha256Hex(rawKey);
+    await c.env.DB.prepare(
+      'INSERT INTO api_keys (id, user_id, key_hash, label, created_at) VALUES (?, ?, ?, ?, ?)',
+    ).bind(keyId, user.id, keyHash, 'native-password-login', Date.now()).run();
+    apiKey = rawKey;
+  }
+
   return c.json({
     ok: true,
     passwordMustChange: !!user.password_must_change,
     accessToken,
     refreshToken: refreshRaw,
+    ...(native ? { apiKey, keyId, userId: user.id } : {}),
   });
 });
 

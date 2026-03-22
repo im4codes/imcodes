@@ -40,3 +40,5 @@ openspec/
 # P2P sandbox temp files
 .p2p-*.md
 .imcodes-prompt-*.md
+tmp/
+imc_files/

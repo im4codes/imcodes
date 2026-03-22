@@ -478,10 +478,10 @@ export async function passkeyLoginCompleteNative(
   });
 }
 
-export async function passwordLogin(username: string, password: string): Promise<{ ok: boolean; passwordMustChange?: boolean }> {
+export async function passwordLogin(username: string, password: string, native?: boolean): Promise<{ ok: boolean; passwordMustChange?: boolean; apiKey?: string; keyId?: string; userId?: string }> {
   return apiFetch('/api/auth/password/login', {
     method: 'POST',
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ username, password, ...(native ? { native: true } : {}) }),
   });
 }
 

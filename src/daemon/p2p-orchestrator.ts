@@ -6,8 +6,8 @@
  * Completion = file grew + agent idle.
  */
 
-import { stat, writeFile, readFile, mkdir, copyFile, unlink } from 'node:fs/promises';
-import { join, basename } from 'node:path';
+import { stat, writeFile, readFile, mkdir, unlink } from 'node:fs/promises';
+import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { sendKeysDelayedEnter } from '../agent/tmux.js';
 import { detectStatus, detectStatusAsync } from '../agent/detect.js';
@@ -73,8 +73,12 @@ export function listP2pRuns(): P2pRun[] { return [...activeRuns.values()]; }
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
-import { homedir } from 'node:os';
-const P2P_DIR = join(homedir(), '.imcodes', 'discussions');
+/** Resolve the discussion file directory based on session projectDir (project-local). */
+function resolveP2pDir(session: string): string {
+  const record = getSession(session);
+  const cwd = record?.projectDir || process.cwd();
+  return join(cwd, 'imc_files', 'discussions');
+}
 let IDLE_POLL_MS = 3_000;
 let GRACE_PERIOD_DEFAULT_MS = 180_000; // 3 min — complex analysis (subagent research + write) takes time
 let MIN_PROCESSING_MS = 30_000; // Don't trust idle detection until 30s after dispatch
@@ -169,9 +173,10 @@ export async function startP2pRun(
   const discussionId = `dsc_${randomUUID().slice(0, 8)}`;
   const now = new Date().toISOString();
 
-  // Create temp context file
-  await mkdir(P2P_DIR, { recursive: true });
-  const contextFilePath = join(P2P_DIR, `${runId}.md`);
+  // Create temp context file under project dir
+  const p2pDir = resolveP2pDir(initiatorSession);
+  await mkdir(p2pDir, { recursive: true });
+  const contextFilePath = join(p2pDir, `${runId}.md`);
 
   let seed = `# P2P Discussion: ${runId}\n\n`;
   seed += `## User Request\n\n${userText}\n\n`;
@@ -289,25 +294,16 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
     const hopLabel = `${shortName(target.session)} — ${capitalize(target.mode)} (hop ${i + 1}/${totalHops})`;
     const hopModeConfig = getP2pMode(target.mode) ?? modeConfig;
 
-    // For sandboxed agents: copy discussion file into project dir
-    const sandboxed = isSandboxedSession(target.session);
-    let sandboxLocalPath: string | null = null;
-    if (sandboxed) {
-      sandboxLocalPath = await copyToSandbox(run, target.session);
-      logger.info({ runId: run.id, target: target.session, sandboxLocalPath }, 'P2P: sandboxed agent — using project-local temp file');
-    }
-
     const hopPrompt = buildHopPrompt(run, hopModeConfig, {
       session: target.session,
       sectionHeader: hopLabel,
       instruction: `Read the full context file and provide your ${target.mode} analysis. Append your output to the file.`,
       isInitial: false,
-      filePath: sandboxLocalPath ?? undefined,
     });
 
     // Dispatch immediately — agent will queue the message and process after current task
     logger.info({ runId: run.id, target: target.session, mode: target.mode, hop: i + 1, totalHops }, 'P2P: Phase 2 — dispatching hop');
-    await dispatchHop(run, target.session, hopPrompt, serverLink, sandboxLocalPath, hopLabel);
+    await dispatchHop(run, target.session, hopPrompt, serverLink, null, hopLabel);
     logger.info({ runId: run.id, target: target.session, status: run.status }, 'P2P: Phase 2 — hop dispatch returned');
     if (run._cancelled || isTerminal(run.status)) return;
   }
@@ -353,18 +349,21 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
     skippedHops: run.skippedHops,
   }, { source: 'daemon' });
 
-  // Keep in memory for a bit so status queries work, then clean up
-  setTimeout(() => activeRuns.delete(run.id), 60_000);
+  // Keep in memory for a bit so status queries work, then clean up run + file
+  setTimeout(async () => {
+    activeRuns.delete(run.id);
+    try { await unlink(run.contextFilePath); } catch { /* already deleted or missing */ }
+  }, 60_000);
 }
 
 // ── Single hop dispatch + wait ────────────────────────────────────────────
 
-async function dispatchHop(run: P2pRun, session: string, prompt: string, serverLink: ServerLink | null, sandboxLocalPath?: string | null, sectionHeader?: string): Promise<void> {
+async function dispatchHop(run: P2pRun, session: string, prompt: string, serverLink: ServerLink | null, _unused?: unknown, sectionHeader?: string): Promise<void> {
   run.currentTargetSession = session;
   // Don't remove from remainingTargets yet — defer until hop actually completes
   transition(run, 'dispatched', serverLink);
 
-  const watchPath = sandboxLocalPath ?? run.contextFilePath;
+  const watchPath = run.contextFilePath;
   const MAX_RETRIES = 1;
 
   /** Helper: clean up hop state on every exit path */
@@ -382,11 +381,8 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
     try { sizeBefore = (await stat(watchPath)).size; } catch { /* file should exist */ }
 
     // Send the prompt (sendKeys auto-handles long text; pass cwd for sandboxed agents)
-    // Gemini: use ~/.gemini/tmp for temp files (Gemini can't read /tmp or .gitignored project files)
-    const geminiTmpDir = isSandboxedSession(session) ? join(homedir(), '.gemini', 'tmp') : undefined;
-    const sendOpts = geminiTmpDir ? { cwd: geminiTmpDir } : undefined;
     try {
-      await sendKeysDelayedEnter(session, prompt, sendOpts);
+      await sendKeysDelayedEnter(session, prompt);
     } catch (err) {
       if (attempt < MAX_RETRIES) {
         logger.warn({ runId: run.id, session, attempt }, 'P2P: sendKeys failed, will retry');
@@ -447,7 +443,6 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
       if (headingFound && (Date.now() - headingFoundAt) >= 5_000) {
         logger.info({ runId: run.id, session, sectionHeader }, 'P2P: heading found in file, completing hop');
         idleWaiter.cancel();
-        if (sandboxLocalPath) await copyBackFromSandbox(run, sandboxLocalPath);
         finishHop(false);
         if (run.remainingTargets.length > 0 || session !== run.finalReturnSession) {
           transition(run, 'awaiting_next_hop', serverLink);
@@ -510,7 +505,6 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
             }
           } catch { /* ignore */ }
           idleWaiter.cancel();
-          if (sandboxLocalPath) await copyBackFromSandbox(run, sandboxLocalPath);
           finishHop(false);
           if (run.remainingTargets.length > 0 || session !== run.finalReturnSession) {
             transition(run, 'awaiting_next_hop', serverLink);
@@ -527,7 +521,6 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
           }
           logger.warn({ runId: run.id, session }, 'P2P: agent idle without file change after retry, skipping hop');
           idleWaiter.cancel();
-          if (sandboxLocalPath) await copyBackFromSandbox(run, sandboxLocalPath).catch(() => {});
           finishHop(true);
           if (run.remainingTargets.length > 0 || session !== run.finalReturnSession) {
             transition(run, 'awaiting_next_hop', serverLink);
@@ -542,46 +535,13 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
     // If we got here from break (retry), continue to next attempt
     if (!fileGrew && attempt < MAX_RETRIES) continue;
 
-    // Timeout — copy back whatever we got and skip (don't fail the whole run)
-    if (sandboxLocalPath) await copyBackFromSandbox(run, sandboxLocalPath).catch(() => {});
+    // Timeout — skip (don't fail the whole run)
     logger.warn({ runId: run.id, session }, 'P2P: hop timed out, skipping to next');
     finishHop(true);
     if (run.remainingTargets.length > 0 || session !== run.finalReturnSession) {
       transition(run, 'awaiting_next_hop', serverLink);
     }
     return;
-  }
-}
-
-// ── Sandbox detection ─────────────────────────────────────────────────────
-
-/** Agents that can only read/write files within their project directory. */
-const SANDBOXED_AGENTS = new Set(['gemini']);
-
-function isSandboxedSession(session: string): boolean {
-  const record = getSession(session);
-  return SANDBOXED_AGENTS.has(record?.agentType ?? '');
-}
-
-/**
- * For sandboxed agents: copy the discussion file into the project dir,
- * return the local temp path. After the hop, copyBackFromSandbox() merges it back.
- */
-async function copyToSandbox(run: P2pRun, _session: string): Promise<string | null> {
-  // Use ~/.gemini/tmp for sandboxed agents (Gemini can't read .gitignored project files or /tmp)
-  const tmpDir = join(homedir(), '.gemini', 'tmp');
-  await mkdir(tmpDir, { recursive: true });
-  const localPath = join(tmpDir, `.p2p-${run.id}.md`);
-  await copyFile(run.contextFilePath, localPath);
-  return localPath;
-}
-
-async function copyBackFromSandbox(run: P2pRun, localPath: string): Promise<void> {
-  try {
-    await copyFile(localPath, run.contextFilePath);
-    await unlink(localPath);
-  } catch (err) {
-    logger.warn({ err, localPath }, 'P2P: failed to copy back from sandbox temp file');
   }
 }
 
@@ -592,13 +552,11 @@ interface HopOpts {
   sectionHeader: string;
   instruction: string;
   isInitial: boolean;
-  /** Override file path for sandboxed agents (project-local temp file). */
-  filePath?: string;
 }
 
 function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: HopOpts): string {
   const parts: string[] = [];
-  const filePath = opts.filePath ?? run.contextFilePath;
+  const filePath = run.contextFilePath;
 
   // Mode role prompt
   if (mode?.prompt) {
@@ -616,9 +574,9 @@ function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: HopOpts): 
   parts.push(`2. ${opts.instruction}`);
   parts.push(`3. Add a new heading "## ${opts.sectionHeader}" at the end of this file and write your analysis below it`);
   parts.push(``);
-  parts.push(`Rules: ALL output goes into this same file. Do NOT print analysis to chat.`);
+  parts.push(`Rules: ALL analysis goes into this same file.`);
   parts.push(`Do NOT ask for confirmation. Do NOT explain your plan. Execute immediately.`);
-  parts.push(`After writing to the file, respond with only: Done`);
+  parts.push(`After writing to the file, print a brief response summary of what you wrote, then say: Done`);
 
   return parts.join('\n');
 }
