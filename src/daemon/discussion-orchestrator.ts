@@ -615,7 +615,9 @@ export async function stopDiscussion(id: string): Promise<void> {
   d.state = 'failed';
   d.error = 'stopped by user';
   for (const p of d.participants) {
-    // stopSubSession with serverLink=null — DB cleanup relies on bridge handling subsession.close
-    await stopSubSession(p.sessionName).catch(() => {});
+    // Only stop sub-sessions that the discussion created — NEVER close reused ones
+    if (!p.reused) {
+      await stopSubSession(p.sessionName).catch(() => {});
+    }
   }
 }
