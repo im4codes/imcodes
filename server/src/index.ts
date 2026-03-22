@@ -84,8 +84,15 @@ export function buildApp(env: Env) {
   app.use('*', async (c, next) => {
     let socketIp = '127.0.0.1';
     try { socketIp = getConnInfo(c).remote.address ?? '127.0.0.1'; } catch { /* test or non-node context */ }
-    // REAL_IP_HEADER is injected by the CDN/proxy and cannot be spoofed by clients.
-    const cdnIp = c.req.header(realIpHeader);
+
+    // Resolve client IP with priority:
+    // 1. REAL_IP_HEADER (e.g. cf-connecting-ip) — but ONLY trust it when request comes
+    //    from a trusted proxy. Without this check, clients can spoof the header on
+    //    direct-access deployments (no CF) to bypass rate limiting.
+    // 2. X-Forwarded-For via trusted proxy chain (proxyAddr)
+    // 3. Socket IP (direct connection)
+    const isTrustedSource = trust(socketIp, 0);
+    const cdnIp = isTrustedSource ? c.req.header(realIpHeader) : null;
     let clientIp: string;
     if (cdnIp) {
       clientIp = cdnIp.trim();

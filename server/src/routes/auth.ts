@@ -322,7 +322,12 @@ authRoutes.post('/refresh', async (c) => {
     return c.json({ error: 'account_disabled' }, 403);
   }
 
-  // Per-user lockout check
+  // Per-IP + per-user lockout check on refresh
+  const refreshIp = c.get('clientIp' as never) as string ?? 'unknown';
+  const refreshIpLockout = await checkAuthLockout(c.env.DB, `ip:${refreshIp}`);
+  if (refreshIpLockout.locked) {
+    return c.json({ error: 'too_many_attempts', retryAfterMs: refreshIpLockout.lockedUntil ? refreshIpLockout.lockedUntil - Date.now() : 0 }, 429);
+  }
   const userLockout = await checkAuthLockout(c.env.DB, `user:${row.user_id}`);
   if (userLockout.locked) {
     return c.json({ error: 'too_many_attempts', retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0 }, 429);
@@ -452,20 +457,31 @@ authRoutes.post('/password/login', async (c) => {
 
   const { username, password, native } = parsed.data;
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
+  const normalizedUsername = username.trim().toLowerCase();
 
-  // Per-IP lockout check
+  // Triple-dimension lockout checks (OWASP/NIST compliant):
+  // 1. IP — prevents single-source brute force
+  // 2. Username (normalized) — prevents distributed credential stuffing
+  // Both checked BEFORE user lookup to avoid timing side-channels.
   const ipLockout = await checkAuthLockout(c.env.DB, `ip:${ip}`);
   if (ipLockout.locked) {
     return c.json({ error: 'too_many_attempts', retryAfterMs: ipLockout.lockedUntil ? ipLockout.lockedUntil - Date.now() : 0 }, 429);
   }
 
-  const user = await getUserByUsername(c.env.DB, username);
+  const usernameLockout = await checkAuthLockout(c.env.DB, `username:${normalizedUsername}`);
+  if (usernameLockout.locked) {
+    return c.json({ error: 'too_many_attempts', retryAfterMs: usernameLockout.lockedUntil ? usernameLockout.lockedUntil - Date.now() : 0 }, 429);
+  }
+
+  const user = await getUserByUsername(c.env.DB, normalizedUsername);
   if (!user || !user.password_hash) {
+    // Unified failure: record against BOTH ip and username even for non-existent users
     await recordAuthFailure(c.env.DB, `ip:${ip}`);
+    await recordAuthFailure(c.env.DB, `username:${normalizedUsername}`);
     return c.json({ error: 'invalid_credentials' }, 401);
   }
 
-  // Per-user lockout check
+  // 3. User ID — prevents abuse of specific known accounts
   const userLockout = await checkAuthLockout(c.env.DB, `user:${user.id}`);
   if (userLockout.locked) {
     return c.json({ error: 'too_many_attempts', retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0 }, 429);
@@ -474,6 +490,7 @@ authRoutes.post('/password/login', async (c) => {
   const valid = await verifyPassword(password, user.password_hash);
   if (!valid) {
     await recordAuthFailure(c.env.DB, `ip:${ip}`);
+    await recordAuthFailure(c.env.DB, `username:${normalizedUsername}`);
     await recordAuthFailure(c.env.DB, `user:${user.id}`);
     return c.json({ error: 'invalid_credentials' }, 401);
   }
