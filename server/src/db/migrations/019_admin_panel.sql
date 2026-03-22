@@ -10,7 +10,7 @@ UPDATE users SET is_admin = TRUE WHERE username = 'admin';
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL,
-  updated_at INTEGER NOT NULL DEFAULT 0
+  updated_at BIGINT NOT NULL DEFAULT 0
 );
 
 INSERT INTO settings (key, value, updated_at) VALUES
