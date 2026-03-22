@@ -306,7 +306,9 @@
     "password_changed": "密碼變更成功",
     "password_error": "變更密碼失敗，請確認目前密碼。",
     "passwords_mismatch": "兩次輸入的密碼不一致",
-    "password_too_short": "密碼至少需要 8 個字元"
+    "password_too_short": "密碼至少需要 8 個字元",
+    "privacy_policy": "隱私權政策",
+    "terms_of_service": "服務條款"
   },
   "admin": {
     "title": "管理面板",

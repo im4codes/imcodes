@@ -306,7 +306,9 @@
     "password_changed": "パスワードを変更しました",
     "password_error": "パスワードの変更に失敗しました。現在のパスワードを確認してください。",
     "passwords_mismatch": "パスワードが一致しません",
-    "password_too_short": "パスワードは8文字以上で入力してください"
+    "password_too_short": "パスワードは8文字以上で入力してください",
+    "privacy_policy": "プライバシーポリシー",
+    "terms_of_service": "利用規約"
   },
   "admin": {
     "title": "管理パネル",

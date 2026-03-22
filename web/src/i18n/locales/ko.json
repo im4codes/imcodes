@@ -306,7 +306,9 @@
     "password_changed": "비밀번호가 변경되었습니다",
     "password_error": "비밀번호 변경에 실패했습니다. 현재 비밀번호를 확인하세요.",
     "passwords_mismatch": "비밀번호가 일치하지 않습니다",
-    "password_too_short": "비밀번호는 최소 8자 이상이어야 합니다"
+    "password_too_short": "비밀번호는 최소 8자 이상이어야 합니다",
+    "privacy_policy": "개인정보 처리방침",
+    "terms_of_service": "이용약관"
   },
   "admin": {
     "title": "관리자 패널",

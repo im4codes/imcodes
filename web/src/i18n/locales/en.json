@@ -306,7 +306,9 @@
     "password_changed": "Password changed successfully",
     "password_error": "Failed to change password. Check your current password.",
     "passwords_mismatch": "Passwords do not match",
-    "password_too_short": "Password must be at least 8 characters"
+    "password_too_short": "Password must be at least 8 characters",
+    "privacy_policy": "Privacy Policy",
+    "terms_of_service": "Terms of Service"
   },
   "admin": {
     "title": "Admin Panel",

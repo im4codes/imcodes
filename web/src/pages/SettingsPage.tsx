@@ -189,6 +189,26 @@ export function SettingsPage({ displayName, onBack, onDisplayNameChanged }: Prop
             </div>
           )}
         </div>
+
+        {/* Legal links */}
+        <div style={{ textAlign: 'center', marginTop: '24px', marginBottom: '12px' }}>
+          <a
+            href="https://im.codes/privacy.html"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ color: '#64748b', fontSize: '13px', textDecoration: 'none', marginRight: '16px' }}
+          >
+            {t('settings.privacy_policy')}
+          </a>
+          <a
+            href="https://im.codes/terms.html"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ color: '#64748b', fontSize: '13px', textDecoration: 'none' }}
+          >
+            {t('settings.terms_of_service')}
+          </a>
+        </div>
       </div>
     </div>
   );

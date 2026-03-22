@@ -388,6 +388,24 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
           </button>
         </div>
       )}
+        <div style={{ textAlign: 'center', marginTop: 20 }}>
+          <a
+            href="https://im.codes/privacy.html"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ color: '#64748b', fontSize: 12, textDecoration: 'none', marginRight: 16 }}
+          >
+            {t('settings.privacy_policy')}
+          </a>
+          <a
+            href="https://im.codes/terms.html"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ color: '#64748b', fontSize: 12, textDecoration: 'none' }}
+          >
+            {t('settings.terms_of_service')}
+          </a>
+        </div>
       </div>
     </div>
   );

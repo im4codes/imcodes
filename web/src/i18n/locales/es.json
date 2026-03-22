@@ -306,7 +306,9 @@
     "password_changed": "Contrase\u00f1a cambiada exitosamente",
     "password_error": "Error al cambiar la contrase\u00f1a. Verifica tu contrase\u00f1a actual.",
     "passwords_mismatch": "Las contrase\u00f1as no coinciden",
-    "password_too_short": "La contrase\u00f1a debe tener al menos 8 caracteres"
+    "password_too_short": "La contrase\u00f1a debe tener al menos 8 caracteres",
+    "privacy_policy": "Pol\u00edtica de privacidad",
+    "terms_of_service": "T\u00e9rminos de servicio"
   },
   "admin": {
     "title": "Panel de administraci\u00f3n",
