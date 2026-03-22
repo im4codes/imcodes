@@ -716,6 +716,12 @@ export class WsBridge {
       return;
     }
 
+    // ── P2P conflict → broadcast to browsers ────────────────────────────────
+    if (type === 'p2p.conflict') {
+      this.broadcastToBrowsers(JSON.stringify(msg));
+      return;
+    }
+
     // ── P2P orchestration run persistence + broadcast ────────────────────────
     if (type === 'p2p.run_save' && this.db) {
       void upsertOrchestrationRun(this.db, msg.run as any).catch(() => {});

@@ -615,23 +615,31 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     try {
       // ── Concurrency guard: check for active P2P runs on same initiator ──
       const forceNew = !!(cmd as Record<string, unknown>).force;
-      if (!forceNew) {
-        const TERMINAL_STATUSES = new Set(['completed', 'failed', 'timed_out', 'cancelled']);
-        const existingRun = listP2pRuns().find(
-          (r) => r.initiatorSession === sessionName && !TERMINAL_STATUSES.has(r.status),
-        );
-        if (existingRun) {
-          logger.info({ sessionName, existingRunId: existingRun.id }, 'P2P conflict: active run already exists');
-          try {
-            serverLink.send({
-              type: 'p2p.conflict',
-              existingRunId: existingRun.id,
-              initiatorSession: sessionName,
-              commandId: effectiveId,
-            });
-          } catch { /* not connected */ }
-          return;
-        }
+      const TERMINAL_STATUSES = new Set(['completed', 'failed', 'timed_out', 'cancelled']);
+      const existingRun = listP2pRuns().find(
+        (r) => r.initiatorSession === sessionName && !TERMINAL_STATUSES.has(r.status),
+      );
+
+      if (existingRun && !forceNew) {
+        // Conflict: active run exists, user didn't force → notify browser
+        logger.info({ sessionName, existingRunId: existingRun.id }, 'P2P conflict: active run already exists');
+        try {
+          serverLink.send({
+            type: 'p2p.conflict',
+            existingRunId: existingRun.id,
+            initiatorSession: sessionName,
+            commandId: effectiveId,
+          });
+          // Send command.ack so pending message state clears
+          serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'conflict', session: sessionName });
+        } catch { /* not connected */ }
+        return;
+      }
+
+      if (existingRun && forceNew) {
+        // Force: cancel existing run first, then start new
+        logger.info({ sessionName, existingRunId: existingRun.id }, 'P2P force: cancelling existing run');
+        cancelP2pRun(existingRun.id, serverLink);
       }
 
       const fileContents: Array<{ path: string; content: string }> = [];

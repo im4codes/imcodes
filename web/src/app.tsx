@@ -772,6 +772,15 @@ export function App() {
         });
       }
       // ── P2P Quick Discussion progress → map to discussions state ──────────
+      if (msg.type === 'p2p.conflict') {
+        // Active P2P run exists — notify user
+        if (typeof window !== 'undefined') {
+          window.alert(
+            trans('p2p.conflict_alert') ||
+            'A P2P discussion is already running. Your message was sent as a regular message instead. Wait for the current discussion to finish, or stop it first.'
+          );
+        }
+      }
       if (msg.type === 'p2p.run_update' && msg.run) {
         const r = msg.run as Record<string, any>;
         const id = `p2p_${r.id}`;
