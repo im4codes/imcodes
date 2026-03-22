@@ -27,6 +27,47 @@ import { exec as execCb } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, type P2pTarget } from './p2p-orchestrator.js';
+import { copyFile, mkdir } from 'node:fs/promises';
+import { ensureImcDir } from '../util/imc-dir.js';
+
+/**
+ * For sandboxed agents (Gemini, Codex): copy files from ~/.imcodes/ to
+ * the session's project .imc/refs/ so the agent can access them.
+ * Rewrites @paths in the message text. Auto-deletes copies after 5 min.
+ */
+async function rewritePathsForSandbox(sessionName: string, text: string): Promise<string> {
+  const record = getSession(sessionName);
+  const projectDir = record?.projectDir;
+  if (!projectDir) return text;
+
+  const imcodesDir = nodePath.join(homedir(), '.imcodes');
+  // Match @paths that point into ~/.imcodes/
+  const pathRegex = new RegExp(`@(${imcodesDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[/\\\\][^\\s]+)`, 'g');
+
+  let result = text;
+  const matches = [...text.matchAll(pathRegex)];
+  if (matches.length === 0) return text;
+
+  const refsDir = await ensureImcDir(projectDir, 'refs');
+
+  for (const match of matches) {
+    const srcPath = match[1];
+    const filename = nodePath.basename(srcPath);
+    const destPath = nodePath.join(refsDir, filename);
+    try {
+      await copyFile(srcPath, destPath);
+      result = result.replace(`@${srcPath}`, `@${destPath}`);
+      // Auto-delete after 5 minutes
+      setTimeout(async () => {
+        try { const { unlink } = await import('node:fs/promises'); await unlink(destPath); } catch { /* already deleted */ }
+      }, 5 * 60_000);
+    } catch (err) {
+      logger.warn({ src: srcPath, dest: destPath, err }, 'Failed to copy file for sandboxed agent');
+    }
+  }
+
+  return result;
+}
 import { handleRepoCommand } from './repo-handler.js';
 import { handleFileUpload, handleFileDownload, initFileTransfer, startCleanupTimer, createProjectFileHandle, lookupAttachment } from './file-transfer-handler.js';
 import { FILE_TRANSFER_LIMITS } from '../shared/transport/file-transfer.js';
@@ -634,7 +675,15 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const release = await getMutex(sessionName).acquire();
   try {
     const agentType = getSession(sessionName)?.agentType ?? 'unknown';
-    await sendShellAwareCommand(sessionName, finalText, agentType);
+
+    // Sandboxed agents (Gemini, Codex) can only access files under their project dir.
+    // Copy referenced files from ~/.imcodes/ to project .imc/ and rewrite paths.
+    let sendText = finalText;
+    if (agentType === 'gemini' || agentType === 'codex') {
+      sendText = await rewritePathsForSandbox(sessionName, finalText);
+    }
+
+    await sendShellAwareCommand(sessionName, sendText, agentType);
     const payload: Record<string, unknown> = { text };
     if (attachments.length > 0) payload.attachments = attachments;
     timelineEmitter.emit(sessionName, 'user.message', payload);
