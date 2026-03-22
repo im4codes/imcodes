@@ -796,7 +796,7 @@ export function App() {
           }, 30_000);
         }
       }
-      if (msg.type === 'repo.detected') {
+      if (msg.type === 'repo.detected' || msg.type === 'repo.detect_response') {
         const dir = msg.projectDir as string;
         if (dir) {
           setRepoContexts((prev) => {
@@ -1180,6 +1180,32 @@ export function App() {
   }
 
   const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
+
+  // ── Auto-detect repo for active session (with retry) ───────────────────
+  useEffect(() => {
+    const ws = wsRef.current;
+    const dir = activeSessionInfo?.projectDir;
+    if (!ws || !dir || !connected) return;
+
+    const existing = repoContexts.get(dir);
+    // Already detected with a definitive status — no need to re-detect
+    if (existing?.context?.status === 'ok' || existing?.context?.status === 'no_repo') return;
+
+    // Send detect request immediately
+    ws.repoDetect(dir);
+
+    // Retry every 15s unless we get a definitive answer
+    const interval = setInterval(() => {
+      const ctx = repoContexts.get(dir);
+      if (ctx?.context?.status === 'ok' || ctx?.context?.status === 'no_repo') {
+        clearInterval(interval);
+        return;
+      }
+      ws.repoDetect(dir);
+    }, 15_000);
+
+    return () => clearInterval(interval);
+  }, [activeSessionInfo?.projectDir, connected]);
 
   return (
     <div class="layout">
