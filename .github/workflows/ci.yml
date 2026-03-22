@@ -116,7 +116,7 @@ jobs:
         run: npm run build
         working-directory: server
       - name: Runtime import smoke test (catches import path errors that tsc misses)
-        run: node -e "import('./dist/src/index.js').then(() => { console.log('Server module loaded OK'); process.exit(0); }).catch(e => { console.error('IMPORT FAILED:', e.message); process.exit(1); })"
+        run: node -e "import('./dist/server/src/index.js').then(() => { console.log('Server module loaded OK'); process.exit(0); }).catch(e => { console.error('IMPORT FAILED:', e.message); process.exit(1); })"
         working-directory: server
 
   # ── Server DB integration tests (testcontainers + real PostgreSQL) ─────────
