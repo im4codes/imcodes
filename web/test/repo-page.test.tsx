@@ -357,7 +357,9 @@ describe('RepoPage', () => {
       respondDetectError('Could not detect repository');
     });
 
-    expect(screen.getByText('Could not detect repository')).toBeDefined();
+    // Error text appears in both header and tab content (with debug info)
+    const elements = screen.getAllByText('Could not detect repository');
+    expect(elements.length).toBeGreaterThanOrEqual(1);
   });
 
   // Critical: detect_response with flat shape (real daemon format)
