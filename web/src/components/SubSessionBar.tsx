@@ -268,7 +268,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
             📋
           </button>
         )}
-        {onViewRepo && repoContext && repoContext.status !== 'no_repo' && repoContext.status !== 'unknown_platform' && (
+        {onViewRepo && (
           <button
             class="subcard-toolbar-btn"
             onClick={() => onViewRepo()}
@@ -276,7 +276,6 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
             style={{
               marginLeft: 4,
               fontSize: 11,
-              opacity: repoContext.status === 'cli_missing' || repoContext.status === 'cli_outdated' || repoContext.status === 'unauthorized' ? 0.5 : 1,
             }}
           >
             🔀

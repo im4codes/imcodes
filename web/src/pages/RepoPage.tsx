@@ -402,6 +402,8 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
     // Detect failed — show retry prompt (header already shows the error text)
     if (detectError) return (
       <div style={{ padding: 24, textAlign: 'center', color: '#94a3b8', fontSize: 13 }}>
+        <div style={{ marginBottom: 12, color: '#f87171' }}>{detectError}</div>
+        <div style={{ marginBottom: 12, fontSize: 11, color: '#475569', wordBreak: 'break-all' }}>projectDir: {projectDir}</div>
         <button class="btn btn-sm" onClick={doDetect}>{t('repo.retry')}</button>
       </div>
     );
@@ -466,7 +468,10 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
         )}
 
         {detectError && (
-          <span style={{ color: '#f87171', fontSize: 13 }}>{detectError}</span>
+          <div style={{ flex: 1, overflow: 'hidden' }}>
+            <span style={{ color: '#f87171', fontSize: 13 }}>{detectError}</span>
+            <span style={{ color: '#475569', fontSize: 10, marginLeft: 8 }}>{projectDir}</span>
+          </div>
         )}
 
         {context && !detectLoading && (
