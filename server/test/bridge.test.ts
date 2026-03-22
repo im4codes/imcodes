@@ -797,4 +797,200 @@ describe('WsBridge', () => {
       expect(browserWs.sentStrings).toHaveLength(0);
     });
   });
+
+  // ── Repo message relay ──────────────────────────────────────────────────────
+
+  describe('repo message relay', () => {
+    async function setupBridge() {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      return { bridge, daemonWs, browserWs };
+    }
+
+    it('repo.detect from browser reaches daemon (not rate-limited)', async () => {
+      const { daemonWs, browserWs } = await setupBridge();
+
+      // Send many repo.detect messages — they should not be rate-limited
+      for (let i = 0; i < 35; i++) {
+        browserWs.emit('message', JSON.stringify({
+          type: 'repo.detect',
+          requestId: `detect-${i}`,
+          projectDir: '/home/user/myproject',
+        }));
+      }
+      await flushAsync();
+
+      // All 35 should have reached the daemon (repo.detect is rate-limit exempt)
+      const detectMessages = daemonWs.sentStrings.filter((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === 'repo.detect'; } catch { return false; }
+      });
+      expect(detectMessages).toHaveLength(35);
+    });
+
+    it('repo.detect_response from daemon reaches browser', async () => {
+      const { daemonWs, browserWs } = await setupBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'repo.detect_response',
+        requestId: 'req-1',
+        projectDir: '/home/user/myproject',
+        status: 'ok',
+        info: { platform: 'github', owner: 'acme', repo: 'widgets' },
+        cliVersion: '2.50.0',
+        cliAuth: true,
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings.length).toBeGreaterThan(0);
+      const msg = JSON.parse(browserWs.sentStrings[0]);
+      expect(msg.type).toBe('repo.detect_response');
+      expect(msg.requestId).toBe('req-1');
+      expect(msg.status).toBe('ok');
+      expect(msg.info.platform).toBe('github');
+    });
+
+    it('repo.error from daemon reaches browser', async () => {
+      const { daemonWs, browserWs } = await setupBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'repo.error',
+        requestId: 'req-2',
+        error: 'gh CLI not found',
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings.length).toBeGreaterThan(0);
+      const msg = JSON.parse(browserWs.sentStrings[0]);
+      expect(msg.type).toBe('repo.error');
+      expect(msg.error).toBe('gh CLI not found');
+    });
+
+    it('repo.detected (push) from daemon reaches browser', async () => {
+      const { daemonWs, browserWs } = await setupBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'repo.detected',
+        projectDir: '/home/user/myproject',
+        context: {
+          status: 'ok',
+          info: { platform: 'github', owner: 'acme', repo: 'widgets' },
+        },
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings.length).toBeGreaterThan(0);
+      const msg = JSON.parse(browserWs.sentStrings[0]);
+      expect(msg.type).toBe('repo.detected');
+      expect(msg.projectDir).toBe('/home/user/myproject');
+      expect(msg.context.status).toBe('ok');
+    });
+
+    it('repo.list_issues_response reaches browser', async () => {
+      const { daemonWs, browserWs } = await setupBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'repo.list_issues_response',
+        requestId: 'req-issues',
+        projectDir: '/home/user/myproject',
+        items: [{ number: 1, title: 'Bug', state: 'open' }],
+        page: 1,
+        hasMore: false,
+      }));
+      await flushAsync();
+
+      const msg = JSON.parse(browserWs.sentStrings[0]);
+      expect(msg.type).toBe('repo.list_issues_response');
+      expect(msg.items).toHaveLength(1);
+      expect(msg.items[0].title).toBe('Bug');
+    });
+
+    it('repo.list_prs_response reaches browser', async () => {
+      const { daemonWs, browserWs } = await setupBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'repo.list_prs_response',
+        requestId: 'req-prs',
+        projectDir: '/home/user/myproject',
+        items: [{ number: 10, title: 'Feature PR', state: 'open' }],
+        page: 1,
+        hasMore: true,
+      }));
+      await flushAsync();
+
+      const msg = JSON.parse(browserWs.sentStrings[0]);
+      expect(msg.type).toBe('repo.list_prs_response');
+      expect(msg.items[0].title).toBe('Feature PR');
+      expect(msg.hasMore).toBe(true);
+    });
+
+    it('repo.list_branches_response reaches browser', async () => {
+      const { daemonWs, browserWs } = await setupBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'repo.list_branches_response',
+        requestId: 'req-branches',
+        projectDir: '/home/user/myproject',
+        items: [{ name: 'main', current: true }, { name: 'dev', current: false }],
+        page: 1,
+        hasMore: false,
+      }));
+      await flushAsync();
+
+      const msg = JSON.parse(browserWs.sentStrings[0]);
+      expect(msg.type).toBe('repo.list_branches_response');
+      expect(msg.items).toHaveLength(2);
+    });
+
+    it('repo.list_commits_response reaches browser', async () => {
+      const { daemonWs, browserWs } = await setupBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'repo.list_commits_response',
+        requestId: 'req-commits',
+        projectDir: '/home/user/myproject',
+        items: [{ sha: 'abc123', message: 'initial commit' }],
+        page: 1,
+        hasMore: false,
+      }));
+      await flushAsync();
+
+      const msg = JSON.parse(browserWs.sentStrings[0]);
+      expect(msg.type).toBe('repo.list_commits_response');
+      expect(msg.items[0].sha).toBe('abc123');
+    });
+
+    it('repo messages are broadcast to all connected browsers', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browser1 = new MockWs();
+      const browser2 = new MockWs();
+      bridge.handleBrowserConnection(browser1 as never, 'user-1', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(browser2 as never, 'user-2', makeDb('valid-hash'));
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'repo.detect_response',
+        requestId: 'req-bc',
+        projectDir: '/proj',
+        status: 'ok',
+        info: { platform: 'github', owner: 'x', repo: 'y' },
+      }));
+      await flushAsync();
+
+      // Both browsers should receive the message
+      expect(browser1.sentStrings.length).toBeGreaterThan(0);
+      expect(browser2.sentStrings.length).toBeGreaterThan(0);
+      expect(JSON.parse(browser1.sentStrings[0]).type).toBe('repo.detect_response');
+      expect(JSON.parse(browser2.sentStrings[0]).type).toBe('repo.detect_response');
+    });
+  });
 });

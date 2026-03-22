@@ -404,4 +404,111 @@ describe('RepoPage', () => {
     fireEvent.click(screen.getByText('Back'));
     expect(onBack).toHaveBeenCalledOnce();
   });
+
+  // ── Detect timeout ──────────────────────────────────────────────────────────
+
+  it('shows timeout error with projectDir if no detect response within 10s', async () => {
+    vi.useFakeTimers();
+    const { ws } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    // Advance past the 10s timeout
+    await act(async () => {
+      vi.advanceTimersByTime(10_001);
+    });
+
+    vi.useRealTimers();
+
+    // The timeout error message should appear
+    const errorElements = screen.getAllByText(/Detect timeout/);
+    expect(errorElements.length).toBeGreaterThanOrEqual(1);
+    // Should mention "10s" in the error
+    expect(errorElements[0].textContent).toContain('10s');
+  });
+
+  it('does not show timeout if detect response arrives before 10s', async () => {
+    vi.useFakeTimers();
+    const { ws, respondDetect } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    // Response arrives at 5s
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+    });
+
+    await act(async () => {
+      respondDetect({ provider: 'github', owner: 'acme', repo: 'widgets' });
+    });
+
+    // Advance past 10s
+    await act(async () => {
+      vi.advanceTimersByTime(6_000);
+    });
+
+    vi.useRealTimers();
+
+    // No timeout error should appear
+    expect(screen.queryByText(/Detect timeout/)).toBeNull();
+    expect(screen.getByText('acme/widgets')).toBeDefined();
+  });
+
+  // ── End-to-end flat daemon shape through mapDetectToContext ──────────────────
+
+  it('mapDetectToContext: flat daemon shape displays provider/owner/repo correctly', async () => {
+    const { ws, respondDetectFlat } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    // Simulate the exact shape daemon sends: status + info at top level
+    await act(async () => {
+      respondDetectFlat({
+        status: 'ok',
+        info: { platform: 'gitlab', owner: 'myorg', repo: 'myapp', defaultBranch: 'develop' },
+        cliVersion: '2.60.0',
+        cliAuth: true,
+      });
+    });
+
+    // mapDetectToContext should extract info.platform → provider, info.owner → owner, info.repo → repo
+    expect(screen.getByText('gitlab')).toBeDefined();
+    expect(screen.getByText('myorg/myapp')).toBeDefined();
+    expect(screen.getByText('develop')).toBeDefined();
+  });
+
+  it('mapDetectToContext: flat daemon shape with nested context also works', async () => {
+    const { ws, respondDetect } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    // respondDetect wraps in { context: { ... } } — the "old" nested shape
+    await act(async () => {
+      respondDetect({
+        status: 'ok',
+        info: { platform: 'github', owner: 'torvalds', repo: 'linux', defaultBranch: 'master' },
+        cliVersion: '2.50.0',
+        cliAuth: true,
+      });
+    });
+
+    expect(screen.getByText('github')).toBeDefined();
+    expect(screen.getByText('torvalds/linux')).toBeDefined();
+    expect(screen.getByText('master')).toBeDefined();
+  });
+
+  it('mapDetectToContext: cli_missing status sets cliInstalled=false', async () => {
+    const { ws, respondDetectFlat } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    await act(async () => {
+      respondDetectFlat({
+        status: 'cli_missing',
+        info: null,
+        cliMinVersion: '2.0.0',
+      });
+    });
+
+    // When CLI is missing, the header shows the cli_missing badge
+    expect(screen.getByText('CLI not installed')).toBeDefined();
+    // No provider badge or owner/repo should be rendered since info is null
+    expect(screen.queryByText('github')).toBeNull();
+    expect(screen.queryByText('gitlab')).toBeNull();
+  });
 });
