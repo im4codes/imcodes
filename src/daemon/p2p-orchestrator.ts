@@ -278,7 +278,8 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
     instruction: 'Read the context file below and provide your initial analysis. Append your output to the file.',
     isInitial: true,
   });
-  await dispatchHop(run, run.initiatorSession, initialPrompt, serverLink);
+  const initialHeader = `${shortName(run.initiatorSession)} — Initial Analysis`;
+  await dispatchHop(run, run.initiatorSession, initialPrompt, serverLink, undefined, initialHeader);
   if (run._cancelled || isTerminal(run.status)) return;
 
   // ── Phase 2: Sub-session hops ──
@@ -306,7 +307,7 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
 
     // Dispatch immediately — agent will queue the message and process after current task
     logger.info({ runId: run.id, target: target.session, mode: target.mode, hop: i + 1, totalHops }, 'P2P: Phase 2 — dispatching hop');
-    await dispatchHop(run, target.session, hopPrompt, serverLink, sandboxLocalPath);
+    await dispatchHop(run, target.session, hopPrompt, serverLink, sandboxLocalPath, hopLabel);
     logger.info({ runId: run.id, target: target.session, status: run.status }, 'P2P: Phase 2 — hop dispatch returned');
     if (run._cancelled || isTerminal(run.status)) return;
   }
@@ -327,7 +328,8 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
     instruction: summaryInstruction,
     isInitial: false,
   });
-  await dispatchHop(run, run.initiatorSession, summaryPrompt, serverLink);
+  const summaryHeader = `${shortName(run.initiatorSession)} — Summary`;
+  await dispatchHop(run, run.initiatorSession, summaryPrompt, serverLink, undefined, summaryHeader);
   if (run._cancelled || isTerminal(run.status)) return;
 
   // ── Done ──
@@ -357,7 +359,7 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
 
 // ── Single hop dispatch + wait ────────────────────────────────────────────
 
-async function dispatchHop(run: P2pRun, session: string, prompt: string, serverLink: ServerLink | null, sandboxLocalPath?: string | null): Promise<void> {
+async function dispatchHop(run: P2pRun, session: string, prompt: string, serverLink: ServerLink | null, sandboxLocalPath?: string | null, sectionHeader?: string): Promise<void> {
   run.currentTargetSession = session;
   // Don't remove from remainingTargets yet — defer until hop actually completes
   transition(run, 'dispatched', serverLink);
@@ -410,6 +412,8 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
     let fileGrew = false;
     let lastSize = sizeBefore;
     let lastGrowthAt = 0;
+    let headingFound = false;
+    let headingFoundAt = 0;
 
     while (Date.now() < deadline) {
       if (run._cancelled) { idleWaiter.cancel(); finishHop(false); return; }
@@ -429,7 +433,27 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
           // Reset idle flag: transient idle before this growth doesn't count
           idleEventReceived = false;
         }
+        // Fast completion check: if the section heading is in the file, the agent has written its output.
+        if (sectionHeader && fileGrew) {
+          const content = await readFile(watchPath, 'utf8');
+          if (!headingFound && content.includes(`## ${sectionHeader}`)) {
+            headingFound = true;
+            headingFoundAt = Date.now();
+          }
+        }
       } catch { /* ignore */ }
+
+      // Heading fast-path: once heading is found, wait max 5s for final writes then complete
+      if (headingFound && (Date.now() - headingFoundAt) >= 5_000) {
+        logger.info({ runId: run.id, session, sectionHeader }, 'P2P: heading found in file, completing hop');
+        idleWaiter.cancel();
+        if (sandboxLocalPath) await copyBackFromSandbox(run, sandboxLocalPath);
+        finishHop(false);
+        if (run.remainingTargets.length > 0 || session !== run.finalReturnSession) {
+          transition(run, 'awaiting_next_hop', serverLink);
+        }
+        return;
+      }
 
       // Don't trust idle detection until MIN_PROCESSING_MS after dispatch
       const canCheckIdle = (Date.now() - dispatchTime) > MIN_PROCESSING_MS;
@@ -588,11 +612,11 @@ function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: HopOpts): 
   parts.push(`[P2P Discussion Task — run ${run.id}]`);
   parts.push(``);
   parts.push(`Execute these steps NOW on ${filePath}:`);
-  parts.push(`1. Read the file`);
+  parts.push(`1. Read this file`);
   parts.push(`2. ${opts.instruction}`);
-  parts.push(`3. Append your output under "## ${opts.sectionHeader}"`);
+  parts.push(`3. Add a new heading "## ${opts.sectionHeader}" at the end of this file and write your analysis below it`);
   parts.push(``);
-  parts.push(`Rules: ALL output goes to the file. Do NOT print analysis to chat.`);
+  parts.push(`Rules: ALL output goes into this same file. Do NOT print analysis to chat.`);
   parts.push(`Do NOT ask for confirmation. Do NOT explain your plan. Execute immediately.`);
   parts.push(`After writing to the file, respond with only: Done`);
 
