@@ -52,7 +52,7 @@ export type ServerMessage =
   | { type: 'p2p.list_discussions_response'; discussions: Array<{ id: string; fileName: string; preview: string; mtime: number }> }
   | { type: 'p2p.read_discussion_response'; id?: string; content?: string; error?: string }
   | FsGitDiffResponse
-  | { type: 'repo.detect_response'; requestId: string; context: any }
+  | { type: 'repo.detect_response'; requestId: string; projectDir: string; context: any }
   | { type: 'repo.issues_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
   | { type: 'repo.prs_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
   | { type: 'repo.branches_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
