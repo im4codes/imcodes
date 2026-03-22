@@ -1197,8 +1197,8 @@ export function App() {
     // Already detected with a definitive status — no need to re-detect
     if (existing?.context?.status === 'ok' || existing?.context?.status === 'no_repo') return;
 
-    // Send detect request immediately
-    ws.repoDetect(dir);
+    // Delay initial detect to avoid browser rate limit on connect (burst of subscribes + timeline requests)
+    const initialTimer = setTimeout(() => ws.repoDetect(dir), 3_000);
 
     // Retry every 15s unless we get a definitive answer
     const interval = setInterval(() => {
@@ -1210,7 +1210,7 @@ export function App() {
       ws.repoDetect(dir);
     }, 15_000);
 
-    return () => clearInterval(interval);
+    return () => { clearTimeout(initialTimer); clearInterval(interval); };
   }, [activeSessionInfo?.projectDir, connected]);
 
   return (
