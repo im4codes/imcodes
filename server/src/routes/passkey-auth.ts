@@ -379,6 +379,11 @@ passkeyRoutes.post('/login/complete', async (c) => {
   const user = await getUserById(c.env.DB, storedCred.user_id);
   if (!user) return c.json({ error: 'user_not_found' }, 400);
 
+  // Reject disabled/pending users
+  if (user.status !== 'active') {
+    return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+  }
+
   const ip = (c.get('clientIp' as never) as string | undefined) ?? 'unknown';
   await logAudit({ userId: user.id, action: 'auth.passkey.login', ip, details: { credentialId: storedCred.id } }, c.env.DB);
 

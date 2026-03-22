@@ -63,6 +63,9 @@ adminRoutes.post('/users/:id/approve', async (c) => {
 
 adminRoutes.post('/users/:id/disable', async (c) => {
   const targetId = c.req.param('id');
+  const adminUserId = c.get('adminUserId' as never) as string;
+  if (targetId === adminUserId) return c.json({ error: 'cannot_modify_self' }, 403);
+
   const target = await getUserById(c.env.DB, targetId);
   if (!target) return c.json({ error: 'not_found' }, 404);
 
@@ -80,6 +83,9 @@ adminRoutes.post('/users/:id/disable', async (c) => {
 
 adminRoutes.delete('/users/:id', async (c) => {
   const targetId = c.req.param('id');
+  const adminUserId = c.get('adminUserId' as never) as string;
+  if (targetId === adminUserId) return c.json({ error: 'cannot_modify_self' }, 403);
+
   const target = await getUserById(c.env.DB, targetId);
   if (!target) return c.json({ error: 'not_found' }, 404);
 
@@ -109,16 +115,19 @@ adminRoutes.put('/settings', async (c) => {
   const body = await c.req.json().catch(() => null);
   if (!body || typeof body !== 'object') return c.json({ error: 'invalid_body' }, 400);
 
-  const ALLOWED_KEYS = new Set(['registration_enabled', 'require_approval']);
+  const BOOLEAN_SETTINGS = new Set(['registration_enabled', 'require_approval']);
+  const VALID_BOOLEANS = new Set(['true', 'false']);
   const updates = body as Record<string, string>;
+  const changed: Record<string, string> = {};
 
   for (const [key, value] of Object.entries(updates)) {
-    if (!ALLOWED_KEYS.has(key)) continue;
-    if (typeof value !== 'string') continue;
+    if (!BOOLEAN_SETTINGS.has(key)) continue;
+    if (typeof value !== 'string' || !VALID_BOOLEANS.has(value)) continue;
     await setSetting(c.env.DB, key, value);
+    changed[key] = value;
   }
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
-  await logAudit({ userId: c.get('adminUserId' as never) as string, action: 'admin.update_settings', ip }, c.env.DB);
+  await logAudit({ userId: c.get('adminUserId' as never) as string, action: 'admin.update_settings', ip, details: changed }, c.env.DB);
   return c.json({ ok: true });
 });

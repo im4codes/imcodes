@@ -457,6 +457,11 @@ authRoutes.post('/password/login', async (c) => {
     return c.json({ error: 'invalid_credentials' }, 401);
   }
 
+  // Reject disabled/pending users
+  if (user.status !== 'active') {
+    return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+  }
+
   // Issue access (4h) + refresh (30d) tokens
   const accessToken = signJwt({ sub: user.id, type: 'web' }, c.env.JWT_SIGNING_KEY, 4 * 3600);
   const refreshRaw = randomHex(32);
