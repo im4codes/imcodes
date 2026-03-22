@@ -96,6 +96,15 @@ export function useSubSessions(
       let sessionName: string | undefined;
       let state: string | undefined;
 
+      // Sub-session removed by daemon (stopped/cleaned up server-side)
+      if (msg.type === 'subsession.removed') {
+        const removedId = (msg as any).id as string;
+        if (removedId) {
+          setSubSessions((prev) => prev.filter((s) => s.id !== removedId));
+        }
+        return;
+      }
+
       if (msg.type === 'timeline.event') {
         const ev = msg.event;
         if (ev.type !== 'session.state') return;

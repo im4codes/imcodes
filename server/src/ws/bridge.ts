@@ -716,6 +716,17 @@ export class WsBridge {
       return;
     }
 
+    // ── Sub-session closed by daemon → mark in DB + notify browsers ─────────
+    if (type === 'subsession.closed' && this.db) {
+      const id = msg.id as string;
+      if (id) {
+        void this.db.prepare('UPDATE sub_sessions SET closed_at = ? WHERE id = ? AND server_id = ?')
+          .bind(Date.now(), id, this.serverId).run().catch(() => {});
+        this.broadcastToBrowsers(JSON.stringify({ type: 'subsession.removed', id, sessionName: msg.sessionName }));
+      }
+      return;
+    }
+
     // ── P2P conflict → broadcast to browsers ────────────────────────────────
     if (type === 'p2p.conflict') {
       this.broadcastToBrowsers(JSON.stringify(msg));

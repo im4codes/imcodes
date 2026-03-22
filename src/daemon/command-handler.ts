@@ -344,7 +344,7 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       void handleSubSessionStart(cmd, serverLink);
       break;
     case 'subsession.stop':
-      void handleSubSessionStop(cmd);
+      void handleSubSessionStop(cmd, serverLink);
       break;
     case 'subsession.rebuild_all':
       void handleSubSessionRebuildAll(cmd);
@@ -977,13 +977,13 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
   }).catch((e: unknown) => logger.error({ err: e, id }, 'subsession.start failed'));
 }
 
-async function handleSubSessionStop(cmd: Record<string, unknown>): Promise<void> {
+async function handleSubSessionStop(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sName = cmd.sessionName as string | undefined;
   if (!sName) {
     logger.warn('subsession.stop: missing sessionName');
     return;
   }
-  await stopSubSession(sName).catch((e: unknown) => logger.error({ err: e, sName }, 'subsession.stop failed'));
+  await stopSubSession(sName, serverLink).catch((e: unknown) => logger.error({ err: e, sName }, 'subsession.stop failed'));
 }
 
 async function handleSubSessionRebuildAll(cmd: Record<string, unknown>): Promise<void> {

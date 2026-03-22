@@ -118,7 +118,7 @@ async function killSessionProcesses(sessionName: string): Promise<void> {
   } catch { /* session may not exist or have no panes */ }
 }
 
-export async function stopSubSession(sessionName: string): Promise<void> {
+export async function stopSubSession(sessionName: string, serverLink?: { send(msg: object): void } | null): Promise<void> {
   timelineEmitter.emit(sessionName, 'session.state', { state: 'stopped' });
   await killSessionProcesses(sessionName);
   await killSession(sessionName).catch(() => {});
@@ -126,6 +126,12 @@ export async function stopSubSession(sessionName: string): Promise<void> {
   (await import('./codex-watcher.js')).stopWatching(sessionName);
   (await import('./gemini-watcher.js')).stopWatching(sessionName);
   removeSession(sessionName);
+
+  // Notify server so DB is updated (sub-session ID = session name without 'deck_sub_' prefix)
+  const id = sessionName.replace(/^deck_sub_/, '');
+  if (serverLink && id !== sessionName) {
+    try { serverLink.send({ type: 'subsession.closed', id, sessionName }); } catch { /* not connected */ }
+  }
 }
 
 export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promise<void> {
