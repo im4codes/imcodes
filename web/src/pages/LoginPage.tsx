@@ -172,7 +172,7 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
         if (key) {
           // userId already known from login, but we can read from Preferences
           const { Preferences } = await import('@capacitor/preferences');
-          const { value: keyId } = await Preferences.get({ key: 'deck_api_key_id' });
+          await Preferences.get({ key: 'deck_api_key_id' });
           // Re-resolve userId from /me endpoint
           const { apiFetch } = await import('../api.js');
           const me = await apiFetch<{ userId: string }>('/api/auth/user/me');
