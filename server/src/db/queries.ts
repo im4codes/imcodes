@@ -104,6 +104,10 @@ export async function updateUserStatus(db: PgDatabase, userId: string, status: '
 }
 
 export async function deleteUser(db: PgDatabase, userId: string): Promise<void> {
+  // Cascade: revoke all auth artifacts before deleting user
+  await db.prepare('DELETE FROM refresh_tokens WHERE user_id = ?').bind(userId).run();
+  await db.prepare('UPDATE api_keys SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL').bind(Date.now(), userId).run();
+  await db.prepare('DELETE FROM passkey_credentials WHERE user_id = ?').bind(userId).run();
   await db.prepare('DELETE FROM users WHERE id = ?').bind(userId).run();
 }
 

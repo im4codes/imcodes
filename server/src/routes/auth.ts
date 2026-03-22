@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
-import { createUser, getUserById, getUserByUsername } from '../db/queries.js';
+import { createUser, getUserById, getUserByUsername, getSetting, updateUserStatus } from '../db/queries.js';
 import { randomHex, sha256Hex, signJwt, verifyJwt, hashPassword, verifyPassword } from '../security/crypto.js';
 import { checkIdempotency, recordIdempotency } from '../security/replay.js';
 import { logAudit } from '../security/audit.js';
@@ -64,6 +64,12 @@ async function resolveUserId(c: AnyAuthContext): Promise<string | null> {
 
 // POST /api/auth/register — create a new user and issue initial API key
 authRoutes.post('/register', async (c) => {
+  // Check if registration is enabled
+  const regEnabled = await getSetting(c.env.DB, 'registration_enabled');
+  if (regEnabled === 'false') {
+    return c.json({ error: 'registration_disabled' }, 403);
+  }
+
   // Idempotency: deduplicate retried registration requests
   const idempotencyKey = c.req.header('Idempotency-Key');
   if (idempotencyKey) {
@@ -73,6 +79,12 @@ authRoutes.post('/register', async (c) => {
 
   const userId = randomHex(16);
   await createUser(c.env.DB, userId);
+
+  // Set status to pending if approval is required
+  const requireApproval = await getSetting(c.env.DB, 'require_approval');
+  if (requireApproval === 'true') {
+    await updateUserStatus(c.env.DB, userId, 'pending');
+  }
 
   const rawKey = `deck_${randomHex(32)}`;
   const keyHash = sha256Hex(rawKey);
@@ -300,6 +312,14 @@ authRoutes.post('/refresh', async (c) => {
   if (!row) {
     logger.warn({ hashPrefix: tokenHash.slice(0, 8) }, '[refresh] token not found, already used, or expired');
     return c.json({ error: 'invalid_token' }, 401);
+  }
+
+  // Reject disabled/pending users — prevents token refresh after admin disables account
+  const refreshUser = await getUserById(c.env.DB, row.user_id);
+  if (!refreshUser || refreshUser.status !== 'active') {
+    // Consume the token to prevent replay, but don't issue new ones
+    await c.env.DB.prepare('UPDATE refresh_tokens SET used_at = ? WHERE id = ?').bind(Date.now(), row.id).run();
+    return c.json({ error: 'account_disabled' }, 403);
   }
 
   // Per-user lockout check

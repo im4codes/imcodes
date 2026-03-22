@@ -69,6 +69,9 @@ adminRoutes.post('/users/:id/disable', async (c) => {
   const target = await getUserById(c.env.DB, targetId);
   if (!target) return c.json({ error: 'not_found' }, 404);
 
+  // Default admin cannot be disabled
+  if (target.username === 'admin') return c.json({ error: 'cannot_disable_admin' }, 403);
+
   // Cannot disable the last active admin
   if (target.is_admin && target.status === 'active') {
     const adminCount = await countActiveAdmins(c.env.DB);
