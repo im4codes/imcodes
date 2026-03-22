@@ -114,4 +114,4 @@ imcodes bind https://your-domain/bind/<api-key>
 
 ## License
 
-MIT
+[GPLv3](LICENSE)
