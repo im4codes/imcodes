@@ -817,6 +817,26 @@ export function App() {
           });
         }
       }
+      if (msg.type === 'repo.error') {
+        // Store error status so the auto-detect effect can stop retrying for terminal errors
+        // and SubSessionBar can show appropriate state (dimmed button or hidden)
+        const error = (msg as any).error as string;
+        const dir = (msg as any).projectDir as string;
+        if (dir && error) {
+          const status = error === 'invalid_params' ? 'no_repo'
+            : error === 'cli_missing' ? 'cli_missing'
+            : error === 'unauthorized' ? 'unauthorized'
+            : error === 'cli_outdated' ? 'cli_outdated'
+            : null;
+          if (status) {
+            setRepoContexts((prev) => {
+              const next = new Map(prev);
+              next.set(dir, { status, context: { status }, projectDir: dir });
+              return next;
+            });
+          }
+        }
+      }
       if (msg.type === 'daemon.disconnected') {
         // Daemon went offline — keep existing session data visible, just update status
         setDaemonOnline(false);
@@ -1211,7 +1231,8 @@ export function App() {
 
     const existing = repoContextsRef.current.get(dir);
     // Already detected with a definitive status — no need to re-detect
-    if (existing?.context?.status === 'ok' || existing?.context?.status === 'no_repo') return;
+    const TERMINAL_STATUSES = new Set(['ok', 'no_repo', 'cli_missing', 'cli_outdated', 'unauthorized', 'unknown_platform']);
+    if (existing?.context?.status && TERMINAL_STATUSES.has(existing.context.status)) return;
 
     // Delay initial detect to avoid browser rate limit on connect (burst of subscribes + timeline requests)
     const initialTimer = setTimeout(() => ws.repoDetect(dir), 3_000);
@@ -1219,7 +1240,7 @@ export function App() {
     // Retry every 15s unless we get a definitive answer
     const interval = setInterval(() => {
       const ctx = repoContextsRef.current.get(dir);
-      if (ctx?.context?.status === 'ok' || ctx?.context?.status === 'no_repo') {
+      if (ctx?.context?.status && TERMINAL_STATUSES.has(ctx.context.status)) {
         clearInterval(interval);
         return;
       }

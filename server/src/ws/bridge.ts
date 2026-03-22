@@ -358,12 +358,6 @@ export class WsBridge {
         return;
       }
 
-      const browserId = this.getBrowserId(ws);
-      if (!this.browserRateLimiter.check(browserId, BROWSER_RATE_LIMIT, BROWSER_RATE_WINDOW)) {
-        logger.warn({ serverId: this.serverId }, 'Browser rate limit exceeded — dropped');
-        return;
-      }
-
       let msg: Record<string, unknown>;
       try {
         msg = JSON.parse(raw) as Record<string, unknown>;
@@ -374,6 +368,15 @@ export class WsBridge {
       if (msg.type === 'ping') {
         ws.send(JSON.stringify({ type: 'pong' }));
         return;
+      }
+
+      // Rate limit — exempt repo.detect (low-volume, critical for UI, easily dropped during init burst)
+      if (msg.type !== 'repo.detect') {
+        const browserId = this.getBrowserId(ws);
+        if (!this.browserRateLimiter.check(browserId, BROWSER_RATE_LIMIT, BROWSER_RATE_WINDOW)) {
+          logger.warn({ serverId: this.serverId, type: msg.type }, 'Browser rate limit exceeded — dropped');
+          return;
+        }
       }
 
       if (typeof msg.type !== 'string' || !BROWSER_WHITELIST.has(msg.type)) {

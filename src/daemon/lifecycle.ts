@@ -162,6 +162,21 @@ export async function startup(): Promise<DaemonContext> {
       handleWebCommand(msg, serverLink!);
     });
     serverLink.connect();
+
+    // Broadcast cached repo detections after connect so browsers that missed
+    // the initial repo.detected push (e.g. connected late, reconnected) get the data.
+    setTimeout(() => {
+      if (!serverLink) return;
+      for (const session of listSessions()) {
+        const dir = session.projectDir;
+        if (!dir) continue;
+        const cacheKey = RepoCache.buildKey(dir, 'detect');
+        const cached = repoCache.get(cacheKey);
+        if (cached) {
+          try { serverLink.send({ type: 'repo.detected', projectDir: dir, context: cached }); } catch { /* ignore */ }
+        }
+      }
+    }, 3_000); // delay to ensure WS auth handshake completes first
   }
 
   // Wire session events → ServerLink so the browser sees them

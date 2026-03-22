@@ -157,7 +157,7 @@ async function handleListIssues(
     repoCache.set(cacheKey, result, projectDir);
     serverLink.send({ type: 'repo.issues_response', requestId, ...result });
   } catch (err) {
-    sendError(serverLink, requestId, 'cli_error', err);
+    sendError(serverLink, requestId, projectDir, 'cli_error', err);
   }
 }
 
@@ -187,7 +187,7 @@ async function handleListPRs(
     repoCache.set(cacheKey, result, projectDir);
     serverLink.send({ type: 'repo.prs_response', requestId, ...result });
   } catch (err) {
-    sendError(serverLink, requestId, 'cli_error', err);
+    sendError(serverLink, requestId, projectDir, 'cli_error', err);
   }
 }
 
@@ -213,7 +213,7 @@ async function handleListBranches(
     repoCache.set(cacheKey, result, projectDir);
     serverLink.send({ type: 'repo.branches_response', requestId, ...result });
   } catch (err) {
-    sendError(serverLink, requestId, 'cli_error', err);
+    sendError(serverLink, requestId, projectDir, 'cli_error', err);
   }
 }
 
@@ -243,7 +243,7 @@ async function handleListCommits(
     repoCache.set(cacheKey, result, projectDir);
     serverLink.send({ type: 'repo.commits_response', requestId, ...result });
   } catch (err) {
-    sendError(serverLink, requestId, 'cli_error', err);
+    sendError(serverLink, requestId, projectDir, 'cli_error', err);
   }
 }
 
@@ -289,6 +289,7 @@ function extractErrorCode(err: unknown, fallback: RepoError): RepoError {
 function sendError(
   serverLink: ServerLink,
   requestId: string | undefined,
+  projectDir: string,
   fallbackError: RepoError,
   err?: unknown,
 ): void {
@@ -296,7 +297,7 @@ function sendError(
   if (err) {
     logger.error({ err }, `repo handler: ${error}`);
   }
-  serverLink.send({ type: 'repo.error', requestId, error });
+  serverLink.send({ type: 'repo.error', requestId, projectDir, error });
 }
 
 // ---------------------------------------------------------------------------
@@ -309,21 +310,22 @@ export function handleRepoCommand(cmd: Record<string, unknown>, serverLink: Serv
 
   // projectDir validation for all commands
   if (!validateProjectDir(projectDir)) {
-    serverLink.send({ type: 'repo.error', requestId, error: 'invalid_params' as RepoError });
+    logger.debug({ projectDir, knownDirs: listSessions().map((s) => s.projectDir) }, 'repo: projectDir validation failed');
+    serverLink.send({ type: 'repo.error', requestId, projectDir, error: 'invalid_params' as RepoError });
     return;
   }
 
   // Input schema validation
   if (cmd.state !== undefined && !isValidState(cmd.state)) {
-    serverLink.send({ type: 'repo.error', requestId, error: 'invalid_params' as RepoError });
+    serverLink.send({ type: 'repo.error', requestId, projectDir, error: 'invalid_params' as RepoError });
     return;
   }
   if (cmd.branch !== undefined && !isValidBranch(cmd.branch)) {
-    serverLink.send({ type: 'repo.error', requestId, error: 'invalid_params' as RepoError });
+    serverLink.send({ type: 'repo.error', requestId, projectDir, error: 'invalid_params' as RepoError });
     return;
   }
   if (cmd.page !== undefined && !isValidPage(cmd.page)) {
-    serverLink.send({ type: 'repo.error', requestId, error: 'invalid_params' as RepoError });
+    serverLink.send({ type: 'repo.error', requestId, projectDir, error: 'invalid_params' as RepoError });
     return;
   }
 
@@ -354,6 +356,6 @@ export function handleRepoCommand(cmd: Record<string, unknown>, serverLink: Serv
 
   void withConcurrencyLimit(projectDir as string, run).catch((err) => {
     logger.error({ err, type: cmd.type }, 'repo handler failed');
-    serverLink.send({ type: 'repo.error', requestId, error: 'cli_error' as RepoError });
+    serverLink.send({ type: 'repo.error', requestId, projectDir, error: 'cli_error' as RepoError });
   });
 }
