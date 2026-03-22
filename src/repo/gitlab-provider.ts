@@ -72,19 +72,10 @@ export class GitLabProvider implements RepoProvider {
     const page = opts?.page ?? 1;
     const perPage = opts?.perPage ?? DEFAULT_PAGE_SIZE;
 
-    const args = [
-      'api',
-      `/projects/${this.encodedProject}/issues`,
-      '--method', 'GET',
-      '-f', `per_page=${perPage}`,
-      '-f', `page=${page}`,
-    ];
-    if (opts?.state) {
-      const glState = opts.state === 'open' ? 'opened' : opts.state;
-      args.push('-f', `state=${glState}`);
-    }
+    const params = new URLSearchParams({ per_page: String(perPage), page: String(page) });
+    if (opts?.state) params.set('state', opts.state === 'open' ? 'opened' : opts.state);
 
-    const raw = await this.glab(args);
+    const raw = await this.glab(['api', `/projects/${this.encodedProject}/issues?${params}`]);
     const data: any[] = JSON.parse(raw);
 
     const items: RepoIssue[] = data.map((i) => ({
@@ -112,19 +103,10 @@ export class GitLabProvider implements RepoProvider {
     const page = opts?.page ?? 1;
     const perPage = opts?.perPage ?? DEFAULT_PAGE_SIZE;
 
-    const args = [
-      'api',
-      `/projects/${this.encodedProject}/merge_requests`,
-      '--method', 'GET',
-      '-f', `per_page=${perPage}`,
-      '-f', `page=${page}`,
-    ];
-    if (opts?.state) {
-      const glState = opts.state === 'open' ? 'opened' : opts.state;
-      args.push('-f', `state=${glState}`);
-    }
+    const params = new URLSearchParams({ per_page: String(perPage), page: String(page) });
+    if (opts?.state) params.set('state', opts.state === 'open' ? 'opened' : opts.state);
 
-    const raw = await this.glab(args);
+    const raw = await this.glab(['api', `/projects/${this.encodedProject}/merge_requests?${params}`]);
     const data: any[] = JSON.parse(raw);
 
     const items: RepoPR[] = data.map((mr) => ({
@@ -149,14 +131,7 @@ export class GitLabProvider implements RepoProvider {
   /* ------------------------------------------------------------------ */
 
   async listBranches(): Promise<RepoListResult<RepoBranch>> {
-    const args = [
-      'api',
-      `/projects/${this.encodedProject}/repository/branches`,
-      '--method', 'GET',
-      '-f', `per_page=${DEFAULT_PAGE_SIZE}`,
-    ];
-
-    const raw = await this.glab(args);
+    const raw = await this.glab(['api', `/projects/${this.encodedProject}/repository/branches?per_page=${DEFAULT_PAGE_SIZE}`]);
     const data: any[] = JSON.parse(raw);
 
     // Determine current branch via git
@@ -191,18 +166,10 @@ export class GitLabProvider implements RepoProvider {
     const page = opts?.page ?? 1;
     const perPage = opts?.perPage ?? DEFAULT_PAGE_SIZE;
 
-    const args = [
-      'api',
-      `/projects/${this.encodedProject}/repository/commits`,
-      '--method', 'GET',
-      '-f', `per_page=${perPage}`,
-      '-f', `page=${page}`,
-    ];
-    if (opts?.branch) {
-      args.push('-f', `ref_name=${opts.branch}`);
-    }
+    const params = new URLSearchParams({ per_page: String(perPage), page: String(page) });
+    if (opts?.branch) params.set('ref_name', opts.branch);
 
-    const raw = await this.glab(args);
+    const raw = await this.glab(['api', `/projects/${this.encodedProject}/repository/commits?${params}`]);
     const data: any[] = JSON.parse(raw);
 
     const items: RepoCommit[] = data.map((c) => ({

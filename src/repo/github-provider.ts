@@ -66,11 +66,8 @@ export class GitHubProvider implements RepoProvider {
     try {
       const { stdout } = await execFileAsync('gh', [
         'api',
-        `/repos/${this.owner}/${this.repo}/issues`,
+        `/repos/${this.owner}/${this.repo}/issues?state=${state}&per_page=${perPage}&page=${page}`,
         '-q', jq,
-        '-f', `state=${state}`,
-        '-f', `per_page=${perPage}`,
-        '-f', `page=${page}`,
       ], { cwd: this.projectDir, timeout: 15000, maxBuffer: 10 * 1024 * 1024 });
 
       const items: RepoIssue[] = JSON.parse(stdout || '[]');
@@ -97,11 +94,8 @@ export class GitHubProvider implements RepoProvider {
     try {
       const { stdout } = await execFileAsync('gh', [
         'api',
-        `/repos/${this.owner}/${this.repo}/pulls`,
+        `/repos/${this.owner}/${this.repo}/pulls?state=${state}&per_page=${perPage}&page=${page}`,
         '-q', jq,
-        '-f', `state=${state}`,
-        '-f', `per_page=${perPage}`,
-        '-f', `page=${page}`,
       ], { cwd: this.projectDir, timeout: 15000, maxBuffer: 10 * 1024 * 1024 });
 
       const items: RepoPR[] = JSON.parse(stdout || '[]');
@@ -124,9 +118,8 @@ export class GitHubProvider implements RepoProvider {
       const [branchesResult, currentResult, defaultResult] = await Promise.all([
         execFileAsync('gh', [
           'api',
-          `/repos/${this.owner}/${this.repo}/branches`,
+          `/repos/${this.owner}/${this.repo}/branches?per_page=100`,
           '-q', `[.[] | {name, lastCommitDate: (.commit.commit.committer.date | fromdateiso8601)}]`,
-          '-f', `per_page=100`,
         ], { cwd: this.projectDir, timeout: 15000 }),
 
         execFileAsync('git', [
@@ -171,17 +164,14 @@ export class GitHubProvider implements RepoProvider {
 
     const jq = `[.[] | {sha, shortSha: .sha[:7], message: .commit.message, author: (.commit.author.name // .author.login // "unknown"), date: (.commit.author.date | fromdateiso8601), url: .html_url}]`;
 
+    const params = new URLSearchParams({ per_page: String(perPage), page: String(page) });
+    if (opts?.branch) params.set('sha', opts.branch);
+
     const args = [
       'api',
-      `/repos/${this.owner}/${this.repo}/commits`,
+      `/repos/${this.owner}/${this.repo}/commits?${params}`,
       '-q', jq,
-      '-f', `per_page=${perPage}`,
-      '-f', `page=${page}`,
     ];
-
-    if (opts?.branch) {
-      args.push('-f', `sha=${opts.branch}`);
-    }
 
     try {
       const { stdout } = await execFileAsync('gh', args, {
