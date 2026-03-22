@@ -1556,7 +1556,6 @@ export function App() {
                 onHistory={registerHistoryApplyer}
                 serverId={selectedServerId}
                 onViewRepo={() => setShowRepoPage(true)}
-                repoContext={repoContexts.get(activeSessionInfo?.projectDir ?? '')}
               />
             )}
           </>
