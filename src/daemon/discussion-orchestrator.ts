@@ -8,6 +8,7 @@ import { startSubSession, stopSubSession } from './subsession-manager.js';
 import { writeFile, readFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import logger from '../util/logger.js';
+import { ensureImcDir } from '../util/imc-dir.js';
 import type { AgentType } from '../agent/detect.js';
 
 const IDLE_TIMEOUT = 300_000;      // max total wall time per response
@@ -333,8 +334,7 @@ async function runDiscussion(
   }
 
   // 2. Generate semantic title via LLM, then create discussion file
-  const discussDir = path.join(d.cwd || process.cwd(), 'imc_files', 'discussions');
-  await mkdir(discussDir, { recursive: true });
+  const discussDir = await ensureImcDir(d.cwd || process.cwd(), 'discussions');
   const titleAgent = d.participants[d.verdictParticipantIdx];
   const titleFile = path.join(discussDir, `title-${d.id.slice(0, 8)}.txt`);
   const title = await generateTitle(titleAgent.sessionName, d.topic, titleFile);

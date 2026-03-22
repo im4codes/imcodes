@@ -8,6 +8,7 @@
 
 import { stat, writeFile, readFile, mkdir, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
+import { imcSubDir, ensureImcDir } from '../util/imc-dir.js';
 import { randomUUID } from 'node:crypto';
 import { sendKeysDelayedEnter } from '../agent/tmux.js';
 import { detectStatus, detectStatusAsync } from '../agent/detect.js';
@@ -77,7 +78,7 @@ export function listP2pRuns(): P2pRun[] { return [...activeRuns.values()]; }
 function resolveP2pDir(session: string): string {
   const record = getSession(session);
   const cwd = record?.projectDir || process.cwd();
-  return join(cwd, 'imc_files', 'discussions');
+  return imcSubDir(cwd, 'discussions');
 }
 let IDLE_POLL_MS = 3_000;
 let GRACE_PERIOD_DEFAULT_MS = 180_000; // 3 min — complex analysis (subagent research + write) takes time
@@ -173,9 +174,10 @@ export async function startP2pRun(
   const discussionId = `dsc_${randomUUID().slice(0, 8)}`;
   const now = new Date().toISOString();
 
-  // Create temp context file under project dir
-  const p2pDir = resolveP2pDir(initiatorSession);
-  await mkdir(p2pDir, { recursive: true });
+  // Create temp context file under project .imc/discussions/
+  const record = getSession(initiatorSession);
+  const projectDir = record?.projectDir || process.cwd();
+  const p2pDir = await ensureImcDir(projectDir, 'discussions');
   const contextFilePath = join(p2pDir, `${runId}.md`);
 
   let seed = `# P2P Discussion: ${runId}\n\n`;
