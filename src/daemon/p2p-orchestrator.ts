@@ -432,17 +432,23 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
           idleEventReceived = false;
         }
         // Fast completion check: if the section heading is in the file, the agent has written its output.
-        if (sectionHeader && fileGrew) {
+        // Runs regardless of fileGrew — stat() can miss growth between polls.
+        // Case-insensitive to handle agents that change heading capitalization.
+        if (sectionHeader && !headingFound && currentSize > sizeBefore) {
           const content = await readFile(watchPath, 'utf8');
-          if (!headingFound && content.includes(`## ${sectionHeader}`)) {
+          if (content.toLowerCase().includes(`## ${sectionHeader}`.toLowerCase())) {
             headingFound = true;
             headingFoundAt = Date.now();
+            if (!fileGrew) {
+              fileGrew = true;
+              if (run.status === 'dispatched') transition(run, 'running', serverLink);
+            }
           }
         }
       } catch { /* ignore */ }
 
-      // Heading fast-path: once heading is found, wait max 5s for final writes then complete
-      if (headingFound && (Date.now() - headingFoundAt) >= 5_000) {
+      // Heading fast-path: once heading is found, wait 2s for final writes then complete
+      if (headingFound && (Date.now() - headingFoundAt) >= 2_000) {
         logger.info({ runId: run.id, session, sectionHeader }, 'P2P: heading found in file, completing hop');
         idleWaiter.cancel();
         finishHop(false);
