@@ -86,12 +86,22 @@ function makeWs() {
   /** Send a message to the component's onMessage handler */
   const emit = (msg: ServerMessage) => messageHandler?.(msg);
 
-  /** Respond to the pending detect request with repo context */
+  /** Respond to the pending detect request with repo context (nested shape) */
   const respondDetect = (context: Record<string, unknown>) => {
     emit({
       type: 'repo.detect_response',
       requestId: detectReqId,
       context,
+    } as ServerMessage);
+  };
+
+  /** Respond with real daemon shape: context fields spread at top level, no nested context */
+  const respondDetectFlat = (context: Record<string, unknown>, projectDir = PROJECT_DIR) => {
+    emit({
+      type: 'repo.detect_response',
+      requestId: detectReqId,
+      projectDir,
+      ...context,
     } as ServerMessage);
   };
 
@@ -134,6 +144,7 @@ function makeWs() {
     repoListBranches,
     repoListCommits,
     respondDetect,
+    respondDetectFlat,
     respondDetectError,
     respondTab,
     respondTabError,
@@ -347,6 +358,39 @@ describe('RepoPage', () => {
     });
 
     expect(screen.getByText('Could not detect repository')).toBeDefined();
+  });
+
+  // Critical: detect_response with flat shape (real daemon format)
+  it('renders correctly with flat detect_response (real daemon shape)', async () => {
+    const { ws, respondDetectFlat } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    await act(async () => {
+      respondDetectFlat({
+        status: 'ok',
+        info: { platform: 'github', owner: 'facebook', repo: 'react' },
+        cliVersion: '2.50.0',
+        cliAuth: true,
+      });
+    });
+
+    expect(screen.getByText('github')).toBeDefined();
+    expect(screen.getByText('facebook/react')).toBeDefined();
+  });
+
+  it('shows cli_missing hint with flat detect_response', async () => {
+    const { ws, respondDetectFlat } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    await act(async () => {
+      respondDetectFlat({
+        status: 'cli_missing',
+        info: null,
+        cliMinVersion: '2.0.0',
+      });
+    });
+
+    expect(screen.getByText('CLI not installed')).toBeDefined();
   });
 
   // Back button calls onBack

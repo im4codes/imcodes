@@ -31,6 +31,22 @@ interface TabState<T = any> {
   fetched: boolean; // true once first fetch completed (for lazy load)
 }
 
+/** Map daemon RepoContext shape ({ info: { platform, owner, repo }, status }) to page context. */
+function mapDetectToContext(raw: any): RepoContext {
+  if (!raw) return {};
+  // Already in page shape (e.g. from old-style message or test mock)
+  if (raw.provider !== undefined) return raw;
+  // Daemon shape: { status, info: { platform, owner, repo, defaultBranch }, cliVersion, cliAuth }
+  const info = raw.info;
+  return {
+    provider: info?.platform,
+    owner: info?.owner,
+    repo: info?.repo,
+    defaultBranch: info?.defaultBranch ?? raw.defaultBranch,
+    cliInstalled: raw.status !== 'cli_missing',
+  };
+}
+
 function emptyTab<T = any>(): TabState<T> {
   return { items: [], page: 1, hasMore: false, loading: false, error: null, fetched: false };
 }
@@ -126,7 +142,7 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
       if (msg.type === 'repo.detect_response') {
         if (msg.requestId !== detectReqRef.current) return;
         pendingRef.current.delete(msg.requestId);
-        setContext(msg.context ?? {});
+        setContext(mapDetectToContext((msg as any).context ?? msg));
         setDetectLoading(false);
         return;
       }
@@ -134,7 +150,7 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
       // Passive detect push — only accept if projectDir matches
       if (msg.type === 'repo.detected') {
         if (msg.projectDir !== projectDir) return;
-        setContext(prev => ({ ...prev, ...msg.context }));
+        setContext(prev => ({ ...prev, ...mapDetectToContext(msg.context) }));
         return;
       }
 
