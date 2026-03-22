@@ -421,6 +421,87 @@ passkeyRoutes.get('/credentials', async (c) => {
   });
 });
 
+// ── GET /api/auth/passkey/native ───────────────────────────────────────────
+// Lightweight self-contained HTML page for native iOS passkey auth.
+// Replaces loading the full SPA bundle in ASWebAuthenticationSession.
+passkeyRoutes.get('/native', async (c) => {
+  const callback = c.req.query('callback');
+  const action = c.req.query('action') === 'register' ? 'register' : 'login';
+
+  if (!callback || !callback.startsWith('imcodes://')) {
+    return c.text('Invalid callback URL', 400);
+  }
+
+  const html = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IM.codes Auth</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#e0e0e0;font-family:-apple-system,system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.c{text-align:center;max-width:320px}
+.s{font-size:16px;margin-top:12px;color:#aaa}
+.e{color:#f44;margin-top:12px;font-size:14px;word-break:break-word}
+.r{margin-top:16px;padding:10px 24px;background:#2563eb;color:#fff;border:none;border-radius:8px;font-size:15px;cursor:pointer;display:none}
+.spinner{width:32px;height:32px;border:3px solid #333;border-top-color:#2563eb;border-radius:50%;animation:spin 0.8s linear infinite;margin:0 auto}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style></head><body>
+<div class="c">
+<div class="spinner" id="sp"></div>
+<div class="s" id="st">Authenticating\u2026</div>
+<div class="e" id="er"></div>
+<button class="r" id="rt" onclick="run()">Retry</button>
+</div>
+<script>
+var CB=${JSON.stringify(callback)};
+var ACTION=${JSON.stringify(action)};
+function gc(n){var m=document.cookie.match(new RegExp('(?:^|;\\\\s*)'+n+'=([^;]+)'));return m?decodeURIComponent(m[1]):'';}
+function $(i){return document.getElementById(i);}
+function err(m){$('sp').style.display='none';$('er').textContent=m;$('rt').style.display='inline-block';$('st').textContent='Authentication failed';}
+async function run(){
+$('sp').style.display='block';$('er').textContent='';$('rt').style.display='none';$('st').textContent='Authenticating\\u2026';
+try{
+var csrf=gc('rcc_csrf');
+var h={'Content-Type':'application/json'};
+if(csrf)h['X-CSRF-Token']=csrf;
+var beginUrl=ACTION==='register'?'/api/auth/passkey/register/begin':'/api/auth/passkey/login/begin';
+var r=await fetch(beginUrl,{method:'POST',headers:h,credentials:'include',body:ACTION==='register'?'{"displayName":"Mobile User"}':'{}'});
+if(!r.ok){err('Server error: '+r.status);return;}
+var opts=await r.json();
+var cid=opts.challengeId;delete opts.challengeId;
+var cred;
+if(ACTION==='register'){
+opts.user.id=base64ToBuffer(opts.user.id);
+opts.challenge=base64ToBuffer(opts.challenge);
+if(opts.excludeCredentials)opts.excludeCredentials.forEach(function(c){c.id=base64ToBuffer(c.id);});
+cred=await navigator.credentials.create({publicKey:opts});
+}else{
+opts.challenge=base64ToBuffer(opts.challenge);
+if(opts.allowCredentials)opts.allowCredentials.forEach(function(c){c.id=base64ToBuffer(c.id);});
+cred=await navigator.credentials.get({publicKey:opts});
+}
+var cbEnc=encodeURIComponent(CB);
+var completeUrl=(ACTION==='register'?'/api/auth/passkey/register/complete':'/api/auth/passkey/login/complete')+'?native=1&native_callback='+cbEnc;
+var payload=JSON.stringify({challengeId:cid,response:credToJSON(cred)});
+$('st').textContent='Verifying\\u2026';
+var f=document.createElement('form');f.method='POST';f.action=completeUrl;
+var inp=document.createElement('input');inp.type='hidden';inp.name='json';inp.value=payload;
+f.appendChild(inp);document.body.appendChild(f);f.submit();
+}catch(e){
+var m=e.message||String(e);
+if(m.includes('NotAllowedError')||m.toLowerCase().includes('cancel')){$('sp').style.display='none';$('st').textContent='Cancelled';$('rt').style.display='inline-block';}
+else err(m);
+}}
+function base64ToBuffer(s){s=s.replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';var b=atob(s),a=new Uint8Array(b.length);for(var i=0;i<b.length;i++)a[i]=b.charCodeAt(i);return a.buffer;}
+function bufferToBase64(b){var a=new Uint8Array(b),s='';for(var i=0;i<a.length;i++)s+=String.fromCharCode(a[i]);return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');}
+function credToJSON(c){
+if(ACTION==='register')return{id:c.id,rawId:bufferToBase64(c.rawId),type:c.type,response:{attestationObject:bufferToBase64(c.response.attestationObject),clientDataJSON:bufferToBase64(c.response.clientDataJSON)},clientExtensionResults:c.getClientExtensionResults()};
+return{id:c.id,rawId:bufferToBase64(c.rawId),type:c.type,response:{authenticatorData:bufferToBase64(c.response.authenticatorData),clientDataJSON:bufferToBase64(c.response.clientDataJSON),signature:bufferToBase64(c.response.signature),userHandle:c.response.userHandle?bufferToBase64(c.response.userHandle):null},clientExtensionResults:c.getClientExtensionResults()};}
+run();
+</script></body></html>`;
+
+  return c.html(html);
+});
+
 // ── DELETE /api/auth/passkey/credentials/:credId ──────────────────────────
 passkeyRoutes.delete('/credentials/:credId', async (c) => {
   const userId = await resolveAuthedUserId(c);
