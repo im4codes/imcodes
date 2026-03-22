@@ -9,7 +9,7 @@ import type { PgDatabase } from '../src/db/client.js';
 // ── In-memory mock DB ─────────────────────────────────────────────────────────
 
 function makeMemDb(): PgDatabase {
-  const users = new Map<string, { id: string; created_at: number }>();
+  const users = new Map<string, { id: string; created_at: number; is_admin: boolean; status: string }>();
   const apiKeys = new Map<string, { id: string; user_id: string; key_hash: string; created_at: number; revoked_at: number | null; grace_expires_at: number | null }>();
   const refreshTokens = new Map<string, { id: string; user_id: string; token_hash: string; family_id: string; expires_at: number; created_at: number; used_at: number | null }>();
   // auth_lockout: identity → { fail_count, first_fail_at, locked_until }
@@ -74,7 +74,7 @@ function makeMemDb(): PgDatabase {
           const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
 
           if (s.includes('insert into users')) {
-            users.set(args[0] as string, { id: args[0] as string, created_at: args[1] as number });
+            users.set(args[0] as string, { id: args[0] as string, created_at: args[1] as number, is_admin: false, status: 'active' });
           }
           if (s.includes('insert into api_keys')) {
             apiKeys.set(args[0] as string, {

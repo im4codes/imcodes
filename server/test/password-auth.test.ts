@@ -17,6 +17,8 @@ interface MemUser {
   password_hash: string | null;
   display_name: string | null;
   password_must_change: boolean | null;
+  is_admin: boolean;
+  status: 'active' | 'pending' | 'disabled';
 }
 
 function makeMemDb(): PgDatabase {
@@ -91,6 +93,8 @@ function makeMemDb(): PgDatabase {
               password_hash: null,
               display_name: null,
               password_must_change: null,
+              is_admin: false,
+              status: 'active',
             });
           }
           if (s.includes('insert into api_keys')) {
