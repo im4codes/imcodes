@@ -16,6 +16,7 @@ import type { PgDatabase } from '../db/client.js';
 import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
 import { sha256Hex } from '../security/crypto.js';
+import { REPO_RELAY_TYPES } from '../../../src/shared/repo-types.js';
 import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, updateSubSession, upsertOrchestrationRun } from '../db/queries.js';
 import logger from '../util/logger.js';
 
@@ -755,9 +756,8 @@ export class WsBridge {
       return;
     }
 
-    if (type === 'repo.detected' || type === 'repo.detect_response' || type === 'repo.error' ||
-        type === 'repo.issues_response' || type === 'repo.prs_response' ||
-        type === 'repo.branches_response' || type === 'repo.commits_response') {
+    // Repo messages: use shared constants to prevent type-name drift between daemon and bridge
+    if ((REPO_RELAY_TYPES as Set<string>).has(type)) {
       this.broadcastToBrowsers(JSON.stringify(msg));
       return;
     }
