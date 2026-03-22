@@ -46,30 +46,40 @@ describe('RepoCache', () => {
   });
 
   describe('TTL expiry', () => {
-    it('returns data within default TTL (30s)', () => {
+    it('returns data within default TTL (5 min)', () => {
       cache.set('k', 'data', '/proj');
-      vi.advanceTimersByTime(29_000);
+      vi.advanceTimersByTime(4 * 60_000); // 4 min
       expect(cache.get('k')).toBe('data');
     });
 
-    it('expires after default TTL (30s)', () => {
+    it('expires after default TTL (5 min)', () => {
       cache.set('k', 'data', '/proj');
-      vi.advanceTimersByTime(31_000);
+      vi.advanceTimersByTime(5 * 60_000 + 1000); // 5 min + 1s
       expect(cache.get('k')).toBeNull();
     });
 
-    it('expires error-state entries after 5s', () => {
+    it('detect keys get longer TTL (30 min)', () => {
+      const key = RepoCache.buildKey('/proj', 'detect');
+      cache.set(key, 'detect-data', '/proj');
+      vi.advanceTimersByTime(29 * 60_000); // 29 min
+      expect(cache.get(key)).toBe('detect-data');
+
+      vi.advanceTimersByTime(2 * 60_000); // 31 min total
+      expect(cache.get(key)).toBeNull();
+    });
+
+    it('expires error-state entries after 10s', () => {
       cache.set('k', 'err-data', '/proj', true);
-      vi.advanceTimersByTime(4_000);
+      vi.advanceTimersByTime(9_000);
       expect(cache.get('k')).toBe('err-data');
 
-      vi.advanceTimersByTime(2_000); // total 6s
+      vi.advanceTimersByTime(2_000); // total 11s
       expect(cache.get('k')).toBeNull();
     });
 
-    it('error-state entries do not last 30s', () => {
+    it('error-state entries do not last 5 min', () => {
       cache.set('k', 'err', '/proj', true);
-      vi.advanceTimersByTime(10_000);
+      vi.advanceTimersByTime(15_000);
       expect(cache.get('k')).toBeNull();
     });
   });
