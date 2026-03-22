@@ -98,7 +98,16 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
   const doDetect = useCallback(() => {
     setDetectLoading(true);
     setDetectError(null);
-    const rid = ws.repoDetect(projectDir);
+
+    let rid: string;
+    try {
+      rid = ws.repoDetect(projectDir);
+    } catch (err) {
+      setDetectError(`Send failed: ${err instanceof Error ? err.message : String(err)}`);
+      setDetectLoading(false);
+      return;
+    }
+
     detectReqRef.current = rid;
     pendingRef.current.add(rid);
 
@@ -107,7 +116,7 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
     detectTimeoutRef.current = setTimeout(() => {
       if (detectReqRef.current === rid && pendingRef.current.has(rid)) {
         pendingRef.current.delete(rid);
-        setDetectError(`Detect timeout — no response from daemon after 10s`);
+        setDetectError(`Detect timeout — no response after 10s (requestId: ${rid.slice(0, 8)})`);
         setDetectLoading(false);
       }
     }, 10_000);
