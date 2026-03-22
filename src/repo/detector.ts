@@ -59,21 +59,39 @@ function parseRemotes(output: string): ParsedRemote[] {
   return remotes;
 }
 
-/** Determine platform for a host — known hosts first, then CLI probe. */
+/** Resolve SSH alias to actual hostname via `ssh -G`. */
+async function resolveSSHHost(alias: string): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync('ssh', ['-G', alias], { timeout: 3000 });
+    const match = stdout.match(/^hostname\s+(\S+)/m);
+    return match ? match[1] : alias;
+  } catch {
+    return alias;
+  }
+}
+
+/** Determine platform for a host — known hosts first, SSH alias, then CLI probe. */
 async function detectPlatform(host: string): Promise<RepoPlatform> {
-  // 1. Known hosts
+  // 1. Known hosts (direct match)
   if (KNOWN_HOSTS[host]) return KNOWN_HOSTS[host];
 
-  // 2. CLI auth host probe — try gh first, then glab
-  try {
-    await execFileAsync('gh', ['auth', 'status', '--hostname', host], { timeout: 5000 });
-    return 'github';
-  } catch { /* not a gh host or gh not installed */ }
+  // 2. Resolve SSH alias (e.g. github-work → github.com via ~/.ssh/config)
+  const resolved = await resolveSSHHost(host);
+  if (resolved !== host && KNOWN_HOSTS[resolved]) return KNOWN_HOSTS[resolved];
+
+  // 3. CLI auth host probe — try gh on both alias and resolved hostname
+  const hostsToTry = resolved !== host ? [resolved, host] : [host];
+  for (const h of hostsToTry) {
+    try {
+      await execFileAsync('gh', ['auth', 'status', '--hostname', h], { timeout: 5000 });
+      return 'github';
+    } catch { /* not a gh host or gh not installed */ }
+  }
 
   try {
     // glab doesn't have --hostname, check config
     const { stdout } = await execFileAsync('glab', ['config', 'get', 'host'], { timeout: 5000 });
-    if (stdout.trim() === host) return 'gitlab';
+    if (stdout.trim() === host || stdout.trim() === resolved) return 'gitlab';
   } catch { /* not a glab host or glab not installed */ }
 
   return 'unknown';
@@ -196,11 +214,15 @@ export async function detectRepo(projectDir: string): Promise<RepoContext> {
     }
   }
 
-  // 3. Detect platform
+  // 3. Detect platform (resolve SSH aliases like github-work → github.com)
+  const resolvedHost = await resolveSSHHost(selected.host);
   const platform = await detectPlatform(selected.host);
   if (platform === 'unknown') {
     return { info: null, status: 'unknown_platform' };
   }
+
+  // Use resolved host for CLI auth checks (alias won't work with gh auth --hostname)
+  const authHost = KNOWN_HOSTS[resolvedHost] ? resolvedHost : selected.host;
 
   // 4. Check CLI
   const cliCheck = await checkCli(platform, projectDir);
@@ -214,7 +236,7 @@ export async function detectRepo(projectDir: string): Promise<RepoContext> {
   }
 
   // 5. Check auth
-  const cliAuth = await checkAuth(platform, selected.host);
+  const cliAuth = await checkAuth(platform, authHost);
   if (!cliAuth) {
     return {
       info: { platform, owner: selected.owner, repo: selected.repo, remoteUrl: selected.url },
