@@ -426,6 +426,26 @@ describe('RepoPage', () => {
     expect(errorElements[0].textContent).toContain('10s');
   });
 
+  it('shows send error when WS is not connected', async () => {
+    // Create a ws mock where repoDetect throws (simulating disconnected WS)
+    const failWs = {
+      onMessage: (_handler: (msg: any) => void) => () => {},
+      repoDetect: () => { throw new Error('WebSocket not connected'); },
+      repoListIssues: vi.fn(),
+      repoListPRs: vi.fn(),
+      repoListBranches: vi.fn(),
+      repoListCommits: vi.fn(),
+    } as unknown as WsClient;
+
+    render(<RepoPage ws={failWs} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    // Should immediately show send error
+    await act(async () => {});
+    const errorElements = screen.getAllByText(/Send failed/);
+    expect(errorElements.length).toBeGreaterThanOrEqual(1);
+    expect(errorElements[0].textContent).toContain('WebSocket not connected');
+  });
+
   it('does not show timeout if detect response arrives before 10s', async () => {
     vi.useFakeTimers();
     const { ws, respondDetect } = makeWs();
