@@ -327,21 +327,21 @@ export class WsClient {
   // ── Repo commands ──────────────────────────────────────────────────────────
 
   /** Detect repo context for a project directory. Returns requestId. */
-  repoDetect(projectDir: string): string {
+  repoDetect(projectDir: string, opts?: { force?: boolean }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'repo.detect', requestId, projectDir });
+    this.send({ type: 'repo.detect', requestId, projectDir, ...(opts?.force ? { force: true } : {}) });
     return requestId;
   }
 
   /** List issues for a project. Returns requestId. */
-  repoListIssues(projectDir: string, opts?: { state?: string; page?: number }): string {
+  repoListIssues(projectDir: string, opts?: { state?: string; page?: number; force?: boolean }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: 'repo.list_issues', requestId, projectDir, ...opts });
     return requestId;
   }
 
   /** List pull requests for a project. Returns requestId. */
-  repoListPRs(projectDir: string, opts?: { state?: string; page?: number }): string {
+  repoListPRs(projectDir: string, opts?: { state?: string; page?: number; force?: boolean }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: 'repo.list_prs', requestId, projectDir, ...opts });
     return requestId;

@@ -237,11 +237,23 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
   // ── Actions ──────────────────────────────────────────────────────────────
 
   const handleRefresh = useCallback(() => {
-    doDetect();
-    // Re-fetch active tab
+    // Force refresh — bypass daemon cache to get fresh data from gh/glab CLI
+    setDetectLoading(true);
+    setDetectError(null);
+    let rid: string;
+    try {
+      rid = ws.repoDetect(projectDir, { force: true });
+    } catch (err) {
+      setDetectError(`Send failed: ${err instanceof Error ? err.message : String(err)}`);
+      setDetectLoading(false);
+      return;
+    }
+    detectReqRef.current = rid;
+    pendingRef.current.add(rid);
+    // Re-fetch active tab with force
     updateTab(activeTab, { fetched: false, items: [], page: 1, hasMore: false });
     fetchTab(activeTab);
-  }, [doDetect, activeTab, updateTab, fetchTab]);
+  }, [ws, projectDir, activeTab, updateTab, fetchTab]);
 
   const handleLoadMore = useCallback(() => {
     const tab = tabs[activeTab];
@@ -426,7 +438,7 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
     if (detectError) return (
       <div style={{ padding: 24, textAlign: 'center', color: '#94a3b8', fontSize: 13 }}>
         <div style={{ marginBottom: 12, color: '#f87171' }}>{detectError}</div>
-        <div style={{ marginBottom: 12, fontSize: 11, color: '#475569', wordBreak: 'break-all' }}>projectDir: {projectDir}</div>
+        <div style={{ marginBottom: 12, fontSize: 11, color: '#475569' }}>{t('repo.retry')}</div>
         <button class="btn btn-sm" onClick={doDetect}>{t('repo.retry')}</button>
       </div>
     );
@@ -491,10 +503,7 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
         )}
 
         {detectError && (
-          <div style={{ flex: 1, overflow: 'hidden' }}>
-            <span style={{ color: '#f87171', fontSize: 13 }}>{detectError}</span>
-            <span style={{ color: '#475569', fontSize: 10, marginLeft: 8 }}>{projectDir}</span>
-          </div>
+          <span style={{ color: '#f87171', fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{detectError}</span>
         )}
 
         {context && !detectLoading && (

@@ -12,6 +12,7 @@ import type { RepoProvider, ListOptions, CommitListOptions } from '../repo/provi
 import { listSessions } from '../store/session-store.js';
 import type { ServerLink } from './server-link.js';
 import logger from '../util/logger.js';
+import { REPO_MSG } from '../shared/repo-types.js';
 
 // ---------------------------------------------------------------------------
 // Concurrency limiter — max 3 concurrent CLI calls per projectDir
@@ -122,13 +123,13 @@ async function handleDetect(
   const cacheKey = RepoCache.buildKey(projectDir, 'detect');
   const cached = repoCache.get<RepoContext>(cacheKey);
   if (cached) {
-    serverLink.send({ type: 'repo.detect_response', requestId, projectDir, ...cached });
+    serverLink.send({ type: REPO_MSG.DETECT_RESPONSE, requestId, projectDir, ...cached });
     return;
   }
 
   const ctx = await detectRepo(projectDir);
   repoCache.set(cacheKey, ctx, projectDir, ctx.status !== 'ok');
-  serverLink.send({ type: 'repo.detect_response', requestId, projectDir, ...ctx });
+  serverLink.send({ type: REPO_MSG.DETECT_RESPONSE, requestId, projectDir, ...ctx });
 }
 
 async function handleListIssues(
@@ -145,7 +146,7 @@ async function handleListIssues(
   const cacheKey = RepoCache.buildKey(projectDir, 'issues', { ...opts });
   const cached = repoCache.get<unknown>(cacheKey);
   if (cached) {
-    serverLink.send({ type: 'repo.issues_response', requestId, ...cached as object });
+    serverLink.send({ type: REPO_MSG.ISSUES_RESPONSE, requestId, ...cached as object });
     return;
   }
 
@@ -155,7 +156,7 @@ async function handleListIssues(
   try {
     const result = await provider.listIssues(opts);
     repoCache.set(cacheKey, result, projectDir);
-    serverLink.send({ type: 'repo.issues_response', requestId, ...result });
+    serverLink.send({ type: REPO_MSG.ISSUES_RESPONSE, requestId, ...result });
   } catch (err) {
     sendError(serverLink, requestId, projectDir, 'cli_error', err);
   }
@@ -175,7 +176,7 @@ async function handleListPRs(
   const cacheKey = RepoCache.buildKey(projectDir, 'prs', { ...opts });
   const cached = repoCache.get<unknown>(cacheKey);
   if (cached) {
-    serverLink.send({ type: 'repo.prs_response', requestId, ...cached as object });
+    serverLink.send({ type: REPO_MSG.PRS_RESPONSE, requestId, ...cached as object });
     return;
   }
 
@@ -185,7 +186,7 @@ async function handleListPRs(
   try {
     const result = await provider.listPRs(opts);
     repoCache.set(cacheKey, result, projectDir);
-    serverLink.send({ type: 'repo.prs_response', requestId, ...result });
+    serverLink.send({ type: REPO_MSG.PRS_RESPONSE, requestId, ...result });
   } catch (err) {
     sendError(serverLink, requestId, projectDir, 'cli_error', err);
   }
@@ -201,7 +202,7 @@ async function handleListBranches(
   const cacheKey = RepoCache.buildKey(projectDir, 'branches');
   const cached = repoCache.get<unknown>(cacheKey);
   if (cached) {
-    serverLink.send({ type: 'repo.branches_response', requestId, ...cached as object });
+    serverLink.send({ type: REPO_MSG.BRANCHES_RESPONSE, requestId, ...cached as object });
     return;
   }
 
@@ -211,7 +212,7 @@ async function handleListBranches(
   try {
     const result = await provider.listBranches();
     repoCache.set(cacheKey, result, projectDir);
-    serverLink.send({ type: 'repo.branches_response', requestId, ...result });
+    serverLink.send({ type: REPO_MSG.BRANCHES_RESPONSE, requestId, ...result });
   } catch (err) {
     sendError(serverLink, requestId, projectDir, 'cli_error', err);
   }
@@ -231,7 +232,7 @@ async function handleListCommits(
   const cacheKey = RepoCache.buildKey(projectDir, 'commits', { ...opts });
   const cached = repoCache.get<unknown>(cacheKey);
   if (cached) {
-    serverLink.send({ type: 'repo.commits_response', requestId, ...cached as object });
+    serverLink.send({ type: REPO_MSG.COMMITS_RESPONSE, requestId, ...cached as object });
     return;
   }
 
@@ -241,7 +242,7 @@ async function handleListCommits(
   try {
     const result = await provider.listCommits(opts);
     repoCache.set(cacheKey, result, projectDir);
-    serverLink.send({ type: 'repo.commits_response', requestId, ...result });
+    serverLink.send({ type: REPO_MSG.COMMITS_RESPONSE, requestId, ...result });
   } catch (err) {
     sendError(serverLink, requestId, projectDir, 'cli_error', err);
   }
@@ -267,7 +268,7 @@ async function getProvider(
   const provider = createProvider(ctx, projectDir);
   if (!provider) {
     serverLink.send({
-      type: 'repo.error',
+      type: REPO_MSG.ERROR,
       requestId,
       error: 'not_detected' as RepoError,
       status: ctx.status,
@@ -297,7 +298,7 @@ function sendError(
   if (err) {
     logger.error({ err }, `repo handler: ${error}`);
   }
-  serverLink.send({ type: 'repo.error', requestId, projectDir, error });
+  serverLink.send({ type: REPO_MSG.ERROR, requestId, projectDir, error });
 }
 
 // ---------------------------------------------------------------------------
@@ -311,26 +312,31 @@ export function handleRepoCommand(cmd: Record<string, unknown>, serverLink: Serv
   // projectDir validation for all commands
   if (!validateProjectDir(projectDir)) {
     logger.debug({ projectDir, knownDirs: listSessions().map((s) => s.projectDir) }, 'repo: projectDir validation failed');
-    serverLink.send({ type: 'repo.error', requestId, projectDir, error: 'invalid_params' as RepoError });
+    serverLink.send({ type: REPO_MSG.ERROR, requestId, projectDir, error: 'invalid_params' as RepoError });
     return;
   }
 
   // Input schema validation
   if (cmd.state !== undefined && !isValidState(cmd.state)) {
-    serverLink.send({ type: 'repo.error', requestId, projectDir, error: 'invalid_params' as RepoError });
+    serverLink.send({ type: REPO_MSG.ERROR, requestId, projectDir, error: 'invalid_params' as RepoError });
     return;
   }
   if (cmd.branch !== undefined && !isValidBranch(cmd.branch)) {
-    serverLink.send({ type: 'repo.error', requestId, projectDir, error: 'invalid_params' as RepoError });
+    serverLink.send({ type: REPO_MSG.ERROR, requestId, projectDir, error: 'invalid_params' as RepoError });
     return;
   }
   if (cmd.page !== undefined && !isValidPage(cmd.page)) {
-    serverLink.send({ type: 'repo.error', requestId, projectDir, error: 'invalid_params' as RepoError });
+    serverLink.send({ type: REPO_MSG.ERROR, requestId, projectDir, error: 'invalid_params' as RepoError });
     return;
   }
 
   // Strip any browser-sent provider field
   delete cmd.provider;
+
+  // Force refresh: invalidate cache for this projectDir before re-fetching
+  if (cmd.force === true) {
+    repoCache.invalidate(projectDir as string);
+  }
 
   const run = async (): Promise<void> => {
     switch (cmd.type) {
@@ -356,6 +362,6 @@ export function handleRepoCommand(cmd: Record<string, unknown>, serverLink: Serv
 
   void withConcurrencyLimit(projectDir as string, run).catch((err) => {
     logger.error({ err, type: cmd.type }, 'repo handler failed');
-    serverLink.send({ type: 'repo.error', requestId, projectDir, error: 'cli_error' as RepoError });
+    serverLink.send({ type: REPO_MSG.ERROR, requestId, projectDir, error: 'cli_error' as RepoError });
   });
 }
