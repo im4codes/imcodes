@@ -1,7 +1,8 @@
 /** Daemon-side TTL cache for repo data. */
 
-const DEFAULT_TTL_MS = 30_000;    // 30s for successful results
-const ERROR_TTL_MS = 5_000;       // 5s for error states
+const DEFAULT_TTL_MS = 5 * 60_000;  // 5 min for successful results (issues/PRs/branches don't change frequently)
+const DETECT_TTL_MS = 30 * 60_000;  // 30 min for detect results (platform/auth rarely changes)
+const ERROR_TTL_MS = 10_000;        // 10s for error states
 
 interface CacheEntry<T> {
   data: T;
@@ -29,10 +30,11 @@ export class RepoCache {
   }
 
   set<T>(key: string, data: T, projectDir: string, errorState = false): void {
+    const isDetect = key.includes(':detect:');
     this.store.set(key, {
       data,
       cachedAt: Date.now(),
-      ttlMs: errorState ? ERROR_TTL_MS : DEFAULT_TTL_MS,
+      ttlMs: errorState ? ERROR_TTL_MS : isDetect ? DETECT_TTL_MS : DEFAULT_TTL_MS,
       projectDir,
     });
   }
