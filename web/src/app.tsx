@@ -372,6 +372,8 @@ export function App() {
   // ── Repo ────────────────────────────────────────────────────────────────────
   const [showRepoPage, setShowRepoPage] = useState(false);
   const [repoContexts, setRepoContexts] = useState<Map<string, any>>(new Map());
+  const repoContextsRef = useRef(repoContexts);
+  repoContextsRef.current = repoContexts;
 
   // ── Discussions ─────────────────────────────────────────────────────────────
   const [showDiscussionsPage, setShowDiscussionsPage] = useState(false);
@@ -799,9 +801,13 @@ export function App() {
       if (msg.type === 'repo.detected' || msg.type === 'repo.detect_response') {
         const dir = msg.projectDir as string;
         if (dir) {
+          // Normalize shape: repo.detected wraps in { context }, detect_response spreads at top level.
+          // Flatten so repoContext.status always works (SubSessionBar) AND repoContext.context.status works (effect).
+          const context = (msg as any).context ?? msg;
+          const normalized = { ...context, context, projectDir: dir };
           setRepoContexts((prev) => {
             const next = new Map(prev);
-            next.set(dir, msg);
+            next.set(dir, normalized);
             return next;
           });
         }
@@ -1187,7 +1193,7 @@ export function App() {
     const dir = activeSessionInfo?.projectDir;
     if (!ws || !dir || !connected) return;
 
-    const existing = repoContexts.get(dir);
+    const existing = repoContextsRef.current.get(dir);
     // Already detected with a definitive status — no need to re-detect
     if (existing?.context?.status === 'ok' || existing?.context?.status === 'no_repo') return;
 
@@ -1196,7 +1202,7 @@ export function App() {
 
     // Retry every 15s unless we get a definitive answer
     const interval = setInterval(() => {
-      const ctx = repoContexts.get(dir);
+      const ctx = repoContextsRef.current.get(dir);
       if (ctx?.context?.status === 'ok' || ctx?.context?.status === 'no_repo') {
         clearInterval(interval);
         return;
