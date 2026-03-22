@@ -336,28 +336,28 @@ export class WsClient {
   /** List issues for a project. Returns requestId. */
   repoListIssues(projectDir: string, opts?: { state?: string; page?: number }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'repo.issues', requestId, projectDir, ...opts });
+    this.send({ type: 'repo.list_issues', requestId, projectDir, ...opts });
     return requestId;
   }
 
   /** List pull requests for a project. Returns requestId. */
   repoListPRs(projectDir: string, opts?: { state?: string; page?: number }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'repo.prs', requestId, projectDir, ...opts });
+    this.send({ type: 'repo.list_prs', requestId, projectDir, ...opts });
     return requestId;
   }
 
   /** List branches for a project. Returns requestId. */
   repoListBranches(projectDir: string): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'repo.branches', requestId, projectDir });
+    this.send({ type: 'repo.list_branches', requestId, projectDir });
     return requestId;
   }
 
   /** List commits for a project. Returns requestId. */
   repoListCommits(projectDir: string, opts?: { branch?: string; page?: number }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'repo.commits', requestId, projectDir, ...opts });
+    this.send({ type: 'repo.list_commits', requestId, projectDir, ...opts });
     return requestId;
   }
 

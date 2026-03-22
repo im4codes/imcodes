@@ -381,10 +381,21 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
   };
 
   const renderTabContent = (key: TabKey) => {
+    // Show spinner while detect is in progress (tabs can't fetch without context)
+    if (detectLoading) return renderSpinner();
+    if (detectError) return (
+      <div style={{ padding: 24, textAlign: 'center', color: '#f87171', fontSize: 13 }}>
+        {detectError}
+        <div style={{ marginTop: 8 }}>
+          <button class="btn btn-sm" onClick={doDetect}>{t('repo.retry')}</button>
+        </div>
+      </div>
+    );
     const tab = tabs[key];
     if (tab.loading && !tab.fetched) return renderSpinner();
     if (tab.error) return renderError(tab.error, key);
     if (tab.fetched && tab.items.length === 0) return renderEmpty(key);
+    if (!tab.fetched && !tab.loading) return renderSpinner(); // waiting for lazy load
 
     const renderer = RENDERERS[key];
     return (
@@ -424,6 +435,7 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
       background: '#0f172a', color: '#e2e8f0',
       display: 'flex', flexDirection: 'column',
       overflow: 'hidden',
+      paddingTop: 'env(safe-area-inset-top)',
     }}>
       {/* Header bar */}
       <div style={{
