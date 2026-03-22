@@ -53,7 +53,9 @@ async function rewritePathsForSandbox(sessionName: string, text: string): Promis
   for (const match of matches) {
     const srcPath = match[1];
     const filename = nodePath.basename(srcPath);
-    const destPath = nodePath.join(refsDir, filename);
+    // Unique prefix prevents collision when multiple sessions copy the same file concurrently
+    const uniqueName = `${Date.now()}_${Math.random().toString(36).slice(2, 6)}_${filename}`;
+    const destPath = nodePath.join(refsDir, uniqueName);
     try {
       await copyFile(srcPath, destPath);
       result = result.replace(`@${srcPath}`, `@${destPath}`);
