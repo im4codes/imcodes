@@ -74,6 +74,37 @@ imcodes bind https://app.im.codes/bind/<api-key>
 
 This binds your machine, starts the daemon, and registers it as a system service.
 
+## Self-Host (One-Click Deploy)
+
+Deploy your own IM.codes server with Docker Compose. Includes automatic HTTPS via Caddy and auto-updates via Watchtower.
+
+```bash
+# 1. Clone and configure
+git clone https://github.com/im4codes/imcodes.git
+cd imcodes
+cp .env.example .env
+
+# 2. Edit .env — set your domain and generate secrets
+#    DOMAIN=im.example.com
+#    POSTGRES_PASSWORD=$(openssl rand -hex 16)
+#    JWT_SIGNING_KEY=$(openssl rand -hex 32)
+#    BOT_ENCRYPTION_KEY=$(openssl rand -hex 32)
+
+# 3. Start
+docker compose up -d
+```
+
+That's it. Caddy automatically provisions a Let's Encrypt certificate for your domain. Watchtower checks for new images every 5 minutes and updates automatically.
+
+Point your DNS A record to the server IP, then visit `https://your-domain`. Default login: `admin` / password shown in `docker compose logs server` on first run.
+
+After logging in, bind your dev machine:
+
+```bash
+npm install -g imcodes
+imcodes bind https://your-domain/bind/<api-key>
+```
+
 ## Requirements
 
 - macOS or Linux (tested on both). Windows users need [WSL](https://learn.microsoft.com/en-us/windows/wsl/) — native Windows is not supported since the project uses tmux to manage agent sessions.
