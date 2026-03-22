@@ -840,10 +840,11 @@ export function App() {
         const error = (msg as any).error as string;
         const dir = (msg as any).projectDir as string;
         if (dir && error) {
-          const status = error === 'invalid_params' ? 'no_repo'
+          const status = error === 'invalid_params' ? 'cli_error'
             : error === 'cli_missing' ? 'cli_missing'
             : error === 'unauthorized' ? 'unauthorized'
             : error === 'cli_outdated' ? 'cli_outdated'
+            : error === 'cli_error' ? 'cli_error'
             : null;
           if (status) {
             setRepoContexts((prev) => {
@@ -1240,6 +1241,7 @@ export function App() {
     const existing = repoContextsRef.current.get(dir);
     // Already detected with a definitive status — no need to re-detect
     const TERMINAL_STATUSES = new Set(['ok', 'no_repo', 'cli_missing', 'cli_outdated', 'unauthorized', 'unknown_platform']);
+    // Note: 'cli_error' is NOT terminal — it can be transient (rate limit, path mismatch, etc.)
     if (existing?.context?.status && TERMINAL_STATUSES.has(existing.context.status)) return;
 
     // Delay initial detect to avoid browser rate limit on connect (burst of subscribes + timeline requests)

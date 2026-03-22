@@ -57,7 +57,7 @@ export type ServerMessage =
   | { type: 'repo.prs_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
   | { type: 'repo.branches_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
   | { type: 'repo.commits_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
-  | { type: 'repo.error'; requestId: string; error: string }
+  | { type: 'repo.error'; requestId: string; projectDir?: string; error: string }
   | { type: 'repo.detected'; projectDir: string; context: any };
 
 export type {
