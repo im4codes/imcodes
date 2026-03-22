@@ -1194,7 +1194,8 @@ sleep 60 && rm -rf "${scriptDir}" &
 
 // ── File system browser ────────────────────────────────────────────────────
 
-const FS_ALLOWED_ROOTS = [homedir(), FILE_TRANSFER_LIMITS.UPLOAD_DIR, '/tmp', '/private/tmp'];
+const UPLOAD_DIR = nodePath.join(homedir(), '.imcodes', 'uploads');
+const FS_ALLOWED_ROOTS = [homedir(), UPLOAD_DIR, '/tmp', '/private/tmp'];
 
 // ── P2P cancel/status handlers ────────────────────────────────────────────
 

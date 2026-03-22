@@ -17,6 +17,10 @@ import {
   type FileDownloadError,
 } from '../shared/transport/file-transfer.js';
 import type { ServerLink } from './server-link.js';
+import { homedir } from 'node:os';
+
+/** Upload directory — ~/.imcodes/uploads (persists across reboots, unlike /tmp). */
+const UPLOAD_DIR = path.join(homedir(), '.imcodes', 'uploads');
 
 // ── Attachment registry ─────────────────────────────────────────────────────
 
@@ -44,7 +48,7 @@ let initialized = false;
 export async function initFileTransfer(): Promise<void> {
   if (initialized) return;
   initialized = true;
-  await mkdir(FILE_TRANSFER_LIMITS.UPLOAD_DIR, { recursive: true }).catch(() => {});
+  await mkdir(UPLOAD_DIR, { recursive: true }).catch(() => {});
   await cleanupExpiredUploads();
   await recoverRegistry();
 }
@@ -52,13 +56,13 @@ export async function initFileTransfer(): Promise<void> {
 /** Scan upload dir and rebuild attachment registry for surviving files. */
 async function recoverRegistry(): Promise<void> {
   try {
-    const files = await readdir(FILE_TRANSFER_LIMITS.UPLOAD_DIR);
+    const files = await readdir(UPLOAD_DIR);
     const now = Date.now();
     for (const file of files) {
       if (file.endsWith('.meta.json')) continue; // skip sidecar files
       if (attachmentRegistry.has(file)) continue;
       try {
-        const filePath = path.join(FILE_TRANSFER_LIMITS.UPLOAD_DIR, file);
+        const filePath = path.join(UPLOAD_DIR, file);
         const fileStat = await stat(filePath);
         const age = now - fileStat.mtimeMs;
         if (age > FILE_TRANSFER_LIMITS.TEMP_TTL_MS) continue;
@@ -103,11 +107,11 @@ export async function handleFileUpload(cmd: Record<string, unknown>, serverLink:
     // Opportunistic cleanup before writing
     await cleanupExpiredUploads();
 
-    const filePath = path.join(FILE_TRANSFER_LIMITS.UPLOAD_DIR, filename);
+    const filePath = path.join(UPLOAD_DIR, filename);
 
     // Safety: ensure the resolved path is inside UPLOAD_DIR
     const resolved = path.resolve(filePath);
-    if (!resolved.startsWith(path.resolve(FILE_TRANSFER_LIMITS.UPLOAD_DIR) + path.sep)) {
+    if (!resolved.startsWith(path.resolve(UPLOAD_DIR) + path.sep)) {
       throw new Error('path_traversal');
     }
 
@@ -197,7 +201,7 @@ export async function handleFileDownload(cmd: Record<string, unknown>, serverLin
 
     // Validate path is in allowed ranges
     const resolved = path.resolve(entry.daemonPath);
-    const uploadDirResolved = path.resolve(FILE_TRANSFER_LIMITS.UPLOAD_DIR);
+    const uploadDirResolved = path.resolve(UPLOAD_DIR);
     const isUpload = resolved.startsWith(uploadDirResolved + path.sep);
     // For 'local' source, the path must exist and is validated at handle creation time
     if (!isUpload && entry.source !== 'local') {
@@ -306,10 +310,10 @@ async function cleanupExpiredUploads(): Promise<void> {
 
   // Clean actual files in upload dir
   try {
-    const files = await readdir(FILE_TRANSFER_LIMITS.UPLOAD_DIR);
+    const files = await readdir(UPLOAD_DIR);
     for (const file of files) {
       try {
-        const filePath = path.join(FILE_TRANSFER_LIMITS.UPLOAD_DIR, file);
+        const filePath = path.join(UPLOAD_DIR, file);
         const fileStat = await stat(filePath);
         const age = now - fileStat.mtimeMs;
         if (age > FILE_TRANSFER_LIMITS.TEMP_TTL_MS) {
