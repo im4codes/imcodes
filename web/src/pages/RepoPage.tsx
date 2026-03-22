@@ -476,10 +476,6 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
       overflow: 'hidden',
       paddingTop: 'env(safe-area-inset-top)',
     }}>
-      {/* Debug banner — remove after fixing repo detection */}
-      <div style={{ background: '#1e293b', padding: '4px 12px', fontSize: 10, color: '#64748b', borderBottom: '1px solid #334155' }}>
-        detect: {detectLoading ? 'loading' : detectError ? `error: ${detectError}` : context ? 'ok' : 'idle'} | dir: {projectDir?.slice(-30)} | reqId: {detectReqRef.current?.slice(0, 8) ?? 'none'}
-      </div>
       {/* Header bar */}
       <div style={{
         display: 'flex', alignItems: 'center', gap: 12,
