@@ -234,6 +234,38 @@
       "discuss": "토론"
     }
   },
+  "repo": {
+    "title": "저장소",
+    "back": "뒤로",
+    "refresh": "새로고침",
+    "last_refresh": "마지막 새로고침: {{time}}초 전",
+    "tab_issues": "이슈",
+    "tab_prs": "풀 리퀘스트",
+    "tab_branches": "브랜치",
+    "tab_commits": "커밋",
+    "overview_branch": "{{default}} ← {{current}}",
+    "cli_ok": "{{cli}} {{version}} ✓",
+    "load_more": "더 보기",
+    "loading": "로딩 중...",
+    "empty_issues": "이슈를 찾을 수 없습니다",
+    "empty_prs": "풀 리퀘스트를 찾을 수 없습니다",
+    "empty_branches": "브랜치를 찾을 수 없습니다",
+    "empty_commits": "커밋을 찾을 수 없습니다",
+    "error_cli_missing": "저장소 기능을 사용하려면 {{cli}}를 설치하세요",
+    "error_cli_outdated": "{{cli}}를 {{version}}+ 버전으로 업데이트하세요",
+    "error_unauthorized": "`{{command}}`를 실행하여 인증하세요",
+    "error_rate_limited": "API 속도 제한에 도달했습니다. 나중에 다시 시도하세요.",
+    "error_generic": "데이터를 불러오지 못했습니다",
+    "retry": "다시 시도",
+    "state_open": "열림",
+    "state_closed": "닫힘",
+    "state_merged": "병합됨",
+    "draft": "초안",
+    "default_branch": "기본",
+    "current_branch": "현재",
+    "ahead": "{{count}} 앞섬",
+    "behind": "{{count}} 뒤처짐"
+  },
   "upload": {
     "upload_file": "파일 업로드",
     "uploading": "업로드 중...",
@@ -244,5 +276,23 @@
     "preview_unavailable": "미리보기 불가",
     "download_expired": "다운로드 링크 만료",
     "daemon_offline": "데몬 오프라인"
+  },
+  "repo": {
+    "back": "\u2190 뒤로",
+    "refresh": "새로고침",
+    "tab_issues": "이슈",
+    "tab_prs": "PR",
+    "tab_branches": "브랜치",
+    "tab_commits": "커밋",
+    "cli_not_installed": "CLI 미설치",
+    "load_more": "더 보기",
+    "retry": "재시도",
+    "current_branch": "현재",
+    "error_cli_missing_hint": "저장소 기능을 사용하려면 GitHub CLI를 설치하세요:",
+    "error_unauthorized_hint": "CLI로 인증하세요:",
+    "empty_issues": "이슈가 없습니다",
+    "empty_prs": "PR이 없습니다",
+    "empty_branches": "브랜치가 없습니다",
+    "empty_commits": "커밋이 없습니다"
   }
 }

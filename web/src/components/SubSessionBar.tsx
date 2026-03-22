@@ -40,6 +40,8 @@ interface Props {
   onNew: () => void;
   onViewDiscussions?: () => void;
   onViewDiscussion?: (fileId: string) => void;
+  onViewRepo?: () => void;
+  repoContext?: any;
   discussions?: DiscussionSummary[];
   onStopDiscussion?: (id: string) => void;
   ws: WsClient | null;
@@ -89,7 +91,7 @@ function formatUptime(seconds: number): string {
   return d > 0 ? `${d}d ${h}h` : `${h}h`;
 }
 
-export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscussions, onViewDiscussion, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId }: Props) {
+export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, repoContext, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId }: Props) {
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
   const [collapsed, setCollapsed] = useState(isMobile);
   const [showSizePanel, setShowSizePanel] = useState(false);
@@ -264,6 +266,20 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
         {onViewDiscussions && (
           <button class="subcard-toolbar-btn" onClick={onViewDiscussions} title="P2P discussions" style={{ marginLeft: 4, fontSize: 11 }}>
             📋
+          </button>
+        )}
+        {onViewRepo && repoContext && repoContext.status !== 'no_repo' && repoContext.status !== 'unknown_platform' && (
+          <button
+            class="subcard-toolbar-btn"
+            onClick={() => onViewRepo()}
+            title="Repository"
+            style={{
+              marginLeft: 4,
+              fontSize: 11,
+              opacity: repoContext.status === 'cli_missing' || repoContext.status === 'cli_outdated' || repoContext.status === 'unauthorized' ? 0.5 : 1,
+            }}
+          >
+            🔀
           </button>
         )}
       </div>

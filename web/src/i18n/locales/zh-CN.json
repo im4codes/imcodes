@@ -234,6 +234,38 @@
       "discuss": "讨论"
     }
   },
+  "repo": {
+    "title": "仓库",
+    "back": "返回",
+    "refresh": "刷新",
+    "last_refresh": "上次刷新：{{time}}秒前",
+    "tab_issues": "问题",
+    "tab_prs": "拉取请求",
+    "tab_branches": "分支",
+    "tab_commits": "提交",
+    "overview_branch": "{{default}} ← {{current}}",
+    "cli_ok": "{{cli}} {{version}} ✓",
+    "load_more": "加载更多",
+    "loading": "加载中...",
+    "empty_issues": "没有找到问题",
+    "empty_prs": "没有找到拉取请求",
+    "empty_branches": "没有找到分支",
+    "empty_commits": "没有找到提交",
+    "error_cli_missing": "请安装 {{cli}} 以使用仓库功能",
+    "error_cli_outdated": "请将 {{cli}} 更新到 {{version}}+ 版本",
+    "error_unauthorized": "运行 `{{command}}` 进行身份验证",
+    "error_rate_limited": "已达到 API 速率限制，请稍后重试。",
+    "error_generic": "加载数据失败",
+    "retry": "重试",
+    "state_open": "打开",
+    "state_closed": "已关闭",
+    "state_merged": "已合并",
+    "draft": "草稿",
+    "default_branch": "默认",
+    "current_branch": "当前",
+    "ahead": "领先 {{count}}",
+    "behind": "落后 {{count}}"
+  },
   "upload": {
     "upload_file": "上传文件",
     "uploading": "上传中...",
@@ -244,5 +276,23 @@
     "preview_unavailable": "无法预览",
     "download_expired": "下载链接已过期",
     "daemon_offline": "守护进程离线"
+  },
+  "repo": {
+    "back": "\u2190 返回",
+    "refresh": "刷新",
+    "tab_issues": "议题",
+    "tab_prs": "拉取请求",
+    "tab_branches": "分支",
+    "tab_commits": "提交",
+    "cli_not_installed": "CLI 未安装",
+    "load_more": "加载更多",
+    "retry": "重试",
+    "current_branch": "当前",
+    "error_cli_missing_hint": "安装 GitHub CLI 以使用仓库功能：",
+    "error_unauthorized_hint": "使用 CLI 进行身份验证：",
+    "empty_issues": "暂无议题",
+    "empty_prs": "暂无拉取请求",
+    "empty_branches": "暂无分支",
+    "empty_commits": "暂无提交"
   }
 }

@@ -25,6 +25,7 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { existsSync } from 'node:fs';
 import { getAgentVersion } from './agent-version.js';
+import { repoCache } from '../repo/cache.js';
 
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
 function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string): void {
@@ -150,6 +151,7 @@ export async function startProject(config: ProjectConfig): Promise<void> {
 /** Stop all sessions for a project and remove them from the store. */
 export async function stopProject(projectName: string): Promise<void> {
   const sessions = storeSessions(projectName);
+  const invalidatedDirs = new Set<string>();
   for (const s of sessions) {
     stopWatching(s.name);
     stopCodexWatching(s.name);
@@ -158,6 +160,10 @@ export async function stopProject(projectName: string): Promise<void> {
     removeSession(s.name);
     emitSessionPersist(null, s.name);
     emitSessionEvent('stopped', s.name, 'stopped');
+    if (s.projectDir && !invalidatedDirs.has(s.projectDir)) {
+      invalidatedDirs.add(s.projectDir);
+      repoCache.invalidate(s.projectDir);
+    }
   }
 }
 

@@ -234,6 +234,38 @@
       "discuss": "ディスカッション"
     }
   },
+  "repo": {
+    "title": "リポジトリ",
+    "back": "戻る",
+    "refresh": "更新",
+    "last_refresh": "最終更新：{{time}}秒前",
+    "tab_issues": "Issue",
+    "tab_prs": "プルリクエスト",
+    "tab_branches": "ブランチ",
+    "tab_commits": "コミット",
+    "overview_branch": "{{default}} ← {{current}}",
+    "cli_ok": "{{cli}} {{version}} ✓",
+    "load_more": "さらに読み込む",
+    "loading": "読み込み中...",
+    "empty_issues": "Issueが見つかりません",
+    "empty_prs": "プルリクエストが見つかりません",
+    "empty_branches": "ブランチが見つかりません",
+    "empty_commits": "コミットが見つかりません",
+    "error_cli_missing": "リポジトリ機能を使用するには {{cli}} をインストールしてください",
+    "error_cli_outdated": "{{cli}} をバージョン {{version}}+ に更新してください",
+    "error_unauthorized": "`{{command}}` を実行して認証してください",
+    "error_rate_limited": "APIレート制限に達しました。しばらくしてから再試行してください。",
+    "error_generic": "データの読み込みに失敗しました",
+    "retry": "再試行",
+    "state_open": "オープン",
+    "state_closed": "クローズ",
+    "state_merged": "マージ済み",
+    "draft": "下書き",
+    "default_branch": "デフォルト",
+    "current_branch": "現在",
+    "ahead": "{{count}} 先行",
+    "behind": "{{count}} 遅延"
+  },
   "upload": {
     "upload_file": "ファイルをアップロード",
     "uploading": "アップロード中...",
@@ -244,5 +276,23 @@
     "preview_unavailable": "プレビューできません",
     "download_expired": "ダウンロードリンクの期限切れ",
     "daemon_offline": "デーモンがオフラインです"
+  },
+  "repo": {
+    "back": "\u2190 戻る",
+    "refresh": "更新",
+    "tab_issues": "Issue",
+    "tab_prs": "PR",
+    "tab_branches": "ブランチ",
+    "tab_commits": "コミット",
+    "cli_not_installed": "CLIが未インストール",
+    "load_more": "さらに読み込む",
+    "retry": "再試行",
+    "current_branch": "現在",
+    "error_cli_missing_hint": "リポジトリ機能を使用するにはGitHub CLIをインストールしてください：",
+    "error_unauthorized_hint": "CLIで認証してください：",
+    "empty_issues": "Issueはありません",
+    "empty_prs": "PRはありません",
+    "empty_branches": "ブランチはありません",
+    "empty_commits": "コミットはありません"
   }
 }

@@ -1,7 +1,9 @@
-import { loadStore, flushStore, listSessions, upsertSession, removeSession } from '../store/session-store.js';
+import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession } from '../store/session-store.js';
 import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, restartSession, respawnSession, initOnStartup } from '../agent/session-manager.js';
 import { sessionExists, isPaneAlive } from '../agent/tmux.js';
 import { detectMemoryBackend } from '../memory/detector.js';
+import { detectRepo } from '../repo/detector.js';
+import { repoCache, RepoCache } from '../repo/cache.js';
 import { ServerLink } from './server-link.js';
 import { handleWebCommand, setRouterContext } from './command-handler.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
@@ -166,6 +168,27 @@ export async function startup(): Promise<DaemonContext> {
   setSessionEventCallback((event, session, state) => {
     if (!serverLink) return;
     try { serverLink.send({ type: 'session_event', event, session, state }); } catch { /* not connected */ }
+
+    // Background repo detection on session start
+    if (event === 'started') {
+      const record = getSession(session);
+      const projectDir = record?.projectDir;
+      if (projectDir) {
+        const cacheKey = RepoCache.buildKey(projectDir, 'detect');
+        const cached = repoCache.get(cacheKey);
+        if (!cached) {
+          detectRepo(projectDir)
+            .then((context) => {
+              repoCache.set(cacheKey, context, projectDir, context.status !== 'ok');
+              try { serverLink!.send({ type: 'repo.detected', projectDir, context }); } catch { /* not connected */ }
+              logger.debug({ projectDir, status: context.status }, 'Background repo detection complete');
+            })
+            .catch((err) => {
+              logger.warn({ err, projectDir }, 'Background repo detection failed');
+            });
+        }
+      }
+    }
   });
 
   // Wire timeline idle events → P2P orchestrator (covers all agent types: CC, codex, gemini, etc.)

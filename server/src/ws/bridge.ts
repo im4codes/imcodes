@@ -82,6 +82,11 @@ const BROWSER_WHITELIST = new Set([
   'p2p.read_discussion',
   'subsession.set_model',
   'ask.answer',
+  'repo.detect',
+  'repo.list_issues',
+  'repo.list_prs',
+  'repo.list_branches',
+  'repo.list_commits',
 ]);
 
 // ── Terminal forwarding queue (per (session, browser)) ────────────────────────
@@ -743,6 +748,11 @@ export class WsBridge {
 
     // ── P2P discussion list/read responses → broadcast to browsers ────────────
     if (type === 'p2p.list_discussions_response' || type === 'p2p.read_discussion_response') {
+      this.broadcastToBrowsers(JSON.stringify(msg));
+      return;
+    }
+
+    if (type === 'repo.detected') {
       this.broadcastToBrowsers(JSON.stringify(msg));
       return;
     }

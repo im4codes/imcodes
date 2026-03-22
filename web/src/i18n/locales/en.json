@@ -234,6 +234,38 @@
       "discuss": "Discuss"
     }
   },
+  "repo": {
+    "title": "Repository",
+    "back": "Back",
+    "refresh": "Refresh",
+    "last_refresh": "Last refresh: {{time}}s ago",
+    "tab_issues": "Issues",
+    "tab_prs": "Pull Requests",
+    "tab_branches": "Branches",
+    "tab_commits": "Commits",
+    "overview_branch": "{{default}} ← {{current}}",
+    "cli_ok": "{{cli}} {{version}} ✓",
+    "load_more": "Load more",
+    "loading": "Loading...",
+    "empty_issues": "No issues found",
+    "empty_prs": "No pull requests found",
+    "empty_branches": "No branches found",
+    "empty_commits": "No commits found",
+    "error_cli_missing": "Install {{cli}} to use repo features",
+    "error_cli_outdated": "Update {{cli}} to version {{version}}+",
+    "error_unauthorized": "Run `{{command}}` to authenticate",
+    "error_rate_limited": "API rate limit reached. Try again later.",
+    "error_generic": "Failed to load data",
+    "retry": "Retry",
+    "state_open": "Open",
+    "state_closed": "Closed",
+    "state_merged": "Merged",
+    "draft": "Draft",
+    "default_branch": "default",
+    "current_branch": "current",
+    "ahead": "{{count}} ahead",
+    "behind": "{{count}} behind"
+  },
   "upload": {
     "upload_file": "Upload file",
     "uploading": "Uploading...",
@@ -244,5 +276,23 @@
     "preview_unavailable": "Preview unavailable",
     "download_expired": "Download link expired",
     "daemon_offline": "Daemon is offline"
+  },
+  "repo": {
+    "back": "\u2190 Back",
+    "refresh": "Refresh",
+    "tab_issues": "Issues",
+    "tab_prs": "PRs",
+    "tab_branches": "Branches",
+    "tab_commits": "Commits",
+    "cli_not_installed": "CLI not installed",
+    "load_more": "Load more",
+    "retry": "Retry",
+    "current_branch": "current",
+    "error_cli_missing_hint": "Install the GitHub CLI to use repo features:",
+    "error_unauthorized_hint": "Authenticate with the CLI:",
+    "empty_issues": "No issues found",
+    "empty_prs": "No pull requests found",
+    "empty_branches": "No branches found",
+    "empty_commits": "No commits found"
   }
 }

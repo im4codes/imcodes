@@ -16,6 +16,7 @@ import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } fr
 import { AskQuestionDialog, type PendingQuestion } from './components/AskQuestionDialog.js';
 import { ServerContextMenu, DeleteServerDialog } from './components/ServerContextMenu.js';
 import { DiscussionsPage } from './pages/DiscussionsPage.js';
+import { RepoPage } from './pages/RepoPage.js';
 import { useSubSessions } from './hooks/useSubSessions.js';
 import { useTimeline } from './hooks/useTimeline.js';
 import { useSwipeBack } from './hooks/useSwipeBack.js';
@@ -367,6 +368,10 @@ export function App() {
   // z-index per sub-session window
   const [subZIndexes, setSubZIndexes] = useState<Map<string, number>>(new Map());
   const [showSubDialog, setShowSubDialog] = useState(false);
+
+  // ── Repo ────────────────────────────────────────────────────────────────────
+  const [showRepoPage, setShowRepoPage] = useState(false);
+  const [repoContexts, setRepoContexts] = useState<Map<string, any>>(new Map());
 
   // ── Discussions ─────────────────────────────────────────────────────────────
   const [showDiscussionsPage, setShowDiscussionsPage] = useState(false);
@@ -789,6 +794,16 @@ export function App() {
           setTimeout(() => {
             setDiscussions((prev) => prev.filter((d) => d.id !== id));
           }, 30_000);
+        }
+      }
+      if (msg.type === 'repo.detected') {
+        const dir = msg.projectDir as string;
+        if (dir) {
+          setRepoContexts((prev) => {
+            const next = new Map(prev);
+            next.set(dir, msg);
+            return next;
+          });
         }
       }
       if (msg.type === 'daemon.disconnected') {
@@ -1434,6 +1449,8 @@ export function App() {
                 onDiff={registerDiffApplyer}
                 onHistory={registerHistoryApplyer}
                 serverId={selectedServerId}
+                onViewRepo={() => setShowRepoPage(true)}
+                repoContext={repoContexts.get(activeSessionInfo?.projectDir ?? '')}
               />
             )}
           </>
@@ -1447,6 +1464,12 @@ export function App() {
             onBack={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }}
             initialSelectedId={discussionInitialId}
           />
+        </div>
+      )}
+
+      {showRepoPage && wsRef.current && activeSessionInfo?.projectDir && (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)' }}>
+          <RepoPage ws={wsRef.current} projectDir={activeSessionInfo.projectDir} onBack={() => setShowRepoPage(false)} />
         </div>
       )}
 

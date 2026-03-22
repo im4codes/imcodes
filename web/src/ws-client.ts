@@ -51,7 +51,14 @@ export type ServerMessage =
   | { type: 'p2p.status_response'; runId?: string; run?: any; runs?: any[] }
   | { type: 'p2p.list_discussions_response'; discussions: Array<{ id: string; fileName: string; preview: string; mtime: number }> }
   | { type: 'p2p.read_discussion_response'; id?: string; content?: string; error?: string }
-  | FsGitDiffResponse;
+  | FsGitDiffResponse
+  | { type: 'repo.detect_response'; requestId: string; context: any }
+  | { type: 'repo.issues_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
+  | { type: 'repo.prs_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
+  | { type: 'repo.branches_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
+  | { type: 'repo.commits_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
+  | { type: 'repo.error'; requestId: string; error: string }
+  | { type: 'repo.detected'; projectDir: string; context: any };
 
 export type {
   TimelineEvent,
@@ -314,6 +321,43 @@ export class WsClient {
   fsGitDiff(path: string): string {
     const requestId = crypto.randomUUID();
     this.send({ type: 'fs.git_diff', path, requestId });
+    return requestId;
+  }
+
+  // ── Repo commands ──────────────────────────────────────────────────────────
+
+  /** Detect repo context for a project directory. Returns requestId. */
+  repoDetect(projectDir: string): string {
+    const requestId = crypto.randomUUID();
+    this.send({ type: 'repo.detect', requestId, projectDir });
+    return requestId;
+  }
+
+  /** List issues for a project. Returns requestId. */
+  repoListIssues(projectDir: string, opts?: { state?: string; page?: number }): string {
+    const requestId = crypto.randomUUID();
+    this.send({ type: 'repo.issues', requestId, projectDir, ...opts });
+    return requestId;
+  }
+
+  /** List pull requests for a project. Returns requestId. */
+  repoListPRs(projectDir: string, opts?: { state?: string; page?: number }): string {
+    const requestId = crypto.randomUUID();
+    this.send({ type: 'repo.prs', requestId, projectDir, ...opts });
+    return requestId;
+  }
+
+  /** List branches for a project. Returns requestId. */
+  repoListBranches(projectDir: string): string {
+    const requestId = crypto.randomUUID();
+    this.send({ type: 'repo.branches', requestId, projectDir });
+    return requestId;
+  }
+
+  /** List commits for a project. Returns requestId. */
+  repoListCommits(projectDir: string, opts?: { branch?: string; page?: number }): string {
+    const requestId = crypto.randomUUID();
+    this.send({ type: 'repo.commits', requestId, projectDir, ...opts });
     return requestId;
   }
 

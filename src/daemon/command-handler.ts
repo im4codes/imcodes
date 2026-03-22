@@ -27,6 +27,7 @@ import { exec as execCb } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, type P2pTarget } from './p2p-orchestrator.js';
+import { handleRepoCommand } from './repo-handler.js';
 import { handleFileUpload, handleFileDownload, initFileTransfer, startCleanupTimer, createProjectFileHandle, lookupAttachment } from './file-transfer-handler.js';
 import { FILE_TRANSFER_LIMITS } from '../shared/transport/file-transfer.js';
 
@@ -379,6 +380,13 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'ping':
     case 'pong':
       // Expected internal messages, ignore silently
+      break;
+    case 'repo.detect':
+    case 'repo.list_issues':
+    case 'repo.list_prs':
+    case 'repo.list_branches':
+    case 'repo.list_commits':
+      void handleRepoCommand(cmd, serverLink);
       break;
     default:
       if (typeof cmd.type === 'string') {

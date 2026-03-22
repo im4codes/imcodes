@@ -234,6 +234,38 @@
       "discuss": "Обсуждение"
     }
   },
+  "repo": {
+    "title": "Репозиторий",
+    "back": "Назад",
+    "refresh": "Обновить",
+    "last_refresh": "Последнее обновление: {{time}}с назад",
+    "tab_issues": "Задачи",
+    "tab_prs": "Pull-запросы",
+    "tab_branches": "Ветки",
+    "tab_commits": "Коммиты",
+    "overview_branch": "{{default}} ← {{current}}",
+    "cli_ok": "{{cli}} {{version}} ✓",
+    "load_more": "Загрузить ещё",
+    "loading": "Загрузка...",
+    "empty_issues": "Задачи не найдены",
+    "empty_prs": "Pull-запросы не найдены",
+    "empty_branches": "Ветки не найдены",
+    "empty_commits": "Коммиты не найдены",
+    "error_cli_missing": "Установите {{cli}} для работы с репозиторием",
+    "error_cli_outdated": "Обновите {{cli}} до версии {{version}}+",
+    "error_unauthorized": "Выполните `{{command}}` для аутентификации",
+    "error_rate_limited": "Достигнут лимит API. Попробуйте позже.",
+    "error_generic": "Не удалось загрузить данные",
+    "retry": "Повторить",
+    "state_open": "Открыто",
+    "state_closed": "Закрыто",
+    "state_merged": "Объединено",
+    "draft": "Черновик",
+    "default_branch": "по умолчанию",
+    "current_branch": "текущая",
+    "ahead": "впереди на {{count}}",
+    "behind": "позади на {{count}}"
+  },
   "upload": {
     "upload_file": "Загрузить файл",
     "uploading": "Загрузка...",
@@ -244,5 +276,23 @@
     "preview_unavailable": "Предпросмотр недоступен",
     "download_expired": "Ссылка на скачивание истекла",
     "daemon_offline": "Демон недоступен"
+  },
+  "repo": {
+    "back": "\u2190 Назад",
+    "refresh": "Обновить",
+    "tab_issues": "Задачи",
+    "tab_prs": "PR",
+    "tab_branches": "Ветки",
+    "tab_commits": "Коммиты",
+    "cli_not_installed": "CLI не установлен",
+    "load_more": "Загрузить ещё",
+    "retry": "Повторить",
+    "current_branch": "текущая",
+    "error_cli_missing_hint": "Установите GitHub CLI для работы с репозиторием:",
+    "error_unauthorized_hint": "Авторизуйтесь через CLI:",
+    "empty_issues": "Задачи не найдены",
+    "empty_prs": "Pull request\u2019ы не найдены",
+    "empty_branches": "Ветки не найдены",
+    "empty_commits": "Коммиты не найдены"
   }
 }

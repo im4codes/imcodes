@@ -234,6 +234,38 @@
       "discuss": "討論"
     }
   },
+  "repo": {
+    "title": "儲存庫",
+    "back": "返回",
+    "refresh": "重新整理",
+    "last_refresh": "上次重新整理：{{time}}秒前",
+    "tab_issues": "議題",
+    "tab_prs": "拉取請求",
+    "tab_branches": "分支",
+    "tab_commits": "提交",
+    "overview_branch": "{{default}} ← {{current}}",
+    "cli_ok": "{{cli}} {{version}} ✓",
+    "load_more": "載入更多",
+    "loading": "載入中...",
+    "empty_issues": "找不到議題",
+    "empty_prs": "找不到拉取請求",
+    "empty_branches": "找不到分支",
+    "empty_commits": "找不到提交",
+    "error_cli_missing": "請安裝 {{cli}} 以使用儲存庫功能",
+    "error_cli_outdated": "請將 {{cli}} 更新至 {{version}}+ 版本",
+    "error_unauthorized": "執行 `{{command}}` 進行身份驗證",
+    "error_rate_limited": "已達到 API 速率限制，請稍後再試。",
+    "error_generic": "載入資料失敗",
+    "retry": "重試",
+    "state_open": "開啟",
+    "state_closed": "已關閉",
+    "state_merged": "已合併",
+    "draft": "草稿",
+    "default_branch": "預設",
+    "current_branch": "目前",
+    "ahead": "領先 {{count}}",
+    "behind": "落後 {{count}}"
+  },
   "upload": {
     "upload_file": "上傳檔案",
     "uploading": "上傳中...",
@@ -244,5 +276,23 @@
     "preview_unavailable": "無法預覽",
     "download_expired": "下載連結已過期",
     "daemon_offline": "守護程序離線"
+  },
+  "repo": {
+    "back": "\u2190 返回",
+    "refresh": "重新整理",
+    "tab_issues": "議題",
+    "tab_prs": "拉取請求",
+    "tab_branches": "分支",
+    "tab_commits": "提交",
+    "cli_not_installed": "CLI 未安裝",
+    "load_more": "載入更多",
+    "retry": "重試",
+    "current_branch": "目前",
+    "error_cli_missing_hint": "安裝 GitHub CLI 以使用儲存庫功能：",
+    "error_unauthorized_hint": "使用 CLI 進行身份驗證：",
+    "empty_issues": "沒有議題",
+    "empty_prs": "沒有拉取請求",
+    "empty_branches": "沒有分支",
+    "empty_commits": "沒有提交"
   }
 }
