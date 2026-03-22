@@ -54,8 +54,9 @@ describe.skipIf(!ghAvailable)('GitHubProvider integration — facebook/react', (
     });
 
     it('supports state=closed filter', async () => {
-      const result = await provider.listIssues({ state: 'closed', perPage: 3 });
+      const result = await provider.listIssues({ state: 'closed', perPage: 20 });
 
+      // After jq PR filtering some pages may have fewer items, but react has many closed issues
       expect(result.items.length).toBeGreaterThan(0);
       for (const issue of result.items) {
         expect(issue.state).toBe('closed');
