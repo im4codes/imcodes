@@ -756,8 +756,8 @@ export class WsBridge {
     }
 
     if (type === 'repo.detected' || type === 'repo.detect_response' || type === 'repo.error' ||
-        type === 'repo.list_issues_response' || type === 'repo.list_prs_response' ||
-        type === 'repo.list_branches_response' || type === 'repo.list_commits_response') {
+        type === 'repo.issues_response' || type === 'repo.prs_response' ||
+        type === 'repo.branches_response' || type === 'repo.commits_response') {
       this.broadcastToBrowsers(JSON.stringify(msg));
       return;
     }

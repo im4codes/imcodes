@@ -891,11 +891,11 @@ describe('WsBridge', () => {
       expect(msg.context.status).toBe('ok');
     });
 
-    it('repo.list_issues_response reaches browser', async () => {
+    it('repo.issues_response reaches browser', async () => {
       const { daemonWs, browserWs } = await setupBridge();
 
       daemonWs.emit('message', JSON.stringify({
-        type: 'repo.list_issues_response',
+        type: 'repo.issues_response',
         requestId: 'req-issues',
         projectDir: '/home/user/myproject',
         items: [{ number: 1, title: 'Bug', state: 'open' }],
@@ -905,16 +905,16 @@ describe('WsBridge', () => {
       await flushAsync();
 
       const msg = JSON.parse(browserWs.sentStrings[0]);
-      expect(msg.type).toBe('repo.list_issues_response');
+      expect(msg.type).toBe('repo.issues_response');
       expect(msg.items).toHaveLength(1);
       expect(msg.items[0].title).toBe('Bug');
     });
 
-    it('repo.list_prs_response reaches browser', async () => {
+    it('repo.prs_response reaches browser', async () => {
       const { daemonWs, browserWs } = await setupBridge();
 
       daemonWs.emit('message', JSON.stringify({
-        type: 'repo.list_prs_response',
+        type: 'repo.prs_response',
         requestId: 'req-prs',
         projectDir: '/home/user/myproject',
         items: [{ number: 10, title: 'Feature PR', state: 'open' }],
@@ -924,16 +924,16 @@ describe('WsBridge', () => {
       await flushAsync();
 
       const msg = JSON.parse(browserWs.sentStrings[0]);
-      expect(msg.type).toBe('repo.list_prs_response');
+      expect(msg.type).toBe('repo.prs_response');
       expect(msg.items[0].title).toBe('Feature PR');
       expect(msg.hasMore).toBe(true);
     });
 
-    it('repo.list_branches_response reaches browser', async () => {
+    it('repo.branches_response reaches browser', async () => {
       const { daemonWs, browserWs } = await setupBridge();
 
       daemonWs.emit('message', JSON.stringify({
-        type: 'repo.list_branches_response',
+        type: 'repo.branches_response',
         requestId: 'req-branches',
         projectDir: '/home/user/myproject',
         items: [{ name: 'main', current: true }, { name: 'dev', current: false }],
@@ -943,15 +943,15 @@ describe('WsBridge', () => {
       await flushAsync();
 
       const msg = JSON.parse(browserWs.sentStrings[0]);
-      expect(msg.type).toBe('repo.list_branches_response');
+      expect(msg.type).toBe('repo.branches_response');
       expect(msg.items).toHaveLength(2);
     });
 
-    it('repo.list_commits_response reaches browser', async () => {
+    it('repo.commits_response reaches browser', async () => {
       const { daemonWs, browserWs } = await setupBridge();
 
       daemonWs.emit('message', JSON.stringify({
-        type: 'repo.list_commits_response',
+        type: 'repo.commits_response',
         requestId: 'req-commits',
         projectDir: '/home/user/myproject',
         items: [{ sha: 'abc123', message: 'initial commit' }],
@@ -961,7 +961,7 @@ describe('WsBridge', () => {
       await flushAsync();
 
       const msg = JSON.parse(browserWs.sentStrings[0]);
-      expect(msg.type).toBe('repo.list_commits_response');
+      expect(msg.type).toBe('repo.commits_response');
       expect(msg.items[0].sha).toBe('abc123');
     });
 
