@@ -1032,9 +1032,6 @@ export class WsBridge {
   // ── Push notifications ──────────────────────────────────────────────────────
 
   private async dispatchEventPush(db: PgDatabase, env: Env, msg: Record<string, unknown>): Promise<void> {
-    // Skip push if any browser WS is connected (app is in foreground)
-    if (this.browserSockets.size > 0) return;
-
     const server = await db.prepare('SELECT user_id FROM servers WHERE id = ?').bind(this.serverId).first<{ user_id: string }>();
     if (!server) return;
 
