@@ -142,26 +142,43 @@ async function getApnsJwt(env: Env): Promise<string> {
   return jwt;
 }
 
-async function sendApnsToHost(host: string, deviceToken: string, payload: PushPayload, jwt: string, bundleId: string): Promise<Response> {
-  const body = {
+/** Send APNs push via HTTP/2 (required by Apple). Returns { status, body }. */
+async function sendApnsToHost(
+  host: string, deviceToken: string, payload: PushPayload, jwt: string, bundleId: string,
+): Promise<{ status: number; body: string }> {
+  const { connect } = await import('node:http2');
+  const jsonBody = JSON.stringify({
     aps: {
       alert: { title: payload.title, body: payload.body },
       sound: 'default',
       'mutable-content': 1,
     },
     ...payload.data,
-  };
+  });
 
-  return fetch(`https://${host}/3/device/${deviceToken}`, {
-    method: 'POST',
-    headers: {
-      Authorization: `bearer ${jwt}`,
+  return new Promise((resolve, reject) => {
+    const client = connect(`https://${host}`);
+    client.on('error', (err) => { client.close(); reject(err); });
+
+    const req = client.request({
+      ':method': 'POST',
+      ':path': `/3/device/${deviceToken}`,
+      'authorization': `bearer ${jwt}`,
       'apns-topic': bundleId,
       'apns-push-type': 'alert',
       'apns-priority': '10',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
+      'content-type': 'application/json',
+    });
+
+    let status = 0;
+    let data = '';
+    req.setEncoding('utf8');
+    req.on('response', (headers) => { status = (headers[':status'] as number) ?? 0; });
+    req.on('data', (chunk: string) => { data += chunk; });
+    req.on('end', () => { client.close(); resolve({ status, body: data }); });
+    req.on('error', (err) => { client.close(); reject(err); });
+
+    req.end(jsonBody);
   });
 }
 
@@ -175,18 +192,17 @@ async function sendApns(deviceToken: string, payload: PushPayload, env: Env): Pr
 
   for (let i = 0; i < hosts.length; i++) {
     const res = await sendApnsToHost(hosts[i], deviceToken, payload, jwt, bundleId);
-    if (res.ok) return;
+    if (res.status === 200) return;
 
-    const errBody = await res.text().catch(() => '');
-    const unregistered = res.status === 410 || errBody.includes('Unregistered');
+    const unregistered = res.status === 410 || res.body.includes('Unregistered');
 
     // BadDeviceToken on production → likely a sandbox token, try sandbox
-    if (i === 0 && res.status === 400 && errBody.includes('BadDeviceToken')) {
+    if (i === 0 && res.status === 400 && res.body.includes('BadDeviceToken')) {
       logger.info({ token: deviceToken.slice(0, 10) }, 'APNs production rejected token, trying sandbox');
       continue;
     }
 
-    throw new PushError(`APNs ${res.status}: ${errBody}`, unregistered);
+    throw new PushError(`APNs ${res.status}: ${res.body}`, unregistered);
   }
 }
 
