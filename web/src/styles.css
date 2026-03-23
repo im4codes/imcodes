@@ -357,6 +357,7 @@ body {
   .mobile-server-switcher-wrap { position: relative; }
   .mobile-server-btn { background: none; border: none; color: #94a3b8; font-family: inherit; font-size: 12px; cursor: pointer; padding: 4px 0; }
   .mobile-server-btn:active { color: #e2e8f0; }
+  .mobile-server-backdrop { position: fixed; inset: 0; z-index: 49; }
   .mobile-server-menu { position: absolute; top: calc(100% + 4px); left: 0; background: #1e293b; border: 1px solid #334155; border-radius: 6px; min-width: 180px; box-shadow: 0 8px 24px #00000080; z-index: 50; overflow: hidden; }
   .mobile-server-menu-item { display: block; width: 100%; padding: 10px 14px; background: none; border: none; color: #cbd5e1; font-size: 13px; font-family: inherit; text-align: left; cursor: pointer; }
   .mobile-server-menu-item:hover, .mobile-server-menu-item:active { background: #334155; }

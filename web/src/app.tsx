@@ -1434,6 +1434,8 @@ export function App() {
                   ≡ {selectedServerName ?? 'Server'} ▾
                 </button>
                 {showMobileServerMenu && (
+                  <>
+                  <div class="mobile-server-backdrop" onClick={() => setShowMobileServerMenu(false)} />
                   <div class="mobile-server-menu">
                     <button class="mobile-server-menu-item" onClick={handleBackToDashboard}>
                       ← Home
@@ -1460,6 +1462,7 @@ export function App() {
                       <LanguageSwitcher />
                     </div>
                   </div>
+                  </>
                 )}
               </div>
               <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
