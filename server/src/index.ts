@@ -406,7 +406,7 @@ async function main() {
   const env: Env = { ...envConfig, DB: db };
 
   const bindHost = env.BIND_HOST ?? '0.0.0.0';
-  const port = parseInt(env.PORT ?? '3000', 10);
+  const port = parseInt(env.PORT ?? '19138', 10);
 
   if (bindHost === '0.0.0.0') {
     logger.warn({}, 'Server is listening on 0.0.0.0 — ensure TLS is terminated by a reverse proxy');

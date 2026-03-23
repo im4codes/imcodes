@@ -89,36 +89,36 @@ This binds your machine, starts the daemon, and registers it as a system service
 
 ## Self-Host
 
-Deploy your own IM.codes server with Docker Compose. Includes automatic HTTPS via Caddy and auto-updates via Watchtower.
+### One-Command Setup
 
-```bash
-# 1. Clone and configure
-git clone https://github.com/im4codes/imcodes.git
-cd imcodes
-cp .env.example .env
-
-# 2. Edit .env — set your domain, admin password, and secrets
-#    DOMAIN=im.example.com
-#    DEFAULT_ADMIN_PASSWORD=your-secure-password
-#    POSTGRES_PASSWORD=$(openssl rand -hex 16)
-#    JWT_SIGNING_KEY=$(openssl rand -hex 32)
-
-# 3. Start
-docker compose up -d
-```
-
-Caddy automatically provisions a Let's Encrypt certificate for your domain. Watchtower checks for new images every 5 minutes and updates automatically.
-
-Point your DNS A record to the server IP, then visit `https://your-domain`.
-
-Login with `admin` and the password you set in `DEFAULT_ADMIN_PASSWORD`. If not set, a random password is generated on first run — check `docker compose logs server` to find it.
-
-After logging in, bind your dev machine:
+Deploy server + daemon on a single machine. Requires Docker and a domain with DNS pointing to the server.
 
 ```bash
 npm install -g imcodes
-imcodes bind https://your-domain/bind/<api-key>
+mkdir imcodes && cd imcodes
+imcodes setup --domain imc.example.com
 ```
+
+This generates all config, starts PostgreSQL + server + Caddy with automatic HTTPS, creates the admin account, and binds the local daemon — all in one step. Credentials are printed at the end.
+
+To connect additional machines:
+
+```bash
+npm install -g imcodes
+imcodes bind https://imc.example.com/bind/<api-key>
+```
+
+### Manual Setup
+
+If you prefer to configure manually:
+
+```bash
+git clone https://github.com/im4codes/imcodes.git && cd imcodes
+./gen-env.sh imc.example.com        # generates .env with random secrets, prints admin password
+docker compose up -d
+```
+
+Login at `https://your-domain` with `admin` and the printed password. Bind your dev machine with `imcodes bind`.
 
 ## Requirements
 

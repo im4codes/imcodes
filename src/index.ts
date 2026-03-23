@@ -267,6 +267,16 @@ program
   });
 
 program
+  .command('setup')
+  .description('Deploy IM.codes server + daemon on this machine (Docker required)')
+  .requiredOption('--domain <domain>', 'Domain name for HTTPS (e.g. imc.example.com)')
+  .option('--force', 'Overwrite existing setup')
+  .action(async (opts: { domain: string; force?: boolean }) => {
+    const { setupFlow } = await import('./setup/setup-flow.js');
+    await setupFlow(opts.domain, { force: opts.force });
+  });
+
+program
   .command('service')
   .description('Manage the imcodes system service')
   .addCommand(

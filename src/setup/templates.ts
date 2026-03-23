@@ -1,11 +1,13 @@
-services:
+/** Embedded deployment templates for `imcodes setup`. */
+
+export const DOCKER_COMPOSE_TEMPLATE = `services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
       POSTGRES_DB: imcodes
       POSTGRES_USER: imcodes
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_PASSWORD: "\${POSTGRES_PASSWORD}"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -20,17 +22,15 @@ services:
     ports:
       - "127.0.0.1:19138:19138"
     environment:
-      DATABASE_URL: "postgresql://imcodes:${POSTGRES_PASSWORD}@postgres:5432/imcodes"
-      JWT_SIGNING_KEY: "${JWT_SIGNING_KEY}"
+      DATABASE_URL: "postgresql://imcodes:\${POSTGRES_PASSWORD}@postgres:5432/imcodes"
+      JWT_SIGNING_KEY: "\${JWT_SIGNING_KEY}"
       NODE_ENV: production
       PORT: "19138"
-      SERVER_URL: "https://${DOMAIN}"
-      ALLOWED_ORIGINS: "https://${DOMAIN}"
-      WEBAUTHN_RP_ID: "${WEBAUTHN_RP_ID:-${DOMAIN}}"
-      DEFAULT_ADMIN_PASSWORD: "${DEFAULT_ADMIN_PASSWORD:-}"
+      SERVER_URL: "https://\${DOMAIN}"
+      ALLOWED_ORIGINS: "https://\${DOMAIN}"
+      WEBAUTHN_RP_ID: "\${WEBAUTHN_RP_ID:-\${DOMAIN}}"
+      DEFAULT_ADMIN_PASSWORD: "\${DEFAULT_ADMIN_PASSWORD:-}"
       TRUSTED_PROXIES: "127.0.0.1,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16"
-      GITHUB_CLIENT_ID: "${GITHUB_CLIENT_ID:-}"
-      GITHUB_CLIENT_SECRET: "${GITHUB_CLIENT_SECRET:-}"
     labels:
       - com.centurylinklabs.watchtower.scope=imcodes
     depends_on:
@@ -68,3 +68,24 @@ volumes:
   pgdata:
   caddy_data:
   caddy_config:
+`;
+
+export function caddyfileTemplate(domain: string): string {
+  return `${domain} {
+\treverse_proxy server:19138
+}
+`;
+}
+
+export function envTemplate(vars: {
+  domain: string;
+  postgresPassword: string;
+  jwtSigningKey: string;
+  adminPassword: string;
+}): string {
+  return `DOMAIN=${vars.domain}
+POSTGRES_PASSWORD=${vars.postgresPassword}
+JWT_SIGNING_KEY=${vars.jwtSigningKey}
+DEFAULT_ADMIN_PASSWORD=${vars.adminPassword}
+`;
+}

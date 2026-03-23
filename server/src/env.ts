@@ -44,7 +44,7 @@ export interface EnvConfig {
   // Network
   /** Host to bind the HTTP server on. Default: 0.0.0.0 (logs a warning). */
   BIND_HOST?: string;
-  /** Port to listen on. Default: 3000 */
+  /** Port to listen on. Default: 19138 */
   PORT?: string;
 
   // APNs push notifications (iOS)
@@ -95,7 +95,7 @@ export function loadEnv(): EnvConfig {
     BOT_ENCRYPTION_KEY: process.env.BOT_ENCRYPTION_KEY ?? '',
     GITHUB_CLIENT_ID: process.env.GITHUB_CLIENT_ID,
     GITHUB_CLIENT_SECRET: process.env.GITHUB_CLIENT_SECRET,
-    SERVER_URL: process.env.SERVER_URL ?? `http://localhost:${process.env.PORT ?? 3000}`,
+    SERVER_URL: process.env.SERVER_URL ?? `http://localhost:${process.env.PORT ?? 19138}`,
     ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS,
     TRUSTED_PROXIES: process.env.TRUSTED_PROXIES,
     REAL_IP_HEADER: process.env.REAL_IP_HEADER,
