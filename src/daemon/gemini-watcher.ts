@@ -417,16 +417,22 @@ async function pollTickInner(sessionName: string, state: WatcherState): Promise<
   const prevMsgLen = state._lastMsgLen;
   state._lastMsgLen = lastMsgLen;
 
+  // Detect real content growth vs metadata-only updates.
+  // prevMsgLen === undefined means _lastMsgLen was never seeded (shouldn't happen
+  // after the startWatching fix, but guard against it). Only count as "content grew"
+  // when both values are known numbers and the length actually increased.
+  const contentGrew = prevMsgLen !== undefined && lastMsgLen > prevMsgLen;
+
   if (conversationStatus === 'running') {
     transitionState(sessionName, state, 'running');
-  } else if (!isUpdate || lastMsgLen !== prevMsgLen) {
-    // New messages arrived or last message's content grew (streaming) —
-    // agent is actively producing. Bias toward running so the unchanged
-    // path (terminal check) can confirm idle on the next tick.
+  } else if (!isUpdate || contentGrew) {
+    // New messages arrived or last message's content is actively growing
+    // (streaming). Bias toward running so the unchanged path (terminal
+    // check) can confirm idle on the next tick.
     transitionState(sessionName, state, 'running');
   }
-  // else: isUpdate with same content length — metadata-only update (e.g. lastUpdated
-  // timestamp). Don't bounce running→idle; let the current state stand.
+  // else: metadata-only update (lastUpdated changed, content length stable).
+  // Don't bounce to running — let current state stand.
 }
 
 // ── File rotation helper ────────────────────────────────────────────────────────
@@ -479,6 +485,10 @@ export async function startWatching(sessionName: string, sessionUuid: string): P
       state.seenCount = conv.messages.length;
       state.lastUpdated = conv.lastUpdated;
       state.lastConversationStatus = inferConversationStatus(conv);
+      // Seed _lastMsgLen so the first pollTick "changed file" path doesn't
+      // treat a metadata-only update (lastUpdated timestamp) as new content.
+      const lastMsg = conv.messages[conv.messages.length - 1];
+      state._lastMsgLen = typeof lastMsg?.content === 'string' ? lastMsg.content.length : -1;
       if (state.lastConversationStatus === 'idle') {
         transitionState(sessionName, state, 'idle');
       }
@@ -548,6 +558,11 @@ export async function startWatchingDiscovered(
                 state.activeFile = fullPath;
                 claimedFiles.set(fullPath, sessionName);
                 state.sessionUuid = conv.sessionId;
+                state.seenCount = conv.messages?.length ?? 0;
+                state.lastUpdated = conv.lastUpdated ?? '';
+                state.lastConversationStatus = inferConversationStatus(conv);
+                const lm = conv.messages?.[conv.messages.length - 1];
+                state._lastMsgLen = typeof lm?.content === 'string' ? lm.content.length : -1;
                 // Persist to local session store so daemon restarts can use the UUID
                 const sess = getSession(sessionName);
                 if (sess && !sess.geminiSessionId) {

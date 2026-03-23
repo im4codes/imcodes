@@ -310,6 +310,9 @@ describe('Gemini JSON change detection hardening', () => {
     const { stat: statMock } = await import('fs/promises');
     vi.mocked(statMock).mockResolvedValue({ mtimeMs: 1000, size: 200 } as any);
 
+    // Simulate content growth: previous content was shorter
+    state._lastMsgLen = 5;
+
     const growingConv = {
       lastUpdated: '2026-03-14T10:00:01Z',
       messages: [
