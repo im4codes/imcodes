@@ -45,9 +45,9 @@ Single-model output shouldn't be trusted blindly. Spawn quick discussion rounds 
 
 Connect multiple dev machines to one dashboard. Each machine runs a lightweight daemon that manages local agent sessions via tmux. See all servers and sessions at a glance — start, stop, restart, or switch between them instantly. Sub-sessions let you spawn additional agents from within a running session for parallel tasks.
 
-### File Transfer
+### File Browser & Preview
 
-Upload files from browser or phone (including camera capture). Files are relayed to the daemon and referenced in chat with `@path`. Download project files directly from the built-in file browser.
+Browse project files, preview any file with syntax highlighting, and view git diffs with inline change comparison — all from the browser. Upload files from browser or phone (including camera capture), referenced in chat with `@path`.
 
 ### Mobile & Notifications
 
