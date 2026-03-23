@@ -24,6 +24,20 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 
+/** Get the last assistant.text from a session's timeline (for push notification context). */
+function getLastAssistantText(sessionName: string): string | undefined {
+  try {
+    const events = timelineStore.read(sessionName, { limit: 20 });
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i].type === 'assistant.text') {
+        const text = (events[i].payload as Record<string, unknown>)?.text;
+        if (typeof text === 'string' && text.trim()) return text.slice(0, 200);
+      }
+    }
+  } catch { /* ignore */ }
+  return undefined;
+}
+
 export interface DaemonContext {
   config: Config;
   memory: MemoryBackend | null;
@@ -416,7 +430,9 @@ export async function startup(): Promise<DaemonContext> {
       const projectName = record?.projectName ?? payload.session;
       if (payload.event === 'idle') {
         // notifySessionIdle is handled by the unified timeline listener below
-        serverLink.send({ type: 'session.idle', session: payload.session, project: projectName, agentType: payload.agentType });
+        // Include last assistant text for push notification context
+        const lastText = getLastAssistantText(payload.session);
+        serverLink.send({ type: 'session.idle', session: payload.session, project: projectName, agentType: payload.agentType, ...(lastText ? { lastText } : {}) });
       } else if (payload.event === 'notification') {
         serverLink.send({ type: 'session.notification', session: payload.session, project: projectName, title: payload.title, message: payload.message });
       } else if (payload.event === 'tool_start') {

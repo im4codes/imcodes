@@ -1038,34 +1038,44 @@ export class WsBridge {
     // Skip push if mobile app is in foreground (user is actively watching)
     if (this.mobileSockets.size > 0) return;
 
-    const server = await db.prepare('SELECT user_id FROM servers WHERE id = ?').bind(this.serverId).first<{ user_id: string }>();
+    const server = await db.prepare('SELECT user_id, name FROM servers WHERE id = ?').bind(this.serverId).first<{ user_id: string; name: string }>();
     if (!server) return;
 
     const { dispatchPush } = await import('../routes/push.js').catch(() => ({ dispatchPush: null }));
     if (!dispatchPush) return;
 
-    const session = String(msg.session ?? msg.sessionId ?? '');
+    const sessionName = String(msg.session ?? msg.sessionId ?? '');
     const eventType = String(msg.type ?? '');
+
+    // Look up session metadata for human-readable push content
+    const sessionRow = await db.prepare(
+      'SELECT project_name, agent_type, label FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
+    ).bind(this.serverId, sessionName).first<{ project_name: string; agent_type: string; label: string | null }>().catch(() => null);
+
+    const displayName = sessionRow?.label || sessionRow?.project_name || sessionName;
+    const agentType = sessionRow?.agent_type ?? '';
+    const agentLabel = agentType ? ` (${agentType})` : '';
+    const lastText = String(msg.lastText ?? msg.message ?? '').slice(0, 200);
 
     let title: string;
     let body: string;
     switch (eventType) {
       case 'session.idle':
-        title = 'Task complete';
-        body = `${session} is ready for input`;
+        title = `${server.name} · ${displayName}${agentLabel}`;
+        body = lastText || 'Task complete — ready for input';
         break;
       case 'session.notification': {
-        title = String(msg.title ?? 'Notification');
-        body = String(msg.message ?? session);
+        title = `${server.name} · ${displayName}`;
+        body = String(msg.message ?? 'Notification');
         break;
       }
       case 'session.error':
-        title = 'Session error';
-        body = `${session}: ${String(msg.error ?? 'unknown error')}`;
+        title = `${server.name} · ${displayName}`;
+        body = `Error: ${String(msg.error ?? 'unknown')}`;
         break;
       case 'ask.question':
-        title = 'Input needed';
-        body = `${session} is waiting for your answer`;
+        title = `${server.name} · ${displayName}${agentLabel}`;
+        body = lastText || 'Waiting for your answer';
         break;
       default:
         return;
@@ -1075,7 +1085,7 @@ export class WsBridge {
       userId: server.user_id,
       title,
       body,
-      data: { serverId: this.serverId, session, type: eventType },
+      data: { serverId: this.serverId, session: sessionName, type: eventType },
     }, env);
   }
 
