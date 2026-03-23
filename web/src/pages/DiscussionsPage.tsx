@@ -74,7 +74,7 @@ export function DiscussionsPage({ ws, onBack, initialSelectedId }: Props) {
       </div>
 
       <div class="discussions-layout">
-        <div class="discussions-list">
+        <div class="discussions-list" style={initialSelectedId && selected ? { display: window.innerWidth < 768 ? 'none' : undefined } : undefined}>
           {loading && <div class="discussions-empty">Loading...</div>}
           {!loading && discussions.length === 0 && <div class="discussions-empty">No P2P discussions yet. Use @@all(discuss) or @agent to start one.</div>}
           {discussions.map((d) => (

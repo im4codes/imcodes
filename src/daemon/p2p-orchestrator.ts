@@ -55,6 +55,8 @@ export interface P2pRun {
   userText: string;
   timeoutMs: number;
   resultSummary: string | null;
+  /** Sessions whose hops completed successfully. */
+  completedHops: P2pTarget[];
   /** Sessions whose hops were skipped (timeout, sendKeys failure, idle without file change). */
   skippedHops: string[];
   error: string | null;
@@ -205,6 +207,7 @@ export async function startP2pRun(
     userText,
     timeoutMs: modeConfig?.defaultTimeoutMs ?? 300_000,
     resultSummary: null,
+    completedHops: [],
     skippedHops: [],
     error: null,
     createdAt: now,
@@ -371,8 +374,13 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
   /** Helper: clean up hop state on every exit path */
   const finishHop = (skipped: boolean) => {
     run.currentTargetSession = null;
+    const target = run.remainingTargets.find((t) => t.session === session);
     run.remainingTargets = run.remainingTargets.filter((t) => t.session !== session);
-    if (skipped) run.skippedHops.push(session);
+    if (skipped) {
+      run.skippedHops.push(session);
+    } else if (target) {
+      run.completedHops.push(target);
+    }
   };
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -671,34 +679,41 @@ function pushState(run: P2pRun, serverLink: ServerLink | null): void {
           const agentType = rec?.agentType ?? '';
           return agentType ? `${name} (${agentType})` : name;
         })(),
-        // Full node list for segmented progress display
+        // Full node list for segmented progress display — includes completed, active, pending, skipped
         all_nodes: (() => {
-          const nodes: Array<{ session: string; label: string; agentType: string; status: 'done' | 'active' | 'pending' | 'skipped' }> = [];
-          // Phase 1: initiator initial
-          const initRec = getSession(run.initiatorSession);
-          const initName = shortName(run.initiatorSession);
-          const initType = initRec?.agentType ?? 'unknown';
-          const initDone = run.status !== 'queued' && run.status !== 'dispatched' || (run.currentTargetSession !== run.initiatorSession && run.remainingTargets.length < run.totalTargets);
-          nodes.push({ session: run.initiatorSession, label: initName, agentType: initType, status: initDone ? 'done' : run.currentTargetSession === run.initiatorSession ? 'active' : 'pending' });
-          // Phase 2: hops (all original targets)
-          // remainingTargets only has pending ones — completed are removed
-          const allTargetSessions = new Set(run.remainingTargets.map(t => t.session));
+          type NodeInfo = { session: string; label: string; agentType: string; status: 'done' | 'active' | 'pending' | 'skipped' };
+          const nodes: NodeInfo[] = [];
           const skippedSet = new Set(run.skippedHops);
-          // We need original targets — reconstruct from totalTargets count
-          // For simplicity, show remaining + current as the hop nodes
-          if (run.currentTargetSession && run.currentTargetSession !== run.initiatorSession && run.currentTargetSession !== run.finalReturnSession) {
-            const rec = getSession(run.currentTargetSession);
-            nodes.push({ session: run.currentTargetSession, label: shortName(run.currentTargetSession), agentType: rec?.agentType ?? 'unknown', status: 'active' });
+          const getInfo = (s: string) => { const r = getSession(s); return { label: shortName(s), agentType: r?.agentType ?? 'unknown' }; };
+
+          // Phase 1: initiator initial analysis
+          const init = getInfo(run.initiatorSession);
+          const phase1Done = run.completedHops.length > 0 || run.remainingTargets.length < run.totalTargets || run.status === 'completed';
+          const phase1Active = !phase1Done && run.currentTargetSession === run.initiatorSession;
+          nodes.push({ session: run.initiatorSession, ...init, status: phase1Done ? 'done' : phase1Active ? 'active' : 'pending' });
+
+          // Phase 2: completed hops (in order)
+          for (const t of run.completedHops) {
+            const info = getInfo(t.session);
+            nodes.push({ session: t.session, ...info, status: skippedSet.has(t.session) ? 'skipped' : 'done' });
           }
+          // Phase 2: current active hop
+          if (run.currentTargetSession && run.currentTargetSession !== run.initiatorSession) {
+            const info = getInfo(run.currentTargetSession);
+            nodes.push({ session: run.currentTargetSession, ...info, status: 'active' });
+          }
+          // Phase 2: remaining pending hops
           for (const t of run.remainingTargets) {
-            if (t.session === run.currentTargetSession) continue; // already added as active
-            const rec = getSession(t.session);
-            nodes.push({ session: t.session, label: shortName(t.session), agentType: rec?.agentType ?? 'unknown', status: skippedSet.has(t.session) ? 'skipped' : 'pending' });
+            if (t.session === run.currentTargetSession) continue;
+            const info = getInfo(t.session);
+            nodes.push({ session: t.session, ...info, status: 'pending' });
           }
-          // Phase 3: summary (initiator again)
+
+          // Phase 3: summary
           const summaryDone = run.status === 'completed';
           const summaryActive = run.remainingTargets.length === 0 && !summaryDone && run.currentTargetSession === run.initiatorSession;
-          nodes.push({ session: run.initiatorSession, label: `${initName} (summary)`, agentType: initType, status: summaryDone ? 'done' : summaryActive ? 'active' : 'pending' });
+          nodes.push({ session: run.initiatorSession, label: `${init.label} · summary`, agentType: init.agentType, status: summaryDone ? 'done' : summaryActive ? 'active' : 'pending' });
+
           return nodes;
         })(),
       },
