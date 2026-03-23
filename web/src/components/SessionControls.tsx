@@ -273,9 +273,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       return;
     }
 
-    const history = activeSession
+    // Use session-scoped history, falling back to global history if session has no entries
+    const sessionHist = activeSession
       ? (quickData.data.sessionHistory[activeSession.name] ?? [])
       : [];
+    const history = sessionHist.length > 0 ? sessionHist : quickData.data.history;
     if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && history.length > 0) {
       // Only intercept when caret is on first/last line to avoid breaking multiline editing
       const sel = window.getSelection();
@@ -311,10 +313,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       }
     }
 
-    // Any other key while navigating: exit history nav but keep text
+    // Any other key while navigating: exit history nav, keep current text as new draft
     if (histIdxRef.current !== -1 && e.key !== 'Shift' && !e.metaKey && !e.ctrlKey) {
       histIdxRef.current = -1;
-      draftRef.current = '';
+      // Preserve current input as draft so Up→Down still restores it
+      draftRef.current = divRef.current?.textContent ?? '';
     }
   };
 
