@@ -25,7 +25,7 @@ const MAX_QUEUE_SIZE = 100;
 const MAX_BROWSER_PAYLOAD = 65536; // 64KB (subsession.rebuild_all can include many sessions)
 const BROWSER_RATE_LIMIT = 30;    // messages
 const BROWSER_RATE_WINDOW = 10_000; // 10s
-const QUEUE_MAX_BYTES = 512 * 1024; // 512KB per (session, browser)
+const QUEUE_MAX_BYTES = 1024 * 1024; // 1MB per (session, browser) — increased from 512KB to reduce stream_reset cascades
 
 /**
  * Safe ws.send: checks readyState, wraps in try/catch.
@@ -656,6 +656,7 @@ export class WsBridge {
         (msg.label as string) || null,
         (msg.ccSessionId as string) || null,
         (msg.geminiSessionId as string) || null,
+        (msg.parentSession as string) || null,
       ).then(() => {
         // Notify browsers so sub-session appears immediately without page refresh
         this.broadcastToBrowsers(JSON.stringify({

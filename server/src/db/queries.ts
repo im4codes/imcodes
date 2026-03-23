@@ -655,10 +655,10 @@ export async function upsertOrchestrationRun(db: PgDatabase, r: DbOrchestrationR
   ).run();
 }
 
-export async function getOrchestrationRunsByDiscussion(db: PgDatabase, discussionId: string): Promise<DbOrchestrationRun[]> {
+export async function getOrchestrationRunsByDiscussion(db: PgDatabase, discussionId: string, serverId: string): Promise<DbOrchestrationRun[]> {
   const rows = await db
-    .prepare('SELECT * FROM discussion_orchestration_runs WHERE discussion_id = ? ORDER BY created_at DESC')
-    .bind(discussionId)
+    .prepare('SELECT * FROM discussion_orchestration_runs WHERE discussion_id = ? AND server_id = ? ORDER BY created_at DESC')
+    .bind(discussionId, serverId)
     .all<DbOrchestrationRun>();
   return rows.results ?? [];
 }

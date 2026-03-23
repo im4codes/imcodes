@@ -128,22 +128,13 @@ export class TerminalStreamer {
       // Check subscriber is still active
       if (!this.subscribers.get(sessionName)?.has(subscriber)) return;
       subscriber.send(diff);
-
-      // Send scrollback history if subscriber wants it
-      if (subscriber.sendHistory) {
-        try {
-          const historyContent = await capturePaneHistory(sessionName);
-          if (historyContent && this.subscribers.get(sessionName)?.has(subscriber)) {
-            subscriber.sendHistory({ sessionName, content: historyContent });
-          }
-        } catch { /* best-effort */ }
-      }
     } catch (err) {
       logger.warn({ sessionName, err }, 'Snapshot failed during subscribe');
       // Continue — raw stream may still recover state
     }
 
-    // 2. Flush buffered raw bytes (if pipe was already running)
+    // 2. Flush buffered raw bytes immediately after snapshot — never block live
+    //    PTY forwarding for history capture (which can be slow under load).
     subState.snapshotPending = false;
     for (const chunk of subState.rawBuffer) {
       if (!this.subscribers.get(sessionName)?.has(subscriber)) break;
@@ -152,7 +143,19 @@ export class TerminalStreamer {
     subState.rawBuffer = [];
     subState.rawBufferBytes = 0;
 
-    // 3. Start pipe if this was the first subscriber
+    // 3. Send scrollback history asynchronously (best-effort, never blocks raw stream)
+    if (subscriber.sendHistory) {
+      void (async () => {
+        try {
+          const historyContent = await capturePaneHistory(sessionName);
+          if (historyContent && this.subscribers.get(sessionName)?.has(subscriber)) {
+            subscriber.sendHistory!({ sessionName, content: historyContent });
+          }
+        } catch { /* best-effort */ }
+      })();
+    }
+
+    // 4. Start pipe if this was the first subscriber
     if (!hasPipe && this.subscribers.get(sessionName)?.has(subscriber)) {
       await this.startPipe(sessionName, 0);
     }

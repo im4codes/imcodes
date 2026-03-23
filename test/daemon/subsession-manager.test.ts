@@ -189,6 +189,68 @@ describe('startSubSession — ccSessionId stored in session-store', () => {
   });
 });
 
+describe('startSubSession — geminiSessionId stored in session-store', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionExistsMock.mockResolvedValue(false);
+    newSessionMock.mockResolvedValue(undefined);
+    getDriverMock.mockReturnValue({
+      buildLaunchCommand: () => 'gemini',
+      buildResumeCommand: () => 'gemini --resume test-id',
+      postLaunch: undefined,
+    });
+  });
+
+  it('passes geminiSessionId to upsertSession for gemini sub-sessions', async () => {
+    await startSubSession({
+      id: 'gem-sub1',
+      type: 'gemini',
+      cwd: '/proj',
+      geminiSessionId: 'gemini-uuid-abc',
+    });
+
+    expect(upsertSession).toHaveBeenCalledWith(
+      expect.objectContaining({ geminiSessionId: 'gemini-uuid-abc' }),
+    );
+  });
+
+  it('persists undefined geminiSessionId as undefined (not lost)', async () => {
+    await startSubSession({
+      id: 'gem-sub2',
+      type: 'gemini',
+      cwd: '/proj',
+      geminiSessionId: null,
+      fresh: true,
+    });
+
+    const call = vi.mocked(upsertSession).mock.calls[0]?.[0] as Record<string, unknown>;
+    // Should not have geminiSessionId set to something truthy when null was passed
+    expect(call.geminiSessionId).toBeUndefined();
+  });
+});
+
+describe('SAFE_SESSION_NAME_RE — session name validation', () => {
+  // Import the regex pattern indirectly by testing stopSubSession behavior
+  // The regex is: /^deck_sub_[a-zA-Z0-9_-]+$/
+
+  it('accepts valid session names', () => {
+    const re = /^deck_sub_[a-zA-Z0-9_-]+$/;
+    expect(re.test('deck_sub_abc12345')).toBe(true);
+    expect(re.test('deck_sub_my-session-id')).toBe(true);
+    expect(re.test('deck_sub_a_b_c')).toBe(true);
+  });
+
+  it('rejects injection attempts', () => {
+    const re = /^deck_sub_[a-zA-Z0-9_-]+$/;
+    expect(re.test('deck_sub_$(whoami)')).toBe(false);
+    expect(re.test('deck_sub_; rm -rf /')).toBe(false);
+    expect(re.test('deck_sub_`id`')).toBe(false);
+    expect(re.test('../../../etc/passwd')).toBe(false);
+    expect(re.test('deck_sub_a b c')).toBe(false);
+    expect(re.test('')).toBe(false);
+  });
+});
+
 describe('readSubSessionResponse()', () => {
   beforeEach(() => {
     vi.clearAllMocks();

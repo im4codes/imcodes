@@ -314,21 +314,18 @@ export function TerminalView({ sessionName, ws, connected, onDiff, onHistory, on
 
     // Always scroll to bottom on new content (fullFrame handles its own scroll internally).
     if (!diff.fullFrame) {
-      setTimeout(() => term.scrollToBottom(), 0);
+      requestAnimationFrame(() => term.scrollToBottom());
     }
   }, []);
 
   const applyHistory = useCallback((content: string) => {
     const term = termRef.current;
     if (!term || !content) return;
-    // Write history into scrollback: save cursor, move to top, write history lines,
-    // then the visible frame will be painted on top by the next diff.
+    // Write history into scrollback as a single batched write to reduce main-thread churn.
     // We use the normal buffer — history goes above current viewport.
     const historyLines = content.split('\n');
-    // Write history lines followed by newlines — these go into scrollback
-    for (const line of historyLines) {
-      term.write(line + '\r\n');
-    }
+    const batch = historyLines.map((l) => l + '\r\n').join('');
+    term.write(batch);
   }, []);
 
   useEffect(() => {

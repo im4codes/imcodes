@@ -50,7 +50,7 @@ discussionRoutes.get('/:id/discussions/:discussionId/runs', async (c) => {
   const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
 
-  const runs = await getOrchestrationRunsByDiscussion(c.env.DB, discussionId);
+  const runs = await getOrchestrationRunsByDiscussion(c.env.DB, discussionId, serverId);
   return c.json({ runs });
 });
 

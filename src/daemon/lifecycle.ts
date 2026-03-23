@@ -194,6 +194,7 @@ export async function startup(): Promise<DaemonContext> {
             sessionType: session.agentType,
             cwd: session.projectDir || null,
             ccSessionId: session.ccSessionId ?? null,
+            geminiSessionId: session.geminiSessionId ?? null,
             parentSession: session.parentSession ?? null,
           });
         } catch { /* ignore */ }

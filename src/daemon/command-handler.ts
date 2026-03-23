@@ -28,7 +28,7 @@ import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, type P2pTarget } from './p2p-orchestrator.js';
 import { copyFile, mkdir } from 'node:fs/promises';
-import { ensureImcDir } from '../util/imc-dir.js';
+import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
 
 /**
  * For sandboxed agents (Gemini, Codex): copy files from ~/.imcodes/ to
@@ -792,9 +792,27 @@ function handleGetSessions(serverLink: ServerLink): void {
   }
 }
 
+const RAW_BATCH_FLUSH_MS = 16;           // ~60fps flush interval
+const RAW_BATCH_MAX_BYTES = 32 * 1024;   // flush immediately at 32KB
+
 function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): void {
   const session = cmd.session as string | undefined;
   if (!session) return;
+
+  // Per-session raw PTY batching: accumulate small chunks and flush on timer or size threshold.
+  // Reduces WebSocket frame count and queue pressure on the server bridge.
+  let rawBatch: Buffer[] = [];
+  let rawBatchBytes = 0;
+  let rawBatchTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const flushRawBatch = (): void => {
+    if (rawBatchTimer) { clearTimeout(rawBatchTimer); rawBatchTimer = null; }
+    if (rawBatch.length === 0) return;
+    const combined = rawBatch.length === 1 ? rawBatch[0] : Buffer.concat(rawBatch);
+    serverLink.sendBinary(packRawFrame(session, combined));
+    rawBatch = [];
+    rawBatchBytes = 0;
+  };
 
   const subscriber: StreamSubscriber = {
     sessionName: session,
@@ -802,12 +820,19 @@ function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): 
       try { serverLink.send({ type: 'terminal_update', diff }); } catch { /* ignore */ }
     },
     sendRaw: (data: Buffer) => {
-      serverLink.sendBinary(packRawFrame(session, data));
+      rawBatch.push(data);
+      rawBatchBytes += data.length;
+      if (rawBatchBytes >= RAW_BATCH_MAX_BYTES) {
+        flushRawBatch();
+      } else if (!rawBatchTimer) {
+        rawBatchTimer = setTimeout(flushRawBatch, RAW_BATCH_FLUSH_MS);
+      }
     },
     sendControl: (msg) => {
       try { serverLink.send(msg); } catch { /* ignore */ }
     },
     onError: () => {
+      if (rawBatchTimer) clearTimeout(rawBatchTimer);
       activeSubscriptions.delete(session);
     },
   };
@@ -1083,38 +1108,51 @@ async function handleAskAnswer(cmd: Record<string, unknown>): Promise<void> {
 // ── P2P discussion file listing ────────────────────────────────────────────
 
 async function handleP2pListDiscussions(_cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  const dir = nodePath.join(homedir(), '.imcodes', 'discussions');
-  try {
-    const entries = await fsReaddir(dir);
-    const files = entries.filter(e => e.endsWith('.md')).sort().reverse(); // newest first
-    const discussions: Array<{ id: string; fileName: string; preview: string; mtime: number }> = [];
-    for (const f of files.slice(0, 50)) { // cap at 50
-      try {
-        const fullPath = nodePath.join(dir, f);
-        const s = await fsStat(fullPath);
-        const content = await fsReadFileRaw(fullPath, 'utf8');
-        // Extract first non-empty line after "## User Request" as preview
-        const reqMatch = content.match(/## User Request\s*\n+(.+)/);
-        const preview = reqMatch?.[1]?.trim().slice(0, 120) || f;
-        discussions.push({ id: f.replace('.md', ''), fileName: f, preview, mtime: s.mtimeMs });
-      } catch { /* skip unreadable */ }
-    }
-    serverLink.send({ type: 'p2p.list_discussions_response', discussions });
-  } catch {
-    serverLink.send({ type: 'p2p.list_discussions_response', discussions: [] });
+  // Collect unique project dirs from all sessions
+  const projectDirs = new Set<string>();
+  for (const s of listSessions()) {
+    if (s.projectDir) projectDirs.add(s.projectDir);
   }
+  const discussions: Array<{ id: string; fileName: string; preview: string; mtime: number }> = [];
+  for (const projectDir of projectDirs) {
+    const dir = imcSubDir(projectDir, 'discussions');
+    try {
+      const entries = await fsReaddir(dir);
+      const files = entries.filter(e => e.endsWith('.md'));
+      for (const f of files) {
+        try {
+          const fullPath = nodePath.join(dir, f);
+          const s = await fsStat(fullPath);
+          const content = await fsReadFileRaw(fullPath, 'utf8');
+          const reqMatch = content.match(/## User Request\s*\n+(.+)/);
+          const preview = reqMatch?.[1]?.trim().slice(0, 120) || f;
+          discussions.push({ id: f.replace('.md', ''), fileName: f, preview, mtime: s.mtimeMs });
+        } catch { /* skip unreadable */ }
+      }
+    } catch { /* dir may not exist */ }
+  }
+  // Sort by mtime descending, cap at 50
+  discussions.sort((a, b) => b.mtime - a.mtime);
+  serverLink.send({ type: 'p2p.list_discussions_response', discussions: discussions.slice(0, 50) });
 }
 
 async function handleP2pReadDiscussion(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const id = cmd.id as string | undefined;
   if (!id) { serverLink.send({ type: 'p2p.read_discussion_response', error: 'missing_id' }); return; }
-  const filePath = nodePath.join(homedir(), '.imcodes', 'discussions', `${id}.md`);
-  try {
-    const content = await fsReadFileRaw(filePath, 'utf8');
-    serverLink.send({ type: 'p2p.read_discussion_response', id, content });
-  } catch {
-    serverLink.send({ type: 'p2p.read_discussion_response', id, error: 'not_found' });
+  // Search across all known project .imc/discussions/ directories
+  const projectDirs = new Set<string>();
+  for (const s of listSessions()) {
+    if (s.projectDir) projectDirs.add(s.projectDir);
   }
+  for (const projectDir of projectDirs) {
+    const filePath = nodePath.join(imcSubDir(projectDir, 'discussions'), `${id}.md`);
+    try {
+      const content = await fsReadFileRaw(filePath, 'utf8');
+      serverLink.send({ type: 'p2p.read_discussion_response', id, content });
+      return;
+    } catch { /* try next project */ }
+  }
+  serverLink.send({ type: 'p2p.read_discussion_response', id, error: 'not_found' });
 }
 
 // ── Discussion handlers ────────────────────────────────────────────────────

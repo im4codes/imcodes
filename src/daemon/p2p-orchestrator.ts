@@ -6,8 +6,8 @@
  * Completion = file grew + agent idle.
  */
 
-import { stat, writeFile, readFile, mkdir, unlink } from 'node:fs/promises';
-import { join } from 'node:path';
+import { stat, writeFile, readFile, mkdir, unlink, copyFile } from 'node:fs/promises';
+import { join, basename } from 'node:path';
 import { imcSubDir, ensureImcDir } from '../util/imc-dir.js';
 import { randomUUID } from 'node:crypto';
 import { sendKeysDelayedEnter } from '../agent/tmux.js';
@@ -368,11 +368,48 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
   // Don't remove from remainingTargets yet — defer until hop actually completes
   transition(run, 'dispatched', serverLink);
 
-  const watchPath = run.contextFilePath;
+  // ── Cross-project file copy for sandboxed agents ──
+  // If the target session's project dir differs from where the discussion file lives,
+  // copy the file into the target's .imc/discussions/ so sandboxed agents can access it.
+  const targetRecord = getSession(session);
+  const targetDir = targetRecord?.projectDir || null;
+  const sourceDir = run.contextFilePath.split('/.imc/discussions/')[0] || null;
+  const isCrossProject = targetDir && sourceDir && targetDir !== sourceDir;
+  let localCopyPath: string | null = null;
+
+  if (isCrossProject) {
+    const targetDiscussDir = await ensureImcDir(targetDir, 'discussions');
+    localCopyPath = join(targetDiscussDir, basename(run.contextFilePath));
+    try {
+      await copyFile(run.contextFilePath, localCopyPath);
+      // Rewrite the prompt to reference the local copy path
+      prompt = prompt.replace(run.contextFilePath, localCopyPath);
+      logger.info({ runId: run.id, session, from: run.contextFilePath, to: localCopyPath }, 'P2P: copied discussion file to target project');
+    } catch (err) {
+      logger.warn({ runId: run.id, session, err }, 'P2P: failed to copy discussion file to target project');
+      localCopyPath = null; // fall back to original path
+    }
+  }
+
+  const watchPath = localCopyPath ?? run.contextFilePath;
   const MAX_RETRIES = 1;
 
   /** Helper: clean up hop state on every exit path */
-  const finishHop = (skipped: boolean) => {
+  const finishHop = async (skipped: boolean) => {
+    // Copy result back from local copy to source file
+    if (localCopyPath && !skipped) {
+      try {
+        await copyFile(localCopyPath, run.contextFilePath);
+        logger.info({ runId: run.id, session }, 'P2P: copied discussion result back to source project');
+      } catch (err) {
+        logger.warn({ runId: run.id, session, err }, 'P2P: failed to copy discussion result back');
+      }
+    }
+    // Schedule cleanup of local copy
+    if (localCopyPath) {
+      const copyToClean = localCopyPath;
+      setTimeout(async () => { try { await unlink(copyToClean); } catch { /* already deleted */ } }, 30_000);
+    }
     run.currentTargetSession = null;
     const target = run.remainingTargets.find((t) => t.session === session);
     run.remainingTargets = run.remainingTargets.filter((t) => t.session !== session);
@@ -384,7 +421,7 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
   };
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    if (run._cancelled) { finishHop(false); return; }
+    if (run._cancelled) { await finishHop(false); return; }
 
     // Record file size before dispatch
     let sizeBefore = 0;
@@ -400,7 +437,7 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
         continue;
       }
       logger.warn({ runId: run.id, session, err }, 'P2P: hop dispatch failed after retry, skipping');
-      finishHop(true);
+      await finishHop(true);
       return;
     }
 
@@ -422,9 +459,9 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
     let headingFoundAt = 0;
 
     while (Date.now() < deadline) {
-      if (run._cancelled) { idleWaiter.cancel(); finishHop(false); return; }
+      if (run._cancelled) { idleWaiter.cancel(); await finishHop(false); return; }
       await sleep(IDLE_POLL_MS);
-      if (run._cancelled) { idleWaiter.cancel(); finishHop(false); return; }
+      if (run._cancelled) { idleWaiter.cancel(); await finishHop(false); return; }
 
       // Check file growth — track last growth time for settle detection
       try {
@@ -461,7 +498,7 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
       if (headingFound && (Date.now() - headingFoundAt) >= 2_000) {
         logger.info({ runId: run.id, session, sectionHeader }, 'P2P: heading found in file, completing hop');
         idleWaiter.cancel();
-        finishHop(false);
+        await finishHop(false);
         if (run.remainingTargets.length > 0 || session !== run.finalReturnSession) {
           transition(run, 'awaiting_next_hop', serverLink);
         }
@@ -476,7 +513,7 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
           (Date.now() - dispatchTime) > MIN_PROCESSING_MS) {
         logger.info({ runId: run.id, session, growth: lastSize - sizeBefore }, 'P2P: content growth fallback — completing hop without heading');
         idleWaiter.cancel();
-        finishHop(false);
+        await finishHop(false);
         if (run.remainingTargets.length > 0 || session !== run.finalReturnSession) {
           transition(run, 'awaiting_next_hop', serverLink);
         }
@@ -538,7 +575,7 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
             }
           } catch { /* ignore */ }
           idleWaiter.cancel();
-          finishHop(false);
+          await finishHop(false);
           if (run.remainingTargets.length > 0 || session !== run.finalReturnSession) {
             transition(run, 'awaiting_next_hop', serverLink);
           }
@@ -554,7 +591,7 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
           }
           logger.warn({ runId: run.id, session }, 'P2P: agent idle without file change after retry, skipping hop');
           idleWaiter.cancel();
-          finishHop(true);
+          await finishHop(true);
           if (run.remainingTargets.length > 0 || session !== run.finalReturnSession) {
             transition(run, 'awaiting_next_hop', serverLink);
           }
@@ -570,7 +607,7 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
 
     // Timeout — skip (don't fail the whole run)
     logger.warn({ runId: run.id, session }, 'P2P: hop timed out, skipping to next');
-    finishHop(true);
+    await finishHop(true);
     if (run.remainingTargets.length > 0 || session !== run.finalReturnSession) {
       transition(run, 'awaiting_next_hop', serverLink);
     }

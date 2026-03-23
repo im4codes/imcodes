@@ -78,7 +78,7 @@ export type {
 
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
-const HEARTBEAT_MS = 25000;
+const HEARTBEAT_MS = 10000; // lowered from 25s for faster dead-connection detection
 
 export class WsClient {
   private ws: WebSocket | null = null;
@@ -498,8 +498,8 @@ export class WsClient {
     }
     state.count++;
 
-    // Cooldown: ≥3 resets in 60s → 30s pause
-    if (state.count >= 3 && !state.inCooldown) {
+    // Cooldown: ≥5 resets in 60s → 5s pause (relaxed from 3/30s to reduce perceived freezes)
+    if (state.count >= 5 && !state.inCooldown) {
       state.inCooldown = true;
       setTimeout(() => {
         const s = this.resetState.get(session);
@@ -507,7 +507,7 @@ export class WsClient {
           s.inCooldown = false;
           s.retryCount = 0;
         }
-      }, 30_000);
+      }, 5_000);
       return; // Don't resubscribe during cooldown
     }
 

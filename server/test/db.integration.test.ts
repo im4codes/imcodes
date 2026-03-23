@@ -34,6 +34,7 @@ import {
   upsertOrchestrationRun,
   getOrchestrationRunById,
   getActiveOrchestrationRuns,
+  getOrchestrationRunsByDiscussion,
   type DbOrchestrationRun,
 } from '../src/db/queries.js';
 
@@ -391,6 +392,51 @@ describe('composite PK multi-server isolation', () => {
 
     it('getOrchestrationRunById returns null for wrong server', async () => {
       expect(await getOrchestrationRunById(db, runId, 'nonexistent-srv')).toBeNull();
+    });
+
+    it('getOrchestrationRunsByDiscussion is scoped by server_id', async () => {
+      const runsA = await getOrchestrationRunsByDiscussion(db, discId, serverA);
+      const runsB = await getOrchestrationRunsByDiscussion(db, discId, serverB);
+      expect(runsA).toHaveLength(1);
+      expect(runsA[0].status).toBe('running');
+      expect(runsB).toHaveLength(1);
+      expect(runsB[0].status).toBe('completed');
+      // Wrong server returns empty
+      expect(await getOrchestrationRunsByDiscussion(db, discId, 'nonexistent-srv')).toHaveLength(0);
+    });
+  });
+
+  describe('sub_session parentSession persistence', () => {
+    const subId = 'parent-test-sub';
+
+    it('createSubSession persists parentSession', async () => {
+      await createSubSession(db, subId, serverA, 'claude-code', null, '/test', null, null, null, 'deck_proj_brain');
+      const row = await getSubSessionById(db, subId, serverA);
+      expect(row?.parent_session).toBe('deck_proj_brain');
+    });
+
+    it('upsert preserves parentSession on reconnect sync', async () => {
+      // Simulate reconnect sync — same id, same server, parentSession included
+      await createSubSession(db, subId, serverA, 'claude-code', null, '/test-updated', null, null, null, 'deck_proj_brain');
+      const row = await getSubSessionById(db, subId, serverA);
+      expect(row?.parent_session).toBe('deck_proj_brain');
+      expect(row?.cwd).toBe('/test-updated');
+    });
+  });
+
+  describe('sub_session geminiSessionId persistence', () => {
+    const subId = 'gemini-test-sub';
+
+    it('createSubSession persists geminiSessionId', async () => {
+      await createSubSession(db, subId, serverA, 'gemini', null, '/gemini', null, null, 'gemini-uuid-123');
+      const row = await getSubSessionById(db, subId, serverA);
+      expect(row?.gemini_session_id).toBe('gemini-uuid-123');
+    });
+
+    it('upsert preserves geminiSessionId on reconnect sync', async () => {
+      await createSubSession(db, subId, serverA, 'gemini', null, '/gemini', null, null, 'gemini-uuid-123');
+      const row = await getSubSessionById(db, subId, serverA);
+      expect(row?.gemini_session_id).toBe('gemini-uuid-123');
     });
   });
 });
