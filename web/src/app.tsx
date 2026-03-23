@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
+import { FileBrowser } from './components/FileBrowser.js';
 
 /** Map P2P orchestrator status to UI display state (shared logic, no hardcoded strings). */
 const P2P_DONE = new Set(['completed']);
@@ -98,6 +99,17 @@ export function App() {
   );
   const [showMobileServerMenu, setShowMobileServerMenu] = useState(false);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
+  const [showDesktopFileBrowser, setShowDesktopFileBrowser] = useState(false);
+  const [desktopFbRect, setDesktopFbRect] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem('rcc_fb_rect') || '');
+      return { x: saved.x ?? 100, y: saved.y ?? 80, w: saved.w ?? 420, h: saved.h ?? 500 };
+    } catch { return { x: 100, y: 80, w: 420, h: 500 }; }
+  });
+  const fbDragRef = useRef<{ mode: 'move' | 'resize'; startX: number; startY: number; startRect: typeof desktopFbRect } | null>(null);
+  const saveFbRect = useCallback((rect: typeof desktopFbRect) => {
+    localStorage.setItem('rcc_fb_rect', JSON.stringify(rect));
+  }, []);
   const [serverCtxMenu, setServerCtxMenu] = useState<{ server: ServerInfo; x: number; y: number } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ServerInfo | null>(null);
 
@@ -1504,6 +1516,9 @@ export function App() {
             {/* Desktop view mode toggle — mobile uses the one in mobile-server-bar */}
             {!isMobile && activeSession && (
               <div class="desktop-view-toggle">
+                <button class="view-toggle" title={trans('picker.files')} onClick={() => setShowDesktopFileBrowser(o => !o)}>
+                  📁
+                </button>
                 <button class="view-toggle" onClick={toggleViewMode}>
                   {viewMode === 'chat' ? '⌨ Terminal' : '💬 Chat'}
                 </button>
@@ -1590,6 +1605,83 @@ export function App() {
               );
             })()}
             <SessionControls ws={wsRef.current} activeSession={activeSessionInfo} inputRef={inputRef} onAfterAction={focusTerminal} onSend={(_name, text) => { addOptimisticUserMessage(text); scrollActiveToBottom(); }} onStopProject={handleStopProject} onRenameSession={() => activeSession && setRenameRequest(activeSession)} sessionDisplayName={activeSessionInfo?.project ?? null} quickData={quickData} detectedModel={activeSession ? detectedModels.get(activeSession) : undefined} hideShortcuts={false} activeThinking={!!activeThinkingTs} mobileFileBrowserOpen={showMobileFileBrowser} onMobileFileBrowserClose={() => setShowMobileFileBrowser(false)} sessions={sessions} subSessions={subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession }))} serverId={selectedServerId ?? undefined} />
+
+            {/* Desktop floating file browser */}
+            {!isMobile && showDesktopFileBrowser && wsRef.current && activeSessionInfo && (
+              <div
+                class="desktop-fb-float"
+                style={{ left: desktopFbRect.x, top: desktopFbRect.y, width: desktopFbRect.w, height: desktopFbRect.h }}
+              >
+                <div
+                  class="desktop-fb-titlebar"
+                  onMouseDown={(e: MouseEvent) => {
+                    e.preventDefault();
+                    fbDragRef.current = { mode: 'move', startX: e.clientX, startY: e.clientY, startRect: { ...desktopFbRect } };
+                    const onMove = (ev: MouseEvent) => {
+                      if (!fbDragRef.current || fbDragRef.current.mode !== 'move') return;
+                      const { startX, startY, startRect } = fbDragRef.current;
+                      setDesktopFbRect({ ...startRect, x: startRect.x + (ev.clientX - startX), y: startRect.y + (ev.clientY - startY) });
+                    };
+                    const onUp = () => {
+                      document.removeEventListener('mousemove', onMove);
+                      document.removeEventListener('mouseup', onUp);
+                      setDesktopFbRect(r => { saveFbRect(r); return r; });
+                      fbDragRef.current = null;
+                    };
+                    document.addEventListener('mousemove', onMove);
+                    document.addEventListener('mouseup', onUp);
+                  }}
+                >
+                  <span style={{ fontSize: 13, fontWeight: 600 }}>📁 {trans('picker.files')}</span>
+                  <button class="fb-close" onClick={() => setShowDesktopFileBrowser(false)}>✕</button>
+                </div>
+                <FileBrowser
+                  ws={wsRef.current}
+                  mode="file-multi"
+                  layout="panel"
+                  initialPath={activeSessionInfo.projectDir ?? '~'}
+                  changesRootPath={activeSessionInfo.projectDir ?? undefined}
+                  hideFooter={false}
+                  onConfirm={(paths) => {
+                    const cwd = activeSessionInfo.projectDir;
+                    const rel = cwd
+                      ? paths.map((p) => '@' + (p.startsWith(cwd + '/') ? p.slice(cwd.length + 1) : p) + ' ')
+                      : paths.map((p) => '@' + p + ' ');
+                    if (inputRef.current) {
+                      inputRef.current.textContent = (inputRef.current.textContent || '') + rel.join('');
+                      inputRef.current.focus();
+                    }
+                  }}
+                  onClose={() => setShowDesktopFileBrowser(false)}
+                />
+                {/* Resize handle (bottom-right corner) */}
+                <div
+                  class="desktop-fb-resize-corner"
+                  onMouseDown={(e: MouseEvent) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    fbDragRef.current = { mode: 'resize', startX: e.clientX, startY: e.clientY, startRect: { ...desktopFbRect } };
+                    const onMove = (ev: MouseEvent) => {
+                      if (!fbDragRef.current || fbDragRef.current.mode !== 'resize') return;
+                      const { startX, startY, startRect } = fbDragRef.current;
+                      setDesktopFbRect({
+                        ...startRect,
+                        w: Math.max(280, startRect.w + (ev.clientX - startX)),
+                        h: Math.max(200, startRect.h + (ev.clientY - startY)),
+                      });
+                    };
+                    const onUp = () => {
+                      document.removeEventListener('mousemove', onMove);
+                      document.removeEventListener('mouseup', onUp);
+                      setDesktopFbRect(r => { saveFbRect(r); return r; });
+                      fbDragRef.current = null;
+                    };
+                    document.addEventListener('mousemove', onMove);
+                    document.addEventListener('mouseup', onUp);
+                  }}
+                />
+              </div>
+            )}
 
             {/* Sub-session bar */}
             {selectedServerId && (

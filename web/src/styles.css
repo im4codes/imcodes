@@ -436,8 +436,13 @@ body {
 .chat-snapshot-content { background: #1e293b; border-radius: 4px; padding: 8px; font-size: 11px; overflow-x: auto; max-height: 200px; margin-top: 4px; }
 .view-toggle { background: none; border: 1px solid #475569; color: #e2e8f0; border-radius: 4px; padding: 4px 8px; cursor: pointer; font-size: 14px; }
 .view-toggle:hover { background: #334155; }
-.desktop-view-toggle { display: flex; justify-content: flex-end; padding: 2px 8px; background: #0f172a; }
+.desktop-view-toggle { display: flex; justify-content: flex-end; padding: 2px 8px; background: #0f172a; gap: 4px; }
 .desktop-view-toggle .view-toggle { font-size: 12px; padding: 2px 8px; }
+.desktop-fb-float { position: fixed; z-index: 1500; display: flex; flex-direction: column; background: #0f172a; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); overflow: hidden; }
+.desktop-fb-titlebar { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; border-bottom: 1px solid #334155; cursor: grab; flex-shrink: 0; user-select: none; }
+.desktop-fb-titlebar:active { cursor: grabbing; }
+.desktop-fb-resize-corner { position: absolute; right: 0; bottom: 0; width: 16px; height: 16px; cursor: nwse-resize; }
+.desktop-fb-resize-corner::after { content: ''; position: absolute; right: 3px; bottom: 3px; width: 8px; height: 8px; border-right: 2px solid #475569; border-bottom: 2px solid #475569; }
 
 /* ── Sub-session preview cards ────────────────────────────────────────────── */
 .subcard-bar { background: #0d1117; border-top: 1px solid #1e293b; flex-shrink: 0; }
