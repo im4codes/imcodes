@@ -38,20 +38,20 @@ export class ClaudeCodeDriver implements AgentDriver {
     const cwd = opts?.cwd ? `cd ${JSON.stringify(opts.cwd)} && ` : '';
     if (opts?.ccSessionId) {
       // Sub-session: use deterministic session ID, always fresh start for that UUID
-      return `${cwd}claude --dangerously-skip-permissions --session-id ${opts.ccSessionId}`;
+      return `${cwd}claude --dangerously-skip-permissions --trust-workspace --session-id ${opts.ccSessionId}`;
     }
     if (opts?.fresh) {
-      return `${cwd}claude --dangerously-skip-permissions`;
+      return `${cwd}claude --dangerously-skip-permissions --trust-workspace`;
     }
     // Default: resume last conversation; fall back to fresh if no history
-    return `${cwd}claude --dangerously-skip-permissions -c || claude --dangerously-skip-permissions`;
+    return `${cwd}claude --dangerously-skip-permissions --trust-workspace -c || claude --dangerously-skip-permissions --trust-workspace`;
   }
 
   buildResumeCommand(_sessionName: string, opts?: LaunchOptions): string {
     const cwd = opts?.cwd ? `cd ${JSON.stringify(opts.cwd)} && ` : '';
     if (opts?.ccSessionId) {
       // Resume specific session by UUID
-      return `${cwd}claude --dangerously-skip-permissions --resume ${opts.ccSessionId}`;
+      return `${cwd}claude --dangerously-skip-permissions --trust-workspace --resume ${opts.ccSessionId}`;
     }
     return this.buildLaunchCommand(_sessionName, opts);
   }
