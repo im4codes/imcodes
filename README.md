@@ -1,6 +1,6 @@
 # IM.codes
 
-A chat interface built for talking to AI coding agents. Not Slack, not Discord, not Telegram — something actually designed for the job.
+A purpose-built interface for managing AI coding agents. Remote terminal, multi-agent orchestration, and session management — from any device.
 
 ## Screenshots
 
@@ -25,24 +25,37 @@ A chat interface built for talking to AI coding agents. Not Slack, not Discord, 
 
 ## Why
 
-Every existing chat tool is built for humans talking to humans. When you're working with Claude Code, Codex, or Gemini CLI, you need terminal output, diff views, session management, multi-agent coordination — none of which fit into a 4096-char message box with emoji reactions.
+AI coding agents live in terminals. Managing them means SSH sessions, split panes, copy-pasting between windows. It doesn't scale — not across machines, not from a phone, and definitely not when you're running multiple agents on a single task.
 
-I wanted a tool I could fully customize. Something that speaks the language of code, not social media. So I built one.
+IM.codes gives you a single control plane: remote terminals that work like SSH without the SSH, a chat layer that understands agent output, and multi-agent workflows that let you pit different models against each other.
 
 This is a personal project. I haven't written any code myself — it was built almost entirely by [Claude Code](https://github.com/anthropics/claude-code), with significant contributions from [Codex](https://github.com/openai/codex) and [Gemini CLI](https://github.com/google-gemini/gemini-cli).
 
-## What it does
+## Features
 
-- **Remote agent control** — Talk to your agents from a browser or phone. No SSH, no VPN.
-- **Terminal + Chat modes** — Switch between raw terminal (the native CLI experience) and a structured chat view.
-- **Multi-server, multi-session** — Manage agents across machines from one dashboard.
-- **Real-time streaming** — Live terminal output, no message limits, no rate throttling.
-- **Sub-sessions** — Spawn additional agents from within a session. Run parallel tasks with full visibility.
-- **P2P multi-agent discussions** — Route a topic through multiple agents in sequence. Each agent reads prior contributions and adds their own. Supports discuss, audit, review, and brainstorm modes. Works across Claude Code, Codex, and Gemini CLI — including sandboxed agents.
-- **File upload & download** — Upload files from browser or phone (including camera). Files are relayed to the daemon and referenced in chat with `@path`. Download project files directly from the built-in file browser.
-- **Push notifications** — Get notified on your phone when an agent needs attention.
-- **OTA updates** — Daemon self-upgrades via npm. Trigger from the web UI for one device or all devices at once.
-- **Fully customizable** — It's your UI. Add whatever you need — diff viewers, approval flows, custom scripts.
+### Remote Terminal
+
+Full terminal access to your agent sessions from any browser — no SSH, no VPN, no port forwarding. Switch between raw terminal mode (the native CLI experience) and a structured chat view with parsed tool calls, thinking blocks, and streaming output. Real-time PTY streaming with zero message limits.
+
+### Multi-Agent Discussions & Audit
+
+Single-model output shouldn't be trusted blindly. Spawn quick discussion rounds where multiple agents — across different providers — review, audit, or brainstorm on the same topic. Each agent reads prior contributions and adds their own. Modes include `discuss`, `audit`, `review`, and `brainstorm`. Works across Claude Code, Codex, and Gemini CLI, including sandboxed agents.
+
+### Multi-Server, Multi-Session Management
+
+Connect multiple dev machines to one dashboard. Each machine runs a lightweight daemon that manages local agent sessions via tmux. See all servers and sessions at a glance — start, stop, restart, or switch between them instantly. Sub-sessions let you spawn additional agents from within a running session for parallel tasks.
+
+### File Transfer
+
+Upload files from browser or phone (including camera capture). Files are relayed to the daemon and referenced in chat with `@path`. Download project files directly from the built-in file browser.
+
+### Mobile & Notifications
+
+Full mobile support with biometric auth. Push notifications when an agent finishes a task or needs attention — so you don't have to watch a spinner.
+
+### OTA Updates
+
+Daemon self-upgrades via npm. Trigger from the web UI for one device or all devices at once.
 
 ## Architecture
 
@@ -74,7 +87,7 @@ imcodes bind https://app.im.codes/bind/<api-key>
 
 This binds your machine, starts the daemon, and registers it as a system service.
 
-## Self-Host (One-Click Deploy)
+## Self-Host
 
 Deploy your own IM.codes server with Docker Compose. Includes automatic HTTPS via Caddy and auto-updates via Watchtower.
 
@@ -84,19 +97,21 @@ git clone https://github.com/im4codes/imcodes.git
 cd imcodes
 cp .env.example .env
 
-# 2. Edit .env — set your domain and generate secrets
+# 2. Edit .env — set your domain, admin password, and secrets
 #    DOMAIN=im.example.com
+#    DEFAULT_ADMIN_PASSWORD=your-secure-password
 #    POSTGRES_PASSWORD=$(openssl rand -hex 16)
 #    JWT_SIGNING_KEY=$(openssl rand -hex 32)
-#    BOT_ENCRYPTION_KEY=$(openssl rand -hex 32)
 
 # 3. Start
 docker compose up -d
 ```
 
-That's it. Caddy automatically provisions a Let's Encrypt certificate for your domain. Watchtower checks for new images every 5 minutes and updates automatically.
+Caddy automatically provisions a Let's Encrypt certificate for your domain. Watchtower checks for new images every 5 minutes and updates automatically.
 
-Point your DNS A record to the server IP, then visit `https://your-domain`. Default login: `admin` / password shown in `docker compose logs server` on first run.
+Point your DNS A record to the server IP, then visit `https://your-domain`.
+
+Login with `admin` and the password you set in `DEFAULT_ADMIN_PASSWORD`. If not set, a random password is generated on first run — check `docker compose logs server` to find it.
 
 After logging in, bind your dev machine:
 

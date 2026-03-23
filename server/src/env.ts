@@ -81,7 +81,7 @@ export interface Env extends EnvConfig {
 
 /** Parse and validate env from process.env. Exits on missing required vars. */
 export function loadEnv(): EnvConfig {
-  const required = ['DATABASE_URL', 'JWT_SIGNING_KEY', 'BOT_ENCRYPTION_KEY'] as const;
+  const required = ['DATABASE_URL', 'JWT_SIGNING_KEY'] as const;
   for (const key of required) {
     if (!process.env[key]) {
       console.error(`[startup] Missing required environment variable: ${key}`);
@@ -92,7 +92,7 @@ export function loadEnv(): EnvConfig {
   return {
     DATABASE_URL: process.env.DATABASE_URL!,
     JWT_SIGNING_KEY: process.env.JWT_SIGNING_KEY!,
-    BOT_ENCRYPTION_KEY: process.env.BOT_ENCRYPTION_KEY!,
+    BOT_ENCRYPTION_KEY: process.env.BOT_ENCRYPTION_KEY ?? '',
     GITHUB_CLIENT_ID: process.env.GITHUB_CLIENT_ID,
     GITHUB_CLIENT_SECRET: process.env.GITHUB_CLIENT_SECRET,
     SERVER_URL: process.env.SERVER_URL ?? `http://localhost:${process.env.PORT ?? 3000}`,
