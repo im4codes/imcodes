@@ -15,7 +15,9 @@ import logger from '../util/logger.js';
 
 export const pushRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
-pushRoutes.use('/*', requireAuth());
+// Auth required for register/unregister but NOT for relay (self-hosted servers call relay without auth)
+pushRoutes.use('/register', requireAuth());
+pushRoutes.use('/unregister', requireAuth());
 
 // POST /api/push/register — store device token for user
 pushRoutes.post('/register', async (c) => {
