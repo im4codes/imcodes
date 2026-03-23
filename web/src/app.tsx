@@ -1230,6 +1230,20 @@ export function App() {
     } catch { /* ignore */ }
   }, [setActiveSession]);
 
+  // Push notification tap → navigate to the right server + session
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { serverId: sid, session } = (e as CustomEvent).detail ?? {};
+      if (sid) handleSelectServer(sid);
+      if (session) {
+        localStorage.setItem('rcc_session', session);
+        setActiveSession(session);
+      }
+    };
+    window.addEventListener('deck:navigate', handler);
+    return () => window.removeEventListener('deck:navigate', handler);
+  }, [handleSelectServer, setActiveSession]);
+
   const handleBackToDashboard = useCallback(() => {
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');

@@ -36,10 +36,11 @@ export async function initPushNotifications(
 
   PushNotifications.addListener('pushNotificationActionPerformed', (action: { notification: { data: unknown } }) => {
     console.log('Push action:', action);
-    // Navigate based on action data (e.g., to specific session)
     const data = action.notification.data as Record<string, string> | undefined;
-    if (data?.sessionName) {
-      window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { sessionName: data.sessionName } }));
+    if (data?.serverId || data?.session) {
+      window.dispatchEvent(new CustomEvent('deck:navigate', {
+        detail: { serverId: data.serverId, session: data.session },
+      }));
     }
   });
 }
