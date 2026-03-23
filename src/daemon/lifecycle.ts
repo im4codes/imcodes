@@ -92,16 +92,20 @@ async function syncSessionsFromWorker(workerUrl: string, serverId: string, token
     let count = 0;
     for (const s of data.sessions) {
       if (s.state === 'stopped') continue; // skip stopped sessions
+      const existing = getSession(s.name);
+      // Merge with existing local record to preserve fields not stored in server DB
+      // (ccSessionId, codexSessionId, geminiSessionId, restarts, etc.)
       upsertSession({
+        ...(existing ?? {}),
         name: s.name,
         projectName: s.project_name,
         role: s.role as 'brain' | `w${number}`,
         agentType: s.agent_type,
         projectDir: s.project_dir,
         state: s.state as import('../store/session-store.js').SessionState,
-        restarts: 0,
-        restartTimestamps: [],
-        createdAt: Date.now(),
+        restarts: existing?.restarts ?? 0,
+        restartTimestamps: existing?.restartTimestamps ?? [],
+        createdAt: existing?.createdAt ?? Date.now(),
         updatedAt: Date.now(),
       });
       count++;
@@ -419,6 +423,18 @@ function startHealthPoller(): void {
     const sessions = listSessions();
     for (const s of sessions) {
       if (s.state === 'stopped' || s.state === 'error') continue;
+      // Sub-sessions are ephemeral — managed by P2P orchestrator / web UI.
+      // Don't auto-restart them; mark as stopped if their tmux session is gone.
+      if (s.name.startsWith('deck_sub_')) {
+        try {
+          const exists = await sessionExists(s.name);
+          if (!exists) {
+            logger.info({ session: s.name }, 'Sub-session gone, marking stopped');
+            upsertSession({ ...s, state: 'stopped', updatedAt: Date.now() });
+          }
+        } catch { /* ignore */ }
+        continue;
+      }
       try {
         const exists = await sessionExists(s.name);
         if (!exists) {

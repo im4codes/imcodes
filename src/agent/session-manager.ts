@@ -222,7 +222,11 @@ export async function restoreFromStore(): Promise<void> {
     if (s.name.startsWith('deck_sub_')) {
       const isLive = live.includes(s.name);
       logger.info({ session: s.name, agentType: s.agentType, isLive, codexSessionId: s.codexSessionId ?? null }, 'Restoring sub-session watcher');
-      if (!isLive) continue;
+      if (!isLive) {
+        // Mark dead sub-sessions as stopped so the health poller doesn't restart them
+        upsertSession({ ...s, state: 'stopped', updatedAt: Date.now() });
+        continue;
+      }
       if (s.agentType === 'claude-code' && s.ccSessionId && s.projectDir && !isWatching(s.name)) {
         startCCWatcher(s.name, s.projectDir, s.ccSessionId);
       } else if (s.agentType === 'codex' && s.codexSessionId && !isCodexWatching(s.name)) {

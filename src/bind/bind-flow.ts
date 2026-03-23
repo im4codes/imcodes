@@ -237,6 +237,7 @@ After=network.target
 ExecStart=${nodeExec} ${script} start --foreground
 Restart=always
 RestartSec=5
+KillMode=process
 Environment=PATH=${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}
 Environment=HOME=${homedir()}
 StandardOutput=append:${logPath}

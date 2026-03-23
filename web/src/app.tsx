@@ -374,6 +374,7 @@ export function App() {
   const [connecting, setConnecting] = useState(false);
   const [daemonOnline, setDaemonOnline] = useState(false);
   const sessionListRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const stoppedNavTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [idleAlerts, setIdleAlerts] = useState<Set<string>>(new Set());
   const [activeTools, setActiveTools] = useState<Map<string, string>>(new Map());
@@ -626,6 +627,21 @@ export function App() {
             }
             return prev.map((s) => s.name === msg.session ? { ...s, state: msg.state as SessionInfo['state'] } : s);
           });
+          // Active session stopped → navigate back after a short grace period
+          // (allows restart to re-create the session before navigating away)
+          if (msg.event === 'stopped' && msg.session === activeSessionRef.current) {
+            if (stoppedNavTimerRef.current) clearTimeout(stoppedNavTimerRef.current);
+            stoppedNavTimerRef.current = setTimeout(() => {
+              stoppedNavTimerRef.current = null;
+              if (activeSessionRef.current === msg.session) {
+                setActiveSession(null);
+              }
+            }, 3000);
+          }
+          if (msg.event === 'started' && stoppedNavTimerRef.current) {
+            clearTimeout(stoppedNavTimerRef.current);
+            stoppedNavTimerRef.current = null;
+          }
         }
       }
       if (msg.type === 'session_list') {
@@ -635,7 +651,8 @@ export function App() {
         setServers((prev) => prev.map((s) =>
           s.id === selectedServerId ? { ...s, lastHeartbeatAt: Date.now() } : s,
         ));
-        setSessions((prev) => msg.sessions.filter((s) => !s.name.startsWith('deck_sub_')).map((s) => {
+        const newSessions = msg.sessions.filter((s) => !s.name.startsWith('deck_sub_'));
+        setSessions((prev) => newSessions.map((s) => {
           const existing = prev.find((p) => p.name === s.name);
           return {
             name: s.name,
@@ -648,6 +665,10 @@ export function App() {
           };
         }));
         setSessionsLoaded(true);
+        // If active session disappeared from the list, navigate back
+        if (activeSessionRef.current && !newSessions.some((s) => s.name === activeSessionRef.current)) {
+          setActiveSession(null);
+        }
       }
       if (msg.type === 'terminal.diff') {
         const apply = diffApplyersRef.current.get(msg.diff.sessionName);
