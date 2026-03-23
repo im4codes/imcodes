@@ -25,6 +25,14 @@ scripts/deploy.sh
 # Discussion and plans (private)
 docs/plan/
 
+# Claude Code skills/agents cache
+web/.agents/
+web/skills/
+web/skills-lock.json
+
+# Legacy discussion files
+imc_files/
+
 # Server deployment config — contains IPs, domains, env var values (private)
 docs/*.local.md
 
