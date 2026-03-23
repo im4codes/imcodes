@@ -970,11 +970,13 @@ export function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected, subSessionNamesKey]);
 
-  // When switching to a session in terminal mode, trigger fit (display:none → flex needs refit)
+  // When switching to a session in terminal mode, trigger fit + full refresh
   useEffect(() => {
     if (!activeSession || viewMode !== 'terminal') return;
     requestAnimationFrame(() => {
       termFitFnsRef.current.get(activeSession)?.();
+      // Request full screen snapshot so terminal content is up-to-date
+      try { wsRef.current?.sendSnapshotRequest(activeSession); } catch { /* ignore */ }
     });
   }, [activeSession, viewMode]);
 
