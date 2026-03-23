@@ -26,7 +26,7 @@ const REPOS = {
   vscode: { owner: 'microsoft', repo: 'vscode' },
 } as const;
 
-describe.skipIf(!ghAvailable)('GitHubProvider integration — facebook/react', () => {
+describe.skipIf(!ghAvailable)('GitHubProvider integration — facebook/react', { retry: 2 }, () => {
   const provider = new GitHubProvider(REPOS.react.owner, REPOS.react.repo, process.cwd());
 
   describe('listIssues', () => {
@@ -172,7 +172,7 @@ describe.skipIf(!ghAvailable)('GitHubProvider integration — facebook/react', (
   });
 });
 
-describe.skipIf(!ghAvailable)('GitHubProvider integration — microsoft/vscode', () => {
+describe.skipIf(!ghAvailable)('GitHubProvider integration — microsoft/vscode', { retry: 2 }, () => {
   const provider = new GitHubProvider(REPOS.vscode.owner, REPOS.vscode.repo, process.cwd());
 
   it('lists issues from vscode', async () => {
