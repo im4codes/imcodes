@@ -26,9 +26,17 @@ export function csrfMiddleware() {
     // Safe methods pass through
     if (SAFE_METHODS.has(method)) { await next(); return; }
 
-    // Passkey endpoints use challenge-response which is inherently CSRF-safe
     const path = new URL(c.req.url).pathname;
+
+    // Passkey endpoints use challenge-response which is inherently CSRF-safe
     if (path.startsWith('/api/auth/passkey/')) { await next(); return; }
+
+    // Logout must work even when CSRF token is stale/missing — otherwise
+    // users get stuck in a broken session they can't escape
+    if (path === '/api/auth/logout') { await next(); return; }
+
+    // Password login sets its own session — no existing session to CSRF-attack
+    if (path === '/api/auth/password/login') { await next(); return; }
 
     // Bearer auth (API key, daemon, CLI) skips CSRF — not a browser session
     const authHeader = c.req.header('Authorization');
