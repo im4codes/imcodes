@@ -60,6 +60,9 @@ export interface EnvConfig {
   // FCM push notifications (Android)
   FCM_SERVER_KEY?: string;
 
+  // Push relay for self-hosted servers without APNs keys (default: https://app.im.codes)
+  PUSH_RELAY_URL?: string;
+
   // Password auth
   /** Default admin password when auto-creating admin user. Default: 'imcodes' */
   DEFAULT_ADMIN_PASSWORD?: string;
@@ -108,6 +111,7 @@ export function loadEnv(): EnvConfig {
     APNS_TEAM_ID: process.env.APNS_TEAM_ID,
     APNS_BUNDLE_ID: process.env.APNS_BUNDLE_ID ?? 'app.imcodes',
     FCM_SERVER_KEY: process.env.FCM_SERVER_KEY,
+    PUSH_RELAY_URL: process.env.PUSH_RELAY_URL,
     DEFAULT_ADMIN_PASSWORD: process.env.DEFAULT_ADMIN_PASSWORD,
     LANDING_HOST: process.env.LANDING_HOST,
     NODE_ENV: process.env.NODE_ENV,

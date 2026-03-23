@@ -50,6 +50,39 @@ pushRoutes.delete('/unregister', async (c) => {
   return c.json({ ok: true });
 });
 
+// ── Push relay for self-hosted servers ─────────────────────────────────────────
+// Self-hosted servers don't have APNs keys. They call this endpoint to relay
+// push notifications through app.im.codes which owns the APNs credentials.
+// No auth required — validation is implicit: if the device token is invalid,
+// APNs rejects it and we return the error.
+
+pushRoutes.post('/relay', async (c) => {
+  const body = await c.req.json<{ token: string; platform: string; title: string; body: string; data?: Record<string, string> }>().catch(() => null);
+  if (!body?.token || !body?.platform || !body?.title) {
+    return c.json({ error: 'token, platform, title, body required' }, 400);
+  }
+
+  // Only relay if this server has APNs configured
+  if (!c.env.APNS_KEY || !c.env.APNS_KEY_ID || !c.env.APNS_TEAM_ID) {
+    return c.json({ error: 'push relay not available on this server' }, 503);
+  }
+
+  try {
+    if (body.platform === 'ios') {
+      await sendApns(body.token, { userId: '', title: body.title, body: body.body, data: body.data }, c.env);
+      return c.json({ ok: true });
+    } else if (body.platform === 'android' && c.env.FCM_SERVER_KEY) {
+      await sendFcm(body.token, { userId: '', title: body.title, body: body.body, data: body.data }, c.env.FCM_SERVER_KEY);
+      return c.json({ ok: true });
+    }
+    return c.json({ error: 'unsupported platform' }, 400);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const unregistered = err instanceof PushError && err.unregistered;
+    return c.json({ error: msg, unregistered }, unregistered ? 410 : 502);
+  }
+});
+
 // ── Push dispatch ─────────────────────────────────────────────────────────────
 
 export interface PushPayload {
@@ -91,20 +124,47 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | PgDataba
 
   if (tokens.length === 0) return;
 
+  const hasApns = !!(env.APNS_KEY && env.APNS_KEY_ID && env.APNS_TEAM_ID);
+  const relayUrl = hasApns ? null : (env.PUSH_RELAY_URL || 'https://app.im.codes');
+
   for (const { token, platform } of tokens) {
     try {
-      if (platform === 'ios') {
+      if (relayUrl) {
+        // Self-hosted: relay through central server
+        await relayPush(relayUrl, token, platform, payload);
+      } else if (platform === 'ios' && hasApns) {
         await sendApns(token, payload, env);
       } else if (platform === 'android' && env.FCM_SERVER_KEY) {
         await sendFcm(token, payload, env.FCM_SERVER_KEY);
       }
     } catch (err) {
-      logger.warn({ token: token.slice(0, 10) + '...', platform, err }, 'Push dispatch failed');
-      // Remove invalid tokens (APNs 410 = unregistered)
+      logger.warn({ token: token.slice(0, 10) + '...', platform, err: err instanceof Error ? err.message : err }, 'Push dispatch failed');
       if (err instanceof PushError && err.unregistered) {
         await db.prepare('DELETE FROM push_tokens WHERE token = ?').bind(token).run().catch(() => {});
       }
     }
+  }
+}
+
+/** Relay push through a central server (for self-hosted instances without APNs keys). */
+async function relayPush(relayBaseUrl: string, token: string, platform: string, payload: PushPayload): Promise<void> {
+  const res = await fetch(`${relayBaseUrl}/api/push/relay`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      token,
+      platform,
+      title: payload.title,
+      body: payload.body,
+      data: payload.data,
+    }),
+    signal: AbortSignal.timeout(10_000),
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    const unregistered = res.status === 410;
+    throw new PushError(`Relay ${res.status}: ${body}`, unregistered);
   }
 }
 
