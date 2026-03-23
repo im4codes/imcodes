@@ -142,6 +142,7 @@ export class WsBridge {
   private authenticated = false;
   private daemonVersion: string | null = null;
   private browserSockets = new Set<WebSocket>();
+  private mobileSockets = new Set<WebSocket>();
   private queue: string[] = [];
   private authTimer: ReturnType<typeof setTimeout> | null = null;
   private browserRateLimiter = new MemoryRateLimiter();
@@ -345,9 +346,10 @@ export class WsBridge {
 
   // ── Browser connection ─────────────────────────────────────────────────────
 
-  handleBrowserConnection(ws: WebSocket, userId: string, db: PgDatabase): void {
+  handleBrowserConnection(ws: WebSocket, userId: string, db: PgDatabase, isMobile = false): void {
     this.db = db;
     this.browserSockets.add(ws);
+    if (isMobile) this.mobileSockets.add(ws);
     this.browserSubscriptions.set(ws, new Set());
     this.browserUserIds.set(ws, userId);
 
@@ -896,6 +898,7 @@ export class WsBridge {
 
   private cleanupBrowserSocket(ws: WebSocket): void {
     this.browserSockets.delete(ws);
+    this.mobileSockets.delete(ws);
     this.browserUserIds.delete(ws);
     const sessions = this.browserSubscriptions.get(ws);
     if (sessions) {
@@ -1032,6 +1035,9 @@ export class WsBridge {
   // ── Push notifications ──────────────────────────────────────────────────────
 
   private async dispatchEventPush(db: PgDatabase, env: Env, msg: Record<string, unknown>): Promise<void> {
+    // Skip push if mobile app is in foreground (user is actively watching)
+    if (this.mobileSockets.size > 0) return;
+
     const server = await db.prepare('SELECT user_id FROM servers WHERE id = ?').bind(this.serverId).first<{ user_id: string }>();
     if (!server) return;
 

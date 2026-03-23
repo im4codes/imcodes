@@ -344,8 +344,10 @@ function setupWebSocketUpgrade(server: import('node:http').Server, env: Env) {
       }
 
       const userId = payload.sub as string;
+      const ua = (req.headers['user-agent'] ?? '').toLowerCase();
+      const isMobile = /iphone|ipad|android|mobile/.test(ua);
       wss.handleUpgrade(req, socket, head, (ws) => {
-        WsBridge.get(serverId).handleBrowserConnection(ws, userId, env.DB);
+        WsBridge.get(serverId).handleBrowserConnection(ws, userId, env.DB, isMobile);
       });
     }
   });
