@@ -87,6 +87,10 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
+      - name: Install tmux
+        run: brew install tmux
+      - name: Prime tmux server
+        run: tmux new-session -d -s init && tmux kill-session -t init
       - run: npm ci
       - run: npm run test:unit
 
