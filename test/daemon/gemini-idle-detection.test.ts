@@ -16,7 +16,7 @@ vi.mock('../../src/util/logger.js', () => ({
 
 vi.mock('fs/promises', () => ({
   readFile: vi.fn(),
-  stat: vi.fn().mockResolvedValue({ mtimeMs: 1000 }),
+  stat: vi.fn().mockResolvedValue({ mtimeMs: 1000, size: 100 }),
 }));
 
 vi.mock('../../src/agent/tmux.js', () => ({
@@ -179,6 +179,7 @@ describe('Gemini spinner detection (braille at col 0)', () => {
       lastConversationStatus: 'idle',
       idleConfirmCount: 2,
       _lastMtimeMs: 1000,
+      _lastSize: 100,
     };
     vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify(idleConv));
   });
@@ -266,5 +267,74 @@ describe('Gemini spinner detection (braille at col 0)', () => {
       .map(c => (c[2] as any).state);
 
     expect(states).toContain('idle');
+  });
+});
+
+// ── File size change detection + parse failure bias ───────────────────────────
+
+describe('Gemini JSON change detection hardening', () => {
+  const sid = 'session-change-test';
+  let state: WatcherState;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    state = {
+      sessionUuid: 'uuid-1',
+      activeFile: '/tmp/session.json',
+      seenCount: 1,
+      lastUpdated: '2026-03-14T10:00:00Z',
+      abort: new AbortController(),
+      watchAbort: new AbortController(),
+      stopped: false,
+      polling: false,
+      currentState: 'idle',
+      lastConversationStatus: 'idle',
+      idleConfirmCount: 2,
+      _lastMtimeMs: 1000,
+      _lastSize: 100,
+    };
+    vi.mocked(tmux.capturePane).mockResolvedValue(['', '> ', '']);
+  });
+
+  it('detects change when size differs even if mtime is same', async () => {
+    const { stat: statMock } = await import('fs/promises');
+    vi.mocked(statMock).mockResolvedValue({ mtimeMs: 1000, size: 200 } as any);
+
+    const growingConv = {
+      lastUpdated: '2026-03-14T10:00:01Z',
+      messages: [
+        { type: 'gemini', content: 'Still writing...', timestamp: '2026-03-14T10:00:01Z' },
+      ],
+    };
+    vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify(growingConv));
+
+    await pollTick(sid, state);
+
+    const states = vi.mocked(timelineEmitter.emit).mock.calls
+      .filter(c => c[1] === 'session.state')
+      .map(c => (c[2] as any).state);
+
+    expect(states).toContain('running');
+  });
+
+  it('biases toward running when JSON parse fails on changed file', async () => {
+    const { stat: statMock } = await import('fs/promises');
+    vi.mocked(statMock).mockResolvedValue({ mtimeMs: 1001, size: 150 } as any);
+    vi.mocked(fs.readFile).mockResolvedValue('{ "messages": [ INCOMPLETE');
+
+    await pollTick(sid, state);
+
+    expect(state.currentState).toBe('running');
+  });
+
+  it('stays on unchanged path when both mtime and size match', async () => {
+    const { stat: statMock } = await import('fs/promises');
+    vi.mocked(statMock).mockResolvedValue({ mtimeMs: 1000, size: 100 } as any);
+
+    vi.mocked(fs.readFile).mockRejectedValue(new Error('should not be called'));
+
+    await pollTick(sid, state);
+
+    expect(state.currentState).toBe('idle');
   });
 });

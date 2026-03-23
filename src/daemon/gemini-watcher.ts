@@ -131,6 +131,8 @@ export interface WatcherState {
   spinnerFrameCount?: number;
   /** Last known mtime of activeFile — used as cheap change check before full read. */
   _lastMtimeMs?: number;
+  /** Last known file size — supplements mtime to catch same-ms writes. */
+  _lastSize?: number;
 }
 
 const watchers = new Map<string, WatcherState>();
@@ -316,11 +318,14 @@ async function pollTickInner(sessionName: string, state: WatcherState): Promise<
     if (found) { state.activeFile = found; claimedFiles.set(found, sessionName); } else return;
   }
 
-  // Cheap change check: skip full read if file mtime hasn't changed
+  // Cheap change check: skip full read if file mtime AND size haven't changed.
+  // Size check catches same-millisecond writes that mtime misses.
   try {
     const s = await stat(state.activeFile!);
-    if (state._lastMtimeMs !== undefined && s.mtimeMs === state._lastMtimeMs) {
-      // File unchanged on disk — run terminal spinner check (ground truth),
+    const mtimeUnchanged = state._lastMtimeMs !== undefined && s.mtimeMs === state._lastMtimeMs;
+    const sizeUnchanged = state._lastSize !== undefined && s.size === state._lastSize;
+    if (mtimeUnchanged && sizeUnchanged) {
+      // File truly unchanged — run terminal spinner check (ground truth),
       // then idle detection if JSON also says idle. Skip expensive JSON read/parse.
       await terminalThinkingCheck(sessionName, state);
       // If spinner confirmed running, skip idle logic
@@ -336,12 +341,20 @@ async function pollTickInner(sessionName: string, state: WatcherState): Promise<
       return;
     }
     state._lastMtimeMs = s.mtimeMs;
+    state._lastSize = s.size;
   } catch {
     // stat failed — fall through to full read attempt
   }
 
   const conv = await readConversation(state.activeFile!, sessionName);
-  if (!conv) return;
+  if (!conv) {
+    // Parse failed but file just changed (mtime/size different) — Gemini is likely mid-write.
+    // Bias toward running to prevent false idle during large tool outputs.
+    if (state.currentState !== 'running') {
+      transitionState(sessionName, state, 'running');
+    }
+    return;
+  }
   const conversationStatus = inferConversationStatus(conv);
   state.lastConversationStatus = conversationStatus;
 
@@ -413,6 +426,7 @@ function activateFile(sessionName: string, state: WatcherState, newFile: string)
   state.seenCount = 0;
   state.lastUpdated = '';
   state._lastMtimeMs = undefined;
+  state._lastSize = undefined;
   state._terminalThinkingEmitted = false;
   state.idleConfirmCount = 0;
   if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
