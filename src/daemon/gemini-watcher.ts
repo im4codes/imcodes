@@ -234,6 +234,12 @@ async function terminalThinkingCheck(sessionName: string, state: WatcherState): 
       transitionState(sessionName, state, 'idle');
       return;
     }
+    // JSON says running (last message is user type, or pending tool call) —
+    // agent MUST respond. Trust JSON over terminal; don't debounce to idle.
+    if (state.lastConversationStatus === 'running') {
+      return;
+    }
+    // JSON status unknown/null — terminal idle might be correct, use debounce
     if (state.currentState === 'running' && !state.idleDebounceTimer) {
       state.idleDebounceTimer = setTimeout(() => {
         state.idleDebounceTimer = undefined;

@@ -183,8 +183,8 @@ export async function initOnStartup(): Promise<void> {
   await cleanupOrphanFifos();
 }
 
-/** Extract ccSessionId from tmux pane start command (supports both --session-id and --resume). */
-async function extractCcSessionIdFromPane(sessionName: string): Promise<string | undefined> {
+/** Extract a UUID from tmux pane start command (supports --session-id and --resume). */
+async function extractSessionUuidFromPane(sessionName: string): Promise<string | undefined> {
   try {
     const cmd = await getPaneStartCommand(sessionName);
     const match = cmd.match(/(?:--session-id|--resume)\s+([0-9a-f-]{36})/);
@@ -193,6 +193,11 @@ async function extractCcSessionIdFromPane(sessionName: string): Promise<string |
     return undefined;
   }
 }
+
+/** Extract ccSessionId from tmux pane start command. */
+const extractCcSessionIdFromPane = extractSessionUuidFromPane;
+/** Extract geminiSessionId from tmux pane start command (gemini --resume <uuid>). */
+const extractGeminiSessionIdFromPane = extractSessionUuidFromPane;
 
 /** Infer agent type from tmux pane start command. */
 async function inferAgentTypeFromPane(sessionName: string): Promise<AgentType> {
@@ -241,8 +246,17 @@ export async function restoreFromStore(): Promise<void> {
           }
         }).catch((e) => logger.warn({ err: e, session: s.name }, 'Sub-session codex watcher findRollout failed'));
       } else if (s.agentType === 'gemini' && !isGeminiWatching(s.name)) {
-        if (s.geminiSessionId) {
-          startGeminiWatching(s.name, s.geminiSessionId);
+        let gemId = s.geminiSessionId;
+        if (!gemId) {
+          gemId = await extractGeminiSessionIdFromPane(s.name);
+          if (gemId) {
+            upsertSession({ ...s, geminiSessionId: gemId });
+            emitSessionPersist({ ...s, geminiSessionId: gemId }, s.name);
+            logger.info({ session: s.name, geminiSessionId: gemId }, 'Backfilled missing geminiSessionId from tmux');
+          }
+        }
+        if (gemId) {
+          startGeminiWatching(s.name, gemId);
         }
       }
       continue;
@@ -307,8 +321,18 @@ export async function restoreFromStore(): Promise<void> {
         );
       }
     } else if (hydrated.agentType === 'gemini' && !isGeminiWatching(hydrated.name)) {
-      if (hydrated.geminiSessionId) {
-        startGeminiWatching(hydrated.name, hydrated.geminiSessionId).catch((e) =>
+      let gemId = hydrated.geminiSessionId;
+      if (!gemId) {
+        gemId = await extractGeminiSessionIdFromPane(hydrated.name);
+        if (gemId) {
+          hydrated = { ...hydrated, geminiSessionId: gemId };
+          upsertSession(hydrated);
+          emitSessionPersist(hydrated, hydrated.name);
+          logger.info({ session: hydrated.name, geminiSessionId: gemId }, 'Backfilled missing geminiSessionId from tmux');
+        }
+      }
+      if (gemId) {
+        startGeminiWatching(hydrated.name, gemId).catch((e) =>
           logger.warn({ err: e, session: hydrated.name }, 'gemini-watcher start failed (restore)'),
         );
       } else {
