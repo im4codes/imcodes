@@ -73,6 +73,7 @@ function csrfHeaders(token: string): Record<string, string> {
 async function cleanUsers(): Promise<void> {
   await db.prepare('DELETE FROM refresh_tokens').bind().run();
   await db.prepare('DELETE FROM api_keys').bind().run();
+  await db.prepare('DELETE FROM user_quick_data').bind().run();
   await db.prepare('DELETE FROM users').bind().run();
 }
 
