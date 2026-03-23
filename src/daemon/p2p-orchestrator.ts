@@ -7,7 +7,7 @@
  */
 
 import { stat, writeFile, readFile, mkdir, unlink, copyFile } from 'node:fs/promises';
-import { join, basename } from 'node:path';
+import { join, basename, dirname } from 'node:path';
 import { imcSubDir, ensureImcDir } from '../util/imc-dir.js';
 import { randomUUID } from 'node:crypto';
 import { sendKeysDelayedEnter } from '../agent/tmux.js';
@@ -373,7 +373,8 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
   // copy the file into the target's .imc/discussions/ so sandboxed agents can access it.
   const targetRecord = getSession(session);
   const targetDir = targetRecord?.projectDir || null;
-  const sourceDir = run.contextFilePath.split('/.imc/discussions/')[0] || null;
+  // contextFilePath = /project/.imc/discussions/runId.md → sourceDir = /project
+  const sourceDir = dirname(dirname(dirname(run.contextFilePath))) || null;
   const isCrossProject = targetDir && sourceDir && targetDir !== sourceDir;
   let localCopyPath: string | null = null;
 

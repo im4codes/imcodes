@@ -128,6 +128,22 @@ function hasSpinner(lines: string[], spinners: string[]): boolean {
   });
 }
 
+/** Check if any of the last few non-empty lines starts with a braille spinner character (col 0).
+ *  This is the definitive working signal for Gemini CLI — the spinner always appears at the leftmost position. */
+function hasLeadingBrailleSpinner(lines: string[]): boolean {
+  const tail = lines.slice(-8);
+  for (let i = tail.length - 1; i >= 0; i--) {
+    const line = tail[i];
+    if (!line || !line.trim()) continue;
+    // Braille pattern dots: U+2800..U+28FF
+    const firstChar = line.charAt(0);
+    if (firstChar >= '\u2800' && firstChar <= '\u28FF') return true;
+    // Only check last few non-empty lines
+    break;
+  }
+  return false;
+}
+
 function matchesAny(text: string, patterns: RegExp[]): boolean {
   return patterns.some((p) => p.test(text));
 }
@@ -189,16 +205,16 @@ export function detectStatus(
       break;
 
     case 'gemini': {
-      const geminiHasSpinner = hasSpinner(lines, GEMINI_SPINNER_CHARS);
+      // Braille spinner at column 0 is the definitive working signal for Gemini CLI.
+      // Check the last few non-empty lines for a leading braille character.
+      const geminiLeadingSpinner = hasLeadingBrailleSpinner(lines);
+      const geminiHasSpinner = geminiLeadingSpinner || hasSpinner(lines, GEMINI_SPINNER_CHARS);
       if (matchesAny(tail, GEMINI_IDLE_PATTERNS) && !geminiHasSpinner)
         return 'idle';
-      // Use tail (not full text) to avoid matching stale output from previous turns
       if (matchesAny(tail, GEMINI_THINKING_PATTERNS)) return 'thinking';
       if (matchesAny(tail, GEMINI_TOOL_PATTERNS)) return 'tool_running';
+      if (geminiLeadingSpinner) return 'streaming'; // high-confidence: spinner at col 0
       if (geminiHasSpinner) return 'streaming';
-      // No idle prompt visible and no clear working signal → default to idle.
-      // JSON is the authoritative source for Gemini; terminal detection is supplementary.
-      // Being conservative (idle) prevents state oscillation from prompt redraws.
       break;
     }
 

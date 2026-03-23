@@ -13,6 +13,32 @@ import { resolve, join, dirname } from 'path';
 
 const { version } = JSON.parse(readFileSync(join(__dirname, '../package.json'), 'utf8')) as { version: string };
 
+/** Kill any lingering imcodes daemon processes after launchctl unload.
+ *  Uses PID file (~/.imcodes/daemon.pid) for reliable targeting. */
+function killStaleImcodesProcesses(): void {
+  const pidPath = resolve(homedir(), '.imcodes', 'daemon.pid');
+  let pid: number | null = null;
+  try {
+    const raw = readFileSync(pidPath, 'utf8').trim();
+    pid = parseInt(raw, 10);
+    if (!pid || pid <= 0 || pid === process.pid) return;
+  } catch { return; /* no PID file — nothing to kill */ }
+
+  // Check if process is actually alive
+  try { process.kill(pid, 0); } catch { return; /* already gone */ }
+
+  try { process.kill(pid, 'SIGTERM'); } catch { return; }
+
+  // Wait up to 3s for process to exit
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    try { process.kill(pid, 0); } catch { return; /* exited */ }
+    execSync('sleep 0.1');
+  }
+  // Force kill if still alive
+  try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+}
+
 /** Ensure plist/systemd service uses --foreground. Patches in-place if missing. */
 function ensureServiceForeground(): void {
   const platform = process.platform;
@@ -272,6 +298,8 @@ program
           }
           console.log('Restarting via launchctl...');
           execSync(`launchctl unload "${plist}"`, { stdio: 'inherit' });
+          // Wait for old process to fully exit before starting new one
+          killStaleImcodesProcesses();
           execSync(`launchctl load "${plist}"`, { stdio: 'inherit' });
           console.log('Done.');
         } else if (platform === 'linux') {
@@ -302,6 +330,7 @@ program
       if (!existsSync(plist)) { console.error(`Plist not found: ${plist}`); process.exit(1); }
       console.log('Restarting via launchctl...');
       execSync(`launchctl unload "${plist}"`, { stdio: 'inherit' });
+      killStaleImcodesProcesses();
       execSync(`launchctl load "${plist}"`, { stdio: 'inherit' });
     } else if (platform === 'linux') {
       const userService = resolve(homedir(), '.config/systemd/user/imcodes.service');

@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { pollTick, WatcherState } from '../../src/daemon/gemini-watcher.js';
 import * as fs from 'fs/promises';
+import * as tmux from '../../src/agent/tmux.js';
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
 
@@ -15,6 +16,11 @@ vi.mock('../../src/util/logger.js', () => ({
 
 vi.mock('fs/promises', () => ({
   readFile: vi.fn(),
+  stat: vi.fn().mockResolvedValue({ mtimeMs: 1000 }),
+}));
+
+vi.mock('../../src/agent/tmux.js', () => ({
+  capturePane: vi.fn(),
 }));
 
 describe('Gemini Idle Detection (Direct pollTick test)', () => {
@@ -134,6 +140,125 @@ describe('Gemini Idle Detection (Direct pollTick test)', () => {
     // Poll 2: unchanged → idle confirm = 1
     await pollTick(sid, state);
     // Poll 3: unchanged → idle confirm = 2 → emit idle
+    await pollTick(sid, state);
+
+    const states = vi.mocked(timelineEmitter.emit).mock.calls
+      .filter(c => c[1] === 'session.state')
+      .map(c => (c[2] as any).state);
+
+    expect(states).toContain('idle');
+  });
+});
+
+// ── Spinner ground truth detection ────────────────────────────────────────────
+
+describe('Gemini spinner detection (braille at col 0)', () => {
+  const sid = 'session-spinner-test';
+  let state: WatcherState;
+
+  // Stable idle JSON — Gemini finished responding
+  const idleConv = {
+    lastUpdated: '2026-03-14T10:00:00Z',
+    messages: [
+      { type: 'gemini', content: 'Done.', timestamp: '2026-03-14T10:00:00Z' },
+    ],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    state = {
+      sessionUuid: 'uuid-1',
+      activeFile: '/tmp/session.json',
+      seenCount: 1,
+      lastUpdated: '2026-03-14T10:00:00Z',
+      abort: new AbortController(),
+      watchAbort: new AbortController(),
+      stopped: false,
+      polling: false,
+      currentState: 'idle',
+      lastConversationStatus: 'idle',
+      idleConfirmCount: 2,
+      _lastMtimeMs: 1000,
+    };
+    vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify(idleConv));
+  });
+
+  function spinnerLines(): string[] {
+    return ['', '⠹ Thinking...', '', ''];
+  }
+
+  function idleLines(): string[] {
+    return ['', 'Done.', '', '> ', ''];
+  }
+
+  it('confirms working state when spinner seen in majority of burst reads', async () => {
+    // capturePane returns spinner lines on all calls (burst confirmation succeeds)
+    vi.mocked(tmux.capturePane).mockResolvedValue(spinnerLines());
+
+    await pollTick(sid, state);
+
+    const states = vi.mocked(timelineEmitter.emit).mock.calls
+      .filter(c => c[1] === 'session.state')
+      .map(c => (c[2] as any).state);
+
+    expect(states).toContain('running');
+  });
+
+  it('emits assistant.thinking with terminal-spinner source on confirmed spinner', async () => {
+    vi.mocked(tmux.capturePane).mockResolvedValue(spinnerLines());
+
+    await pollTick(sid, state);
+
+    const thinkingCalls = vi.mocked(timelineEmitter.emit).mock.calls
+      .filter(c => c[1] === 'assistant.thinking');
+
+    expect(thinkingCalls.length).toBeGreaterThan(0);
+    expect(thinkingCalls[0][3]).toMatchObject({ source: 'terminal-spinner', confidence: 'high' });
+  });
+
+  it('does NOT transition to running on single-frame spinner (burst fails)', async () => {
+    // First call: spinner. Subsequent burst reads: idle (2/6 spinner = below threshold)
+    let callCount = 0;
+    vi.mocked(tmux.capturePane).mockImplementation(async () => {
+      callCount++;
+      return callCount === 1 ? spinnerLines() : idleLines();
+    });
+
+    await pollTick(sid, state);
+
+    const states = vi.mocked(timelineEmitter.emit).mock.calls
+      .filter(c => c[1] === 'session.state')
+      .map(c => (c[2] as any).state);
+
+    expect(states).not.toContain('running');
+  });
+
+  it('spinner overrides JSON idle status (ground truth)', async () => {
+    // JSON says idle, but terminal shows spinner consistently → must be running
+    state.lastConversationStatus = 'idle';
+    state.currentState = 'idle';
+    vi.mocked(tmux.capturePane).mockResolvedValue(spinnerLines());
+
+    await pollTick(sid, state);
+
+    const states = vi.mocked(timelineEmitter.emit).mock.calls
+      .filter(c => c[1] === 'session.state')
+      .map(c => (c[2] as any).state);
+
+    expect(states).toContain('running');
+  });
+
+  it('returns to idle when spinner disappears', async () => {
+    // First tick: spinner confirmed → running
+    vi.mocked(tmux.capturePane).mockResolvedValue(spinnerLines());
+    await pollTick(sid, state);
+
+    vi.clearAllMocks();
+    vi.mocked(fs.readFile).mockResolvedValue(JSON.stringify(idleConv));
+
+    // Next ticks: no spinner, idle terminal + idle JSON → should transition back to idle
+    vi.mocked(tmux.capturePane).mockResolvedValue(idleLines());
+    state.lastConversationStatus = 'idle';
     await pollTick(sid, state);
 
     const states = vi.mocked(timelineEmitter.emit).mock.calls

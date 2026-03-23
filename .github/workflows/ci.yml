@@ -76,6 +76,20 @@ jobs:
       - run: npm ci
       - run: npm run test:unit
 
+  # ── macOS daemon unit tests ─────────────────────────────────────────────
+
+  macos-unit-tests:
+    name: Unit Tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run test:unit
+
   # ── Web frontend tests ────────────────────────────────────────────────────
 
   web-tests:
@@ -250,7 +264,7 @@ jobs:
   docker:
     name: Docker Build & Push
     runs-on: ubuntu-latest
-    needs: [lint, typecheck, secret-scan, unit-tests, web-tests, server-tests, server-db-tests, e2e-tests]
+    needs: [lint, typecheck, secret-scan, unit-tests, macos-unit-tests, web-tests, server-tests, server-db-tests, e2e-tests]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
     outputs:
       npm_version: ${{ steps.git_tag.outputs.npm_version }}

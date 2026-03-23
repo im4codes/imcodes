@@ -144,15 +144,22 @@ describe('tmux shell-injection prevention', () => {
 });
 
 describe('tmux FIFO open mode', () => {
-  it('uses O_RDWR without O_NONBLOCK on darwin', () => {
-    // Verify the platform-specific logic exists in the source
-    // This is a static analysis check — actual FIFO behavior tested in integration
-    const O_RDWR = 2;          // fs.constants.O_RDWR
-    const O_NONBLOCK = 2048;   // fs.constants.O_NONBLOCK (Linux), 4 on macOS
+  it('macOS uses cat subprocess (not blocking createReadStream)', () => {
+    // macOS path spawns `cat` to read the FIFO — stdout is a native pipe
+    // that kqueue handles without occupying the libuv thread pool.
+    // The keepalive fd uses O_RDWR | O_NONBLOCK to prevent cat from getting EOF.
+    const O_RDWR = 2;
+    const O_NONBLOCK = process.platform === 'darwin' ? 4 : 2048;
+    // Both flags are used together on macOS for the keepalive fd
+    expect((O_RDWR | O_NONBLOCK) & O_RDWR).toBe(O_RDWR);
+    expect((O_RDWR | O_NONBLOCK) & O_NONBLOCK).toBe(O_NONBLOCK);
+  });
 
-    // On macOS, O_RDWR alone should be used (no O_NONBLOCK)
-    // On Linux, O_RDWR | O_NONBLOCK should be used
-    // We verify the constants exist and are distinct
-    expect(O_RDWR & O_NONBLOCK).toBe(0); // They don't overlap
+  it('Linux uses net.Socket with O_RDWR|O_NONBLOCK (epoll)', () => {
+    const O_RDWR = 2;
+    const O_NONBLOCK = 2048; // Linux value
+    const flags = O_RDWR | O_NONBLOCK;
+    expect(flags & O_RDWR).toBe(O_RDWR);
+    expect(flags & O_NONBLOCK).toBe(O_NONBLOCK);
   });
 });

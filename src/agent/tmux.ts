@@ -1,4 +1,4 @@
-import { execFile as execFileCb } from 'child_process';
+import { execFile as execFileCb, spawn } from 'child_process';
 import { createHash } from 'crypto';
 import { promisify } from 'util';
 import * as fs from 'fs';
@@ -367,15 +367,18 @@ interface PipePaneHandle {
 }
 
 /** Track active pipe-pane handles: session → handle info for cleanup. */
-const activePipes = new Map<string, { paneId: string; fifoPath: string; dir: string; fd: number; stream: Readable; needsManualClose: boolean }>();
+const activePipes = new Map<string, { paneId: string; fifoPath: string; dir: string; fd: number; stream: Readable; needsManualClose: boolean; catProc?: import('child_process').ChildProcess }>();
 
 /** Destroy a pipe stream and close its fd if needed. */
-function destroyPipeStream(stream: Readable, fd: number, needsManualClose: boolean): void {
+function destroyPipeStream(stream: Readable, fd: number, needsManualClose: boolean, catProc?: import('child_process').ChildProcess): void {
   stream.destroy();
-  // On macOS: createReadStream with autoClose:false does NOT close the fd on destroy.
+  if (catProc) {
+    try { catProc.kill('SIGTERM'); } catch { /* already gone */ }
+  }
+  // On macOS with cat subprocess: fd is managed by us (O_WRONLY keepalive), close it.
   // On Linux: net.Socket.destroy() closes the fd internally — calling closeSync again
   // risks closing a reused fd number.
-  if (needsManualClose) {
+  if (needsManualClose && fd >= 0) {
     try { fs.closeSync(fd); } catch { /* already closed */ }
   }
 }
@@ -406,9 +409,8 @@ export async function startPipePaneStream(session: string, paneId: string): Prom
 
   let fd = -1;
   let stream: Readable | null = null;
-  // macOS ReadStream with autoClose:false needs manual fd close;
-  // Linux net.Socket closes the fd itself on destroy.
   let needsManualClose = false;
+  let catProc: import('child_process').ChildProcess | undefined;
 
   try {
     // Create FIFO with 0600 permissions
@@ -416,15 +418,18 @@ export async function startPipePaneStream(session: string, paneId: string): Prom
 
     if (process.platform === 'darwin') {
       // macOS: kqueue does not reliably deliver read-ready events for FIFOs,
-      // so net.Socket (which relies on kqueue) won't get data notifications.
-      // Instead, use fs.createReadStream which does blocking reads in the
-      // libuv thread pool. For this to work, the fd must NOT have O_NONBLOCK —
-      // otherwise fs.read() returns EAGAIN immediately instead of blocking.
-      // O_RDWR alone is safe: it prevents openSync from blocking (both ends
-      // held by this process) and keeps the write-end open to prevent EOF.
-      fd = fs.openSync(fifoPath, fs.constants.O_RDWR);
-      stream = fs.createReadStream('', { fd, autoClose: false, highWaterMark: 16384 });
+      // so net.Socket won't work. Blocking fs.createReadStream starves the
+      // libuv thread pool when multiple FIFOs are open simultaneously.
+      //
+      // Solution: spawn `cat` to read the FIFO — its stdout is a pipe that
+      // Node handles natively via kqueue with zero thread-pool overhead.
+      // We keep a write-end fd open (O_RDWR|O_NONBLOCK) to prevent cat from
+      // getting EOF when tmux hasn't written yet.
+      fd = fs.openSync(fifoPath, fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
+      const cat = spawn('cat', [fifoPath], { stdio: ['ignore', 'pipe', 'ignore'] });
+      stream = cat.stdout!;
       needsManualClose = true;
+      catProc = cat;
     } else {
       // Linux: Open with O_RDWR|O_NONBLOCK for epoll-based non-blocking I/O.
       // O_NONBLOCK prevents open() from blocking; net.Socket handles EAGAIN
@@ -459,18 +464,18 @@ export async function startPipePaneStream(session: string, paneId: string): Prom
         if (info) {
           activePipes.delete(session);
           await execFile('tmux', ['pipe-pane', '-t', info.paneId]).catch(() => {});
-          destroyPipeStream(info.stream, info.fd, info.needsManualClose);
+          destroyPipeStream(info.stream, info.fd, info.needsManualClose, info.catProc);
           await fsp.unlink(info.fifoPath).catch(() => {});
           await fsp.rmdir(info.dir).catch(() => {});
         }
       },
     };
 
-    activePipes.set(session, { paneId, fifoPath, dir, fd, stream, needsManualClose });
+    activePipes.set(session, { paneId, fifoPath, dir, fd, stream, needsManualClose, catProc });
     return handle;
   } catch (err) {
     // Rollback: destroy stream + close fd if needed, clean up files
-    if (stream) { destroyPipeStream(stream, fd, needsManualClose); }
+    if (stream) { destroyPipeStream(stream, fd, needsManualClose, catProc); }
     else if (fd >= 0) { try { fs.closeSync(fd); } catch { /* ignore */ } }
     await execFile('tmux', ['pipe-pane', '-t', paneId]).catch(() => {});
     await fsp.unlink(fifoPath).catch(() => {});
@@ -488,7 +493,7 @@ export async function stopPipePaneStream(session: string): Promise<void> {
   if (!info) return;
   activePipes.delete(session);
   await execFile('tmux', ['pipe-pane', '-t', info.paneId]).catch(() => {});
-  destroyPipeStream(info.stream, info.fd, info.needsManualClose);
+  destroyPipeStream(info.stream, info.fd, info.needsManualClose, info.catProc);
   await fsp.unlink(info.fifoPath).catch(() => {});
   await fsp.rmdir(info.dir).catch(() => {});
 }

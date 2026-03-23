@@ -127,6 +127,8 @@ export interface WatcherState {
   lastConversationStatus?: 'running' | 'idle' | null;
   /** Consecutive poll ticks where JSON inferred idle. Prevents tool-call gap false idles. */
   idleConfirmCount?: number;
+  /** Consecutive terminal frames showing a leading braille spinner. 2+ = confirmed working. */
+  spinnerFrameCount?: number;
   /** Last known mtime of activeFile — used as cheap change check before full read. */
   _lastMtimeMs?: number;
 }
@@ -144,6 +146,36 @@ export function preClaimFile(sessionName: string, filePath: string): void {
 // shows activity (spinner, "esc to cancel"), emit assistant.thinking so the
 // web UI chat mode reflects that Gemini is working.
 
+/** Check if the last non-empty line starts with a braille spinner char (col 0). */
+function hasLeadingSpinner(lines: string[]): boolean {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line || !line.trim()) continue;
+    const ch = line.charAt(0);
+    return ch >= '\u2800' && ch <= '\u28FF';
+  }
+  return false;
+}
+
+const SPINNER_CONFIRM_READS = 5;
+const SPINNER_CONFIRM_INTERVAL_MS = 80;
+
+/** Burst-read capture-pane N times to confirm spinner presence. ~400ms total. */
+async function confirmSpinner(sessionName: string): Promise<boolean> {
+  let hits = 0;
+  for (let i = 0; i < SPINNER_CONFIRM_READS; i++) {
+    try {
+      const lines = await capturePane(sessionName);
+      if (hasLeadingSpinner(lines)) hits++;
+    } catch { /* session gone */ }
+    if (i < SPINNER_CONFIRM_READS - 1) {
+      await new Promise(r => setTimeout(r, SPINNER_CONFIRM_INTERVAL_MS));
+    }
+  }
+  // Require majority (3/5) to confirm — tolerates occasional capture miss
+  return hits >= 3;
+}
+
 async function terminalThinkingCheck(sessionName: string, state: WatcherState): Promise<void> {
   let lines: string[];
   try {
@@ -153,17 +185,34 @@ async function terminalThinkingCheck(sessionName: string, state: WatcherState): 
   }
 
   const status = detectStatus(lines, 'gemini');
+  const spinnerVisible = hasLeadingSpinner(lines);
 
-  if (status === 'idle') {
-    // Strong idle: both JSON and terminal agree on idle — skip confirm count + running lock
-    if (state.lastConversationStatus === 'idle') {
-      state.idleConfirmCount = 2; // force past threshold
+  // ── First frame shows spinner → burst-confirm ──────────────────────────
+  if (spinnerVisible) {
+    const confirmed = await confirmSpinner(sessionName);
+    if (confirmed) {
       if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
-      state._terminalThinkingEmitted = false;
-      transitionState(sessionName, state, 'idle', true); // force bypasses running lock
+      state.spinnerFrameCount = SPINNER_CONFIRM_READS;
+      transitionState(sessionName, state, 'running', true); // spinner is ground truth
+      if (!state._terminalThinkingEmitted) {
+        state._terminalThinkingEmitted = true;
+        timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'terminal-spinner', confidence: 'high' });
+      }
       return;
     }
-    // Terminal shows idle but JSON doesn't — debounce before transitioning
+    // Burst didn't confirm — fall through to normal logic
+  }
+  state.spinnerFrameCount = 0;
+
+  // ── No spinner: use existing idle/running logic ─────────────────────────
+  if (status === 'idle') {
+    if (state.lastConversationStatus === 'idle') {
+      state.idleConfirmCount = 2;
+      if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
+      state._terminalThinkingEmitted = false;
+      transitionState(sessionName, state, 'idle', true);
+      return;
+    }
     if (state.currentState === 'running' && !state.idleDebounceTimer) {
       state.idleDebounceTimer = setTimeout(() => {
         state.idleDebounceTimer = undefined;
@@ -176,11 +225,8 @@ async function terminalThinkingCheck(sessionName: string, state: WatcherState): 
     return;
   }
 
-  // Terminal shows activity — but only transition state if JSON hasn't already settled on idle.
-  // JSON is the authoritative source; terminal is supplementary for thinking hints only.
+  // Terminal shows activity but spinner not confirmed — use JSON as tiebreaker
   if (state.lastConversationStatus === 'idle') {
-    // JSON says idle — terminal may show residual activity (prompt redraw, lingering "esc to cancel").
-    // Emit thinking hint for UI but do NOT change session.state — prevents idle/running oscillation.
     if (!state._terminalThinkingEmitted) {
       state._terminalThinkingEmitted = true;
       timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'terminal-parse', confidence: 'low' });
@@ -188,7 +234,6 @@ async function terminalThinkingCheck(sessionName: string, state: WatcherState): 
     return;
   }
 
-  // JSON is not idle (running or unknown) — terminal activity confirms running state
   if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
   transitionState(sessionName, state, 'running');
   if (!state._terminalThinkingEmitted) {
@@ -275,8 +320,11 @@ async function pollTickInner(sessionName: string, state: WatcherState): Promise<
   try {
     const s = await stat(state.activeFile!);
     if (state._lastMtimeMs !== undefined && s.mtimeMs === state._lastMtimeMs) {
-      // File unchanged on disk — still run idle detection logic but skip expensive read/parse.
-      // Only applies to the "unchanged" path; new files always get a full read.
+      // File unchanged on disk — run terminal spinner check (ground truth),
+      // then idle detection if JSON also says idle. Skip expensive JSON read/parse.
+      await terminalThinkingCheck(sessionName, state);
+      // If spinner confirmed running, skip idle logic
+      if (state.currentState === 'running' && (state.spinnerFrameCount ?? 0) > 0) return;
       if (state.lastConversationStatus === 'idle') {
         state.idleConfirmCount = (state.idleConfirmCount ?? 0) + 1;
         if (state.idleConfirmCount >= 2 && !state.idleDebounceTimer) {
@@ -285,7 +333,6 @@ async function pollTickInner(sessionName: string, state: WatcherState): Promise<
         return;
       }
       state.idleConfirmCount = 0;
-      await terminalThinkingCheck(sessionName, state);
       return;
     }
     state._lastMtimeMs = s.mtimeMs;

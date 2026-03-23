@@ -19,6 +19,9 @@ import { sendKeys } from '../agent/tmux.js';
 import logger from '../util/logger.js';
 import type { MemoryBackend } from '../memory/interface.js';
 import type { RouterContext } from '../router/message-router.js';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
 
 export interface DaemonContext {
   config: Config;
@@ -79,6 +82,7 @@ async function syncSessionsFromWorker(workerUrl: string, serverId: string, token
   try {
     const res = await fetch(`${workerUrl}/api/server/${serverId}/sessions`, {
       headers: { Authorization: `Bearer ${token}`, 'X-Server-Id': serverId },
+      signal: AbortSignal.timeout(5_000),
     });
     if (!res.ok) {
       logger.warn({ status: res.status }, 'syncSessionsFromWorker: non-ok response');
@@ -108,9 +112,19 @@ async function syncSessionsFromWorker(workerUrl: string, serverId: string, token
   }
 }
 
+/** Write PID file so restart can reliably find the old process. */
+function writePidFile(): void {
+  const pidPath = path.join(os.homedir(), '.imcodes', 'daemon.pid');
+  try {
+    fs.mkdirSync(path.dirname(pidPath), { recursive: true });
+    fs.writeFileSync(pidPath, String(process.pid), 'utf8');
+  } catch { /* best-effort */ }
+}
+
 /** Startup sequence: config → store → memory → sessions → server link */
 export async function startup(): Promise<DaemonContext> {
   logger.info('Daemon starting');
+  writePidFile();
 
   const config = await loadConfig();
   logger.info({ config: config.daemon }, 'Config loaded');
