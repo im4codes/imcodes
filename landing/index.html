@@ -224,7 +224,7 @@ footer {
 </section>
 
 <section class="warning" data-i18n="self_host_warning">
-  For production use, self-host the server on your own infrastructure. <code>app.im.codes</code> is a shared demo instance and may be rate-limited or unavailable.
+  <strong>Self-hosting is strongly recommended.</strong> <code>app.im.codes</code> is a shared test instance with no uptime guarantees — it may be rate-limited, targeted, or unavailable. This is a personal project with no commercial support. For anything beyond evaluation, deploy on your own infrastructure.
 </section>
 
 <section>
@@ -359,7 +359,7 @@ const I18N = {
   'zh-CN': {
     tagline: 'AI 编程代理的远程管理界面',
     hero_output: '已绑定 app.im.codes · 守护进程已启动 · 已注册为系统服务',
-    self_host_warning: '生产环境建议自行部署服务端。<code>app.im.codes</code> 是共享测试实例，可能存在限流或不可用。',
+    self_host_warning: '<strong>强烈建议自行部署。</strong><code>app.im.codes</code> 是共享测试实例，无可用性保证，可能被限流、攻击或不可用。这是个人项目，不提供商用保障。正式使用请部署到自己的服务器。',
     h_screenshots: '截图', h_why: '为什么', h_features: '功能', h_arch: '架构', h_install: '安装', h_quick: '快速开始', h_selfhost: '自托管部署', h_agents: '支持的代理', h_reqs: '系统要求', h_about: '关于',
     why_text: 'AI 编程代理运行在终端中。管理它们意味着 SSH 会话、分屏、窗口间复制粘贴——无法扩展。IM.codes 提供统一控制面板：无需 SSH 的远程终端、理解代理输出的聊天层、以及让不同模型互相审查的多代理工作流。',
     f_remote_name: '远程终端', f_remote_desc: '浏览器和手机访问，无需 SSH/VPN，实时 PTY 推流',
@@ -386,7 +386,7 @@ const I18N = {
   'zh-TW': {
     tagline: 'AI 程式代理的遠端管理介面',
     hero_output: '已綁定 app.im.codes · 守護程序已啟動 · 已註冊為系統服務',
-    self_host_warning: '正式環境建議自行部署伺服器。<code>app.im.codes</code> 是共享測試實例，可能有限流或不可用。',
+    self_host_warning: '<strong>強烈建議自行部署。</strong><code>app.im.codes</code> 是共享測試實例，無可用性保證，可能被限流、攻擊或不可用。這是個人專案，不提供商用保障。正式使用請部署到自己的伺服器。',
     h_screenshots: '截圖', h_why: '為什麼', h_features: '功能', h_arch: '架構', h_install: '安裝', h_quick: '快速開始', h_selfhost: '自託管部署', h_agents: '支援的代理', h_reqs: '系統需求', h_about: '關於',
     why_text: 'AI 程式代理運行在終端機中。管理它們意味著 SSH 會話、分割視窗、在視窗間複製貼上——無法擴展。IM.codes 提供統一控制面板：無需 SSH 的遠端終端機、理解代理輸出的聊天層、以及讓不同模型互相審查的多代理工作流。',
     f_remote_name: '遠端終端機', f_remote_desc: '瀏覽器和手機存取，無需 SSH/VPN，即時 PTY 串流',
@@ -413,7 +413,7 @@ const I18N = {
   ja: {
     tagline: 'AIコーディングエージェントのチャットインターフェース',
     hero_output: 'app.im.codes にバインド完了 · デーモン起動 · システムサービスとして登録',
-    self_host_warning: '本番環境ではサーバーの自己ホスティングを推奨します。<code>app.im.codes</code> は共有デモインスタンスであり、レート制限や利用不可の可能性があります。',
+    self_host_warning: '<strong>セルフホスティングを強く推奨します。</strong><code>app.im.codes</code> は共有テストインスタンスであり、稼働保証はありません。レート制限、攻撃対象、利用不可の可能性があります。個人プロジェクトのため商用サポートはありません。評価以外の用途では自社インフラにデプロイしてください。',
     h_screenshots: 'スクリーンショット', h_why: '背景', h_features: '機能', h_arch: 'アーキテクチャ', h_install: 'インストール', h_quick: 'クイックスタート', h_selfhost: 'セルフホスト', h_agents: '対応エージェント', h_reqs: '要件', h_about: '概要',
     why_text: 'AIコーディングエージェントはターミナルで動作します。管理にはSSH、画面分割、ウィンドウ間のコピペが必要でスケールしません。IM.codesは統一コントロールパネルを提供：SSHなしのリモートターミナル、エージェント出力を理解するチャットレイヤー、異なるモデルを相互レビューさせるマルチエージェントワークフロー。',
     f_remote_name: 'リモートターミナル', f_remote_desc: 'ブラウザ＆モバイル、SSH/VPN不要、リアルタイムPTYストリーミング',
@@ -440,7 +440,7 @@ const I18N = {
   ko: {
     tagline: 'AI 코딩 에이전트를 위한 채팅 인터페이스',
     hero_output: 'app.im.codes에 바인딩 완료 · 데몬 시작됨 · 시스템 서비스로 등록됨',
-    self_host_warning: '프로덕션 환경에서는 자체 서버 호스팅을 권장합니다. <code>app.im.codes</code>는 공유 데모 인스턴스이며 속도 제한이 있거나 사용 불가할 수 있습니다.',
+    self_host_warning: '<strong>셀프 호스팅을 강력히 권장합니다.</strong> <code>app.im.codes</code>는 공유 테스트 인스턴스로 가동 보장이 없으며, 속도 제한, 공격 대상이 되거나 사용 불가할 수 있습니다. 개인 프로젝트로 상업적 지원은 제공되지 않습니다. 평가 이외의 용도에는 자체 인프라에 배포하세요.',
     h_screenshots: '스크린샷', h_why: '배경', h_features: '기능', h_arch: '아키텍처', h_install: '설치', h_quick: '빠른 시작', h_selfhost: '셀프 호스팅', h_agents: '지원 에이전트', h_reqs: '요구사항', h_about: '소개',
     why_text: 'AI 코딩 에이전트는 터미널에서 실행됩니다. 관리하려면 SSH 세션, 화면 분할, 창 간 복사-붙여넣기가 필요하며 확장이 어렵습니다. IM.codes는 통합 제어판을 제공합니다: SSH 없는 원격 터미널, 에이전트 출력을 이해하는 채팅 레이어, 다양한 모델을 상호 검토시키는 멀티 에이전트 워크플로우.',
     f_remote_name: '원격 터미널', f_remote_desc: '브라우저 & 모바일, SSH/VPN 불필요, 실시간 PTY 스트리밍',
@@ -467,7 +467,7 @@ const I18N = {
   es: {
     tagline: 'interfaz de chat para agentes de programación IA',
     hero_output: 'vinculado a app.im.codes · daemon iniciado · registrado como servicio del sistema',
-    self_host_warning: 'Para producción, aloja el servidor en tu propia infraestructura. <code>app.im.codes</code> es una instancia demo compartida y puede tener límites o no estar disponible.',
+    self_host_warning: '<strong>Se recomienda encarecidamente el autoalojamiento.</strong> <code>app.im.codes</code> es una instancia de prueba compartida sin garantías de disponibilidad — puede tener límites, ser objetivo de ataques o no estar disponible. Este es un proyecto personal sin soporte comercial. Para uso más allá de la evaluación, despliega en tu propia infraestructura.',
     h_screenshots: 'capturas', h_why: 'por qué', h_features: 'características', h_arch: 'arquitectura', h_install: 'instalar', h_quick: 'inicio rápido', h_selfhost: 'autoalojamiento', h_agents: 'agentes compatibles', h_reqs: 'requisitos', h_about: 'acerca de',
     why_text: 'Los agentes de programación IA viven en terminales. Gestionarlos significa sesiones SSH, paneles divididos, copiar y pegar entre ventanas — no escala. IM.codes ofrece un panel de control unificado: terminales remotas sin SSH, una capa de chat que entiende la salida del agente, y flujos multi-agente para que diferentes modelos se revisen mutuamente.',
     f_remote_name: 'terminal remota', f_remote_desc: 'navegador y móvil, sin SSH/VPN, streaming PTY en tiempo real',
@@ -494,7 +494,7 @@ const I18N = {
   ru: {
     tagline: 'чат-интерфейс для AI-агентов программирования',
     hero_output: 'привязан к app.im.codes · демон запущен · зарегистрирован как системная служба',
-    self_host_warning: 'Для продакшена рекомендуется размещать сервер на собственной инфраструктуре. <code>app.im.codes</code> — общий демо-экземпляр, может быть ограничен или недоступен.',
+    self_host_warning: '<strong>Настоятельно рекомендуется самостоятельный хостинг.</strong> <code>app.im.codes</code> — общий тестовый экземпляр без гарантий доступности. Может быть ограничен, атакован или недоступен. Это личный проект без коммерческой поддержки. Для использования помимо тестирования разверните на собственной инфраструктуре.',
     h_screenshots: 'скриншоты', h_why: 'зачем', h_features: 'возможности', h_arch: 'архитектура', h_install: 'установка', h_quick: 'быстрый старт', h_selfhost: 'свой сервер', h_agents: 'поддерживаемые агенты', h_reqs: 'требования', h_about: 'о проекте',
     why_text: 'AI-агенты программирования работают в терминалах. Управление ими означает SSH-сессии, разделение экрана, копирование между окнами — это не масштабируется. IM.codes предоставляет единую панель управления: удалённые терминалы без SSH, чат-слой, понимающий вывод агентов, и мульти-агентные рабочие процессы для взаимной проверки разных моделей.',
     f_remote_name: 'удалённый терминал', f_remote_desc: 'браузер и мобильный, без SSH/VPN, PTY-стриминг в реальном времени',

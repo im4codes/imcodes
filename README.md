@@ -79,7 +79,9 @@ npm install -g imcodes
 
 ## Quick Start
 
-Use the hosted version at [app.im.codes](https://app.im.codes), or self-host the server on your own infrastructure.
+> **Self-hosting is strongly recommended.** The shared instance at `app.im.codes` is for testing only — it comes with no uptime guarantees, may be rate-limited, and could be targeted. This is a personal project with no commercial support. For anything beyond evaluation, deploy the server on your own infrastructure.
+
+Use [app.im.codes](https://app.im.codes) to try it out, or self-host for production use.
 
 ```bash
 imcodes bind https://app.im.codes/bind/<api-key>
