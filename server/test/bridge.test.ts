@@ -1116,4 +1116,109 @@ describe('WsBridge', () => {
       expect(JSON.parse(browserWs.sentStrings[0]).type).toBe('p2p.conflict');
     });
   });
+
+  describe('push notifications', () => {
+    function makePushDb(tokenHash: string) {
+      return {
+        prepare: (sql: string) => ({
+          bind: (..._args: unknown[]) => ({
+            first: async () => {
+              if (sql.includes('FROM servers')) return { token_hash: tokenHash, user_id: 'user-1', name: 'my-server' };
+              if (sql.includes('FROM sessions')) return { project_name: 'codedeck', agent_type: 'claude-code', label: null };
+              return { token_hash: tokenHash };
+            },
+            all: async () => ({ results: [] }),
+            run: async () => ({ changes: 1 }),
+          }),
+        }),
+      } as unknown as import('../src/db/client.js').PgDatabase;
+    }
+
+    async function setupPushBridge() {
+      const db = makePushDb('valid-hash');
+      const env = { APNS_KEY: 'test', APNS_KEY_ID: 'kid', APNS_TEAM_ID: 'tid' } as never;
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, db, env);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      return { bridge, daemonWs, db, env };
+    }
+
+    it('includes server name and session metadata in push title', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle', session: 'deck_cd_brain', lastText: 'Done implementing the feature.',
+      }));
+      await flushAsync();
+
+      expect(dispatchPush).toHaveBeenCalled();
+      const call = vi.mocked(dispatchPush).mock.calls[0];
+      const payload = call[0];
+      expect(payload.title).toContain('my-server');
+      expect(payload.title).toContain('codedeck');
+      expect(payload.title).toContain('claude-code');
+      expect(payload.body).toContain('Done implementing');
+    });
+
+    it('uses lastText as push body for session.idle', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle', session: 'deck_cd_brain', lastText: 'All tests passing.',
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls[0][0];
+      expect(payload.body).toBe('All tests passing.');
+    });
+
+    it('falls back to default body when no lastText', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle', session: 'deck_cd_brain',
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls[0][0];
+      expect(payload.body).toContain('ready for input');
+    });
+
+    it('skips push when mobile client is connected', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { bridge, daemonWs } = await setupPushBridge();
+
+      // Connect a mobile browser
+      const mobileWs = new MockWs();
+      bridge.handleBrowserConnection(mobileWs as never, 'user-1', makePushDb('valid-hash'), true);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle', session: 'deck_cd_brain',
+      }));
+      await flushAsync();
+
+      expect(dispatchPush).not.toHaveBeenCalled();
+    });
+
+    it('sends push when only desktop browser is connected', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { bridge, daemonWs } = await setupPushBridge();
+
+      // Connect a desktop browser (isMobile = false)
+      const desktopWs = new MockWs();
+      bridge.handleBrowserConnection(desktopWs as never, 'user-1', makePushDb('valid-hash'), false);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle', session: 'deck_cd_brain', lastText: 'Completed.',
+      }));
+      await flushAsync();
+
+      expect(dispatchPush).toHaveBeenCalled();
+    });
+  });
 });
