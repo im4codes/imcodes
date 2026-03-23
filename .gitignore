@@ -33,9 +33,8 @@ web/skills-lock.json
 # Legacy discussion files
 imc_files/
 
-# App Store assets (large PNGs, not code) — keep README
-web/store-assets/*
-!web/store-assets/README.md
+# App Store assets
+web/store-assets/
 
 # Server deployment config — contains IPs, domains, env var values (private)
 docs/*.local.md
