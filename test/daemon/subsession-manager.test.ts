@@ -6,6 +6,9 @@ const {
   upsertSessionMock, startWatchingMock, startWatchingFileMock,
   isWatchingMock, sessionExistsMock, newSessionMock, getDriverMock, getSessionMock,
   capturePaneMock, timelineReadMock,
+  geminiStartWatchingMock, geminiIsWatchingMock,
+  codexStartWatchingByIdMock, codexIsWatchingMock, codexIsFileClaimedMock,
+  removeSessionMock,
 } = vi.hoisted(() => ({
   upsertSessionMock: vi.fn(),
   startWatchingMock: vi.fn().mockResolvedValue(undefined),
@@ -17,11 +20,18 @@ const {
   getSessionMock: vi.fn(() => null),
   capturePaneMock: vi.fn().mockResolvedValue([]),
   timelineReadMock: vi.fn(() => []),
+  geminiStartWatchingMock: vi.fn().mockResolvedValue(undefined),
+  geminiIsWatchingMock: vi.fn().mockReturnValue(false),
+  codexStartWatchingByIdMock: vi.fn().mockResolvedValue(undefined),
+  codexIsWatchingMock: vi.fn().mockReturnValue(false),
+  codexIsFileClaimedMock: vi.fn().mockReturnValue(false),
+  removeSessionMock: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
   upsertSession: upsertSessionMock,
   getSession: getSessionMock,
+  removeSession: removeSessionMock,
 }));
 
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
@@ -36,15 +46,19 @@ vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
 
 vi.mock('../../src/daemon/codex-watcher.js', () => ({
   startWatching: vi.fn().mockResolvedValue(undefined),
+  startWatchingSpecificFile: vi.fn().mockResolvedValue(undefined),
+  startWatchingById: codexStartWatchingByIdMock,
   stopWatching: vi.fn(),
-  isWatching: vi.fn().mockReturnValue(false),
+  isWatching: codexIsWatchingMock,
+  isFileClaimedByOther: codexIsFileClaimedMock,
+  findRolloutPathByUuid: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock('../../src/daemon/gemini-watcher.js', () => ({
-  startWatching: vi.fn().mockResolvedValue(undefined),
+  startWatching: geminiStartWatchingMock,
   startWatchingDiscovered: vi.fn().mockResolvedValue(undefined),
   stopWatching: vi.fn(),
-  isWatching: vi.fn().mockReturnValue(false),
+  isWatching: geminiIsWatchingMock,
 }));
 
 vi.mock('../../src/agent/tmux.js', () => ({
@@ -63,7 +77,7 @@ vi.mock('../../src/daemon/timeline-store.js', () => ({
   timelineStore: { read: timelineReadMock, append: vi.fn() },
 }));
 
-import { subSessionName, detectShells, startSubSession, readSubSessionResponse } from '../../src/daemon/subsession-manager.js';
+import { subSessionName, detectShells, startSubSession, rebuildSubSessions, readSubSessionResponse } from '../../src/daemon/subsession-manager.js';
 import { upsertSession } from '../../src/store/session-store.js';
 import { startWatchingFile, startWatching } from '../../src/daemon/jsonl-watcher.js';
 
@@ -294,5 +308,119 @@ describe('readSubSessionResponse()', () => {
     const result = await readSubSessionResponse('deck_sub_3');
 
     expect(result).toEqual({ status: 'idle', response: 'done' });
+  });
+});
+
+// ── rebuildSubSessions: geminiSessionId preserved ────────────────────────────
+// Regression: rebuildSubSessions overwrote the session record without
+// geminiSessionId, causing the watcher to fall back to findLatestSessionFile
+// which would track the wrong file after old files were touched.
+
+describe('rebuildSubSessions — geminiSessionId preserved', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Session already exists in tmux (rebuild, not create)
+    sessionExistsMock.mockResolvedValue(true);
+    geminiIsWatchingMock.mockReturnValue(false);
+    getDriverMock.mockReturnValue({
+      buildLaunchCommand: () => 'gemini --yolo',
+      buildResumeCommand: () => 'gemini --yolo --resume test',
+      postLaunch: undefined,
+    });
+  });
+
+  it('preserves geminiSessionId from local store when sub.geminiSessionId is absent', async () => {
+    // Local store has the UUID from a previous run
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_rebuild1',
+      agentType: 'gemini',
+      geminiSessionId: 'stored-uuid-1234',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1000,
+    });
+
+    await rebuildSubSessions([{
+      id: 'rebuild1',
+      type: 'gemini',
+      cwd: '/proj',
+      // geminiSessionId NOT provided by server (common during reconnect)
+    }]);
+
+    // upsertSession must include the stored geminiSessionId
+    expect(upsertSessionMock).toHaveBeenCalledWith(
+      expect.objectContaining({ geminiSessionId: 'stored-uuid-1234' }),
+    );
+  });
+
+  it('uses sub.geminiSessionId when both sub and store have it', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_rebuild2',
+      agentType: 'gemini',
+      geminiSessionId: 'old-uuid',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1000,
+    });
+
+    await rebuildSubSessions([{
+      id: 'rebuild2',
+      type: 'gemini',
+      cwd: '/proj',
+      geminiSessionId: 'new-uuid-from-server',
+    }]);
+
+    expect(upsertSessionMock).toHaveBeenCalledWith(
+      expect.objectContaining({ geminiSessionId: 'new-uuid-from-server' }),
+    );
+  });
+
+  it('starts gemini watcher with stored UUID when sub has none', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_rebuild3',
+      agentType: 'gemini',
+      geminiSessionId: 'fallback-uuid',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1000,
+    });
+
+    await rebuildSubSessions([{
+      id: 'rebuild3',
+      type: 'gemini',
+      cwd: '/proj',
+    }]);
+
+    expect(geminiStartWatchingMock).toHaveBeenCalledWith(
+      'deck_sub_rebuild3',
+      'fallback-uuid',
+    );
+  });
+
+  it('does NOT lose geminiSessionId when store has it (regression)', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_rebuild4',
+      agentType: 'gemini',
+      geminiSessionId: 'must-not-lose',
+      state: 'idle',
+      restarts: 1,
+      restartTimestamps: [1000],
+      createdAt: 500,
+    });
+
+    await rebuildSubSessions([{
+      id: 'rebuild4',
+      type: 'gemini',
+      cwd: '/proj',
+      // No geminiSessionId from server
+    }]);
+
+    const call = upsertSessionMock.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(call.geminiSessionId).toBe('must-not-lose');
+    // Also verify other fields aren't clobbered
+    expect(call.agentType).toBe('gemini');
   });
 });

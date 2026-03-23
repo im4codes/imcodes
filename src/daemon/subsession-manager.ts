@@ -162,21 +162,26 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         );
         startWatchingFile(sessionName, path.join(claudeProjectDir(sub.cwd), `${effectiveCcSessionId}.jsonl`));
       } else if (sub.type === 'codex' && !isCodexWatching(sessionName)) {
-        const uuid = stored?.codexSessionId;
-        if (uuid && !isFileClaimedByOther(sessionName, uuid)) {
-          startWatchingById(sessionName, uuid, sub.codexModel ?? undefined);
+        const effectiveCodexId = sub.codexSessionId ?? stored?.codexSessionId;
+        if (effectiveCodexId && !isFileClaimedByOther(sessionName, effectiveCodexId)) {
+          startWatchingById(sessionName, effectiveCodexId, sub.codexModel ?? undefined);
         }
       } else if (sub.type === 'gemini' && !isGeminiWatching(sessionName)) {
-        if (sub.geminiSessionId) {
-          startGeminiWatching(sessionName, sub.geminiSessionId);
+        const effectiveGeminiId = sub.geminiSessionId ?? stored?.geminiSessionId;
+        if (effectiveGeminiId) {
+          startGeminiWatching(sessionName, effectiveGeminiId);
         } else if (sub._fileSnapshot) {
           startGeminiWatchingDiscovered(sessionName, sub._fileSnapshot, sub._onGeminiDiscovered);
         }
       }
+      // Merge all session IDs: prefer server-provided, fall back to local store
+      const effectiveCodexSessionId = sub.codexSessionId ?? stored?.codexSessionId;
+      const effectiveGeminiSessionId = sub.geminiSessionId ?? stored?.geminiSessionId;
       upsertSession({
         name: sessionName, projectName: sessionName, agentType: sub.type, agentVersion: stored?.agentVersion ?? await getAgentVersion(sub.type as AgentType, sub.shellBin ?? undefined), role: 'w1', state: 'running',
         projectDir: sub.cwd ?? '', ccSessionId: effectiveCcSessionId ?? undefined,
-        codexSessionId: stored?.codexSessionId,
+        codexSessionId: effectiveCodexSessionId ?? undefined,
+        geminiSessionId: effectiveGeminiSessionId ?? undefined,
         parentSession: sub.parentSession ?? stored?.parentSession,
         // Preserve existing diagnostic fields instead of resetting
         restarts: stored?.restarts ?? 0,

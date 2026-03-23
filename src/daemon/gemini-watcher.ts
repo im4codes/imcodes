@@ -9,7 +9,7 @@ import { timelineEmitter } from './timeline-emitter.js';
 import { capturePane } from '../agent/tmux.js';
 import { detectStatus } from '../agent/detect.js';
 import logger from '../util/logger.js';
-import { updateSessionState } from '../store/session-store.js';
+import { updateSessionState, getSession, upsertSession } from '../store/session-store.js';
 
 const GEMINI_TMP_DIR = join(homedir(), '.gemini', 'tmp');
 const POLL_INTERVAL_MS = 1500; // Balanced: responsive enough without causing state flicker
@@ -134,8 +134,12 @@ export interface WatcherState {
   _lastMtimeMs?: number;
   /** Last known file size — supplements mtime to catch same-ms writes. */
   _lastSize?: number;
+  /** Last known inode — detects atomic file replacement (write-to-temp + rename). */
+  _lastIno?: number;
   /** Content length of the last processed message — detects real content growth vs metadata-only updates. */
   _lastMsgLen?: number;
+  /** Consecutive readConversation failures — triggers file rescan after threshold. */
+  _readFailCount?: number;
 }
 
 const watchers = new Map<string, WatcherState>();
@@ -274,6 +278,7 @@ function transitionState(sessionName: string, state: WatcherState, next: 'runnin
   state.currentState = next;
   if (next === 'idle') state.lastIdleEmitTs = Date.now();
   if (next === 'running') state.lastRunningEmitTs = Date.now();
+  logger.debug({ sessionName, state: next, activeFile: state.activeFile, seenCount: state.seenCount }, 'gemini-watcher: state transition');
   timelineEmitter.emit(sessionName, 'session.state', { state: next });
   updateSessionState(sessionName, next);
 }
@@ -336,13 +341,15 @@ async function pollTickInner(sessionName: string, state: WatcherState): Promise<
     if (found) { state.activeFile = found; claimedFiles.set(found, sessionName); } else return;
   }
 
-  // Cheap change check: skip full read if file mtime AND size haven't changed.
-  // Size check catches same-millisecond writes that mtime misses.
+  // Cheap change check: skip full read if file mtime, size, AND inode haven't changed.
+  // Inode check catches atomic file replacement (write-to-temp + rename).
   try {
     const s = await stat(state.activeFile!);
     const mtimeUnchanged = state._lastMtimeMs !== undefined && s.mtimeMs === state._lastMtimeMs;
     const sizeUnchanged = state._lastSize !== undefined && s.size === state._lastSize;
-    if (mtimeUnchanged && sizeUnchanged) {
+    // Inode change = atomic file replacement. Only triggers re-read when both old and new ino are known.
+    const inodeChanged = state._lastIno !== undefined && s.ino !== undefined && s.ino !== state._lastIno;
+    if (mtimeUnchanged && sizeUnchanged && !inodeChanged) {
       // File truly unchanged — terminal spinner is ground truth.
       // terminalThinkingCheck handles all state transitions via assertSpinnerGate.
       await terminalThinkingCheck(sessionName, state);
@@ -350,19 +357,27 @@ async function pollTickInner(sessionName: string, state: WatcherState): Promise<
     }
     state._lastMtimeMs = s.mtimeMs;
     state._lastSize = s.size;
+    state._lastIno = s.ino;
   } catch {
     // stat failed — fall through to full read attempt
   }
 
   const conv = await readConversation(state.activeFile!, sessionName);
   if (!conv) {
-    // Parse failed but file just changed (mtime/size different) — Gemini is likely mid-write.
-    // Bias toward running to prevent false idle during large tool outputs.
-    if (state.currentState !== 'running') {
+    // Parse failed — Gemini is likely mid-write. Track consecutive failures.
+    state._readFailCount = (state._readFailCount ?? 0) + 1;
+    if (state._readFailCount >= 5) {
+      // Too many consecutive failures — file may be corrupt or replaced.
+      // Reset activeFile to trigger rediscovery on next tick.
+      logger.warn({ sessionName, file: state.activeFile, failures: state._readFailCount }, 'gemini-watcher: too many read failures, triggering file rescan');
+      state.activeFile = null;
+      state._readFailCount = 0;
+    } else if (state.currentState !== 'running') {
       transitionState(sessionName, state, 'running');
     }
     return;
   }
+  state._readFailCount = 0;
   const conversationStatus = inferConversationStatus(conv);
   state.lastConversationStatus = conversationStatus;
 
@@ -435,6 +450,8 @@ function activateFile(sessionName: string, state: WatcherState, newFile: string)
   state.lastUpdated = '';
   state._lastMtimeMs = undefined;
   state._lastSize = undefined;
+  state._lastIno = undefined;
+  state._readFailCount = 0;
   state._terminalThinkingEmitted = false;
   state.idleConfirmCount = 0;
   if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
@@ -470,19 +487,19 @@ export async function startWatching(sessionName: string, sessionUuid: string): P
 
   state.pollTimer = setInterval(() => {
     void (async () => {
-      // Periodic rotation check (every 30s)
+      // Periodic rotation check (every 10s)
       const now = Date.now();
-      if (now - (state._lastRotationCheck || 0) > 30000 && state.sessionUuid) {
+      if (now - (state._lastRotationCheck || 0) > 10000 && state.sessionUuid) {
         state._lastRotationCheck = now;
         const currentFile = await findSessionFile(state.sessionUuid);
         if (currentFile && currentFile !== state.activeFile) {
           logger.info({ sessionName, newFile: currentFile, oldFile: state.activeFile }, 'gemini-watcher: date rotation detected');
           activateFile(sessionName, state, currentFile);
-          // Re-read initial state from the new file
+          // Don't pre-mark messages as seen — let pollTickInner process them
+          // naturally. activateFile already set seenCount=0, so the next poll
+          // will emit all messages from the new file.
           const conv = await readConversation(currentFile, sessionName);
           if (conv) {
-            state.seenCount = conv.messages.length;
-            state.lastUpdated = conv.lastUpdated;
             state.lastConversationStatus = inferConversationStatus(conv);
           }
         }
@@ -531,6 +548,12 @@ export async function startWatchingDiscovered(
                 state.activeFile = fullPath;
                 claimedFiles.set(fullPath, sessionName);
                 state.sessionUuid = conv.sessionId;
+                // Persist to local session store so daemon restarts can use the UUID
+                const sess = getSession(sessionName);
+                if (sess && !sess.geminiSessionId) {
+                  upsertSession({ ...sess, geminiSessionId: conv.sessionId, updatedAt: Date.now() });
+                  logger.info({ sessionName, geminiSessionId: conv.sessionId }, 'gemini-watcher: persisted discovered session ID to store');
+                }
                 onDiscovered?.(conv.sessionId);
                 void watchGeminiDir(sessionName, state);
                 break;

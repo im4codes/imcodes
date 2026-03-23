@@ -405,6 +405,7 @@ export async function restartSession(record: SessionRecord): Promise<boolean> {
     skipStore: true,
     ccSessionId: record.ccSessionId,
     codexSessionId: record.codexSessionId,
+    geminiSessionId: record.geminiSessionId,
   });
 
   return true;
@@ -454,7 +455,7 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
       cmd = driver.buildLaunchCommand(record.name, { cwd: projectDir, ccSessionId });
     }
   } else {
-    cmd = driver.buildResumeCommand(record.name, { cwd: projectDir, ccSessionId, codexSessionId: record.codexSessionId }) ?? driver.buildLaunchCommand(record.name, { cwd: projectDir, ccSessionId, codexSessionId: record.codexSessionId });
+    cmd = driver.buildResumeCommand(record.name, { cwd: projectDir, ccSessionId, codexSessionId: record.codexSessionId, geminiSessionId: record.geminiSessionId }) ?? driver.buildLaunchCommand(record.name, { cwd: projectDir, ccSessionId, codexSessionId: record.codexSessionId, geminiSessionId: record.geminiSessionId });
   }
 
   await respawnPane(record.name, cmd);
