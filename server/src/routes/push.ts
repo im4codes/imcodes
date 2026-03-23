@@ -139,12 +139,7 @@ async function getApnsJwt(env: Env): Promise<string> {
   return jwt;
 }
 
-async function sendApns(deviceToken: string, payload: PushPayload, env: Env): Promise<void> {
-  const jwt = await getApnsJwt(env);
-  const bundleId = env.APNS_BUNDLE_ID ?? 'app.imcodes';
-  const isProd = env.NODE_ENV === 'production' || env.ENVIRONMENT === 'production';
-  const host = isProd ? 'api.push.apple.com' : 'api.sandbox.push.apple.com';
-
+async function sendApnsToHost(host: string, deviceToken: string, payload: PushPayload, jwt: string, bundleId: string): Promise<Response> {
   const body = {
     aps: {
       alert: { title: payload.title, body: payload.body },
@@ -154,7 +149,7 @@ async function sendApns(deviceToken: string, payload: PushPayload, env: Env): Pr
     ...payload.data,
   };
 
-  const res = await fetch(`https://${host}/3/device/${deviceToken}`, {
+  return fetch(`https://${host}/3/device/${deviceToken}`, {
     method: 'POST',
     headers: {
       Authorization: `bearer ${jwt}`,
@@ -165,10 +160,29 @@ async function sendApns(deviceToken: string, payload: PushPayload, env: Env): Pr
     },
     body: JSON.stringify(body),
   });
+}
 
-  if (!res.ok) {
+async function sendApns(deviceToken: string, payload: PushPayload, env: Env): Promise<void> {
+  const jwt = await getApnsJwt(env);
+  const bundleId = env.APNS_BUNDLE_ID ?? 'app.imcodes';
+
+  // Try production first, fallback to sandbox for development tokens (Xcode builds).
+  // APNs returns 400 BadDeviceToken when environment doesn't match.
+  const hosts = ['api.push.apple.com', 'api.sandbox.push.apple.com'];
+
+  for (let i = 0; i < hosts.length; i++) {
+    const res = await sendApnsToHost(hosts[i], deviceToken, payload, jwt, bundleId);
+    if (res.ok) return;
+
     const errBody = await res.text().catch(() => '');
     const unregistered = res.status === 410 || errBody.includes('Unregistered');
+
+    // BadDeviceToken on production → likely a sandbox token, try sandbox
+    if (i === 0 && res.status === 400 && errBody.includes('BadDeviceToken')) {
+      logger.info({ token: deviceToken.slice(0, 10) }, 'APNs production rejected token, trying sandbox');
+      continue;
+    }
+
     throw new PushError(`APNs ${res.status}: ${errBody}`, unregistered);
   }
 }
