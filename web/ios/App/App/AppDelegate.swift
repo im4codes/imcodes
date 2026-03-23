@@ -1,12 +1,16 @@
 import UIKit
 import Capacitor
+import UserNotifications
 
 @UIApplicationMain
-class AppDelegate: UIResponder, UIApplicationDelegate {
+class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterDelegate {
 
     var window: UIWindow?
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+        // Set notification delegate so push notifications display in foreground
+        UNUserNotificationCenter.current().delegate = self
+
         // Register local Capacitor plugins after the bridge initializes
         DispatchQueue.main.async {
             if let vc = self.window?.rootViewController as? CAPBridgeViewController {
@@ -14,6 +18,13 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
             }
         }
         return true
+    }
+
+    // Show push notifications even when app is in foreground
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound, .badge])
     }
 
     func applicationWillResignActive(_ application: UIApplication) {
