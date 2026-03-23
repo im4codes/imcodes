@@ -1299,7 +1299,15 @@ async function handleDaemonUpgrade(): Promise<void> {
     }
   } else if (process.platform === 'darwin') {
     const plist = join(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
-    restartCmd = `launchctl unload "${plist}" 2>/dev/null || true; sleep 1; launchctl load -w "${plist}"`;
+    const pidFile = join(homedir(), '.imcodes', 'daemon.pid');
+    restartCmd = `launchctl unload "${plist}" 2>/dev/null || true
+# Kill any lingering daemon processes after unload
+STALE_PID=$(cat "${pidFile}" 2>/dev/null)
+if [ -n "$STALE_PID" ] && kill -0 "$STALE_PID" 2>/dev/null; then
+  kill "$STALE_PID" 2>/dev/null; sleep 2
+  kill -0 "$STALE_PID" 2>/dev/null && kill -9 "$STALE_PID" 2>/dev/null
+fi
+launchctl load -w "${plist}"`;
   } else {
     logger.warn('daemon.upgrade: unsupported platform, cannot restart service');
     return;
