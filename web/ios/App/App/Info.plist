@@ -51,6 +51,8 @@
 	<string>IM.codes uses speech recognition to convert your voice to text commands.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>IM.codes needs microphone access for voice input.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>IM.codes uses Face ID to protect your account.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>IM.codes needs camera access to take photos for upload.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
