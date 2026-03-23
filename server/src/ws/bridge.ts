@@ -311,7 +311,7 @@ export class WsBridge {
             logger.error({ err }, 'Push dispatch failed'),
           );
         }
-        // Timeline events: ask.question
+        // Timeline events: session.state(idle) and ask.question
         if (pushType === 'timeline.event') {
           const event = (msg as Record<string, unknown>).event as Record<string, unknown> | undefined;
           if (event?.type === 'ask.question') {
@@ -319,6 +319,14 @@ export class WsBridge {
               type: 'ask.question',
               session: event.sessionId ?? '',
               ...event.payload as Record<string, unknown>,
+            }).catch((err) => logger.error({ err }, 'Push dispatch failed'));
+          }
+          // session.state idle from timeline (covers all agent types: CC, codex, gemini)
+          if (event?.type === 'session.state' && (event.payload as Record<string, unknown>)?.state === 'idle') {
+            this.dispatchEventPush(db, env, {
+              type: 'session.idle',
+              session: event.sessionId ?? '',
+              lastText: (msg as Record<string, unknown>).lastText ?? '',
             }).catch((err) => logger.error({ err }, 'Push dispatch failed'));
           }
         }

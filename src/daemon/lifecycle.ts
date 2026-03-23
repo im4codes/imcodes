@@ -386,7 +386,13 @@ export async function startup(): Promise<DaemonContext> {
   // Forward all timeline events to connected browsers via ServerLink
   if (serverLink) {
     timelineEmitter.on((event) => {
-      serverLink!.sendTimelineEvent(event);
+      // For session.state idle, attach lastText so push notifications have context
+      if (event.type === 'session.state' && (event.payload as Record<string, unknown>).state === 'idle') {
+        const lastText = getLastAssistantText(event.sessionId);
+        serverLink!.send({ type: 'timeline.event', event, ...(lastText ? { lastText } : {}) });
+      } else {
+        serverLink!.sendTimelineEvent(event);
+      }
     });
   }
 
