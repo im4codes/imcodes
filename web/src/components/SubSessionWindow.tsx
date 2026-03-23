@@ -89,6 +89,7 @@ export function SubSessionWindow({
   const [viewMode, setViewMode] = useState<ViewMode>(isShell ? 'terminal' : initial.viewMode);
   const [confirmClose, setConfirmClose] = useState(false);
   const inputRef = useRef<HTMLDivElement>(null);
+  const termFitFnRef = useRef<(() => void) | null>(null);
   const geomRef = useRef(geom);
   geomRef.current = geom;
   const viewModeRef = useRef(viewMode);
@@ -113,12 +114,17 @@ export function SubSessionWindow({
   }, [sub.id, geom, viewMode]);
 
   // Scroll to bottom whenever switching to chat view;
-  // force a full terminal refresh when switching to terminal view.
+  // force fit + full terminal refresh when switching to terminal view.
   useEffect(() => {
     if (viewMode === 'chat') {
       setTimeout(() => chatScrollRef.current?.(), 50);
-    } else if (viewMode === 'terminal' && ws && connected) {
-      try { ws.sendSnapshotRequest(sub.sessionName); } catch { /* ignore */ }
+    } else if (viewMode === 'terminal') {
+      requestAnimationFrame(() => {
+        termFitFnRef.current?.();
+        if (ws && connected) {
+          try { ws.sendSnapshotRequest(sub.sessionName); } catch { /* ignore */ }
+        }
+      });
     }
   }, [viewMode, ws, connected, sub.sessionName]);
 
@@ -291,6 +297,7 @@ export function SubSessionWindow({
             connected={connected}
             onDiff={(apply) => onDiff(sub.sessionName, apply)}
             onHistory={(apply) => onHistory(sub.sessionName, apply)}
+            onFitFn={(fn) => { termFitFnRef.current = fn; }}
             onScrollBottomFn={onTermScrollBottomFn}
           />
         </div>
