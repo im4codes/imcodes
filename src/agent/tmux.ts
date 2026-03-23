@@ -408,7 +408,7 @@ export async function startPipePaneStream(session: string, paneId: string): Prom
   }
 
   let fd = -1;
-  let stream: NetSocket | null = null;
+  let stream: Readable | null = null;
 
   try {
     // Create FIFO with 0600 permissions
@@ -418,15 +418,19 @@ export async function startPipePaneStream(session: string, paneId: string): Prom
     // - O_RDWR: process holds both read and write ends → no blocking on open, and
     //   write-end stays open preventing premature EOF before pipe-pane connects.
     // - O_NONBLOCK: required to avoid the open() syscall itself ever blocking.
-    // Do NOT use fs.createReadStream here — it uses thread-pool blocking read() which
-    // cannot be interrupted by destroy() when no data is available.
-    // Instead, wrap with net.Socket: FIFOs are epoll-pollable on Linux, so net.Socket
-    // uses non-blocking I/O multiplexing (handles EAGAIN correctly, destroy() works).
-    // Use fs.openSync to get a raw fd (no FileHandle GC issue).
     fd = fs.openSync(fifoPath, fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
 
-    // Wrap fd in a net.Socket (epoll-based, handles EAGAIN → wait, not error)
-    stream = new NetSocket({ fd, readable: true, writable: false, allowHalfOpen: true });
+    if (process.platform === 'darwin') {
+      // macOS: kqueue does not reliably deliver read-ready events for FIFOs when
+      // new data arrives from an external writer (pipe-pane → cat → FIFO).
+      // Use fs.createReadStream which uses libuv thread-pool blocking reads —
+      // one thread per session, but works correctly on all platforms.
+      stream = fs.createReadStream('', { fd, autoClose: false, highWaterMark: 16384 });
+    } else {
+      // Linux: FIFOs are epoll-pollable, so net.Socket provides non-blocking
+      // I/O multiplexing (handles EAGAIN correctly, destroy() works cleanly).
+      stream = new NetSocket({ fd, readable: true, writable: false, allowHalfOpen: true });
+    }
 
     // Build pipe-pane command: fixed helper script + shell-quoted FIFO path
     const cmd = shellQuote(PIPE_WRITER_SCRIPT) + ' ' + shellQuote(fifoPath);

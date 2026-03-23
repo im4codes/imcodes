@@ -1084,6 +1084,8 @@ export function App() {
     setSessions([]);
     setActiveSession(null);
     setSelectedServerId(null);
+    setDiscussions([]);
+    setRepoContexts(new Map());
   }, [setActiveSession]);
 
   // Native only: log out + clear server URL → back to ServerSetupPage
@@ -1108,6 +1110,9 @@ export function App() {
     if (serverName) { localStorage.setItem('rcc_server_name', serverName); setSelectedServerName(serverName); }
     setSessions([]);
     setSessionsLoaded(false);
+    // Clear server-scoped state to prevent cross-server data leaks
+    setDiscussions([]);
+    setRepoContexts(new Map());
 
     // Restore previously selected session for this server
     const savedSession = localStorage.getItem(`rcc_session_${serverId}`);
