@@ -13,6 +13,7 @@ import { timelineStore } from './timeline-store.js';
 import { startHookServer } from './hook-server.js';
 import { setupCCHooks } from '../agent/signal.js';
 import type http from 'http';
+import net from 'node:net';
 import { loadConfig, type Config } from '../config.js';
 import { loadCredentials } from '../bind/bind-flow.js';
 import { sendKeys } from '../agent/tmux.js';
@@ -125,9 +126,52 @@ function writePidFile(): void {
   } catch { /* best-effort */ }
 }
 
+let lockServer: net.Server | null = null;
+
+/** Acquire a single-instance lock via Unix domain socket.
+ *  If another daemon is already running, the socket is in use and we exit.
+ *  The lock auto-releases when the process exits (even on crash).
+ *  @param sockPath — override for testing; defaults to ~/.imcodes/daemon.sock */
+export async function acquireInstanceLock(sockPath?: string): Promise<net.Server> {
+  const p = sockPath ?? path.join(os.homedir(), '.imcodes', 'daemon.sock');
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+
+    server.on('error', (err: NodeJS.ErrnoException) => {
+      if (err.code === 'EADDRINUSE') {
+        // Socket exists — check if another daemon is actually alive
+        const client = net.connect(p, () => {
+          // Connection succeeded → another daemon is running
+          client.destroy();
+          reject(new Error(`Another imcodes daemon is already running. Use 'imcodes restart' to restart it.`));
+        });
+        client.on('error', () => {
+          // Connection failed → stale socket from a crashed process, reclaim it
+          try { fs.unlinkSync(p); } catch { /* ignore */ }
+          server.listen(p, () => resolve(server));
+        });
+      } else {
+        reject(err);
+      }
+    });
+
+    server.listen(p, () => resolve(server));
+  });
+}
+
+/** Release a single-instance lock. */
+export function releaseInstanceLock(server: net.Server, sockPath?: string): void {
+  server.close();
+  const p = sockPath ?? path.join(os.homedir(), '.imcodes', 'daemon.sock');
+  try { fs.unlinkSync(p); } catch { /* ignore */ }
+}
+
 /** Startup sequence: config → store → memory → sessions → server link */
 export async function startup(): Promise<DaemonContext> {
   logger.info('Daemon starting');
+  lockServer = await acquireInstanceLock();
   writePidFile();
 
   const config = await loadConfig();
@@ -394,7 +438,7 @@ export async function startup(): Promise<DaemonContext> {
   return ctx;
 }
 
-/** Shutdown sequence: flush store, disconnect WS, exit cleanly */
+/** Shutdown sequence: flush store, disconnect WS, release lock, exit cleanly */
 export async function shutdown(exitCode = 0): Promise<void> {
   logger.info('Daemon shutting down');
 
@@ -407,6 +451,8 @@ export async function shutdown(exitCode = 0): Promise<void> {
   } catch (e) {
     logger.error({ err: e }, 'Error during shutdown');
   }
+
+  if (lockServer) releaseInstanceLock(lockServer);
 
   // tmux sessions are intentionally NOT killed — they keep running
   logger.info('Daemon stopped (tmux sessions left running)');

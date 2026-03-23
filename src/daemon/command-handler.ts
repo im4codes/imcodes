@@ -1275,8 +1275,8 @@ async function handleDiscussionStop(cmd: Record<string, unknown>): Promise<void>
  */
 async function handleDaemonUpgrade(): Promise<void> {
   const { spawn } = await import('child_process');
-  const { writeFileSync, mkdtempSync } = await import('fs');
-  const { join } = await import('path');
+  const { writeFileSync, mkdtempSync, existsSync } = await import('fs');
+  const { join, dirname } = await import('path');
   const { tmpdir, homedir } = await import('os');
 
   logger.info('daemon.upgrade: preparing upgrade script');
@@ -1291,7 +1291,6 @@ async function handleDaemonUpgrade(): Promise<void> {
   let restartCmd: string;
   if (process.platform === 'linux') {
     const userSvc = join(homedir(), '.config/systemd/user/imcodes.service');
-    const { existsSync } = await import('fs');
     if (existsSync(userSvc)) {
       restartCmd = 'systemctl --user restart imcodes';
     } else {
@@ -1313,6 +1312,10 @@ launchctl load -w "${plist}"`;
     return;
   }
 
+  // Resolve full npm path — bare `npm` may not work in detached shells (nvm not loaded)
+  const npmBin = join(dirname(process.execPath), 'npm');
+  const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
+
   const script = `#!/bin/bash
 LOG="${logFile}"
 echo "=== imcodes upgrade started at $(date) ===" >> "$LOG"
@@ -1322,7 +1325,7 @@ sleep 3
 
 # Attempt npm install — if it fails we still restart to keep the daemon alive
 echo "Installing imcodes@latest..." >> "$LOG"
-if npm install -g imcodes@latest >> "$LOG" 2>&1; then
+if "${npmCmd}" install -g imcodes@latest >> "$LOG" 2>&1; then
   echo "Install succeeded." >> "$LOG"
 else
   echo "Install FAILED (exit $?). Will restart on existing version." >> "$LOG"

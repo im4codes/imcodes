@@ -85,6 +85,18 @@ program
       ensureServiceForeground();
     }
     if (opts.foreground) {
+      // Acquire single-instance lock before installing global error handlers
+      // so duplicate-instance errors propagate cleanly instead of being swallowed.
+      try {
+        await startup();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('already running')) {
+          console.error(msg);
+          process.exit(1);
+        }
+        throw err; // re-throw other startup errors
+      }
       // Called by launchd/systemd plist/unit — run inline.
       // Global error handlers: daemon must NEVER crash from unhandled errors.
       process.on('uncaughtException', (err) => {
@@ -93,7 +105,6 @@ program
       process.on('unhandledRejection', (err) => {
         logger.error({ err }, 'Unhandled rejection — daemon stays alive');
       });
-      await startup();
       logger.info('Daemon running. Press Ctrl+C to stop.');
       await new Promise(() => {});
       return;
@@ -328,6 +339,71 @@ program
         }
       }),
   );
+
+program
+  .command('upgrade')
+  .description('Upgrade imcodes to latest version and restart daemon')
+  .option('--version <ver>', 'Install specific version instead of latest')
+  .action((opts: { version?: string }) => {
+    const pkg = opts.version ? `imcodes@${opts.version}` : 'imcodes@latest';
+    console.log(`Upgrading to ${pkg}...`);
+
+    // Detect package manager: npm global or from a git clone?
+    const selfPath = realpathSync(process.argv[1]);
+    const isGlobal = selfPath.includes('node_modules');
+
+    if (isGlobal) {
+      // Installed via npm — use the same node/npm that's running this process
+      const npmBin = resolve(dirname(process.execPath), 'npm');
+      const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
+      try {
+        execSync(`${npmCmd} install -g ${pkg}`, { stdio: 'inherit' });
+      } catch {
+        console.error('npm install failed.');
+        process.exit(1);
+      }
+    } else {
+      // Git clone — pull and rebuild
+      const projectRoot = resolve(selfPath, '../..');
+      try {
+        execSync('git pull && npm run build', { cwd: projectRoot, stdio: 'inherit' });
+      } catch {
+        console.error('Git pull / build failed.');
+        process.exit(1);
+      }
+    }
+
+    // Show new version
+    try {
+      const newVer = execSync(`${realpathSync(process.argv[1])} --version 2>/dev/null || echo unknown`, { encoding: 'utf8' }).trim();
+      console.log(`Upgraded to v${newVer}`);
+    } catch { /* ignore */ }
+
+    // Restart daemon
+    ensureServiceForeground();
+    const platform = process.platform;
+    if (platform === 'darwin') {
+      const plist = resolve(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
+      if (existsSync(plist)) {
+        console.log('Restarting daemon via launchctl...');
+        try { execSync(`launchctl unload "${plist}" 2>/dev/null`, { stdio: 'pipe' }); } catch { /* ok */ }
+        killStaleImcodesProcesses();
+        execSync(`launchctl load "${plist}"`, { stdio: 'inherit' });
+      }
+    } else if (platform === 'linux') {
+      const userService = resolve(homedir(), '.config/systemd/user/imcodes.service');
+      if (existsSync(userService)) {
+        console.log('Restarting daemon via systemd...');
+        execSync('systemctl --user daemon-reload && systemctl --user restart imcodes', { stdio: 'inherit' });
+      } else {
+        try {
+          console.log('Restarting daemon via systemd...');
+          execSync('sudo systemctl daemon-reload && sudo systemctl restart imcodes', { stdio: 'inherit' });
+        } catch { /* no service — skip */ }
+      }
+    }
+    console.log('Done.');
+  });
 
 program
   .command('restart')
