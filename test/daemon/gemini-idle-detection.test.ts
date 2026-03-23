@@ -29,13 +29,17 @@ describe('Gemini Idle Detection (Direct pollTick test)', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // Default: terminal shows idle prompt (no spinner)
+    vi.mocked(tmux.capturePane).mockResolvedValue(['', '> ', '']);
     state = {
       sessionUuid: 'uuid-1',
       activeFile: '/tmp/session.json',
       seenCount: 0,
       lastUpdated: '',
       abort: new AbortController(),
+      watchAbort: new AbortController(),
       stopped: false,
+      polling: false,
     };
   });
 

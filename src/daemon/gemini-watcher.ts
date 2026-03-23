@@ -178,6 +178,28 @@ async function confirmSpinner(sessionName: string): Promise<boolean> {
   return hits >= 3;
 }
 
+/**
+ * Burst-confirm spinner presence. This is the SINGLE GATE for all idle/running
+ * decisions — every path must call this before transitioning state.
+ * Returns true if spinner is confirmed active (= agent is working).
+ */
+async function assertSpinnerGate(sessionName: string, state: WatcherState): Promise<boolean> {
+  const confirmed = await confirmSpinner(sessionName);
+  if (confirmed) {
+    if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
+    state.spinnerFrameCount = SPINNER_CONFIRM_READS;
+    state.idleConfirmCount = 0;
+    transitionState(sessionName, state, 'running', true); // spinner is ground truth
+    if (!state._terminalThinkingEmitted) {
+      state._terminalThinkingEmitted = true;
+      timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'terminal-spinner', confidence: 'high' });
+    }
+  } else {
+    state.spinnerFrameCount = 0;
+  }
+  return confirmed;
+}
+
 async function terminalThinkingCheck(sessionName: string, state: WatcherState): Promise<void> {
   let lines: string[];
   try {
@@ -189,24 +211,12 @@ async function terminalThinkingCheck(sessionName: string, state: WatcherState): 
   const status = detectStatus(lines, 'gemini');
   const spinnerVisible = hasLeadingSpinner(lines);
 
-  // ── First frame shows spinner → burst-confirm ──────────────────────────
-  if (spinnerVisible) {
-    const confirmed = await confirmSpinner(sessionName);
-    if (confirmed) {
-      if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
-      state.spinnerFrameCount = SPINNER_CONFIRM_READS;
-      transitionState(sessionName, state, 'running', true); // spinner is ground truth
-      if (!state._terminalThinkingEmitted) {
-        state._terminalThinkingEmitted = true;
-        timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'terminal-spinner', confidence: 'high' });
-      }
-      return;
-    }
-    // Burst didn't confirm — fall through to normal logic
+  // ── Spinner visible on first frame OR about to declare idle → burst-confirm ──
+  if (spinnerVisible || status === 'idle') {
+    if (await assertSpinnerGate(sessionName, state)) return; // spinner confirmed → running
   }
-  state.spinnerFrameCount = 0;
 
-  // ── No spinner: use existing idle/running logic ─────────────────────────
+  // ── No spinner confirmed — proceed with idle/running logic ─────────────
   if (status === 'idle') {
     if (state.lastConversationStatus === 'idle') {
       state.idleConfirmCount = 2;
@@ -325,19 +335,9 @@ async function pollTickInner(sessionName: string, state: WatcherState): Promise<
     const mtimeUnchanged = state._lastMtimeMs !== undefined && s.mtimeMs === state._lastMtimeMs;
     const sizeUnchanged = state._lastSize !== undefined && s.size === state._lastSize;
     if (mtimeUnchanged && sizeUnchanged) {
-      // File truly unchanged — run terminal spinner check (ground truth),
-      // then idle detection if JSON also says idle. Skip expensive JSON read/parse.
+      // File truly unchanged — terminal spinner is ground truth.
+      // terminalThinkingCheck handles all state transitions via assertSpinnerGate.
       await terminalThinkingCheck(sessionName, state);
-      // If spinner confirmed running, skip idle logic
-      if (state.currentState === 'running' && (state.spinnerFrameCount ?? 0) > 0) return;
-      if (state.lastConversationStatus === 'idle') {
-        state.idleConfirmCount = (state.idleConfirmCount ?? 0) + 1;
-        if (state.idleConfirmCount >= 2 && !state.idleDebounceTimer) {
-          transitionState(sessionName, state, 'idle');
-        }
-        return;
-      }
-      state.idleConfirmCount = 0;
       return;
     }
     state._lastMtimeMs = s.mtimeMs;
@@ -359,17 +359,8 @@ async function pollTickInner(sessionName: string, state: WatcherState): Promise<
   state.lastConversationStatus = conversationStatus;
 
   if (conv.lastUpdated === state.lastUpdated && conv.messages.length === state.seenCount) {
-    if (conversationStatus === 'idle') {
-      state.idleConfirmCount = (state.idleConfirmCount ?? 0) + 1;
-      // Require consecutive idle confirmations to prevent tool-call gap false idles
-      if (state.idleConfirmCount >= 2 && !state.idleDebounceTimer) {
-        transitionState(sessionName, state, 'idle');
-      }
-      return;
-    }
-    state.idleConfirmCount = 0;
-    // JSON unchanged — supplement with terminal-based detection.
-    // Gemini CLI may be thinking/working without writing to JSON yet.
+    // JSON unchanged — terminal spinner is ground truth.
+    // terminalThinkingCheck handles all state transitions via assertSpinnerGate.
     await terminalThinkingCheck(sessionName, state);
     return;
   }
