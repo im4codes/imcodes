@@ -16,8 +16,10 @@ const STARTUP_PROMPTS: Array<{
   keys: string[]; // tmux key names to send in sequence
   label: string;
 }> = [
-  // "Do you trust the files in this folder?" — Enter to accept (Yes is default)
-  { pattern: /trust.*folder|do you trust/i, keys: ['Enter'], label: 'trust-folder' },
+  // "Security guide" / "Do you trust the files in this folder?" — select "Yes, I trust"
+  // Newer CC versions use a numbered menu (1=Yes, 2=No); older use Enter for default.
+  // Sending "1" then Enter covers both: numbered picks option 1, legacy confirms default.
+  { pattern: /security guide|trust.*folder|do you trust/i, keys: ['1', 'Enter'], label: 'trust-folder' },
   // Update available / Press enter to continue
   { pattern: /update available|press enter to continue/i, keys: ['Enter'], label: 'update' },
   // "Bypass Permissions mode" dialog — "No, exit" is selected, Down selects "Yes, I accept"
