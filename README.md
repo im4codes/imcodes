@@ -66,7 +66,7 @@ Server (self-hosted)
         ↓ WebSocket
 Daemon (your machine, manages tmux)
         ↓ tmux
-AI Agents (Claude Code / Codex / Gemini CLI / OpenCode)
+AI Agents (Claude Code / Codex / Gemini CLI)
 ```
 
 The daemon runs on your dev machine and manages agent sessions through tmux. The server relays connections between your devices and the daemon. Everything stays on your infrastructure.
@@ -125,7 +125,7 @@ Login at `https://your-domain` with `admin` and the printed password. Bind your 
 - macOS or Linux (tested on both). Windows users need [WSL](https://learn.microsoft.com/en-us/windows/wsl/) — native Windows is not supported since the project uses tmux to manage agent sessions.
 - Node.js >= 20
 - tmux
-- At least one AI coding agent: [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or [OpenCode](https://github.com/opencode-ai/opencode)
+- At least one AI coding agent: [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), or [Gemini CLI](https://github.com/google-gemini/gemini-cli)
 
 ## License
 
