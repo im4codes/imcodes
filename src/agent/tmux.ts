@@ -335,8 +335,6 @@ const SESSION_PATTERN = /^deck_([a-z0-9A-Z0-9_]+_(brain|w\d+)|sub_[a-z0-9_]+)$/;
 /** Cached pipe-pane capability (tmux >= 2.6 supports -O). */
 let pipePaneCapability: boolean | null = null;
 
-/** Fixed path to the pipe-writer helper script. */
-const PIPE_WRITER_SCRIPT = path.join(__dirname, '../../scripts/pipe-writer.sh');
 
 /**
  * Check if tmux supports `pipe-pane -O` (requires tmux >= 2.6).
@@ -438,8 +436,8 @@ export async function startPipePaneStream(session: string, paneId: string): Prom
       stream = new NetSocket({ fd, readable: true, writable: false, allowHalfOpen: true });
     }
 
-    // Build pipe-pane command: fixed helper script + shell-quoted FIFO path
-    const cmd = shellQuote(PIPE_WRITER_SCRIPT) + ' ' + shellQuote(fifoPath);
+    // Inline cat command — no external script needed
+    const cmd = 'cat > ' + shellQuote(fifoPath);
 
     // Start pipe-pane -O (output only, not existing history)
     await execFile('tmux', ['pipe-pane', '-O', '-t', paneId, cmd]);

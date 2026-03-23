@@ -13,8 +13,7 @@
   "main": "./dist/index.js",
   "files": [
     "dist/",
-    "config/",
-    "scripts/pipe-writer.sh"
+    "config/"
   ],
   "engines": {
     "node": ">=20"
