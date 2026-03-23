@@ -182,6 +182,22 @@ export async function startup(): Promise<DaemonContext> {
         if (TERMINAL.has(run.status)) continue;
         try { serverLink.send({ type: 'p2p.run_save', run }); } catch { /* ignore */ }
       }
+      // Re-sync all active sub-sessions so server DB and frontend stay in sync
+      for (const session of listSessions()) {
+        if (!session.name.startsWith('deck_sub_')) continue;
+        if (session.state !== 'running') continue;
+        const id = session.name.slice('deck_sub_'.length);
+        try {
+          serverLink.send({
+            type: 'subsession.sync',
+            id,
+            sessionType: session.agentType,
+            cwd: session.projectDir || null,
+            ccSessionId: session.ccSessionId ?? null,
+            parentSession: session.parentSession ?? null,
+          });
+        } catch { /* ignore */ }
+      }
     }, 3_000); // delay to ensure WS auth handshake completes first
   }
 

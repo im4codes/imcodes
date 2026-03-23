@@ -33,12 +33,12 @@ discussionRoutes.get('/:id/discussions/:discussionId', async (c) => {
   const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
 
-  const discussion = await getDiscussionById(c.env.DB, discussionId);
-  if (!discussion || discussion.server_id !== serverId) {
+  const discussion = await getDiscussionById(c.env.DB, discussionId, serverId);
+  if (!discussion) {
     return c.json({ error: 'not_found' }, 404);
   }
 
-  const rounds = await getDiscussionRounds(c.env.DB, discussionId);
+  const rounds = await getDiscussionRounds(c.env.DB, discussionId, serverId);
   return c.json({ discussion, rounds });
 });
 
@@ -73,8 +73,8 @@ discussionRoutes.get('/:id/p2p/runs/:runId', async (c) => {
   const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
 
-  const run = await getOrchestrationRunById(c.env.DB, runId);
-  if (!run || run.server_id !== serverId) {
+  const run = await getOrchestrationRunById(c.env.DB, runId, serverId);
+  if (!run) {
     return c.json({ error: 'not_found' }, 404);
   }
   return c.json({ run });

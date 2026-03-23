@@ -423,7 +423,9 @@ export async function createSubSession(
   const now = Date.now();
   await db
     .prepare(
-      'INSERT INTO sub_sessions (id, server_id, type, shell_bin, cwd, label, closed_at, cc_session_id, gemini_session_id, parent_session, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)',
+      `INSERT INTO sub_sessions (id, server_id, type, shell_bin, cwd, label, closed_at, cc_session_id, gemini_session_id, parent_session, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+       ON CONFLICT (id, server_id) DO UPDATE SET type = EXCLUDED.type, shell_bin = EXCLUDED.shell_bin, cwd = EXCLUDED.cwd, label = EXCLUDED.label, closed_at = NULL, cc_session_id = EXCLUDED.cc_session_id, gemini_session_id = EXCLUDED.gemini_session_id, parent_session = EXCLUDED.parent_session, updated_at = EXCLUDED.updated_at`,
     )
     .bind(id, serverId, type, shellBin, cwd, label, ccSessionId, geminiSessionId, parentSession, now, now)
     .run();
@@ -528,8 +530,8 @@ export async function getDiscussionsByServer(db: PgDatabase, serverId: string): 
   return rows.results ?? [];
 }
 
-export async function getDiscussionById(db: PgDatabase, id: string): Promise<DbDiscussion | null> {
-  return db.prepare('SELECT * FROM discussions WHERE id = ?').bind(id).first<DbDiscussion>();
+export async function getDiscussionById(db: PgDatabase, id: string, serverId: string): Promise<DbDiscussion | null> {
+  return db.prepare('SELECT * FROM discussions WHERE id = ? AND server_id = ?').bind(id, serverId).first<DbDiscussion>();
 }
 
 export async function upsertDiscussion(
@@ -556,7 +558,7 @@ export async function upsertDiscussion(
     .prepare(
       `INSERT INTO discussions (id, server_id, topic, state, max_rounds, current_round, current_speaker, participants, file_path, conclusion, file_content, error, started_at, finished_at, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
+       ON CONFLICT(id, server_id) DO UPDATE SET
          state = excluded.state,
          current_round = excluded.current_round,
          current_speaker = excluded.current_speaker,
@@ -582,6 +584,7 @@ export async function insertDiscussionRound(
   r: {
     id: string;
     discussionId: string;
+    serverId: string;
     round: number;
     speakerRole: string;
     speakerAgent: string;
@@ -591,16 +594,16 @@ export async function insertDiscussionRound(
 ): Promise<void> {
   await db
     .prepare(
-      'INSERT INTO discussion_rounds (id, discussion_id, round, speaker_role, speaker_agent, speaker_model, response, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO discussion_rounds (id, discussion_id, server_id, round, speaker_role, speaker_agent, speaker_model, response, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
     )
-    .bind(r.id, r.discussionId, r.round, r.speakerRole, r.speakerAgent, r.speakerModel ?? null, r.response, Date.now())
+    .bind(r.id, r.discussionId, r.serverId, r.round, r.speakerRole, r.speakerAgent, r.speakerModel ?? null, r.response, Date.now())
     .run();
 }
 
-export async function getDiscussionRounds(db: PgDatabase, discussionId: string): Promise<DbDiscussionRound[]> {
+export async function getDiscussionRounds(db: PgDatabase, discussionId: string, serverId: string): Promise<DbDiscussionRound[]> {
   const rows = await db
-    .prepare('SELECT * FROM discussion_rounds WHERE discussion_id = ? ORDER BY round, created_at')
-    .bind(discussionId)
+    .prepare('SELECT * FROM discussion_rounds WHERE discussion_id = ? AND server_id = ? ORDER BY round, created_at')
+    .bind(discussionId, serverId)
     .all<DbDiscussionRound>();
   return rows.results ?? [];
 }
@@ -636,7 +639,7 @@ export async function upsertOrchestrationRun(db: PgDatabase, r: DbOrchestrationR
        remaining_targets, mode_key, status, request_message_id, callback_message_id, context_ref, timeout_ms,
        result_summary, error, created_at, updated_at, completed_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?, ?, ?, ?::jsonb, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT (id) DO UPDATE SET
+    ON CONFLICT (id, server_id) DO UPDATE SET
       current_target_session = EXCLUDED.current_target_session,
       remaining_targets = EXCLUDED.remaining_targets,
       status = EXCLUDED.status,
@@ -660,8 +663,8 @@ export async function getOrchestrationRunsByDiscussion(db: PgDatabase, discussio
   return rows.results ?? [];
 }
 
-export async function getOrchestrationRunById(db: PgDatabase, id: string): Promise<DbOrchestrationRun | null> {
-  return db.prepare('SELECT * FROM discussion_orchestration_runs WHERE id = ?').bind(id).first<DbOrchestrationRun>();
+export async function getOrchestrationRunById(db: PgDatabase, id: string, serverId: string): Promise<DbOrchestrationRun | null> {
+  return db.prepare('SELECT * FROM discussion_orchestration_runs WHERE id = ? AND server_id = ?').bind(id, serverId).first<DbOrchestrationRun>();
 }
 
 export async function getActiveOrchestrationRuns(db: PgDatabase, serverId: string): Promise<DbOrchestrationRun[]> {

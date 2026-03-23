@@ -358,7 +358,7 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       void handleSubSessionReadResponse(cmd, serverLink);
       break;
     case 'subsession.set_model':
-      void handleSubSessionSetModel(cmd);
+      void handleSubSessionSetModel(cmd, serverLink);
       break;
     case 'ask.answer':
       void handleAskAnswer(cmd);
@@ -962,21 +962,41 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
       logger.warn({ err: e, id }, 'Failed to resolve Gemini session ID — using snapshot-diff fallback');
     }
   }
-  await startSubSession({
-    id,
-    type,
-    shellBin: cmd.shellBin as string | null | undefined,
-    cwd: cmd.cwd as string | null | undefined,
-    ccSessionId: cmd.ccSessionId as string | null | undefined,
-    parentSession: cmd.parentSession as string | null | undefined,
-    geminiSessionId,
-    fresh: type === 'gemini' && !geminiSessionId,
-    _fileSnapshot: fileSnapshot,
-    _onGeminiDiscovered: fileSnapshot ? (sessionId: string) => {
-      logger.info({ id, sessionId }, 'Discovered Gemini session ID via snapshot-diff');
-      try { serverLink.send({ type: 'subsession.update_gemini_id', id, geminiSessionId: sessionId }); } catch { /* ignore */ }
-    } : undefined,
-  }).catch((e: unknown) => logger.error({ err: e, id }, 'subsession.start failed'));
+  const cwd = cmd.cwd as string | null | undefined;
+  const shellBin = cmd.shellBin as string | null | undefined;
+  const ccSessionId = cmd.ccSessionId as string | null | undefined;
+  const parentSession = cmd.parentSession as string | null | undefined;
+  try {
+    await startSubSession({
+      id,
+      type,
+      shellBin,
+      cwd,
+      ccSessionId,
+      parentSession,
+      geminiSessionId,
+      fresh: type === 'gemini' && !geminiSessionId,
+      _fileSnapshot: fileSnapshot,
+      _onGeminiDiscovered: fileSnapshot ? (sessionId: string) => {
+        logger.info({ id, sessionId }, 'Discovered Gemini session ID via snapshot-diff');
+        try { serverLink.send({ type: 'subsession.update_gemini_id', id, geminiSessionId: sessionId }); } catch { /* ignore */ }
+      } : undefined,
+    });
+    // Sync to server DB so frontend can see the sub-session
+    try {
+      serverLink.send({
+        type: 'subsession.sync',
+        id,
+        sessionType: type,
+        cwd: cwd ?? null,
+        shellBin: shellBin ?? null,
+        ccSessionId: ccSessionId ?? null,
+        parentSession: parentSession ?? null,
+      });
+    } catch { /* not connected */ }
+  } catch (e: unknown) {
+    logger.error({ err: e, id }, 'subsession.start failed');
+  }
 }
 
 async function handleSubSessionStop(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
@@ -1001,7 +1021,7 @@ async function handleSubSessionDetectShells(serverLink: ServerLink): Promise<voi
   } catch { /* not connected */ }
 }
 
-async function handleSubSessionSetModel(cmd: Record<string, unknown>): Promise<void> {
+async function handleSubSessionSetModel(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = cmd.sessionName as string | undefined;
   const model = cmd.model as string | undefined;
   const cwd = cmd.cwd as string | undefined;
@@ -1020,9 +1040,22 @@ async function handleSubSessionSetModel(cmd: Record<string, unknown>): Promise<v
   }
 
   logger.info({ sessionName, model }, 'Restarting Codex sub-session with new model');
-  await stopSubSession(sessionName).catch(() => {});
-  await startSubSession({ id, type: 'codex', cwd: cwd ?? null, codexModel: model })
-    .catch((e: unknown) => logger.error({ err: e, sessionName, model }, 'subsession.set_model restart failed'));
+  await stopSubSession(sessionName, serverLink).catch(() => {});
+  try {
+    await startSubSession({ id, type: 'codex', cwd: cwd ?? null, codexModel: model });
+    // Sync restarted sub-session to server DB
+    try {
+      serverLink.send({
+        type: 'subsession.sync',
+        id,
+        sessionType: 'codex',
+        cwd: cwd ?? null,
+        codexModel: model,
+      });
+    } catch { /* not connected */ }
+  } catch (e: unknown) {
+    logger.error({ err: e, sessionName, model }, 'subsession.set_model restart failed');
+  }
 }
 
 async function handleSubSessionReadResponse(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {

@@ -707,6 +707,7 @@ export class WsBridge {
       void insertDiscussionRound(this.db, {
         id: msg.roundId as string,
         discussionId: msg.discussionId as string,
+        serverId: this.serverId,
         round: msg.round as number,
         speakerRole: msg.speakerRole as string,
         speakerAgent: msg.speakerAgent as string,
