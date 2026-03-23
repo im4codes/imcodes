@@ -1,4 +1,4 @@
-import { exec as execCb, execFile as execFileCb } from 'child_process';
+import { execFile as execFileCb } from 'child_process';
 import { createHash } from 'crypto';
 import { promisify } from 'util';
 import * as fs from 'fs';
@@ -8,12 +8,11 @@ import * as path from 'path';
 import { Socket as NetSocket } from 'net';
 import type { Readable } from 'stream';
 
-const exec = promisify(execCb);
 const execFile = promisify(execFileCb);
 
-/** Run a raw tmux command. */
-export async function tmuxExec(args: string): Promise<string> {
-  const { stdout } = await exec(`tmux ${args}`);
+/** Run a tmux command with array args (no shell — safe from injection). */
+async function tmuxRun(...args: string[]): Promise<string> {
+  const { stdout } = await execFile('tmux', args);
   return stdout.trim();
 }
 
@@ -22,7 +21,7 @@ export async function tmuxExec(args: string): Promise<string> {
  * Returns lines as a string array.
  */
 export async function capturePane(session: string, lines = 50): Promise<string[]> {
-  const raw = await tmuxExec(`capture-pane -p -t ${session} -S -${lines}`);
+  const raw = await tmuxRun('capture-pane', '-p', '-t', session, '-S', `-${lines}`);
   return raw.split('\n');
 }
 
@@ -31,7 +30,7 @@ export async function capturePane(session: string, lines = 50): Promise<string[]
  * Used for terminal streaming — gives exactly the rows the user sees.
  */
 export async function capturePaneVisible(session: string): Promise<string> {
-  return tmuxExec(`capture-pane -e -p -t ${session}`);
+  return tmuxRun('capture-pane', '-e', '-p', '-t', session);
 }
 
 /**
@@ -39,7 +38,7 @@ export async function capturePaneVisible(session: string): Promise<string> {
  * -S -N starts N lines before visible top; -E -1 ends at the line before visible row 0.
  */
 export async function capturePaneHistory(session: string, lines = 1000): Promise<string> {
-  return tmuxExec(`capture-pane -e -p -t ${session} -S -${lines} -E -1`);
+  return tmuxRun('capture-pane', '-e', '-p', '-t', session, '-S', `-${lines}`, '-E', '-1');
 }
 
 /**
@@ -47,8 +46,8 @@ export async function capturePaneHistory(session: string, lines = 1000): Promise
  * Useful for detecting if an agent is at an input prompt (cursor on ">" or "›" line).
  */
 export async function getCursorLine(session: string): Promise<string> {
-  const cursorY = parseInt(await tmuxExec(`display-message -t ${session} -p "#{cursor_y}"`), 10);
-  const lines = (await tmuxExec(`capture-pane -p -t ${session}`)).split('\n');
+  const cursorY = parseInt(await tmuxRun('display-message', '-t', session, '-p', '#{cursor_y}'), 10);
+  const lines = (await tmuxRun('capture-pane', '-p', '-t', session)).split('\n');
   return lines[cursorY] ?? '';
 }
 
@@ -83,24 +82,22 @@ export async function sendKeys(session: string, keys: string, opts?: SendKeysOpt
     const filePath = opts?.cwd ? path.join(opts.cwd, fileName) : `/tmp/${fileName}`;
     await fsp.writeFile(filePath, keys, { encoding: 'utf-8', mode: 0o600 });
     const instruction = `Read and execute all instructions in @${filePath}`;
-    const escaped = instruction.replace(/'/g, "'\\''");
-    await tmuxExec(`send-keys -t ${session} -l -- '${escaped}'`);
+    await tmuxRun('send-keys', '-t', session, '-l', '--', instruction);
     setTimeout(() => fsp.unlink(filePath).catch(() => {}), 120_000);
   } else {
-    // Short text: simple send-keys
-    const escaped = keys.replace(/'/g, "'\\''");
-    await tmuxExec(`send-keys -t ${session} -l -- '${escaped}'`);
+    // Short text: simple send-keys (no shell quoting needed with execFile)
+    await tmuxRun('send-keys', '-t', session, '-l', '--', keys);
   }
 
   // Delay before Enter
   const delay = isLong ? 500 : Math.min(80 + Math.floor(keys.length / 10) * 5, 1000);
   await new Promise<void>((r) => setTimeout(r, delay));
-  await tmuxExec(`send-keys -t ${session} Enter`);
+  await tmuxRun('send-keys', '-t', session, 'Enter');
 
   // Safety net: 3s delayed Enter for long text (empty-line Enter is a no-op)
   if (isLong) {
     setTimeout(async () => {
-      try { await tmuxExec(`send-keys -t ${session} Enter`); } catch { /* ignore */ }
+      try { await tmuxRun('send-keys', '-t', session, 'Enter'); } catch { /* ignore */ }
     }, 3_000);
   }
 }
@@ -116,19 +113,15 @@ async function sendKeysChunked(session: string, text: string): Promise<void> {
   const lines = text.split('\n');
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    // Send line in chunks to avoid shell arg limits
     for (let offset = 0; offset < line.length; offset += CHUNK_SIZE) {
       const chunk = line.slice(offset, offset + CHUNK_SIZE);
-      const escaped = chunk.replace(/'/g, "'\\''");
-      await tmuxExec(`send-keys -t ${session} -l -- '${escaped}'`);
-      // Delay between chunks so the agent can consume input
+      await tmuxRun('send-keys', '-t', session, '-l', '--', chunk);
       if (offset + CHUNK_SIZE < line.length) {
         await new Promise<void>((r) => setTimeout(r, CHUNK_DELAY_MS));
       }
     }
-    // Send Enter between lines (but not after the last — the caller sends final Enter)
     if (i < lines.length - 1) {
-      await tmuxExec(`send-keys -t ${session} Enter`);
+      await tmuxRun('send-keys', '-t', session, 'Enter');
       await new Promise<void>((r) => setTimeout(r, LINE_DELAY_MS));
     }
   }
@@ -139,7 +132,7 @@ export const sendKeysDelayedEnter = sendKeys;
 
 /** Send raw keys without appending Enter (e.g. for Ctrl-C). */
 export async function sendKey(session: string, key: string): Promise<void> {
-  await tmuxExec(`send-keys -t ${session} ${key}`);
+  await tmuxRun('send-keys', '-t', session, key);
 }
 
 export interface NewSessionOptions {
@@ -149,31 +142,28 @@ export interface NewSessionOptions {
 
 /** Create a new detached tmux session. Throws if it already exists. */
 export async function newSession(name: string, command?: string, opts?: NewSessionOptions): Promise<void> {
-  const cwdArg = opts?.cwd ? `-c ${JSON.stringify(opts.cwd)}` : '';
-  const envArgs = opts?.env
-    ? Object.entries(opts.env)
-        .map(([k, v]) => `-e ${k}=${JSON.stringify(v)}`)
-        .join(' ')
-    : '';
-  // Quote the command with single quotes so the outer /bin/sh does NOT interpret
-  // shell operators (&&, ||, etc.) — tmux receives the full string and runs it
-  // via $SHELL -c internally.
-  const cmdArg = command ? `-- '${command.replace(/'/g, "'\\''")}'` : '';
-  await tmuxExec(`new-session -d -s ${name} ${cwdArg} ${envArgs} ${cmdArg}`.trim());
+  const args = ['new-session', '-d', '-s', name];
+  if (opts?.cwd) args.push('-c', opts.cwd);
+  if (opts?.env) {
+    for (const [k, v] of Object.entries(opts.env)) {
+      args.push('-e', `${k}=${v}`);
+    }
+  }
+  if (command) args.push('--', command);
+  await tmuxRun(...args);
   // Keep the tmux session alive after the process exits so daemon restarts
   // can detect it and reconnect instead of launching a fresh session.
   try {
-    await tmuxExec(`set-option -t ${name} remain-on-exit on`);
+    await tmuxRun('set-option', '-t', name, 'remain-on-exit', 'on');
   } catch {
     // Non-fatal: session was created but remain-on-exit couldn't be set
-    // (e.g., session exited immediately). The session still works.
   }
 }
 
 /** Kill a tmux session by name. Does not throw if it doesn't exist. */
 export async function killSession(name: string): Promise<void> {
   try {
-    await tmuxExec(`kill-session -t ${name}`);
+    await tmuxRun('kill-session', '-t', name);
   } catch {
     // session may not exist
   }
@@ -182,10 +172,9 @@ export async function killSession(name: string): Promise<void> {
 /** List all tmux sessions. Returns session names. */
 export async function listSessions(): Promise<string[]> {
   try {
-    const raw = await tmuxExec(`list-sessions -F '#{session_name}'`);
+    const raw = await tmuxRun('list-sessions', '-F', '#{session_name}');
     return raw.split('\n').filter(Boolean);
   } catch (e: any) {
-    // tmux returns 1 if there are no sessions
     const err = String(e.stderr || e.message || '');
     if (err.includes('no sessions') || err.includes('no server running') || err.includes('No such file or directory') || err.includes('error connecting')) return [];
     throw e;
@@ -201,7 +190,7 @@ export async function sessionExists(name: string): Promise<boolean> {
 /** Check if the pane process in a tmux session is still alive (not dead from remain-on-exit). */
 export async function isPaneAlive(name: string): Promise<boolean> {
   try {
-    const raw = await tmuxExec(`list-panes -t ${name} -F '#{pane_dead}'`);
+    const raw = await tmuxRun('list-panes', '-t', name, '-F', '#{pane_dead}');
     return raw.trim() === '0';
   } catch {
     return false;
@@ -210,18 +199,18 @@ export async function isPaneAlive(name: string): Promise<boolean> {
 
 /** Respawn a dead pane (remain-on-exit) with a new command. */
 export async function respawnPane(name: string, command: string): Promise<void> {
-  await tmuxExec(`respawn-pane -t ${name} -k '${command.replace(/'/g, "'\\''")}'`);
+  await tmuxRun('respawn-pane', '-t', name, '-k', command);
 }
 
 /** Resize a tmux session window to the given dimensions. */
 export async function resizeSession(name: string, cols: number, rows: number): Promise<void> {
-  await tmuxExec(`resize-window -t ${name} -x ${cols} -y ${rows}`);
+  await tmuxRun('resize-window', '-t', name, '-x', String(cols), '-y', String(rows));
 }
 
 /** Get the pane size (cols x rows) of a tmux session. */
 export async function getPaneSize(session: string): Promise<{ cols: number; rows: number }> {
   try {
-    const raw = await tmuxExec(`display-message -p -t ${session} '#{pane_width} #{pane_height}'`);
+    const raw = await tmuxRun('display-message', '-p', '-t', session, '#{pane_width} #{pane_height}');
     const [cols, rows] = raw.split(' ').map(Number);
     return { cols: cols || 80, rows: rows || 24 };
   } catch {
@@ -231,30 +220,28 @@ export async function getPaneSize(session: string): Promise<{ cols: number; rows
 
 /** Read the tmux paste buffer (used for CC /copy output). */
 export async function showBuffer(): Promise<string> {
-  return tmuxExec('show-buffer');
+  return tmuxRun('show-buffer');
 }
 
 /** Get the pane ID of the first pane in a tmux session (e.g. "%42"). */
 export async function getPaneId(session: string): Promise<string> {
-  return tmuxExec(`display-message -p -t ${session} '#{pane_id}'`);
+  return tmuxRun('display-message', '-p', '-t', session, '#{pane_id}');
 }
 
 /** Get the current working directory of the first pane of a session. */
 export async function getPaneCwd(session: string): Promise<string> {
-  const raw = await tmuxExec(`display-message -p -t ${session} '#{pane_current_path}'`);
-  return raw.trim();
+  return tmuxRun('display-message', '-p', '-t', session, '#{pane_current_path}');
 }
 
 /** Get the start command of the first pane of a session. */
 export async function getPaneStartCommand(session: string): Promise<string> {
-  const raw = await tmuxExec(`display-message -p -t ${session} '#{pane_start_command}'`);
-  return raw.trim();
+  return tmuxRun('display-message', '-p', '-t', session, '#{pane_start_command}');
 }
 
 /** Delete the tmux paste buffer (clipboard cleanup after CC /copy). */
 export async function deleteBuffer(): Promise<void> {
   try {
-    await tmuxExec('delete-buffer');
+    await tmuxRun('delete-buffer');
   } catch {
     // buffer may not exist
   }
@@ -308,7 +295,7 @@ export async function sendRawInput(session: string, data: string): Promise<void>
   // Check escape sequence map first
   const tmuxKey = XTERM_KEY_MAP[data];
   if (tmuxKey) {
-    await tmuxExec(`send-keys -t ${session} ${tmuxKey}`);
+    await tmuxRun('send-keys', '-t', session, tmuxKey);
     return;
   }
 
@@ -316,10 +303,9 @@ export async function sendRawInput(session: string, data: string): Promise<void>
   if (data.length === 1) {
     const code = data.charCodeAt(0);
     if (code >= 1 && code <= 26) {
-      // Rate-limit Ctrl+C to prevent session kill
       if (code === 3 && isCtrlCRateLimited(session)) return;
-      const letter = String.fromCharCode(code + 96); // 1→'a', 2→'b', ...
-      await tmuxExec(`send-keys -t ${session} C-${letter}`);
+      const letter = String.fromCharCode(code + 96);
+      await tmuxRun('send-keys', '-t', session, `C-${letter}`);
       return;
     }
   }
@@ -327,9 +313,8 @@ export async function sendRawInput(session: string, data: string): Promise<void>
   // Unknown escape sequence — skip
   if (data.startsWith('\x1b')) return;
 
-  // Regular printable text — send literally (no Enter appended)
-  const escaped = data.replace(/'/g, "'\\''");
-  await tmuxExec(`send-keys -t ${session} -l -- '${escaped}'`);
+  // Regular printable text — send literally (no shell quoting needed with execFile)
+  await tmuxRun('send-keys', '-t', session, '-l', '--', data);
 }
 
 // ── pipe-pane streaming ───────────────────────────────────────────────────────
@@ -360,7 +345,7 @@ const PIPE_WRITER_SCRIPT = path.join(__dirname, '../../scripts/pipe-writer.sh');
 export async function checkPipePaneCapability(): Promise<boolean> {
   if (pipePaneCapability !== null) return pipePaneCapability;
   try {
-    const { stdout } = await exec('tmux -V');
+    const { stdout } = await execFile('tmux', ['-V']);
     const match = stdout.trim().match(/^tmux\s+(\d+)\.(\d+)/);
     if (match) {
       const major = parseInt(match[1], 10);
@@ -382,11 +367,23 @@ interface PipePaneHandle {
 }
 
 /** Track active pipe-pane handles: session → handle info for cleanup. */
-const activePipes = new Map<string, { paneId: string; fifoPath: string; dir: string; fd: number }>();
+const activePipes = new Map<string, { paneId: string; fifoPath: string; dir: string; fd: number; stream: Readable; needsManualClose: boolean }>();
+
+/** Destroy a pipe stream and close its fd if needed. */
+function destroyPipeStream(stream: Readable, fd: number, needsManualClose: boolean): void {
+  stream.destroy();
+  // On macOS: createReadStream with autoClose:false does NOT close the fd on destroy.
+  // On Linux: net.Socket.destroy() closes the fd internally — calling closeSync again
+  // risks closing a reused fd number.
+  if (needsManualClose) {
+    try { fs.closeSync(fd); } catch { /* already closed */ }
+  }
+}
 
 /**
  * Start a `tmux pipe-pane -O` raw PTY stream for a session.
- * Uses a PID-scoped FIFO with O_RDWR|O_NONBLOCK to avoid blocking/premature-EOF.
+ * Uses a PID-scoped FIFO: O_RDWR on macOS (blocking reads in libuv thread pool),
+ * O_RDWR|O_NONBLOCK on Linux (epoll-based non-blocking via net.Socket).
  * Returns a ReadStream and a cleanup function.
  */
 export async function startPipePaneStream(session: string, paneId: string): Promise<PipePaneHandle> {
@@ -409,26 +406,30 @@ export async function startPipePaneStream(session: string, paneId: string): Prom
 
   let fd = -1;
   let stream: Readable | null = null;
+  // macOS ReadStream with autoClose:false needs manual fd close;
+  // Linux net.Socket closes the fd itself on destroy.
+  let needsManualClose = false;
 
   try {
     // Create FIFO with 0600 permissions
     await execFile('mkfifo', ['-m', '0600', fifoPath]);
 
-    // Open FIFO with O_RDWR|O_NONBLOCK:
-    // - O_RDWR: process holds both read and write ends → no blocking on open, and
-    //   write-end stays open preventing premature EOF before pipe-pane connects.
-    // - O_NONBLOCK: required to avoid the open() syscall itself ever blocking.
-    fd = fs.openSync(fifoPath, fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
-
     if (process.platform === 'darwin') {
-      // macOS: kqueue does not reliably deliver read-ready events for FIFOs when
-      // new data arrives from an external writer (pipe-pane → cat → FIFO).
-      // Use fs.createReadStream which uses libuv thread-pool blocking reads —
-      // one thread per session, but works correctly on all platforms.
+      // macOS: kqueue does not reliably deliver read-ready events for FIFOs,
+      // so net.Socket (which relies on kqueue) won't get data notifications.
+      // Instead, use fs.createReadStream which does blocking reads in the
+      // libuv thread pool. For this to work, the fd must NOT have O_NONBLOCK —
+      // otherwise fs.read() returns EAGAIN immediately instead of blocking.
+      // O_RDWR alone is safe: it prevents openSync from blocking (both ends
+      // held by this process) and keeps the write-end open to prevent EOF.
+      fd = fs.openSync(fifoPath, fs.constants.O_RDWR);
       stream = fs.createReadStream('', { fd, autoClose: false, highWaterMark: 16384 });
+      needsManualClose = true;
     } else {
-      // Linux: FIFOs are epoll-pollable, so net.Socket provides non-blocking
-      // I/O multiplexing (handles EAGAIN correctly, destroy() works cleanly).
+      // Linux: Open with O_RDWR|O_NONBLOCK for epoll-based non-blocking I/O.
+      // O_NONBLOCK prevents open() from blocking; net.Socket handles EAGAIN
+      // and closes the fd on destroy() — do NOT double-close.
+      fd = fs.openSync(fifoPath, fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
       stream = new NetSocket({ fd, readable: true, writable: false, allowHalfOpen: true });
     }
 
@@ -457,20 +458,20 @@ export async function startPipePaneStream(session: string, paneId: string): Prom
         const info = activePipes.get(session);
         if (info) {
           activePipes.delete(session);
-          // Stop pipe-pane (suppress errors — pane may be gone)
           await execFile('tmux', ['pipe-pane', '-t', info.paneId]).catch(() => {});
-          stream?.destroy();
+          destroyPipeStream(info.stream, info.fd, info.needsManualClose);
           await fsp.unlink(info.fifoPath).catch(() => {});
           await fsp.rmdir(info.dir).catch(() => {});
         }
       },
     };
 
-    activePipes.set(session, { paneId, fifoPath, dir, fd });
+    activePipes.set(session, { paneId, fifoPath, dir, fd, stream, needsManualClose });
     return handle;
   } catch (err) {
-    // Rollback
-    stream?.destroy();
+    // Rollback: destroy stream + close fd if needed, clean up files
+    if (stream) { destroyPipeStream(stream, fd, needsManualClose); }
+    else if (fd >= 0) { try { fs.closeSync(fd); } catch { /* ignore */ } }
     await execFile('tmux', ['pipe-pane', '-t', paneId]).catch(() => {});
     await fsp.unlink(fifoPath).catch(() => {});
     await fsp.rmdir(dir).catch(() => {});
@@ -487,6 +488,7 @@ export async function stopPipePaneStream(session: string): Promise<void> {
   if (!info) return;
   activePipes.delete(session);
   await execFile('tmux', ['pipe-pane', '-t', info.paneId]).catch(() => {});
+  destroyPipeStream(info.stream, info.fd, info.needsManualClose);
   await fsp.unlink(info.fifoPath).catch(() => {});
   await fsp.rmdir(info.dir).catch(() => {});
 }

@@ -183,7 +183,7 @@ describe('Session Restoration (all agents)', () => {
     expect(mocks.jsonlStartWatching).not.toHaveBeenCalled();
   });
 
-  it('forces respawn instead of directory scan for live Claude sessions with no recoverable ccSessionId', async () => {
+  it('skips respawn for live Claude sessions with no recoverable ccSessionId (does not interrupt running task)', async () => {
     mocks.storeListSessions.mockReturnValue([
       {
         name: 'deck_proj_brain',
@@ -197,8 +197,8 @@ describe('Session Restoration (all agents)', () => {
 
     await restoreFromStore();
 
+    // Should NOT respawn — session is alive, just missing ccSessionId
+    expect(mocks.respawnPane).not.toHaveBeenCalled();
     expect(mocks.jsonlStartWatching).not.toHaveBeenCalled();
-    expect(mocks.jsonlStartWatchingFile).toHaveBeenCalledTimes(1);
-    expect(mocks.respawnPane).toHaveBeenCalledTimes(1);
   });
 });

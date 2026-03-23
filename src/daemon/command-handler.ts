@@ -800,7 +800,6 @@ function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): 
   if (!session) return;
 
   // Per-session raw PTY batching: accumulate small chunks and flush on timer or size threshold.
-  // Reduces WebSocket frame count and queue pressure on the server bridge.
   let rawBatch: Buffer[] = [];
   let rawBatchBytes = 0;
   let rawBatchTimer: ReturnType<typeof setTimeout> | null = null;

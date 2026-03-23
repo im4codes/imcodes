@@ -285,7 +285,7 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
   const initialPrompt = buildHopPrompt(run, modeConfig, {
     session: run.initiatorSession,
     sectionHeader: `${shortName(run.initiatorSession)} — Initial Analysis`,
-    instruction: 'Read the context file below and provide your initial analysis. Append your output to the file.',
+    instruction: 'Read the context file below and provide your initial analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.',
     isInitial: true,
   });
   const initialHeader = `${shortName(run.initiatorSession)} — Initial Analysis`;
@@ -302,7 +302,7 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
     const hopPrompt = buildHopPrompt(run, hopModeConfig, {
       session: target.session,
       sectionHeader: hopLabel,
-      instruction: `Read the full context file and provide your ${target.mode} analysis. Append your output to the file.`,
+      instruction: `Read the full context file and provide your ${target.mode} analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`,
       isInitial: false,
     });
 

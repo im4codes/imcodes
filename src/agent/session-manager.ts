@@ -275,8 +275,10 @@ export async function restoreFromStore(): Promise<void> {
       if (hydrated.ccSessionId) {
         startCCWatcher(hydrated.name, hydrated.projectDir, hydrated.ccSessionId);
       } else {
-        logger.warn({ session: hydrated.name }, 'Live Claude session has no recoverable ccSessionId; forcing respawn onto a freshly seeded UUID');
-        await respawnSession(hydrated);
+        // Session is alive but we can't recover the ccSessionId — do NOT respawn
+        // (that would kill a running CC task). Skip watcher; the session continues
+        // working, just without structured event tracking until next restart.
+        logger.warn({ session: hydrated.name }, 'Live Claude session has no recoverable ccSessionId; skipping watcher (will not interrupt running task)');
       }
     } else if (hydrated.agentType === 'codex' && hydrated.projectDir && !isCodexWatching(hydrated.name)) {
       if (hydrated.codexSessionId) {

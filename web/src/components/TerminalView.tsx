@@ -264,7 +264,6 @@ export function TerminalView({ sessionName, ws, connected, onDiff, onHistory, on
 
   // Handle terminal.stream_reset — reset xterm state so stale ANSI doesn't corrupt (Task 5.4)
   useEffect(() => {
-    const ws = wsRef.current;
     if (!ws) return;
     const unsub = ws.onMessage((msg) => {
       if (msg.type === 'terminal.stream_reset' && msg.session === sessionName) {
@@ -273,8 +272,7 @@ export function TerminalView({ sessionName, ws, connected, onDiff, onHistory, on
       }
     });
     return unsub;
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionName]);
+  }, [ws, sessionName]);
 
   const applyDiff = useCallback((diff: TerminalDiff) => {
     const term = termRef.current;
