@@ -1042,9 +1042,20 @@ export class WsBridge {
 
   // ── Push notifications ──────────────────────────────────────────────────────
 
+  /** Dedup: last push timestamp per session to avoid duplicate notifications. */
+  private lastPushAt = new Map<string, number>();
+  private static readonly PUSH_DEDUP_MS = 10_000;
+
   private async dispatchEventPush(db: PgDatabase, env: Env, msg: Record<string, unknown>): Promise<void> {
     // Skip push if mobile app is in foreground (user is actively watching)
     if (this.mobileSockets.size > 0) return;
+
+    // Dedup: same session idle/error can fire from both hook and timeline paths
+    const sessionKey = `${msg.type}:${msg.session ?? msg.sessionId ?? ''}`;
+    const now = Date.now();
+    const lastPush = this.lastPushAt.get(sessionKey);
+    if (lastPush && now - lastPush < WsBridge.PUSH_DEDUP_MS) return;
+    this.lastPushAt.set(sessionKey, now);
 
     const server = await db.prepare('SELECT user_id, name FROM servers WHERE id = ?').bind(this.serverId).first<{ user_id: string; name: string }>();
     if (!server) return;

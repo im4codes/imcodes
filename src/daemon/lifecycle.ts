@@ -27,7 +27,7 @@ import * as os from 'node:os';
 /** Get the last assistant.text from a session's timeline (for push notification context). */
 function getLastAssistantText(sessionName: string): string | undefined {
   try {
-    const events = timelineStore.read(sessionName, { limit: 20 });
+    const events = timelineStore.read(sessionName, { limit: 100 });
     for (let i = events.length - 1; i >= 0; i--) {
       if (events[i].type === 'assistant.text') {
         const text = (events[i].payload as Record<string, unknown>)?.text;
