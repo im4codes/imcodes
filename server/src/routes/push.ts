@@ -126,7 +126,10 @@ async function getApnsJwt(env: Env): Promise<string> {
     throw new Error('APNs not configured (APNS_KEY, APNS_KEY_ID, APNS_TEAM_ID)');
   }
 
-  const keyPem = Buffer.from(env.APNS_KEY, 'base64').toString('utf8');
+  // APNS_KEY can be either raw PEM text or base64-encoded PEM
+  const keyPem = env.APNS_KEY.startsWith('-----')
+    ? env.APNS_KEY
+    : Buffer.from(env.APNS_KEY, 'base64').toString('utf8');
   const key = await importPKCS8(keyPem, 'ES256');
 
   const jwt = await new SignJWT({})
