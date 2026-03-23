@@ -71,11 +71,9 @@ function csrfHeaders(token: string): Record<string, string> {
 }
 
 async function cleanUsers(): Promise<void> {
-  await db.prepare('DELETE FROM refresh_tokens').bind().run();
-  await db.prepare('DELETE FROM api_keys').bind().run();
-  await db.prepare('DELETE FROM user_quick_data').bind().run();
-  await db.prepare('DELETE FROM platform_identities').bind().run();
-  await db.prepare('DELETE FROM users').bind().run();
+  // TRUNCATE CASCADE handles all FK dependencies automatically,
+  // so we don't need to enumerate every child table.
+  await db.prepare('TRUNCATE users CASCADE').bind().run();
 }
 
 async function setTestSetting(key: string, value: string): Promise<void> {
