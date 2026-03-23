@@ -40,6 +40,13 @@ vi.mock('../../src/daemon/codex-watcher.js', () => ({
   isWatching: vi.fn().mockReturnValue(false),
 }));
 
+vi.mock('../../src/daemon/gemini-watcher.js', () => ({
+  startWatching: vi.fn().mockResolvedValue(undefined),
+  startWatchingDiscovered: vi.fn().mockResolvedValue(undefined),
+  stopWatching: vi.fn(),
+  isWatching: vi.fn().mockReturnValue(false),
+}));
+
 vi.mock('../../src/agent/tmux.js', () => ({
   newSession: newSessionMock,
   killSession: vi.fn().mockResolvedValue(undefined),

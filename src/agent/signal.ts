@@ -54,9 +54,16 @@ export async function checkIdleSignal(session: string): Promise<IdleSignal | nul
   }
 }
 
-// Common preamble for all hook scripts: get deck_ session name or exit
+// Common preamble for all hook scripts: get deck_ session name or exit.
+// Layer 1 (fast): TMUX_PANE must be set (proves we're inside tmux) and we
+// query the session that OWNS this pane (-t "$TMUX_PANE") instead of the
+// most-recently-attached client. Without -t, a CC started in a non-deck
+// terminal while the user is attached to a deck_ session would misroute.
+// Layer 2 (precise): verified server-side in hook-server.ts (session must
+// exist in store and be a claude-code agent).
 const SESSION_PREAMBLE = `\
-SESSION_NAME=$(tmux display-message -p '#S' 2>/dev/null || echo "")
+[ -z "$TMUX_PANE" ] && exit 0
+SESSION_NAME=$(tmux display-message -p -t "$TMUX_PANE" '#S' 2>/dev/null || echo "")
 [ -z "$SESSION_NAME" ] && exit 0
 case "$SESSION_NAME" in
   deck_*) ;;

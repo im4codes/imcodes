@@ -106,6 +106,8 @@ describe('Gemini Idle Detection (Direct pollTick test)', () => {
 
     // Poll 1: new data → running (never idle on new data path)
     await pollTick(sid, state);
+    // Expire running lock so subsequent polls can transition to idle
+    state.lastRunningEmitTs = 0;
     // Poll 2: unchanged JSON → idle confirm = 1
     await pollTick(sid, state);
     // Poll 3: unchanged JSON → idle confirm = 2 → emit idle
@@ -141,6 +143,8 @@ describe('Gemini Idle Detection (Direct pollTick test)', () => {
 
     // Poll 1: new data → running
     await pollTick(sid, state);
+    // Expire running lock so subsequent polls can transition to idle
+    state.lastRunningEmitTs = 0;
     // Poll 2: unchanged → idle confirm = 1
     await pollTick(sid, state);
     // Poll 3: unchanged → idle confirm = 2 → emit idle
@@ -264,6 +268,8 @@ describe('Gemini spinner detection (braille at col 0)', () => {
     // Next ticks: no spinner, idle terminal + idle JSON → should transition back to idle
     vi.mocked(tmux.capturePane).mockResolvedValue(idleLines());
     state.lastConversationStatus = 'idle';
+    // Expire running lock so idle transition is allowed
+    state.lastRunningEmitTs = 0;
     await pollTick(sid, state);
 
     const states = vi.mocked(timelineEmitter.emit).mock.calls

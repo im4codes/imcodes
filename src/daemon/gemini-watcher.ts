@@ -14,8 +14,7 @@ import { updateSessionState } from '../store/session-store.js';
 const GEMINI_TMP_DIR = join(homedir(), '.gemini', 'tmp');
 const POLL_INTERVAL_MS = 1500; // Balanced: responsive enough without causing state flicker
 const IDLE_LOCK_MS = 2000;    // After emitting idle, ignore terminal noise for this long
-// Running lock removed — the "new data = always running" rule (pollTick new-data path)
-// now prevents tool-gap idle transitions more reliably than a time-based lock.
+const RUNNING_LOCK_MS = 3000; // After emitting running, don't transition to idle for this long
 const RETRY_DELAY_MS = 100;
 
 // ── Path helpers ───────────────────────────────────────────────────────────────
@@ -122,6 +121,8 @@ export interface WatcherState {
   idleDebounceTimer?: ReturnType<typeof setTimeout>;
   /** Timestamp of last idle emit — used for idle lock (ignore terminal noise shortly after idle). */
   lastIdleEmitTs?: number;
+  /** Timestamp of last running emit — used for running lock (prevent rapid running→idle). */
+  lastRunningEmitTs?: number;
   _lastRotationCheck?: number;
   _terminalThinkingEmitted?: boolean;
   lastConversationStatus?: 'running' | 'idle' | null;
@@ -133,6 +134,8 @@ export interface WatcherState {
   _lastMtimeMs?: number;
   /** Last known file size — supplements mtime to catch same-ms writes. */
   _lastSize?: number;
+  /** Content length of the last processed message — detects real content growth vs metadata-only updates. */
+  _lastMsgLen?: number;
 }
 
 const watchers = new Map<string, WatcherState>();
@@ -222,7 +225,9 @@ async function terminalThinkingCheck(sessionName: string, state: WatcherState): 
       state.idleConfirmCount = 2;
       if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
       state._terminalThinkingEmitted = false;
-      transitionState(sessionName, state, 'idle', true);
+      // Both terminal and JSON agree idle — high confidence, but still respect running lock
+      // to prevent flicker when JSON is stale (hasn't updated after user sent a message)
+      transitionState(sessionName, state, 'idle');
       return;
     }
     if (state.currentState === 'running' && !state.idleDebounceTimer) {
@@ -263,9 +268,12 @@ function transitionState(sessionName: string, state: WatcherState, next: 'runnin
   if (!force) {
     // Idle lock: don't transition to running if we just emitted idle (terminal noise)
     if (next === 'running' && state.lastIdleEmitTs && (Date.now() - state.lastIdleEmitTs) < IDLE_LOCK_MS) return;
+    // Running lock: don't transition to idle if we just emitted running (prevents flicker)
+    if (next === 'idle' && state.lastRunningEmitTs && (Date.now() - state.lastRunningEmitTs) < RUNNING_LOCK_MS) return;
   }
   state.currentState = next;
   if (next === 'idle') state.lastIdleEmitTs = Date.now();
+  if (next === 'running') state.lastRunningEmitTs = Date.now();
   timelineEmitter.emit(sessionName, 'session.state', { state: next });
   updateSessionState(sessionName, next);
 }
@@ -382,19 +390,28 @@ async function pollTickInner(sessionName: string, state: WatcherState): Promise<
     parseMessage(sessionName, msg, hist, isUpdate);
   }
 
-  // JSON just changed → agent is actively working.
-  // Always reset idle confirm count and transition to running.
-  // NEVER transition to idle on the "new data" path — tool-call gaps
-  // briefly show idle in JSON, but more data will arrive shortly.
-  // Only the "unchanged JSON" path (above) can transition to idle.
+  // JSON just changed → agent may be actively working.
+  // Reset idle confirm count and debounce timer.
   state.idleConfirmCount = 0;
   if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
+
+  // Track last message content length to distinguish real content growth from
+  // metadata-only updates (e.g. lastUpdated timestamp changing without new content).
+  const lastMsg = conv.messages[conv.messages.length - 1];
+  const lastMsgLen = typeof lastMsg?.content === 'string' ? lastMsg.content.length : -1;
+  const prevMsgLen = state._lastMsgLen;
+  state._lastMsgLen = lastMsgLen;
+
   if (conversationStatus === 'running') {
     transitionState(sessionName, state, 'running');
-  } else {
-    // JSON says idle but just changed — treat as running (tool gap)
+  } else if (!isUpdate || lastMsgLen !== prevMsgLen) {
+    // New messages arrived or last message's content grew (streaming) —
+    // agent is actively producing. Bias toward running so the unchanged
+    // path (terminal check) can confirm idle on the next tick.
     transitionState(sessionName, state, 'running');
   }
+  // else: isUpdate with same content length — metadata-only update (e.g. lastUpdated
+  // timestamp). Don't bounce running→idle; let the current state stand.
 }
 
 // ── File rotation helper ────────────────────────────────────────────────────────

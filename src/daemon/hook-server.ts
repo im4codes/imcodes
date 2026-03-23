@@ -106,6 +106,18 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
           return;
         }
 
+        // Layer 2: verify session belongs to a daemon-managed CC session.
+        // Hooks are global (~/.claude/settings.json) so any CC instance triggers
+        // them. Without this check, a manually-started CC whose tmux pane happens
+        // to live in a deck_ session would misroute events.
+        const record = getSession(session);
+        if (!record || record.agentType !== 'claude-code') {
+          logger.debug({ session, event, agentType: record?.agentType }, 'Hook: ignored — not a managed claude-code session');
+          res.writeHead(200);
+          res.end('ignored');
+          return;
+        }
+
         if (event === 'idle') {
           const agentType = (msg['agentType'] as string | undefined) ?? 'unknown';
           logger.info({ session, agentType }, 'Hook: session idle');

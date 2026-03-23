@@ -61,7 +61,7 @@ export class GitHubProvider implements RepoProvider {
     const perPage = opts?.perPage ?? DEFAULT_PAGE_SIZE;
     const state = opts?.state ?? 'open';
 
-    const jq = `[.[] | select(.pull_request == null) | {id: (.id | tostring), number, title, body: (.body // ""), state, author: .user.login, labels: [.labels[].name], url: .html_url, assignee: (.assignee.login // null), createdAt: (.created_at | fromdateiso8601), updatedAt: (.updated_at | fromdateiso8601)}]`;
+    const jq = `[.[] | select(.pull_request == null) | {id: (.id | tostring), number, title, body: (.body // ""), state, author: .user.login, labels: [.labels[].name], url: .html_url, assignee: (.assignee.login // null), createdAt: (.created_at | fromdateiso8601 * 1000), updatedAt: (.updated_at | fromdateiso8601 * 1000)}]`;
 
     try {
       const { stdout } = await execFileAsync('gh', [
@@ -89,7 +89,7 @@ export class GitHubProvider implements RepoProvider {
     const perPage = opts?.perPage ?? DEFAULT_PAGE_SIZE;
     const state = opts?.state ?? 'open';
 
-    const jq = `[.[] | {number, title, state: (if .merged_at then "merged" elif .state == "closed" then "closed" else "open" end), author: .user.login, head: .head.ref, base: .base.ref, url: .html_url, createdAt: (.created_at | fromdateiso8601), updatedAt: (.updated_at | fromdateiso8601), reviewDecision: null, draft: .draft, labels: [.labels[].name]}]`;
+    const jq = `[.[] | {number, title, state: (if .merged_at then "merged" elif .state == "closed" then "closed" else "open" end), author: .user.login, head: .head.ref, base: .base.ref, url: .html_url, createdAt: (.created_at | fromdateiso8601 * 1000), updatedAt: (.updated_at | fromdateiso8601 * 1000), reviewDecision: null, draft: .draft, labels: [.labels[].name]}]`;
 
     try {
       const { stdout } = await execFileAsync('gh', [
@@ -119,7 +119,7 @@ export class GitHubProvider implements RepoProvider {
         execFileAsync('gh', [
           'api',
           `/repos/${this.owner}/${this.repo}/branches?per_page=100`,
-          '-q', `[.[] | {name, lastCommitDate: (.commit.commit.committer.date // null | if . then fromdateiso8601 else null end)}]`,
+          '-q', `[.[] | {name, lastCommitDate: (.commit.commit.committer.date // null | if . then fromdateiso8601 * 1000 else null end)}]`,
         ], { cwd: this.projectDir, timeout: 15000 }),
 
         execFileAsync('git', [
@@ -162,7 +162,7 @@ export class GitHubProvider implements RepoProvider {
     const page = opts?.page ?? 1;
     const perPage = opts?.perPage ?? DEFAULT_PAGE_SIZE;
 
-    const jq = `[.[] | {sha, shortSha: .sha[:7], message: .commit.message, author: (.commit.author.name // .author.login // "unknown"), date: (.commit.author.date | fromdateiso8601), url: .html_url}]`;
+    const jq = `[.[] | {sha, shortSha: .sha[:7], message: .commit.message, author: (.commit.author.name // .author.login // "unknown"), date: (.commit.author.date | fromdateiso8601 * 1000), url: .html_url}]`;
 
     const params = new URLSearchParams({ per_page: String(perPage), page: String(page) });
     if (opts?.branch) params.set('sha', opts.branch);

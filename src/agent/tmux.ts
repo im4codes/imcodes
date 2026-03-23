@@ -5,7 +5,6 @@ import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
-import { Socket as NetSocket } from 'net';
 import type { Readable } from 'stream';
 
 const execFile = promisify(execFileCb);
@@ -414,27 +413,24 @@ export async function startPipePaneStream(session: string, paneId: string): Prom
     // Create FIFO with 0600 permissions
     await execFile('mkfifo', ['-m', '0600', fifoPath]);
 
-    if (process.platform === 'darwin') {
-      // macOS: kqueue does not reliably deliver read-ready events for FIFOs,
-      // so net.Socket won't work. Blocking fs.createReadStream starves the
-      // libuv thread pool when multiple FIFOs are open simultaneously.
-      //
-      // Solution: spawn `cat` to read the FIFO — its stdout is a pipe that
-      // Node handles natively via kqueue with zero thread-pool overhead.
-      // We keep a write-end fd open (O_RDWR|O_NONBLOCK) to prevent cat from
-      // getting EOF when tmux hasn't written yet.
-      fd = fs.openSync(fifoPath, fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
-      const cat = spawn('cat', [fifoPath], { stdio: ['ignore', 'pipe', 'ignore'] });
-      stream = cat.stdout!;
-      needsManualClose = true;
-      catProc = cat;
-    } else {
-      // Linux: Open with O_RDWR|O_NONBLOCK for epoll-based non-blocking I/O.
-      // O_NONBLOCK prevents open() from blocking; net.Socket handles EAGAIN
-      // and closes the fd on destroy() — do NOT double-close.
-      fd = fs.openSync(fifoPath, fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
-      stream = new NetSocket({ fd, readable: true, writable: false, allowHalfOpen: true });
-    }
+    // Spawn `cat` to read the FIFO — its stdout is a regular pipe that
+    // libuv handles natively on all platforms (kqueue + epoll).
+    // We keep a write-end fd open (O_RDWR|O_NONBLOCK) to prevent cat from
+    // getting EOF when tmux hasn't written yet.
+    //
+    // Why not net.Socket({ fd }) directly on the FIFO?
+    // - macOS: kqueue does not reliably deliver read-ready events for FIFOs.
+    // - Linux: net.Socket on a FIFO fd is undocumented (libuv treats it as
+    //   UV_NAMED_PIPE by accident). Under load the single 64KB FIFO buffer
+    //   fills before the event loop drains it, blocking tmux's pipe-pane
+    //   writer and causing visible input lag. The cat subprocess adds a
+    //   second 64KB pipe buffer (128KB total) and converts the read into a
+    //   well-tested libuv pipe path.
+    fd = fs.openSync(fifoPath, fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
+    const cat = spawn('cat', [fifoPath], { stdio: ['ignore', 'pipe', 'ignore'] });
+    stream = cat.stdout!;
+    needsManualClose = true;
+    catProc = cat;
 
     // Inline cat command — no external script needed
     const cmd = 'cat > ' + shellQuote(fifoPath);

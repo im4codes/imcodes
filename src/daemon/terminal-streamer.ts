@@ -372,7 +372,7 @@ export class TerminalStreamer {
   // ── Raw data handling ───────────────────────────────────────────────────────
 
   private onRawData(sessionName: string, data: Buffer): void {
-    const hasStructuredWatcher = isWatching(sessionName) || isCodexWatching(sessionName);
+    const hasStructuredWatcher = isWatching(sessionName) || isCodexWatching(sessionName) || isGeminiWatching(sessionName);
 
     // Idle detection: skip for sessions with a structured watcher (CC/Codex).
     // Those sessions get authoritative idle/running signals via hooks and JSONL events,
