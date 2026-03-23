@@ -197,6 +197,17 @@ footer {
   vertical-align: text-bottom;
 }
 @keyframes blink { 50% { opacity: 0; } }
+
+.lightbox { display: none; position: fixed; inset: 0; z-index: 9000; background: rgba(0,0,0,0.92); align-items: center; justify-content: center; }
+.lightbox.open { display: flex; }
+.lightbox img { max-width: 90vw; max-height: 85vh; border-radius: 6px; box-shadow: 0 4px 40px rgba(0,0,0,0.6); }
+.lightbox .lb-close { position: absolute; top: 16px; right: 20px; background: none; border: none; color: #888; font-size: 28px; cursor: pointer; z-index: 1; }
+.lightbox .lb-close:hover { color: #fff; }
+.lightbox .lb-nav { position: absolute; top: 50%; transform: translateY(-50%); background: none; border: none; color: #666; font-size: 36px; cursor: pointer; padding: 12px; user-select: none; }
+.lightbox .lb-nav:hover { color: #fff; }
+.lightbox .lb-prev { left: 8px; }
+.lightbox .lb-next { right: 8px; }
+.lightbox .lb-counter { position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%); color: #555; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -232,18 +243,18 @@ footer {
   <div class="screenshots">
     <p>Desktop</p>
     <div class="row desktop">
-      <a href="imcodes0.png"><img src="imcodes0.png" alt="Desktop 1" loading="lazy" /></a>
-      <a href="imcodes1.png"><img src="imcodes1.png" alt="Desktop 2" loading="lazy" /></a>
-      <a href="imcodes2.png"><img src="imcodes2.png" alt="Desktop 3" loading="lazy" /></a>
-      <a href="imcodes3.png"><img src="imcodes3.png" alt="Desktop 4" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(0);return false"><img src="imcodes0.png" alt="Desktop 1" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(1);return false"><img src="imcodes1.png" alt="Desktop 2" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(2);return false"><img src="imcodes2.png" alt="Desktop 3" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(3);return false"><img src="imcodes3.png" alt="Desktop 4" loading="lazy" /></a>
     </div>
     <p>Mobile</p>
     <div class="row mobile">
-      <a href="imcodes-m1.png"><img src="imcodes-m1.png" alt="Mobile 1" loading="lazy" /></a>
-      <a href="imcodes-m2.png"><img src="imcodes-m2.png" alt="Mobile 2" loading="lazy" /></a>
-      <a href="imcodes-m3.png"><img src="imcodes-m3.png" alt="Mobile 3" loading="lazy" /></a>
-      <a href="imcodes-m4.png"><img src="imcodes-m4.png" alt="Mobile 4" loading="lazy" /></a>
-      <a href="imcodes-m0.png"><img src="imcodes-m0.png" alt="Mobile 5" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(4);return false"><img src="imcodes-m1.png" alt="Mobile 1" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(5);return false"><img src="imcodes-m2.png" alt="Mobile 2" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(6);return false"><img src="imcodes-m3.png" alt="Mobile 3" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(7);return false"><img src="imcodes-m4.png" alt="Mobile 4" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(8);return false"><img src="imcodes-m0.png" alt="Mobile 5" loading="lazy" /></a>
     </div>
   </div>
 </section>
@@ -353,6 +364,15 @@ docker compose up -d</div>
 </footer>
 
 </div>
+
+<div class="lightbox" id="lightbox" onclick="if(event.target===this)closeLightbox()">
+  <button class="lb-close" onclick="closeLightbox()">&times;</button>
+  <button class="lb-nav lb-prev" onclick="navLightbox(-1)">&#8249;</button>
+  <img id="lb-img" src="" alt="" />
+  <button class="lb-nav lb-next" onclick="navLightbox(1)">&#8250;</button>
+  <div class="lb-counter" id="lb-counter"></div>
+</div>
+
 <script>
 const I18N = {
   en: {},
@@ -563,6 +583,31 @@ function copy(el) {
 }
 
 applyLang();
+
+// Lightbox
+const LB_IMAGES = ['imcodes0.png','imcodes1.png','imcodes2.png','imcodes3.png','imcodes-m1.png','imcodes-m2.png','imcodes-m3.png','imcodes-m4.png','imcodes-m0.png'];
+let lbIdx = 0;
+function openLightbox(i) {
+  lbIdx = i;
+  document.getElementById('lb-img').src = LB_IMAGES[i];
+  document.getElementById('lb-counter').textContent = (i + 1) + ' / ' + LB_IMAGES.length;
+  document.getElementById('lightbox').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+function closeLightbox() {
+  document.getElementById('lightbox').classList.remove('open');
+  document.body.style.overflow = '';
+}
+function navLightbox(dir) {
+  lbIdx = (lbIdx + dir + LB_IMAGES.length) % LB_IMAGES.length;
+  openLightbox(lbIdx);
+}
+document.addEventListener('keydown', function(e) {
+  if (!document.getElementById('lightbox').classList.contains('open')) return;
+  if (e.key === 'Escape') closeLightbox();
+  else if (e.key === 'ArrowLeft') navLightbox(-1);
+  else if (e.key === 'ArrowRight') navLightbox(1);
+});
 </script>
 </body>
 </html>
