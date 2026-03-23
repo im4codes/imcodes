@@ -4,7 +4,7 @@
  */
 import { useState, useRef, useCallback, useEffect, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { getActiveThinkingTs, isVisuallyBusy } from '../thinking-utils.js';
+import { getActiveThinkingTs, getActiveStatusText, isVisuallyBusy } from '../thinking-utils.js';
 import { recordCost, getSessionCost, getWeeklyCost, getMonthlyCost, formatCost } from '../cost-tracker.js';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
@@ -72,6 +72,9 @@ export function SubSessionWindow({
 
   // Earliest ts of the current continuous thinking sequence (shared logic).
   const activeThinkingTs = useMemo(() => getActiveThinkingTs(events), [events]);
+
+  // Extract active agent status (e.g. "Reading file...")
+  const statusText = useMemo(() => getActiveStatusText(events), [events]);
 
   const [thinkingNow, setThinkingNow] = useState(() => Date.now());
   useEffect(() => {
@@ -330,10 +333,12 @@ export function SubSessionWindow({
             </div>
             <div class="session-usage-stats">
               <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>
-              {activeThinkingTs && (
+              {(activeThinkingTs || statusText) && (
                 <span class="session-thinking-inline">
                   <span class="chat-thinking-dots">···</span>
-                  {' '}{t('chat.thinking_running', { sec: Math.max(0, Math.round((thinkingNow - activeThinkingTs) / 1000)) })}
+                  {' '}{activeThinkingTs
+                    ? t('chat.thinking_running', { sec: Math.max(0, Math.round((thinkingNow - activeThinkingTs) / 1000)) })
+                    : statusText}
                 </span>
               )}
               {sessionCost > 0 && (

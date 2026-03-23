@@ -49,6 +49,20 @@ export function getActiveThinkingTs(events: Array<{ type: string; ts: number; pa
  * animations on the main session input bar. activeThinking should only drive text labels
  * and thinking timers, not high-visibility animations.
  */
+/**
+ * Extract active agent status label (e.g. "Reading file...") from the tail of events.
+ * Returns the label of the last agent.status event if it's at the very end of the
+ * event stream (only other agent.status events may follow it).
+ */
+export function getActiveStatusText(events: Array<{ type: string; payload?: Record<string, unknown> }>): string | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.type === 'agent.status' && e.payload?.label) return String(e.payload.label);
+    if (e.type !== 'agent.status') break;
+  }
+  return null;
+}
+
 export function isVisuallyBusy(sessionState: string | undefined, _activeThinking: boolean): boolean {
   if (!sessionState || sessionState === 'idle' || sessionState === 'stopped') return false;
   return sessionState === 'running';

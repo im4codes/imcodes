@@ -33,7 +33,7 @@ import { AdminPage } from './pages/AdminPage.js';
 import { useSubSessions } from './hooks/useSubSessions.js';
 import { useTimeline } from './hooks/useTimeline.js';
 import { useSwipeBack } from './hooks/useSwipeBack.js';
-import { getActiveThinkingTs } from './thinking-utils.js';
+import { getActiveThinkingTs, getActiveStatusText } from './thinking-utils.js';
 import { WsClient } from './ws-client.js';
 import { resolveContextWindow } from './model-context.js';
 import { shortModelLabel } from './model-label.js';
@@ -575,6 +575,9 @@ export function App() {
 
   // Earliest ts of the current continuous thinking sequence (shared logic).
   const activeThinkingTs = useMemo(() => getActiveThinkingTs(timelineEvents), [timelineEvents]);
+
+  // Extract active agent status (e.g. "Reading file...")
+  const statusText = useMemo(() => getActiveStatusText(timelineEvents), [timelineEvents]);
 
   // Timer for thinking elapsed display (1s tick only while thinking)
   const [thinkingNow, setThinkingNow] = useState(() => Date.now());
@@ -1549,10 +1552,12 @@ export function App() {
                   </div>
                   <div class="session-usage-stats">
                     <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>
-                    {activeThinkingTs && (
+                    {(activeThinkingTs || statusText) && (
                       <span class="session-thinking-inline">
                         <span class="chat-thinking-dots">···</span>
-                        {' '}{trans('chat.thinking_running', { sec: Math.max(0, Math.round((thinkingNow - activeThinkingTs) / 1000)) })}
+                        {' '}{activeThinkingTs
+                          ? trans('chat.thinking_running', { sec: Math.max(0, Math.round((thinkingNow - activeThinkingTs) / 1000)) })
+                          : statusText}
                       </span>
                     )}
                     {lastUsage.model && <span class="session-usage-tokens" style={{ color: '#818cf8', marginLeft: 'auto' }}>{shortModelLabel(lastUsage.model)}</span>}

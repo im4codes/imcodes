@@ -7,7 +7,6 @@ import { h } from 'preact';
 import { useEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent, WsClient } from '../ws-client.js';
-import { getActiveThinkingTs } from '../thinking-utils.js';
 import { FileBrowser } from './FileBrowser.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 
@@ -283,20 +282,6 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
 
   const viewItems = useMemo(() => buildViewItems(events), [events]);
 
-  // Extract active status: show last agent.status until any other event arrives after it
-  const statusText = useMemo(() => {
-    for (let i = events.length - 1; i >= 0; i--) {
-      const e = events[i];
-      if (e.type === 'agent.status' && e.payload.label) return String(e.payload.label);
-      if (e.type !== 'agent.status') break;
-    }
-    return null;
-  }, [events]);
-
-  // Earliest ts of the current continuous thinking sequence.
-  // Multiple thinking events in one turn keep the original start ts (timer doesn't reset).
-  const activeThinkingTs = useMemo(() => getActiveThinkingTs(events), [events]);
-
   const scrollToBottom = () => {
     const el = scrollRef.current;
     if (!el) return;
@@ -501,15 +486,6 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
           })}
           <div ref={bottomRef} />
         </div>
-        {/* Status / thinking bar — fixed at bottom */}
-        {!preview && (statusText || activeThinkingTs) && (
-          <div class="chat-thinking-bar">
-            <span class="chat-thinking-dots">●●●</span>
-            {' '}{activeThinkingTs
-              ? <ActiveThinkingLabel startTs={activeThinkingTs} />
-              : statusText}
-          </div>
-        )}
         {!preview && showScrollBtn && (
           <button
             class="chat-scroll-btn"
