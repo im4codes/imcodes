@@ -95,11 +95,6 @@ export function useQuickData(): UseQuickDataResult {
     return () => document.removeEventListener('visibilitychange', onVisibility);
   }, []);
 
-  const update = (next: QuickData) => {
-    setData(next);
-    scheduleSave(next);
-  };
-
   const recordHistory = (text: string, sessionName?: string) => {
     setData((prev) => {
       const next = recordHistoryEntry(prev, text, sessionName);
@@ -130,16 +125,49 @@ export function useQuickData(): UseQuickDataResult {
     });
   };
 
-  const removeCommand = (cmd: string) => update({ ...data, commands: data.commands.filter((c) => c !== cmd) });
-  const removePhrase = (phrase: string) => update({ ...data, phrases: data.phrases.filter((p) => p !== phrase) });
-  const removeHistory = (text: string) => update({ ...data, history: data.history.filter((h) => h !== text) });
-  const removeSessionHistory = (sessionName: string, text: string) => {
-    const prev = data.sessionHistory[sessionName] ?? [];
-    update({ ...data, sessionHistory: { ...data.sessionHistory, [sessionName]: prev.filter((h) => h !== text) } });
+  const removeCommand = (cmd: string) => {
+    setData((prev) => {
+      const next = { ...prev, commands: prev.commands.filter((c) => c !== cmd) };
+      scheduleSave(next);
+      return next;
+    });
   };
-  const clearHistory = () => update({ ...data, history: [] });
-  const clearSessionHistory = (sessionName: string) =>
-    update({ ...data, sessionHistory: { ...data.sessionHistory, [sessionName]: [] } });
+  const removePhrase = (phrase: string) => {
+    setData((prev) => {
+      const next = { ...prev, phrases: prev.phrases.filter((p) => p !== phrase) };
+      scheduleSave(next);
+      return next;
+    });
+  };
+  const removeHistory = (text: string) => {
+    setData((prev) => {
+      const next = { ...prev, history: prev.history.filter((h) => h !== text) };
+      scheduleSave(next);
+      return next;
+    });
+  };
+  const removeSessionHistory = (sessionName: string, text: string) => {
+    setData((prev) => {
+      const sh = prev.sessionHistory[sessionName] ?? [];
+      const next = { ...prev, sessionHistory: { ...prev.sessionHistory, [sessionName]: sh.filter((h) => h !== text) } };
+      scheduleSave(next);
+      return next;
+    });
+  };
+  const clearHistory = () => {
+    setData((prev) => {
+      const next = { ...prev, history: [] };
+      scheduleSave(next);
+      return next;
+    });
+  };
+  const clearSessionHistory = (sessionName: string) => {
+    setData((prev) => {
+      const next = { ...prev, sessionHistory: { ...prev.sessionHistory, [sessionName]: [] } };
+      scheduleSave(next);
+      return next;
+    });
+  };
 
   return { data, loaded, recordHistory, addCommand, addPhrase, removeCommand, removePhrase, removeHistory, removeSessionHistory, clearHistory, clearSessionHistory };
 }
@@ -371,7 +399,7 @@ export function QuickInputPanel({
                     <span key={cmd} class="qp-pill qp-pill-custom" title={cmd.length > TRUNCATE_THRESHOLD ? cmd : undefined}>
                       <span class="qp-pill-text" onClick={() => handleSend(cmd)}>{truncateMiddle(cmd)}</span>
                       <button class="qp-pill-edit" onClick={() => startEdit('command', cmd)}>✎</button>
-                      <button class="qp-pill-del" onClick={() => onRemoveCommand(cmd)}>✕</button>
+                      <button class="qp-pill-del" onClick={() => { if (confirm(t('quick_input.confirm_delete'))) onRemoveCommand(cmd); }}>✕</button>
                     </span>
                   )
                 ))}
@@ -403,7 +431,7 @@ export function QuickInputPanel({
                     <span key={phrase} class="qp-pill qp-pill-custom" title={phrase.length > TRUNCATE_THRESHOLD ? phrase : undefined}>
                       <span class="qp-pill-text" onClick={() => handleSend(phrase)}>{truncateMiddle(phrase)}</span>
                       <button class="qp-pill-edit" onClick={() => startEdit('phrase', phrase)}>✎</button>
-                      <button class="qp-pill-del" onClick={() => onRemovePhrase(phrase)}>✕</button>
+                      <button class="qp-pill-del" onClick={() => { if (confirm(t('quick_input.confirm_delete'))) onRemovePhrase(phrase); }}>✕</button>
                     </span>
                   )
                 ))}

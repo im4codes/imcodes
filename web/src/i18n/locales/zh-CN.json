@@ -85,7 +85,8 @@
     "older": "较旧 →",
     "loading": "加载中…",
     "tab_quick": "快捷",
-    "tab_files": "文件"
+    "tab_files": "文件",
+    "confirm_delete": "确认删除？"
   },
   "file_browser": {
     "title_dir": "选择目录",
@@ -258,7 +259,7 @@
   },
   "settings": {
     "title": "设置",
-    "back": "\u2190 返回",
+    "back": "← 返回",
     "display_name": "显示名称",
     "no_name": "未设置",
     "edit": "编辑",
@@ -280,7 +281,7 @@
   },
   "admin": {
     "title": "管理面板",
-    "back": "\u2190 返回",
+    "back": "← 返回",
     "settings": "设置",
     "users": "用户",
     "load_error": "加载管理数据失败",
@@ -308,7 +309,7 @@
   },
   "repo": {
     "title": "仓库",
-    "back": "\u2190 返回",
+    "back": "← 返回",
     "refresh": "刷新",
     "last_refresh": "上次刷新：{{time}}秒前",
     "tab_issues": "议题",
@@ -316,8 +317,8 @@
     "tab_branches": "分支",
     "tab_commits": "提交",
     "tab_cicd": "CI/CD",
-    "overview_branch": "{{default}} \u2190 {{current}}",
-    "cli_ok": "{{cli}} {{version}} \u2713",
+    "overview_branch": "{{default}} ← {{current}}",
+    "cli_ok": "{{cli}} {{version}} ✓",
     "cli_not_installed": "CLI 未安装",
     "load_more": "加载更多",
     "loading": "加载中...",
@@ -349,9 +350,9 @@
     "detail_error": "加载详情失败",
     "detail_retry": "重试",
     "files": "个文件",
-    "more_files": "更多文件 \u2014 在 GitHub 上查看完整列表",
+    "more_files": "更多文件 — 在 GitHub 上查看完整列表",
     "view_on_platform": "在 GitHub 上查看",
-    "body_truncated": "内容已截断 \u2014 在 GitHub 上查看完整内容",
+    "body_truncated": "内容已截断 — 在 GitHub 上查看完整内容",
     "checks_success": "检查通过",
     "checks_failure": "检查失败",
     "checks_pending": "检查中",

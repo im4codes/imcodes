@@ -85,7 +85,8 @@
     "older": "較舊 →",
     "loading": "載入中…",
     "tab_quick": "快捷",
-    "tab_files": "檔案"
+    "tab_files": "檔案",
+    "confirm_delete": "確認刪除？"
   },
   "file_browser": {
     "title_dir": "選擇目錄",
@@ -258,7 +259,7 @@
   },
   "settings": {
     "title": "設定",
-    "back": "\u2190 返回",
+    "back": "← 返回",
     "display_name": "顯示名稱",
     "no_name": "未設定",
     "edit": "編輯",
@@ -280,7 +281,7 @@
   },
   "admin": {
     "title": "管理面板",
-    "back": "\u2190 返回",
+    "back": "← 返回",
     "settings": "設定",
     "users": "使用者",
     "load_error": "載入管理資料失敗",
@@ -308,7 +309,7 @@
   },
   "repo": {
     "title": "儲存庫",
-    "back": "\u2190 返回",
+    "back": "← 返回",
     "refresh": "重新整理",
     "last_refresh": "上次重新整理：{{time}}秒前",
     "tab_issues": "議題",
@@ -316,8 +317,8 @@
     "tab_branches": "分支",
     "tab_commits": "提交",
     "tab_cicd": "CI/CD",
-    "overview_branch": "{{default}} \u2190 {{current}}",
-    "cli_ok": "{{cli}} {{version}} \u2713",
+    "overview_branch": "{{default}} ← {{current}}",
+    "cli_ok": "{{cli}} {{version}} ✓",
     "cli_not_installed": "CLI 未安裝",
     "load_more": "載入更多",
     "loading": "載入中...",
@@ -349,9 +350,9 @@
     "detail_error": "載入詳情失敗",
     "detail_retry": "重試",
     "files": "個檔案",
-    "more_files": "更多檔案 \u2014 在 GitHub 上查看完整列表",
+    "more_files": "更多檔案 — 在 GitHub 上查看完整列表",
     "view_on_platform": "在 GitHub 上查看",
-    "body_truncated": "內容已截斷 \u2014 在 GitHub 上查看完整內容",
+    "body_truncated": "內容已截斷 — 在 GitHub 上查看完整內容",
     "checks_success": "檢查通過",
     "checks_failure": "檢查失敗",
     "checks_pending": "檢查中",

@@ -85,7 +85,8 @@
     "older": "Older →",
     "loading": "Loading…",
     "tab_quick": "Quick",
-    "tab_files": "Files"
+    "tab_files": "Files",
+    "confirm_delete": "Delete this item?"
   },
   "file_browser": {
     "title_dir": "Select Directory",
@@ -258,7 +259,7 @@
   },
   "settings": {
     "title": "Settings",
-    "back": "\u2190 Back",
+    "back": "← Back",
     "display_name": "Display Name",
     "no_name": "Not set",
     "edit": "Edit",
@@ -280,7 +281,7 @@
   },
   "admin": {
     "title": "Admin Panel",
-    "back": "\u2190 Back",
+    "back": "← Back",
     "settings": "Settings",
     "users": "Users",
     "load_error": "Failed to load admin data",
@@ -308,7 +309,7 @@
   },
   "repo": {
     "title": "Repository",
-    "back": "\u2190 Back",
+    "back": "← Back",
     "refresh": "Refresh",
     "last_refresh": "Last refresh: {{time}}s ago",
     "tab_issues": "Issues",
@@ -316,8 +317,8 @@
     "tab_branches": "Branches",
     "tab_commits": "Commits",
     "tab_cicd": "CI/CD",
-    "overview_branch": "{{default}} \u2190 {{current}}",
-    "cli_ok": "{{cli}} {{version}} \u2713",
+    "overview_branch": "{{default}} ← {{current}}",
+    "cli_ok": "{{cli}} {{version}} ✓",
     "cli_not_installed": "CLI not installed",
     "load_more": "Load more",
     "loading": "Loading...",
@@ -349,9 +350,9 @@
     "detail_error": "Failed to load details",
     "detail_retry": "Retry",
     "files": "files",
-    "more_files": "More files \u2014 view full list on GitHub",
+    "more_files": "More files — view full list on GitHub",
     "view_on_platform": "View on GitHub",
-    "body_truncated": "Content truncated \u2014 view full on GitHub",
+    "body_truncated": "Content truncated — view full on GitHub",
     "checks_success": "Checks passed",
     "checks_failure": "Checks failed",
     "checks_pending": "Checks pending",
