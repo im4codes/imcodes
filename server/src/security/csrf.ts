@@ -39,6 +39,11 @@ export function csrfMiddleware() {
     // Password login sets its own session — no existing session to CSRF-attack
     if (path === '/api/auth/password/login') { await next(); return; }
 
+    // Token refresh must bypass CSRF — it's the recovery mechanism when CSRF
+    // cookie has expired. Refresh uses HttpOnly refresh_token cookie which
+    // is not accessible to JS, providing equivalent CSRF protection.
+    if (path === '/api/auth/refresh') { await next(); return; }
+
     // Bearer auth (API key, daemon, CLI) skips CSRF — not a browser session
     const authHeader = c.req.header('Authorization');
     if (authHeader?.startsWith('Bearer ')) { await next(); return; }
