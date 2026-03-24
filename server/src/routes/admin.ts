@@ -6,26 +6,15 @@ import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import { getUserById, listAllUsers, updateUserStatus, deleteUser, countActiveAdmins, getAllSettings, setSetting } from '../db/queries.js';
 import { logAudit } from '../security/audit.js';
-import { verifyJwt } from '../security/crypto.js';
-
-// Resolve user ID from session
-function resolveUserIdFromCookie(c: { req: { header(name: string): string | undefined }; env: Env }): string | null {
-  const cookieHeader = c.req.header('cookie') ?? '';
-  const match = cookieHeader.match(/(?:^|;\s*)rcc_session=([^;]+)/);
-  if (!match) return null;
-  const token = decodeURIComponent(match[1]);
-  const payload = verifyJwt(token, c.env.JWT_SIGNING_KEY);
-  return (payload && typeof payload.sub === 'string' && payload.type !== 'ws-ticket') ? payload.sub : null;
-}
+import { requireAuth } from '../security/authorization.js';
 
 export const adminRoutes = new Hono<{ Bindings: Env }>();
 
-// ── Admin middleware ──────────────────────────────────────────────────────
+// ── Admin middleware — reuses global requireAuth + checks is_admin ────────
 
+adminRoutes.use('*', requireAuth());
 adminRoutes.use('*', async (c, next) => {
-  const userId = resolveUserIdFromCookie(c);
-  if (!userId) return c.json({ error: 'unauthorized' }, 401);
-
+  const userId = c.get('userId' as never) as string;
   const user = await getUserById(c.env.DB, userId);
   if (!user || !user.is_admin) return c.json({ error: 'forbidden' }, 403);
   if (user.status !== 'active') return c.json({ error: 'account_disabled' }, 403);
