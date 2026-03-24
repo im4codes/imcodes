@@ -297,7 +297,7 @@ async function handleCommitDetail(
   const cacheKey = RepoCache.buildKey(projectDir, 'commit_detail', { sha });
   const cached = repoCache.get<unknown>(cacheKey);
   if (cached) {
-    serverLink.send({ type: REPO_MSG.COMMIT_DETAIL_RESPONSE, requestId, ...cached as object });
+    serverLink.send({ type: REPO_MSG.COMMIT_DETAIL_RESPONSE, requestId, projectDir, detail: cached });
     return;
   }
 
@@ -307,7 +307,7 @@ async function handleCommitDetail(
   try {
     const result = await provider.getCommitDetail(sha);
     repoCache.set(cacheKey, result, projectDir, false, Infinity);
-    serverLink.send({ type: REPO_MSG.COMMIT_DETAIL_RESPONSE, requestId, ...result });
+    serverLink.send({ type: REPO_MSG.COMMIT_DETAIL_RESPONSE, requestId, projectDir, detail: result });
   } catch (err) {
     sendError(serverLink, requestId, projectDir, 'cli_error', err);
   }
@@ -324,7 +324,7 @@ async function handlePRDetail(
   const cacheKey = RepoCache.buildKey(projectDir, 'pr_detail', { number: num });
   const cached = repoCache.get<unknown>(cacheKey);
   if (cached) {
-    serverLink.send({ type: REPO_MSG.PR_DETAIL_RESPONSE, requestId, ...cached as object });
+    serverLink.send({ type: REPO_MSG.PR_DETAIL_RESPONSE, requestId, projectDir, detail: cached });
     return;
   }
 
@@ -334,7 +334,7 @@ async function handlePRDetail(
   try {
     const result = await provider.getPRDetail(num);
     repoCache.set(cacheKey, result, projectDir);
-    serverLink.send({ type: REPO_MSG.PR_DETAIL_RESPONSE, requestId, ...result });
+    serverLink.send({ type: REPO_MSG.PR_DETAIL_RESPONSE, requestId, projectDir, detail: result });
   } catch (err) {
     sendError(serverLink, requestId, projectDir, 'cli_error', err);
   }
@@ -351,7 +351,7 @@ async function handleIssueDetail(
   const cacheKey = RepoCache.buildKey(projectDir, 'issue_detail', { number: num });
   const cached = repoCache.get<unknown>(cacheKey);
   if (cached) {
-    serverLink.send({ type: REPO_MSG.ISSUE_DETAIL_RESPONSE, requestId, ...cached as object });
+    serverLink.send({ type: REPO_MSG.ISSUE_DETAIL_RESPONSE, requestId, projectDir, detail: cached });
     return;
   }
 
@@ -361,7 +361,7 @@ async function handleIssueDetail(
   try {
     const result = await provider.getIssueDetail(num);
     repoCache.set(cacheKey, result, projectDir);
-    serverLink.send({ type: REPO_MSG.ISSUE_DETAIL_RESPONSE, requestId, ...result });
+    serverLink.send({ type: REPO_MSG.ISSUE_DETAIL_RESPONSE, requestId, projectDir, detail: result });
   } catch (err) {
     sendError(serverLink, requestId, projectDir, 'cli_error', err);
   }
@@ -467,22 +467,22 @@ export function handleRepoCommand(cmd: Record<string, unknown>, serverLink: Serv
 
   const run = async (): Promise<void> => {
     switch (cmd.type) {
-      case 'repo.detect':
+      case REPO_MSG.DETECT:
         await handleDetect(cmd, serverLink);
         break;
-      case 'repo.list_issues':
+      case REPO_MSG.LIST_ISSUES:
         await handleListIssues(cmd, serverLink);
         break;
-      case 'repo.list_prs':
+      case REPO_MSG.LIST_PRS:
         await handleListPRs(cmd, serverLink);
         break;
-      case 'repo.list_branches':
+      case REPO_MSG.LIST_BRANCHES:
         await handleListBranches(cmd, serverLink);
         break;
-      case 'repo.list_commits':
+      case REPO_MSG.LIST_COMMITS:
         await handleListCommits(cmd, serverLink);
         break;
-      case 'repo.list_actions':
+      case REPO_MSG.LIST_ACTIONS:
         await handleListActions(cmd, serverLink);
         break;
       case REPO_MSG.COMMIT_DETAIL:

@@ -73,6 +73,7 @@ async function rewritePathsForSandbox(sessionName: string, text: string): Promis
 import { handleRepoCommand } from './repo-handler.js';
 import { handleFileUpload, handleFileDownload, initFileTransfer, startCleanupTimer, createProjectFileHandle, lookupAttachment } from './file-transfer-handler.js';
 import { FILE_TRANSFER_LIMITS } from '../shared/transport/file-transfer.js';
+import { REPO_MSG } from '../shared/repo-types.js';
 
 // ── Common MIME map for file metadata ────────────────────────────────────────
 
@@ -424,15 +425,15 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'pong':
       // Expected internal messages, ignore silently
       break;
-    case 'repo.detect':
-    case 'repo.list_issues':
-    case 'repo.list_prs':
-    case 'repo.list_branches':
-    case 'repo.list_commits':
-    case 'repo.list_actions':
-    case 'repo.commit_detail':
-    case 'repo.pr_detail':
-    case 'repo.issue_detail':
+    case REPO_MSG.DETECT:
+    case REPO_MSG.LIST_ISSUES:
+    case REPO_MSG.LIST_PRS:
+    case REPO_MSG.LIST_BRANCHES:
+    case REPO_MSG.LIST_COMMITS:
+    case REPO_MSG.LIST_ACTIONS:
+    case REPO_MSG.COMMIT_DETAIL:
+    case REPO_MSG.PR_DETAIL:
+    case REPO_MSG.ISSUE_DETAIL:
       void handleRepoCommand(cmd, serverLink);
       break;
     default:
