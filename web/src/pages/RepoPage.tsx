@@ -777,10 +777,10 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
               {branch}
             </code>
           )}
-          {commitMsg && (
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 200 }}>
-              {commitMsg.split('\n')[0]}
-            </span>
+          {item.commitSha && (
+            <code style={{ background: '#1e293b', padding: '1px 4px', borderRadius: 3, fontSize: 10, color: '#94a3b8' }}>
+              {item.commitSha}
+            </code>
           )}
           {actor && (
             <span>{actor}</span>
@@ -788,10 +788,28 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
           {duration != null && duration > 0 && (
             <span>{formatDuration(duration)}</span>
           )}
+          {item.runAttempt && item.runAttempt > 1 && (
+            <span style={{ color: '#f59e0b' }}>attempt #{item.runAttempt}</span>
+          )}
           {item.createdAt && (
             <span>{formatRelativeTs(item.createdAt)}</span>
           )}
         </div>
+        {/* Second row: commit message + workflow path */}
+        {(commitMsg || item.workflowPath) && (
+          <div style={{ fontSize: 11, color: '#475569', marginTop: 2, display: 'flex', gap: 8, alignItems: 'center' }}>
+            {item.workflowPath && (
+              <span style={{ fontSize: 10, color: '#64748b', flexShrink: 0 }}>
+                {item.workflowPath.replace(/^\.github\/workflows\//, '')}
+              </span>
+            )}
+            {commitMsg && (
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                {commitMsg.split('\n')[0]}
+              </span>
+            )}
+          </div>
+        )}
       </div>
     );
   };

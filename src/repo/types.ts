@@ -106,6 +106,9 @@ export interface RepoWorkflowRun {
   runNumber?: number;
   event?: string;         // push, pull_request, schedule, workflow_dispatch, etc.
   conclusion?: string;    // success, failure, cancelled, skipped, etc.
+  runAttempt?: number;    // retry attempt number
+  workflowPath?: string;  // e.g. ".github/workflows/ci.yml"
+  headCommitMessage?: string; // full commit message (not just display_title)
 }
 
 export interface RepoCommitDetailFile {
