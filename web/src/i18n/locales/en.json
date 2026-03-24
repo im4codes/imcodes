@@ -345,6 +345,7 @@
     "tab_prs": "PRs",
     "tab_branches": "Branches",
     "tab_commits": "Commits",
+    "tab_cicd": "CI/CD",
     "cli_not_installed": "CLI not installed",
     "load_more": "Load more",
     "retry": "Retry",
@@ -354,6 +355,10 @@
     "empty_issues": "No issues found",
     "empty_prs": "No pull requests found",
     "empty_branches": "No branches found",
-    "empty_commits": "No commits found"
+    "empty_commits": "No commits found",
+    "empty_actions": "No workflow runs found",
+    "actions_refresh": "Refresh",
+    "actions_last_updated": "Updated {{time}}",
+    "actions_view": "View"
   }
 }

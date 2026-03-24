@@ -60,6 +60,7 @@ export type ServerMessage =
   | { type: 'repo.prs_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
   | { type: 'repo.branches_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
   | { type: 'repo.commits_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
+  | { type: 'repo.actions_response'; requestId?: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
   | { type: 'repo.error'; requestId: string; projectDir?: string; error: string }
   | { type: 'repo.detected'; projectDir: string; context: any };
 
@@ -361,6 +362,13 @@ export class WsClient {
   repoListCommits(projectDir: string, opts?: { branch?: string; page?: number }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: 'repo.list_commits', requestId, projectDir, ...opts });
+    return requestId;
+  }
+
+  /** List workflow runs (CI/CD actions) for a project. Returns requestId. */
+  repoListActions(projectDir: string, opts?: { page?: number; force?: boolean }): string {
+    const requestId = crypto.randomUUID();
+    this.send({ type: 'repo.list_actions', requestId, projectDir, ...opts });
     return requestId;
   }
 

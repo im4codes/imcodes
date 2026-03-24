@@ -345,6 +345,7 @@
     "tab_prs": "拉取请求",
     "tab_branches": "分支",
     "tab_commits": "提交",
+    "tab_cicd": "CI/CD",
     "cli_not_installed": "CLI 未安装",
     "load_more": "加载更多",
     "retry": "重试",
@@ -354,6 +355,10 @@
     "empty_issues": "暂无议题",
     "empty_prs": "暂无拉取请求",
     "empty_branches": "暂无分支",
-    "empty_commits": "暂无提交"
+    "empty_commits": "暂无提交",
+    "empty_actions": "没有找到工作流运行记录",
+    "actions_refresh": "刷新",
+    "actions_last_updated": "更新于 {{time}}",
+    "actions_view": "查看"
   }
 }

@@ -88,6 +88,7 @@ const BROWSER_WHITELIST = new Set([
   'repo.list_prs',
   'repo.list_branches',
   'repo.list_commits',
+  'repo.list_actions',
 ]);
 
 // ── Terminal forwarding queue (per (session, browser)) ────────────────────────

@@ -248,6 +248,35 @@ async function handleListCommits(
   }
 }
 
+async function handleListActions(
+  cmd: Record<string, unknown>,
+  serverLink: ServerLink,
+): Promise<void> {
+  const projectDir = cmd.projectDir as string;
+  const requestId = cmd.requestId as string | undefined;
+
+  const opts: ListOptions = {};
+  if (cmd.page !== undefined) opts.page = cmd.page as number;
+
+  const cacheKey = RepoCache.buildKey(projectDir, 'actions', { ...opts });
+  const cached = repoCache.get<unknown>(cacheKey);
+  if (cached) {
+    serverLink.send({ type: REPO_MSG.ACTIONS_RESPONSE, requestId, ...cached as object });
+    return;
+  }
+
+  const provider = await getProvider(projectDir, requestId, serverLink);
+  if (!provider) return;
+
+  try {
+    const result = await provider.listActions(opts);
+    repoCache.set(cacheKey, result, projectDir);
+    serverLink.send({ type: REPO_MSG.ACTIONS_RESPONSE, requestId, ...result });
+  } catch (err) {
+    sendError(serverLink, requestId, projectDir, 'cli_error', err);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
@@ -354,6 +383,9 @@ export function handleRepoCommand(cmd: Record<string, unknown>, serverLink: Serv
         break;
       case 'repo.list_commits':
         await handleListCommits(cmd, serverLink);
+        break;
+      case 'repo.list_actions':
+        await handleListActions(cmd, serverLink);
         break;
       default:
         logger.warn({ type: cmd.type }, 'repo: unknown subcommand');

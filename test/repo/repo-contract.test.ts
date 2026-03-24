@@ -59,7 +59,7 @@ describe('Repo message type contract', () => {
     expect(REPO_MSG.LIST_PRS).toBe('repo.list_prs');
   });
 
-  it('REPO_RELAY_TYPES has exactly 7 entries', () => {
-    expect(REPO_RELAY_TYPES.size).toBe(7);
+  it('REPO_RELAY_TYPES has exactly 8 entries', () => {
+    expect(REPO_RELAY_TYPES.size).toBe(8);
   });
 });

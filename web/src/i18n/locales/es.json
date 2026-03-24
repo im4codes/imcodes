@@ -345,6 +345,7 @@
     "tab_prs": "PRs",
     "tab_branches": "Ramas",
     "tab_commits": "Commits",
+    "tab_cicd": "CI/CD",
     "cli_not_installed": "CLI no instalado",
     "load_more": "Cargar m\u00e1s",
     "retry": "Reintentar",
@@ -354,6 +355,10 @@
     "empty_issues": "No se encontraron issues",
     "empty_prs": "No se encontraron pull requests",
     "empty_branches": "No se encontraron ramas",
-    "empty_commits": "No se encontraron commits"
+    "empty_commits": "No se encontraron commits",
+    "empty_actions": "No se encontraron ejecuciones de flujos de trabajo",
+    "actions_refresh": "Actualizar",
+    "actions_last_updated": "Actualizado {{time}}",
+    "actions_view": "Ver"
   }
 }

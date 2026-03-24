@@ -10,6 +10,7 @@ import type {
   RepoIssue,
   RepoPR,
   RepoListResult,
+  RepoWorkflowRun,
 } from './types.js';
 import type {
   CommitListOptions,
@@ -182,6 +183,14 @@ export class GitLabProvider implements RepoProvider {
     }));
 
     return { items, page, hasMore: data.length === perPage, projectDir: this.projectDir };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  Actions (pipelines) — stub                                         */
+  /* ------------------------------------------------------------------ */
+
+  async listActions(_opts?: ListOptions): Promise<RepoListResult<RepoWorkflowRun>> {
+    return { items: [], page: 1, hasMore: false, projectDir: this.projectDir };
   }
 
   /* ------------------------------------------------------------------ */

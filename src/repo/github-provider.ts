@@ -10,6 +10,7 @@ import type {
   RepoPR,
   RepoBranch,
   RepoCommit,
+  RepoWorkflowRun,
   RepoError,
 } from './types.js';
 import type { RepoProvider, ListOptions, CommitListOptions } from './provider.js';
@@ -180,6 +181,33 @@ export class GitHubProvider implements RepoProvider {
       });
 
       const items: RepoCommit[] = JSON.parse(stdout || '[]');
+      return { items, page, hasMore: items.length === perPage, projectDir: this.projectDir };
+    } catch (err) {
+      const code = translateError(err);
+      const error = new Error(`gh error: ${code}`);
+      (error as any).code = code;
+      throw error;
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  listActions                                                        */
+  /* ------------------------------------------------------------------ */
+
+  async listActions(opts?: ListOptions): Promise<RepoListResult<RepoWorkflowRun>> {
+    const page = opts?.page ?? 1;
+    const perPage = opts?.perPage ?? DEFAULT_PAGE_SIZE;
+
+    const jq = `[.workflow_runs[] | {id, name, status: (if .status == "completed" then (if .conclusion == "success" then "success" elif .conclusion == "failure" then "failure" elif .conclusion == "cancelled" then "cancelled" else "failure" end) elif .status == "in_progress" then "running" else "queued" end), branch: .head_branch, commitSha: .head_sha[:7], commitMessage: .display_title, actor: .actor.login, url: .html_url, createdAt: (.created_at | fromdateiso8601 * 1000), updatedAt: (.updated_at | fromdateiso8601 * 1000), duration: (if .status == "completed" then (((.updated_at | fromdateiso8601) - (.created_at | fromdateiso8601))) else null end)}]`;
+
+    try {
+      const { stdout } = await execFileAsync('gh', [
+        'api',
+        `/repos/${this.owner}/${this.repo}/actions/runs?per_page=${perPage}&page=${page}`,
+        '-q', jq,
+      ], { cwd: this.projectDir, timeout: 15000, maxBuffer: 10 * 1024 * 1024 });
+
+      const items: RepoWorkflowRun[] = JSON.parse(stdout || '[]');
       return { items, page, hasMore: items.length === perPage, projectDir: this.projectDir };
     } catch (err) {
       const code = translateError(err);

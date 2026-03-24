@@ -7,6 +7,7 @@ import type {
   RepoPR,
   RepoBranch,
   RepoCommit,
+  RepoWorkflowRun,
 } from './types.js';
 
 export interface ListOptions {
@@ -36,6 +37,9 @@ export interface RepoProvider {
 
   /** List commits, optionally filtered by branch. Default page size: 20. */
   listCommits(opts?: CommitListOptions): Promise<RepoListResult<RepoCommit>>;
+
+  /** List CI/CD workflow runs (Actions / Pipelines). Default page size: 20. */
+  listActions(opts?: ListOptions): Promise<RepoListResult<RepoWorkflowRun>>;
 }
 
 export const DEFAULT_PAGE_SIZE = 20;

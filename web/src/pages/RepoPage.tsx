@@ -10,7 +10,7 @@ interface Props {
   onBack: () => void;
 }
 
-type TabKey = 'issues' | 'prs' | 'branches' | 'commits';
+type TabKey = 'issues' | 'prs' | 'branches' | 'commits' | 'actions';
 
 interface RepoContext {
   provider?: string; // 'github' | 'gitlab' | ...
@@ -78,6 +78,7 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
     prs: emptyTab(),
     branches: emptyTab(),
     commits: emptyTab(),
+    actions: emptyTab(),
   });
 
   // Track pending requestIds to discard stale responses
@@ -141,6 +142,9 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
         break;
       case 'commits':
         rid = ws.repoListCommits(projectDir, { page });
+        break;
+      case 'actions':
+        rid = ws.repoListActions(projectDir, { page });
         break;
     }
     pendingRef.current.add(rid);
@@ -207,6 +211,7 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
         'repo.prs_response': 'prs',
         'repo.branches_response': 'branches',
         'repo.commits_response': 'commits',
+        'repo.actions_response': 'actions',
       };
       const tabKey = tabMap[msg.type];
       if (tabKey && 'requestId' in msg && 'projectDir' in msg) {
@@ -274,6 +279,7 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
     prs: t('repo.tab_prs'),
     branches: t('repo.tab_branches'),
     commits: t('repo.tab_commits'),
+    actions: t('repo.tab_cicd'),
   };
 
   const renderError = (error: string, tabKey: TabKey) => {
@@ -424,11 +430,102 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
     </div>
   );
 
+  const formatDuration = (ms: number) => {
+    const totalSec = Math.floor(ms / 1000);
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    return m > 0 ? `${m}m ${s}s` : `${s}s`;
+  };
+
+  const formatRelative = (dateStr: string) => {
+    const diff = Date.now() - new Date(dateStr).getTime();
+    const sec = Math.floor(diff / 1000);
+    if (sec < 60) return `${sec}s`;
+    const min = Math.floor(sec / 60);
+    if (min < 60) return `${min}m`;
+    const hr = Math.floor(min / 60);
+    if (hr < 24) return `${hr}h`;
+    const d = Math.floor(hr / 24);
+    return `${d}d`;
+  };
+
+  const actionStatusColor = (status: string, conclusion: string | null | undefined) => {
+    if (status === 'in_progress' || status === 'running') return '#f59e0b';
+    if (status === 'queued' || status === 'waiting' || status === 'pending') return '#94a3b8';
+    if (conclusion === 'success') return '#4ade80';
+    if (conclusion === 'failure') return '#ef4444';
+    if (conclusion === 'cancelled') return '#6b7280';
+    return '#94a3b8';
+  };
+
+  const actionStatusLabel = (status: string, conclusion: string | null | undefined) => {
+    if (status === 'in_progress' || status === 'running') return 'RUNNING';
+    if (status === 'queued' || status === 'waiting' || status === 'pending') return 'QUEUED';
+    if (conclusion) return conclusion.toUpperCase();
+    return status?.toUpperCase() ?? '';
+  };
+
+  const renderActionItem = (item: any) => {
+    const color = actionStatusColor(item.status, item.conclusion);
+    const duration = item.updatedAt && item.createdAt
+      ? new Date(item.updatedAt).getTime() - new Date(item.createdAt).getTime()
+      : null;
+    return (
+      <div key={item.id ?? item.runId} style={listItemStyle}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{
+            width: 8, height: 8, borderRadius: '50%', background: color, flexShrink: 0,
+            display: 'inline-block',
+          }} />
+          <span style={{ fontSize: 11, fontWeight: 600, color, flexShrink: 0 }}>
+            {actionStatusLabel(item.status, item.conclusion)}
+          </span>
+          <span style={{ color: '#cbd5e1', fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {item.name ?? item.workflowName ?? ''}
+          </span>
+          {item.url && (
+            <a
+              href={item.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ fontSize: 11, color: '#60a5fa', flexShrink: 0, textDecoration: 'none' }}
+              onClick={(e: MouseEvent) => e.stopPropagation()}
+            >
+              {t('repo.actions_view')}
+            </a>
+          )}
+        </div>
+        <div style={{ fontSize: 11, color: '#64748b', marginTop: 4, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          {item.headBranch && (
+            <code style={{ background: '#1e293b', padding: '1px 4px', borderRadius: 3, fontSize: 10 }}>
+              {item.headBranch}
+            </code>
+          )}
+          {item.headCommit?.message && (
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 200 }}>
+              {item.headCommit.message.split('\n')[0]}
+            </span>
+          )}
+          {item.actor?.login && (
+            <span>{item.actor.login}</span>
+          )}
+          {duration != null && duration > 0 && (
+            <span>{formatDuration(duration)}</span>
+          )}
+          {item.createdAt && (
+            <span>{formatRelative(item.createdAt)}</span>
+          )}
+        </div>
+      </div>
+    );
+  };
+
   const RENDERERS: Record<TabKey, (item: any) => any> = {
     issues: renderIssueItem,
     prs: renderPrItem,
     branches: renderBranchItem,
     commits: renderCommitItem,
+    actions: renderActionItem,
   };
 
   const renderTabContent = (key: TabKey) => {
@@ -549,7 +646,7 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
       <div style={{
         display: 'flex', borderBottom: '1px solid #1e293b', flexShrink: 0,
       }}>
-        {(['issues', 'prs', 'branches', 'commits'] as TabKey[]).map(key => (
+        {(['issues', 'prs', 'branches', 'commits', 'actions'] as TabKey[]).map(key => (
           <button
             key={key}
             onClick={() => handleTabClick(key)}

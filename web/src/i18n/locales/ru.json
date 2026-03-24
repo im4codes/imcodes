@@ -345,6 +345,7 @@
     "tab_prs": "PR",
     "tab_branches": "Ветки",
     "tab_commits": "Коммиты",
+    "tab_cicd": "CI/CD",
     "cli_not_installed": "CLI не установлен",
     "load_more": "Загрузить ещё",
     "retry": "Повторить",
@@ -354,6 +355,10 @@
     "empty_issues": "Задачи не найдены",
     "empty_prs": "Pull request\u2019ы не найдены",
     "empty_branches": "Ветки не найдены",
-    "empty_commits": "Коммиты не найдены"
+    "empty_commits": "Коммиты не найдены",
+    "empty_actions": "Запуски рабочих процессов не найдены",
+    "actions_refresh": "Обновить",
+    "actions_last_updated": "Обновлено {{time}}",
+    "actions_view": "Открыть"
   }
 }

@@ -91,6 +91,20 @@ export interface RepoCommit {
   url: string;
 }
 
+export interface RepoWorkflowRun {
+  id: number;
+  name: string;           // workflow name
+  status: 'queued' | 'running' | 'success' | 'failure' | 'cancelled';
+  branch: string;
+  commitSha: string;
+  commitMessage: string;
+  actor: string;          // who triggered it
+  url: string;
+  createdAt: number;
+  updatedAt: number;
+  duration?: number;      // seconds
+}
+
 /** Structured error from providers — never exposes raw CLI output. */
 export type RepoError =
   | 'unauthorized'

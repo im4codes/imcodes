@@ -345,6 +345,7 @@
     "tab_prs": "PR",
     "tab_branches": "브랜치",
     "tab_commits": "커밋",
+    "tab_cicd": "CI/CD",
     "cli_not_installed": "CLI 미설치",
     "load_more": "더 보기",
     "retry": "재시도",
@@ -354,6 +355,10 @@
     "empty_issues": "이슈가 없습니다",
     "empty_prs": "PR이 없습니다",
     "empty_branches": "브랜치가 없습니다",
-    "empty_commits": "커밋이 없습니다"
+    "empty_commits": "커밋이 없습니다",
+    "empty_actions": "워크플로 실행을 찾을 수 없습니다",
+    "actions_refresh": "새로고침",
+    "actions_last_updated": "{{time}} 업데이트됨",
+    "actions_view": "보기"
   }
 }

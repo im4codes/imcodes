@@ -345,6 +345,7 @@
     "tab_prs": "PR",
     "tab_branches": "ブランチ",
     "tab_commits": "コミット",
+    "tab_cicd": "CI/CD",
     "cli_not_installed": "CLIが未インストール",
     "load_more": "さらに読み込む",
     "retry": "再試行",
@@ -354,6 +355,10 @@
     "empty_issues": "Issueはありません",
     "empty_prs": "PRはありません",
     "empty_branches": "ブランチはありません",
-    "empty_commits": "コミットはありません"
+    "empty_commits": "コミットはありません",
+    "empty_actions": "ワークフロー実行が見つかりません",
+    "actions_refresh": "更新",
+    "actions_last_updated": "更新 {{time}}",
+    "actions_view": "表示"
   }
 }
