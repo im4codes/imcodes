@@ -1613,9 +1613,9 @@ export function App() {
               </div>
             )}
 
-            {lastUsage && (
+            {(lastUsage || activeThinkingTs || statusText) && (
               <UsageFooter
-                usage={lastUsage}
+                usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
                 sessionName={activeSession ?? ''}
                 showCost={!!lastCostEvent}
                 activeThinkingTs={activeThinkingTs}

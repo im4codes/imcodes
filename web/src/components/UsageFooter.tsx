@@ -58,13 +58,15 @@ export function UsageFooter({ usage, sessionName, showCost, activeThinkingTs, st
 
   return (
     <div class="session-usage-footer" title={tip}>
-      <div class="session-ctx-bar">
-        <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
-        <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
-      </div>
+      {total > 0 && (
+        <div class="session-ctx-bar">
+          <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
+          <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
+        </div>
+      )}
       <div class="session-usage-stats">
         {modelLabel && <span class="session-usage-model">{modelLabel}</span>}
-        <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>
+        {total > 0 && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}
         {(activeThinkingTs || statusText) && (
           <span class="session-thinking-inline">
             <span class="chat-thinking-dots">···</span>

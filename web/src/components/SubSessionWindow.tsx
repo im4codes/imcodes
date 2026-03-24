@@ -314,9 +314,9 @@ export function SubSessionWindow({
       </div>
 
       {/* Usage footer — shared component */}
-      {lastUsage && (
+      {(lastUsage || activeThinkingTs || statusText) && (
         <UsageFooter
-          usage={lastUsage}
+          usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sub.sessionName}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
