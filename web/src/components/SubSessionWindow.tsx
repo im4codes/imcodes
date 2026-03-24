@@ -273,7 +273,7 @@ export function SubSessionWindow({
         <span class="subsession-title">{typeLabel}</span>
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
           {!isShell && <button class="subsession-mode-btn" onClick={() => { const next = viewMode === 'chat' ? 'terminal' : 'chat'; setViewMode(next); if (next === 'chat') requestAnimationFrame(() => chatScrollRef.current?.()); }} title={viewMode === 'chat' ? 'Switch to terminal' : 'Switch to chat'}>{viewMode === 'chat' ? '⌨' : '💬'}</button>}
-          <button class="subsession-minimize-btn" onClick={onMinimize} title="Minimize">─</button>
+          <button class="subsession-minimize-btn" onClick={onMinimize} title="Minimize">▾</button>
           {confirmClose ? (
             <>
               <span class="subsession-close-confirm-label">Terminate?</span>

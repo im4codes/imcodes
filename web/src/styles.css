@@ -534,9 +534,9 @@ body {
 .subsession-mode-btn { background: none; border: 1px solid transparent; border-radius: 4px; color: #64748b; cursor: pointer; font-size: 13px; padding: 2px 5px; transition: all 0.15s; }
 .subsession-mode-btn:hover { border-color: #475569; color: #94a3b8; }
 .subsession-mode-btn.active { border-color: #3b82f6; color: #93c5fd; background: #1e3a5f; }
-.subsession-minimize-btn { background: none; border: none; color: #64748b; cursor: pointer; font-size: 14px; padding: 0 4px; line-height: 1; transition: color 0.15s; }
+.subsession-minimize-btn { background: none; border: none; color: #64748b; cursor: pointer; font-size: 16px; padding: 4px 12px; line-height: 1; transition: color 0.15s; }
 .subsession-minimize-btn:hover { color: #94a3b8; }
-.subsession-close-btn { background: none; border: none; color: #64748b; cursor: pointer; font-size: 16px; padding: 0 4px; line-height: 1; transition: color 0.15s; }
+.subsession-close-btn { background: none; border: none; color: #64748b; cursor: pointer; font-size: 16px; padding: 4px 12px; line-height: 1; transition: color 0.15s; }
 .subsession-close-btn:hover { color: #ef4444; }
 .subsession-close-confirm-label { font-size: 11px; color: #f87171; padding: 0 2px; }
 .subsession-content { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
@@ -925,9 +925,8 @@ body {
 
 /* ── Repo page container ── */
 .repo-page {
-  position: fixed; inset: 0; z-index: 1000;
   background: #0f172a; color: #e2e8f0;
   display: flex; flex-direction: column;
   overflow: hidden;
-  padding-top: env(safe-area-inset-top, 0px);
+  flex: 1;
 }

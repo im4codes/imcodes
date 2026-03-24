@@ -820,6 +820,12 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
             )}
             {item.createdAt && <span>{formatTime(item.createdAt)} ({formatRelativeTs(item.createdAt)})</span>}
           </div>
+          {/* Commit message summary — max 2 lines */}
+          {commitMsg && (
+            <div style={{ fontSize: 11, color: '#475569', marginTop: 2, overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
+              {commitMsg}
+            </div>
+          )}
         </div>
         {isExpanded && (
           <div class="repo-detail-panel">

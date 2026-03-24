@@ -29,11 +29,12 @@ import { AskQuestionDialog, type PendingQuestion } from './components/AskQuestio
 import { ServerContextMenu, DeleteServerDialog } from './components/ServerContextMenu.js';
 import { DiscussionsPage } from './pages/DiscussionsPage.js';
 import { RepoPage } from './pages/RepoPage.js';
+import { FloatingPanel } from './components/FloatingPanel.js';
 import { SettingsPage } from './pages/SettingsPage.js';
 import { AdminPage } from './pages/AdminPage.js';
 import { useSubSessions } from './hooks/useSubSessions.js';
 import { useTimeline } from './hooks/useTimeline.js';
-import { useSwipeBack } from './hooks/useSwipeBack.js';
+// useSwipeBack now handled inside FloatingPanel for discussion/repo pages
 import { getActiveThinkingTs, getActiveStatusText } from './thinking-utils.js';
 import { WsClient } from './ws-client.js';
 import { UsageFooter } from './components/UsageFooter.js';
@@ -426,7 +427,7 @@ export function App() {
   // ── Discussions ─────────────────────────────────────────────────────────────
   const [showDiscussionsPage, setShowDiscussionsPage] = useState(false);
   const [discussionInitialId, setDiscussionInitialId] = useState<string | null>(null);
-  const discussionsSwipeRef = useSwipeBack(useCallback(() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }, []));
+  // Swipe back for discussions is handled by FloatingPanel on mobile
   const [showDiscussionDialog, setShowDiscussionDialog] = useState(false);
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [discussionPrefs, _setDiscussionPrefs] = useState<DiscussionPrefs | null>(null);
@@ -1743,7 +1744,7 @@ export function App() {
       </main>
 
       {showDiscussionsPage && selectedServerId && (
-        <div ref={discussionsSwipeRef} style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)' }}>
+        <FloatingPanel id="discussions" title="Discussions" onClose={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }} defaultW={800} defaultH={600}>
           <DiscussionsPage
             ws={wsRef.current}
             onBack={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }}
@@ -1758,13 +1759,13 @@ export function App() {
               }
             }}
           />
-        </div>
+        </FloatingPanel>
       )}
 
       {showRepoPage && wsRef.current && activeSessionInfo?.projectDir && (
-        <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)' }}>
+        <FloatingPanel id="repo" title="Repository" onClose={() => setShowRepoPage(false)} defaultW={800} defaultH={600}>
           <RepoPage ws={wsRef.current} projectDir={activeSessionInfo.projectDir} onBack={() => setShowRepoPage(false)} />
-        </div>
+        </FloatingPanel>
       )}
 
       {showSettingsPage && (
