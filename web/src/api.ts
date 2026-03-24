@@ -582,3 +582,14 @@ export async function downloadAttachment(serverId: string, attachmentId: string)
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
+
+export async function previewAttachment(serverId: string, attachmentId: string): Promise<void> {
+  const res = await rawFetch(`/api/server/${serverId}/uploads/${attachmentId}/download`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new ApiError(res.status, body);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  window.open(url, '_blank');
+}

@@ -391,6 +391,11 @@ body {
 .chat-panel-drag:hover { background: #6366f1; }
 /* Split file panel container */
 .chat-file-panel { display: flex; flex-direction: column; border-left: 1px solid #334155; background: #0f172a; overflow: hidden; min-width: 220px; }
+.chat-attachment-row { display: inline-flex; align-items: center; gap: 4px; margin-top: 4px; }
+.chat-attachment-dl { background: #172337; border: 1px solid #334155; border-radius: 6px; color: #94a3b8; padding: 3px 8px; font-size: 12px; cursor: pointer; text-align: left; }
+.chat-attachment-dl:hover { color: #e2e8f0; border-color: #475569; }
+.chat-attachment-dl-btn { background: #172337; border: 1px solid #334155; border-radius: 6px; color: #64748b; padding: 3px 6px; font-size: 11px; cursor: pointer; line-height: 1; }
+.chat-attachment-dl-btn:hover { color: #60a5fa; border-color: #3b82f6; }
 .chat-event { margin: 2px 0; min-width: 0; }
 .chat-user { background: #1e3a5f; border-radius: 8px; padding: 6px 12px; align-self: flex-end; max-width: 80%; width: fit-content; text-align: left; word-break: break-all; overflow-wrap: break-word; }
 .chat-user.chat-pending { background: #1e3a5f80; color: #94a3b8; }

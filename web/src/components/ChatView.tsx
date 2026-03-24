@@ -657,27 +657,43 @@ function AttachmentDownloadButton({ att, serverId }: { att: { id: string; origin
   const [error, setError] = useState<string | null>(null);
   const label = att.originalName || att.id;
   const sizeLabel = att.size ? ` (${(att.size / 1024).toFixed(0)}KB)` : '';
+
+  const handleError = (err: unknown) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('daemon_offline') || msg.includes('503')) setError(t('upload.daemon_offline'));
+    else if (msg.includes('410') || msg.includes('expired')) setError(t('upload.download_expired'));
+    else if (msg.includes('404')) setError(t('upload.download_expired'));
+    else setError(t('upload.upload_failed'));
+    setTimeout(() => setError(null), 5000);
+  };
+
   return (
-    <button
-      class="chat-attachment-dl"
-      style={error ? { color: '#ef4444' } : undefined}
-      onClick={() => {
-        setError(null);
-        import('../api.js').then(({ downloadAttachment }) => {
-          downloadAttachment(serverId, att.id).catch((err: unknown) => {
-            const msg = err instanceof Error ? err.message : String(err);
-            if (msg.includes('daemon_offline') || msg.includes('503')) setError(t('upload.daemon_offline'));
-            else if (msg.includes('410') || msg.includes('expired')) setError(t('upload.download_expired'));
-            else if (msg.includes('404')) setError(t('upload.download_expired'));
-            else setError(t('upload.upload_failed'));
-            setTimeout(() => setError(null), 5000);
+    <span class="chat-attachment-row" style={error ? { color: '#ef4444' } : undefined}>
+      <button
+        class="chat-attachment-dl"
+        onClick={() => {
+          setError(null);
+          import('../api.js').then(({ previewAttachment }) => {
+            previewAttachment(serverId, att.id).catch(handleError);
           });
-        });
-      }}
-      title={error || label}
-    >
-      {error ? `\u{26A0} ${error}` : `\u{1F4CE} ${label}${sizeLabel}`}
-    </button>
+        }}
+        title={error || label}
+      >
+        {error ? `\u{26A0} ${error}` : `\u{1F4CE} ${label}${sizeLabel}`}
+      </button>
+      <button
+        class="chat-attachment-dl-btn"
+        onClick={() => {
+          setError(null);
+          import('../api.js').then(({ downloadAttachment }) => {
+            downloadAttachment(serverId, att.id).catch(handleError);
+          });
+        }}
+        title={t('common.download')}
+      >
+        ⬇
+      </button>
+    </span>
   );
 }
 
