@@ -328,31 +328,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
         </div>
       )}
 
-      {/* Collapsed: compact buttons (all platforms) */}
-      {collapsed && subSessions.length > 0 && (
-        <div class="subsession-bar" style={{ borderTop: 'none' }}>
-          {orderedSessions.map((sub) => {
-            const agentTag = sub.type === 'shell' ? (sub.shellBin?.split('/').pop() ?? 'shell') : sub.type;
-            const label = sub.label ? `${sub.label} · ${agentTag}` : agentTag;
-            const abbr = TYPE_ABBR[sub.type] ?? agentTag.slice(0, 2);
-            const isOpen = openIds.has(sub.id);
-            return (
-              <button
-                key={sub.id}
-                class={`subsession-card${isOpen ? ' open' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
-                onClick={() => onOpen(sub.id)}
-                title={label}
-              >
-                <span class="subsession-card-icon">{abbr}</span>
-                <span class="subsession-card-label">{sub.label ? sub.label.slice(0, 6) : agentTag.slice(0, 6)}</span>
-                {sub.state === 'starting' && <span class="subsession-card-badge">…</span>}
-              </button>
-            );
-          })}
-        </div>
-      )}
-
-      {/* Discussions panel — always visible when discussions exist */}
+      {/* Discussions panel — above sub-session buttons */}
       {discussions.length > 0 && (
         <div class="discussion-panel">
           {discussions.map((d) => {
@@ -420,6 +396,30 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
                   )}
                 </div>
               </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Collapsed: compact buttons (all platforms) */}
+      {collapsed && subSessions.length > 0 && (
+        <div class="subsession-bar" style={{ borderTop: 'none' }}>
+          {orderedSessions.map((sub) => {
+            const agentTag = sub.type === 'shell' ? (sub.shellBin?.split('/').pop() ?? 'shell') : sub.type;
+            const label = sub.label ? `${sub.label} · ${agentTag}` : agentTag;
+            const abbr = TYPE_ABBR[sub.type] ?? agentTag.slice(0, 2);
+            const isOpen = openIds.has(sub.id);
+            return (
+              <button
+                key={sub.id}
+                class={`subsession-card${isOpen ? ' open' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
+                onClick={() => onOpen(sub.id)}
+                title={label}
+              >
+                <span class="subsession-card-icon">{abbr}</span>
+                <span class="subsession-card-label">{sub.label ? sub.label.slice(0, 6) : agentTag.slice(0, 6)}</span>
+                {sub.state === 'starting' && <span class="subsession-card-badge">…</span>}
+              </button>
             );
           })}
         </div>
