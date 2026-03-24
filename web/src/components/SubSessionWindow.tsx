@@ -339,6 +339,7 @@ export function SubSessionWindow({
               <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
             </div>
             <div class="session-usage-stats">
+              {lastUsage.model && <span class="session-usage-model">{lastUsage.model}</span>}
               <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>
               {(activeThinkingTs || statusText) && (
                 <span class="session-thinking-inline">
@@ -376,6 +377,7 @@ export function SubSessionWindow({
           sessions={sessions}
           subSessions={subSessions}
           serverId={serverId}
+          detectedModel={lastUsage?.model}
         />
       </div>
     </div>

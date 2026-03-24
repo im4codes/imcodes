@@ -134,18 +134,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (inputRef) (inputRef as { current: HTMLDivElement | null }).current = divRef.current;
   });
 
-  // Auto-adopt detected model when user hasn't explicitly chosen one
+  // Auto-sync model selector with detected model from terminal/ctx
+  // Detection is the real-time truth — always override the selector
   useEffect(() => {
     if (!detectedModel) return;
     // CC models
-    if ((detectedModel === 'opus' || detectedModel === 'sonnet' || detectedModel === 'haiku') && model === null) {
-      setModel(detectedModel);
+    if (detectedModel === 'opus' || detectedModel === 'sonnet' || detectedModel === 'haiku') {
+      if (model !== detectedModel) setModel(detectedModel);
     }
     // Codex models
     if (detectedModel.startsWith('gpt-') && CODEX_MODELS.includes(detectedModel as CodexModelChoice)) {
-      setCodexModel(detectedModel as CodexModelChoice);
+      if (codexModel !== detectedModel) setCodexModel(detectedModel as CodexModelChoice);
     }
-  }, [detectedModel, model]);
+  }, [detectedModel]);
 
   const connected = !!ws?.connected;
   const hasSession = !!activeSession;

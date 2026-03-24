@@ -540,6 +540,7 @@ body {
 .session-ctx-input { position: absolute; left: 0; top: 0; height: 100%; background: #34d399; border-radius: 3px; }
 .session-ctx-cache { position: absolute; left: 0; top: 0; height: 100%; background: #818cf8; border-radius: 3px; }
 .session-usage-stats { display: flex; justify-content: space-between; font-size: 10px; color: #475569; }
+.session-usage-model { color: #a78bfa; font-size: 10px; font-weight: 500; margin-right: 6px; }
 .session-usage-tokens { color: #64748b; }
 .session-usage-cost { color: #94a3b8; }
 .session-thinking-inline { color: #818cf8; font-style: italic; margin-left: auto; padding-left: 8px; }
