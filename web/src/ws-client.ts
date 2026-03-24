@@ -576,6 +576,15 @@ export class WsClient {
     }, delay);
   }
 
+  /** Force immediate reconnect (e.g. app returning from background). */
+  reconnectNow(): void {
+    if (this._destroyed) return;
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) return; // already connected
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectAttempt = 0;
+    void this.openSocket();
+  }
+
   private startHeartbeat(): void {
     // Send first ping immediately to get initial latency
     try {

@@ -978,7 +978,14 @@ export function App() {
     setConnecting(true);
     ws.connect();
 
+    // Reconnect immediately when app returns from background (mobile + desktop tab)
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') ws.reconnectNow();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+
     return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
       unsub();
       unsubStats();
       ws.onLatency(null);
