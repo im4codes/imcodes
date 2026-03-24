@@ -73,7 +73,10 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
   const [context, setContext] = useState<RepoContext | null>(null);
   const [detectLoading, setDetectLoading] = useState(true);
   const [detectError, setDetectError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<TabKey>('issues');
+  const [activeTab, setActiveTab] = useState<TabKey>(() => {
+    const saved = localStorage.getItem('repo-active-tab');
+    return saved && ['issues', 'prs', 'branches', 'commits', 'actions'].includes(saved) ? saved as TabKey : 'issues';
+  });
 
   const [tabs, setTabs] = useState<Record<TabKey, TabState>>({
     issues: emptyTab(),
@@ -346,6 +349,7 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
 
   const handleTabClick = useCallback((key: TabKey) => {
     setActiveTab(key);
+    localStorage.setItem('repo-active-tab', key);
   }, []);
 
   // ── Render helpers ───────────────────────────────────────────────────────
