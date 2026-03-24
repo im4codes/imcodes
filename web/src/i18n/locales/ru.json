@@ -51,7 +51,20 @@
     "send_queued": "Переподключение… (отправка в очереди)",
     "send_placeholder": "Отправить в {{name}}…",
     "actions": "Действия с сессией",
-    "new_btn": "Новая сессия"
+    "new_btn": "Новая сессия",
+    "agentType": {
+      "openclaw": "OpenClaw"
+    },
+    "sessionMode": "Режим сессии",
+    "newSession": "Новая сессия",
+    "bindExisting": "Привязать существующую OC сессию",
+    "selectSession": "Выбрать сессию",
+    "loadingSessions": "Загрузка сессий...",
+    "noSessions": "Нет доступных сессий",
+    "description": "Описание",
+    "descriptionPlaceholder": "Роль или цель сессии (необязательно)",
+    "sessionKey": "Ключ сессии",
+    "autoGenerate": "Автогенерация"
   },
   "server": {
     "upgrade_daemon": "↑ Обновить Daemon",
@@ -363,5 +376,13 @@
     "no_comments": "Нет комментариев",
     "show_changed_files": "Показать изменённые файлы",
     "refresh_tab": "Обновить"
+  },
+  "transport_chat": {
+    "inputPlaceholder": "Введите сообщение...",
+    "send": "Отправить",
+    "streaming": "Думаю...",
+    "error": "Ошибка",
+    "connectionLost": "Соединение потеряно",
+    "empty": "Сообщений пока нет"
   }
 }

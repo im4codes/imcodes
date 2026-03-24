@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import type { WsClient } from '../ws-client.js';
 import { FileBrowser } from './FileBrowser.js';
 import { getUserPref, saveUserPref } from '../api.js';
+import { useProviderStatus } from '../hooks/useProviderStatus.js';
 
 const DEFAULT_SHELL_KEY = 'default_shell';
 
@@ -12,7 +13,13 @@ interface Props {
   onSessionStarted: (sessionName: string) => void;
 }
 
-type AgentType = 'claude-code' | 'codex' | 'opencode' | 'gemini';
+type AgentType = 'claude-code' | 'codex' | 'opencode' | 'gemini' | 'openclaw';
+type OpenClawMode = 'new' | 'bind';
+
+interface RemoteSession {
+  id: string;
+  label: string;
+}
 
 export function NewSessionDialog({ ws, onClose, onSessionStarted }: Props) {
   const { t } = useTranslation();
@@ -24,6 +31,17 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted }: Props) {
   const [showDirBrowser, setShowDirBrowser] = useState(false);
   const [shells, setShells] = useState<string[]>([]);
   const [shellBin, setShellBin] = useState<string>('/bin/bash');
+
+  // OpenClaw-specific state
+  const [ocMode, setOcMode] = useState<OpenClawMode>('new');
+  const [ocSessionKey, setOcSessionKey] = useState('');
+  const [ocDescription, setOcDescription] = useState('');
+  const [ocRemoteSessions, setOcRemoteSessions] = useState<RemoteSession[]>([]);
+  const [ocLoadingSessions, setOcLoadingSessions] = useState(false);
+  const [ocSelectedSession, setOcSelectedSession] = useState('');
+
+  const { isProviderConnected } = useProviderStatus(ws);
+  const openClawAvailable = isProviderConnected('openclaw');
 
   // Load saved shell preference from server, then detect available shells
   useEffect(() => {
@@ -41,11 +59,40 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted }: Props) {
         // Keep saved preference if it's available, otherwise pick first
         setShellBin((prev) => (list.includes(prev) ? prev : (list[0] ?? prev)));
       }
+      // Listen for openclaw remote session list response
+      const raw = msg as unknown as Record<string, unknown>;
+      if (raw['type'] === 'openclaw.sessions_response') {
+        const sessions = raw['sessions'] as RemoteSession[] | undefined;
+        setOcRemoteSessions(sessions ?? []);
+        setOcLoadingSessions(false);
+      }
     });
     ws.subSessionDetectShells?.();
     return unsub;
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ws]);
+
+  // Fetch remote sessions when bind mode is selected
+  useEffect(() => {
+    if (agentType !== 'openclaw' || ocMode !== 'bind' || !ws) return;
+    setOcLoadingSessions(true);
+    setOcRemoteSessions([]);
+    ws.send({ type: 'openclaw.list_sessions' });
+  }, [agentType, ocMode, ws]);
+
+  // Auto-generate a session key when switching to openclaw new mode
+  useEffect(() => {
+    if (agentType === 'openclaw' && ocMode === 'new' && !ocSessionKey) {
+      setOcSessionKey(`oc-${Math.random().toString(36).slice(2, 10)}`);
+    }
+  }, [agentType, ocMode, ocSessionKey]);
+
+  // Fall back to claude-code if openclaw provider disconnects while selected
+  useEffect(() => {
+    if (agentType === 'openclaw' && !openClawAvailable) {
+      setAgentType('claude-code');
+    }
+  }, [openClawAvailable, agentType]);
 
   // Listen for session.event started/error while dialog is open
   useEffect(() => {
@@ -89,7 +136,16 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted }: Props) {
     setError('');
     setStarting(true);
     if (shellBin) void saveUserPref(DEFAULT_SHELL_KEY, shellBin).catch(() => {});
-    ws.sendSessionCommand('start', { project: project.trim(), dir: dir.trim(), agentType });
+
+    if (agentType === 'openclaw') {
+      const extra =
+        ocMode === 'bind'
+          ? { ocMode: 'bind', ocSessionId: ocSelectedSession }
+          : { ocMode: 'new', ocSessionKey: ocSessionKey.trim(), ocDescription: ocDescription.trim() };
+      ws.sendSessionCommand('start', { project: project.trim(), dir: dir.trim(), agentType, ...extra });
+    } else {
+      ws.sendSessionCommand('start', { project: project.trim(), dir: dir.trim(), agentType });
+    }
   };
 
   const handleKey = (e: KeyboardEvent) => {
@@ -170,8 +226,87 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted }: Props) {
             <option value="codex">Codex CLI</option>
             <option value="opencode">OpenCode</option>
             <option value="gemini">Gemini CLI</option>
+            {openClawAvailable && (
+              <option value="openclaw">{t('session.agentType.openclaw')}</option>
+            )}
           </select>
         </div>
+
+        {/* OpenClaw-specific options */}
+        {agentType === 'openclaw' && (
+          <>
+            <div class="form-group">
+              <label>{t('session.sessionMode')}</label>
+              <select
+                value={ocMode}
+                disabled={starting}
+                onChange={(e) => setOcMode((e.target as HTMLSelectElement).value as OpenClawMode)}
+                style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#e2e8f0', padding: '8px 12px', borderRadius: 4, fontFamily: 'inherit' }}
+              >
+                <option value="new">{t('session.newSession')}</option>
+                <option value="bind">{t('session.bindExisting')}</option>
+              </select>
+            </div>
+
+            {ocMode === 'bind' ? (
+              <div class="form-group">
+                <label>{t('session.selectSession')}</label>
+                {ocLoadingSessions ? (
+                  <div style={{ fontSize: 13, color: '#64748b', padding: '8px 0' }}>{t('session.loadingSessions')}</div>
+                ) : ocRemoteSessions.length === 0 ? (
+                  <div style={{ fontSize: 13, color: '#64748b', padding: '8px 0' }}>{t('session.noSessions')}</div>
+                ) : (
+                  <select
+                    value={ocSelectedSession}
+                    disabled={starting}
+                    onChange={(e) => setOcSelectedSession((e.target as HTMLSelectElement).value)}
+                    style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#e2e8f0', padding: '8px 12px', borderRadius: 4, fontFamily: 'inherit' }}
+                  >
+                    <option value="">{t('session.selectSession')}</option>
+                    {ocRemoteSessions.map((s) => (
+                      <option key={s.id} value={s.id}>{s.label || s.id}</option>
+                    ))}
+                  </select>
+                )}
+              </div>
+            ) : (
+              <div class="form-group">
+                <label>{t('session.sessionKey')}</label>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <input
+                    type="text"
+                    value={ocSessionKey}
+                    disabled={starting}
+                    onInput={(e) => setOcSessionKey((e.target as HTMLInputElement).value)}
+                    autoComplete="off"
+                    style={{ flex: 1 }}
+                  />
+                  <button
+                    type="button"
+                    class="btn btn-secondary"
+                    disabled={starting}
+                    onClick={() => setOcSessionKey(`oc-${Math.random().toString(36).slice(2, 10)}`)}
+                    style={{ whiteSpace: 'nowrap', fontSize: 12 }}
+                  >
+                    {t('session.autoGenerate')}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <div class="form-group">
+              <label>{t('session.description')}</label>
+              <textarea
+                placeholder={t('session.descriptionPlaceholder')}
+                value={ocDescription}
+                disabled={starting}
+                onInput={(e) => setOcDescription((e.target as HTMLTextAreaElement).value)}
+                rows={3}
+                style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#e2e8f0', padding: '8px 12px', borderRadius: 4, fontFamily: 'inherit', resize: 'vertical', boxSizing: 'border-box' }}
+              />
+            </div>
+          </>
+        )}
 
         <div class="form-group">
           <label>Default shell (for terminal sub-session)</label>

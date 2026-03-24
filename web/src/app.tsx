@@ -18,6 +18,7 @@ import { DashboardPage } from './pages/DashboardPage.js';
 import { SessionTabs } from './components/SessionTabs.js';
 import { TerminalView } from './components/TerminalView.js';
 import { ChatView } from './components/ChatView.js';
+import { TransportChatView } from './components/TransportChatView.js';
 import { SessionControls } from './components/SessionControls.js';
 import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
@@ -694,6 +695,7 @@ export function App() {
             agentVersion: s.agentVersion,
             state: s.state as SessionInfo['state'],
             projectDir: existing?.projectDir,
+            runtimeType: s.runtimeType,
           };
         }));
         setSessionsLoaded(true);
@@ -1580,7 +1582,8 @@ export function App() {
             />
 
             {/* Desktop view mode toggle — mobile uses the one in mobile-server-bar */}
-            {!isMobile && activeSession && (
+            {/* Transport sessions have no tmux terminal so the toggle is hidden */}
+            {!isMobile && activeSession && activeSessionInfo?.runtimeType !== 'transport' && (
               <div class="desktop-view-toggle">
                 <button class="view-toggle" title={trans('picker.files')} onClick={() => setShowDesktopFileBrowser(o => !o)}>
                   📁
@@ -1591,32 +1594,52 @@ export function App() {
               </div>
             )}
 
-            {/* Terminal views: all sessions kept alive, show/hide via CSS */}
-            {sessions.map((s) => {
-              const isActive = s.name === activeSession;
-              const sViewMode = viewModes[s.name] ?? defaultViewMode;
-              const visible = isActive && sViewMode === 'terminal';
-              return (
-                <div
-                  key={s.name}
-                  style={{ display: visible ? 'flex' : 'none', flex: 1, overflow: 'hidden' }}
-                >
-                  <TerminalView
-                    sessionName={s.name}
-                    ws={wsRef.current}
-                    connected={connected}
-                    onDiff={(apply) => registerDiffApplyer(s.name, apply)}
-                    onHistory={(apply) => registerHistoryApplyer(s.name, apply)}
-                    onFocusFn={(fn) => { termFocusFnsRef.current.set(s.name, fn); }}
-                    onFitFn={(fn) => { termFitFnsRef.current.set(s.name, fn); }}
-                    onScrollBottomFn={(fn) => { termScrollFnsRef.current.set(s.name, fn); }}
-                  />
-                </div>
-              );
-            })}
+            {/* Transport sessions: always render TransportChatView (no tmux terminal) */}
+            {sessions
+              .filter((s) => s.runtimeType === 'transport')
+              .map((s) => {
+                const isActive = s.name === activeSession;
+                return (
+                  <div
+                    key={s.name}
+                    style={{ display: isActive ? 'flex' : 'none', flex: 1, overflow: 'hidden' }}
+                  >
+                    <TransportChatView
+                      sessionName={s.name}
+                      ws={connected ? wsRef.current : null}
+                    />
+                  </div>
+                );
+              })}
 
-            {/* Chat view for active session in chat mode */}
-            {activeSession && viewMode === 'chat' && (
+            {/* Terminal views: all non-transport sessions kept alive, show/hide via CSS */}
+            {sessions
+              .filter((s) => s.runtimeType !== 'transport')
+              .map((s) => {
+                const isActive = s.name === activeSession;
+                const sViewMode = viewModes[s.name] ?? defaultViewMode;
+                const visible = isActive && sViewMode === 'terminal';
+                return (
+                  <div
+                    key={s.name}
+                    style={{ display: visible ? 'flex' : 'none', flex: 1, overflow: 'hidden' }}
+                  >
+                    <TerminalView
+                      sessionName={s.name}
+                      ws={wsRef.current}
+                      connected={connected}
+                      onDiff={(apply) => registerDiffApplyer(s.name, apply)}
+                      onHistory={(apply) => registerHistoryApplyer(s.name, apply)}
+                      onFocusFn={(fn) => { termFocusFnsRef.current.set(s.name, fn); }}
+                      onFitFn={(fn) => { termFitFnsRef.current.set(s.name, fn); }}
+                      onScrollBottomFn={(fn) => { termScrollFnsRef.current.set(s.name, fn); }}
+                    />
+                  </div>
+                );
+              })}
+
+            {/* Chat view for active non-transport session in chat mode */}
+            {activeSession && activeSessionInfo?.runtimeType !== 'transport' && viewMode === 'chat' && (
               <ChatView events={timelineEvents} loading={timelineLoading} refreshing={timelineRefreshing} loadingOlder={timelineLoadingOlder} onLoadOlder={loadOlderEvents} sessionId={activeSession} sessionState={activeSessionInfo?.state} onScrollBottomFn={setChatScrollFn} workdir={activeSessionInfo?.projectDir} ws={connected ? wsRef.current : null} serverId={selectedServerId ?? undefined} />
             )}
 

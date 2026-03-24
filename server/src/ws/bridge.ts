@@ -17,6 +17,7 @@ import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
 import { sha256Hex } from '../security/crypto.js';
 import { REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
+import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, updateSubSession, upsertOrchestrationRun } from '../db/queries.js';
 import logger from '../util/logger.js';
 
@@ -92,6 +93,8 @@ const BROWSER_WHITELIST = new Set([
   'repo.commit_detail',
   'repo.pr_detail',
   'repo.issue_detail',
+  'chat.subscribe',
+  'chat.unsubscribe',
 ]);
 
 // ── Terminal forwarding queue (per (session, browser)) ────────────────────────
@@ -153,6 +156,9 @@ export class WsBridge {
 
   /** browser socket → set of subscribed session names */
   private browserSubscriptions = new Map<WebSocket, Set<string>>();
+
+  /** browser socket → set of subscribed transport session IDs */
+  private transportSubscriptions = new Map<WebSocket, Set<string>>();
 
   /** browser socket → userId (for session ownership checks) */
   private browserUserIds = new Map<WebSocket, string>();
@@ -363,6 +369,7 @@ export class WsBridge {
     this.browserSockets.add(ws);
     if (isMobile) this.mobileSockets.add(ws);
     this.browserSubscriptions.set(ws, new Set());
+    this.transportSubscriptions.set(ws, new Set());
     this.browserUserIds.set(ws, userId);
 
     ws.on('message', (data) => {
@@ -448,6 +455,16 @@ export class WsBridge {
       } else if (msg.type === 'terminal.unsubscribe' && typeof msg.session === 'string') {
         this.removeBrowserSessionSubscription(ws, msg.session);
         return; // forwarding handled inside (only on 1→0)
+      }
+
+      // Track transport (chat) subscriptions for session-scoped transport event delivery
+      if (msg.type === TRANSPORT_MSG.CHAT_SUBSCRIBE && typeof msg.sessionId === 'string') {
+        this.transportSubscriptions.get(ws)?.add(msg.sessionId);
+        return;
+      }
+      if (msg.type === TRANSPORT_MSG.CHAT_UNSUBSCRIBE && typeof msg.sessionId === 'string') {
+        this.transportSubscriptions.get(ws)?.delete(msg.sessionId);
+        return;
       }
 
       this.sendToDaemon(raw);
@@ -807,6 +824,21 @@ export class WsBridge {
       return;
     }
 
+    // Provider status: broadcast to all browsers
+    if (type === TRANSPORT_MSG.PROVIDER_STATUS) {
+      this.broadcastToBrowsers(JSON.stringify(msg));
+      return;
+    }
+
+    // Transport events: route to browsers subscribed to the transport session
+    if ((TRANSPORT_RELAY_TYPES as Set<string>).has(type)) {
+      const sessionId = msg.sessionId as string | undefined;
+      if (sessionId) {
+        this.sendToTransportSubscribers(sessionId, JSON.stringify(msg));
+      }
+      return;
+    }
+
     // ── Default-deny: unknown type → discard ──────────────────────────────────
     logger.warn({ serverId: this.serverId, type }, 'relayToBrowsers: unknown message type — discarded (default-deny)');
   }
@@ -825,6 +857,13 @@ export class WsBridge {
       if (!sessions.has(sessionName)) continue;
       const queue = this.getOrCreateQueue(sessionName, ws);
       queue.send(ws, data, () => this.handleQueueOverflow(sessionName, ws));
+    }
+  }
+
+  private sendToTransportSubscribers(sessionId: string, data: string): void {
+    for (const [ws, sessions] of this.transportSubscriptions) {
+      if (!sessions.has(sessionId)) continue;
+      safeSend(ws, data);
     }
   }
 
@@ -920,6 +959,7 @@ export class WsBridge {
       }
     }
     this.browserSubscriptions.delete(ws);
+    this.transportSubscriptions.delete(ws);
   }
 
   /**

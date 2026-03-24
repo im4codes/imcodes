@@ -1,0 +1,566 @@
+/**
+ * OpenClaw TransportProvider
+ *
+ * Connects to a local OpenClaw gateway via WebSocket, completes the
+ * connect-challenge handshake, and routes messages to/from OC agent sessions.
+ *
+ * Connection mode : persistent  (long-lived WebSocket, reconnects on drop)
+ * Session ownership: provider   (OpenClaw owns history and session state)
+ */
+
+import WebSocket from 'ws';
+import { randomUUID } from 'node:crypto';
+import type {
+  TransportProvider,
+  ProviderConfig,
+  SessionConfig,
+  ProviderCapabilities,
+  ProviderError,
+  RemoteSessionInfo,
+} from '../transport-provider.js';
+import {
+  CONNECTION_MODES,
+  SESSION_OWNERSHIP,
+  PROVIDER_ERROR_CODES,
+} from '../transport-provider.js';
+import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
+import logger from '../../util/logger.js';
+
+// ── Internal frame types ─────────────────────────────────────────────────────
+
+interface OcFrame {
+  type: 'req' | 'res' | 'event';
+  id?: string;
+  method?: string;
+  params?: unknown;
+  ok?: boolean;
+  payload?: unknown;
+  event?: string;
+}
+
+interface OcResolvePair {
+  resolve: (payload: unknown) => void;
+  reject: (err: ProviderError) => void;
+}
+
+// How long to wait for a single RPC response before timing out (ms).
+const RPC_TIMEOUT_MS = 30_000;
+
+// Reconnect backoff: starts at 1 s, doubles each attempt, caps at 5 min.
+const BACKOFF_INITIAL_MS = 1_000;
+const BACKOFF_MAX_MS = 5 * 60 * 1_000;
+
+// If we receive no tick within this window we consider the connection stale.
+const TICK_STALE_MS = 90_000;
+
+// ── OpenClawProvider ─────────────────────────────────────────────────────────
+
+export class OpenClawProvider implements TransportProvider {
+  readonly id = 'openclaw';
+  readonly connectionMode = CONNECTION_MODES.PERSISTENT;
+  readonly sessionOwnership = SESSION_OWNERSHIP.PROVIDER;
+  readonly capabilities: ProviderCapabilities = {
+    streaming: true,
+    toolCalling: false,
+    approval: false,
+    sessionRestore: true,
+    multiTurn: true,
+    attachments: false,
+  };
+
+  // ── Private state ──────────────────────────────────────────────────────────
+
+  private config: ProviderConfig | null = null;
+  private ws: WebSocket | null = null;
+
+  /** Pending RPC calls keyed by request id. */
+  private pending = new Map<string, OcResolvePair>();
+
+  /** Registered callbacks. */
+  private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
+  private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
+  private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
+
+  /** Accumulator: partial text per runId while streaming. */
+  private runAccumulator = new Map<string, { sessionId: string; messageId: string; text: string }>();
+
+  /** Reconnect state. */
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private backoffMs = BACKOFF_INITIAL_MS;
+  private intentionalDisconnect = false;
+
+  /** Tick / heartbeat state. */
+  private lastTickAt = 0;
+  private tickStaleTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Whether connect() has resolved successfully at least once. */
+  private connected = false;
+
+  // ── TransportProvider — core ───────────────────────────────────────────────
+
+  async connect(config: ProviderConfig): Promise<void> {
+    this.config = config;
+    this.intentionalDisconnect = false;
+    await this.openSocket();
+  }
+
+  async disconnect(): Promise<void> {
+    this.intentionalDisconnect = true;
+    this.clearTimers();
+    this.rejectAllPending('Provider disconnected');
+    if (this.ws) {
+      this.ws.removeAllListeners();
+      this.ws.close();
+      this.ws = null;
+    }
+    this.connected = false;
+    logger.info({ provider: this.id }, 'Disconnected from OpenClaw gateway');
+  }
+
+  async send(sessionId: string, message: string, _attachments?: unknown[]): Promise<void> {
+    await this.rpc('sessions.send', {
+      key: sessionId,
+      message,
+      thinking: 'off',
+      idempotencyKey: randomUUID(),
+    });
+  }
+
+  onDelta(cb: (sessionId: string, delta: MessageDelta) => void): void {
+    this.deltaCallbacks.push(cb);
+  }
+
+  onComplete(cb: (sessionId: string, message: AgentMessage) => void): void {
+    this.completeCallbacks.push(cb);
+  }
+
+  onError(cb: (sessionId: string, error: ProviderError) => void): void {
+    this.errorCallbacks.push(cb);
+  }
+
+  async createSession(config: SessionConfig): Promise<string> {
+    const key = config.bindExistingKey ?? config.sessionKey;
+    await this.rpc('sessions.create', {
+      key,
+      agentId: config.agentId ?? 'main',
+      label: config.label ?? key,
+    });
+    logger.info({ provider: this.id, sessionKey: key }, 'Session created');
+    return key;
+  }
+
+  async endSession(_sessionId: string): Promise<void> {
+    // OpenClaw does not expose a session-delete RPC in the MVP protocol.
+    // Sessions persist on the gateway; nothing to do locally.
+  }
+
+  // ── Optional capabilities ──────────────────────────────────────────────────
+
+  async restoreSession(sessionId: string): Promise<boolean> {
+    try {
+      const sessions = await this.listSessions();
+      return sessions.some((s) => s.key === sessionId);
+    } catch {
+      return false;
+    }
+  }
+
+  async listSessions(): Promise<RemoteSessionInfo[]> {
+    const payload = await this.rpc('sessions.list', {}) as { sessions?: Array<{
+      key: string;
+      label?: string;
+      agentId?: string;
+      updatedAt?: number;
+      percentUsed?: number;
+    }> };
+    const all = payload?.sessions ?? [];
+    return all
+      .filter((s) => !s.key.includes(':cron:'))
+      .map((s) => ({
+        key: s.key,
+        displayName: s.label,
+        agentId: s.agentId,
+        updatedAt: s.updatedAt,
+        percentUsed: s.percentUsed,
+      }));
+  }
+
+  // ── WebSocket management ───────────────────────────────────────────────────
+
+  private async openSocket(): Promise<void> {
+    const url = (this.config?.url as string | undefined) ?? 'ws://127.0.0.1:18789';
+    const token = (this.config?.token as string | undefined) ?? (this.config?.apiKey as string | undefined) ?? '';
+
+    logger.info({ provider: this.id, url }, 'Connecting to OpenClaw gateway');
+
+    return new Promise<void>((resolve, reject) => {
+      const ws = new WebSocket(url);
+      this.ws = ws;
+
+      // We gate the promise on the handshake completing.
+      let handshakeDone = false;
+
+      const failHandshake = (err: unknown): void => {
+        if (!handshakeDone) {
+          handshakeDone = true;
+          ws.removeAllListeners();
+          ws.close();
+          reject(this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, String(err), false, err));
+        }
+      };
+
+      ws.once('error', failHandshake);
+
+      ws.on('message', (raw: Buffer | string) => {
+        let frame: OcFrame;
+        try {
+          frame = JSON.parse(raw.toString()) as OcFrame;
+        } catch (e) {
+          logger.warn({ provider: this.id, raw: raw.toString() }, 'Unparseable frame from gateway');
+          return;
+        }
+
+        // ── Handshake sequence ──────────────────────────────────────────────
+        if (!handshakeDone) {
+          if (frame.type === 'event' && frame.event === 'connect.challenge') {
+            const challengePayload = frame.payload as { nonce?: string } | undefined;
+            logger.debug({ provider: this.id, nonce: challengePayload?.nonce }, 'Received connect.challenge');
+            const connectReq: OcFrame = {
+              type: 'req',
+              id: randomUUID(),
+              method: 'connect',
+              params: {
+                minProtocol: 3,
+                maxProtocol: 3,
+                client: {
+                  id: 'gateway-client',
+                  version: '0.1.0',
+                  platform: process.platform,
+                  mode: 'backend',
+                  displayName: 'imcodes-daemon',
+                },
+                auth: { token },
+                role: 'operator',
+                scopes: ['operator.write', 'operator.read', 'operator.admin'],
+              },
+            };
+            ws.send(JSON.stringify(connectReq));
+            return;
+          }
+
+          if (frame.type === 'event' && frame.event === 'hello-ok') {
+            handshakeDone = true;
+            this.connected = true;
+            this.backoffMs = BACKOFF_INITIAL_MS;
+            ws.removeListener('error', failHandshake);
+            ws.on('error', (err) => this.handleWsError(err));
+            ws.on('close', (code, reason) => this.handleWsClose(code, reason));
+            this.resetTickTimer();
+            logger.info({ provider: this.id, url }, 'OpenClaw handshake complete');
+            resolve();
+            return;
+          }
+
+          // Some gateways echo back a res frame for the connect request too.
+          if (frame.type === 'res' && frame.ok === true) {
+            // Not the hello-ok event yet — ignore, keep waiting.
+            return;
+          }
+
+          if (frame.type === 'res' && frame.ok === false) {
+            failHandshake(new Error(`Gateway rejected connect: ${JSON.stringify(frame.payload)}`));
+            return;
+          }
+
+          return;
+        }
+
+        // ── Post-handshake frame dispatch ───────────────────────────────────
+        this.handleFrame(frame);
+      });
+    });
+  }
+
+  private handleFrame(frame: OcFrame): void {
+    switch (frame.type) {
+      case 'event':
+        this.handleEventFrame(frame);
+        break;
+      case 'res':
+        this.handleResFrame(frame);
+        break;
+      default:
+        break;
+    }
+  }
+
+  private handleEventFrame(frame: OcFrame): void {
+    const event = frame.event;
+
+    if (event === 'tick') {
+      this.lastTickAt = Date.now();
+      this.resetTickTimer();
+      return;
+    }
+
+    if (event === 'agent') {
+      this.handleAgentEvent(frame.payload as AgentEventPayload);
+      return;
+    }
+
+    if (event === 'chat') {
+      this.handleChatEvent(frame.payload as ChatEventPayload);
+      return;
+    }
+  }
+
+  private handleResFrame(frame: OcFrame): void {
+    const id = frame.id;
+    if (!id) return;
+    const pending = this.pending.get(id);
+    if (!pending) return;
+    this.pending.delete(id);
+    if (frame.ok) {
+      pending.resolve(frame.payload);
+    } else {
+      pending.reject(this.makeError(
+        PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+        `RPC failed: ${JSON.stringify(frame.payload)}`,
+        true,
+        frame.payload,
+      ));
+    }
+  }
+
+  private handleAgentEvent(payload: AgentEventPayload): void {
+    if (!payload) return;
+
+    const { runId, stream, data } = payload;
+
+    if (stream === 'lifecycle') {
+      const phase = (data as { phase?: string })?.phase;
+
+      if (phase === 'start') {
+        // Initialise accumulator for this run.
+        // We need sessionId; OpenClaw includes it in the payload as `key` or `sessionKey`.
+        const sessionId = payload.key ?? payload.sessionKey ?? runId;
+        const messageId = randomUUID();
+        this.runAccumulator.set(runId, { sessionId, messageId, text: '' });
+        logger.debug({ provider: this.id, runId, sessionId }, 'Agent run started');
+        return;
+      }
+
+      if (phase === 'end') {
+        const acc = this.runAccumulator.get(runId);
+        if (acc) {
+          this.runAccumulator.delete(runId);
+          const message: AgentMessage = {
+            id: acc.messageId,
+            sessionId: acc.sessionId,
+            kind: 'text',
+            role: 'assistant',
+            content: acc.text,
+            timestamp: Date.now(),
+            status: 'complete',
+          };
+          this.completeCallbacks.forEach((cb) => cb(acc.sessionId, message));
+          logger.debug({ provider: this.id, runId, sessionId: acc.sessionId }, 'Agent run complete');
+        }
+        return;
+      }
+
+      if (phase === 'error') {
+        const acc = this.runAccumulator.get(runId);
+        const sessionId = acc?.sessionId ?? payload.key ?? payload.sessionKey ?? runId;
+        this.runAccumulator.delete(runId);
+        const err = this.makeError(
+          PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+          `Agent run error for session ${sessionId}`,
+          true,
+          data,
+        );
+        this.errorCallbacks.forEach((cb) => cb(sessionId, err));
+        return;
+      }
+    }
+
+    if (stream === 'assistant') {
+      const assistantData = data as { delta?: string; text?: string } | undefined;
+      if (!assistantData) return;
+
+      const acc = this.runAccumulator.get(runId);
+      if (!acc) {
+        // Received delta before lifecycle start — create accumulator on the fly.
+        const sessionId = payload.key ?? payload.sessionKey ?? runId;
+        const messageId = randomUUID();
+        this.runAccumulator.set(runId, { sessionId, messageId, text: assistantData.text ?? assistantData.delta ?? '' });
+        // Emit the delta we have now.
+        const delta: MessageDelta = {
+          messageId,
+          type: 'text',
+          delta: assistantData.delta ?? '',
+          role: 'assistant',
+        };
+        this.deltaCallbacks.forEach((cb) => cb(sessionId, delta));
+        return;
+      }
+
+      // Update accumulated text (prefer cumulative `text` field, fall back to appending delta).
+      if (assistantData.text !== undefined) {
+        acc.text = assistantData.text;
+      } else if (assistantData.delta !== undefined) {
+        acc.text += assistantData.delta;
+      }
+
+      const delta: MessageDelta = {
+        messageId: acc.messageId,
+        type: 'text',
+        delta: assistantData.delta ?? '',
+        role: 'assistant',
+      };
+      this.deltaCallbacks.forEach((cb) => cb(acc.sessionId, delta));
+    }
+  }
+
+  private handleChatEvent(payload: ChatEventPayload): void {
+    if (!payload) return;
+    const { state, key } = payload;
+
+    if (state === 'error') {
+      const sessionId = key ?? 'unknown';
+      const err = this.makeError(
+        PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+        `Chat error for session ${sessionId}`,
+        true,
+        payload,
+      );
+      this.errorCallbacks.forEach((cb) => cb(sessionId, err));
+    }
+    // state === 'done' is handled via lifecycle/end; nothing extra needed here.
+  }
+
+  // ── RPC helper ─────────────────────────────────────────────────────────────
+
+  private rpc(method: string, params: unknown): Promise<unknown> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject(this.makeError(
+        PROVIDER_ERROR_CODES.CONNECTION_LOST,
+        'WebSocket not open',
+        true,
+      ));
+    }
+
+    return new Promise<unknown>((resolve, reject) => {
+      const id = randomUUID();
+      const frame: OcFrame = { type: 'req', id, method, params };
+
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(this.makeError(
+          PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+          `RPC timeout: ${method}`,
+          true,
+        ));
+      }, RPC_TIMEOUT_MS);
+
+      this.pending.set(id, {
+        resolve: (payload) => { clearTimeout(timer); resolve(payload); },
+        reject:  (err)     => { clearTimeout(timer); reject(err); },
+      });
+
+      this.ws!.send(JSON.stringify(frame));
+    });
+  }
+
+  // ── Error helpers ──────────────────────────────────────────────────────────
+
+  private makeError(
+    code: string,
+    message: string,
+    recoverable: boolean,
+    details?: unknown,
+  ): ProviderError {
+    return { code, message, recoverable, details };
+  }
+
+  // ── Reconnect ─────────────────────────────────────────────────────────────
+
+  private handleWsError(err: Error): void {
+    logger.warn({ provider: this.id, err: err.message }, 'WebSocket error');
+  }
+
+  private handleWsClose(code: number, reason: Buffer): void {
+    if (this.intentionalDisconnect) return;
+
+    logger.warn(
+      { provider: this.id, code, reason: reason.toString() },
+      'WebSocket closed unexpectedly — scheduling reconnect',
+    );
+    this.connected = false;
+    this.rejectAllPending('WebSocket closed');
+    this.clearTimers();
+    this.scheduleReconnect();
+  }
+
+  private scheduleReconnect(): void {
+    const delay = this.backoffMs;
+    this.backoffMs = Math.min(this.backoffMs * 2, BACKOFF_MAX_MS);
+
+    logger.info({ provider: this.id, delayMs: delay }, 'Reconnecting to OpenClaw gateway');
+    this.reconnectTimer = setTimeout(async () => {
+      if (this.intentionalDisconnect) return;
+      try {
+        await this.openSocket();
+        logger.info({ provider: this.id }, 'Reconnected to OpenClaw gateway');
+      } catch (err) {
+        logger.warn({ provider: this.id, err }, 'Reconnect failed');
+        this.scheduleReconnect();
+      }
+    }, delay);
+  }
+
+  // ── Tick / heartbeat ───────────────────────────────────────────────────────
+
+  private resetTickTimer(): void {
+    if (this.tickStaleTimer) clearTimeout(this.tickStaleTimer);
+    this.tickStaleTimer = setTimeout(() => {
+      if (this.intentionalDisconnect) return;
+      const age = Date.now() - this.lastTickAt;
+      logger.warn({ provider: this.id, ageMs: age }, 'No tick received — connection appears stale, reconnecting');
+      this.ws?.close();
+    }, TICK_STALE_MS);
+  }
+
+  // ── Cleanup helpers ────────────────────────────────────────────────────────
+
+  private clearTimers(): void {
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    if (this.tickStaleTimer) { clearTimeout(this.tickStaleTimer); this.tickStaleTimer = null; }
+  }
+
+  private rejectAllPending(reason: string): void {
+    const err = this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, reason, true);
+    for (const pair of this.pending.values()) {
+      pair.reject(err);
+    }
+    this.pending.clear();
+  }
+}
+
+// ── Internal payload shapes (not exported — only used internally) ─────────────
+
+interface AgentEventPayload {
+  runId: string;
+  seq?: number;
+  stream: string;
+  data?: unknown;
+  /** Session key — gateway may supply it as `key` or `sessionKey`. */
+  key?: string;
+  sessionKey?: string;
+}
+
+interface ChatEventPayload {
+  key?: string;
+  state?: string;
+  [k: string]: unknown;
+}

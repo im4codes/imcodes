@@ -8,6 +8,9 @@ const DEBOUNCE_MS = 500;
 
 export type SessionState = 'running' | 'idle' | 'error' | 'stopped';
 
+// TODO: import from '../agent/session-runtime.js' when available
+type RuntimeType = 'process' | 'transport';
+
 export interface SessionRecord {
   name: string;
   projectName: string;
@@ -30,6 +33,14 @@ export interface SessionRecord {
   geminiSessionId?: string;
   /** Parent main session name (e.g. `deck_proj_brain`) — links sub-sessions to their parent. */
   parentSession?: string;
+  /** Runtime type — 'process' for tmux, 'transport' for network-backed. Defaults to 'process' for backward compat. */
+  runtimeType?: RuntimeType;
+  /** Transport provider ID (e.g. 'openclaw', 'minimax'). Only set for transport sessions. */
+  providerId?: string;
+  /** Provider-side session ID/key. For OpenClaw this is the OC session key. */
+  providerSessionId?: string;
+  /** Session description — used for persona/system prompt injection. */
+  description?: string;
 }
 
 export interface SessionStore {
@@ -61,6 +72,10 @@ async function probeSessionStates(): Promise<void> {
     const { timelineEmitter } = await import('../daemon/timeline-emitter.js');
     for (const s of Object.values(store.sessions)) {
       if (s.state !== 'running') continue;
+      if (s.runtimeType === 'transport') {
+        // Transport sessions don't use tmux — skip terminal-based detection
+        continue;
+      }
       let newState: 'idle' | 'running' = 'running';
       try {
         const status = await detectStatusAsync(s.name, s.agentType as import('../agent/detect.js').AgentType);

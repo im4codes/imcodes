@@ -6,6 +6,10 @@ import { ShellDriver } from './drivers/shell.js';
 import { GeminiDriver } from './drivers/gemini.js';
 import type { AgentDriver } from './drivers/base.js';
 import type { AgentType } from './detect.js';
+import { isTransportAgent } from './detect.js';
+import { RUNTIME_TYPES } from './session-runtime.js';
+import { TransportSessionRuntime } from './transport-session-runtime.js';
+import { getProvider } from './provider-registry.js';
 import { setupCCStopHook } from './signal.js';
 import { setupCodexNotify, setupOpenCodePlugin } from './notify-setup.js';
 import {
@@ -129,6 +133,8 @@ export function getDriver(type: AgentType): AgentDriver {
     case 'shell': return new ShellDriver();
     case 'script': return new ShellDriver();
     case 'gemini': return new GeminiDriver();
+    default:
+      throw new Error(`getDriver: no tmux driver for transport agent '${type as string}'`);
   }
 }
 
@@ -156,7 +162,13 @@ export async function stopProject(projectName: string): Promise<void> {
     stopWatching(s.name);
     stopCodexWatching(s.name);
     stopGeminiWatching(s.name);
-    await killSession(s.name).catch(() => {});
+    const transportRuntime = transportRuntimes.get(s.name);
+    if (transportRuntime) {
+      await transportRuntime.kill().catch(() => {});
+      transportRuntimes.delete(s.name);
+    } else {
+      await killSession(s.name).catch(() => {});
+    }
     removeSession(s.name);
     emitSessionPersist(null, s.name);
     emitSessionEvent('stopped', s.name, 'stopped');
@@ -174,7 +186,13 @@ export async function teardownProject(projectName: string): Promise<void> {
     stopWatching(s.name);
     stopCodexWatching(s.name);
     stopGeminiWatching(s.name);
-    await killSession(s.name).catch(() => {});
+    const transportRuntime = transportRuntimes.get(s.name);
+    if (transportRuntime) {
+      await transportRuntime.kill().catch(() => {});
+      transportRuntimes.delete(s.name);
+    } else {
+      await killSession(s.name).catch(() => {});
+    }
   }
 }
 
@@ -222,6 +240,9 @@ export async function restoreFromStore(): Promise<void> {
   // 1. Restart store sessions missing from tmux; start jsonl-watcher for live ones
   for (const s of all) {
     if (s.state === 'stopped') continue;
+    // Transport sessions don't have tmux panes — skip all tmux reconciliation.
+    // They will reconnect via provider auto-reconnect on next use.
+    if (s.runtimeType === RUNTIME_TYPES.TRANSPORT) continue;
     // Sub-sessions (deck_sub_*): skip restart/respawn (managed by rebuildSubSessions),
     // but still restore watchers if the tmux session is alive.
     if (s.name.startsWith('deck_sub_')) {
@@ -400,6 +421,12 @@ export async function restoreFromStore(): Promise<void> {
  * Enforces max 3 restarts within 5 minutes; marks as error if exceeded.
  */
 export async function restartSession(record: SessionRecord): Promise<boolean> {
+  // Transport sessions are managed by the provider — no tmux restart logic applies.
+  if (record.runtimeType === RUNTIME_TYPES.TRANSPORT) {
+    logger.info({ session: record.name }, 'Skipping restart for transport session');
+    return false;
+  }
+
   const now = Date.now();
   const windowStart = now - RESTART_WINDOW_MS;
   const recentRestarts = record.restartTimestamps.filter((t) => t > windowStart);
@@ -440,6 +467,12 @@ export async function restartSession(record: SessionRecord): Promise<boolean> {
  * Avoids creating a new tmux session — just restarts the process inside the existing one.
  */
 export async function respawnSession(record: SessionRecord): Promise<boolean> {
+  // Transport sessions have no tmux pane to respawn — not applicable.
+  if (record.runtimeType === RUNTIME_TYPES.TRANSPORT) {
+    logger.info({ session: record.name }, 'Skipping respawn for transport session');
+    return false;
+  }
+
   const now = Date.now();
   const windowStart = now - RESTART_WINDOW_MS;
   const recentRestarts = record.restartTimestamps.filter((t) => t > windowStart);
@@ -519,9 +552,73 @@ interface LaunchOpts {
   codexSessionId?: string;
   /** Gemini session UUID for `gemini --resume <UUID>`. */
   geminiSessionId?: string;
+  /** Session description for transport sessions (persona/system prompt injection). */
+  description?: string;
+  /** Bind to an existing remote session key instead of creating a new one. */
+  bindExistingKey?: string;
+}
+
+/** In-memory map of active transport session runtimes */
+const transportRuntimes = new Map<string, TransportSessionRuntime>();
+
+/** Get the transport runtime for a session (if it is a transport session). */
+export function getTransportRuntime(name: string): TransportSessionRuntime | undefined {
+  return transportRuntimes.get(name);
+}
+
+async function launchTransportSession(opts: LaunchOpts): Promise<void> {
+  const { name, projectName, role, agentType, projectDir, skipStore, description, bindExistingKey } = opts;
+
+  const provider = getProvider(agentType);
+  if (!provider) {
+    throw new Error(`No connected provider for agent type '${agentType}'`);
+  }
+
+  const runtime = new TransportSessionRuntime(provider, name);
+
+  // Create session on provider
+  await runtime.initialize({
+    sessionKey: name,
+    label: name,
+    description,
+    bindExistingKey,
+  });
+
+  // Store runtime for later use
+  transportRuntimes.set(name, runtime);
+
+  if (!skipStore) {
+    const record: SessionRecord = {
+      name,
+      projectName,
+      role,
+      agentType,
+      projectDir,
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: RUNTIME_TYPES.TRANSPORT,
+      providerId: provider.id,
+      providerSessionId: runtime.providerSessionId ?? undefined,
+      description,
+    };
+    upsertSession(record);
+    emitSessionPersist(record, name);
+  }
+
+  emitSessionEvent('started', name, 'running');
+  logger.info({ session: name, agentType, providerId: provider.id }, 'Launched transport session');
 }
 
 export async function launchSession(opts: LaunchOpts): Promise<void> {
+  // Transport-backed agents don't use tmux — delegate to dedicated handler
+  if (isTransportAgent(opts.agentType)) {
+    await launchTransportSession(opts);
+    return;
+  }
+
   const { name, projectName, role, agentType, projectDir, skipStore, extraEnv, fresh } = opts;
   const driver = getDriver(agentType);
   const agentVersion = await getAgentVersion(agentType);

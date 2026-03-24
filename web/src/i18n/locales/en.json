@@ -51,7 +51,20 @@
     "send_queued": "Reconnecting… (send queued)",
     "send_placeholder": "Send to {{name}}…",
     "actions": "Session actions",
-    "new_btn": "New session"
+    "new_btn": "New session",
+    "agentType": {
+      "openclaw": "OpenClaw"
+    },
+    "sessionMode": "Session Mode",
+    "newSession": "New Session",
+    "bindExisting": "Bind Existing OC Session",
+    "selectSession": "Select a session",
+    "loadingSessions": "Loading sessions...",
+    "noSessions": "No available sessions",
+    "description": "Description",
+    "descriptionPlaceholder": "Session persona or purpose (optional)",
+    "sessionKey": "Session Key",
+    "autoGenerate": "Auto-generate"
   },
   "server": {
     "upgrade_daemon": "↑ Upgrade Daemon",
@@ -363,5 +376,13 @@
     "no_comments": "No comments",
     "show_changed_files": "Show changed files",
     "refresh_tab": "Refresh"
+  },
+  "transport_chat": {
+    "inputPlaceholder": "Type a message...",
+    "send": "Send",
+    "streaming": "Thinking...",
+    "error": "Error",
+    "connectionLost": "Connection lost",
+    "empty": "No messages yet"
   }
 }

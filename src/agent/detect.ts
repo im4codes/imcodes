@@ -13,7 +13,31 @@ export type AgentStatus =
   | 'permission'
   | 'unknown';
 
-export type AgentType = 'claude-code' | 'codex' | 'opencode' | 'shell' | 'script' | 'gemini';
+/** Process-backed agents — controlled via tmux sessions */
+export type ProcessAgent = 'claude-code' | 'codex' | 'opencode' | 'shell' | 'script' | 'gemini';
+
+/** Transport-backed agents — controlled via network protocols */
+export type TransportAgent = 'openclaw';
+// Future: | 'claude-code-sdk' | 'codex-sdk' | 'minimax' | 'deepseek'
+
+/** All agent types */
+export type AgentType = ProcessAgent | TransportAgent;
+
+/** Set of all transport agent type strings */
+export const TRANSPORT_AGENTS = new Set<TransportAgent>(['openclaw']);
+
+/** Set of all process agent type strings */
+export const PROCESS_AGENTS = new Set<ProcessAgent>(['claude-code', 'codex', 'opencode', 'shell', 'script', 'gemini']);
+
+/** Check if an agent type is transport-backed */
+export function isTransportAgent(agentType: string): agentType is TransportAgent {
+  return TRANSPORT_AGENTS.has(agentType as TransportAgent);
+}
+
+/** Check if an agent type is process-backed */
+export function isProcessAgent(agentType: string): agentType is ProcessAgent {
+  return !isTransportAgent(agentType);
+}
 
 // ─── Claude Code patterns ─────────────────────────────────────────────────────
 
@@ -293,3 +317,102 @@ export async function detectStatusAsync(
   try { cursorLine = await getCursorLine(session); } catch { /* ignore */ }
   return detectStatus(lines, agentType, cursorLine);
 }
+
+// ─── session-manager.ts tmux/driver audit (for SessionRuntime refactor) ───────
+//
+// ## 1. Direct tmux function call sites
+//
+// Line   1  import: newSession, killSession, sessionExists, isPaneAlive,
+//            respawnPane, listSessions, sendKeys, sendKey, capturePane,
+//            showBuffer, getPaneId, getPaneCwd, getPaneStartCommand,
+//            cleanupOrphanFifos  — all from './tmux.js'
+//
+// initOnStartup() [L182]:
+//   cleanupOrphanFifos()                          — startup FIFO cleanup
+//
+// stopProject() [L152]:
+//   killSession(s.name)                           — teardown
+//
+// teardownProject() [L171]:
+//   killSession(s.name)                           — teardown without store removal
+//
+// restoreFromStore() [L218]:
+//   tmuxListSessions()                            — enumerate live tmux sessions
+//   isPaneAlive(s.name)                           — remain-on-exit health check
+//   getPaneCwd(name)                              — infer projectDir for orphan
+//   getPaneId(name)                               — infer paneId for orphan
+//   getPaneStartCommand(name) via helpers         — infer agent type / UUID
+//
+// respawnSession() [L442]:
+//   respawnPane(record.name, cmd)                 — restart dead pane in-place
+//
+// launchSession() [L524]:
+//   sessionExists(name)                           — guard: skip if already live
+//   newSession(name, launchCmd, { cwd, env })     — create tmux session + process
+//   getPaneId(name)                               — read paneId after create
+//   capturePane(name)  via postLaunch closure     — TUI scrape during setup
+//   sendKey(name, key) via postLaunch closure     — send keystrokes during setup
+//
+// getSessionOps() [L699]:
+//   capturePane(name)  returned closure           — used by status poller
+//   sendKeys(name, keys) returned closure         — used by response collector
+//   showBuffer()       returned closure           — tmux scroll buffer read
+//
+// extractSessionUuidFromPane() [L187]:
+//   getPaneStartCommand(sessionName)              — parse pane cmd for UUID
+//
+// ## 2. AgentDriver method call sites
+//
+// getDriver(type) [L124]:
+//   Constructs ClaudeCodeDriver | CodexDriver | OpenCodeDriver |
+//   ShellDriver | GeminiDriver; throws for transport agents.
+//
+// launchSession() [L524]:
+//   driver.buildLaunchCommand(name, opts)         — build tmux new-session cmd
+//   driver.buildResumeCommand(name, opts)         — build resume variant
+//   driver.postLaunch?(capturePane, sendKey)      — auto-dismiss TUI prompts
+//   (driver as OpenCodeDriver).ensurePermissions  — write .opencode/config.json
+//
+// respawnSession() [L442]:
+//   driver.buildResumeCommand(record.name, opts)  — build respawn cmd
+//   driver.buildLaunchCommand(record.name, opts)  — fallback if no resume
+//
+// ## 3. State assumptions that presuppose process-backed behavior
+//
+// a. paneId field: set after newSession/respawnPane [launchSession L626].
+//    Meaningless for transport agents (no tmux pane).
+//
+// b. sessionExists() guard [launchSession L540]: checks tmux session existence.
+//    Transport agents have no tmux session to check.
+//
+// c. ccSessionId / codexSessionId / geminiSessionId resolution blocks
+//    [launchSession L545–605]: all agent-specific UUID paths assume process model.
+//
+// d. isPaneAlive() [restoreFromStore L285]: remain-on-exit pane health check.
+//    No equivalent for transport agents.
+//
+// e. inferAgentTypeFromPane() [L203]: reads pane start command to guess type.
+//    Only valid for tmux-spawned processes.
+//
+// f. extractSessionUuidFromPane() [L187]: parses --session-id / --resume from
+//    pane cmd. Transport agents don't have pane commands.
+//
+// g. startStructuredWatcher() [L44]: chooses JSONL/rollout/gemini watcher by
+//    agentType. All branches watch local disk files written by processes.
+//    Transport agents deliver events over the network, not local JSONL.
+//
+// h. setupCCStopHook / setupCodexNotify / setupOpenCodePlugin [launchSession
+//    L530–538]: process-level hook/plugin setup; N/A for transport agents.
+//
+// i. getSessionOps() [L699]: returns capturePane/sendKeys/showBuffer closures
+//    bound to a tmux session name. Transport agents need a different ops shape.
+//
+// ## Summary: operations to abstract behind SessionRuntime
+//
+//   create / kill / exists / isAlive    tmux: newSession / killSession / sessionExists / isPaneAlive
+//   respawn                             tmux: respawnPane
+//   sendInput                           tmux: sendKeys / sendKey
+//   captureOutput                       tmux: capturePane / showBuffer
+//   getPaneId / getPaneCwd / getPaneStartCommand
+//   startStructuredWatcher / stopStructuredWatcher
+//   buildLaunchCommand / buildResumeCommand / postLaunch   (AgentDriver)

@@ -51,7 +51,20 @@
     "send_queued": "重连中… (消息已排队)",
     "send_placeholder": "发送到 {{name}}…",
     "actions": "会话操作",
-    "new_btn": "新建会话"
+    "new_btn": "新建会话",
+    "agentType": {
+      "openclaw": "OpenClaw"
+    },
+    "sessionMode": "会话模式",
+    "newSession": "新会话",
+    "bindExisting": "绑定已有 OC 会话",
+    "selectSession": "选择会话",
+    "loadingSessions": "加载会话中...",
+    "noSessions": "暂无可用会话",
+    "description": "描述",
+    "descriptionPlaceholder": "会话角色或用途（可选）",
+    "sessionKey": "会话密钥",
+    "autoGenerate": "自动生成"
   },
   "server": {
     "upgrade_daemon": "↑ 升级 Daemon",
@@ -363,5 +376,13 @@
     "no_comments": "暂无评论",
     "show_changed_files": "查看变更文件",
     "refresh_tab": "刷新"
+  },
+  "transport_chat": {
+    "inputPlaceholder": "输入消息...",
+    "send": "发送",
+    "streaming": "思考中...",
+    "error": "错误",
+    "connectionLost": "连接已断开",
+    "empty": "暂无消息"
   }
 }

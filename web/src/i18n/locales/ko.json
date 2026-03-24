@@ -51,7 +51,20 @@
     "send_queued": "재연결 중… (전송 대기 중)",
     "send_placeholder": "{{name}}에게 전송…",
     "actions": "세션 작업",
-    "new_btn": "새 세션"
+    "new_btn": "새 세션",
+    "agentType": {
+      "openclaw": "OpenClaw"
+    },
+    "sessionMode": "세션 모드",
+    "newSession": "새 세션",
+    "bindExisting": "기존 OC 세션 바인딩",
+    "selectSession": "세션 선택",
+    "loadingSessions": "세션 로딩 중...",
+    "noSessions": "사용 가능한 세션 없음",
+    "description": "설명",
+    "descriptionPlaceholder": "세션 페르소나 또는 목적 (선택 사항)",
+    "sessionKey": "세션 키",
+    "autoGenerate": "자동 생성"
   },
   "server": {
     "upgrade_daemon": "↑ Daemon 업그레이드",
@@ -363,5 +376,13 @@
     "no_comments": "댓글 없음",
     "show_changed_files": "변경된 파일 보기",
     "refresh_tab": "새로고침"
+  },
+  "transport_chat": {
+    "inputPlaceholder": "메시지를 입력하세요...",
+    "send": "전송",
+    "streaming": "생각 중...",
+    "error": "오류",
+    "connectionLost": "연결이 끊겼습니다",
+    "empty": "아직 메시지가 없습니다"
   }
 }

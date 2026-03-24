@@ -433,6 +433,68 @@ program
     console.log('Done.');
   });
 
+program
+  .command('connect')
+  .description('Connect to a transport provider')
+  .argument('<provider>', 'Provider name (e.g. openclaw)')
+  .option('--url <url>', 'Provider URL (default: auto-detect)')
+  .option('--token <token>', 'Auth token (default: auto-detect from provider config)')
+  .option('--insecure', 'Allow non-TLS connections to remote hosts')
+  .action(async (provider: string, opts: { url?: string; token?: string; insecure?: boolean }) => {
+    if (provider !== 'openclaw') {
+      console.error(`Unknown provider: ${provider}. Supported providers: openclaw`);
+      process.exit(1);
+    }
+
+    const { resolveToken, saveConfig } = await import('./agent/openclaw-config.js');
+    const { connectProvider } = await import('./agent/provider-registry.js');
+
+    // Resolve URL
+    const url = opts.url ?? 'ws://127.0.0.1:18789';
+
+    // Check non-localhost + non-TLS without --insecure
+    const isLocalhost = url.startsWith('ws://127.') || url.startsWith('ws://localhost') || url.startsWith('ws://[::1]');
+    const isTLS = url.startsWith('wss://');
+    if (!isLocalhost && !isTLS && !opts.insecure) {
+      console.error(`Error: Non-TLS connection to a remote host requires --insecure flag.`);
+      console.error(`  URL: ${url}`);
+      console.error(`  Use --insecure to allow, or change the URL to wss://`);
+      process.exit(1);
+    }
+
+    // Resolve token
+    const token = resolveToken(opts.token);
+    if (!token) {
+      console.error(`Error: No auth token found.`);
+      console.error(`  Provide one via --token, OPENCLAW_GATEWAY_TOKEN env var,`);
+      console.error(`  or place it in ~/.openclaw/openclaw.json → gateway.auth.token`);
+      process.exit(1);
+    }
+
+    console.log(`Connecting to ${provider} at ${url}...`);
+    await connectProvider(provider, { url, token });
+    await saveConfig({ url, token });
+    console.log(`Connected to ${provider}.`);
+  });
+
+program
+  .command('disconnect')
+  .description('Disconnect from a transport provider')
+  .argument('<provider>', 'Provider name (e.g. openclaw)')
+  .action(async (provider: string) => {
+    if (provider !== 'openclaw') {
+      console.error(`Unknown provider: ${provider}. Supported providers: openclaw`);
+      process.exit(1);
+    }
+
+    const { removeConfig } = await import('./agent/openclaw-config.js');
+    const { disconnectProvider } = await import('./agent/provider-registry.js');
+
+    await disconnectProvider(provider);
+    await removeConfig();
+    console.log(`Disconnected from ${provider}.`);
+  });
+
 program.parseAsync(process.argv).catch((err) => {
   logger.error({ err }, 'Fatal error');
   process.exit(1);

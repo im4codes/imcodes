@@ -51,7 +51,20 @@
     "send_queued": "Reconectando… (envío en cola)",
     "send_placeholder": "Enviar a {{name}}…",
     "actions": "Acciones de sesión",
-    "new_btn": "Nueva sesión"
+    "new_btn": "Nueva sesión",
+    "agentType": {
+      "openclaw": "OpenClaw"
+    },
+    "sessionMode": "Modo de sesión",
+    "newSession": "Nueva sesión",
+    "bindExisting": "Vincular sesión OC existente",
+    "selectSession": "Seleccionar sesión",
+    "loadingSessions": "Cargando sesiones...",
+    "noSessions": "No hay sesiones disponibles",
+    "description": "Descripción",
+    "descriptionPlaceholder": "Persona o propósito de la sesión (opcional)",
+    "sessionKey": "Clave de sesión",
+    "autoGenerate": "Generar automáticamente"
   },
   "server": {
     "upgrade_daemon": "↑ Actualizar Daemon",
@@ -363,5 +376,13 @@
     "no_comments": "Sin comentarios",
     "show_changed_files": "Mostrar archivos modificados",
     "refresh_tab": "Actualizar"
+  },
+  "transport_chat": {
+    "inputPlaceholder": "Escribe un mensaje...",
+    "send": "Enviar",
+    "streaming": "Pensando...",
+    "error": "Error",
+    "connectionLost": "Conexión perdida",
+    "empty": "Sin mensajes aún"
   }
 }
