@@ -102,16 +102,7 @@ export function App() {
   const [showMobileServerMenu, setShowMobileServerMenu] = useState(false);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
   const [showDesktopFileBrowser, setShowDesktopFileBrowser] = useState(false);
-  const [desktopFbRect, setDesktopFbRect] = useState(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem('rcc_fb_rect') || '');
-      return { x: saved.x ?? 100, y: saved.y ?? 80, w: saved.w ?? 420, h: saved.h ?? 500 };
-    } catch { return { x: 100, y: 80, w: 420, h: 500 }; }
-  });
-  const fbDragRef = useRef<{ mode: 'move' | 'resize'; startX: number; startY: number; startRect: typeof desktopFbRect } | null>(null);
-  const saveFbRect = useCallback((rect: typeof desktopFbRect) => {
-    localStorage.setItem('rcc_fb_rect', JSON.stringify(rect));
-  }, []);
+  // File browser geometry now managed by FloatingPanel (id="filebrowser")
   const [serverCtxMenu, setServerCtxMenu] = useState<{ server: ServerInfo; x: number; y: number } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ServerInfo | null>(null);
 
@@ -1645,33 +1636,7 @@ export function App() {
 
             {/* Desktop floating file browser */}
             {!isMobile && showDesktopFileBrowser && wsRef.current && activeSessionInfo && (
-              <div
-                class="desktop-fb-float"
-                style={{ left: desktopFbRect.x, top: desktopFbRect.y, width: desktopFbRect.w, height: desktopFbRect.h }}
-              >
-                <div
-                  class="desktop-fb-titlebar"
-                  onMouseDown={(e: MouseEvent) => {
-                    e.preventDefault();
-                    fbDragRef.current = { mode: 'move', startX: e.clientX, startY: e.clientY, startRect: { ...desktopFbRect } };
-                    const onMove = (ev: MouseEvent) => {
-                      if (!fbDragRef.current || fbDragRef.current.mode !== 'move') return;
-                      const { startX, startY, startRect } = fbDragRef.current;
-                      setDesktopFbRect({ ...startRect, x: startRect.x + (ev.clientX - startX), y: startRect.y + (ev.clientY - startY) });
-                    };
-                    const onUp = () => {
-                      document.removeEventListener('mousemove', onMove);
-                      document.removeEventListener('mouseup', onUp);
-                      setDesktopFbRect(r => { saveFbRect(r); return r; });
-                      fbDragRef.current = null;
-                    };
-                    document.addEventListener('mousemove', onMove);
-                    document.addEventListener('mouseup', onUp);
-                  }}
-                >
-                  <span style={{ fontSize: 13, fontWeight: 600 }}>📁 {trans('picker.files')}</span>
-                  <button class="fb-close" onClick={() => setShowDesktopFileBrowser(false)}>✕</button>
-                </div>
+              <FloatingPanel id="filebrowser" title={`📁 ${trans('picker.files')}`} onClose={() => setShowDesktopFileBrowser(false)} defaultW={420} defaultH={500}>
                 <FileBrowser
                   ws={wsRef.current}
                   mode="file-multi"
@@ -1691,33 +1656,7 @@ export function App() {
                   }}
                   onClose={() => setShowDesktopFileBrowser(false)}
                 />
-                {/* Resize handle (bottom-right corner) */}
-                <div
-                  class="desktop-fb-resize-corner"
-                  onMouseDown={(e: MouseEvent) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    fbDragRef.current = { mode: 'resize', startX: e.clientX, startY: e.clientY, startRect: { ...desktopFbRect } };
-                    const onMove = (ev: MouseEvent) => {
-                      if (!fbDragRef.current || fbDragRef.current.mode !== 'resize') return;
-                      const { startX, startY, startRect } = fbDragRef.current;
-                      setDesktopFbRect({
-                        ...startRect,
-                        w: Math.max(280, startRect.w + (ev.clientX - startX)),
-                        h: Math.max(200, startRect.h + (ev.clientY - startY)),
-                      });
-                    };
-                    const onUp = () => {
-                      document.removeEventListener('mousemove', onMove);
-                      document.removeEventListener('mouseup', onUp);
-                      setDesktopFbRect(r => { saveFbRect(r); return r; });
-                      fbDragRef.current = null;
-                    };
-                    document.addEventListener('mousemove', onMove);
-                    document.addEventListener('mouseup', onUp);
-                  }}
-                />
-              </div>
+              </FloatingPanel>
             )}
 
             {/* Sub-session bar */}
