@@ -23,6 +23,11 @@ vi.mock('../../src/components/QuickInputPanel.js', () => ({
   EMPTY_QUICK_DATA: { history: [], sessionHistory: {}, commands: [], phrases: [] },
 }));
 
+const uploadFileMock = vi.fn();
+vi.mock('../../src/api.js', () => ({
+  uploadFile: (...args: unknown[]) => uploadFileMock(...args),
+}));
+
 import { SessionControls } from '../../src/components/SessionControls.js';
 import type { SessionInfo } from '../../src/types.js';
 
@@ -333,5 +338,127 @@ describe('SessionControls', () => {
       />,
     );
     expect(screen.queryByTitle('upload_file')).toBeNull();
+  });
+
+  describe('attachment badges', () => {
+    it('shows badge after file upload', async () => {
+      uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/test.txt' } });
+      render(
+        <SessionControls
+          ws={makeWs() as any}
+          activeSession={makeSession()}
+          quickData={makeQuickData() as any}
+          serverId="srv-1"
+        />,
+      );
+      const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+      const file = new File(['hello'], 'test.txt', { type: 'text/plain' });
+      Object.defineProperty(fileInput, 'files', { value: [file] });
+      fireEvent.change(fileInput);
+      // Wait for async upload
+      await vi.waitFor(() => {
+        expect(screen.getByText('test.txt')).toBeDefined();
+      });
+      // Badge should exist
+      expect(document.querySelector('.attachment-badge')).toBeTruthy();
+    });
+
+    it('removes badge when × is clicked', async () => {
+      uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/remove-me.txt' } });
+      render(
+        <SessionControls
+          ws={makeWs() as any}
+          activeSession={makeSession()}
+          quickData={makeQuickData() as any}
+          serverId="srv-1"
+        />,
+      );
+      const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+      const file = new File(['data'], 'remove-me.txt', { type: 'text/plain' });
+      Object.defineProperty(fileInput, 'files', { value: [file] });
+      fireEvent.change(fileInput);
+      await vi.waitFor(() => {
+        expect(screen.getByText('remove-me.txt')).toBeDefined();
+      });
+      // Click × to remove
+      const removeBtn = document.querySelector('.attachment-badge-remove') as HTMLButtonElement;
+      fireEvent.click(removeBtn);
+      expect(document.querySelector('.attachment-badge')).toBeNull();
+    });
+
+    it('prepends @path references on send', async () => {
+      uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/data.csv' } });
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({ name: 'my-session' })}
+          quickData={makeQuickData() as any}
+          serverId="srv-1"
+        />,
+      );
+      // Upload file
+      const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+      const file = new File(['csv'], 'data.csv', { type: 'text/csv' });
+      Object.defineProperty(fileInput, 'files', { value: [file] });
+      fireEvent.change(fileInput);
+      await vi.waitFor(() => {
+        expect(screen.getByText('data.csv')).toBeDefined();
+      });
+      // Type message
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+      input.textContent = 'analyze this';
+      fireEvent.input(input);
+      // Send
+      fireEvent.click(screen.getByRole('button', { name: /send/i }));
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+        sessionName: 'my-session',
+        text: '@/tmp/data.csv analyze this',
+      });
+    });
+
+    it('send enabled with attachment but no text', async () => {
+      uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/file.txt' } });
+      render(
+        <SessionControls
+          ws={makeWs() as any}
+          activeSession={makeSession()}
+          quickData={makeQuickData() as any}
+          serverId="srv-1"
+        />,
+      );
+      const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+      const file = new File(['x'], 'file.txt', { type: 'text/plain' });
+      Object.defineProperty(fileInput, 'files', { value: [file] });
+      fireEvent.change(fileInput);
+      await vi.waitFor(() => {
+        expect(screen.getByText('file.txt')).toBeDefined();
+      });
+      const sendBtn = screen.getByRole('button', { name: /send/i }) as HTMLButtonElement;
+      expect(sendBtn.disabled).toBe(false);
+    });
+
+    it('clears badges after send', async () => {
+      uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/gone.txt' } });
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession()}
+          quickData={makeQuickData() as any}
+          serverId="srv-1"
+        />,
+      );
+      const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+      const file = new File(['x'], 'gone.txt', { type: 'text/plain' });
+      Object.defineProperty(fileInput, 'files', { value: [file] });
+      fireEvent.change(fileInput);
+      await vi.waitFor(() => {
+        expect(screen.getByText('gone.txt')).toBeDefined();
+      });
+      // Send (with attachment only, no text)
+      fireEvent.click(screen.getByRole('button', { name: /send/i }));
+      expect(document.querySelector('.attachment-badge')).toBeNull();
+    });
   });
 });
