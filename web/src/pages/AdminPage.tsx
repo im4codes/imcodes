@@ -44,14 +44,14 @@ export function AdminPage({ onBack }: Props) {
     try {
       await approveUser(user.id);
       setUsers((prev) => prev.map((u) => u.id === user.id ? { ...u, status: 'active' } : u));
-    } catch { setError(t('admin.action_error')); }
+    } catch (err) { setError(`${t('admin.action_error')}: ${err instanceof Error ? err.message : String(err)}`); }
   };
 
   const handleDisable = async (user: AdminUser) => {
     try {
       await disableUser(user.id);
       setUsers((prev) => prev.map((u) => u.id === user.id ? { ...u, status: 'disabled' } : u));
-    } catch { setError(t('admin.action_error')); }
+    } catch (err) { setError(`${t('admin.action_error')}: ${err instanceof Error ? err.message : String(err)}`); }
     setConfirmAction(null);
   };
 
@@ -59,19 +59,20 @@ export function AdminPage({ onBack }: Props) {
     try {
       await deleteAdminUser(user.id);
       setUsers((prev) => prev.filter((u) => u.id !== user.id));
-    } catch { setError(t('admin.action_error')); }
+    } catch (err) { setError(`${t('admin.action_error')}: ${err instanceof Error ? err.message : String(err)}`); }
     setConfirmAction(null);
   };
 
   const handleToggleSetting = async (key: string, currentValue: string) => {
     const newValue = currentValue === 'true' ? 'false' : 'true';
-    const updated = { ...settings, [key]: newValue };
-    setSettings(updated);
+    const prev = { ...settings };
+    setSettings({ ...settings, [key]: newValue });
     try {
       await updateAdminSettings({ [key]: newValue });
-    } catch {
-      setSettings(settings); // revert
-      setError(t('admin.action_error'));
+    } catch (err) {
+      setSettings(prev); // revert
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(`${t('admin.action_error')}: ${msg}`);
     }
   };
 
