@@ -53,10 +53,10 @@ body {
 .tab.busy::after { content: '◌'; margin-left: 5px; color: #e3b341; font-size: 7px; vertical-align: middle; animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 /* Alert pulse: session just went idle (task completed) */
-.tab.alert { animation: tab-alert 0.7s ease-in-out 4; }
-@keyframes tab-alert { 0%, 100% { background: transparent; box-shadow: none; } 50% { background: #1c3a2a; box-shadow: 0 0 10px #3fb95060 inset; } }
-.tab.alert.active { animation: tab-alert-active 0.7s ease-in-out 4; }
-@keyframes tab-alert-active { 0%, 100% { background: #161b22; } 50% { background: #1e3a2f; box-shadow: 0 0 12px #3fb95070 inset; } }
+.tab.alert { animation: tab-alert 0.5s ease-in-out 6; }
+@keyframes tab-alert { 0%, 100% { background: transparent; box-shadow: none; border-color: transparent; } 50% { background: #3a1c1c; box-shadow: 0 0 12px #ef444480 inset, 0 0 4px #ef444440; border-color: #ef4444; } }
+.tab.alert.active { animation: tab-alert-active 0.5s ease-in-out 6; }
+@keyframes tab-alert-active { 0%, 100% { background: #161b22; border-color: #3b82f6; } 50% { background: #3a1c1c; box-shadow: 0 0 14px #ef444490 inset; border-color: #ef4444; } }
 /* WS dot inline on active tab */
 .tab-ws-dot { margin-left: 6px; font-size: 7px; line-height: 1; vertical-align: middle; flex-shrink: 0; }
 .tab-latency { font-size: 9px; font-family: monospace; margin-left: 2px; vertical-align: middle; }
