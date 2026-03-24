@@ -162,7 +162,7 @@ export function TransportChatView({ sessionName, ws }: Props) {
           <button
             class="btn btn-primary"
             onClick={handleSend}
-            disabled={!inputText.trim() || !ws || !ws.connected}
+            disabled={!inputText.trim() || !ws || !ws.connected || isStreaming}
             style={{ flexShrink: 0, padding: '0 16px', fontSize: 13 }}
           >
             {t('transport_chat.send')}

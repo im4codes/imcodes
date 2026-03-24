@@ -118,6 +118,7 @@ export class OpenClawProvider implements TransportProvider {
       this.ws = null;
     }
     this.connected = false;
+    this.runAccumulator.clear();
     logger.info({ provider: this.id }, 'Disconnected from OpenClaw gateway');
   }
 

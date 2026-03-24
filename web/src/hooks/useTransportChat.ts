@@ -9,6 +9,11 @@ import { useState, useEffect, useCallback } from 'preact/hooks';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '@shared/transport-events.js';
 import type { WsClient } from '../ws-client.js';
 
+let _idCounter = 0;
+function uniqueId(prefix: string): string {
+  return `${prefix}-${Date.now()}-${++_idCounter}`;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
@@ -17,9 +22,12 @@ export interface ChatMessage {
   timestamp: number;
 }
 
+export type TransportStatus = 'idle' | 'streaming' | 'thinking' | 'tool_running' | 'permission' | 'unknown';
+
 export interface UseTransportChatResult {
   messages: ChatMessage[];
   isStreaming: boolean;
+  agentStatus: TransportStatus;
   sendMessage: (text: string) => void;
 }
 
@@ -29,6 +37,7 @@ export function useTransportChat(
 ): UseTransportChatResult {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [agentStatus, setAgentStatus] = useState<TransportStatus>('idle');
 
   useEffect(() => {
     if (!ws || !ws.connected) return;
@@ -54,6 +63,7 @@ export function useTransportChat(
         const delta = (raw['delta'] as string) ?? '';
 
         setIsStreaming(true);
+        setAgentStatus('streaming');
         setMessages((prev) => {
           const existing = prev.find((m) => m.id === messageId);
           if (existing) {
@@ -80,6 +90,7 @@ export function useTransportChat(
         const messageId = raw['messageId'] as string;
 
         setIsStreaming(false);
+        setAgentStatus('idle');
         setMessages((prev) =>
           prev.map((m) =>
             m.id === messageId ? { ...m, status: 'complete' as const } : m,
@@ -91,16 +102,22 @@ export function useTransportChat(
         const error = (raw['error'] as string | undefined) ?? 'Unknown error';
 
         setIsStreaming(false);
+        setAgentStatus('error' as TransportStatus);
         setMessages((prev) => [
           ...prev,
           {
-            id: `error-${Date.now()}`,
+            id: uniqueId('error'),
             role: 'assistant',
             content: error,
             status: 'error' as const,
             timestamp: Date.now(),
           },
         ]);
+      } else if (type === TRANSPORT_EVENT.CHAT_STATUS) {
+        const sessionId = raw['sessionId'] as string | undefined;
+        if (sessionId !== sessionName) return;
+        const status = raw['status'] as TransportStatus | undefined;
+        if (status) setAgentStatus(status);
       }
     });
 
@@ -117,12 +134,12 @@ export function useTransportChat(
 
   const sendMessage = useCallback(
     (text: string) => {
-      if (!ws) return;
+      if (!ws || isStreaming) return;
       // Add user message to local state immediately (optimistic)
       setMessages((prev) => [
         ...prev,
         {
-          id: `user-${Date.now()}`,
+          id: uniqueId('user'),
           role: 'user',
           content: text,
           status: 'complete',
@@ -136,8 +153,8 @@ export function useTransportChat(
         // Ignore send errors — the optimistic message remains visible.
       }
     },
-    [sessionName, ws],
+    [sessionName, ws, isStreaming],
   );
 
-  return { messages, isStreaming, sendMessage };
+  return { messages, isStreaming, agentStatus, sendMessage };
 }

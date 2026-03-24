@@ -11,6 +11,7 @@ export type AgentStatus =
   | 'thinking'
   | 'tool_running'
   | 'permission'
+  | 'error'
   | 'unknown';
 
 /** Process-backed agents — controlled via tmux sessions */
