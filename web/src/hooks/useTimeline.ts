@@ -340,12 +340,14 @@ export function useTimeline(
       if (msg.type === 'session.event' && (msg as { event: string }).event === 'disconnected') {
         if (loadingOlderRef.current) resetOlderState();
       }
-      // ── Browser WS reconnected: fill gaps since last seen seq ──
+      // ── Browser WS reconnected: fill gaps using afterTs for reliability ──
+      // Always use timestamp-based history (not seq-based replay) to avoid
+      // epoch mismatch and seq desync issues on mobile (app killed/backgrounded).
       if (msg.type === 'session.event' && (msg as { event: string }).event === 'connected') {
-        if (ws && sessionId && epochRef.current > 0) {
-          replayRequestIdRef.current = ws.sendTimelineReplayRequest(sessionId, seqRef.current, epochRef.current);
-        } else if (ws && sessionId) {
-          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId);
+        if (ws && sessionId) {
+          const cached = eventsCache.get(sessionId);
+          const afterTs = cached && cached.length > 0 ? Math.max(...cached.map((e) => e.ts)) : undefined;
+          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500, afterTs);
         }
       }
     };
