@@ -533,7 +533,7 @@ export async function uploadFile(
       xhr.setRequestHeader('Authorization', `Bearer ${_apiKey}`);
     } else {
       xhr.withCredentials = true;
-      const csrf = document.cookie.match(/csrf_token=([^;]+)/)?.[1];
+      const csrf = document.cookie.match(/rcc_csrf=([^;]+)/)?.[1];
       if (csrf) xhr.setRequestHeader('X-CSRF-Token', csrf);
     }
 
