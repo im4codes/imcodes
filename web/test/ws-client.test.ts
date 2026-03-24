@@ -88,7 +88,7 @@ describe('WsClient', () => {
     client.connect();
     await flushAsync();
     expect(lastWs!.url).toContain('ws://localhost:8787');
-    expect(lastWs!.url).toContain('/api/server/srv-1/terminal');
+    expect(lastWs!.url).toContain('/api/server/srv-1/ws');
     expect(lastWs!.url).toContain('ticket=test-ticket');
   });
 

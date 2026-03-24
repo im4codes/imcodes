@@ -285,12 +285,13 @@ function setupWebSocketUpgrade(server: import('node:http').Server, env: Env) {
 
   server.on('upgrade', async (req: IncomingMessage, socket, head) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
-    const match = url.pathname.match(/^\/api\/server\/([^/]+)\/(ws|terminal)$/);
+    const match = url.pathname.match(/^\/api\/server\/([^/]+)\/ws$/);
     if (!match) { socket.destroy(); return; }
 
-    const [, serverId, endpoint] = match;
+    const [, serverId] = match;
+    const hasBrowserTicket = url.searchParams.has('ticket');
 
-    if (endpoint === 'ws') {
+    if (!hasBrowserTicket) {
       // Daemon connection — per-IP rate limit + global cap
       const ip = proxyAddr(req as never, wsTrust);
       if (!daemonConnectLimiter.check(`daemon:${ip}`, 5, 10_000)) {

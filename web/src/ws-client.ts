@@ -433,7 +433,7 @@ export class WsClient {
       return;
     }
 
-    const url = `${wsUrl}/api/server/${this.serverId}/terminal?ticket=${encodeURIComponent(ticket)}`;
+    const url = `${wsUrl}/api/server/${this.serverId}/ws?ticket=${encodeURIComponent(ticket)}`;
 
     this.ws = new WebSocket(url);
     this.ws.binaryType = 'arraybuffer';
