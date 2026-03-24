@@ -65,8 +65,6 @@ export function UsageFooter({ usage, sessionName, showCost, activeThinkingTs, st
         </div>
       )}
       <div class="session-usage-stats">
-        {modelLabel && <span class="session-usage-model">{modelLabel}</span>}
-        {total > 0 && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}
         {(activeThinkingTs || statusText) && (
           <span class="session-thinking-inline">
             <span class="chat-thinking-dots">···</span>
@@ -75,11 +73,15 @@ export function UsageFooter({ usage, sessionName, showCost, activeThinkingTs, st
               : statusText}
           </span>
         )}
-        {sessionCost > 0 && (
-          <span class="session-usage-cost" style={{ marginLeft: 'auto' }}>
-            {formatCost(sessionCost)} · wk {formatCost(weeklyCost)} · mo {formatCost(monthlyCost)}
-          </span>
-        )}
+        <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' }}>
+          {modelLabel && <span class="session-usage-model">{modelLabel}</span>}
+          {total > 0 && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}
+          {sessionCost > 0 && (
+            <span class="session-usage-cost">
+              {formatCost(sessionCost)} · wk {formatCost(weeklyCost)} · mo {formatCost(monthlyCost)}
+            </span>
+          )}
+        </span>
       </div>
     </div>
   );
