@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback } from 'preact/hooks';
+import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
 import { marked } from 'marked';
+import DOMPurify from 'dompurify';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 
 interface P2pNode {
@@ -51,7 +52,7 @@ export function DiscussionsPage({ ws, onBack, initialSelectedId, liveDiscussions
   useEffect(() => { loadList(); }, [loadList]);
 
   // Auto-select initialSelectedId once list is loaded
-  const initialAppliedRef = { current: false };
+  const initialAppliedRef = useRef(false);
   useEffect(() => {
     if (initialAppliedRef.current || !initialSelectedId || discussions.length === 0) return;
     const match = discussions.find((d) => d.id === initialSelectedId || d.id.includes(initialSelectedId));
@@ -92,9 +93,9 @@ export function DiscussionsPage({ ws, onBack, initialSelectedId, liveDiscussions
   // Render markdown content safely
   const renderMarkdown = (md: string): string => {
     try {
-      return marked(md) as string;
+      return DOMPurify.sanitize(marked(md) as string);
     } catch {
-      return `<pre>${md}</pre>`;
+      return DOMPurify.sanitize(md);
     }
   };
 

@@ -177,7 +177,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     };
     document.addEventListener('mousedown', handleClick);
     return () => document.removeEventListener('mousedown', handleClick);
-  }, [menuOpen, modelOpen]);
+  }, [menuOpen, modelOpen, p2pOpen]);
 
   const getText = () => (divRef.current?.textContent ?? '').trim();
 

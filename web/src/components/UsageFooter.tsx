@@ -49,7 +49,7 @@ export function UsageFooter({ usage, sessionName, showCost, activeThinkingTs, st
       `  New: ${fmt(usage.inputTokens)}  Cache: ${fmt(usage.cacheTokens)}`,
     ].filter(Boolean).join('\n');
     return { ctx, total, totalPct, cachePct, newPct, pctStr, tip };
-  }, [usage]);
+  }, [usage.inputTokens, usage.cacheTokens, usage.contextWindow, usage.model]);
 
   const sessionCost = showCost ? getSessionCost(sessionName) : 0;
   const weeklyCost = sessionCost > 0 ? getWeeklyCost() : 0;

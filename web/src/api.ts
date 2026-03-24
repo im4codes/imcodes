@@ -592,4 +592,5 @@ export async function previewAttachment(serverId: string, attachmentId: string):
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
   window.open(url, '_blank');
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }

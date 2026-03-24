@@ -705,7 +705,7 @@ function ChatEvent({ event, nextTs, onPathClick, serverId }: { event: TimelineEv
       // Strip @path references from text when they're shown as attachment badges
       if (attachments && attachments.length > 0) {
         for (const att of attachments) {
-          if (att.daemonPath) userText = userText.replace(`@${att.daemonPath}`, '').trim();
+          if (att.daemonPath) userText = userText.split(`@${att.daemonPath}`).join('').trim();
         }
       }
       return (

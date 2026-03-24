@@ -37,6 +37,7 @@ import { useSwipeBack } from './hooks/useSwipeBack.js';
 import { getActiveThinkingTs, getActiveStatusText } from './thinking-utils.js';
 import { WsClient } from './ws-client.js';
 import { UsageFooter } from './components/UsageFooter.js';
+import { recordCost } from './cost-tracker.js';
 import { configure as configureApi, apiFetch, onAuthExpired, getUserPref, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, listP2pRuns, fetchMe } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { getAuthKey, clearAuthKey } from './biometric-auth.js';
@@ -585,6 +586,22 @@ export function App() {
     }
     return null;
   }, [timelineEvents]);
+
+  // Cost tracking — extract latest costUsd and record to ledger
+  const lastCostEvent = useMemo(() => {
+    for (let i = timelineEvents.length - 1; i >= 0; i--) {
+      if (timelineEvents[i].type === 'usage.update' && timelineEvents[i].payload.costUsd) {
+        return timelineEvents[i].payload as { costUsd: number };
+      }
+    }
+    return null;
+  }, [timelineEvents]);
+
+  useEffect(() => {
+    if (lastCostEvent?.costUsd && activeSession) {
+      recordCost(activeSession, lastCostEvent.costUsd);
+    }
+  }, [lastCostEvent?.costUsd, activeSession]);
 
   // Earliest ts of the current continuous thinking sequence (shared logic).
   const activeThinkingTs = useMemo(() => getActiveThinkingTs(timelineEvents), [timelineEvents]);
@@ -1588,7 +1605,7 @@ export function App() {
               <UsageFooter
                 usage={lastUsage}
                 sessionName={activeSession ?? ''}
-                showCost
+                showCost={!!lastCostEvent}
                 activeThinkingTs={activeThinkingTs}
                 statusText={statusText}
                 now={thinkingNow}
