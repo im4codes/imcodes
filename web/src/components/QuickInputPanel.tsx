@@ -20,7 +20,7 @@ const DEFAULT_COMMANDS: Record<string, string[]> = {
   'codex':       ['/compact', '/help', '/model', '/approval', '/clear'],
   'opencode':    ['/compact', '/clear', '/model', '/help'],
 };
-const DEFAULT_PHRASES = ['continue', 'fix', 'explain', 'refactor this', 'write tests', 'check errors', 'LGTM, commit', 'yes'];
+const DEFAULT_PHRASES = ['continue', 'fix', 'explain', 'refactor this', 'write tests', 'check errors', 'LGTM, commit', 'test & push', 'yes'];
 
 const SESSION_HISTORY_MAX = 50;
 const GLOBAL_HISTORY_MAX = 50;
