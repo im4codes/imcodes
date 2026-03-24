@@ -518,6 +518,9 @@ body {
 .subsession-card-label { font-size: 10px; color: #64748b; }
 .subsession-card.open .subsession-card-label { color: #93c5fd; }
 .subsession-card-badge { font-size: 10px; color: #f59e0b; }
+.subsession-card-model { font-size: 9px; color: #818cf8; margin-left: 2px; }
+.subsession-card-ctx { display: block; height: 2px; background: #1e293b; border-radius: 1px; overflow: hidden; margin-top: 2px; }
+.subsession-card-ctx-fill { display: block; height: 100%; background: #3b82f6; border-radius: 1px; transition: width 0.3s; }
 
 /* ── Sub-session window ───────────────────────────────────────────────────── */
 .subsession-window { display: flex; flex-direction: column; background: #0f1117; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); overflow: hidden; min-width: 300px; min-height: 200px; }

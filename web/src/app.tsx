@@ -393,6 +393,7 @@ export function App() {
   const [activeTools, setActiveTools] = useState<Map<string, string>>(new Map());
   const [toasts, setToasts] = useState<Array<{ id: number; sessionName: string; project: string; kind: 'idle' | 'notification'; title?: string; message?: string }>>([]);
   const [detectedModels, setDetectedModels] = useState<Map<string, string>>(new Map());
+  const [subUsages, setSubUsages] = useState<Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string }>>(new Map());
   const quickData = useQuickData();
 
   // IDs of currently-open (non-minimized) sub-session windows
@@ -741,20 +742,31 @@ export function App() {
             ));
           }
         }
-        if (event.type === 'usage.update' && event.payload.model) {
-          const modelStr = String(event.payload.model).toLowerCase();
-          const claudeM: string | null =
-            modelStr.includes('opus') ? 'opus' :
-            modelStr.includes('sonnet') ? 'sonnet' :
-            modelStr.includes('haiku') ? 'haiku' : null;
-          const gptM = modelStr.match(/\b(gpt-5(?:\.\d+)?(?:-\w+)?)\b/);
-          const gemM = modelStr.match(/\b(gemini[- ]\d[\w.-]*)\b/);
-          const det = claudeM ?? (gptM ? gptM[1] : null) ?? (gemM ? gemM[1] : null);
-          if (det) {
-            setDetectedModels((prev) => {
-              if (prev.get(event.sessionId) === det) return prev;
+        if (event.type === 'usage.update') {
+          // Model detection
+          if (event.payload.model) {
+            const modelStr = String(event.payload.model).toLowerCase();
+            const claudeM: string | null =
+              modelStr.includes('opus') ? 'opus' :
+              modelStr.includes('sonnet') ? 'sonnet' :
+              modelStr.includes('haiku') ? 'haiku' : null;
+            const gptM = modelStr.match(/\b(gpt-5(?:\.\d+)?(?:-\w+)?)\b/);
+            const gemM = modelStr.match(/\b(gemini[- ]\d[\w.-]*)\b/);
+            const det = claudeM ?? (gptM ? gptM[1] : null) ?? (gemM ? gemM[1] : null);
+            if (det) {
+              setDetectedModels((prev) => {
+                if (prev.get(event.sessionId) === det) return prev;
+                const next = new Map(prev);
+                next.set(event.sessionId, det);
+                return next;
+              });
+            }
+          }
+          // Track usage data for all sub-sessions (ctx bar in collapsed buttons)
+          if (event.sessionId.startsWith('deck_sub_') && event.payload.inputTokens) {
+            setSubUsages((prev) => {
               const next = new Map(prev);
-              next.set(event.sessionId, det);
+              next.set(event.sessionId, event.payload as { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string });
               return next;
             });
           }
@@ -1716,6 +1728,7 @@ export function App() {
                 onHistory={registerHistoryApplyer}
                 serverId={selectedServerId}
                 onViewRepo={() => setShowRepoPage(true)}
+                subUsages={subUsages}
               />
             )}
           </>

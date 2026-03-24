@@ -9,6 +9,8 @@ import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
 import { isVisuallyBusy } from '../thinking-utils.js';
 import { reorderSubSessions } from '../api.js';
+import { resolveContextWindow } from '../model-context.js';
+import { shortModelLabel } from '../model-label.js';
 
 interface DaemonStats {
   daemonVersion?: string | null;
@@ -56,6 +58,8 @@ interface Props {
   onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void;
   onHistory: (sessionName: string, apply: (c: string) => void) => void;
   serverId?: string;
+  /** Per-sub-session usage data (ctx tokens, model) collected from timeline events. */
+  subUsages?: Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string }>;
 }
 
 const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -98,7 +102,7 @@ function formatUptime(seconds: number): string {
   return d > 0 ? `${d}d ${h}h` : `${h}h`;
 }
 
-export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId }: Props) {
+export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages }: Props) {
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
   const [collapsed, setCollapsed] = useState(isMobile);
   const [showSizePanel, setShowSizePanel] = useState(false);
@@ -409,16 +413,30 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
             const label = sub.label ? `${sub.label} · ${agentTag}` : agentTag;
             const abbr = TYPE_ABBR[sub.type] ?? agentTag.slice(0, 2);
             const isOpen = openIds.has(sub.id);
+            const usage = subUsages?.get(`deck_sub_${sub.id}`);
+            const model = usage ? shortModelLabel(usage.model) : null;
+            // Compute ctx percentage for mini bar
+            let ctxPct = 0;
+            if (usage) {
+              const ctx = resolveContextWindow(usage.contextWindow, usage.model);
+              ctxPct = Math.min(100, (usage.inputTokens + usage.cacheTokens) / ctx * 100);
+            }
             return (
               <button
                 key={sub.id}
                 class={`subsession-card${isOpen ? ' open' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
                 onClick={() => onOpen(sub.id)}
-                title={label}
+                title={label + (model ? ` · ${model}` : '') + (ctxPct > 0 ? ` · ctx ${ctxPct.toFixed(0)}%` : '')}
               >
                 <span class="subsession-card-icon">{abbr}</span>
                 <span class="subsession-card-label">{sub.label ? sub.label.slice(0, 6) : agentTag.slice(0, 6)}</span>
+                {model && <span class="subsession-card-model">{model}</span>}
                 {sub.state === 'starting' && <span class="subsession-card-badge">…</span>}
+                {ctxPct > 0 && (
+                  <span class="subsession-card-ctx" style={{ width: '100%' }}>
+                    <span class="subsession-card-ctx-fill" style={{ width: `${ctxPct}%` }} />
+                  </span>
+                )}
               </button>
             );
           })}
