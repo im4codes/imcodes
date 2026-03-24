@@ -527,6 +527,10 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
         <>
           <div class="chat-panel-drag" onMouseDown={onDragStart} />
           <div class="chat-file-panel" style={{ width: `${filePanelWidth}px`, flexShrink: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', padding: '4px 8px', background: '#1e293b', borderBottom: '1px solid #334155' }}>
+              <span style={{ flex: 1, fontSize: 11, color: '#64748b' }}>{t('picker.files')}</span>
+              <button onClick={() => { setShowFilePanel(false); try { localStorage.setItem(panelOpenKey(sessionId), '0'); } catch { /* ignore */ } }} style={{ background: 'none', border: 'none', color: '#64748b', cursor: 'pointer', fontSize: 14, padding: '2px 6px' }}>✕</button>
+            </div>
             <FileBrowser
               ws={ws}
               mode="file-single"
