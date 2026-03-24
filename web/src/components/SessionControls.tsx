@@ -127,6 +127,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [attachments, setAttachments] = useState<Array<{ path: string; name: string }>>([]);
 
   // Keep external inputRef in sync so parent can call .focus()
   useEffect(() => {
@@ -226,23 +227,28 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const handleSend = useCallback(() => {
     let text = getText();
-    if (!text || !ws || !activeSession) return;
+    if ((!text && attachments.length === 0) || !ws || !activeSession) return;
     text = prepareMessage(text);
+    // Prepend attachment references
+    if (attachments.length > 0) {
+      const refs = attachments.map((a) => `@${a.path}`).join(' ');
+      text = text ? `${refs} ${text}` : refs;
+    }
     quickData.recordHistory(text, activeSession.name);
     try {
       ws.sendSessionCommand('send', { sessionName: activeSession.name, text });
     } catch {
-      // WS not connected — keep text in input so user can retry
       return;
     }
     onSend?.(activeSession.name, text);
     if (divRef.current) divRef.current.textContent = '';
     setHasText(false);
+    setAttachments([]);
     atSelectionLockRef.current = false;
     atSelectionSnapshotRef.current = '';
     histIdxRef.current = -1;
     draftRef.current = '';
-  }, [ws, activeSession, quickData, onSend]);
+  }, [ws, activeSession, quickData, onSend, attachments]);
 
   // Voice overlay send handler — applies same P2P mode as text send
   const handleVoiceSend = useCallback((voiceText: string) => {
@@ -341,12 +347,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setUploading(true);
     setUploadProgress(0);
     setUploadError(null);
-    const paths: string[] = [];
     for (const file of Array.from(files)) {
       try {
         const result = await uploadFile(serverId, file, (pct) => setUploadProgress(pct));
         if (result.attachment?.daemonPath) {
-          paths.push('@' + result.attachment.daemonPath + ' ');
+          setAttachments((prev) => [...prev, { path: result.attachment!.daemonPath, name: file.name }]);
         }
       } catch (err) {
         console.error('[upload] failed:', err);
@@ -358,17 +363,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         } else {
           setUploadError(t('upload.upload_failed'));
         }
-        // Auto-dismiss error after 5s
         setTimeout(() => setUploadError(null), 5000);
       }
     }
     setUploading(false);
-    if (paths.length > 0) {
-      appendToInput(paths);
-      atJustClosedRef.current = true;
-      setTimeout(() => { atJustClosedRef.current = false; }, 200);
-    }
-  }, [serverId, appendToInput, t]);
+  }, [serverId, t]);
 
   const handleShortcut = (data: string) => {
     if (!ws || !activeSession) return;
@@ -703,6 +702,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           />
         )}
 
+        {/* Attachment badges */}
+        {attachments.length > 0 && (
+          <div class="attachment-badges">
+            {attachments.map((a, i) => (
+              <span key={a.path} class="attachment-badge" title={a.path}>
+                <span class="attachment-badge-icon">📎</span>
+                <span class="attachment-badge-name">{a.name}</span>
+                <button
+                  class="attachment-badge-remove"
+                  onClick={() => setAttachments((prev) => prev.filter((_, j) => j !== i))}
+                  title={t('common.delete')}
+                >×</button>
+              </span>
+            ))}
+          </div>
+        )}
+
         {/*
           contenteditable div — iOS does NOT show the password/keychain autofill bar
           for contenteditable elements, unlike <input> or <textarea>.
@@ -800,7 +816,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         <button
           class="btn btn-primary"
           onClick={handleSend}
-          disabled={inputDisabled || !hasText || !connected}
+          disabled={inputDisabled || (!hasText && attachments.length === 0) || !connected}
           style={p2pMode !== 'solo' ? { background: P2P_MODE_COLORS[p2pMode], borderColor: P2P_MODE_COLORS[p2pMode] } : undefined}
         >
           {p2pMode !== 'solo' ? `${t(P2P_MODE_I18N[p2pMode])}` : t('common.send')}

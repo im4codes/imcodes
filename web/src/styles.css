@@ -114,6 +114,12 @@ body {
 .shortcut-btn:disabled { opacity: 0.4; cursor: default; }
 .shortcut-btn-wide { padding-left: 14px; padding-right: 14px; }
 .controls { padding: 6px 8px; display: flex; gap: 6px; align-items: center; }
+.attachment-badges { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 2px 2px; }
+.attachment-badge { display: inline-flex; align-items: center; gap: 4px; background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 2px 8px 2px 6px; font-size: 12px; color: #94a3b8; max-width: 200px; }
+.attachment-badge-icon { font-size: 11px; flex-shrink: 0; }
+.attachment-badge-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-badge-remove { background: none; border: none; color: #64748b; cursor: pointer; font-size: 14px; padding: 0 2px; line-height: 1; }
+.attachment-badge-remove:hover { color: #ef4444; }
 .controls-input { flex: 1; min-width: 0; background: #0f172a; border: 1px solid #334155; color: #e2e8f0; padding: 6px 10px; border-radius: 4px; font-family: inherit; font-size: 13px; outline: none; overflow-y: auto; min-height: 32px; max-height: 120px; line-height: 1.45; word-break: break-word; white-space: pre-wrap; text-align: left !important; direction: ltr; -webkit-user-modify: read-write-plaintext-only; }
 .controls-input:focus { border-color: #3b82f6; }
 .controls-input-disabled { opacity: 0.4; pointer-events: none; }
