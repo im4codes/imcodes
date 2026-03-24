@@ -8,6 +8,7 @@ import { useEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks'
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent, WsClient } from '../ws-client.js';
 import { FileBrowser } from './FileBrowser.js';
+import { FloatingPanel } from './FloatingPanel.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 
 interface Props {
@@ -559,29 +560,31 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
         </div>
       )}
       {fileBrowserPath && ws && (
-        <FileBrowser
-          ws={ws}
-          mode="file-single"
-          layout="modal"
-          initialPath={(() => {
-            const isAbsolute = fileBrowserPath.startsWith('/') || fileBrowserPath.startsWith('~');
-            const resolved = isAbsolute ? fileBrowserPath : `${workdir ?? '~'}/${fileBrowserPath}`;
-            return resolved.includes('.') && !resolved.endsWith('/')
-              ? resolved.split('/').slice(0, -1).join('/') || '~'
-              : resolved;
-          })()}
-          highlightPath={fileBrowserPath.startsWith('/') || fileBrowserPath.startsWith('~')
-            ? fileBrowserPath
-            : `${workdir ?? '~'}/${fileBrowserPath}`}
-          autoPreviewPath={fileBrowserPath.startsWith('/') || fileBrowserPath.startsWith('~')
-            ? fileBrowserPath
-            : `${workdir ?? '~'}/${fileBrowserPath}`}
-          onConfirm={(paths) => {
-            if (paths[0]) onInsertPath?.(paths[0]);
-            setFileBrowserPath(null);
-          }}
-          onClose={() => setFileBrowserPath(null)}
-        />
+        <FloatingPanel id="chat-file-preview" title={`📄 ${fileBrowserPath.split('/').pop() ?? 'File'}`} onClose={() => setFileBrowserPath(null)} defaultW={600} defaultH={500}>
+          <FileBrowser
+            ws={ws}
+            mode="file-single"
+            layout="panel"
+            initialPath={(() => {
+              const isAbsolute = fileBrowserPath.startsWith('/') || fileBrowserPath.startsWith('~');
+              const resolved = isAbsolute ? fileBrowserPath : `${workdir ?? '~'}/${fileBrowserPath}`;
+              return resolved.includes('.') && !resolved.endsWith('/')
+                ? resolved.split('/').slice(0, -1).join('/') || '~'
+                : resolved;
+            })()}
+            highlightPath={fileBrowserPath.startsWith('/') || fileBrowserPath.startsWith('~')
+              ? fileBrowserPath
+              : `${workdir ?? '~'}/${fileBrowserPath}`}
+            autoPreviewPath={fileBrowserPath.startsWith('/') || fileBrowserPath.startsWith('~')
+              ? fileBrowserPath
+              : `${workdir ?? '~'}/${fileBrowserPath}`}
+            onConfirm={(paths) => {
+              if (paths[0]) onInsertPath?.(paths[0]);
+              setFileBrowserPath(null);
+            }}
+            onClose={() => setFileBrowserPath(null)}
+          />
+        </FloatingPanel>
       )}
     </div>
   );
