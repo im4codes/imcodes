@@ -395,15 +395,7 @@ describe('RepoPage', () => {
     expect(screen.getByText('CLI not installed')).toBeDefined();
   });
 
-  // Back button calls onBack
-  it('calls onBack when Back button is clicked', () => {
-    const onBack = vi.fn();
-    const { ws } = makeWs();
-    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={onBack} />);
-
-    fireEvent.click(screen.getByText('Back'));
-    expect(onBack).toHaveBeenCalledOnce();
-  });
+  // Back button removed — FloatingPanel provides close/minimize instead
 
   // ── Detect timeout ──────────────────────────────────────────────────────────
 
