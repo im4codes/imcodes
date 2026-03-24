@@ -259,6 +259,12 @@ export function RepoPage({ ws, projectDir }: Props) {
     }
   }, [activeTab, context, tabs, fetchTab]);
 
+  // Auto-fetch CI/CD on detect complete (so auto-refresh works even if tab not visited)
+  useEffect(() => {
+    if (!context || tabs.actions.fetched || tabs.actions.loading) return;
+    fetchTab('actions');
+  }, [context, tabs.actions.fetched, tabs.actions.loading, fetchTab]);
+
   // ── Message handler ──────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -367,16 +373,16 @@ export function RepoPage({ ws, projectDir }: Props) {
     fetchTab(key, 1, true);
   }, [fetchTab, updateTab]);
 
-  // ── CI/CD auto-refresh: 10s when running, 30s otherwise ────────────────
+  // ── CI/CD auto-refresh: 10s when running, 30s otherwise (always active) ─
   useEffect(() => {
-    if (activeTab !== 'actions' || !tabs.actions.fetched) return;
+    if (!tabs.actions.fetched) return;
     const hasRunning = tabs.actions.items.some((r: any) => r.status === 'running' || r.status === 'queued');
     const interval = hasRunning ? 10_000 : 30_000;
     const timer = setInterval(() => {
       silentRefreshTab('actions');
     }, interval);
     return () => clearInterval(timer);
-  }, [activeTab, tabs.actions.items, tabs.actions.fetched, silentRefreshTab]);
+  }, [tabs.actions.items, tabs.actions.fetched, silentRefreshTab]);
 
   const handleLoadMore = useCallback(() => {
     const tab = tabs[activeTab];
