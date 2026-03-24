@@ -321,16 +321,22 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
     fetchTab(key, 1, true);
   }, [fetchTab]);
 
+  /** Silently refresh a tab — keep existing items visible while loading. */
+  const silentRefreshTab = useCallback((key: TabKey) => {
+    updateTab(key, { loading: true });
+    fetchTab(key, 1, true);
+  }, [fetchTab, updateTab]);
+
   // ── CI/CD auto-refresh when any run is "running" ───────────────────────
   useEffect(() => {
     if (activeTab !== 'actions') return;
     const hasRunning = tabs.actions.items.some((r: any) => r.status === 'running' || r.status === 'queued');
     if (!hasRunning) return;
     const timer = setInterval(() => {
-      handleRefreshTab('actions');
+      silentRefreshTab('actions');
     }, 10_000);
     return () => clearInterval(timer);
-  }, [activeTab, tabs.actions.items, handleRefreshTab]);
+  }, [activeTab, tabs.actions.items, silentRefreshTab]);
 
   const handleLoadMore = useCallback(() => {
     const tab = tabs[activeTab];
