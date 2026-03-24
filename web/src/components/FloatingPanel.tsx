@@ -140,7 +140,13 @@ export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onF
         <span style={{ flex: 1, fontSize: 12, color: '#94a3b8', fontWeight: 600 }}>{title}</span>
         <button
           onClick={onClose}
-          style={{ background: 'none', border: 'none', color: '#64748b', cursor: 'pointer', fontSize: 14, padding: '0 4px' }}
+          class="subsession-minimize-btn"
+          title="Minimize"
+        >▾</button>
+        <button
+          onClick={onClose}
+          class="subsession-close-btn"
+          title="Close"
         >×</button>
       </div>
 
