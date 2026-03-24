@@ -107,7 +107,13 @@ export class PgStatement {
   }
 
   bind(...params: unknown[]): BoundStatement {
-    return new BoundStatement(this.pool, this.pgSql, params);
+    // PostgreSQL integer is 32-bit signed (max 2147483647). JS numbers exceeding
+    // this (e.g. Date.now() timestamps) must be passed as strings so pg driver
+    // doesn't try to fit them into int4. PG auto-coerces strings to bigint columns.
+    const safe = params.map(p =>
+      typeof p === 'number' && (p > 2147483647 || p < -2147483648) ? String(p) : p
+    );
+    return new BoundStatement(this.pool, this.pgSql, safe);
   }
 }
 
