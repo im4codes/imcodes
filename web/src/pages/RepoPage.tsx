@@ -321,6 +321,17 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
     fetchTab(key, 1, true);
   }, [fetchTab]);
 
+  // ── CI/CD auto-refresh when any run is "running" ───────────────────────
+  useEffect(() => {
+    if (activeTab !== 'actions') return;
+    const hasRunning = tabs.actions.items.some((r: any) => r.status === 'running' || r.status === 'queued');
+    if (!hasRunning) return;
+    const timer = setInterval(() => {
+      handleRefreshTab('actions');
+    }, 10_000);
+    return () => clearInterval(timer);
+  }, [activeTab, tabs.actions.items, handleRefreshTab]);
+
   const handleLoadMore = useCallback(() => {
     const tab = tabs[activeTab];
     if (tab.loading || !tab.hasMore) return;
@@ -733,80 +744,90 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
       : (item.updatedAt && item.createdAt ? item.updatedAt - item.createdAt : null);
     const branch = item.branch ?? item.headBranch;
     const commitMsg = item.commitMessage ?? item.headCommit?.message;
+    const fullCommitMsg = item.headCommitMessage ?? commitMsg;
     const actor = typeof item.actor === 'string' ? item.actor : item.actor?.login;
     const eventColor = item.event ? (EVENT_COLORS[item.event] ?? '#64748b') : undefined;
+    const actionKey = `actions:${item.id}`;
+    const isExpanded = expandedKey === actionKey;
     return (
-      <div key={item.id ?? item.runId} style={listItemStyle}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{
-            width: 8, height: 8, borderRadius: '50%', background: color, flexShrink: 0,
-            display: 'inline-block',
-          }} />
-          <span style={{ fontSize: 11, fontWeight: 600, color, flexShrink: 0 }}>
-            {actionStatusLabel(item.status, item.conclusion)}
-          </span>
-          <span style={{ color: '#cbd5e1', fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {item.name ?? item.workflowName ?? ''}
-          </span>
-          {item.runNumber && (
-            <span style={{ fontSize: 10, color: '#64748b', flexShrink: 0 }}>#{item.runNumber}</span>
-          )}
-          {item.event && (
+      <div key={item.id ?? item.runId}>
+        <div
+          style={{ ...listItemStyle, cursor: 'pointer' }}
+          onClick={() => setExpandedKey(isExpanded ? null : actionKey)}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span style={{
-              fontSize: 9, padding: '1px 6px', borderRadius: 9999,
-              background: `${eventColor}20`, color: eventColor, flexShrink: 0, fontWeight: 500,
-            }}>
-              {item.event}
+              width: 8, height: 8, borderRadius: '50%', background: color, flexShrink: 0,
+              display: 'inline-block',
+            }} />
+            <span style={{ fontSize: 11, fontWeight: 600, color, flexShrink: 0 }}>
+              {actionStatusLabel(item.status, item.conclusion)}
             </span>
-          )}
-          {item.url && (
-            <a
-              href={item.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{ fontSize: 11, color: '#60a5fa', flexShrink: 0, textDecoration: 'none' }}
-              onClick={(e: MouseEvent) => e.stopPropagation()}
-            >
-              {t('repo.actions_view')}
-            </a>
-          )}
-        </div>
-        <div style={{ fontSize: 11, color: '#64748b', marginTop: 4, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-          {branch && (
-            <code style={{ background: '#1e293b', padding: '1px 4px', borderRadius: 3, fontSize: 10 }}>
-              {branch}
-            </code>
-          )}
-          {item.commitSha && (
-            <code style={{ background: '#1e293b', padding: '1px 4px', borderRadius: 3, fontSize: 10, color: '#94a3b8' }}>
-              {item.commitSha}
-            </code>
-          )}
-          {actor && (
-            <span>{actor}</span>
-          )}
-          {duration != null && duration > 0 && (
-            <span>{formatDuration(duration)}</span>
-          )}
-          {item.runAttempt && item.runAttempt > 1 && (
-            <span style={{ color: '#f59e0b' }}>attempt #{item.runAttempt}</span>
-          )}
-          {item.createdAt && (
-            <span>{formatRelativeTs(item.createdAt)}</span>
-          )}
-        </div>
-        {/* Second row: commit message + workflow path */}
-        {(commitMsg || item.workflowPath) && (
-          <div style={{ fontSize: 11, color: '#475569', marginTop: 2, display: 'flex', gap: 8, alignItems: 'center' }}>
-            {item.workflowPath && (
-              <span style={{ fontSize: 10, color: '#64748b', flexShrink: 0 }}>
-                {item.workflowPath.replace(/^\.github\/workflows\//, '')}
+            <span style={{ color: '#cbd5e1', fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {item.name ?? item.workflowName ?? ''}
+            </span>
+            {item.runNumber && (
+              <span style={{ fontSize: 10, color: '#64748b', flexShrink: 0 }}>#{item.runNumber}</span>
+            )}
+            {item.event && (
+              <span style={{
+                fontSize: 9, padding: '1px 6px', borderRadius: 9999,
+                background: `${eventColor}20`, color: eventColor, flexShrink: 0, fontWeight: 500,
+              }}>
+                {item.event}
               </span>
             )}
-            {commitMsg && (
-              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
-                {commitMsg.split('\n')[0]}
-              </span>
+            {item.url && (
+              <a
+                href={item.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ fontSize: 11, color: '#60a5fa', flexShrink: 0, textDecoration: 'none' }}
+                onClick={(e: MouseEvent) => e.stopPropagation()}
+              >
+                {t('repo.actions_view')}
+              </a>
+            )}
+          </div>
+          <div style={{ fontSize: 11, color: '#64748b', marginTop: 4, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            {branch && (
+              <code style={{ background: '#1e293b', padding: '1px 4px', borderRadius: 3, fontSize: 10 }}>
+                {branch}
+              </code>
+            )}
+            {item.commitSha && (
+              <code style={{ background: '#1e293b', padding: '1px 4px', borderRadius: 3, fontSize: 10, color: '#94a3b8' }}>
+                {item.commitSha}
+              </code>
+            )}
+            {actor && <span>{actor}</span>}
+            {duration != null && duration > 0 && <span>{formatDuration(duration)}</span>}
+            {item.runAttempt && item.runAttempt > 1 && (
+              <span style={{ color: '#f59e0b' }}>attempt #{item.runAttempt}</span>
+            )}
+            {item.createdAt && <span>{formatRelativeTs(item.createdAt)}</span>}
+          </div>
+        </div>
+        {isExpanded && (
+          <div class="repo-detail-panel">
+            {item.workflowPath && (
+              <div style={{ fontSize: 11, color: '#64748b', marginBottom: 6 }}>
+                {item.workflowPath}
+              </div>
+            )}
+            {fullCommitMsg && (
+              <pre class="repo-detail-body">{fullCommitMsg}</pre>
+            )}
+            <div style={{ fontSize: 11, color: '#94a3b8', display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+              {item.conclusion && <span>Conclusion: <strong style={{ color }}>{item.conclusion}</strong></span>}
+              {item.event && <span>Trigger: <strong>{item.event}</strong></span>}
+              {duration != null && duration > 0 && <span>Duration: <strong>{formatDuration(duration)}</strong></span>}
+              {item.runAttempt && <span>Attempt: <strong>#{item.runAttempt}</strong></span>}
+              {item.createdAt && <span>Started: <strong>{formatTime(item.createdAt)}</strong></span>}
+              {item.updatedAt && item.status !== 'queued' && <span>Updated: <strong>{formatTime(item.updatedAt)}</strong></span>}
+            </div>
+            {item.url && (
+              <a href={item.url} target="_blank" rel="noopener" class="repo-detail-link">{t('repo.view_on_platform')}</a>
             )}
           </div>
         )}
@@ -841,17 +862,15 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
 
     const renderer = RENDERERS[key];
     return (
-      <div>
-        <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '4px 12px 0' }}>
-          <button
-            class="repo-detail-retry"
-            style={{ fontSize: 11, padding: '3px 10px' }}
-            onClick={() => handleRefreshTab(key)}
-            disabled={tab.loading}
-          >
-            {t('repo.refresh_tab')}
-          </button>
-        </div>
+      <div
+        onScroll={(e: Event) => {
+          const el = e.currentTarget as HTMLElement;
+          // Pull-to-refresh: when scrolled to top and user pulls, refresh
+          if (el.scrollTop === 0 && !tab.loading) {
+            handleRefreshTab(key);
+          }
+        }}
+      >
         {tab.items.map(renderer)}
         {tab.loading && (
           <div style={{ padding: 12, textAlign: 'center', color: '#94a3b8', fontSize: 12 }}>
