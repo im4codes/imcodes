@@ -19,8 +19,10 @@ worker/dist/
 mobile/ios/
 mobile/android/
 
-# Deploy script with server-specific info
+# Deploy/sync scripts with server-specific info
 scripts/deploy.sh
+scripts/sync-from-remote.sh
+scripts/sync-to-remote.sh
 
 # Discussion and plans (private)
 docs/plan/
