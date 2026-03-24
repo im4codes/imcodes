@@ -36,8 +36,7 @@ import { useTimeline } from './hooks/useTimeline.js';
 import { useSwipeBack } from './hooks/useSwipeBack.js';
 import { getActiveThinkingTs, getActiveStatusText } from './thinking-utils.js';
 import { WsClient } from './ws-client.js';
-import { resolveContextWindow } from './model-context.js';
-import { shortModelLabel } from './model-label.js';
+import { UsageFooter } from './components/UsageFooter.js';
 import { configure as configureApi, apiFetch, onAuthExpired, getUserPref, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, listP2pRuns, fetchMe } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { getAuthKey, clearAuthKey } from './biometric-auth.js';
@@ -1585,40 +1584,16 @@ export function App() {
               </div>
             )}
 
-            {lastUsage && (() => {
-              const ctx = resolveContextWindow(lastUsage.contextWindow, lastUsage.model);
-              const total = lastUsage.inputTokens + lastUsage.cacheTokens;
-              const totalPct = Math.min(100, total / ctx * 100);
-              const cachePct = Math.min(totalPct, lastUsage.cacheTokens / ctx * 100);
-              const newPct = totalPct - cachePct;
-              const fmt = (n: number) => n >= 1000000 ? `${(n / 1000000).toFixed(n % 1000000 === 0 ? 0 : 1)}M` : n >= 1000 ? `${(n / 1000).toFixed(0)}k` : String(n);
-              const pctStr = totalPct < 1 ? totalPct.toFixed(1) : totalPct.toFixed(0);
-              const tip = [
-                lastUsage.model ?? '',
-                `Context: ${fmt(total)} / ${fmt(ctx)} (${pctStr}%)`,
-                `  New: ${fmt(lastUsage.inputTokens)}  Cache: ${fmt(lastUsage.cacheTokens)}`,
-              ].filter(Boolean).join('\n');
-              return (
-                <div class="session-usage-footer" title={tip}>
-                  <div class="session-ctx-bar">
-                    <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
-                    <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
-                  </div>
-                  <div class="session-usage-stats">
-                    <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>
-                    {(activeThinkingTs || statusText) && (
-                      <span class="session-thinking-inline">
-                        <span class="chat-thinking-dots">···</span>
-                        {' '}{activeThinkingTs
-                          ? trans('chat.thinking_running', { sec: Math.max(0, Math.round((thinkingNow - activeThinkingTs) / 1000)) })
-                          : statusText}
-                      </span>
-                    )}
-                    {lastUsage.model && <span class="session-usage-tokens" style={{ color: '#818cf8', marginLeft: 'auto' }}>{shortModelLabel(lastUsage.model)}</span>}
-                  </div>
-                </div>
-              );
-            })()}
+            {lastUsage && (
+              <UsageFooter
+                usage={lastUsage}
+                sessionName={activeSession ?? ''}
+                showCost
+                activeThinkingTs={activeThinkingTs}
+                statusText={statusText}
+                now={thinkingNow}
+              />
+            )}
             <SessionControls ws={wsRef.current} activeSession={activeSessionInfo} inputRef={inputRef} onAfterAction={focusTerminal} onSend={(_name, text) => { addOptimisticUserMessage(text); scrollActiveToBottom(); }} onStopProject={handleStopProject} onRenameSession={() => activeSession && setRenameRequest(activeSession)} sessionDisplayName={activeSessionInfo?.project ?? null} quickData={quickData} detectedModel={activeSession ? detectedModels.get(activeSession) : undefined} hideShortcuts={false} activeThinking={!!activeThinkingTs} mobileFileBrowserOpen={showMobileFileBrowser} onMobileFileBrowserClose={() => setShowMobileFileBrowser(false)} sessions={sessions} subSessions={subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession }))} serverId={selectedServerId ?? undefined} />
 
             {/* Desktop floating file browser */}

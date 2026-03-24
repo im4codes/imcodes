@@ -3,13 +3,12 @@
  * Uses the full SessionControls for input (same as the main session).
  */
 import { useState, useRef, useCallback, useEffect, useMemo } from 'preact/hooks';
-import { useTranslation } from 'react-i18next';
 import { getActiveThinkingTs, getActiveStatusText, isVisuallyBusy } from '../thinking-utils.js';
-import { recordCost, getSessionCost, getWeeklyCost, getMonthlyCost, formatCost } from '../cost-tracker.js';
+import { recordCost } from '../cost-tracker.js';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
-import { resolveContextWindow } from '../model-context.js';
 import { SessionControls } from './SessionControls.js';
+import { UsageFooter } from './UsageFooter.js';
 import { useTimeline } from '../hooks/useTimeline.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import { useQuickData } from './QuickInputPanel.js';
@@ -66,7 +65,6 @@ export function SubSessionWindow({
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const swipeBackRef = useSwipeBack(isMobile ? onMinimize : null);
 
-  const { t } = useTranslation();
   const { events, refreshing } = useTimeline(sub.sessionName, ws);
   const quickData = useQuickData();
 
@@ -315,49 +313,17 @@ export function SubSessionWindow({
         )}
       </div>
 
-      {/* Usage footer — context bar + cost */}
-      {lastUsage && (() => {
-        const ctx = resolveContextWindow(lastUsage.contextWindow, lastUsage.model);
-        const total = lastUsage.inputTokens + lastUsage.cacheTokens;
-        const totalPct = Math.min(100, total / ctx * 100);
-        const cachePct = Math.min(totalPct, lastUsage.cacheTokens / ctx * 100);
-        const newPct = totalPct - cachePct;
-        const fmt = (n: number) => n >= 1000000 ? `${(n / 1000000).toFixed(n % 1000000 === 0 ? 0 : 1)}M` : n >= 1000 ? `${(n / 1000).toFixed(0)}k` : String(n);
-        const pctStr = totalPct < 1 ? totalPct.toFixed(1) : totalPct.toFixed(0);
-        const sessionCost = lastCostEvent ? getSessionCost(sub.sessionName) : 0;
-        const weeklyCost = sessionCost > 0 ? getWeeklyCost() : 0;
-        const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
-        const tip = [
-          lastUsage.model ?? '',
-          `Context: ${fmt(total)} / ${fmt(ctx)} (${pctStr}%)`,
-          `  New: ${fmt(lastUsage.inputTokens)}  Cache: ${fmt(lastUsage.cacheTokens)}`,
-        ].filter(Boolean).join('\n');
-        return (
-          <div class="session-usage-footer" title={tip}>
-            <div class="session-ctx-bar">
-              <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
-              <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
-            </div>
-            <div class="session-usage-stats">
-              {lastUsage.model && <span class="session-usage-model">{lastUsage.model}</span>}
-              <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>
-              {(activeThinkingTs || statusText) && (
-                <span class="session-thinking-inline">
-                  <span class="chat-thinking-dots">···</span>
-                  {' '}{activeThinkingTs
-                    ? t('chat.thinking_running', { sec: Math.max(0, Math.round((thinkingNow - activeThinkingTs) / 1000)) })
-                    : statusText}
-                </span>
-              )}
-              {sessionCost > 0 && (
-                <span class="session-usage-cost" style={{ marginLeft: 'auto' }}>
-                  {formatCost(sessionCost)} · wk {formatCost(weeklyCost)} · mo {formatCost(monthlyCost)}
-                </span>
-              )}
-            </div>
-          </div>
-        );
-      })()}
+      {/* Usage footer — shared component */}
+      {lastUsage && (
+        <UsageFooter
+          usage={lastUsage}
+          sessionName={sub.sessionName}
+          showCost={!!lastCostEvent}
+          activeThinkingTs={activeThinkingTs}
+          statusText={statusText}
+          now={thinkingNow}
+        />
+      )}
 
       {/* Full SessionControls — with sub-session action overrides */}
       <div onMouseDown={startDrag} style={{ cursor: 'grab' }}>
