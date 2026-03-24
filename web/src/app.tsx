@@ -1735,6 +1735,15 @@ export function App() {
             ws={wsRef.current}
             onBack={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }}
             initialSelectedId={discussionInitialId}
+            liveDiscussions={discussions}
+            onStopDiscussion={(id) => {
+              if (id.startsWith('p2p_')) {
+                wsRef.current?.send({ type: 'p2p.cancel', runId: id.slice(4) });
+                setDiscussions((prev) => prev.filter((d) => d.id !== id));
+              } else {
+                wsRef.current?.discussionStop(id);
+              }
+            }}
           />
         </div>
       )}

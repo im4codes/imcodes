@@ -607,6 +607,26 @@ body {
 .discussions-pulse { width: 6px; height: 6px; border-radius: 50%; background: #22c55e; animation: pulse-glow 1.5s ease-in-out infinite; }
 @keyframes pulse-glow { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 .discussions-empty { padding: 40px 20px; text-align: center; color: #64748b; font-size: 14px; }
+.discussions-progress-strip { padding: 8px 12px; display: flex; flex-direction: column; gap: 6px; border-bottom: 1px solid #1e293b; }
+.discussions-progress-card { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 8px 10px; }
+.discussions-markdown { padding: 16px 20px; font-size: 14px; line-height: 1.7; color: #cbd5e1; overflow-y: auto; }
+.discussions-markdown h1 { font-size: 20px; margin: 24px 0 12px; color: #f1f5f9; border-bottom: 1px solid #334155; padding-bottom: 6px; }
+.discussions-markdown h2 { font-size: 17px; margin: 20px 0 10px; color: #e2e8f0; border-bottom: 1px solid #1e293b; padding-bottom: 4px; }
+.discussions-markdown h3 { font-size: 15px; margin: 16px 0 8px; color: #e2e8f0; }
+.discussions-markdown p { margin: 8px 0; }
+.discussions-markdown ul, .discussions-markdown ol { margin: 8px 0; padding-left: 24px; }
+.discussions-markdown li { margin: 4px 0; }
+.discussions-markdown code { background: #1e293b; padding: 2px 6px; border-radius: 3px; font-size: 13px; color: #f59e0b; }
+.discussions-markdown pre { background: #0f172a; border: 1px solid #334155; border-radius: 6px; padding: 12px; overflow-x: auto; margin: 12px 0; }
+.discussions-markdown pre code { background: none; padding: 0; color: #e2e8f0; }
+.discussions-markdown blockquote { border-left: 3px solid #3b82f6; margin: 12px 0; padding: 4px 12px; color: #94a3b8; }
+.discussions-markdown table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+.discussions-markdown th, .discussions-markdown td { border: 1px solid #334155; padding: 6px 10px; text-align: left; font-size: 13px; }
+.discussions-markdown th { background: #1e293b; color: #e2e8f0; }
+.discussions-markdown hr { border: none; border-top: 1px solid #334155; margin: 16px 0; }
+.discussions-markdown strong { color: #f1f5f9; }
+.discussions-markdown a { color: #60a5fa; text-decoration: none; }
+.discussions-markdown a:hover { text-decoration: underline; }
 .discussions-detail { flex: 1; overflow-y: auto; display: flex; flex-direction: column; }
 .discussions-detail-header { padding: 16px; border-bottom: 1px solid #1e293b; }
 .discussions-detail-header h3 { margin: 0 0 8px; font-size: 16px; }

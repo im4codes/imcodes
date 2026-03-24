@@ -1,5 +1,21 @@
 import { useState, useEffect, useCallback } from 'preact/hooks';
+import { marked } from 'marked';
 import type { WsClient, ServerMessage } from '../ws-client.js';
+
+interface P2pNode {
+  label: string;
+  agentType: string;
+  status: 'done' | 'active' | 'pending' | 'skipped';
+}
+
+interface LiveDiscussion {
+  id: string;
+  topic: string;
+  state: string;
+  currentRound: number;
+  maxRounds: number;
+  nodes?: P2pNode[];
+}
 
 interface P2pDiscussion {
   id: string;
@@ -11,11 +27,16 @@ interface P2pDiscussion {
 interface Props {
   ws: WsClient | null;
   onBack: () => void;
-  /** Pre-select a discussion file by ID on open (e.g. from clicking a P2P progress card). */
   initialSelectedId?: string | null;
+  /** Live discussion state from app (progress, nodes). */
+  liveDiscussions?: LiveDiscussion[];
+  onStopDiscussion?: (id: string) => void;
 }
 
-export function DiscussionsPage({ ws, onBack, initialSelectedId }: Props) {
+// Configure marked for safe rendering
+marked.setOptions({ breaks: true, gfm: true });
+
+export function DiscussionsPage({ ws, onBack, initialSelectedId, liveDiscussions = [], onStopDiscussion }: Props) {
   const [discussions, setDiscussions] = useState<P2pDiscussion[]>([]);
   const [selected, setSelected] = useState<string | null>(initialSelectedId ?? null);
   const [content, setContent] = useState<string | null>(null);
@@ -65,6 +86,18 @@ export function DiscussionsPage({ ws, onBack, initialSelectedId }: Props) {
 
   const formatTime = (ts: number) => new Date(ts).toLocaleString();
 
+  // Find matching live discussion for progress display
+  const activeLive = liveDiscussions.filter((d) => d.state !== 'done' && d.state !== 'failed');
+
+  // Render markdown content safely
+  const renderMarkdown = (md: string): string => {
+    try {
+      return marked(md) as string;
+    } catch {
+      return `<pre>${md}</pre>`;
+    }
+  };
+
   return (
     <div class="discussions-page">
       <div class="discussions-header">
@@ -72,6 +105,49 @@ export function DiscussionsPage({ ws, onBack, initialSelectedId }: Props) {
         <h2>P2P Discussions</h2>
         <button class="btn btn-sm" onClick={loadList}>Refresh</button>
       </div>
+
+      {/* Active P2P progress cards at top */}
+      {activeLive.length > 0 && (
+        <div class="discussions-progress-strip">
+          {activeLive.map((d) => {
+            const nodes = d.nodes ?? [];
+            return (
+              <div key={d.id} class="discussions-progress-card">
+                {nodes.length > 0 && (
+                  <div style={{ display: 'flex', gap: 1, height: 4, borderRadius: 2, overflow: 'hidden', marginBottom: 6 }}>
+                    {nodes.map((n, i) => (
+                      <div key={i} style={{
+                        flex: 1,
+                        background: n.status === 'done' ? '#22c55e' : n.status === 'active' ? '#3b82f6' : n.status === 'skipped' ? '#ef4444' : '#334155',
+                        transition: 'background 0.3s',
+                      }} title={`${n.label} (${n.agentType}) — ${n.status}`} />
+                    ))}
+                  </div>
+                )}
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                  <span style={{ fontSize: 12, color: '#e2e8f0' }}>⚖️ {d.topic || 'Discussion'}</span>
+                  {onStopDiscussion && (
+                    <button class="btn btn-sm btn-danger" style={{ fontSize: 10, padding: '1px 6px' }} onClick={() => onStopDiscussion(d.id)}>Stop</button>
+                  )}
+                </div>
+                {nodes.length > 0 && (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '3px 8px', fontSize: 10, color: '#94a3b8', marginTop: 4 }}>
+                    {nodes.map((n, i) => (
+                      <span key={i} style={{
+                        color: n.status === 'done' ? '#22c55e' : n.status === 'active' ? '#60a5fa' : n.status === 'skipped' ? '#f87171' : '#475569',
+                        fontWeight: n.status === 'active' ? 600 : 400,
+                      }}>
+                        {n.status === 'done' ? '✓' : n.status === 'active' ? '▸' : n.status === 'skipped' ? '✕' : '○'}{' '}
+                        {n.label} <span style={{ opacity: 0.6 }}>({n.agentType})</span>
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       <div class="discussions-layout">
         <div class="discussions-list" style={initialSelectedId && selected ? { display: window.innerWidth < 768 ? 'none' : undefined } : undefined}>
@@ -100,9 +176,10 @@ export function DiscussionsPage({ ws, onBack, initialSelectedId }: Props) {
             <div class="discussions-empty">Loading...</div>
           )}
           {selected && content !== null && (
-            <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', padding: 16, fontSize: 13, lineHeight: 1.6, color: '#cbd5e1' }}>
-              {content}
-            </pre>
+            <div
+              class="discussions-markdown"
+              dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
+            />
           )}
         </div>
       </div>
