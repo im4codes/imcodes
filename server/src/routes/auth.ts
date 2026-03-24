@@ -363,12 +363,12 @@ authRoutes.post('/refresh', async (c) => {
     const existingCsrf = getCookie(c, COOKIE_CSRF);
     if (existingCsrf) {
       setCookie(c, COOKIE_CSRF, existingCsrf, {
-        httpOnly: false, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 86400,
+        httpOnly: false, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400,
       });
     } else {
       // CSRF cookie expired — issue a new one
       setCookie(c, COOKIE_CSRF, randomHex(32), {
-        httpOnly: false, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 86400,
+        httpOnly: false, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400,
       });
     }
     return c.json({ ok: true });
@@ -529,7 +529,7 @@ authRoutes.post('/password/login', async (c) => {
     httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400,
   });
   setCookie(c, COOKIE_CSRF, randomHex(32), {
-    httpOnly: false, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 86400,
+    httpOnly: false, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400,
   });
 
   await logAudit({ userId: user.id, action: 'auth.password_login', ip }, c.env.DB);

@@ -231,6 +231,27 @@ export async function apiFetch<T = unknown>(
     throw new ApiError(401, 'session_expired');
   }
 
+  // CSRF token mismatch (cookie expired) — refresh session to get new CSRF cookie, then retry
+  if (res.status === 403) {
+    const body = await res.text().catch(() => '');
+    if (body.includes('csrf_rejected')) {
+      console.warn(`[auth] CSRF rejected on ${path} — refreshing session for new CSRF cookie`);
+      if (!refreshPromise) {
+        refreshPromise = doRefresh().finally(() => { refreshPromise = null; });
+      }
+      try {
+        const ok = await refreshPromise;
+        if (ok) {
+          const retryRes = await rawFetch(path, opts);
+          if (!retryRes.ok) throw new ApiError(retryRes.status, await retryRes.text().catch(() => ''));
+          return retryRes.json() as Promise<T>;
+        }
+      } catch { /* refresh failed */ }
+      throw new ApiError(403, body);
+    }
+    throw new ApiError(403, body);
+  }
+
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new ApiError(res.status, body);

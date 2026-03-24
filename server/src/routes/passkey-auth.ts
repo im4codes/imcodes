@@ -80,7 +80,7 @@ function setSessionCookies(c: Context<HonoEnv>, accessToken: string, refreshToke
   const isSecure = c.env.NODE_ENV === 'production';
   setCookie(c, COOKIE_SESSION, accessToken, { httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 4 * 3600 });
   setCookie(c, 'rcc_refresh', refreshToken, { httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400 });
-  setCookie(c, 'rcc_csrf', randomHex(32), { httpOnly: false, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 86400 });
+  setCookie(c, 'rcc_csrf', randomHex(32), { httpOnly: false, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400 });
 }
 
 async function storeRefreshToken(db: Env['DB'], userId: string, refreshHash: string): Promise<void> {

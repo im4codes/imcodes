@@ -234,7 +234,7 @@ githubAuthRoutes.get('/callback', async (c): Promise<Response> => {
     secure: isSecure,
     sameSite: 'Lax',
     path: '/',
-    maxAge: 86400,
+    maxAge: 30 * 86400,
   });
 
   c.header('Cache-Control', 'no-store');
