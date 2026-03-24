@@ -11,7 +11,7 @@
  * State-changing ops use Idempotency-Key stored in idempotency_records (24h TTL).
  */
 
-import type { PgDatabase } from '../db/client.js';
+import type { Database } from '../db/client.js';
 
 const TIMESTAMP_TOLERANCE_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -39,12 +39,12 @@ export function verifyTimestamp(req: Request): boolean {
 export async function checkIdempotency(
   key: string,
   userId: string,
-  db: PgDatabase,
+  db: Database,
 ): Promise<{ status: number; body: string } | null> {
-  const row = await db
-    .prepare('SELECT response_status, response_body FROM idempotency_records WHERE key = ? AND user_id = ?')
-    .bind(key, userId)
-    .first<{ response_status: number; response_body: string }>();
+  const row = await db.queryOne<{ response_status: number; response_body: string }>(
+    'SELECT response_status, response_body FROM idempotency_records WHERE key = $1 AND user_id = $2',
+    [key, userId],
+  );
 
   if (!row) return null;
   return { status: row.response_status, body: row.response_body };
@@ -58,25 +58,20 @@ export async function recordIdempotency(
   userId: string,
   status: number,
   body: string,
-  db: PgDatabase,
+  db: Database,
 ): Promise<void> {
-  await db
-    .prepare(
-      'INSERT INTO idempotency_records (key, user_id, response_status, response_body, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING',
-    )
-    .bind(key, userId, status, body, Date.now())
-    .run();
+  await db.execute(
+    'INSERT INTO idempotency_records (key, user_id, response_status, response_body, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING',
+    [key, userId, status, body, Date.now()],
+  );
 }
 
 /**
  * Clean up idempotency records older than 24 hours.
  * Called by scheduled cron.
  */
-export async function cleanupIdempotencyRecords(db: PgDatabase): Promise<number> {
+export async function cleanupIdempotencyRecords(db: Database): Promise<number> {
   const cutoff = Date.now() - 24 * 3600 * 1000;
-  const result = await db
-    .prepare('DELETE FROM idempotency_records WHERE created_at < ?')
-    .bind(cutoff)
-    .run();
+  const result = await db.execute('DELETE FROM idempotency_records WHERE created_at < $1', [cutoff]);
   return result.changes ?? 0;
 }

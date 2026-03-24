@@ -15,7 +15,7 @@ import { stat, readFile } from 'node:fs/promises';
 import type { IncomingMessage } from 'node:http';
 
 import { loadEnv, type Env, type EnvConfig } from './env.js';
-import { createDatabase, type PgDatabase } from './db/client.js';
+import { createDatabase, type Database } from './db/client.js';
 import { runMigrations } from './db/migrate.js';
 import { randomHex, hashPassword } from './security/crypto.js';
 import { authRoutes } from './routes/auth.js';
@@ -379,8 +379,8 @@ function scheduleCrons(env: Env) {
 
 // ── Default admin ─────────────────────────────────────────────────────────────
 
-async function ensureDefaultAdmin(db: PgDatabase, envConfig: EnvConfig): Promise<void> {
-  const row = await db.prepare('SELECT COUNT(*) AS cnt FROM users').bind().first<{ cnt: number }>();
+async function ensureDefaultAdmin(db: Database, envConfig: EnvConfig): Promise<void> {
+  const row = await db.queryOne<{ cnt: number }>('SELECT COUNT(*) AS cnt FROM users');
   if (row && Number(row.cnt) > 0) return;
 
   const userId = randomHex(16);
@@ -388,9 +388,10 @@ async function ensureDefaultAdmin(db: PgDatabase, envConfig: EnvConfig): Promise
   const passwordHash = await hashPassword(password);
   const now = Date.now();
 
-  await db.prepare(
-    'INSERT INTO users (id, username, password_hash, display_name, password_must_change, is_admin, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-  ).bind(userId, 'admin', passwordHash, 'Admin', true, true, 'active', now).run();
+  await db.execute(
+    'INSERT INTO users (id, username, password_hash, display_name, password_must_change, is_admin, status, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+    [userId, 'admin', passwordHash, 'Admin', true, true, 'active', now],
+  );
 
   logger.info({ username: 'admin' }, 'Default admin account created (password_must_change=true)');
 }

@@ -33,9 +33,10 @@ webhookRoutes.post('/:platform/:botId', async (c) => {
   }
 
   // Load per-user bot config from DB and decrypt
-  const row = await c.env.DB.prepare(
-    'SELECT id, user_id, platform, config_encrypted FROM platform_bots WHERE id = ? AND platform = ?',
-  ).bind(botId, platform).first<{ id: string; user_id: string; platform: string; config_encrypted: string }>();
+  const row = await c.env.DB.queryOne<{ id: string; user_id: string; platform: string; config_encrypted: string }>(
+    'SELECT id, user_id, platform, config_encrypted FROM platform_bots WHERE id = $1 AND platform = $2',
+    [botId, platform],
+  );
 
   if (!row) {
     return c.json({ error: 'bot_not_found' }, 404);

@@ -16,11 +16,11 @@ const cronJobSchema = z.object({
 // GET /api/cron — list user's cron jobs
 cronApiRoutes.get('/', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
-  const jobs = await c.env.DB
-    .prepare("SELECT * FROM cron_jobs WHERE user_id = ? ORDER BY created_at DESC")
-    .bind(userId)
-    .all();
-  return c.json({ jobs: jobs.results });
+  const jobs = await c.env.DB.query(
+    "SELECT * FROM cron_jobs WHERE user_id = $1 ORDER BY created_at DESC",
+    [userId],
+  );
+  return c.json({ jobs });
 });
 
 // POST /api/cron — create a cron job
@@ -34,12 +34,10 @@ cronApiRoutes.post('/', requireAuth(), async (c) => {
   const id = randomHex(16);
   const now = Date.now();
 
-  await c.env.DB
-    .prepare(
-      "INSERT INTO cron_jobs (id, user_id, name, schedule, action, status, next_run_at, created_at) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)",
-    )
-    .bind(id, userId, name, schedule, action, now + 60_000, now)
-    .run();
+  await c.env.DB.execute(
+    "INSERT INTO cron_jobs (id, user_id, name, schedule, action, status, next_run_at, created_at) VALUES ($1, $2, $3, $4, $5, 'active', $6, $7)",
+    [id, userId, name, schedule, action, now + 60_000, now],
+  );
 
   await logAudit({ userId, action: 'cron.create', details: { id, name, schedule } }, c.env.DB);
 
@@ -54,16 +52,16 @@ cronApiRoutes.put('/:id', requireAuth(), async (c) => {
   const parsed = cronJobSchema.partial().safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
-  const job = await c.env.DB
-    .prepare('SELECT * FROM cron_jobs WHERE id = ? AND user_id = ?')
-    .bind(jobId, userId)
-    .first();
+  const job = await c.env.DB.queryOne(
+    'SELECT * FROM cron_jobs WHERE id = $1 AND user_id = $2',
+    [jobId, userId],
+  );
   if (!job) return c.json({ error: 'not_found' }, 404);
 
   const updates = parsed.data;
-  if (updates.name) await c.env.DB.prepare('UPDATE cron_jobs SET name = ? WHERE id = ?').bind(updates.name, jobId).run();
-  if (updates.schedule) await c.env.DB.prepare('UPDATE cron_jobs SET schedule = ? WHERE id = ?').bind(updates.schedule, jobId).run();
-  if (updates.action) await c.env.DB.prepare('UPDATE cron_jobs SET action = ? WHERE id = ?').bind(updates.action, jobId).run();
+  if (updates.name) await c.env.DB.execute('UPDATE cron_jobs SET name = $1 WHERE id = $2', [updates.name, jobId]);
+  if (updates.schedule) await c.env.DB.execute('UPDATE cron_jobs SET schedule = $1 WHERE id = $2', [updates.schedule, jobId]);
+  if (updates.action) await c.env.DB.execute('UPDATE cron_jobs SET action = $1 WHERE id = $2', [updates.action, jobId]);
 
   await logAudit({ userId, action: 'cron.update', details: { id: jobId } }, c.env.DB);
   return c.json({ ok: true });
@@ -74,12 +72,12 @@ cronApiRoutes.delete('/:id', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const jobId = c.req.param('id');
 
-  const result = await c.env.DB
-    .prepare('DELETE FROM cron_jobs WHERE id = ? AND user_id = ?')
-    .bind(jobId, userId)
-    .run();
+  const result = await c.env.DB.execute(
+    'DELETE FROM cron_jobs WHERE id = $1 AND user_id = $2',
+    [jobId, userId],
+  );
 
-  if ((result.changes ?? 0) === 0) return c.json({ error: 'not_found' }, 404);
+  if (result.changes === 0) return c.json({ error: 'not_found' }, 404);
 
   await logAudit({ userId, action: 'cron.delete', details: { id: jobId } }, c.env.DB);
   return c.json({ ok: true });

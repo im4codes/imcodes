@@ -22,11 +22,10 @@ bindRoutes.post('/initiate', requireAuth(), async (c) => {
   const code = randomHex(4).toUpperCase(); // 8-char hex code
   const expiresAt = Date.now() + BIND_CODE_TTL_MS;
 
-  await c.env.DB.prepare(
-    'INSERT INTO pending_binds (code, user_id, server_name, expires_at, created_at) VALUES (?, ?, ?, ?, ?)',
-  )
-    .bind(code, userId, serverName, expiresAt, Date.now())
-    .run();
+  await c.env.DB.execute(
+    'INSERT INTO pending_binds (code, user_id, server_name, expires_at, created_at) VALUES ($1, $2, $3, $4, $5)',
+    [code, userId, serverName, expiresAt, Date.now()],
+  );
 
   return c.json({ code, expiresAt });
 });
@@ -38,11 +37,10 @@ bindRoutes.post('/confirm', async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
   const { code } = parsed.data;
-  const pending = await c.env.DB.prepare(
-    'SELECT * FROM pending_binds WHERE code = ? AND expires_at > ?',
-  )
-    .bind(code, Date.now())
-    .first<{ code: string; user_id: string; server_name: string }>();
+  const pending = await c.env.DB.queryOne<{ code: string; user_id: string; server_name: string }>(
+    'SELECT * FROM pending_binds WHERE code = $1 AND expires_at > $2',
+    [code, Date.now()],
+  );
 
   if (!pending) return c.json({ error: 'invalid_code' }, 404);
 
@@ -54,7 +52,7 @@ bindRoutes.post('/confirm', async (c) => {
   await createServer(c.env.DB, serverId, pending.user_id, pending.server_name, tokenHash);
 
   // Consume the bind code
-  await c.env.DB.prepare('DELETE FROM pending_binds WHERE code = ?').bind(code).run();
+  await c.env.DB.execute('DELETE FROM pending_binds WHERE code = $1', [code]);
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
   await logAudit({ userId: pending.user_id, action: 'bind.confirm', ip, details: { serverId } }, c.env.DB);

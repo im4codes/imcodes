@@ -4,7 +4,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { buildApp } from '../src/index.js';
 import type { Env } from '../src/env.js';
-import type { PgDatabase } from '../src/db/client.js';
+import type { Database } from '../src/db/client.js';
 
 vi.mock('../src/security/crypto.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../src/security/crypto.js')>();
@@ -21,93 +21,97 @@ vi.mock('../src/security/crypto.js', async (importOriginal) => {
 
 // ── In-memory mock DB ─────────────────────────────────────────────────────────
 
-function makeMemDb(): PgDatabase {
+function makeMemDb(): Database {
   const users = new Map<string, { id: string; created_at: number }>();
   const apiKeys = new Map<string, { id: string; user_id: string; key_hash: string; created_at: number }>();
   const servers = new Map<string, { id: string; user_id: string; name: string; token_hash: string; status: string; last_heartbeat_at: number | null; created_at: number }>();
   const idempotency = new Map<string, { body: string; status: number }>();
   const auditLog: unknown[] = [];
 
+  function normalize(sql: string): string {
+    return sql.toLowerCase().replace(/\s+/g, ' ').trim();
+  }
+
   return {
-    prepare: (sql: string) => ({
-      bind: (...args: unknown[]) => ({
-        first: async <T = unknown>(): Promise<T | null> => {
-          const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+    queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
+      const s = normalize(sql);
 
-          if (s.includes('from users where id')) {
-            return (users.get(args[0] as string) ?? null) as T | null;
+      if (s.includes('from users where id')) {
+        return (users.get(params[0] as string) ?? null) as T | null;
+      }
+      if (s.includes('from api_keys where key_hash')) {
+        for (const k of apiKeys.values()) {
+          if (k.key_hash === params[0]) return { id: k.id, user_id: k.user_id } as T;
+        }
+        return null;
+      }
+      if (s.includes('from servers where id')) {
+        return (servers.get(params[0] as string) ?? null) as T | null;
+      }
+      if (s.includes('from servers where token_hash')) {
+        for (const sv of servers.values()) {
+          if (sv.token_hash === params[0] && sv.id === params[1]) {
+            return { id: sv.id, user_id: sv.user_id } as T;
           }
-          if (s.includes('from api_keys where key_hash')) {
-            for (const k of apiKeys.values()) {
-              if (k.key_hash === args[0]) return { id: k.id, user_id: k.user_id } as T;
-            }
-            return null;
-          }
-          if (s.includes('from servers where id')) {
-            return (servers.get(args[0] as string) ?? null) as T | null;
-          }
-          if (s.includes('from servers where token_hash')) {
-            for (const sv of servers.values()) {
-              if (sv.token_hash === args[0] && sv.id === args[1]) {
-                return { id: sv.id, user_id: sv.user_id } as T;
-              }
-            }
-            return null;
-          }
-          if (s.includes('from idempotency_cache')) {
-            return (idempotency.get(args[0] as string) ?? null) as T | null;
-          }
-          return null;
-        },
-        all: async <T = unknown>() => ({ results: [] as T[] }),
-        run: async () => {
-          const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+        }
+        return null;
+      }
+      if (s.includes('from idempotency_cache')) {
+        return (idempotency.get(params[0] as string) ?? null) as T | null;
+      }
+      return null;
+    },
+    query: async <T = unknown>(): Promise<T[]> => {
+      return [] as T[];
+    },
+    execute: async (sql: string, params: unknown[] = []): Promise<{ changes: number }> => {
+      const s = normalize(sql);
 
-          if (s.includes('insert into users')) {
-            users.set(args[0] as string, { id: args[0] as string, created_at: args[1] as number });
-          }
-          if (s.includes('insert into api_keys')) {
-            apiKeys.set(args[0] as string, {
-              id: args[0] as string,
-              user_id: args[1] as string,
-              key_hash: args[2] as string,
-              created_at: args[3] as number,
-            });
-          }
-          if (s.includes('insert into servers')) {
-            servers.set(args[0] as string, {
-              id: args[0] as string,
-              user_id: args[1] as string,
-              name: args[2] as string,
-              token_hash: args[3] as string,
-              status: 'offline',
-              last_heartbeat_at: null,
-              created_at: args[5] as number,
-            });
-            return { changes: 1 };
-          }
-          if (s.includes('update servers set token_hash')) {
-            // args: tokenHash, name, bound_with_key_id, id, userId
-            const [tokenHash, name, , id, userId] = args as string[];
-            const sv = servers.get(id);
-            if (sv && sv.user_id === userId) {
-              sv.token_hash = tokenHash;
-              sv.name = name;
-              return { changes: 1 };
-            }
-            return { changes: 0 };
-          }
-          if (s.includes('insert into idempotency_cache')) {
-            idempotency.set(args[0] as string, { body: args[3] as string, status: args[2] as number });
-          }
-          if (s.includes('insert into audit_log')) {
-            auditLog.push(args);
-          }
+      if (s.includes('insert into users')) {
+        users.set(params[0] as string, { id: params[0] as string, created_at: params[1] as number });
+      }
+      if (s.includes('insert into api_keys')) {
+        apiKeys.set(params[0] as string, {
+          id: params[0] as string,
+          user_id: params[1] as string,
+          key_hash: params[2] as string,
+          created_at: params[3] as number,
+        });
+      }
+      if (s.includes('insert into servers')) {
+        servers.set(params[0] as string, {
+          id: params[0] as string,
+          user_id: params[1] as string,
+          name: params[2] as string,
+          token_hash: params[3] as string,
+          status: 'offline',
+          last_heartbeat_at: null,
+          created_at: params[5] as number,
+        });
+        return { changes: 1 };
+      }
+      if (s.includes('update servers set token_hash')) {
+        // params: tokenHash, name, bound_with_key_id, id, userId
+        const [tokenHash, name, , id, userId] = params as string[];
+        const sv = servers.get(id);
+        if (sv && sv.user_id === userId) {
+          sv.token_hash = tokenHash;
+          sv.name = name;
           return { changes: 1 };
-        },
-      }),
-    }),
-  } as unknown as PgDatabase;
+        }
+        return { changes: 0 };
+      }
+      if (s.includes('insert into idempotency_cache')) {
+        idempotency.set(params[0] as string, { body: params[3] as string, status: params[2] as number });
+      }
+      if (s.includes('insert into audit_log')) {
+        auditLog.push(params);
+      }
+      return { changes: 1 };
+    },
+    exec: async () => {},
+    close: async () => {},
+  } as unknown as Database;
 }
 
 function makeEnv(): Env {

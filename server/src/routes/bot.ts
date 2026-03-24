@@ -47,9 +47,10 @@ botRoutes.post('/', async (c) => {
   const now = Date.now();
   const configEncrypted = encryptBotConfig(config, c.env.BOT_ENCRYPTION_KEY);
 
-  await c.env.DB.prepare(
-    'INSERT INTO platform_bots (id, user_id, platform, label, config_encrypted, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-  ).bind(botId, userId, platform, label ?? null, configEncrypted, now, now).run();
+  await c.env.DB.execute(
+    'INSERT INTO platform_bots (id, user_id, platform, label, config_encrypted, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+    [botId, userId, platform, label ?? null, configEncrypted, now, now],
+  );
 
   await logAudit({ userId, action: 'bot.register', details: { botId, platform } }, c.env.DB);
 
@@ -66,12 +67,13 @@ botRoutes.post('/', async (c) => {
 botRoutes.get('/', async (c) => {
   const userId = c.get('userId' as never) as string;
 
-  const rows = await c.env.DB.prepare(
-    'SELECT id, platform, label, created_at FROM platform_bots WHERE user_id = ? ORDER BY created_at DESC',
-  ).bind(userId).all<{ id: string; platform: string; label: string | null; created_at: number }>();
+  const rows = await c.env.DB.query<{ id: string; platform: string; label: string | null; created_at: number }>(
+    'SELECT id, platform, label, created_at FROM platform_bots WHERE user_id = $1 ORDER BY created_at DESC',
+    [userId],
+  );
 
   return c.json({
-    bots: (rows.results ?? []).map((r) => ({
+    bots: rows.map((r) => ({
       botId: r.id,
       platform: r.platform,
       label: r.label,
@@ -100,13 +102,14 @@ botRoutes.delete('/:botId', async (c) => {
   const userId = c.get('userId' as never) as string;
   const botId = c.req.param('botId');
 
-  const row = await c.env.DB.prepare(
-    'SELECT id FROM platform_bots WHERE id = ? AND user_id = ?',
-  ).bind(botId, userId).first<{ id: string }>();
+  const row = await c.env.DB.queryOne<{ id: string }>(
+    'SELECT id FROM platform_bots WHERE id = $1 AND user_id = $2',
+    [botId, userId],
+  );
 
   if (!row) return c.json({ error: 'not_found' }, 404);
 
-  await c.env.DB.prepare('DELETE FROM platform_bots WHERE id = ?').bind(botId).run();
+  await c.env.DB.execute('DELETE FROM platform_bots WHERE id = $1', [botId]);
 
   await logAudit({ userId, action: 'bot.delete', details: { botId } }, c.env.DB);
 
@@ -125,9 +128,10 @@ botRoutes.patch('/:botId', async (c) => {
     return c.json({ error: 'server_misconfigured' }, 500);
   }
 
-  const row = await c.env.DB.prepare(
-    'SELECT id, platform, config_encrypted FROM platform_bots WHERE id = ? AND user_id = ?',
-  ).bind(botId, userId).first<{ id: string; platform: string; config_encrypted: string }>();
+  const row = await c.env.DB.queryOne<{ id: string; platform: string; config_encrypted: string }>(
+    'SELECT id, platform, config_encrypted FROM platform_bots WHERE id = $1 AND user_id = $2',
+    [botId, userId],
+  );
 
   if (!row) return c.json({ error: 'not_found' }, 404);
 
@@ -159,9 +163,10 @@ botRoutes.patch('/:botId', async (c) => {
     newEncrypted = encryptBotConfig(merged, c.env.BOT_ENCRYPTION_KEY);
   }
 
-  await c.env.DB.prepare(
-    'UPDATE platform_bots SET label = COALESCE(?, label), config_encrypted = ?, updated_at = ? WHERE id = ?',
-  ).bind(label ?? null, newEncrypted, Date.now(), botId).run();
+  await c.env.DB.execute(
+    'UPDATE platform_bots SET label = COALESCE($1, label), config_encrypted = $2, updated_at = $3 WHERE id = $4',
+    [label ?? null, newEncrypted, Date.now(), botId],
+  );
 
   return c.json({ ok: true });
 });

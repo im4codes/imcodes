@@ -1,30 +1,50 @@
 /**
  * DB integration tests — runs against a real PostgreSQL via testcontainers.
- *
- * Tests:
- *  1. convertPlaceholders()  — pure function, no DB
- *  2. Migration              — DDL runs cleanly, all tables created
- *  3. PgDatabase wrapper     — .first() / .all() / .run() roundtrip
- *  4. ON CONFLICT            — DO NOTHING and DO UPDATE actually work
- *  5. queries.ts helpers     — createUser, createServer, upsert, heartbeat
- *  6. Composite PK isolation — multi-server id collision safety
+ * Full coverage of every exported query function in queries.ts.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { createDatabase, convertPlaceholders, type PgDatabase } from '../src/db/client.js';
+import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import {
   createUser,
   getUserById,
+  getUserByUsername,
+  listAllUsers,
+  updateUserStatus,
+  deleteUser,
+  countActiveAdmins,
+  getSetting,
+  setSetting,
+  getAllSettings,
   createServer,
   getServerById,
   updateServerHeartbeat,
+  updateServerStatus,
+  updateServerName,
+  updateServerToken,
+  deleteServer,
   upsertPlatformIdentity,
   getUserByPlatformId,
   getServersByUserId,
+  upsertChannelBinding,
+  getChannelBinding,
+  findChannelBindingByPlatformChannel,
+  getDbSessionsByServer,
+  upsertDbSession,
+  deleteDbSession,
+  updateSessionLabel,
+  updateProjectName,
+  getQuickData,
+  upsertQuickData,
+  getUserPref,
+  setUserPref,
+  deleteUserPref,
   createSubSession,
   getSubSessionsByServer,
   getSubSessionById,
+  updateSubSession,
+  reorderSubSessions,
   deleteSubSession,
   upsertDiscussion,
   getDiscussionById,
@@ -35,12 +55,14 @@ import {
   getOrchestrationRunById,
   getActiveOrchestrationRuns,
   getOrchestrationRunsByDiscussion,
+  getRecentOrchestrationRuns,
+  writeAuditLog,
   type DbOrchestrationRun,
 } from '../src/db/queries.js';
 
 // ── DB lifecycle — container is managed by globalSetup ────────────────────────
 
-let db: PgDatabase;
+let db: Database;
 
 beforeAll(async () => {
   // TEST_DATABASE_URL is set by test/setup/integration-global.ts
@@ -52,28 +74,7 @@ afterAll(async () => {
   await db.close();
 });
 
-// ── 1. convertPlaceholders ────────────────────────────────────────────────────
-
-describe('convertPlaceholders', () => {
-  it('converts ? to $1, $2, ...', () => {
-    expect(convertPlaceholders('SELECT * FROM t WHERE id = ?')).toBe('SELECT * FROM t WHERE id = $1');
-    expect(convertPlaceholders('INSERT INTO t (a, b) VALUES (?, ?)')).toBe('INSERT INTO t (a, b) VALUES ($1, $2)');
-  });
-
-  it('does not convert ? inside single-quoted strings', () => {
-    expect(convertPlaceholders("SELECT '?' FROM t WHERE id = ?")).toBe("SELECT '?' FROM t WHERE id = $1");
-  });
-
-  it('does not convert ? inside double-quoted identifiers', () => {
-    expect(convertPlaceholders('SELECT "col?" FROM t WHERE id = ?')).toBe('SELECT "col?" FROM t WHERE id = $1');
-  });
-
-  it('handles escaped single quotes (\'\')', () => {
-    expect(convertPlaceholders("SELECT 'it''s' WHERE id = ?")).toBe("SELECT 'it''s' WHERE id = $1");
-  });
-});
-
-// ── 2. Migration ──────────────────────────────────────────────────────────────
+// ── 1. Migration ──────────────────────────────────────────────────────────────
 
 describe('runMigrations', () => {
   it('creates all expected tables', async () => {
@@ -85,10 +86,10 @@ describe('runMigrations', () => {
     ];
 
     for (const table of tables) {
-      const row = await db
-        .prepare("SELECT to_regclass($1) AS oid")
-        .bind(`public.${table}`)
-        .first<{ oid: string | null }>();
+      const row = await db.queryOne<{ oid: string | null }>(
+        "SELECT to_regclass($1) AS oid",
+        [`public.${table}`],
+      );
       expect(row?.oid, `table ${table} should exist`).not.toBeNull();
     }
   });
@@ -98,47 +99,47 @@ describe('runMigrations', () => {
   });
 });
 
-// ── 3. PgDatabase wrapper ─────────────────────────────────────────────────────
+// ── 2. Database wrapper ─────────────────────────────────────────────────────
 
-describe('PgDatabase wrapper', () => {
-  it('.first() returns null for missing row', async () => {
-    const row = await db.prepare('SELECT * FROM users WHERE id = ?').bind('no-such-id').first();
+describe('Database wrapper', () => {
+  it('.queryOne() returns null for missing row', async () => {
+    const row = await db.queryOne('SELECT * FROM users WHERE id = $1', ['no-such-id']);
     expect(row).toBeNull();
   });
 
-  it('.run() returns changes count', async () => {
-    const result = await db
-      .prepare('INSERT INTO users (id, created_at) VALUES (?, ?)')
-      .bind('wrapper-test-user', Date.now())
-      .run();
+  it('.execute() returns changes count', async () => {
+    const result = await db.execute(
+      'INSERT INTO users (id, created_at) VALUES ($1, $2)',
+      ['wrapper-test-user', Date.now()],
+    );
     expect(result.changes).toBe(1);
   });
 
-  it('.all() returns all matching rows', async () => {
+  it('.query() returns all matching rows', async () => {
     const userId = 'alltest-' + Math.random().toString(36).slice(2);
-    await db.prepare('INSERT INTO users (id, created_at) VALUES (?, ?)').bind(userId, Date.now()).run();
+    await db.execute('INSERT INTO users (id, created_at) VALUES ($1, $2)', [userId, Date.now()]);
 
-    const result = await db
-      .prepare('SELECT * FROM users WHERE id = ?')
-      .bind(userId)
-      .all<{ id: string }>();
-    expect(result.results).toHaveLength(1);
-    expect(result.results[0].id).toBe(userId);
+    const rows = await db.query<{ id: string }>(
+      'SELECT * FROM users WHERE id = $1',
+      [userId],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe(userId);
   });
 });
 
-// ── 4. ON CONFLICT ────────────────────────────────────────────────────────────
+// ── 3. ON CONFLICT ────────────────────────────────────────────────────────────
 
 describe('ON CONFLICT', () => {
   it('DO NOTHING silently ignores duplicate', async () => {
     const id = 'conflict-test-' + Math.random().toString(36).slice(2);
-    await db.prepare('INSERT INTO users (id, created_at) VALUES (?, ?)').bind(id, Date.now()).run();
+    await db.execute('INSERT INTO users (id, created_at) VALUES ($1, $2)', [id, Date.now()]);
 
     // Second insert should not throw
-    const result = await db
-      .prepare('INSERT INTO users (id, created_at) VALUES (?, ?) ON CONFLICT (id) DO NOTHING')
-      .bind(id, Date.now())
-      .run();
+    const result = await db.execute(
+      'INSERT INTO users (id, created_at) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING',
+      [id, Date.now()],
+    );
     expect(result.changes).toBe(0); // nothing inserted
   });
 
@@ -150,24 +151,26 @@ describe('ON CONFLICT', () => {
     const data2 = JSON.stringify({ history: ['b'], commands: [], phrases: [] });
     const now = Date.now();
 
-    await db.prepare(
-      'INSERT INTO user_quick_data (user_id, data, updated_at) VALUES (?, ?, ?) ON CONFLICT (user_id) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at',
-    ).bind(userId, data1, now).run();
+    await db.execute(
+      'INSERT INTO user_quick_data (user_id, data, updated_at) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at',
+      [userId, data1, now],
+    );
 
     // Upsert again — should update
-    await db.prepare(
-      'INSERT INTO user_quick_data (user_id, data, updated_at) VALUES (?, ?, ?) ON CONFLICT (user_id) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at',
-    ).bind(userId, data2, now + 1).run();
+    await db.execute(
+      'INSERT INTO user_quick_data (user_id, data, updated_at) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at',
+      [userId, data2, now + 1],
+    );
 
-    const row = await db
-      .prepare('SELECT data FROM user_quick_data WHERE user_id = ?')
-      .bind(userId)
-      .first<{ data: string }>();
+    const row = await db.queryOne<{ data: string }>(
+      'SELECT data FROM user_quick_data WHERE user_id = $1',
+      [userId],
+    );
     expect(JSON.parse(row!.data).history).toEqual(['b']);
   });
 });
 
-// ── 5. queries.ts helpers ─────────────────────────────────────────────────────
+// ── 4. queries.ts helpers ─────────────────────────────────────────────────────
 
 describe('queries.ts', () => {
   let userId: string;
@@ -212,6 +215,98 @@ describe('queries.ts', () => {
     expect(servers.some((s) => s.id === serverId)).toBe(true);
   });
 
+  it('getUserByUsername roundtrip', async () => {
+    const uid = 'uname-' + Math.random().toString(36).slice(2);
+    await createUser(db, uid);
+    await db.execute('UPDATE users SET username = $1 WHERE id = $2', ['testuser_' + uid, uid]);
+    const fetched = await getUserByUsername(db, 'testuser_' + uid);
+    expect(fetched?.id).toBe(uid);
+    expect(await getUserByUsername(db, 'nonexistent-user')).toBeNull();
+  });
+
+  it('listAllUsers returns all users', async () => {
+    const users = await listAllUsers(db);
+    expect(users.length).toBeGreaterThan(0);
+  });
+
+  it('updateUserStatus changes user status', async () => {
+    const uid = 'status-' + Math.random().toString(36).slice(2);
+    await createUser(db, uid);
+    await updateUserStatus(db, uid, 'disabled');
+    const u = await getUserById(db, uid);
+    expect(u?.status).toBe('disabled');
+    await updateUserStatus(db, uid, 'active');
+    const u2 = await getUserById(db, uid);
+    expect(u2?.status).toBe('active');
+  });
+
+  it('deleteUser cascades credentials', async () => {
+    const uid = 'del-' + Math.random().toString(36).slice(2);
+    await createUser(db, uid);
+    await deleteUser(db, uid);
+    expect(await getUserById(db, uid)).toBeNull();
+  });
+
+  it('countActiveAdmins returns correct count', async () => {
+    const uid = 'admin-cnt-' + Math.random().toString(36).slice(2);
+    await createUser(db, uid);
+    await db.execute('UPDATE users SET is_admin = TRUE, status = $1 WHERE id = $2', ['active', uid]);
+    const cnt = await countActiveAdmins(db);
+    expect(cnt).toBeGreaterThanOrEqual(1);
+  });
+
+  it('getSetting / setSetting / getAllSettings roundtrip', async () => {
+    const key = 'test_key_' + Math.random().toString(36).slice(2);
+    expect(await getSetting(db, key)).toBeNull();
+    await setSetting(db, key, 'hello');
+    expect(await getSetting(db, key)).toBe('hello');
+    await setSetting(db, key, 'updated');
+    expect(await getSetting(db, key)).toBe('updated');
+    const all = await getAllSettings(db);
+    expect(all[key]).toBe('updated');
+  });
+
+  it('updateServerStatus changes status', async () => {
+    await updateServerStatus(db, serverId, 'offline');
+    const s = await getServerById(db, serverId);
+    expect(s?.status).toBe('offline');
+  });
+
+  it('updateServerName changes name', async () => {
+    const ok = await updateServerName(db, serverId, userId, 'renamed-server');
+    expect(ok).toBe(true);
+    const s = await getServerById(db, serverId);
+    expect(s?.name).toBe('renamed-server');
+    // Wrong userId should fail
+    const notOk = await updateServerName(db, serverId, 'wrong-user', 'bad-name');
+    expect(notOk).toBe(false);
+  });
+
+  it('updateServerToken updates token hash', async () => {
+    const ok = await updateServerToken(db, serverId, userId, 'new-hash', 'token-updated-server');
+    expect(ok).toBe(true);
+    const s = await getServerById(db, serverId);
+    expect(s?.token_hash).toBe('new-hash');
+    expect(s?.name).toBe('token-updated-server');
+  });
+
+  it('updateServerHeartbeat with daemonVersion', async () => {
+    await updateServerHeartbeat(db, serverId, '1.2.3');
+    const s = await getServerById(db, serverId);
+    expect(s?.daemon_version).toBe('1.2.3');
+    expect(s?.status).toBe('online');
+  });
+
+  it('deleteServer cascades and returns boolean', async () => {
+    const sid = 'del-srv-' + Math.random().toString(36).slice(2);
+    await createServer(db, sid, userId, 'to-delete', 'hash-del');
+    const ok = await deleteServer(db, sid, userId);
+    expect(ok).toBe(true);
+    expect(await getServerById(db, sid)).toBeNull();
+    const notOk = await deleteServer(db, sid, userId);
+    expect(notOk).toBe(false);
+  });
+
   it('upsertPlatformIdentity DO NOTHING on duplicate', async () => {
     const pid = 'plat-' + Math.random().toString(36).slice(2);
     await upsertPlatformIdentity(db, pid, userId, 'discord', 'disc-user-1');
@@ -226,7 +321,241 @@ describe('queries.ts', () => {
   });
 });
 
-// ── 6. Composite PK multi-server isolation ────────────────────────────────────
+// ── 5. Channel bindings ───────────────────────────────────────────────────────
+
+describe('channel bindings', () => {
+  let userId: string;
+  let serverId: string;
+  const botId = 'cb-bot-' + Math.random().toString(36).slice(2);
+
+  beforeAll(async () => {
+    userId = 'cb-user-' + Math.random().toString(36).slice(2);
+    serverId = 'cb-srv-' + Math.random().toString(36).slice(2);
+    await createUser(db, userId);
+    await createServer(db, serverId, userId, 'cb-server', 'hash-cb');
+    // Create a platform bot to satisfy FK constraint on channel_bindings
+    const now = Date.now();
+    await db.execute(
+      'INSERT INTO platform_bots (id, user_id, platform, label, config_encrypted, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [botId, userId, 'discord', 'test-bot', 'encrypted', now, now],
+    );
+  });
+
+  it('upsertChannelBinding / getChannelBinding roundtrip', async () => {
+    const bid = 'bind-' + Math.random().toString(36).slice(2);
+    await upsertChannelBinding(db, bid, serverId, 'discord', 'ch-123', 'session', 'brain', botId);
+    const b = await getChannelBinding(db, 'discord', 'ch-123', serverId);
+    expect(b?.binding_type).toBe('session');
+    expect(b?.target).toBe('brain');
+  });
+
+  it('findChannelBindingByPlatformChannel works', async () => {
+    const b = await findChannelBindingByPlatformChannel(db, 'discord', 'ch-123', botId);
+    expect(b?.server_id).toBe(serverId);
+    expect(await findChannelBindingByPlatformChannel(db, 'discord', 'ch-123', 'wrong-bot')).toBeNull();
+  });
+
+  it('upsertChannelBinding updates on conflict', async () => {
+    await upsertChannelBinding(db, 'new-id', serverId, 'discord', 'ch-123', 'project', 'w1', botId);
+    const b = await findChannelBindingByPlatformChannel(db, 'discord', 'ch-123', botId);
+    expect(b?.binding_type).toBe('project');
+    expect(b?.target).toBe('w1');
+  });
+});
+
+// ── 6. Sessions ──────────────────────────────────────────────────────────────
+
+describe('sessions', () => {
+  let userId: string;
+  let serverId: string;
+
+  beforeAll(async () => {
+    userId = 'sess-user-' + Math.random().toString(36).slice(2);
+    serverId = 'sess-srv-' + Math.random().toString(36).slice(2);
+    await createUser(db, userId);
+    await createServer(db, serverId, userId, 'sess-server', 'hash-sess');
+  });
+
+  it('upsertDbSession / getDbSessionsByServer roundtrip', async () => {
+    await upsertDbSession(db, 'sid-1', serverId, 'deck_proj_brain', 'myproj', 'brain', 'claude-code', '/home/dev', 'running');
+    const sessions = await getDbSessionsByServer(db, serverId);
+    expect(sessions.length).toBeGreaterThanOrEqual(1);
+    const s = sessions.find(s => s.name === 'deck_proj_brain');
+    expect(s?.project_name).toBe('myproj');
+    expect(s?.agent_type).toBe('claude-code');
+  });
+
+  it('upsertDbSession updates on conflict', async () => {
+    await upsertDbSession(db, 'sid-1', serverId, 'deck_proj_brain', 'myproj', 'brain', 'claude-code', '/home/dev', 'idle');
+    const sessions = await getDbSessionsByServer(db, serverId);
+    const s = sessions.find(s => s.name === 'deck_proj_brain');
+    expect(s?.state).toBe('idle');
+  });
+
+  it('updateSessionLabel sets label', async () => {
+    await updateSessionLabel(db, serverId, 'deck_proj_brain', 'My Project');
+    const sessions = await getDbSessionsByServer(db, serverId);
+    const s = sessions.find(s => s.name === 'deck_proj_brain');
+    expect(s?.label).toBe('My Project');
+  });
+
+  it('updateProjectName sets project_name', async () => {
+    await updateProjectName(db, serverId, 'deck_proj_brain', 'new-proj');
+    const sessions = await getDbSessionsByServer(db, serverId);
+    const s = sessions.find(s => s.name === 'deck_proj_brain');
+    expect(s?.project_name).toBe('new-proj');
+  });
+
+  it('deleteDbSession removes session', async () => {
+    await upsertDbSession(db, 'sid-2', serverId, 'deck_proj_w1', 'myproj', 'w1', 'codex', '/home/dev', 'idle');
+    await deleteDbSession(db, serverId, 'deck_proj_w1');
+    const sessions = await getDbSessionsByServer(db, serverId);
+    expect(sessions.find(s => s.name === 'deck_proj_w1')).toBeUndefined();
+  });
+});
+
+// ── 7. Quick data ────────────────────────────────────────────────────────────
+
+describe('quick data', () => {
+  let userId: string;
+
+  beforeAll(async () => {
+    userId = 'qd-user-' + Math.random().toString(36).slice(2);
+    await createUser(db, userId);
+  });
+
+  it('getQuickData returns empty default for new user', async () => {
+    const qd = await getQuickData(db, userId);
+    expect(qd.history).toEqual([]);
+    expect(qd.commands).toEqual([]);
+  });
+
+  it('upsertQuickData / getQuickData roundtrip', async () => {
+    await upsertQuickData(db, userId, { history: ['hello'], commands: ['/status'], phrases: ['hi'], sessionHistory: {} });
+    const qd = await getQuickData(db, userId);
+    expect(qd.history).toEqual(['hello']);
+    expect(qd.commands).toEqual(['/status']);
+  });
+
+  it('upsertQuickData updates on conflict', async () => {
+    await upsertQuickData(db, userId, { history: ['updated'], commands: [], phrases: [] });
+    const qd = await getQuickData(db, userId);
+    expect(qd.history).toEqual(['updated']);
+  });
+});
+
+// ── 8. User preferences ──────────────────────────────────────────────────────
+
+describe('user preferences', () => {
+  let userId: string;
+
+  beforeAll(async () => {
+    userId = 'pref-user-' + Math.random().toString(36).slice(2);
+    await createUser(db, userId);
+  });
+
+  it('getUserPref returns null for missing key', async () => {
+    expect(await getUserPref(db, userId, 'nonexistent')).toBeNull();
+  });
+
+  it('setUserPref / getUserPref roundtrip', async () => {
+    await setUserPref(db, userId, 'theme', 'dark');
+    expect(await getUserPref(db, userId, 'theme')).toBe('dark');
+  });
+
+  it('setUserPref updates on conflict', async () => {
+    await setUserPref(db, userId, 'theme', 'light');
+    expect(await getUserPref(db, userId, 'theme')).toBe('light');
+  });
+
+  it('deleteUserPref removes the pref', async () => {
+    await deleteUserPref(db, userId, 'theme');
+    expect(await getUserPref(db, userId, 'theme')).toBeNull();
+  });
+});
+
+// ── 9. Sub-session updateSubSession / reorderSubSessions ─────────────────────
+
+describe('sub-session updates', () => {
+  let userId: string;
+  let serverId: string;
+
+  beforeAll(async () => {
+    userId = 'subupd-user-' + Math.random().toString(36).slice(2);
+    serverId = 'subupd-srv-' + Math.random().toString(36).slice(2);
+    await createUser(db, userId);
+    await createServer(db, serverId, userId, 'sub-server', 'hash-sub');
+  });
+
+  it('updateSubSession sets label and gemini_session_id', async () => {
+    await createSubSession(db, 'upd-sub-1', serverId, 'gemini', null, '/test', null, null);
+    await updateSubSession(db, 'upd-sub-1', serverId, { label: 'My Agent', gemini_session_id: 'gid-456' });
+    const s = await getSubSessionById(db, 'upd-sub-1', serverId);
+    expect(s?.label).toBe('My Agent');
+    expect(s?.gemini_session_id).toBe('gid-456');
+  });
+
+  it('updateSubSession sets closed_at', async () => {
+    const closedAt = Date.now();
+    await updateSubSession(db, 'upd-sub-1', serverId, { closed_at: closedAt });
+    const s = await getSubSessionById(db, 'upd-sub-1', serverId);
+    expect(s?.closed_at).toBe(closedAt);
+  });
+
+  it('reorderSubSessions sets sort_order', async () => {
+    await createSubSession(db, 'ord-a', serverId, 'claude-code', null, '/a', null, null);
+    await createSubSession(db, 'ord-b', serverId, 'claude-code', null, '/b', null, null);
+    await reorderSubSessions(db, serverId, ['ord-b', 'ord-a']);
+    const a = await getSubSessionById(db, 'ord-a', serverId);
+    const b = await getSubSessionById(db, 'ord-b', serverId);
+    expect(b?.sort_order).toBe(0);
+    expect(a?.sort_order).toBe(1);
+  });
+});
+
+// ── 10. Audit log ────────────────────────────────────────────────────────────
+
+describe('writeAuditLog', () => {
+  it('inserts audit log entry without throwing', async () => {
+    const uid = 'audit-user-' + Math.random().toString(36).slice(2);
+    await createUser(db, uid);
+    const logId = 'log-' + Math.random().toString(36).slice(2);
+    await expect(writeAuditLog(db, logId, uid, null, 'test.action', { foo: 'bar' }, '127.0.0.1')).resolves.not.toThrow();
+    const row = await db.queryOne<{ action: string }>('SELECT action FROM audit_log WHERE id = $1', [logId]);
+    expect(row?.action).toBe('test.action');
+  });
+});
+
+// ── 11. Orchestration getRecentOrchestrationRuns ─────────────────────────────
+
+describe('getRecentOrchestrationRuns', () => {
+  it('returns runs ordered by updated_at DESC', async () => {
+    const uid = 'recent-user-' + Math.random().toString(36).slice(2);
+    const sid = 'recent-srv-' + Math.random().toString(36).slice(2);
+    await createUser(db, uid);
+    await createServer(db, sid, uid, 'recent-srv', 'hash-recent');
+    const discId = 'recent-disc';
+    await upsertDiscussion(db, { id: discId, serverId: sid, topic: 'Recent', state: 'done', maxRounds: 1, startedAt: Date.now() });
+
+    const now = new Date().toISOString();
+    const base: DbOrchestrationRun = {
+      id: 'recent-run', discussion_id: discId, server_id: sid,
+      main_session: 'brain', initiator_session: 'brain',
+      current_target_session: null, final_return_session: 'brain',
+      remaining_targets: '[]', mode_key: 'round-robin',
+      status: 'completed', request_message_id: null,
+      callback_message_id: null, context_ref: '{}',
+      timeout_ms: 300000, result_summary: 'done', error: null,
+      created_at: now, updated_at: now, completed_at: now,
+    };
+    await upsertOrchestrationRun(db, base);
+    const runs = await getRecentOrchestrationRuns(db, sid, 10);
+    expect(runs.length).toBeGreaterThanOrEqual(1);
+    expect(runs.some(r => r.id === 'recent-run')).toBe(true);
+  });
+});
+
+// ── 12. Composite PK multi-server isolation ──────────────────────────────────
 
 describe('composite PK multi-server isolation', () => {
   let userId: string;

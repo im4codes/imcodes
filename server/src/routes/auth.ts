@@ -52,9 +52,10 @@ async function resolveUserId(c: AnyAuthContext): Promise<string | null> {
 
   // Fall back to API key check
   const keyHash = sha256Hex(bearerToken);
-  const row = await c.env.DB.prepare(
-    'SELECT user_id FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL',
-  ).bind(keyHash).first<{ user_id: string }>();
+  const row = await c.env.DB.queryOne<{ user_id: string }>(
+    'SELECT user_id FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL',
+    [keyHash],
+  );
   if (row) {
     const apiKeyUser = await getUserById(c.env.DB, row.user_id);
     if (apiKeyUser && apiKeyUser.status === 'active') return row.user_id;
@@ -90,11 +91,10 @@ authRoutes.post('/register', async (c) => {
   const rawKey = `deck_${randomHex(32)}`;
   const keyHash = sha256Hex(rawKey);
   const now = Date.now();
-  await c.env.DB.prepare(
-    'INSERT INTO api_keys (id, user_id, key_hash, created_at) VALUES (?, ?, ?, ?)',
-  )
-    .bind(randomHex(16), userId, keyHash, now)
-    .run();
+  await c.env.DB.execute(
+    'INSERT INTO api_keys (id, user_id, key_hash, created_at) VALUES ($1, $2, $3, $4)',
+    [randomHex(16), userId, keyHash, now],
+  );
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
   await logAudit({ userId, action: 'auth.register', ip }, c.env.DB);
@@ -145,16 +145,18 @@ authRoutes.post('/user/:id/rotate-key', async (c) => {
 
   // Mark existing active keys as grace-period (grace expires in 24 hours)
   const graceExpiry = Date.now() + 24 * 3600 * 1000;
-  await c.env.DB.prepare(
-    "UPDATE api_keys SET grace_expires_at = ? WHERE user_id = ? AND revoked_at IS NULL AND grace_expires_at IS NULL",
-  ).bind(graceExpiry, userId).run();
+  await c.env.DB.execute(
+    "UPDATE api_keys SET grace_expires_at = $1 WHERE user_id = $2 AND revoked_at IS NULL AND grace_expires_at IS NULL",
+    [graceExpiry, userId],
+  );
 
   // Issue new key
   const rawKey = `deck_${randomHex(32)}`;
   const keyHash = sha256Hex(rawKey);
-  await c.env.DB.prepare(
-    'INSERT INTO api_keys (id, user_id, key_hash, created_at) VALUES (?, ?, ?, ?)',
-  ).bind(randomHex(16), userId, keyHash, Date.now()).run();
+  await c.env.DB.execute(
+    'INSERT INTO api_keys (id, user_id, key_hash, created_at) VALUES ($1, $2, $3, $4)',
+    [randomHex(16), userId, keyHash, Date.now()],
+  );
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
   await logAudit({ userId, action: 'auth.rotate_key', ip }, c.env.DB);
@@ -174,9 +176,10 @@ authRoutes.delete('/user/:id/key', async (c) => {
   if (!user) return c.json({ error: 'not_found' }, 404);
 
   const now = Date.now();
-  await c.env.DB.prepare(
-    'UPDATE api_keys SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL',
-  ).bind(now, userId).run();
+  await c.env.DB.execute(
+    'UPDATE api_keys SET revoked_at = $1 WHERE user_id = $2 AND revoked_at IS NULL',
+    [now, userId],
+  );
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
   await logAudit({ userId, action: 'auth.revoke_keys', ip }, c.env.DB);
@@ -197,9 +200,10 @@ authRoutes.post('/user/me/keys', async (c) => {
   const keyId = randomHex(16);
   const now = Date.now();
 
-  await c.env.DB.prepare(
-    'INSERT INTO api_keys (id, user_id, key_hash, label, created_at) VALUES (?, ?, ?, ?, ?)',
-  ).bind(keyId, userId, keyHash, label, now).run();
+  await c.env.DB.execute(
+    'INSERT INTO api_keys (id, user_id, key_hash, label, created_at) VALUES ($1, $2, $3, $4, $5)',
+    [keyId, userId, keyHash, label, now],
+  );
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
   await logAudit({ userId, action: 'auth.create_key', ip }, c.env.DB);
@@ -212,11 +216,12 @@ authRoutes.get('/user/me/keys', async (c) => {
   const userId = await resolveUserId(c);
   if (!userId) return c.json({ error: 'unauthorized' }, 401);
 
-  const result = await c.env.DB.prepare(
-    'SELECT id, label, created_at, revoked_at FROM api_keys WHERE user_id = ? ORDER BY created_at DESC',
-  ).bind(userId).all<{ id: string; label: string | null; created_at: number; revoked_at: number | null }>();
+  const results = await c.env.DB.query<{ id: string; label: string | null; created_at: number; revoked_at: number | null }>(
+    'SELECT id, label, created_at, revoked_at FROM api_keys WHERE user_id = $1 ORDER BY created_at DESC',
+    [userId],
+  );
 
-  const keys = result.results.map((r) => ({
+  const keys = results.map((r) => ({
     id: r.id,
     label: r.label,
     createdAt: r.created_at,
@@ -234,27 +239,30 @@ authRoutes.delete('/user/me/keys/:keyId', async (c) => {
   const keyId = c.req.param('keyId');
 
   // Verify ownership
-  const key = await c.env.DB.prepare(
-    'SELECT id FROM api_keys WHERE id = ? AND user_id = ?',
-  ).bind(keyId, userId).first<{ id: string }>();
+  const key = await c.env.DB.queryOne<{ id: string }>(
+    'SELECT id FROM api_keys WHERE id = $1 AND user_id = $2',
+    [keyId, userId],
+  );
 
   if (!key) return c.json({ error: 'not_found' }, 404);
 
   const now = Date.now();
-  await c.env.DB.prepare(
-    'UPDATE api_keys SET revoked_at = ? WHERE id = ? AND user_id = ?',
-  ).bind(now, keyId, userId).run();
+  await c.env.DB.execute(
+    'UPDATE api_keys SET revoked_at = $1 WHERE id = $2 AND user_id = $3',
+    [now, keyId, userId],
+  );
 
   // Kick all daemon WebSocket connections that were bound using this API key
-  const boundServers = await c.env.DB.prepare(
-    'SELECT id FROM servers WHERE bound_with_key_id = ? AND user_id = ?',
-  ).bind(keyId, userId).all<{ id: string }>();
-  for (const srv of boundServers.results) {
+  const boundServers = await c.env.DB.query<{ id: string }>(
+    'SELECT id FROM servers WHERE bound_with_key_id = $1 AND user_id = $2',
+    [keyId, userId],
+  );
+  for (const srv of boundServers) {
     try { WsBridge.get(srv.id).kickDaemon(); } catch { /* bridge may not be active */ }
   }
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
-  await logAudit({ userId, action: 'auth.revoke_key', ip, details: { keyId, serversKicked: boundServers.results.length } }, c.env.DB);
+  await logAudit({ userId, action: 'auth.revoke_key', ip, details: { keyId, serversKicked: boundServers.length } }, c.env.DB);
 
   return c.json({ ok: true, revokedAt: now });
 });
@@ -304,11 +312,10 @@ authRoutes.post('/refresh', async (c) => {
   // that was stable. The replay-detection pattern (revoking entire families) caused
   // cascading logouts whenever a Set-Cookie response was lost (network glitch, browser
   // crash, race between tabs).
-  const row = await c.env.DB.prepare(
-    'SELECT * FROM refresh_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?',
-  )
-    .bind(tokenHash, Date.now())
-    .first<{ id: string; user_id: string; family_id: string }>();
+  const row = await c.env.DB.queryOne<{ id: string; user_id: string; family_id: string }>(
+    'SELECT * FROM refresh_tokens WHERE token_hash = $1 AND used_at IS NULL AND expires_at > $2',
+    [tokenHash, Date.now()],
+  );
 
   if (!row) {
     logger.warn({ hashPrefix: tokenHash.slice(0, 8) }, '[refresh] token not found, already used, or expired');
@@ -319,7 +326,7 @@ authRoutes.post('/refresh', async (c) => {
   const refreshUser = await getUserById(c.env.DB, row.user_id);
   if (!refreshUser || refreshUser.status !== 'active') {
     // Consume the token to prevent replay, but don't issue new ones
-    await c.env.DB.prepare('UPDATE refresh_tokens SET used_at = ? WHERE id = ?').bind(Date.now(), row.id).run();
+    await c.env.DB.execute('UPDATE refresh_tokens SET used_at = $1 WHERE id = $2', [Date.now(), row.id]);
     return c.json({ error: 'account_disabled' }, 403);
   }
 
@@ -335,7 +342,7 @@ authRoutes.post('/refresh', async (c) => {
   }
 
   // Mark old token consumed (rotation)
-  await c.env.DB.prepare('UPDATE refresh_tokens SET used_at = ? WHERE id = ?').bind(Date.now(), row.id).run();
+  await c.env.DB.execute('UPDATE refresh_tokens SET used_at = $1 WHERE id = $2', [Date.now(), row.id]);
   logger.info({ tokenId: row.id }, '[refresh] token consumed, issuing new pair');
 
   // Issue new access (4h) + refresh (30d) tokens
@@ -343,11 +350,10 @@ authRoutes.post('/refresh', async (c) => {
   const newRefresh = randomHex(32);
   const newRefreshHash = sha256Hex(newRefresh);
   const newRefreshId = randomHex(16);
-  await c.env.DB.prepare(
-    'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-  )
-    .bind(newRefreshId, row.user_id, newRefreshHash, row.family_id, Date.now() + 30 * 24 * 3600 * 1000, Date.now())
-    .run();
+  await c.env.DB.execute(
+    'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+    [newRefreshId, row.user_id, newRefreshHash, row.family_id, Date.now() + 30 * 24 * 3600 * 1000, Date.now()],
+  );
 
   const isSecure = c.env.NODE_ENV === 'production';
 
@@ -388,58 +394,58 @@ authRoutes.delete('/user/me', async (c) => {
   const db = c.env.DB;
 
   // 1. Passkey credentials
-  await db.prepare('DELETE FROM passkey_credentials WHERE user_id = ?').bind(userId).run();
+  await db.execute('DELETE FROM passkey_credentials WHERE user_id = $1', [userId]);
   // 2. Passkey challenges
-  await db.prepare('DELETE FROM passkey_challenges WHERE user_id = ?').bind(userId).run();
+  await db.execute('DELETE FROM passkey_challenges WHERE user_id = $1', [userId]);
   // 3. API keys
-  await db.prepare('DELETE FROM api_keys WHERE user_id = ?').bind(userId).run();
+  await db.execute('DELETE FROM api_keys WHERE user_id = $1', [userId]);
   // 4. Refresh tokens
-  await db.prepare('DELETE FROM refresh_tokens WHERE user_id = ?').bind(userId).run();
+  await db.execute('DELETE FROM refresh_tokens WHERE user_id = $1', [userId]);
   // 5. Push tokens
-  await db.prepare('DELETE FROM push_tokens WHERE user_id = ?').bind(userId).run();
+  await db.execute('DELETE FROM push_tokens WHERE user_id = $1', [userId]);
   // 6. Push subscriptions
-  await db.prepare('DELETE FROM push_subscriptions WHERE user_id = ?').bind(userId).run();
+  await db.execute('DELETE FROM push_subscriptions WHERE user_id = $1', [userId]);
 
   // 7. Get server IDs for cascade deleting server-scoped data
-  const serverRows = await db.prepare('SELECT id FROM servers WHERE user_id = ?').bind(userId).all<{ id: string }>();
-  const serverIds = serverRows.results.map((r) => r.id);
+  const serverRows = await db.query<{ id: string }>('SELECT id FROM servers WHERE user_id = $1', [userId]);
+  const serverIds = serverRows.map((r) => r.id);
 
   if (serverIds.length > 0) {
     for (const sid of serverIds) {
       // Discussion rounds → discussions (CASCADE should handle rounds, but be explicit)
-      await db.prepare('DELETE FROM discussion_rounds WHERE discussion_id IN (SELECT id FROM discussions WHERE server_id = ?)').bind(sid).run();
-      await db.prepare('DELETE FROM discussions WHERE server_id = ?').bind(sid).run();
+      await db.execute('DELETE FROM discussion_rounds WHERE discussion_id IN (SELECT id FROM discussions WHERE server_id = $1)', [sid]);
+      await db.execute('DELETE FROM discussions WHERE server_id = $1', [sid]);
       // Sub-sessions
-      await db.prepare('DELETE FROM sub_sessions WHERE server_id = ?').bind(sid).run();
+      await db.execute('DELETE FROM sub_sessions WHERE server_id = $1', [sid]);
       // Channel bindings
-      await db.prepare('DELETE FROM channel_bindings WHERE server_id = ?').bind(sid).run();
+      await db.execute('DELETE FROM channel_bindings WHERE server_id = $1', [sid]);
       // Sessions
-      await db.prepare('DELETE FROM sessions WHERE server_id = ?').bind(sid).run();
+      await db.execute('DELETE FROM sessions WHERE server_id = $1', [sid]);
       // Cron jobs
-      await db.prepare('DELETE FROM cron_jobs WHERE server_id = ?').bind(sid).run();
+      await db.execute('DELETE FROM cron_jobs WHERE server_id = $1', [sid]);
     }
   }
 
   // 8. Platform bots
-  await db.prepare('DELETE FROM platform_bots WHERE user_id = ?').bind(userId).run();
+  await db.execute('DELETE FROM platform_bots WHERE user_id = $1', [userId]);
   // 9. Servers
-  await db.prepare('DELETE FROM servers WHERE user_id = ?').bind(userId).run();
+  await db.execute('DELETE FROM servers WHERE user_id = $1', [userId]);
   // 10. Pending binds
-  await db.prepare('DELETE FROM pending_binds WHERE user_id = ?').bind(userId).run();
+  await db.execute('DELETE FROM pending_binds WHERE user_id = $1', [userId]);
   // 11. Platform identities
-  await db.prepare('DELETE FROM platform_identities WHERE user_id = ?').bind(userId).run();
+  await db.execute('DELETE FROM platform_identities WHERE user_id = $1', [userId]);
   // 12. User preferences
-  await db.prepare('DELETE FROM user_preferences WHERE user_id = ?').bind(userId).run();
+  await db.execute('DELETE FROM user_preferences WHERE user_id = $1', [userId]);
   // 13. User quick data
-  await db.prepare('DELETE FROM user_quick_data WHERE user_id = ?').bind(userId).run();
+  await db.execute('DELETE FROM user_quick_data WHERE user_id = $1', [userId]);
   // 14. Idempotency records
-  await db.prepare('DELETE FROM idempotency_records WHERE user_id = ?').bind(userId).run();
+  await db.execute('DELETE FROM idempotency_records WHERE user_id = $1', [userId]);
   // 15. Team memberships (not owned teams — those are separate)
-  await db.prepare('DELETE FROM team_members WHERE user_id = ?').bind(userId).run();
+  await db.execute('DELETE FROM team_members WHERE user_id = $1', [userId]);
   // 16. Audit log entries (keep? delete for GDPR compliance)
-  await db.prepare('DELETE FROM audit_log WHERE user_id = ?').bind(userId).run();
+  await db.execute('DELETE FROM audit_log WHERE user_id = $1', [userId]);
   // 17. Delete user
-  await db.prepare('DELETE FROM users WHERE id = ?').bind(userId).run();
+  await db.execute('DELETE FROM users WHERE id = $1', [userId]);
 
   // Clear session cookies
   deleteCookie(c, COOKIE_SESSION, { path: '/' });
@@ -517,9 +523,10 @@ authRoutes.post('/password/login', async (c) => {
   const refreshHash = sha256Hex(refreshRaw);
   const familyId = randomHex(16);
   const refreshId = randomHex(16);
-  await c.env.DB.prepare(
-    'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-  ).bind(refreshId, user.id, refreshHash, familyId, Date.now() + 30 * 24 * 3600 * 1000, Date.now()).run();
+  await c.env.DB.execute(
+    'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+    [refreshId, user.id, refreshHash, familyId, Date.now() + 30 * 24 * 3600 * 1000, Date.now()],
+  );
 
   const isSecure = c.env.NODE_ENV === 'production';
   setCookie(c, COOKIE_SESSION, accessToken, {
@@ -541,9 +548,10 @@ authRoutes.post('/password/login', async (c) => {
     const rawKey = `deck_${randomHex(32)}`;
     keyId = randomHex(16);
     const keyHash = sha256Hex(rawKey);
-    await c.env.DB.prepare(
-      'INSERT INTO api_keys (id, user_id, key_hash, label, created_at) VALUES (?, ?, ?, ?, ?)',
-    ).bind(keyId, user.id, keyHash, 'native-password-login', Date.now()).run();
+    await c.env.DB.execute(
+      'INSERT INTO api_keys (id, user_id, key_hash, label, created_at) VALUES ($1, $2, $3, $4, $5)',
+      [keyId, user.id, keyHash, 'native-password-login', Date.now()],
+    );
     apiKey = rawKey;
   }
 
@@ -570,9 +578,7 @@ authRoutes.patch('/user/me', async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
   if (parsed.data.displayName !== undefined) {
-    await c.env.DB.prepare('UPDATE users SET display_name = ? WHERE id = ?')
-      .bind(parsed.data.displayName, userId)
-      .run();
+    await c.env.DB.execute('UPDATE users SET display_name = $1 WHERE id = $2', [parsed.data.displayName, userId]);
   }
 
   const user = await getUserById(c.env.DB, userId);
@@ -602,9 +608,10 @@ authRoutes.post('/password/change', async (c) => {
   if (!valid) return c.json({ error: 'invalid_old_password' }, 401);
 
   const newHash = await hashPassword(newPassword);
-  await c.env.DB.prepare(
-    'UPDATE users SET password_hash = ?, password_must_change = false WHERE id = ?',
-  ).bind(newHash, userId).run();
+  await c.env.DB.execute(
+    'UPDATE users SET password_hash = $1, password_must_change = false WHERE id = $2',
+    [newHash, userId],
+  );
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
   await logAudit({ userId, action: 'auth.password_change', ip }, c.env.DB);
@@ -623,9 +630,10 @@ authRoutes.post('/logout', async (c) => {
 
   // Invalidate all active refresh tokens for the user
   if (userId) {
-    await c.env.DB.prepare(
-      'UPDATE refresh_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL',
-    ).bind(Date.now(), userId).run();
+    await c.env.DB.execute(
+      'UPDATE refresh_tokens SET used_at = $1 WHERE user_id = $2 AND used_at IS NULL',
+      [Date.now(), userId],
+    );
   }
 
   return c.json({ ok: true });

@@ -12,7 +12,7 @@
  */
 
 import WebSocket from 'ws';
-import type { PgDatabase } from '../db/client.js';
+import type { Database } from '../db/client.js';
 import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
 import { sha256Hex } from '../security/crypto.js';
@@ -158,7 +158,7 @@ export class WsBridge {
   private browserUserIds = new Map<WebSocket, string>();
 
   /** db reference for session ownership checks */
-  private db: PgDatabase | null = null;
+  private db: Database | null = null;
 
   /**
    * Per-request fs.ls pending map: requestId → { socket, timer }.
@@ -220,7 +220,7 @@ export class WsBridge {
 
   // ── Daemon connection ──────────────────────────────────────────────────────
 
-  handleDaemonConnection(ws: WebSocket, db: PgDatabase, env: Env, onAuthenticated?: () => void): void {
+  handleDaemonConnection(ws: WebSocket, db: Database, env: Env, onAuthenticated?: () => void): void {
     // Replace existing daemon connection
     if (this.daemonWs) {
       try { this.daemonWs.close(1001, 'replaced'); } catch { /* ignore */ }
@@ -258,7 +258,7 @@ export class WsBridge {
         if (this.authTimer) clearTimeout(this.authTimer);
 
         const tokenHash = sha256Hex(msg.token);
-        const server = await db.prepare('SELECT token_hash FROM servers WHERE id = ?').bind(this.serverId).first<{ token_hash: string }>();
+        const server = await db.queryOne<{ token_hash: string }>('SELECT token_hash FROM servers WHERE id = $1', [this.serverId]);
 
         if (!server || server.token_hash !== tokenHash) {
           logger.warn({ serverId: this.serverId }, 'Daemon auth failed');
@@ -358,7 +358,7 @@ export class WsBridge {
 
   // ── Browser connection ─────────────────────────────────────────────────────
 
-  handleBrowserConnection(ws: WebSocket, userId: string, db: PgDatabase, isMobile = false): void {
+  handleBrowserConnection(ws: WebSocket, userId: string, db: Database, isMobile = false): void {
     this.db = db;
     this.browserSockets.add(ws);
     if (isMobile) this.mobileSockets.add(ws);
@@ -748,8 +748,8 @@ export class WsBridge {
     if (type === 'subsession.closed' && this.db) {
       const id = msg.id as string;
       if (id) {
-        void this.db.prepare('UPDATE sub_sessions SET closed_at = ? WHERE id = ? AND server_id = ?')
-          .bind(Date.now(), id, this.serverId).run().catch(() => {});
+        void this.db.execute('UPDATE sub_sessions SET closed_at = $1 WHERE id = $2 AND server_id = $3',
+          [Date.now(), id, this.serverId]).catch(() => {});
         this.broadcastToBrowsers(JSON.stringify({ type: 'subsession.removed', id, sessionName: msg.sessionName }));
       }
       return;
@@ -930,20 +930,20 @@ export class WsBridge {
     if (!this.db) return true; // no db = dev/test mode, allow all
     try {
       // Check regular sessions
-      const row = await this.db
-        .prepare('SELECT 1 FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1')
-        .bind(this.serverId, sessionName)
-        .first<Record<string, unknown>>();
+      const row = await this.db.queryOne<Record<string, unknown>>(
+        'SELECT 1 FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
+        [this.serverId, sessionName],
+      );
       if (row) return true;
 
       // Check sub-sessions: name is deck_sub_{id}
       const subMatch = sessionName.match(/^deck_sub_([a-z0-9]+)$/);
       if (subMatch) {
         const subId = subMatch[1];
-        const subRow = await this.db
-          .prepare('SELECT 1 FROM sub_sessions WHERE server_id = $1 AND id = $2 LIMIT 1')
-          .bind(this.serverId, subId)
-          .first<Record<string, unknown>>();
+        const subRow = await this.db.queryOne<Record<string, unknown>>(
+          'SELECT 1 FROM sub_sessions WHERE server_id = $1 AND id = $2 LIMIT 1',
+          [this.serverId, subId],
+        );
         if (subRow) return true;
       }
 
@@ -1050,7 +1050,7 @@ export class WsBridge {
   private lastPushAt = new Map<string, number>();
   private static readonly PUSH_DEDUP_MS = 10_000;
 
-  private async dispatchEventPush(db: PgDatabase, env: Env, msg: Record<string, unknown>): Promise<void> {
+  private async dispatchEventPush(db: Database, env: Env, msg: Record<string, unknown>): Promise<void> {
     // Skip push if mobile app is in foreground (user is actively watching)
     if (this.mobileSockets.size > 0) return;
 
@@ -1061,7 +1061,7 @@ export class WsBridge {
     if (lastPush && now - lastPush < WsBridge.PUSH_DEDUP_MS) return;
     this.lastPushAt.set(sessionKey, now);
 
-    const server = await db.prepare('SELECT user_id, name FROM servers WHERE id = ?').bind(this.serverId).first<{ user_id: string; name: string }>();
+    const server = await db.queryOne<{ user_id: string; name: string }>('SELECT user_id, name FROM servers WHERE id = $1', [this.serverId]);
     if (!server) return;
 
     const { dispatchPush } = await import('../routes/push.js').catch(() => ({ dispatchPush: null }));
@@ -1071,9 +1071,10 @@ export class WsBridge {
     const eventType = String(msg.type ?? '');
 
     // Look up session metadata for human-readable push content
-    const sessionRow = await db.prepare(
+    const sessionRow = await db.queryOne<{ project_name: string; agent_type: string; label: string | null }>(
       'SELECT project_name, agent_type, label FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
-    ).bind(this.serverId, sessionName).first<{ project_name: string; agent_type: string; label: string | null }>().catch(() => null);
+      [this.serverId, sessionName],
+    ).catch(() => null);
 
     const displayName = sessionRow?.label || sessionRow?.project_name || sessionName;
     const agentType = sessionRow?.agent_type ?? '';

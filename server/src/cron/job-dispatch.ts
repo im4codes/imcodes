@@ -19,23 +19,21 @@ interface CronJob {
 export async function jobDispatchCron(env: Env): Promise<void> {
   const now = Date.now();
 
-  const dueJobs = await env.DB
-    .prepare(
-      "SELECT * FROM cron_jobs WHERE status = 'active' AND next_run_at <= ? ORDER BY next_run_at ASC LIMIT 50",
-    )
-    .bind(now)
-    .all<CronJob>();
+  const dueJobs = await env.DB.query<CronJob>(
+    "SELECT * FROM cron_jobs WHERE status = 'active' AND next_run_at <= $1 ORDER BY next_run_at ASC LIMIT 50",
+    [now],
+  );
 
-  for (const job of dueJobs.results) {
+  for (const job of dueJobs) {
     try {
       const payload = JSON.stringify({ type: 'cron.dispatch', job: { id: job.id, name: job.name, action: job.action } });
       WsBridge.get(job.server_id).sendToDaemon(payload);
 
       const nextRun = calculateNextRun(job.cron_expr, now);
-      await env.DB
-        .prepare('UPDATE cron_jobs SET last_run_at = ?, next_run_at = ? WHERE id = ?')
-        .bind(now, nextRun, job.id)
-        .run();
+      await env.DB.execute(
+        'UPDATE cron_jobs SET last_run_at = $1, next_run_at = $2 WHERE id = $3',
+        [now, nextRun, job.id],
+      );
 
       await logAudit(
         {
@@ -51,8 +49,8 @@ export async function jobDispatchCron(env: Env): Promise<void> {
     }
   }
 
-  if (dueJobs.results.length > 0) {
-    logger.info({ dispatched: dueJobs.results.length }, 'Job dispatch cron complete');
+  if (dueJobs.length > 0) {
+    logger.info({ dispatched: dueJobs.length }, 'Job dispatch cron complete');
   }
 }
 

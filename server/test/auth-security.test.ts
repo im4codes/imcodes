@@ -4,11 +4,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { buildApp } from '../src/index.js';
 import type { Env } from '../src/env.js';
-import type { PgDatabase } from '../src/db/client.js';
+import type { Database } from '../src/db/client.js';
 
 // ── In-memory mock DB ─────────────────────────────────────────────────────────
 
-function makeMemDb(): PgDatabase {
+function makeMemDb(): Database {
   const users = new Map<string, { id: string; created_at: number; is_admin: boolean; status: string }>();
   const apiKeys = new Map<string, { id: string; user_id: string; key_hash: string; created_at: number; revoked_at: number | null; grace_expires_at: number | null }>();
   const refreshTokens = new Map<string, { id: string; user_id: string; token_hash: string; family_id: string; expires_at: number; created_at: number; used_at: number | null }>();
@@ -16,100 +16,104 @@ function makeMemDb(): PgDatabase {
   const lockout = new Map<string, { identity: string; fail_count: number; first_fail_at: Date; locked_until: Date | null }>();
   const auditLog: unknown[] = [];
 
+  function normalize(sql: string): string {
+    return sql.toLowerCase().replace(/\s+/g, ' ').trim();
+  }
+
   return {
-    prepare: (sql: string) => ({
-      bind: (...args: unknown[]) => ({
-        first: async <T = unknown>(): Promise<T | null> => {
-          const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+    queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
+      const s = normalize(sql);
 
-          if (s.includes('from users where id')) {
-            return (users.get(args[0] as string) ?? null) as T | null;
+      if (s.includes('from users where id')) {
+        return (users.get(params[0] as string) ?? null) as T | null;
+      }
+      if (s.includes('from api_keys where key_hash')) {
+        for (const k of apiKeys.values()) {
+          if (k.key_hash === params[0] && !k.revoked_at) return { user_id: k.user_id } as T;
+        }
+        return null;
+      }
+      if (s.includes('from refresh_tokens where token_hash')) {
+        const now = params[1] as number;
+        for (const rt of refreshTokens.values()) {
+          if (rt.token_hash === params[0] && rt.used_at === null && rt.expires_at > now) {
+            return { id: rt.id, user_id: rt.user_id, family_id: rt.family_id } as T;
           }
-          if (s.includes('from api_keys where key_hash')) {
-            for (const k of apiKeys.values()) {
-              if (k.key_hash === args[0] && !k.revoked_at) return { user_id: k.user_id } as T;
-            }
-            return null;
-          }
-          if (s.includes('from refresh_tokens where token_hash')) {
-            const now = args[1] as number;
-            for (const rt of refreshTokens.values()) {
-              if (rt.token_hash === args[0] && rt.used_at === null && rt.expires_at > now) {
-                return { id: rt.id, user_id: rt.user_id, family_id: rt.family_id } as T;
-              }
-            }
-            return null;
-          }
-          if (s.includes('from auth_lockout') && s.includes('locked_until > now')) {
-            const entry = lockout.get(args[0] as string);
-            if (entry && entry.locked_until && entry.locked_until > new Date()) {
-              return { locked_until: entry.locked_until } as T;
-            }
-            return null;
-          }
-          // ON CONFLICT upsert for auth_lockout — returns fail_count + locked_until
-          if (s.includes('insert into auth_lockout')) {
-            const identity = args[0] as string;
-            const now = new Date();
-            const existing = lockout.get(identity);
-            let failCount: number;
-            let firstFailAt: Date;
+        }
+        return null;
+      }
+      if (s.includes('from auth_lockout') && s.includes('locked_until > now')) {
+        const entry = lockout.get(params[0] as string);
+        if (entry && entry.locked_until && entry.locked_until > new Date()) {
+          return { locked_until: entry.locked_until } as T;
+        }
+        return null;
+      }
+      // ON CONFLICT upsert for auth_lockout — returns fail_count + locked_until
+      if (s.includes('insert into auth_lockout')) {
+        const identity = params[0] as string;
+        const now = new Date();
+        const existing = lockout.get(identity);
+        let failCount: number;
+        let firstFailAt: Date;
 
-            if (!existing || existing.first_fail_at < new Date(now.getTime() - 15 * 60 * 1000)) {
-              failCount = 1;
-              firstFailAt = now;
-            } else {
-              failCount = existing.fail_count + 1;
-              firstFailAt = existing.first_fail_at;
-            }
+        if (!existing || existing.first_fail_at < new Date(now.getTime() - 15 * 60 * 1000)) {
+          failCount = 1;
+          firstFailAt = now;
+        } else {
+          failCount = existing.fail_count + 1;
+          firstFailAt = existing.first_fail_at;
+        }
 
-            const lockedUntil = failCount >= 5 ? new Date(now.getTime() + 15 * 60 * 1000) : null;
-            lockout.set(identity, { identity, fail_count: failCount, first_fail_at: firstFailAt, locked_until: lockedUntil });
-            return { fail_count: failCount, locked_until: lockedUntil } as T;
-          }
-          return null;
-        },
-        all: async <T = unknown>() => ({ results: [] as T[] }),
-        run: async () => {
-          const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+        const lockedUntil = failCount >= 5 ? new Date(now.getTime() + 15 * 60 * 1000) : null;
+        lockout.set(identity, { identity, fail_count: failCount, first_fail_at: firstFailAt, locked_until: lockedUntil });
+        return { fail_count: failCount, locked_until: lockedUntil } as T;
+      }
+      return null;
+    },
+    query: async <T = unknown>(): Promise<T[]> => {
+      return [] as T[];
+    },
+    execute: async (sql: string, params: unknown[] = []): Promise<{ changes: number }> => {
+      const s = normalize(sql);
 
-          if (s.includes('insert into users')) {
-            users.set(args[0] as string, { id: args[0] as string, created_at: args[1] as number, is_admin: false, status: 'active' });
-          }
-          if (s.includes('insert into api_keys')) {
-            apiKeys.set(args[0] as string, {
-              id: args[0] as string,
-              user_id: args[1] as string,
-              key_hash: args[2] as string,
-              created_at: args[3] as number,
-              revoked_at: null,
-              grace_expires_at: null,
-            });
-          }
-          if (s.includes('insert into refresh_tokens')) {
-            // (id, user_id, token_hash, family_id, expires_at, created_at)
-            refreshTokens.set(args[0] as string, {
-              id: args[0] as string,
-              user_id: args[1] as string,
-              token_hash: args[2] as string,
-              family_id: args[3] as string,
-              expires_at: args[4] as number,
-              created_at: args[5] as number,
-              used_at: null,
-            });
-          }
-          if (s.includes('update refresh_tokens set used_at')) {
-            const token = refreshTokens.get(args[1] as string);
-            if (token) token.used_at = args[0] as number;
-          }
-          if (s.includes('insert into audit_log')) {
-            auditLog.push(args);
-          }
-          return { changes: 1 };
-        },
-      }),
-    }),
-  } as unknown as PgDatabase;
+      if (s.includes('insert into users')) {
+        users.set(params[0] as string, { id: params[0] as string, created_at: params[1] as number, is_admin: false, status: 'active' });
+      }
+      if (s.includes('insert into api_keys')) {
+        apiKeys.set(params[0] as string, {
+          id: params[0] as string,
+          user_id: params[1] as string,
+          key_hash: params[2] as string,
+          created_at: params[3] as number,
+          revoked_at: null,
+          grace_expires_at: null,
+        });
+      }
+      if (s.includes('insert into refresh_tokens')) {
+        // (id, user_id, token_hash, family_id, expires_at, created_at)
+        refreshTokens.set(params[0] as string, {
+          id: params[0] as string,
+          user_id: params[1] as string,
+          token_hash: params[2] as string,
+          family_id: params[3] as string,
+          expires_at: params[4] as number,
+          created_at: params[5] as number,
+          used_at: null,
+        });
+      }
+      if (s.includes('update refresh_tokens set used_at')) {
+        const token = refreshTokens.get(params[1] as string);
+        if (token) token.used_at = params[0] as number;
+      }
+      if (s.includes('insert into audit_log')) {
+        auditLog.push(params);
+      }
+      return { changes: 1 };
+    },
+    exec: async () => {},
+    close: async () => {},
+  } as unknown as Database;
 }
 
 function makeEnv(overrides?: Partial<Env>): Env {
@@ -143,15 +147,16 @@ async function registerAndGetKey(app: ReturnType<typeof buildApp>): Promise<stri
  * seed a refresh token directly, then call POST /api/auth/refresh with it.
  */
 async function seedRefreshToken(
-  db: PgDatabase,
+  db: Database,
   userId: string,
   rawToken: string,
   sha256HexFn: (s: string) => string,
 ): Promise<void> {
   const tokenHash = sha256HexFn(rawToken);
-  await db.prepare(
-    'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-  ).bind(`rt_${Math.random().toString(36).slice(2)}`, userId, tokenHash, 'family1', Date.now() + 30 * 86400 * 1000, Date.now()).run();
+  await db.execute(
+    'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+    [`rt_${Math.random().toString(36).slice(2)}`, userId, tokenHash, 'family1', Date.now() + 30 * 86400 * 1000, Date.now()],
+  );
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

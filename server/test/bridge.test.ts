@@ -50,14 +50,12 @@ function packFrame(sessionName: string, payload: Buffer): Buffer {
 
 function makeDb(tokenHash: string) {
   return {
-    prepare: (_sql: string) => ({
-      bind: (..._args: unknown[]) => ({
-        first: async () => ({ token_hash: tokenHash }),
-        all: async () => ({ results: [] }),
-        run: async () => ({ changes: 1 }),
-      }),
-    }),
-  } as unknown as import('../src/db/client.js').PgDatabase;
+    queryOne: async () => ({ token_hash: tokenHash }),
+    query: async () => [],
+    execute: async () => ({ changes: 1 }),
+    exec: async () => {},
+    close: () => {},
+  } as unknown as import('../src/db/client.js').Database;
 }
 
 // ── Mock crypto + push ─────────────────────────────────────────────────────────
@@ -1120,18 +1118,16 @@ describe('WsBridge', () => {
   describe('push notifications', () => {
     function makePushDb(tokenHash: string) {
       return {
-        prepare: (sql: string) => ({
-          bind: (..._args: unknown[]) => ({
-            first: async () => {
-              if (sql.includes('FROM servers')) return { token_hash: tokenHash, user_id: 'user-1', name: 'my-server' };
-              if (sql.includes('FROM sessions')) return { project_name: 'codedeck', agent_type: 'claude-code', label: null };
-              return { token_hash: tokenHash };
-            },
-            all: async () => ({ results: [] }),
-            run: async () => ({ changes: 1 }),
-          }),
-        }),
-      } as unknown as import('../src/db/client.js').PgDatabase;
+        queryOne: async (sql: string) => {
+          if (sql.includes('FROM servers')) return { token_hash: tokenHash, user_id: 'user-1', name: 'my-server' };
+          if (sql.includes('FROM sessions')) return { project_name: 'codedeck', agent_type: 'claude-code', label: null };
+          return { token_hash: tokenHash };
+        },
+        query: async () => [],
+        execute: async () => ({ changes: 1 }),
+        exec: async () => {},
+        close: () => {},
+      } as unknown as import('../src/db/client.js').Database;
     }
 
     async function setupPushBridge() {

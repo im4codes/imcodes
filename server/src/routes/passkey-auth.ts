@@ -67,9 +67,9 @@ async function resolveAuthedUserId(c: Context<HonoEnv>): Promise<string | null> 
       if (user) return user.id;
     }
     const keyHash = sha256Hex(bearerToken);
-    const row = await c.env.DB.prepare(
-      'SELECT user_id FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL',
-    ).bind(keyHash).first<{ user_id: string }>();
+    const row = await c.env.DB.queryOne<{ user_id: string }>(
+      'SELECT user_id FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL', [keyHash],
+    );
     if (row) return row.user_id;
   }
 
@@ -85,9 +85,10 @@ function setSessionCookies(c: Context<HonoEnv>, accessToken: string, refreshToke
 
 async function storeRefreshToken(db: Env['DB'], userId: string, refreshHash: string): Promise<void> {
   const now = Date.now();
-  await db.prepare(
-    'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-  ).bind(randomHex(16), userId, refreshHash, randomHex(16), now + 30 * 24 * 3600 * 1000, now).run();
+  await db.execute(
+    'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+    [randomHex(16), userId, refreshHash, randomHex(16), now + 30 * 24 * 3600 * 1000, now],
+  );
 }
 
 /**
@@ -137,19 +138,21 @@ async function saveChallenge(
   displayName: string,
 ): Promise<void> {
   const now = Date.now();
-  await db.prepare(
-    'INSERT INTO passkey_challenges (id, challenge, user_id, display_name, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-  ).bind(id, challenge, userId, displayName, now + 5 * 60 * 1000, now).run();
+  await db.execute(
+    'INSERT INTO passkey_challenges (id, challenge, user_id, display_name, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+    [id, challenge, userId, displayName, now + 5 * 60 * 1000, now],
+  );
   // Clean up expired challenges opportunistically
-  await db.prepare('DELETE FROM passkey_challenges WHERE expires_at < ?').bind(now).run();
+  await db.execute('DELETE FROM passkey_challenges WHERE expires_at < $1', [now]);
 }
 
 async function consumeChallenge(db: Env['DB'], id: string): Promise<PendingChallenge | null> {
-  const row = await db.prepare(
-    'SELECT challenge, user_id, display_name FROM passkey_challenges WHERE id = ? AND expires_at > ?',
-  ).bind(id, Date.now()).first<{ challenge: string; user_id: string | null; display_name: string }>();
+  const row = await db.queryOne<{ challenge: string; user_id: string | null; display_name: string }>(
+    'SELECT challenge, user_id, display_name FROM passkey_challenges WHERE id = $1 AND expires_at > $2',
+    [id, Date.now()],
+  );
   if (!row) return null;
-  await db.prepare('DELETE FROM passkey_challenges WHERE id = ?').bind(id).run();
+  await db.execute('DELETE FROM passkey_challenges WHERE id = $1', [id]);
   return { challenge: row.challenge, userId: row.user_id, displayName: row.display_name };
 }
 
@@ -177,10 +180,10 @@ passkeyRoutes.post('/register/begin', async (c) => {
   // Exclude already-registered credentials for this user
   let excludeCredentials: { id: string; type: 'public-key' }[] = [];
   if (existingUserId) {
-    const rows = await c.env.DB.prepare(
-      'SELECT id FROM passkey_credentials WHERE user_id = ?',
-    ).bind(existingUserId).all<{ id: string }>();
-    excludeCredentials = rows.results.map((r) => ({ id: r.id, type: 'public-key' as const }));
+    const rows = await c.env.DB.query<{ id: string }>(
+      'SELECT id FROM passkey_credentials WHERE user_id = $1', [existingUserId],
+    );
+    excludeCredentials = rows.map((r) => ({ id: r.id, type: 'public-key' as const }));
   }
 
   const userIdBytes = existingUserId
@@ -248,9 +251,9 @@ passkeyRoutes.post('/register/complete', async (c) => {
 
   const { credentialID, credentialPublicKey, counter } = verification.registrationInfo;
 
-  const existing = await c.env.DB.prepare(
-    'SELECT id FROM passkey_credentials WHERE id = ?',
-  ).bind(credentialID).first<{ id: string }>();
+  const existing = await c.env.DB.queryOne<{ id: string }>(
+    'SELECT id FROM passkey_credentials WHERE id = $1', [credentialID],
+  );
   if (existing) return c.json({ error: 'credential_already_registered' }, 409);
 
   let userId = pending.userId;
@@ -266,17 +269,10 @@ passkeyRoutes.post('/register/complete', async (c) => {
   }
 
   const now = Date.now();
-  await c.env.DB.prepare(
-    'INSERT INTO passkey_credentials (id, user_id, public_key, counter, device_name, transports, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-  ).bind(
-    credentialID,
-    userId,
-    Buffer.from(credentialPublicKey).toString('base64'),
-    counter,
-    deviceName ?? null,
-    null,
-    now,
-  ).run();
+  await c.env.DB.execute(
+    'INSERT INTO passkey_credentials (id, user_id, public_key, counter, device_name, transports, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+    [credentialID, userId, Buffer.from(credentialPublicKey).toString('base64'), counter, deviceName ?? null, null, now],
+  );
 
   const ip = (c.get('clientIp' as never) as string | undefined) ?? 'unknown';
   await logAudit({ userId, action: 'auth.passkey.register', ip, details: { credentialId: credentialID } }, c.env.DB);
@@ -287,9 +283,10 @@ passkeyRoutes.post('/register/complete', async (c) => {
     const rawKey = `deck_${randomHex(32)}`;
     const keyHash = sha256Hex(rawKey);
     const keyId = randomHex(16);
-    await c.env.DB.prepare(
-      'INSERT INTO api_keys (id, user_id, key_hash, label, created_at) VALUES (?, ?, ?, ?, ?)',
-    ).bind(keyId, userId, keyHash, 'mobile-app', now).run();
+    await c.env.DB.execute(
+      'INSERT INTO api_keys (id, user_id, key_hash, label, created_at) VALUES ($1, $2, $3, $4, $5)',
+      [keyId, userId, keyHash, 'mobile-app', now],
+    );
 
     const cbUrl = new URL(nativeCallback);
     cbUrl.searchParams.set('key', rawKey);
@@ -340,9 +337,9 @@ passkeyRoutes.post('/login/complete', async (c) => {
   logger.info({ rpId, origin }, '[passkey] login/complete verification');
 
   const credentialId = response.id as string;
-  const storedCred = await c.env.DB.prepare(
-    'SELECT id, user_id, public_key, counter, transports FROM passkey_credentials WHERE id = ?',
-  ).bind(credentialId).first<{ id: string; user_id: string; public_key: string; counter: number; transports: string | null }>();
+  const storedCred = await c.env.DB.queryOne<{ id: string; user_id: string; public_key: string; counter: number; transports: string | null }>(
+    'SELECT id, user_id, public_key, counter, transports FROM passkey_credentials WHERE id = $1', [credentialId],
+  );
 
   if (!storedCred) return c.json({ error: 'credential_not_found' }, 400);
 
@@ -373,9 +370,10 @@ passkeyRoutes.post('/login/complete', async (c) => {
   }
 
   const now = Date.now();
-  await c.env.DB.prepare(
-    'UPDATE passkey_credentials SET counter = ?, last_used_at = ? WHERE id = ?',
-  ).bind(verification.authenticationInfo.newCounter, now, storedCred.id).run();
+  await c.env.DB.execute(
+    'UPDATE passkey_credentials SET counter = $1, last_used_at = $2 WHERE id = $3',
+    [verification.authenticationInfo.newCounter, now, storedCred.id],
+  );
 
   const user = await getUserById(c.env.DB, storedCred.user_id);
   if (!user) return c.json({ error: 'user_not_found' }, 400);
@@ -398,9 +396,10 @@ passkeyRoutes.post('/login/complete', async (c) => {
     const keyHash = sha256Hex(rawKey);
     const keyId = randomHex(16);
     const now = Date.now();
-    await c.env.DB.prepare(
-      'INSERT INTO api_keys (id, user_id, key_hash, label, created_at) VALUES (?, ?, ?, ?, ?)',
-    ).bind(keyId, user.id, keyHash, 'mobile-app', now).run();
+    await c.env.DB.execute(
+      'INSERT INTO api_keys (id, user_id, key_hash, label, created_at) VALUES ($1, $2, $3, $4, $5)',
+      [keyId, user.id, keyHash, 'mobile-app', now],
+    );
 
     // If native_callback is provided, redirect via HTTP 302 so ASWebAuthenticationSession
     // detects the custom-scheme navigation (JS window.location.href is unreliable).
@@ -428,12 +427,13 @@ passkeyRoutes.get('/credentials', async (c) => {
   const userId = await resolveAuthedUserId(c);
   if (!userId) return c.json({ error: 'unauthorized' }, 401);
 
-  const rows = await c.env.DB.prepare(
-    'SELECT id, device_name, created_at, last_used_at FROM passkey_credentials WHERE user_id = ? ORDER BY created_at DESC',
-  ).bind(userId).all<{ id: string; device_name: string | null; created_at: number; last_used_at: number | null }>();
+  const rows = await c.env.DB.query<{ id: string; device_name: string | null; created_at: number; last_used_at: number | null }>(
+    'SELECT id, device_name, created_at, last_used_at FROM passkey_credentials WHERE user_id = $1 ORDER BY created_at DESC',
+    [userId],
+  );
 
   return c.json({
-    credentials: rows.results.map((r) => ({
+    credentials: rows.map((r) => ({
       id: r.id,
       deviceName: r.device_name,
       createdAt: r.created_at,
@@ -529,11 +529,11 @@ passkeyRoutes.delete('/credentials/:credId', async (c) => {
   if (!userId) return c.json({ error: 'unauthorized' }, 401);
 
   const credId = c.req.param('credId');
-  const result = await c.env.DB.prepare(
-    'DELETE FROM passkey_credentials WHERE id = ? AND user_id = ?',
-  ).bind(credId, userId).run();
+  const result = await c.env.DB.execute(
+    'DELETE FROM passkey_credentials WHERE id = $1 AND user_id = $2', [credId, userId],
+  );
 
-  if ((result.changes ?? 0) === 0) return c.json({ error: 'not_found' }, 404);
+  if (result.changes === 0) return c.json({ error: 'not_found' }, 404);
 
   const ip = (c.get('clientIp' as never) as string | undefined) ?? 'unknown';
   await logAudit({ userId, action: 'auth.passkey.delete', ip, details: { credentialId: credId } }, c.env.DB);

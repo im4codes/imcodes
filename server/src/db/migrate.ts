@@ -7,12 +7,12 @@
 import { readFile, readdir } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { PgDatabase } from './client.js';
+import type { Database } from './client.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = join(__dirname, 'migrations');
 
-export async function runMigrations(db: PgDatabase): Promise<void> {
+export async function runMigrations(db: Database): Promise<void> {
   // Ensure migrations tracking table exists
   await db.exec(`
     CREATE TABLE IF NOT EXISTS _migrations (
@@ -22,7 +22,7 @@ export async function runMigrations(db: PgDatabase): Promise<void> {
   `);
 
   // Get already-applied migrations
-  const { results } = await db.prepare('SELECT name FROM _migrations ORDER BY name').bind().all<{ name: string }>();
+  const results = await db.query<{ name: string }>('SELECT name FROM _migrations ORDER BY name');
   const applied = new Set(results.map((r) => r.name));
 
   // Discover migration files sorted by name
@@ -34,7 +34,7 @@ export async function runMigrations(db: PgDatabase): Promise<void> {
     console.log(`[migrate] Applying ${file}...`);
     const sql = await readFile(join(MIGRATIONS_DIR, file), 'utf-8');
     await db.exec(sql);
-    await db.prepare('INSERT INTO _migrations (name, applied_at) VALUES ($1, $2)').bind(file, Date.now()).run();
+    await db.execute('INSERT INTO _migrations (name, applied_at) VALUES ($1, $2)', [file, Date.now()]);
     console.log(`[migrate] Applied ${file}`);
   }
 

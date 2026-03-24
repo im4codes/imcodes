@@ -1,4 +1,4 @@
-import type { PgDatabase } from './db/client.js';
+import type { Database } from './db/client.js';
 
 /** Environment config loaded from process.env (no DB, that's injected at runtime). */
 export interface EnvConfig {
@@ -76,10 +76,10 @@ export interface EnvConfig {
   ENVIRONMENT?: string;
 }
 
-/** Full Env type used in Hono context — includes the injected PgDatabase instance. */
+/** Full Env type used in Hono context — includes the injected Database instance. */
 export interface Env extends EnvConfig {
   /** Injected at app startup via createDatabase(). */
-  DB: PgDatabase;
+  DB: Database;
 }
 
 /** Parse and validate env from process.env. Exits on missing required vars. */

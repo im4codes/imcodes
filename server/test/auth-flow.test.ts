@@ -8,7 +8,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { buildApp } from '../src/index.js';
 import type { Env } from '../src/env.js';
-import type { PgDatabase } from '../src/db/client.js';
+import type { Database } from '../src/db/client.js';
 
 // ── Mock crypto to use deterministic values ──────────────────────────────────
 
@@ -22,7 +22,7 @@ vi.mock('../src/security/crypto.js', async (importOriginal) => {
 
 // ── In-memory mock DB ─────────────────────────────────────────────────────────
 
-function makeMemDb(): PgDatabase {
+function makeMemDb(): Database {
   const users = new Map<string, { id: string; created_at: number }>();
   const apiKeys = new Map<string, { id: string; user_id: string; key_hash: string; created_at: number }>();
   const pendingBinds = new Map<string, { code: string; user_id: string; server_name: string; expires_at: number }>();
@@ -30,89 +30,93 @@ function makeMemDb(): PgDatabase {
   const idempotency = new Map<string, { body: string; status: number }>();
   const auditLog: unknown[] = [];
 
+  function normalize(sql: string): string {
+    return sql.toLowerCase().replace(/\s+/g, ' ').trim();
+  }
+
   return {
-    prepare: (sql: string) => ({
-      bind: (...args: unknown[]) => ({
-        first: async <T = unknown>(): Promise<T | null> => {
-          // Normalize whitespace so multiline SQL still matches
-          const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+    queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
+      // Normalize whitespace so multiline SQL still matches
+      const s = normalize(sql);
 
-          if (s.includes('from users where id')) {
-            return (users.get(args[0] as string) ?? null) as T | null;
+      if (s.includes('from users where id')) {
+        return (users.get(params[0] as string) ?? null) as T | null;
+      }
+      if (s.includes('from api_keys where key_hash')) {
+        for (const k of apiKeys.values()) {
+          if (k.key_hash === params[0]) return { user_id: k.user_id } as T;
+        }
+        return null;
+      }
+      if (s.includes('from pending_binds where code')) {
+        const b = pendingBinds.get(params[0] as string);
+        if (b && b.expires_at > (params[1] as number)) return b as T;
+        return null;
+      }
+      if (s.includes('from servers where token_hash')) {
+        for (const s2 of servers.values()) {
+          if (s2.token_hash === params[0] && s2.id === params[1]) {
+            return { id: s2.id, user_id: s2.user_id } as T;
           }
-          if (s.includes('from api_keys where key_hash')) {
-            for (const k of apiKeys.values()) {
-              if (k.key_hash === args[0]) return { user_id: k.user_id } as T;
-            }
-            return null;
-          }
-          if (s.includes('from pending_binds where code')) {
-            const b = pendingBinds.get(args[0] as string);
-            if (b && b.expires_at > (args[1] as number)) return b as T;
-            return null;
-          }
-          if (s.includes('from servers where token_hash')) {
-            for (const s2 of servers.values()) {
-              if (s2.token_hash === args[0] && s2.id === args[1]) {
-                return { id: s2.id, user_id: s2.user_id } as T;
-              }
-            }
-            return null;
-          }
-          if (s.includes('from idempotency_cache')) {
-            const cached = idempotency.get(args[0] as string);
-            return (cached ?? null) as T | null;
-          }
-          return null;
-        },
-        all: async <T = unknown>() => ({ results: [] as T[] }),
-        run: async () => {
-          const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+        }
+        return null;
+      }
+      if (s.includes('from idempotency_cache')) {
+        const cached = idempotency.get(params[0] as string);
+        return (cached ?? null) as T | null;
+      }
+      return null;
+    },
+    query: async <T = unknown>(): Promise<T[]> => {
+      return [] as T[];
+    },
+    execute: async (sql: string, params: unknown[] = []): Promise<{ changes: number }> => {
+      const s = normalize(sql);
 
-          if (s.includes('insert into users')) {
-            users.set(args[0] as string, { id: args[0] as string, created_at: args[1] as number });
-          }
-          if (s.includes('insert into api_keys')) {
-            apiKeys.set(args[0] as string, {
-              id: args[0] as string,
-              user_id: args[1] as string,
-              key_hash: args[2] as string,
-              created_at: args[3] as number,
-            });
-          }
-          if (s.includes('insert into pending_binds')) {
-            pendingBinds.set(args[0] as string, {
-              code: args[0] as string,
-              user_id: args[1] as string,
-              server_name: args[2] as string,
-              expires_at: args[3] as number,
-            });
-          }
-          if (s.includes('delete from pending_binds')) {
-            pendingBinds.delete(args[0] as string);
-          }
-          if (s.includes('insert into servers')) {
-            servers.set(args[0] as string, {
-              id: args[0] as string,
-              user_id: args[1] as string,
-              name: args[2] as string,
-              token_hash: args[3] as string,
-              status: 'offline',
-              last_heartbeat_at: null,
-              created_at: args[4] as number,
-            });
-          }
-          if (s.includes('insert into idempotency_cache')) {
-            idempotency.set(args[0] as string, { body: args[3] as string, status: args[2] as number });
-          }
-          if (s.includes('insert into audit_log')) {
-            auditLog.push(args);
-          }
-          return { changes: 1 };
-        },
-      }),
-    }),
-  } as unknown as PgDatabase;
+      if (s.includes('insert into users')) {
+        users.set(params[0] as string, { id: params[0] as string, created_at: params[1] as number });
+      }
+      if (s.includes('insert into api_keys')) {
+        apiKeys.set(params[0] as string, {
+          id: params[0] as string,
+          user_id: params[1] as string,
+          key_hash: params[2] as string,
+          created_at: params[3] as number,
+        });
+      }
+      if (s.includes('insert into pending_binds')) {
+        pendingBinds.set(params[0] as string, {
+          code: params[0] as string,
+          user_id: params[1] as string,
+          server_name: params[2] as string,
+          expires_at: params[3] as number,
+        });
+      }
+      if (s.includes('delete from pending_binds')) {
+        pendingBinds.delete(params[0] as string);
+      }
+      if (s.includes('insert into servers')) {
+        servers.set(params[0] as string, {
+          id: params[0] as string,
+          user_id: params[1] as string,
+          name: params[2] as string,
+          token_hash: params[3] as string,
+          status: 'offline',
+          last_heartbeat_at: null,
+          created_at: params[4] as number,
+        });
+      }
+      if (s.includes('insert into idempotency_cache')) {
+        idempotency.set(params[0] as string, { body: params[3] as string, status: params[2] as number });
+      }
+      if (s.includes('insert into audit_log')) {
+        auditLog.push(params);
+      }
+      return { changes: 1 };
+    },
+    exec: async () => {},
+    close: async () => {},
+  } as unknown as Database;
 }
 
 // ── Test env ─────────────────────────────────────────────────────────────────

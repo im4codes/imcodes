@@ -6,7 +6,7 @@
  * and registration control.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
-import { createDatabase, type PgDatabase } from '../src/db/client.js';
+import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { buildApp } from '../src/index.js';
 import { hashPassword, signJwt, randomHex, sha256Hex } from '../src/security/crypto.js';
@@ -14,7 +14,7 @@ import type { Env } from '../src/env.js';
 
 // ── DB lifecycle ──────────────────────────────────────────────────────────────
 
-let db: PgDatabase;
+let db: Database;
 const JWT_KEY = 'test-jwt-key-for-admin-tests-000000000000';
 
 beforeAll(async () => {
@@ -50,9 +50,10 @@ async function createTestUser(opts: {
   const id = randomHex(16);
   const hash = await hashPassword(opts.password);
   const now = Date.now();
-  await db.prepare(
-    'INSERT INTO users (id, username, password_hash, display_name, password_must_change, is_admin, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-  ).bind(id, opts.username, hash, opts.displayName ?? opts.username, false, opts.isAdmin ?? false, opts.status ?? 'active', now).run();
+  await db.execute(
+    'INSERT INTO users (id, username, password_hash, display_name, password_must_change, is_admin, status, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+    [id, opts.username, hash, opts.displayName ?? opts.username, false, opts.isAdmin ?? false, opts.status ?? 'active', now],
+  );
   return id;
 }
 
@@ -73,12 +74,12 @@ function csrfHeaders(token: string): Record<string, string> {
 async function cleanUsers(): Promise<void> {
   // TRUNCATE CASCADE handles all FK dependencies automatically,
   // so we don't need to enumerate every child table.
-  await db.prepare('TRUNCATE users CASCADE').bind().run();
+  await db.exec('TRUNCATE users CASCADE');
 }
 
 async function setTestSetting(key: string, value: string): Promise<void> {
   // Use string '0' for updated_at to avoid integer overflow with Date.now()
-  await db.prepare('INSERT INTO settings (key, value, updated_at) VALUES (?, ?, 0) ON CONFLICT(key) DO UPDATE SET value = excluded.value').bind(key, value).run();
+  await db.execute('INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, 0) ON CONFLICT(key) DO UPDATE SET value = excluded.value', [key, value]);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -122,7 +123,7 @@ describe('Admin API — Access Control', () => {
   });
 
   it('rejects disabled admin with 403', async () => {
-    await db.prepare("UPDATE users SET status = 'disabled' WHERE id = ?").bind(adminId).run();
+    await db.execute("UPDATE users SET status = 'disabled' WHERE id = $1", [adminId]);
     const app = makeApp();
     const token = makeToken(adminId);
     const res = await app.request('/api/admin/users', {
@@ -166,7 +167,7 @@ describe('Admin API — User Management', () => {
     });
     expect(res.status).toBe(200);
 
-    const user = await db.prepare('SELECT status FROM users WHERE id = ?').bind(pendingId).first<{ status: string }>();
+    const user = await db.queryOne<{ status: string }>('SELECT status FROM users WHERE id = $1', [pendingId]);
     expect(user!.status).toBe('active');
   });
 
@@ -180,15 +181,15 @@ describe('Admin API — User Management', () => {
     });
     expect(res.status).toBe(200);
 
-    const user = await db.prepare('SELECT status FROM users WHERE id = ?').bind(userId).first<{ status: string }>();
+    const user = await db.queryOne<{ status: string }>('SELECT status FROM users WHERE id = $1', [userId]);
     expect(user!.status).toBe('disabled');
   });
 
   it('deletes a user and cascades credentials', async () => {
     const userId = await createTestUser({ username: 'to_delete', password: 'pass1234' });
     // Add a refresh token for this user
-    await db.prepare('INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-      .bind(randomHex(16), userId, sha256Hex('test'), randomHex(16), Date.now() + 86400000, Date.now()).run();
+    await db.execute('INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+      [randomHex(16), userId, sha256Hex('test'), randomHex(16), Date.now() + 86400000, Date.now()]);
 
     const app = makeApp();
     const token = makeToken(adminId);
@@ -198,10 +199,10 @@ describe('Admin API — User Management', () => {
     });
     expect(res.status).toBe(200);
 
-    const user = await db.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first();
+    const user = await db.queryOne('SELECT * FROM users WHERE id = $1', [userId]);
     expect(user).toBeNull();
 
-    const tokens = await db.prepare('SELECT * FROM refresh_tokens WHERE user_id = ?').bind(userId).first();
+    const tokens = await db.queryOne('SELECT * FROM refresh_tokens WHERE user_id = $1', [userId]);
     expect(tokens).toBeNull();
   });
 
@@ -248,7 +249,7 @@ describe('Admin API — User Management', () => {
     // adminId is the only admin — create another non-admin user to disable
     const otherAdminId = await createTestUser({ username: 'otheradmin', password: 'pass1234', isAdmin: true });
     // Disable otherAdmin first (so only adminId is left)
-    await db.prepare("UPDATE users SET status = 'disabled' WHERE id = ?").bind(otherAdminId).run();
+    await db.execute("UPDATE users SET status = 'disabled' WHERE id = $1", [otherAdminId]);
 
     // Now try to create a third user as admin and disable them
     const thirdAdminId = await createTestUser({ username: 'thirdadmin', password: 'pass1234', isAdmin: true });
@@ -263,12 +264,12 @@ describe('Admin API — User Management', () => {
 
     // Now only adminId is active admin, try to disable them via another admin's perspective
     // Re-enable otherAdmin to do this
-    await db.prepare("UPDATE users SET status = 'active' WHERE id = ?").bind(otherAdminId).run();
+    await db.execute("UPDATE users SET status = 'active' WHERE id = $1", [otherAdminId]);
     const otherToken = makeToken(otherAdminId);
     // Disable adminId — should fail because after this there would be only otherAdmin
     // Actually this should succeed since otherAdmin is active. Let's verify the count logic instead:
     // Disable otherAdmin from adminId perspective when otherAdmin is the last besides adminId
-    await db.prepare("UPDATE users SET status = 'disabled' WHERE id = ?").bind(otherAdminId).run();
+    await db.execute("UPDATE users SET status = 'disabled' WHERE id = $1", [otherAdminId]);
     // Now only adminId is active admin
     // Cannot disable adminId because username='admin' protection would apply
     // Let's test with a fresh scenario: only one active admin, try to disable someone else
@@ -309,7 +310,7 @@ describe('Admin API — Settings', () => {
     });
     expect(res.status).toBe(200);
 
-    const row = await db.prepare("SELECT value FROM settings WHERE key = 'registration_enabled'").bind().first<{ value: string }>();
+    const row = await db.queryOne<{ value: string }>("SELECT value FROM settings WHERE key = 'registration_enabled'");
     expect(row!.value).toBe('false');
   });
 
@@ -322,7 +323,7 @@ describe('Admin API — Settings', () => {
       body: JSON.stringify({ registration_enabled: 'maybe' }),
     });
     // Value should remain unchanged
-    const row = await db.prepare("SELECT value FROM settings WHERE key = 'registration_enabled'").bind().first<{ value: string }>();
+    const row = await db.queryOne<{ value: string }>("SELECT value FROM settings WHERE key = 'registration_enabled'");
     expect(row!.value).toBe('true');
   });
 
@@ -335,7 +336,7 @@ describe('Admin API — Settings', () => {
       body: JSON.stringify({ unknown_key: 'true' }),
     });
     expect(res.status).toBe(200);
-    const row = await db.prepare("SELECT value FROM settings WHERE key = 'unknown_key'").bind().first();
+    const row = await db.queryOne("SELECT value FROM settings WHERE key = 'unknown_key'");
     expect(row).toBeNull();
   });
 });

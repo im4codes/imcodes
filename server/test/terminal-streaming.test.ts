@@ -37,14 +37,12 @@ class MockWs extends EventEmitter {
 
 function makeDb() {
   return {
-    prepare: (_sql: string) => ({
-      bind: (..._args: unknown[]) => ({
-        first: async () => ({ token_hash: 'valid-hash', user_id: 'user-1' }),
-        all: async () => ({ results: [] }),
-        run: async () => ({ changes: 1 }),
-      }),
-    }),
-  } as unknown as import('../src/db/client.js').PgDatabase;
+    queryOne: async () => ({ token_hash: 'valid-hash', user_id: 'user-1' }),
+    query: async () => [],
+    execute: async () => ({ changes: 1 }),
+    exec: async () => {},
+    close: () => {},
+  } as unknown as import('../src/db/client.js').Database;
 }
 
 vi.mock('../src/security/crypto.js', () => ({

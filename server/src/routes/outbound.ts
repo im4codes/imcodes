@@ -31,9 +31,10 @@ export async function routeInbound(msg: InboundMessage, env: Env, botId: string)
 async function loadBotConfig(botId: string, env: Env): Promise<BotConfig | null> {
   if (!env.BOT_ENCRYPTION_KEY) throw new Error('BOT_ENCRYPTION_KEY is not configured');
 
-  const row = await env.DB.prepare(
-    'SELECT id, user_id, platform, config_encrypted FROM platform_bots WHERE id = ?',
-  ).bind(botId).first<{ id: string; user_id: string; platform: string; config_encrypted: string }>();
+  const row = await env.DB.queryOne<{ id: string; user_id: string; platform: string; config_encrypted: string }>(
+    'SELECT id, user_id, platform, config_encrypted FROM platform_bots WHERE id = $1',
+    [botId],
+  );
 
   if (!row) return null;
 
@@ -61,9 +62,10 @@ outboundRoutes.post('/', async (c) => {
 
   // Validate server token
   const tokenHash = sha256Hex(token);
-  const serverRow = await c.env.DB.prepare(
-    'SELECT id, user_id FROM servers WHERE token_hash = ?',
-  ).bind(tokenHash).first<{ id: string; user_id: string }>();
+  const serverRow = await c.env.DB.queryOne<{ id: string; user_id: string }>(
+    'SELECT id, user_id FROM servers WHERE token_hash = $1',
+    [tokenHash],
+  );
 
   if (!serverRow) {
     return c.json({ error: 'unauthorized' }, 401);

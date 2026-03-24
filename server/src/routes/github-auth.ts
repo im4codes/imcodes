@@ -210,9 +210,10 @@ githubAuthRoutes.get('/callback', async (c): Promise<Response> => {
   const refreshHash = sha256Hex(refreshRaw);
   const familyId = randomHex(16);
   const refreshId = randomHex(16);
-  await c.env.DB.prepare(
-    'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-  ).bind(refreshId, userId, refreshHash, familyId, Date.now() + 30 * 24 * 3600 * 1000, Date.now()).run();
+  await c.env.DB.execute(
+    'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+    [refreshId, userId, refreshHash, familyId, Date.now() + 30 * 24 * 3600 * 1000, Date.now()],
+  );
 
   // Task 1: Deliver tokens via HttpOnly cookies
   setCookie(c, 'rcc_session', accessToken, {

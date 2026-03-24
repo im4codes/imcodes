@@ -5,7 +5,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { buildApp } from '../src/index.js';
 import type { Env } from '../src/env.js';
-import type { PgDatabase } from '../src/db/client.js';
+import type { Database } from '../src/db/client.js';
 import { hashPassword } from '../src/security/crypto.js';
 
 // ── In-memory mock DB ─────────────────────────────────────────────────────────
@@ -21,7 +21,7 @@ interface MemUser {
   status: 'active' | 'pending' | 'disabled';
 }
 
-function makeMemDb(): PgDatabase {
+function makeMemDb(): Database {
   const users = new Map<string, MemUser>();
   const apiKeys = new Map<string, { id: string; user_id: string; key_hash: string; label: string | null; created_at: number; revoked_at: number | null; grace_expires_at: number | null }>();
   const refreshTokens = new Map<string, { id: string; user_id: string; token_hash: string; family_id: string; used_at: number | null; expires_at: number; created_at: number }>();
@@ -29,137 +29,138 @@ function makeMemDb(): PgDatabase {
   const auditLog: unknown[] = [];
   const lockouts = new Map<string, { identity: string; failed_attempts: number; locked_until: number | null; last_attempt_at: number }>();
 
+  function normalize(sql: string): string {
+    return sql.toLowerCase().replace(/\s+/g, ' ').trim();
+  }
+
   return {
-    prepare: (sql: string) => ({
-      bind: (...args: unknown[]) => ({
-        first: async <T = unknown>(): Promise<T | null> => {
-          const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+    queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
+      const s = normalize(sql);
 
-          if (s.includes('from users where id')) {
-            return (users.get(args[0] as string) ?? null) as T | null;
-          }
-          if (s.includes('from users where username')) {
-            for (const u of users.values()) {
-              if (u.username === args[0]) return u as T;
-            }
-            return null;
-          }
-          if (s.includes('from api_keys where key_hash') && s.includes('revoked_at is null')) {
-            for (const k of apiKeys.values()) {
-              if (k.key_hash === args[0] && !k.revoked_at) return { user_id: k.user_id } as T;
-            }
-            return null;
-          }
-          if (s.includes('from api_keys where id')) {
-            for (const k of apiKeys.values()) {
-              if (k.id === args[0] && k.user_id === args[1]) return { id: k.id } as T;
-            }
-            return null;
-          }
-          if (s.includes('from auth_lockout')) {
-            return (lockouts.get(args[0] as string) ?? null) as T | null;
-          }
-          if (s.includes('count(*) as cnt from users')) {
-            return { cnt: users.size } as T;
-          }
-          return null;
-        },
-        all: async <T = unknown>() => {
-          const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
-          if (s.includes('from servers where user_id')) {
-            const results: unknown[] = [];
-            for (const sv of servers.values()) {
-              if (sv.user_id === args[0]) results.push(sv);
-            }
-            return { results: results as T[] };
-          }
-          if (s.includes('from api_keys') && s.includes('where user_id')) {
-            const results: unknown[] = [];
-            for (const k of apiKeys.values()) {
-              if (k.user_id === args[0]) results.push(k);
-            }
-            return { results: results as T[] };
-          }
-          return { results: [] as T[] };
-        },
-        run: async () => {
-          const s = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+      if (s.includes('from users where id')) {
+        return (users.get(params[0] as string) ?? null) as T | null;
+      }
+      if (s.includes('from users where username')) {
+        for (const u of users.values()) {
+          if (u.username === params[0]) return u as T;
+        }
+        return null;
+      }
+      if (s.includes('from api_keys where key_hash') && s.includes('revoked_at is null')) {
+        for (const k of apiKeys.values()) {
+          if (k.key_hash === params[0] && !k.revoked_at) return { user_id: k.user_id } as T;
+        }
+        return null;
+      }
+      if (s.includes('from api_keys where id')) {
+        for (const k of apiKeys.values()) {
+          if (k.id === params[0] && k.user_id === params[1]) return { id: k.id } as T;
+        }
+        return null;
+      }
+      if (s.includes('from auth_lockout')) {
+        return (lockouts.get(params[0] as string) ?? null) as T | null;
+      }
+      if (s.includes('count(*) as cnt from users')) {
+        return { cnt: users.size } as T;
+      }
+      return null;
+    },
+    query: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T[]> => {
+      const s = normalize(sql);
+      if (s.includes('from servers where user_id')) {
+        const results: unknown[] = [];
+        for (const sv of servers.values()) {
+          if (sv.user_id === params[0]) results.push(sv);
+        }
+        return results as T[];
+      }
+      if (s.includes('from api_keys') && s.includes('where user_id')) {
+        const results: unknown[] = [];
+        for (const k of apiKeys.values()) {
+          if (k.user_id === params[0]) results.push(k);
+        }
+        return results as T[];
+      }
+      return [] as T[];
+    },
+    execute: async (sql: string, params: unknown[] = []): Promise<{ changes: number }> => {
+      const s = normalize(sql);
 
-          if (s.includes('insert into users')) {
-            users.set(args[0] as string, {
-              id: args[0] as string,
-              created_at: args[1] as number,
-              username: null,
-              password_hash: null,
-              display_name: null,
-              password_must_change: null,
-              is_admin: false,
-              status: 'active',
-            });
-          }
-          if (s.includes('insert into api_keys')) {
-            apiKeys.set(args[0] as string, {
-              id: args[0] as string,
-              user_id: args[1] as string,
-              key_hash: args[2] as string,
-              label: args.length > 4 ? args[3] as string : null,
-              created_at: args[args.length - 1] as number,
-              revoked_at: null,
-              grace_expires_at: null,
-            });
-          }
-          if (s.includes('insert into refresh_tokens')) {
-            refreshTokens.set(args[0] as string, {
-              id: args[0] as string,
-              user_id: args[1] as string,
-              token_hash: args[2] as string,
-              family_id: args[3] as string,
-              used_at: null,
-              expires_at: args[4] as number,
-              created_at: args[5] as number,
-            });
-          }
-          if (s.includes('update users set password_hash') && s.includes('password_must_change')) {
-            const user = users.get(args[1] as string);
-            if (user) {
-              user.password_hash = args[0] as string;
-              user.password_must_change = false;
-            }
-          }
-          if (s.includes('delete from users where id')) {
-            users.delete(args[0] as string);
-          }
-          if (s.includes('delete from api_keys where user_id')) {
-            for (const [k, v] of apiKeys) {
-              if (v.user_id === args[0]) apiKeys.delete(k);
-            }
-          }
-          if (s.includes('delete from refresh_tokens where user_id')) {
-            for (const [k, v] of refreshTokens) {
-              if (v.user_id === args[0]) refreshTokens.delete(k);
-            }
-          }
-          if (s.includes('insert into audit_log')) {
-            auditLog.push(args);
-          }
-          if (s.includes('insert into auth_lockout') || s.includes('update auth_lockout')) {
-            // simplified lockout handling
-          }
-          return { changes: 1 };
-        },
-      }),
-    }),
-    exec: async () => ({ rows: [] }),
-  } as unknown as PgDatabase;
+      if (s.includes('insert into users')) {
+        users.set(params[0] as string, {
+          id: params[0] as string,
+          created_at: params[1] as number,
+          username: null,
+          password_hash: null,
+          display_name: null,
+          password_must_change: null,
+          is_admin: false,
+          status: 'active',
+        });
+      }
+      if (s.includes('insert into api_keys')) {
+        apiKeys.set(params[0] as string, {
+          id: params[0] as string,
+          user_id: params[1] as string,
+          key_hash: params[2] as string,
+          label: params.length > 4 ? params[3] as string : null,
+          created_at: params[params.length - 1] as number,
+          revoked_at: null,
+          grace_expires_at: null,
+        });
+      }
+      if (s.includes('insert into refresh_tokens')) {
+        refreshTokens.set(params[0] as string, {
+          id: params[0] as string,
+          user_id: params[1] as string,
+          token_hash: params[2] as string,
+          family_id: params[3] as string,
+          used_at: null,
+          expires_at: params[4] as number,
+          created_at: params[5] as number,
+        });
+      }
+      if (s.includes('update users set password_hash') && s.includes('password_must_change')) {
+        const user = users.get(params[1] as string);
+        if (user) {
+          user.password_hash = params[0] as string;
+          user.password_must_change = false;
+        }
+      }
+      if (s.includes('delete from users where id')) {
+        users.delete(params[0] as string);
+      }
+      if (s.includes('delete from api_keys where user_id')) {
+        for (const [k, v] of apiKeys) {
+          if (v.user_id === params[0]) apiKeys.delete(k);
+        }
+      }
+      if (s.includes('delete from refresh_tokens where user_id')) {
+        for (const [k, v] of refreshTokens) {
+          if (v.user_id === params[0]) refreshTokens.delete(k);
+        }
+      }
+      if (s.includes('insert into audit_log')) {
+        auditLog.push(params);
+      }
+      if (s.includes('insert into auth_lockout') || s.includes('update auth_lockout')) {
+        // simplified lockout handling
+      }
+      return { changes: 1 };
+    },
+    exec: async () => {},
+    close: async () => {},
+  } as unknown as Database;
 }
 
 // Helper to seed a user with password in the mock DB
-async function seedPasswordUser(db: PgDatabase, id: string, username: string, password: string, mustChange = false) {
+async function seedPasswordUser(db: Database, id: string, username: string, password: string, mustChange = false) {
   const hash = await hashPassword(password);
   const now = Date.now();
-  await db.prepare('INSERT INTO users (id, created_at) VALUES (?, ?)').bind(id, now).run();
+  await db.execute('INSERT INTO users (id, created_at) VALUES ($1, $2)', [id, now]);
   // Manually patch the user record
-  const user = await db.prepare('SELECT * FROM users WHERE id = ?').bind(id).first<MemUser>();
+  const user = await db.queryOne<MemUser>('SELECT * FROM users WHERE id = $1', [id]);
   if (user) {
     user.username = username;
     user.password_hash = hash;
@@ -167,7 +168,7 @@ async function seedPasswordUser(db: PgDatabase, id: string, username: string, pa
   }
 }
 
-function makeEnv(db?: PgDatabase): Env {
+function makeEnv(db?: Database): Env {
   return {
     DB: db ?? makeMemDb(),
     JWT_SIGNING_KEY: 'test-signing-key-32chars-padding!!',
@@ -187,7 +188,7 @@ function makeEnv(db?: PgDatabase): Env {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('Password authentication', () => {
-  let db: PgDatabase;
+  let db: Database;
   let app: ReturnType<typeof buildApp>;
   let env: Env;
 
@@ -321,7 +322,7 @@ describe('Password authentication', () => {
 });
 
 describe('Account deletion', () => {
-  let db: PgDatabase;
+  let db: Database;
   let app: ReturnType<typeof buildApp>;
   let env: Env;
 

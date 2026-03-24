@@ -74,9 +74,10 @@ serverRoutes.post('/:id/heartbeat', async (c) => {
   const tokenHash = sha256Hex(token);
 
   const serverId = c.req.param('id');
-  const server = await c.env.DB.prepare(
-    'SELECT id FROM servers WHERE id = ? AND token_hash = ?',
-  ).bind(serverId, tokenHash).first<{ id: string }>();
+  const server = await c.env.DB.queryOne<{ id: string }>(
+    'SELECT id FROM servers WHERE id = $1 AND token_hash = $2',
+    [serverId, tokenHash],
+  );
   if (!server) return c.json({ error: 'unauthorized' }, 401);
 
   await updateServerHeartbeat(c.env.DB, serverId);
@@ -97,9 +98,10 @@ serverRoutes.post('/:id/bindings', async (c) => {
   const token = auth.slice(7);
 
   const tokenHash = sha256Hex(token);
-  const serverRow = await c.env.DB.prepare(
-    'SELECT id, user_id FROM servers WHERE token_hash = ? AND id = ?',
-  ).bind(tokenHash, c.req.param('id')).first<{ id: string; user_id: string }>();
+  const serverRow = await c.env.DB.queryOne<{ id: string; user_id: string }>(
+    'SELECT id, user_id FROM servers WHERE token_hash = $1 AND id = $2',
+    [tokenHash, c.req.param('id')],
+  );
 
   if (!serverRow) return c.json({ error: 'unauthorized' }, 401);
 
@@ -131,9 +133,10 @@ serverRoutes.delete('/:id/bindings', async (c) => {
   const token = auth.slice(7);
 
   const tokenHash = sha256Hex(token);
-  const serverRow = await c.env.DB.prepare(
-    'SELECT id FROM servers WHERE token_hash = ? AND id = ?',
-  ).bind(tokenHash, c.req.param('id')).first<{ id: string }>();
+  const serverRow = await c.env.DB.queryOne<{ id: string }>(
+    'SELECT id FROM servers WHERE token_hash = $1 AND id = $2',
+    [tokenHash, c.req.param('id')],
+  );
 
   if (!serverRow) return c.json({ error: 'unauthorized' }, 401);
 
@@ -143,9 +146,10 @@ serverRoutes.delete('/:id/bindings', async (c) => {
 
   const { platform, channelId, botId } = parsed.data;
   // Scope to server_id to prevent cross-server deletion races
-  await c.env.DB.prepare(
-    'DELETE FROM channel_bindings WHERE platform = ? AND channel_id = ? AND bot_id = ? AND server_id = ?',
-  ).bind(platform, channelId, botId, serverRow.id).run();
+  await c.env.DB.execute(
+    'DELETE FROM channel_bindings WHERE platform = $1 AND channel_id = $2 AND bot_id = $3 AND server_id = $4',
+    [platform, channelId, botId, serverRow.id],
+  );
 
   return c.json({ ok: true });
 });

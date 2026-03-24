@@ -5,7 +5,7 @@
  * rateLimiter singleton is kept for WS JTI single-use tracking only.
  */
 import { MemoryRateLimiter } from '../ws/rate-limiter.js';
-import type { PgDatabase } from '../db/client.js';
+import type { Database } from '../db/client.js';
 import logger from '../util/logger.js';
 
 export interface LockoutResult {
@@ -22,12 +22,12 @@ export const rateLimiter = new MemoryRateLimiter();
  * Requires DB — uses auth_lockout table (migration 004).
  */
 export async function recordAuthFailure(
-  db: PgDatabase,
+  db: Database,
   identity: string,
 ): Promise<LockoutResult> {
-  const row = await db.prepare(`
+  const row = await db.queryOne<{ fail_count: number; locked_until: Date | null }>(`
     INSERT INTO auth_lockout (identity, fail_count, first_fail_at)
-    VALUES (?, 1, NOW())
+    VALUES ($1, 1, NOW())
     ON CONFLICT (identity) DO UPDATE SET
       fail_count = CASE
         WHEN auth_lockout.first_fail_at < NOW() - INTERVAL '15 minutes' THEN 1
@@ -46,7 +46,7 @@ export async function recordAuthFailure(
         ELSE NULL
       END
     RETURNING fail_count, locked_until
-  `).bind(identity).first<{ fail_count: number; locked_until: Date | null }>();
+  `, [identity]);
 
   const isLocked = !!row?.locked_until;
   const lockedUntil = row?.locked_until ? new Date(row.locked_until).getTime() : undefined;
@@ -62,13 +62,14 @@ export async function recordAuthFailure(
  * Check if an identity is currently locked out.
  */
 export async function checkAuthLockout(
-  db: PgDatabase,
+  db: Database,
   identity: string,
 ): Promise<LockoutResult> {
-  const row = await db.prepare(
+  const row = await db.queryOne<{ locked_until: Date }>(
     `SELECT locked_until FROM auth_lockout
-     WHERE identity = ? AND locked_until > NOW()`,
-  ).bind(identity).first<{ locked_until: Date }>();
+     WHERE identity = $1 AND locked_until > NOW()`,
+    [identity],
+  );
 
   if (!row) return { locked: false };
 

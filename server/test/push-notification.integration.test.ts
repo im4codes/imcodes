@@ -8,7 +8,7 @@
 
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { createDatabase, type PgDatabase } from '../src/db/client.js';
+import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createUser, createServer } from '../src/db/queries.js';
 import { sha256Hex, randomHex } from '../src/security/crypto.js';
@@ -39,7 +39,7 @@ async function flushAsync(ms = 500) {
 
 // ── DB lifecycle ────────────────────────────────────────────────────────────
 
-let db: PgDatabase;
+let db: Database;
 let userId: string;
 let serverId: string;
 const serverToken = randomHex(32);
@@ -56,10 +56,11 @@ beforeAll(async () => {
 
   // Insert a session record so push can look up metadata
   const now = Date.now();
-  await db.prepare(
+  await db.execute(
     `INSERT INTO sessions (id, server_id, name, project_name, project_dir, role, agent_type, state, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).bind(randomHex(16), serverId, 'deck_cd_brain', 'my-project', '/home/dev/project', 'brain', 'claude-code', 'running', now, now).run();
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    [randomHex(16), serverId, 'deck_cd_brain', 'my-project', '/home/dev/project', 'brain', 'claude-code', 'running', now, now],
+  );
 });
 
 afterAll(async () => {

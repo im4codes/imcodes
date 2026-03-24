@@ -15,13 +15,15 @@ teamRoutes.post('/', requireAuth(), async (c) => {
   const teamId = randomHex(16);
   const now = Date.now();
 
-  await c.env.DB.prepare(
-    "INSERT INTO teams (id, name, owner_id, plan, created_at) VALUES (?, ?, ?, 'free', ?)",
-  ).bind(teamId, body.name, userId, now).run();
+  await c.env.DB.execute(
+    "INSERT INTO teams (id, name, owner_id, plan, created_at) VALUES ($1, $2, $3, 'free', $4)",
+    [teamId, body.name, userId, now],
+  );
 
-  await c.env.DB.prepare(
-    "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES (?, ?, 'owner', ?)",
-  ).bind(teamId, userId, now).run();
+  await c.env.DB.execute(
+    "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'owner', $3)",
+    [teamId, userId, now],
+  );
 
   await logAudit({ userId, action: 'team.create', details: { teamId, name: body.name } }, c.env.DB);
 
@@ -34,23 +36,17 @@ teamRoutes.get('/:id', requireAuth(), async (c) => {
   const teamId = c.req.param('id');
 
   const member = await c.env.DB
-    .prepare('SELECT role FROM team_members WHERE team_id = ? AND user_id = ?')
-    .bind(teamId, userId)
-    .first<{ role: string }>();
+    .queryOne<{ role: string }>('SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2', [teamId, userId]);
   if (!member) return c.json({ error: 'not_found' }, 404);
 
   const team = await c.env.DB
-    .prepare('SELECT * FROM teams WHERE id = ?')
-    .bind(teamId)
-    .first();
+    .queryOne('SELECT * FROM teams WHERE id = $1', [teamId]);
   if (!team) return c.json({ error: 'not_found' }, 404);
 
   const members = await c.env.DB
-    .prepare('SELECT user_id, role, joined_at FROM team_members WHERE team_id = ?')
-    .bind(teamId)
-    .all();
+    .query('SELECT user_id, role, joined_at FROM team_members WHERE team_id = $1', [teamId]);
 
-  return c.json({ ...team as object, members: members.results, myRole: member.role });
+  return c.json({ ...team as object, members, myRole: member.role });
 });
 
 // POST /api/team/:id/invite — create invite link (owner/admin only)
@@ -59,8 +55,7 @@ teamRoutes.post('/:id/invite', requireAuth(), async (c) => {
   const teamId = c.req.param('id');
 
   const member = await c.env.DB
-    .prepare("SELECT role FROM team_members WHERE team_id = ? AND user_id = ? AND role IN ('owner', 'admin')")
-    .bind(teamId, userId).first<{ role: string }>();
+    .queryOne<{ role: string }>("SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2 AND role IN ('owner', 'admin')", [teamId, userId]);
   if (!member) return c.json({ error: 'forbidden' }, 403);
 
   const body = await c.req.json<{ role?: string; email?: string }>().catch(() => ({} as { role?: string; email?: string }));
@@ -71,9 +66,10 @@ teamRoutes.post('/:id/invite', requireAuth(), async (c) => {
   const expiresAt = Date.now() + 7 * 24 * 3600 * 1000; // 7 days
   const now = Date.now();
 
-  await c.env.DB.prepare(
-    'INSERT INTO team_invites (id, team_id, email, token, role, invited_by, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-  ).bind(inviteId, teamId, body.email ?? null, token, role, userId, expiresAt, now).run();
+  await c.env.DB.execute(
+    'INSERT INTO team_invites (id, team_id, email, token, role, invited_by, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+    [inviteId, teamId, body.email ?? null, token, role, userId, expiresAt, now],
+  );
 
   await logAudit({ userId, action: 'team.invite_created', details: { teamId, role } }, c.env.DB);
 
@@ -87,18 +83,17 @@ teamRoutes.post('/join/:token', requireAuth(), async (c) => {
   const now = Date.now();
 
   const invite = await c.env.DB
-    .prepare('SELECT * FROM team_invites WHERE token = ? AND used_at IS NULL AND expires_at > ?')
-    .bind(token, now)
-    .first<{ id: string; team_id: string; role: string }>();
+    .queryOne<{ id: string; team_id: string; role: string }>('SELECT * FROM team_invites WHERE token = $1 AND used_at IS NULL AND expires_at > $2', [token, now]);
   if (!invite) return c.json({ error: 'invalid_or_expired_invite' }, 400);
 
   // Add to team
-  await c.env.DB.prepare(
-    'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING',
-  ).bind(invite.team_id, userId, invite.role, now).run();
+  await c.env.DB.execute(
+    'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+    [invite.team_id, userId, invite.role, now],
+  );
 
   // Mark invite used
-  await c.env.DB.prepare('UPDATE team_invites SET used_at = ? WHERE id = ?').bind(now, invite.id).run();
+  await c.env.DB.execute('UPDATE team_invites SET used_at = $1 WHERE id = $2', [now, invite.id]);
 
   await logAudit({ userId, action: 'team.joined', details: { teamId: invite.team_id, via: 'invite' } }, c.env.DB);
 
@@ -114,16 +109,15 @@ teamRoutes.post('/:id/join', requireAuth(), async (c) => {
 
   if (body.token) {
     const invite = await c.env.DB
-      .prepare('SELECT * FROM team_invites WHERE token = ? AND team_id = ? AND used_at IS NULL AND expires_at > ?')
-      .bind(body.token, teamId, now)
-      .first<{ id: string; role: string }>();
+      .queryOne<{ id: string; role: string }>('SELECT * FROM team_invites WHERE token = $1 AND team_id = $2 AND used_at IS NULL AND expires_at > $3', [body.token, teamId, now]);
     if (!invite) return c.json({ error: 'invalid_or_expired_invite' }, 400);
 
-    await c.env.DB.prepare(
-      'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING',
-    ).bind(teamId, userId, invite.role, now).run();
+    await c.env.DB.execute(
+      'INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+      [teamId, userId, invite.role, now],
+    );
 
-    await c.env.DB.prepare('UPDATE team_invites SET used_at = ? WHERE id = ?').bind(now, invite.id).run();
+    await c.env.DB.execute('UPDATE team_invites SET used_at = $1 WHERE id = $2', [now, invite.id]);
     await logAudit({ userId, action: 'team.joined', details: { teamId, via: 'invite' } }, c.env.DB);
     return c.json({ ok: true, role: invite.role });
   }
@@ -139,16 +133,15 @@ teamRoutes.put('/:id/member/:memberId/role', requireAuth(), async (c) => {
   const body = await c.req.json<{ role: string }>().catch(() => null);
 
   const me = await c.env.DB
-    .prepare("SELECT role FROM team_members WHERE team_id = ? AND user_id = ? AND role IN ('owner', 'admin')")
-    .bind(teamId, userId).first<{ role: string }>();
+    .queryOne<{ role: string }>("SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2 AND role IN ('owner', 'admin')", [teamId, userId]);
   if (!me) return c.json({ error: 'forbidden' }, 403);
 
   if (!['admin', 'member'].includes(body?.role ?? '')) return c.json({ error: 'invalid_role' }, 400);
 
-  await c.env.DB
-    .prepare('UPDATE team_members SET role = ? WHERE team_id = ? AND user_id = ?')
-    .bind(body!.role, teamId, memberId)
-    .run();
+  await c.env.DB.execute(
+    'UPDATE team_members SET role = $1 WHERE team_id = $2 AND user_id = $3',
+    [body!.role, teamId, memberId],
+  );
 
   await logAudit({ userId, action: 'team.role_change', details: { teamId, memberId, role: body!.role } }, c.env.DB);
   return c.json({ ok: true });
@@ -161,14 +154,13 @@ teamRoutes.delete('/:id/member/:memberId', requireAuth(), async (c) => {
   const memberId = c.req.param('memberId');
 
   const me = await c.env.DB
-    .prepare("SELECT role FROM team_members WHERE team_id = ? AND user_id = ? AND role IN ('owner', 'admin')")
-    .bind(teamId, userId).first<{ role: string }>();
+    .queryOne<{ role: string }>("SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2 AND role IN ('owner', 'admin')", [teamId, userId]);
   if (!me) return c.json({ error: 'forbidden' }, 403);
 
-  await c.env.DB
-    .prepare('DELETE FROM team_members WHERE team_id = ? AND user_id = ?')
-    .bind(teamId, memberId)
-    .run();
+  await c.env.DB.execute(
+    'DELETE FROM team_members WHERE team_id = $1 AND user_id = $2',
+    [teamId, memberId],
+  );
 
   await logAudit({ userId, action: 'team.member_removed', details: { teamId, memberId } }, c.env.DB);
   return c.json({ ok: true });

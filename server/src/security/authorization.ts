@@ -5,7 +5,7 @@
 import type { Context, Next } from 'hono';
 import { getCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
-import type { PgDatabase } from '../db/client.js';
+import type { Database } from '../db/client.js';
 import { sha256Hex, verifyJwt } from './crypto.js';
 import { getServerById } from '../db/queries.js';
 import { COOKIE_SESSION } from '../../../shared/cookie-names.js';
@@ -53,12 +53,13 @@ async function resolveAuth(c: Context<{ Bindings: Env }>): Promise<AuthContext |
   if (token.startsWith('deck_')) {
     const keyHash = sha256Hex(token);
     const now = Date.now();
-    const row = await c.env.DB.prepare(
+    const row = await c.env.DB.queryOne<{ id: string; user_id: string }>(
       `SELECT id, user_id FROM api_keys
-       WHERE key_hash = ?
+       WHERE key_hash = $1
          AND revoked_at IS NULL
-         AND (grace_expires_at IS NULL OR grace_expires_at > ?)`,
-    ).bind(keyHash, now).first<{ id: string; user_id: string }>();
+         AND (grace_expires_at IS NULL OR grace_expires_at > $2)`,
+      [keyHash, now],
+    );
     if (!row) return null;
     return { userId: row.user_id, role: 'member', keyId: row.id }; // API keys default to member
   }
@@ -154,10 +155,10 @@ export function requireTeamRole(minRole: 'owner' | 'admin' | 'member' = 'member'
     if (!auth) return c.json({ error: 'unauthorized' }, 401);
 
     const teamId = c.req.param(paramName);
-    const row = await c.env.DB
-      .prepare('SELECT role FROM team_members WHERE team_id = ? AND user_id = ?')
-      .bind(teamId, auth.userId)
-      .first<{ role: Role }>();
+    const row = await c.env.DB.queryOne<{ role: Role }>(
+      'SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2',
+      [teamId, auth.userId],
+    );
 
     if (!row) return c.json({ error: 'forbidden', reason: 'not_a_team_member' }, 403);
 
@@ -181,14 +182,14 @@ export type ServerRole = 'owner' | 'admin' | 'member' | 'none';
  * Checks server ownership first, then team membership.
  */
 export async function resolveServerRole(
-  db: PgDatabase,
+  db: Database,
   serverId: string,
   userId: string,
 ): Promise<ServerRole> {
-  const server = await db
-    .prepare('SELECT team_id, user_id FROM servers WHERE id = ?')
-    .bind(serverId)
-    .first<{ team_id: string | null; user_id: string }>();
+  const server = await db.queryOne<{ team_id: string | null; user_id: string }>(
+    'SELECT team_id, user_id FROM servers WHERE id = $1',
+    [serverId],
+  );
 
   if (!server) return 'none';
 
@@ -197,10 +198,10 @@ export async function resolveServerRole(
 
   // Team membership
   if (server.team_id) {
-    const member = await db
-      .prepare('SELECT role FROM team_members WHERE team_id = ? AND user_id = ?')
-      .bind(server.team_id, userId)
-      .first<{ role: string }>();
+    const member = await db.queryOne<{ role: string }>(
+      'SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2',
+      [server.team_id, userId],
+    );
     if (member) {
       if (member.role === 'owner') return 'admin'; // team owner → admin on server
       if (member.role === 'admin') return 'admin';

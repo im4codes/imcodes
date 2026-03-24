@@ -8,7 +8,7 @@
  */
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
-import type { PgDatabase } from '../db/client.js';
+import type { Database } from '../db/client.js';
 import { requireAuth } from '../security/authorization.js';
 import { SignJWT, importPKCS8 } from 'jose';
 import logger from '../util/logger.js';
@@ -26,11 +26,12 @@ pushRoutes.post('/register', async (c) => {
   if (!body?.token || !body?.platform) return c.json({ error: 'token and platform required' }, 400);
 
   try {
-    await c.env.DB.prepare(
+    await c.env.DB.execute(
       `INSERT INTO push_tokens (user_id, token, platform, created_at)
-       VALUES (?, ?, ?, ?)
+       VALUES ($1, $2, $3, $4)
        ON CONFLICT (user_id, token) DO UPDATE SET platform = excluded.platform`,
-    ).bind(userId, body.token, body.platform, Date.now()).run();
+      [userId, body.token, body.platform, Date.now()],
+    );
   } catch (err) {
     logger.warn({ err }, 'push_tokens insert failed');
   }
@@ -45,8 +46,8 @@ pushRoutes.delete('/unregister', async (c) => {
   if (!body?.token) return c.json({ error: 'token required' }, 400);
 
   try {
-    await c.env.DB.prepare('DELETE FROM push_tokens WHERE user_id = ? AND token = ?')
-      .bind(userId, body.token).run();
+    await c.env.DB.execute('DELETE FROM push_tokens WHERE user_id = $1 AND token = $2',
+      [userId, body.token]);
   } catch { /* ignore */ }
 
   return c.json({ ok: true });
@@ -99,26 +100,25 @@ export interface PushPayload {
  * Routes iOS to APNs, Android to FCM.
  */
 export async function dispatchPush(payload: PushPayload, env: Env): Promise<void>;
-export async function dispatchPush(payload: PushPayload, db: PgDatabase, env?: Env): Promise<void>;
-export async function dispatchPush(payload: PushPayload, envOrDb: Env | PgDatabase, maybeEnv?: Env): Promise<void> {
-  let db: PgDatabase;
+export async function dispatchPush(payload: PushPayload, db: Database, env?: Env): Promise<void>;
+export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database, maybeEnv?: Env): Promise<void> {
+  let db: Database;
   let env: Env;
 
   if ('DB' in envOrDb) {
     db = (envOrDb as Env).DB;
     env = envOrDb as Env;
   } else {
-    db = envOrDb as PgDatabase;
+    db = envOrDb as Database;
     env = maybeEnv!;
   }
 
   let tokens: Array<{ token: string; platform: string }> = [];
   try {
-    const result = await db
-      .prepare('SELECT token, platform FROM push_tokens WHERE user_id = ?')
-      .bind(payload.userId)
-      .all<{ token: string; platform: string }>();
-    tokens = result.results;
+    tokens = await db.query<{ token: string; platform: string }>(
+      'SELECT token, platform FROM push_tokens WHERE user_id = $1',
+      [payload.userId],
+    );
   } catch (err) {
     logger.warn({ err }, 'Failed to fetch push tokens');
     return;
@@ -142,7 +142,7 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | PgDataba
     } catch (err) {
       logger.warn({ token: token.slice(0, 10) + '...', platform, err: err instanceof Error ? err.message : err }, 'Push dispatch failed');
       if (err instanceof PushError && err.unregistered) {
-        await db.prepare('DELETE FROM push_tokens WHERE token = ?').bind(token).run().catch(() => {});
+        await db.execute('DELETE FROM push_tokens WHERE token = $1', [token]).catch(() => {});
       }
     }
   }
