@@ -71,6 +71,8 @@ interface Props {
   ws: WsClient;
   projectDir: string;
   onBack?: () => void;
+  /** Called when a CI/CD run completes (success/failure). */
+  onCiEvent?: (run: { name: string; status: string; conclusion?: string; url: string }) => void;
 }
 
 type TabKey = 'issues' | 'prs' | 'branches' | 'commits' | 'actions';
@@ -128,7 +130,7 @@ function classifyError(msg: string): ErrorKind {
 
 // ── Component ────────────────────────────────────────────────────────────────
 
-export function RepoPage({ ws, projectDir }: Props) {
+export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
   const { t } = useTranslation();
 
   const [context, setContext] = useState<RepoContext | null>(null);
@@ -349,6 +351,16 @@ export function RepoPage({ ws, projectDir }: Props) {
         setTabs(prev => {
           const existing = prev[tabKey];
           const isLoadMore = m.page > 1;
+          // Detect newly completed CI/CD runs (was running/queued, now success/failure)
+          if (tabKey === 'actions' && !isLoadMore && existing.fetched && onCiEvent) {
+            const oldStatuses = new Map(existing.items.map((r: any) => [r.id, r.status]));
+            for (const run of m.items) {
+              const prev = oldStatuses.get(run.id);
+              if (prev && (prev === 'running' || prev === 'queued') && (run.status === 'success' || run.status === 'failure')) {
+                onCiEvent({ name: run.name, status: run.status, conclusion: run.conclusion, url: run.url });
+              }
+            }
+          }
           return {
             ...prev,
             [tabKey]: {
@@ -377,7 +389,7 @@ export function RepoPage({ ws, projectDir }: Props) {
   useEffect(() => {
     if (!tabs.actions.fetched) return;
     const hasRunning = tabs.actions.items.some((r: any) => r.status === 'running' || r.status === 'queued');
-    const interval = hasRunning ? 10_000 : 30_000;
+    const interval = hasRunning ? 10_000 : 15_000;
     const timer = setInterval(() => {
       silentRefreshTab('actions');
     }, interval);

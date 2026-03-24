@@ -1714,7 +1714,12 @@ export function App() {
 
       {showRepoPage && wsRef.current && activeSessionInfo?.projectDir && (
         <FloatingPanel id="repo" title="Repository" onClose={() => setShowRepoPage(false)} defaultW={800} defaultH={600}>
-          <RepoPage ws={wsRef.current} projectDir={activeSessionInfo.projectDir} onBack={() => setShowRepoPage(false)} />
+          <RepoPage ws={wsRef.current} projectDir={activeSessionInfo.projectDir} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
+            const id = Date.now();
+            const icon = run.status === 'success' ? '✅' : '❌';
+            setToasts((prev) => [...prev, { id, sessionName: '', project: `${icon} ${run.name}`, kind: 'notification', title: run.status === 'success' ? 'CI Passed' : 'CI Failed', message: run.conclusion ?? run.status }]);
+            setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 6000);
+          }} />
         </FloatingPanel>
       )}
 
