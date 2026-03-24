@@ -196,7 +196,7 @@ interface SelectionMenu {
 }
 
 const FILE_PANEL_MIN = 220;
-const FILE_PANEL_MAX = 900;
+const FILE_PANEL_MAX_RATIO = 0.6; // 60% of viewport width
 const FILE_PANEL_DEFAULT = 340;
 const panelWidthKey = (id: string | null | undefined) => `chatFilePanelWidth:${id ?? '_'}`;
 const panelOpenKey  = (id: string | null | undefined) => `chatFilePanelOpen:${id ?? '_'}`;
@@ -267,7 +267,8 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
     const onMove = (ev: MouseEvent) => {
       if (!dragStateRef.current) return;
       const delta = dragStateRef.current.startX - ev.clientX;
-      const newW = Math.max(FILE_PANEL_MIN, Math.min(FILE_PANEL_MAX, dragStateRef.current.startWidth + delta));
+      const maxW = Math.floor(window.innerWidth * FILE_PANEL_MAX_RATIO);
+      const newW = Math.max(FILE_PANEL_MIN, Math.min(maxW, dragStateRef.current.startWidth + delta));
       setFilePanelWidth(newW);
     };
     const onUp = () => {
