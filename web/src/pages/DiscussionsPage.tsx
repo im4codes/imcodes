@@ -27,7 +27,7 @@ interface P2pDiscussion {
 
 interface Props {
   ws: WsClient | null;
-  onBack: () => void;
+  onBack?: () => void;
   initialSelectedId?: string | null;
   /** Live discussion state from app (progress, nodes). */
   liveDiscussions?: LiveDiscussion[];
@@ -37,7 +37,7 @@ interface Props {
 // Configure marked for safe rendering
 marked.setOptions({ breaks: true, gfm: true });
 
-export function DiscussionsPage({ ws, onBack, initialSelectedId, liveDiscussions = [], onStopDiscussion }: Props) {
+export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], onStopDiscussion }: Props) {
   const [discussions, setDiscussions] = useState<P2pDiscussion[]>([]);
   const [selected, setSelected] = useState<string | null>(initialSelectedId ?? null);
   const [content, setContent] = useState<string | null>(null);
@@ -102,9 +102,7 @@ export function DiscussionsPage({ ws, onBack, initialSelectedId, liveDiscussions
   return (
     <div class="discussions-page">
       <div class="discussions-header">
-        <button class="btn btn-sm" onClick={onBack}>← Back</button>
         <h2>P2P Discussions</h2>
-        <button class="btn btn-sm" onClick={loadList}>Refresh</button>
       </div>
 
       {/* Active P2P progress cards at top */}

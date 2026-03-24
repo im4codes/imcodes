@@ -1,15 +1,76 @@
 import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
+import type { ComponentChildren } from 'preact';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 import { ChatMarkdown } from '../components/ChatMarkdown.js';
 import { REPO_MSG } from '@shared/repo-types.js';
+
+// ── Pull-to-refresh component ────────────────────────────────────────────
+
+const PTR_THRESHOLD = 60; // px to pull before triggering
+
+function PullToRefresh({ children, loading, onRefresh }: { children: ComponentChildren; loading: boolean; onRefresh: () => void }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const startY = useRef(0);
+  const [pullDistance, setPullDistance] = useState(0);
+  const pulling = useRef(false);
+
+  const onTouchStart = useCallback((e: TouchEvent) => {
+    const el = containerRef.current;
+    if (!el || el.scrollTop > 0 || loading) return;
+    startY.current = e.touches[0].clientY;
+    pulling.current = true;
+  }, [loading]);
+
+  const onTouchMove = useCallback((e: TouchEvent) => {
+    if (!pulling.current) return;
+    const dy = e.touches[0].clientY - startY.current;
+    if (dy > 0) {
+      setPullDistance(Math.min(dy * 0.5, 100));
+      if (dy > 10) e.preventDefault();
+    } else {
+      setPullDistance(0);
+    }
+  }, []);
+
+  const onTouchEnd = useCallback(() => {
+    if (!pulling.current) return;
+    pulling.current = false;
+    if (pullDistance >= PTR_THRESHOLD && !loading) {
+      onRefresh();
+    }
+    setPullDistance(0);
+  }, [pullDistance, loading, onRefresh]);
+
+  return (
+    <div
+      ref={containerRef}
+      style={{ flex: 1, overflowY: 'auto', position: 'relative' }}
+      onTouchStart={onTouchStart}
+      onTouchMove={onTouchMove}
+      onTouchEnd={onTouchEnd}
+    >
+      {(pullDistance > 0 || loading) && (
+        <div style={{
+          textAlign: 'center', padding: '8px 0', fontSize: 11, color: '#64748b',
+          transition: pulling.current ? 'none' : 'height 0.2s',
+          height: loading ? 28 : pullDistance > 0 ? Math.min(pullDistance, 40) : 0,
+          overflow: 'hidden', lineHeight: '28px',
+        }}>
+          {loading ? '↻ refreshing...' : pullDistance >= PTR_THRESHOLD ? '↑ release to refresh' : '↓ pull to refresh'}
+        </div>
+      )}
+      {children}
+    </div>
+  );
+}
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
 interface Props {
   ws: WsClient;
   projectDir: string;
-  onBack: () => void;
+  onBack?: () => void;
 }
 
 type TabKey = 'issues' | 'prs' | 'branches' | 'commits' | 'actions';
@@ -67,7 +128,7 @@ function classifyError(msg: string): ErrorKind {
 
 // ── Component ────────────────────────────────────────────────────────────────
 
-export function RepoPage({ ws, projectDir, onBack }: Props) {
+export function RepoPage({ ws, projectDir }: Props) {
   const { t } = useTranslation();
 
   const [context, setContext] = useState<RepoContext | null>(null);
@@ -300,46 +361,22 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
 
   // ── Actions ──────────────────────────────────────────────────────────────
 
-  const handleRefresh = useCallback(() => {
-    // Force refresh — bypass daemon cache to get fresh data from gh/glab CLI
-    setDetectLoading(true);
-    setDetectError(null);
-    let rid: string;
-    try {
-      rid = ws.repoDetect(projectDir, { force: true });
-    } catch (err) {
-      setDetectError(`Send failed: ${err instanceof Error ? err.message : String(err)}`);
-      setDetectLoading(false);
-      return;
-    }
-    detectReqRef.current = rid;
-    pendingRef.current.add(rid);
-    // Re-fetch active tab with force
-    updateTab(activeTab, { fetched: false, items: [], page: 1, hasMore: false });
-    fetchTab(activeTab, 1, true);
-  }, [ws, projectDir, activeTab, updateTab, fetchTab]);
-
-  const handleRefreshTab = useCallback((key: TabKey) => {
-    setTabs(prev => ({ ...prev, [key]: emptyTab() }));
-    fetchTab(key, 1, true);
-  }, [fetchTab]);
-
   /** Silently refresh a tab — keep existing items visible while loading. */
   const silentRefreshTab = useCallback((key: TabKey) => {
     updateTab(key, { loading: true });
     fetchTab(key, 1, true);
   }, [fetchTab, updateTab]);
 
-  // ── CI/CD auto-refresh when any run is "running" ───────────────────────
+  // ── CI/CD auto-refresh: 10s when running, 30s otherwise ────────────────
   useEffect(() => {
-    if (activeTab !== 'actions') return;
+    if (activeTab !== 'actions' || !tabs.actions.fetched) return;
     const hasRunning = tabs.actions.items.some((r: any) => r.status === 'running' || r.status === 'queued');
-    if (!hasRunning) return;
+    const interval = hasRunning ? 10_000 : 30_000;
     const timer = setInterval(() => {
       silentRefreshTab('actions');
-    }, 10_000);
+    }, interval);
     return () => clearInterval(timer);
-  }, [activeTab, tabs.actions.items, silentRefreshTab]);
+  }, [activeTab, tabs.actions.items, tabs.actions.fetched, silentRefreshTab]);
 
   const handleLoadMore = useCallback(() => {
     const tab = tabs[activeTab];
@@ -881,15 +918,7 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
 
     const renderer = RENDERERS[key];
     return (
-      <div
-        onScroll={(e: Event) => {
-          const el = e.currentTarget as HTMLElement;
-          // Pull-to-refresh: when scrolled to top and user pulls, refresh
-          if (el.scrollTop === 0 && !tab.loading) {
-            handleRefreshTab(key);
-          }
-        }}
-      >
+      <PullToRefresh loading={tab.loading} onRefresh={() => silentRefreshTab(key)}>
         {tab.items.map(renderer)}
         {tab.loading && (
           <div style={{ padding: 12, textAlign: 'center', color: '#94a3b8', fontSize: 12 }}>
@@ -905,7 +934,7 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
             {t('repo.load_more')}
           </button>
         )}
-      </div>
+      </PullToRefresh>
     );
   };
 
@@ -927,10 +956,6 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
         padding: '10px 16px', borderBottom: '1px solid #1e293b',
         flexShrink: 0,
       }}>
-        <button class="btn btn-sm" onClick={onBack} style={{ flexShrink: 0 }}>
-          {t('repo.back')}
-        </button>
-
         {detectLoading && (
           <span style={{ color: '#94a3b8', fontSize: 13 }}>{t('common.loading')}</span>
         )}
@@ -966,10 +991,6 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
             )}
           </div>
         )}
-
-        <button class="btn btn-sm" onClick={handleRefresh} style={{ flexShrink: 0 }}>
-          {t('repo.refresh')}
-        </button>
 
         {context?.lastRefresh && (
           <span style={{ fontSize: 10, color: '#475569', flexShrink: 0, whiteSpace: 'nowrap' }}>
