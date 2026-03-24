@@ -10,6 +10,7 @@ import {
 import type { Env } from '../env.js';
 import { createUser, getUserById } from '../db/queries.js';
 import { randomHex, sha256Hex, signJwt, verifyJwt } from '../security/crypto.js';
+import { COOKIE_SESSION } from '../../../shared/cookie-names.js';
 import { logAudit } from '../security/audit.js';
 import { z } from 'zod';
 import logger from '../util/logger.js';
@@ -46,7 +47,7 @@ function getRpInfo(c: Context<HonoEnv>): { rpId: string; origin: string } {
 async function resolveAuthedUserId(c: Context<HonoEnv>): Promise<string | null> {
   // Try rcc_session cookie first (browser)
   const cookieHeader = c.req.header('cookie') ?? '';
-  const cookieMatch = cookieHeader.match(/(?:^|;\s*)rcc_session=([^;]+)/);
+  const cookieMatch = cookieHeader.match(new RegExp(`(?:^|;\\s*)${COOKIE_SESSION}=([^;]+)`));
   const cookieToken = cookieMatch ? decodeURIComponent(cookieMatch[1]) : null;
   if (cookieToken && c.env.JWT_SIGNING_KEY) {
     const jwt = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
@@ -77,7 +78,7 @@ async function resolveAuthedUserId(c: Context<HonoEnv>): Promise<string | null> 
 
 function setSessionCookies(c: Context<HonoEnv>, accessToken: string, refreshToken: string): void {
   const isSecure = c.env.NODE_ENV === 'production';
-  setCookie(c, 'rcc_session', accessToken, { httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 4 * 3600 });
+  setCookie(c, COOKIE_SESSION, accessToken, { httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 4 * 3600 });
   setCookie(c, 'rcc_refresh', refreshToken, { httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400 });
   setCookie(c, 'rcc_csrf', randomHex(32), { httpOnly: false, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 86400 });
 }

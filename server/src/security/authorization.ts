@@ -8,6 +8,7 @@ import type { Env } from '../env.js';
 import type { PgDatabase } from '../db/client.js';
 import { sha256Hex, verifyJwt } from './crypto.js';
 import { getServerById } from '../db/queries.js';
+import { COOKIE_SESSION } from '../../../shared/cookie-names.js';
 
 export type Role = 'owner' | 'admin' | 'member' | 'unauthenticated';
 
@@ -24,7 +25,7 @@ interface AuthContext {
  */
 async function resolveAuth(c: Context<{ Bindings: Env }>): Promise<AuthContext | null> {
   // Task 1: Try HttpOnly session cookie first (browser sessions)
-  const cookieToken = getCookie(c, 'rcc_session');
+  const cookieToken = getCookie(c, COOKIE_SESSION);
   if (cookieToken && c.env.JWT_SIGNING_KEY) {
     const payload = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
     if (payload && typeof payload.sub === 'string' && payload.type !== 'ws-ticket') {

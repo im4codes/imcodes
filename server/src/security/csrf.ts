@@ -16,6 +16,7 @@ import type { Context, Next } from 'hono';
 import { getCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
 import logger from '../util/logger.js';
+import { COOKIE_SESSION, COOKIE_CSRF, HEADER_CSRF } from '../../../shared/cookie-names.js';
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
@@ -42,7 +43,7 @@ export function csrfMiddleware() {
     const authHeader = c.req.header('Authorization');
     if (authHeader?.startsWith('Bearer ')) { await next(); return; }
 
-    const sessionCookie = getCookie(c, 'rcc_session');
+    const sessionCookie = getCookie(c, COOKIE_SESSION);
     const rawOrigin = c.req.header('Origin') ?? c.req.header('Referer');
 
     if (sessionCookie) {
@@ -58,8 +59,8 @@ export function csrfMiddleware() {
         return c.json({ error: 'csrf_rejected', reason: 'invalid_origin' }, 403);
       }
 
-      const csrfCookie = getCookie(c, 'rcc_csrf');
-      const csrfHeader = c.req.header('X-CSRF-Token');
+      const csrfCookie = getCookie(c, COOKIE_CSRF);
+      const csrfHeader = c.req.header(HEADER_CSRF);
       if (!csrfCookie || !csrfHeader || csrfCookie !== csrfHeader) {
         logger.warn({ path, hasCookie: !!csrfCookie, hasHeader: !!csrfHeader }, '[csrf] token mismatch — rejecting');
         return c.json({ error: 'csrf_rejected', reason: 'token_mismatch' }, 403);

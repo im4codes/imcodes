@@ -8,6 +8,7 @@ import { logAudit } from '../security/audit.js';
 import { checkAuthLockout, recordAuthFailure } from '../security/lockout.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
+import { COOKIE_SESSION, COOKIE_CSRF } from '../../../shared/cookie-names.js';
 import { z } from 'zod';
 import logger from '../util/logger.js';
 
@@ -28,7 +29,7 @@ type AnyAuthContext = { req: { header(name: string): string | undefined }; env: 
 async function resolveUserId(c: AnyAuthContext): Promise<string | null> {
   // Task 1: Try rcc_session cookie first (parse manually to avoid Hono Context type constraint)
   const cookieHeader = c.req.header('cookie') ?? '';
-  const cookieMatch = cookieHeader.match(/(?:^|;\s*)rcc_session=([^;]+)/);
+  const cookieMatch = cookieHeader.match(new RegExp(`(?:^|;\\s*)${COOKIE_SESSION}=([^;]+)`));
   const cookieToken = cookieMatch ? decodeURIComponent(cookieMatch[1]) : null;
   if (cookieToken && c.env.JWT_SIGNING_KEY) {
     const jwt = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
@@ -351,7 +352,7 @@ authRoutes.post('/refresh', async (c) => {
   const isSecure = c.env.NODE_ENV === 'production';
 
   if (cookieRefresh) {
-    setCookie(c, 'rcc_session', accessToken, {
+    setCookie(c, COOKIE_SESSION, accessToken, {
       httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 4 * 3600,
     });
     setCookie(c, 'rcc_refresh', newRefresh, {
@@ -431,9 +432,9 @@ authRoutes.delete('/user/me', async (c) => {
   await db.prepare('DELETE FROM users WHERE id = ?').bind(userId).run();
 
   // Clear session cookies
-  deleteCookie(c, 'rcc_session', { path: '/' });
+  deleteCookie(c, COOKIE_SESSION, { path: '/' });
   deleteCookie(c, 'rcc_refresh', { path: '/' });
-  deleteCookie(c, 'rcc_csrf', { path: '/' });
+  deleteCookie(c, COOKIE_CSRF, { path: '/' });
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
   logger.info({ userId, ip }, '[auth] account deleted');
@@ -511,13 +512,13 @@ authRoutes.post('/password/login', async (c) => {
   ).bind(refreshId, user.id, refreshHash, familyId, Date.now() + 30 * 24 * 3600 * 1000, Date.now()).run();
 
   const isSecure = c.env.NODE_ENV === 'production';
-  setCookie(c, 'rcc_session', accessToken, {
+  setCookie(c, COOKIE_SESSION, accessToken, {
     httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 4 * 3600,
   });
   setCookie(c, 'rcc_refresh', refreshRaw, {
     httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400,
   });
-  setCookie(c, 'rcc_csrf', randomHex(32), {
+  setCookie(c, COOKIE_CSRF, randomHex(32), {
     httpOnly: false, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 86400,
   });
 
@@ -606,9 +607,9 @@ authRoutes.post('/logout', async (c) => {
   const userId = await resolveUserId(c);
 
   // Clear all auth cookies regardless of auth state
-  deleteCookie(c, 'rcc_session', { path: '/' });
+  deleteCookie(c, COOKIE_SESSION, { path: '/' });
   deleteCookie(c, 'rcc_refresh', { path: '/' });
-  deleteCookie(c, 'rcc_csrf', { path: '/' });
+  deleteCookie(c, COOKIE_CSRF, { path: '/' });
 
   // Invalidate all active refresh tokens for the user
   if (userId) {

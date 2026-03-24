@@ -1,8 +1,13 @@
 /**
  * Fetch wrapper with cookie-based auth for the IM.codes API.
- * Credentials (rcc_session) are sent automatically via HttpOnly cookie.
- * CSRF token is read from the rcc_csrf cookie and sent as X-CSRF-Token.
+ * Credentials are sent automatically via HttpOnly cookie.
+ * CSRF token is read from cookie and sent as X-CSRF-Token.
  */
+
+// Cookie names — must match shared/cookie-names.ts (web can't import shared/ directly)
+const COOKIE_SESSION = 'rcc_session';
+const COOKIE_CSRF = 'rcc_csrf';
+const HEADER_CSRF = 'X-CSRF-Token';
 
 let _baseUrl = '';
 let _onAuthExpired: ((reason?: string) => void) | null = null;
@@ -37,7 +42,7 @@ export function onAuthExpired(cb: (reason?: string) => void): void {
 }
 
 function getCsrfToken(): string | null {
-  const match = document.cookie.match(/(?:^|;\s*)rcc_csrf=([^;]+)/);
+  const match = document.cookie.match(new RegExp(`(?:^|;\\s*)${COOKIE_CSRF}=([^;]+)`));
   return match ? decodeURIComponent(match[1]) : null;
 }
 
@@ -68,7 +73,7 @@ async function doRefresh(): Promise<boolean> {
   }
   _refreshChannel?.postMessage('refresh-start');
   const hasCsrf = !!getCsrfToken();
-  const hasSession = document.cookie.includes('rcc_session');
+  const hasSession = document.cookie.includes(COOKIE_SESSION);
   const hasRefresh = document.cookie.includes('rcc_refresh');
   console.warn(`[auth] doRefresh: cookies present: session=${hasSession} refresh=${hasRefresh} csrf=${hasCsrf}`);
 
@@ -169,7 +174,7 @@ async function rawFetch(path: string, opts: RequestInit = {}): Promise<Response>
     const method = (opts.method ?? 'GET').toUpperCase();
     if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
       const csrf = getCsrfToken();
-      if (csrf) headers.set('X-CSRF-Token', csrf);
+      if (csrf) headers.set(HEADER_CSRF, csrf);
     }
   }
   // Native (Bearer auth): omit credentials — no cookies needed, and 'include' would
@@ -533,8 +538,8 @@ export async function uploadFile(
       xhr.setRequestHeader('Authorization', `Bearer ${_apiKey}`);
     } else {
       xhr.withCredentials = true;
-      const csrf = document.cookie.match(/rcc_csrf=([^;]+)/)?.[1];
-      if (csrf) xhr.setRequestHeader('X-CSRF-Token', csrf);
+      const csrf = document.cookie.match(new RegExp(`${COOKIE_CSRF}=([^;]+)`))?.[1];
+      if (csrf) xhr.setRequestHeader(HEADER_CSRF, csrf);
     }
 
     xhr.upload.onprogress = (e) => {
