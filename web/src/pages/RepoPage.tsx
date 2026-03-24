@@ -163,15 +163,15 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
 
   // ── Tab data fetching ────────────────────────────────────────────────────
 
-  const fetchTab = useCallback((key: TabKey, page = 1) => {
+  const fetchTab = useCallback((key: TabKey, page = 1, force = false) => {
     updateTab(key, { loading: true, error: null });
     let rid: string;
     switch (key) {
       case 'issues':
-        rid = ws.repoListIssues(projectDir, { page });
+        rid = ws.repoListIssues(projectDir, { page, ...(force ? { force: true } : {}) });
         break;
       case 'prs':
-        rid = ws.repoListPRs(projectDir, { page });
+        rid = ws.repoListPRs(projectDir, { page, ...(force ? { force: true } : {}) });
         break;
       case 'branches':
         rid = ws.repoListBranches(projectDir);
@@ -180,7 +180,7 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
         rid = ws.repoListCommits(projectDir, { page });
         break;
       case 'actions':
-        rid = ws.repoListActions(projectDir, { page });
+        rid = ws.repoListActions(projectDir, { page, ...(force ? { force: true } : {}) });
         break;
     }
     pendingRef.current.add(rid);
@@ -313,8 +313,13 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
     pendingRef.current.add(rid);
     // Re-fetch active tab with force
     updateTab(activeTab, { fetched: false, items: [], page: 1, hasMore: false });
-    fetchTab(activeTab);
+    fetchTab(activeTab, 1, true);
   }, [ws, projectDir, activeTab, updateTab, fetchTab]);
+
+  const handleRefreshTab = useCallback((key: TabKey) => {
+    setTabs(prev => ({ ...prev, [key]: emptyTab() }));
+    fetchTab(key, 1, true);
+  }, [fetchTab]);
 
   const handleLoadMore = useCallback(() => {
     const tab = tabs[activeTab];
@@ -478,22 +483,94 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
 
   const renderCommitItem = (item: any) => {
     const sha = item.sha ?? item.oid ?? item.hash ?? '';
+    const fullMsg: string = item.message ?? item.title ?? '';
+    const firstLine = fullMsg.split('\n')[0];
+    const body = fullMsg.includes('\n') ? fullMsg.slice(fullMsg.indexOf('\n') + 1).replace(/^\n+/, '') : '';
+    const commitKey = `commits:${sha}`;
+    const isExpanded = expandedKey === commitKey;
+    const filesDetail = detailData.get(commitKey);
+    const filesState = detailState.get(commitKey);
+
+    const handleClick = () => {
+      // Toggle expand/collapse
+      setExpandedKey(isExpanded ? null : commitKey);
+    };
+
+    const handleShowFiles = (e: MouseEvent) => {
+      e.stopPropagation();
+      if (filesDetail) return; // already loaded
+      // Fetch detail for stats + files
+      setDetailState(prev => new Map(prev).set(commitKey, 'loading'));
+      try {
+        const rid = ws.repoCommitDetail(projectDir, sha);
+        pendingRef.current.add(rid);
+      } catch {
+        setDetailState(prev => new Map(prev).set(commitKey, 'error'));
+      }
+    };
+
     return (
       <div key={sha}>
-        <div style={{ ...listItemStyle, cursor: 'pointer' }} onClick={() => fetchDetail('commits', sha)}>
+        <div style={{ ...listItemStyle, cursor: 'pointer' }} onClick={handleClick}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <code style={{ color: '#60a5fa', fontSize: 11, flexShrink: 0 }}>
               {sha.slice(0, 7)}
             </code>
             <span style={{ color: '#cbd5e1', fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {item.message ?? item.title}
+              {firstLine}
             </span>
           </div>
           <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
             {item.author?.name ?? item.author ?? ''} {item.date ? `· ${formatTime(new Date(item.date).getTime())}` : ''}
           </div>
         </div>
-        {renderDetailPanel('commits', sha)}
+        {isExpanded && (
+          <div class="repo-detail-panel">
+            {body && <pre class="repo-detail-body">{body}</pre>}
+            {/* Show files button / loaded files */}
+            {filesDetail ? (
+              <>
+                <div class="repo-detail-stats">
+                  <span style={{ color: '#4ade80' }}>+{filesDetail.stats.additions}</span>
+                  {' '}
+                  <span style={{ color: '#ef4444' }}>-{filesDetail.stats.deletions}</span>
+                  {' '}
+                  <span style={{ color: '#94a3b8' }}>{filesDetail.stats.filesChanged} {t('repo.files')}</span>
+                </div>
+                <div class="repo-detail-files">
+                  {filesDetail.files.map((f: any) => (
+                    <div key={f.filename} class="repo-detail-file">
+                      <span class="repo-file-name">{f.filename}</span>
+                      {f.additions !== undefined && (
+                        <span class="repo-file-stats">
+                          <span style={{ color: '#4ade80' }}>+{f.additions}</span>
+                          <span style={{ color: '#ef4444' }}>-{f.deletions}</span>
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                  {filesDetail.hasMoreFiles && <div class="repo-detail-more">{t('repo.more_files')}</div>}
+                </div>
+              </>
+            ) : filesState === 'loading' ? (
+              <div class="repo-detail-loading">{t('repo.detail_loading')}</div>
+            ) : filesState === 'error' ? (
+              <div class="repo-detail-error">
+                {t('repo.detail_error')}
+                <button class="repo-detail-retry" onClick={handleShowFiles}>{t('repo.detail_retry')}</button>
+              </div>
+            ) : (
+              <button
+                class="repo-detail-retry"
+                style={{ marginTop: body ? 4 : 0 }}
+                onClick={handleShowFiles}
+              >
+                {t('repo.show_changed_files')}
+              </button>
+            )}
+            {item.url && <a href={item.url} target="_blank" rel="noopener" class="repo-detail-link">{t('repo.view_on_platform')}</a>}
+          </div>
+        )}
       </div>
     );
   };
@@ -503,18 +580,6 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
     const m = Math.floor(totalSec / 60);
     const s = totalSec % 60;
     return m > 0 ? `${m}m ${s}s` : `${s}s`;
-  };
-
-  const formatRelative = (dateStr: string) => {
-    const diff = Date.now() - new Date(dateStr).getTime();
-    const sec = Math.floor(diff / 1000);
-    if (sec < 60) return `${sec}s`;
-    const min = Math.floor(sec / 60);
-    if (min < 60) return `${min}m`;
-    const hr = Math.floor(min / 60);
-    if (hr < 24) return `${hr}h`;
-    const d = Math.floor(hr / 24);
-    return `${d}d`;
   };
 
   // ── Detail renderers ─────────────────────────────────────────────────
@@ -654,11 +719,22 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
     return status?.toUpperCase() ?? '';
   };
 
+  const EVENT_COLORS: Record<string, string> = {
+    push: '#3b82f6',
+    pull_request: '#a78bfa',
+    schedule: '#f59e0b',
+    workflow_dispatch: '#14b8a6',
+  };
+
   const renderActionItem = (item: any) => {
     const color = actionStatusColor(item.status, item.conclusion);
-    const duration = item.updatedAt && item.createdAt
-      ? new Date(item.updatedAt).getTime() - new Date(item.createdAt).getTime()
-      : null;
+    const duration = item.duration != null
+      ? item.duration * 1000
+      : (item.updatedAt && item.createdAt ? item.updatedAt - item.createdAt : null);
+    const branch = item.branch ?? item.headBranch;
+    const commitMsg = item.commitMessage ?? item.headCommit?.message;
+    const actor = typeof item.actor === 'string' ? item.actor : item.actor?.login;
+    const eventColor = item.event ? (EVENT_COLORS[item.event] ?? '#64748b') : undefined;
     return (
       <div key={item.id ?? item.runId} style={listItemStyle}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -672,6 +748,17 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
           <span style={{ color: '#cbd5e1', fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {item.name ?? item.workflowName ?? ''}
           </span>
+          {item.runNumber && (
+            <span style={{ fontSize: 10, color: '#64748b', flexShrink: 0 }}>#{item.runNumber}</span>
+          )}
+          {item.event && (
+            <span style={{
+              fontSize: 9, padding: '1px 6px', borderRadius: 9999,
+              background: `${eventColor}20`, color: eventColor, flexShrink: 0, fontWeight: 500,
+            }}>
+              {item.event}
+            </span>
+          )}
           {item.url && (
             <a
               href={item.url}
@@ -685,24 +772,24 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
           )}
         </div>
         <div style={{ fontSize: 11, color: '#64748b', marginTop: 4, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-          {item.headBranch && (
+          {branch && (
             <code style={{ background: '#1e293b', padding: '1px 4px', borderRadius: 3, fontSize: 10 }}>
-              {item.headBranch}
+              {branch}
             </code>
           )}
-          {item.headCommit?.message && (
+          {commitMsg && (
             <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 200 }}>
-              {item.headCommit.message.split('\n')[0]}
+              {commitMsg.split('\n')[0]}
             </span>
           )}
-          {item.actor?.login && (
-            <span>{item.actor.login}</span>
+          {actor && (
+            <span>{actor}</span>
           )}
           {duration != null && duration > 0 && (
             <span>{formatDuration(duration)}</span>
           )}
           {item.createdAt && (
-            <span>{formatRelative(item.createdAt)}</span>
+            <span>{formatRelativeTs(item.createdAt)}</span>
           )}
         </div>
       </div>
@@ -737,6 +824,16 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
     const renderer = RENDERERS[key];
     return (
       <div>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '4px 12px 0' }}>
+          <button
+            class="repo-detail-retry"
+            style={{ fontSize: 11, padding: '3px 10px' }}
+            onClick={() => handleRefreshTab(key)}
+            disabled={tab.loading}
+          >
+            {t('repo.refresh_tab')}
+          </button>
+        </div>
         {tab.items.map(renderer)}
         {tab.loading && (
           <div style={{ padding: 12, textAlign: 'center', color: '#94a3b8', fontSize: 12 }}>
@@ -767,13 +864,7 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
   // ── Main render ──────────────────────────────────────────────────────────
 
   return (
-    <div style={{
-      position: 'fixed', inset: 0, zIndex: 1000,
-      background: '#0f172a', color: '#e2e8f0',
-      display: 'flex', flexDirection: 'column',
-      overflow: 'hidden',
-      paddingTop: 'env(safe-area-inset-top)',
-    }}>
+    <div class="repo-page">
       {/* Header bar */}
       <div style={{
         display: 'flex', alignItems: 'center', gap: 12,

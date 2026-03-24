@@ -359,6 +359,8 @@
     "conflicts": "存在衝突",
     "comments_count": "則留言",
     "comments_header": "{{count}} 則留言",
-    "no_comments": "暫無留言"
+    "no_comments": "暫無留言",
+    "show_changed_files": "查看變更檔案",
+    "refresh_tab": "重新整理"
   }
 }

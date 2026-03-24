@@ -359,6 +359,8 @@
     "conflicts": "Tiene conflictos",
     "comments_count": "comentarios",
     "comments_header": "{{count}} comentarios",
-    "no_comments": "Sin comentarios"
+    "no_comments": "Sin comentarios",
+    "show_changed_files": "Mostrar archivos modificados",
+    "refresh_tab": "Actualizar"
   }
 }

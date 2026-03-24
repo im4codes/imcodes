@@ -359,6 +359,8 @@
     "conflicts": "\ucda9\ub3cc \uc788\uc74c",
     "comments_count": "\uac1c \ub313\uae00",
     "comments_header": "{{count}}\uac1c \ub313\uae00",
-    "no_comments": "\ub313\uae00 \uc5c6\uc74c"
+    "no_comments": "\ub313\uae00 \uc5c6\uc74c",
+    "show_changed_files": "\ubcc0\uacbd\ub41c \ud30c\uc77c \ubcf4\uae30",
+    "refresh_tab": "\uc0c8\ub85c\uace0\uce68"
   }
 }

@@ -103,6 +103,9 @@ export interface RepoWorkflowRun {
   createdAt: number;
   updatedAt: number;
   duration?: number;      // seconds
+  runNumber?: number;
+  event?: string;         // push, pull_request, schedule, workflow_dispatch, etc.
+  conclusion?: string;    // success, failure, cancelled, skipped, etc.
 }
 
 export interface RepoCommitDetailFile {

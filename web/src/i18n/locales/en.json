@@ -359,6 +359,8 @@
     "conflicts": "Has conflicts",
     "comments_count": "comments",
     "comments_header": "{{count}} comments",
-    "no_comments": "No comments"
+    "no_comments": "No comments",
+    "show_changed_files": "Show changed files",
+    "refresh_tab": "Refresh"
   }
 }

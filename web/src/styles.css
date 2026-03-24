@@ -918,3 +918,25 @@ body {
 .repo-detail-retry:hover { background: #1e293b; }
 .repo-item-clickable { cursor: pointer; }
 .repo-item-clickable:hover { background: #1e293b; }
+
+/* ── Repo page container ── */
+.repo-page {
+  position: fixed; inset: 0; z-index: 1000;
+  background: #0f172a; color: #e2e8f0;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  padding-top: env(safe-area-inset-top, 0px);
+}
+@media (min-width: 768px) {
+  .repo-page {
+    inset: auto;
+    position: fixed;
+    top: 10%; left: 10%; width: 80%; height: 80%;
+    border-radius: 12px;
+    border: 1px solid #334155;
+    box-shadow: 0 20px 60px #00000080;
+    resize: both;
+    overflow: auto;
+    padding-top: 0;
+  }
+}

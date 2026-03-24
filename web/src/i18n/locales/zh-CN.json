@@ -359,6 +359,8 @@
     "conflicts": "存在冲突",
     "comments_count": "条评论",
     "comments_header": "{{count}} 条评论",
-    "no_comments": "暂无评论"
+    "no_comments": "暂无评论",
+    "show_changed_files": "查看变更文件",
+    "refresh_tab": "刷新"
   }
 }
