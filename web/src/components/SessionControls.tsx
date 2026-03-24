@@ -134,6 +134,21 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (inputRef) (inputRef as { current: HTMLDivElement | null }).current = divRef.current;
   });
 
+  // Persist input draft across unmount/remount (sub-session minimize/restore)
+  const draftKey = activeSession ? `rcc_draft_${activeSession.name}` : null;
+  useEffect(() => {
+    if (!draftKey || !divRef.current) return;
+    const saved = sessionStorage.getItem(draftKey);
+    if (saved) {
+      divRef.current.textContent = saved;
+      setHasText(!!saved.trim());
+    }
+    return () => {
+      const text = divRef.current?.textContent ?? '';
+      if (draftKey) sessionStorage.setItem(draftKey, text);
+    };
+  }, [draftKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Auto-sync model selector with detected model from terminal/ctx
   // Detection is the real-time truth — always override the selector
   useEffect(() => {
@@ -249,6 +264,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     atSelectionSnapshotRef.current = '';
     histIdxRef.current = -1;
     draftRef.current = '';
+    if (draftKey) sessionStorage.removeItem(draftKey);
   }, [ws, activeSession, quickData, onSend, attachments]);
 
   // Voice overlay send handler — applies same P2P mode as text send
@@ -296,6 +312,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         if (histIdxRef.current === -1) {
           // Save current draft before navigating
           draftRef.current = divRef.current?.textContent ?? '';
+          if (draftKey) sessionStorage.setItem(draftKey, draftRef.current);
         }
         const next = Math.min(histIdxRef.current + 1, history.length - 1);
         if (next !== histIdxRef.current || histIdxRef.current === -1) {
