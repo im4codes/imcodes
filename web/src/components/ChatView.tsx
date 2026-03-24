@@ -700,14 +700,20 @@ function AttachmentDownloadButton({ att, serverId }: { att: { id: string; origin
 function ChatEvent({ event, nextTs, onPathClick, serverId }: { event: TimelineEvent; nextTs?: number; onPathClick?: (p: string) => void; serverId?: string }) {
   switch (event.type) {
     case 'user.message': {
-      const userText = String(event.payload.text ?? '');
-      const attachments = event.payload.attachments as Array<{ id: string; originalName?: string; mime?: string; size?: number }> | undefined;
+      let userText = String(event.payload.text ?? '');
+      const attachments = event.payload.attachments as Array<{ id: string; originalName?: string; mime?: string; size?: number; daemonPath?: string }> | undefined;
+      // Strip @path references from text when they're shown as attachment badges
+      if (attachments && attachments.length > 0) {
+        for (const att of attachments) {
+          if (att.daemonPath) userText = userText.replace(`@${att.daemonPath}`, '').trim();
+        }
+      }
       return (
         <div class={`chat-event chat-user${event.payload.pending ? ' chat-pending' : ''}`}>
-          <div class="chat-bubble-content">{splitPathsAndUrls(userText, onPathClick)}</div>
           {attachments && serverId && attachments.map((att) => (
             <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} />
           ))}
+          {userText && <div class="chat-bubble-content">{splitPathsAndUrls(userText, onPathClick)}</div>}
           {!event.payload.pending && <ChatTime ts={event.ts} />}
         </div>
       );
