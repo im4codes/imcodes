@@ -96,10 +96,14 @@ export class OpenClawProvider implements TransportProvider {
   /** Whether connect() has resolved successfully at least once. */
   private connected = false;
 
+  /** OC agent ID (e.g. 'main'). Resolved from config on connect. */
+  private agentId = 'main';
+
   // ── TransportProvider — core ───────────────────────────────────────────────
 
   async connect(config: ProviderConfig): Promise<void> {
     this.config = config;
+    this.agentId = (config.agentId as string) || 'main';
     this.intentionalDisconnect = false;
     await this.openSocket();
   }
@@ -118,12 +122,24 @@ export class OpenClawProvider implements TransportProvider {
   }
 
   async send(sessionId: string, message: string, _attachments?: unknown[]): Promise<void> {
-    await this.rpc('sessions.send', {
-      key: sessionId,
-      message,
-      thinking: 'off',
-      idempotencyKey: randomUUID(),
-    });
+    try {
+      // Prefer sessions.send (v2026.3.24+): auto canonicalKey, messageSeq, subagent reactivation
+      await this.rpc('sessions.send', {
+        key: sessionId,
+        message,
+        thinking: 'off',
+        idempotencyKey: randomUUID(),
+      });
+    } catch {
+      // Fallback to agent RPC (v2026.3.7+)
+      await this.rpc('agent', {
+        sessionKey: sessionId,
+        message,
+        agentId: this.agentId,
+        thinking: 'off',
+        idempotencyKey: randomUUID(),
+      });
+    }
   }
 
   onDelta(cb: (sessionId: string, delta: MessageDelta) => void): void {
@@ -140,11 +156,17 @@ export class OpenClawProvider implements TransportProvider {
 
   async createSession(config: SessionConfig): Promise<string> {
     const key = config.bindExistingKey ?? config.sessionKey;
-    await this.rpc('sessions.create', {
-      key,
-      agentId: config.agentId ?? 'main',
-      label: config.label ?? key,
-    });
+    try {
+      // Prefer sessions.create (v2026.3.24+)
+      await this.rpc('sessions.create', {
+        key,
+        agentId: config.agentId ?? this.agentId,
+        label: config.label ?? key,
+      });
+    } catch {
+      // Fallback: OC auto-creates sessions on first agent RPC, so just log
+      logger.info({ provider: this.id, sessionKey: key }, 'sessions.create unavailable, session will be created on first message');
+    }
     logger.info({ provider: this.id, sessionKey: key }, 'Session created');
     return key;
   }
@@ -248,7 +270,16 @@ export class OpenClawProvider implements TransportProvider {
             return;
           }
 
-          if (frame.type === 'event' && frame.event === 'hello-ok') {
+          // hello-ok may arrive as top-level `type: "hello-ok"` OR nested
+          // inside a res frame as `payload.type: "hello-ok"` (OC v2026.3.7+).
+          const frameType = frame.type as string;
+          const payloadType = (frame.payload as Record<string, unknown> | undefined)?.type;
+          const isHelloOk =
+            frameType === 'hello-ok' ||
+            (frameType === 'event' && frame.event === 'hello-ok') ||
+            (frameType === 'res' && frame.ok === true && payloadType === 'hello-ok');
+
+          if (isHelloOk) {
             handshakeDone = true;
             this.connected = true;
             this.backoffMs = BACKOFF_INITIAL_MS;
@@ -261,9 +292,8 @@ export class OpenClawProvider implements TransportProvider {
             return;
           }
 
-          // Some gateways echo back a res frame for the connect request too.
+          // Non-hello res frames during handshake — keep waiting.
           if (frame.type === 'res' && frame.ok === true) {
-            // Not the hello-ok event yet — ignore, keep waiting.
             return;
           }
 
