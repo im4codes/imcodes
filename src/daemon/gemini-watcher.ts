@@ -10,6 +10,7 @@ import { capturePane } from '../agent/tmux.js';
 import { detectStatus } from '../agent/detect.js';
 import logger from '../util/logger.js';
 import { updateSessionState, getSession, upsertSession } from '../store/session-store.js';
+import { resolveContextWindow } from '../util/model-context.js';
 
 const GEMINI_TMP_DIR = join(homedir(), '.gemini', 'tmp');
 const POLL_INTERVAL_MS = 1500; // Balanced: responsive enough without causing state flicker
@@ -92,6 +93,18 @@ function parseMessage(sessionName: string, msg: any, hist?: any, streaming = fal
     }
     if (typeof msg.content === 'string' && msg.content.trim()) {
       timelineEmitter.emit(sessionName, 'assistant.text', { text: msg.content, streaming }, { source: 'daemon', confidence: 'high', eventId: stableId('at'), ts: stableTs });
+    }
+    // Emit usage.update from Gemini's per-message token counts
+    const tokens = msg.tokens;
+    if (tokens && typeof tokens.input === 'number') {
+      const model = msg.model as string | undefined;
+      timelineEmitter.emit(sessionName, 'usage.update', {
+        inputTokens: tokens.input,
+        cacheTokens: tokens.cached ?? 0,
+        outputTokens: tokens.output ?? 0,
+        contextWindow: resolveContextWindow(undefined, model),
+        ...(model ? { model } : {}),
+      }, { source: 'daemon', confidence: 'high', eventId: stableId('uu'), ts: stableTs });
     }
   }
 }

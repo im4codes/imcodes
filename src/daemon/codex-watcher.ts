@@ -201,6 +201,7 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
       timelineEmitter.emit(sessionName, 'usage.update', {
         inputTokens: last.input_tokens,
         cacheTokens: last.cached_input_tokens ?? 0,
+        outputTokens: last.output_tokens ?? 0,
         contextWindow: resolveContextWindow(pl.info.model_context_window, model),
         ...(model ? { model } : {}),
       }, { source: 'daemon', confidence: 'high' });
