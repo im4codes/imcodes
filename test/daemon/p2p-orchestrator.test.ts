@@ -937,8 +937,8 @@ describe('Group 13: Context & File I/O', () => {
       serverLinkMock as any,
     );
 
-    // Read the initial seed content (before agent writes)
-    // Note: the agent has already started, so we read what's there
+    // Read the initial seed content — wait briefly for file to be written
+    await new Promise(r => setTimeout(r, 200));
     const content = await readFile(run.contextFilePath, 'utf8');
 
     expect(content).toContain('# P2P Discussion:');
