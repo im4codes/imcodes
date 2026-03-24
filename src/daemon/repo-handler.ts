@@ -91,6 +91,15 @@ function isValidPage(v: unknown): v is number {
   return typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 100;
 }
 
+const SHA_RE = /^[0-9a-f]{7,40}$/;
+function isValidSha(v: unknown): v is string {
+  return typeof v === 'string' && SHA_RE.test(v);
+}
+
+function isValidNumber(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 999999;
+}
+
 function validateProjectDir(projectDir: unknown): projectDir is string {
   if (typeof projectDir !== 'string' || !projectDir) return false;
   const knownDirs = new Set(listSessions().map((s) => s.projectDir));
@@ -277,6 +286,87 @@ async function handleListActions(
   }
 }
 
+async function handleCommitDetail(
+  cmd: Record<string, unknown>,
+  serverLink: ServerLink,
+): Promise<void> {
+  const projectDir = cmd.projectDir as string;
+  const requestId = cmd.requestId as string | undefined;
+  const sha = cmd.sha as string;
+
+  const cacheKey = RepoCache.buildKey(projectDir, 'commit_detail', { sha });
+  const cached = repoCache.get<unknown>(cacheKey);
+  if (cached) {
+    serverLink.send({ type: REPO_MSG.COMMIT_DETAIL_RESPONSE, requestId, ...cached as object });
+    return;
+  }
+
+  const provider = await getProvider(projectDir, requestId, serverLink);
+  if (!provider) return;
+
+  try {
+    const result = await provider.getCommitDetail(sha);
+    repoCache.set(cacheKey, result, projectDir, false, Infinity);
+    serverLink.send({ type: REPO_MSG.COMMIT_DETAIL_RESPONSE, requestId, ...result });
+  } catch (err) {
+    sendError(serverLink, requestId, projectDir, 'cli_error', err);
+  }
+}
+
+async function handlePRDetail(
+  cmd: Record<string, unknown>,
+  serverLink: ServerLink,
+): Promise<void> {
+  const projectDir = cmd.projectDir as string;
+  const requestId = cmd.requestId as string | undefined;
+  const num = cmd.number as number;
+
+  const cacheKey = RepoCache.buildKey(projectDir, 'pr_detail', { number: num });
+  const cached = repoCache.get<unknown>(cacheKey);
+  if (cached) {
+    serverLink.send({ type: REPO_MSG.PR_DETAIL_RESPONSE, requestId, ...cached as object });
+    return;
+  }
+
+  const provider = await getProvider(projectDir, requestId, serverLink);
+  if (!provider) return;
+
+  try {
+    const result = await provider.getPRDetail(num);
+    repoCache.set(cacheKey, result, projectDir);
+    serverLink.send({ type: REPO_MSG.PR_DETAIL_RESPONSE, requestId, ...result });
+  } catch (err) {
+    sendError(serverLink, requestId, projectDir, 'cli_error', err);
+  }
+}
+
+async function handleIssueDetail(
+  cmd: Record<string, unknown>,
+  serverLink: ServerLink,
+): Promise<void> {
+  const projectDir = cmd.projectDir as string;
+  const requestId = cmd.requestId as string | undefined;
+  const num = cmd.number as number;
+
+  const cacheKey = RepoCache.buildKey(projectDir, 'issue_detail', { number: num });
+  const cached = repoCache.get<unknown>(cacheKey);
+  if (cached) {
+    serverLink.send({ type: REPO_MSG.ISSUE_DETAIL_RESPONSE, requestId, ...cached as object });
+    return;
+  }
+
+  const provider = await getProvider(projectDir, requestId, serverLink);
+  if (!provider) return;
+
+  try {
+    const result = await provider.getIssueDetail(num);
+    repoCache.set(cacheKey, result, projectDir);
+    serverLink.send({ type: REPO_MSG.ISSUE_DETAIL_RESPONSE, requestId, ...result });
+  } catch (err) {
+    sendError(serverLink, requestId, projectDir, 'cli_error', err);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
@@ -358,6 +448,14 @@ export function handleRepoCommand(cmd: Record<string, unknown>, serverLink: Serv
     serverLink.send({ type: REPO_MSG.ERROR, requestId, projectDir, error: 'invalid_params' as RepoError });
     return;
   }
+  if (cmd.sha !== undefined && !isValidSha(cmd.sha)) {
+    serverLink.send({ type: REPO_MSG.ERROR, requestId, projectDir, error: 'invalid_params' as RepoError });
+    return;
+  }
+  if (cmd.number !== undefined && !isValidNumber(cmd.number)) {
+    serverLink.send({ type: REPO_MSG.ERROR, requestId, projectDir, error: 'invalid_params' as RepoError });
+    return;
+  }
 
   // Strip any browser-sent provider field
   delete cmd.provider;
@@ -386,6 +484,15 @@ export function handleRepoCommand(cmd: Record<string, unknown>, serverLink: Serv
         break;
       case 'repo.list_actions':
         await handleListActions(cmd, serverLink);
+        break;
+      case REPO_MSG.COMMIT_DETAIL:
+        await handleCommitDetail(cmd, serverLink);
+        break;
+      case REPO_MSG.PR_DETAIL:
+        await handlePRDetail(cmd, serverLink);
+        break;
+      case REPO_MSG.ISSUE_DETAIL:
+        await handleIssueDetail(cmd, serverLink);
         break;
       default:
         logger.warn({ type: cmd.type }, 'repo: unknown subcommand');

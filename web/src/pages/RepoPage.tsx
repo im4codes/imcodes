@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { WsClient, ServerMessage } from '../ws-client.js';
+import { ChatMarkdown } from '../components/ChatMarkdown.js';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -81,6 +82,11 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
     actions: emptyTab(),
   });
 
+  // ── Expand/collapse detail state ──────────────────────────────────────
+  const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  const [detailData, setDetailData] = useState<Map<string, any>>(new Map());
+  const [detailState, setDetailState] = useState<Map<string, 'loading' | 'loaded' | 'error'>>(new Map());
+
   // Track pending requestIds to discard stale responses
   const pendingRef = useRef<Set<string>>(new Set());
   // Track detect requestId separately
@@ -91,6 +97,35 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
   const updateTab = useCallback((key: TabKey, patch: Partial<TabState>) => {
     setTabs(prev => ({ ...prev, [key]: { ...prev[key], ...patch } }));
   }, []);
+
+  // ── Detail fetching (expand on click) ───────────────────────────────────
+
+  const fetchDetail = useCallback((tab: 'commits' | 'prs' | 'issues', id: string | number) => {
+    const key = `${tab}:${id}`;
+    // Toggle collapse if already expanded
+    if (expandedKey === key) {
+      setExpandedKey(null);
+      return;
+    }
+    setExpandedKey(key);
+    // Already loaded — just expand
+    if (detailData.has(key)) return;
+    // Fetch
+    setDetailState(prev => new Map(prev).set(key, 'loading'));
+    try {
+      let rid: string;
+      if (tab === 'commits') {
+        rid = ws.repoCommitDetail(projectDir, id as string);
+      } else if (tab === 'prs') {
+        rid = ws.repoPRDetail(projectDir, id as number);
+      } else {
+        rid = ws.repoIssueDetail(projectDir, id as number);
+      }
+      pendingRef.current.add(rid);
+    } catch {
+      setDetailState(prev => new Map(prev).set(key, 'error'));
+    }
+  }, [ws, projectDir, expandedKey, detailData]);
 
   // ── Detect on mount ──────────────────────────────────────────────────────
 
@@ -202,6 +237,26 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
             return next;
           });
         }
+        return;
+      }
+
+      // Detail responses
+      if (msg.type === 'repo.commit_detail_response') {
+        const m = msg as any;
+        setDetailData(prev => new Map(prev).set(`commits:${m.detail.sha}`, m.detail));
+        setDetailState(prev => new Map(prev).set(`commits:${m.detail.sha}`, 'loaded'));
+        return;
+      }
+      if (msg.type === 'repo.pr_detail_response') {
+        const m = msg as any;
+        setDetailData(prev => new Map(prev).set(`prs:${m.detail.number}`, m.detail));
+        setDetailState(prev => new Map(prev).set(`prs:${m.detail.number}`, 'loaded'));
+        return;
+      }
+      if (msg.type === 'repo.issue_detail_response') {
+        const m = msg as any;
+        setDetailData(prev => new Map(prev).set(`issues:${m.detail.number}`, m.detail));
+        setDetailState(prev => new Map(prev).set(`issues:${m.detail.number}`, 'loaded'));
         return;
       }
 
@@ -344,55 +399,61 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
   );
 
   const renderIssueItem = (item: any) => (
-    <div key={item.number ?? item.id} style={listItemStyle}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-        <span style={{ color: item.state === 'open' ? '#4ade80' : '#f87171', fontSize: 11, fontWeight: 600 }}>
-          {item.state?.toUpperCase()}
-        </span>
-        <span style={{ fontWeight: 500, color: '#e2e8f0', fontSize: 13 }}>#{item.number}</span>
-        <span style={{ color: '#cbd5e1', fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {item.title}
-        </span>
-      </div>
-      {item.labels?.length > 0 && (
-        <div style={{ display: 'flex', gap: 4, marginTop: 4, flexWrap: 'wrap' }}>
-          {item.labels.map((l: any) => (
-            <span key={l.name ?? l} style={{ fontSize: 10, padding: '1px 6px', borderRadius: 9999, background: '#334155', color: '#94a3b8' }}>
-              {typeof l === 'string' ? l : l.name}
-            </span>
-          ))}
+    <div key={item.number ?? item.id}>
+      <div style={{ ...listItemStyle, cursor: 'pointer' }} onClick={() => fetchDetail('issues', item.number)}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ color: item.state === 'open' ? '#4ade80' : '#f87171', fontSize: 11, fontWeight: 600 }}>
+            {item.state?.toUpperCase()}
+          </span>
+          <span style={{ fontWeight: 500, color: '#e2e8f0', fontSize: 13 }}>#{item.number}</span>
+          <span style={{ color: '#cbd5e1', fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {item.title}
+          </span>
         </div>
-      )}
-      <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
-        {item.author ?? item.user?.login} {item.createdAt ? `· ${formatTime(new Date(item.createdAt).getTime())}` : ''}
+        {item.labels?.length > 0 && (
+          <div style={{ display: 'flex', gap: 4, marginTop: 4, flexWrap: 'wrap' }}>
+            {item.labels.map((l: any) => (
+              <span key={l.name ?? l} style={{ fontSize: 10, padding: '1px 6px', borderRadius: 9999, background: '#334155', color: '#94a3b8' }}>
+                {typeof l === 'string' ? l : l.name}
+              </span>
+            ))}
+          </div>
+        )}
+        <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
+          {item.author ?? item.user?.login} {item.createdAt ? `· ${formatTime(new Date(item.createdAt).getTime())}` : ''}
+        </div>
       </div>
+      {renderDetailPanel('issues', item.number)}
     </div>
   );
 
   const renderPrItem = (item: any) => (
-    <div key={item.number ?? item.id} style={listItemStyle}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-        <span style={{
-          color: item.state === 'open' ? '#4ade80' : item.state === 'merged' ? '#a78bfa' : '#f87171',
-          fontSize: 11, fontWeight: 600,
-        }}>
-          {item.state?.toUpperCase()}
-        </span>
-        <span style={{ fontWeight: 500, color: '#e2e8f0', fontSize: 13 }}>#{item.number}</span>
-        <span style={{ color: '#cbd5e1', fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {item.title}
-        </span>
-      </div>
-      {item.head && (
-        <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
-          <code style={{ background: '#1e293b', padding: '1px 4px', borderRadius: 3, fontSize: 10 }}>{item.head}</code>
-          {' → '}
-          <code style={{ background: '#1e293b', padding: '1px 4px', borderRadius: 3, fontSize: 10 }}>{item.base}</code>
+    <div key={item.number ?? item.id}>
+      <div style={{ ...listItemStyle, cursor: 'pointer' }} onClick={() => fetchDetail('prs', item.number)}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{
+            color: item.state === 'open' ? '#4ade80' : item.state === 'merged' ? '#a78bfa' : '#f87171',
+            fontSize: 11, fontWeight: 600,
+          }}>
+            {item.state?.toUpperCase()}
+          </span>
+          <span style={{ fontWeight: 500, color: '#e2e8f0', fontSize: 13 }}>#{item.number}</span>
+          <span style={{ color: '#cbd5e1', fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {item.title}
+          </span>
         </div>
-      )}
-      <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
-        {item.author ?? item.user?.login} {item.createdAt ? `· ${formatTime(new Date(item.createdAt).getTime())}` : ''}
+        {item.head && (
+          <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
+            <code style={{ background: '#1e293b', padding: '1px 4px', borderRadius: 3, fontSize: 10 }}>{item.head}</code>
+            {' → '}
+            <code style={{ background: '#1e293b', padding: '1px 4px', borderRadius: 3, fontSize: 10 }}>{item.base}</code>
+          </div>
+        )}
+        <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
+          {item.author ?? item.user?.login} {item.createdAt ? `· ${formatTime(new Date(item.createdAt).getTime())}` : ''}
+        </div>
       </div>
+      {renderDetailPanel('prs', item.number)}
     </div>
   );
 
@@ -414,21 +475,27 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
     </div>
   );
 
-  const renderCommitItem = (item: any) => (
-    <div key={item.sha ?? item.oid ?? item.hash} style={listItemStyle}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-        <code style={{ color: '#60a5fa', fontSize: 11, flexShrink: 0 }}>
-          {(item.sha ?? item.oid ?? item.hash ?? '').slice(0, 7)}
-        </code>
-        <span style={{ color: '#cbd5e1', fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {item.message ?? item.title}
-        </span>
+  const renderCommitItem = (item: any) => {
+    const sha = item.sha ?? item.oid ?? item.hash ?? '';
+    return (
+      <div key={sha}>
+        <div style={{ ...listItemStyle, cursor: 'pointer' }} onClick={() => fetchDetail('commits', sha)}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <code style={{ color: '#60a5fa', fontSize: 11, flexShrink: 0 }}>
+              {sha.slice(0, 7)}
+            </code>
+            <span style={{ color: '#cbd5e1', fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {item.message ?? item.title}
+            </span>
+          </div>
+          <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
+            {item.author?.name ?? item.author ?? ''} {item.date ? `· ${formatTime(new Date(item.date).getTime())}` : ''}
+          </div>
+        </div>
+        {renderDetailPanel('commits', sha)}
       </div>
-      <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
-        {item.author?.name ?? item.author ?? ''} {item.date ? `· ${formatTime(new Date(item.date).getTime())}` : ''}
-      </div>
-    </div>
-  );
+    );
+  };
 
   const formatDuration = (ms: number) => {
     const totalSec = Math.floor(ms / 1000);
@@ -447,6 +514,127 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
     if (hr < 24) return `${hr}h`;
     const d = Math.floor(hr / 24);
     return `${d}d`;
+  };
+
+  // ── Detail renderers ─────────────────────────────────────────────────
+
+  const formatRelativeTs = (ts: number): string => {
+    const diff = Date.now() - ts;
+    const mins = Math.floor(diff / 60000);
+    if (mins < 60) return `${mins}m`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours}h`;
+    const days = Math.floor(hours / 24);
+    return `${days}d`;
+  };
+
+  function renderCommitDetail(detail: any) {
+    return (
+      <div class="repo-detail-panel">
+        {detail.body && <pre class="repo-detail-body">{detail.body}</pre>}
+        <div class="repo-detail-stats">
+          <span style={{ color: '#4ade80' }}>+{detail.stats.additions}</span>
+          {' '}
+          <span style={{ color: '#ef4444' }}>-{detail.stats.deletions}</span>
+          {' '}
+          <span style={{ color: '#94a3b8' }}>{detail.stats.filesChanged} {t('repo.files')}</span>
+        </div>
+        <div class="repo-detail-files">
+          {detail.files.map((f: any) => (
+            <div key={f.filename} class="repo-detail-file">
+              <span class="repo-file-name">{f.filename}</span>
+              {f.additions !== undefined && (
+                <span class="repo-file-stats">
+                  <span style={{ color: '#4ade80' }}>+{f.additions}</span>
+                  <span style={{ color: '#ef4444' }}>-{f.deletions}</span>
+                </span>
+              )}
+            </div>
+          ))}
+          {detail.hasMoreFiles && <div class="repo-detail-more">{t('repo.more_files')}</div>}
+        </div>
+        {detail.url && <a href={detail.url} target="_blank" rel="noopener" class="repo-detail-link">{t('repo.view_on_platform')}</a>}
+      </div>
+    );
+  }
+
+  function renderPRDetail(detail: any) {
+    const reviewColor = detail.reviewDecision === 'APPROVED' ? '#4ade80' : detail.reviewDecision === 'CHANGES_REQUESTED' ? '#ef4444' : '#f59e0b';
+    const checksColor = detail.checksStatus === 'success' ? '#4ade80' : detail.checksStatus === 'failure' ? '#ef4444' : detail.checksStatus === 'pending' ? '#f59e0b' : '#6b7280';
+    return (
+      <div class="repo-detail-panel">
+        {detail.body && (
+          <div class="repo-detail-markdown">
+            <ChatMarkdown text={detail.body} />
+            {detail.bodyTruncated && <div class="repo-detail-truncated">{t('repo.body_truncated')}</div>}
+          </div>
+        )}
+        <div class="repo-detail-badges">
+          {detail.reviewDecision && <span class="repo-badge" style={{ borderColor: reviewColor, color: reviewColor }}>{detail.reviewDecision}</span>}
+          {detail.checksStatus !== 'none' && <span class="repo-badge" style={{ borderColor: checksColor, color: checksColor }}>{t(`repo.checks_${detail.checksStatus}`)}</span>}
+          {detail.mergeable === true && <span class="repo-badge" style={{ borderColor: '#4ade80', color: '#4ade80' }}>{t('repo.mergeable')}</span>}
+          {detail.mergeable === false && <span class="repo-badge" style={{ borderColor: '#ef4444', color: '#ef4444' }}>{t('repo.conflicts')}</span>}
+        </div>
+        <div class="repo-detail-stats">
+          <span style={{ color: '#4ade80' }}>+{detail.additions}</span>{' '}
+          <span style={{ color: '#ef4444' }}>-{detail.deletions}</span>{' '}
+          <span style={{ color: '#94a3b8' }}>{detail.changedFiles} {t('repo.files')}</span>
+          {' · '}{detail.comments} {t('repo.comments_count')}
+        </div>
+        <a href={detail.url} target="_blank" rel="noopener" class="repo-detail-link">{t('repo.view_on_platform')}</a>
+      </div>
+    );
+  }
+
+  function renderIssueDetail(detail: any) {
+    return (
+      <div class="repo-detail-panel">
+        {detail.body && (
+          <div class="repo-detail-markdown">
+            <ChatMarkdown text={detail.body} />
+            {detail.bodyTruncated && <div class="repo-detail-truncated">{t('repo.body_truncated')}</div>}
+          </div>
+        )}
+        {detail.comments && detail.comments.length > 0 ? (
+          <div class="repo-detail-comments">
+            <div class="repo-detail-comments-header">{t('repo.comments_header', { count: detail.comments.length })}</div>
+            {detail.comments.map((c: any, i: number) => (
+              <div key={i} class="repo-detail-comment">
+                <div class="repo-comment-meta">
+                  <strong>{c.author}</strong>
+                  <span class="repo-comment-time">{formatRelativeTs(c.createdAt)}</span>
+                </div>
+                <div class="repo-detail-markdown">
+                  <ChatMarkdown text={c.body} />
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div class="repo-detail-no-comments">{t('repo.no_comments')}</div>
+        )}
+      </div>
+    );
+  }
+
+  const renderDetailPanel = (tab: 'commits' | 'prs' | 'issues', id: string | number) => {
+    const key = `${tab}:${id}`;
+    if (expandedKey !== key) return null;
+    const state = detailState.get(key);
+    if (state === 'loading') return <div class="repo-detail-loading">{t('repo.detail_loading')}</div>;
+    if (state === 'error') return (
+      <div class="repo-detail-error">
+        {t('repo.detail_error')}
+        <button class="repo-detail-retry" onClick={(e: MouseEvent) => { e.stopPropagation(); setDetailState(prev => { const n = new Map(prev); n.delete(key); return n; }); setDetailData(prev => { const n = new Map(prev); n.delete(key); return n; }); fetchDetail(tab, id); }}>
+          {t('repo.detail_retry')}
+        </button>
+      </div>
+    );
+    const detail = detailData.get(key);
+    if (!detail) return null;
+    if (tab === 'commits') return renderCommitDetail(detail);
+    if (tab === 'prs') return renderPRDetail(detail);
+    return renderIssueDetail(detail);
   };
 
   const actionStatusColor = (status: string, conclusion: string | null | undefined) => {

@@ -61,6 +61,9 @@ export type ServerMessage =
   | { type: 'repo.branches_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
   | { type: 'repo.commits_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
   | { type: 'repo.actions_response'; requestId?: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
+  | { type: 'repo.commit_detail_response'; requestId?: string; projectDir: string; detail: any }
+  | { type: 'repo.pr_detail_response'; requestId?: string; projectDir: string; detail: any }
+  | { type: 'repo.issue_detail_response'; requestId?: string; projectDir: string; detail: any }
   | { type: 'repo.error'; requestId: string; projectDir?: string; error: string }
   | { type: 'repo.detected'; projectDir: string; context: any };
 
@@ -369,6 +372,27 @@ export class WsClient {
   repoListActions(projectDir: string, opts?: { page?: number; force?: boolean }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: 'repo.list_actions', requestId, projectDir, ...opts });
+    return requestId;
+  }
+
+  /** Get commit detail (diff stats, files). Returns requestId. */
+  repoCommitDetail(projectDir: string, sha: string): string {
+    const requestId = crypto.randomUUID();
+    this.send({ type: 'repo.commit_detail', projectDir, sha, requestId });
+    return requestId;
+  }
+
+  /** Get PR detail (body, review, checks, stats). Returns requestId. */
+  repoPRDetail(projectDir: string, number: number): string {
+    const requestId = crypto.randomUUID();
+    this.send({ type: 'repo.pr_detail', projectDir, number, requestId });
+    return requestId;
+  }
+
+  /** Get issue detail (body, comments). Returns requestId. */
+  repoIssueDetail(projectDir: string, number: number): string {
+    const requestId = crypto.randomUUID();
+    this.send({ type: 'repo.issue_detail', projectDir, number, requestId });
     return requestId;
   }
 

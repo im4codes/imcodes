@@ -359,6 +359,21 @@
     "empty_actions": "워크플로 실행을 찾을 수 없습니다",
     "actions_refresh": "새로고침",
     "actions_last_updated": "{{time}} 업데이트됨",
-    "actions_view": "보기"
+    "actions_view": "보기",
+    "detail_loading": "로딩 중...",
+    "detail_error": "상세 정보를 불러오지 못했습니다",
+    "detail_retry": "재시도",
+    "files": "개 파일",
+    "more_files": "더 많은 파일이 있습니다 — GitHub에서 보기",
+    "view_on_platform": "GitHub에서 보기",
+    "body_truncated": "내용이 잘렸습니다 — GitHub에서 전체 내용 보기",
+    "checks_success": "체크 통과",
+    "checks_failure": "체크 실패",
+    "checks_pending": "체크 진행 중",
+    "mergeable": "병합 가능",
+    "conflicts": "충돌 있음",
+    "comments_count": "개 댓글",
+    "comments_header": "{{count}}개 댓글",
+    "no_comments": "댓글 없음"
   }
 }

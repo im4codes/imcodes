@@ -430,6 +430,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'repo.list_branches':
     case 'repo.list_commits':
     case 'repo.list_actions':
+    case 'repo.commit_detail':
+    case 'repo.pr_detail':
+    case 'repo.issue_detail':
       void handleRepoCommand(cmd, serverLink);
       break;
     default:

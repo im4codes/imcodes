@@ -105,6 +105,42 @@ export interface RepoWorkflowRun {
   duration?: number;      // seconds
 }
 
+export interface RepoCommitDetailFile {
+  filename: string;
+  status: string;
+  additions?: number;
+  deletions?: number;
+}
+
+export interface RepoCommitDetail extends RepoCommit {
+  body: string;
+  stats: { additions: number; deletions: number; filesChanged: number };
+  files: RepoCommitDetailFile[];
+  hasMoreFiles: boolean;
+}
+
+export interface RepoPRDetail extends RepoPR {
+  body: string;
+  bodyTruncated: boolean;
+  checksStatus: 'success' | 'failure' | 'pending' | 'none';
+  additions: number;
+  deletions: number;
+  changedFiles: number;
+  comments: number;
+  mergeable: boolean | null;
+}
+
+export interface RepoIssueComment {
+  author: string;
+  body: string;
+  createdAt: number;
+}
+
+export interface RepoIssueDetail extends RepoIssue {
+  comments: RepoIssueComment[];
+  bodyTruncated: boolean;
+}
+
 /** Structured error from providers — never exposes raw CLI output. */
 export type RepoError =
   | 'unauthorized'

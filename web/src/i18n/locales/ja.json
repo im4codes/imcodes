@@ -359,6 +359,21 @@
     "empty_actions": "ワークフロー実行が見つかりません",
     "actions_refresh": "更新",
     "actions_last_updated": "更新 {{time}}",
-    "actions_view": "表示"
+    "actions_view": "表示",
+    "detail_loading": "読み込み中...",
+    "detail_error": "詳細の読み込みに失敗しました",
+    "detail_retry": "再試行",
+    "files": "ファイル",
+    "more_files": "他にもファイルがあります — GitHub で確認",
+    "view_on_platform": "GitHub で表示",
+    "body_truncated": "内容が省略されています — GitHub で全文を確認",
+    "checks_success": "チェック通過",
+    "checks_failure": "チェック失敗",
+    "checks_pending": "チェック実行中",
+    "mergeable": "マージ可能",
+    "conflicts": "コンフリクトあり",
+    "comments_count": "件のコメント",
+    "comments_header": "{{count}} 件のコメント",
+    "no_comments": "コメントなし"
   }
 }

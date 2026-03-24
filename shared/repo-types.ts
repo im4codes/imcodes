@@ -11,6 +11,9 @@ export const REPO_MSG = {
   LIST_BRANCHES: 'repo.list_branches',
   LIST_COMMITS: 'repo.list_commits',
   LIST_ACTIONS: 'repo.list_actions',
+  COMMIT_DETAIL: 'repo.commit_detail',
+  PR_DETAIL: 'repo.pr_detail',
+  ISSUE_DETAIL: 'repo.issue_detail',
 
   // Daemon → Browser (responses)
   DETECT_RESPONSE: 'repo.detect_response',
@@ -20,6 +23,9 @@ export const REPO_MSG = {
   BRANCHES_RESPONSE: 'repo.branches_response',
   COMMITS_RESPONSE: 'repo.commits_response',
   ACTIONS_RESPONSE: 'repo.actions_response',
+  COMMIT_DETAIL_RESPONSE: 'repo.commit_detail_response',
+  PR_DETAIL_RESPONSE: 'repo.pr_detail_response',
+  ISSUE_DETAIL_RESPONSE: 'repo.issue_detail_response',
   ERROR: 'repo.error',
 } as const;
 
@@ -32,5 +38,8 @@ export const REPO_RELAY_TYPES = new Set([
   REPO_MSG.BRANCHES_RESPONSE,
   REPO_MSG.COMMITS_RESPONSE,
   REPO_MSG.ACTIONS_RESPONSE,
+  REPO_MSG.COMMIT_DETAIL_RESPONSE,
+  REPO_MSG.PR_DETAIL_RESPONSE,
+  REPO_MSG.ISSUE_DETAIL_RESPONSE,
   REPO_MSG.ERROR,
 ]);

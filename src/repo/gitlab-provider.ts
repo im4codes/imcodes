@@ -6,9 +6,14 @@ import { promisify } from 'node:util';
 import type {
   RepoBranch,
   RepoCommit,
+  RepoCommitDetail,
+  RepoCommitDetailFile,
   RepoError,
   RepoIssue,
+  RepoIssueComment,
+  RepoIssueDetail,
   RepoPR,
+  RepoPRDetail,
   RepoListResult,
   RepoWorkflowRun,
 } from './types.js';
@@ -191,6 +196,136 @@ export class GitLabProvider implements RepoProvider {
 
   async listActions(_opts?: ListOptions): Promise<RepoListResult<RepoWorkflowRun>> {
     return { items: [], page: 1, hasMore: false, projectDir: this.projectDir };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  getCommitDetail                                                    */
+  /* ------------------------------------------------------------------ */
+
+  async getCommitDetail(sha: string): Promise<RepoCommitDetail> {
+    const [commitRaw, diffRaw] = await Promise.all([
+      this.glab(['api', `/projects/${this.encodedProject}/repository/commits/${sha}`]),
+      this.glab(['api', `/projects/${this.encodedProject}/repository/commits/${sha}/diff`]),
+    ]);
+
+    const c = JSON.parse(commitRaw);
+    const diffs: any[] = JSON.parse(diffRaw);
+
+    const messageParts = (c.message ?? '').split('\n');
+    const message = messageParts[0] ?? '';
+    const body = messageParts.slice(1).join('\n').replace(/^\n/, '');
+
+    const files: RepoCommitDetailFile[] = diffs.slice(0, 100).map((d: any) => {
+      let status = 'modified';
+      if (d.new_file) status = 'added';
+      else if (d.deleted_file) status = 'removed';
+      else if (d.renamed_file) status = 'renamed';
+      return { filename: d.new_path, status };
+    });
+
+    return {
+      sha: c.id,
+      shortSha: c.short_id,
+      message,
+      author: c.author_name ?? '',
+      date: new Date(c.committed_date ?? c.created_at).getTime(),
+      url: c.web_url,
+      body,
+      stats: {
+        additions: c.stats?.additions ?? 0,
+        deletions: c.stats?.deletions ?? 0,
+        filesChanged: c.stats?.total ?? diffs.length,
+      },
+      files,
+      hasMoreFiles: diffs.length > 100,
+    };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  getPRDetail                                                        */
+  /* ------------------------------------------------------------------ */
+
+  async getPRDetail(num: number): Promise<RepoPRDetail> {
+    const raw = await this.glab(['api', `/projects/${this.encodedProject}/merge_requests/${num}`]);
+    const mr = JSON.parse(raw);
+
+    const MAX_BODY = 10_000;
+    const rawBody = mr.description ?? '';
+    const bodyTruncated = rawBody.length > MAX_BODY;
+    const body = bodyTruncated ? rawBody.slice(0, MAX_BODY) : rawBody;
+
+    const mergeable = mr.detailed_merge_status === 'mergeable' ? true
+      : mr.detailed_merge_status ? false
+      : null;
+
+    return {
+      number: mr.iid,
+      title: mr.title,
+      state: mapMRState(mr.state),
+      author: mr.author?.username ?? '',
+      head: mr.source_branch,
+      base: mr.target_branch,
+      url: mr.web_url,
+      createdAt: new Date(mr.created_at).getTime(),
+      updatedAt: new Date(mr.updated_at).getTime(),
+      draft: mr.draft ?? mr.work_in_progress ?? false,
+      labels: (mr.labels ?? []) as string[],
+      body,
+      bodyTruncated,
+      checksStatus: 'none',
+      additions: mr.changes_count ? parseInt(mr.changes_count, 10) || 0 : 0,
+      deletions: 0,
+      changedFiles: mr.changes_count ? parseInt(mr.changes_count, 10) || 0 : 0,
+      comments: mr.user_notes_count ?? 0,
+      mergeable,
+    };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  getIssueDetail                                                     */
+  /* ------------------------------------------------------------------ */
+
+  async getIssueDetail(num: number): Promise<RepoIssueDetail> {
+    const [issueRaw, notesRaw] = await Promise.all([
+      this.glab(['api', `/projects/${this.encodedProject}/issues/${num}`]),
+      this.glab(['api', `/projects/${this.encodedProject}/issues/${num}/notes?per_page=20&sort=asc`]),
+    ]);
+
+    const i = JSON.parse(issueRaw);
+    const notes: any[] = JSON.parse(notesRaw);
+
+    const MAX_BODY = 20_000;
+    const rawBody = i.description ?? '';
+    const bodyTruncated = rawBody.length > MAX_BODY;
+    const body = bodyTruncated ? rawBody.slice(0, MAX_BODY) : rawBody;
+
+    const MAX_COMMENT = 20_000;
+    const comments: RepoIssueComment[] = notes
+      .filter((n: any) => !n.system)
+      .map((n: any) => {
+        const commentBody = n.body ?? '';
+        return {
+          author: n.author?.username ?? '',
+          body: commentBody.length > MAX_COMMENT ? commentBody.slice(0, MAX_COMMENT) : commentBody,
+          createdAt: new Date(n.created_at).getTime(),
+        };
+      });
+
+    return {
+      id: String(i.id),
+      number: i.iid,
+      title: i.title,
+      body,
+      state: mapIssueState(i.state),
+      author: i.author?.username ?? '',
+      labels: (i.labels ?? []) as string[],
+      url: i.web_url,
+      assignee: i.assignee?.username,
+      createdAt: new Date(i.created_at).getTime(),
+      updatedAt: new Date(i.updated_at).getTime(),
+      comments,
+      bodyTruncated,
+    };
   }
 
   /* ------------------------------------------------------------------ */

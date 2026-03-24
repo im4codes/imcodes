@@ -12,6 +12,10 @@ import type {
   RepoCommit,
   RepoWorkflowRun,
   RepoError,
+  RepoCommitDetail,
+  RepoPRDetail,
+  RepoIssueDetail,
+  RepoIssueComment,
 } from './types.js';
 import type { RepoProvider, ListOptions, CommitListOptions } from './provider.js';
 import { DEFAULT_PAGE_SIZE } from './provider.js';
@@ -209,6 +213,136 @@ export class GitHubProvider implements RepoProvider {
 
       const items: RepoWorkflowRun[] = JSON.parse(stdout || '[]');
       return { items, page, hasMore: items.length === perPage, projectDir: this.projectDir };
+    } catch (err) {
+      const code = translateError(err);
+      const error = new Error(`gh error: ${code}`);
+      (error as any).code = code;
+      throw error;
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  getCommitDetail                                                    */
+  /* ------------------------------------------------------------------ */
+
+  async getCommitDetail(sha: string): Promise<RepoCommitDetail> {
+    const jq = `{sha: .sha, shortSha: .sha[:7], message: (.commit.message | split("\n") | .[0]), author: (.commit.author.name // .author.login // "unknown"), date: (.commit.author.date | fromdateiso8601 * 1000), url: .html_url, body: (.commit.message | split("\n") | .[1:] | join("\n") | ltrimstr("\n")), stats: {additions: .stats.additions, deletions: .stats.deletions, filesChanged: .stats.total}, files: [.files[:100][] | {filename, status, additions, deletions}], hasMoreFiles: ((.files | length) > 100)}`;
+
+    try {
+      const { stdout } = await execFileAsync('gh', [
+        'api',
+        `/repos/${this.owner}/${this.repo}/commits/${sha}`,
+        '-q', jq,
+      ], { cwd: this.projectDir, timeout: 15000, maxBuffer: 10 * 1024 * 1024 });
+
+      return JSON.parse(stdout);
+    } catch (err) {
+      const code = translateError(err);
+      const error = new Error(`gh error: ${code}`);
+      (error as any).code = code;
+      throw error;
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  getPRDetail                                                        */
+  /* ------------------------------------------------------------------ */
+
+  async getPRDetail(num: number): Promise<RepoPRDetail> {
+    const jq = `{number, title, state: (if .merged_at then "merged" elif .state == "closed" then "closed" else "open" end), author: .user.login, head: .head.ref, base: .base.ref, url: .html_url, createdAt: (.created_at | fromdateiso8601 * 1000), updatedAt: (.updated_at | fromdateiso8601 * 1000), reviewDecision: null, draft: .draft, labels: [.labels[].name], body: .body, additions, deletions, changedFiles: .changed_files, comments: .comments, mergeable: .mergeable, mergeableState: .mergeable_state}`;
+
+    try {
+      const { stdout } = await execFileAsync('gh', [
+        'api',
+        `/repos/${this.owner}/${this.repo}/pulls/${num}`,
+        '-q', jq,
+      ], { cwd: this.projectDir, timeout: 15000, maxBuffer: 10 * 1024 * 1024 });
+
+      const raw = JSON.parse(stdout);
+
+      // Truncate body at 10K characters
+      const MAX_BODY = 10_000;
+      const bodyTruncated = (raw.body?.length ?? 0) > MAX_BODY;
+      const body = bodyTruncated ? raw.body.slice(0, MAX_BODY) : (raw.body ?? '');
+
+      // Determine checksStatus from mergeable_state
+      let checksStatus: RepoPRDetail['checksStatus'] = 'none';
+      if (raw.mergeableState === 'clean' || raw.mergeableState === 'has_hooks') checksStatus = 'success';
+      else if (raw.mergeableState === 'unstable') checksStatus = 'failure';
+      else if (raw.mergeableState === 'blocked') checksStatus = 'pending';
+
+      return {
+        number: raw.number,
+        title: raw.title,
+        state: raw.state,
+        author: raw.author,
+        head: raw.head,
+        base: raw.base,
+        url: raw.url,
+        createdAt: raw.createdAt,
+        updatedAt: raw.updatedAt,
+        reviewDecision: raw.reviewDecision,
+        draft: raw.draft,
+        labels: raw.labels,
+        body,
+        bodyTruncated,
+        checksStatus,
+        additions: raw.additions ?? 0,
+        deletions: raw.deletions ?? 0,
+        changedFiles: raw.changedFiles ?? 0,
+        comments: raw.comments ?? 0,
+        mergeable: raw.mergeable,
+      };
+    } catch (err) {
+      const code = translateError(err);
+      const error = new Error(`gh error: ${code}`);
+      (error as any).code = code;
+      throw error;
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  getIssueDetail                                                     */
+  /* ------------------------------------------------------------------ */
+
+  async getIssueDetail(num: number): Promise<RepoIssueDetail> {
+    const issueJq = `{id: (.id | tostring), number, title, body: (.body // ""), state, author: .user.login, labels: [.labels[].name], url: .html_url, assignee: (.assignee.login // null), createdAt: (.created_at | fromdateiso8601 * 1000), updatedAt: (.updated_at | fromdateiso8601 * 1000)}`;
+    const commentsJq = `[.[] | {author: .user.login, body: (.body // ""), createdAt: (.created_at | fromdateiso8601 * 1000)}]`;
+
+    try {
+      const [issueResult, commentsResult] = await Promise.all([
+        execFileAsync('gh', [
+          'api',
+          `/repos/${this.owner}/${this.repo}/issues/${num}`,
+          '-q', issueJq,
+        ], { cwd: this.projectDir, timeout: 15000, maxBuffer: 10 * 1024 * 1024 }),
+        execFileAsync('gh', [
+          'api',
+          `/repos/${this.owner}/${this.repo}/issues/${num}/comments?per_page=20`,
+          '-q', commentsJq,
+        ], { cwd: this.projectDir, timeout: 15000, maxBuffer: 10 * 1024 * 1024 }),
+      ]);
+
+      const issue = JSON.parse(issueResult.stdout);
+      const comments: RepoIssueComment[] = JSON.parse(commentsResult.stdout || '[]');
+
+      // Truncate body at 20K
+      const MAX_BODY = 20_000;
+      const bodyTruncated = issue.body.length > MAX_BODY;
+      if (bodyTruncated) issue.body = issue.body.slice(0, MAX_BODY);
+
+      // Truncate each comment body at 20K
+      const MAX_COMMENT = 20_000;
+      for (const c of comments) {
+        if (c.body.length > MAX_COMMENT) c.body = c.body.slice(0, MAX_COMMENT);
+      }
+
+      return {
+        ...issue,
+        state: issue.state === 'open' ? 'open' : 'closed',
+        comments,
+        bodyTruncated,
+      };
     } catch (err) {
       const code = translateError(err);
       const error = new Error(`gh error: ${code}`);

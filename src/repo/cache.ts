@@ -29,12 +29,12 @@ export class RepoCache {
     return entry.data as T;
   }
 
-  set<T>(key: string, data: T, projectDir: string, errorState = false): void {
+  set<T>(key: string, data: T, projectDir: string, errorState = false, ttlMs?: number): void {
     const isDetect = key.includes(':detect:');
     this.store.set(key, {
       data,
       cachedAt: Date.now(),
-      ttlMs: errorState ? ERROR_TTL_MS : isDetect ? DETECT_TTL_MS : DEFAULT_TTL_MS,
+      ttlMs: ttlMs ?? (errorState ? ERROR_TTL_MS : isDetect ? DETECT_TTL_MS : DEFAULT_TTL_MS),
       projectDir,
     });
   }

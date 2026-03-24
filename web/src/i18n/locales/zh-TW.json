@@ -359,6 +359,21 @@
     "empty_actions": "找不到工作流程執行記錄",
     "actions_refresh": "重新整理",
     "actions_last_updated": "更新於 {{time}}",
-    "actions_view": "查看"
+    "actions_view": "查看",
+    "detail_loading": "載入中...",
+    "detail_error": "載入詳情失敗",
+    "detail_retry": "重試",
+    "files": "個檔案",
+    "more_files": "還有更多檔案 — 在 GitHub 上查看",
+    "view_on_platform": "在 GitHub 上查看",
+    "body_truncated": "內容已截斷 — 在 GitHub 上查看完整內容",
+    "checks_success": "檢查通過",
+    "checks_failure": "檢查失敗",
+    "checks_pending": "檢查進行中",
+    "mergeable": "可合併",
+    "conflicts": "存在衝突",
+    "comments_count": "則留言",
+    "comments_header": "{{count}} 則留言",
+    "no_comments": "暫無留言"
   }
 }

@@ -359,6 +359,21 @@
     "empty_actions": "No se encontraron ejecuciones de flujos de trabajo",
     "actions_refresh": "Actualizar",
     "actions_last_updated": "Actualizado {{time}}",
-    "actions_view": "Ver"
+    "actions_view": "Ver",
+    "detail_loading": "Cargando...",
+    "detail_error": "Error al cargar los detalles",
+    "detail_retry": "Reintentar",
+    "files": "archivos",
+    "more_files": "Hay más archivos — ver en GitHub",
+    "view_on_platform": "Ver en GitHub",
+    "body_truncated": "Contenido truncado — ver contenido completo en GitHub",
+    "checks_success": "Checks aprobados",
+    "checks_failure": "Checks fallidos",
+    "checks_pending": "Checks pendientes",
+    "mergeable": "Fusionable",
+    "conflicts": "Tiene conflictos",
+    "comments_count": "comentarios",
+    "comments_header": "{{count}} comentarios",
+    "no_comments": "Sin comentarios"
   }
 }

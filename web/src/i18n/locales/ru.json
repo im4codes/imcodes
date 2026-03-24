@@ -359,6 +359,21 @@
     "empty_actions": "Запуски рабочих процессов не найдены",
     "actions_refresh": "Обновить",
     "actions_last_updated": "Обновлено {{time}}",
-    "actions_view": "Открыть"
+    "actions_view": "Открыть",
+    "detail_loading": "Загрузка...",
+    "detail_error": "Не удалось загрузить детали",
+    "detail_retry": "Повторить",
+    "files": "файлов",
+    "more_files": "Ещё файлы — посмотреть на GitHub",
+    "view_on_platform": "Открыть на GitHub",
+    "body_truncated": "Содержание сокращено — полная версия на GitHub",
+    "checks_success": "Проверки пройдены",
+    "checks_failure": "Проверки не пройдены",
+    "checks_pending": "Проверки выполняются",
+    "mergeable": "Можно слить",
+    "conflicts": "Есть конфликты",
+    "comments_count": "комментариев",
+    "comments_header": "{{count}} комментариев",
+    "no_comments": "Нет комментариев"
   }
 }

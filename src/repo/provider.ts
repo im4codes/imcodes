@@ -8,6 +8,9 @@ import type {
   RepoBranch,
   RepoCommit,
   RepoWorkflowRun,
+  RepoCommitDetail,
+  RepoPRDetail,
+  RepoIssueDetail,
 } from './types.js';
 
 export interface ListOptions {
@@ -40,6 +43,15 @@ export interface RepoProvider {
 
   /** List CI/CD workflow runs (Actions / Pipelines). Default page size: 20. */
   listActions(opts?: ListOptions): Promise<RepoListResult<RepoWorkflowRun>>;
+
+  /** Get detailed commit info including stats and file list. */
+  getCommitDetail(sha: string): Promise<RepoCommitDetail>;
+
+  /** Get detailed pull request / merge request info. */
+  getPRDetail(number: number): Promise<RepoPRDetail>;
+
+  /** Get detailed issue info including comments. */
+  getIssueDetail(number: number): Promise<RepoIssueDetail>;
 }
 
 export const DEFAULT_PAGE_SIZE = 20;
