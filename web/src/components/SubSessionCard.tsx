@@ -35,6 +35,7 @@ interface Props {
   ws: WsClient | null;
   connected: boolean;
   isOpen: boolean;
+  isFocused?: boolean;
   onOpen: () => void;
   onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void;
   onHistory: (sessionName: string, apply: (c: string) => void) => void;
@@ -50,7 +51,7 @@ function loadCardW(id: string, fallback: number): number {
   return fallback;
 }
 
-export function SubSessionCard({ sub, ws, connected, isOpen, onOpen, onDiff, onHistory, cardW = 350, cardH = 250 }: Props) {
+export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, onDiff, onHistory, cardW = 350, cardH = 250 }: Props) {
   const isShell = sub.type === 'shell' || sub.type === 'script';
   const { events, refreshing } = isShell ? { events: [], refreshing: false } : useTimeline(sub.sessionName, ws);
   const termScrollRef = useRef<(() => void) | null>(null);
@@ -126,7 +127,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, onOpen, onDiff, onH
 
   return (
     <div
-      class={`subcard${isOpen ? ' subcard-open' : ''}${busy ? ' subcard-running-pulse' : ''}`}
+      class={`subcard${isOpen ? ' subcard-open' : ''}${isFocused ? ' subcard-focused' : ''}${busy ? ' subcard-running-pulse' : ''}`}
       style={{ width: effectiveW, height: cardH, minWidth: effectiveW, position: 'relative' }}
       onClick={() => { if (!draggingRef.current) onOpen(); }}
     >

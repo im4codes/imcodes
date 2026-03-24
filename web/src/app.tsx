@@ -403,6 +403,16 @@ export function App() {
   const [subZIndexes, setSubZIndexes] = useState<Map<string, number>>(new Map());
   const [showSubDialog, setShowSubDialog] = useState(false);
 
+  // Derive focused (topmost) sub-session from z-indexes + open set
+  const focusedSubId = useMemo(() => {
+    let maxZ = -1;
+    let maxId: string | null = null;
+    for (const [id, z] of subZIndexes) {
+      if (openSubIds.has(id) && z > maxZ) { maxZ = z; maxId = id; }
+    }
+    return maxId;
+  }, [subZIndexes, openSubIds]);
+
   // ── Repo ────────────────────────────────────────────────────────────────────
   const [showRepoPage, setShowRepoPage] = useState(false);
   const [repoContexts, setRepoContexts] = useState<Map<string, any>>(new Map());
@@ -1737,6 +1747,7 @@ export function App() {
                 serverId={selectedServerId}
                 onViewRepo={() => setShowRepoPage(true)}
                 subUsages={subUsages}
+                focusedSubId={focusedSubId}
               />
             )}
           </>
