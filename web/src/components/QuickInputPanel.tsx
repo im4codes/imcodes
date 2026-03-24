@@ -170,9 +170,17 @@ interface Props {
 }
 
 const HISTORY_PAGE_SIZE = 10;
+const TRUNCATE_THRESHOLD = 40;
 type AddTarget = 'command' | 'phrase' | null;
 type HistoryScope = 'session' | 'global';
 type QpTab = 'quick' | 'files';
+
+/** Truncate long text: "start of text...end of text" */
+function truncateMiddle(text: string, max = TRUNCATE_THRESHOLD): string {
+  if (text.length <= max) return text;
+  const half = Math.floor((max - 3) / 2);
+  return text.slice(0, half) + '...' + text.slice(-half);
+}
 
 export function QuickInputPanel({
   open, onClose, onSelect, onSend, agentType, sessionName,
@@ -186,6 +194,9 @@ export function QuickInputPanel({
   const addInputRef = useRef<HTMLInputElement>(null);
   const [addTarget, setAddTarget] = useState<AddTarget>(null);
   const [addValue, setAddValue] = useState('');
+  const [editingItem, setEditingItem] = useState<{ type: 'command' | 'phrase'; original: string } | null>(null);
+  const [editValue, setEditValue] = useState('');
+  const editInputRef = useRef<HTMLInputElement>(null);
   const [historyPage, setHistoryPage] = useState(0);
   const [historyScope, setHistoryScope] = useState<HistoryScope>('session');
   const [activeTab, setActiveTab] = useState<QpTab>('quick');
@@ -204,10 +215,13 @@ export function QuickInputPanel({
     return () => document.removeEventListener('mousedown', handler);
   }, [open, onClose]);
 
-  // Focus add input when shown
+  // Focus add/edit input when shown
   useEffect(() => {
     if (addTarget) setTimeout(() => addInputRef.current?.focus(), 50);
   }, [addTarget]);
+  useEffect(() => {
+    if (editingItem) setTimeout(() => editInputRef.current?.focus(), 50);
+  }, [editingItem]);
 
   if (!open) return null;
 
@@ -244,6 +258,28 @@ export function QuickInputPanel({
   const handleAddKeyDown = (e: KeyboardEvent) => {
     if (e.key === 'Enter') { e.preventDefault(); commitAdd(); }
     if (e.key === 'Escape') { setAddTarget(null); setAddValue(''); }
+  };
+
+  const startEdit = (type: 'command' | 'phrase', original: string) => {
+    setEditingItem({ type, original });
+    setEditValue(original);
+  };
+
+  const commitEdit = () => {
+    if (!editingItem) return;
+    const v = editValue.trim();
+    const { type, original } = editingItem;
+    if (v && v !== original) {
+      if (type === 'command') { onRemoveCommand(original); onAddCommand(v); }
+      else { onRemovePhrase(original); onAddPhrase(v); }
+    }
+    setEditingItem(null);
+    setEditValue('');
+  };
+
+  const handleEditKeyDown = (e: KeyboardEvent) => {
+    if (e.key === 'Enter') { e.preventDefault(); commitEdit(); }
+    if (e.key === 'Escape') { setEditingItem(null); setEditValue(''); }
   };
 
   return (
@@ -320,10 +356,24 @@ export function QuickInputPanel({
                   <button key={cmd} class="qp-pill qp-pill-default" onClick={() => handleSend(cmd)}>{cmd}</button>
                 ))}
                 {data.commands.map((cmd) => (
-                  <span key={cmd} class="qp-pill qp-pill-custom">
-                    <span class="qp-pill-text" onClick={() => handleSend(cmd)}>{cmd}</span>
-                    <button class="qp-pill-del" onClick={() => onRemoveCommand(cmd)}>✕</button>
-                  </span>
+                  editingItem?.type === 'command' && editingItem.original === cmd ? (
+                    <span key={cmd} class="qp-pill qp-pill-editing">
+                      <input
+                        ref={editInputRef}
+                        class="qp-edit-input"
+                        value={editValue}
+                        onInput={(e) => setEditValue((e.target as HTMLInputElement).value)}
+                        onKeyDown={handleEditKeyDown}
+                        onBlur={commitEdit}
+                      />
+                    </span>
+                  ) : (
+                    <span key={cmd} class="qp-pill qp-pill-custom" title={cmd.length > TRUNCATE_THRESHOLD ? cmd : undefined}>
+                      <span class="qp-pill-text" onClick={() => handleSend(cmd)}>{truncateMiddle(cmd)}</span>
+                      <button class="qp-pill-edit" onClick={() => startEdit('command', cmd)}>✎</button>
+                      <button class="qp-pill-del" onClick={() => onRemoveCommand(cmd)}>✕</button>
+                    </span>
+                  )
                 ))}
               </div>
             </>
@@ -338,10 +388,24 @@ export function QuickInputPanel({
                   <button key={phrase} class="qp-pill qp-pill-default" onClick={() => handleSend(phrase)}>{phrase}</button>
                 ))}
                 {data.phrases.map((phrase) => (
-                  <span key={phrase} class="qp-pill qp-pill-custom">
-                    <span class="qp-pill-text" onClick={() => handleSend(phrase)}>{phrase}</span>
-                    <button class="qp-pill-del" onClick={() => onRemovePhrase(phrase)}>✕</button>
-                  </span>
+                  editingItem?.type === 'phrase' && editingItem.original === phrase ? (
+                    <span key={phrase} class="qp-pill qp-pill-editing">
+                      <input
+                        ref={editInputRef}
+                        class="qp-edit-input"
+                        value={editValue}
+                        onInput={(e) => setEditValue((e.target as HTMLInputElement).value)}
+                        onKeyDown={handleEditKeyDown}
+                        onBlur={commitEdit}
+                      />
+                    </span>
+                  ) : (
+                    <span key={phrase} class="qp-pill qp-pill-custom" title={phrase.length > TRUNCATE_THRESHOLD ? phrase : undefined}>
+                      <span class="qp-pill-text" onClick={() => handleSend(phrase)}>{truncateMiddle(phrase)}</span>
+                      <button class="qp-pill-edit" onClick={() => startEdit('phrase', phrase)}>✎</button>
+                      <button class="qp-pill-del" onClick={() => onRemovePhrase(phrase)}>✕</button>
+                    </span>
+                  )
                 ))}
               </div>
             </>
@@ -364,8 +428,8 @@ export function QuickInputPanel({
                 </div>
               </div>
               {historySlice.length > 0 ? historySlice.map((text, i) => (
-                <div key={historyPage * HISTORY_PAGE_SIZE + i} class="qp-item qp-item-history" onClick={() => handleSelect(text)}>
-                  <span class="qp-item-text">{text}</span>
+                <div key={historyPage * HISTORY_PAGE_SIZE + i} class="qp-item qp-item-history" onClick={() => handleSelect(text)} title={text.length > 60 ? text : undefined}>
+                  <span class="qp-item-text">{truncateMiddle(text, 60)}</span>
                   <button class="qp-item-del" onClick={(e) => { e.stopPropagation(); handleRemoveItem(text); }}>✕</button>
                 </div>
               )) : (

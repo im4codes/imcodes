@@ -296,8 +296,12 @@ body {
 .qp-pill-custom { background: #1e293b; border-color: #475569; color: #cbd5e1; display: inline-flex; align-items: center; border-radius: 999px; overflow: hidden; padding: 0; }
 .qp-pill-text { padding: 4px 8px 4px 10px; font-size: 12px; cursor: pointer; }
 .qp-pill-text:hover { background: #334155; }
-.qp-pill-del { padding: 4px 7px 4px 4px; background: none; border: none; color: #475569; font-size: 10px; cursor: pointer; transition: color 0.1s; }
+.qp-pill-edit { padding: 4px 4px 4px 2px; background: none; border: none; color: #475569; font-size: 10px; cursor: pointer; transition: color 0.1s; }
+.qp-pill-edit:hover { color: #60a5fa; }
+.qp-pill-del { padding: 4px 7px 4px 2px; background: none; border: none; color: #475569; font-size: 10px; cursor: pointer; transition: color 0.1s; }
 .qp-pill-del:hover { color: #f87171; }
+.qp-pill-editing { display: inline-flex; }
+.qp-edit-input { background: #0f172a; border: 1px solid #3b82f6; color: #e2e8f0; font-size: 11px; padding: 3px 8px; border-radius: 10px; outline: none; min-width: 120px; font-family: inherit; }
 /* History rows — compact */
 .qp-item { display: flex; align-items: flex-start; gap: 6px; padding: 5px 10px; cursor: pointer; transition: background 0.1s; }
 .qp-item:hover { background: #293548; }
