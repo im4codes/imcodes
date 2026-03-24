@@ -45,6 +45,7 @@ import { initPushNotifications } from './push-notifications.js';
 import { ServerSetupPage } from './pages/ServerSetupPage.js';
 import { NativeAuthBridge } from './pages/NativeAuthBridge.js';
 import type { SessionInfo, TerminalDiff } from './types.js';
+import { REPO_MSG } from '@shared/repo-types.js';
 
 // On web: if opened by the native app for passkey auth, render the bridge page.
 const nativeCallback = typeof window !== 'undefined'
@@ -881,7 +882,7 @@ export function App() {
           }, 120_000);
         }
       }
-      if (msg.type === 'repo.detected' || msg.type === 'repo.detect_response') {
+      if (msg.type === REPO_MSG.DETECTED || msg.type === REPO_MSG.DETECT_RESPONSE) {
         const dir = msg.projectDir as string;
         if (dir) {
           // Normalize shape: repo.detected wraps in { context }, detect_response spreads at top level.
@@ -895,7 +896,7 @@ export function App() {
           });
         }
       }
-      if (msg.type === 'repo.error') {
+      if (msg.type === REPO_MSG.ERROR) {
         // Store error status so the auto-detect effect can stop retrying for terminal errors
         // and SubSessionBar can show appropriate state (dimmed button or hidden)
         const error = (msg as any).error as string;

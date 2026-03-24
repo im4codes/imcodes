@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 import { ChatMarkdown } from '../components/ChatMarkdown.js';
+import { REPO_MSG } from '@shared/repo-types.js';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -199,7 +200,7 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
   useEffect(() => {
     return ws.onMessage((msg: ServerMessage) => {
       // Detect response
-      if (msg.type === 'repo.detect_response') {
+      if (msg.type === REPO_MSG.DETECT_RESPONSE) {
         if (msg.requestId !== detectReqRef.current) return;
         pendingRef.current.delete(msg.requestId);
         if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current);
@@ -209,14 +210,14 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
       }
 
       // Passive detect push — only accept if projectDir matches
-      if (msg.type === 'repo.detected') {
+      if (msg.type === REPO_MSG.DETECTED) {
         if (msg.projectDir !== projectDir) return;
         setContext(prev => ({ ...prev, ...mapDetectToContext(msg.context) }));
         return;
       }
 
       // Error response
-      if (msg.type === 'repo.error') {
+      if (msg.type === REPO_MSG.ERROR) {
         if (!pendingRef.current.has(msg.requestId)) return;
         pendingRef.current.delete(msg.requestId);
         // Could be detect error or tab error
@@ -241,19 +242,19 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
       }
 
       // Detail responses
-      if (msg.type === 'repo.commit_detail_response') {
+      if (msg.type === REPO_MSG.COMMIT_DETAIL_RESPONSE) {
         const m = msg as any;
         setDetailData(prev => new Map(prev).set(`commits:${m.detail.sha}`, m.detail));
         setDetailState(prev => new Map(prev).set(`commits:${m.detail.sha}`, 'loaded'));
         return;
       }
-      if (msg.type === 'repo.pr_detail_response') {
+      if (msg.type === REPO_MSG.PR_DETAIL_RESPONSE) {
         const m = msg as any;
         setDetailData(prev => new Map(prev).set(`prs:${m.detail.number}`, m.detail));
         setDetailState(prev => new Map(prev).set(`prs:${m.detail.number}`, 'loaded'));
         return;
       }
-      if (msg.type === 'repo.issue_detail_response') {
+      if (msg.type === REPO_MSG.ISSUE_DETAIL_RESPONSE) {
         const m = msg as any;
         setDetailData(prev => new Map(prev).set(`issues:${m.detail.number}`, m.detail));
         setDetailState(prev => new Map(prev).set(`issues:${m.detail.number}`, 'loaded'));
@@ -262,11 +263,11 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
 
       // Tab responses
       const tabMap: Record<string, TabKey> = {
-        'repo.issues_response': 'issues',
-        'repo.prs_response': 'prs',
-        'repo.branches_response': 'branches',
-        'repo.commits_response': 'commits',
-        'repo.actions_response': 'actions',
+        [REPO_MSG.ISSUES_RESPONSE]: 'issues',
+        [REPO_MSG.PRS_RESPONSE]: 'prs',
+        [REPO_MSG.BRANCHES_RESPONSE]: 'branches',
+        [REPO_MSG.COMMITS_RESPONSE]: 'commits',
+        [REPO_MSG.ACTIONS_RESPONSE]: 'actions',
       };
       const tabKey = tabMap[msg.type];
       if (tabKey && 'requestId' in msg && 'projectDir' in msg) {

@@ -5,6 +5,7 @@
 import type { TerminalDiff } from './types.js';
 import { apiFetch } from './api.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
+import { REPO_MSG } from '@shared/repo-types.js';
 import type {
   FsLsResponse,
   FsReadResponse,
@@ -336,63 +337,63 @@ export class WsClient {
   /** Detect repo context for a project directory. Returns requestId. */
   repoDetect(projectDir: string, opts?: { force?: boolean }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'repo.detect', requestId, projectDir, ...(opts?.force ? { force: true } : {}) });
+    this.send({ type: REPO_MSG.DETECT, requestId, projectDir, ...(opts?.force ? { force: true } : {}) });
     return requestId;
   }
 
   /** List issues for a project. Returns requestId. */
   repoListIssues(projectDir: string, opts?: { state?: string; page?: number; force?: boolean }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'repo.list_issues', requestId, projectDir, ...opts });
+    this.send({ type: REPO_MSG.LIST_ISSUES, requestId, projectDir, ...opts });
     return requestId;
   }
 
   /** List pull requests for a project. Returns requestId. */
   repoListPRs(projectDir: string, opts?: { state?: string; page?: number; force?: boolean }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'repo.list_prs', requestId, projectDir, ...opts });
+    this.send({ type: REPO_MSG.LIST_PRS, requestId, projectDir, ...opts });
     return requestId;
   }
 
   /** List branches for a project. Returns requestId. */
   repoListBranches(projectDir: string): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'repo.list_branches', requestId, projectDir });
+    this.send({ type: REPO_MSG.LIST_BRANCHES, requestId, projectDir });
     return requestId;
   }
 
   /** List commits for a project. Returns requestId. */
   repoListCommits(projectDir: string, opts?: { branch?: string; page?: number }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'repo.list_commits', requestId, projectDir, ...opts });
+    this.send({ type: REPO_MSG.LIST_COMMITS, requestId, projectDir, ...opts });
     return requestId;
   }
 
   /** List workflow runs (CI/CD actions) for a project. Returns requestId. */
   repoListActions(projectDir: string, opts?: { page?: number; force?: boolean }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'repo.list_actions', requestId, projectDir, ...opts });
+    this.send({ type: REPO_MSG.LIST_ACTIONS, requestId, projectDir, ...opts });
     return requestId;
   }
 
   /** Get commit detail (diff stats, files). Returns requestId. */
   repoCommitDetail(projectDir: string, sha: string): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'repo.commit_detail', projectDir, sha, requestId });
+    this.send({ type: REPO_MSG.COMMIT_DETAIL, projectDir, sha, requestId });
     return requestId;
   }
 
   /** Get PR detail (body, review, checks, stats). Returns requestId. */
   repoPRDetail(projectDir: string, number: number): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'repo.pr_detail', projectDir, number, requestId });
+    this.send({ type: REPO_MSG.PR_DETAIL, projectDir, number, requestId });
     return requestId;
   }
 
   /** Get issue detail (body, comments). Returns requestId. */
   repoIssueDetail(projectDir: string, number: number): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'repo.issue_detail', projectDir, number, requestId });
+    this.send({ type: REPO_MSG.ISSUE_DETAIL, projectDir, number, requestId });
     return requestId;
   }
 
