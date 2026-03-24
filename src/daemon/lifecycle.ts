@@ -491,14 +491,16 @@ function startHealthPoller(): void {
     const sessions = listSessions();
     for (const s of sessions) {
       if (s.state === 'stopped' || s.state === 'error') continue;
-      // Sub-sessions are ephemeral — managed by P2P orchestrator / web UI.
-      // Don't auto-restart them; mark as stopped if their tmux session is gone.
+      // Sub-sessions: auto-restart dead panes, mark stopped if tmux session gone entirely
       if (s.name.startsWith('deck_sub_')) {
         try {
           const exists = await sessionExists(s.name);
           if (!exists) {
             logger.info({ session: s.name }, 'Sub-session gone, marking stopped');
             upsertSession({ ...s, state: 'stopped', updatedAt: Date.now() });
+          } else if (!(await isPaneAlive(s.name))) {
+            logger.warn({ session: s.name }, 'Sub-session pane dead, respawning');
+            await respawnSession(s);
           }
         } catch { /* ignore */ }
         continue;
