@@ -209,7 +209,9 @@ export function detectStatus(
       // Check the last few non-empty lines for a leading braille character.
       const geminiLeadingSpinner = hasLeadingBrailleSpinner(lines);
       const geminiHasSpinner = geminiLeadingSpinner || hasSpinner(lines, GEMINI_SPINNER_CHARS);
-      if (matchesAny(tail, GEMINI_IDLE_PATTERNS) && !geminiHasSpinner)
+      // Scan ALL lines for idle prompt — Gemini's ">" prompt can appear anywhere
+      // on screen (not just the last line) after long output.
+      if (matchesAny(text, GEMINI_IDLE_PATTERNS) && !geminiHasSpinner)
         return 'idle';
       if (matchesAny(tail, GEMINI_THINKING_PATTERNS)) return 'thinking';
       if (matchesAny(tail, GEMINI_TOOL_PATTERNS)) return 'tool_running';
