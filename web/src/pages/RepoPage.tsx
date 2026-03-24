@@ -801,11 +801,14 @@ export function RepoPage({ ws, projectDir, onBack }: Props) {
               </code>
             )}
             {actor && <span>{actor}</span>}
-            {duration != null && duration > 0 && <span>{formatDuration(duration)}</span>}
+            {duration != null && duration > 0 && <span>⏱ {formatDuration(duration)}</span>}
+            {(item.status === 'running' || item.status === 'queued') && item.createdAt && (
+              <span style={{ color: '#f59e0b' }}>⏱ {formatDuration(Date.now() - item.createdAt)}</span>
+            )}
             {item.runAttempt && item.runAttempt > 1 && (
               <span style={{ color: '#f59e0b' }}>attempt #{item.runAttempt}</span>
             )}
-            {item.createdAt && <span>{formatRelativeTs(item.createdAt)}</span>}
+            {item.createdAt && <span>{formatTime(item.createdAt)} ({formatRelativeTs(item.createdAt)})</span>}
           </div>
         </div>
         {isExpanded && (
