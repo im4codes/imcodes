@@ -85,7 +85,7 @@ export function SubSessionWindow({
   const initial = loadLocal(sub.id);
   const [geom, setGeom] = useState<WindowGeometry>(initial.geom);
   const [viewMode, setViewMode] = useState<ViewMode>(isShell ? 'terminal' : initial.viewMode);
-  const [confirmClose, setConfirmClose] = useState(false);
+  // confirmClose removed — × now minimizes instead of terminating
 
   // Flash red when sub-session transitions to idle
   const [idleFlash, setIdleFlash] = useState(false);
@@ -286,15 +286,7 @@ export function SubSessionWindow({
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
           {!isShell && <button class="subsession-mode-btn" onClick={() => { const next = viewMode === 'chat' ? 'terminal' : 'chat'; setViewMode(next); if (next === 'chat') requestAnimationFrame(() => chatScrollRef.current?.()); }} title={viewMode === 'chat' ? 'Switch to terminal' : 'Switch to chat'}>{viewMode === 'chat' ? '⌨' : '💬'}</button>}
           <button class="subsession-minimize-btn" onClick={onMinimize} title="Minimize">▾</button>
-          {confirmClose ? (
-            <>
-              <span class="subsession-close-confirm-label">Terminate?</span>
-              <button class="subsession-close-btn" onClick={onClose} title="Confirm close">✓</button>
-              <button class="subsession-minimize-btn" onClick={() => setConfirmClose(false)} title="Cancel">✕</button>
-            </>
-          ) : (
-            <button class="subsession-close-btn" onClick={() => setConfirmClose(true)} title="Close (terminate)">×</button>
-          )}
+          <button class="subsession-close-btn" onClick={onMinimize} title="Hide">×</button>
         </div>
       </div>
 

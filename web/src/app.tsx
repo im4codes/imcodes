@@ -1746,28 +1746,32 @@ export function App() {
       )}
 
       {/* Sub-session windows (floating) */}
-      {visibleSubSessions.filter((s) => openSubIds.has(s.id)).map((sub) => (
-        <SubSessionWindow
-          key={sub.id}
-          sub={sub}
-          ws={wsRef.current}
-          connected={connected}
-          onDiff={registerDiffApplyer}
-          onHistory={registerHistoryApplyer}
-          onMinimize={() => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; })}
-          onClose={() => closeSubSession(sub.id)}
-          onRestart={() => restartSubSession(sub.id)}
-          onRename={() => {
-            const label = prompt('Rename sub-session:', sub.label ?? '');
-            if (label !== null) renameSubSession(sub.id, label);
-          }}
-          zIndex={subZIndexes.get(sub.id) ?? 1000}
-          onFocus={() => bringSubToFront(sub.id)}
-          sessions={sessions}
-          subSessions={subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession }))}
-          serverId={selectedServerId ?? undefined}
-        />
-      ))}
+      {visibleSubSessions.map((sub) => {
+        const isOpen = openSubIds.has(sub.id);
+        return (
+          <div key={sub.id} style={{ display: isOpen ? 'contents' : 'none' }}>
+            <SubSessionWindow
+              sub={sub}
+              ws={wsRef.current}
+              connected={connected}
+              onDiff={registerDiffApplyer}
+              onHistory={registerHistoryApplyer}
+              onMinimize={() => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; })}
+              onClose={() => closeSubSession(sub.id)}
+              onRestart={() => restartSubSession(sub.id)}
+              onRename={() => {
+                const label = prompt('Rename sub-session:', sub.label ?? '');
+                if (label !== null) renameSubSession(sub.id, label);
+              }}
+              zIndex={subZIndexes.get(sub.id) ?? 1000}
+              onFocus={() => bringSubToFront(sub.id)}
+              sessions={sessions}
+              subSessions={subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession }))}
+              serverId={selectedServerId ?? undefined}
+            />
+          </div>
+        );
+      })}
 
       {showDiscussionDialog && wsRef.current && (
         <StartDiscussionDialog
