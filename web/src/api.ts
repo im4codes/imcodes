@@ -4,10 +4,7 @@
  * CSRF token is read from cookie and sent as X-CSRF-Token.
  */
 
-// Cookie names — must match shared/cookie-names.ts (web can't import shared/ directly)
-const COOKIE_SESSION = 'rcc_session';
-const COOKIE_CSRF = 'rcc_csrf';
-const HEADER_CSRF = 'X-CSRF-Token';
+import { COOKIE_SESSION, COOKIE_CSRF, HEADER_CSRF } from '@shared/cookie-names.js';
 
 let _baseUrl = '';
 let _onAuthExpired: ((reason?: string) => void) | null = null;
