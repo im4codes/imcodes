@@ -3,7 +3,7 @@
  * Content renders at native size (no scaling) — card acts as a clipped viewport.
  * Right-edge drag handle lets user resize width independently per card.
  */
-import { useRef, useState, useCallback, useMemo } from 'preact/hooks';
+import { useRef, useState, useCallback, useMemo, useEffect } from 'preact/hooks';
 import { ChatView } from './ChatView.js';
 import { resolveContextWindow } from '../model-context.js';
 import { shortModelLabel } from '../model-label.js';
@@ -61,6 +61,18 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
   const badge = STATE_BADGE[sub.state];
 
   const busy = useMemo(() => isVisuallyBusy(sub.state, !!getActiveThinkingTs(events)), [events, sub.state]);
+
+  // Flash red when sub-session transitions to idle
+  const [idleFlash, setIdleFlash] = useState(false);
+  const prevStateRef = useRef(sub.state);
+  useEffect(() => {
+    if (prevStateRef.current === 'running' && sub.state === 'idle') {
+      setIdleFlash(true);
+      const t = setTimeout(() => setIdleFlash(false), 3000);
+      return () => clearTimeout(t);
+    }
+    prevStateRef.current = sub.state;
+  }, [sub.state]);
 
   const lastUsage = useMemo(() => {
     for (let i = events.length - 1; i >= 0; i--) {
@@ -127,7 +139,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
 
   return (
     <div
-      class={`subcard${isOpen ? ' subcard-open' : ''}${isFocused ? ' subcard-focused' : ''}${busy ? ' subcard-running-pulse' : ''}`}
+      class={`subcard${isOpen ? ' subcard-open' : ''}${isFocused ? ' subcard-focused' : ''}${busy ? ' subcard-running-pulse' : ''}${idleFlash ? ' subcard-idle-flash' : ''}`}
       style={{ width: effectiveW, height: cardH, minWidth: effectiveW, position: 'relative' }}
       onClick={() => { if (!draggingRef.current) onOpen(); }}
     >

@@ -780,18 +780,16 @@ export function App() {
       }
       if (msg.type === 'session.idle') {
         const sessionName = msg.session as string;
-        // Sub-sessions are handled by useSubSessions — skip them here to avoid cross-contamination
-        if (!sessionName || sessionName.startsWith('deck_sub_')) return;
+        if (!sessionName) return;
         const project = (msg.project as string) || sessionName;
-        // Mark session as idle in local state (session_event never carries idle state)
-        setSessions((prev) => prev.map((s) => s.name === sessionName ? { ...s, state: 'idle' as SessionInfo['state'] } : s));
-        // Clear any active tool since session is now idle
-        setActiveTools((prev) => { const m = new Map(prev); m.delete(sessionName); return m; });
-        // Add tab pulse alert (only when not the currently active tab)
-        if (sessionName !== activeSessionRef.current) {
+        if (!sessionName.startsWith('deck_sub_')) {
+          // Main session: update state + tab alert
+          setSessions((prev) => prev.map((s) => s.name === sessionName ? { ...s, state: 'idle' as SessionInfo['state'] } : s));
+          setActiveTools((prev) => { const m = new Map(prev); m.delete(sessionName); return m; });
+          // Always flash the tab — even if it's the active one
           setIdleAlerts((prev) => new Set([...prev, sessionName]));
         }
-        // Always show a toast
+        // Always show a toast (main + sub sessions)
         const id = Date.now();
         setToasts((prev) => [...prev, { id, sessionName, project, kind: 'idle' }]);
         setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 5000);

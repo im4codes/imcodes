@@ -495,7 +495,9 @@ body {
 @keyframes subcard-focus-glow { 0%, 100% { box-shadow: 0 0 8px #60a5faaa, 0 0 20px #3b82f644; } 50% { box-shadow: 0 0 16px #60a5facc, 0 0 32px #3b82f666; } }
 .subcard-focused:not(.subcard-running-pulse) { border-color: #60a5fa; border-width: 2px; animation: subcard-focus-glow 2s ease-in-out infinite; }
 .subcard-focused.subcard-running-pulse { border-width: 2px; box-shadow: 0 0 12px #60a5faaa, 0 0 24px #3b82f644; }
-.subcard:not(.subcard-running-pulse):not(.subcard-focused) { transition: border-color 0.3s ease-out, box-shadow 0.3s ease-out; }
+@keyframes subcard-idle-flash { 0%, 100% { border-color: #334155; box-shadow: none; } 50% { border-color: #ef4444; box-shadow: 0 0 16px #ef444488, 0 0 4px #ef444444; } }
+.subcard-idle-flash { animation: subcard-idle-flash 0.5s ease-in-out 6 !important; }
+.subcard:not(.subcard-running-pulse):not(.subcard-focused):not(.subcard-idle-flash) { transition: border-color 0.3s ease-out, box-shadow 0.3s ease-out; }
 
 .subcard-header { display: flex; align-items: center; gap: 6px; padding: 5px 10px; background: #1a2233; border-bottom: 1px solid #1e293b; flex-shrink: 0; font-size: 12px; color: #94a3b8; }
 .subcard-icon { font-size: 13px; }
