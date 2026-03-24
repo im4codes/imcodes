@@ -1266,19 +1266,35 @@ export function App() {
     } catch { /* ignore */ }
   }, [setActiveSession]);
 
-  // Push notification tap → navigate to the right server + session
+  // Push notification tap → navigate to the right server + session.
+  // For sub-sessions: activate parent main session first, then open the sub-session window.
   useEffect(() => {
     const handler = (e: Event) => {
       const { serverId: sid, session } = (e as CustomEvent).detail ?? {};
       if (sid) handleSelectServer(sid);
       if (session) {
-        localStorage.setItem('rcc_session', session);
-        setActiveSession(session);
+        // Check if this is a sub-session (deck_sub_xxx)
+        const subMatch = (session as string).match(/^deck_sub_(.+)$/);
+        if (subMatch) {
+          const subId = subMatch[1];
+          const sub = subSessionsRef.current.find((s) => s.id === subId);
+          // Activate parent main session first (or keep current if no parent)
+          if (sub?.parentSession) {
+            localStorage.setItem('rcc_session', sub.parentSession);
+            setActiveSession(sub.parentSession);
+          }
+          // Open the sub-session window
+          setOpenSubIds((prev) => new Set([...prev, subId]));
+          bringSubToFront(subId);
+        } else {
+          localStorage.setItem('rcc_session', session);
+          setActiveSession(session);
+        }
       }
     };
     window.addEventListener('deck:navigate', handler);
     return () => window.removeEventListener('deck:navigate', handler);
-  }, [handleSelectServer, setActiveSession]);
+  }, [handleSelectServer, setActiveSession, bringSubToFront]);
 
   const handleBackToDashboard = useCallback(() => {
     localStorage.removeItem('rcc_server');
