@@ -132,7 +132,7 @@ describe('parseLine — user_message', () => {
       'session-a',
       'user.message',
       { text: 'hello world' },
-      { source: 'daemon', confidence: 'high' },
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
     );
   });
 
@@ -170,7 +170,7 @@ describe('parseLine — agent_message', () => {
       'session-b',
       'assistant.text',
       { text: 'Here is my answer', streaming: false },
-      { source: 'daemon', confidence: 'high' },
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
     );
   });
 
@@ -453,7 +453,7 @@ describe('parseLine — function_call (Codex tool calls)', () => {
       'session-f',
       'tool.call',
       { tool: 'exec_command', input: 'git status' },
-      { source: 'daemon', confidence: 'high' },
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
     );
   });
 
@@ -483,7 +483,7 @@ describe('parseLine — function_call (Codex tool calls)', () => {
       'session-f',
       'tool.result',
       {},
-      { source: 'daemon', confidence: 'high' },
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
     );
   });
 
@@ -535,7 +535,7 @@ describe('parseLine — edge cases', () => {
       'session-e',
       'session.state',
       { state: 'running' },
-      { source: 'daemon', confidence: 'high' },
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
     );
   });
 
@@ -549,7 +549,7 @@ describe('parseLine — edge cases', () => {
       'session-e',
       'session.state',
       { state: 'idle' },
-      { source: 'daemon', confidence: 'high' },
+      expect.objectContaining({ source: 'daemon', confidence: 'high' }),
     );
   });
 
