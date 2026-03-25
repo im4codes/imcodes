@@ -360,7 +360,11 @@ export function AtPicker({
       }
 
       // Files or Agents list
-      const nonSelfCount = agents.filter(a => !a.isSelf).length;
+      const configSessions = p2pConfig ? new Map(Object.entries(p2pConfig.sessions)) : null;
+      const kbVisibleAgents = configSessions
+        ? agents.filter(a => { const e = configSessions.get(a.session); return !e || (e.enabled && e.mode !== 'skip'); })
+        : agents;
+      const nonSelfCount = kbVisibleAgents.filter(a => !a.isSelf).length;
       const hasAllRow = category === 'agents' && nonSelfCount > 1;
       const cfgParticipants = p2pConfig
         ? Object.entries(p2pConfig.sessions).filter(([, e]) => e.enabled && e.mode !== 'skip')
@@ -368,7 +372,7 @@ export function AtPicker({
       const cfgRowCount = category === 'agents' && cfgParticipants.length > 0 ? 2 : 0;
       const regAllOffset = cfgRowCount;
       const agentsOff = regAllOffset + (hasAllRow ? 1 : 0);
-      const count = category === 'files' ? fileResults.length : cfgRowCount + (hasAllRow ? 1 : 0) + agents.length;
+      const count = category === 'files' ? fileResults.length : cfgRowCount + (hasAllRow ? 1 : 0) + kbVisibleAgents.length;
       if (e.key === 'Escape') {
         e.preventDefault();
         setCategory('choose');
@@ -581,7 +585,12 @@ export function AtPicker({
   }
 
   // ── Agents list ──
-  const nonSelfAgents = agents.filter(a => !a.isSelf);
+  // When p2pConfig exists, filter to only show enabled sessions
+  const renderConfigSessions = p2pConfig ? new Map(Object.entries(p2pConfig.sessions)) : null;
+  const renderVisibleAgents = renderConfigSessions
+    ? agents.filter(a => { const e = renderConfigSessions.get(a.session); return !e || (e.enabled && e.mode !== 'skip'); })
+    : agents;
+  const nonSelfAgents = renderVisibleAgents.filter(a => !a.isSelf);
   const showAll = nonSelfAgents.length > 1;
   // Config-mode rows: shown when p2pConfig is set and there are eligible sessions
   const configParticipants = p2pConfig
@@ -672,25 +681,35 @@ export function AtPicker({
         </div>
       )}
 
-      {/* Individual agents */}
-      {agents.map((a, idx) => {
-        const adjustedIdx = agentsOffset + idx;
-        const hl = adjustedIdx === highlightIdx;
-        return (
-          <div
-            key={a.session}
-            data-hl={hl ? 'true' : undefined}
-            style={hl ? itemHighlightStyle : itemStyle}
-            onClick={() => { setModeAgent(a.session); setModeHighlight(0); }}
-            onMouseEnter={() => setHighlightIdx(adjustedIdx)}
-          >
-            <span style={{ fontWeight: 500 }}>{a.shortName}</span>
-            <span style={dimStyle}>{a.agentType}</span>
-            {a.isSelf && <span style={{ color: '#60a5fa', fontSize: 10, marginLeft: 4 }}>({t('p2p.picker.you')})</span>}
-            {a.busy && <span style={busyDotStyle} title={t('p2p.picker.busy')} />}
-          </div>
-        );
-      })}
+      {/* Individual agents — when p2pConfig exists, only show enabled sessions */}
+      {(() => {
+        const configSessions = p2pConfig ? new Map(Object.entries(p2pConfig.sessions)) : null;
+        const visibleAgents = configSessions
+          ? agents.filter(a => {
+              const entry = configSessions.get(a.session);
+              return !entry || (entry.enabled && entry.mode !== 'skip');
+            })
+          : agents;
+        return visibleAgents.map((a, idx) => {
+          const adjustedIdx = agentsOffset + idx;
+          const hl = adjustedIdx === highlightIdx;
+          const cfgMode = configSessions?.get(a.session)?.mode;
+          return (
+            <div
+              key={a.session}
+              data-hl={hl ? 'true' : undefined}
+              style={hl ? itemHighlightStyle : itemStyle}
+              onClick={() => { setModeAgent(a.session); setModeHighlight(0); }}
+              onMouseEnter={() => setHighlightIdx(adjustedIdx)}
+            >
+              <span style={{ fontWeight: 500 }}>{a.shortName}</span>
+              <span style={dimStyle}>{a.agentType}{cfgMode ? ` · ${cfgMode}` : ''}</span>
+              {a.isSelf && <span style={{ color: '#60a5fa', fontSize: 10, marginLeft: 4 }}>({t('p2p.picker.you')})</span>}
+              {a.busy && <span style={busyDotStyle} title={t('p2p.picker.busy')} />}
+            </div>
+          );
+        });
+      })()}
     </div>
   );
 }
