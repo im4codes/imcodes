@@ -668,6 +668,9 @@ export class WsBridge {
         (msg.ccSessionId as string) || null,
         (msg.geminiSessionId as string) || null,
         (msg.parentSession as string) || null,
+        (msg.runtimeType as string) || null,
+        (msg.providerId as string) || null,
+        (msg.providerSessionId as string) || null,
       ).then(() => {
         // Notify browsers so sub-session appears immediately without page refresh
         this.broadcastToBrowsers(JSON.stringify({

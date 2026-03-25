@@ -62,6 +62,8 @@ const TICK_STALE_MS = 90_000;
 function sanitizeKey(key: string): string { return key.replaceAll(':', '___'); }
 /** Safe internal key → OC key */
 function unsanitizeKey(key: string): string { return key.replaceAll('___', ':'); }
+/** Returns true if a raw OC key contains `___`, which would cause unsanitize collision. */
+function hasCollisionRisk(rawKey: string): boolean { return rawKey.includes('___'); }
 
 // ── OpenClawProvider ─────────────────────────────────────────────────────────
 
@@ -154,31 +156,36 @@ export class OpenClawProvider implements TransportProvider {
     }
   }
 
-  onDelta(cb: (sessionId: string, delta: MessageDelta) => void): void {
+  onDelta(cb: (sessionId: string, delta: MessageDelta) => void): () => void {
     this.deltaCallbacks.push(cb);
+    return () => { const i = this.deltaCallbacks.indexOf(cb); if (i >= 0) this.deltaCallbacks.splice(i, 1); };
   }
 
-  onComplete(cb: (sessionId: string, message: AgentMessage) => void): void {
+  onComplete(cb: (sessionId: string, message: AgentMessage) => void): () => void {
     this.completeCallbacks.push(cb);
+    return () => { const i = this.completeCallbacks.indexOf(cb); if (i >= 0) this.completeCallbacks.splice(i, 1); };
   }
 
-  onError(cb: (sessionId: string, error: ProviderError) => void): void {
+  onError(cb: (sessionId: string, error: ProviderError) => void): () => void {
     this.errorCallbacks.push(cb);
+    return () => { const i = this.errorCallbacks.indexOf(cb); if (i >= 0) this.errorCallbacks.splice(i, 1); };
   }
 
   async createSession(config: SessionConfig): Promise<string> {
     // bindExistingKey may already be sanitized (from UI), unsanitize for OC RPC
     const ocKey = unsanitizeKey(config.bindExistingKey ?? config.sessionKey);
-    try {
-      // Prefer sessions.create (v2026.3.24+)
-      await this.rpc('sessions.create', {
-        key: ocKey,
-        agentId: config.agentId ?? this.agentId,
-        label: config.label ?? ocKey,
-      });
-    } catch {
-      // Fallback: OC auto-creates sessions on first agent RPC, so just log
-      logger.info({ provider: this.id, sessionKey: ocKey }, 'sessions.create unavailable, session will be created on first message');
+    if (!config.skipCreate) {
+      try {
+        // Prefer sessions.create (v2026.3.24+)
+        await this.rpc('sessions.create', {
+          key: ocKey,
+          agentId: config.agentId ?? this.agentId,
+          label: config.label ?? ocKey,
+        });
+      } catch {
+        // Fallback: OC auto-creates sessions on first agent RPC, so just log
+        logger.info({ provider: this.id, sessionKey: ocKey }, 'sessions.create unavailable, session will be created on first message');
+      }
     }
     logger.info({ provider: this.id, sessionKey: ocKey }, 'Session created');
     // Return sanitized key — all internal code sees `___` instead of `:`
@@ -216,7 +223,11 @@ export class OpenClawProvider implements TransportProvider {
       }> };
       const all = payload?.sessions ?? [];
       return all
-        .filter((s) => !s.key.includes(':cron:'))
+        .filter((s) => {
+          if (s.key.includes(':cron:')) return false;
+          if (hasCollisionRisk(s.key)) { logger.warn({ key: s.key }, 'Skipping OC session — raw key contains ___'); return false; }
+          return true;
+        })
         .map((s) => ({
           key: sanitizeKey(s.key),
           displayName: s.label,

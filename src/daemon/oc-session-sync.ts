@@ -1,0 +1,252 @@
+/**
+ * OC Session Auto-Sync — materialization pipeline.
+ *
+ * When OpenClaw connects, fetches all remote sessions and materializes them
+ * as IM.codes main sessions + sub-sessions. Distinct from the catalog cache
+ * (provider.sync_sessions) which only stores the list for UI display.
+ */
+import { getProvider } from '../agent/provider-registry.js';
+import {
+  launchTransportSession,
+  isProviderSessionBound,
+  resolveSessionName,
+  getTransportRuntime,
+  registerProviderRoute,
+  type LaunchOpts,
+} from '../agent/session-manager.js';
+import { getSession, findSessionByProviderSessionId } from '../store/session-store.js';
+import { randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import logger from '../util/logger.js';
+import type { ServerLink } from './server-link.js';
+import type { RemoteSessionInfo } from '../agent/transport-provider.js';
+
+// ── Configuration ───────────────────────────────────────────────────────────
+
+/** Default OC root directory. Override via connect --cwd. */
+let ocRoot = join(homedir(), 'clawd');
+
+export function setOcRoot(dir: string): void { ocRoot = dir; }
+export function getOcRoot(): string { return ocRoot; }
+
+// ── Key parsing ─────────────────────────────────────────────────────────────
+
+/** Extract agent name from a sanitized OC key: `agent___{name}___...` → `name` */
+export function extractAgentName(sanitizedKey: string): string | null {
+  const parts = sanitizedKey.split('___');
+  // Expected: ['agent', agentName, type, ...]
+  if (parts.length < 3 || parts[0] !== 'agent') return null;
+  return parts[1];
+}
+
+/** Check if a sanitized key is a :main session */
+export function isMainSession(sanitizedKey: string): boolean {
+  return sanitizedKey.endsWith('___main') && sanitizedKey.split('___').length === 3;
+}
+
+/** Check if a session should be filtered (metadata, not a real conversation) */
+export function shouldFilter(sanitizedKey: string): boolean {
+  if (sanitizedKey.includes('___cron___')) return true; // :cron: (defense-in-depth, also filtered by provider)
+  if (sanitizedKey.endsWith('___sessions')) return true; // :sessions (OC metadata)
+  return false;
+}
+
+// ── Grouping ────────────────────────────────────────────────────────────────
+
+export interface OcSessionGroup {
+  agentName: string;
+  mainSession: RemoteSessionInfo | null;
+  channelSessions: RemoteSessionInfo[];
+}
+
+/** Group OC sessions by agent name. Filters out metadata sessions. */
+export function groupByAgent(sessions: RemoteSessionInfo[]): OcSessionGroup[] {
+  const groups = new Map<string, OcSessionGroup>();
+
+  for (const s of sessions) {
+    if (shouldFilter(s.key)) continue;
+
+    const agentName = extractAgentName(s.key);
+    if (!agentName) {
+      logger.debug({ key: s.key }, 'oc-sync: cannot extract agent name — skipped');
+      continue;
+    }
+
+    let group = groups.get(agentName);
+    if (!group) {
+      group = { agentName, mainSession: null, channelSessions: [] };
+      groups.set(agentName, group);
+    }
+
+    if (isMainSession(s.key)) {
+      group.mainSession = s;
+    } else {
+      group.channelSessions.push(s);
+    }
+  }
+
+  return [...groups.values()];
+}
+
+// ── Session naming ──────────────────────────────────────────────────────────
+
+export function mainSessionName(agentName: string): string {
+  return `deck_agent___${agentName}`;
+}
+
+export function mainSessionLabel(agentName: string): string {
+  return `OC:${agentName}`;
+}
+
+export function mainSessionProjectDir(agentName: string): string {
+  return agentName === 'main' ? ocRoot : join(ocRoot, 'agents', agentName);
+}
+
+// ── Sync pipeline ───────────────────────────────────────────────────────────
+
+export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
+  const provider = getProvider('openclaw');
+  if (!provider || !provider.capabilities.sessionRestore || !provider.listSessions) {
+    logger.debug('oc-sync: no openclaw provider or no listSessions capability');
+    return;
+  }
+
+  let sessions: RemoteSessionInfo[];
+  try {
+    sessions = await provider.listSessions();
+  } catch (err) {
+    logger.warn({ err }, 'oc-sync: failed to list OC sessions');
+    return;
+  }
+
+  const groups = groupByAgent(sessions);
+  let created = 0;
+
+  for (const group of groups) {
+    // ── Main session ──
+    const mName = mainSessionName(group.agentName);
+    const mainExists = !!getSession(mName);
+
+    if (!mainExists && group.mainSession) {
+      // Check uniqueness — routing map + session store
+      if (isProviderSessionBound(group.mainSession.key)) {
+        logger.debug({ key: group.mainSession.key, mName }, 'oc-sync: main session providerSessionId already bound — skipped');
+      } else if (findSessionByProviderSessionId(group.mainSession.key)) {
+        // Exists in store but runtime/route lost (reconnect) — recreate runtime + re-register route
+        if (!getTransportRuntime(mName)) {
+          try {
+            await launchTransportSession({
+              name: mName, projectName: mName, role: 'w1', agentType: 'openclaw',
+              projectDir: mainSessionProjectDir(group.agentName),
+              bindExistingKey: group.mainSession.key, skipCreate: true, skipStore: true,
+            });
+            logger.info({ session: mName, ocKey: group.mainSession.key }, 'oc-sync: reconnected main session runtime');
+          } catch (err) {
+            // Fallback: at least register the route so events can flow
+            registerProviderRoute(group.mainSession.key, mName);
+            logger.warn({ err, session: mName }, 'oc-sync: failed to recreate runtime, route-only fallback');
+          }
+        } else {
+          registerProviderRoute(group.mainSession.key, mName);
+        }
+      } else {
+        try {
+          const opts: LaunchOpts = {
+            name: mName,
+            projectName: mName,
+            role: 'w1',
+            agentType: 'openclaw',
+            projectDir: mainSessionProjectDir(group.agentName),
+            description: group.mainSession.displayName,
+            bindExistingKey: group.mainSession.key,
+            skipCreate: true,
+          };
+          await launchTransportSession(opts);
+          created++;
+          logger.info({ session: mName, ocKey: group.mainSession.key }, 'oc-sync: materialized main session');
+        } catch (err) {
+          logger.warn({ err, session: mName }, 'oc-sync: failed to materialize main session');
+        }
+      }
+    }
+
+    // ── Sub-sessions (channel bindings) ──
+    for (const ch of group.channelSessions) {
+      // Check uniqueness — routing map (fast) + session store (covers reconnect without restart)
+      if (isProviderSessionBound(ch.key)) {
+        logger.debug({ key: ch.key }, 'oc-sync: sub-session providerSessionId already bound in routing — skipped');
+        continue;
+      }
+      if (resolveSessionName(ch.key)) continue;
+
+      // Check session store — handles OC reconnect without daemon restart
+      const existingInStore = findSessionByProviderSessionId(ch.key);
+      if (existingInStore) {
+        // Exists in store but runtime/route lost — recreate runtime + re-register route
+        if (!getTransportRuntime(existingInStore.name)) {
+          try {
+            await launchTransportSession({
+              name: existingInStore.name, projectName: existingInStore.name, role: 'w1', agentType: 'openclaw',
+              projectDir: mainSessionProjectDir(group.agentName),
+              bindExistingKey: ch.key, skipCreate: true, skipStore: true,
+            });
+            logger.info({ session: existingInStore.name, ocKey: ch.key }, 'oc-sync: reconnected sub-session runtime');
+          } catch (err) {
+            registerProviderRoute(ch.key, existingInStore.name);
+            logger.warn({ err, session: existingInStore.name }, 'oc-sync: failed to recreate runtime, route-only fallback');
+          }
+        } else {
+          registerProviderRoute(ch.key, existingInStore.name);
+        }
+        continue;
+      }
+
+      const subId = randomUUID();
+      const subName = `deck_sub_${subId}`;
+      const parentSession = mName;
+
+      try {
+        const opts: LaunchOpts = {
+          name: subName,
+          projectName: subName,
+          role: 'w1',
+          agentType: 'openclaw',
+          projectDir: mainSessionProjectDir(group.agentName),
+          description: ch.displayName,
+          bindExistingKey: ch.key,
+          skipCreate: true,
+        };
+        await launchTransportSession(opts);
+        created++;
+
+        // Sync to server DB
+        try {
+          serverLink.send({
+            type: 'subsession.sync',
+            id: subId,
+            sessionType: 'openclaw',
+            cwd: mainSessionProjectDir(group.agentName),
+            shellBin: null,
+            ccSessionId: null,
+            parentSession,
+            label: ch.displayName || ch.key,
+            runtimeType: 'transport',
+            providerId: 'openclaw',
+            providerSessionId: ch.key,
+          });
+        } catch { /* not connected */ }
+
+        logger.info({ session: subName, ocKey: ch.key, parent: parentSession }, 'oc-sync: materialized sub-session');
+      } catch (err) {
+        logger.warn({ err, ocKey: ch.key }, 'oc-sync: failed to materialize sub-session');
+      }
+    }
+  }
+
+  if (created > 0) {
+    logger.info({ created, groups: groups.length }, 'oc-sync: materialization complete');
+  } else {
+    logger.debug({ groups: groups.length }, 'oc-sync: no new sessions to materialize');
+  }
+}

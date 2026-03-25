@@ -7,6 +7,10 @@ import logger from '../util/logger.js';
 
 const providers = new Map<string, TransportProvider>();
 
+/** ServerLink reference for sync pipeline — set by daemon startup. */
+let _serverLink: { send(msg: object): void } | null = null;
+export function setProviderRegistryServerLink(link: { send(msg: object): void }): void { _serverLink = link; }
+
 export function getProvider(id: string): TransportProvider | undefined {
   return providers.get(id);
 }
@@ -25,6 +29,17 @@ export async function connectProvider(id: string, config: ProviderConfig): Promi
   await provider.connect(config);
   providers.set(id, provider);
   wireProviderToRelay(provider);
+
+  // Materialize OC sessions before broadcasting status (sessions appear before catalog)
+  if (id === 'openclaw' && _serverLink) {
+    try {
+      const { syncOcSessions } = await import('../daemon/oc-session-sync.js');
+      await syncOcSessions(_serverLink as any);
+    } catch (err) {
+      logger.warn({ err }, 'OC session auto-sync failed — continuing without materialization');
+    }
+  }
+
   broadcastProviderStatus(id, true);
   logger.info({ provider: id }, 'Provider connected');
 

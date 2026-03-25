@@ -3,6 +3,7 @@ import type { TimelineEvent } from './timeline-event.js';
 import logger from '../util/logger.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import { setTransportRelaySend } from './transport-relay.js';
+import { setProviderRegistryServerLink } from '../agent/provider-registry.js';
 
 /** Collect lightweight system stats for daemon.stats messages. */
 function collectSystemStats(): { cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number } {
@@ -82,6 +83,7 @@ export class ServerLink {
           // Not connected — transport relay events are best-effort
         }
       });
+      setProviderRegistryServerLink(this);
       this.startHeartbeat();
       this.startWatchdog();
     });

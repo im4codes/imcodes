@@ -21,6 +21,11 @@ vi.mock('../../src/daemon/transport-history.js', () => ({
   appendTransportEvent: vi.fn().mockResolvedValue(undefined),
 }));
 
+// Mock resolveSessionName to return identity mapping (providerSid === sessionName for tests)
+vi.mock('../../src/agent/session-manager.js', () => ({
+  resolveSessionName: (providerSid: string) => providerSid,
+}));
+
 // ── Imports after mocks ──────────────────────────────────────────────────────
 
 import {
@@ -50,9 +55,9 @@ function makeMockProvider() {
 
   return {
     provider: {
-      onDelta: (cb: DeltaCb) => { deltaCb = cb; },
-      onComplete: (cb: CompleteCb) => { completeCb = cb; },
-      onError: (cb: ErrorCb) => { errorCb = cb; },
+      onDelta: (cb: DeltaCb) => { deltaCb = cb; return () => { deltaCb = undefined; }; },
+      onComplete: (cb: CompleteCb) => { completeCb = cb; return () => { completeCb = undefined; }; },
+      onError: (cb: ErrorCb) => { errorCb = cb; return () => { errorCb = undefined; }; },
     } as unknown as TransportProvider,
     fireDelta: (sid: string, delta: MessageDelta) => deltaCb?.(sid, delta),
     fireComplete: (sid: string, msg: AgentMessage) => completeCb?.(sid, msg),

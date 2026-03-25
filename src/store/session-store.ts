@@ -121,6 +121,11 @@ export function listSessions(projectName?: string): SessionRecord[] {
   return projectName ? all.filter((s) => s.projectName === projectName) : all;
 }
 
+/** Find a session by its provider session ID (for transport sessions). */
+export function findSessionByProviderSessionId(providerSessionId: string): SessionRecord | undefined {
+  return Object.values(store.sessions).find((s) => s.providerSessionId === providerSessionId);
+}
+
 export function updateSessionState(name: string, state: SessionState): void {
   const s = store.sessions[name];
   if (!s) return;

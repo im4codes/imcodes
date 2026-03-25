@@ -104,6 +104,8 @@ export interface SessionConfig {
   parentSessionKey?: string;
   /** If binding to an already-existing remote session, use this key directly. */
   bindExistingKey?: string;
+  /** Skip the sessions.create RPC — session already exists on provider (auto-sync bind). */
+  skipCreate?: boolean;
 }
 
 /** Structured error emitted by a provider. */
@@ -199,18 +201,21 @@ export interface TransportProvider {
   /**
    * Register a callback to receive incremental output deltas while the agent is streaming.
    * Only meaningful when capabilities.streaming is true.
+   * @returns Unsubscribe function that removes the callback.
    */
-  onDelta(cb: (sessionId: string, delta: MessageDelta) => void): void;
+  onDelta(cb: (sessionId: string, delta: MessageDelta) => void): () => void;
 
   /**
    * Register a callback to receive the final completed message after the agent finishes a turn.
+   * @returns Unsubscribe function that removes the callback.
    */
-  onComplete(cb: (sessionId: string, message: AgentMessage) => void): void;
+  onComplete(cb: (sessionId: string, message: AgentMessage) => void): () => void;
 
   /**
    * Register a callback to receive provider errors scoped to a session.
+   * @returns Unsubscribe function that removes the callback.
    */
-  onError(cb: (sessionId: string, error: ProviderError) => void): void;
+  onError(cb: (sessionId: string, error: ProviderError) => void): () => void;
 
   /**
    * Create a new session on the provider.

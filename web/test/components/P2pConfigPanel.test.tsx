@@ -49,9 +49,10 @@ function renderPanel(overrides: {
   return render(<P2pConfigPanel {...props} />);
 }
 
-/** Flush all pending microtasks/promises (async useEffect + nested awaits). */
+/** Flush all pending microtasks/promises (async useEffect + nested awaits).
+ *  Increased iterations for nested getUserPref fallback chain. */
 async function flush() {
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < 10; i++) {
     await act(async () => {
       await new Promise((r) => setTimeout(r, 0));
     });
@@ -146,6 +147,7 @@ describe('P2pConfigPanel', () => {
     await act(async () => {
       fireEvent.click(saveBtn);
     });
+    await flush();
 
     expect(onSave).toHaveBeenCalledOnce();
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
@@ -175,6 +177,7 @@ describe('P2pConfigPanel', () => {
     await act(async () => {
       fireEvent.click(saveBtn);
     });
+    await flush();
 
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
     // The first eligible session mode should be 'review'
@@ -253,6 +256,7 @@ describe('P2pConfigPanel', () => {
     await act(async () => {
       fireEvent.click(saveBtn);
     });
+    await flush();
 
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
     const firstKey = Object.keys(cfg.sessions)[0];
@@ -275,6 +279,7 @@ describe('P2pConfigPanel', () => {
     await act(async () => {
       fireEvent.click(saveBtn);
     });
+    await flush();
 
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
     expect(cfg.rounds).toBe(5);
@@ -291,6 +296,7 @@ describe('P2pConfigPanel', () => {
     await act(async () => {
       fireEvent.click(saveBtn);
     });
+    await flush();
 
     expect(saveUserPrefMock).toHaveBeenCalledOnce();
     expect(saveUserPrefMock.mock.calls[0][0]).toBe('p2p_session_config:deck_proj_brain');
@@ -312,6 +318,7 @@ describe('P2pConfigPanel', () => {
     await act(async () => {
       fireEvent.click(saveBtn);
     });
+    await flush();
 
     expect(onClose).toHaveBeenCalledOnce();
   });

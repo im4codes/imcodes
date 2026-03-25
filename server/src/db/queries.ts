@@ -463,6 +463,17 @@ export async function getSubSessionsByServer(db: Database, serverId: string): Pr
   );
 }
 
+export async function getSubSessionByProviderSessionId(
+  db: Database,
+  serverId: string,
+  providerSessionId: string,
+): Promise<DbSubSession | null> {
+  return db.queryOne<DbSubSession>(
+    'SELECT * FROM sub_sessions WHERE server_id = $1 AND provider_session_id = $2 AND closed_at IS NULL',
+    [serverId, providerSessionId],
+  );
+}
+
 export async function getSubSessionById(db: Database, id: string, serverId: string): Promise<DbSubSession | null> {
   return db.queryOne<DbSubSession>(
     'SELECT * FROM sub_sessions WHERE id = $1 AND server_id = $2',

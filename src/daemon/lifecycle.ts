@@ -1,5 +1,5 @@
 import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession } from '../store/session-store.js';
-import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, restartSession, respawnSession, initOnStartup } from '../agent/session-manager.js';
+import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes } from '../agent/session-manager.js';
 import { sessionExists, isPaneAlive } from '../agent/tmux.js';
 import { detectMemoryBackend } from '../memory/detector.js';
 import { detectRepo } from '../repo/detector.js';
@@ -197,6 +197,9 @@ export async function startup(): Promise<DaemonContext> {
 
   await loadStore();
   logger.info('Session store loaded');
+
+  // Rebuild provider routing from persisted transport sessions BEFORE any connectProvider()
+  rebuildProviderRoutes();
 
   await initOnStartup();
   logger.info('Startup cleanup done');

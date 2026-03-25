@@ -138,19 +138,22 @@ export class YourProvider implements TransportProvider {
     logger.debug({ provider: this.id, sessionId }, 'send() — not yet implemented');
   }
 
-  /** Register a callback for streaming deltas (only meaningful when capabilities.streaming is true). */
-  onDelta(cb: (sessionId: string, delta: MessageDelta) => void): void {
+  /** Register a callback for streaming deltas. Returns unsubscribe function. */
+  onDelta(cb: (sessionId: string, delta: MessageDelta) => void): () => void {
     this.deltaCallbacks.push(cb);
+    return () => { const i = this.deltaCallbacks.indexOf(cb); if (i >= 0) this.deltaCallbacks.splice(i, 1); };
   }
 
-  /** Register a callback for the final completed message after a turn. */
-  onComplete(cb: (sessionId: string, message: AgentMessage) => void): void {
+  /** Register a callback for the final completed message. Returns unsubscribe function. */
+  onComplete(cb: (sessionId: string, message: AgentMessage) => void): () => void {
     this.completeCallbacks.push(cb);
+    return () => { const i = this.completeCallbacks.indexOf(cb); if (i >= 0) this.completeCallbacks.splice(i, 1); };
   }
 
-  /** Register a callback for provider errors scoped to a session. */
-  onError(cb: (sessionId: string, error: ProviderError) => void): void {
+  /** Register a callback for provider errors. Returns unsubscribe function. */
+  onError(cb: (sessionId: string, error: ProviderError) => void): () => void {
     this.errorCallbacks.push(cb);
+    return () => { const i = this.errorCallbacks.indexOf(cb); if (i >= 0) this.errorCallbacks.splice(i, 1); };
   }
 
   /**

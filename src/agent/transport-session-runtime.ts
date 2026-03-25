@@ -13,28 +13,30 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _providerSessionId: string | null = null;
   /** Guard: true while a send is in flight — prevents concurrent sends. */
   private _sending = false;
+  /** Unsubscribe functions for provider callbacks — called in kill(). */
+  private _unsubscribes: Array<() => void> = [];
 
   constructor(
     private readonly provider: TransportProvider,
     private readonly sessionKey: string,
   ) {
-    this.provider.onDelta((sid: string, _delta: MessageDelta) => {
-      if (sid !== this._providerSessionId) return;
-      this._status = 'streaming';
-    });
-
-    this.provider.onComplete((sid: string, message: AgentMessage) => {
-      if (sid !== this._providerSessionId) return;
-      this._status = 'idle';
-      this._sending = false;
-      this._history.push(message);
-    });
-
-    this.provider.onError((sid: string, _error: ProviderError) => {
-      if (sid !== this._providerSessionId) return;
-      this._status = 'error';
-      this._sending = false;
-    });
+    this._unsubscribes.push(
+      this.provider.onDelta((sid: string, _delta: MessageDelta) => {
+        if (sid !== this._providerSessionId) return;
+        this._status = 'streaming';
+      }),
+      this.provider.onComplete((sid: string, message: AgentMessage) => {
+        if (sid !== this._providerSessionId) return;
+        this._status = 'idle';
+        this._sending = false;
+        this._history.push(message);
+      }),
+      this.provider.onError((sid: string, _error: ProviderError) => {
+        if (sid !== this._providerSessionId) return;
+        this._status = 'error';
+        this._sending = false;
+      }),
+    );
   }
 
   get providerSessionId(): string | null {
@@ -84,6 +86,10 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   async kill(): Promise<void> {
+    // Unsubscribe from provider callbacks to prevent O(n) accumulation
+    for (const unsub of this._unsubscribes) unsub();
+    this._unsubscribes = [];
+
     if (this._providerSessionId) {
       await this.provider.endSession(this._providerSessionId);
       this._providerSessionId = null;

@@ -8,6 +8,7 @@
 import type { TransportProvider, ProviderError } from '../agent/transport-provider.js';
 import type { MessageDelta, AgentMessage } from '../../shared/agent-message.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
+import { resolveSessionName } from '../agent/session-manager.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { appendTransportEvent } from './transport-history.js';
 import logger from '../util/logger.js';
@@ -22,62 +23,81 @@ export function setTransportRelaySend(fn: (msg: Record<string, unknown>) => void
 /** Per-session text accumulator for streaming deltas → assistant.text events. */
 const accumulators = new Map<string, { messageId: string; text: string }>();
 
-/** Wire up a provider's callbacks to emit standard timeline events. */
+/** Wire up a provider's callbacks to emit standard timeline events.
+ *  Provider callbacks use providerSessionId; we resolve to IM.codes sessionName
+ *  via the routing map before emitting. Unresolved routes are dropped + warned. */
 export function wireProviderToRelay(provider: TransportProvider): void {
-  provider.onDelta((sessionId: string, delta: MessageDelta) => {
-    // Accumulate text and emit with stable eventId — ChatView replaces same-ID events
-    let acc = accumulators.get(`${sessionId}:${delta.messageId}`);
+  provider.onDelta((providerSid: string, delta: MessageDelta) => {
+    const sessionName = resolveSessionName(providerSid);
+    if (!sessionName) {
+      logger.debug({ providerSid }, 'transport-relay: unresolved route for delta — dropped');
+      return;
+    }
+
+    // Accumulate text — key by resolved sessionName for consistency
+    const accKey = `${sessionName}:${delta.messageId}`;
+    let acc = accumulators.get(accKey);
     if (!acc) {
       acc = { messageId: delta.messageId, text: '' };
-      accumulators.set(`${sessionId}:${delta.messageId}`, acc);
+      accumulators.set(accKey, acc);
     }
     acc.text += delta.delta;
 
-    // Emit with stable eventId so ChatView replaces the previous version (typewriter effect)
-    const stableEventId = `transport:${sessionId}:${delta.messageId}`;
-    timelineEmitter.emit(sessionId, 'assistant.text', {
+    // Emit with stable eventId using resolved sessionName (typewriter effect)
+    const stableEventId = `transport:${sessionName}:${delta.messageId}`;
+    timelineEmitter.emit(sessionName, 'assistant.text', {
       text: acc.text,
       streaming: true,
     }, { source: 'daemon', confidence: 'high', eventId: stableEventId });
   });
 
-  provider.onComplete((sessionId: string, message: AgentMessage) => {
-    const key = `${sessionId}:${message.id}`;
-    const acc = accumulators.get(key);
-    const finalText = acc?.text ?? message.content;
-    accumulators.delete(key);
+  provider.onComplete((providerSid: string, message: AgentMessage) => {
+    const sessionName = resolveSessionName(providerSid);
+    if (!sessionName) {
+      logger.debug({ providerSid }, 'transport-relay: unresolved route for complete — dropped');
+      return;
+    }
 
-    // Replace the streaming event with final version (same eventId → in-place update in ChatView)
-    const stableEventId = `transport:${sessionId}:${message.id}`;
-    timelineEmitter.emit(sessionId, 'assistant.text', {
+    const accKey = `${sessionName}:${message.id}`;
+    const acc = accumulators.get(accKey);
+    const finalText = acc?.text ?? message.content;
+    accumulators.delete(accKey);
+
+    // Replace streaming event with final version (same eventId → in-place update)
+    const stableEventId = `transport:${sessionName}:${message.id}`;
+    timelineEmitter.emit(sessionName, 'assistant.text', {
       text: finalText,
       streaming: false,
     }, { source: 'daemon', confidence: 'high', eventId: stableEventId });
 
     // Emit idle state
-    timelineEmitter.emit(sessionId, 'session.state', {
+    timelineEmitter.emit(sessionName, 'session.state', {
       state: 'idle',
     }, { source: 'daemon', confidence: 'high' });
 
     // Cache final text for replay
-    void appendTransportEvent(sessionId, {
+    void appendTransportEvent(sessionName, {
       type: 'assistant.text',
-      sessionId,
+      sessionId: sessionName,
       text: finalText,
     });
   });
 
-  provider.onError((sessionId: string, error: ProviderError) => {
-    // Emit as session error — ChatView renders these
-    timelineEmitter.emit(sessionId, 'session.state', {
+  provider.onError((providerSid: string, error: ProviderError) => {
+    const sessionName = resolveSessionName(providerSid);
+    if (!sessionName) {
+      logger.debug({ providerSid }, 'transport-relay: unresolved route for error — dropped');
+      return;
+    }
+
+    timelineEmitter.emit(sessionName, 'session.state', {
       state: 'idle',
       error: error.message,
     }, { source: 'daemon', confidence: 'high' });
 
-    // Cache for replay
-    void appendTransportEvent(sessionId, {
+    void appendTransportEvent(sessionName, {
       type: 'session.error',
-      sessionId,
+      sessionId: sessionName,
       error: error.message,
       code: error.code,
     });

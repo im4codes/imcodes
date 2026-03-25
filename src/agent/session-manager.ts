@@ -164,6 +164,7 @@ export async function stopProject(projectName: string): Promise<void> {
     stopGeminiWatching(s.name);
     const transportRuntime = transportRuntimes.get(s.name);
     if (transportRuntime) {
+      if (transportRuntime.providerSessionId) unregisterProviderRoute(transportRuntime.providerSessionId);
       await transportRuntime.kill().catch(() => {});
       transportRuntimes.delete(s.name);
     } else {
@@ -188,6 +189,7 @@ export async function teardownProject(projectName: string): Promise<void> {
     stopGeminiWatching(s.name);
     const transportRuntime = transportRuntimes.get(s.name);
     if (transportRuntime) {
+      if (transportRuntime.providerSessionId) unregisterProviderRoute(transportRuntime.providerSessionId);
       await transportRuntime.kill().catch(() => {});
       transportRuntimes.delete(s.name);
     } else {
@@ -561,10 +563,48 @@ export interface LaunchOpts {
   description?: string;
   /** Bind to an existing remote session key instead of creating a new one. */
   bindExistingKey?: string;
+  /** Skip the sessions.create RPC — session already exists on provider (auto-sync bind). */
+  skipCreate?: boolean;
 }
 
 /** In-memory map of active transport session runtimes */
 const transportRuntimes = new Map<string, TransportSessionRuntime>();
+
+/** providerSessionId → IM.codes sessionName routing map */
+const providerRouting = new Map<string, string>();
+
+/** Register a provider session ID → IM.codes session name route. */
+export function registerProviderRoute(providerSessionId: string, sessionName: string): void {
+  providerRouting.set(providerSessionId, sessionName);
+}
+
+/** Unregister a provider session ID route. */
+export function unregisterProviderRoute(providerSessionId: string): void {
+  providerRouting.delete(providerSessionId);
+}
+
+/** Resolve a provider session ID to an IM.codes session name. */
+export function resolveSessionName(providerSessionId: string): string | undefined {
+  return providerRouting.get(providerSessionId);
+}
+
+/** Check if a providerSessionId is already bound (for uniqueness enforcement). */
+export function isProviderSessionBound(providerSessionId: string): boolean {
+  return providerRouting.has(providerSessionId);
+}
+
+/** Rebuild providerRouting from persisted sessions (call on daemon startup, before connectProvider). */
+export function rebuildProviderRoutes(): void {
+  const all = storeSessions();
+  let count = 0;
+  for (const s of all) {
+    if (s.runtimeType === 'transport' && s.providerSessionId) {
+      providerRouting.set(s.providerSessionId, s.name);
+      count++;
+    }
+  }
+  if (count > 0) logger.info({ count }, 'Rebuilt provider routing from stored sessions');
+}
 
 /** Get the transport runtime for a session (if it is a transport session). */
 export function getTransportRuntime(name: string): TransportSessionRuntime | undefined {
@@ -572,7 +612,7 @@ export function getTransportRuntime(name: string): TransportSessionRuntime | und
 }
 
 export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
-  const { name, projectName, role, agentType, projectDir, skipStore, description, bindExistingKey } = opts;
+  const { name, projectName, role, agentType, projectDir, skipStore, description, bindExistingKey, skipCreate } = opts;
 
   const provider = getProvider(agentType);
   if (!provider) {
@@ -587,34 +627,44 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     label: name,
     description,
     bindExistingKey,
+    skipCreate,
   });
 
-  // Store runtime for later use
+  // Atomic: store runtime + register provider route + persist — rollback all on failure
+  const providerSid = runtime.providerSessionId;
   transportRuntimes.set(name, runtime);
+  if (providerSid) registerProviderRoute(providerSid, name);
 
-  if (!skipStore) {
-    const record: SessionRecord = {
-      name,
-      projectName,
-      role,
-      agentType,
-      projectDir,
-      state: 'running',
-      restarts: 0,
-      restartTimestamps: [],
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      runtimeType: RUNTIME_TYPES.TRANSPORT,
-      providerId: provider.id,
-      providerSessionId: runtime.providerSessionId ?? undefined,
-      description,
-    };
-    upsertSession(record);
-    emitSessionPersist(record, name);
+  try {
+    if (!skipStore) {
+      const record: SessionRecord = {
+        name,
+        projectName,
+        role,
+        agentType,
+        projectDir,
+        state: 'running',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        runtimeType: RUNTIME_TYPES.TRANSPORT,
+        providerId: provider.id,
+        providerSessionId: runtime.providerSessionId ?? undefined,
+        description,
+      };
+      upsertSession(record);
+      emitSessionPersist(record, name);
+    }
+
+    emitSessionEvent('started', name, 'running');
+    logger.info({ session: name, agentType, providerId: provider.id }, 'Launched transport session');
+  } catch (err) {
+    // Rollback runtime + route on persistence failure
+    transportRuntimes.delete(name);
+    if (providerSid) unregisterProviderRoute(providerSid);
+    throw err;
   }
-
-  emitSessionEvent('started', name, 'running');
-  logger.info({ session: name, agentType, providerId: provider.id }, 'Launched transport session');
 }
 
 export async function launchSession(opts: LaunchOpts): Promise<void> {
