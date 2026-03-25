@@ -8,9 +8,9 @@
     "url": "https://github.com/im4codes/imcodes"
   },
   "bin": {
-    "imcodes": "./dist/index.js"
+    "imcodes": "./dist/src/index.js"
   },
-  "main": "./dist/index.js",
+  "main": "./dist/src/index.js",
   "files": [
     "dist/",
     "config/"

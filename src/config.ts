@@ -3,7 +3,7 @@ import { homedir } from 'os';
 import { join, resolve } from 'path';
 import yaml from 'yaml';
 
-const DEFAULT_CONFIG_PATH = join(__dirname, '..', 'config', 'default.yaml');
+const DEFAULT_CONFIG_PATH = join(__dirname, '../..', 'config', 'default.yaml');
 function userConfigPath(): string {
   return join(homedir(), '.imcodes', 'config.yaml');
 }
