@@ -283,8 +283,8 @@ describe('SessionControls', () => {
     fireEvent.click(screen.getByText('Worker Alpha'));
     fireEvent.click(screen.getByText('audit'));
 
-    // Input shows short label, not full @@discuss token (daemon handles expansion)
-    expect(input.textContent).toBe('@worker-alpha ');
+    // Input shows short @@label (double-@ = P2P, single-@ = file ref)
+    expect(input.textContent).toBe('@@worker-alpha ');
     getSelectionSpy.mockRestore();
   });
 

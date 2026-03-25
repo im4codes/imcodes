@@ -247,14 +247,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   /** Build a short display label for the input box — the full token is sent via WS extra fields. */
   const buildAgentLabel = (session: string, _mode: string) =>
-    session === '__all__' ? '@all' : `@${session.replace(/^deck_sub_/, '')}`;
+    session === '__all__' ? '@@all' : `@@${session.replace(/^deck_sub_/, '')}`;
 
-  /** Pending @-selected P2P targets — populated by @ picker, consumed by handleSend. */
-  const pendingAtTargetsRef = useRef<Array<{ session: string; mode: string }>>([]);
+  /** Pending @-selected P2P targets + their display labels for removal at send time. */
+  const pendingAtTargetsRef = useRef<Array<{ session: string; mode: string; label: string }>>([]);
 
-  /** Strip @-labels from text (they're sent as structured fields, not inline tokens). */
-  const stripAtLabels = (text: string): string =>
-    text.replace(/@all\b/g, '').replace(/@[a-zA-Z0-9_]+/g, '').replace(/\s+/g, ' ').trim();
+  /** Strip only the exact @@labels we inserted (preserves single-@ file references). */
+  const stripAtLabels = (text: string, labels: string[]): string => {
+    let result = text;
+    for (const label of labels) {
+      result = result.replace(label, '');
+    }
+    return result.replace(/\s+/g, ' ').trim();
+  };
 
   const handleSend = useCallback(() => {
     let text = getText();
@@ -265,9 +270,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     const atTargets = pendingAtTargetsRef.current.splice(0);
 
     if (atTargets.length > 0) {
-      // @ picker was used — send targets as structured field, strip labels from text
-      text = stripAtLabels(text);
-      extra.p2pAtTargets = atTargets;
+      // @ picker was used — send targets as structured field, strip @@labels from text
+      text = stripAtLabels(text, atTargets.map(t => t.label));
+      extra.p2pAtTargets = atTargets.map(({ session, mode }) => ({ session, mode }));
     } else if (p2pMode !== 'solo' && !text.includes('@@')) {
       // Dropdown P2P mode — daemon handles expansion
       if (p2pMode === P2P_CONFIG_MODE) {
@@ -763,9 +768,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             onSelectAgent={(session, mode) => {
               const text = divRef.current?.textContent ?? '';
               const before = text.replace(/@[^\s@]*$/, '');
-              // Show short label in input; full token sent via WS extra fields
-              divRef.current!.textContent = `${before}${buildAgentLabel(session, mode)} `;
-              pendingAtTargetsRef.current.push({ session, mode });
+              // Show short @@label in input (double-@ = P2P, single-@ = file ref)
+              const label = buildAgentLabel(session, mode);
+              divRef.current!.textContent = `${before}${label} `;
+              pendingAtTargetsRef.current.push({ session, mode, label });
               atSelectionSnapshotRef.current = divRef.current!.textContent;
               atSelectionLockRef.current = true;
               setAtPickerOpen(false);
