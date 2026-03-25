@@ -252,14 +252,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const prepareMessage = useCallback((text: string): string => {
     if (p2pMode === 'solo' || text.includes('@@')) return text;
     if (p2pMode === P2P_CONFIG_MODE) {
-      if (!p2pSavedConfig) return text;
-      const rounds = p2pSavedConfig.rounds ?? 1;
-      // Build per-session tokens for all enabled, non-skip sessions
-      const tokens = Object.entries(p2pSavedConfig.sessions)
-        .filter(([, entry]) => entry.enabled && entry.mode !== 'skip')
-        .map(([session, entry]) => `@@discuss(${session}, ${entry.mode})`);
-      if (tokens.length === 0) return text;
-      return `@@p2p-config(rounds=${rounds}) ${tokens.join(' ')} ${text}`;
+      // Config mode: send @@all(config) and let daemon expand per-session modes.
+      // Config data + rounds are sent as structured WS fields, not in the text.
+      return `@@all(config) ${text}`;
     }
     const flag = p2pExcludeSameType ? `, exclude-same-type` : '';
     return `@@all(${p2pMode}${flag}) ${text}`;
@@ -276,7 +271,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     }
     quickData.recordHistory(text, activeSession.name);
     try {
-      ws.sendSessionCommand('send', { sessionName: activeSession.name, text });
+      const extra: Record<string, unknown> = {};
+      if (p2pMode === P2P_CONFIG_MODE && p2pSavedConfig) {
+        extra.p2pSessionConfig = p2pSavedConfig.sessions;
+        extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
+      }
+      ws.sendSessionCommand('send', { sessionName: activeSession.name, text, ...extra });
     } catch {
       return;
     }
@@ -289,7 +289,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     histIdxRef.current = -1;
     draftRef.current = '';
     if (draftKey) sessionStorage.removeItem(draftKey);
-  }, [ws, activeSession, quickData, onSend, attachments]);
+  }, [ws, activeSession, quickData, onSend, attachments, p2pMode, p2pSavedConfig]);
 
   // Voice overlay send handler — applies same P2P mode as text send
   const handleVoiceSend = useCallback((voiceText: string) => {

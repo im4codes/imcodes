@@ -14,7 +14,7 @@ import { sendKeysDelayedEnter } from '../agent/tmux.js';
 import { detectStatus, detectStatusAsync } from '../agent/detect.js';
 import { capturePane } from '../agent/tmux.js';
 import { getSession, type SessionRecord } from '../store/session-store.js';
-import { getP2pMode, roundPrompt, type P2pMode } from '../shared/p2p-modes.js';
+import { getP2pMode, roundPrompt, type P2pMode } from '../../shared/p2p-modes.js';
 import logger from '../util/logger.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
@@ -199,7 +199,8 @@ export async function startP2pRun(
   }
   await writeFile(contextFilePath, seed, 'utf8');
 
-  const totalRounds = Math.max(1, rounds ?? 1);
+  const P2P_MAX_ROUNDS = 6;
+  const totalRounds = Math.min(P2P_MAX_ROUNDS, Math.max(1, rounds ?? 1));
   const run: P2pRun = {
     id: runId,
     discussionId,

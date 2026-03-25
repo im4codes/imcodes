@@ -27,7 +27,7 @@ import { exec as execCb } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, type P2pTarget } from './p2p-orchestrator.js';
-import { P2P_CONFIG_MODE, type P2pSessionConfig } from '../shared/p2p-modes.js';
+import { P2P_CONFIG_MODE, type P2pSessionConfig } from '../../shared/p2p-modes.js';
 import { copyFile, mkdir } from 'node:fs/promises';
 import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
 
@@ -151,6 +151,7 @@ const VALID_MODES = new Set(['audit', 'review', 'brainstorm', 'discuss', 'config
 const DISCUSS_TOKEN_RE = /@@discuss\(([^,]+),\s*([^)]+)\)/g;
 // @@all(mode) or @@all(mode, exclude-same-type)
 const ALL_TOKEN_RE = /@@all\(([^)]+)\)/g;
+const P2P_CONFIG_TOKEN_RE = /@@p2p-config\([^)]*\)/g;
 const FILE_TOKEN_RE = /@((?:[a-zA-Z0-9_.\-/]+\/)*[a-zA-Z0-9_.\-]+\.[a-zA-Z0-9]+)/g;
 
 interface ParsedTokens {
@@ -188,8 +189,8 @@ function parseAtTokens(text: string): ParsedTokens {
     }
   }
 
-  // Remove @@all and @@discuss tokens first so @file regex doesn't partially match them
-  let withoutCx = text.replace(ALL_TOKEN_RE, '').replace(DISCUSS_TOKEN_RE, '');
+  // Remove @@all, @@discuss, and @@p2p-config tokens first so @file regex doesn't partially match them
+  let withoutCx = text.replace(ALL_TOKEN_RE, '').replace(DISCUSS_TOKEN_RE, '').replace(P2P_CONFIG_TOKEN_RE, '');
   for (const m of withoutCx.matchAll(FILE_TOKEN_RE)) {
     files.push(m[1]);
   }
