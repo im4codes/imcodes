@@ -880,21 +880,18 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               atSelectionLockRef.current = false;
               atSelectionSnapshotRef.current = currentText;
             }
-            // Detect @/@@: single @ → choose (files/agents), @@ → jump to agents
+            // Detect @/@@: use end of text (contentEditable anchorOffset is unreliable)
             const text = currentText;
-            const sel = window.getSelection();
-            const cursorPos = sel?.anchorOffset ?? text.length;
-            const beforeCursor = text.slice(0, cursorPos);
 
             // @@ → jump straight to agents picker
-            const doubleAt = beforeCursor.match(/@@([^\s]*)$/);
+            const doubleAt = text.match(/@@([^\s]*)$/);
             if (doubleAt) {
               setAtPickerOpen(true);
               setAtPickerStage('agents');
               setAtQuery(doubleAt[1]);
             } else {
               // Single @ → choose stage (files + agents menu)
-              const singleAt = beforeCursor.match(/@([^\s@]*)$/);
+              const singleAt = text.match(/@([^\s@]*)$/);
               if (singleAt) {
                 const query = singleAt[1];
                 if (!atPickerOpen) {
@@ -904,8 +901,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     setAtQuery('');
                   } else {
                     setAtPickerOpen(false);
-                    setAtPickerStage('choose');
-                    setAtQuery('');
                   }
                 } else if (atPickerStage === 'choose') {
                   if (query.length === 0) {
@@ -913,8 +908,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     setAtQuery('');
                   } else {
                     setAtPickerOpen(false);
-                    setAtPickerStage('choose');
-                    setAtQuery('');
                   }
                 } else {
                   setAtPickerOpen(true);
