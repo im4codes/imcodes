@@ -1372,24 +1372,36 @@ export function App() {
   const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
 
   // ── Git changes count for file browser badge ───────────────────────────
+  // Refreshes on: initial load, every 30s, and after tool calls (file writes).
+  const refreshGitStatusRef = useRef<(() => void) | null>(null);
   useEffect(() => {
     const ws = wsRef.current;
     const dir = activeSessionInfo?.projectDir;
-    if (!ws || !connected || !dir) { setGitChangesCount(0); return; }
+    if (!ws || !connected || !dir) { setGitChangesCount(0); refreshGitStatusRef.current = null; return; }
 
-    let reqId: string | null = null;
+    let lastReqId: string | null = null;
+    const refresh = () => { lastReqId = ws.fsGitStatus(dir); };
+    refreshGitStatusRef.current = refresh;
+
     const unsub = ws.onMessage((msg) => {
-      if (msg.type === 'fs.git_status_response' && 'requestId' in msg && msg.requestId === reqId) {
+      // Handle git status response
+      if (msg.type === 'fs.git_status_response' && 'requestId' in msg && msg.requestId === lastReqId) {
         const entries = (msg as unknown as { entries?: unknown[] }).entries;
         setGitChangesCount(Array.isArray(entries) ? entries.length : 0);
       }
+      // Refresh when session goes idle (agent finished working)
+      if (msg.type === 'timeline.event') {
+        const evt = (msg as unknown as { event?: { type?: string; payload?: { state?: string } } }).event;
+        if (evt?.type === 'session.state' && evt.payload?.state === 'idle') {
+          refresh();
+        }
+      }
     });
 
-    // Initial request + poll every 30s
-    reqId = ws.fsGitStatus(dir);
-    const timer = setInterval(() => { reqId = ws.fsGitStatus(dir); }, 30_000);
+    refresh(); // initial
+    const timer = setInterval(refresh, 30_000); // fallback poll
 
-    return () => { unsub(); clearInterval(timer); };
+    return () => { unsub(); clearInterval(timer); refreshGitStatusRef.current = null; };
   }, [activeSessionInfo?.projectDir, connected]);
 
   // ── Auto-detect repo for active session (with retry) ───────────────────
