@@ -148,6 +148,10 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
   let raw: any;
   try { raw = JSON.parse(line); } catch { return; }
 
+  // Extract original timestamp from JSONL entry (Codex writes ISO timestamp on each line)
+  const lineTs = raw.timestamp ? new Date(raw.timestamp).getTime() : undefined;
+  const ts = lineTs && isFinite(lineTs) ? lineTs : undefined;
+
   if (raw.type === 'response_item') {
     const pl = raw.payload;
     if (!pl) return;
@@ -160,33 +164,32 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
         const summary = args.cmd ?? args.command ?? args.path ?? args.query ?? args.input;
         if (summary !== undefined) input = String(summary);
       } catch {}
-      timelineEmitter.emit(sessionName, 'tool.call', { tool: name, ...(input ? { input } : {}) }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'tool.call', { tool: name, ...(input ? { input } : {}) }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
     } else if (pl.type === 'function_call_output') {
       const errMsg = pl.error;
-      timelineEmitter.emit(sessionName, 'tool.result', { ...(errMsg ? { error: errMsg } : {}) }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'tool.result', { ...(errMsg ? { error: errMsg } : {}) }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
     } else if (pl.type === 'reasoning') {
       emitSessionState(sessionName, 'running');
       // Codex reasoning — content is encrypted, emit empty thinking event to show activity
-      timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
     } else if (pl.type === 'custom_tool_call') {
       emitSessionState(sessionName, 'running');
-      // Codex custom tools (e.g. apply_patch)
       const name = String(pl.name ?? 'tool');
       const input = typeof pl.input === 'string' ? pl.input.slice(0, 200) : '';
-      timelineEmitter.emit(sessionName, 'tool.call', { tool: name, ...(input ? { input } : {}) }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'tool.call', { tool: name, ...(input ? { input } : {}) }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
     } else if (pl.type === 'custom_tool_call_output') {
       let error: string | undefined;
       try {
         const out = JSON.parse(pl.output ?? '{}');
         if (out.metadata?.exit_code && out.metadata.exit_code !== 0) error = `exit ${out.metadata.exit_code}`;
       } catch {}
-      timelineEmitter.emit(sessionName, 'tool.result', { ...(error ? { error } : {}) }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'tool.result', { ...(error ? { error } : {}) }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
     } else if (pl.type === 'web_search_call') {
       emitSessionState(sessionName, 'running');
       const action = pl.action;
       const actionType = action?.type ?? 'search';
       const query = action?.query ?? action?.url ?? '';
-      timelineEmitter.emit(sessionName, 'tool.call', { tool: `web_${actionType}`, ...(query ? { input: String(query) } : {}) }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'tool.call', { tool: `web_${actionType}`, ...(query ? { input: String(query) } : {}) }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
     }
     return;
   }
@@ -204,7 +207,7 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
         outputTokens: last.output_tokens ?? 0,
         contextWindow: resolveContextWindow(pl.info.model_context_window, model),
         ...(model ? { model } : {}),
-      }, { source: 'daemon', confidence: 'high' });
+      }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
     }
   } else if (pl.type === 'task_started') {
     emitSessionState(sessionName, 'running');
@@ -213,20 +216,19 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
     emitSessionState(sessionName, 'idle');
   } else if (pl.type === 'user_message') {
     flushFinalAnswer(sessionName);
-    if (pl.message?.trim()) timelineEmitter.emit(sessionName, 'user.message', { text: pl.message }, { source: 'daemon', confidence: 'high' });
+    if (pl.message?.trim()) timelineEmitter.emit(sessionName, 'user.message', { text: pl.message }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
   } else if (pl.type === 'agent_message') {
     const text = pl.message;
     if (!text?.trim()) return;
     if (pl.phase === 'final_answer') {
       emitSessionState(sessionName, 'running');
-      // Buffer and debounce — emit only once when streaming stops
       const existing = finalAnswerBuffers.get(sessionName);
       if (existing) clearTimeout(existing.timer);
       const timer = setTimeout(() => flushFinalAnswer(sessionName), FINAL_ANSWER_DEBOUNCE_MS);
       finalAnswerBuffers.set(sessionName, { text, timer });
     } else if (pl.phase === 'commentary') {
       emitSessionState(sessionName, 'running');
-      timelineEmitter.emit(sessionName, 'assistant.thinking', { text }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'assistant.thinking', { text }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
     }
   }
 }
