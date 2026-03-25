@@ -74,6 +74,7 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: 'npm'
       - run: npm ci
+      - run: npm run build
       - run: npm run test:unit
 
   # ── macOS daemon unit tests ─────────────────────────────────────────────
@@ -92,6 +93,7 @@ jobs:
       - name: Prime tmux server
         run: tmux new-session -d -s init && tmux kill-session -t init
       - run: npm ci
+      - run: npm run build
       - run: npm run test:unit
 
   # ── Web frontend tests ────────────────────────────────────────────────────

@@ -4,11 +4,9 @@ import { join, resolve, dirname } from 'path';
 
 const ROOT = resolve(__dirname, '..');
 const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
-const distExists = existsSync(join(ROOT, 'dist'));
-
 // These tests validate that package.json paths match the actual build output.
-// They require `npm run build` first — skip if dist/ doesn't exist (CI unit-test jobs don't build).
-describe.skipIf(!distExists)('npm package integrity', () => {
+// CI runs `npm run build` before tests to ensure dist/ exists.
+describe('npm package integrity', () => {
   it('bin entry point exists after build', () => {
     const binPath = join(ROOT, pkg.bin.imcodes);
     expect(existsSync(binPath), `bin "${pkg.bin.imcodes}" not found — did tsconfig outDir structure change?`).toBe(true);
