@@ -35,6 +35,7 @@ import { SettingsPage } from './pages/SettingsPage.js';
 import { AdminPage } from './pages/AdminPage.js';
 import { useSubSessions } from './hooks/useSubSessions.js';
 import { useTimeline } from './hooks/useTimeline.js';
+import { useProviderStatus } from './hooks/useProviderStatus.js';
 // useSwipeBack now handled inside FloatingPanel for discussion/repo pages
 import { getActiveThinkingTs, getActiveStatusText } from './thinking-utils.js';
 import { WsClient } from './ws-client.js';
@@ -576,6 +577,9 @@ export function App() {
       termScrollFnsRef.current.get(activeSession)?.();
     }
   }, [activeSession, defaultViewMode]);
+
+  // Provider status (hoisted to app level so it's always listening — dialogs mount later)
+  const { isProviderConnected } = useProviderStatus(wsRef.current);
 
   // Timeline events for chat view
   const { events: timelineEvents, loading: timelineLoading, refreshing: timelineRefreshing, loadingOlder: timelineLoadingOlder, addOptimisticUserMessage, loadOlderEvents } = useTimeline(activeSession, wsRef.current);
@@ -1781,6 +1785,7 @@ export function App() {
           ws={wsRef.current}
           onClose={() => setShowNewSession(false)}
           onSessionStarted={(name) => { setActiveSession(name); setShowNewSession(false); }}
+          isProviderConnected={isProviderConnected}
         />
       )}
 
@@ -1862,6 +1867,7 @@ export function App() {
         <StartSubSessionDialog
           ws={wsRef.current}
           defaultCwd={activeSessionInfo?.projectDir}
+          isProviderConnected={isProviderConnected}
           onStart={async (type, shellBin, cwd, label) => {
             setShowSubDialog(false);
             const sub = await createSubSession(type, shellBin, cwd, label);

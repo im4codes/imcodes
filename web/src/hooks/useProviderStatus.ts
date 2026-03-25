@@ -12,14 +12,11 @@ export function useProviderStatus(ws: WsClient | null) {
   useEffect(() => {
     if (!ws) return;
 
-    const unsub = ws.onMessage((raw) => {
-      const msg = raw as unknown as Record<string, unknown>;
-      if (msg['type'] === 'provider.status') {
-        const providerId = msg['providerId'] as string;
-        const connected = msg['connected'] as boolean;
+    const unsub = ws.onMessage((msg) => {
+      if (msg.type === 'provider.status') {
         setProviders((prev) => {
           const next = new Map(prev);
-          next.set(providerId, connected);
+          next.set(msg.providerId, msg.connected);
           return next;
         });
       }

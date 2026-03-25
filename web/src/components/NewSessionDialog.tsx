@@ -3,7 +3,6 @@ import { useTranslation } from 'react-i18next';
 import type { WsClient } from '../ws-client.js';
 import { FileBrowser } from './FileBrowser.js';
 import { getUserPref, saveUserPref } from '../api.js';
-import { useProviderStatus } from '../hooks/useProviderStatus.js';
 
 const DEFAULT_SHELL_KEY = 'default_shell';
 
@@ -11,6 +10,7 @@ interface Props {
   ws: WsClient | null;
   onClose: () => void;
   onSessionStarted: (sessionName: string) => void;
+  isProviderConnected: (id: string) => boolean;
 }
 
 type AgentType = 'claude-code' | 'codex' | 'opencode' | 'gemini' | 'openclaw';
@@ -21,7 +21,7 @@ interface RemoteSession {
   label: string;
 }
 
-export function NewSessionDialog({ ws, onClose, onSessionStarted }: Props) {
+export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConnected }: Props) {
   const { t } = useTranslation();
   const [project, setProject] = useState('');
   const [dir, setDir] = useState('~/');
@@ -40,7 +40,6 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted }: Props) {
   const [ocLoadingSessions, setOcLoadingSessions] = useState(false);
   const [ocSelectedSession, setOcSelectedSession] = useState('');
 
-  const { isProviderConnected } = useProviderStatus(ws);
   const openClawAvailable = isProviderConnected('openclaw');
 
   // Load saved shell preference from server, then detect available shells

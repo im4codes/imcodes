@@ -38,23 +38,23 @@ describe('NewSessionDialog', () => {
   });
 
   it('renders project name input', () => {
-    render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} />);
+    render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     expect(screen.getByPlaceholderText('my-project')).toBeDefined();
   });
 
   it('renders working directory input', () => {
-    render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} />);
+    render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     expect(screen.getByPlaceholderText('~/projects/my-project')).toBeDefined();
   });
 
   it('renders agent type selector', () => {
-    render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} />);
+    render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     const select = screen.getByRole('combobox') as HTMLSelectElement;
     expect(select).toBeDefined();
   });
 
   it('agent type selector has claude-code, codex, opencode options', () => {
-    render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} />);
+    render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     const select = screen.getByRole('combobox') as HTMLSelectElement;
     const options = Array.from(select.options).map((o) => o.value);
     expect(options).toContain('claude-code');
@@ -63,21 +63,21 @@ describe('NewSessionDialog', () => {
   });
 
   it('defaults agent type to claude-code', () => {
-    render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} />);
+    render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     const select = screen.getByRole('combobox') as HTMLSelectElement;
     expect(select.value).toBe('claude-code');
   });
 
   it('cancel button calls onClose', () => {
     const onClose = vi.fn();
-    render(<NewSessionDialog ws={makeWs() as any} onClose={onClose} onSessionStarted={vi.fn()} />);
+    render(<NewSessionDialog ws={makeWs() as any} onClose={onClose} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
     expect(onClose).toHaveBeenCalledOnce();
   });
 
   it('submit with valid inputs calls ws.sendSessionCommand with correct payload', () => {
     const ws = makeWs();
-    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} />);
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), {
       target: { value: 'my-app' },
@@ -98,7 +98,7 @@ describe('NewSessionDialog', () => {
 
   it('shows error when submitting with empty project name', () => {
     const ws = makeWs();
-    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} />);
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     // Clear the project field (it's empty by default)
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
@@ -108,7 +108,7 @@ describe('NewSessionDialog', () => {
 
   it('shows error when not connected', () => {
     const ws = { sendSessionCommand: vi.fn(), connected: false, onMessage: vi.fn().mockReturnValue(() => {}) };
-    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} />);
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), {
       target: { value: 'my-app' },
@@ -122,7 +122,7 @@ describe('NewSessionDialog', () => {
 
   it('agent type changes when selector is updated', () => {
     const ws = makeWs();
-    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} />);
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
     const select = screen.getByRole('combobox') as HTMLSelectElement;
     fireEvent.change(select, { target: { value: 'codex' } });
@@ -140,7 +140,7 @@ describe('NewSessionDialog', () => {
 
   it('pressing Escape calls onClose', () => {
     const onClose = vi.fn();
-    const { container } = render(<NewSessionDialog ws={makeWs() as any} onClose={onClose} onSessionStarted={vi.fn()} />);
+    const { container } = render(<NewSessionDialog ws={makeWs() as any} onClose={onClose} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     const dialog = container.querySelector('[role="dialog"]')!;
     fireEvent.keyDown(dialog, { key: 'Escape' });
     expect(onClose).toHaveBeenCalledOnce();
@@ -148,7 +148,7 @@ describe('NewSessionDialog', () => {
 
   it('clicking the backdrop calls onClose', () => {
     const onClose = vi.fn();
-    const { container } = render(<NewSessionDialog ws={makeWs() as any} onClose={onClose} onSessionStarted={vi.fn()} />);
+    const { container } = render(<NewSessionDialog ws={makeWs() as any} onClose={onClose} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     const backdrop = container.querySelector('[role="dialog"]')!;
     // Simulate clicking the backdrop element itself (currentTarget === target)
     fireEvent.click(backdrop, { target: backdrop });

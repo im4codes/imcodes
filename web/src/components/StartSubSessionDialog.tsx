@@ -6,11 +6,11 @@ import { useTranslation } from 'react-i18next';
 import type { WsClient } from '../ws-client.js';
 import { FileBrowser } from './FileBrowser.js';
 import { getUserPref, saveUserPref } from '../api.js';
-import { useProviderStatus } from '../hooks/useProviderStatus.js';
 
 interface Props {
   ws: WsClient | null;
   defaultCwd?: string;
+  isProviderConnected: (id: string) => boolean;
   onStart: (type: string, shellBin?: string, cwd?: string, label?: string, extra?: Record<string, unknown>) => void;
   onClose: () => void;
 }
@@ -33,7 +33,7 @@ interface RemoteSession {
   label: string;
 }
 
-export function StartSubSessionDialog({ ws, defaultCwd, onStart, onClose }: Props) {
+export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected, onStart, onClose }: Props) {
   const { t } = useTranslation();
   const [type, setType] = useState('claude-code');
   const [shells, setShells] = useState<string[]>([]);
@@ -53,7 +53,6 @@ export function StartSubSessionDialog({ ws, defaultCwd, onStart, onClose }: Prop
   const [ocLoadingSessions, setOcLoadingSessions] = useState(false);
   const [ocSelectedSession, setOcSelectedSession] = useState('');
 
-  const { isProviderConnected } = useProviderStatus(ws);
   const openClawAvailable = isProviderConnected('openclaw');
 
   const agentTypes = openClawAvailable

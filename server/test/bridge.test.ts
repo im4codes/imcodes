@@ -1293,5 +1293,227 @@ describe('WsBridge', () => {
       const msgs = browserWs.sentStrings.filter(s => JSON.parse(s).type === 'totally.unknown.type');
       expect(msgs.length).toBe(0);
     });
+
+    it('provider.status broadcasts to ALL connected browsers', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browser1 = new MockWs();
+      const browser2 = new MockWs();
+      const browser3 = new MockWs();
+      bridge.handleBrowserConnection(browser1 as never, 'user-1', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(browser2 as never, 'user-2', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(browser3 as never, 'user-3', makeDb('valid-hash'));
+      browser1.sent.length = 0;
+      browser2.sent.length = 0;
+      browser3.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'provider.status', providerId: 'openclaw', connected: true,
+      }));
+      await flushAsync();
+
+      for (const browser of [browser1, browser2, browser3]) {
+        const msg = JSON.parse(browser.sentStrings.at(-1)!);
+        expect(msg.type).toBe('provider.status');
+        expect(msg.providerId).toBe('openclaw');
+        expect(msg.connected).toBe(true);
+      }
+    });
+
+    it('chat.subscribe → receive events → chat.unsubscribe → stop receiving', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+
+      // Subscribe to transport session
+      browserWs.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'ts-sub-test' }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+
+      // Should receive events for subscribed session
+      daemonWs.emit('message', JSON.stringify({
+        type: 'chat.delta', sessionId: 'ts-sub-test', delta: 'hello',
+      }));
+      await flushAsync();
+      expect(browserWs.sentStrings.some(s => JSON.parse(s).type === 'chat.delta')).toBe(true);
+      browserWs.sent.length = 0;
+
+      // Unsubscribe
+      browserWs.emit('message', JSON.stringify({ type: 'chat.unsubscribe', sessionId: 'ts-sub-test' }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+
+      // Should NOT receive events after unsubscribe
+      daemonWs.emit('message', JSON.stringify({
+        type: 'chat.delta', sessionId: 'ts-sub-test', delta: 'should not arrive',
+      }));
+      await flushAsync();
+      expect(browserWs.sentStrings.filter(s => JSON.parse(s).type === 'chat.delta')).toHaveLength(0);
+    });
+
+    it('relays chat.complete events to subscribed browsers', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      browserWs.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'ts-complete' }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'chat.complete', sessionId: 'ts-complete', messageId: 'msg-1',
+      }));
+      await flushAsync();
+
+      const msg = JSON.parse(browserWs.sentStrings[0]);
+      expect(msg.type).toBe('chat.complete');
+      expect(msg.sessionId).toBe('ts-complete');
+      expect(msg.messageId).toBe('msg-1');
+    });
+
+    it('relays chat.error events to subscribed browsers', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      browserWs.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'ts-err' }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'chat.error', sessionId: 'ts-err', error: 'rate limited', code: 'RATE_LIMITED',
+      }));
+      await flushAsync();
+
+      const msg = JSON.parse(browserWs.sentStrings[0]);
+      expect(msg.type).toBe('chat.error');
+      expect(msg.error).toBe('rate limited');
+      expect(msg.code).toBe('RATE_LIMITED');
+    });
+
+    it('relays chat.status events to subscribed browsers', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      browserWs.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'ts-status' }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'chat.status', sessionId: 'ts-status', status: 'streaming',
+      }));
+      await flushAsync();
+
+      const msg = JSON.parse(browserWs.sentStrings[0]);
+      expect(msg.type).toBe('chat.status');
+      expect(msg.status).toBe('streaming');
+    });
+
+    it('relays chat.tool events to subscribed browsers', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      browserWs.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'ts-tool' }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'chat.tool', sessionId: 'ts-tool', messageId: 'msg-1',
+        tool: { name: 'read_file', status: 'started' },
+      }));
+      await flushAsync();
+
+      const msg = JSON.parse(browserWs.sentStrings[0]);
+      expect(msg.type).toBe('chat.tool');
+      expect(msg.tool.name).toBe('read_file');
+    });
+
+    it('relays chat.approval events to subscribed browsers', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      browserWs.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'ts-approval' }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'chat.approval', sessionId: 'ts-approval', requestId: 'req-1',
+        description: 'Write to file /etc/passwd',
+      }));
+      await flushAsync();
+
+      const msg = JSON.parse(browserWs.sentStrings[0]);
+      expect(msg.type).toBe('chat.approval');
+      expect(msg.requestId).toBe('req-1');
+      expect(msg.description).toBe('Write to file /etc/passwd');
+    });
+
+    it('isolates transport subscriptions between browsers', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browser1 = new MockWs();
+      const browser2 = new MockWs();
+      bridge.handleBrowserConnection(browser1 as never, 'user-1', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(browser2 as never, 'user-2', makeDb('valid-hash'));
+
+      // browser1 subscribes to session A, browser2 subscribes to session B
+      browser1.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'sess-A' }));
+      browser2.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'sess-B' }));
+      await flushAsync();
+      browser1.sent.length = 0;
+      browser2.sent.length = 0;
+
+      // Delta for session A — only browser1 should get it
+      daemonWs.emit('message', JSON.stringify({
+        type: 'chat.delta', sessionId: 'sess-A', delta: 'for-browser-1',
+      }));
+      await flushAsync();
+
+      expect(browser1.sentStrings.filter(s => JSON.parse(s).type === 'chat.delta')).toHaveLength(1);
+      expect(browser2.sentStrings.filter(s => JSON.parse(s).type === 'chat.delta')).toHaveLength(0);
+
+      browser1.sent.length = 0;
+      browser2.sent.length = 0;
+
+      // Delta for session B — only browser2 should get it
+      daemonWs.emit('message', JSON.stringify({
+        type: 'chat.delta', sessionId: 'sess-B', delta: 'for-browser-2',
+      }));
+      await flushAsync();
+
+      expect(browser1.sentStrings.filter(s => JSON.parse(s).type === 'chat.delta')).toHaveLength(0);
+      expect(browser2.sentStrings.filter(s => JSON.parse(s).type === 'chat.delta')).toHaveLength(1);
+    });
+
+    it('provider.status still reaches browsers that have no transport subscriptions', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      // Browser has NOT subscribed to any transport session
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'provider.status', providerId: 'openclaw', connected: true,
+      }));
+      await flushAsync();
+
+      // provider.status is broadcast (not subscription-gated)
+      const msg = JSON.parse(browserWs.sentStrings.at(-1)!);
+      expect(msg.type).toBe('provider.status');
+      expect(msg.connected).toBe(true);
+    });
+
+    it('provider connect → disconnect sequence reaches browser in order', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'provider.status', providerId: 'openclaw', connected: true,
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'provider.status', providerId: 'openclaw', connected: false,
+      }));
+      await flushAsync();
+
+      const statusMsgs = browserWs.sentStrings
+        .map(s => JSON.parse(s))
+        .filter((m: Record<string, unknown>) => m.type === 'provider.status');
+
+      expect(statusMsgs).toHaveLength(2);
+      expect(statusMsgs[0].connected).toBe(true);
+      expect(statusMsgs[1].connected).toBe(false);
+    });
   });
 });
