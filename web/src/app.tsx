@@ -1380,7 +1380,13 @@ export function App() {
     if (!ws || !connected || !dir) { setGitChangesCount(0); refreshGitStatusRef.current = null; return; }
 
     let lastReqId: string | null = null;
-    const refresh = () => { lastReqId = ws.fsGitStatus(dir); };
+    let lastRefreshTs = 0;
+    const refresh = () => {
+      const now = Date.now();
+      if (now - lastRefreshTs < 10_000) return; // throttle: max once per 10s
+      lastRefreshTs = now;
+      lastReqId = ws.fsGitStatus(dir);
+    };
     refreshGitStatusRef.current = refresh;
 
     const unsub = ws.onMessage((msg) => {
@@ -1389,10 +1395,10 @@ export function App() {
         const entries = (msg as unknown as { entries?: unknown[] }).entries;
         setGitChangesCount(Array.isArray(entries) ? entries.length : 0);
       }
-      // Refresh when session goes idle (agent finished working)
+      // Refresh on tool completion + session idle (throttled to max 1 per 10s)
       if (msg.type === 'timeline.event') {
         const evt = (msg as unknown as { event?: { type?: string; payload?: { state?: string } } }).event;
-        if (evt?.type === 'session.state' && evt.payload?.state === 'idle') {
+        if (evt?.type === 'tool.result' || (evt?.type === 'session.state' && evt.payload?.state === 'idle')) {
           refresh();
         }
       }
