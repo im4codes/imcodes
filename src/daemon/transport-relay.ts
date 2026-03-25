@@ -1,11 +1,14 @@
 /**
- * Relay TransportEvents from provider callbacks to the server-link WebSocket,
- * which forwards them to WsBridge for browser delivery.
- * Also writes events to local JSONL cache for replay on reconnect.
+ * Relay TransportProvider callbacks into the unified timeline event system.
+ *
+ * Transport events are emitted through timelineEmitter (same as CC/Codex/Gemini
+ * JSONL watchers), so ChatView renders them without any special handling.
+ * Also cached to local JSONL for replay on reconnect/restart.
  */
 import type { TransportProvider, ProviderError } from '../agent/transport-provider.js';
 import type { MessageDelta, AgentMessage } from '../../shared/agent-message.js';
-import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
+import { TRANSPORT_MSG } from '../../shared/transport-events.js';
+import { timelineEmitter } from './timeline-emitter.js';
 import { appendTransportEvent } from './transport-history.js';
 import logger from '../util/logger.js';
 
@@ -16,39 +19,78 @@ export function setTransportRelaySend(fn: (msg: Record<string, unknown>) => void
   sendToServer = fn;
 }
 
-/** Send to server + cache locally. */
-function relayAndCache(sessionId: string, msg: Record<string, unknown>): void {
-  sendToServer?.(msg);
-  void appendTransportEvent(sessionId, msg);
-}
+/** Per-session text accumulator for streaming deltas → assistant.text events. */
+const accumulators = new Map<string, { messageId: string; text: string }>();
 
-/** Wire up a provider's callbacks to relay events to the server */
+/** Wire up a provider's callbacks to emit standard timeline events. */
 export function wireProviderToRelay(provider: TransportProvider): void {
   provider.onDelta((sessionId: string, delta: MessageDelta) => {
-    relayAndCache(sessionId, {
-      type: TRANSPORT_EVENT.CHAT_DELTA,
-      sessionId,
-      messageId: delta.messageId,
-      delta: delta.delta,
-      deltaType: delta.type,
-    });
+    // Accumulate text and emit with stable eventId — ChatView replaces same-ID events
+    let acc = accumulators.get(`${sessionId}:${delta.messageId}`);
+    if (!acc) {
+      acc = { messageId: delta.messageId, text: '' };
+      accumulators.set(`${sessionId}:${delta.messageId}`, acc);
+    }
+    acc.text += delta.delta;
+
+    // Emit with stable eventId so ChatView replaces the previous version (typewriter effect)
+    const stableEventId = `transport:${sessionId}:${delta.messageId}`;
+    timelineEmitter.emit(sessionId, 'assistant.text', {
+      text: acc.text,
+      streaming: true,
+    }, { source: 'daemon', confidence: 'high', eventId: stableEventId });
   });
 
   provider.onComplete((sessionId: string, message: AgentMessage) => {
-    relayAndCache(sessionId, {
-      type: TRANSPORT_EVENT.CHAT_COMPLETE,
+    const key = `${sessionId}:${message.id}`;
+    const acc = accumulators.get(key);
+    const finalText = acc?.text ?? message.content;
+    accumulators.delete(key);
+
+    // Replace the streaming event with final version (same eventId → in-place update in ChatView)
+    const stableEventId = `transport:${sessionId}:${message.id}`;
+    timelineEmitter.emit(sessionId, 'assistant.text', {
+      text: finalText,
+      streaming: false,
+    }, { source: 'daemon', confidence: 'high', eventId: stableEventId });
+
+    // Emit idle state
+    timelineEmitter.emit(sessionId, 'session.state', {
+      state: 'idle',
+    }, { source: 'daemon', confidence: 'high' });
+
+    // Cache final text for replay
+    void appendTransportEvent(sessionId, {
+      type: 'assistant.text',
       sessionId,
-      messageId: message.id,
+      text: finalText,
     });
   });
 
   provider.onError((sessionId: string, error: ProviderError) => {
-    relayAndCache(sessionId, {
-      type: TRANSPORT_EVENT.CHAT_ERROR,
+    // Emit as session error — ChatView renders these
+    timelineEmitter.emit(sessionId, 'session.state', {
+      state: 'idle',
+      error: error.message,
+    }, { source: 'daemon', confidence: 'high' });
+
+    // Cache for replay
+    void appendTransportEvent(sessionId, {
+      type: 'session.error',
       sessionId,
       error: error.message,
       code: error.code,
     });
+  });
+}
+
+/** Emit user.message through timeline when user sends to a transport session. */
+export function emitTransportUserMessage(sessionId: string, text: string): void {
+  timelineEmitter.emit(sessionId, 'user.message', { text }, { source: 'daemon', confidence: 'high' });
+  void appendTransportEvent(sessionId, {
+    type: 'user.message',
+    sessionId,
+    text,
   });
 }
 
