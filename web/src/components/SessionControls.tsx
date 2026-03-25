@@ -806,16 +806,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               } catch { /* jsdom lacks Selection API */ }
             }}
             onSelectAllConfig={(cfg, rounds) => {
-              // Store config targets as structured data — don't expand into text
+              // Just show @@all — daemon expands per config. Don't list individual sessions.
               const text = divRef.current?.textContent ?? '';
               const before = text.replace(/@[^\s@]*$/, '');
-              const targets = Object.entries(cfg.sessions)
-                .filter(([, entry]) => entry.enabled && entry.mode !== 'skip')
-                .map(([session, entry]) => ({ session, mode: entry.mode, label: `@@${session.replace(/^deck_sub_/, '')}` }));
-              const labels = targets.map(t => t.label).join(' ');
-              divRef.current!.textContent = `${before}${labels} `;
-              for (const t of targets) pendingAtTargetsRef.current.push(t);
-              // Store rounds + config for handleSend
+              divRef.current!.textContent = `${before}@@all `;
+              pendingAtTargetsRef.current.push({ session: '__all__', mode: 'config', label: '@@all' });
               setP2pSavedConfig({ sessions: cfg.sessions, rounds });
               setP2pMode(P2P_CONFIG_MODE);
               atSelectionSnapshotRef.current = divRef.current!.textContent;
