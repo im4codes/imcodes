@@ -264,8 +264,14 @@ jobs:
       - run: npm run build
       - name: Set version
         run: npm version ${{ needs.docker.outputs.npm_version }} --no-git-tag-version
-      - name: Publish (skip if version already exists)
-        run: npm publish --provenance --access public || echo "Version already published — skipping"
+      - name: Publish (skip if version already on npm)
+        run: |
+          VERSION=${{ needs.docker.outputs.npm_version }}
+          if npm view "imcodes@${VERSION}" version >/dev/null 2>&1; then
+            echo "::warning::Version ${VERSION} already published — skipping"
+          else
+            npm publish --provenance --access public
+          fi
 
   # ── Build & push Docker image ─────────────────────────────────────────────
 
