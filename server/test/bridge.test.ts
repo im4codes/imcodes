@@ -1217,4 +1217,81 @@ describe('WsBridge', () => {
       expect(dispatchPush).toHaveBeenCalled();
     });
   });
+
+  describe('transport provider relay', () => {
+    async function setupAuthenticatedBridge() {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      return { bridge, daemonWs, browserWs };
+    }
+
+    it('relays provider.status to all browsers (broadcast)', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      daemonWs.emit('message', JSON.stringify({
+        type: 'provider.status', providerId: 'openclaw', connected: true,
+      }));
+      await flushAsync();
+      const msg = JSON.parse(browserWs.sentStrings.at(-1)!);
+      expect(msg.type).toBe('provider.status');
+      expect(msg.providerId).toBe('openclaw');
+      expect(msg.connected).toBe(true);
+    });
+
+    it('relays provider.status disconnected', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      daemonWs.emit('message', JSON.stringify({
+        type: 'provider.status', providerId: 'openclaw', connected: false,
+      }));
+      await flushAsync();
+      const msg = JSON.parse(browserWs.sentStrings.at(-1)!);
+      expect(msg.type).toBe('provider.status');
+      expect(msg.connected).toBe(false);
+    });
+
+    it('relays transport chat events to subscribed browsers', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      // Subscribe browser to transport session
+      browserWs.emit('message', JSON.stringify({ type: 'chat.subscribe', sessionId: 'ts-123' }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'chat.delta', sessionId: 'ts-123', delta: 'hello',
+      }));
+      await flushAsync();
+      const msg = JSON.parse(browserWs.sentStrings[0]);
+      expect(msg.type).toBe('chat.delta');
+      expect(msg.sessionId).toBe('ts-123');
+    });
+
+    it('does NOT relay transport chat events to unsubscribed browsers', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      // Don't subscribe
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'chat.delta', sessionId: 'ts-456', delta: 'nope',
+      }));
+      await flushAsync();
+      // Should not receive transport event (only provider.status is broadcast)
+      const transportMsgs = browserWs.sentStrings.filter(s => JSON.parse(s).type === 'chat.delta');
+      expect(transportMsgs.length).toBe(0);
+    });
+
+    it('discards unknown message types (default-deny)', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      browserWs.sent.length = 0;
+      daemonWs.emit('message', JSON.stringify({ type: 'totally.unknown.type', foo: 'bar' }));
+      await flushAsync();
+      // No message should reach browser
+      const msgs = browserWs.sentStrings.filter(s => JSON.parse(s).type === 'totally.unknown.type');
+      expect(msgs.length).toBe(0);
+    });
+  });
 });
