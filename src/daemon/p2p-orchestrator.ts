@@ -352,14 +352,7 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       ? `${shortName(run.initiatorSession)} — Final Summary`
       : `${shortName(run.initiatorSession)} — Round ${run.currentRound}/${run.rounds} Summary`;
     const roundSummaryInstruction = isLastRound
-      ? [
-          'Read the complete context file with ALL rounds of discussion.',
-          'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.',
-          '',
-          'After writing the summary, execute the user\'s original request based on the discussion results.',
-          `Original user request: "${run.userText}"`,
-          'If the user requested output to a specific file (e.g. a plan document), generate that file now using the discussion consensus.',
-        ].join('\n')
+      ? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.'
       : `Synthesize the key points, areas of agreement, and open questions from this round. Then assign specific focus areas or questions for each participant in the next round (round ${run.currentRound + 1}). Append to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`;
     const roundSummaryPrompt = buildHopPrompt(run, modeConfig, {
       session: run.initiatorSession,
@@ -682,16 +675,34 @@ export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: Hop
   // Prompt: assertive and unambiguous. File path mentioned exactly ONCE to prevent
   // Claude Code from parsing two paths and executing the task twice.
   // Stronger phrasing needed for Gemini/Codex to execute reliably.
+  //
+  // Final summary may include execution instructions — use different framing
+  // so the LLM writes the summary first, then acts on the user's request.
+  const isFinalSummary = opts.sectionHeader.includes('Final Summary');
   parts.push(``);
   parts.push(`[P2P Discussion Task — run ${run.id}]`);
   parts.push(``);
-  parts.push(`Execute these steps NOW on ${filePath}:`);
-  parts.push(`1. Read this file`);
-  parts.push(`2. ${opts.instruction}`);
-  parts.push(`3. Add a new heading "## ${opts.sectionHeader}" at the end of this file and write your analysis below it`);
-  parts.push(``);
-  parts.push(`Rules: ALL analysis goes into this same file.`);
-  parts.push(`Do NOT ask for confirmation. Do NOT explain your plan. Execute immediately.`);
+  if (isFinalSummary) {
+    parts.push(`This is the FINAL round of a multi-agent discussion. Your discussion file is: ${filePath}`);
+    parts.push(``);
+    parts.push(`Steps:`);
+    parts.push(`1. Read the discussion file`);
+    parts.push(`2. Add a new heading "## ${opts.sectionHeader}" at the end and write your final synthesis`);
+    parts.push(`3. After writing the summary, execute the user's original request based on the discussion consensus`);
+    parts.push(``);
+    parts.push(`User's original request: "${run.userText}"`);
+  } else {
+    parts.push(`This is a dedicated discussion file for multi-agent analysis: ${filePath}`);
+    parts.push(`All output MUST go into this file. Do NOT modify any other files or run any commands.`);
+    parts.push(``);
+    parts.push(`Steps:`);
+    parts.push(`1. Read the discussion file`);
+    parts.push(`2. ${opts.instruction}`);
+    parts.push(`3. Add a new heading "## ${opts.sectionHeader}" at the end of this file and write your analysis below it`);
+    parts.push(``);
+    parts.push(`Rules: ALL analysis goes into this same file. Do NOT edit code files. Do NOT implement fixes.`);
+  }
+  parts.push(`Do NOT ask for confirmation. Do NOT explain your plan. Start immediately.`);
   parts.push(`After writing to the file, print a brief response summary of what you wrote, then say: Done`);
 
   // User-defined extra prompt (e.g. "使用中文回复", "focus on security")
