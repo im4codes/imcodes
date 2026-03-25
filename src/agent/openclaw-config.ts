@@ -1,7 +1,7 @@
 // Manages ~/.imcodes/openclaw.json for persistent connection config
 // AND auto-reads token from ~/.openclaw/openclaw.json (OC's own config)
 
-import { readFile, writeFile, unlink, chmod } from 'fs/promises';
+import { readFile, writeFile, unlink, chmod, mkdir } from 'fs/promises';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -18,8 +18,8 @@ export interface OpenClawConnectionConfig {
 
 /** Save connection config with 0600 permissions */
 export async function saveConfig(config: OpenClawConnectionConfig): Promise<void> {
-  await writeFile(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
-  await chmod(CONFIG_PATH, 0o600);
+  await mkdir(IMCODES_DIR, { recursive: true });
+  await writeFile(CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 });
 }
 
 /** Load saved connection config (returns null if not found) */
