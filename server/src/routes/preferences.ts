@@ -7,7 +7,7 @@ export const preferencesRoutes = new Hono<{ Bindings: Env; Variables: { userId: 
 
 preferencesRoutes.use('/*', requireAuth());
 
-const KEY_RE = /^[a-zA-Z0-9_]{1,64}$/;
+const KEY_RE = /^[a-zA-Z0-9_.:@-]{1,128}$/;
 const MAX_VALUE_BYTES = 65536; // 64KB
 
 /** GET /api/preferences/:key */
