@@ -142,16 +142,13 @@ export function SubSessionWindow({
     }
   }, [viewMode, ws, connected, sub.sessionName]);
 
-  // Subscribe terminal only when window is open and in terminal view mode.
+  // Re-subscribe terminal on mount so the server sends a fresh snapshot.
   // SubSessionWindow unmounts on minimize, so without this the remounted
   // TerminalView would start empty (no snapshot, only incremental data).
   useEffect(() => {
-    if (!ws || !connected || !active || viewMode !== 'terminal') return;
+    if (!ws || !connected || !active) return;
     try { ws.subscribeTerminal(sub.sessionName); } catch { /* ignore */ }
-    return () => {
-      try { ws.unsubscribeTerminal(sub.sessionName); } catch { /* ignore */ }
-    };
-  }, [ws, connected, sub.sessionName, active, viewMode]);
+  }, [ws, connected, sub.sessionName, active]);
 
   const scrollToBottom = useCallback(() => {
     setTimeout(() => {
