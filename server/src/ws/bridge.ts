@@ -18,7 +18,7 @@ import { MemoryRateLimiter } from './rate-limiter.js';
 import { sha256Hex } from '../security/crypto.js';
 import { REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
-import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, updateSubSession, upsertOrchestrationRun } from '../db/queries.js';
+import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus } from '../db/queries.js';
 import logger from '../util/logger.js';
 
 const AUTH_TIMEOUT_MS = 5000;
@@ -166,6 +166,9 @@ export class WsBridge {
   /** db reference for session ownership checks */
   private db: Database | null = null;
 
+  /** Cached provider connection status — pushed to browsers on connect, persisted to DB. */
+  private providerStatus = new Map<string, boolean>();
+
   /**
    * Per-request fs.ls pending map: requestId → { socket, timer }.
    * Used to single-cast fs.ls_response back to the requesting browser.
@@ -227,6 +230,7 @@ export class WsBridge {
   // ── Daemon connection ──────────────────────────────────────────────────────
 
   handleDaemonConnection(ws: WebSocket, db: Database, env: Env, onAuthenticated?: () => void): void {
+    this.db = db;
     // Replace existing daemon connection
     if (this.daemonWs) {
       try { this.daemonWs.close(1001, 'replaced'); } catch { /* ignore */ }
@@ -348,7 +352,13 @@ export class WsBridge {
         this.daemonWs = null;
         this.authenticated = false;
         this.rejectAllPendingFileTransfers('daemon_disconnected');
+        // Clear provider statuses — daemon is gone, providers are unreachable
+        for (const [providerId] of this.providerStatus) {
+          this.broadcastToBrowsers(JSON.stringify({ type: TRANSPORT_MSG.PROVIDER_STATUS, providerId, connected: false }));
+        }
+        this.providerStatus.clear();
         this.broadcastToBrowsers(JSON.stringify({ type: 'daemon.disconnected' }));
+        void clearProviderStatus(db, this.serverId).catch(() => {});
         updateServerStatus(db, this.serverId, 'offline').catch((err) =>
           logger.error({ err }, 'Failed to mark server offline'),
         );
@@ -371,6 +381,11 @@ export class WsBridge {
     this.browserSubscriptions.set(ws, new Set());
     this.transportSubscriptions.set(ws, new Set());
     this.browserUserIds.set(ws, userId);
+
+    // Push cached provider statuses so the browser has them immediately — no WS race.
+    for (const [providerId, connected] of this.providerStatus) {
+      safeSend(ws, JSON.stringify({ type: TRANSPORT_MSG.PROVIDER_STATUS, providerId, connected }));
+    }
 
     ws.on('message', (data) => {
       const raw = (data as Buffer).toString();
@@ -824,8 +839,17 @@ export class WsBridge {
       return;
     }
 
-    // Provider status: broadcast to all browsers
+    // Provider status: cache + persist to DB + broadcast to all browsers
     if (type === TRANSPORT_MSG.PROVIDER_STATUS) {
+      const providerId = msg.providerId as string;
+      const connected = msg.connected as boolean;
+      if (providerId) {
+        this.providerStatus.set(providerId, connected);
+        if (this.db) {
+          void updateProviderStatus(this.db, this.serverId, providerId, connected)
+            .catch((e) => logger.error({ err: e, providerId }, 'Failed to persist provider status'));
+        }
+      }
       this.broadcastToBrowsers(JSON.stringify(msg));
       return;
     }

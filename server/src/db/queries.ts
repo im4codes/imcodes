@@ -201,6 +201,35 @@ export async function updateServerStatus(db: Database, id: string, status: strin
   await db.execute('UPDATE servers SET status = $1 WHERE id = $2', [status, id]);
 }
 
+export async function updateProviderStatus(db: Database, serverId: string, providerId: string, connected: boolean): Promise<void> {
+  if (connected) {
+    await db.execute(
+      `UPDATE servers SET connected_providers = coalesce(connected_providers, '{}'::jsonb) || $1::jsonb WHERE id = $2`,
+      [JSON.stringify({ [providerId]: true }), serverId],
+    );
+  } else {
+    await db.execute(
+      `UPDATE servers SET connected_providers = coalesce(connected_providers, '{}'::jsonb) - $1 WHERE id = $2`,
+      [providerId, serverId],
+    );
+  }
+}
+
+export async function clearProviderStatus(db: Database, serverId: string): Promise<void> {
+  await db.execute(`UPDATE servers SET connected_providers = '{}'::jsonb WHERE id = $1`, [serverId]);
+}
+
+export async function getProviderStatus(db: Database, serverId: string): Promise<Record<string, boolean>> {
+  const row = await db.queryOne<{ connected_providers: Record<string, boolean> | string }>(
+    'SELECT connected_providers FROM servers WHERE id = $1',
+    [serverId],
+  );
+  if (!row) return {};
+  const val = row.connected_providers;
+  if (typeof val === 'string') return JSON.parse(val);
+  return val ?? {};
+}
+
 export async function updateServerName(db: Database, id: string, userId: string, name: string): Promise<boolean> {
   const result = await db.execute('UPDATE servers SET name = $1 WHERE id = $2 AND user_id = $3', [name, id, userId]);
   return (result.changes ?? 0) > 0;

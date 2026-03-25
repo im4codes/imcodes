@@ -836,14 +836,6 @@ function handleGetSessions(serverLink: ServerLink): void {
     }));
   try {
     serverLink.send({ type: 'session_list', daemonVersion: serverLink.daemonVersion, sessions });
-    // Re-broadcast connected provider statuses so browsers see them on initial load
-    import('../agent/provider-registry.js').then(({ getAllProviders }) => {
-      import('./transport-relay.js').then(({ broadcastProviderStatus }) => {
-        for (const p of getAllProviders()) {
-          broadcastProviderStatus(p.id, true);
-        }
-      });
-    }).catch(() => {});
   } catch {
     // not connected
   }

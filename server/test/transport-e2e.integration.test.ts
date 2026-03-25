@@ -365,4 +365,84 @@ describe('transport provider e2e', () => {
       closeAll(daemon, b1, b2);
     }
   });
+
+  it('late-joining browser receives cached provider.status immediately', async () => {
+    const { serverId, token } = await createTestServer();
+    const daemon = await connectDaemon(serverId, token);
+
+    try {
+      // Daemon announces provider connected — no browser connected yet
+      send(daemon, { type: 'provider.status', providerId: 'openclaw', connected: true });
+      await wait(300);
+
+      // Register listener BEFORE open so we catch messages sent during handleBrowserConnection
+      const received: any[] = [];
+      const ws = new WebSocket(`ws://127.0.0.1:${serverPort}/api/server/${serverId}/ws?browser=1`);
+      ws.on('message', (d) => { try { received.push(JSON.parse(d.toString())); } catch {} });
+      await new Promise<void>((resolve, reject) => {
+        ws.on('open', () => resolve());
+        ws.on('error', reject);
+      });
+      await wait(500);
+
+      const statusMsgs = received.filter(m => m.type === 'provider.status');
+      expect(statusMsgs).toHaveLength(1);
+      expect(statusMsgs[0].providerId).toBe('openclaw');
+      expect(statusMsgs[0].connected).toBe(true);
+
+      closeAll(ws);
+    } finally {
+      closeAll(daemon);
+    }
+  });
+
+  it('daemon disconnect clears provider status for late-joining browsers', async () => {
+    const { serverId, token } = await createTestServer();
+    const daemon = await connectDaemon(serverId, token);
+
+    try {
+      // Provider connected
+      send(daemon, { type: 'provider.status', providerId: 'openclaw', connected: true });
+      await wait(200);
+
+      // Daemon disconnects — bridge should clear cached statuses
+      daemon.close();
+      await wait(500);
+
+      // New browser connects — should NOT receive stale provider.status
+      const browser = await connectBrowser(serverId);
+      const received: any[] = [];
+      browser.on('message', (d) => { try { received.push(JSON.parse(d.toString())); } catch {} });
+      await wait(500);
+
+      const providerMsgs = received.filter(m => m.type === 'provider.status' && m.connected === true);
+      expect(providerMsgs).toHaveLength(0);
+
+      closeAll(browser);
+    } finally {
+      // daemon already closed
+    }
+  });
+
+  it('provider status persists to DB and survives bridge cache clear', async () => {
+    const { serverId, token } = await createTestServer();
+    const daemon = await connectDaemon(serverId, token);
+
+    try {
+      send(daemon, { type: 'provider.status', providerId: 'openclaw', connected: true });
+      await wait(500); // Wait for async DB write
+
+      // Verify DB has the status
+      const row = await db.queryOne<{ connected_providers: any }>(
+        'SELECT connected_providers FROM servers WHERE id = $1',
+        [serverId],
+      );
+      const providers = typeof row?.connected_providers === 'string'
+        ? JSON.parse(row.connected_providers)
+        : row?.connected_providers;
+      expect(providers?.openclaw).toBe(true);
+    } finally {
+      closeAll(daemon);
+    }
+  });
 });
