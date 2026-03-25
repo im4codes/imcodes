@@ -1473,6 +1473,13 @@ echo "=== imcodes upgrade started at $(date) ===" >> "$LOG"
 # Give the running daemon a moment to finish sending its response
 sleep 3
 
+# Remove npm link if present — it shadows npm install and prevents real upgrades
+GLOBAL_PKG=$(${npmCmd} root -g 2>/dev/null)/imcodes
+if [ -L "$GLOBAL_PKG" ]; then
+  echo "Removing npm link ($GLOBAL_PKG -> $(readlink "$GLOBAL_PKG"))..." >> "$LOG"
+  ${npmCmd} uninstall -g imcodes >> "$LOG" 2>&1 || true
+fi
+
 # Attempt npm install — if it fails we still restart to keep the daemon alive
 echo "Installing imcodes@latest..." >> "$LOG"
 if "${npmCmd}" install -g imcodes@latest >> "$LOG" 2>&1; then
