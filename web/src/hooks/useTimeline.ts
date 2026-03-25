@@ -63,15 +63,13 @@ export function useTimeline(
   const olderRequestIdRef = useRef<string | null>(null);
   const historyLoadedRef = useRef<string | null>(null); // tracks which session has been loaded
 
-  // Reset on session change
+  // Reset on session change — but DON'T clear events when sessionId becomes null
+  // (window minimized). The memory cache (eventsCache) preserves them for instant
+  // restore when the window reopens.
   useEffect(() => {
     if (!sessionId) {
-      setEvents([]);
       setLoading(false);
       resetOlderState();
-      epochRef.current = 0;
-      seqRef.current = 0;
-      historyLoadedRef.current = null;
       return;
     }
 
