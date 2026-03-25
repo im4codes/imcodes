@@ -189,23 +189,29 @@ export class OpenClawProvider implements TransportProvider {
   }
 
   async listSessions(): Promise<RemoteSessionInfo[]> {
-    const payload = await this.rpc('sessions.list', {}) as { sessions?: Array<{
-      key: string;
-      label?: string;
-      agentId?: string;
-      updatedAt?: number;
-      percentUsed?: number;
-    }> };
-    const all = payload?.sessions ?? [];
-    return all
-      .filter((s) => !s.key.includes(':cron:'))
-      .map((s) => ({
-        key: s.key,
-        displayName: s.label,
-        agentId: s.agentId,
-        updatedAt: s.updatedAt,
-        percentUsed: s.percentUsed,
-      }));
+    try {
+      const payload = await this.rpc('sessions.list', {}) as { sessions?: Array<{
+        key: string;
+        label?: string;
+        agentId?: string;
+        updatedAt?: number;
+        percentUsed?: number;
+      }> };
+      const all = payload?.sessions ?? [];
+      return all
+        .filter((s) => !s.key.includes(':cron:'))
+        .map((s) => ({
+          key: s.key,
+          displayName: s.label,
+          agentId: s.agentId,
+          updatedAt: s.updatedAt,
+          percentUsed: s.percentUsed,
+        }));
+    } catch (err) {
+      // Gateway may fail on sessions with incomplete metadata — return empty
+      logger.warn({ provider: this.id, err }, 'sessions.list failed — returning empty');
+      return [];
+    }
   }
 
   // ── WebSocket management ───────────────────────────────────────────────────
