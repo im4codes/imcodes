@@ -1869,7 +1869,12 @@ export function App() {
               key={t.id}
               class={`toast toast-${t.kind}`}
               onClick={() => {
-                setActiveSession(t.sessionName);
+                if (t.sessionName) {
+                  // Reuse push notification navigation — handles sub-sessions, parent activation, etc.
+                  window.dispatchEvent(new CustomEvent('deck:navigate', {
+                    detail: { session: t.sessionName, serverId: selectedServerId },
+                  }));
+                }
                 setIdleAlerts((prev) => { const s = new Set(prev); s.delete(t.sessionName); return s; });
                 setToasts((prev) => prev.filter((x) => x.id !== t.id));
               }}
