@@ -1,14 +1,15 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── Hoisted mocks ─────────────────────────────────────────────────────────────
 
+const MOCK_SESSIONS = [
+  { name: 'deck_proj_brain', agentType: 'claude-code', state: 'running', projectName: 'proj' },
+  { name: 'deck_proj_w1', agentType: 'codex', state: 'running', projectName: 'proj' },
+  { name: 'deck_proj_w2', agentType: 'gemini', state: 'idle', projectName: 'proj' },
+];
 vi.mock('../../src/store/session-store.js', () => ({
-  listSessions: () => [
-    { name: 'deck_proj_brain', agentType: 'claude-code', state: 'running', projectName: 'proj' },
-    { name: 'deck_proj_w1', agentType: 'codex', state: 'running', projectName: 'proj' },
-    { name: 'deck_proj_w2', agentType: 'gemini', state: 'idle', projectName: 'proj' },
-  ],
-  getSession: () => null,
+  listSessions: () => MOCK_SESSIONS,
+  getSession: (name: string) => MOCK_SESSIONS.find(s => s.name === name) ?? null,
   upsertSession: vi.fn(),
   removeSession: vi.fn(),
 }));
@@ -104,7 +105,8 @@ vi.mock('../../src/util/imc-dir.js', () => ({
 
 // ── Imports (after mocks) ─────────────────────────────────────────────────────
 
-import { parseAtTokens } from '../../src/daemon/command-handler.js';
+import { parseAtTokens, handleWebCommand } from '../../src/daemon/command-handler.js';
+import { startP2pRun, listP2pRuns } from '../../src/daemon/p2p-orchestrator.js';
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -206,5 +208,107 @@ describe('parseAtTokens', () => {
       expect(result.cleanText).toBe(input);
       expect(result.expandAll).toBeUndefined();
     });
+  });
+});
+
+// ── Structured WS field routing (no inline @@tokens) ──────────────────────────
+
+describe('structured P2P routing via WS fields', () => {
+  const mockServerLink = {
+    send: vi.fn(),
+    sendTimelineEvent: vi.fn(),
+    daemonVersion: '0.1.0',
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (listP2pRuns as ReturnType<typeof vi.fn>).mockReturnValue([]);
+    (startP2pRun as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'run-1' });
+  });
+
+  it('p2pAtTargets with __all__ expands to all active sessions', async () => {
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'review this code',
+      commandId: 'cmd-1',
+      p2pAtTargets: [{ session: '__all__', mode: 'audit' }],
+    }, mockServerLink as any);
+
+    // Give async handler time to process
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(startP2pRun).toHaveBeenCalledOnce();
+    const [_initiator, targets, cleanText] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(targets.length).toBeGreaterThan(0);
+    expect(targets.every((t: any) => t.mode === 'audit')).toBe(true);
+    // Text should be clean — no @@tokens
+    expect(cleanText).toBe('review this code');
+    expect(cleanText).not.toContain('@@');
+  });
+
+  it('p2pAtTargets with specific session sends to that session', async () => {
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'check the tests',
+      commandId: 'cmd-2',
+      p2pAtTargets: [{ session: 'deck_proj_w1', mode: 'review' }],
+    }, mockServerLink as any);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(startP2pRun).toHaveBeenCalledOnce();
+    const [_initiator, targets, cleanText] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(targets).toEqual([{ session: 'deck_proj_w1', mode: 'review' }]);
+    expect(cleanText).toBe('check the tests');
+  });
+
+  it('p2pMode field expands to all sessions with that mode', async () => {
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'brainstorm ideas',
+      commandId: 'cmd-3',
+      p2pMode: 'brainstorm',
+    }, mockServerLink as any);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(startP2pRun).toHaveBeenCalledOnce();
+    const [_initiator, targets, cleanText] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(targets.length).toBeGreaterThan(0);
+    expect(targets.every((t: any) => t.mode === 'brainstorm')).toBe(true);
+    expect(cleanText).toBe('brainstorm ideas');
+  });
+
+  it('plain text without p2p fields is sent directly (no P2P)', async () => {
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'just a normal message',
+      commandId: 'cmd-4',
+    }, mockServerLink as any);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Should NOT trigger P2P
+    expect(startP2pRun).not.toHaveBeenCalled();
+  });
+
+  it('legacy @@all(audit) in text still works (backward compat)', async () => {
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: '@@all(audit) legacy client message',
+      commandId: 'cmd-5',
+    }, mockServerLink as any);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(startP2pRun).toHaveBeenCalledOnce();
+    const [_initiator, targets] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(targets.length).toBeGreaterThan(0);
+    expect(targets.every((t: any) => t.mode === 'audit')).toBe(true);
   });
 });
