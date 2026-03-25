@@ -188,14 +188,24 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
   const { t } = useTranslation();
   const [crossSession, setCrossSession] = useState(false);
 
-  // Build combined eligible session list (exclude shell/script)
+  // Build combined eligible session list (exclude shell/script).
+  // If activeSession is a sub-session, resolve its parent for scope filtering.
+  const scopeSession = (() => {
+    if (!activeSession) return null;
+    if (activeSession.startsWith('deck_sub_')) {
+      const parentRef = subSessions.find(s => s.sessionName === activeSession)?.parentSession;
+      return parentRef ?? activeSession;
+    }
+    return activeSession;
+  })();
+
   const eligible: Array<{ key: string; shortName: string; agentType: string }> = [];
   const seen = new Set<string>();
 
   for (const s of sessions) {
     if (EXCLUDED_TYPES.has(s.agentType)) continue;
-    // When not cross-session, only show active session itself
-    if (!crossSession && activeSession && s.name !== activeSession) continue;
+    // When not cross-session, only show the scoped main session
+    if (!crossSession && scopeSession && s.name !== scopeSession) continue;
     if (seen.has(s.name)) continue;
     seen.add(s.name);
     const shortName = s.name.split('_').pop() || s.name;
@@ -204,8 +214,8 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
 
   for (const s of subSessions) {
     if (EXCLUDED_TYPES.has(s.type)) continue;
-    // When not cross-session, only show sub-sessions under active main session
-    if (!crossSession && activeSession && s.parentSession && s.parentSession !== activeSession) continue;
+    // When not cross-session, only show sub-sessions under the scoped main session
+    if (!crossSession && scopeSession && s.parentSession && s.parentSession !== scopeSession) continue;
     if (seen.has(s.sessionName)) continue;
     seen.add(s.sessionName);
     const shortName = s.label || s.sessionName;

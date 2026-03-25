@@ -614,7 +614,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     setP2pMode(m);
                     if (m === 'solo') setP2pExcludeSameType(false);
                     setP2pOpen(false);
-                    if (m === P2P_CONFIG_MODE) setP2pConfigOpen(true);
+                    // Only open config panel if no saved config exists yet
+                    if (m === P2P_CONFIG_MODE && !p2pSavedConfig) setP2pConfigOpen(true);
                   }}
                   style={{ color: P2P_MODE_COLORS[m] }}
                 >
