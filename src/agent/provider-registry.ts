@@ -27,6 +27,13 @@ export async function connectProvider(id: string, config: ProviderConfig): Promi
   wireProviderToRelay(provider);
   broadcastProviderStatus(id, true);
   logger.info({ provider: id }, 'Provider connected');
+
+  // Persist config so autoReconnectProviders can restore on daemon restart
+  if (id === 'openclaw' && config.url && config.token) {
+    import('./openclaw-config.js')
+      .then(({ saveConfig }) => saveConfig({ url: config.url!, token: config.token! }))
+      .catch((e) => logger.warn({ err: e }, 'Failed to persist openclaw config'));
+  }
 }
 
 export async function disconnectProvider(id: string): Promise<void> {
