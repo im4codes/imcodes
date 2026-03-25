@@ -449,7 +449,6 @@ program
     }
 
     const { resolveToken, saveConfig } = await import('./agent/openclaw-config.js');
-    const { connectProvider } = await import('./agent/provider-registry.js');
 
     // Resolve URL
     const url = opts.url ?? 'ws://127.0.0.1:18789';
@@ -473,26 +472,9 @@ program
       process.exit(1);
     }
 
-    // Save config first — the daemon's autoReconnectProviders reads this on restart
+    // Save config — daemon's autoReconnectProviders reads this on startup
     await saveConfig({ url, token });
-
-    // Test connectivity in this process to give immediate feedback
-    console.log(`Testing connection to ${provider} at ${url}...`);
-    try {
-      await connectProvider(provider, { url, token });
-      console.log(`Connection verified.`);
-      // Disconnect test connection — the daemon will establish its own persistent one
-      const { disconnectProvider } = await import('./agent/provider-registry.js');
-      await disconnectProvider(provider);
-    } catch (err) {
-      console.error(`Connection failed: ${err instanceof Error ? err.message : err}`);
-      process.exit(1);
-    }
-
-    // Restart the daemon so it picks up the saved config and maintains the connection
-    // (connectProvider above runs in this CLI process which exits — the daemon process
-    // needs to establish its own long-lived connection)
-    console.log(`Restarting daemon to establish persistent connection...`);
+    console.log(`Config saved. Restarting daemon...`);
     ensureServiceForeground();
     const platform = process.platform;
     if (platform === 'darwin') {
