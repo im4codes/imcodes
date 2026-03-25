@@ -790,14 +790,18 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               } catch { /* jsdom lacks Selection API */ }
             }}
             onSelectAllConfig={(cfg, rounds) => {
-              // Inject config-mode dispatch token into input
+              // Store config targets as structured data — don't expand into text
               const text = divRef.current?.textContent ?? '';
               const before = text.replace(/@[^\s@]*$/, '');
-              const tokens = Object.entries(cfg.sessions)
+              const targets = Object.entries(cfg.sessions)
                 .filter(([, entry]) => entry.enabled && entry.mode !== 'skip')
-                .map(([session, entry]) => `@@discuss(${session}, ${entry.mode})`);
-              const roundsFlag = rounds > 1 ? `@@p2p-config(rounds=${rounds}) ` : '';
-              divRef.current!.textContent = `${before}${roundsFlag}${tokens.join(' ')} `;
+                .map(([session, entry]) => ({ session, mode: entry.mode, label: `@@${session.replace(/^deck_sub_/, '')}` }));
+              const labels = targets.map(t => t.label).join(' ');
+              divRef.current!.textContent = `${before}${labels} `;
+              for (const t of targets) pendingAtTargetsRef.current.push(t);
+              // Store rounds + config for handleSend
+              setP2pSavedConfig({ sessions: cfg.sessions, rounds });
+              setP2pMode(P2P_CONFIG_MODE);
               atSelectionSnapshotRef.current = divRef.current!.textContent;
               atSelectionLockRef.current = true;
               setAtPickerOpen(false);
