@@ -310,17 +310,19 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
 
     const targets = [...run.remainingTargets];
 
-    // ── Phase 1: Initiator initial analysis ──
-    if (run._cancelled) return;
-    const initialHeader = `${shortName(run.initiatorSession)} — Initial Analysis${roundLabel}`;
-    const initialPrompt = buildHopPrompt(run, modeConfig, {
-      session: run.initiatorSession,
-      sectionHeader: initialHeader,
-      instruction: 'Read the context file below and provide your initial analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.',
-      isInitial: true,
-    }, rp);
-    await dispatchHop(run, run.initiatorSession, initialPrompt, serverLink, undefined, initialHeader);
-    if (run._cancelled || isTerminal(run.status)) return;
+    // ── Phase 1: Initiator initial analysis (first round only) ──
+    if (run.currentRound === 1) {
+      if (run._cancelled) return;
+      const initialHeader = `${shortName(run.initiatorSession)} — Initial Analysis${roundLabel}`;
+      const initialPrompt = buildHopPrompt(run, modeConfig, {
+        session: run.initiatorSession,
+        sectionHeader: initialHeader,
+        instruction: 'Read the context file below and provide your initial analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.',
+        isInitial: true,
+      }, rp);
+      await dispatchHop(run, run.initiatorSession, initialPrompt, serverLink, undefined, initialHeader);
+      if (run._cancelled || isTerminal(run.status)) return;
+    }
 
     // ── Phase 2: Sub-session hops ──
     for (let i = 0; i < targets.length; i++) {
@@ -342,26 +344,33 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       logger.info({ runId: run.id, target: target.session, status: run.status }, 'P2P: Phase 2 — hop dispatch returned');
       if (run._cancelled || isTerminal(run.status)) return;
     }
-  }
 
-  // ── Phase 3: Initiator summary + execute user instructions ──
-  logger.info({ runId: run.id, status: run.status }, 'P2P: Phase 3 — initiator summary');
-  if (run._cancelled) return;
-  const summaryInstruction = [
-    'Read the complete context file with all participants\' contributions. Synthesize a final summary. Append it to the file.',
-    '',
-    'After writing the summary, execute the user\'s original request based on the discussion results.',
-    `Original user request: "${run.userText}"`,
-    'If the user requested output to a specific file (e.g. a plan document), generate that file now using the discussion consensus.',
-  ].join('\n');
-  const summaryPrompt = buildHopPrompt(run, modeConfig, {
-    session: run.initiatorSession,
-    sectionHeader: `${shortName(run.initiatorSession)} — Summary`,
-    instruction: summaryInstruction,
-    isInitial: false,
-  });
-  const summaryHeader = `${shortName(run.initiatorSession)} — Summary`;
-  await dispatchHop(run, run.initiatorSession, summaryPrompt, serverLink, undefined, summaryHeader);
+    // ── Round summary: Initiator synthesizes this round ──
+    if (run._cancelled) return;
+    const isLastRound = run.currentRound === run.rounds;
+    const roundSummaryHeader = isLastRound
+      ? `${shortName(run.initiatorSession)} — Final Summary`
+      : `${shortName(run.initiatorSession)} — Round ${run.currentRound}/${run.rounds} Summary`;
+    const roundSummaryInstruction = isLastRound
+      ? [
+          'Read the complete context file with ALL rounds of discussion.',
+          'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.',
+          '',
+          'After writing the summary, execute the user\'s original request based on the discussion results.',
+          `Original user request: "${run.userText}"`,
+          'If the user requested output to a specific file (e.g. a plan document), generate that file now using the discussion consensus.',
+        ].join('\n')
+      : `Synthesize the key points, areas of agreement, and open questions from this round. Then assign specific focus areas or questions for each participant in the next round (round ${run.currentRound + 1}). Append to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`;
+    const roundSummaryPrompt = buildHopPrompt(run, modeConfig, {
+      session: run.initiatorSession,
+      sectionHeader: roundSummaryHeader,
+      instruction: roundSummaryInstruction,
+      isInitial: false,
+    }, rp);
+    logger.info({ runId: run.id, round: run.currentRound, isLastRound }, isLastRound ? 'P2P: Final summary — initiator' : 'P2P: Round summary — initiator');
+    await dispatchHop(run, run.initiatorSession, roundSummaryPrompt, serverLink, undefined, roundSummaryHeader);
+    if (run._cancelled || isTerminal(run.status)) return;
+  }
   if (run._cancelled || isTerminal(run.status)) return;
 
   // ── Done ──
