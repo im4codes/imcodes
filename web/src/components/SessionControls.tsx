@@ -245,25 +245,45 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const activeSub = (subSessions ?? []).find((s) => s.sessionName === activeSession?.name);
   const rootSession = activeSub?.parentSession || activeSession?.name || '';
 
-  const buildAgentToken = (session: string, mode: string) =>
-    session === '__all__' ? `@@all(${mode})` : `@@discuss(${session}, ${mode})`;
+  /** Build a short display label for the input box — the full token is sent via WS extra fields. */
+  const buildAgentLabel = (session: string, _mode: string) =>
+    session === '__all__' ? '@all' : `@${session.replace(/^deck_sub_/, '')}`;
 
-  /** Unified message preprocessing — applies P2P mode to any outgoing message. */
-  const prepareMessage = useCallback((text: string): string => {
-    if (p2pMode === 'solo' || text.includes('@@')) return text;
-    if (p2pMode === P2P_CONFIG_MODE) {
-      // Config mode: send @@all(config) and let daemon expand per-session modes.
-      // Config data + rounds are sent as structured WS fields, not in the text.
-      return `@@all(config) ${text}`;
-    }
-    const flag = p2pExcludeSameType ? `, exclude-same-type` : '';
-    return `@@all(${p2pMode}${flag}) ${text}`;
-  }, [p2pMode, p2pExcludeSameType, p2pSavedConfig]);
+  /** Pending @-selected P2P targets — populated by @ picker, consumed by handleSend. */
+  const pendingAtTargetsRef = useRef<Array<{ session: string; mode: string }>>([]);
+
+  /** Strip @-labels from text (they're sent as structured fields, not inline tokens). */
+  const stripAtLabels = (text: string): string =>
+    text.replace(/@all\b/g, '').replace(/@[a-zA-Z0-9_]+/g, '').replace(/\s+/g, ' ').trim();
 
   const handleSend = useCallback(() => {
     let text = getText();
     if ((!text && attachments.length === 0) || !ws || !activeSession) return;
-    text = prepareMessage(text);
+
+    // Build P2P routing as structured WS fields — keep text clean for display.
+    const extra: Record<string, unknown> = {};
+    const atTargets = pendingAtTargetsRef.current.splice(0);
+
+    if (atTargets.length > 0) {
+      // @ picker was used — send targets as structured field, strip labels from text
+      text = stripAtLabels(text);
+      extra.p2pAtTargets = atTargets;
+    } else if (p2pMode !== 'solo' && !text.includes('@@')) {
+      // Dropdown P2P mode — daemon handles expansion
+      if (p2pMode === P2P_CONFIG_MODE) {
+        extra.p2pMode = 'config';
+      } else {
+        extra.p2pMode = p2pMode;
+        if (p2pExcludeSameType) extra.p2pExcludeSameType = true;
+      }
+    }
+
+    if (p2pMode === P2P_CONFIG_MODE && p2pSavedConfig) {
+      extra.p2pSessionConfig = p2pSavedConfig.sessions;
+      extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
+      if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
+    }
+
     // Prepend attachment references
     if (attachments.length > 0) {
       const refs = attachments.map((a) => `@${a.path}`).join(' ');
@@ -271,12 +291,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     }
     quickData.recordHistory(text, activeSession.name);
     try {
-      const extra: Record<string, unknown> = {};
-      if (p2pMode === P2P_CONFIG_MODE && p2pSavedConfig) {
-        extra.p2pSessionConfig = p2pSavedConfig.sessions;
-        extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
-        if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
-      }
       ws.sendSessionCommand('send', { sessionName: activeSession.name, text, ...extra });
     } catch {
       return;
@@ -290,24 +304,27 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     histIdxRef.current = -1;
     draftRef.current = '';
     if (draftKey) sessionStorage.removeItem(draftKey);
-  }, [ws, activeSession, quickData, onSend, attachments, p2pMode, p2pSavedConfig]);
+  }, [ws, activeSession, quickData, onSend, attachments, p2pMode, p2pExcludeSameType, p2pSavedConfig]);
 
-  // Voice overlay send handler — applies same P2P mode + config as text send
+  // Voice overlay send handler — applies same P2P mode as text send
   const handleVoiceSend = useCallback((voiceText: string) => {
     if (!ws || !activeSession) return;
-    const text = prepareMessage(voiceText);
-    quickData.recordHistory(text, activeSession.name);
+    const extra: Record<string, unknown> = {};
+    if (p2pMode !== 'solo') {
+      extra.p2pMode = p2pMode === P2P_CONFIG_MODE ? 'config' : p2pMode;
+      if (p2pExcludeSameType && p2pMode !== P2P_CONFIG_MODE) extra.p2pExcludeSameType = true;
+    }
+    if (p2pMode === P2P_CONFIG_MODE && p2pSavedConfig) {
+      extra.p2pSessionConfig = p2pSavedConfig.sessions;
+      extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
+      if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
+    }
+    quickData.recordHistory(voiceText, activeSession.name);
     try {
-      const extra: Record<string, unknown> = {};
-      if (p2pMode === P2P_CONFIG_MODE && p2pSavedConfig) {
-        extra.p2pSessionConfig = p2pSavedConfig.sessions;
-        extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
-        if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
-      }
-      ws.sendSessionCommand('send', { sessionName: activeSession.name, text, ...extra });
+      ws.sendSessionCommand('send', { sessionName: activeSession.name, text: voiceText, ...extra });
     } catch { return; }
-    onSend?.(activeSession.name, text);
-  }, [ws, activeSession, quickData, onSend, prepareMessage, p2pMode, p2pSavedConfig]);
+    onSend?.(activeSession.name, voiceText);
+  }, [ws, activeSession, quickData, onSend, p2pMode, p2pExcludeSameType, p2pSavedConfig]);
 
   const handleKeyDown = (e: KeyboardEvent) => {
     // When @ picker is open, let it handle Enter/Arrow/Escape — don't send or navigate history
@@ -746,7 +763,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             onSelectAgent={(session, mode) => {
               const text = divRef.current?.textContent ?? '';
               const before = text.replace(/@[^\s@]*$/, '');
-              divRef.current!.textContent = `${before}${buildAgentToken(session, mode)} `;
+              // Show short label in input; full token sent via WS extra fields
+              divRef.current!.textContent = `${before}${buildAgentLabel(session, mode)} `;
+              pendingAtTargetsRef.current.push({ session, mode });
               atSelectionSnapshotRef.current = divRef.current!.textContent;
               atSelectionLockRef.current = true;
               setAtPickerOpen(false);

@@ -250,10 +250,11 @@ describe('SessionControls', () => {
     fireEvent.input(input);
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
 
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       sessionName: 'deck_my-project_brain',
-      text: '@@discuss(deck_sub_w1, audit) please review',
-    });
+      text: 'please review',
+      p2pAtTargets: [{ session: 'deck_sub_w1', mode: 'audit' }],
+    }));
 
     getSelectionSpy.mockRestore();
   });
@@ -282,7 +283,8 @@ describe('SessionControls', () => {
     fireEvent.click(screen.getByText('Worker Alpha'));
     fireEvent.click(screen.getByText('audit'));
 
-    expect(input.textContent).toBe('@@discuss(deck_sub_worker-alpha, audit) ');
+    // Input shows short label, not full @@discuss token (daemon handles expansion)
+    expect(input.textContent).toBe('@worker-alpha ');
     getSelectionSpy.mockRestore();
   });
 

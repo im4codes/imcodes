@@ -629,12 +629,41 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   }
   dedup.add(effectiveId);
 
-  // Check for P2P tokens
-  const tokens = parseAtTokens(text);
-
+  // ── P2P routing: structured WS fields (new) or inline @@tokens (legacy) ──
   const p2pSessionConfig = (cmd as any).p2pSessionConfig as P2pSessionConfig | undefined;
   let p2pRounds = (cmd as any).p2pRounds as number | undefined;
   const p2pExtraPrompt = (cmd as any).p2pExtraPrompt as string | undefined;
+  const p2pModeField = (cmd as any).p2pMode as string | undefined;
+  const p2pAtTargets = (cmd as any).p2pAtTargets as Array<{ session: string; mode: string }> | undefined;
+
+  // Build P2P tokens from structured fields (frontend no longer injects @@tokens into text)
+  let tokens: ParsedTokens;
+  if (p2pAtTargets && p2pAtTargets.length > 0) {
+    // @ picker targets — expand __all__ or use specific sessions
+    const agents: P2pTarget[] = [];
+    const files: string[] = [];
+    for (const t of p2pAtTargets) {
+      if (t.session === '__all__') {
+        agents.push(...expandAllTargets(sessionName, t.mode, false, p2pSessionConfig));
+      } else if (getSession(t.session)) {
+        agents.push({ session: t.session, mode: t.mode });
+      }
+    }
+    // Extract @file references from text
+    for (const m of text.matchAll(FILE_TOKEN_RE)) files.push(m[1]);
+    const cleanText = text.replace(FILE_TOKEN_RE, '').replace(/\s+/g, ' ').trim();
+    tokens = { agents, files, cleanText };
+  } else if (p2pModeField) {
+    // Dropdown P2P mode — expand to all targets
+    const agents = expandAllTargets(sessionName, p2pModeField, !!(cmd as any).p2pExcludeSameType, p2pSessionConfig);
+    const files: string[] = [];
+    for (const m of text.matchAll(FILE_TOKEN_RE)) files.push(m[1]);
+    const cleanText = text.replace(FILE_TOKEN_RE, '').replace(/\s+/g, ' ').trim();
+    tokens = { agents, files, cleanText };
+  } else {
+    // Legacy: parse @@tokens from text (backward compat with older frontends)
+    tokens = parseAtTokens(text);
+  }
 
   // Extract rounds from @@p2p-config(rounds=N) text token if not in WS field
   if (!p2pRounds) {
@@ -650,7 +679,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     return;
   }
 
-  // @@all(mode) — expand to all active sessions in the same domain
+  // @@all(mode) from legacy text tokens — expand to all active sessions
   if (tokens.expandAll && tokens.agents.length === 0) {
     const mode = tokens.expandAll.mode;
     tokens.agents.push(...expandAllTargets(sessionName, mode, tokens.expandAll.excludeSameType, p2pSessionConfig));
@@ -661,6 +690,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       return;
     }
     logger.info({ sessionName, targets: tokens.agents.map(a => a.session) }, '@@all expanded');
+  }
+
+  // No targets found from any source
+  if ((p2pAtTargets || p2pModeField) && tokens.agents.length === 0) {
+    logger.warn({ sessionName, p2pModeField }, 'P2P: no active sessions found for structured routing');
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: 'No active sessions found' });
+    try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: 'no_sessions' }); } catch {}
+    return;
   }
 
   if (tokens.agents.length > 0) {
