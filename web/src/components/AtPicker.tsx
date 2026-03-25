@@ -360,12 +360,11 @@ export function AtPicker({
       }
 
       // Files or Agents list
-      const kbAgentMap = new Map(agents.map(a => [a.session, a]));
-      const kbVisibleAgents = p2pConfig
-        ? Object.entries(p2pConfig.sessions)
-            .filter(([, e]) => e.enabled && e.mode !== 'skip')
-            .map(([s]) => kbAgentMap.get(s))
-            .filter((a): a is NonNullable<typeof a> => a !== null)
+      // Filter agents to match render path: when p2pConfig exists, keep agents whose
+      // config entry is enabled (or agents not in config at all — non-strict match)
+      const kbConfigMap = p2pConfig ? new Map(Object.entries(p2pConfig.sessions)) : null;
+      const kbVisibleAgents = kbConfigMap
+        ? agents.filter(a => { const entry = kbConfigMap.get(a.session); return !entry || (entry.enabled && entry.mode !== 'skip'); })
         : agents;
       const nonSelfCount = kbVisibleAgents.filter(a => !a.isSelf).length;
       const hasAllRow = category === 'agents' && nonSelfCount > 1;

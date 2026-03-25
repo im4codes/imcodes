@@ -12,7 +12,7 @@ import { timelineStore } from './timeline-store.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { upsertSession, getSession, removeSession } from '../store/session-store.js';
 import { existsSync } from 'node:fs';
-import path from 'node:path';
+
 import logger from '../util/logger.js';
 import { getAgentVersion } from '../agent/agent-version.js';
 import { randomUUID } from 'node:crypto';
@@ -90,8 +90,8 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
 
   // Start Watchers
   if (agentType === 'claude-code' && sub.ccSessionId && sub.cwd) {
-    const { startWatchingFile, claudeProjectDir } = await import('./jsonl-watcher.js');
-    startWatchingFile(sessionName, path.join(claudeProjectDir(sub.cwd), `${sub.ccSessionId}.jsonl`));
+    const { startWatchingFile, findJsonlPathBySessionId } = await import('./jsonl-watcher.js');
+    startWatchingFile(sessionName, findJsonlPathBySessionId(sub.cwd, sub.ccSessionId));
   } else if (agentType === 'codex' && sub.codexSessionId) {
     const { startWatchingById } = await import('./codex-watcher.js');
     void startWatchingById(sessionName, sub.codexSessionId, sub.codexModel ?? undefined);
@@ -144,7 +144,7 @@ export async function stopSubSession(sessionName: string, serverLink?: { send(ms
 }
 
 export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promise<void> {
-  const { startWatchingFile, claudeProjectDir, ensureClaudeSessionFile, isWatching } = await import('./jsonl-watcher.js');
+  const { startWatchingFile, findJsonlPathBySessionId, ensureClaudeSessionFile, isWatching } = await import('./jsonl-watcher.js');
   const { startWatchingById, isWatching: isCodexWatching, isFileClaimedByOther } = await import('./codex-watcher.js');
   const { startWatching: startGeminiWatching, startWatchingDiscovered: startGeminiWatchingDiscovered, isWatching: isGeminiWatching } = await import('./gemini-watcher.js');
 
@@ -160,7 +160,7 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         await ensureClaudeSessionFile(effectiveCcSessionId, sub.cwd).catch((e) =>
           logger.warn({ err: e, sessionName, ccSessionId: effectiveCcSessionId }, 'Failed to ensure Claude seed session file during sub-session rebuild'),
         );
-        startWatchingFile(sessionName, path.join(claudeProjectDir(sub.cwd), `${effectiveCcSessionId}.jsonl`));
+        startWatchingFile(sessionName, findJsonlPathBySessionId(sub.cwd, effectiveCcSessionId));
       } else if (sub.type === 'codex' && !isCodexWatching(sessionName)) {
         const effectiveCodexId = sub.codexSessionId ?? stored?.codexSessionId;
         if (effectiveCodexId && !isFileClaimedByOther(sessionName, effectiveCodexId)) {

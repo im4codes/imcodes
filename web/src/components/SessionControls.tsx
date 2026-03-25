@@ -355,10 +355,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const handleKeyDown = (e: KeyboardEvent) => {
     // When @ picker is open, let it handle Enter/Arrow/Escape — don't send or navigate history
+    // AtPicker registers a document-level capture handler that fires BEFORE this bubble handler.
+    // AtPicker calls preventDefault + stopPropagation, so this code only runs if AtPicker didn't handle it.
     if (atPickerOpen && (e.key === 'Enter' || e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'Escape')) {
-      // Prevent contenteditable default (Enter = newline, arrows = cursor move)
-      e.preventDefault();
-      // AtPicker's document-level keydown handler will handle these
       return;
     }
     // Block Enter right after picker closes (prevents accidental send from the same Enter that selected)

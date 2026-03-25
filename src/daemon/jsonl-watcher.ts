@@ -14,6 +14,7 @@
  */
 
 import { watch, readdir, stat, open, mkdir, writeFile } from 'fs/promises';
+import { readdirSync, statSync } from 'fs';
 import type { FileChangeInfo } from 'fs/promises';
 import { join, dirname, basename } from 'path';
 import { homedir } from 'os';
@@ -35,9 +36,37 @@ export function claudeProjectDir(workDir: string): string {
   return join(homedir(), '.claude', 'projects', key);
 }
 
-/** Deterministic path for a Claude Code transcript file by cwd + session UUID. */
+/**
+ * Scan ~/.claude/projects/* for {sessionId}.jsonl.
+ * UUID is globally unique so we don't need the project key to locate it.
+ * Returns the real path if found, null otherwise.
+ */
+export function scanForJsonlBySessionId(sessionId: string): string | null {
+  const projectsRoot = join(homedir(), '.claude', 'projects');
+  const filename = `${sessionId}.jsonl`;
+  let dirs: string[];
+  try {
+    dirs = readdirSync(projectsRoot);
+  } catch {
+    return null;
+  }
+  for (const d of dirs) {
+    const candidate = join(projectsRoot, d, filename);
+    try {
+      statSync(candidate);
+      return candidate;
+    } catch { /* not here */ }
+  }
+  return null;
+}
+
+/**
+ * Locate a Claude Code transcript file by session UUID.
+ * First scans ~/.claude/projects/* (robust against project-key changes),
+ * then falls back to the deterministic path for seed creation.
+ */
 export function findJsonlPathBySessionId(workDir: string, sessionId: string): string {
-  return join(claudeProjectDir(workDir), `${sessionId}.jsonl`);
+  return scanForJsonlBySessionId(sessionId) ?? join(claudeProjectDir(workDir), `${sessionId}.jsonl`);
 }
 
 function buildSeedText(cwd: string, memory: string | null): string {

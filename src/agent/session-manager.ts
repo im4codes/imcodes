@@ -22,11 +22,11 @@ import {
 } from '../store/session-store.js';
 import logger from '../util/logger.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
-import { startWatching, startWatchingFile, stopWatching, isWatching, claudeProjectDir, ensureClaudeSessionFile, findJsonlPathBySessionId } from '../daemon/jsonl-watcher.js';
+import { startWatching, startWatchingFile, stopWatching, isWatching, ensureClaudeSessionFile, findJsonlPathBySessionId } from '../daemon/jsonl-watcher.js';
 import { startWatching as startCodexWatching, startWatchingSpecificFile as startCodexWatchingFile, startWatchingById as startCodexWatchingById, stopWatching as stopCodexWatching, isWatching as isCodexWatching, findRolloutPathByUuid, extractNewRolloutUuid, ensureSessionFile as ensureCodexSessionFile } from '../daemon/codex-watcher.js';
 import { startWatching as startGeminiWatching, startWatchingLatest as startGeminiWatchingLatest, stopWatching as stopGeminiWatching, isWatching as isGeminiWatching } from '../daemon/gemini-watcher.js';
 import { randomUUID } from 'node:crypto';
-import { join } from 'node:path';
+
 import { existsSync } from 'node:fs';
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
@@ -764,7 +764,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     // Claude 2.1+ rejects --session-id when the UUID already has a JSONL on disk ("already in use").
     let launchCmd: string;
     if (agentType === 'claude-code' && ccSessionId) {
-      const jsonlPath = join(claudeProjectDir(projectDir), `${ccSessionId}.jsonl`);
+      const jsonlPath = findJsonlPathBySessionId(projectDir, ccSessionId);
       if (existsSync(jsonlPath)) {
         launchCmd = driver.buildResumeCommand(name, { cwd: projectDir, ccSessionId }) ?? driver.buildLaunchCommand(name, { cwd: projectDir, fresh, ccSessionId, codexSessionId, geminiSessionId });
       } else {
