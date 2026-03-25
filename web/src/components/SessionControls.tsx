@@ -805,14 +805,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 sel?.addRange(range);
               } catch { /* jsdom lacks Selection API */ }
             }}
-            onSelectAllConfig={(cfg, rounds) => {
-              // Just show @@all — daemon expands per config. Don't list individual sessions.
+            onSelectAllConfig={() => {
+              // Just show @@all — daemon expands per saved config. Don't touch dropdown mode.
               const text = divRef.current?.textContent ?? '';
               const before = text.replace(/@[^\s@]*$/, '');
               divRef.current!.textContent = `${before}@@all `;
               pendingAtTargetsRef.current.push({ session: '__all__', mode: 'config', label: '@@all' });
-              setP2pSavedConfig({ sessions: cfg.sessions, rounds });
-              setP2pMode(P2P_CONFIG_MODE);
               atSelectionSnapshotRef.current = divRef.current!.textContent;
               atSelectionLockRef.current = true;
               setAtPickerOpen(false);
