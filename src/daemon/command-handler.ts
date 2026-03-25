@@ -1466,28 +1466,51 @@ launchctl load -w "${plist}"`;
   const npmBin = join(dirname(process.execPath), 'npm');
   const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
 
-  const script = `#!/bin/bash
-LOG="${logFile}"
-echo "=== imcodes upgrade started at $(date) ===" >> "$LOG"
+  // Detect dev mode: npm link creates a symlink from global node_modules to the repo
+  const globalPkg = join(dirname(dirname(process.execPath)), 'lib', 'node_modules', 'imcodes');
+  let isLinked = false;
+  let linkTarget = '';
+  try {
+    const { lstatSync, readlinkSync } = await import('fs');
+    const st = lstatSync(globalPkg);
+    if (st.isSymbolicLink()) {
+      isLinked = true;
+      linkTarget = readlinkSync(globalPkg);
+    }
+  } catch { /* not linked */ }
 
-# Give the running daemon a moment to finish sending its response
-sleep 3
-
-# Remove npm link if present — it shadows npm install and prevents real upgrades
-GLOBAL_PKG=$(${npmCmd} root -g 2>/dev/null)/imcodes
-if [ -L "$GLOBAL_PKG" ]; then
-  echo "Removing npm link ($GLOBAL_PKG -> $(readlink "$GLOBAL_PKG"))..." >> "$LOG"
-  ${npmCmd} uninstall -g imcodes >> "$LOG" 2>&1 || true
-fi
-
-# Attempt npm install — if it fails we still restart to keep the daemon alive
+  let upgradeCmd: string;
+  if (isLinked && linkTarget) {
+    // Dev mode: git pull + rebuild in the linked repo, keep the link
+    upgradeCmd = `
+echo "Dev mode detected (npm link → ${linkTarget})" >> "$LOG"
+cd "${linkTarget}"
+echo "Pulling latest from origin..." >> "$LOG"
+git pull origin master >> "$LOG" 2>&1 || echo "git pull failed (exit $?)" >> "$LOG"
+echo "Installing deps..." >> "$LOG"
+"${npmCmd}" install >> "$LOG" 2>&1 || true
+echo "Building..." >> "$LOG"
+"${npmCmd}" run build >> "$LOG" 2>&1 || echo "Build failed (exit $?)" >> "$LOG"
+`;
+  } else {
+    // Production: install from npm registry
+    upgradeCmd = `
 echo "Installing imcodes@latest..." >> "$LOG"
 if "${npmCmd}" install -g imcodes@latest >> "$LOG" 2>&1; then
   echo "Install succeeded." >> "$LOG"
 else
   echo "Install FAILED (exit $?). Will restart on existing version." >> "$LOG"
 fi
+`;
+  }
 
+  const script = `#!/bin/bash
+LOG="${logFile}"
+echo "=== imcodes upgrade started at $(date) ===" >> "$LOG"
+
+# Give the running daemon a moment to finish sending its response
+sleep 3
+${upgradeCmd}
 # Always restart the service
 echo "Restarting service..." >> "$LOG"
 ${restartCmd} >> "$LOG" 2>&1 || echo "Restart command failed (exit $?)" >> "$LOG"
