@@ -1793,6 +1793,7 @@ export function App() {
               sub={sub}
               ws={wsRef.current}
               connected={connected}
+              active={isOpen}
               onDiff={registerDiffApplyer}
               onHistory={registerHistoryApplyer}
               onMinimize={() => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; })}

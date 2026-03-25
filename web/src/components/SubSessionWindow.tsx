@@ -22,6 +22,8 @@ interface Props {
   sub: SubSession;
   ws: WsClient | null;
   connected: boolean;
+  /** When false, timeline and terminal subscriptions are paused to save CPU. */
+  active: boolean;
   onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void;
   onHistory: (sessionName: string, apply: (c: string) => void) => void;
   onMinimize: () => void;
@@ -60,12 +62,14 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, zIndex, onFocus, sessions, subSessions, serverId,
+  sub, ws, connected, active, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, zIndex, onFocus, sessions, subSessions, serverId,
 }: Props) {
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const swipeBackRef = useSwipeBack(isMobile ? onMinimize : null);
 
-  const { events, refreshing } = useTimeline(sub.sessionName, ws);
+  // Pause timeline subscription when window is hidden — prevents invisible
+  // windows from processing WS events, running memos, and re-rendering.
+  const { events, refreshing } = useTimeline(active ? sub.sessionName : null, active ? ws : null);
   const quickData = useQuickData();
 
   // Earliest ts of the current continuous thinking sequence (shared logic).
@@ -76,11 +80,11 @@ export function SubSessionWindow({
 
   const [thinkingNow, setThinkingNow] = useState(() => Date.now());
   useEffect(() => {
-    if (!activeThinkingTs) return;
+    if (!activeThinkingTs || !active) return;
     setThinkingNow(Date.now());
     const id = setInterval(() => setThinkingNow(Date.now()), 1000);
     return () => clearInterval(id);
-  }, [!!activeThinkingTs]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [!!activeThinkingTs, active]); // eslint-disable-line react-hooks/exhaustive-deps
   const isShell = sub.type === 'shell' || sub.type === 'script';
   const initial = loadLocal(sub.id);
   const [geom, setGeom] = useState<WindowGeometry>(initial.geom);
@@ -142,9 +146,9 @@ export function SubSessionWindow({
   // SubSessionWindow unmounts on minimize, so without this the remounted
   // TerminalView would start empty (no snapshot, only incremental data).
   useEffect(() => {
-    if (!ws || !connected) return;
+    if (!ws || !connected || !active) return;
     try { ws.subscribeTerminal(sub.sessionName); } catch { /* ignore */ }
-  }, [ws, connected, sub.sessionName]);
+  }, [ws, connected, sub.sessionName, active]);
 
   const scrollToBottom = useCallback(() => {
     setTimeout(() => {
