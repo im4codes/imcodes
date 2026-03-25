@@ -69,6 +69,8 @@ export interface P2pRun {
   currentRound: number;
   /** Full set of targets for repeating across rounds. */
   allTargets: P2pTarget[];
+  /** User-defined extra prompt appended to every participant's system prompt. */
+  extraPrompt: string;
   /** Internal: set to true when cancel requested */
   _cancelled: boolean;
 }
@@ -168,6 +170,7 @@ export async function startP2pRun(
   fileContents: Array<{ path: string; content: string }>,
   serverLink: ServerLink | null,
   rounds?: number,
+  extraPrompt?: string,
 ): Promise<P2pRun> {
   // Validate same domain
   const mainSession = extractMainSession(initiatorSession);
@@ -225,6 +228,7 @@ export async function startP2pRun(
     rounds: totalRounds,
     currentRound: 1,
     allTargets: [...targets],
+    extraPrompt: extraPrompt ?? '',
     _cancelled: false,
   };
 
@@ -680,6 +684,12 @@ function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: HopOpts, r
   parts.push(`Rules: ALL analysis goes into this same file.`);
   parts.push(`Do NOT ask for confirmation. Do NOT explain your plan. Execute immediately.`);
   parts.push(`After writing to the file, print a brief response summary of what you wrote, then say: Done`);
+
+  // User-defined extra prompt (e.g. "使用中文回复", "focus on security")
+  if (run.extraPrompt) {
+    parts.push('');
+    parts.push(`Additional instructions: ${run.extraPrompt}`);
+  }
 
   return parts.join('\n');
 }

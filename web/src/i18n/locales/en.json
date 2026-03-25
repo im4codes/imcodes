@@ -268,6 +268,8 @@
     "settings_default_hint": "New sessions default to: enabled + audit",
     "settings_rounds": "Rounds",
     "settings_rounds_hint": "Number of discussion rounds (more = deeper analysis)",
+    "settings_extra_prompt": "Extra Instructions",
+    "settings_extra_prompt_hint": "Additional instructions for all participants (e.g. \"Reply in Chinese\")",
     "all_label": "All",
     "all_rounds": "{{count}} round",
     "all_rounds_plural": "{{count}} rounds",

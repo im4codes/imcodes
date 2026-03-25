@@ -268,6 +268,8 @@
     "settings_default_hint": "Sesiones nuevas por defecto: habilitado + audit",
     "settings_rounds": "Rondas",
     "settings_rounds_hint": "Número de rondas (más = análisis más profundo)",
+    "settings_extra_prompt": "Instrucciones extra",
+    "settings_extra_prompt_hint": "Instrucciones adicionales para todos (ej. \"Responder en español\")",
     "all_label": "Todos",
     "all_rounds": "{{count}} ronda",
     "all_rounds_plural": "{{count}} rondas",

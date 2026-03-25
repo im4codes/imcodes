@@ -209,6 +209,7 @@ export function P2pConfigPanel({ sessions, subSessions, onClose, onSave }: Props
   // Local config state: per-session enabled + mode
   const [sessionCfg, setSessionCfg] = useState<P2pSessionConfig>({});
   const [rounds, setRounds] = useState(3);
+  const [extraPrompt, setExtraPrompt] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
@@ -221,6 +222,7 @@ export function P2pConfigPanel({ sessions, subSessions, onClose, onSave }: Props
           const parsed: P2pSavedConfig = JSON.parse(raw);
           setSessionCfg(parsed.sessions ?? {});
           setRounds(parsed.rounds ?? 3);
+          setExtraPrompt(parsed.extraPrompt ?? '');
         } catch { /* start fresh */ }
       }
       setLoading(false);
@@ -250,7 +252,7 @@ export function P2pConfigPanel({ sessions, subSessions, onClose, onSave }: Props
         merged[e.key] = { enabled: true, mode: 'audit' };
       }
     }
-    const cfg: P2pSavedConfig = { sessions: merged, rounds };
+    const cfg: P2pSavedConfig = { sessions: merged, rounds, extraPrompt: extraPrompt.trim() || undefined };
     try {
       await saveUserPref('p2p_session_config', JSON.stringify(cfg));
       onSave(cfg);
@@ -328,6 +330,27 @@ export function P2pConfigPanel({ sessions, subSessions, onClose, onSave }: Props
               <div style={{ fontSize: 11, color: '#64748b', marginTop: 6 }}>
                 {t('p2p.settings_rounds_hint')}
               </div>
+
+              {/* Extra prompt */}
+              <div style={{ ...sectionLabelStyle, marginTop: 12 }}>{t('p2p.settings_extra_prompt')}</div>
+              <textarea
+                value={extraPrompt}
+                onInput={(e) => setExtraPrompt((e.target as HTMLTextAreaElement).value)}
+                placeholder={t('p2p.settings_extra_prompt_hint')}
+                rows={2}
+                style={{
+                  width: '100%',
+                  background: '#0f172a',
+                  border: '1px solid #334155',
+                  borderRadius: 6,
+                  color: '#e2e8f0',
+                  fontFamily: 'inherit',
+                  fontSize: 13,
+                  padding: '6px 8px',
+                  resize: 'vertical',
+                  outline: 'none',
+                }}
+              />
             </>
           )}
         </div>

@@ -14,6 +14,8 @@ export type P2pSessionConfig = Record<string, P2pSessionEntry>;
 export interface P2pSavedConfig {
   sessions: P2pSessionConfig;
   rounds: number;
+  /** User-defined extra prompt appended to every participant's system prompt. */
+  extraPrompt?: string;
 }
 
 /** Round-aware prompt wrapper — prepended to the mode's base prompt. */

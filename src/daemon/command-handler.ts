@@ -619,6 +619,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
 
   const p2pSessionConfig = (cmd as any).p2pSessionConfig as P2pSessionConfig | undefined;
   const p2pRounds = (cmd as any).p2pRounds as number | undefined;
+  const p2pExtraPrompt = (cmd as any).p2pExtraPrompt as string | undefined;
 
   // @@all(mode) — expand to all active sessions in the same domain
   if (tokens.expandAll && tokens.agents.length === 0) {
@@ -681,7 +682,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           fileContents.push({ path: fp, content: capped }); // cap at 50KB
         } catch { /* ignore unreadable files */ }
       }
-      const run = await startP2pRun(sessionName, tokens.agents, tokens.cleanText, fileContents, serverLink, p2pRounds);
+      const run = await startP2pRun(sessionName, tokens.agents, tokens.cleanText, fileContents, serverLink, p2pRounds, p2pExtraPrompt);
       const status = isLegacy ? 'accepted_legacy' : 'accepted';
       timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
       try {

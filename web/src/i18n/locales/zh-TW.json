@@ -268,6 +268,8 @@
     "settings_default_hint": "新會話預設：啟用 + audit",
     "settings_rounds": "輪數",
     "settings_rounds_hint": "討論輪數（越多分析越深入）",
+    "settings_extra_prompt": "額外指令",
+    "settings_extra_prompt_hint": "所有參與者的附加提示詞（如「使用中文回覆」）",
     "all_label": "全部",
     "all_rounds": "{{count}} 輪",
     "all_rounds_plural": "{{count}} 輪",

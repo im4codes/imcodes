@@ -268,6 +268,8 @@
     "settings_default_hint": "Новые сессии по умолчанию: включено + audit",
     "settings_rounds": "Раунды",
     "settings_rounds_hint": "Количество раундов (больше = глубже анализ)",
+    "settings_extra_prompt": "Доп. инструкции",
+    "settings_extra_prompt_hint": "Дополнительные указания для всех участников (напр. \"Отвечать на русском\")",
     "all_label": "Все",
     "all_rounds": "{{count}} раунд",
     "all_rounds_plural": "{{count}} раундов",

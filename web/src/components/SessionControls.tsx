@@ -275,6 +275,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (p2pMode === P2P_CONFIG_MODE && p2pSavedConfig) {
         extra.p2pSessionConfig = p2pSavedConfig.sessions;
         extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
+        if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
       }
       ws.sendSessionCommand('send', { sessionName: activeSession.name, text, ...extra });
     } catch {
