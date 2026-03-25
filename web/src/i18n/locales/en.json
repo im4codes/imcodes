@@ -55,6 +55,8 @@
     "agentType": {
       "openclaw": "OpenClaw"
     },
+    "openclaw_not_connected": "not connected",
+    "openclaw_connect_hint": "OpenClaw gateway is not connected. Run the following command on your daemon machine to connect:",
     "sessionMode": "Session Mode",
     "newSession": "New Session",
     "bindExisting": "Bind Existing OC Session",

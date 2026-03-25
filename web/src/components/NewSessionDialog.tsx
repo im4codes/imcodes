@@ -87,12 +87,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted }: Props) {
     }
   }, [agentType, ocMode, ocSessionKey]);
 
-  // Fall back to claude-code if openclaw provider disconnects while selected
-  useEffect(() => {
-    if (agentType === 'openclaw' && !openClawAvailable) {
-      setAgentType('claude-code');
-    }
-  }, [openClawAvailable, agentType]);
+  // (openclaw fallback removed — show connect hint instead of auto-switching)
 
   // Listen for session.event started/error while dialog is open
   useEffect(() => {
@@ -226,14 +221,22 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted }: Props) {
             <option value="codex">Codex CLI</option>
             <option value="opencode">OpenCode</option>
             <option value="gemini">Gemini CLI</option>
-            {openClawAvailable && (
-              <option value="openclaw">{t('session.agentType.openclaw')}</option>
-            )}
+            <option value="openclaw">{t('session.agentType.openclaw')}{openClawAvailable ? '' : ` (${t('session.openclaw_not_connected')})`}</option>
           </select>
         </div>
 
+        {/* OpenClaw not connected hint */}
+        {agentType === 'openclaw' && !openClawAvailable && (
+          <div style={{ padding: '12px 16px', background: '#1c1917', border: '1px solid #f59e0b44', borderRadius: 6, color: '#fbbf24', fontSize: 13, marginBottom: 8 }}>
+            {t('session.openclaw_connect_hint')}
+            <code style={{ display: 'block', marginTop: 6, color: '#e2e8f0', background: '#0f172a', padding: '4px 8px', borderRadius: 4, fontSize: 12 }}>
+              imcodes connect openclaw
+            </code>
+          </div>
+        )}
+
         {/* OpenClaw-specific options */}
-        {agentType === 'openclaw' && (
+        {agentType === 'openclaw' && openClawAvailable && (
           <>
             <div class="form-group">
               <label>{t('session.sessionMode')}</label>
@@ -345,7 +348,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted }: Props) {
 
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
           <button class="btn btn-secondary" onClick={onClose} disabled={starting}>{t('common.cancel')}</button>
-          <button class="btn btn-primary" onClick={handleStart} disabled={starting}>
+          <button class="btn btn-primary" onClick={handleStart} disabled={starting || (agentType === 'openclaw' && !openClawAvailable)}>
             {starting ? t('new_session.starting') : t('new_session.start')}
           </button>
         </div>

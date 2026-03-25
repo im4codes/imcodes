@@ -55,6 +55,8 @@
     "agentType": {
       "openclaw": "OpenClaw"
     },
+    "openclaw_not_connected": "no conectado",
+    "openclaw_connect_hint": "El gateway de OpenClaw no est\u00e1 conectado. Ejecuta el siguiente comando en tu m\u00e1quina daemon:",
     "sessionMode": "Modo de sesión",
     "newSession": "Nueva sesión",
     "bindExisting": "Vincular sesión OC existente",

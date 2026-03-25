@@ -55,6 +55,8 @@
     "agentType": {
       "openclaw": "OpenClaw"
     },
+    "openclaw_not_connected": "미연결",
+    "openclaw_connect_hint": "OpenClaw 게이트웨이가 연결되지 않았습니다. 데몬 머신에서 다음 명령을 실행하세요:",
     "sessionMode": "세션 모드",
     "newSession": "새 세션",
     "bindExisting": "기존 OC 세션 바인딩",

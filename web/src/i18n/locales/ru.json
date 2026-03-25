@@ -55,6 +55,8 @@
     "agentType": {
       "openclaw": "OpenClaw"
     },
+    "openclaw_not_connected": "не подключено",
+    "openclaw_connect_hint": "Шлюз OpenClaw не подключён. Запустите следующую команду на машине с демоном:",
     "sessionMode": "Режим сессии",
     "newSession": "Новая сессия",
     "bindExisting": "Привязать существующую OC сессию",

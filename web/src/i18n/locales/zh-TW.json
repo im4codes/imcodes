@@ -55,6 +55,8 @@
     "agentType": {
       "openclaw": "OpenClaw"
     },
+    "openclaw_not_connected": "未連接",
+    "openclaw_connect_hint": "OpenClaw 閘道未連接。請在 daemon 機器上執行以下命令連接：",
     "sessionMode": "Session 模式",
     "newSession": "新 Session",
     "bindExisting": "綁定已有 OC Session",

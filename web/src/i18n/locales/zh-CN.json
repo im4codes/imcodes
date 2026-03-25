@@ -55,6 +55,8 @@
     "agentType": {
       "openclaw": "OpenClaw"
     },
+    "openclaw_not_connected": "未连接",
+    "openclaw_connect_hint": "OpenClaw 网关未连接。请在 daemon 机器上运行以下命令连接：",
     "sessionMode": "会话模式",
     "newSession": "新会话",
     "bindExisting": "绑定已有 OC 会话",

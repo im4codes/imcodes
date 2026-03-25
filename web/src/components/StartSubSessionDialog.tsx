@@ -106,13 +106,6 @@ export function StartSubSessionDialog({ ws, defaultCwd, onStart, onClose }: Prop
     }
   }, [type, ocMode, ocSessionKey]);
 
-  // Fall back if openclaw disappears
-  useEffect(() => {
-    if (type === 'openclaw' && !openClawAvailable) {
-      setType('claude-code');
-    }
-  }, [openClawAvailable, type]);
-
   const handleStart = () => {
     if (type === 'script') {
       if (!scriptCmd.trim()) return;
@@ -153,10 +146,12 @@ export function StartSubSessionDialog({ ws, defaultCwd, onStart, onClose }: Prop
               {agentTypes.map((at) => (
                 <button
                   key={at.id}
-                  class={`subsession-type-btn${type === at.id ? ' active' : ''}`}
+                  class={`subsession-type-btn${type === at.id ? ' active' : ''}${at.id === 'openclaw' && !openClawAvailable ? ' disabled' : ''}`}
                   onClick={() => setType(at.id)}
+                  style={at.id === 'openclaw' && !openClawAvailable ? { opacity: 0.5 } : undefined}
                 >
                   <span>{at.icon}</span> {at.id === 'openclaw' ? t('session.agentType.openclaw') : at.label}
+                  {at.id === 'openclaw' && !openClawAvailable && <span style={{ fontSize: 10, color: '#f59e0b', marginLeft: 4 }}>●</span>}
                 </button>
               ))}
             </div>
@@ -213,8 +208,16 @@ export function StartSubSessionDialog({ ws, defaultCwd, onStart, onClose }: Prop
             </div>
           )}
 
+          {/* OpenClaw not connected hint */}
+          {type === 'openclaw' && !openClawAvailable && (
+            <div style={{ padding: '10px 14px', background: '#1c1917', border: '1px solid #f59e0b44', borderRadius: 6, color: '#fbbf24', fontSize: 12 }}>
+              {t('session.openclaw_connect_hint')}
+              <code style={{ display: 'block', marginTop: 4, color: '#e2e8f0', background: '#0f172a', padding: '3px 6px', borderRadius: 4, fontSize: 11 }}>imcodes connect openclaw</code>
+            </div>
+          )}
+
           {/* OpenClaw-specific options */}
-          {type === 'openclaw' && (
+          {type === 'openclaw' && openClawAvailable && (
             <>
               <div>
                 <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.sessionMode')}</div>
@@ -335,7 +338,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, onStart, onClose }: Prop
 
         <div class="dialog-footer">
           <button class="btn btn-secondary" onClick={onClose}>Cancel</button>
-          <button class="btn btn-primary" onClick={handleStart}>Launch</button>
+          <button class="btn btn-primary" onClick={handleStart} disabled={type === 'openclaw' && !openClawAvailable}>Launch</button>
         </div>
       </div>
     </div>

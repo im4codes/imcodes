@@ -55,6 +55,8 @@
     "agentType": {
       "openclaw": "OpenClaw"
     },
+    "openclaw_not_connected": "未接続",
+    "openclaw_connect_hint": "OpenClaw ゲートウェイに接続されていません。デーモンマシンで以下のコマンドを実行してください：",
     "sessionMode": "セッションモード",
     "newSession": "新規セッション",
     "bindExisting": "既存の OC セッションをバインド",
