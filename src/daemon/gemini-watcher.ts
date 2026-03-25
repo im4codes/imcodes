@@ -153,6 +153,8 @@ export interface WatcherState {
   _lastMsgLen?: number;
   /** Consecutive readConversation failures — triggers file rescan after threshold. */
   _readFailCount?: number;
+  /** Last time assertSpinnerGate was called — cooldown to avoid 400ms burst every 1.5s. */
+  _lastSpinnerGateTs?: number;
 }
 
 const watchers = new Map<string, WatcherState>();
@@ -198,14 +200,26 @@ async function confirmSpinner(sessionName: string): Promise<boolean> {
   return hits >= 3;
 }
 
+const SPINNER_GATE_COOLDOWN_MS = 3_000; // Skip burst if last gate was < 3s ago and state unchanged
+
 /**
  * Burst-confirm spinner presence. This is the SINGLE GATE for all idle/running
  * decisions — every path must call this before transitioning state.
  * Returns true if spinner is confirmed active (= agent is working).
+ *
+ * Cooldown: if the last gate check was recent and state is still 'running',
+ * skip the expensive 5-read burst to reduce tmux I/O load.
  */
 async function assertSpinnerGate(sessionName: string, state: WatcherState): Promise<boolean> {
+  const now = Date.now();
+  // If recently confirmed running and still in running state, skip burst
+  if (state._lastSpinnerGateTs && state.currentState === 'running' &&
+      (now - state._lastSpinnerGateTs) < SPINNER_GATE_COOLDOWN_MS) {
+    return true; // trust recent confirmation
+  }
   const confirmed = await confirmSpinner(sessionName);
   if (confirmed) {
+    state._lastSpinnerGateTs = now;
     if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
     state.spinnerFrameCount = SPINNER_CONFIRM_READS;
     state.idleConfirmCount = 0;
@@ -216,6 +230,7 @@ async function assertSpinnerGate(sessionName: string, state: WatcherState): Prom
     }
   } else {
     state.spinnerFrameCount = 0;
+    state._lastSpinnerGateTs = undefined; // Clear cooldown so next check does full burst
   }
   return confirmed;
 }

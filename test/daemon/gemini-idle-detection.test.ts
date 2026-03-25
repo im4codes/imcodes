@@ -268,8 +268,9 @@ describe('Gemini spinner detection (braille at col 0)', () => {
     // Next ticks: no spinner, idle terminal + idle JSON → should transition back to idle
     vi.mocked(tmux.capturePane).mockResolvedValue(idleLines());
     state.lastConversationStatus = 'idle';
-    // Expire running lock so idle transition is allowed
+    // Expire running lock and spinner gate cooldown so idle transition is allowed
     state.lastRunningEmitTs = 0;
+    state._lastSpinnerGateTs = 0;
     await pollTick(sid, state);
 
     const states = vi.mocked(timelineEmitter.emit).mock.calls
