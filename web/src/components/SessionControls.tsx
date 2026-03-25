@@ -860,41 +860,51 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               atSelectionLockRef.current = false;
               atSelectionSnapshotRef.current = currentText;
             }
-            // Detect @ for picker
+            // Detect @/@@: single @ → choose (files/agents), @@ → jump to agents
             const text = currentText;
             const sel = window.getSelection();
             const cursorPos = sel?.anchorOffset ?? text.length;
             const beforeCursor = text.slice(0, cursorPos);
-            const atMatch = beforeCursor.match(/@([^\s@]*)$/);
-            if (atMatch) {
-              const query = atMatch[1];
-              if (!atPickerOpen) {
-                if (query.length === 0) {
-                  setAtPickerOpen(true);
-                  setAtPickerStage('choose');
-                  setAtQuery('');
+
+            // @@ → jump straight to agents picker
+            const doubleAt = beforeCursor.match(/@@([^\s]*)$/);
+            if (doubleAt) {
+              setAtPickerOpen(true);
+              setAtPickerStage('agents');
+              setAtQuery(doubleAt[1]);
+            } else {
+              // Single @ → choose stage (files + agents menu)
+              const singleAt = beforeCursor.match(/@([^\s@]*)$/);
+              if (singleAt) {
+                const query = singleAt[1];
+                if (!atPickerOpen) {
+                  if (query.length === 0) {
+                    setAtPickerOpen(true);
+                    setAtPickerStage('choose');
+                    setAtQuery('');
+                  } else {
+                    setAtPickerOpen(false);
+                    setAtPickerStage('choose');
+                    setAtQuery('');
+                  }
+                } else if (atPickerStage === 'choose') {
+                  if (query.length === 0) {
+                    setAtPickerOpen(true);
+                    setAtQuery('');
+                  } else {
+                    setAtPickerOpen(false);
+                    setAtPickerStage('choose');
+                    setAtQuery('');
+                  }
                 } else {
-                  setAtPickerOpen(false);
-                  setAtPickerStage('choose');
-                  setAtQuery('');
-                }
-              } else if (atPickerStage === 'choose') {
-                if (query.length === 0) {
                   setAtPickerOpen(true);
-                  setAtQuery('');
-                } else {
-                  setAtPickerOpen(false);
-                  setAtPickerStage('choose');
-                  setAtQuery('');
+                  setAtQuery(query);
                 }
               } else {
-                setAtPickerOpen(true);
-                setAtQuery(query);
+                setAtPickerOpen(false);
+                setAtPickerStage('choose');
+                setAtQuery('');
               }
-            } else {
-              setAtPickerOpen(false);
-              setAtPickerStage('choose');
-              setAtQuery('');
             }
           }}
           onKeyDown={handleKeyDown}
