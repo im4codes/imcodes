@@ -9,6 +9,26 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, act, cleanup } from '@testing-library/preact';
 
+// jsdom localStorage may be a plain object without methods — ensure a working stub
+const localStorageStore: Record<string, string> = {};
+Object.defineProperty(globalThis, 'localStorage', {
+  value: {
+    getItem: (k: string) => localStorageStore[k] ?? null,
+    setItem: (k: string, v: string) => { localStorageStore[k] = v; },
+    removeItem: (k: string) => { delete localStorageStore[k]; },
+    clear: () => { for (const k of Object.keys(localStorageStore)) delete localStorageStore[k]; },
+    get length() { return Object.keys(localStorageStore).length; },
+    key: (i: number) => Object.keys(localStorageStore)[i] ?? null,
+  },
+  writable: true,
+  configurable: true,
+});
+
+beforeEach(() => {
+  // Clear localStorage between tests
+  for (const k of Object.keys(localStorageStore)) delete localStorageStore[k];
+});
+
 afterEach(cleanup);
 
 // ── i18n stub ─────────────────────────────────────────────────────────────
