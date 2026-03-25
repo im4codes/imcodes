@@ -11,7 +11,9 @@ import { homedir } from 'os';
 import { existsSync, realpathSync, readFileSync, writeFileSync } from 'fs';
 import { resolve, join, dirname } from 'path';
 
-const { version } = JSON.parse(readFileSync(join(__dirname, '../../package.json'), 'utf8')) as { version: string };
+import { PROJECT_ROOT } from './util/project-root.js';
+
+const { version } = JSON.parse(readFileSync(join(PROJECT_ROOT, 'package.json'), 'utf8')) as { version: string };
 
 /** Kill any lingering imcodes daemon processes after launchctl unload.
  *  Uses PID file (~/.imcodes/daemon.pid) for reliable targeting. */
@@ -297,7 +299,7 @@ program
       .action(async (opts: { build: boolean }) => {
         ensureServiceForeground();
         const realScript = realpathSync(process.argv[1]);
-        const projectRoot = resolve(realScript, '../../..'); // dist/src/index.js → project root
+        const projectRoot = PROJECT_ROOT;
 
         if (opts.build) {
           console.log('Building...');
@@ -364,7 +366,7 @@ program
       }
     } else {
       // Git clone — pull and rebuild
-      const projectRoot = resolve(selfPath, '../../..');
+      const projectRoot = PROJECT_ROOT;
       try {
         execSync('git pull && npm run build', { cwd: projectRoot, stdio: 'inherit' });
       } catch {

@@ -2,8 +2,9 @@ import { readFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join, resolve } from 'path';
 import yaml from 'yaml';
+import { PROJECT_ROOT } from './util/project-root.js';
 
-const DEFAULT_CONFIG_PATH = join(__dirname, '../..', 'config', 'default.yaml');
+const DEFAULT_CONFIG_PATH = join(PROJECT_ROOT, 'config', 'default.yaml');
 function userConfigPath(): string {
   return join(homedir(), '.imcodes', 'config.yaml');
 }
