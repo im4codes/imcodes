@@ -2,7 +2,7 @@
  * Handle commands from the web UI and inbound chat messages via ServerLink.
  * Commands arrive as JSON objects with a `type` field.
  */
-import { startProject, stopProject, teardownProject, type ProjectConfig } from '../agent/session-manager.js';
+import { startProject, stopProject, teardownProject, getTransportRuntime, type ProjectConfig } from '../agent/session-manager.js';
 import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey } from '../agent/tmux.js';
 import { listSessions, getSession } from '../store/session-store.js';
 import { routeMessage, type InboundMessage, type RouterContext } from '../router/message-router.js';
@@ -684,6 +684,26 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     return;
   }
 
+  // Transport sessions — route directly to the provider runtime, bypassing tmux.
+  const transportRuntime = getTransportRuntime(sessionName);
+  if (transportRuntime) {
+    const release = await getMutex(sessionName).acquire();
+    try {
+      await transportRuntime.send(text);
+      timelineEmitter.emit(sessionName, 'user.message', { text });
+      const status = isLegacy ? 'accepted_legacy' : 'accepted';
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
+      try {
+        serverLink.send({ type: 'command.ack', commandId: effectiveId, status, session: sessionName });
+      } catch { /* not connected */ }
+    } catch (err) {
+      logger.error({ sessionName, err }, 'session.send (transport) failed');
+    } finally {
+      release();
+    }
+    return;
+  }
+
   // Preserve raw @file references for normal sends.
   const finalText = text;
 
@@ -743,6 +763,9 @@ async function handleInput(cmd: Record<string, unknown>): Promise<void> {
   // session.input SHALL NOT require or process commandId
   if (!sessionName || data === undefined) return;
 
+  // Transport sessions have no terminal — raw key input is not applicable.
+  if (getTransportRuntime(sessionName)) return;
+
   // Serialized via same per-session mutex (no commandId, no retry)
   const release = await getMutex(sessionName).acquire();
   try {
@@ -789,6 +812,10 @@ function handleGetSessions(serverLink: ServerLink): void {
       agentVersion: s.agentVersion,
       state: s.state,
       projectDir: s.projectDir,
+      runtimeType: s.runtimeType,
+      providerId: s.providerId,
+      providerSessionId: s.providerSessionId,
+      description: s.description,
     }));
   try {
     serverLink.send({ type: 'session_list', daemonVersion: serverLink.daemonVersion, sessions });

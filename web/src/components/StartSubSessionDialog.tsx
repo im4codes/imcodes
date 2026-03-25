@@ -1,19 +1,21 @@
 /**
- * StartSubSessionDialog — choose type (cc/codex/opencode/shell) and launch a sub-session.
+ * StartSubSessionDialog — choose type (cc/codex/opencode/shell/openclaw) and launch a sub-session.
  */
 import { useState, useEffect } from 'preact/hooks';
+import { useTranslation } from 'react-i18next';
 import type { WsClient } from '../ws-client.js';
 import { FileBrowser } from './FileBrowser.js';
 import { getUserPref, saveUserPref } from '../api.js';
+import { useProviderStatus } from '../hooks/useProviderStatus.js';
 
 interface Props {
   ws: WsClient | null;
   defaultCwd?: string;
-  onStart: (type: string, shellBin?: string, cwd?: string, label?: string) => void;
+  onStart: (type: string, shellBin?: string, cwd?: string, label?: string, extra?: Record<string, unknown>) => void;
   onClose: () => void;
 }
 
-const AGENT_TYPES = [
+const BASE_AGENT_TYPES = [
   { id: 'claude-code', label: 'Claude Code', icon: '⚡' },
   { id: 'codex', label: 'Codex', icon: '📦' },
   { id: 'opencode', label: 'OpenCode', icon: '🔆' },
@@ -22,7 +24,17 @@ const AGENT_TYPES = [
   { id: 'script', label: 'Script', icon: '🔄' },
 ];
 
+const OPENCLAW_AGENT = { id: 'openclaw', label: 'OpenClaw', icon: '🦞' };
+
+type OpenClawMode = 'new' | 'bind';
+
+interface RemoteSession {
+  id: string;
+  label: string;
+}
+
 export function StartSubSessionDialog({ ws, defaultCwd, onStart, onClose }: Props) {
+  const { t } = useTranslation();
   const [type, setType] = useState('claude-code');
   const [shells, setShells] = useState<string[]>([]);
   const [shellBin, setShellBin] = useState<string>('/bin/bash');
@@ -32,6 +44,21 @@ export function StartSubSessionDialog({ ws, defaultCwd, onStart, onClose }: Prop
   const [scriptInterval, setScriptInterval] = useState('5');
   const [detectingShells, setDetectingShells] = useState(false);
   const [showDirBrowser, setShowDirBrowser] = useState(false);
+
+  // OpenClaw-specific state
+  const [ocMode, setOcMode] = useState<OpenClawMode>('new');
+  const [ocSessionKey, setOcSessionKey] = useState('');
+  const [ocDescription, setOcDescription] = useState('');
+  const [ocRemoteSessions, setOcRemoteSessions] = useState<RemoteSession[]>([]);
+  const [ocLoadingSessions, setOcLoadingSessions] = useState(false);
+  const [ocSelectedSession, setOcSelectedSession] = useState('');
+
+  const { isProviderConnected } = useProviderStatus(ws);
+  const openClawAvailable = isProviderConnected('openclaw');
+
+  const agentTypes = openClawAvailable
+    ? [...BASE_AGENT_TYPES, OPENCLAW_AGENT]
+    : BASE_AGENT_TYPES;
 
   // Load saved shell preference from server
   useEffect(() => {
@@ -50,6 +77,12 @@ export function StartSubSessionDialog({ ws, defaultCwd, onStart, onClose }: Prop
         setDetectingShells(false);
         setShellBin((prev) => (msg.shells.includes(prev) ? prev : (msg.shells[0] ?? prev)));
       }
+      const raw = msg as unknown as Record<string, unknown>;
+      if (raw['type'] === 'openclaw.sessions_response') {
+        const sessions = raw['sessions'] as RemoteSession[] | undefined;
+        setOcRemoteSessions(sessions ?? []);
+        setOcLoadingSessions(false);
+      }
     });
 
     setDetectingShells(true);
@@ -58,6 +91,28 @@ export function StartSubSessionDialog({ ws, defaultCwd, onStart, onClose }: Prop
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ws]);
 
+  // Fetch remote sessions when bind mode is selected
+  useEffect(() => {
+    if (type !== 'openclaw' || ocMode !== 'bind' || !ws) return;
+    setOcLoadingSessions(true);
+    setOcRemoteSessions([]);
+    ws.send({ type: 'openclaw.list_sessions' });
+  }, [type, ocMode, ws]);
+
+  // Auto-generate a session key when switching to openclaw new mode
+  useEffect(() => {
+    if (type === 'openclaw' && ocMode === 'new' && !ocSessionKey) {
+      setOcSessionKey(`oc-${Math.random().toString(36).slice(2, 10)}`);
+    }
+  }, [type, ocMode, ocSessionKey]);
+
+  // Fall back if openclaw disappears
+  useEffect(() => {
+    if (type === 'openclaw' && !openClawAvailable) {
+      setType('claude-code');
+    }
+  }, [openClawAvailable, type]);
+
   const handleStart = () => {
     if (type === 'script') {
       if (!scriptCmd.trim()) return;
@@ -65,6 +120,14 @@ export function StartSubSessionDialog({ ws, defaultCwd, onStart, onClose }: Prop
       const escaped = scriptCmd.trim().replace(/'/g, "'\\''");
       const wrapper = `bash -c 'while true; do clear; ${escaped}; sleep ${interval}; done'`;
       onStart('script', wrapper, cwd || undefined, label || scriptCmd.trim().slice(0, 30));
+      return;
+    }
+    if (type === 'openclaw') {
+      const extra =
+        ocMode === 'bind'
+          ? { ocMode: 'bind', ocSessionId: ocSelectedSession }
+          : { ocMode: 'new', ocSessionKey: ocSessionKey.trim(), ocDescription: ocDescription.trim() };
+      onStart('openclaw', undefined, cwd || undefined, label || undefined, extra);
       return;
     }
     const selectedShell = type === 'shell' ? (shellBin || undefined) : undefined;
@@ -87,13 +150,13 @@ export function StartSubSessionDialog({ ws, defaultCwd, onStart, onClose }: Prop
           <div>
             <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>Type</div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-              {AGENT_TYPES.map((at) => (
+              {agentTypes.map((at) => (
                 <button
                   key={at.id}
                   class={`subsession-type-btn${type === at.id ? ' active' : ''}`}
                   onClick={() => setType(at.id)}
                 >
-                  <span>{at.icon}</span> {at.label}
+                  <span>{at.icon}</span> {at.id === 'openclaw' ? t('session.agentType.openclaw') : at.label}
                 </button>
               ))}
             </div>
@@ -148,6 +211,86 @@ export function StartSubSessionDialog({ ws, defaultCwd, onStart, onClose }: Prop
                 />
               )}
             </div>
+          )}
+
+          {/* OpenClaw-specific options */}
+          {type === 'openclaw' && (
+            <>
+              <div>
+                <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.sessionMode')}</div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                  <button
+                    class={`subsession-type-btn${ocMode === 'new' ? ' active' : ''}`}
+                    onClick={() => setOcMode('new')}
+                  >
+                    {t('session.newSession')}
+                  </button>
+                  <button
+                    class={`subsession-type-btn${ocMode === 'bind' ? ' active' : ''}`}
+                    onClick={() => setOcMode('bind')}
+                  >
+                    {t('session.bindExisting')}
+                  </button>
+                </div>
+              </div>
+
+              {ocMode === 'bind' ? (
+                <div>
+                  <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.selectSession')}</div>
+                  {ocLoadingSessions ? (
+                    <div style={{ fontSize: 12, color: '#64748b' }}>{t('session.loadingSessions')}</div>
+                  ) : ocRemoteSessions.length === 0 ? (
+                    <div style={{ fontSize: 12, color: '#64748b' }}>{t('session.noSessions')}</div>
+                  ) : (
+                    <select
+                      class="input"
+                      value={ocSelectedSession}
+                      onChange={(e) => setOcSelectedSession((e.target as HTMLSelectElement).value)}
+                      style={{ width: '100%' }}
+                    >
+                      <option value="">{t('session.selectSession')}</option>
+                      {ocRemoteSessions.map((s) => (
+                        <option key={s.id} value={s.id}>{s.label || s.id}</option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+              ) : (
+                <div>
+                  <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.sessionKey')}</div>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <input
+                      class="input"
+                      type="text"
+                      value={ocSessionKey}
+                      onInput={(e) => setOcSessionKey((e.target as HTMLInputElement).value)}
+                      autoComplete="off"
+                      style={{ flex: 1 }}
+                    />
+                    <button
+                      type="button"
+                      class="btn btn-secondary"
+                      onClick={() => setOcSessionKey(`oc-${Math.random().toString(36).slice(2, 10)}`)}
+                      style={{ whiteSpace: 'nowrap', fontSize: 12 }}
+                    >
+                      {t('session.autoGenerate')}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.description')}</div>
+                <textarea
+                  class="input"
+                  placeholder={t('session.descriptionPlaceholder')}
+                  value={ocDescription}
+                  onInput={(e) => setOcDescription((e.target as HTMLTextAreaElement).value)}
+                  rows={3}
+                  style={{ width: '100%', resize: 'vertical' }}
+                />
+              </div>
+            </>
           )}
 
           {/* Working directory */}

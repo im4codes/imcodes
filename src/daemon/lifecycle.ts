@@ -72,6 +72,10 @@ async function persistSessionToWorker(
         agentVersion: record.agentVersion,
         projectDir: record.projectDir,
         state: record.state,
+        runtimeType: record.runtimeType ?? null,
+        providerId: record.providerId ?? null,
+        providerSessionId: record.providerSessionId ?? null,
+        description: record.description ?? null,
       }),
     });
     if (!res.ok) logger.warn({ status: res.status, name }, 'persistSessionToWorker: non-ok response');
@@ -457,12 +461,45 @@ export async function startup(): Promise<DaemonContext> {
   startHealthPoller();
 
   logger.info('Daemon started');
+
+  void autoReconnectProviders();
+
   return ctx;
+}
+
+async function autoReconnectProviders(): Promise<void> {
+  try {
+    // Dynamic import to avoid loading WS deps when not needed
+    const { loadConfig: loadOcConfig } = await import('../agent/openclaw-config.js');
+    const { connectProvider } = await import('../agent/provider-registry.js');
+
+    const ocConfig = await loadOcConfig();
+    if (ocConfig) {
+      logger.info({ url: ocConfig.url }, 'Auto-reconnecting to OpenClaw gateway...');
+      try {
+        await connectProvider('openclaw', {
+          url: ocConfig.url,
+          token: ocConfig.token,
+          agentId: ocConfig.agentId,
+        });
+        logger.info('OpenClaw gateway reconnected');
+      } catch (err) {
+        logger.warn({ err }, 'OpenClaw auto-reconnect failed — will retry on next connect command');
+      }
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Provider auto-reconnect check failed');
+  }
 }
 
 /** Shutdown sequence: flush store, disconnect WS, release lock, exit cleanly */
 export async function shutdown(exitCode = 0): Promise<void> {
   logger.info('Daemon shutting down');
+
+  try {
+    const { disconnectAll } = await import('../agent/provider-registry.js');
+    await disconnectAll();
+  } catch { /* ignore */ }
 
   try {
     if (healthTimer) clearInterval(healthTimer);

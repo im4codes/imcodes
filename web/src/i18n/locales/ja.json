@@ -51,7 +51,20 @@
     "send_queued": "再接続中… (送信待ち)",
     "send_placeholder": "{{name}} へ送信…",
     "actions": "セッション操作",
-    "new_btn": "新規セッション"
+    "new_btn": "新規セッション",
+    "agentType": {
+      "openclaw": "OpenClaw"
+    },
+    "sessionMode": "セッションモード",
+    "newSession": "新規セッション",
+    "bindExisting": "既存の OC セッションをバインド",
+    "selectSession": "セッションを選択",
+    "loadingSessions": "セッションを読み込み中...",
+    "noSessions": "利用可能なセッションがありません",
+    "description": "説明",
+    "descriptionPlaceholder": "セッションのペルソナまたは目的（任意）",
+    "sessionKey": "セッションキー",
+    "autoGenerate": "自動生成"
   },
   "server": {
     "upgrade_daemon": "↑ Daemonをアップグレード",
@@ -363,5 +376,13 @@
     "no_comments": "コメントなし",
     "show_changed_files": "変更ファイルを表示",
     "refresh_tab": "更新"
+  },
+  "transport_chat": {
+    "inputPlaceholder": "メッセージを入力...",
+    "send": "送信",
+    "streaming": "考え中...",
+    "error": "エラー",
+    "connectionLost": "接続が切断されました",
+    "empty": "まだメッセージはありません"
   }
 }

@@ -51,7 +51,20 @@
     "send_queued": "重新連線中… (訊息已排隊)",
     "send_placeholder": "傳送給 {{name}}…",
     "actions": "Session 操作",
-    "new_btn": "新建 Session"
+    "new_btn": "新建 Session",
+    "agentType": {
+      "openclaw": "OpenClaw"
+    },
+    "sessionMode": "Session 模式",
+    "newSession": "新 Session",
+    "bindExisting": "綁定已有 OC Session",
+    "selectSession": "選擇 Session",
+    "loadingSessions": "載入 Session 中...",
+    "noSessions": "暫無可用 Session",
+    "description": "描述",
+    "descriptionPlaceholder": "Session 角色或用途（選填）",
+    "sessionKey": "Session 金鑰",
+    "autoGenerate": "自動產生"
   },
   "server": {
     "upgrade_daemon": "↑ 升級 Daemon",
@@ -363,5 +376,13 @@
     "no_comments": "暫無留言",
     "show_changed_files": "查看變更檔案",
     "refresh_tab": "重新整理"
+  },
+  "transport_chat": {
+    "inputPlaceholder": "輸入訊息...",
+    "send": "傳送",
+    "streaming": "思考中...",
+    "error": "錯誤",
+    "connectionLost": "連線已中斷",
+    "empty": "尚無訊息"
   }
 }

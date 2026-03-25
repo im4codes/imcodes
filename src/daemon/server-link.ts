@@ -2,6 +2,7 @@ import os from 'node:os';
 import type { TimelineEvent } from './timeline-event.js';
 import logger from '../util/logger.js';
 import { DAEMON_VERSION } from '../util/version.js';
+import { setTransportRelaySend } from './transport-relay.js';
 
 /** Collect lightweight system stats for daemon.stats messages. */
 function collectSystemStats(): { cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number } {
@@ -73,6 +74,14 @@ export class ServerLink {
       // Send auth handshake immediately — server closes the socket if this is not
       // the first message or if credentials are invalid (5s timeout enforced server-side).
       ws.send(JSON.stringify({ type: 'auth', serverId: this.serverId, token: this.token, daemonVersion: this.daemonVersion }));
+      // Wire transport relay so provider callbacks can send events to browsers via this socket.
+      setTransportRelaySend((msg) => {
+        try {
+          this.send(msg);
+        } catch {
+          // Not connected — transport relay events are best-effort
+        }
+      });
       this.startHeartbeat();
       this.startWatchdog();
     });
@@ -108,6 +117,7 @@ export class ServerLink {
       logger.info({ code: event.code, reason: event.reason }, 'ServerLink: closed');
       this.stopHeartbeat();
       this.stopWatchdog();
+      setTransportRelaySend(() => { /* disconnected — discard */ });
       if (!this.stopping) this.scheduleReconnect();
     });
   }

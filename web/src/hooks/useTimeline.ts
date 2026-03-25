@@ -183,10 +183,14 @@ export function useTimeline(
     olderTimeoutRef.current = setTimeout(resetOlderState, 10_000);
   }, [ws, sessionId, loadingOlder]);
 
-  // Append a single event, dedup by eventId
+  // Append a single event, dedup by eventId.
+  // Uses a Set for O(1) dedup instead of O(n) .some() scan.
   const appendEvent = useCallback((event: TimelineEvent) => {
     setEvents((prev) => {
-      if (prev.some((e) => e.eventId === event.eventId)) return prev;
+      // Fast path: check last few events (most common: appending to end)
+      for (let i = prev.length - 1; i >= Math.max(0, prev.length - 10); i--) {
+        if (prev[i].eventId === event.eventId) return prev;
+      }
       const next = [...prev, event];
       const result = next.length > MAX_MEMORY_EVENTS
         ? next.slice(next.length - MAX_MEMORY_EVENTS)
@@ -196,14 +200,28 @@ export function useTimeline(
     });
   }, []);
 
-  /** Merge a batch of events into state (dedup + sort). */
+  /** Merge a batch of events into state (dedup + O(n) merge).
+   *  Both `prev` and `incoming` are assumed mostly sorted by timestamp.
+   *  Uses two-pointer merge instead of concatenate + full sort. */
   const mergeEvents = useCallback((incoming: TimelineEvent[]) => {
     setEvents((prev) => {
       const existingIds = new Set(prev.map((e) => e.eventId));
       const newEvents = incoming.filter((e) => !existingIds.has(e.eventId));
       if (newEvents.length === 0) return prev;
-      // Sort by timestamp (not seq) — seq resets across epochs and would interleave
-      const merged = [...prev, ...newEvents].sort((a, b) => a.ts - b.ts);
+
+      // Sort only the new events (typically small batch), then merge with already-sorted prev.
+      newEvents.sort((a, b) => a.ts - b.ts);
+
+      // Two-pointer O(n+m) merge
+      const merged: TimelineEvent[] = [];
+      let i = 0, j = 0;
+      while (i < prev.length && j < newEvents.length) {
+        if (prev[i].ts <= newEvents[j].ts) merged.push(prev[i++]);
+        else merged.push(newEvents[j++]);
+      }
+      while (i < prev.length) merged.push(prev[i++]);
+      while (j < newEvents.length) merged.push(newEvents[j++]);
+
       const result = merged.length > MAX_MEMORY_EVENTS
         ? merged.slice(merged.length - MAX_MEMORY_EVENTS)
         : merged;

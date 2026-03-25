@@ -30,6 +30,7 @@ export interface DbServer {
   last_heartbeat_at: number | null;
   status: string;
   daemon_version: string | null;
+  bound_with_key_id: string | null;
   created_at: number;
 }
 
@@ -40,6 +41,7 @@ export interface DbChannelBinding {
   channel_id: string;
   binding_type: string;
   target: string;
+  bot_id: string | null;
   created_at: number;
 }
 
@@ -51,6 +53,7 @@ export interface DbCronJob {
   cron_expr: string;
   action: string;
   enabled: number;
+  status: string | null;
   last_run_at: number | null;
   next_run_at: number | null;
   created_at: number;
@@ -67,6 +70,10 @@ export interface DbSession {
   project_dir: string;
   state: string;
   label: string | null;
+  runtime_type: string | null;
+  provider_id: string | null;
+  provider_session_id: string | null;
+  description: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -175,7 +182,7 @@ export async function createServer(
     'INSERT INTO servers (id, user_id, name, token_hash, status, created_at, bound_with_key_id) VALUES ($1, $2, $3, $4, $5, $6, $7)',
     [id, userId, name, tokenHash, 'offline', now, keyId ?? null],
   );
-  return { id, user_id: userId, team_id: null, name, token_hash: tokenHash, last_heartbeat_at: null, status: 'offline', daemon_version: null, created_at: now };
+  return { id, user_id: userId, team_id: null, name, token_hash: tokenHash, last_heartbeat_at: null, status: 'offline', daemon_version: null, bound_with_key_id: keyId ?? null, created_at: now };
 }
 
 export async function getServerById(db: Database, id: string): Promise<DbServer | null> {
@@ -298,19 +305,27 @@ export async function upsertDbSession(
   projectDir: string,
   state: string,
   agentVersion?: string | null,
+  runtimeType?: string | null,
+  providerId?: string | null,
+  providerSessionId?: string | null,
+  description?: string | null,
 ): Promise<void> {
   const now = Date.now();
   await db.execute(
-    `INSERT INTO sessions (id, server_id, name, project_name, role, agent_type, agent_version, project_dir, state, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    `INSERT INTO sessions (id, server_id, name, project_name, role, agent_type, agent_version, project_dir, state, runtime_type, provider_id, provider_session_id, description, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
      ON CONFLICT(server_id, name) DO UPDATE SET
        role = excluded.role,
        agent_type = excluded.agent_type,
        agent_version = excluded.agent_version,
        project_dir = excluded.project_dir,
        state = excluded.state,
+       runtime_type = excluded.runtime_type,
+       provider_id = excluded.provider_id,
+       provider_session_id = excluded.provider_session_id,
+       description = excluded.description,
        updated_at = excluded.updated_at`,
-    [id, serverId, name, projectName, role, agentType, agentVersion ?? null, projectDir, state, now, now],
+    [id, serverId, name, projectName, role, agentType, agentVersion ?? null, projectDir, state, runtimeType ?? null, providerId ?? null, providerSessionId ?? null, description ?? null, now, now],
   );
 }
 
@@ -380,6 +395,10 @@ export interface DbSubSession {
   gemini_session_id: string | null;
   parent_session: string | null;
   sort_order: number | null;
+  runtime_type: string | null;
+  provider_id: string | null;
+  provider_session_id: string | null;
+  description: string | null;
 }
 
 export async function getSubSessionsByServer(db: Database, serverId: string): Promise<DbSubSession[]> {
@@ -407,15 +426,19 @@ export async function createSubSession(
   ccSessionId: string | null,
   geminiSessionId: string | null = null,
   parentSession: string | null = null,
+  runtimeType: string | null = null,
+  providerId: string | null = null,
+  providerSessionId: string | null = null,
+  description: string | null = null,
 ): Promise<DbSubSession> {
   const now = Date.now();
   await db.execute(
-    `INSERT INTO sub_sessions (id, server_id, type, shell_bin, cwd, label, closed_at, cc_session_id, gemini_session_id, parent_session, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, $11)
-     ON CONFLICT (id, server_id) DO UPDATE SET type = EXCLUDED.type, shell_bin = EXCLUDED.shell_bin, cwd = EXCLUDED.cwd, label = EXCLUDED.label, closed_at = NULL, cc_session_id = EXCLUDED.cc_session_id, gemini_session_id = EXCLUDED.gemini_session_id, parent_session = EXCLUDED.parent_session, updated_at = EXCLUDED.updated_at`,
-    [id, serverId, type, shellBin, cwd, label, ccSessionId, geminiSessionId, parentSession, now, now],
+    `INSERT INTO sub_sessions (id, server_id, type, shell_bin, cwd, label, closed_at, cc_session_id, gemini_session_id, parent_session, runtime_type, provider_id, provider_session_id, description, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+     ON CONFLICT (id, server_id) DO UPDATE SET type = EXCLUDED.type, shell_bin = EXCLUDED.shell_bin, cwd = EXCLUDED.cwd, label = EXCLUDED.label, closed_at = NULL, cc_session_id = EXCLUDED.cc_session_id, gemini_session_id = EXCLUDED.gemini_session_id, parent_session = EXCLUDED.parent_session, runtime_type = EXCLUDED.runtime_type, provider_id = EXCLUDED.provider_id, provider_session_id = EXCLUDED.provider_session_id, description = EXCLUDED.description, updated_at = EXCLUDED.updated_at`,
+    [id, serverId, type, shellBin, cwd, label, ccSessionId, geminiSessionId, parentSession, runtimeType, providerId, providerSessionId, description, now, now],
   );
-  return { id, server_id: serverId, type, shell_bin: shellBin, cwd, label, closed_at: null, cc_session_id: ccSessionId, gemini_session_id: geminiSessionId, parent_session: parentSession, sort_order: null, created_at: now, updated_at: now };
+  return { id, server_id: serverId, type, shell_bin: shellBin, cwd, label, closed_at: null, cc_session_id: ccSessionId, gemini_session_id: geminiSessionId, parent_session: parentSession, sort_order: null, runtime_type: runtimeType, provider_id: providerId, provider_session_id: providerSessionId, description, created_at: now, updated_at: now };
 }
 
 export async function updateSubSession(
@@ -500,6 +523,7 @@ export interface DbDiscussion {
 export interface DbDiscussionRound {
   id: string;
   discussion_id: string;
+  server_id: string;
   round: number;
   speaker_role: string;
   speaker_agent: string;
