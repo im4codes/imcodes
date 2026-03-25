@@ -289,6 +289,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       // @ picker was used — send targets as structured field, strip @@labels from text
       text = stripAtLabels(text, atTargets.map(t => t.label));
       extra.p2pAtTargets = atTargets.map(({ session, mode }) => ({ session, mode }));
+      // Attach config data when any target uses config mode
+      const hasConfigTarget = atTargets.some(t => t.mode === 'config');
+      if (hasConfigTarget && p2pSavedConfig) {
+        extra.p2pSessionConfig = p2pSavedConfig.sessions;
+        extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
+        if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
+      }
     } else if (p2pMode !== 'solo' && !text.includes('@@')) {
       // Dropdown P2P mode — daemon handles expansion
       if (p2pMode === P2P_CONFIG_MODE) {
@@ -297,12 +304,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         extra.p2pMode = p2pMode;
         if (p2pExcludeSameType) extra.p2pExcludeSameType = true;
       }
-    }
-
-    if (p2pMode === P2P_CONFIG_MODE && p2pSavedConfig) {
-      extra.p2pSessionConfig = p2pSavedConfig.sessions;
-      extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
-      if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
+      if (p2pMode === P2P_CONFIG_MODE && p2pSavedConfig) {
+        extra.p2pSessionConfig = p2pSavedConfig.sessions;
+        extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
+        if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
+      }
     }
 
     // Prepend attachment references
