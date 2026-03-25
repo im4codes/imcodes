@@ -646,23 +646,22 @@ export async function startWatchingFile(sessionName: string, filePath: string): 
   await activateFile(sessionName, state, filePath);
   state.status = 'active';
 
-  // Poll drains new lines + detects stale file (CC may rotate to a new session).
-  let lastPollWrite = Date.now();
+  // Poll drains new lines every 2s; rotation scan every 10s as fallback (fs.watch is primary).
+  let pollCount = 0;
   state.pollTimer = setInterval(async () => {
-    const prevOffset = state.fileOffset;
     await drainNewLines(sessionName, state);
-    if (state.fileOffset > prevOffset) lastPollWrite = Date.now();
 
-    // If file has been stale >60s, check for a newer file in the same dir
-    if (Date.now() - lastPollWrite > 60_000 && state.activeFile) {
+    // Fallback rotation scan every 10s (5 ticks × 2s) in case fs.watch misses events.
+    // Primary rotation detection is via fs.watch in watchFile() which fires instantly.
+    pollCount++;
+    if (pollCount % 5 === 0 && state.activeFile) {
       try {
         const latest = await findLatestJsonl(state.projectDir);
         if (latest && latest !== state.activeFile && canClaim(sessionName, latest)) {
           logger.info({ sessionName, oldFile: basename(state.activeFile), newFile: basename(latest) },
-            'jsonl-watcher: poll detected stale file, switching (CC rotation)');
+            'jsonl-watcher: newer file detected (poll fallback), switching (CC rotation)');
           await activateFile(sessionName, state, latest);
           state.status = 'active';
-          lastPollWrite = Date.now();
         }
       } catch { /* ignore */ }
     }
@@ -682,22 +681,17 @@ async function watchFile(sessionName: string, state: WatcherState, filePath: str
       const changedFile = join(dir, event.filename);
 
       if (changedFile === state.activeFile) {
-        lastActiveWrite = Date.now();
         await drainNewLines(sessionName, state);
       } else if (canClaim(sessionName, changedFile)) {
-        // A different JSONL file is being written to. If our file has been stale
-        // for >30s, CC likely rotated to a new conversation — switch to it.
-        const staleMs = Date.now() - lastActiveWrite;
-        if (staleMs > 30_000) {
-          logger.info({ sessionName, oldFile: basename(state.activeFile ?? ''), newFile: event.filename, staleMs },
-            'jsonl-watcher: active file stale, switching to newer file (CC session rotation)');
-          try {
-            await activateFile(sessionName, state, changedFile);
-            state.status = 'active';
-            lastActiveWrite = Date.now();
-          } catch {
-            logger.warn({ sessionName, file: changedFile }, 'jsonl-watcher: failed to switch to newer file');
-          }
+        // A different JSONL file is being written to — CC started a new conversation.
+        // Switch immediately, no stale timeout.
+        logger.info({ sessionName, oldFile: basename(state.activeFile ?? ''), newFile: event.filename },
+          'jsonl-watcher: new file detected via fs.watch, switching (CC rotation)');
+        try {
+          await activateFile(sessionName, state, changedFile);
+          state.status = 'active';
+        } catch {
+          logger.warn({ sessionName, file: changedFile }, 'jsonl-watcher: failed to switch to newer file');
         }
       }
     }
