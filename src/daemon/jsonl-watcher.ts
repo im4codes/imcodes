@@ -470,44 +470,48 @@ async function emitRecentHistory(sessionName: string, filePath: string): Promise
       let blockIdx = 0;
       const stableId = (suffix: string) => `cc:${sessionName}:${lineBytePos}:${suffix}:${blockIdx++}`;
 
+      // Extract original timestamp from JSONL entry (same as parseLine)
+      const lineTs = raw['timestamp'] ? new Date(raw['timestamp'] as string).getTime() : undefined;
+      const ts = lineTs && isFinite(lineTs) ? lineTs : undefined;
+
       if (raw['type'] === 'assistant') {
         const msg = raw['message'] as Record<string, unknown> | undefined;
         const content = msg?.['content'] as ContentBlock[] | string;
         if (typeof content === 'string') {
-          emitAssistantStringContent(sessionName, content, stableId);
+          emitAssistantStringContent(sessionName, content, stableId, ts);
           continue;
         }
         for (const block of content) {
           if (block.type === 'text' && block.text) {
             timelineEmitter.emit(sessionName, 'assistant.text', {
               text: block.text, streaming: false,
-            }, { source: 'daemon', confidence: 'high', eventId: stableId('at') });
+            }, { source: 'daemon', confidence: 'high', eventId: stableId('at'), ...(ts ? { ts } : {}) });
           } else if (block.type === 'thinking') {
             timelineEmitter.emit(sessionName, 'assistant.thinking', {
               text: block.thinking,
-            }, { source: 'daemon', confidence: 'high', eventId: stableId('th') });
+            }, { source: 'daemon', confidence: 'high', eventId: stableId('th'), ...(ts ? { ts } : {}) });
           } else if (block.type === 'tool_use' && block.name) {
             const input = extractToolInput(block.name, block.input);
             timelineEmitter.emit(sessionName, 'tool.call', {
               tool: block.name, ...(input ? { input } : {}),
-            }, { source: 'daemon', confidence: 'high', eventId: stableId('tc') });
+            }, { source: 'daemon', confidence: 'high', eventId: stableId('tc'), ...(ts ? { ts } : {}) });
           }
         }
       } else if (raw['type'] === 'user') {
         const msg = raw['message'] as Record<string, unknown> | undefined;
         const content = msg?.['content'] as ContentBlock[] | string;
         if (typeof content === 'string') {
-          emitUserStringContent(sessionName, content, stableId);
+          emitUserStringContent(sessionName, content, stableId, ts);
           continue;
         }
         for (const block of content) {
           if (block.type === 'text' && block.text?.trim()) {
-            emitUserStringContent(sessionName, block.text, stableId);
+            emitUserStringContent(sessionName, block.text, stableId, ts);
           } else if (block.type === 'tool_result') {
             const error = block.is_error ? String(block.content ?? 'error') : undefined;
             timelineEmitter.emit(sessionName, 'tool.result', {
               ...(error ? { error } : {}),
-            }, { source: 'daemon', confidence: 'high', eventId: stableId('tr') });
+            }, { source: 'daemon', confidence: 'high', eventId: stableId('tr'), ...(ts ? { ts } : {}) });
           }
         }
       }
