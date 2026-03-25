@@ -164,3 +164,42 @@ describe('getP2pMode', () => {
     expect(getP2pMode(P2P_CONFIG_MODE)).toBeUndefined();
   });
 });
+
+describe('P2P_MAX_ROUNDS clamping', () => {
+  it('rounds are clamped to 6 max', () => {
+    // The clamping happens in p2p-orchestrator.ts with Math.min(P2P_MAX_ROUNDS, ...)
+    // We test the constant and the math here since the orchestrator is hard to unit test
+    const P2P_MAX_ROUNDS = 6;
+    expect(Math.min(P2P_MAX_ROUNDS, Math.max(1, 100))).toBe(6);
+    expect(Math.min(P2P_MAX_ROUNDS, Math.max(1, 3))).toBe(3);
+    expect(Math.min(P2P_MAX_ROUNDS, Math.max(1, 0))).toBe(1);
+    expect(Math.min(P2P_MAX_ROUNDS, Math.max(1, -5))).toBe(1);
+    expect(Math.min(P2P_MAX_ROUNDS, Math.max(1, 6))).toBe(6);
+    expect(Math.min(P2P_MAX_ROUNDS, Math.max(1, 7))).toBe(6);
+  });
+});
+
+describe('extraPrompt in P2pSavedConfig', () => {
+  it('extraPrompt is optional and preserved in config shape', () => {
+    const withPrompt: P2pSavedConfig = {
+      sessions: { 'deck_proj_w1': { enabled: true, mode: 'audit' } },
+      rounds: 2,
+      extraPrompt: '使用中文回复',
+    };
+    expect(withPrompt.extraPrompt).toBe('使用中文回复');
+
+    const withoutPrompt: P2pSavedConfig = {
+      sessions: {},
+      rounds: 1,
+    };
+    expect(withoutPrompt.extraPrompt).toBeUndefined();
+  });
+
+  it('roundPrompt + extraPrompt do not conflict', () => {
+    const rp = roundPrompt(2, 3);
+    const extra = 'Reply in Chinese';
+    const combined = rp + extra;
+    expect(combined).toContain('Round 2/3');
+    expect(combined).toContain('Reply in Chinese');
+  });
+});

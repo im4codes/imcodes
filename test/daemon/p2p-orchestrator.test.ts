@@ -63,32 +63,7 @@ import {
 } from '../../src/daemon/p2p-orchestrator.js';
 import { getP2pMode, BUILT_IN_MODES } from '../../shared/p2p-modes.js';
 
-// ── Re-export parseAtTokens for Group 15 tests ───────────────────────────────
-// parseAtTokens is not exported from command-handler, so we replicate its logic
-// here for isolated testing. The regexes and logic are copied verbatim.
-
-const DISCUSS_TOKEN_RE = /@@discuss\(([^,]+),\s*([^)]+)\)/g;
-const FILE_TOKEN_RE = /@((?:[a-zA-Z0-9_.\-/]+\/)*[a-zA-Z0-9_.\-]+\.[a-zA-Z0-9]+)/g;
-
-interface ParsedTokens {
-  agents: Array<{ session: string; mode: string }>;
-  files: string[];
-  cleanText: string;
-}
-
-function parseAtTokens(text: string): ParsedTokens {
-  const agents: Array<{ session: string; mode: string }> = [];
-  const files: string[] = [];
-  for (const m of text.matchAll(DISCUSS_TOKEN_RE)) {
-    agents.push({ session: m[1].trim(), mode: m[2].trim() });
-  }
-  let withoutCx = text.replace(DISCUSS_TOKEN_RE, '');
-  for (const m of withoutCx.matchAll(FILE_TOKEN_RE)) {
-    files.push(m[1]);
-  }
-  const cleanText = withoutCx.replace(FILE_TOKEN_RE, '').replace(/\s+/g, ' ').trim();
-  return { agents, files, cleanText };
-}
+// parseAtTokens tests moved to test/daemon/p2p-parser.test.ts (tests real exported parser)
 
 // File search excludes set (copied from command-handler.ts)
 const FILE_SEARCH_EXCLUDES = new Set([
@@ -1116,65 +1091,8 @@ describe('Group 14: Error Handling', () => {
 // Group 15: Token Parser + File Search (from command-handler.ts)
 // =============================================================================
 
-describe('Group 15: Token Parser + File Search', () => {
-  describe('parseAtTokens', () => {
-    it('extracts @@discuss tokens', () => {
-      const result = parseAtTokens('hello @@discuss(deck_proj_w1, audit) world');
-      expect(result.agents).toEqual([{ session: 'deck_proj_w1', mode: 'audit' }]);
-      expect(result.cleanText).toBe('hello world');
-    });
-
-
-    it('extracts @file tokens', () => {
-      const result = parseAtTokens('check @src/index.ts please');
-      expect(result.files).toEqual(['src/index.ts']);
-      expect(result.cleanText).toBe('check please');
-    });
-
-    it('handles mixed tokens', () => {
-      const result = parseAtTokens(
-        'review @@discuss(deck_proj_w1, audit) @src/auth.ts and @@discuss(deck_proj_w2, review) @lib/utils.ts please',
-      );
-
-      expect(result.agents).toEqual([
-        { session: 'deck_proj_w1', mode: 'audit' },
-        { session: 'deck_proj_w2', mode: 'review' },
-      ]);
-      expect(result.files).toEqual(['src/auth.ts', 'lib/utils.ts']);
-      expect(result.cleanText).toBe('review and please');
-    });
-
-    it('does not partially match @@discuss tokens as @file tokens', () => {
-      const result = parseAtTokens('test @@discuss(deck_proj_w1, audit) only');
-      // The @@discuss token should not produce a file match
-      expect(result.files).toEqual([]);
-    });
-
-    it('handles multiple @@discuss tokens', () => {
-      const result = parseAtTokens('@@discuss(deck_proj_w1, audit) @@discuss(deck_proj_w2, review)');
-      expect(result.agents).toHaveLength(2);
-      expect(result.agents[0].mode).toBe('audit');
-      expect(result.agents[1].mode).toBe('review');
-    });
-
-    it('handles text with no tokens', () => {
-      const result = parseAtTokens('just a normal message');
-      expect(result.agents).toEqual([]);
-      expect(result.files).toEqual([]);
-      expect(result.cleanText).toBe('just a normal message');
-    });
-
-    it('extracts file with nested path', () => {
-      const result = parseAtTokens('look at @src/daemon/p2p-orchestrator.ts');
-      expect(result.files).toEqual(['src/daemon/p2p-orchestrator.ts']);
-    });
-
-    it('handles @file with dashes and dots', () => {
-      const result = parseAtTokens('check @my-module/sub.component.tsx');
-      expect(result.files).toEqual(['my-module/sub.component.tsx']);
-    });
-  });
-
+// Group 15: parseAtTokens tests removed — now in test/daemon/p2p-parser.test.ts
+describe('Group 15: FILE_SEARCH_EXCLUDES', () => {
   describe('FILE_SEARCH_EXCLUDES', () => {
     it('excludes node_modules', () => {
       expect(FILE_SEARCH_EXCLUDES.has('node_modules')).toBe(true);
