@@ -43,6 +43,13 @@ export async function disconnectProvider(id: string): Promise<void> {
   providers.delete(id);
   broadcastProviderStatus(id, false);
   logger.info({ provider: id }, 'Provider disconnected');
+
+  // Remove persisted config so autoReconnectProviders won't restore on restart
+  if (id === 'openclaw') {
+    import('./openclaw-config.js')
+      .then(({ removeConfig }) => removeConfig())
+      .catch((e) => logger.warn({ err: e }, 'Failed to remove openclaw config'));
+  }
 }
 
 export async function disconnectAll(): Promise<void> {
