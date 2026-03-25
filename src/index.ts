@@ -471,9 +471,43 @@ program
       process.exit(1);
     }
 
-    console.log(`Connecting to ${provider} at ${url}...`);
-    await connectProvider(provider, { url, token });
+    // Save config first — the daemon's autoReconnectProviders reads this on restart
     await saveConfig({ url, token });
+
+    // Test connectivity in this process to give immediate feedback
+    console.log(`Testing connection to ${provider} at ${url}...`);
+    try {
+      await connectProvider(provider, { url, token });
+      console.log(`Connection verified.`);
+      // Disconnect test connection — the daemon will establish its own persistent one
+      const { disconnectProvider } = await import('./agent/provider-registry.js');
+      await disconnectProvider(provider);
+    } catch (err) {
+      console.error(`Connection failed: ${err instanceof Error ? err.message : err}`);
+      process.exit(1);
+    }
+
+    // Restart the daemon so it picks up the saved config and maintains the connection
+    // (connectProvider above runs in this CLI process which exits — the daemon process
+    // needs to establish its own long-lived connection)
+    console.log(`Restarting daemon to establish persistent connection...`);
+    ensureServiceForeground();
+    const platform = process.platform;
+    if (platform === 'darwin') {
+      const plist = resolve(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
+      if (existsSync(plist)) {
+        try { execSync(`launchctl unload "${plist}" 2>/dev/null`, { stdio: 'pipe' }); } catch { /* ok */ }
+        killStaleImcodesProcesses();
+        execSync(`launchctl load "${plist}"`, { stdio: 'inherit' });
+      }
+    } else if (platform === 'linux') {
+      const userService = resolve(homedir(), '.config/systemd/user/imcodes.service');
+      if (existsSync(userService)) {
+        execSync('systemctl --user restart imcodes', { stdio: 'inherit' });
+      } else {
+        try { execSync('sudo systemctl restart imcodes', { stdio: 'inherit' }); } catch { /* ok */ }
+      }
+    }
     console.log(`Connected to ${provider}.`);
   });
 
@@ -488,10 +522,29 @@ program
     }
 
     const { removeConfig } = await import('./agent/openclaw-config.js');
-    const { disconnectProvider } = await import('./agent/provider-registry.js');
 
-    await disconnectProvider(provider);
+    // Remove saved config so daemon won't auto-reconnect
     await removeConfig();
+
+    // Restart daemon to drop the active connection
+    console.log(`Restarting daemon to disconnect...`);
+    ensureServiceForeground();
+    const platform = process.platform;
+    if (platform === 'darwin') {
+      const plist = resolve(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
+      if (existsSync(plist)) {
+        try { execSync(`launchctl unload "${plist}" 2>/dev/null`, { stdio: 'pipe' }); } catch { /* ok */ }
+        killStaleImcodesProcesses();
+        execSync(`launchctl load "${plist}"`, { stdio: 'inherit' });
+      }
+    } else if (platform === 'linux') {
+      const userService = resolve(homedir(), '.config/systemd/user/imcodes.service');
+      if (existsSync(userService)) {
+        execSync('systemctl --user restart imcodes', { stdio: 'inherit' });
+      } else {
+        try { execSync('sudo systemctl restart imcodes', { stdio: 'inherit' }); } catch { /* ok */ }
+      }
+    }
     console.log(`Disconnected from ${provider}.`);
   });
 

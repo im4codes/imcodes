@@ -47,9 +47,10 @@ export function wireProviderToRelay(provider: TransportProvider): void {
 /** Broadcast provider status change to all browsers */
 export function broadcastProviderStatus(providerId: string, connected: boolean): void {
   if (!sendToServer) {
-    logger.debug({ providerId }, 'broadcastProviderStatus: no server link, skipping');
+    logger.warn({ providerId, connected }, 'broadcastProviderStatus: no server link — status NOT sent to browsers');
     return;
   }
+  logger.info({ providerId, connected }, 'Broadcasting provider status to browsers');
   sendToServer({
     type: TRANSPORT_MSG.PROVIDER_STATUS,
     providerId,
