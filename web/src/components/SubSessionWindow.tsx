@@ -3,7 +3,7 @@
  * Uses the full SessionControls for input (same as the main session).
  */
 import { useState, useRef, useCallback, useEffect, useMemo } from 'preact/hooks';
-import { getActiveThinkingTs, getActiveStatusText, isVisuallyBusy } from '../thinking-utils.js';
+import { getActiveThinkingTs, getActiveStatusText } from '../thinking-utils.js';
 import { recordCost } from '../cost-tracker.js';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';

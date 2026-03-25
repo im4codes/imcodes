@@ -649,14 +649,14 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
 
 // ── Prompt construction ───────────────────────────────────────────────────
 
-interface HopOpts {
+export interface HopOpts {
   session: string;
   sectionHeader: string;
   instruction: string;
   isInitial: boolean;
 }
 
-function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: HopOpts, roundPrefix = ''): string {
+export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: HopOpts, roundPrefix = ''): string {
   const parts: string[] = [];
   const filePath = run.contextFilePath;
 

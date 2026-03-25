@@ -269,7 +269,7 @@
     "settings_rounds": "轮数",
     "settings_rounds_hint": "讨论轮数（越多分析越深入）",
     "settings_extra_prompt": "额外指令",
-    "settings_extra_prompt_hint": "所有参与者的附加提示词（如"使用中文回复"）",
+    "settings_extra_prompt_hint": "所有参与者的附加提示词（如「使用中文回复」）",
     "all_label": "全部",
     "all_rounds": "{{count}} 轮",
     "all_rounds_plural": "{{count}} 轮",
