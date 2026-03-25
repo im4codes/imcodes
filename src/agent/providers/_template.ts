@@ -178,7 +178,7 @@ export class YourProvider implements TransportProvider {
 
   // ── Optional capability methods — implement only if the capability is true ──
 
-  // onToolCall?(cb: (sessionId: string, tool: ToolCallEvent) => void): void { ... }
+  // onToolCall?(cb: (sessionId: string, tool: ToolCallEvent) => void): () => void { ... }
   // onApprovalRequest?(cb: (sessionId: string, req: ApprovalRequest) => void): void { ... }
   // respondApproval?(sessionId: string, requestId: string, approved: boolean): Promise<void> { ... }
   // restoreSession?(sessionId: string): Promise<boolean> { ... }
