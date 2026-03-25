@@ -50,57 +50,10 @@ function safeSend(ws: WebSocket, data: string | Buffer, onComplete?: (err?: Erro
 }
 
 /** Message types allowed to be forwarded from browser → daemon */
-const BROWSER_WHITELIST = new Set([
-  'terminal.subscribe',
-  'terminal.unsubscribe',
-  'terminal.snapshot_request',
-  'timeline.replay_request',
-  'timeline.history_request',
-  'session.start',
-  'session.stop',
-  'session.restart',
-  'session.send',
-  'session.input',
-  'session.resize',
-  'get_sessions',
-  'subsession.start',
-  'subsession.stop',
-  'subsession.rebuild_all',
-  'subsession.detect_shells',
-  'subsession.read_response',
-  'discussion.start',
-  'discussion.status',
-  'discussion.stop',
-  'discussion.list',
-  'fs.ls',
-  'fs.read',
-  'fs.git_status',
-  'fs.git_diff',
-  'file.search',
-  'fs.mkdir',
-  'p2p.cancel',
-  'p2p.status',
-  'p2p.list_discussions',
-  'p2p.read_discussion',
-  'subsession.set_model',
-  'ask.answer',
-  'repo.detect',
-  'repo.list_issues',
-  'repo.list_prs',
-  'repo.list_branches',
-  'repo.list_commits',
-  'repo.list_actions',
-  'repo.commit_detail',
-  'repo.pr_detail',
-  'repo.issue_detail',
-  'chat.subscribe',
-  'chat.unsubscribe',
-  'daemon.upgrade',
-  'server.delete',
-  'provider.list_sessions',
-  'file.upload',
-  'file.download',
-]);
+// Browser→daemon message filtering: auth + rate-limit + payload-size are the real
+// security boundaries. The daemon command-handler ignores unknown types via its
+// switch default. No whitelist needed — it only caused silent message drops when
+// new features were added to the daemon but not mirrored here.
 
 // ── Terminal forwarding queue (per (session, browser)) ────────────────────────
 
@@ -427,8 +380,7 @@ export class WsBridge {
         }
       }
 
-      if (typeof msg.type !== 'string' || !BROWSER_WHITELIST.has(msg.type)) {
-        logger.warn({ serverId: this.serverId, type: msg.type }, 'Browser message type not whitelisted — dropped');
+      if (typeof msg.type !== 'string') {
         return;
       }
 
