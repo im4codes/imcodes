@@ -347,6 +347,14 @@ export function useTimeline(
 
       // ── Reconnect: daemon restarted → epoch changed, replay is useless. Request only new events. ──
       if (msg.type === 'daemon.reconnected') {
+        // Clear pending optimistic messages — they were sent to the old connection
+        // and we can't guarantee they reached the agent. The history replay below
+        // will bring back any messages that were actually processed.
+        setEvents((prev) => {
+          const cleaned = prev.filter((e) => !(e.type === 'user.message' && e.payload.pending));
+          if (cleaned.length !== prev.length && sessionId) eventsCache.set(sessionId, cleaned);
+          return cleaned;
+        });
         if (ws && sessionId) {
           setRefreshing(true);
           const cached = eventsCache.get(sessionId);
