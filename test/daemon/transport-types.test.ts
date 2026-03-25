@@ -100,9 +100,9 @@ describe('shared/transport-events', () => {
     expect(Object.keys(TRANSPORT_MSG)).toHaveLength(3);
   });
 
-  it('TRANSPORT_AGENT_STATUSES contains all 6 statuses', () => {
-    const expected = ['idle', 'streaming', 'thinking', 'tool_running', 'permission', 'unknown'];
-    expect(TRANSPORT_AGENT_STATUSES.size).toBe(6);
+  it('TRANSPORT_AGENT_STATUSES contains all 7 statuses', () => {
+    const expected = ['idle', 'streaming', 'thinking', 'tool_running', 'permission', 'error', 'unknown'];
+    expect(TRANSPORT_AGENT_STATUSES.size).toBe(7);
     for (const status of expected) {
       expect(TRANSPORT_AGENT_STATUSES.has(status as any)).toBe(true);
     }

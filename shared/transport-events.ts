@@ -33,11 +33,12 @@ export type TransportAgentStatus =
   | 'thinking'
   | 'tool_running'
   | 'permission'
+  | 'error'
   | 'unknown';
 
 /** All valid TransportAgentStatus values for runtime validation. */
 export const TRANSPORT_AGENT_STATUSES = new Set<TransportAgentStatus>([
-  'idle', 'streaming', 'thinking', 'tool_running', 'permission', 'unknown',
+  'idle', 'streaming', 'thinking', 'tool_running', 'permission', 'error', 'unknown',
 ]);
 
 /** Statuses that indicate the agent is actively doing work. */

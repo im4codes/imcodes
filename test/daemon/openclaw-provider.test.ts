@@ -379,7 +379,19 @@ describe('OpenClawProvider', () => {
     it('rejects pending RPC promise when response has ok:false', async () => {
       await connectProvider(provider);
 
+      const ws = lastWs();
+      const sentBefore = ws.sent.length;
       const sendPromise = provider.send('sess-1', 'msg');
+
+      // send() tries sessions.send first
+      replyToLastRpcError({ error: 'rate limited' });
+
+      // Wait for fallback agent RPC to be sent
+      await vi.waitFor(() => {
+        expect(ws.sent.length).toBeGreaterThan(sentBefore + 1);
+      }, { timeout: 1000 });
+
+      // Reject the fallback agent RPC too
       replyToLastRpcError({ error: 'rate limited' });
 
       await expect(sendPromise).rejects.toMatchObject({

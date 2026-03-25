@@ -22,7 +22,7 @@ export interface ChatMessage {
   timestamp: number;
 }
 
-export type TransportStatus = 'idle' | 'streaming' | 'thinking' | 'tool_running' | 'permission' | 'unknown';
+export type TransportStatus = 'idle' | 'streaming' | 'thinking' | 'tool_running' | 'permission' | 'error' | 'unknown';
 
 export interface UseTransportChatResult {
   messages: ChatMessage[];
@@ -102,7 +102,7 @@ export function useTransportChat(
         const error = (raw['error'] as string | undefined) ?? 'Unknown error';
 
         setIsStreaming(false);
-        setAgentStatus('error' as TransportStatus);
+        setAgentStatus('error');
         setMessages((prev) => [
           ...prev,
           {

@@ -813,6 +813,9 @@ function handleGetSessions(serverLink: ServerLink): void {
       state: s.state,
       projectDir: s.projectDir,
       runtimeType: s.runtimeType,
+      providerId: s.providerId,
+      providerSessionId: s.providerSessionId,
+      description: s.description,
     }));
   try {
     serverLink.send({ type: 'session_list', daemonVersion: serverLink.daemonVersion, sessions });

@@ -769,3 +769,60 @@ describe('composite PK multi-server isolation', () => {
     });
   });
 });
+
+// ── 13. Transport session metadata persistence ───────────────────────────────
+
+describe('transport session metadata persistence', () => {
+  let userId: string;
+  let serverId: string;
+
+  beforeAll(async () => {
+    userId = 'tmd-user-' + Math.random().toString(36).slice(2);
+    serverId = 'tmd-srv-' + Math.random().toString(36).slice(2);
+    await createUser(db, userId);
+    await createServer(db, serverId, userId, 'tmd-server', 'hash-tmd');
+  });
+
+  it('upsertDbSession with transport fields roundtrip', async () => {
+    await upsertDbSession(
+      db, 'tmd-sid-1', serverId, 'deck_transport_brain', 'tproj', 'brain', 'claude-code', '/home/dev',
+      'running', null, 'transport', 'openclaw', 'oc-key-123', 'test persona',
+    );
+    const sessions = await getDbSessionsByServer(db, serverId);
+    const s = sessions.find(s => s.name === 'deck_transport_brain');
+    expect(s).toBeDefined();
+    expect(s!.runtime_type).toBe('transport');
+    expect(s!.provider_id).toBe('openclaw');
+    expect(s!.provider_session_id).toBe('oc-key-123');
+    expect(s!.description).toBe('test persona');
+  });
+
+  it('upsertDbSession update preserves transport fields', async () => {
+    // Upsert same session with a new state — transport fields should survive
+    await upsertDbSession(
+      db, 'tmd-sid-1', serverId, 'deck_transport_brain', 'tproj', 'brain', 'claude-code', '/home/dev',
+      'idle', null, 'transport', 'openclaw', 'oc-key-123', 'test persona',
+    );
+    const sessions = await getDbSessionsByServer(db, serverId);
+    const s = sessions.find(s => s.name === 'deck_transport_brain');
+    expect(s).toBeDefined();
+    expect(s!.state).toBe('idle');
+    expect(s!.runtime_type).toBe('transport');
+    expect(s!.provider_id).toBe('openclaw');
+    expect(s!.provider_session_id).toBe('oc-key-123');
+    expect(s!.description).toBe('test persona');
+  });
+
+  it('createSubSession with transport fields roundtrip', async () => {
+    await createSubSession(
+      db, 'tmd-sub-1', serverId, 'claude-code', null, '/transport', null, null,
+      null, null, 'transport', 'openclaw', 'oc-sub-456', 'sub persona',
+    );
+    const sub = await getSubSessionById(db, 'tmd-sub-1', serverId);
+    expect(sub).not.toBeNull();
+    expect(sub!.runtime_type).toBe('transport');
+    expect(sub!.provider_id).toBe('openclaw');
+    expect(sub!.provider_session_id).toBe('oc-sub-456');
+    expect(sub!.description).toBe('sub persona');
+  });
+});

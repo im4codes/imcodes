@@ -72,6 +72,10 @@ async function persistSessionToWorker(
         agentVersion: record.agentVersion,
         projectDir: record.projectDir,
         state: record.state,
+        runtimeType: record.runtimeType ?? null,
+        providerId: record.providerId ?? null,
+        providerSessionId: record.providerSessionId ?? null,
+        description: record.description ?? null,
       }),
     });
     if (!res.ok) logger.warn({ status: res.status, name }, 'persistSessionToWorker: non-ok response');
