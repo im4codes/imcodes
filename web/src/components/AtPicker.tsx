@@ -144,6 +144,25 @@ const backBtnStyle: Record<string, string | number> = {
   gap: 4,
 };
 
+const MODE_COLORS: Record<string, string> = {
+  config: '#94a3b8',
+  audit: '#f59e0b',
+  review: '#3b82f6',
+  brainstorm: '#a78bfa',
+  discuss: '#22c55e',
+};
+
+function buildEffectiveConfig(config: P2pSavedConfig, modeOverride: string): P2pSavedConfig {
+  if (modeOverride === 'config') return config;
+  const overriddenSessions: P2pSavedConfig['sessions'] = {};
+  for (const [session, entry] of Object.entries(config.sessions)) {
+    overriddenSessions[session] = entry.enabled && entry.mode !== 'skip'
+      ? { ...entry, mode: modeOverride }
+      : { ...entry };
+  }
+  return { ...config, sessions: overriddenSessions };
+}
+
 export function AtPicker({
   query,
   sessions,
@@ -167,6 +186,7 @@ export function AtPicker({
   // Config mode: show rounds picker before dispatching
   const [configRoundsPicker, setConfigRoundsPicker] = useState(false);
   const [configRoundsHighlight, setConfigRoundsHighlight] = useState(0);
+  const [configModeOverride, setConfigModeOverride] = useState<string>('config');
   const CONFIG_ROUNDS_OPTIONS = [1, 2, 3, 5] as const;
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const requestIdRef = useRef<string | null>(null);
@@ -258,6 +278,7 @@ export function AtPicker({
       setFileResults([]);
       setModeAgent(null);
       setConfigRoundsPicker(false);
+      setConfigModeOverride('config');
     }
   }, [visible]);
 
@@ -283,7 +304,8 @@ export function AtPicker({
         if (e.key === 'Enter' && p2pConfig) {
           e.preventDefault();
           const rounds = CONFIG_ROUNDS_OPTIONS[configRoundsHighlight];
-          onSelectAllConfig?.(p2pConfig, rounds);
+          const effectiveConfig = buildEffectiveConfig(p2pConfig, configModeOverride);
+          onSelectAllConfig?.(effectiveConfig, rounds);
           setConfigRoundsPicker(false);
           return;
         }
@@ -345,7 +367,7 @@ export function AtPicker({
           onSelectAllConfig?.(p2pConfig!, rounds);
         } else if (cfgRowCount > 0 && highlightIdx === 1) {
           // @all+ — open rounds picker
-          setConfigRoundsPicker(true); setConfigRoundsHighlight(0);
+          setConfigRoundsPicker(true); setConfigRoundsHighlight(0); setConfigModeOverride('config');
         } else if (hasAllRow && highlightIdx === regAllOffset) {
           setModeAgent('__all__'); setModeHighlight(0);
         } else {
@@ -355,7 +377,7 @@ export function AtPicker({
         }
       }
     },
-    [visible, category, highlightIdx, fileResults, agents, modeAgent, modeHighlight, configRoundsPicker, configRoundsHighlight, p2pConfig, onClose, onSelectFile, onSelectAgent, onSelectAllConfig],
+    [visible, category, highlightIdx, fileResults, agents, modeAgent, modeHighlight, configRoundsPicker, configRoundsHighlight, configModeOverride, p2pConfig, onClose, onSelectFile, onSelectAgent, onSelectAllConfig],
   );
 
   useEffect(() => {
@@ -375,12 +397,35 @@ export function AtPicker({
 
   // ── Config rounds sub-picker (for @all+ with custom rounds) ──
   if (configRoundsPicker && p2pConfig) {
-    // Build participant preview
-    const participants = Object.entries(p2pConfig.sessions)
+    const ALL_MODES = ['config', 'audit', 'review', 'brainstorm', 'discuss'];
+    const effectiveConfig = buildEffectiveConfig(p2pConfig, configModeOverride);
+    const participants = Object.entries(effectiveConfig.sessions)
       .filter(([, e]) => e.enabled && e.mode !== 'skip');
     return (
       <div ref={containerRef} style={containerStyle}>
-        <div style={backBtnStyle} onClick={() => setConfigRoundsPicker(false)}>← {t('p2p.picker.back')}</div>
+        <div style={backBtnStyle} onClick={() => { setConfigRoundsPicker(false); setConfigModeOverride('config'); }}>← {t('p2p.picker.back')}</div>
+        <div style={groupLabelStyle}>{t('p2p.settings_mode', 'Mode')}</div>
+        <div style={modeContainerStyle}>
+          {ALL_MODES.map((m) => (
+            <button
+              key={m}
+              type="button"
+              style={{
+                ...modeBtnStyle,
+                ...(configModeOverride === m ? {
+                  background: '#334155',
+                  borderColor: MODE_COLORS[m] ?? '#60a5fa',
+                  color: MODE_COLORS[m] ?? '#93c5fd',
+                } : {}),
+                fontSize: 11,
+                padding: '2px 8px',
+              }}
+              onClick={() => setConfigModeOverride(m)}
+            >
+              {t(`p2p.mode_${m}`)}
+            </button>
+          ))}
+        </div>
         <div style={groupLabelStyle}>{t('p2p.settings_rounds')}</div>
         <div style={modeContainerStyle}>
           {CONFIG_ROUNDS_OPTIONS.map((r, idx) => (
@@ -388,7 +433,11 @@ export function AtPicker({
               key={r}
               type="button"
               style={idx === configRoundsHighlight ? modeBtnHoverStyle : modeBtnStyle}
-              onClick={() => { onSelectAllConfig?.(p2pConfig, r); setConfigRoundsPicker(false); }}
+              onClick={() => {
+                const cfg = buildEffectiveConfig(p2pConfig, configModeOverride);
+                onSelectAllConfig?.(cfg, r);
+                setConfigRoundsPicker(false);
+              }}
               onMouseEnter={() => setConfigRoundsHighlight(idx)}
             >
               {r}
@@ -401,10 +450,11 @@ export function AtPicker({
             {participants.map(([session, entry]) => {
               const parts = session.split('_');
               const shortName = parts[parts.length - 1] || session;
+              const effectiveMode = configModeOverride === 'config' ? entry.mode : configModeOverride;
               return (
                 <div key={session} style={{ ...itemStyle, fontSize: 12, paddingLeft: 14 }}>
                   <span style={{ color: '#e2e8f0' }}>{shortName}</span>
-                  <span style={dimStyle}>· {entry.mode}</span>
+                  <span style={{ ...dimStyle, color: MODE_COLORS[effectiveMode] ?? dimStyle.color }}>· {effectiveMode}</span>
                 </div>
               );
             })}
@@ -564,7 +614,7 @@ export function AtPicker({
             <div
               data-hl={hlAllPlus ? 'true' : undefined}
               style={hlAllPlus ? itemHighlightStyle : itemStyle}
-              onClick={() => { setConfigRoundsPicker(true); setConfigRoundsHighlight(0); }}
+              onClick={() => { setConfigRoundsPicker(true); setConfigRoundsHighlight(0); setConfigModeOverride('config'); }}
               onMouseEnter={() => setHighlightIdx(1)}
             >
               <span style={{ fontWeight: 600, color: '#94a3b8' }}>⚙ {t('p2p.all_plus')}</span>
