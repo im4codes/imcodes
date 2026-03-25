@@ -4,8 +4,11 @@ import { join, resolve, dirname } from 'path';
 
 const ROOT = resolve(__dirname, '..');
 const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
+const distExists = existsSync(join(ROOT, 'dist'));
 
-describe('npm package integrity', () => {
+// These tests validate that package.json paths match the actual build output.
+// They require `npm run build` first — skip if dist/ doesn't exist (CI unit-test jobs don't build).
+describe.skipIf(!distExists)('npm package integrity', () => {
   it('bin entry point exists after build', () => {
     const binPath = join(ROOT, pkg.bin.imcodes);
     expect(existsSync(binPath), `bin "${pkg.bin.imcodes}" not found — did tsconfig outDir structure change?`).toBe(true);
@@ -18,14 +21,12 @@ describe('npm package integrity', () => {
 
   it('entry point can resolve package.json (src/index.ts)', () => {
     const entryDir = dirname(join(ROOT, pkg.bin.imcodes));
-    // src/index.ts uses: join(__dirname, '../../package.json')
     const pkgFromEntry = join(entryDir, '../../package.json');
     expect(existsSync(pkgFromEntry), `package.json not reachable from ${pkg.bin.imcodes} via ../../package.json`).toBe(true);
     expect(JSON.parse(readFileSync(pkgFromEntry, 'utf8')).name).toBe('imcodes');
   });
 
   it('version.ts can resolve package.json', () => {
-    // src/util/version.ts uses: join(__dirname, '../../../package.json')
     const versionJs = join(ROOT, pkg.bin.imcodes, '../util/version.js');
     expect(existsSync(versionJs), `version.js not found at expected path`).toBe(true);
     const versionDir = dirname(versionJs);
@@ -35,7 +36,6 @@ describe('npm package integrity', () => {
   });
 
   it('config.ts can resolve default.yaml', () => {
-    // src/config.ts uses: join(__dirname, '../..', 'config', 'default.yaml')
     const configJs = join(ROOT, pkg.bin.imcodes, '../config.js');
     expect(existsSync(configJs), `config.js not found at expected path`).toBe(true);
     const configDir = dirname(configJs);
