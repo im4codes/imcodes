@@ -362,7 +362,7 @@ export function AtPicker({
       // Files or Agents list
       const configSessions = p2pConfig ? new Map(Object.entries(p2pConfig.sessions)) : null;
       const kbVisibleAgents = configSessions
-        ? agents.filter(a => { const e = configSessions.get(a.session); return !e || (e.enabled && e.mode !== 'skip'); })
+        ? agents.filter(a => { const e = configSessions.get(a.session); return e ? (e.enabled && e.mode !== 'skip') : false; })
         : agents;
       const nonSelfCount = kbVisibleAgents.filter(a => !a.isSelf).length;
       const hasAllRow = category === 'agents' && nonSelfCount > 1;
