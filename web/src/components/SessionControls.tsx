@@ -292,16 +292,22 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (draftKey) sessionStorage.removeItem(draftKey);
   }, [ws, activeSession, quickData, onSend, attachments, p2pMode, p2pSavedConfig]);
 
-  // Voice overlay send handler — applies same P2P mode as text send
+  // Voice overlay send handler — applies same P2P mode + config as text send
   const handleVoiceSend = useCallback((voiceText: string) => {
     if (!ws || !activeSession) return;
     const text = prepareMessage(voiceText);
     quickData.recordHistory(text, activeSession.name);
     try {
-      ws.sendSessionCommand('send', { sessionName: activeSession.name, text });
+      const extra: Record<string, unknown> = {};
+      if (p2pMode === P2P_CONFIG_MODE && p2pSavedConfig) {
+        extra.p2pSessionConfig = p2pSavedConfig.sessions;
+        extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
+        if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
+      }
+      ws.sendSessionCommand('send', { sessionName: activeSession.name, text, ...extra });
     } catch { return; }
     onSend?.(activeSession.name, text);
-  }, [ws, activeSession, quickData, onSend, prepareMessage]);
+  }, [ws, activeSession, quickData, onSend, prepareMessage, p2pMode, p2pSavedConfig]);
 
   const handleKeyDown = (e: KeyboardEvent) => {
     // When @ picker is open, let it handle Enter/Arrow/Escape — don't send or navigate history

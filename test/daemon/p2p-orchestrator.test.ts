@@ -61,7 +61,7 @@ import {
   type P2pRunStatus,
   notifySessionIdle,
 } from '../../src/daemon/p2p-orchestrator.js';
-import { getP2pMode, BUILT_IN_MODES } from '../../src/shared/p2p-modes.js';
+import { getP2pMode, BUILT_IN_MODES } from '../../shared/p2p-modes.js';
 
 // ── Re-export parseAtTokens for Group 15 tests ───────────────────────────────
 // parseAtTokens is not exported from command-handler, so we replicate its logic
@@ -425,7 +425,7 @@ describe('Group 10: State Machine Transitions', () => {
       if (msg.run?.status) transitions.push(msg.run.status);
     });
 
-    const { BUILT_IN_MODES: modes } = await import('../../src/shared/p2p-modes.js');
+    const { BUILT_IN_MODES: modes } = await import('../../shared/p2p-modes.js');
     const original = modes[0].defaultTimeoutMs;
     modes[0].defaultTimeoutMs = 300; // short timeout
 
@@ -734,7 +734,7 @@ describe('Group 12: Completion Detection', () => {
       if (msg.run?.status) transitions.push(msg.run.status);
     });
 
-    const { BUILT_IN_MODES: modes } = await import('../../src/shared/p2p-modes.js');
+    const { BUILT_IN_MODES: modes } = await import('../../shared/p2p-modes.js');
     const original = modes[0].defaultTimeoutMs;
     modes[0].defaultTimeoutMs = 500;
 
@@ -771,7 +771,7 @@ describe('Group 12: Completion Detection', () => {
       if (msg.run?.status) transitions.push(msg.run.status);
     });
 
-    const { BUILT_IN_MODES: modes } = await import('../../src/shared/p2p-modes.js');
+    const { BUILT_IN_MODES: modes } = await import('../../shared/p2p-modes.js');
     const original = modes[0].defaultTimeoutMs;
     modes[0].defaultTimeoutMs = 2_000;
 
@@ -893,7 +893,7 @@ describe('Group 12: Completion Detection', () => {
       if (msg.run?.status) transitions.push(msg.run.status);
     });
 
-    const { BUILT_IN_MODES: modes } = await import('../../src/shared/p2p-modes.js');
+    const { BUILT_IN_MODES: modes } = await import('../../shared/p2p-modes.js');
     const original = modes[0].defaultTimeoutMs;
     modes[0].defaultTimeoutMs = 300;
 
@@ -1359,7 +1359,7 @@ describe('Group 17: Grace Period Behavior', () => {
     sendKeysDelayedEnterMock.mockResolvedValue(undefined); // no file write
 
     _setGracePeriodMs(5_000); // 5s grace period
-    const { BUILT_IN_MODES: modes } = await import('../../src/shared/p2p-modes.js');
+    const { BUILT_IN_MODES: modes } = await import('../../shared/p2p-modes.js');
     const original = modes[0].defaultTimeoutMs;
     modes[0].defaultTimeoutMs = 2_000; // 2s timeout (less than grace period)
 
@@ -1393,7 +1393,7 @@ describe('Group 17: Grace Period Behavior', () => {
     sendKeysDelayedEnterMock.mockResolvedValue(undefined);
 
     _setGracePeriodMs(100); // very short grace
-    const { BUILT_IN_MODES: modes } = await import('../../src/shared/p2p-modes.js');
+    const { BUILT_IN_MODES: modes } = await import('../../shared/p2p-modes.js');
     const original = modes[0].defaultTimeoutMs;
     modes[0].defaultTimeoutMs = 10_000;
 
