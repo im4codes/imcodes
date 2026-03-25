@@ -18,7 +18,7 @@ import { MemoryRateLimiter } from './rate-limiter.js';
 import { sha256Hex } from '../security/crypto.js';
 import { REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
-import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus } from '../db/queries.js';
+import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions } from '../db/queries.js';
 import logger from '../util/logger.js';
 
 const AUTH_TIMEOUT_MS = 5000;
@@ -95,6 +95,11 @@ const BROWSER_WHITELIST = new Set([
   'repo.issue_detail',
   'chat.subscribe',
   'chat.unsubscribe',
+  'daemon.upgrade',
+  'server.delete',
+  'provider.list_sessions',
+  'file.upload',
+  'file.download',
 ]);
 
 // ── Terminal forwarding queue (per (session, browser)) ────────────────────────
@@ -168,6 +173,8 @@ export class WsBridge {
 
   /** Cached provider connection status — pushed to browsers on connect, persisted to DB. */
   private providerStatus = new Map<string, boolean>();
+  /** Cached remote sessions from providers — pushed to browsers on connect, persisted to DB. */
+  private providerRemoteSessions = new Map<string, unknown[]>();
 
   /**
    * Per-request fs.ls pending map: requestId → { socket, timer }.
@@ -385,6 +392,10 @@ export class WsBridge {
     // Push cached provider statuses so the browser has them immediately — no WS race.
     for (const [providerId, connected] of this.providerStatus) {
       safeSend(ws, JSON.stringify({ type: TRANSPORT_MSG.PROVIDER_STATUS, providerId, connected }));
+    }
+    // Push cached remote sessions for each connected provider
+    for (const [providerId, sessions] of this.providerRemoteSessions) {
+      safeSend(ws, JSON.stringify({ type: TRANSPORT_MSG.SESSIONS_RESPONSE, providerId, sessions }));
     }
 
     ws.on('message', (data) => {
@@ -853,6 +864,26 @@ export class WsBridge {
         }
       }
       this.broadcastToBrowsers(JSON.stringify(msg));
+      return;
+    }
+
+    // Provider remote sessions sync: cache + persist to DB + broadcast to browsers
+    if (type === 'provider.sync_sessions') {
+      const providerId = msg.providerId as string;
+      const sessions = msg.sessions as unknown[];
+      if (providerId && Array.isArray(sessions)) {
+        this.providerRemoteSessions.set(providerId, sessions);
+        if (this.db) {
+          void updateProviderRemoteSessions(this.db, this.serverId, providerId, sessions)
+            .catch((e) => logger.error({ err: e, providerId }, 'Failed to sync provider remote sessions'));
+        }
+      }
+      // Broadcast as sessions_response so browsers update immediately
+      this.broadcastToBrowsers(JSON.stringify({
+        type: TRANSPORT_MSG.SESSIONS_RESPONSE,
+        providerId,
+        sessions: sessions ?? [],
+      }));
       return;
     }
 
