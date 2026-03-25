@@ -154,7 +154,7 @@ const ALL_TOKEN_RE = /@@all\(([^)]+)\)/g;
 const P2P_CONFIG_TOKEN_RE = /@@p2p-config\([^)]*\)/g;
 const FILE_TOKEN_RE = /@((?:[a-zA-Z0-9_.\-/]+\/)*[a-zA-Z0-9_.\-]+\.[a-zA-Z0-9]+)/g;
 
-interface ParsedTokens {
+export interface ParsedTokens {
   agents: P2pTarget[];
   files: string[];
   cleanText: string;
@@ -162,7 +162,7 @@ interface ParsedTokens {
   expandAll?: { mode: string; excludeSameType?: boolean };
 }
 
-function parseAtTokens(text: string): ParsedTokens {
+export function parseAtTokens(text: string): ParsedTokens {
   const agents: P2pTarget[] = [];
   const files: string[] = [];
   let expandAll: { mode: string; excludeSameType?: boolean } | undefined;
