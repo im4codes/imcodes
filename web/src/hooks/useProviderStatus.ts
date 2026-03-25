@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'preact/hooks';
+import { useState, useEffect, useCallback } from 'preact/hooks';
 import type { WsClient } from '../ws-client.js';
 
 export interface ProviderStatus {
@@ -6,8 +6,17 @@ export interface ProviderStatus {
   connected: boolean;
 }
 
+export interface RemoteSession {
+  key: string;
+  displayName?: string;
+  agentId?: string;
+  updatedAt?: number;
+  percentUsed?: number;
+}
+
 export function useProviderStatus(ws: WsClient | null) {
   const [providers, setProviders] = useState<Map<string, boolean>>(new Map());
+  const [remoteSessions, setRemoteSessions] = useState<Map<string, RemoteSession[]>>(new Map());
 
   useEffect(() => {
     if (!ws) return;
@@ -20,13 +29,30 @@ export function useProviderStatus(ws: WsClient | null) {
           return next;
         });
       }
+      if (msg.type === 'provider.sessions_response') {
+        setRemoteSessions((prev) => {
+          const next = new Map(prev);
+          next.set(msg.providerId, msg.sessions ?? []);
+          return next;
+        });
+      }
     });
 
     return unsub;
   }, [ws]);
 
+  const refreshSessions = useCallback((providerId: string) => {
+    if (!ws) return;
+    try {
+      ws.send({ type: 'provider.list_sessions', providerId });
+    } catch { /* not connected */ }
+  }, [ws]);
+
   return {
     providers,
+    remoteSessions,
     isProviderConnected: (id: string) => providers.get(id) === true,
+    getRemoteSessions: (id: string) => remoteSessions.get(id) ?? [],
+    refreshSessions,
   };
 }

@@ -18,7 +18,7 @@ import { DashboardPage } from './pages/DashboardPage.js';
 import { SessionTabs } from './components/SessionTabs.js';
 import { TerminalView } from './components/TerminalView.js';
 import { ChatView } from './components/ChatView.js';
-import { TransportChatView } from './components/TransportChatView.js';
+// TransportChatView removed — transport sessions use unified ChatView via timelineEmitter
 import { SessionControls } from './components/SessionControls.js';
 import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
@@ -579,7 +579,7 @@ export function App() {
   }, [activeSession, defaultViewMode]);
 
   // Provider status (hoisted to app level so it's always listening — dialogs mount later)
-  const { isProviderConnected } = useProviderStatus(wsRef.current);
+  const { isProviderConnected, getRemoteSessions, refreshSessions } = useProviderStatus(wsRef.current);
 
   // Timeline events for chat view
   const { events: timelineEvents, loading: timelineLoading, refreshing: timelineRefreshing, loadingOlder: timelineLoadingOlder, addOptimisticUserMessage, loadOlderEvents } = useTimeline(activeSession, wsRef.current);
@@ -1586,8 +1586,7 @@ export function App() {
             />
 
             {/* Desktop view mode toggle — mobile uses the one in mobile-server-bar */}
-            {/* Transport sessions have no tmux terminal so the toggle is hidden */}
-            {!isMobile && activeSession && activeSessionInfo?.runtimeType !== 'transport' && (
+            {!isMobile && activeSession && (
               <div class="desktop-view-toggle">
                 <button class="view-toggle" title={trans('picker.files')} onClick={() => setShowDesktopFileBrowser(o => !o)}>
                   📁
@@ -1598,28 +1597,8 @@ export function App() {
               </div>
             )}
 
-            {/* Transport sessions: always render TransportChatView (no tmux terminal) */}
-            {sessions
-              .filter((s) => s.runtimeType === 'transport')
-              .map((s) => {
-                const isActive = s.name === activeSession;
-                return (
-                  <div
-                    key={s.name}
-                    style={{ display: isActive ? 'flex' : 'none', flex: 1, overflow: 'hidden' }}
-                  >
-                    <TransportChatView
-                      sessionName={s.name}
-                      ws={connected ? wsRef.current : null}
-                    />
-                  </div>
-                );
-              })}
-
-            {/* Terminal views: all non-transport sessions kept alive, show/hide via CSS */}
-            {sessions
-              .filter((s) => s.runtimeType !== 'transport')
-              .map((s) => {
+            {/* Terminal views: all sessions kept alive, show/hide via CSS */}
+            {sessions.map((s) => {
                 const isActive = s.name === activeSession;
                 const sViewMode = viewModes[s.name] ?? defaultViewMode;
                 const visible = isActive && sViewMode === 'terminal';
@@ -1642,8 +1621,8 @@ export function App() {
                 );
               })}
 
-            {/* Chat view for active non-transport session in chat mode */}
-            {activeSession && activeSessionInfo?.runtimeType !== 'transport' && viewMode === 'chat' && (
+            {/* Chat view for active session in chat mode */}
+            {activeSession && viewMode === 'chat' && (
               <ChatView events={timelineEvents} loading={timelineLoading} refreshing={timelineRefreshing} loadingOlder={timelineLoadingOlder} onLoadOlder={loadOlderEvents} sessionId={activeSession} sessionState={activeSessionInfo?.state} onScrollBottomFn={setChatScrollFn} workdir={activeSessionInfo?.projectDir} ws={connected ? wsRef.current : null} serverId={selectedServerId ?? undefined} />
             )}
 
@@ -1868,9 +1847,11 @@ export function App() {
           ws={wsRef.current}
           defaultCwd={activeSessionInfo?.projectDir}
           isProviderConnected={isProviderConnected}
-          onStart={async (type, shellBin, cwd, label) => {
+          getRemoteSessions={getRemoteSessions}
+          refreshSessions={refreshSessions}
+          onStart={async (type, shellBin, cwd, label, extra) => {
             setShowSubDialog(false);
-            const sub = await createSubSession(type, shellBin, cwd, label);
+            const sub = await createSubSession(type, shellBin, cwd, label, extra);
             if (sub) {
               setOpenSubIds((prev) => new Set([...prev, sub.id]));
               bringSubToFront(sub.id);

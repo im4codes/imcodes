@@ -2,7 +2,7 @@
  * Handle commands from the web UI and inbound chat messages via ServerLink.
  * Commands arrive as JSON objects with a `type` field.
  */
-import { startProject, stopProject, teardownProject, getTransportRuntime, type ProjectConfig } from '../agent/session-manager.js';
+import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, type ProjectConfig } from '../agent/session-manager.js';
 import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey } from '../agent/tmux.js';
 import { listSessions, getSession } from '../store/session-store.js';
 import { routeMessage, type InboundMessage, type RouterContext } from '../router/message-router.js';
@@ -28,6 +28,8 @@ import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, type P2pTarget } from './p2p-orchestrator.js';
 import { P2P_CONFIG_MODE, type P2pSessionConfig } from '../../shared/p2p-modes.js';
+import { TRANSPORT_MSG } from '../../shared/transport-events.js';
+import { getProvider } from '../agent/provider-registry.js';
 import { copyFile, mkdir } from 'node:fs/promises';
 import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
 
@@ -160,6 +162,8 @@ export interface ParsedTokens {
   cleanText: string;
   /** True if @@all was used — caller must expand with active sessions. */
   expandAll?: { mode: string; excludeSameType?: boolean };
+  /** True if @@discuss tokens were present but ALL failed validation. */
+  hadDiscussTokens?: boolean;
 }
 
 export function parseAtTokens(text: string): ParsedTokens {
@@ -181,11 +185,15 @@ export function parseAtTokens(text: string): ParsedTokens {
 
   // Validate session names and modes in @@discuss tokens
   const validSessions = new Set(listSessions().map((s) => s.name));
+  let discussTokenCount = 0;
   for (const m of text.matchAll(DISCUSS_TOKEN_RE)) {
+    discussTokenCount++;
     const session = m[1].trim();
     const mode = m[2].trim();
     if (SESSION_NAME_RE.test(session) && validSessions.has(session) && VALID_MODES.has(mode)) {
       agents.push({ session, mode });
+    } else {
+      logger.warn({ session, mode, valid: validSessions.has(session), modeValid: VALID_MODES.has(mode) }, 'parseAtTokens: @@discuss token skipped — session not in store or invalid mode');
     }
   }
 
@@ -196,7 +204,8 @@ export function parseAtTokens(text: string): ParsedTokens {
   }
 
   const cleanText = withoutCx.replace(FILE_TOKEN_RE, '').replace(/\s+/g, ' ').trim();
-  return { agents, files, cleanText, expandAll };
+  const hadDiscussTokens = discussTokenCount > 0 && agents.length === 0;
+  return { agents, files, cleanText, expandAll, hadDiscussTokens };
 }
 
 // ── Binary frame packing ─────────────────────────────────────────────────────
@@ -356,6 +365,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'timeline.history_request':
       handleTimelineHistory(cmd, serverLink);
       break;
+    case 'chat.subscribe':
+      void handleChatSubscribeReplay(cmd, serverLink);
+      break;
     case 'subsession.start':
       void handleSubSessionStart(cmd, serverLink);
       break;
@@ -430,6 +442,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       break;
     case 'file.download':
       void handleFileDownload(cmd, serverLink);
+      break;
+    case TRANSPORT_MSG.LIST_SESSIONS:
+      void handleListProviderSessions(cmd, serverLink);
       break;
     case 'auth_ok':
     case 'heartbeat':
@@ -618,8 +633,22 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const tokens = parseAtTokens(text);
 
   const p2pSessionConfig = (cmd as any).p2pSessionConfig as P2pSessionConfig | undefined;
-  const p2pRounds = (cmd as any).p2pRounds as number | undefined;
+  let p2pRounds = (cmd as any).p2pRounds as number | undefined;
   const p2pExtraPrompt = (cmd as any).p2pExtraPrompt as string | undefined;
+
+  // Extract rounds from @@p2p-config(rounds=N) text token if not in WS field
+  if (!p2pRounds) {
+    const roundsMatch = /@@p2p-config\(rounds=(\d+)\)/.exec(text);
+    if (roundsMatch) p2pRounds = Math.min(parseInt(roundsMatch[1], 10), 6);
+  }
+
+  // All @@discuss tokens were rejected — sessions not found in store
+  if (tokens.hadDiscussTokens) {
+    logger.warn({ sessionName }, 'P2P: all @@discuss tokens had invalid session names — none matched session store');
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: 'No valid P2P targets — session names not found' });
+    try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: 'no_valid_targets' }); } catch {}
+    return;
+  }
 
   // @@all(mode) — expand to all active sessions in the same domain
   if (tokens.expandAll && tokens.agents.length === 0) {
@@ -836,14 +865,6 @@ function handleGetSessions(serverLink: ServerLink): void {
     }));
   try {
     serverLink.send({ type: 'session_list', daemonVersion: serverLink.daemonVersion, sessions });
-    // Re-broadcast connected provider statuses so browsers see them on initial load
-    import('../agent/provider-registry.js').then(({ getAllProviders }) => {
-      import('./transport-relay.js').then(({ broadcastProviderStatus }) => {
-        for (const p of getAllProviders()) {
-          broadcastProviderStatus(p.id, true);
-        }
-      });
-    }).catch(() => {});
   } catch {
     // not connected
   }
@@ -1047,6 +1068,41 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
   const shellBin = cmd.shellBin as string | null | undefined;
   const ccSessionId = cmd.ccSessionId as string | null | undefined;
   const parentSession = cmd.parentSession as string | null | undefined;
+
+  // OpenClaw: launch transport session instead of tmux
+  if (type === 'openclaw') {
+    const sessionName = subSessionName(id);
+    const ocMode = cmd.ocMode as string | undefined;
+    const description = (cmd.ocDescription as string) || undefined;
+    const bindExistingKey = ocMode === 'bind' ? (cmd.ocSessionId as string) || undefined : undefined;
+    try {
+      await launchTransportSession({
+        name: sessionName,
+        projectName: sessionName,
+        role: 'w1',
+        agentType: 'openclaw',
+        projectDir: (cwd as string) || process.cwd(),
+        description,
+        bindExistingKey,
+      });
+      // Sync to server DB
+      try {
+        serverLink.send({
+          type: 'subsession.sync',
+          id,
+          sessionType: type,
+          cwd: cwd ?? null,
+          shellBin: null,
+          ccSessionId: null,
+          parentSession: parentSession ?? null,
+        });
+      } catch { /* not connected */ }
+    } catch (e: unknown) {
+      logger.error({ err: e, id }, 'subsession.start failed (openclaw transport)');
+    }
+    return;
+  }
+
   try {
     await startSubSession({
       id,
@@ -1728,4 +1784,41 @@ async function handleServerDelete(): Promise<void> {
   logger.info('Daemon unbound — exiting');
   // Give the log a moment to flush before exiting
   setTimeout(() => process.exit(0), 500);
+}
+
+// ── Transport chat history replay ─────────────────────────────────────────────
+
+async function handleChatSubscribeReplay(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const sessionId = cmd.sessionId as string | undefined;
+  if (!sessionId) return;
+  try {
+    const { replayTransportHistory } = await import('./transport-history.js');
+    const events = await replayTransportHistory(sessionId);
+    if (events.length === 0) return;
+    // Send history as a batch so the browser can render them before live events
+    serverLink.send({ type: 'chat.history', sessionId, events });
+    logger.debug({ sessionId, count: events.length }, 'Replayed transport chat history');
+  } catch (err) {
+    logger.debug({ sessionId, err }, 'Transport history replay failed');
+  }
+}
+
+/** Handle provider.list_sessions — list remote sessions from a provider and respond. */
+async function handleListProviderSessions(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const providerId = (cmd.providerId as string) || 'openclaw';
+  try {
+    const sessions = await listProviderSessions(providerId);
+    serverLink.send({ type: TRANSPORT_MSG.SESSIONS_RESPONSE, providerId, sessions });
+  } catch (err) {
+    logger.warn({ err, providerId }, 'Failed to list provider sessions');
+    serverLink.send({ type: TRANSPORT_MSG.SESSIONS_RESPONSE, providerId, sessions: [], error: String(err) });
+  }
+}
+
+/** Reusable: fetch remote sessions from a provider. */
+export async function listProviderSessions(providerId: string): Promise<Array<{ key: string; displayName?: string; agentId?: string; updatedAt?: number; percentUsed?: number }>> {
+  const provider = getProvider(providerId);
+  if (!provider) return [];
+  if (!provider.capabilities.sessionRestore || !provider.listSessions) return [];
+  return provider.listSessions();
 }

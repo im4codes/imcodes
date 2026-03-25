@@ -203,9 +203,11 @@ describe('P2pConfigPanel', () => {
     await act(async () => {});
 
     // Checkboxes should all be checked (enabled=true by default)
+    // First checkbox is the cross-session toggle — skip it
     const checkboxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
-    expect(checkboxes.length).toBeGreaterThan(0);
-    for (const cb of checkboxes) {
+    const sessionCheckboxes = checkboxes.slice(1); // skip cross-session toggle
+    expect(sessionCheckboxes.length).toBeGreaterThan(0);
+    for (const cb of sessionCheckboxes) {
       expect(cb.checked).toBe(true);
     }
 
@@ -224,11 +226,12 @@ describe('P2pConfigPanel', () => {
     await act(async () => {});
 
     const checkboxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
-    expect(checkboxes[0].checked).toBe(true);
+    // First checkbox is cross-session toggle, session checkboxes start at index 1
+    expect(checkboxes[1].checked).toBe(true);
 
     // Uncheck the first session
-    fireEvent.click(checkboxes[0]);
-    expect(checkboxes[0].checked).toBe(false);
+    fireEvent.click(checkboxes[1]);
+    expect(checkboxes[1].checked).toBe(false);
 
     const saveBtn = screen.getByText('settings_save');
     await act(async () => {

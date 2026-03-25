@@ -4,6 +4,7 @@
 import { useState, useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { WsClient } from '../ws-client.js';
+import type { RemoteSession } from '../hooks/useProviderStatus.js';
 import { FileBrowser } from './FileBrowser.js';
 import { getUserPref, saveUserPref } from '../api.js';
 
@@ -11,6 +12,8 @@ interface Props {
   ws: WsClient | null;
   defaultCwd?: string;
   isProviderConnected: (id: string) => boolean;
+  getRemoteSessions: (providerId: string) => RemoteSession[];
+  refreshSessions: (providerId: string) => void;
   onStart: (type: string, shellBin?: string, cwd?: string, label?: string, extra?: Record<string, unknown>) => void;
   onClose: () => void;
 }
@@ -28,12 +31,7 @@ const OPENCLAW_AGENT = { id: 'openclaw', label: 'OpenClaw', icon: '🦞' };
 
 type OpenClawMode = 'new' | 'bind';
 
-interface RemoteSession {
-  id: string;
-  label: string;
-}
-
-export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected, onStart, onClose }: Props) {
+export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected, getRemoteSessions, refreshSessions, onStart, onClose }: Props) {
   const { t } = useTranslation();
   const [type, setType] = useState('claude-code');
   const [shells, setShells] = useState<string[]>([]);
@@ -49,15 +47,14 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected, onS
   const [ocMode, setOcMode] = useState<OpenClawMode>('new');
   const [ocSessionKey, setOcSessionKey] = useState('');
   const [ocDescription, setOcDescription] = useState('');
-  const [ocRemoteSessions, setOcRemoteSessions] = useState<RemoteSession[]>([]);
-  const [ocLoadingSessions, setOcLoadingSessions] = useState(false);
   const [ocSelectedSession, setOcSelectedSession] = useState('');
 
   const openClawAvailable = isProviderConnected('openclaw');
+  // Remote sessions come from the provider status hook (pushed on connect, cached in DB)
+  const ocRemoteSessions = getRemoteSessions('openclaw');
 
-  const agentTypes = openClawAvailable
-    ? [...BASE_AGENT_TYPES, OPENCLAW_AGENT]
-    : BASE_AGENT_TYPES;
+  // OpenClaw is always shown (greyed when not connected)
+  const agentTypes = [...BASE_AGENT_TYPES, OPENCLAW_AGENT];
 
   // Load saved shell preference from server
   useEffect(() => {
@@ -76,12 +73,6 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected, onS
         setDetectingShells(false);
         setShellBin((prev) => (msg.shells.includes(prev) ? prev : (msg.shells[0] ?? prev)));
       }
-      const raw = msg as unknown as Record<string, unknown>;
-      if (raw['type'] === 'openclaw.sessions_response') {
-        const sessions = raw['sessions'] as RemoteSession[] | undefined;
-        setOcRemoteSessions(sessions ?? []);
-        setOcLoadingSessions(false);
-      }
     });
 
     setDetectingShells(true);
@@ -89,14 +80,6 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected, onS
     return unsub;
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ws]);
-
-  // Fetch remote sessions when bind mode is selected
-  useEffect(() => {
-    if (type !== 'openclaw' || ocMode !== 'bind' || !ws) return;
-    setOcLoadingSessions(true);
-    setOcRemoteSessions([]);
-    ws.send({ type: 'openclaw.list_sessions' });
-  }, [type, ocMode, ws]);
 
   // Auto-generate a session key when switching to openclaw new mode
   useEffect(() => {
@@ -238,10 +221,19 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected, onS
 
               {ocMode === 'bind' ? (
                 <div>
-                  <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.selectSession')}</div>
-                  {ocLoadingSessions ? (
-                    <div style={{ fontSize: 12, color: '#64748b' }}>{t('session.loadingSessions')}</div>
-                  ) : ocRemoteSessions.length === 0 ? (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                    <div style={{ fontSize: 12, color: '#94a3b8' }}>{t('session.selectSession')}</div>
+                    <button
+                      type="button"
+                      class="btn btn-secondary"
+                      onClick={() => refreshSessions('openclaw')}
+                      style={{ fontSize: 10, padding: '2px 8px', lineHeight: 1.4 }}
+                      title={t('common.refresh')}
+                    >
+                      {t('common.refresh')}
+                    </button>
+                  </div>
+                  {ocRemoteSessions.length === 0 ? (
                     <div style={{ fontSize: 12, color: '#64748b' }}>{t('session.noSessions')}</div>
                   ) : (
                     <select
@@ -252,7 +244,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected, onS
                     >
                       <option value="">{t('session.selectSession')}</option>
                       {ocRemoteSessions.map((s) => (
-                        <option key={s.id} value={s.id}>{s.label || s.id}</option>
+                        <option key={s.key} value={s.key}>{s.displayName || s.key}</option>
                       ))}
                     </select>
                   )}

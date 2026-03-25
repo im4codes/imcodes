@@ -14,7 +14,8 @@
     "yes": "да",
     "connected": "Подключено",
     "disconnected": "Отключено",
-    "reconnecting": "Переподключение…"
+    "reconnecting": "Переподключение…",
+    "refresh": "Обновить"
   },
   "chat": {
     "loading": "Загрузка чата...",
@@ -262,6 +263,7 @@
     },
     "mode_config": "Конфиг",
     "settings_title": "Настройки участников P2P",
+    "cross_session": "Включить сессии из других проектов",
     "settings_save": "Сохранить",
     "settings_close": "Закрыть",
     "settings_enabled": "Участвовать",

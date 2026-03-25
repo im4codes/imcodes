@@ -238,6 +238,7 @@ export async function restoreFromStore(): Promise<void> {
   const live = await tmuxListSessions();
 
   // 1. Restart store sessions missing from tmux; start jsonl-watcher for live ones
+  logger.debug({ totalSessions: all.length, liveTmux: live.length }, 'restoreFromStore: starting reconciliation');
   for (const s of all) {
     if (s.state === 'stopped') continue;
     // Transport sessions don't have tmux panes — skip all tmux reconciliation.
@@ -297,13 +298,17 @@ export async function restoreFromStore(): Promise<void> {
       }
     }
 
-    if (!live.includes(s.name)) {
+    const isLiveSession = live.includes(s.name);
+    const paneAlive = isLiveSession ? await isPaneAlive(s.name) : false;
+    logger.debug({ session: s.name, agentType: s.agentType, isLive: isLiveSession, paneAlive, ccSessionId: s.ccSessionId ?? null, watching: isWatching(s.name) }, 'restoreFromStore: processing main session');
+
+    if (!isLiveSession) {
       logger.info({ session: hydrated.name }, 'Missing on restore, restarting');
       try { await restartSession(hydrated); } catch (err) {
         logger.error({ err, session: hydrated.name }, 'Failed to restart session on restore — skipping (tmux may be unavailable)');
         updateSessionState(hydrated.name, 'error');
       }
-    } else if (live.includes(s.name) && !(await isPaneAlive(s.name))) {
+    } else if (isLiveSession && !paneAlive) {
       // Session exists (remain-on-exit) but process is dead — respawn instead of creating a new session
       logger.info({ session: hydrated.name }, 'Pane dead on restore, respawning');
       try { await respawnSession(hydrated); } catch (err) {
@@ -536,7 +541,7 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
   return true;
 }
 
-interface LaunchOpts {
+export interface LaunchOpts {
   name: string;
   projectName: string;
   role: 'brain' | `w${number}`;
@@ -566,7 +571,7 @@ export function getTransportRuntime(name: string): TransportSessionRuntime | und
   return transportRuntimes.get(name);
 }
 
-async function launchTransportSession(opts: LaunchOpts): Promise<void> {
+export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const { name, projectName, role, agentType, projectDir, skipStore, description, bindExistingKey } = opts;
 
   const provider = getProvider(agentType);

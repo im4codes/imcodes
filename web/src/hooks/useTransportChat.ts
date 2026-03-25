@@ -52,9 +52,46 @@ export function useTransportChat(
     }
 
     const unsubscribe = ws.onMessage((msg) => {
-      // Narrow to transport event shapes — msg.type is the discriminant.
       const raw = msg as Record<string, unknown>;
       const type = raw['type'];
+
+      // History replay — batch of cached events sent on subscribe
+      if (type === 'chat.history') {
+        const sid = raw['sessionId'] as string | undefined;
+        if (sid !== sessionName) return;
+        const events = raw['events'] as Array<Record<string, unknown>> | undefined;
+        if (!events || events.length === 0) return;
+        // Rebuild messages from cached delta/complete/error events
+        const rebuilt = new Map<string, ChatMessage>();
+        for (const evt of events) {
+          const evtType = evt['type'] as string;
+          const ts = (evt['_ts'] as number) ?? Date.now();
+          if (evtType === TRANSPORT_EVENT.CHAT_DELTA) {
+            const mid = evt['messageId'] as string;
+            const delta = (evt['delta'] as string) ?? '';
+            const existing = rebuilt.get(mid);
+            if (existing) {
+              existing.content += delta;
+            } else {
+              rebuilt.set(mid, { id: mid, role: 'assistant', content: delta, status: 'streaming', timestamp: ts });
+            }
+          } else if (evtType === TRANSPORT_EVENT.CHAT_COMPLETE) {
+            const mid = evt['messageId'] as string;
+            const existing = rebuilt.get(mid);
+            if (existing) existing.status = 'complete';
+          } else if (evtType === TRANSPORT_EVENT.CHAT_ERROR) {
+            const error = (evt['error'] as string) ?? 'Error';
+            rebuilt.set(uniqueId('error'), { id: uniqueId('error'), role: 'assistant', content: error, status: 'error', timestamp: ts });
+          }
+        }
+        // Merge into state without duplicating
+        setMessages((prev) => {
+          const existingIds = new Set(prev.map(m => m.id));
+          const newMsgs = [...rebuilt.values()].filter(m => !existingIds.has(m.id));
+          return newMsgs.length > 0 ? [...newMsgs, ...prev] : prev;
+        });
+        return;
+      }
 
       if (type === TRANSPORT_EVENT.CHAT_DELTA) {
         const sessionId = raw['sessionId'] as string | undefined;

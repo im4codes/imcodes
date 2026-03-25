@@ -14,7 +14,8 @@
     "yes": "예",
     "connected": "연결됨",
     "disconnected": "연결 끊김",
-    "reconnecting": "재연결 중…"
+    "reconnecting": "재연결 중…",
+    "refresh": "새로고침"
   },
   "chat": {
     "loading": "채팅 로딩 중...",
@@ -262,6 +263,7 @@
     },
     "mode_config": "설정",
     "settings_title": "P2P 참가자 설정",
+    "cross_session": "다른 프로젝트의 세션 포함",
     "settings_save": "저장",
     "settings_close": "닫기",
     "settings_enabled": "참여",

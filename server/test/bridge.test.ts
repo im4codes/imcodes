@@ -196,10 +196,10 @@ describe('WsBridge', () => {
       expect(daemonWs.sentStrings.some((s) => s.includes('terminal.subscribe'))).toBe(true);
     });
 
-    it('drops non-whitelisted type', async () => {
+    it('forwards any valid message type to daemon (no whitelist)', async () => {
       const { daemonWs, browserWs } = await setupBridge();
       browserWs.emit('message', JSON.stringify({ type: 'admin.shutdown' }));
-      expect(daemonWs.sent).toHaveLength(0);
+      expect(daemonWs.sentStrings.some((s) => s.includes('admin.shutdown'))).toBe(true);
     });
 
     it('drops oversized payload', async () => {

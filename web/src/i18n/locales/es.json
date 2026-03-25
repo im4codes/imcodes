@@ -14,7 +14,8 @@
     "yes": "sí",
     "connected": "Conectado",
     "disconnected": "Desconectado",
-    "reconnecting": "Reconectando…"
+    "reconnecting": "Reconectando…",
+    "refresh": "Actualizar"
   },
   "chat": {
     "loading": "Cargando chat...",
@@ -262,6 +263,7 @@
     },
     "mode_config": "Config",
     "settings_title": "Ajustes de participantes P2P",
+    "cross_session": "Incluir sesiones de otros proyectos",
     "settings_save": "Guardar",
     "settings_close": "Cerrar",
     "settings_enabled": "Participar",

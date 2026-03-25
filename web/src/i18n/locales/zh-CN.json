@@ -14,7 +14,8 @@
     "yes": "是",
     "connected": "已连接",
     "disconnected": "已断开",
-    "reconnecting": "重新连接中…"
+    "reconnecting": "重新连接中…",
+    "refresh": "刷新"
   },
   "chat": {
     "loading": "加载聊天记录中...",
@@ -262,6 +263,7 @@
     },
     "mode_config": "配置",
     "settings_title": "P2P 参与者设置",
+    "cross_session": "包含其他项目的会话",
     "settings_save": "保存",
     "settings_close": "关闭",
     "settings_enabled": "参与",

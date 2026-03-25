@@ -122,6 +122,8 @@ body {
 .attachment-badge-remove:hover { color: #ef4444; }
 .controls-input { flex: 1; min-width: 0; background: #0f172a; border: 1px solid #334155; color: #e2e8f0; padding: 6px 10px; border-radius: 4px; font-family: inherit; font-size: 13px; outline: none; overflow-y: auto; min-height: 32px; max-height: 120px; line-height: 1.45; word-break: break-word; white-space: pre-wrap; text-align: left !important; direction: ltr; -webkit-user-modify: read-write-plaintext-only; }
 .controls-input:focus { border-color: #3b82f6; }
+.controls-input-p2p { background: #1a1520; }
+.controls-input-p2p:focus { border-color: inherit; }
 .controls-input-disabled { opacity: 0.4; pointer-events: none; }
 /* Placeholder via CSS when empty */
 .controls-input:empty::before { content: attr(data-placeholder); color: #475569; pointer-events: none; }

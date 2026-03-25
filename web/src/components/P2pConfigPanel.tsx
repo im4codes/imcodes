@@ -17,12 +17,15 @@ interface SubSessionRow {
   sessionName: string;
   type: string;
   label?: string | null;
+  parentSession?: string | null;
   state: string;
 }
 
 interface Props {
   sessions: SessionRow[];
   subSessions: SubSessionRow[];
+  /** Active main session name — only show sessions scoped to this one by default */
+  activeSession?: string | null;
   onClose: () => void;
   onSave: (config: P2pSavedConfig) => void;
 }
@@ -181,8 +184,9 @@ const btnPrimaryStyle: Record<string, string | number> = {
   cursor: 'pointer',
 };
 
-export function P2pConfigPanel({ sessions, subSessions, onClose, onSave }: Props) {
+export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, onSave }: Props) {
   const { t } = useTranslation();
+  const [crossSession, setCrossSession] = useState(false);
 
   // Build combined eligible session list (exclude shell/script)
   const eligible: Array<{ key: string; shortName: string; agentType: string }> = [];
@@ -190,19 +194,21 @@ export function P2pConfigPanel({ sessions, subSessions, onClose, onSave }: Props
 
   for (const s of sessions) {
     if (EXCLUDED_TYPES.has(s.agentType)) continue;
+    // When not cross-session, only show active session itself
+    if (!crossSession && activeSession && s.name !== activeSession) continue;
     if (seen.has(s.name)) continue;
     seen.add(s.name);
-    const parts = s.name.split('_');
-    const shortName = parts[parts.length - 1] || s.name;
+    const shortName = s.name.split('_').pop() || s.name;
     eligible.push({ key: s.name, shortName, agentType: s.agentType });
   }
 
   for (const s of subSessions) {
     if (EXCLUDED_TYPES.has(s.type)) continue;
+    // When not cross-session, only show sub-sessions under active main session
+    if (!crossSession && activeSession && s.parentSession && s.parentSession !== activeSession) continue;
     if (seen.has(s.sessionName)) continue;
     seen.add(s.sessionName);
-    const parts = s.sessionName.split('_');
-    const shortName = s.label || parts[parts.length - 1] || s.sessionName;
+    const shortName = s.label || s.sessionName;
     eligible.push({ key: s.sessionName, shortName, agentType: s.type });
   }
 
@@ -278,6 +284,17 @@ export function P2pConfigPanel({ sessions, subSessions, onClose, onSave }: Props
             <div style={{ textAlign: 'center', padding: 24, color: '#64748b', fontSize: 13 }}>…</div>
           ) : (
             <>
+              {/* Cross-session toggle */}
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: '#94a3b8', cursor: 'pointer', marginBottom: 4 }}>
+                <input
+                  type="checkbox"
+                  style={checkboxStyle}
+                  checked={crossSession}
+                  onChange={() => setCrossSession((v) => !v)}
+                />
+                {t('p2p.cross_session')}
+              </label>
+
               {/* Session rows */}
               <div style={sectionLabelStyle}>{t('p2p.picker.agents')}</div>
               {eligible.length === 0 && (

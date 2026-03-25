@@ -53,14 +53,14 @@ describe('TRANSPORT_EVENT constant', () => {
 
 describe('TRANSPORT_MSG constant', () => {
   it('has all expected keys', () => {
-    const expectedKeys = ['CHAT_SUBSCRIBE', 'CHAT_UNSUBSCRIBE', 'PROVIDER_STATUS'];
+    const expectedKeys = ['CHAT_SUBSCRIBE', 'CHAT_UNSUBSCRIBE', 'PROVIDER_STATUS', 'LIST_SESSIONS', 'SESSIONS_RESPONSE'];
     for (const key of expectedKeys) {
       expect(TRANSPORT_MSG).toHaveProperty(key);
     }
   });
 
   it('has exactly the expected number of keys', () => {
-    expect(Object.keys(TRANSPORT_MSG)).toHaveLength(3);
+    expect(Object.keys(TRANSPORT_MSG)).toHaveLength(5);
   });
 
   it('has no duplicate values', () => {
@@ -73,6 +73,8 @@ describe('TRANSPORT_MSG constant', () => {
     expect(TRANSPORT_MSG.CHAT_SUBSCRIBE).toBe('chat.subscribe');
     expect(TRANSPORT_MSG.CHAT_UNSUBSCRIBE).toBe('chat.unsubscribe');
     expect(TRANSPORT_MSG.PROVIDER_STATUS).toBe('provider.status');
+    expect(TRANSPORT_MSG.LIST_SESSIONS).toBe('provider.list_sessions');
+    expect(TRANSPORT_MSG.SESSIONS_RESPONSE).toBe('provider.sessions_response');
   });
 });
 

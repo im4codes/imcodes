@@ -387,9 +387,27 @@ export async function startup(): Promise<DaemonContext> {
     }
   }
 
-  // Forward all timeline events to connected browsers via ServerLink
+  // Forward all timeline events to connected browsers via ServerLink.
+  // Dedup by eventId so history replays (daemon restart, JSONL rotation) don't
+  // re-send events that browsers already received.
   if (serverLink) {
+    const sentEventIds = new Set<string>();
+    const DEDUP_MAX = 2000;
+
     timelineEmitter.on((event) => {
+      if (event.eventId && sentEventIds.has(event.eventId)) return; // already sent
+      if (event.eventId) {
+        sentEventIds.add(event.eventId);
+        if (sentEventIds.size > DEDUP_MAX) {
+          // Evict oldest entries (Sets iterate in insertion order)
+          const it = sentEventIds.values();
+          for (let i = 0; i < DEDUP_MAX / 2; i++) it.next();
+          const keep = new Set<string>();
+          for (const v of it) keep.add(v);
+          sentEventIds.clear();
+          for (const v of keep) sentEventIds.add(v);
+        }
+      }
       // For session.state idle, attach lastText so push notifications have context
       if (event.type === 'session.state' && (event.payload as Record<string, unknown>).state === 'idle') {
         const lastText = getLastAssistantText(event.sessionId);

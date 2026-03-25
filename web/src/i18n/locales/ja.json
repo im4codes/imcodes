@@ -14,7 +14,8 @@
     "yes": "はい",
     "connected": "接続済み",
     "disconnected": "切断済み",
-    "reconnecting": "再接続中…"
+    "reconnecting": "再接続中…",
+    "refresh": "更新"
   },
   "chat": {
     "loading": "チャットを読み込み中...",
@@ -262,6 +263,7 @@
     },
     "mode_config": "設定",
     "settings_title": "P2P参加者設定",
+    "cross_session": "他のプロジェクトのセッションを含める",
     "settings_save": "保存",
     "settings_close": "閉じる",
     "settings_enabled": "参加",

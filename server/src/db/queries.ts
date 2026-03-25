@@ -201,6 +201,61 @@ export async function updateServerStatus(db: Database, id: string, status: strin
   await db.execute('UPDATE servers SET status = $1 WHERE id = $2', [status, id]);
 }
 
+export async function updateProviderStatus(db: Database, serverId: string, providerId: string, connected: boolean): Promise<void> {
+  if (connected) {
+    await db.execute(
+      `UPDATE servers SET connected_providers = coalesce(connected_providers, '{}'::jsonb) || $1::jsonb WHERE id = $2`,
+      [JSON.stringify({ [providerId]: true }), serverId],
+    );
+  } else {
+    await db.execute(
+      `UPDATE servers SET connected_providers = coalesce(connected_providers, '{}'::jsonb) - $1 WHERE id = $2`,
+      [providerId, serverId],
+    );
+  }
+}
+
+export async function clearProviderStatus(db: Database, serverId: string): Promise<void> {
+  await db.execute(`UPDATE servers SET connected_providers = '{}'::jsonb WHERE id = $1`, [serverId]);
+}
+
+export async function getProviderStatus(db: Database, serverId: string): Promise<Record<string, boolean>> {
+  const row = await db.queryOne<{ connected_providers: Record<string, boolean> | string }>(
+    'SELECT connected_providers FROM servers WHERE id = $1',
+    [serverId],
+  );
+  if (!row) return {};
+  const val = row.connected_providers;
+  if (typeof val === 'string') return JSON.parse(val);
+  return val ?? {};
+}
+
+export async function updateProviderRemoteSessions(
+  db: Database,
+  serverId: string,
+  providerId: string,
+  sessions: unknown[],
+): Promise<void> {
+  await db.execute(
+    `UPDATE servers SET provider_remote_sessions = coalesce(provider_remote_sessions, '{}'::jsonb) || $1::jsonb WHERE id = $2`,
+    [JSON.stringify({ [providerId]: sessions }), serverId],
+  );
+}
+
+export async function getProviderRemoteSessions(
+  db: Database,
+  serverId: string,
+): Promise<Record<string, unknown[]>> {
+  const row = await db.queryOne<{ provider_remote_sessions: Record<string, unknown[]> | string }>(
+    'SELECT provider_remote_sessions FROM servers WHERE id = $1',
+    [serverId],
+  );
+  if (!row) return {};
+  const val = row.provider_remote_sessions;
+  if (typeof val === 'string') return JSON.parse(val);
+  return val ?? {};
+}
+
 export async function updateServerName(db: Database, id: string, userId: string, name: string): Promise<boolean> {
   const result = await db.execute('UPDATE servers SET name = $1 WHERE id = $2 AND user_id = $3', [name, id, userId]);
   return (result.changes ?? 0) > 0;
@@ -435,7 +490,7 @@ export async function createSubSession(
   await db.execute(
     `INSERT INTO sub_sessions (id, server_id, type, shell_bin, cwd, label, closed_at, cc_session_id, gemini_session_id, parent_session, runtime_type, provider_id, provider_session_id, description, created_at, updated_at)
      VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-     ON CONFLICT (id, server_id) DO UPDATE SET type = EXCLUDED.type, shell_bin = EXCLUDED.shell_bin, cwd = EXCLUDED.cwd, label = EXCLUDED.label, closed_at = NULL, cc_session_id = EXCLUDED.cc_session_id, gemini_session_id = EXCLUDED.gemini_session_id, parent_session = EXCLUDED.parent_session, runtime_type = EXCLUDED.runtime_type, provider_id = EXCLUDED.provider_id, provider_session_id = EXCLUDED.provider_session_id, description = EXCLUDED.description, updated_at = EXCLUDED.updated_at`,
+     ON CONFLICT (id, server_id) DO UPDATE SET type = EXCLUDED.type, shell_bin = EXCLUDED.shell_bin, cwd = EXCLUDED.cwd, label = COALESCE(EXCLUDED.label, sub_sessions.label), closed_at = NULL, cc_session_id = EXCLUDED.cc_session_id, gemini_session_id = EXCLUDED.gemini_session_id, parent_session = EXCLUDED.parent_session, runtime_type = EXCLUDED.runtime_type, provider_id = EXCLUDED.provider_id, provider_session_id = EXCLUDED.provider_session_id, description = EXCLUDED.description, updated_at = EXCLUDED.updated_at`,
     [id, serverId, type, shellBin, cwd, label, ccSessionId, geminiSessionId, parentSession, runtimeType, providerId, providerSessionId, description, now, now],
   );
   return { id, server_id: serverId, type, shell_bin: shellBin, cwd, label, closed_at: null, cc_session_id: ccSessionId, gemini_session_id: geminiSessionId, parent_session: parentSession, sort_order: null, runtime_type: runtimeType, provider_id: providerId, provider_session_id: providerSessionId, description, created_at: now, updated_at: now };

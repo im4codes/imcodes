@@ -183,13 +183,20 @@ export function useTimeline(
     olderTimeoutRef.current = setTimeout(resetOlderState, 10_000);
   }, [ws, sessionId, loadingOlder]);
 
-  // Append a single event, dedup by eventId.
-  // Uses a Set for O(1) dedup instead of O(n) .some() scan.
+  // Append or replace a single event by eventId.
+  // Same eventId → replace in place (supports streaming transport updates).
+  // New eventId → append to end.
   const appendEvent = useCallback((event: TimelineEvent) => {
     setEvents((prev) => {
-      // Fast path: check last few events (most common: appending to end)
+      // Fast path: check last few events for same-ID replacement
       for (let i = prev.length - 1; i >= Math.max(0, prev.length - 10); i--) {
-        if (prev[i].eventId === event.eventId) return prev;
+        if (prev[i].eventId === event.eventId) {
+          // Replace in place — enables typewriter effect for streaming events
+          const updated = [...prev];
+          updated[i] = event;
+          if (event.sessionId) eventsCache.set(event.sessionId, updated);
+          return updated;
+        }
       }
       const next = [...prev, event];
       const result = next.length > MAX_MEMORY_EVENTS
