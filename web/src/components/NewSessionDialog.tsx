@@ -225,6 +225,19 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted }: Props) {
           </select>
         </div>
 
+        {/* Session description / persona (all agent types) */}
+        <div class="form-group">
+          <label>{t('session.description')}</label>
+          <textarea
+            placeholder={t('session.descriptionPlaceholder')}
+            value={ocDescription}
+            rows={2}
+            onInput={(e) => setOcDescription((e.target as HTMLTextAreaElement).value)}
+            disabled={starting}
+            style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#e2e8f0', padding: '8px 12px', borderRadius: 4, fontFamily: 'inherit', resize: 'vertical', fontSize: 13 }}
+          />
+        </div>
+
         {/* OpenClaw not connected hint */}
         {agentType === 'openclaw' && !openClawAvailable && (
           <div style={{ padding: '12px 16px', background: '#1c1917', border: '1px solid #f59e0b44', borderRadius: 6, color: '#fbbf24', fontSize: 13, marginBottom: 8 }}>

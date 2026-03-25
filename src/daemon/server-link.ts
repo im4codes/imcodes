@@ -82,6 +82,14 @@ export class ServerLink {
           // Not connected — transport relay events are best-effort
         }
       });
+      // Re-broadcast connected provider statuses so browsers see them after reconnect
+      import('./transport-relay.js').then(({ broadcastProviderStatus }) => {
+        import('../agent/provider-registry.js').then(({ getAllProviders }) => {
+          for (const p of getAllProviders()) {
+            broadcastProviderStatus(p.id, true);
+          }
+        });
+      }).catch(() => {});
       this.startHeartbeat();
       this.startWatchdog();
     });

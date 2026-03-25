@@ -2,6 +2,7 @@
 // For now only OpenClaw, but designed for future providers
 
 import type { TransportProvider, ProviderConfig } from './transport-provider.js';
+import { wireProviderToRelay, broadcastProviderStatus } from '../daemon/transport-relay.js';
 import logger from '../util/logger.js';
 
 const providers = new Map<string, TransportProvider>();
@@ -23,6 +24,8 @@ export async function connectProvider(id: string, config: ProviderConfig): Promi
   const provider = await createProvider(id);
   await provider.connect(config);
   providers.set(id, provider);
+  wireProviderToRelay(provider);
+  broadcastProviderStatus(id, true);
   logger.info({ provider: id }, 'Provider connected');
 }
 
@@ -31,6 +34,7 @@ export async function disconnectProvider(id: string): Promise<void> {
   if (!provider) return;
   await provider.disconnect();
   providers.delete(id);
+  broadcastProviderStatus(id, false);
   logger.info({ provider: id }, 'Provider disconnected');
 }
 
