@@ -94,7 +94,7 @@ export function emitTransportUserMessage(sessionId: string, text: string): void 
   });
 }
 
-/** Broadcast provider status change to all browsers */
+/** Broadcast provider status change to all browsers. When connected, also push remote sessions. */
 export function broadcastProviderStatus(providerId: string, connected: boolean): void {
   if (!sendToServer) {
     logger.warn({ providerId, connected }, 'broadcastProviderStatus: no server link — status NOT sent to browsers');
@@ -106,4 +106,32 @@ export function broadcastProviderStatus(providerId: string, connected: boolean):
     providerId,
     connected,
   });
+
+  // Auto-push remote sessions when provider connects
+  if (connected) {
+    void pushProviderSessions(providerId);
+  }
+}
+
+/** Fetch remote sessions from a provider and broadcast to browsers + sync to server DB. */
+async function pushProviderSessions(providerId: string): Promise<void> {
+  try {
+    const { listProviderSessions } = await import('./command-handler.js');
+    const sessions = await listProviderSessions(providerId);
+    if (!sendToServer) return;
+    sendToServer({
+      type: TRANSPORT_MSG.SESSIONS_RESPONSE,
+      providerId,
+      sessions,
+    });
+    // Also sync to server DB for cross-device persistence
+    sendToServer({
+      type: 'provider.sync_sessions',
+      providerId,
+      sessions,
+    });
+    logger.info({ providerId, count: sessions.length }, 'Pushed provider remote sessions');
+  } catch (err) {
+    logger.warn({ err, providerId }, 'Failed to push provider sessions on connect');
+  }
 }

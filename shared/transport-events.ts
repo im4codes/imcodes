@@ -89,6 +89,10 @@ export const TRANSPORT_MSG = {
   CHAT_UNSUBSCRIBE: 'chat.unsubscribe',
   /** Bridge → Browser: broadcast of agent/provider availability status. */
   PROVIDER_STATUS:  'provider.status',
+  /** Browser → Daemon: request list of remote sessions from a provider. */
+  LIST_SESSIONS:    'provider.list_sessions',
+  /** Daemon → Browser: response with remote sessions list. */
+  SESSIONS_RESPONSE:'provider.sessions_response',
 } as const;
 
 /** Union of all TRANSPORT_MSG values. */

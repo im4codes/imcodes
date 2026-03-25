@@ -160,6 +160,7 @@ export function useSubSessions(
     shellBin?: string,
     cwd?: string,
     label?: string,
+    extra?: Record<string, unknown>,
   ): Promise<SubSession | null> => {
     if (!serverId) return null;
     try {
@@ -171,8 +172,19 @@ export function useSubSessions(
         state: 'starting',
       };
       setSubSessions((prev) => [...prev, sub]);
-      // Ask daemon to start it
-      ws?.subSessionStart(sub.id, type, shellBin, cwd, ccSessionId, activeSession);
+      // Ask daemon to start it — for openclaw pass extra fields
+      if (type === 'openclaw' && extra) {
+        ws?.send({
+          type: 'subsession.start',
+          id: sub.id,
+          sessionType: type,
+          cwd,
+          parentSession: activeSession,
+          ...extra,
+        });
+      } else {
+        ws?.subSessionStart(sub.id, type, shellBin, cwd, ccSessionId, activeSession);
+      }
       return sub;
     } catch {
       return null;

@@ -579,7 +579,7 @@ export function App() {
   }, [activeSession, defaultViewMode]);
 
   // Provider status (hoisted to app level so it's always listening — dialogs mount later)
-  const { isProviderConnected } = useProviderStatus(wsRef.current);
+  const { isProviderConnected, getRemoteSessions, refreshSessions } = useProviderStatus(wsRef.current);
 
   // Timeline events for chat view
   const { events: timelineEvents, loading: timelineLoading, refreshing: timelineRefreshing, loadingOlder: timelineLoadingOlder, addOptimisticUserMessage, loadOlderEvents } = useTimeline(activeSession, wsRef.current);
@@ -1847,9 +1847,11 @@ export function App() {
           ws={wsRef.current}
           defaultCwd={activeSessionInfo?.projectDir}
           isProviderConnected={isProviderConnected}
-          onStart={async (type, shellBin, cwd, label) => {
+          getRemoteSessions={getRemoteSessions}
+          refreshSessions={refreshSessions}
+          onStart={async (type, shellBin, cwd, label, extra) => {
             setShowSubDialog(false);
-            const sub = await createSubSession(type, shellBin, cwd, label);
+            const sub = await createSubSession(type, shellBin, cwd, label, extra);
             if (sub) {
               setOpenSubIds((prev) => new Set([...prev, sub.id]));
               bringSubToFront(sub.id);

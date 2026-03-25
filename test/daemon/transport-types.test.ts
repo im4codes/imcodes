@@ -93,11 +93,13 @@ describe('shared/transport-events', () => {
     expect(Object.keys(TRANSPORT_EVENT)).toHaveLength(6);
   });
 
-  it('TRANSPORT_MSG has correct values for all 3 message types', () => {
+  it('TRANSPORT_MSG has correct values for all 5 message types', () => {
     expect(TRANSPORT_MSG.CHAT_SUBSCRIBE).toBe('chat.subscribe');
     expect(TRANSPORT_MSG.CHAT_UNSUBSCRIBE).toBe('chat.unsubscribe');
     expect(TRANSPORT_MSG.PROVIDER_STATUS).toBe('provider.status');
-    expect(Object.keys(TRANSPORT_MSG)).toHaveLength(3);
+    expect(TRANSPORT_MSG.LIST_SESSIONS).toBe('provider.list_sessions');
+    expect(TRANSPORT_MSG.SESSIONS_RESPONSE).toBe('provider.sessions_response');
+    expect(Object.keys(TRANSPORT_MSG)).toHaveLength(5);
   });
 
   it('TRANSPORT_AGENT_STATUSES contains all 7 statuses', () => {

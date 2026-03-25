@@ -536,7 +536,7 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
   return true;
 }
 
-interface LaunchOpts {
+export interface LaunchOpts {
   name: string;
   projectName: string;
   role: 'brain' | `w${number}`;
@@ -566,7 +566,7 @@ export function getTransportRuntime(name: string): TransportSessionRuntime | und
   return transportRuntimes.get(name);
 }
 
-async function launchTransportSession(opts: LaunchOpts): Promise<void> {
+export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const { name, projectName, role, agentType, projectDir, skipStore, description, bindExistingKey } = opts;
 
   const provider = getProvider(agentType);

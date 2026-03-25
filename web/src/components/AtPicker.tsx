@@ -192,6 +192,28 @@ export function AtPicker({
   const requestIdRef = useRef<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
+  // Build session lookup for label/type resolution (used in config previews)
+  const sessionLookup = useMemo(() => {
+    const map = new Map<string, { label?: string | null; agentType: string }>();
+    for (const s of sessions) {
+      if (!map.has(s.name)) map.set(s.name, { label: s.label, agentType: s.agentType });
+    }
+    return map;
+  }, [sessions]);
+
+  /** Resolve a human-readable display name for a session key */
+  const resolveDisplayName = useCallback((sessionKey: string) => {
+    const entry = sessionLookup.get(sessionKey);
+    if (entry?.label) return entry.label;
+    const parts = sessionKey.split('_');
+    return parts[parts.length - 1] || sessionKey;
+  }, [sessionLookup]);
+
+  /** Resolve agent type for a session key */
+  const resolveAgentType = useCallback((sessionKey: string) => {
+    return sessionLookup.get(sessionKey)?.agentType ?? '';
+  }, [sessionLookup]);
+
   // Deduplicate sessions by name, keep isSelf flag, exclude shell/script
   const agents = useMemo(() => {
     const seen = new Map<string, SessionEntry>();
@@ -208,8 +230,7 @@ export function AtPicker({
     }
     return [...seen.values()]
       .map((s) => {
-        const parts = s.name.split('_');
-        const shortName = s.label || parts[parts.length - 1] || s.name;
+        const shortName = s.label || s.name.split('_').pop() || s.name;
         return {
           session: s.name,
           shortName,
@@ -448,12 +469,13 @@ export function AtPicker({
           <>
             <div style={groupLabelStyle}>{t('p2p.picker.agents')}</div>
             {participants.map(([session, entry]) => {
-              const parts = session.split('_');
-              const shortName = parts[parts.length - 1] || session;
+              const shortName = resolveDisplayName(session);
+              const aType = resolveAgentType(session);
               const effectiveMode = configModeOverride === 'config' ? entry.mode : configModeOverride;
               return (
                 <div key={session} style={{ ...itemStyle, fontSize: 12, paddingLeft: 14 }}>
                   <span style={{ color: '#e2e8f0' }}>{shortName}</span>
+                  {aType && <span style={dimStyle}>{aType}</span>}
                   <span style={{ ...dimStyle, color: MODE_COLORS[effectiveMode] ?? dimStyle.color }}>· {effectiveMode}</span>
                 </div>
               );
@@ -600,11 +622,11 @@ export function AtPicker({
             {hlAll && (
               <div style={{ paddingLeft: 20, paddingBottom: 4 }}>
                 {configParticipants.map(([session, entry]) => {
-                  const parts = session.split('_');
-                  const shortName = parts[parts.length - 1] || session;
+                  const shortName = resolveDisplayName(session);
+                  const aType = resolveAgentType(session);
                   return (
                     <div key={session} style={{ fontSize: 11, color: '#64748b', lineHeight: '1.6' }}>
-                      {shortName} · {entry.mode}
+                      {shortName}{aType ? ` (${aType})` : ''} · {entry.mode}
                     </div>
                   );
                 })}
@@ -623,11 +645,11 @@ export function AtPicker({
             {hlAllPlus && (
               <div style={{ paddingLeft: 20, paddingBottom: 4 }}>
                 {configParticipants.map(([session, entry]) => {
-                  const parts = session.split('_');
-                  const shortName = parts[parts.length - 1] || session;
+                  const shortName = resolveDisplayName(session);
+                  const aType = resolveAgentType(session);
                   return (
                     <div key={session} style={{ fontSize: 11, color: '#64748b', lineHeight: '1.6' }}>
-                      {shortName} · {entry.mode}
+                      {shortName}{aType ? ` (${aType})` : ''} · {entry.mode}
                     </div>
                   );
                 })}

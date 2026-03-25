@@ -230,6 +230,32 @@ export async function getProviderStatus(db: Database, serverId: string): Promise
   return val ?? {};
 }
 
+export async function updateProviderRemoteSessions(
+  db: Database,
+  serverId: string,
+  providerId: string,
+  sessions: unknown[],
+): Promise<void> {
+  await db.execute(
+    `UPDATE servers SET provider_remote_sessions = coalesce(provider_remote_sessions, '{}'::jsonb) || $1::jsonb WHERE id = $2`,
+    [JSON.stringify({ [providerId]: sessions }), serverId],
+  );
+}
+
+export async function getProviderRemoteSessions(
+  db: Database,
+  serverId: string,
+): Promise<Record<string, unknown[]>> {
+  const row = await db.queryOne<{ provider_remote_sessions: Record<string, unknown[]> | string }>(
+    'SELECT provider_remote_sessions FROM servers WHERE id = $1',
+    [serverId],
+  );
+  if (!row) return {};
+  const val = row.provider_remote_sessions;
+  if (typeof val === 'string') return JSON.parse(val);
+  return val ?? {};
+}
+
 export async function updateServerName(db: Database, id: string, userId: string, name: string): Promise<boolean> {
   const result = await db.execute('UPDATE servers SET name = $1 WHERE id = $2 AND user_id = $3', [name, id, userId]);
   return (result.changes ?? 0) > 0;

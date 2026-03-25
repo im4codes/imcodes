@@ -67,7 +67,8 @@ export type ServerMessage =
   | { type: 'repo.issue_detail_response'; requestId?: string; projectDir: string; detail: any }
   | { type: 'repo.error'; requestId: string; projectDir?: string; error: string }
   | { type: 'repo.detected'; projectDir: string; context: any }
-  | { type: 'provider.status'; providerId: string; connected: boolean };
+  | { type: 'provider.status'; providerId: string; connected: boolean }
+  | { type: 'provider.sessions_response'; providerId: string; sessions: Array<{ key: string; displayName?: string; agentId?: string; updatedAt?: number; percentUsed?: number }>; error?: string };
 
 export type {
   TimelineEvent,

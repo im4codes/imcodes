@@ -818,13 +818,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         */}
         <div
           ref={divRef}
-          class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}`}
+          class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}`}
           contenteditable={inputDisabled ? 'false' : 'true'}
           role="textbox"
           aria-multiline="true"
           aria-label="Message input"
           data-placeholder={placeholder}
           spellcheck={false}
+          style={p2pMode !== 'solo' ? { borderColor: P2P_MODE_COLORS[p2pMode], boxShadow: `0 0 0 1px ${P2P_MODE_COLORS[p2pMode]}40` } : undefined}
           onFocus={handleFocus}
           onInput={() => {
             const currentText = divRef.current?.textContent ?? '';
@@ -975,6 +976,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       <P2pConfigPanel
         sessions={(sessions ?? []).map(s => ({ name: s.name, agentType: s.agentType, state: s.state }))}
         subSessions={subSessions ?? []}
+        activeSession={activeSession?.name}
         onClose={() => setP2pConfigOpen(false)}
         onSave={(cfg) => {
           setP2pSavedConfig(cfg);
