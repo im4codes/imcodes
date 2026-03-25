@@ -104,6 +104,7 @@ export function App() {
   const [showMobileServerMenu, setShowMobileServerMenu] = useState(false);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
   const [showDesktopFileBrowser, setShowDesktopFileBrowser] = useState(false);
+  const [gitChangesCount, setGitChangesCount] = useState(0);
   // File browser geometry now managed by FloatingPanel (id="filebrowser")
   const [serverCtxMenu, setServerCtxMenu] = useState<{ server: ServerInfo; x: number; y: number } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ServerInfo | null>(null);
@@ -1370,6 +1371,27 @@ export function App() {
 
   const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
 
+  // ── Git changes count for file browser badge ───────────────────────────
+  useEffect(() => {
+    const ws = wsRef.current;
+    const dir = activeSessionInfo?.projectDir;
+    if (!ws || !connected || !dir) { setGitChangesCount(0); return; }
+
+    let reqId: string | null = null;
+    const unsub = ws.onMessage((msg) => {
+      if (msg.type === 'fs.git_status_response' && 'requestId' in msg && msg.requestId === reqId) {
+        const entries = (msg as unknown as { entries?: unknown[] }).entries;
+        setGitChangesCount(Array.isArray(entries) ? entries.length : 0);
+      }
+    });
+
+    // Initial request + poll every 30s
+    reqId = ws.fsGitStatus(dir);
+    const timer = setInterval(() => { reqId = ws.fsGitStatus(dir); }, 30_000);
+
+    return () => { unsub(); clearInterval(timer); };
+  }, [activeSessionInfo?.projectDir, connected]);
+
   // ── Auto-detect repo for active session (with retry) ───────────────────
   // IMPORTANT: This useEffect MUST be before any conditional returns to avoid
   // React hooks ordering violation (hooks cannot be called conditionally).
@@ -1551,8 +1573,9 @@ export function App() {
               </div>
               <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
                 {activeSession && (
-                  <button class="view-toggle" title="Files" onClick={() => setShowMobileFileBrowser((o) => !o)}>
+                  <button class="view-toggle" title="Files" onClick={() => setShowMobileFileBrowser((o) => !o)} style={{ position: 'relative' }}>
                     📁
+                    {gitChangesCount > 0 && <span class="file-badge">{gitChangesCount}</span>}
                   </button>
                 )}
                 <button class="view-toggle" onClick={toggleViewMode}>
@@ -1588,8 +1611,9 @@ export function App() {
             {/* Desktop view mode toggle — mobile uses the one in mobile-server-bar */}
             {!isMobile && activeSession && (
               <div class="desktop-view-toggle">
-                <button class="view-toggle" title={trans('picker.files')} onClick={() => setShowDesktopFileBrowser(o => !o)}>
+                <button class="view-toggle" title={trans('picker.files')} onClick={() => setShowDesktopFileBrowser(o => !o)} style={{ position: 'relative' }}>
                   📁
+                  {gitChangesCount > 0 && <span class="file-badge">{gitChangesCount}</span>}
                 </button>
                 <button class="view-toggle" onClick={toggleViewMode}>
                   {viewMode === 'chat' ? '⌨ Terminal' : '💬 Chat'}
