@@ -53,6 +53,16 @@ const BACKOFF_MAX_MS = 5 * 60 * 1_000;
 // If we receive no tick within this window we consider the connection stale.
 const TICK_STALE_MS = 90_000;
 
+// ── Session key sanitisation ─────────────────────────────────────────────────
+// OC keys use `:` (e.g. `agent:main:discord:channel:123`) which breaks tmux
+// names, file paths, regexes, and `split('_')` patterns throughout IM.codes.
+// Replace `:` with `___` at the provider boundary so internal code never sees `:`.
+
+/** OC key → safe internal key */
+function sanitizeKey(key: string): string { return key.replaceAll(':', '___'); }
+/** Safe internal key → OC key */
+function unsanitizeKey(key: string): string { return key.replaceAll('___', ':'); }
+
 // ── OpenClawProvider ─────────────────────────────────────────────────────────
 
 export class OpenClawProvider implements TransportProvider {
@@ -123,10 +133,11 @@ export class OpenClawProvider implements TransportProvider {
   }
 
   async send(sessionId: string, message: string, _attachments?: unknown[]): Promise<void> {
+    const ocKey = unsanitizeKey(sessionId);
     try {
       // Prefer sessions.send (v2026.3.24+): auto canonicalKey, messageSeq, subagent reactivation
       await this.rpc('sessions.send', {
-        key: sessionId,
+        key: ocKey,
         message,
         thinking: 'off',
         idempotencyKey: randomUUID(),
@@ -134,7 +145,7 @@ export class OpenClawProvider implements TransportProvider {
     } catch {
       // Fallback to agent RPC (v2026.3.7+)
       await this.rpc('agent', {
-        sessionKey: sessionId,
+        sessionKey: ocKey,
         message,
         agentId: this.agentId,
         thinking: 'off',
@@ -156,25 +167,28 @@ export class OpenClawProvider implements TransportProvider {
   }
 
   async createSession(config: SessionConfig): Promise<string> {
-    const key = config.bindExistingKey ?? config.sessionKey;
+    // bindExistingKey may already be sanitized (from UI), unsanitize for OC RPC
+    const ocKey = unsanitizeKey(config.bindExistingKey ?? config.sessionKey);
     try {
       // Prefer sessions.create (v2026.3.24+)
       await this.rpc('sessions.create', {
-        key,
+        key: ocKey,
         agentId: config.agentId ?? this.agentId,
-        label: config.label ?? key,
+        label: config.label ?? ocKey,
       });
     } catch {
       // Fallback: OC auto-creates sessions on first agent RPC, so just log
-      logger.info({ provider: this.id, sessionKey: key }, 'sessions.create unavailable, session will be created on first message');
+      logger.info({ provider: this.id, sessionKey: ocKey }, 'sessions.create unavailable, session will be created on first message');
     }
-    logger.info({ provider: this.id, sessionKey: key }, 'Session created');
-    return key;
+    logger.info({ provider: this.id, sessionKey: ocKey }, 'Session created');
+    // Return sanitized key — all internal code sees `___` instead of `:`
+    return sanitizeKey(ocKey);
   }
 
   async endSession(_sessionId: string): Promise<void> {
     // OpenClaw does not expose a session-delete RPC in the MVP protocol.
     // Sessions persist on the gateway; nothing to do locally.
+    // Note: _sessionId is sanitized (___), but unused here.
   }
 
   // ── Optional capabilities ──────────────────────────────────────────────────
@@ -187,6 +201,9 @@ export class OpenClawProvider implements TransportProvider {
       return false;
     }
   }
+
+  /** Convert internal sanitized key back to OC key for RPC calls. */
+  toProviderKey(sessionId: string): string { return unsanitizeKey(sessionId); }
 
   async listSessions(): Promise<RemoteSessionInfo[]> {
     try {
@@ -201,7 +218,7 @@ export class OpenClawProvider implements TransportProvider {
       return all
         .filter((s) => !s.key.includes(':cron:'))
         .map((s) => ({
-          key: s.key,
+          key: sanitizeKey(s.key),
           displayName: s.label,
           agentId: s.agentId,
           updatedAt: s.updatedAt,
@@ -380,7 +397,8 @@ export class OpenClawProvider implements TransportProvider {
       if (phase === 'start') {
         // Initialise accumulator for this run.
         // We need sessionId; OpenClaw includes it in the payload as `key` or `sessionKey`.
-        const sessionId = payload.key ?? payload.sessionKey ?? runId;
+        // Sanitize `:` → `___` so internal code never sees colons.
+        const sessionId = sanitizeKey(payload.key ?? payload.sessionKey ?? runId);
         const messageId = randomUUID();
         this.runAccumulator.set(runId, { sessionId, messageId, text: '' });
         logger.debug({ provider: this.id, runId, sessionId }, 'Agent run started');
@@ -408,7 +426,7 @@ export class OpenClawProvider implements TransportProvider {
 
       if (phase === 'error') {
         const acc = this.runAccumulator.get(runId);
-        const sessionId = acc?.sessionId ?? payload.key ?? payload.sessionKey ?? runId;
+        const sessionId = acc?.sessionId ?? sanitizeKey(payload.key ?? payload.sessionKey ?? runId);
         this.runAccumulator.delete(runId);
         const err = this.makeError(
           PROVIDER_ERROR_CODES.PROVIDER_ERROR,
@@ -428,7 +446,7 @@ export class OpenClawProvider implements TransportProvider {
       const acc = this.runAccumulator.get(runId);
       if (!acc) {
         // Received delta before lifecycle start — create accumulator on the fly.
-        const sessionId = payload.key ?? payload.sessionKey ?? runId;
+        const sessionId = sanitizeKey(payload.key ?? payload.sessionKey ?? runId);
         const messageId = randomUUID();
         this.runAccumulator.set(runId, { sessionId, messageId, text: assistantData.text ?? assistantData.delta ?? '' });
         // Emit the delta we have now.
@@ -464,7 +482,7 @@ export class OpenClawProvider implements TransportProvider {
     const { state, key } = payload;
 
     if (state === 'error') {
-      const sessionId = key ?? 'unknown';
+      const sessionId = sanitizeKey(key ?? 'unknown');
       const err = this.makeError(
         PROVIDER_ERROR_CODES.PROVIDER_ERROR,
         `Chat error for session ${sessionId}`,

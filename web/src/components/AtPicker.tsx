@@ -588,7 +588,7 @@ export function AtPicker({
   // When p2pConfig exists, filter to only show enabled sessions
   const renderConfigSessions = p2pConfig ? new Map(Object.entries(p2pConfig.sessions)) : null;
   const renderVisibleAgents = renderConfigSessions
-    ? agents.filter(a => { const e = renderConfigSessions.get(a.session); return !e || (e.enabled && e.mode !== 'skip'); })
+    ? agents.filter(a => { const e = renderConfigSessions.get(a.session); return e ? (e.enabled && e.mode !== 'skip') : false; })
     : agents;
   const nonSelfAgents = renderVisibleAgents.filter(a => !a.isSelf);
   const showAll = nonSelfAgents.length > 1;
@@ -687,7 +687,7 @@ export function AtPicker({
         const visibleAgents = configSessions
           ? agents.filter(a => {
               const entry = configSessions.get(a.session);
-              return !entry || (entry.enabled && entry.mode !== 'skip');
+              return entry ? (entry.enabled && entry.mode !== 'skip') : false;
             })
           : agents;
         return visibleAgents.map((a, idx) => {
