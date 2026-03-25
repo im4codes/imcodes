@@ -119,12 +119,7 @@ async function pushProviderSessions(providerId: string): Promise<void> {
     const { listProviderSessions } = await import('./command-handler.js');
     const sessions = await listProviderSessions(providerId);
     if (!sendToServer) return;
-    sendToServer({
-      type: TRANSPORT_MSG.SESSIONS_RESPONSE,
-      providerId,
-      sessions,
-    });
-    // Also sync to server DB for cross-device persistence
+    // Send via sync_sessions — bridge handles this: caches, persists to DB, broadcasts to browsers
     sendToServer({
       type: 'provider.sync_sessions',
       providerId,

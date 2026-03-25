@@ -1852,10 +1852,11 @@ async function handleListProviderSessions(cmd: Record<string, unknown>, serverLi
   const providerId = (cmd.providerId as string) || 'openclaw';
   try {
     const sessions = await listProviderSessions(providerId);
-    serverLink.send({ type: TRANSPORT_MSG.SESSIONS_RESPONSE, providerId, sessions });
+    // Send via sync_sessions — bridge handles this type: caches, persists to DB, and broadcasts to browsers
+    serverLink.send({ type: 'provider.sync_sessions', providerId, sessions });
   } catch (err) {
     logger.warn({ err, providerId }, 'Failed to list provider sessions');
-    serverLink.send({ type: TRANSPORT_MSG.SESSIONS_RESPONSE, providerId, sessions: [], error: String(err) });
+    serverLink.send({ type: 'provider.sync_sessions', providerId, sessions: [] });
   }
 }
 
