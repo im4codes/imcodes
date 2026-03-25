@@ -959,17 +959,20 @@ export function App() {
       if (msg.type === 'daemon.reconnected') {
         setDaemonOnline(true);
         // Daemon process (re)started — all its subscriptions are gone.
-        // Re-subscribe all sessions immediately so terminals resume without a page refresh.
+        // Re-subscribe only terminal-mode sessions.
         for (const s of sessionsRef.current) {
-          ws.subscribeTerminal(s.name);
           const mode = viewModesRef.current[s.name] ?? defaultViewMode;
-          if (mode === 'chat') {
+          if (mode === 'terminal') {
+            ws.subscribeTerminal(s.name);
+          } else {
             ws.sendResize(s.name, 200, 50);
           }
         }
-        // Re-subscribe all sub-session terminals (for preview cards)
+        // Re-subscribe only open sub-session windows
         for (const sub of subSessionsRef.current) {
-          ws.subscribeTerminal(sub.sessionName);
+          if (openSubIdsRef.current.has(sub.id)) {
+            ws.subscribeTerminal(sub.sessionName);
+          }
         }
         // Refresh discussion list
         ws.discussionList();
@@ -1007,21 +1010,26 @@ export function App() {
     };
   }, [auth, selectedServerId]);
 
-  // Subscribe to terminal for ALL sessions when connected.
-  // Always subscribe (even in chat mode) so timeline events are generated
-  // from terminal diff parsing. In chat mode, restore tmux to a large
-  // viewport so the agent isn't cramped by mobile screen dimensions.
-  // Use serialized session names as dep to avoid re-subscribing on state updates.
-  const sessionNamesKey = sessions.map((s) => s.name).sort().join(',');
+  // Subscribe to terminal only for sessions in terminal view mode.
+  // Chat-mode sessions don't need raw PTY binary stream — their timeline
+  // events come from structured watchers (JSONL for CC/Codex, Gemini watcher).
+  // Shell/script sessions are always terminal view, so no special handling needed.
+  const terminalSessionNamesKey = sessions
+    .filter((s) => (viewModes[s.name] ?? defaultViewMode) === 'terminal')
+    .map((s) => s.name).sort().join(',');
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws?.connected || sessions.length === 0) return;
-    const names = sessions.map((s) => s.name);
+    const names = sessions
+      .filter((s) => (viewModesRef.current[s.name] ?? defaultViewMode) === 'terminal')
+      .map((s) => s.name);
     for (const name of names) {
       ws.subscribeTerminal(name);
-      const mode = viewModesRef.current[name] ?? defaultViewMode;
-      if (mode === 'chat') {
-        ws.sendResize(name, 200, 50);
+    }
+    // Chat-mode sessions: resize tmux viewport so agent isn't cramped
+    for (const s of sessions) {
+      if ((viewModesRef.current[s.name] ?? defaultViewMode) === 'chat') {
+        ws.sendResize(s.name, 200, 50);
       }
     }
     return () => {
@@ -1030,14 +1038,19 @@ export function App() {
       }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connected, sessionNamesKey]);
+  }, [connected, terminalSessionNamesKey]);
 
-  // Subscribe terminal for ALL sub-sessions (needed for preview cards + open windows)
-  const subSessionNamesKey = subSessions.map((s) => s.sessionName).sort().join(',');
+  // Subscribe terminal only for open sub-session windows (not minimized/closed)
+  const openSubSessionNamesKey = subSessions
+    .filter((s) => openSubIds.has(s.id))
+    .map((s) => s.sessionName).sort().join(',');
   useEffect(() => {
     const ws = wsRef.current;
-    if (!ws?.connected || subSessions.length === 0) return;
-    const names = subSessions.map((s) => s.sessionName);
+    if (!ws?.connected) return;
+    const names = subSessions
+      .filter((s) => openSubIdsRef.current.has(s.id))
+      .map((s) => s.sessionName);
+    if (names.length === 0) return;
     for (const name of names) {
       try { ws.subscribeTerminal(name); } catch { /* ignore */ }
     }
@@ -1047,7 +1060,7 @@ export function App() {
       }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connected, subSessionNamesKey]);
+  }, [connected, openSubSessionNamesKey]);
 
   // When switching to a session in terminal mode, trigger fit + full refresh
   useEffect(() => {
@@ -1068,10 +1081,12 @@ export function App() {
       const ws = wsRef.current;
       const session = activeSessionRef.current;
       if (!ws?.connected || !session) return;
-      ws.subscribeTerminal(session);
       const mode = viewModesRef.current[session] ?? defaultViewMode;
-      if (mode === 'chat') {
-        ws.sendResize(session, 200, 50);
+      if (mode === 'terminal') {
+        ws.subscribeTerminal(session);
+        // Restore correct terminal size after sleep/wake
+        const fitFn = termFitFnsRef.current.get(session);
+        if (fitFn) fitFn();
       }
     };
     document.addEventListener('visibilitychange', handler);

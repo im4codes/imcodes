@@ -2,7 +2,7 @@
  * Handle commands from the web UI and inbound chat messages via ServerLink.
  * Commands arrive as JSON objects with a `type` field.
  */
-import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, type ProjectConfig } from '../agent/session-manager.js';
+import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, type ProjectConfig } from '../agent/session-manager.js';
 import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey } from '../agent/tmux.js';
 import { listSessions, getSession } from '../store/session-store.js';
 import { routeMessage, type InboundMessage, type RouterContext } from '../router/message-router.js';
@@ -907,7 +907,7 @@ function handleGetSessions(serverLink: ServerLink): void {
   }
 }
 
-const RAW_BATCH_FLUSH_MS = 16;           // ~60fps flush interval
+const RAW_BATCH_FLUSH_MS = 166;          // ~6fps flush interval
 const RAW_BATCH_MAX_BYTES = 32 * 1024;   // flush immediately at 32KB
 
 function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): void {
@@ -1112,6 +1112,11 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     const ocMode = cmd.ocMode as string | undefined;
     const description = (cmd.ocDescription as string) || undefined;
     const bindExistingKey = ocMode === 'bind' ? (cmd.ocSessionId as string) || undefined : undefined;
+    // Uniqueness check: prevent duplicate binding to same OC session
+    if (bindExistingKey && isProviderSessionBound(bindExistingKey)) {
+      logger.warn({ id, bindExistingKey }, 'subsession.start: providerSessionId already bound — skipped');
+      return;
+    }
     try {
       await launchTransportSession({
         name: sessionName,
@@ -1847,10 +1852,15 @@ async function handleChatSubscribeReplay(cmd: Record<string, unknown>, serverLin
   }
 }
 
-/** Handle provider.list_sessions — list remote sessions from a provider and respond. */
+/** Handle provider.list_sessions — list remote sessions from a provider, materialize + respond. */
 async function handleListProviderSessions(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const providerId = (cmd.providerId as string) || 'openclaw';
   try {
+    // Materialize any new sessions (side-effectful — creates sessions/sub-sessions)
+    if (providerId === 'openclaw') {
+      const { syncOcSessions } = await import('./oc-session-sync.js');
+      await syncOcSessions(serverLink).catch((e) => logger.warn({ err: e }, 'OC sync during refresh failed'));
+    }
     const sessions = await listProviderSessions(providerId);
     // Send via sync_sessions — bridge handles this type: caches, persists to DB, and broadcasts to browsers
     serverLink.send({ type: 'provider.sync_sessions', providerId, sessions });
