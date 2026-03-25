@@ -264,7 +264,8 @@ jobs:
       - run: npm run build
       - name: Set version
         run: npm version ${{ needs.docker.outputs.npm_version }} --no-git-tag-version
-      - run: npm publish --provenance --access public
+      - name: Publish (skip if version already exists)
+        run: npm publish --provenance --access public || echo "Version already published — skipping"
 
   # ── Build & push Docker image ─────────────────────────────────────────────
 
