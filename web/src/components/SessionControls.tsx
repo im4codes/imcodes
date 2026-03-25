@@ -177,14 +177,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const isClaudeCode = activeSession?.agentType === 'claude-code';
   const isCodex = activeSession?.agentType === 'codex';
 
-  // Load saved P2P config on mount
-  useEffect(() => {
-    void getUserPref('p2p_session_config').then((raw) => {
-      if (raw && typeof raw === 'string') {
-        try { setP2pSavedConfig(JSON.parse(raw) as P2pSavedConfig); } catch { /* ignore */ }
-      }
-    });
-  }, []);
+  // P2P config loading moved after rootSession declaration below
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
@@ -244,6 +237,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const activeSub = (subSessions ?? []).find((s) => s.sessionName === activeSession?.name);
   const rootSession = activeSub?.parentSession || activeSession?.name || '';
+
+  // P2P config is per main-session (sub-sessions follow parent), stored on server for cross-device sync
+  const p2pConfigKey = rootSession ? `p2p_session_config:${rootSession}` : null;
+  useEffect(() => {
+    if (!p2pConfigKey) { setP2pSavedConfig(null); return; }
+    void getUserPref(p2pConfigKey).then((raw) => {
+      if (raw && typeof raw === 'string') {
+        try { setP2pSavedConfig(JSON.parse(raw) as P2pSavedConfig); } catch { setP2pSavedConfig(null); }
+      } else {
+        setP2pSavedConfig(null);
+      }
+    });
+  }, [p2pConfigKey]);
 
   /** Build a short display label for the input box — the full token is sent via WS extra fields. */
   const buildAgentLabel = (session: string, _mode: string) =>
@@ -1020,7 +1026,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         onClose={() => setP2pConfigOpen(false)}
         onSave={(cfg) => {
           setP2pSavedConfig(cfg);
-          void saveUserPref('p2p_session_config', JSON.stringify(cfg));
+          if (p2pConfigKey) void saveUserPref(p2pConfigKey, JSON.stringify(cfg));
         }}
       />
     )}

@@ -229,10 +229,14 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
-  // Load saved config on mount
+  // Config key uses the main session (sub-sessions follow parent config)
+  const configKey = scopeSession ? `p2p_session_config:${scopeSession}` : null;
+
+  // Load saved config for this session
   useEffect(() => {
+    if (!configKey) { setLoading(false); return; }
     setLoading(true);
-    void getUserPref('p2p_session_config').then((raw) => {
+    void getUserPref(configKey).then((raw) => {
       if (raw && typeof raw === 'string') {
         try {
           const parsed: P2pSavedConfig = JSON.parse(raw);
@@ -243,7 +247,7 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
       }
       setLoading(false);
     });
-  }, []);
+  }, [configKey]);
 
   const toggleEnabled = (key: string) => {
     setSessionCfg((prev) => {
@@ -270,7 +274,7 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
     }
     const cfg: P2pSavedConfig = { sessions: merged, rounds, extraPrompt: extraPrompt.trim() || undefined };
     try {
-      await saveUserPref('p2p_session_config', JSON.stringify(cfg));
+      if (configKey) await saveUserPref(configKey, JSON.stringify(cfg));
       onSave(cfg);
     } catch { /* ignore — UI still closes */ }
     setSaving(false);

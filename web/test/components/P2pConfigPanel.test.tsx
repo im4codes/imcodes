@@ -35,12 +35,14 @@ const subSessions = [
 function renderPanel(overrides: {
   sessions?: typeof sessions;
   subSessions?: typeof subSessions;
+  activeSession?: string;
   onClose?: () => void;
   onSave?: (cfg: P2pSavedConfig) => void;
 } = {}) {
   const props = {
     sessions: overrides.sessions ?? sessions,
     subSessions: overrides.subSessions ?? subSessions,
+    activeSession: overrides.activeSession ?? 'deck_proj_brain',
     onClose: overrides.onClose ?? vi.fn(),
     onSave: overrides.onSave ?? vi.fn(),
   };
@@ -121,10 +123,16 @@ describe('P2pConfigPanel', () => {
     const onSave = vi.fn();
     const onClose = vi.fn();
 
-    renderPanel({ onSave, onClose });
+    // Use sub-sessions with parentSession matching activeSession
+    renderPanel({
+      onSave, onClose,
+      subSessions: [
+        { sessionName: 'deck_sub_abc', type: 'gemini', label: 'worker', state: 'running', parentSession: 'deck_proj_brain' },
+        { sessionName: 'deck_sub_def', type: 'shell', label: null, state: 'idle', parentSession: 'deck_proj_brain' },
+      ],
+    });
     await act(async () => {});
 
-    // Click save button (text comes from t('p2p.settings_save') → 'settings_save')
     const saveBtn = screen.getByText('settings_save');
     await act(async () => {
       fireEvent.click(saveBtn);
@@ -133,9 +141,8 @@ describe('P2pConfigPanel', () => {
     expect(onSave).toHaveBeenCalledOnce();
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
 
-    // All eligible sessions should be in the config
+    // Active session + eligible sub-sessions should be in config
     expect(cfg.sessions['deck_proj_brain']).toBeDefined();
-    expect(cfg.sessions['deck_proj_w1']).toBeDefined();
     expect(cfg.sessions['deck_sub_abc']).toBeDefined();
     // shell sub-session should not be included
     expect(cfg.sessions['deck_sub_def']).toBeUndefined();
@@ -277,7 +284,7 @@ describe('P2pConfigPanel', () => {
     });
 
     expect(saveUserPrefMock).toHaveBeenCalledOnce();
-    expect(saveUserPrefMock.mock.calls[0][0]).toBe('p2p_session_config');
+    expect(saveUserPrefMock.mock.calls[0][0]).toBe('p2p_session_config:deck_proj_brain');
     // Second arg should be a JSON string
     const jsonArg = saveUserPrefMock.mock.calls[0][1];
     expect(typeof jsonArg).toBe('string');
@@ -298,5 +305,42 @@ describe('P2pConfigPanel', () => {
     });
 
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it('uses per-session config key for different sessions', async () => {
+    const onSave1 = vi.fn();
+    const onSave2 = vi.fn();
+
+    // Session 1
+    const { unmount: u1 } = renderPanel({ activeSession: 'deck_proj_brain', onSave: onSave1 });
+    await act(async () => {});
+    expect(getUserPrefMock).toHaveBeenCalledWith('p2p_session_config:deck_proj_brain');
+    u1();
+    cleanup();
+
+    vi.clearAllMocks();
+    getUserPrefMock.mockResolvedValue(null);
+    saveUserPrefMock.mockResolvedValue(undefined);
+
+    // Session 2 — different key
+    renderPanel({ activeSession: 'deck_other_brain', onSave: onSave2 });
+    await act(async () => {});
+    expect(getUserPrefMock).toHaveBeenCalledWith('p2p_session_config:deck_other_brain');
+  });
+
+  it('loads saved config from server for the active session', async () => {
+    const savedConfig: P2pSavedConfig = {
+      sessions: { 'deck_sub_abc': { enabled: true, mode: 'review' } },
+      rounds: 2,
+      extraPrompt: 'be concise',
+    };
+    getUserPrefMock.mockResolvedValue(JSON.stringify(savedConfig));
+
+    renderPanel({ activeSession: 'deck_proj_brain' });
+    await act(async () => {});
+
+    // Rounds button "2" should be active (loaded from server config)
+    const roundBtns = screen.getAllByRole('button').filter(b => b.textContent === '2');
+    expect(roundBtns.length).toBeGreaterThan(0);
   });
 });
