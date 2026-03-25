@@ -809,8 +809,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               // Just show @@all — daemon expands per saved config. Don't touch dropdown mode.
               const text = divRef.current?.textContent ?? '';
               const before = text.replace(/@[^\s@]*$/, '');
-              divRef.current!.textContent = `${before}@@all `;
-              pendingAtTargetsRef.current.push({ session: '__all__', mode: 'config', label: '@@all' });
+              divRef.current!.textContent = `${before}@@all(config) `;
+              pendingAtTargetsRef.current.push({ session: '__all__', mode: 'config', label: '@@all(config)' });
               atSelectionSnapshotRef.current = divRef.current!.textContent;
               atSelectionLockRef.current = true;
               setAtPickerOpen(false);

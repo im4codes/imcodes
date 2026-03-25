@@ -323,7 +323,7 @@ export function AtPicker({
         if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); setConfigRoundsHighlight((h) => (h - 1 + CONFIG_ROUNDS_OPTIONS.length) % CONFIG_ROUNDS_OPTIONS.length); return; }
         if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); setConfigRoundsHighlight((h) => (h + 1) % CONFIG_ROUNDS_OPTIONS.length); return; }
         if (e.key === 'Enter' && p2pConfig) {
-          e.preventDefault();
+          e.preventDefault(); e.stopPropagation();
           const rounds = CONFIG_ROUNDS_OPTIONS[configRoundsHighlight];
           const effectiveConfig = buildEffectiveConfig(p2pConfig, configModeOverride);
           onSelectAllConfig?.(effectiveConfig, rounds);
@@ -338,7 +338,7 @@ export function AtPicker({
         if (e.key === 'Escape') { e.preventDefault(); setModeAgent(null); return; }
         if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); setModeHighlight((h) => (h - 1 + MODES.length) % MODES.length); return; }
         if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); setModeHighlight((h) => (h + 1) % MODES.length); return; }
-        if (e.key === 'Enter') { e.preventDefault(); onSelectAgent(modeAgent, MODES[modeHighlight]); setModeAgent(null); return; }
+        if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); onSelectAgent(modeAgent, MODES[modeHighlight]); setModeAgent(null); return; }
         return;
       }
 
@@ -351,7 +351,7 @@ export function AtPicker({
           return;
         }
         if (e.key === 'Enter') {
-          e.preventDefault();
+          e.preventDefault(); e.stopPropagation();
           setCategory(highlightIdx === 0 ? 'files' : 'agents');
           setHighlightIdx(0);
           return;
@@ -385,7 +385,7 @@ export function AtPicker({
       if (e.key === 'ArrowUp') { e.preventDefault(); setHighlightIdx((h) => (h - 1 + count) % count); return; }
       if (e.key === 'ArrowDown') { e.preventDefault(); setHighlightIdx((h) => (h + 1) % count); return; }
       if (e.key === 'Enter' && count > 0) {
-        e.preventDefault();
+        e.preventDefault(); e.stopPropagation();
         if (category === 'files') {
           const f = fileResults[highlightIdx];
           if (f) onSelectFile(f.path);
