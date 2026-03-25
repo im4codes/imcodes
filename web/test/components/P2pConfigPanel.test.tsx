@@ -49,6 +49,15 @@ function renderPanel(overrides: {
   return render(<P2pConfigPanel {...props} />);
 }
 
+/** Flush all pending microtasks/promises (async useEffect + nested awaits). */
+async function flush() {
+  for (let i = 0; i < 5; i++) {
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+  }
+}
+
 describe('P2pConfigPanel', () => {
   beforeEach(() => {
     getUserPrefMock.mockResolvedValue(null);
@@ -71,7 +80,7 @@ describe('P2pConfigPanel', () => {
     });
 
     // Wait for loading to complete
-    await act(async () => {});
+    await flush();
 
     // claude-code session should appear by its short name
     expect(screen.getByText('brain')).toBeDefined();
@@ -83,7 +92,7 @@ describe('P2pConfigPanel', () => {
 
   it('excludes shell type from subSessions', async () => {
     renderPanel();
-    await act(async () => {});
+    await flush();
 
     // gemini sub-session with label 'worker' should appear
     expect(screen.getByText('worker')).toBeDefined();
@@ -94,7 +103,7 @@ describe('P2pConfigPanel', () => {
 
   it('shows rounds selector with buttons for 1, 2, 3, 5', async () => {
     renderPanel();
-    await act(async () => {});
+    await flush();
 
     // ROUND_OPTIONS = [1, 2, 3, 5]
     const buttons = screen.getAllByRole('button');
@@ -110,7 +119,7 @@ describe('P2pConfigPanel', () => {
     getUserPrefMock.mockResolvedValue(JSON.stringify(savedConfig));
 
     renderPanel();
-    await act(async () => {});
+    await flush();
 
     // Round button 5 should be active (has blue border style)
     // We verify by checking the button exists and was set
@@ -131,7 +140,7 @@ describe('P2pConfigPanel', () => {
         { sessionName: 'deck_sub_def', type: 'shell', label: null, state: 'idle', parentSession: 'deck_proj_brain' },
       ],
     });
-    await act(async () => {});
+    await flush();
 
     const saveBtn = screen.getByText('settings_save');
     await act(async () => {
@@ -154,7 +163,7 @@ describe('P2pConfigPanel', () => {
     const onClose = vi.fn();
 
     renderPanel({ onSave, onClose });
-    await act(async () => {});
+    await flush();
 
     // Change mode for first session (deck_proj_brain)
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
@@ -176,7 +185,7 @@ describe('P2pConfigPanel', () => {
   it('calls onClose when the close button (✕) is clicked', async () => {
     const onClose = vi.fn();
     renderPanel({ onClose });
-    await act(async () => {});
+    await flush();
 
     // The ✕ button in the header
     const closeBtn = screen.getByText('✕');
@@ -188,7 +197,7 @@ describe('P2pConfigPanel', () => {
   it('calls onClose when the secondary close button in footer is clicked', async () => {
     const onClose = vi.fn();
     renderPanel({ onClose });
-    await act(async () => {});
+    await flush();
 
     const cancelBtn = screen.getByText('settings_close');
     fireEvent.click(cancelBtn);
@@ -207,7 +216,7 @@ describe('P2pConfigPanel', () => {
     const onClose = vi.fn();
 
     renderPanel({ onSave, onClose });
-    await act(async () => {});
+    await flush();
 
     // Checkboxes should all be checked (enabled=true by default)
     // First checkbox is the cross-session toggle — skip it
@@ -230,7 +239,7 @@ describe('P2pConfigPanel', () => {
     const onClose = vi.fn();
 
     renderPanel({ onSave, onClose });
-    await act(async () => {});
+    await flush();
 
     const checkboxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
     // First checkbox is cross-session toggle, session checkboxes start at index 1
@@ -255,7 +264,7 @@ describe('P2pConfigPanel', () => {
     const onClose = vi.fn();
 
     renderPanel({ onSave, onClose });
-    await act(async () => {});
+    await flush();
 
     // Click round button "5"
     const roundBtn5 = screen.getAllByRole('button').find((b) => b.textContent === '5');
@@ -276,7 +285,7 @@ describe('P2pConfigPanel', () => {
     const onClose = vi.fn();
 
     renderPanel({ onSave, onClose });
-    await act(async () => {});
+    await flush();
 
     const saveBtn = screen.getByText('settings_save');
     await act(async () => {
@@ -297,7 +306,7 @@ describe('P2pConfigPanel', () => {
     const onClose = vi.fn();
 
     renderPanel({ onClose });
-    await act(async () => {});
+    await flush();
 
     const saveBtn = screen.getByText('settings_save');
     await act(async () => {
@@ -313,7 +322,7 @@ describe('P2pConfigPanel', () => {
 
     // Session 1
     const { unmount: u1 } = renderPanel({ activeSession: 'deck_proj_brain', onSave: onSave1 });
-    await act(async () => {});
+    await flush();
     expect(getUserPrefMock).toHaveBeenCalledWith('p2p_session_config:deck_proj_brain');
     u1();
     cleanup();
@@ -324,7 +333,7 @@ describe('P2pConfigPanel', () => {
 
     // Session 2 — different key
     renderPanel({ activeSession: 'deck_other_brain', onSave: onSave2 });
-    await act(async () => {});
+    await flush();
     expect(getUserPrefMock).toHaveBeenCalledWith('p2p_session_config:deck_other_brain');
   });
 
@@ -337,7 +346,7 @@ describe('P2pConfigPanel', () => {
     getUserPrefMock.mockResolvedValue(JSON.stringify(savedConfig));
 
     renderPanel({ activeSession: 'deck_proj_brain' });
-    await act(async () => {});
+    await flush();
 
     // Rounds button "2" should be active (loaded from server config)
     const roundBtns = screen.getAllByRole('button').filter(b => b.textContent === '2');

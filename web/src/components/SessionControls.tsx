@@ -242,12 +242,22 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const p2pConfigKey = rootSession ? `p2p_session_config:${rootSession}` : null;
   useEffect(() => {
     if (!p2pConfigKey) { setP2pSavedConfig(null); return; }
-    void getUserPref(p2pConfigKey).then((raw) => {
+    const apply = (raw: unknown) => {
       if (raw && typeof raw === 'string') {
         try { setP2pSavedConfig(JSON.parse(raw) as P2pSavedConfig); } catch { setP2pSavedConfig(null); }
       } else {
         setP2pSavedConfig(null);
       }
+    };
+    void getUserPref(p2pConfigKey).then((raw) => {
+      if (raw) { apply(raw); return; }
+      // Fallback: migrate from legacy global key
+      void getUserPref('p2p_session_config').then((legacyRaw) => {
+        if (legacyRaw && typeof legacyRaw === 'string') {
+          void saveUserPref(p2pConfigKey!, legacyRaw).catch(() => {});
+        }
+        apply(legacyRaw);
+      });
     });
   }, [p2pConfigKey]);
 

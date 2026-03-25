@@ -232,11 +232,11 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
   // Config key uses the main session (sub-sessions follow parent config)
   const configKey = scopeSession ? `p2p_session_config:${scopeSession}` : null;
 
-  // Load saved config for this session
+  // Load saved config — per-session key with legacy global fallback
   useEffect(() => {
     if (!configKey) { setLoading(false); return; }
     setLoading(true);
-    void getUserPref(configKey).then((raw) => {
+    const apply = (raw: unknown) => {
       if (raw && typeof raw === 'string') {
         try {
           const parsed: P2pSavedConfig = JSON.parse(raw);
@@ -246,6 +246,16 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
         } catch { /* start fresh */ }
       }
       setLoading(false);
+    };
+    void getUserPref(configKey).then((raw) => {
+      if (raw) { apply(raw); return; }
+      // Fallback: migrate from legacy global key
+      void getUserPref('p2p_session_config').then((legacyRaw) => {
+        if (legacyRaw && typeof legacyRaw === 'string') {
+          void saveUserPref(configKey!, legacyRaw).catch(() => {});
+        }
+        apply(legacyRaw);
+      });
     });
   }, [configKey]);
 
