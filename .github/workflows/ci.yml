@@ -229,6 +229,7 @@ jobs:
       - name: Install web deps (needed for tsx component tests)
         run: npm ci
         working-directory: web
+      - run: npm run build
       - run: npm run test:coverage
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4

@@ -54,4 +54,4 @@ export interface RepoProvider {
   getIssueDetail(number: number): Promise<RepoIssueDetail>;
 }
 
-export const DEFAULT_PAGE_SIZE = 30;
+export const DEFAULT_PAGE_SIZE = 10;
