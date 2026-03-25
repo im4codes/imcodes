@@ -10,8 +10,11 @@ import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
-import { uploadFile } from '../api.js';
+import { P2pConfigPanel } from './P2pConfigPanel.js';
+import { uploadFile, getUserPref, saveUserPref } from '../api.js';
 import { isVisuallyBusy } from '../thinking-utils.js';
+import { P2P_CONFIG_MODE } from '@shared/p2p-modes.js';
+import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 
 interface Props {
   ws: WsClient | null;
@@ -53,14 +56,14 @@ interface Props {
 type MenuAction = 'restart' | 'new' | 'stop';
 type ModelChoice = 'opus' | 'sonnet' | 'haiku';
 type CodexModelChoice = 'gpt-5.4' | 'gpt-5.4-mini' | 'gpt-5.2';
-type P2pMode = 'solo' | 'audit' | 'review' | 'brainstorm' | 'discuss';
+type P2pMode = 'solo' | 'audit' | 'review' | 'brainstorm' | 'discuss' | typeof P2P_CONFIG_MODE;
 
 const MODEL_STORAGE_KEY = 'imcodes-model';
 const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const CODEX_MODELS: CodexModelChoice[] = ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.2'];
-const P2P_MODES: P2pMode[] = ['solo', 'audit', 'review', 'brainstorm', 'discuss'];
-const P2P_MODE_I18N: Record<P2pMode, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss' };
-const P2P_MODE_COLORS: Record<P2pMode, string> = { solo: '#6b7280', audit: '#f59e0b', review: '#3b82f6', brainstorm: '#a78bfa', discuss: '#22c55e' };
+const P2P_MODES: P2pMode[] = ['solo', 'audit', 'review', 'brainstorm', 'discuss', P2P_CONFIG_MODE];
+const P2P_MODE_I18N: Record<P2pMode, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
+const P2P_MODE_COLORS: Record<P2pMode, string> = { solo: '#6b7280', audit: '#f59e0b', review: '#3b82f6', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
 
 // Enter moved after ↓ arrow
 const SHORTCUTS: Array<{ label: string; title: string; data: string; wide?: boolean }> = [
@@ -109,6 +112,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [p2pMode, setP2pMode] = useState<P2pMode>('solo');
   const [p2pExcludeSameType, setP2pExcludeSameType] = useState(true);
   const [p2pOpen, setP2pOpen] = useState(false);
+  const [p2pConfigOpen, setP2pConfigOpen] = useState(false);
+  const [p2pSavedConfig, setP2pSavedConfig] = useState<P2pSavedConfig | null>(null);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
   const [confirm, setConfirm] = useState<MenuAction | null>(null);
@@ -171,6 +176,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const disabled = !connected || !hasSession;
   const isClaudeCode = activeSession?.agentType === 'claude-code';
   const isCodex = activeSession?.agentType === 'codex';
+
+  // Load saved P2P config on mount
+  useEffect(() => {
+    void getUserPref('p2p_session_config').then((raw) => {
+      if (raw && typeof raw === 'string') {
+        try { setP2pSavedConfig(JSON.parse(raw) as P2pSavedConfig); } catch { /* ignore */ }
+      }
+    });
+  }, []);
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
@@ -237,9 +251,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   /** Unified message preprocessing — applies P2P mode to any outgoing message. */
   const prepareMessage = useCallback((text: string): string => {
     if (p2pMode === 'solo' || text.includes('@@')) return text;
+    if (p2pMode === P2P_CONFIG_MODE) {
+      if (!p2pSavedConfig) return text;
+      const rounds = p2pSavedConfig.rounds ?? 1;
+      // Build per-session tokens for all enabled, non-skip sessions
+      const tokens = Object.entries(p2pSavedConfig.sessions)
+        .filter(([, entry]) => entry.enabled && entry.mode !== 'skip')
+        .map(([session, entry]) => `@@discuss(${session}, ${entry.mode})`);
+      if (tokens.length === 0) return text;
+      return `@@p2p-config(rounds=${rounds}) ${tokens.join(' ')} ${text}`;
+    }
     const flag = p2pExcludeSameType ? `, exclude-same-type` : '';
     return `@@all(${p2pMode}${flag}) ${text}`;
-  }, [p2pMode, p2pExcludeSameType]);
+  }, [p2pMode, p2pExcludeSameType, p2pSavedConfig]);
 
   const handleSend = useCallback(() => {
     let text = getText();
@@ -561,19 +585,37 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           >
             {p2pMode === 'solo' ? t('p2p.mode_solo') : `P2P:${t(P2P_MODE_I18N[p2pMode])}`}
           </button>
+          {/* Gear button for config panel — only shown when config mode is selected */}
+          {p2pMode === P2P_CONFIG_MODE && (
+            <button
+              class="shortcut-btn"
+              onClick={() => { setP2pOpen(false); setP2pConfigOpen(true); }}
+              disabled={disabled}
+              title={t('p2p.settings_title')}
+              style={{ fontSize: 12, color: '#94a3b8', paddingLeft: 2, paddingRight: 2 }}
+            >
+              ⚙
+            </button>
+          )}
           {p2pOpen && (
             <div class="menu-dropdown">
               {P2P_MODES.map((m) => (
                 <button
                   key={m}
                   class={`menu-item ${p2pMode === m ? 'menu-item-active' : ''}`}
-                  onClick={() => { setP2pMode(m); if (m === 'solo') setP2pExcludeSameType(false); setP2pOpen(false); }}
+                  onClick={() => {
+                    setP2pMode(m);
+                    if (m === 'solo') setP2pExcludeSameType(false);
+                    setP2pOpen(false);
+                    if (m === P2P_CONFIG_MODE) setP2pConfigOpen(true);
+                  }}
                   style={{ color: P2P_MODE_COLORS[m] }}
                 >
                   {p2pMode === m ? '● ' : '○ '}{t(P2P_MODE_I18N[m])}
+                  {m === P2P_CONFIG_MODE && ' ⚙'}
                 </button>
               ))}
-              {p2pMode !== 'solo' && (
+              {p2pMode !== 'solo' && p2pMode !== P2P_CONFIG_MODE && (
                 <>
                   <div class="menu-divider" />
                   <button
@@ -681,7 +723,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               setAtPickerOpen(false);
               setAtPickerStage('choose');
               atJustClosedRef.current = true;
-              setTimeout(() => { atJustClosedRef.current = false; }, 100);
+              setTimeout(() => { atJustClosedRef.current = false; atSelectionLockRef.current = false; }, 150);
               setHasText(true);
               // Move cursor to end
               try {
@@ -702,7 +744,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               setAtPickerOpen(false);
               setAtPickerStage('choose');
               atJustClosedRef.current = true;
-              setTimeout(() => { atJustClosedRef.current = false; }, 100);
+              setTimeout(() => { atJustClosedRef.current = false; atSelectionLockRef.current = false; }, 150);
               setHasText(true);
               // Move cursor to end
               try {
@@ -714,6 +756,32 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 sel?.addRange(range);
               } catch { /* jsdom lacks Selection API */ }
             }}
+            onSelectAllConfig={(cfg, rounds) => {
+              // Inject config-mode dispatch token into input
+              const text = divRef.current?.textContent ?? '';
+              const before = text.replace(/@[^\s@]*$/, '');
+              const tokens = Object.entries(cfg.sessions)
+                .filter(([, entry]) => entry.enabled && entry.mode !== 'skip')
+                .map(([session, entry]) => `@@discuss(${session}, ${entry.mode})`);
+              const roundsFlag = rounds > 1 ? `@@p2p-config(rounds=${rounds}) ` : '';
+              divRef.current!.textContent = `${before}${roundsFlag}${tokens.join(' ')} `;
+              atSelectionSnapshotRef.current = divRef.current!.textContent;
+              atSelectionLockRef.current = true;
+              setAtPickerOpen(false);
+              setAtPickerStage('choose');
+              atJustClosedRef.current = true;
+              setTimeout(() => { atJustClosedRef.current = false; atSelectionLockRef.current = false; }, 150);
+              setHasText(true);
+              try {
+                const sel = window.getSelection();
+                const range = document.createRange();
+                range.selectNodeContents(divRef.current!);
+                range.collapse(false);
+                sel?.removeAllRanges();
+                sel?.addRange(range);
+              } catch { /* jsdom lacks Selection API */ }
+            }}
+            p2pConfig={p2pSavedConfig}
             onClose={() => { setAtPickerOpen(false); setAtPickerStage('choose'); }}
             onStageChange={setAtPickerStage}
             visible={true}
@@ -839,6 +907,18 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         >
           {p2pMode !== 'solo' ? `${t(P2P_MODE_I18N[p2pMode])}` : t('common.send')}
         </button>
+        {/* Config mode: show gear to open settings panel inline with send row */}
+        {p2pMode === P2P_CONFIG_MODE && (
+          <button
+            class="btn btn-secondary"
+            onClick={() => setP2pConfigOpen(true)}
+            disabled={disabled}
+            title={t('p2p.settings_title')}
+            style={{ padding: '6px 10px' }}
+          >
+            ⚙
+          </button>
+        )}
 
         {/* Menu button */}
         <div class="menu-wrap" ref={menuRef}>
@@ -884,6 +964,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       </div>
     </div>
     <VoiceOverlay open={voiceOpen} onClose={() => setVoiceOpen(false)} onSend={handleVoiceSend} initialText={divRef.current?.textContent ?? ''} />
+    {p2pConfigOpen && (
+      <P2pConfigPanel
+        sessions={(sessions ?? []).map(s => ({ name: s.name, agentType: s.agentType, state: s.state }))}
+        subSessions={subSessions ?? []}
+        onClose={() => setP2pConfigOpen(false)}
+        onSave={(cfg) => {
+          setP2pSavedConfig(cfg);
+          void saveUserPref('p2p_session_config', JSON.stringify(cfg));
+        }}
+      />
+    )}
     </>
   );
 }

@@ -5,6 +5,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { ServerMessage } from '../ws-client.js';
+import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 
 interface SessionEntry {
   name: string;
@@ -23,6 +24,8 @@ interface AtPickerProps {
   projectDir?: string;
   onSelectFile: (path: string) => void;
   onSelectAgent: (session: string, mode: string) => void;
+  onSelectAllConfig?: (config: P2pSavedConfig, rounds: number) => void;
+  p2pConfig?: P2pSavedConfig | null;
   onClose: () => void;
   onStageChange?: (stage: 'choose' | 'files' | 'agents' | 'mode') => void;
   visible: boolean;
@@ -149,6 +152,8 @@ export function AtPicker({
   projectDir,
   onSelectFile,
   onSelectAgent,
+  onSelectAllConfig,
+  p2pConfig,
   onClose,
   onStageChange,
   visible,
@@ -159,6 +164,10 @@ export function AtPicker({
   const [highlightIdx, setHighlightIdx] = useState(0);
   const [modeAgent, setModeAgent] = useState<string | null>(null);
   const [modeHighlight, setModeHighlight] = useState(0);
+  // Config mode: show rounds picker before dispatching
+  const [configRoundsPicker, setConfigRoundsPicker] = useState(false);
+  const [configRoundsHighlight, setConfigRoundsHighlight] = useState(0);
+  const CONFIG_ROUNDS_OPTIONS = [1, 2, 3, 5] as const;
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const requestIdRef = useRef<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -248,6 +257,7 @@ export function AtPicker({
       setCategory('choose');
       setFileResults([]);
       setModeAgent(null);
+      setConfigRoundsPicker(false);
     }
   }, [visible]);
 
@@ -264,6 +274,21 @@ export function AtPicker({
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
       if (!visible) return;
+
+      // Config rounds sub-picker
+      if (configRoundsPicker) {
+        if (e.key === 'Escape') { e.preventDefault(); setConfigRoundsPicker(false); return; }
+        if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); setConfigRoundsHighlight((h) => (h - 1 + CONFIG_ROUNDS_OPTIONS.length) % CONFIG_ROUNDS_OPTIONS.length); return; }
+        if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); setConfigRoundsHighlight((h) => (h + 1) % CONFIG_ROUNDS_OPTIONS.length); return; }
+        if (e.key === 'Enter' && p2pConfig) {
+          e.preventDefault();
+          const rounds = CONFIG_ROUNDS_OPTIONS[configRoundsHighlight];
+          onSelectAllConfig?.(p2pConfig, rounds);
+          setConfigRoundsPicker(false);
+          return;
+        }
+        return;
+      }
 
       // Mode sub-picker
       if (modeAgent !== null) {
@@ -294,7 +319,13 @@ export function AtPicker({
       // Files or Agents list
       const nonSelfCount = agents.filter(a => !a.isSelf).length;
       const hasAllRow = category === 'agents' && nonSelfCount > 1;
-      const count = category === 'files' ? fileResults.length : agents.length + (hasAllRow ? 1 : 0);
+      const cfgParticipants = p2pConfig
+        ? Object.entries(p2pConfig.sessions).filter(([, e]) => e.enabled && e.mode !== 'skip')
+        : [];
+      const cfgRowCount = category === 'agents' && cfgParticipants.length > 0 ? 2 : 0;
+      const regAllOffset = cfgRowCount;
+      const agentsOff = regAllOffset + (hasAllRow ? 1 : 0);
+      const count = category === 'files' ? fileResults.length : cfgRowCount + (hasAllRow ? 1 : 0) + agents.length;
       if (e.key === 'Escape') {
         e.preventDefault();
         setCategory('choose');
@@ -308,16 +339,23 @@ export function AtPicker({
         if (category === 'files') {
           const f = fileResults[highlightIdx];
           if (f) onSelectFile(f.path);
-        } else if (hasAllRow && highlightIdx === 0) {
+        } else if (cfgRowCount > 0 && highlightIdx === 0) {
+          // @all with saved rounds
+          const rounds = p2pConfig!.rounds ?? 1;
+          onSelectAllConfig?.(p2pConfig!, rounds);
+        } else if (cfgRowCount > 0 && highlightIdx === 1) {
+          // @all+ — open rounds picker
+          setConfigRoundsPicker(true); setConfigRoundsHighlight(0);
+        } else if (hasAllRow && highlightIdx === regAllOffset) {
           setModeAgent('__all__'); setModeHighlight(0);
         } else {
-          const agentIdx = hasAllRow ? highlightIdx - 1 : highlightIdx;
+          const agentIdx = highlightIdx - agentsOff;
           const a = agents[agentIdx];
           if (a) { setModeAgent(a.session); setModeHighlight(0); }
         }
       }
     },
-    [visible, category, highlightIdx, fileResults, agents, modeAgent, modeHighlight, onClose, onSelectFile, onSelectAgent],
+    [visible, category, highlightIdx, fileResults, agents, modeAgent, modeHighlight, configRoundsPicker, configRoundsHighlight, p2pConfig, onClose, onSelectFile, onSelectAgent, onSelectAllConfig],
   );
 
   useEffect(() => {
@@ -334,6 +372,47 @@ export function AtPicker({
   }, [highlightIdx]);
 
   if (!visible) return null;
+
+  // ── Config rounds sub-picker (for @all+ with custom rounds) ──
+  if (configRoundsPicker && p2pConfig) {
+    // Build participant preview
+    const participants = Object.entries(p2pConfig.sessions)
+      .filter(([, e]) => e.enabled && e.mode !== 'skip');
+    return (
+      <div ref={containerRef} style={containerStyle}>
+        <div style={backBtnStyle} onClick={() => setConfigRoundsPicker(false)}>← {t('p2p.picker.back')}</div>
+        <div style={groupLabelStyle}>{t('p2p.settings_rounds')}</div>
+        <div style={modeContainerStyle}>
+          {CONFIG_ROUNDS_OPTIONS.map((r, idx) => (
+            <button
+              key={r}
+              type="button"
+              style={idx === configRoundsHighlight ? modeBtnHoverStyle : modeBtnStyle}
+              onClick={() => { onSelectAllConfig?.(p2pConfig, r); setConfigRoundsPicker(false); }}
+              onMouseEnter={() => setConfigRoundsHighlight(idx)}
+            >
+              {r}
+            </button>
+          ))}
+        </div>
+        {participants.length > 0 && (
+          <>
+            <div style={groupLabelStyle}>{t('p2p.picker.agents')}</div>
+            {participants.map(([session, entry]) => {
+              const parts = session.split('_');
+              const shortName = parts[parts.length - 1] || session;
+              return (
+                <div key={session} style={{ ...itemStyle, fontSize: 12, paddingLeft: 14 }}>
+                  <span style={{ color: '#e2e8f0' }}>{shortName}</span>
+                  <span style={dimStyle}>· {entry.mode}</span>
+                </div>
+              );
+            })}
+          </>
+        )}
+      </div>
+    );
+  }
 
   // ── Mode sub-picker ──
   if (modeAgent !== null) {
@@ -432,26 +511,98 @@ export function AtPicker({
   // ── Agents list ──
   const nonSelfAgents = agents.filter(a => !a.isSelf);
   const showAll = nonSelfAgents.length > 1;
+  // Config-mode rows: shown when p2pConfig is set and there are eligible sessions
+  const configParticipants = p2pConfig
+    ? Object.entries(p2pConfig.sessions).filter(([, e]) => e.enabled && e.mode !== 'skip')
+    : [];
+  const showConfigRows = !!p2pConfig && configParticipants.length > 0;
+  const configRowCount = showConfigRows ? 2 : 0; // @all and @all+
+  // Index offset: configRows come first, then regular @all, then individual agents
+  const regularAllOffset = configRowCount;
+  const agentsOffset = regularAllOffset + (showAll ? 1 : 0);
+
   return (
     <div ref={containerRef} style={containerStyle}>
       <div style={backBtnStyle} onClick={() => { setCategory('choose'); setHighlightIdx(0); }}>← {t('p2p.picker.back')}</div>
       <div style={groupLabelStyle}>{t('p2p.picker.agents')}</div>
-      {agents.length === 0 && (
+      {agents.length === 0 && !showConfigRows && (
         <div style={{ ...itemStyle, color: '#64748b', justifyContent: 'center' }}>{t('p2p.picker.no_agents_available')}</div>
       )}
+
+      {/* Config @all rows */}
+      {showConfigRows && (() => {
+        const rounds = p2pConfig!.rounds ?? 1;
+        const hlAll = highlightIdx === 0;
+        const hlAllPlus = highlightIdx === 1;
+        return (
+          <>
+            {/* @all (N轮) — use saved rounds, dispatch immediately */}
+            <div
+              data-hl={hlAll ? 'true' : undefined}
+              style={hlAll ? itemHighlightStyle : itemStyle}
+              onClick={() => { onSelectAllConfig?.(p2pConfig!, rounds); }}
+              onMouseEnter={() => setHighlightIdx(0)}
+            >
+              <span style={{ fontWeight: 600, color: '#94a3b8' }}>⚙ {t('p2p.all_label')}</span>
+              <span style={{ ...dimStyle, color: '#94a3b8' }}>({rounds} {t('p2p.settings_rounds').toLowerCase()})</span>
+            </div>
+            {/* Participant preview under @all */}
+            {hlAll && (
+              <div style={{ paddingLeft: 20, paddingBottom: 4 }}>
+                {configParticipants.map(([session, entry]) => {
+                  const parts = session.split('_');
+                  const shortName = parts[parts.length - 1] || session;
+                  return (
+                    <div key={session} style={{ fontSize: 11, color: '#64748b', lineHeight: '1.6' }}>
+                      {shortName} · {entry.mode}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            {/* @all+ — pop rounds picker */}
+            <div
+              data-hl={hlAllPlus ? 'true' : undefined}
+              style={hlAllPlus ? itemHighlightStyle : itemStyle}
+              onClick={() => { setConfigRoundsPicker(true); setConfigRoundsHighlight(0); }}
+              onMouseEnter={() => setHighlightIdx(1)}
+            >
+              <span style={{ fontWeight: 600, color: '#94a3b8' }}>⚙ {t('p2p.all_plus')}</span>
+            </div>
+            {/* Participant preview under @all+ */}
+            {hlAllPlus && (
+              <div style={{ paddingLeft: 20, paddingBottom: 4 }}>
+                {configParticipants.map(([session, entry]) => {
+                  const parts = session.split('_');
+                  const shortName = parts[parts.length - 1] || session;
+                  return (
+                    <div key={session} style={{ fontSize: 11, color: '#64748b', lineHeight: '1.6' }}>
+                      {shortName} · {entry.mode}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </>
+        );
+      })()}
+
+      {/* Regular @all */}
       {showAll && (
         <div
-          data-hl={highlightIdx === 0 ? 'true' : undefined}
-          style={highlightIdx === 0 ? itemHighlightStyle : itemStyle}
+          data-hl={highlightIdx === regularAllOffset ? 'true' : undefined}
+          style={highlightIdx === regularAllOffset ? itemHighlightStyle : itemStyle}
           onClick={() => { setModeAgent('__all__'); setModeHighlight(0); }}
-          onMouseEnter={() => setHighlightIdx(0)}
+          onMouseEnter={() => setHighlightIdx(regularAllOffset)}
         >
           <span style={{ fontWeight: 500, color: '#22c55e' }}>⚡ {t('p2p.picker.all_agents', 'All Agents')}</span>
           <span style={dimStyle}>{nonSelfAgents.length} {t('p2p.picker.sessions', 'sessions')}</span>
         </div>
       )}
+
+      {/* Individual agents */}
       {agents.map((a, idx) => {
-        const adjustedIdx = showAll ? idx + 1 : idx;
+        const adjustedIdx = agentsOffset + idx;
         const hl = adjustedIdx === highlightIdx;
         return (
           <div

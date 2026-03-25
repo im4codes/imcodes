@@ -257,7 +257,22 @@
       "review": "レビュー",
       "brainstorm": "ブレインストーミング",
       "discuss": "ディスカッション"
-    }
+    },
+    "mode_config": "設定",
+    "settings_title": "P2P参加者設定",
+    "settings_save": "保存",
+    "settings_close": "閉じる",
+    "settings_enabled": "参加",
+    "settings_mode": "モード",
+    "settings_skip": "スキップ",
+    "settings_default_hint": "新規セッションのデフォルト：有効 + audit",
+    "settings_rounds": "ラウンド数",
+    "settings_rounds_hint": "ディスカッション回数（多い＝より深い分析）",
+    "all_label": "全員",
+    "all_rounds": "{{count}}ラウンド",
+    "all_rounds_plural": "{{count}}ラウンド",
+    "all_plus": "全員 + カスタムラウンド",
+    "all_preview_empty": "参加者が未設定"
   },
   "upload": {
     "upload_file": "ファイルをアップロード",

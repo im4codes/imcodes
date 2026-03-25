@@ -14,7 +14,7 @@ import { sendKeysDelayedEnter } from '../agent/tmux.js';
 import { detectStatus, detectStatusAsync } from '../agent/detect.js';
 import { capturePane } from '../agent/tmux.js';
 import { getSession, type SessionRecord } from '../store/session-store.js';
-import { getP2pMode, type P2pMode } from '../shared/p2p-modes.js';
+import { getP2pMode, roundPrompt, type P2pMode } from '../shared/p2p-modes.js';
 import logger from '../util/logger.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
@@ -63,6 +63,12 @@ export interface P2pRun {
   createdAt: string;
   updatedAt: string;
   completedAt: string | null;
+  /** Total number of rounds for this run. */
+  rounds: number;
+  /** Current round (1-based). */
+  currentRound: number;
+  /** Full set of targets for repeating across rounds. */
+  allTargets: P2pTarget[];
   /** Internal: set to true when cancel requested */
   _cancelled: boolean;
 }
@@ -161,6 +167,7 @@ export async function startP2pRun(
   userText: string,
   fileContents: Array<{ path: string; content: string }>,
   serverLink: ServerLink | null,
+  rounds?: number,
 ): Promise<P2pRun> {
   // Validate same domain
   const mainSession = extractMainSession(initiatorSession);
@@ -192,6 +199,7 @@ export async function startP2pRun(
   }
   await writeFile(contextFilePath, seed, 'utf8');
 
+  const totalRounds = Math.max(1, rounds ?? 1);
   const run: P2pRun = {
     id: runId,
     discussionId,
@@ -199,7 +207,7 @@ export async function startP2pRun(
     initiatorSession,
     currentTargetSession: null,
     finalReturnSession: initiatorSession,
-    remainingTargets: targets,
+    remainingTargets: [...targets],
     totalTargets: targets.length,
     mode,
     status: 'queued',
@@ -213,6 +221,9 @@ export async function startP2pRun(
     createdAt: now,
     updatedAt: now,
     completedAt: null,
+    rounds: totalRounds,
+    currentRound: 1,
+    allTargets: [...targets],
     _cancelled: false,
   };
 
@@ -277,40 +288,55 @@ export async function resumePendingOrchestrations(serverLink: ServerLink | null)
 // ── Chain execution ───────────────────────────────────────────────────────
 
 async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, serverLink: ServerLink | null): Promise<void> {
-  const targets = [...run.remainingTargets];
-  const totalHops = targets.length;
+  const totalHops = run.allTargets.length;
 
-  // ── Phase 1: Initiator initial analysis ──
-  if (run._cancelled) return;
-  const initialPrompt = buildHopPrompt(run, modeConfig, {
-    session: run.initiatorSession,
-    sectionHeader: `${shortName(run.initiatorSession)} — Initial Analysis`,
-    instruction: 'Read the context file below and provide your initial analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.',
-    isInitial: true,
-  });
-  const initialHeader = `${shortName(run.initiatorSession)} — Initial Analysis`;
-  await dispatchHop(run, run.initiatorSession, initialPrompt, serverLink, undefined, initialHeader);
-  if (run._cancelled || isTerminal(run.status)) return;
-
-  // ── Phase 2: Sub-session hops ──
-  for (let i = 0; i < targets.length; i++) {
-    if (run._cancelled) return;
-    const target = targets[i];
-    const hopLabel = `${shortName(target.session)} — ${capitalize(target.mode)} (hop ${i + 1}/${totalHops})`;
-    const hopModeConfig = getP2pMode(target.mode) ?? modeConfig;
-
-    const hopPrompt = buildHopPrompt(run, hopModeConfig, {
-      session: target.session,
-      sectionHeader: hopLabel,
-      instruction: `Read the full context file and provide your ${target.mode} analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`,
-      isInitial: false,
-    });
-
-    // Dispatch immediately — agent will queue the message and process after current task
-    logger.info({ runId: run.id, target: target.session, mode: target.mode, hop: i + 1, totalHops }, 'P2P: Phase 2 — dispatching hop');
-    await dispatchHop(run, target.session, hopPrompt, serverLink, null, hopLabel);
-    logger.info({ runId: run.id, target: target.session, status: run.status }, 'P2P: Phase 2 — hop dispatch returned');
+  // ── Multi-round loop ──
+  for (; run.currentRound <= run.rounds; run.currentRound++) {
     if (run._cancelled || isTerminal(run.status)) return;
+
+    const rp = roundPrompt(run.currentRound, run.rounds);
+    const roundLabel = run.rounds > 1 ? ` (round ${run.currentRound}/${run.rounds})` : '';
+
+    // Restore full target list for this round (skipped sessions are not retried)
+    if (run.currentRound > 1) {
+      run.remainingTargets = [...run.allTargets];
+      logger.info({ runId: run.id, round: run.currentRound, totalRounds: run.rounds }, 'P2P: starting new round');
+    }
+
+    const targets = [...run.remainingTargets];
+
+    // ── Phase 1: Initiator initial analysis ──
+    if (run._cancelled) return;
+    const initialHeader = `${shortName(run.initiatorSession)} — Initial Analysis${roundLabel}`;
+    const initialPrompt = buildHopPrompt(run, modeConfig, {
+      session: run.initiatorSession,
+      sectionHeader: initialHeader,
+      instruction: 'Read the context file below and provide your initial analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.',
+      isInitial: true,
+    }, rp);
+    await dispatchHop(run, run.initiatorSession, initialPrompt, serverLink, undefined, initialHeader);
+    if (run._cancelled || isTerminal(run.status)) return;
+
+    // ── Phase 2: Sub-session hops ──
+    for (let i = 0; i < targets.length; i++) {
+      if (run._cancelled) return;
+      const target = targets[i];
+      const hopLabel = `${shortName(target.session)} — ${capitalize(target.mode)} (hop ${i + 1}/${totalHops}${roundLabel})`;
+      const hopModeConfig = getP2pMode(target.mode) ?? modeConfig;
+
+      const hopPrompt = buildHopPrompt(run, hopModeConfig, {
+        session: target.session,
+        sectionHeader: hopLabel,
+        instruction: `Read the full context file and provide your ${target.mode} analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`,
+        isInitial: false,
+      }, rp);
+
+      // Dispatch immediately — agent will queue the message and process after current task
+      logger.info({ runId: run.id, target: target.session, mode: target.mode, hop: i + 1, totalHops, round: run.currentRound }, 'P2P: Phase 2 — dispatching hop');
+      await dispatchHop(run, target.session, hopPrompt, serverLink, null, hopLabel);
+      logger.info({ runId: run.id, target: target.session, status: run.status }, 'P2P: Phase 2 — hop dispatch returned');
+      if (run._cancelled || isTerminal(run.status)) return;
+    }
   }
 
   // ── Phase 3: Initiator summary + execute user instructions ──
@@ -625,9 +651,14 @@ interface HopOpts {
   isInitial: boolean;
 }
 
-function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: HopOpts): string {
+function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: HopOpts, roundPrefix = ''): string {
   const parts: string[] = [];
   const filePath = run.contextFilePath;
+
+  // Round-aware prefix (empty for single-round runs)
+  if (roundPrefix) {
+    parts.push(roundPrefix);
+  }
 
   // Mode role prompt
   if (mode?.prompt) {

@@ -257,7 +257,22 @@
       "review": "Review",
       "brainstorm": "Brainstorm",
       "discuss": "Discuss"
-    }
+    },
+    "mode_config": "Config",
+    "settings_title": "P2P Participant Settings",
+    "settings_save": "Save",
+    "settings_close": "Close",
+    "settings_enabled": "Participate",
+    "settings_mode": "Mode",
+    "settings_skip": "Skip",
+    "settings_default_hint": "New sessions default to: enabled + audit",
+    "settings_rounds": "Rounds",
+    "settings_rounds_hint": "Number of discussion rounds (more = deeper analysis)",
+    "all_label": "All",
+    "all_rounds": "{{count}} round",
+    "all_rounds_plural": "{{count}} rounds",
+    "all_plus": "All + custom rounds",
+    "all_preview_empty": "No sessions configured"
   },
   "upload": {
     "upload_file": "Upload file",

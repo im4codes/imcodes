@@ -26,6 +26,8 @@ vi.mock('../../src/components/QuickInputPanel.js', () => ({
 const uploadFileMock = vi.fn();
 vi.mock('../../src/api.js', () => ({
   uploadFile: (...args: unknown[]) => uploadFileMock(...args),
+  getUserPref: vi.fn().mockResolvedValue(null),
+  saveUserPref: vi.fn().mockResolvedValue(undefined),
 }));
 
 import { SessionControls } from '../../src/components/SessionControls.js';

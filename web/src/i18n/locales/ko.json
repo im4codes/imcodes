@@ -257,7 +257,22 @@
       "review": "리뷰",
       "brainstorm": "브레인스토밍",
       "discuss": "토론"
-    }
+    },
+    "mode_config": "설정",
+    "settings_title": "P2P 참가자 설정",
+    "settings_save": "저장",
+    "settings_close": "닫기",
+    "settings_enabled": "참여",
+    "settings_mode": "모드",
+    "settings_skip": "건너뛰기",
+    "settings_default_hint": "새 세션 기본값: 활성화 + audit",
+    "settings_rounds": "라운드",
+    "settings_rounds_hint": "토론 라운드 수 (많을수록 깊은 분석)",
+    "all_label": "전체",
+    "all_rounds": "{{count}}라운드",
+    "all_rounds_plural": "{{count}}라운드",
+    "all_plus": "전체 + 사용자 라운드",
+    "all_preview_empty": "참가자 미설정"
   },
   "upload": {
     "upload_file": "파일 업로드",

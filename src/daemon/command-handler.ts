@@ -27,6 +27,7 @@ import { exec as execCb } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, type P2pTarget } from './p2p-orchestrator.js';
+import { P2P_CONFIG_MODE, type P2pSessionConfig } from '../shared/p2p-modes.js';
 import { copyFile, mkdir } from 'node:fs/promises';
 import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
 
@@ -103,7 +104,7 @@ const MIME_MAP: Record<string, string> = {
  *   select its siblings (same parentSession) + parent
  * - Always skip: initiator itself, stopped sessions
  */
-function expandAllTargets(initiatorName: string, mode: string, excludeSameType = false): P2pTarget[] {
+function expandAllTargets(initiatorName: string, mode: string, excludeSameType = false, sessionConfig?: P2pSessionConfig): P2pTarget[] {
   const initiator = getSession(initiatorName);
   const all = listSessions();
   const targets: P2pTarget[] = [];
@@ -116,16 +117,27 @@ function expandAllTargets(initiatorName: string, mode: string, excludeSameType =
     if (NON_DISCUSSABLE.has(s.agentType ?? '')) continue;
     if (excludeSameType && initiator?.agentType && s.agentType === initiator.agentType) continue;
 
+    let inDomain = false;
     if (initiatorName.startsWith('deck_sub_')) {
-      // Initiator is a sub-session → select siblings (same parent) + parent
       const isSibling = s.parentSession && s.parentSession === initiator?.parentSession;
       const isParent = s.name === initiator?.parentSession;
-      if (isSibling || isParent) targets.push({ session: s.name, mode });
+      inDomain = !!(isSibling || isParent);
     } else {
-      // Initiator is a main session → select its sub-sessions + same-project peers
       const isChild = s.parentSession === initiatorName;
       const isSameProject = !s.name.startsWith('deck_sub_') && initiator?.projectName && s.projectName === initiator.projectName;
-      if (isChild || isSameProject) targets.push({ session: s.name, mode });
+      inDomain = !!(isChild || isSameProject);
+    }
+
+    if (!inDomain) continue;
+
+    if (mode === P2P_CONFIG_MODE && sessionConfig) {
+      const entry = sessionConfig[s.name];
+      const sessionMode = entry?.mode ?? 'audit';
+      if (entry && !entry.enabled) continue;
+      if (sessionMode === 'skip') continue;
+      targets.push({ session: s.name, mode: sessionMode });
+    } else {
+      targets.push({ session: s.name, mode });
     }
   }
   // Sort deterministically by session name for predictable ordering
@@ -135,7 +147,7 @@ function expandAllTargets(initiatorName: string, mode: string, excludeSameType =
 
 // Session names: alphanumeric + underscore only (matches deck_{project}_{role} and deck_sub_{id} patterns)
 const SESSION_NAME_RE = /[a-zA-Z0-9_]+/;
-const VALID_MODES = new Set(['audit', 'review', 'brainstorm', 'discuss']);
+const VALID_MODES = new Set(['audit', 'review', 'brainstorm', 'discuss', 'config']);
 const DISCUSS_TOKEN_RE = /@@discuss\(([^,]+),\s*([^)]+)\)/g;
 // @@all(mode) or @@all(mode, exclude-same-type)
 const ALL_TOKEN_RE = /@@all\(([^)]+)\)/g;
@@ -604,10 +616,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // Check for P2P tokens
   const tokens = parseAtTokens(text);
 
+  const p2pSessionConfig = (cmd as any).p2pSessionConfig as P2pSessionConfig | undefined;
+  const p2pRounds = (cmd as any).p2pRounds as number | undefined;
+
   // @@all(mode) — expand to all active sessions in the same domain
   if (tokens.expandAll && tokens.agents.length === 0) {
     const mode = tokens.expandAll.mode;
-    tokens.agents.push(...expandAllTargets(sessionName, mode, tokens.expandAll.excludeSameType));
+    tokens.agents.push(...expandAllTargets(sessionName, mode, tokens.expandAll.excludeSameType, p2pSessionConfig));
     if (tokens.agents.length === 0) {
       logger.warn({ sessionName }, '@@all: no active sessions found in same domain');
       timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: 'No active sessions found for @@all' });
@@ -665,7 +680,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           fileContents.push({ path: fp, content: capped }); // cap at 50KB
         } catch { /* ignore unreadable files */ }
       }
-      const run = await startP2pRun(sessionName, tokens.agents, tokens.cleanText, fileContents, serverLink);
+      const run = await startP2pRun(sessionName, tokens.agents, tokens.cleanText, fileContents, serverLink, p2pRounds);
       const status = isLegacy ? 'accepted_legacy' : 'accepted';
       timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
       try {

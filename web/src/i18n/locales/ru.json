@@ -257,7 +257,22 @@
       "review": "Обзор",
       "brainstorm": "Мозговой штурм",
       "discuss": "Обсуждение"
-    }
+    },
+    "mode_config": "Конфиг",
+    "settings_title": "Настройки участников P2P",
+    "settings_save": "Сохранить",
+    "settings_close": "Закрыть",
+    "settings_enabled": "Участвовать",
+    "settings_mode": "Режим",
+    "settings_skip": "Пропустить",
+    "settings_default_hint": "Новые сессии по умолчанию: включено + audit",
+    "settings_rounds": "Раунды",
+    "settings_rounds_hint": "Количество раундов (больше = глубже анализ)",
+    "all_label": "Все",
+    "all_rounds": "{{count}} раунд",
+    "all_rounds_plural": "{{count}} раундов",
+    "all_plus": "Все + выбор раундов",
+    "all_preview_empty": "Участники не настроены"
   },
   "upload": {
     "upload_file": "Загрузить файл",

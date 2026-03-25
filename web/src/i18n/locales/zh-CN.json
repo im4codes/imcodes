@@ -257,7 +257,22 @@
       "review": "审查",
       "brainstorm": "头脑风暴",
       "discuss": "讨论"
-    }
+    },
+    "mode_config": "配置",
+    "settings_title": "P2P 参与者设置",
+    "settings_save": "保存",
+    "settings_close": "关闭",
+    "settings_enabled": "参与",
+    "settings_mode": "模式",
+    "settings_skip": "跳过",
+    "settings_default_hint": "新会话默认：启用 + audit",
+    "settings_rounds": "轮数",
+    "settings_rounds_hint": "讨论轮数（越多分析越深入）",
+    "all_label": "全部",
+    "all_rounds": "{{count}} 轮",
+    "all_rounds_plural": "{{count}} 轮",
+    "all_plus": "全部 + 自定义轮数",
+    "all_preview_empty": "未配置参与者"
   },
   "upload": {
     "upload_file": "上传文件",
