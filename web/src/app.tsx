@@ -539,8 +539,11 @@ export function App() {
     } catch { /* ignore */ }
     return {};
   });
-  // Current session's view mode, falls back to device default
-  const viewMode: ViewMode = (activeSession && viewModes[activeSession]) ? viewModes[activeSession] : defaultViewMode;
+  // Transport sessions have no terminal backend — force chat mode, no toggle
+  const activeRuntimeType = sessions.find((s) => s.name === activeSession)?.runtimeType;
+  const isTransportSession = activeRuntimeType === 'transport';
+  const effectiveDefault: ViewMode = isTransportSession ? 'chat' : defaultViewMode;
+  const viewMode: ViewMode = isTransportSession ? 'chat' : ((activeSession && viewModes[activeSession]) ? viewModes[activeSession] : effectiveDefault);
   const toggleViewMode = useCallback(() => {
     if (!activeSession) return;
     setViewModes((prev) => {
@@ -701,6 +704,7 @@ export function App() {
             state: s.state as SessionInfo['state'],
             projectDir: existing?.projectDir,
             runtimeType: s.runtimeType,
+            label: (s as any).label ?? existing?.label,
           };
         }));
         setSessionsLoaded(true);

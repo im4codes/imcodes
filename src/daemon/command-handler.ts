@@ -899,6 +899,7 @@ function handleGetSessions(serverLink: ServerLink): void {
       providerId: s.providerId,
       providerSessionId: s.providerSessionId,
       description: s.description,
+      label: s.label,
     }));
   try {
     serverLink.send({ type: 'session_list', daemonVersion: serverLink.daemonVersion, sessions });

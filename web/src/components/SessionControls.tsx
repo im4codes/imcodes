@@ -356,6 +356,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const handleKeyDown = (e: KeyboardEvent) => {
     // When @ picker is open, let it handle Enter/Arrow/Escape — don't send or navigate history
     if (atPickerOpen && (e.key === 'Enter' || e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'Escape')) {
+      // Prevent contenteditable default (Enter = newline, arrows = cursor move)
+      e.preventDefault();
       // AtPicker's document-level keydown handler will handle these
       return;
     }
@@ -363,6 +365,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (e.key === 'Enter' && (atJustClosedRef.current || atSelectionLockRef.current)) {
       e.preventDefault();
       atJustClosedRef.current = false;
+      atSelectionLockRef.current = false;
       return;
     }
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {

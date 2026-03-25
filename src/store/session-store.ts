@@ -41,6 +41,8 @@ export interface SessionRecord {
   providerSessionId?: string;
   /** Session description — used for persona/system prompt injection. */
   description?: string;
+  /** Human-readable label for UI display (e.g. "OC:main", "discord:#general"). */
+  label?: string;
 }
 
 export interface SessionStore {

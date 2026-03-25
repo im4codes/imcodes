@@ -138,6 +138,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
           try {
             await launchTransportSession({
               name: mName, projectName: mName, role: 'w1', agentType: 'openclaw',
+              label: mainSessionLabel(group.agentName),
               projectDir: mainSessionProjectDir(group.agentName),
               bindExistingKey: group.mainSession.key, skipCreate: true, skipStore: true,
             });
@@ -157,6 +158,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
             projectName: mName,
             role: 'w1',
             agentType: 'openclaw',
+            label: mainSessionLabel(group.agentName),
             projectDir: mainSessionProjectDir(group.agentName),
             description: group.mainSession.displayName,
             bindExistingKey: group.mainSession.key,
@@ -188,6 +190,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
           try {
             await launchTransportSession({
               name: existingInStore.name, projectName: existingInStore.name, role: 'w1', agentType: 'openclaw',
+              label: ch.displayName || ch.key,
               projectDir: mainSessionProjectDir(group.agentName),
               bindExistingKey: ch.key, skipCreate: true, skipStore: true,
             });
@@ -212,6 +215,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
           projectName: subName,
           role: 'w1',
           agentType: 'openclaw',
+          label: ch.displayName || ch.key,
           projectDir: mainSessionProjectDir(group.agentName),
           description: ch.displayName,
           bindExistingKey: ch.key,

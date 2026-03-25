@@ -559,6 +559,8 @@ export interface LaunchOpts {
   codexSessionId?: string;
   /** Gemini session UUID for `gemini --resume <UUID>`. */
   geminiSessionId?: string;
+  /** Human-readable label for UI display. */
+  label?: string;
   /** Session description for transport sessions (persona/system prompt injection). */
   description?: string;
   /** Bind to an existing remote session key instead of creating a new one. */
@@ -612,7 +614,7 @@ export function getTransportRuntime(name: string): TransportSessionRuntime | und
 }
 
 export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
-  const { name, projectName, role, agentType, projectDir, skipStore, description, bindExistingKey, skipCreate } = opts;
+  const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate } = opts;
 
   const provider = getProvider(agentType);
   if (!provider) {
@@ -624,7 +626,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   // Create session on provider
   await runtime.initialize({
     sessionKey: name,
-    label: name,
+    label: label || name,
     description,
     bindExistingKey,
     skipCreate,
@@ -652,6 +654,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         providerId: provider.id,
         providerSessionId: runtime.providerSessionId ?? undefined,
         description,
+        label,
       };
       upsertSession(record);
       emitSessionPersist(record, name);
