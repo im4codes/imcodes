@@ -75,18 +75,14 @@ export function useTimeline(
 
     setRefreshing(false);
     resetOlderState();
-    historyLoadedRef.current = null;
 
     let cancelled = false;
 
-    // Check module-level memory cache first — shows events instantly for sessions
-    // already loaded in this page session (e.g. SubSessionWindow reopened while
-    // SubSessionCard had been receiving events).
+    // 1. Module-level memory cache — instant restore (e.g. window reopen)
     const memCached = eventsCache.get(sessionId);
     if (memCached && memCached.length > 0) {
       setEvents(memCached);
       setLoading(false);
-      // Request only events newer than what we already have
       if (ws?.connected) {
         setRefreshing(true);
         const afterTs = Math.max(...memCached.map((e) => e.ts));
@@ -95,14 +91,23 @@ export function useTimeline(
       return () => { cancelled = true; };
     }
 
-    // No memory cache — load from IndexedDB as immediate cache while waiting for daemon.
-    // Use getRecentEvents (ts-based, no epoch filter) so cached events across
-    // daemon restarts are all included — epoch change doesn't hide old messages.
+    // 2. Already loaded this session — skip reload (prevents flash-of-empty on minimize/restore)
+    if (historyLoadedRef.current === sessionId) {
+      setLoading(false);
+      // Just request incremental updates
+      if (ws?.connected) {
+        setRefreshing(true);
+        historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500);
+      }
+      return () => { cancelled = true; };
+    }
+
+    // 3. IndexedDB cache → daemon history (first load for this session in this page session)
     setLoading(true);
     const load = async () => {
       const db = sharedDb;
       if (!db) return;
-      await db.open(); // ensure DB is open before querying (open() is idempotent)
+      await db.open();
       if (cancelled) return;
       const last = await db.getLastSeqAndEpoch(sessionId);
       if (cancelled) return;
@@ -113,8 +118,8 @@ export function useTimeline(
         if (cancelled) return;
         eventsCache.set(sessionId, stored);
         setEvents(stored);
-        // Cache hit — show immediately, request only events newer than cache
         setLoading(false);
+        historyLoadedRef.current = sessionId;
         if (ws?.connected) {
           setRefreshing(true);
           const afterTs = stored.length > 0 ? Math.max(...stored.map((e) => e.ts)) : undefined;
@@ -125,7 +130,6 @@ export function useTimeline(
         seqRef.current = 0;
         if (cancelled) return;
         setEvents([]);
-        // No cache — request full history from daemon
         if (ws?.connected) {
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId);
         } else {
