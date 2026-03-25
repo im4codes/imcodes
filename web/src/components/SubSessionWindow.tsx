@@ -67,9 +67,9 @@ export function SubSessionWindow({
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const swipeBackRef = useSwipeBack(isMobile ? onMinimize : null);
 
-  // Pause timeline subscription when window is hidden — prevents invisible
-  // windows from processing WS events, running memos, and re-rendering.
-  const { events, refreshing } = useTimeline(active ? sub.sessionName : null, active ? ws : null);
+  // Always pass sessionName + ws so useTimeline keeps its cache warm.
+  // active flag is only for rendering — timeline state should persist across minimize/restore.
+  const { events, refreshing } = useTimeline(sub.sessionName, ws);
   const quickData = useQuickData();
 
   // Earliest ts of the current continuous thinking sequence (shared logic).
