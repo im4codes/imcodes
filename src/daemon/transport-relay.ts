@@ -1,10 +1,12 @@
 /**
  * Relay TransportEvents from provider callbacks to the server-link WebSocket,
  * which forwards them to WsBridge for browser delivery.
+ * Also writes events to local JSONL cache for replay on reconnect.
  */
 import type { TransportProvider, ProviderError } from '../agent/transport-provider.js';
 import type { MessageDelta, AgentMessage } from '../../shared/agent-message.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
+import { appendTransportEvent } from './transport-history.js';
 import logger from '../util/logger.js';
 
 let sendToServer: ((msg: Record<string, unknown>) => void) | null = null;
@@ -14,10 +16,16 @@ export function setTransportRelaySend(fn: (msg: Record<string, unknown>) => void
   sendToServer = fn;
 }
 
+/** Send to server + cache locally. */
+function relayAndCache(sessionId: string, msg: Record<string, unknown>): void {
+  sendToServer?.(msg);
+  void appendTransportEvent(sessionId, msg);
+}
+
 /** Wire up a provider's callbacks to relay events to the server */
 export function wireProviderToRelay(provider: TransportProvider): void {
   provider.onDelta((sessionId: string, delta: MessageDelta) => {
-    sendToServer?.({
+    relayAndCache(sessionId, {
       type: TRANSPORT_EVENT.CHAT_DELTA,
       sessionId,
       messageId: delta.messageId,
@@ -27,7 +35,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
   });
 
   provider.onComplete((sessionId: string, message: AgentMessage) => {
-    sendToServer?.({
+    relayAndCache(sessionId, {
       type: TRANSPORT_EVENT.CHAT_COMPLETE,
       sessionId,
       messageId: message.id,
@@ -35,7 +43,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
   });
 
   provider.onError((sessionId: string, error: ProviderError) => {
-    sendToServer?.({
+    relayAndCache(sessionId, {
       type: TRANSPORT_EVENT.CHAT_ERROR,
       sessionId,
       error: error.message,

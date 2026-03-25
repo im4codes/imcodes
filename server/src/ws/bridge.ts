@@ -475,6 +475,8 @@ export class WsBridge {
       // Track transport (chat) subscriptions for session-scoped transport event delivery
       if (msg.type === TRANSPORT_MSG.CHAT_SUBSCRIBE && typeof msg.sessionId === 'string') {
         this.transportSubscriptions.get(ws)?.add(msg.sessionId);
+        // Forward to daemon so it can replay cached history
+        this.sendToDaemon(raw);
         return;
       }
       if (msg.type === TRANSPORT_MSG.CHAT_UNSUBSCRIBE && typeof msg.sessionId === 'string') {

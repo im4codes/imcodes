@@ -356,6 +356,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'timeline.history_request':
       handleTimelineHistory(cmd, serverLink);
       break;
+    case 'chat.subscribe':
+      void handleChatSubscribeReplay(cmd, serverLink);
+      break;
     case 'subsession.start':
       void handleSubSessionStart(cmd, serverLink);
       break;
@@ -1720,4 +1723,21 @@ async function handleServerDelete(): Promise<void> {
   logger.info('Daemon unbound — exiting');
   // Give the log a moment to flush before exiting
   setTimeout(() => process.exit(0), 500);
+}
+
+// ── Transport chat history replay ─────────────────────────────────────────────
+
+async function handleChatSubscribeReplay(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const sessionId = cmd.sessionId as string | undefined;
+  if (!sessionId) return;
+  try {
+    const { replayTransportHistory } = await import('./transport-history.js');
+    const events = await replayTransportHistory(sessionId);
+    if (events.length === 0) return;
+    // Send history as a batch so the browser can render them before live events
+    serverLink.send({ type: 'chat.history', sessionId, events });
+    logger.debug({ sessionId, count: events.length }, 'Replayed transport chat history');
+  } catch (err) {
+    logger.debug({ sessionId, err }, 'Transport history replay failed');
+  }
 }
