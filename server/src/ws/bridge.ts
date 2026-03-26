@@ -245,13 +245,15 @@ export class WsBridge {
           logger.error({ err }, 'Failed to update heartbeat on auth'),
         );
 
-        // Auto-upgrade: if server version is known and differs from daemon, send upgrade command
+        // Auto-upgrade: if server version is known and differs from daemon, send upgrade command.
+        // Skip dev versions (0.x.x) — those are local npm-linked development builds.
         const serverVersion = process.env.APP_VERSION;
-        if (serverVersion && serverVersion !== '0.0.0' && this.daemonVersion && this.daemonVersion !== serverVersion) {
+        const isDev = this.daemonVersion?.startsWith('0.') ?? false;
+        if (serverVersion && serverVersion !== '0.0.0' && this.daemonVersion && this.daemonVersion !== serverVersion && !isDev) {
           logger.info({ serverId: this.serverId, daemonVersion: this.daemonVersion, serverVersion }, 'Version mismatch — sending daemon.upgrade');
           setTimeout(() => {
             try { ws.send(JSON.stringify({ type: 'daemon.upgrade', targetVersion: serverVersion })); } catch { /* ignore */ }
-          }, 5000); // delay to let daemon finish connecting
+          }, 5000);
         }
 
         // Replay queued messages, skipping terminal.subscribe — refs replay below is authoritative
