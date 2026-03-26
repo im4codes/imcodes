@@ -550,10 +550,9 @@ body {
 
 /* ── Sub-session collapsed bar (mobile compact buttons) ──────────────────── */
 .subsession-bar { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 10px; background: #0d1117; border-top: 1px solid #1e293b; transition: max-height 0.2s, padding 0.2s, opacity 0.2s; overflow: hidden; }
-/* Mobile keyboard open: hide everything below input row */
+/* Mobile keyboard open: hide sub-session bar + usage footer (below input); shortcuts row stays visible */
 .kb-open .subcard-bar { display: none; }
 .kb-open .session-usage-footer { display: none; }
-.kb-open .shortcuts-row { display: none; }
 /* Shell terminal keyboard: hide input row (xterm receives keystrokes directly) but keep shortcuts row */
 .kb-open .shell-terminal-pane .controls { display: none; }
 .kb-open .shell-terminal-pane .attachment-badges { display: none; }
