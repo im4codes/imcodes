@@ -137,6 +137,7 @@ export function App() {
     const vv = window.visualViewport;
     if (!vv) return;
     let inputFocused = false;
+    let scrollTimer: ReturnType<typeof setTimeout> | undefined;
     const update = () => {
       document.documentElement.style.setProperty('--vvh', `${vv.height}px`);
       // Detect keyboard open: viewport shrink + optional input-focus fallback.
@@ -146,6 +147,18 @@ export function App() {
       document.documentElement.classList.toggle('kb-open', kbOpen);
       // Reset any scroll caused by keyboard opening on mobile
       if (window.scrollY !== 0) window.scrollTo(0, 0);
+      // Auto-scroll sidebar panel into view when viewport settles (keyboard done animating).
+      // Debounced 100ms — resize fires multiple times during animation, we want the final one.
+      if (kbOpen && inputFocused) {
+        clearTimeout(scrollTimer);
+        scrollTimer = setTimeout(() => {
+          const el = document.activeElement as HTMLElement | null;
+          const panel = el?.closest?.('.sidebar-pinned-panel') as HTMLElement | null;
+          if (panel?.closest('.mobile-sidebar-body')) {
+            panel.scrollIntoView({ block: 'start', behavior: 'instant' });
+          }
+        }, 100);
+      }
     };
     const onFocusIn = (e: FocusEvent) => {
       const el = e.target as HTMLElement | null;
@@ -155,15 +168,8 @@ export function App() {
         || el.getAttribute('contenteditable') === 'true'
         || el.classList.contains('xterm-helper-textarea');
       update();
-      // Auto-scroll sidebar body to show focused panel when keyboard opens.
-      // Delay to let --vvh update after keyboard animates in, then scroll panel to top.
-      const sidebarBody = el.closest?.('.mobile-sidebar-body');
-      if (sidebarBody) {
-        const panel = el.closest('.sidebar-pinned-panel') as HTMLElement | null;
-        if (panel) setTimeout(() => panel.scrollIntoView({ block: 'start', behavior: 'smooth' }), 350);
-      }
     };
-    const onFocusOut = () => { inputFocused = false; update(); };
+    const onFocusOut = () => { inputFocused = false; clearTimeout(scrollTimer); update(); };
     update();
     vv.addEventListener('resize', update);
     document.addEventListener('focusin', onFocusIn);
