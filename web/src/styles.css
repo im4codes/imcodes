@@ -464,6 +464,7 @@ body {
 .chat-bubble-content { white-space: pre-wrap; word-break: break-word; }
 .chat-bubble-time { font-size: 10px; color: #64748b; margin-top: 2px; }
 .chat-sel-menu { position: absolute; transform: translate(-50%, calc(-100% - 8px)); z-index: 20; pointer-events: auto; display: flex; gap: 4px; }
+@media (pointer: coarse) { .chat-sel-menu { transform: translate(-50%, 8px); } }
 .chat-sel-btn { background: #1e293b; border: 1px solid #475569; color: #e2e8f0; font-size: 13px; padding: 5px 14px; border-radius: 6px; cursor: pointer; font-family: inherit; white-space: nowrap; box-shadow: 0 4px 12px rgba(0,0,0,0.4); transition: background 0.15s; }
 .chat-sel-btn:hover { background: #334155; }
 .chat-sel-btn.copied { background: #166534; border-color: #16a34a; color: #86efac; }

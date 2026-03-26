@@ -426,9 +426,10 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
       const selRect = range.getBoundingClientRect();
       const wrapEl = container.closest('.chat-view-wrap') as HTMLElement | null;
       const wrapRect = (wrapEl ?? container).getBoundingClientRect();
+      const isTouchDevice = 'ontouchstart' in window;
       setSelMenu({
         x: selRect.left + selRect.width / 2 - wrapRect.left,
-        y: selRect.top - wrapRect.top,
+        y: isTouchDevice ? (selRect.bottom - wrapRect.top) : (selRect.top - wrapRect.top),
         text,
       });
       setCopied(false);
