@@ -1246,6 +1246,8 @@ export function App() {
       const t = e.touches[0];
       const isOpen = mobileSidebarOpen;
       if (!isOpen && t.clientX > EDGE_ZONE) return;
+      // Don't trigger on header area (server bar + tab bar) — buttons live there
+      if (!isOpen && (e.target as HTMLElement)?.closest?.('.mobile-server-bar, .tab-bar')) return;
       // Record start position but don't activate drag yet — wait for horizontal move
       tracking = true;
       confirmed = false;
