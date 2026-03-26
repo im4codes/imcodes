@@ -452,7 +452,7 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
       )}
       {refreshing && <div class="chat-refreshing">{t('chat.syncing')}</div>}
       <div class="chat-main">
-        <div class="chat-view" ref={scrollRef} onScroll={preview ? undefined : handleScroll}>
+        <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} onScroll={preview ? undefined : handleScroll}>
           {viewItems.length === 0 && (
             <div class="chat-loading">
               {sessionState ? t('chat.session_state', { state: sessionState }) : t('chat.no_events')}
