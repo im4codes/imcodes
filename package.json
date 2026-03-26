@@ -2,7 +2,7 @@
   "name": "imcodes",
   "version": "0.1.2",
   "description": "A chat interface for AI coding agents — control Claude Code, Codex, Gemini CLI, OpenCode from browser and mobile",
-  "license": "GPL-3.0-only",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/im4codes/imcodes"
