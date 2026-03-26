@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>IM.codes — chat interface for AI coding agents</title>
-<meta name="description" content="Talk to Claude Code, Codex, Gemini CLI, OpenClaw from your browser or phone. Terminal streaming, multi-agent coordination, sub-sessions.">
+<title>IM.codes — The IM for agents</title>
+<meta name="description" content="A specialized instant messenger for AI agents. Terminal, files, git, voice, and multi-agent control built in.">
 <style>
 :root {
   --bg: #0a0a0a;
@@ -217,7 +217,7 @@ footer {
 <header>
   <div class="header-left">
     <h1>IM<span>.</span>codes</h1>
-    <div class="tagline" data-i18n="tagline">a chat interface for AI coding agents</div>
+    <div class="tagline" data-i18n="tagline">The IM for agents</div>
   </div>
   <div class="lang-switch">
     <button onclick="setLang('en')" data-lang="en" class="active">EN</button>
@@ -265,7 +265,7 @@ footer {
 <section>
   <h2 data-i18n="h_why">why</h2>
   <p style="color:var(--fg); margin-bottom:16px;" data-i18n="why_text">
-    AI coding agents live in terminals. Managing them means SSH sessions, split panes, copy-pasting between windows. It doesn't scale. IM.codes gives you a single control plane: remote terminals that work like SSH without the SSH, a chat layer that understands agent output, and multi-agent workflows that let you pit different models against each other.
+    Since 2026, developers talk to agents. Agents write code, run tools, and manage workflows. But generic chat apps were never built for this. IM.codes is a dedicated messaging layer for AI agents: remote terminals that work like SSH without the SSH, a chat view that understands agent output, and multi-agent workflows that let you coordinate different models on the same task.
   </p>
 </section>
 
@@ -274,14 +274,14 @@ footer {
   <div class="features">
     <div class="feat"><div class="feat-name" data-i18n="f_remote_name">remote terminal</div><div class="feat-desc" data-i18n="f_remote_desc">browser & mobile, no SSH/VPN, real-time PTY streaming at 12fps</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_chat_name">terminal + chat</div><div class="feat-desc" data-i18n="f_chat_desc">raw CLI or structured view with parsed tool calls</div></div>
-    <div class="feat"><div class="feat-name" data-i18n="f_openclaw_name">OpenClaw support</div><div class="feat-desc" data-i18n="f_openclaw_desc">native transport provider — remote AI sessions alongside local agents</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_openclaw_name">OpenClaw support</div><div class="feat-desc" data-i18n="f_openclaw_desc">chat with OpenClaw agents — plus terminal, files, and git that OC alone doesn't offer</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_sidebar_name">Discord-style sidebar</div><div class="feat-desc" data-i18n="f_sidebar_desc">server icons, session tree, unread badges, idle flash</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_discuss_name">multi-agent discussions</div><div class="feat-desc" data-i18n="f_discuss_desc">discuss, audit, review across providers with ring progress</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_picker_name">@ picker</div><div class="feat-desc" data-i18n="f_picker_desc">@files, @@agents, @@all(config) for group dispatch</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_multi_name">multi-server</div><div class="feat-desc" data-i18n="f_multi_desc">manage agents across machines from one dashboard</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_pin_name">pinnable panels</div><div class="feat-desc" data-i18n="f_pin_desc">drag any window to sidebar, cross-device sync</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_sub_name">sub-sessions</div><div class="feat-desc" data-i18n="f_sub_desc">spawn parallel agents on the fly</div></div>
-    <div class="feat"><div class="feat-name" data-i18n="f_file_name">file browser & git</div><div class="feat-desc" data-i18n="f_file_desc">tree view, +/- stats, floating preview, auto-refresh</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_file_name">file browser & git</div><div class="feat-desc" data-i18n="f_file_desc">tree view, upload/download, +/- stats, floating preview</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_repo_name">repository dashboard</div><div class="feat-desc" data-i18n="f_repo_desc">issues, PRs, branches, commits, CI/CD</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_sync_name">cross-device sync</div><div class="feat-desc" data-i18n="f_sync_desc">tab order, pinned tabs & panels synced to server</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_mobile_name">mobile & notifications</div><div class="feat-desc" data-i18n="f_mobile_desc">biometric auth, push notifications, shell keyboard input</div></div>
@@ -345,6 +345,7 @@ docker compose up -d</div>
     <a class="agent-tag" href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>
     <a class="agent-tag" href="https://github.com/opencode-ai/opencode">OpenCode</a>
     <span class="agent-tag">Shell</span>
+    <span class="agent-tag" style="color:var(--dim);border-style:dashed">+ more</span>
   </div>
 </section>
 
@@ -387,23 +388,23 @@ docker compose up -d</div>
 const I18N = {
   en: {},
   'zh-CN': {
-    tagline: 'AI 编程代理的远程管理界面',
+    tagline: '为 AI 代理而生的即时通讯',
     hero_output: '已绑定 app.im.codes · 守护进程已启动 · 已注册为系统服务',
     self_host_warning: '<strong>强烈建议自行部署。</strong><code>app.im.codes</code> 是共享测试实例，无可用性保证，可能被限流、攻击或不可用。这是个人项目，不提供商用保障。正式使用请部署到自己的服务器。',
     h_screenshots: '截图', h_why: '为什么', h_features: '功能', h_arch: '架构', h_install: '安装', h_quick: '快速开始', h_selfhost: '自托管部署', h_agents: '支持的代理', h_reqs: '系统要求', h_about: '关于',
-    why_text: 'AI 编程代理运行在终端中。管理它们意味着 SSH 会话、分屏、窗口间复制粘贴——无法扩展。IM.codes 提供统一控制面板：无需 SSH 的远程终端、理解代理输出的聊天层、以及让不同模型互相审查的多代理工作流。',
+    why_text: '2026 年起，开发者开始和 AI 代理对话。代理写代码、运行工具、管理工作流。但通用聊天工具从来不是为此而生的。IM.codes 是 AI 代理的专用消息层：无需 SSH 的远程终端、理解代理输出的聊天视图、以及让不同模型协同工作的多代理工作流。',
     f_remote_name: '远程终端', f_remote_desc: '浏览器和手机访问，无需 SSH/VPN，实时 PTY 推流',
     f_chat_name: '终端 + 聊天', f_chat_desc: '原生 CLI 或结构化视图，解析工具调用',
     f_discuss_name: '多代理讨论', f_discuss_desc: '跨供应商讨论、审计、审查',
     f_multi_name: '多服务器', f_multi_desc: '一个面板管理所有机器上的代理',
     f_sub_name: '子会话', f_sub_desc: '随时启动并行代理',
-    f_file_name: '文件浏览器', f_file_desc: '浏览、预览、Git 差异、相机上传',
+    f_file_name: '文件浏览器', f_file_desc: '浏览、上传下载、Git 差异、浮动预览',
     f_mobile_name: '移动端和通知', f_mobile_desc: '生物认证，代理需要注意时推送通知',
     f_ota_name: 'OTA 更新', f_ota_desc: '从 Web UI 升级守护进程',
     f_stream_name: '实时推流', f_stream_desc: '零轮询、零消息限制',
     f_self_name: '自托管', f_self_desc: '你的服务器，你的数据，一键部署',
     f_openclaw_name: 'OpenClaw 支持',
-    f_openclaw_desc: '原生传输协议——远程 AI 会话与本地代理并行管理',
+    f_openclaw_desc: '与 OpenClaw 代理聊天——还有终端、文件和 Git 等 OC 没有的功能',
     f_sidebar_name: 'Discord 风格侧边栏',
     f_sidebar_desc: '服务器图标、会话树、未读徽章、空闲闪烁',
     f_picker_name: '@ 选择器',
@@ -428,23 +429,23 @@ const I18N = {
     about_text: '个人项目。几乎完全由 <a href="https://github.com/anthropics/claude-code">Claude Code</a> 构建，<a href="https://github.com/openai/codex">Codex</a> 和 <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> 也有重要贡献。',
   },
   'zh-TW': {
-    tagline: 'AI 程式代理的遠端管理介面',
+    tagline: '為 AI 代理而生的即時通訊',
     hero_output: '已綁定 app.im.codes · 守護程序已啟動 · 已註冊為系統服務',
     self_host_warning: '<strong>強烈建議自行部署。</strong><code>app.im.codes</code> 是共享測試實例，無可用性保證，可能被限流、攻擊或不可用。這是個人專案，不提供商用保障。正式使用請部署到自己的伺服器。',
     h_screenshots: '截圖', h_why: '為什麼', h_features: '功能', h_arch: '架構', h_install: '安裝', h_quick: '快速開始', h_selfhost: '自託管部署', h_agents: '支援的代理', h_reqs: '系統需求', h_about: '關於',
-    why_text: 'AI 程式代理運行在終端機中。管理它們意味著 SSH 會話、分割視窗、在視窗間複製貼上——無法擴展。IM.codes 提供統一控制面板：無需 SSH 的遠端終端機、理解代理輸出的聊天層、以及讓不同模型互相審查的多代理工作流。',
+    why_text: '2026 年起，開發者開始和 AI 代理對話。代理寫程式碼、運行工具、管理工作流。但通用聊天工具從來不是為此而生的。IM.codes 是 AI 代理的專用訊息層：無需 SSH 的遠端終端機、理解代理輸出的聊天視圖、以及讓不同模型協同工作的多代理工作流。',
     f_remote_name: '遠端終端機', f_remote_desc: '瀏覽器和手機存取，無需 SSH/VPN，即時 PTY 串流',
     f_chat_name: '終端機 + 聊天', f_chat_desc: '原生 CLI 或結構化檢視，解析工具呼叫',
     f_discuss_name: '多代理討論', f_discuss_desc: '跨供應商討論、稽核、審查',
     f_multi_name: '多伺服器', f_multi_desc: '一個面板管理所有機器上的代理',
     f_sub_name: '子會話', f_sub_desc: '隨時啟動並行代理',
-    f_file_name: '檔案瀏覽器', f_file_desc: '瀏覽、預覽、Git 差異、相機上傳',
+    f_file_name: '檔案瀏覽器', f_file_desc: '瀏覽、上傳下載、Git 差異、浮動預覽',
     f_mobile_name: '行動版和通知', f_mobile_desc: '生物辨識認證，代理需要關注時推播通知',
     f_ota_name: 'OTA 更新', f_ota_desc: '從 Web UI 升級守護程序',
     f_stream_name: '即時串流', f_stream_desc: '零輪詢、零訊息限制',
     f_self_name: '自託管', f_self_desc: '你的伺服器，你的資料，一鍵部署',
     f_openclaw_name: 'OpenClaw 支援',
-    f_openclaw_desc: '原生傳輸協議——遠端 AI 會話與本地代理並行管理',
+    f_openclaw_desc: '與 OpenClaw 代理聊天——還有終端、檔案和 Git 等 OC 沒有的功能',
     f_sidebar_name: 'Discord 風格側邊欄',
     f_sidebar_desc: '伺服器圖示、會話樹、未讀徽章、閒置閃爍',
     f_picker_name: '@ 選擇器',
@@ -469,23 +470,23 @@ const I18N = {
     about_text: '個人專案。幾乎完全由 <a href="https://github.com/anthropics/claude-code">Claude Code</a> 建構，<a href="https://github.com/openai/codex">Codex</a> 和 <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> 也有重要貢獻。',
   },
   ja: {
-    tagline: 'AIコーディングエージェントのチャットインターフェース',
+    tagline: 'AIエージェントのためのIM',
     hero_output: 'app.im.codes にバインド完了 · デーモン起動 · システムサービスとして登録',
     self_host_warning: '<strong>セルフホスティングを強く推奨します。</strong><code>app.im.codes</code> は共有テストインスタンスであり、稼働保証はありません。レート制限、攻撃対象、利用不可の可能性があります。個人プロジェクトのため商用サポートはありません。評価以外の用途では自社インフラにデプロイしてください。',
     h_screenshots: 'スクリーンショット', h_why: '背景', h_features: '機能', h_arch: 'アーキテクチャ', h_install: 'インストール', h_quick: 'クイックスタート', h_selfhost: 'セルフホスト', h_agents: '対応エージェント', h_reqs: '要件', h_about: '概要',
-    why_text: 'AIコーディングエージェントはターミナルで動作します。管理にはSSH、画面分割、ウィンドウ間のコピペが必要でスケールしません。IM.codesは統一コントロールパネルを提供：SSHなしのリモートターミナル、エージェント出力を理解するチャットレイヤー、異なるモデルを相互レビューさせるマルチエージェントワークフロー。',
+    why_text: '2026年から、開発者はAIエージェントと会話するようになりました。エージェントはコードを書き、ツールを実行し、ワークフローを管理します。しかし汎用チャットアプリはこのために作られていません。IM.codesはAIエージェント専用のメッセージングレイヤーです：SSHなしのリモートターミナル、エージェント出力を理解するチャットビュー、異なるモデルを協調させるマルチエージェントワークフロー。',
     f_remote_name: 'リモートターミナル', f_remote_desc: 'ブラウザ＆モバイル、SSH/VPN不要、リアルタイムPTYストリーミング',
     f_chat_name: 'ターミナル＋チャット', f_chat_desc: 'ネイティブCLIまたは構造化ビュー',
     f_discuss_name: 'マルチエージェント議論', f_discuss_desc: 'プロバイダー間で議論・監査・レビュー',
     f_multi_name: 'マルチサーバー', f_multi_desc: '複数マシンのエージェントを一元管理',
     f_sub_name: 'サブセッション', f_sub_desc: '並列エージェントを即座に起動',
-    f_file_name: 'ファイルブラウザ', f_file_desc: '閲覧、プレビュー、Git差分、カメラアップロード',
+    f_file_name: 'ファイルブラウザ', f_file_desc: '閲覧、アップロード/ダウンロード、Git差分、フローティングプレビュー',
     f_mobile_name: 'モバイル＆通知', f_mobile_desc: '生体認証、エージェントが注意を必要とする時にプッシュ通知',
     f_ota_name: 'OTAアップデート', f_ota_desc: 'Web UIからデーモンを更新',
     f_stream_name: 'リアルタイムストリーム', f_stream_desc: 'ポーリングなし、メッセージ制限なし',
     f_self_name: 'セルフホスト', f_self_desc: '自分のインフラ、自分のデータ、ワンコマンドデプロイ',
     f_openclaw_name: 'OpenClaw対応',
-    f_openclaw_desc: 'ネイティブトランスポート——リモートAIセッションをローカルと並行管理',
+    f_openclaw_desc: 'OpenClawエージェントとチャット — さらにターミナル、ファイル、Gitも',
     f_sidebar_name: 'Discordスタイルサイドバー',
     f_sidebar_desc: 'サーバーアイコン、セッションツリー、未読バッジ',
     f_picker_name: '@ ピッカー',
@@ -510,23 +511,23 @@ const I18N = {
     about_text: '個人プロジェクト。ほぼ全てを <a href="https://github.com/anthropics/claude-code">Claude Code</a> が構築、<a href="https://github.com/openai/codex">Codex</a> と <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> も重要な貢献。',
   },
   ko: {
-    tagline: 'AI 코딩 에이전트를 위한 채팅 인터페이스',
+    tagline: 'AI 에이전트를 위한 IM',
     hero_output: 'app.im.codes에 바인딩 완료 · 데몬 시작됨 · 시스템 서비스로 등록됨',
     self_host_warning: '<strong>셀프 호스팅을 강력히 권장합니다.</strong> <code>app.im.codes</code>는 공유 테스트 인스턴스로 가동 보장이 없으며, 속도 제한, 공격 대상이 되거나 사용 불가할 수 있습니다. 개인 프로젝트로 상업적 지원은 제공되지 않습니다. 평가 이외의 용도에는 자체 인프라에 배포하세요.',
     h_screenshots: '스크린샷', h_why: '배경', h_features: '기능', h_arch: '아키텍처', h_install: '설치', h_quick: '빠른 시작', h_selfhost: '셀프 호스팅', h_agents: '지원 에이전트', h_reqs: '요구사항', h_about: '소개',
-    why_text: 'AI 코딩 에이전트는 터미널에서 실행됩니다. 관리하려면 SSH 세션, 화면 분할, 창 간 복사-붙여넣기가 필요하며 확장이 어렵습니다. IM.codes는 통합 제어판을 제공합니다: SSH 없는 원격 터미널, 에이전트 출력을 이해하는 채팅 레이어, 다양한 모델을 상호 검토시키는 멀티 에이전트 워크플로우.',
+    why_text: '2026년부터 개발자는 AI 에이전트와 대화합니다. 에이전트는 코드를 작성하고, 도구를 실행하고, 워크플로우를 관리합니다. 하지만 범용 채팅 앱은 이를 위해 만들어지지 않았습니다. IM.codes는 AI 에이전트를 위한 전용 메시징 레이어입니다: SSH 없는 원격 터미널, 에이전트 출력을 이해하는 채팅 뷰, 다양한 모델을 조율하는 멀티 에이전트 워크플로우.',
     f_remote_name: '원격 터미널', f_remote_desc: '브라우저 & 모바일, SSH/VPN 불필요, 실시간 PTY 스트리밍',
     f_chat_name: '터미널 + 채팅', f_chat_desc: '네이티브 CLI 또는 구조화된 뷰',
     f_discuss_name: '멀티 에이전트 토론', f_discuss_desc: '프로바이더 간 토론, 감사, 리뷰',
     f_multi_name: '멀티 서버', f_multi_desc: '하나의 대시보드에서 모든 머신의 에이전트 관리',
     f_sub_name: '서브 세션', f_sub_desc: '병렬 에이전트 즉시 생성',
-    f_file_name: '파일 브라우저', f_file_desc: '탐색, 미리보기, Git 차이, 카메라 업로드',
+    f_file_name: '파일 브라우저', f_file_desc: '탐색, 업로드/다운로드, Git 차이, 플로팅 미리보기',
     f_mobile_name: '모바일 & 알림', f_mobile_desc: '생체 인증, 에이전트가 주의를 필요로 할 때 푸시 알림',
     f_ota_name: 'OTA 업데이트', f_ota_desc: '웹 UI에서 데몬 업그레이드',
     f_stream_name: '실시간 스트림', f_stream_desc: '폴링 없음, 메시지 제한 없음',
     f_self_name: '셀프 호스팅', f_self_desc: '내 인프라, 내 데이터, 원커맨드 배포',
     f_openclaw_name: 'OpenClaw 지원',
-    f_openclaw_desc: '네이티브 트랜스포트 — 원격 AI 세션과 로컬 에이전트 병행 관리',
+    f_openclaw_desc: 'OpenClaw 에이전트와 채팅 — 터미널, 파일, Git까지',
     f_sidebar_name: 'Discord 스타일 사이드바',
     f_sidebar_desc: '서버 아이콘, 세션 트리, 읽지 않은 배지',
     f_picker_name: '@ 피커',
@@ -551,23 +552,23 @@ const I18N = {
     about_text: '개인 프로젝트. 거의 전적으로 <a href="https://github.com/anthropics/claude-code">Claude Code</a>가 구축, <a href="https://github.com/openai/codex">Codex</a>와 <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>도 중요한 기여.',
   },
   es: {
-    tagline: 'interfaz de chat para agentes de programación IA',
+    tagline: 'El IM para agentes',
     hero_output: 'vinculado a app.im.codes · daemon iniciado · registrado como servicio del sistema',
     self_host_warning: '<strong>Se recomienda encarecidamente el autoalojamiento.</strong> <code>app.im.codes</code> es una instancia de prueba compartida sin garantías de disponibilidad — puede tener límites, ser objetivo de ataques o no estar disponible. Este es un proyecto personal sin soporte comercial. Para uso más allá de la evaluación, despliega en tu propia infraestructura.',
     h_screenshots: 'capturas', h_why: 'por qué', h_features: 'características', h_arch: 'arquitectura', h_install: 'instalar', h_quick: 'inicio rápido', h_selfhost: 'autoalojamiento', h_agents: 'agentes compatibles', h_reqs: 'requisitos', h_about: 'acerca de',
-    why_text: 'Los agentes de programación IA viven en terminales. Gestionarlos significa sesiones SSH, paneles divididos, copiar y pegar entre ventanas — no escala. IM.codes ofrece un panel de control unificado: terminales remotas sin SSH, una capa de chat que entiende la salida del agente, y flujos multi-agente para que diferentes modelos se revisen mutuamente.',
+    why_text: 'Desde 2026, los desarrolladores hablan con agentes. Los agentes escriben código, ejecutan herramientas y gestionan flujos de trabajo. Pero las apps de chat genéricas nunca fueron diseñadas para esto. IM.codes es una capa de mensajería dedicada para agentes IA: terminales remotas sin SSH, una vista de chat que entiende la salida del agente, y flujos multi-agente para coordinar diferentes modelos en la misma tarea.',
     f_remote_name: 'terminal remota', f_remote_desc: 'navegador y móvil, sin SSH/VPN, streaming PTY en tiempo real',
     f_chat_name: 'terminal + chat', f_chat_desc: 'CLI nativo o vista estructurada con llamadas de herramientas',
     f_discuss_name: 'discusiones multi-agente', f_discuss_desc: 'discutir, auditar, revisar entre proveedores',
     f_multi_name: 'multi-servidor', f_multi_desc: 'gestiona agentes en todas las máquinas desde un panel',
     f_sub_name: 'sub-sesiones', f_sub_desc: 'lanza agentes paralelos al instante',
-    f_file_name: 'explorador de archivos', f_file_desc: 'explorar, previsualizar, diffs de Git, subir desde cámara',
+    f_file_name: 'explorador de archivos', f_file_desc: 'explorar, subir/descargar, diffs de Git, vista previa flotante',
     f_mobile_name: 'móvil y notificaciones', f_mobile_desc: 'auth biométrica, push cuando los agentes necesitan atención',
     f_ota_name: 'actualizaciones OTA', f_ota_desc: 'actualiza daemons desde la interfaz web',
     f_stream_name: 'stream en tiempo real', f_stream_desc: 'sin polling, sin límite de mensajes',
     f_self_name: 'autoalojado', f_self_desc: 'tu infraestructura, tus datos, despliegue con un comando',
     f_openclaw_name: 'soporte OpenClaw',
-    f_openclaw_desc: 'proveedor de transporte nativo — sesiones AI remotas junto a agentes locales',
+    f_openclaw_desc: 'chatea con agentes OpenClaw — además terminal, archivos y Git que OC no ofrece',
     f_sidebar_name: 'barra lateral estilo Discord',
     f_sidebar_desc: 'iconos de servidor, árbol de sesiones, insignias no leídas',
     f_picker_name: 'selector @',
@@ -592,23 +593,23 @@ const I18N = {
     about_text: 'Proyecto personal. Construido casi en su totalidad por <a href="https://github.com/anthropics/claude-code">Claude Code</a>, con contribuciones de <a href="https://github.com/openai/codex">Codex</a> y <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>.',
   },
   ru: {
-    tagline: 'чат-интерфейс для AI-агентов программирования',
+    tagline: 'IM для агентов',
     hero_output: 'привязан к app.im.codes · демон запущен · зарегистрирован как системная служба',
     self_host_warning: '<strong>Настоятельно рекомендуется самостоятельный хостинг.</strong> <code>app.im.codes</code> — общий тестовый экземпляр без гарантий доступности. Может быть ограничен, атакован или недоступен. Это личный проект без коммерческой поддержки. Для использования помимо тестирования разверните на собственной инфраструктуре.',
     h_screenshots: 'скриншоты', h_why: 'зачем', h_features: 'возможности', h_arch: 'архитектура', h_install: 'установка', h_quick: 'быстрый старт', h_selfhost: 'свой сервер', h_agents: 'поддерживаемые агенты', h_reqs: 'требования', h_about: 'о проекте',
-    why_text: 'AI-агенты программирования работают в терминалах. Управление ими означает SSH-сессии, разделение экрана, копирование между окнами — это не масштабируется. IM.codes предоставляет единую панель управления: удалённые терминалы без SSH, чат-слой, понимающий вывод агентов, и мульти-агентные рабочие процессы для взаимной проверки разных моделей.',
+    why_text: 'С 2026 года разработчики разговаривают с агентами. Агенты пишут код, запускают инструменты и управляют рабочими процессами. Но универсальные чат-приложения не были для этого созданы. IM.codes — это выделенный слой обмена сообщениями для AI-агентов: удалённые терминалы без SSH, чат-вид, понимающий вывод агентов, и мульти-агентные рабочие процессы для координации разных моделей.',
     f_remote_name: 'удалённый терминал', f_remote_desc: 'браузер и мобильный, без SSH/VPN, PTY-стриминг в реальном времени',
     f_chat_name: 'терминал + чат', f_chat_desc: 'нативный CLI или структурированный вид',
     f_discuss_name: 'мульти-агентные обсуждения', f_discuss_desc: 'обсуждение, аудит, ревью между провайдерами',
     f_multi_name: 'мульти-сервер', f_multi_desc: 'управление агентами на всех машинах с одной панели',
     f_sub_name: 'под-сессии', f_sub_desc: 'мгновенный запуск параллельных агентов',
-    f_file_name: 'файловый браузер', f_file_desc: 'просмотр, превью, Git-диффы, загрузка с камеры',
+    f_file_name: 'файловый браузер', f_file_desc: 'просмотр, загрузка/скачивание, Git-диффы, плавающий превью',
     f_mobile_name: 'мобильная версия и уведомления', f_mobile_desc: 'биометрическая аутентификация, push-уведомления',
     f_ota_name: 'OTA-обновления', f_ota_desc: 'обновление демонов через веб-интерфейс',
     f_stream_name: 'стриминг в реальном времени', f_stream_desc: 'без опроса, без лимитов сообщений',
     f_self_name: 'свой сервер', f_self_desc: 'ваша инфраструктура, ваши данные, развёртывание одной командой',
     f_openclaw_name: 'поддержка OpenClaw',
-    f_openclaw_desc: 'нативный транспорт — удалённые AI-сессии наравне с локальными агентами',
+    f_openclaw_desc: 'чат с агентами OpenClaw — плюс терминал, файлы и Git, которых нет в OC',
     f_sidebar_name: 'боковая панель в стиле Discord',
     f_sidebar_desc: 'иконки серверов, дерево сессий, бейджи непрочитанных',
     f_picker_name: 'выбор @',

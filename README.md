@@ -1,6 +1,10 @@
 # IM.codes
 
-A purpose-built interface for managing AI coding agents. Remote terminal, multi-agent orchestration, and session management — from any device. First-class support for [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), and [OpenClaw](https://openclaw.com).
+**The IM for agents.**
+
+A specialized instant messenger for AI agents. More than chat — terminal access, file browsing, git diffs, voice input, and multi-agent orchestration built in. Works with [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), and more.
+
+> **Disclaimer:** This is an actively developed personal open-source project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk. Breaking changes may happen at any time without notice.
 
 ## Screenshots
 
@@ -31,9 +35,9 @@ A purpose-built interface for managing AI coding agents. Remote terminal, multi-
 
 ## Why
 
-AI coding agents live in terminals. Managing them means SSH sessions, split panes, copy-pasting between windows. It doesn't scale — not across machines, not from a phone, and definitely not when you're running multiple agents on a single task.
+Since 2026, developers talk to agents. Agents write code, run tools, and manage workflows. But generic chat apps were never built for this — and raw terminals don't scale across machines, devices, or multiple agents working in parallel.
 
-IM.codes gives you a single control plane: remote terminals that work like SSH without the SSH, a chat layer that understands agent output, and multi-agent workflows that let you pit different models against each other.
+IM.codes is a dedicated messaging layer for AI agents: remote terminals that work like SSH without the SSH, a chat view that understands agent output, and multi-agent workflows that let you coordinate different models on the same task.
 
 This is a personal project. I haven't written any code myself — it was built almost entirely by [Claude Code](https://github.com/anthropics/claude-code), with significant contributions from [Codex](https://github.com/openai/codex) and [Gemini CLI](https://github.com/google-gemini/gemini-cli).
 
@@ -45,7 +49,7 @@ Full terminal access to your agent sessions from any browser — no SSH, no VPN,
 
 ### OpenClaw Integration
 
-Native support for [OpenClaw](https://openclaw.com) as a transport-backed agent provider. Connect to OpenClaw gateway and manage remote AI sessions alongside local tmux-backed agents — same UI, same multi-agent discussions, same pinnable panels. Sessions auto-sync on provider connect, with bidirectional key sanitization and session lifecycle management. OpenClaw sessions appear in the sidebar tree with a cloud icon and work seamlessly with P2P discussions, the @ picker, and all other features.
+Chat with [OpenClaw](https://openclaw.com) agents directly in IM.codes — plus terminal, file browser, git diffs, and multi-agent discussions that OpenClaw alone doesn't offer.
 
 ### Discord-Style Sidebar
 
@@ -69,7 +73,7 @@ Drag any floating window to the sidebar to pin it as a persistent panel. Support
 
 ### File Browser & Git Changes
 
-Browse project files with a tree view. Changes tab shows git status with per-file `+additions`/`-deletions` line counts in color. Click a file to open a floating preview window with syntax highlighting, diff view, and auto-refresh every 5s. Pin the file browser to the sidebar — it follows the active tab's project directory automatically.
+Browse project files with a tree view. Upload files, images, and photos from any device — download files directly from the server. Changes tab shows git status with per-file `+additions`/`-deletions` line counts in color. Click a file to open a floating preview window with syntax highlighting, diff view, and auto-refresh every 5s. Pin the file browser to the sidebar — it follows the active tab's project directory automatically.
 
 ### Repository Dashboard
 
