@@ -195,7 +195,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
               bindExistingKey: ch.key, skipCreate: true, skipStore: true,
               parentSession: mName,
             });
-            upsertSession({ ...storeEntry, state: 'running', parentSession: mName, label: storeEntry.label || ch.displayName || ch.key, updatedAt: Date.now() });
+            upsertSession({ ...storeEntry, state: 'running', parentSession: mName, label: ch.displayName || storeEntry.label || ch.key, updatedAt: Date.now() });
             logger.info({ session: storeEntry.name, ocKey: ch.key, parent: mName }, 'oc-sync: rebuilt runtime for existing sub-session');
           } catch (err) {
             logger.warn({ err, session: storeEntry.name }, 'oc-sync: failed to rebuild runtime');
@@ -222,7 +222,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
               ...existingInStore,
               state: 'running',
               parentSession: mName,
-              label: existingInStore.label || ch.displayName || ch.key,
+              label: ch.displayName || existingInStore.label || ch.key,
               updatedAt: Date.now(),
             });
             logger.info({ session: existingInStore.name, ocKey: ch.key, parent: mName }, 'oc-sync: reconnected sub-session runtime');

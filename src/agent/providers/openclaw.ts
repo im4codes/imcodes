@@ -217,22 +217,25 @@ export class OpenClawProvider implements TransportProvider {
       const payload = await this.rpc('sessions.list', {}) as { sessions?: Array<{
         key: string;
         label?: string;
+        displayName?: string;
         agentId?: string;
-        updatedAt?: number;
+        updatedAt?: number | null;
         percentUsed?: number;
       }> };
       const all = payload?.sessions ?? [];
       return all
         .filter((s) => {
+          if (!s || typeof s.key !== 'string' || !s.key) return false;
+          if (s.updatedAt == null) return false;
           if (s.key.includes(':cron:')) return false;
           if (hasCollisionRisk(s.key)) { logger.warn({ key: s.key }, 'Skipping OC session — raw key contains ___'); return false; }
           return true;
         })
         .map((s) => ({
           key: sanitizeKey(s.key),
-          displayName: s.label,
+          displayName: s.displayName ?? s.label,
           agentId: s.agentId,
-          updatedAt: s.updatedAt,
+          updatedAt: s.updatedAt ?? undefined,
           percentUsed: s.percentUsed,
         }));
     } catch (err) {
