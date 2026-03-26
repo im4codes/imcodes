@@ -407,8 +407,11 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
     return () => ro.disconnect();
   }, [preview]);
 
-  // Show selection popup menu when text is selected within the chat view
+  const isTouchDevice = 'ontouchstart' in window;
+
+  // Desktop: show selection popup menu when text is selected within the chat view
   useEffect(() => {
+    if (isTouchDevice) return; // mobile uses long-press instead
     const onSelChange = () => {
       const sel = window.getSelection();
       if (!sel || sel.isCollapsed || !sel.rangeCount) {
@@ -426,17 +429,70 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
       const selRect = range.getBoundingClientRect();
       const wrapEl = container.closest('.chat-view-wrap') as HTMLElement | null;
       const wrapRect = (wrapEl ?? container).getBoundingClientRect();
-      const isTouchDevice = 'ontouchstart' in window;
       setSelMenu({
         x: selRect.left + selRect.width / 2 - wrapRect.left,
-        y: isTouchDevice ? (selRect.bottom - wrapRect.top) : (selRect.top - wrapRect.top),
+        y: selRect.top - wrapRect.top,
         text,
       });
       setCopied(false);
     };
     document.addEventListener('selectionchange', onSelChange);
     return () => document.removeEventListener('selectionchange', onSelChange);
-  }, []);
+  }, [isTouchDevice]);
+
+  // Mobile: long-press on a message → highlight + show Copy / Quote All menu (no native toolbar)
+  useEffect(() => {
+    if (!isTouchDevice || preview) return;
+    const container = scrollRef.current;
+    if (!container) return;
+    let pressTimer: ReturnType<typeof setTimeout> | null = null;
+    let startX = 0, startY = 0;
+
+    const onTouchStart = (e: TouchEvent) => {
+      const t = e.touches[0];
+      startX = t.clientX;
+      startY = t.clientY;
+      pressTimer = setTimeout(() => {
+        pressTimer = null;
+        const target = (e.target as HTMLElement).closest?.('.chat-event') as HTMLElement | null;
+        if (!target) return;
+        // Highlight
+        if (highlightEl) highlightEl.classList.remove('chat-highlight');
+        target.classList.add('chat-highlight');
+        setHighlightEl(target);
+        // Show context menu below the touch point
+        const text = (target.textContent ?? '').trim();
+        if (text) {
+          const wrapEl = container.closest('.chat-view-wrap') as HTMLElement | null;
+          const wrapRect = (wrapEl ?? container).getBoundingClientRect();
+          setCtxMenu({ x: t.clientX - wrapRect.left, y: t.clientY - wrapRect.top + container.scrollTop - (wrapEl?.offsetTop ?? 0) + 12, text });
+        }
+      }, 500);
+    };
+
+    const onTouchMove = (e: TouchEvent) => {
+      if (!pressTimer) return;
+      const t = e.touches[0];
+      if (Math.abs(t.clientX - startX) > 10 || Math.abs(t.clientY - startY) > 10) {
+        clearTimeout(pressTimer);
+        pressTimer = null;
+      }
+    };
+
+    const onTouchEnd = () => {
+      if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+    };
+
+    container.addEventListener('touchstart', onTouchStart, { passive: true });
+    container.addEventListener('touchmove', onTouchMove, { passive: true });
+    container.addEventListener('touchend', onTouchEnd, { passive: true });
+    return () => {
+      container.removeEventListener('touchstart', onTouchStart);
+      container.removeEventListener('touchmove', onTouchMove);
+      container.removeEventListener('touchend', onTouchEnd);
+      if (pressTimer) clearTimeout(pressTimer);
+    };
+  }, [isTouchDevice, preview, highlightEl]);
 
   if (loading) {
     return <div class="chat-view"><div class="chat-loading">{t('chat.loading')}</div></div>;
@@ -458,13 +514,13 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
       {refreshing && <div class="chat-refreshing">{t('chat.syncing')}</div>}
       <div class="chat-main">
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} onScroll={preview ? undefined : handleScroll}
-          onContextMenu={!preview && onQuote ? (e) => {
+          onContextMenu={!preview && !isTouchDevice ? (e) => {
+            // Desktop: right-click highlights message + shows context menu
             const target = (e.target as HTMLElement).closest?.('.chat-event') as HTMLElement | null;
             if (highlightEl) highlightEl.classList.remove('chat-highlight');
             if (target) {
               target.classList.add('chat-highlight');
               setHighlightEl(target);
-              // Show context menu with "Quote All" for this block
               const text = (target.textContent ?? '').trim();
               if (text) {
                 const wrapEl = scrollRef.current?.closest('.chat-view-wrap') as HTMLElement | null;
@@ -564,22 +620,36 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
             )}
           </div>
         )}
-        {ctxMenu && !preview && onQuote && (
+        {ctxMenu && !preview && (
           <div
             class="chat-sel-menu"
             style={{ left: `${ctxMenu.x}px`, top: `${ctxMenu.y}px` }}
             onMouseDown={(e) => e.preventDefault()}
+            onTouchStart={(e) => e.stopPropagation()}
           >
             <button
-              class="chat-sel-btn"
+              class={`chat-sel-btn${copied ? ' copied' : ''}`}
               onClick={() => {
-                onQuote(ctxMenu.text);
-                setCtxMenu(null);
-                if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
+                navigator.clipboard.writeText(ctxMenu.text).then(() => {
+                  setCopied(true);
+                  setTimeout(() => { setCtxMenu(null); setCopied(false); if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); } }, 800);
+                });
               }}
             >
-              {t('common.quote_block', 'Quote All')}
+              {copied ? t('common.copied') : t('common.copy')}
             </button>
+            {onQuote && (
+              <button
+                class="chat-sel-btn"
+                onClick={() => {
+                  onQuote(ctxMenu.text);
+                  setCtxMenu(null);
+                  if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
+                }}
+              >
+                {t('common.quote_block', 'Quote All')}
+              </button>
+            )}
           </div>
         )}
       </div>

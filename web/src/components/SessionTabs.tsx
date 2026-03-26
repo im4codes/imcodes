@@ -11,8 +11,6 @@ interface Props {
   /** Set of session names that just went idle — shows pulse alert on that tab */
   idleAlerts?: Set<string>;
   onAlertDismiss?: (sessionName: string) => void;
-  /** Map of session name → currently running tool name */
-  activeTools?: Map<string, string>;
   onSelect: (name: string) => void;
   onNewSession: () => void;
   onStopProject: (project: string) => void;
@@ -46,7 +44,7 @@ function readLegacyPinned(): string[] {
   try { return JSON.parse(localStorage.getItem(LEGACY_LS_PINNED) ?? '[]'); } catch { return []; }
 }
 
-export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, onAlertDismiss, activeTools, onSelect, onNewSession, onStopProject, onRestartProject, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded }: Props) {
+export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, onAlertDismiss, onSelect, onNewSession, onStopProject, onRestartProject, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded }: Props) {
   const [ctx, setCtx] = useState<CtxMenu | null>(null);
   const [stopConfirmProject, setStopConfirmProject] = useState<string | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
@@ -228,7 +226,6 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
         const isBrain = s.role === 'brain';
         const isPinned = pinned.has(s.name);
         const hasAlert = idleAlerts?.has(s.name) ?? false;
-        const activeTool = activeTools?.get(s.name) ?? null;
         const stateClass = s.state === 'running' ? 'busy' : s.state === 'idle' ? 'idle' : '';
         const classes = ['tab', isBrain ? 'brain' : '', isActive ? 'active' : '', stateClass, hasAlert ? 'alert' : '', isPinned ? 'pinned' : ''].filter(Boolean).join(' ');
         const isDragOver = dragOverIdx === idx;

@@ -427,7 +427,6 @@ export function App() {
   const stoppedNavTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [idleAlerts, setIdleAlerts] = useState<Set<string>>(new Set());
-  const [activeTools, setActiveTools] = useState<Map<string, string>>(new Map());
   const [toasts, setToasts] = useState<Array<{ id: number; sessionName: string; project: string; kind: 'idle' | 'notification'; title?: string; message?: string }>>([]);
   const [detectedModels, setDetectedModels] = useState<Map<string, string>>(new Map());
   const [subUsages, setSubUsages] = useState<Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string }>>(new Map());
@@ -839,7 +838,6 @@ export function App() {
         if (!sessionName.startsWith('deck_sub_')) {
           // Main session: update state + tab alert
           setSessions((prev) => prev.map((s) => s.name === sessionName ? { ...s, state: 'idle' as SessionInfo['state'] } : s));
-          setActiveTools((prev) => { const m = new Map(prev); m.delete(sessionName); return m; });
           // Always flash the tab — even if it's the active one
           setIdleAlerts((prev) => new Set([...prev, sessionName]));
         }
@@ -854,15 +852,6 @@ export function App() {
         const id = Date.now();
         setToasts((prev) => [...prev, { id, sessionName, project, kind: 'notification', title: msg.title, message: msg.message }]);
         setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 8000);
-      }
-      if (msg.type === 'session.tool') {
-        const sessionName = msg.session;
-        setActiveTools((prev) => {
-          const m = new Map(prev);
-          if (msg.tool) m.set(sessionName, msg.tool);
-          else m.delete(sessionName);
-          return m;
-        });
       }
       if (msg.type === 'discussion.started') {
         setDiscussions((prev) => [
@@ -1922,7 +1911,6 @@ export function App() {
               connected={connected}
               latencyMs={latencyMs}
               idleAlerts={idleAlerts}
-              activeTools={activeTools}
               onAlertDismiss={(name) => setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; })}
               onSelect={(name) => { setActiveSession(name); setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; }); }}
               onNewSession={() => setShowNewSession(true)}
