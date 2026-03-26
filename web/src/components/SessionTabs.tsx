@@ -104,7 +104,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   }, [orderedSessions]);
 
   useEffect(() => {
-    if (!ctx) { setStopConfirmProject(null); return; }
+    if (!ctx) return;
     const handler = (e: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) setCtx(null);
     };
