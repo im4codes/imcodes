@@ -26,6 +26,10 @@ export interface PanelRenderContext {
   onCiEvent?: (run: { name: string; status: string; conclusion?: string | null }) => void;
   /** Open a file preview in a large floating window (used by pinned file browser) */
   onPreviewFile?: (path: string) => void;
+  /** Current active session name — for file browser to follow tab switches */
+  activeSession?: string | null;
+  /** Current active session's project directory — follows tab switches */
+  activeProjectDir?: string;
 }
 
 export interface PanelTypeRegistration {

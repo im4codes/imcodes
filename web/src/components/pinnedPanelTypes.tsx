@@ -59,9 +59,10 @@ registerPanelType('subsession', {
 registerPanelType('filebrowser', {
   title: () => '📁 Files',
   render: (panel, ctx) => {
-    const projectDir = panel.props?.projectDir as string | undefined;
+    // Follow active tab's project dir; fall back to captured dir at pin time
+    const projectDir = ctx.activeProjectDir ?? panel.props?.projectDir as string | undefined;
     if (!ctx.ws || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
-    const activeSession = panel.props?.sessionName as string | undefined;
+    const activeSession = ctx.activeSession ?? panel.props?.sessionName as string | undefined;
     return (
       <FileBrowser
         ws={ctx.ws}

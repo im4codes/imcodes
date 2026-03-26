@@ -1564,6 +1564,8 @@ export function App() {
                 subSessions: subSessions.map(s => ({ id: s.id, sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, cwd: s.cwd, parentSession: s.parentSession })),
                 inputRefsMap,
                 onPreviewFile: (path) => setPreviewFilePath(path),
+                activeSession,
+                activeProjectDir: activeSessionInfo?.projectDir,
               };
               return (
                 <SidebarPinnedPanel
