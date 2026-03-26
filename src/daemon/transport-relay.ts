@@ -29,24 +29,19 @@ const accumulators = new Map<string, { messageId: string; text: string }>();
 export function wireProviderToRelay(provider: TransportProvider): void {
   provider.onDelta((providerSid: string, delta: MessageDelta) => {
     const sessionName = resolveSessionName(providerSid);
-    if (!sessionName) {
-      logger.debug({ providerSid }, 'transport-relay: unresolved route for delta — dropped');
-      return;
-    }
+    if (!sessionName) return;
 
-    // Accumulate text — key by resolved sessionName for consistency
+    // Provider may send cumulative deltas (full text so far) or incremental.
+    // Use delta.delta as the display text directly — the provider's internal
+    // accumulator handles cumulative vs incremental differences.
     const accKey = `${sessionName}:${delta.messageId}`;
-    let acc = accumulators.get(accKey);
-    if (!acc) {
-      acc = { messageId: delta.messageId, text: '' };
-      accumulators.set(accKey, acc);
-    }
-    acc.text += delta.delta;
+    accumulators.set(accKey, { messageId: delta.messageId, text: delta.delta });
 
-    // Emit with stable eventId using resolved sessionName (typewriter effect)
+    // Emit streaming event via timelineEmitter — use stable eventId so frontend
+    // replaces in place (typewriter effect).
     const stableEventId = `transport:${sessionName}:${delta.messageId}`;
     timelineEmitter.emit(sessionName, 'assistant.text', {
-      text: acc.text,
+      text: delta.delta,
       streaming: true,
     }, { source: 'daemon', confidence: 'high', eventId: stableEventId });
   });
@@ -59,8 +54,8 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     }
 
     const accKey = `${sessionName}:${message.id}`;
-    const acc = accumulators.get(accKey);
-    const finalText = acc?.text ?? message.content;
+    // Use message.content as authoritative final text (provider accumulated internally)
+    const finalText = message.content;
     accumulators.delete(accKey);
 
     // Replace streaming event with final version (same eventId → in-place update)

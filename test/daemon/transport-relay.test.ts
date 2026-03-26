@@ -136,7 +136,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(opts.eventId).toBe('transport:sess-a:msg-abc');
     });
 
-    it('multiple deltas accumulate text correctly', () => {
+    it('multiple deltas pass through directly (provider handles accumulation)', () => {
       const { provider, fireDelta } = makeMockProvider();
       wireProviderToRelay(provider);
 
@@ -146,12 +146,10 @@ describe('transport-relay (timeline-emitter based)', () => {
 
       expect(emitMock).toHaveBeenCalledTimes(3);
 
-      // First delta: "foo "
+      // Each delta is passed through directly — provider already accumulated
       expect(emitMock.mock.calls[0][2].text).toBe('foo ');
-      // Second delta: "foo bar "
-      expect(emitMock.mock.calls[1][2].text).toBe('foo bar ');
-      // Third delta: "foo bar baz"
-      expect(emitMock.mock.calls[2][2].text).toBe('foo bar baz');
+      expect(emitMock.mock.calls[1][2].text).toBe('bar ');
+      expect(emitMock.mock.calls[2][2].text).toBe('baz');
     });
 
     it('uses the same stable eventId across multiple deltas for the same message', () => {
@@ -204,7 +202,7 @@ describe('transport-relay (timeline-emitter based)', () => {
   // ── wireProviderToRelay — onComplete ─────────────────────────────────────
 
   describe('onComplete', () => {
-    it('emits assistant.text with streaming false and final accumulated text', () => {
+    it('emits assistant.text with streaming false and uses message.content for final text', () => {
       const { provider, fireDelta, fireComplete } = makeMockProvider();
       wireProviderToRelay(provider);
 
@@ -212,12 +210,12 @@ describe('transport-relay (timeline-emitter based)', () => {
       fireDelta('sess-1', makeDelta({ messageId: 'msg-2', delta: 'part2' }));
       emitMock.mockClear();
 
-      fireComplete('sess-1', makeMessage({ id: 'msg-2', content: 'fallback' }));
+      fireComplete('sess-1', makeMessage({ id: 'msg-2', content: 'part1 part2' }));
 
       const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
       expect(textCall).toBeDefined();
       expect(textCall![2].streaming).toBe(false);
-      // Should use accumulated text, not message.content fallback
+      // Uses message.content as authoritative final text
       expect(textCall![2].text).toBe('part1 part2');
     });
 

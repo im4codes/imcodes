@@ -412,7 +412,7 @@ describe('OpenClawProvider', () => {
         sessions: [
           { key: 'sess-a', label: 'Alpha', agentId: 'main', updatedAt: 1000, percentUsed: 10 },
           { key: 'proj:cron:daily', label: 'Cron Job', agentId: 'cron' },
-          { key: 'sess-b', label: 'Beta' },
+          { key: 'sess-b', label: 'Beta', updatedAt: 2000 },
         ],
       });
 
