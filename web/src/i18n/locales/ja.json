@@ -419,6 +419,7 @@
     "unpin": "パネルの固定を解除",
     "pinned_repo": "ファイル",
     "session_unavailable": "セッションは利用できません",
-    "drop_to_pin": "ドロップして固定"
+    "drop_to_pin": "ドロップして固定",
+    "pin_to_sidebar": "サイドバーに固定"
   }
 }

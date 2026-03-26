@@ -3,6 +3,7 @@
  * Uses the full SessionControls for input (same as the main session).
  */
 import { useState, useRef, useCallback, useEffect, useMemo } from 'preact/hooks';
+import { useTranslation } from 'react-i18next';
 import { getActiveThinkingTs, getActiveStatusText } from '../thinking-utils.js';
 import { recordCost } from '../cost-tracker.js';
 import { TerminalView } from './TerminalView.js';
@@ -66,6 +67,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 export function SubSessionWindow({
   sub, ws, connected, active, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, zIndex, onFocus, onPin, sessions, subSessions, serverId,
 }: Props) {
+  const { t } = useTranslation();
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const swipeBackRef = useSwipeBack(isMobile ? onMinimize : null);
 
@@ -308,7 +310,7 @@ export function SubSessionWindow({
         <span class="subsession-title">{typeLabel}</span>
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
           {!isShell && !isTransport && <button class="subsession-mode-btn" onClick={() => { const next = viewMode === 'chat' ? 'terminal' : 'chat'; setViewMode(next); if (next === 'chat') requestAnimationFrame(() => chatScrollRef.current?.()); }} title={viewMode === 'chat' ? 'Switch to terminal' : 'Switch to chat'}>{viewMode === 'chat' ? '⌨' : '💬'}</button>}
-          {isPinnable && <button class="subsession-minimize-btn" onClick={onPin} title="Pin to sidebar">📌</button>}
+          {isPinnable && <button class="subsession-minimize-btn" onClick={onPin} title={t('sidebar.pin_to_sidebar')}>📌</button>}
           <button class="subsession-minimize-btn" onClick={onMinimize} title="Minimize">▾</button>
           <button class="subsession-close-btn" onClick={onMinimize} title="Hide">×</button>
         </div>

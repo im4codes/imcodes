@@ -419,6 +419,7 @@
     "unpin": "取消固定",
     "pinned_repo": "檔案",
     "session_unavailable": "工作階段不可用",
-    "drop_to_pin": "拖放以固定"
+    "drop_to_pin": "拖放以固定",
+    "pin_to_sidebar": "固定到側邊欄"
   }
 }

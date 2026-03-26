@@ -1848,7 +1848,7 @@ export function App() {
               <FloatingPanel id="filebrowser" title={`📁 ${trans('picker.files')}`} onClose={() => setShowDesktopFileBrowser(false)} defaultW={420} defaultH={500}>
                 {/* Pin-to-sidebar button */}
                 <div style={{ padding: '2px 8px', background: '#111827', borderBottom: '1px solid #1e293b', display: 'flex', justifyContent: 'flex-end' }}>
-                  <button class="subsession-minimize-btn" onClick={pinRepo} title={trans('sidebar.drop_to_pin')}>📌</button>
+                  <button class="subsession-minimize-btn" onClick={pinRepo} title={trans('sidebar.pin_to_sidebar')}>📌</button>
                 </div>
                 <FileBrowser
                   ws={wsRef.current}

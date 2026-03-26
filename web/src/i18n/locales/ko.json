@@ -419,6 +419,7 @@
     "unpin": "패널 고정 해제",
     "pinned_repo": "파일",
     "session_unavailable": "세션을 사용할 수 없습니다",
-    "drop_to_pin": "여기에 놓아 고정"
+    "drop_to_pin": "여기에 놓아 고정",
+    "pin_to_sidebar": "사이드바에 고정"
   }
 }

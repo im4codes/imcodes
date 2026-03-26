@@ -419,6 +419,7 @@
     "unpin": "Desanclar panel",
     "pinned_repo": "Archivos",
     "session_unavailable": "Sesión no disponible",
-    "drop_to_pin": "Soltar para anclar"
+    "drop_to_pin": "Soltar para anclar",
+    "pin_to_sidebar": "Fijar en barra lateral"
   }
 }

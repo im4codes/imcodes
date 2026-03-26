@@ -419,6 +419,7 @@
     "unpin": "Unpin panel",
     "pinned_repo": "Files",
     "session_unavailable": "Session unavailable",
-    "drop_to_pin": "Drop to pin"
+    "drop_to_pin": "Drop to pin",
+    "pin_to_sidebar": "Pin to sidebar"
   }
 }
