@@ -229,7 +229,7 @@ export function SubSessionWindow({
   const typeLabel = sub.label ? `${sub.label} · ${agentTag}` : agentTag;
 
   // Only non-terminal (chat) sub-sessions can be pinned to sidebar
-  const isPinnable = !isShell && !isTransport && onPin;
+  const isPinnable = !!onPin;
 
   // HTML5 drag-to-pin: set dataTransfer so sidebar can read panel type + id
   const handleDragStart = useCallback((e: DragEvent) => {

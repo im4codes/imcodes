@@ -1847,11 +1847,9 @@ export function App() {
             {!isMobile && showDesktopFileBrowser && wsRef.current && activeSessionInfo && (
               <FloatingPanel id="filebrowser" title={`📁 ${trans('picker.files')}`} onClose={() => setShowDesktopFileBrowser(false)} defaultW={420} defaultH={500}>
                 {/* Pin-to-sidebar button */}
-                {!sidebarCollapsed && (
-                  <div style={{ padding: '2px 8px', background: '#111827', borderBottom: '1px solid #1e293b', display: 'flex', justifyContent: 'flex-end' }}>
-                    <button class="subsession-minimize-btn" onClick={pinRepo} title={trans('sidebar.unpin')}>📌 {trans('sidebar.drop_to_pin')}</button>
-                  </div>
-                )}
+                <div style={{ padding: '2px 8px', background: '#111827', borderBottom: '1px solid #1e293b', display: 'flex', justifyContent: 'flex-end' }}>
+                  <button class="subsession-minimize-btn" onClick={pinRepo} title={trans('sidebar.drop_to_pin')}>📌</button>
+                </div>
                 <FileBrowser
                   ws={wsRef.current}
                   mode="file-multi"
@@ -1967,7 +1965,6 @@ export function App() {
       {/* Sub-session windows (floating) — only show if not pinned */}
       {visibleSubSessions.filter((sub) => !pinnedPanels.some((p) => p.type === 'subsession' && p.sessionName === sub.sessionName)).map((sub) => {
         const isOpen = openSubIds.has(sub.id);
-        const isShellOrTransport = sub.type === 'shell' || sub.type === 'script' || sub.type === 'openclaw';
         return (
           <div key={sub.id} style={{ display: isOpen ? 'contents' : 'none' }}>
             <SubSessionWindow
@@ -1986,7 +1983,7 @@ export function App() {
               }}
               zIndex={subZIndexes.get(sub.id) ?? 1000}
               onFocus={() => bringSubToFront(sub.id)}
-              onPin={!isShellOrTransport ? () => pinSubSession(sub.id) : undefined}
+              onPin={() => pinSubSession(sub.id)}
               sessions={sessions}
               subSessions={subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession }))}
               serverId={selectedServerId ?? undefined}
