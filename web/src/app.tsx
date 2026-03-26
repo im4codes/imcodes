@@ -1957,7 +1957,7 @@ export function App() {
       )}
 
       {/* Sub-session windows (floating) — only show if not pinned */}
-      {visibleSubSessions.filter((sub) => !pinnedPanels.some((p) => p.type === 'subsession' && p.props?.sessionName === sub.sessionName)).map((sub) => {
+      {visibleSubSessions.filter((sub) => isMobile || !pinnedPanels.some((p) => p.type === 'subsession' && p.props?.sessionName === sub.sessionName)).map((sub) => {
         const isOpen = openSubIds.has(sub.id);
         return (
           <div key={sub.id} style={{ display: isOpen ? 'contents' : 'none' }}>
