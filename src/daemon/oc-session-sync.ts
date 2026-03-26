@@ -131,23 +131,22 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
     if (group.mainSession) {
       const mainRecord = getSession(mName);
       const needsRuntime = !getTransportRuntime(mName);
+      const mainLabel = group.mainSession.displayName || mainSessionLabel(group.agentName);
 
       if (mainExists && needsRuntime) {
         // Session in store but runtime lost (daemon restart / OC reconnect) — recreate runtime
-        if (!isProviderSessionBound(group.mainSession.key)) {
-          try {
-            await launchTransportSession({
-              name: mName, projectName: mName, role: 'w1', agentType: 'openclaw',
-              label: mainSessionLabel(group.agentName),
-              projectDir: mainSessionProjectDir(group.agentName),
-              bindExistingKey: group.mainSession.key, skipCreate: true, skipStore: true,
-            });
-            upsertSession({ ...mainRecord!, state: 'running', label: mainSessionLabel(group.agentName), updatedAt: Date.now() });
-            logger.info({ session: mName, ocKey: group.mainSession.key }, 'oc-sync: reconnected main session runtime');
-          } catch (err) {
-            registerProviderRoute(group.mainSession.key, mName);
-            logger.warn({ err, session: mName }, 'oc-sync: failed to recreate main runtime, route-only fallback');
-          }
+        try {
+          await launchTransportSession({
+            name: mName, projectName: mName, role: 'w1', agentType: 'openclaw',
+            label: mainLabel,
+            projectDir: mainSessionProjectDir(group.agentName),
+            bindExistingKey: group.mainSession.key, skipCreate: true, skipStore: true,
+          });
+          upsertSession({ ...mainRecord!, state: 'running', label: mainLabel, updatedAt: Date.now() });
+          logger.info({ session: mName, ocKey: group.mainSession.key }, 'oc-sync: reconnected main session runtime');
+        } catch (err) {
+          registerProviderRoute(group.mainSession.key, mName);
+          logger.warn({ err, session: mName }, 'oc-sync: failed to recreate main runtime, route-only fallback');
         }
       } else if (!mainExists) {
         // New session — check uniqueness then create
@@ -160,7 +159,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
               projectName: mName,
               role: 'w1',
               agentType: 'openclaw',
-              label: mainSessionLabel(group.agentName),
+              label: mainLabel,
               projectDir: mainSessionProjectDir(group.agentName),
               description: group.mainSession.displayName,
               bindExistingKey: group.mainSession.key,
