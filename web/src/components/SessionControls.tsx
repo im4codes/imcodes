@@ -267,6 +267,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   /** Pending @-selected P2P targets + their display labels for removal at send time. */
   const pendingAtTargetsRef = useRef<Array<{ session: string; mode: string; label: string }>>([]);
+  /** Custom config/rounds override from @@all+ picker (cleared on send). */
+  const pendingConfigOverrideRef = useRef<{ config: P2pSavedConfig; rounds: number } | null>(null);
 
   /** Strip only the exact @@labels we inserted (preserves single-@ file references). */
   const stripAtLabels = (text: string, labels: string[]): string => {
@@ -291,10 +293,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       extra.p2pAtTargets = atTargets.map(({ session, mode }) => ({ session, mode }));
       // Attach config data when any target uses config mode
       const hasConfigTarget = atTargets.some(t => t.mode === 'config');
-      if (hasConfigTarget && p2pSavedConfig) {
-        extra.p2pSessionConfig = p2pSavedConfig.sessions;
-        extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
-        if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
+      if (hasConfigTarget) {
+        const override = pendingConfigOverrideRef.current;
+        const cfg = override?.config ?? p2pSavedConfig;
+        if (cfg) {
+          extra.p2pSessionConfig = cfg.sessions;
+          extra.p2pRounds = override?.rounds ?? cfg.rounds ?? 1;
+          if (cfg.extraPrompt) extra.p2pExtraPrompt = cfg.extraPrompt;
+        }
+        pendingConfigOverrideRef.current = null;
       }
     } else if (p2pMode !== 'solo' && !text.includes('@@')) {
       // Dropdown P2P mode — daemon handles expansion
@@ -830,12 +837,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 sel?.addRange(range);
               } catch { /* jsdom lacks Selection API */ }
             }}
-            onSelectAllConfig={() => {
-              // Just show @@all — daemon expands per saved config. Don't touch dropdown mode.
+            onSelectAllConfig={(config, rounds) => {
+              // Show @@all(config) — daemon expands per config. Store custom rounds + config override.
               const text = divRef.current?.textContent ?? '';
               const before = text.replace(/@[^\s@]*$/, '');
-              divRef.current!.textContent = `${before}@@all(config) `;
-              pendingAtTargetsRef.current.push({ session: '__all__', mode: 'config', label: '@@all(config)' });
+              const label = rounds > 1 ? `@@all(config ×${rounds})` : '@@all(config)';
+              divRef.current!.textContent = `${before}${label} `;
+              pendingAtTargetsRef.current.push({ session: '__all__', mode: 'config', label });
+              // Store custom config + rounds for handleSend
+              pendingConfigOverrideRef.current = { config, rounds };
               atSelectionSnapshotRef.current = divRef.current!.textContent;
               atSelectionLockRef.current = true;
               setAtPickerOpen(false);
