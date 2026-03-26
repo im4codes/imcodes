@@ -12,6 +12,7 @@ function mapP2pState(status: string): 'done' | 'failed' | 'running' | 'setup' {
   return 'setup';
 }
 import { useTranslation } from 'react-i18next';
+import { ErrorBoundary } from './components/ErrorBoundary.js';
 import { LanguageSwitcher } from './components/LanguageSwitcher.js';
 import { LoginPage } from './pages/LoginPage.js';
 import { DashboardPage } from './pages/DashboardPage.js';
@@ -1949,6 +1950,7 @@ export function App() {
 
             {/* Session panes: all sessions kept alive (terminal views persist), show/hide per active */}
             {sessions.map((s) => (
+              <ErrorBoundary key={`eb-${s.name}`}>
               <SessionPane
                 key={s.name}
                 serverId={selectedServerId ?? ''}
@@ -1974,6 +1976,7 @@ export function App() {
                 mobileFileBrowserOpen={s.name === activeSession ? showMobileFileBrowser : false}
                 onMobileFileBrowserClose={() => setShowMobileFileBrowser(false)}
               />
+              </ErrorBoundary>
             ))}
 
             {!activeSession && !sessionsLoaded && (
@@ -2073,6 +2076,7 @@ export function App() {
               </div>
             </div>
             <div class="mobile-sidebar-body">
+              <ErrorBoundary>
               {/* Server switcher — collapsible via sidebar toggle */}
               {!mobileHideServerBar && (
                 <div style={{ padding: '8px 12px', borderBottom: '1px solid #1e293b' }}>
@@ -2148,6 +2152,7 @@ export function App() {
                   />
                 );
               })}
+              </ErrorBoundary>
             </div>
             {/* Footer */}
             <div class="mobile-sidebar-footer">
