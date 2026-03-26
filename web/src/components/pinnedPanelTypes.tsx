@@ -68,6 +68,7 @@ registerPanelType('filebrowser', {
         ws={ctx.ws}
         mode="file-multi"
         layout="panel"
+        defaultTab="changes"
         initialPath={projectDir}
         changesRootPath={projectDir}
         hideFooter={false}

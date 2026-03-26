@@ -216,6 +216,8 @@ export interface FileBrowserProps {
   onClose?: () => void;
   /** When set, file clicks open an external preview (e.g. floating window) instead of inline split */
   onPreviewFile?: (path: string) => void;
+  /** Default panel tab — 'files' or 'changes'. Default: 'files' */
+  defaultTab?: 'files' | 'changes';
 }
 
 type FsNode = {
@@ -260,6 +262,7 @@ export function FileBrowser({
   onConfirm,
   onClose,
   onPreviewFile,
+  defaultTab = 'files',
 }: FileBrowserProps) {
   const { t } = useTranslation();
   const includeFiles = mode !== 'dir-only';
@@ -283,7 +286,7 @@ export function FileBrowser({
   const [newFolderName, setNewFolderName] = useState('');
   const [modifiedFiles, setModifiedFiles] = useState<Map<string, string>>(new Map()); // path → git code
   // Panel view: 'files' shows tree + changes section; 'changes' shows only changed files
-  const [panelView, setPanelView] = useState<'files' | 'changes'>('files');
+  const [panelView, setPanelView] = useState<'files' | 'changes'>(defaultTab);
   const [changesFiles, setChangesFiles] = useState<Array<{ path: string; code: string; additions?: number; deletions?: number }>>([]);
   const pendingChangesRef = useRef(new Set<string>()); // all in-flight changesRootPath git status requestIds
 
