@@ -261,14 +261,14 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
 
   const toggleEnabled = (key: string) => {
     setSessionCfg((prev) => {
-      const cur = prev[key] ?? { enabled: true, mode: 'audit' };
+      const cur = prev[key] ?? { enabled: false, mode: 'audit' };
       return { ...prev, [key]: { ...cur, enabled: !cur.enabled } };
     });
   };
 
   const setMode = (key: string, mode: string) => {
     setSessionCfg((prev) => {
-      const cur = prev[key] ?? { enabled: true, mode: 'audit' };
+      const cur = prev[key] ?? { enabled: false, mode: 'audit' };
       return { ...prev, [key]: { ...cur, mode } };
     });
   };
@@ -279,7 +279,7 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
     // from old/closed sessions or other daemons to prevent config rot.
     const merged: P2pSessionConfig = {};
     for (const e of eligible) {
-      merged[e.key] = sessionCfg[e.key] ?? { enabled: true, mode: 'audit' };
+      merged[e.key] = sessionCfg[e.key] ?? { enabled: false, mode: 'audit' };
     }
     const cfg: P2pSavedConfig = { sessions: merged, rounds, extraPrompt: extraPrompt.trim() || undefined };
     try {
@@ -290,7 +290,7 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
     onClose();
   };
 
-  const getEntry = (key: string) => sessionCfg[key] ?? { enabled: true, mode: 'audit' };
+  const getEntry = (key: string) => sessionCfg[key] ?? { enabled: false, mode: 'audit' };
 
   return (
     <div style={overlayStyle} onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>

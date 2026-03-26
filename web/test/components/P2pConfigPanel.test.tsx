@@ -208,7 +208,7 @@ describe('P2pConfigPanel', () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
-  it('new sessions not in saved config default to enabled with audit mode', async () => {
+  it('new sessions not in saved config default to disabled with audit mode', async () => {
     const savedConfig: P2pSavedConfig = {
       sessions: {}, // no prior config for any session
       rounds: 1,
@@ -221,13 +221,13 @@ describe('P2pConfigPanel', () => {
     renderPanel({ onSave, onClose });
     await flush();
 
-    // Checkboxes should all be checked (enabled=true by default)
+    // Checkboxes should all be unchecked (enabled=false by default for new sessions)
     // First checkbox is the cross-session toggle — skip it
     const checkboxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
     const sessionCheckboxes = checkboxes.slice(1); // skip cross-session toggle
     expect(sessionCheckboxes.length).toBeGreaterThan(0);
     for (const cb of sessionCheckboxes) {
-      expect(cb.checked).toBe(true);
+      expect(cb.checked).toBe(false);
     }
 
     // All selects should default to 'audit'
@@ -246,11 +246,12 @@ describe('P2pConfigPanel', () => {
 
     const checkboxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
     // First checkbox is cross-session toggle, session checkboxes start at index 1
-    expect(checkboxes[1].checked).toBe(true);
-
-    // Uncheck the first session
-    fireEvent.click(checkboxes[1]);
+    // New sessions default to unchecked (enabled=false)
     expect(checkboxes[1].checked).toBe(false);
+
+    // Check the first session (toggle from disabled to enabled)
+    fireEvent.click(checkboxes[1]);
+    expect(checkboxes[1].checked).toBe(true);
 
     const saveBtn = screen.getByText('settings_save');
     await act(async () => {
@@ -260,7 +261,7 @@ describe('P2pConfigPanel', () => {
 
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
     const firstKey = Object.keys(cfg.sessions)[0];
-    expect(cfg.sessions[firstKey].enabled).toBe(false);
+    expect(cfg.sessions[firstKey].enabled).toBe(true);
   });
 
   it('changing rounds updates the config passed to onSave', async () => {
