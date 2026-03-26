@@ -1662,12 +1662,32 @@ export function App() {
   }, [activeSessionInfo?.projectDir, connected]);
 
   // Show full-screen connecting indicator while waiting for initial WS + session data.
-  // Prevents the "black screen" gap between splash and layout on slow networks.
+  // After 8s, show escape buttons so the user is never stuck.
+  const [connectTimeout, setConnectTimeout] = useState(false);
+  useEffect(() => {
+    if (auth && selectedServerId && !connected && servers.length === 0) {
+      const t = setTimeout(() => setConnectTimeout(true), 8000);
+      return () => { clearTimeout(t); setConnectTimeout(false); };
+    }
+    setConnectTimeout(false);
+    return undefined;
+  }, [auth, selectedServerId, connected, servers.length]);
+
   if (auth && selectedServerId && !sessionsLoaded && !connected && servers.length === 0) {
     return (
       <div style={{ position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0a0e1a', flexDirection: 'column', gap: 16 }}>
         <div class="spinner" style={{ width: 32, height: 32 }} />
         <div style={{ color: '#64748b', fontSize: 14 }}>{connecting ? trans('common.reconnecting') : trans('common.loading')}</div>
+        {connectTimeout && (
+          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+            <button class="btn" style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }} onClick={() => { setSelectedServerId(null); localStorage.removeItem('rcc_server'); }}>
+              ← Back
+            </button>
+            <button class="btn" style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }} onClick={() => window.location.reload()}>
+              Retry
+            </button>
+          </div>
+        )}
       </div>
     );
   }
