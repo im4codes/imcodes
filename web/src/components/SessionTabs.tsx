@@ -113,8 +113,10 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [renameRequest]);
 
-  const getLabel = (s: SessionInfo) =>
-    s.role === 'brain' ? `🧠 ${s.project}` : `W${s.name.split('_w')[1] ?? '?'}`;
+  const getLabel = (s: SessionInfo) => {
+    if (s.label) return s.label;
+    return s.role === 'brain' ? `🧠 ${s.project}` : `W${s.name.split('_w')[1] ?? '?'}`;
+  };
 
   const agentBadge = (agentType: string) => {
     const b = AGENT_BADGE[agentType];
