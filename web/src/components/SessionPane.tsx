@@ -192,7 +192,7 @@ export function SessionPane({
 
   const terminalVisible = isActive && effectiveViewMode === 'terminal';
   const chatVisible = isActive && effectiveViewMode === 'chat';
-  const isShellTerminal = terminalVisible && session.agentType === 'shell';
+  const isShellTerminal = terminalVisible && (session.agentType === 'shell' || session.agentType === 'script');
 
   return (
     <div class={isShellTerminal ? 'shell-terminal-pane' : undefined} style={{ display: 'contents' }}>

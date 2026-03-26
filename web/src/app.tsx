@@ -136,17 +136,36 @@ export function App() {
   useEffect(() => {
     const vv = window.visualViewport;
     if (!vv) return;
+    let inputFocused = false;
     const update = () => {
       document.documentElement.style.setProperty('--vvh', `${vv.height}px`);
-      // Detect keyboard open: visual viewport significantly smaller than window
-      const kbOpen = window.innerHeight - vv.height > 80;
+      // Detect keyboard open: viewport shrink + optional input-focus fallback.
+      // Chinese IME candidate bars can be ~40px, so use low threshold when input is focused.
+      const shrink = window.innerHeight - vv.height;
+      const kbOpen = shrink > 40 || (inputFocused && shrink > 15);
       document.documentElement.classList.toggle('kb-open', kbOpen);
       // Reset any scroll caused by keyboard opening on mobile
       if (window.scrollY !== 0) window.scrollTo(0, 0);
     };
+    const onFocusIn = (e: FocusEvent) => {
+      const el = e.target as HTMLElement | null;
+      if (!el) return;
+      const tag = el.tagName;
+      inputFocused = tag === 'INPUT' || tag === 'TEXTAREA'
+        || el.getAttribute('contenteditable') === 'true'
+        || el.classList.contains('xterm-helper-textarea');
+      update();
+    };
+    const onFocusOut = () => { inputFocused = false; update(); };
     update();
     vv.addEventListener('resize', update);
-    return () => vv.removeEventListener('resize', update);
+    document.addEventListener('focusin', onFocusIn);
+    document.addEventListener('focusout', onFocusOut);
+    return () => {
+      vv.removeEventListener('resize', update);
+      document.removeEventListener('focusin', onFocusIn);
+      document.removeEventListener('focusout', onFocusOut);
+    };
   }, []);
 
   // Native: initialize server URL and API key from Preferences storage
