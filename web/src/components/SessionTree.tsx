@@ -50,6 +50,10 @@ interface Props {
   unreadCounts: Map<string, number>;
   onSelectSession: (sessionName: string) => void;
   onSelectSubSession: (sub: SubSession) => void;
+  /** Open new session dialog. */
+  onNewSession?: () => void;
+  /** Open new sub-session dialog. */
+  onNewSubSession?: () => void;
 }
 
 // ── Helper: compute label for a main session ─────────────────────────────────
@@ -202,6 +206,8 @@ function SessionTreeInner({
   unreadCounts,
   onSelectSession,
   onSelectSubSession,
+  onNewSession,
+  onNewSubSession,
 }: Props) {
   const { t } = useTranslation();
   const [collapsed, setCollapsed] = useState<Set<string>>(loadCollapsed);
@@ -252,16 +258,21 @@ function SessionTreeInner({
 
   return (
     <div class="session-tree" role="tree" aria-label={t('sidebar.sessionTree', 'Session tree')}>
-      {/* Collapse all / expand all toggle */}
-      {hasSubs && (
-        <button
-          class="session-tree-collapse-all"
-          onClick={allCollapsed ? expandAll : collapseAll}
-          title={allCollapsed ? t('sidebar.expand_all', 'Expand all') : t('sidebar.collapse_all', 'Collapse all')}
-        >
-          {allCollapsed ? '▸' : '▾'} {allCollapsed ? t('sidebar.expand_all', 'Expand all') : t('sidebar.collapse_all', 'Collapse all')}
-        </button>
-      )}
+      {/* Header: collapse toggle + new session button */}
+      <div class="session-tree-header">
+        {hasSubs && (
+          <button
+            class="session-tree-collapse-all"
+            onClick={allCollapsed ? expandAll : collapseAll}
+            title={allCollapsed ? t('sidebar.expand_all', 'Expand all') : t('sidebar.collapse_all', 'Collapse all')}
+          >
+            {allCollapsed ? '▸' : '▾'} {allCollapsed ? t('sidebar.expand_all', 'Expand all') : t('sidebar.collapse_all', 'Collapse all')}
+          </button>
+        )}
+        {onNewSession && (
+          <button class="session-tree-add-btn" onClick={onNewSession} title={t('session.new_session', 'New session')}>+</button>
+        )}
+      </div>
 
       {sessions.map((session) => {
         const sessionLabel = getSessionLabel(session);
@@ -300,6 +311,13 @@ function SessionTreeInner({
                 idleFlash={idleFlash}
                 onClick={() => onSelectSession(session.name)}
               />
+              {onNewSubSession && (
+                <button
+                  class="session-tree-add-sub-btn"
+                  onClick={(e) => { e.stopPropagation(); onSelectSession(session.name); onNewSubSession(); }}
+                  title={t('session.new_sub', 'New sub-session')}
+                >+</button>
+              )}
             </div>
 
             {/* Sub-session nodes (indented) — hidden when collapsed */}

@@ -1538,6 +1538,8 @@ export function App() {
               onSelectSubSession={(sub) => {
                 toggleSubSession(sub.id);
               }}
+              onNewSession={() => setShowNewSession(true)}
+              onNewSubSession={() => setShowSubDialog(true)}
             />
 
             {/* P2P ring progress — show active P2P runs */}
