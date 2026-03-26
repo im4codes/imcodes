@@ -88,6 +88,80 @@ describe('AtPicker', () => {
     expect(screen.queryByText('brain')).toBeNull();
   });
 
+  it('with p2pConfig, only shows enabled config sessions in agents list', () => {
+    const wsClient = { connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) };
+
+    render(
+      <AtPicker
+        query=""
+        sessions={[
+          { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle', parentSession: null, isSelf: true },
+          { name: 'deck_sub_w1', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain' },
+          { name: 'deck_sub_w2', agentType: 'gemini', state: 'idle', parentSession: 'deck_proj_brain' },
+          { name: 'deck_sub_w3', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain' },
+        ]}
+        rootSession="deck_proj_brain"
+        wsClient={wsClient as any}
+        projectDir="/tmp/proj"
+        onSelectFile={vi.fn()}
+        onSelectAgent={vi.fn()}
+        p2pConfig={{
+          sessions: {
+            'deck_sub_w1': { enabled: true, mode: 'audit' },
+            'deck_sub_w2': { enabled: false, mode: 'review' },
+            'deck_sub_w3': { enabled: true, mode: 'discuss' },
+          },
+          rounds: 1,
+        }}
+        onClose={vi.fn()}
+        visible
+      />,
+    );
+
+    fireEvent.click(screen.getByText('agents'));
+
+    // w1 and w3 are enabled — should be visible
+    expect(screen.getByText('w1')).toBeDefined();
+    expect(screen.getByText('w3')).toBeDefined();
+    // w2 is disabled — should NOT be visible
+    expect(screen.queryByText('w2')).toBeNull();
+  });
+
+  it('sessions not in p2pConfig are excluded (strict mode)', () => {
+    const wsClient = { connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) };
+
+    render(
+      <AtPicker
+        query=""
+        sessions={[
+          { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle', parentSession: null, isSelf: true },
+          { name: 'deck_sub_w1', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain' },
+          { name: 'deck_sub_w2', agentType: 'gemini', state: 'idle', parentSession: 'deck_proj_brain' },
+        ]}
+        rootSession="deck_proj_brain"
+        wsClient={wsClient as any}
+        projectDir="/tmp/proj"
+        onSelectFile={vi.fn()}
+        onSelectAgent={vi.fn()}
+        p2pConfig={{
+          sessions: {
+            'deck_sub_w1': { enabled: true, mode: 'audit' },
+            // w2 NOT in config at all — should be excluded
+          },
+          rounds: 1,
+        }}
+        onClose={vi.fn()}
+        visible
+      />,
+    );
+
+    fireEvent.click(screen.getByText('agents'));
+
+    expect(screen.getByText('w1')).toBeDefined();
+    // w2 is not in config — strict mode excludes it
+    expect(screen.queryByText('w2')).toBeNull();
+  });
+
   it('shows localized empty-state labels in agents step', () => {
     const wsClient = {
       connected: true,

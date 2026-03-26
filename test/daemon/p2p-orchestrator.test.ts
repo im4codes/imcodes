@@ -666,7 +666,7 @@ describe('Group 11: Bookend Chain Flow', () => {
     const summaryPrompt = capturedPrompts[capturedPrompts.length - 1];
     expect(summaryPrompt.session).toBe('deck_proj_brain');
     expect(summaryPrompt.prompt).toContain('Summary');
-    expect(summaryPrompt.prompt).toContain('Synthesize');
+    expect(summaryPrompt.prompt).toContain('final synthesis');
   });
 
   it('context file accumulation after full chain', async () => {

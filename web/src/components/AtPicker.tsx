@@ -359,17 +359,15 @@ export function AtPicker({
         return;
       }
 
-      // Files or Agents list
-      // Filter agents to match render path: when p2pConfig exists, keep agents whose
-      // config entry is enabled (or agents not in config at all — non-strict match)
+      // Files or Agents list — use same strict config filtering as render path
       const kbConfigMap = p2pConfig ? new Map(Object.entries(p2pConfig.sessions)) : null;
       const kbVisibleAgents = kbConfigMap
-        ? agents.filter(a => { const entry = kbConfigMap.get(a.session); return !entry || (entry.enabled && entry.mode !== 'skip'); })
+        ? agents.filter(a => { const entry = kbConfigMap.get(a.session); return entry ? (entry.enabled && entry.mode !== 'skip') : false; })
         : agents;
       const nonSelfCount = kbVisibleAgents.filter(a => !a.isSelf).length;
       const hasAllRow = category === 'agents' && nonSelfCount > 1;
-      const cfgParticipants = p2pConfig
-        ? Object.entries(p2pConfig.sessions).filter(([, e]) => e.enabled && e.mode !== 'skip')
+      const cfgParticipants = kbConfigMap
+        ? [...kbConfigMap.entries()].filter(([, e]) => e.enabled && e.mode !== 'skip')
         : [];
       const cfgRowCount = category === 'agents' && cfgParticipants.length > 0 ? 2 : 0;
       const regAllOffset = cfgRowCount;
@@ -399,7 +397,7 @@ export function AtPicker({
           setModeAgent('__all__'); setModeHighlight(0);
         } else {
           const agentIdx = highlightIdx - agentsOff;
-          const a = agents[agentIdx];
+          const a = kbVisibleAgents[agentIdx];
           if (a) { setModeAgent(a.session); setModeHighlight(0); }
         }
       }
@@ -588,22 +586,19 @@ export function AtPicker({
 
   // ── Agents list ──
   // When p2pConfig exists, only show sessions that are enabled in config.
-  // Build from config entries directly (not filter-from-all) to match user's selection.
-  const agentMap = new Map(agents.map(a => [a.session, a]));
-  const renderVisibleAgents = p2pConfig
-    ? Object.entries(p2pConfig.sessions)
-        .filter(([, e]) => e.enabled && e.mode !== 'skip')
-        .map(([session, e]) => {
-          const a = agentMap.get(session);
-          return a ? { ...a, cfgMode: e.mode } : null;
-        })
-        .filter((a): a is NonNullable<typeof a> => a !== null)
+  // Build visible agents using strict config filter, preserving live agent order.
+  // Same logic as keyboard handler to ensure index parity.
+  const cfgMap = p2pConfig ? new Map(Object.entries(p2pConfig.sessions)) : null;
+  const renderVisibleAgents = cfgMap
+    ? agents
+        .filter(a => { const e = cfgMap.get(a.session); return e ? (e.enabled && e.mode !== 'skip') : false; })
+        .map(a => ({ ...a, cfgMode: cfgMap.get(a.session)!.mode }))
     : agents;
   const nonSelfAgents = renderVisibleAgents.filter(a => !a.isSelf);
   const showAll = nonSelfAgents.length > 1;
-  // Config-mode rows: shown when p2pConfig is set and there are eligible sessions
-  const configParticipants = p2pConfig
-    ? Object.entries(p2pConfig.sessions).filter(([, e]) => e.enabled && e.mode !== 'skip')
+  // Config participants — derived from live ∩ config (not raw config) to avoid phantoms
+  const configParticipants: [string, { enabled: boolean; mode: string }][] = cfgMap
+    ? renderVisibleAgents.map(a => [a.session, cfgMap.get(a.session)!] as [string, { enabled: boolean; mode: string }])
     : [];
   const showConfigRows = !!p2pConfig && configParticipants.length > 0;
   const configRowCount = showConfigRows ? 2 : 0; // @all and @all+

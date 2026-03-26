@@ -134,10 +134,9 @@ function expandAllTargets(initiatorName: string, mode: string, excludeSameType =
 
     if (mode === P2P_CONFIG_MODE && sessionConfig) {
       const entry = sessionConfig[s.name];
-      const sessionMode = entry?.mode ?? 'audit';
-      if (entry && !entry.enabled) continue;
-      if (sessionMode === 'skip') continue;
-      targets.push({ session: s.name, mode: sessionMode });
+      if (!entry || !entry.enabled) continue;        // strict: missing = excluded
+      if (entry.mode === 'skip') continue;
+      targets.push({ session: s.name, mode: entry.mode });
     } else {
       targets.push({ session: s.name, mode });
     }
