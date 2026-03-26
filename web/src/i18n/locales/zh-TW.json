@@ -422,6 +422,7 @@
     "drop_to_pin": "拖放以固定",
     "pin_to_sidebar": "固定到側邊欄",
     "expand_all": "全部展開",
-    "collapse_all": "全部折疊"
+    "collapse_all": "全部折疊",
+    "drag_to_resize": "拖動調整寬度"
   }
 }

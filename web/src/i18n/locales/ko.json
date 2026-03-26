@@ -422,6 +422,7 @@
     "drop_to_pin": "여기에 놓아 고정",
     "pin_to_sidebar": "사이드바에 고정",
     "expand_all": "모두 펼치기",
-    "collapse_all": "모두 접기"
+    "collapse_all": "모두 접기",
+    "drag_to_resize": "드래그하여 크기 조절"
   }
 }

@@ -422,6 +422,7 @@
     "drop_to_pin": "Soltar para anclar",
     "pin_to_sidebar": "Fijar en barra lateral",
     "expand_all": "Expandir todo",
-    "collapse_all": "Contraer todo"
+    "collapse_all": "Contraer todo",
+    "drag_to_resize": "Arrastra para cambiar el tamaño"
   }
 }

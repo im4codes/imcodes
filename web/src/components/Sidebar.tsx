@@ -180,12 +180,20 @@ export function Sidebar({ collapsed, serverId, pinnedPanels: _pinnedPanels, onDr
         </div>
       )}
 
-      {/* Footer: language switcher + build time + copyright */}
+      {/* Footer: language switcher + build time + drag-to-resize + copyright */}
       {!collapsed && (
         <div class="sidebar-footer">
           <LanguageSwitcher />
-          <div class="sidebar-build-time">
-            {(() => { try { const d = new Date(__BUILD_TIME__); return `Build: ${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
+          <div
+            class="sidebar-resize-bar"
+            onMouseDown={handleResizeMouseDown}
+            onTouchStart={handleResizeTouchStart}
+            title={t('sidebar.drag_to_resize', 'Drag to resize')}
+          >
+            <span class="sidebar-resize-bar-icon">⠿</span>
+            <span class="sidebar-build-time">
+              {(() => { try { const d = new Date(__BUILD_TIME__); return `${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
+            </span>
           </div>
           <div class="sidebar-copyright">© 2026 IM.codes</div>
         </div>

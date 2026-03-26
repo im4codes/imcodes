@@ -422,6 +422,7 @@
     "drop_to_pin": "ドロップして固定",
     "pin_to_sidebar": "サイドバーに固定",
     "expand_all": "すべて展開",
-    "collapse_all": "すべて折りたたむ"
+    "collapse_all": "すべて折りたたむ",
+    "drag_to_resize": "ドラッグしてサイズ変更"
   }
 }

@@ -422,6 +422,7 @@
     "drop_to_pin": "Drop to pin",
     "pin_to_sidebar": "Pin to sidebar",
     "expand_all": "Expand all",
-    "collapse_all": "Collapse all"
+    "collapse_all": "Collapse all",
+    "drag_to_resize": "Drag to resize"
   }
 }
