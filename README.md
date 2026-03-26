@@ -1,4 +1,4 @@
-# IM.codes
+# [IM.codes](https://im.codes)
 
 **The IM for agents.**
 
@@ -37,7 +37,7 @@ A specialized instant messenger for AI agents. More than chat — terminal acces
 
 Since 2026, developers talk to agents. Agents write code, run tools, and manage workflows. But generic chat apps were never built for this — and raw terminals don't scale across machines, devices, or multiple agents working in parallel.
 
-IM.codes is a dedicated messaging layer for AI agents: remote terminals that work like SSH without the SSH, a chat view that understands agent output, and multi-agent workflows that let you coordinate different models on the same task.
+[IM.codes](https://im.codes) is a dedicated messaging layer for AI agents: remote terminals that work like SSH without the SSH, a chat view that understands agent output, and multi-agent workflows that let you coordinate different models on the same task.
 
 This is a personal project. I haven't written any code myself — it was built almost entirely by [Claude Code](https://github.com/anthropics/claude-code), with significant contributions from [Codex](https://github.com/openai/codex) and [Gemini CLI](https://github.com/google-gemini/gemini-cli).
 
@@ -49,7 +49,7 @@ Full terminal access to your agent sessions from any browser — no SSH, no VPN,
 
 ### OpenClaw Integration
 
-Chat with [OpenClaw](https://openclaw.com) agents directly in IM.codes — plus terminal, file browser, git diffs, and multi-agent discussions that OpenClaw alone doesn't offer.
+Chat with [OpenClaw](https://openclaw.com) agents directly in [IM.codes](https://im.codes) — plus terminal, file browser, git diffs, and multi-agent discussions that OpenClaw alone doesn't offer.
 
 ### Discord-Style Sidebar
 
@@ -171,4 +171,4 @@ Login at `https://your-domain` with `admin` and the printed password. Bind your 
 
 [MIT](LICENSE)
 
-© 2026 IM.codes
+© 2026 [IM.codes](https://im.codes)
