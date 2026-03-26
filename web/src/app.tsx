@@ -1189,38 +1189,130 @@ export function App() {
     return () => document.removeEventListener('keydown', handler);
   }, [isMobile, handleToggleSidebar]);
 
-  // Mobile: swipe-right from left edge opens sidebar overlay
+  // Mobile sidebar: drag-follow gesture system.
+  // - Swipe right from left edge → panel follows finger → snap open/closed on release
+  // - When open, swipe left on panel/backdrop → follows finger → snap closed
+  // Uses refs + direct DOM manipulation for 60fps (no React re-renders during drag).
+  const sidebarPanelRef = useRef<HTMLDivElement>(null);
+  const sidebarOverlayRef = useRef<HTMLDivElement>(null);
+  const sidebarDragRef = useRef({ active: false, startX: 0, startY: 0, lastX: 0, lastTs: 0, opening: false });
+
+  const getSidebarWidth = useCallback(() => {
+    return sidebarPanelRef.current?.offsetWidth ?? Math.min(window.innerWidth * 0.88, 360);
+  }, []);
+
+  // Apply sidebar position directly to DOM (no state updates during drag)
+  const applySidebarTransform = useCallback((progress: number) => {
+    // progress: 0 = fully closed (off-screen left), 1 = fully open
+    const clamped = Math.max(0, Math.min(1, progress));
+    const panel = sidebarPanelRef.current;
+    const overlay = sidebarOverlayRef.current;
+    if (panel) panel.style.transform = `translateX(${(clamped - 1) * 100}%)`;
+    if (overlay) overlay.style.background = `rgba(0,0,0,${clamped * 0.5})`;
+  }, []);
+
+  // Snap to open or closed with a CSS transition
+  const snapSidebar = useCallback((open: boolean) => {
+    const panel = sidebarPanelRef.current;
+    const overlay = sidebarOverlayRef.current;
+    if (panel) {
+      panel.style.transition = 'transform 0.25s cubic-bezier(0.4,0,0.2,1)';
+      panel.style.transform = open ? 'translateX(0)' : 'translateX(-100%)';
+      panel.addEventListener('transitionend', () => { panel.style.transition = ''; }, { once: true });
+    }
+    if (overlay) {
+      overlay.style.transition = 'background 0.25s ease';
+      overlay.style.background = open ? 'rgba(0,0,0,0.5)' : 'rgba(0,0,0,0)';
+      overlay.addEventListener('transitionend', () => {
+        overlay.style.transition = '';
+        if (!open) setMobileSidebarOpen(false);
+      }, { once: true });
+    }
+    if (open) setMobileSidebarOpen(true);
+  }, []);
+
   useEffect(() => {
     if (!isMobile) return;
-    let startX = 0;
-    let startY = 0;
-    let tracking = false;
-    const EDGE_ZONE = 30; // px from left edge
-    const SWIPE_THRESHOLD = 60; // px horizontal distance
+    const drag = sidebarDragRef.current;
+    const EDGE_ZONE = 30;
+    const VELOCITY_THRESHOLD = 0.3; // px/ms — fast flick snaps regardless of position
+
     const onStart = (e: TouchEvent) => {
       const t = e.touches[0];
-      if (t.clientX > EDGE_ZONE) return;
-      startX = t.clientX;
-      startY = t.clientY;
-      tracking = true;
-    };
-    const onEnd = (e: TouchEvent) => {
-      if (!tracking) return;
-      tracking = false;
-      const t = e.changedTouches[0];
-      const dx = t.clientX - startX;
-      const dy = Math.abs(t.clientY - startY);
-      if (dx > SWIPE_THRESHOLD && dx > dy) {
+      const isOpen = mobileSidebarOpen;
+      // Open gesture: touch near left edge when closed
+      // Close gesture: touch anywhere when open
+      if (!isOpen && t.clientX > EDGE_ZONE) return;
+      drag.active = true;
+      drag.startX = t.clientX;
+      drag.startY = t.clientY;
+      drag.lastX = t.clientX;
+      drag.lastTs = e.timeStamp;
+      drag.opening = !isOpen;
+
+      // If opening, mount the overlay immediately so we can drag it
+      if (!isOpen) {
         setMobileSidebarOpen(true);
+        // Start fully closed — will be positioned in rAF after mount
+        requestAnimationFrame(() => applySidebarTransform(0));
       }
     };
+
+    const onMove = (e: TouchEvent) => {
+      if (!drag.active) return;
+      const t = e.touches[0];
+      const dy = Math.abs(t.clientY - drag.startY);
+      const dx = Math.abs(t.clientX - drag.startX);
+      // Cancel if vertical scroll dominates
+      if (dy > dx * 1.5 && dx < 20) { drag.active = false; return; }
+
+      drag.lastX = t.clientX;
+      drag.lastTs = e.timeStamp;
+
+      const w = getSidebarWidth();
+      let progress: number;
+      if (drag.opening) {
+        // Opening: startX near 0, dragging right
+        progress = Math.max(0, t.clientX - drag.startX) / w;
+      } else {
+        // Closing: sidebar is fully open, dragging left reduces progress
+        progress = 1 + Math.min(0, t.clientX - drag.startX) / w;
+      }
+      applySidebarTransform(progress);
+    };
+
+    const onEnd = (e: TouchEvent) => {
+      if (!drag.active) return;
+      drag.active = false;
+      const t = e.changedTouches[0];
+      const dt = Math.max(1, e.timeStamp - drag.lastTs);
+      const velocity = (t.clientX - drag.lastX) / dt; // +ve = moving right
+
+      const w = getSidebarWidth();
+      let progress: number;
+      if (drag.opening) {
+        progress = Math.max(0, t.clientX - drag.startX) / w;
+      } else {
+        progress = 1 + Math.min(0, t.clientX - drag.startX) / w;
+      }
+
+      // Decide: snap open or closed based on position + velocity
+      const snapOpen = velocity > VELOCITY_THRESHOLD ? true
+        : velocity < -VELOCITY_THRESHOLD ? false
+        : progress > 0.4;
+
+      snapSidebar(snapOpen);
+    };
+
     document.addEventListener('touchstart', onStart, { passive: true });
+    document.addEventListener('touchmove', onMove, { passive: true });
     document.addEventListener('touchend', onEnd, { passive: true });
     return () => {
       document.removeEventListener('touchstart', onStart);
+      document.removeEventListener('touchmove', onMove);
       document.removeEventListener('touchend', onEnd);
     };
-  }, [isMobile]);
+  }, [isMobile, mobileSidebarOpen, getSidebarWidth, applySidebarTransform, snapSidebar]);
 
   const handleLogout = useCallback(async () => {
     if (isNative()) {
@@ -1730,7 +1822,7 @@ export function App() {
           <>
             {/* Mobile-only server switcher */}
             <div class="mobile-server-bar">
-              <button class="mobile-sidebar-toggle" onClick={() => setMobileSidebarOpen(true)}>≡</button>
+              <button class="mobile-sidebar-toggle" onClick={() => { setMobileSidebarOpen(true); requestAnimationFrame(() => snapSidebar(true)); }}>≡</button>
               <div class="mobile-server-switcher-wrap">
                 <button
                   class="mobile-server-btn"
@@ -1931,11 +2023,11 @@ export function App() {
 
       {/* Mobile sidebar overlay — full-screen panel with session tree, server list, pinned panels */}
       {isMobile && mobileSidebarOpen && selectedServerId && (
-        <div class="mobile-sidebar-overlay" onClick={() => setMobileSidebarOpen(false)}>
-          <div class="mobile-sidebar-panel" onClick={(e) => e.stopPropagation()}>
+        <div ref={sidebarOverlayRef} class="mobile-sidebar-overlay" onClick={() => snapSidebar(false)}>
+          <div ref={sidebarPanelRef} class="mobile-sidebar-panel" onClick={(e) => e.stopPropagation()}>
             <div class="mobile-sidebar-header">
               <span style={{ fontWeight: 700, fontSize: 14, color: '#e2e8f0' }}>IM.codes</span>
-              <button class="mobile-sidebar-close" onClick={() => setMobileSidebarOpen(false)}>✕</button>
+              <button class="mobile-sidebar-close" onClick={() => snapSidebar(false)}>✕</button>
             </div>
             <div class="mobile-sidebar-body">
               {/* Server switcher */}
