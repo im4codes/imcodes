@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { useTranslation } from 'react-i18next';
 import type { PinnedPanel } from '../app.js';
+import { LanguageSwitcher } from './LanguageSwitcher.js';
 
 const LS_COLLAPSED = 'sidebar_collapsed';
 const LS_WIDTH = 'sidebar_width_';
@@ -179,10 +180,14 @@ export function Sidebar({ collapsed, serverId, pinnedPanels: _pinnedPanels, onDr
         </div>
       )}
 
-      {/* Build time footer */}
+      {/* Footer: language switcher + build time + copyright */}
       {!collapsed && (
-        <div class="sidebar-build-time">
-          {(() => { try { const d = new Date(__BUILD_TIME__); return `Build: ${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
+        <div class="sidebar-footer">
+          <LanguageSwitcher />
+          <div class="sidebar-build-time">
+            {(() => { try { const d = new Date(__BUILD_TIME__); return `Build: ${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
+          </div>
+          <div class="sidebar-copyright">© 2026 IM.codes</div>
         </div>
       )}
 

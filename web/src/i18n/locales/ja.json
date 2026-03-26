@@ -420,6 +420,8 @@
     "pinned_repo": "ファイル",
     "session_unavailable": "セッションは利用できません",
     "drop_to_pin": "ドロップして固定",
-    "pin_to_sidebar": "サイドバーに固定"
+    "pin_to_sidebar": "サイドバーに固定",
+    "expand_all": "すべて展開",
+    "collapse_all": "すべて折りたたむ"
   }
 }

@@ -420,6 +420,8 @@
     "pinned_repo": "파일",
     "session_unavailable": "세션을 사용할 수 없습니다",
     "drop_to_pin": "여기에 놓아 고정",
-    "pin_to_sidebar": "사이드바에 고정"
+    "pin_to_sidebar": "사이드바에 고정",
+    "expand_all": "모두 펼치기",
+    "collapse_all": "모두 접기"
   }
 }

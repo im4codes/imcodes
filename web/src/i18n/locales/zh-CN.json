@@ -420,6 +420,8 @@
     "pinned_repo": "文件",
     "session_unavailable": "会话不可用",
     "drop_to_pin": "拖放以固定",
-    "pin_to_sidebar": "固定到侧边栏"
+    "pin_to_sidebar": "固定到侧边栏",
+    "expand_all": "全部展开",
+    "collapse_all": "全部折叠"
   }
 }

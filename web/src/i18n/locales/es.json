@@ -420,6 +420,8 @@
     "pinned_repo": "Archivos",
     "session_unavailable": "Sesión no disponible",
     "drop_to_pin": "Soltar para anclar",
-    "pin_to_sidebar": "Fijar en barra lateral"
+    "pin_to_sidebar": "Fijar en barra lateral",
+    "expand_all": "Expandir todo",
+    "collapse_all": "Contraer todo"
   }
 }
