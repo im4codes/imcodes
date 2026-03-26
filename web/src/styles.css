@@ -393,6 +393,8 @@ body {
 .mobile-sidebar-close:active { color: #e2e8f0; }
 .mobile-sidebar-body { flex: 1; overflow-y: auto; min-height: 0; scrollbar-width: thin; scrollbar-color: #334155 transparent; }
 .mobile-sidebar-footer { flex-shrink: 0; padding: 8px 14px; border-top: 1px solid #1e293b; }
+.mobile-sidebar-hdr-btn { background: none; border: 1px solid #334155; color: #64748b; border-radius: 4px; padding: 2px 6px; font-size: 13px; cursor: pointer; line-height: 1; }
+.mobile-sidebar-hdr-btn.active { color: #60a5fa; border-color: #3b82f6; }
 
 /* ── Chat view ──────────────────────────────────────────────────── */
 .chat-view-wrap { flex: 1; position: relative; overflow: hidden; display: flex; flex-direction: column; }
@@ -824,8 +826,9 @@ body {
 .sidebar-pinned-unavailable { flex: 1; display: flex; align-items: center; justify-content: center; font-size: 11px; color: #475569; padding: 16px; text-align: center; }
 
 /* Resize handle at the bottom of each pinned panel */
-.sidebar-pinned-resize-handle { height: 4px; cursor: ns-resize; background: transparent; flex-shrink: 0; transition: background 0.15s; }
+.sidebar-pinned-resize-handle { height: 4px; cursor: ns-resize; background: transparent; flex-shrink: 0; transition: background 0.15s; touch-action: none; position: relative; }
 .sidebar-pinned-resize-handle:hover { background: rgba(99,102,241,0.4); }
+@media (pointer: coarse) { .sidebar-pinned-resize-handle { height: 14px; } .sidebar-pinned-resize-handle::before { content: ''; position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%); width: 32px; height: 3px; border-radius: 2px; background: #334155; } }
 
 /* Language switcher */
 .lang-switcher { background: #1e293b; border: 1px solid #334155; color: #94a3b8; cursor: pointer; font-size: 11px; padding: 2px 4px; border-radius: 4px; transition: all 0.15s; font-family: inherit; max-width: 120px; }

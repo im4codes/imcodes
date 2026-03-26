@@ -40,25 +40,27 @@ export function SidebarPinnedPanel({
 
   useEffect(() => { setLocalHeight(height); }, [height]);
 
+  const startDrag = useCallback((clientY: number) => {
+    isDraggingRef.current = true;
+    startYRef.current = clientY;
+    startHeightRef.current = localHeight;
+  }, [localHeight]);
+
   const handleResizeMouseDown = useCallback((e: MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    isDraggingRef.current = true;
-    startYRef.current = e.clientY;
-    startHeightRef.current = localHeight;
+    startDrag(e.clientY);
 
     const onMouseMove = (ev: MouseEvent) => {
       if (!isDraggingRef.current) return;
       const delta = ev.clientY - startYRef.current;
-      const newH = Math.max(MIN_HEIGHT, startHeightRef.current + delta);
-      setLocalHeight(newH);
+      setLocalHeight(Math.max(MIN_HEIGHT, startHeightRef.current + delta));
     };
 
     const onMouseUp = (ev: MouseEvent) => {
       if (!isDraggingRef.current) return;
       isDraggingRef.current = false;
-      const delta = ev.clientY - startYRef.current;
-      const finalH = Math.max(MIN_HEIGHT, startHeightRef.current + delta);
+      const finalH = Math.max(MIN_HEIGHT, startHeightRef.current + (ev.clientY - startYRef.current));
       setLocalHeight(finalH);
       onResize(finalH);
       document.removeEventListener('mousemove', onMouseMove);
@@ -67,7 +69,31 @@ export function SidebarPinnedPanel({
 
     document.addEventListener('mousemove', onMouseMove);
     document.addEventListener('mouseup', onMouseUp);
-  }, [localHeight, onResize]);
+  }, [startDrag, onResize]);
+
+  const handleResizeTouchStart = useCallback((e: TouchEvent) => {
+    e.stopPropagation();
+    startDrag(e.touches[0].clientY);
+
+    const onTouchMove = (ev: TouchEvent) => {
+      if (!isDraggingRef.current) return;
+      const delta = ev.touches[0].clientY - startYRef.current;
+      setLocalHeight(Math.max(MIN_HEIGHT, startHeightRef.current + delta));
+    };
+
+    const onTouchEnd = (ev: TouchEvent) => {
+      if (!isDraggingRef.current) return;
+      isDraggingRef.current = false;
+      const finalH = Math.max(MIN_HEIGHT, startHeightRef.current + (ev.changedTouches[0].clientY - startYRef.current));
+      setLocalHeight(finalH);
+      onResize(finalH);
+      document.removeEventListener('touchmove', onTouchMove);
+      document.removeEventListener('touchend', onTouchEnd);
+    };
+
+    document.addEventListener('touchmove', onTouchMove, { passive: true });
+    document.addEventListener('touchend', onTouchEnd);
+  }, [startDrag, onResize]);
 
   const title = getPanelTitle(panel, ctx);
   const content = renderPanelContent(panel, ctx);
@@ -96,6 +122,7 @@ export function SidebarPinnedPanel({
       <div
         class="sidebar-pinned-resize-handle"
         onMouseDown={handleResizeMouseDown}
+        onTouchStart={handleResizeTouchStart}
         aria-hidden="true"
       />
     </div>

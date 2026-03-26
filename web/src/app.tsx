@@ -117,6 +117,8 @@ export function App() {
   const [showMobileServerMenu, setShowMobileServerMenu] = useState(false);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [mobileHideServerBar, setMobileHideServerBar] = useState(() => localStorage.getItem('mobile_hide_server_bar') === '1');
+  const [mobileHideTabBar, setMobileHideTabBar] = useState(() => localStorage.getItem('mobile_hide_tab_bar') === '1');
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => loadSidebarCollapsed());
   const handleToggleSidebar = useCallback(() => {
     setSidebarCollapsed((prev) => {
@@ -1236,6 +1238,8 @@ export function App() {
     const drag = sidebarDragRef.current;
     const EDGE_ZONE = 30;
     const VELOCITY_THRESHOLD = 0.3; // px/ms — fast flick snaps regardless of position
+    let rafId = 0;
+    let pendingProgress = -1;
 
     const onStart = (e: TouchEvent) => {
       const t = e.touches[0];
@@ -1270,15 +1274,17 @@ export function App() {
       drag.lastTs = e.timeStamp;
 
       const w = getSidebarWidth();
-      let progress: number;
       if (drag.opening) {
-        // Opening: startX near 0, dragging right
-        progress = Math.max(0, t.clientX - drag.startX) / w;
+        pendingProgress = Math.max(0, t.clientX - drag.startX) / w;
       } else {
-        // Closing: sidebar is fully open, dragging left reduces progress
-        progress = 1 + Math.min(0, t.clientX - drag.startX) / w;
+        pendingProgress = 1 + Math.min(0, t.clientX - drag.startX) / w;
       }
-      applySidebarTransform(progress);
+      if (!rafId) {
+        rafId = requestAnimationFrame(() => {
+          rafId = 0;
+          if (pendingProgress >= 0) applySidebarTransform(pendingProgress);
+        });
+      }
     };
 
     const onEnd = (e: TouchEvent) => {
@@ -1308,6 +1314,7 @@ export function App() {
     document.addEventListener('touchmove', onMove, { passive: true });
     document.addEventListener('touchend', onEnd, { passive: true });
     return () => {
+      if (rafId) cancelAnimationFrame(rafId);
       document.removeEventListener('touchstart', onStart);
       document.removeEventListener('touchmove', onMove);
       document.removeEventListener('touchend', onEnd);
@@ -1821,7 +1828,7 @@ export function App() {
         ) : (
           <>
             {/* Mobile-only server switcher */}
-            <div class="mobile-server-bar">
+            <div class="mobile-server-bar" style={isMobile && mobileHideServerBar ? { display: 'none' } : undefined}>
               <button class="mobile-sidebar-toggle" onClick={() => { setMobileSidebarOpen(true); requestAnimationFrame(() => snapSidebar(true)); }}>≡</button>
               <div class="mobile-server-switcher-wrap">
                 <button
@@ -1883,23 +1890,25 @@ export function App() {
               </div>
             </div>
 
-            <SessionTabs
-              sessions={sessions}
-              activeSession={activeSession}
-              connected={connected}
-              latencyMs={latencyMs}
-              idleAlerts={idleAlerts}
-              activeTools={activeTools}
-              onAlertDismiss={(name) => setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; })}
-              onSelect={(name) => { setActiveSession(name); setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; }); }}
-              onNewSession={() => setShowNewSession(true)}
-              onStopProject={handleStopProject}
-              onRestartProject={handleRestartProject}
-              renameRequest={renameRequest}
-              onRenameHandled={() => setRenameRequest(null)}
-              onRenameSession={handleRenameSession}
-              sessionsLoaded={sessionsLoaded}
-            />
+            {!(isMobile && mobileHideTabBar) && (
+              <SessionTabs
+                sessions={sessions}
+                activeSession={activeSession}
+                connected={connected}
+                latencyMs={latencyMs}
+                idleAlerts={idleAlerts}
+                activeTools={activeTools}
+                onAlertDismiss={(name) => setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; })}
+                onSelect={(name) => { setActiveSession(name); setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; }); }}
+                onNewSession={() => setShowNewSession(true)}
+                onStopProject={handleStopProject}
+                onRestartProject={handleRestartProject}
+                renameRequest={renameRequest}
+                onRenameHandled={() => setRenameRequest(null)}
+                onRenameSession={handleRenameSession}
+                sessionsLoaded={sessionsLoaded}
+              />
+            )}
 
             {/* Desktop view mode toggle — mobile uses the one in mobile-server-bar */}
             {!isMobile && activeSession && (
@@ -2027,7 +2036,19 @@ export function App() {
           <div ref={sidebarPanelRef} class="mobile-sidebar-panel" onClick={(e) => e.stopPropagation()}>
             <div class="mobile-sidebar-header">
               <span style={{ fontWeight: 700, fontSize: 14, color: '#e2e8f0' }}>IM.codes</span>
-              <button class="mobile-sidebar-close" onClick={() => snapSidebar(false)}>✕</button>
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                <button
+                  class={`mobile-sidebar-hdr-btn${mobileHideServerBar ? '' : ' active'}`}
+                  onClick={() => setMobileHideServerBar((p) => { const v = !p; localStorage.setItem('mobile_hide_server_bar', v ? '1' : ''); return v; })}
+                  title="Server bar"
+                >≡</button>
+                <button
+                  class={`mobile-sidebar-hdr-btn${mobileHideTabBar ? '' : ' active'}`}
+                  onClick={() => setMobileHideTabBar((p) => { const v = !p; localStorage.setItem('mobile_hide_tab_bar', v ? '1' : ''); return v; })}
+                  title="Session tabs"
+                >⊞</button>
+                <button class="mobile-sidebar-close" onClick={() => snapSidebar(false)}>✕</button>
+              </div>
             </div>
             <div class="mobile-sidebar-body">
               {/* Server switcher */}
