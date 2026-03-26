@@ -155,11 +155,12 @@ export function App() {
         || el.getAttribute('contenteditable') === 'true'
         || el.classList.contains('xterm-helper-textarea');
       update();
-      // Auto-scroll sidebar body to show focused panel when keyboard opens
+      // Auto-scroll sidebar body to show focused panel when keyboard opens.
+      // Delay to let --vvh update after keyboard animates in, then scroll panel to top.
       const sidebarBody = el.closest?.('.mobile-sidebar-body');
       if (sidebarBody) {
         const panel = el.closest('.sidebar-pinned-panel') as HTMLElement | null;
-        if (panel) requestAnimationFrame(() => panel.scrollIntoView({ block: 'nearest', behavior: 'smooth' }));
+        if (panel) setTimeout(() => panel.scrollIntoView({ block: 'start', behavior: 'smooth' }), 350);
       }
     };
     const onFocusOut = () => { inputFocused = false; update(); };
