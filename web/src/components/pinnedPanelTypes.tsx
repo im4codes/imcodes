@@ -47,9 +47,12 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
 }
 
 registerPanelType('subsession', {
-  title: (panel) => {
-    const name = (panel.props?.sessionName as string) ?? '';
-    return (panel.props?.label as string) ?? name.replace(/^deck_sub_/, '');
+  title: (panel, ctx) => {
+    const sessionName = (panel.props?.sessionName as string) ?? '';
+    const liveSub = ctx?.subSessions.find(s => s.sessionName === sessionName);
+    const label = liveSub?.label ?? (panel.props?.label as string) ?? sessionName.replace(/^deck_sub_/, '');
+    const agentType = liveSub?.type;
+    return agentType ? `${label} · ${agentType}` : label;
   },
   render: (panel, ctx) => <SubSessionContent panel={panel} ctx={ctx} />,
 });

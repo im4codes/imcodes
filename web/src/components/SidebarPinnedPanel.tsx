@@ -69,7 +69,7 @@ export function SidebarPinnedPanel({
     document.addEventListener('mouseup', onMouseUp);
   }, [localHeight, onResize]);
 
-  const title = getPanelTitle(panel);
+  const title = getPanelTitle(panel, ctx);
   const content = renderPanelContent(panel, ctx);
 
   return (

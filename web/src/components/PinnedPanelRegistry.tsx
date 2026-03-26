@@ -33,7 +33,7 @@ export interface PanelRenderContext {
 }
 
 export interface PanelTypeRegistration {
-  title: (panel: PinnedPanel) => string;
+  title: (panel: PinnedPanel, ctx?: PanelRenderContext) => string;
   render: (panel: PinnedPanel, ctx: PanelRenderContext) => ComponentChildren;
 }
 
@@ -47,9 +47,9 @@ export function getPanelType(type: string): PanelTypeRegistration | undefined {
   return registry.get(type);
 }
 
-export function getPanelTitle(panel: PinnedPanel): string {
+export function getPanelTitle(panel: PinnedPanel, ctx?: PanelRenderContext): string {
   const reg = registry.get(panel.type);
-  return reg ? reg.title(panel) : panel.type;
+  return reg ? reg.title(panel, ctx) : panel.type;
 }
 
 export function renderPanelContent(panel: PinnedPanel, ctx: PanelRenderContext): ComponentChildren {
