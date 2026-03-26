@@ -275,12 +275,11 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
 
   const handleSave = async () => {
     setSaving(true);
-    // Fill in defaults for any session not yet in cfg
-    const merged: P2pSessionConfig = { ...sessionCfg };
+    // Only keep entries for currently eligible sessions — drop stale entries
+    // from old/closed sessions or other daemons to prevent config rot.
+    const merged: P2pSessionConfig = {};
     for (const e of eligible) {
-      if (!merged[e.key]) {
-        merged[e.key] = { enabled: true, mode: 'audit' };
-      }
+      merged[e.key] = sessionCfg[e.key] ?? { enabled: true, mode: 'audit' };
     }
     const cfg: P2pSavedConfig = { sessions: merged, rounds, extraPrompt: extraPrompt.trim() || undefined };
     try {
