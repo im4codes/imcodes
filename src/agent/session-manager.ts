@@ -567,6 +567,8 @@ export interface LaunchOpts {
   bindExistingKey?: string;
   /** Skip the sessions.create RPC — session already exists on provider (auto-sync bind). */
   skipCreate?: boolean;
+  /** Parent session name for sub-sessions (used to group in UI). */
+  parentSession?: string;
 }
 
 /** In-memory map of active transport session runtimes */
@@ -614,7 +616,7 @@ export function getTransportRuntime(name: string): TransportSessionRuntime | und
 }
 
 export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
-  const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate } = opts;
+  const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate, parentSession } = opts;
 
   const provider = getProvider(agentType);
   if (!provider) {
@@ -655,6 +657,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         providerSessionId: runtime.providerSessionId ?? undefined,
         description,
         label,
+        parentSession,
       };
       upsertSession(record);
       emitSessionPersist(record, name);

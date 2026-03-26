@@ -14,7 +14,7 @@ import {
   registerProviderRoute,
   type LaunchOpts,
 } from '../agent/session-manager.js';
-import { getSession, findSessionByProviderSessionId } from '../store/session-store.js';
+import { getSession, findSessionByProviderSessionId, upsertSession } from '../store/session-store.js';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -128,13 +128,13 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
     const mName = mainSessionName(group.agentName);
     const mainExists = !!getSession(mName);
 
-    if (!mainExists && group.mainSession) {
-      // Check uniqueness — routing map + session store
-      if (isProviderSessionBound(group.mainSession.key)) {
-        logger.debug({ key: group.mainSession.key, mName }, 'oc-sync: main session providerSessionId already bound — skipped');
-      } else if (findSessionByProviderSessionId(group.mainSession.key)) {
-        // Exists in store but runtime/route lost (reconnect) — recreate runtime + re-register route
-        if (!getTransportRuntime(mName)) {
+    if (group.mainSession) {
+      const mainRecord = getSession(mName);
+      const needsRuntime = !getTransportRuntime(mName);
+
+      if (mainExists && needsRuntime) {
+        // Session in store but runtime lost (daemon restart / OC reconnect) — recreate runtime
+        if (!isProviderSessionBound(group.mainSession.key)) {
           try {
             await launchTransportSession({
               name: mName, projectName: mName, role: 'w1', agentType: 'openclaw',
@@ -142,33 +142,36 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
               projectDir: mainSessionProjectDir(group.agentName),
               bindExistingKey: group.mainSession.key, skipCreate: true, skipStore: true,
             });
+            upsertSession({ ...mainRecord!, state: 'running', label: mainSessionLabel(group.agentName), updatedAt: Date.now() });
             logger.info({ session: mName, ocKey: group.mainSession.key }, 'oc-sync: reconnected main session runtime');
           } catch (err) {
-            // Fallback: at least register the route so events can flow
             registerProviderRoute(group.mainSession.key, mName);
-            logger.warn({ err, session: mName }, 'oc-sync: failed to recreate runtime, route-only fallback');
+            logger.warn({ err, session: mName }, 'oc-sync: failed to recreate main runtime, route-only fallback');
           }
-        } else {
-          registerProviderRoute(group.mainSession.key, mName);
         }
-      } else {
-        try {
-          const opts: LaunchOpts = {
-            name: mName,
-            projectName: mName,
-            role: 'w1',
-            agentType: 'openclaw',
-            label: mainSessionLabel(group.agentName),
-            projectDir: mainSessionProjectDir(group.agentName),
-            description: group.mainSession.displayName,
-            bindExistingKey: group.mainSession.key,
-            skipCreate: true,
-          };
-          await launchTransportSession(opts);
-          created++;
-          logger.info({ session: mName, ocKey: group.mainSession.key }, 'oc-sync: materialized main session');
-        } catch (err) {
-          logger.warn({ err, session: mName }, 'oc-sync: failed to materialize main session');
+      } else if (!mainExists) {
+        // New session — check uniqueness then create
+        if (isProviderSessionBound(group.mainSession.key)) {
+          logger.debug({ key: group.mainSession.key, mName }, 'oc-sync: main session providerSessionId already bound — skipped');
+        } else {
+          try {
+            const opts: LaunchOpts = {
+              name: mName,
+              projectName: mName,
+              role: 'w1',
+              agentType: 'openclaw',
+              label: mainSessionLabel(group.agentName),
+              projectDir: mainSessionProjectDir(group.agentName),
+              description: group.mainSession.displayName,
+              bindExistingKey: group.mainSession.key,
+              skipCreate: true,
+            };
+            await launchTransportSession(opts);
+            created++;
+            logger.info({ session: mName, ocKey: group.mainSession.key }, 'oc-sync: materialized main session');
+          } catch (err) {
+            logger.warn({ err, session: mName }, 'oc-sync: failed to materialize main session');
+          }
         }
       }
     }
@@ -193,8 +196,17 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
               label: ch.displayName || ch.key,
               projectDir: mainSessionProjectDir(group.agentName),
               bindExistingKey: ch.key, skipCreate: true, skipStore: true,
+              parentSession: mName,
             });
-            logger.info({ session: existingInStore.name, ocKey: ch.key }, 'oc-sync: reconnected sub-session runtime');
+            // Update store: mark running, set parentSession + label (may have been missing)
+            upsertSession({
+              ...existingInStore,
+              state: 'running',
+              parentSession: mName,
+              label: existingInStore.label || ch.displayName || ch.key,
+              updatedAt: Date.now(),
+            });
+            logger.info({ session: existingInStore.name, ocKey: ch.key, parent: mName }, 'oc-sync: reconnected sub-session runtime');
           } catch (err) {
             registerProviderRoute(ch.key, existingInStore.name);
             logger.warn({ err, session: existingInStore.name }, 'oc-sync: failed to recreate runtime, route-only fallback');
@@ -220,6 +232,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
           description: ch.displayName,
           bindExistingKey: ch.key,
           skipCreate: true,
+          parentSession: mName,
         };
         await launchTransportSession(opts);
         created++;
