@@ -518,6 +518,7 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
       <div class="chat-main">
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} onScroll={preview ? undefined : handleScroll}
           onContextMenu={!preview && !isTouchDevice ? (e) => {
+            e.preventDefault(); // block native context menu
             // Desktop: right-click highlights message + shows context menu
             const target = (e.target as HTMLElement).closest?.('.chat-event') as HTMLElement | null;
             if (highlightEl) highlightEl.classList.remove('chat-highlight');
