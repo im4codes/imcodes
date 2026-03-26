@@ -131,4 +131,4 @@ Login at `https://your-domain` with `admin` and the printed password. Bind your 
 
 ## License
 
-[GPLv3](LICENSE)
+[MIT](LICENSE)
