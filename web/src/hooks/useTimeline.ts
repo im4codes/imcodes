@@ -52,6 +52,8 @@ export function useTimeline(
   ws: WsClient | null,
 ): UseTimelineResult {
   const [events, setEvents] = useState<TimelineEvent[]>([]);
+  const eventsRef = useRef(events);
+  eventsRef.current = events;
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -249,19 +251,18 @@ export function useTimeline(
         const event = msg.event;
         if (event.sessionId !== sessionId) return;
 
-        // Echo dedup: hide assistant.text that echoes a recent user message (e.g. prompt repeat)
+        // Echo dedup: hide assistant.text that echoes a recent user message (e.g. prompt repeat).
+        // Read current events via ref (avoid unnecessary setEvents call that returns prev unchanged).
         if (event.type === 'assistant.text' && event.payload.text) {
           const normalized = normalizeForEcho(String(event.payload.text));
-          setEvents((prev) => {
-            const recentUserMsg = prev.find(
-              (e) =>
-                e.type === 'user.message' &&
-                e.ts > event.ts - ECHO_WINDOW_MS &&
-                normalizeForEcho(String(e.payload.text ?? '')) === normalized,
-            );
-            if (recentUserMsg) event.hidden = true;
-            return prev;
-          });
+          const prev = eventsRef.current;
+          const recentUserMsg = prev.find(
+            (e) =>
+              e.type === 'user.message' &&
+              e.ts > event.ts - ECHO_WINDOW_MS &&
+              normalizeForEcho(String(e.payload.text ?? '')) === normalized,
+          );
+          if (recentUserMsg) event.hidden = true;
         }
 
         // user.message: remove matching optimistic (pending) event, then dedup

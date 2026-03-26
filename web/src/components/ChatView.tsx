@@ -5,6 +5,7 @@
  */
 import { h } from 'preact';
 import { useEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
+import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent, WsClient } from '../ws-client.js';
 import { FileBrowser } from './FileBrowser.js';
@@ -841,7 +842,7 @@ function AttachmentDownloadButton({ att, serverId }: { att: { id: string; origin
   );
 }
 
-function ChatEvent({ event, nextTs, onPathClick, serverId }: { event: TimelineEvent; nextTs?: number; onPathClick?: (p: string) => void; serverId?: string }) {
+const ChatEvent = memo(function ChatEvent({ event, nextTs, onPathClick, serverId }: { event: TimelineEvent; nextTs?: number; onPathClick?: (p: string) => void; serverId?: string }) {
   switch (event.type) {
     case 'user.message': {
       let userText = String(event.payload.text ?? '');
@@ -924,7 +925,7 @@ function ChatEvent({ event, nextTs, onPathClick, serverId }: { event: TimelineEv
     default:
       return null;
   }
-}
+});
 
 function ActiveThinkingLabel({ startTs }: { startTs: number }) {
   const { t } = useTranslation();
@@ -937,7 +938,7 @@ function ActiveThinkingLabel({ startTs }: { startTs: number }) {
   return <>{t('chat.thinking_running', { sec })}</>;
 }
 
-function ThinkingEvent({ event, endTs }: { event: TimelineEvent; endTs?: number }) {
+const ThinkingEvent = memo(function ThinkingEvent({ event, endTs }: { event: TimelineEvent; endTs?: number }) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const isActive = endTs === undefined;
@@ -959,7 +960,7 @@ function ThinkingEvent({ event, endTs }: { event: TimelineEvent; endTs?: number 
       </button>
     </div>
   );
-}
+});
 
 function SnapshotEvent({ event }: { event: TimelineEvent }) {
   const [expanded, setExpanded] = useState(false);
@@ -982,13 +983,13 @@ function SnapshotEvent({ event }: { event: TimelineEvent }) {
   );
 }
 
-function ChatTime({ ts }: { ts: number }) {
+const ChatTime = memo(function ChatTime({ ts }: { ts: number }) {
   return (
     <div class="chat-bubble-time">
       {new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
     </div>
   );
-}
+});
 
 // ── Markdown rendering delegated to ChatMarkdown.tsx ──────────────────────
 

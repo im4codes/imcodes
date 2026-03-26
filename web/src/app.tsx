@@ -1582,6 +1582,17 @@ export function App() {
 
   const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
 
+  // Memoized sub-session mappings — avoids creating new arrays on every render,
+  // which would defeat memo() on child components (SessionPane, SessionTree, pinned panels).
+  const subSessionsSlim = useMemo(() =>
+    subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession })),
+    [subSessions]
+  );
+  const subSessionsFull = useMemo(() =>
+    subSessions.map(s => ({ id: s.id, sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, cwd: s.cwd, parentSession: s.parentSession })),
+    [subSessions]
+  );
+
   // Auto-pin file browser to sidebar on first session activation.
   // Respects user preference: once they have any pinned panels saved, don't interfere.
   const autoPinnedRef = useRef(false);
@@ -1757,7 +1768,7 @@ export function App() {
                 ws: wsRef.current,
                 connected,
                 serverId: (props.serverId as string) ?? selectedServerId ?? '',
-                subSessions: subSessions.map(s => ({ id: s.id, sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, cwd: s.cwd, parentSession: s.parentSession })),
+                subSessions: subSessionsFull,
                 inputRefsMap,
                 onPreviewFile: (path) => setPreviewFilePath(path),
                 activeSession,
@@ -1976,7 +1987,7 @@ export function App() {
                 serverId={selectedServerId ?? ''}
                 session={s}
                 sessions={sessions}
-                subSessions={subSessions.map(sub => ({ sessionName: sub.sessionName, type: sub.type, label: sub.label, state: sub.state, parentSession: sub.parentSession }))}
+                subSessions={subSessionsSlim}
                 ws={wsRef.current}
                 connected={connected}
                 isActive={s.name === activeSession}
@@ -2155,7 +2166,7 @@ export function App() {
                   ws: wsRef.current,
                   connected,
                   serverId: (props.serverId as string) ?? selectedServerId ?? '',
-                  subSessions: subSessions.map(s => ({ id: s.id, sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, cwd: s.cwd, parentSession: s.parentSession })),
+                  subSessions: subSessionsFull,
                   inputRefsMap,
                   onPreviewFile: (path) => { setPreviewFilePath(path); snapSidebar(false); },
                   activeSession,
@@ -2295,7 +2306,7 @@ export function App() {
               onFocus={() => bringSubToFront(sub.id)}
               onPin={(vm) => pinPanel('subsession', { sessionName: sub.sessionName, viewMode: vm, label: sub.label, serverId: selectedServerId }, () => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; }))}
               sessions={sessions}
-              subSessions={subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession }))}
+              subSessions={subSessionsSlim}
               serverId={selectedServerId ?? undefined}
             />
           </div>

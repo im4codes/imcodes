@@ -187,13 +187,15 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
     }
   }, [subSessions]);
 
-  // Merge server order with persisted order: keep known positions, append new sessions at end
+  // Merge server order with persisted order: keep known positions, append new sessions at end.
+  // Uses Set for O(n) membership checks instead of O(n²) .some()/.includes().
   const orderedSessions = useMemo(() => {
-    const known = orderedIds.filter((id) => subSessions.some((s) => s.id === id));
-    const newOnes = subSessions.filter((s) => !known.includes(s.id)).map((s) => s.id);
-    const merged = [...known, ...newOnes];
-    const map = new Map(subSessions.map((s) => [s.id, s]));
-    return merged.map((id) => map.get(id)!).filter(Boolean);
+    const sessionMap = new Map(subSessions.map((s) => [s.id, s]));
+    const sessionIdSet = new Set(sessionMap.keys());
+    const known = orderedIds.filter((id) => sessionIdSet.has(id));
+    const knownSet = new Set(known);
+    const newOnes = subSessions.filter((s) => !knownSet.has(s.id)).map((s) => s.id);
+    return [...known, ...newOnes].map((id) => sessionMap.get(id)!).filter(Boolean);
   }, [subSessions, orderedIds]);
 
   useEffect(() => {
