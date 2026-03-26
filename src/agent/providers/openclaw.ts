@@ -467,29 +467,39 @@ export class OpenClawProvider implements TransportProvider {
         // Received delta before lifecycle start — create accumulator on the fly.
         const sessionId = sanitizeKey(payload.key ?? payload.sessionKey ?? runId);
         const messageId = randomUUID();
-        this.runAccumulator.set(runId, { sessionId, messageId, text: assistantData.text ?? assistantData.delta ?? '' });
-        // Emit the delta we have now.
+        const initialText = assistantData.text ?? assistantData.delta ?? '';
+        this.runAccumulator.set(runId, { sessionId, messageId, text: initialText });
+        // Emit the cumulative text (same as acc.text) so transport-relay can
+        // replace-in-place via stable eventId (typewriter effect).
         const delta: MessageDelta = {
           messageId,
           type: 'text',
-          delta: assistantData.delta ?? '',
+          delta: initialText,
           role: 'assistant',
         };
         this.deltaCallbacks.forEach((cb) => cb(sessionId, delta));
         return;
       }
 
-      // Update accumulated text (prefer cumulative `text` field, fall back to appending delta).
-      if (assistantData.text !== undefined) {
+      // Update accumulated text.
+      // OC gateway is inconsistent: sometimes `text` is cumulative (starts with acc.text),
+      // sometimes it's just the incremental piece (same as `delta`).
+      // Detect which case we're in and handle accordingly.
+      if (assistantData.text !== undefined && assistantData.text.startsWith(acc.text)) {
+        // `text` is cumulative — use it directly as the new accumulator
         acc.text = assistantData.text;
       } else if (assistantData.delta !== undefined) {
+        // Incremental delta — append to accumulator
         acc.text += assistantData.delta;
+      } else if (assistantData.text !== undefined) {
+        // `text` is present but not cumulative and no delta — append text as incremental
+        acc.text += assistantData.text;
       }
 
       const delta: MessageDelta = {
         messageId: acc.messageId,
         type: 'text',
-        delta: assistantData.delta ?? '',
+        delta: acc.text,
         role: 'assistant',
       };
       this.deltaCallbacks.forEach((cb) => cb(acc.sessionId, delta));

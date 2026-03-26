@@ -398,7 +398,10 @@ export async function startup(): Promise<DaemonContext> {
     const DEDUP_MAX = 2000;
 
     timelineEmitter.on((event) => {
-      if (event.eventId && sentEventIds.has(event.eventId)) return; // already sent
+      // Streaming transport events reuse the same eventId for in-place replacement
+      // (typewriter effect). Don't dedup them — every delta must reach the browser.
+      const isStreamingUpdate = (event.payload as Record<string, unknown>)?.streaming === true;
+      if (event.eventId && sentEventIds.has(event.eventId) && !isStreamingUpdate) return;
       if (event.eventId) {
         sentEventIds.add(event.eventId);
         if (sentEventIds.size > DEDUP_MAX) {

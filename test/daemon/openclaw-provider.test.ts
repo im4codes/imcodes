@@ -263,6 +263,81 @@ describe('OpenClawProvider', () => {
       expect(deltas[0].delta.role).toBe('assistant');
     });
 
+    it('emits cumulative text in delta (not incremental) for typewriter replacement', async () => {
+      await connectProvider(provider);
+
+      const deltas: Array<{ sessionId: string; delta: MessageDelta }> = [];
+      provider.onDelta((sessionId, delta) => deltas.push({ sessionId, delta }));
+
+      const runId = 'run-cum-delta';
+
+      // lifecycle start
+      emitAgentEvent({ runId, stream: 'lifecycle', data: { phase: 'start' }, key: 'sess-cd' });
+
+      // 4 incremental deltas (OC sends only `delta` field, no `text`)
+      emitAgentEvent({ runId, stream: 'assistant', data: { delta: '收' }, key: 'sess-cd' });
+      emitAgentEvent({ runId, stream: 'assistant', data: { delta: '到' }, key: 'sess-cd' });
+      emitAgentEvent({ runId, stream: 'assistant', data: { delta: '主' }, key: 'sess-cd' });
+      emitAgentEvent({ runId, stream: 'assistant', data: { delta: '人' }, key: 'sess-cd' });
+
+      expect(deltas).toHaveLength(4);
+      // Each delta.delta should be cumulative (growing), not just the latest char
+      expect(deltas[0].delta.delta).toBe('收');
+      expect(deltas[1].delta.delta).toBe('收到');
+      expect(deltas[2].delta.delta).toBe('收到主');
+      expect(deltas[3].delta.delta).toBe('收到主人');
+    });
+
+    it('emits cumulative text when OC provides both text and delta fields', async () => {
+      await connectProvider(provider);
+
+      const deltas: Array<{ sessionId: string; delta: MessageDelta }> = [];
+      provider.onDelta((sessionId, delta) => deltas.push({ sessionId, delta }));
+
+      const runId = 'run-both-fields';
+
+      emitAgentEvent({ runId, stream: 'lifecycle', data: { phase: 'start' }, key: 'sess-bf' });
+
+      // OC sends cumulative `text` + incremental `delta`
+      emitAgentEvent({ runId, stream: 'assistant', data: { text: 'Hello', delta: 'Hello' }, key: 'sess-bf' });
+      emitAgentEvent({ runId, stream: 'assistant', data: { text: 'Hello World', delta: ' World' }, key: 'sess-bf' });
+
+      expect(deltas).toHaveLength(2);
+      // delta.delta should be the cumulative acc.text, not the incremental delta
+      expect(deltas[0].delta.delta).toBe('Hello');
+      expect(deltas[1].delta.delta).toBe('Hello World');
+    });
+
+    it('handles non-cumulative text field from OC (same as delta, not growing)', async () => {
+      await connectProvider(provider);
+
+      const deltas: Array<{ sessionId: string; delta: MessageDelta }> = [];
+      provider.onDelta((sessionId, delta) => deltas.push({ sessionId, delta }));
+
+      const completes: Array<{ sessionId: string; message: AgentMessage }> = [];
+      provider.onComplete((sessionId, message) => completes.push({ sessionId, message }));
+
+      const runId = 'run-non-cum';
+
+      emitAgentEvent({ runId, stream: 'lifecycle', data: { phase: 'start' }, key: 'sess-nc' });
+
+      // OC sends text=delta (non-cumulative text field, same as delta)
+      emitAgentEvent({ runId, stream: 'assistant', data: { text: '收到主人，', delta: '收到主人，' }, key: 'sess-nc' });
+      emitAgentEvent({ runId, stream: 'assistant', data: { text: '刚查完天气', delta: '刚查完天气' }, key: 'sess-nc' });
+      emitAgentEvent({ runId, stream: 'assistant', data: { text: '有事叫我', delta: '有事叫我' }, key: 'sess-nc' });
+
+      expect(deltas).toHaveLength(3);
+      // Despite text field not being cumulative, delta.delta should still be cumulative
+      expect(deltas[0].delta.delta).toBe('收到主人，');
+      expect(deltas[1].delta.delta).toBe('收到主人，刚查完天气');
+      expect(deltas[2].delta.delta).toBe('收到主人，刚查完天气有事叫我');
+
+      emitAgentEvent({ runId, stream: 'lifecycle', data: { phase: 'end' }, key: 'sess-nc' });
+
+      // onComplete should have the full accumulated text
+      expect(completes[0].message.content).toBe('收到主人，刚查完天气有事叫我');
+    });
+
     it('creates accumulator on the fly if delta arrives before lifecycle start', async () => {
       await connectProvider(provider);
 
