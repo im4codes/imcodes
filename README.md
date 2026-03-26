@@ -7,10 +7,16 @@ A purpose-built interface for managing AI coding agents. Remote terminal, multi-
 ### Desktop
 
 <p>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-sidebar.png"><img src="landing/imcodes-sidebar.png" width="24%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes0.png"><img src="landing/imcodes0.png" width="24%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes1.png"><img src="landing/imcodes1.png" width="24%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes2.png"><img src="landing/imcodes2.png" width="24%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes3.png"><img src="landing/imcodes3.png" width="24%" /></a>
+</p>
+
+### iPad / Tablet
+
+<p>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-ipad.png"><img src="landing/imcodes-ipad.png" width="40%" /></a>
 </p>
 
 ### Mobile
@@ -35,23 +41,47 @@ This is a personal project. I haven't written any code myself — it was built a
 
 ### Remote Terminal
 
-Full terminal access to your agent sessions from any browser — no SSH, no VPN, no port forwarding. Switch between raw terminal mode (the native CLI experience) and a structured chat view with parsed tool calls, thinking blocks, and streaming output. Real-time PTY streaming with zero message limits.
+Full terminal access to your agent sessions from any browser — no SSH, no VPN, no port forwarding. Switch between raw terminal mode (the native CLI experience) and a structured chat view with parsed tool calls, thinking blocks, and streaming output. Real-time PTY streaming at 12fps with zero message limits.
+
+### Discord-Style Sidebar
+
+Server icon bar for instant multi-server switching. Hierarchical session tree with collapsible sub-sessions, unread message badges, and idle flash animation when agents finish tasks. Pin any floating window (file browser, repository, sub-session chat) to the sidebar for persistent access. Language switcher and build info at the bottom.
 
 ### Multi-Agent Discussions & Audit
 
-Single-model output shouldn't be trusted blindly. Spawn quick discussion rounds where multiple agents — across different providers — review, audit, or brainstorm on the same topic. Each agent reads prior contributions and adds their own. Modes include `discuss`, `audit`, `review`, and `brainstorm`. Works across Claude Code, Codex, and Gemini CLI, including sandboxed agents.
+Single-model output shouldn't be trusted blindly. Spawn quick discussion rounds where multiple agents — across different providers — review, audit, or brainstorm on the same topic. Each agent reads prior contributions and adds their own. Modes include `discuss`, `audit`, `review`, and `brainstorm`. Ring progress indicator shows round/hop completion in the sidebar. Works across Claude Code, Codex, and Gemini CLI, including sandboxed agents.
+
+### @ Picker — Smart Agent & File Selection
+
+Type `@` to search project files, `@@` to select agents for P2P dispatch. `@@all(config)` sends to all configured agents with saved per-session P2P settings (mode, rounds, participants). Custom round counts via `@@all+`. The picker integrates with the structured WS routing — daemon handles all expansion, frontend stays clean.
 
 ### Multi-Server, Multi-Session Management
 
-Connect multiple dev machines to one dashboard. Each machine runs a lightweight daemon that manages local agent sessions via tmux. See all servers and sessions at a glance — start, stop, restart, or switch between them instantly. Sub-sessions let you spawn additional agents from within a running session for parallel tasks.
+Connect multiple dev machines to one dashboard. Each machine runs a lightweight daemon that manages local agent sessions via tmux. See all servers and sessions at a glance — start, stop, restart, or switch between them instantly. Sub-sessions let you spawn additional agents from within a running session for parallel tasks. Draggable tabs with pin support and right-click context menus.
 
-### File Browser & Preview
+### Pinnable Panels
 
-Browse project files, preview any file with syntax highlighting, and view git diffs with inline change comparison — all from the browser. Upload files from browser or phone (including camera capture), referenced in chat with `@path`.
+Drag any floating window to the sidebar to pin it as a persistent panel. Supports file browser, repository page, sub-session chat, and terminal views. Panels are resizable, server-synced (cross-device), and auto-recover on reconnect. Generic registry — new panel types register in one file.
+
+### File Browser & Git Changes
+
+Browse project files with a tree view. Changes tab shows git status with per-file `+additions`/`-deletions` line counts in color. Click a file to open a floating preview window with syntax highlighting, diff view, and auto-refresh every 5s. Pin the file browser to the sidebar — it follows the active tab's project directory automatically.
+
+### Repository Dashboard
+
+View issues, pull requests, branches, commits, and CI/CD runs directly in the app. Silent background refresh — no more pull-to-refresh jitter. CI status auto-polls (10s when running, 15s otherwise). Pin the repository page to the sidebar for always-on visibility.
+
+### Cross-Device Sync
+
+Tab order, pinned tabs, and pinned sidebar panels sync across devices via the server preferences API. Write-through cache pattern: localStorage for instant render, debounced server PUT for cross-device consistency. Timestamped payloads for conflict resolution. Device-specific state (sidebar width, panel heights, view mode) stays local.
 
 ### Mobile & Notifications
 
-Full mobile support with biometric auth. Push notifications when an agent finishes a task or needs attention — so you don't have to watch a spinner.
+Full mobile support with biometric auth and push notifications. Shell sessions allow interactive keyboard input on mobile (SSH-like). Sub-session preview cards always show latest messages. Toast notifications navigate directly to the relevant session.
+
+### Internationalization
+
+7 languages: English, 简体中文, 繁體中文, Español, Русский, 日本語, 한국어. Language switcher in the sidebar footer. All user-visible strings use i18n keys.
 
 ### OTA Updates
 
@@ -65,11 +95,11 @@ You (browser / mobile)
 Server (self-hosted)
         ↓ WebSocket
 Daemon (your machine, manages tmux)
-        ↓ tmux
-AI Agents (Claude Code / Codex / Gemini CLI)
+        ↓ tmux / transport
+AI Agents (Claude Code / Codex / Gemini CLI / OpenClaw)
 ```
 
-The daemon runs on your dev machine and manages agent sessions through tmux. The server relays connections between your devices and the daemon. Everything stays on your infrastructure.
+The daemon runs on your dev machine and manages agent sessions through tmux (process-backed) or network protocols (transport-backed, e.g. OpenClaw gateway). The server relays connections between your devices and the daemon. Everything stays on your infrastructure.
 
 ## Install
 
@@ -132,3 +162,5 @@ Login at `https://your-domain` with `admin` and the printed password. Bind your 
 ## License
 
 [MIT](LICENSE)
+
+© 2026 IM.codes

@@ -244,11 +244,13 @@ footer {
   <div class="screenshots">
     <p>Desktop</p>
     <div class="row desktop">
-      <a href="#" onclick="openLightbox(0);return false"><img src="imcodes0.png" alt="Desktop 1" loading="lazy" /></a>
-      <a href="#" onclick="openLightbox(1);return false"><img src="imcodes1.png" alt="Desktop 2" loading="lazy" /></a>
-      <a href="#" onclick="openLightbox(2);return false"><img src="imcodes2.png" alt="Desktop 3" loading="lazy" /></a>
-      <a href="#" onclick="openLightbox(3);return false"><img src="imcodes3.png" alt="Desktop 4" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(0);return false"><img src="imcodes-sidebar.png" alt="Sidebar" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(1);return false"><img src="imcodes0.png" alt="Desktop 1" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(2);return false"><img src="imcodes1.png" alt="Desktop 2" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(3);return false"><img src="imcodes2.png" alt="Desktop 3" loading="lazy" /></a>
     </div>
+    <p>iPad / Tablet</p>
+    <div class="row" style="margin-bottom:12px"><a href="#" onclick="openLightbox(4);return false" style="width:40%;border-radius:4px;overflow:hidden;border:1px solid var(--border)"><img src="imcodes-ipad.png" alt="iPad" style="width:100%;display:block" loading="lazy" /></a></div>
     <p>Mobile</p>
     <div class="row mobile">
       <a href="#" onclick="openLightbox(4);return false"><img src="imcodes-m1.png" alt="Mobile 1" loading="lazy" /></a>
@@ -270,16 +272,22 @@ footer {
 <section>
   <h2 data-i18n="h_features">features</h2>
   <div class="features">
-    <div class="feat"><div class="feat-name" data-i18n="f_remote_name">remote terminal</div><div class="feat-desc" data-i18n="f_remote_desc">browser & mobile, no SSH/VPN, real-time PTY streaming</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_remote_name">remote terminal</div><div class="feat-desc" data-i18n="f_remote_desc">browser & mobile, no SSH/VPN, real-time PTY streaming at 12fps</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_chat_name">terminal + chat</div><div class="feat-desc" data-i18n="f_chat_desc">raw CLI or structured view with parsed tool calls</div></div>
-    <div class="feat"><div class="feat-name" data-i18n="f_discuss_name">multi-agent discussions</div><div class="feat-desc" data-i18n="f_discuss_desc">discuss, audit, review across providers</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_sidebar_name">Discord-style sidebar</div><div class="feat-desc" data-i18n="f_sidebar_desc">server icons, session tree, unread badges, idle flash</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_discuss_name">multi-agent discussions</div><div class="feat-desc" data-i18n="f_discuss_desc">discuss, audit, review across providers with ring progress</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_picker_name">@ picker</div><div class="feat-desc" data-i18n="f_picker_desc">@files, @@agents, @@all(config) for group dispatch</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_multi_name">multi-server</div><div class="feat-desc" data-i18n="f_multi_desc">manage agents across machines from one dashboard</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_pin_name">pinnable panels</div><div class="feat-desc" data-i18n="f_pin_desc">drag any window to sidebar, cross-device sync</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_sub_name">sub-sessions</div><div class="feat-desc" data-i18n="f_sub_desc">spawn parallel agents on the fly</div></div>
-    <div class="feat"><div class="feat-name" data-i18n="f_file_name">file browser</div><div class="feat-desc" data-i18n="f_file_desc">browse, preview, git diffs, upload from camera</div></div>
-    <div class="feat"><div class="feat-name" data-i18n="f_mobile_name">mobile & notifications</div><div class="feat-desc" data-i18n="f_mobile_desc">biometric auth, push when agents need attention</div></div>
-    <div class="feat"><div class="feat-name" data-i18n="f_ota_name">OTA updates</div><div class="feat-desc" data-i18n="f_ota_desc">upgrade daemons from the web UI</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_file_name">file browser & git</div><div class="feat-desc" data-i18n="f_file_desc">tree view, +/- stats, floating preview, auto-refresh</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_repo_name">repository dashboard</div><div class="feat-desc" data-i18n="f_repo_desc">issues, PRs, branches, commits, CI/CD</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_sync_name">cross-device sync</div><div class="feat-desc" data-i18n="f_sync_desc">tab order, pinned tabs & panels synced to server</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_mobile_name">mobile & notifications</div><div class="feat-desc" data-i18n="f_mobile_desc">biometric auth, push notifications, shell keyboard input</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_i18n_name">7 languages</div><div class="feat-desc" data-i18n="f_i18n_desc">EN, 中文, 繁體, ES, RU, JA, KO</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_stream_name">real-time stream</div><div class="feat-desc" data-i18n="f_stream_desc">live output, zero polling, zero message limits</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_self_name">self-hosted</div><div class="feat-desc" data-i18n="f_self_desc">your infra, your data, one-command deploy</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_ota_name">OTA updates</div><div class="feat-desc" data-i18n="f_ota_desc">upgrade daemons from the web UI</div></div>
   </div>
 </section>
 
@@ -393,6 +401,18 @@ const I18N = {
     f_ota_name: 'OTA 更新', f_ota_desc: '从 Web UI 升级守护进程',
     f_stream_name: '实时推流', f_stream_desc: '零轮询、零消息限制',
     f_self_name: '自托管', f_self_desc: '你的服务器，你的数据，一键部署',
+    f_sidebar_name: 'Discord 风格侧边栏',
+    f_sidebar_desc: '服务器图标、会话树、未读徽章、空闲闪烁',
+    f_picker_name: '@ 选择器',
+    f_picker_desc: '@文件、@@代理、@@all(config) 群组派发',
+    f_pin_name: '可固定面板',
+    f_pin_desc: '拖拽窗口到侧边栏，跨设备同步',
+    f_repo_name: '仓库面板',
+    f_repo_desc: 'Issues、PR、分支、提交、CI/CD',
+    f_sync_name: '跨设备同步',
+    f_sync_desc: '标签顺序、固定标签和面板同步到服务器',
+    f_i18n_name: '7 种语言',
+    f_i18n_desc: '中英日韩俄西 + 繁体中文',
     arch_desc: '守护进程运行在你的开发机上，通过 tmux 管理代理会话。服务端在你的设备和守护进程之间中转连接。所有数据留在你的基础设施内。',
     copy_hint: '点击复制',
     qs_1: '使用 <a href="https://app.im.codes">app.im.codes</a> 或自行部署服务端',
@@ -420,6 +440,18 @@ const I18N = {
     f_ota_name: 'OTA 更新', f_ota_desc: '從 Web UI 升級守護程序',
     f_stream_name: '即時串流', f_stream_desc: '零輪詢、零訊息限制',
     f_self_name: '自託管', f_self_desc: '你的伺服器，你的資料，一鍵部署',
+    f_sidebar_name: 'Discord 風格側邊欄',
+    f_sidebar_desc: '伺服器圖示、會話樹、未讀徽章、閒置閃爍',
+    f_picker_name: '@ 選擇器',
+    f_picker_desc: '@檔案、@@代理、@@all(config) 群組派發',
+    f_pin_name: '可固定面板',
+    f_pin_desc: '拖曳視窗到側邊欄，跨裝置同步',
+    f_repo_name: '儲存庫面板',
+    f_repo_desc: 'Issues、PR、分支、提交、CI/CD',
+    f_sync_name: '跨裝置同步',
+    f_sync_desc: '標籤順序、固定標籤和面板同步到伺服器',
+    f_i18n_name: '7 種語言',
+    f_i18n_desc: '中英日韓俄西 + 繁體中文',
     arch_desc: '守護程序運行在你的開發機上，透過 tmux 管理代理會話。伺服器在你的裝置和守護程序之間中轉連線。所有資料留在你的基礎設施內。',
     copy_hint: '點擊複製',
     qs_1: '使用 <a href="https://app.im.codes">app.im.codes</a> 或自行部署伺服器',
@@ -447,6 +479,18 @@ const I18N = {
     f_ota_name: 'OTAアップデート', f_ota_desc: 'Web UIからデーモンを更新',
     f_stream_name: 'リアルタイムストリーム', f_stream_desc: 'ポーリングなし、メッセージ制限なし',
     f_self_name: 'セルフホスト', f_self_desc: '自分のインフラ、自分のデータ、ワンコマンドデプロイ',
+    f_sidebar_name: 'Discordスタイルサイドバー',
+    f_sidebar_desc: 'サーバーアイコン、セッションツリー、未読バッジ',
+    f_picker_name: '@ ピッカー',
+    f_picker_desc: '@ファイル、@@エージェント、@@all(config)',
+    f_pin_name: 'ピン留めパネル',
+    f_pin_desc: 'ウィンドウをサイドバーにドラッグ、クロスデバイス同期',
+    f_repo_name: 'リポジトリダッシュボード',
+    f_repo_desc: 'Issues、PR、ブランチ、コミット、CI/CD',
+    f_sync_name: 'クロスデバイス同期',
+    f_sync_desc: 'タブ順序、ピン留めタブ・パネルをサーバーに同期',
+    f_i18n_name: '7言語',
+    f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
     arch_desc: 'デーモンは開発マシンで動作し、tmuxでエージェントセッションを管理します。サーバーはデバイスとデーモン間の接続を中継します。すべてのデータは自社インフラ内に留まります。',
     copy_hint: 'クリックでコピー',
     qs_1: '<a href="https://app.im.codes">app.im.codes</a> を使用するか、サーバーをセルフホスト',
@@ -474,6 +518,18 @@ const I18N = {
     f_ota_name: 'OTA 업데이트', f_ota_desc: '웹 UI에서 데몬 업그레이드',
     f_stream_name: '실시간 스트림', f_stream_desc: '폴링 없음, 메시지 제한 없음',
     f_self_name: '셀프 호스팅', f_self_desc: '내 인프라, 내 데이터, 원커맨드 배포',
+    f_sidebar_name: 'Discord 스타일 사이드바',
+    f_sidebar_desc: '서버 아이콘, 세션 트리, 읽지 않은 배지',
+    f_picker_name: '@ 피커',
+    f_picker_desc: '@파일, @@에이전트, @@all(config) 그룹 디스패치',
+    f_pin_name: '고정 패널',
+    f_pin_desc: '창을 사이드바로 드래그, 크로스 디바이스 동기화',
+    f_repo_name: '리포지토리 대시보드',
+    f_repo_desc: 'Issues, PR, 브랜치, 커밋, CI/CD',
+    f_sync_name: '크로스 디바이스 동기화',
+    f_sync_desc: '탭 순서, 고정 탭 및 패널 서버 동기화',
+    f_i18n_name: '7개 언어',
+    f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
     arch_desc: '데몬은 개발 머신에서 실행되며 tmux를 통해 에이전트 세션을 관리합니다. 서버는 디바이스와 데몬 간의 연결을 중계합니다. 모든 데이터는 자체 인프라에 유지됩니다.',
     copy_hint: '클릭하여 복사',
     qs_1: '<a href="https://app.im.codes">app.im.codes</a> 사용 또는 서버 셀프 호스팅',
@@ -501,6 +557,18 @@ const I18N = {
     f_ota_name: 'actualizaciones OTA', f_ota_desc: 'actualiza daemons desde la interfaz web',
     f_stream_name: 'stream en tiempo real', f_stream_desc: 'sin polling, sin límite de mensajes',
     f_self_name: 'autoalojado', f_self_desc: 'tu infraestructura, tus datos, despliegue con un comando',
+    f_sidebar_name: 'barra lateral estilo Discord',
+    f_sidebar_desc: 'iconos de servidor, árbol de sesiones, insignias no leídas',
+    f_picker_name: 'selector @',
+    f_picker_desc: '@archivos, @@agentes, @@all(config)',
+    f_pin_name: 'paneles fijables',
+    f_pin_desc: 'arrastra ventanas a la barra lateral, sincronización multi-dispositivo',
+    f_repo_name: 'panel de repositorio',
+    f_repo_desc: 'issues, PRs, ramas, commits, CI/CD',
+    f_sync_name: 'sincronización multi-dispositivo',
+    f_sync_desc: 'orden de pestañas, pestañas y paneles fijados sincronizados',
+    f_i18n_name: '7 idiomas',
+    f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
     arch_desc: 'El daemon se ejecuta en tu máquina de desarrollo y gestiona sesiones de agentes a través de tmux. El servidor retransmite conexiones entre tus dispositivos y el daemon. Todo permanece en tu infraestructura.',
     copy_hint: 'clic para copiar',
     qs_1: 'Usa <a href="https://app.im.codes">app.im.codes</a> o autoaloja el servidor',
@@ -528,6 +596,18 @@ const I18N = {
     f_ota_name: 'OTA-обновления', f_ota_desc: 'обновление демонов через веб-интерфейс',
     f_stream_name: 'стриминг в реальном времени', f_stream_desc: 'без опроса, без лимитов сообщений',
     f_self_name: 'свой сервер', f_self_desc: 'ваша инфраструктура, ваши данные, развёртывание одной командой',
+    f_sidebar_name: 'боковая панель в стиле Discord',
+    f_sidebar_desc: 'иконки серверов, дерево сессий, бейджи непрочитанных',
+    f_picker_name: 'выбор @',
+    f_picker_desc: '@файлы, @@агенты, @@all(config)',
+    f_pin_name: 'закрепляемые панели',
+    f_pin_desc: 'перетащите окно на боковую панель, кросс-девайс синхронизация',
+    f_repo_name: 'панель репозитория',
+    f_repo_desc: 'issues, PRs, ветки, коммиты, CI/CD',
+    f_sync_name: 'кросс-девайс синхронизация',
+    f_sync_desc: 'порядок вкладок, закреплённые вкладки и панели синхронизированы',
+    f_i18n_name: '7 языков',
+    f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
     arch_desc: 'Демон работает на вашей машине разработки и управляет сессиями агентов через tmux. Сервер передаёт соединения между вашими устройствами и демоном. Все данные остаются на вашей инфраструктуре.',
     copy_hint: 'нажмите для копирования',
     qs_1: 'Используйте <a href="https://app.im.codes">app.im.codes</a> или разверните свой сервер',

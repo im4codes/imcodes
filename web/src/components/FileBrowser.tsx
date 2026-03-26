@@ -450,8 +450,7 @@ export function FileBrowser({
             }
             return prev;
           });
-          // Auto-switch to diff view if there's a diff
-          if (diff) setShowDiff(true);
+          // Don't auto-switch to diff view — preserve user's current view choice
         }
         return;
       }
