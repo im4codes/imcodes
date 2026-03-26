@@ -733,9 +733,12 @@ body {
 .sidebar-resize-handle { position: absolute; top: 0; right: 0; width: 4px; height: 100%; cursor: ew-resize; background: transparent; z-index: 10; transition: background 0.15s; touch-action: none; }
 .sidebar-resize-handle:hover { background: rgba(59,130,246,0.4); }
 @media (pointer: coarse) { .sidebar-resize-handle { width: 12px; right: -4px; } }
-.sidebar-footer { flex-shrink: 0; border-top: 1px solid #1e293b; padding: 4px 8px; display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 2px 6px; cursor: ew-resize; user-select: none; touch-action: none; transition: background 0.15s; }
-.sidebar-footer:hover, .sidebar-footer:active { background: rgba(59,130,246,0.08); }
-.sidebar-resize-bar-icon { color: #475569; font-size: 11px; }
+.sidebar-resize-grip { position: relative; flex-shrink: 0; height: 0; display: flex; justify-content: center; border-top: 1px solid #1e293b; cursor: ew-resize; user-select: none; touch-action: none; z-index: 2; }
+.sidebar-resize-grip::after { content: ''; position: absolute; top: -10px; bottom: -10px; left: 0; right: 0; } /* larger touch target */
+.sidebar-resize-grip { font-size: 16px; color: #3b82f6; line-height: 0; }
+.sidebar-resize-grip:hover { color: #60a5fa; }
+.sidebar-resize-grip:active { color: #93c5fd; }
+.sidebar-footer { flex-shrink: 0; padding: 6px 8px; display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 2px 6px; }
 .sidebar-build-time { font-size: 9px; color: #475569; white-space: nowrap; }
 .sidebar-copyright { font-size: 9px; color: #334155; white-space: nowrap; }
 
