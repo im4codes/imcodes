@@ -86,9 +86,11 @@ export function SubSessionWindow({
     return () => clearInterval(id);
   }, [!!activeThinkingTs, active]); // eslint-disable-line react-hooks/exhaustive-deps
   const isShell = sub.type === 'shell' || sub.type === 'script';
+  /** Transport-backed sessions (e.g. openclaw) have no tmux terminal — chat only */
+  const isTransport = sub.type === 'openclaw';
   const initial = loadLocal(sub.id);
   const [geom, setGeom] = useState<WindowGeometry>(initial.geom);
-  const [viewMode, setViewMode] = useState<ViewMode>(isShell ? 'terminal' : initial.viewMode);
+  const [viewMode, setViewMode] = useState<ViewMode>(isShell ? 'terminal' : isTransport ? 'chat' : initial.viewMode);
   // confirmClose removed — × now minimizes instead of terminating
 
   // Flash red when sub-session transitions to idle
@@ -288,7 +290,7 @@ export function SubSessionWindow({
         <span class="subsession-drag-icon">⠿</span>
         <span class="subsession-title">{typeLabel}</span>
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
-          {!isShell && <button class="subsession-mode-btn" onClick={() => { const next = viewMode === 'chat' ? 'terminal' : 'chat'; setViewMode(next); if (next === 'chat') requestAnimationFrame(() => chatScrollRef.current?.()); }} title={viewMode === 'chat' ? 'Switch to terminal' : 'Switch to chat'}>{viewMode === 'chat' ? '⌨' : '💬'}</button>}
+          {!isShell && !isTransport && <button class="subsession-mode-btn" onClick={() => { const next = viewMode === 'chat' ? 'terminal' : 'chat'; setViewMode(next); if (next === 'chat') requestAnimationFrame(() => chatScrollRef.current?.()); }} title={viewMode === 'chat' ? 'Switch to terminal' : 'Switch to chat'}>{viewMode === 'chat' ? '⌨' : '💬'}</button>}
           <button class="subsession-minimize-btn" onClick={onMinimize} title="Minimize">▾</button>
           <button class="subsession-close-btn" onClick={onMinimize} title="Hide">×</button>
         </div>

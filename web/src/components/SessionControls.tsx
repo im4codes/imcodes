@@ -703,6 +703,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>
       )}
 
+      {/* Attachment badges — above input row */}
+      {attachments.length > 0 && (
+        <div class="attachment-badges">
+          {attachments.map((a, i) => (
+            <span key={a.path} class="attachment-badge" title={a.path}>
+              <span class="attachment-badge-icon">📎</span>
+              <span class="attachment-badge-name">{a.name}</span>
+              <button
+                class="attachment-badge-remove"
+                onClick={() => setAttachments((prev) => prev.filter((_, j) => j !== i))}
+                title={t('common.delete')}
+              >×</button>
+            </span>
+          ))}
+        </div>
+      )}
+
       {/* Main input row */}
       <div class="controls">
         {/* Quick input trigger — left of input */}
@@ -840,23 +857,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             onStageChange={setAtPickerStage}
             visible={true}
           />
-        )}
-
-        {/* Attachment badges */}
-        {attachments.length > 0 && (
-          <div class="attachment-badges">
-            {attachments.map((a, i) => (
-              <span key={a.path} class="attachment-badge" title={a.path}>
-                <span class="attachment-badge-icon">📎</span>
-                <span class="attachment-badge-name">{a.name}</span>
-                <button
-                  class="attachment-badge-remove"
-                  onClick={() => setAttachments((prev) => prev.filter((_, j) => j !== i))}
-                  title={t('common.delete')}
-                >×</button>
-              </span>
-            ))}
-          </div>
         )}
 
         {/*

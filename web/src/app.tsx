@@ -1395,8 +1395,8 @@ export function App() {
     const unsub = ws.onMessage((msg) => {
       // Handle git status response
       if (msg.type === 'fs.git_status_response' && 'requestId' in msg && msg.requestId === lastReqId) {
-        const entries = (msg as unknown as { entries?: unknown[] }).entries;
-        setGitChangesCount(Array.isArray(entries) ? entries.length : 0);
+        const files = (msg as unknown as { files?: unknown[] }).files;
+        setGitChangesCount(Array.isArray(files) ? files.length : 0);
       }
       // Refresh on tool completion + session idle (throttled to max 1 per 10s)
       if (msg.type === 'timeline.event') {
@@ -1599,9 +1599,11 @@ export function App() {
                     {gitChangesCount > 0 && <span class="file-badge">{gitChangesCount}</span>}
                   </button>
                 )}
-                <button class="view-toggle" onClick={toggleViewMode}>
-                  {viewMode === 'chat' ? '⌨' : '💬'}
-                </button>
+                {!isTransportSession && (
+                  <button class="view-toggle" onClick={toggleViewMode}>
+                    {viewMode === 'chat' ? '⌨' : '💬'}
+                  </button>
+                )}
                 <span class={`badge ${connected ? (daemonOnline ? 'badge-online' : 'badge-connecting') : connecting ? 'badge-connecting' : 'badge-offline'}`} style={{ fontSize: 10 }}>
                   {connected ? (daemonOnline ? '● Online' : (<><span class="connecting-dot" />{' Daemon Offline'}</>)) : connecting ? (<><span class="connecting-dot" />{' Connecting'}</>) : '○ Offline'}
                 </span>
@@ -1636,9 +1638,11 @@ export function App() {
                   📁
                   {gitChangesCount > 0 && <span class="file-badge">{gitChangesCount}</span>}
                 </button>
-                <button class="view-toggle" onClick={toggleViewMode}>
-                  {viewMode === 'chat' ? '⌨ Terminal' : '💬 Chat'}
-                </button>
+                {!isTransportSession && (
+                  <button class="view-toggle" onClick={toggleViewMode}>
+                    {viewMode === 'chat' ? '⌨ Terminal' : '💬 Chat'}
+                  </button>
+                )}
               </div>
             )}
 
