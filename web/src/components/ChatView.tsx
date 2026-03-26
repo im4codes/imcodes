@@ -463,9 +463,9 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
         // Show context menu below the touch point
         const text = (target.textContent ?? '').trim();
         if (text) {
-          const wrapEl = container.closest('.chat-view-wrap') as HTMLElement | null;
-          const wrapRect = (wrapEl ?? container).getBoundingClientRect();
-          setCtxMenu({ x: t.clientX - wrapRect.left, y: t.clientY - wrapRect.top + container.scrollTop - (wrapEl?.offsetTop ?? 0) + 12, text });
+          const mainEl = container.closest('.chat-main') as HTMLElement | null;
+          const mainRect = (mainEl ?? container).getBoundingClientRect();
+          setCtxMenu({ x: t.clientX - mainRect.left, y: t.clientY - mainRect.top + 12, text });
         }
       }, 500);
     };
@@ -626,6 +626,7 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
             style={{ left: `${ctxMenu.x}px`, top: `${ctxMenu.y}px` }}
             onMouseDown={(e) => e.preventDefault()}
             onTouchStart={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
           >
             <button
               class={`chat-sel-btn${copied ? ' copied' : ''}`}
