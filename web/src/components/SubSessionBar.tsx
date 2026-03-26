@@ -9,6 +9,7 @@ import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
 import { isVisuallyBusy } from '../thinking-utils.js';
 import { reorderSubSessions } from '../api.js';
+import { formatLabel } from '../format-label.js';
 import { resolveContextWindow } from '../model-context.js';
 import { shortModelLabel } from '../model-label.js';
 
@@ -413,7 +414,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
         <div class="subsession-bar" style={{ borderTop: 'none' }}>
           {orderedSessions.map((sub) => {
             const agentTag = sub.type === 'shell' ? (sub.shellBin?.split('/').pop() ?? 'shell') : sub.type;
-            const label = sub.label ? `${sub.label} · ${agentTag}` : agentTag;
+            const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
             const abbr = TYPE_ABBR[sub.type] ?? agentTag.slice(0, 2);
             const isOpen = openIds.has(sub.id);
             const usage = subUsages?.get(`deck_sub_${sub.id}`);
@@ -432,7 +433,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
                 title={label + (model ? ` · ${model}` : '') + (ctxPct > 0 ? ` · ctx ${ctxPct.toFixed(0)}%` : '')}
               >
                 <span class="subsession-card-icon">{abbr}</span>
-                <span class="subsession-card-label">{sub.label ? sub.label.slice(0, 6) : agentTag.slice(0, 6)}</span>
+                <span class="subsession-card-label">{sub.label ? formatLabel(sub.label).slice(0, 12) : agentTag.slice(0, 6)}</span>
                 {model && <span class="subsession-card-model">{model}</span>}
                 {sub.state === 'starting' && <span class="subsession-card-badge">…</span>}
                 {ctxPct > 0 && (

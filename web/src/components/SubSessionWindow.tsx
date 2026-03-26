@@ -6,6 +6,7 @@ import { useState, useRef, useCallback, useEffect, useMemo } from 'preact/hooks'
 import { useTranslation } from 'react-i18next';
 import { getActiveThinkingTs, getActiveStatusText } from '../thinking-utils.js';
 import { recordCost } from '../cost-tracker.js';
+import { formatLabel } from '../format-label.js';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
 import { SessionControls } from './SessionControls.js';
@@ -228,7 +229,7 @@ export function SubSessionWindow({
   }, [onFocus]);
 
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split('/').pop() ?? 'shell') : sub.type;
-  const typeLabel = sub.label ? `${sub.label} · ${agentTag}` : agentTag;
+  const typeLabel = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
 
   // Only non-terminal (chat) sub-sessions can be pinned to sidebar
   const isPinnable = !!onPin;

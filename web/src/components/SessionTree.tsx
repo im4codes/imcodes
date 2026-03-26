@@ -18,6 +18,7 @@ import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { SessionInfo } from '../types.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
+import { formatLabel } from '../format-label.js';
 
 // ── Agent badge config (matches SessionTabs.tsx AGENT_BADGE) ─────────────────
 const AGENT_BADGE: Record<string, { label: string; color: string }> = {
@@ -60,7 +61,7 @@ interface Props {
 
 // ── Helper: compute label for a main session ─────────────────────────────────
 function getSessionLabel(s: SessionInfo): string {
-  if (s.label) return s.label;
+  if (s.label) return formatLabel(s.label);
   return s.role === 'brain' ? s.project : `W${s.name.split('_w')[1] ?? '?'}`;
 }
 
@@ -324,7 +325,7 @@ function SessionTreeInner({
 
             {/* Sub-session nodes (indented) — hidden when collapsed */}
             {!isCollapsed && children.map((sub) => {
-              const subLabel = sub.label ?? sub.type;
+              const subLabel = sub.label ? formatLabel(sub.label) : sub.type;
               const subUnread = unreadCounts.get(sub.sessionName) ?? 0;
               const subIdleFlash = flashingSet.has(sub.sessionName);
               return (

@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from 'preact/hooks';
 import type { SessionInfo } from '../types.js';
 import { useSyncedPreference } from '../hooks/useSyncedPreference.js';
+import { formatLabel } from '../format-label.js';
 
 interface Props {
   sessions: SessionInfo[];
@@ -127,7 +128,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   }, [renameRequest]);
 
   const getLabel = (s: SessionInfo) => {
-    if (s.label) return s.label;
+    if (s.label) return formatLabel(s.label);
     return s.role === 'brain' ? `🧠 ${s.project}` : `W${s.name.split('_w')[1] ?? '?'}`;
   };
 
