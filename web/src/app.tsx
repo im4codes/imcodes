@@ -60,9 +60,9 @@ type ViewMode = 'terminal' | 'chat';
 
 /** A panel pinned to the sidebar. Uses sessionName as stable identity. */
 export interface PinnedPanel {
-  type: 'subsession' | 'repo';
+  type: 'subsession' | 'repo' | 'filebrowser' | 'repopage';
   sessionName: string;
-  /** Captured at pin time for repo panels — stable across session switches */
+  /** Captured at pin time — stable across session switches */
   projectDir?: string;
   serverId?: string;
   /** Captured at pin time — preserve the view mode the user had when pinning */
@@ -598,30 +598,42 @@ export function App() {
     }
   }, [subSessions, setPinnedPanels, bringSubToFront]);
 
-  /** Pin the repo browser: close floating, add to pinnedPanels. */
-  const pinRepo = useCallback(() => {
+  /** Pin file browser: close floating, add to pinnedPanels. */
+  const pinFileBrowser = useCallback(() => {
     const dir = sessions.find(s => s.name === activeSessionRef.current)?.projectDir;
     setShowDesktopFileBrowser(false);
     setPinnedPanels((prev) => {
-      if (prev.some((p) => p.type === 'repo')) return prev;
-      return [...prev, { type: 'repo', sessionName: activeSessionRef.current ?? '__repo__', projectDir: dir, serverId: selectedServerId ?? '' }];
+      if (prev.some((p) => p.type === 'filebrowser')) return prev;
+      return [...prev, { type: 'filebrowser', sessionName: activeSessionRef.current ?? '__filebrowser__', projectDir: dir, serverId: selectedServerId ?? '' }];
     });
   }, [setPinnedPanels, sessions, selectedServerId]);
 
-  /** Unpin the repo browser: remove from pinnedPanels, reopen as floating. */
-  const unpinRepo = useCallback(() => {
-    setPinnedPanels((prev) => prev.filter((p) => p.type !== 'repo'));
-    setShowDesktopFileBrowser(true);
-  }, [setPinnedPanels]);
+  /** Pin repo page: close floating, add to pinnedPanels. */
+  const pinRepoPage = useCallback(() => {
+    const dir = sessions.find(s => s.name === activeSessionRef.current)?.projectDir;
+    setShowRepoPage(false);
+    setPinnedPanels((prev) => {
+      if (prev.some((p) => p.type === 'repopage')) return prev;
+      return [...prev, { type: 'repopage', sessionName: activeSessionRef.current ?? '__repopage__', projectDir: dir, serverId: selectedServerId ?? '' }];
+    });
+  }, [setPinnedPanels, sessions, selectedServerId]);
 
   /** Generic unpin — dispatches to the appropriate handler. */
   const unpinPanel = useCallback((panel: PinnedPanel) => {
-    if (panel.type === 'repo') {
-      unpinRepo();
+    if (panel.type === 'filebrowser') {
+      setPinnedPanels((prev) => prev.filter((p) => p !== panel));
+      setShowDesktopFileBrowser(true);
+    } else if (panel.type === 'repopage') {
+      setPinnedPanels((prev) => prev.filter((p) => p !== panel));
+      setShowRepoPage(true);
+    } else if (panel.type === 'repo') {
+      // Legacy — treat as filebrowser
+      setPinnedPanels((prev) => prev.filter((p) => p !== panel));
+      setShowDesktopFileBrowser(true);
     } else {
       unpinSubSession(panel.sessionName);
     }
-  }, [unpinRepo, unpinSubSession]);
+  }, [setPinnedPanels, unpinSubSession]);
 
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const defaultViewMode: ViewMode = isMobile ? 'chat' : 'terminal';
@@ -1851,7 +1863,7 @@ export function App() {
 
             {/* Desktop floating file browser */}
             {!isMobile && showDesktopFileBrowser && wsRef.current && activeSessionInfo && (
-              <FloatingPanel id="filebrowser" title={`📁 ${trans('picker.files')}`} onClose={() => setShowDesktopFileBrowser(false)} onPin={pinRepo} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={420} defaultH={500}>
+              <FloatingPanel id="filebrowser" title={`📁 ${trans('picker.files')}`} onClose={() => setShowDesktopFileBrowser(false)} onPin={pinFileBrowser} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={420} defaultH={500}>
                 <FileBrowser
                   ws={wsRef.current}
                   mode="file-multi"
@@ -1929,7 +1941,7 @@ export function App() {
       )}
 
       {showRepoPage && wsRef.current && activeSessionInfo?.projectDir && (
-        <FloatingPanel id="repo" title="Repository" onClose={() => setShowRepoPage(false)} onPin={pinRepo} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={800} defaultH={600}>
+        <FloatingPanel id="repo" title="Repository" onClose={() => setShowRepoPage(false)} onPin={pinRepoPage} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={800} defaultH={600}>
           <RepoPage ws={wsRef.current} projectDir={activeSessionInfo.projectDir} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
             const id = Date.now();
             const icon = run.status === 'success' ? '✅' : '❌';

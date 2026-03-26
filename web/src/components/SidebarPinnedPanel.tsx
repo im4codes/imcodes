@@ -15,6 +15,7 @@ import type { RefObject } from 'preact';
 import { ChatView } from './ChatView.js';
 import { TerminalView } from './TerminalView.js';
 import { FileBrowser } from './FileBrowser.js';
+import { RepoPage } from '../pages/RepoPage.js';
 import { useTimeline } from '../hooks/useTimeline.js';
 import { useTranslation } from 'react-i18next';
 import type { WsClient } from '../ws-client.js';
@@ -157,14 +158,28 @@ export function SidebarPinnedPanel({
 
   // ── Title ────────────────────────────────────────────────────────────────
   const title = useMemo(() => {
-    if (panel.type === 'repo') return t('sidebar.pinned_repo');
+    if (panel.type === 'repopage') return 'Repository';
+    if (panel.type === 'filebrowser' || panel.type === 'repo') return t('sidebar.pinned_repo');
     if (liveSubSession) return liveSubSession.label ?? liveSubSession.type;
     return panel.sessionName.replace(/^deck_sub_/, '');
   }, [panel, liveSubSession, t]);
 
   // ── Content ──────────────────────────────────────────────────────────────
   const renderContent = () => {
-    if (panel.type === 'repo') {
+    if (panel.type === 'repopage') {
+      if (!ws || !projectDir) {
+        return <div class="sidebar-pinned-unavailable">{t('sidebar.session_unavailable')}</div>;
+      }
+      return (
+        <RepoPage
+          ws={ws}
+          projectDir={projectDir}
+          onBack={() => {/* pinned — no back action */}}
+          onCiEvent={() => {/* handled at app level */}}
+        />
+      );
+    }
+    if (panel.type === 'filebrowser' || panel.type === 'repo') {
       if (!ws || !projectDir) {
         return (
           <div class="sidebar-pinned-unavailable">
