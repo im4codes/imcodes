@@ -197,7 +197,12 @@ export async function startP2pRun(
   if (fileContents.length > 0) {
     seed += `## Referenced Files\n\n`;
     for (const f of fileContents) {
-      seed += `### ${f.path}\n\n\`\`\`\n${f.content}\n\`\`\`\n\n`;
+      if (f.content) {
+        seed += `### ${f.path}\n\n\`\`\`\n${f.content}\n\`\`\`\n\n`;
+      } else {
+        // Binary file (image, etc.) — include path so agents can read it with their tools
+        seed += `### ${f.path}\n\n*(Binary file — read with your file viewer tool)*\n\n`;
+      }
     }
   }
   await writeFile(contextFilePath, seed, 'utf8');

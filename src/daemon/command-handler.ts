@@ -744,7 +744,8 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           const content = await fsReadFileRaw(absPath, 'utf8');
           const capped = content.slice(0, 50_000);
           if (capped.includes('\0')) {
-            logger.warn({ path: fp }, 'P2P: skipping binary file');
+            // Binary file (image, etc.) — include path reference so agents can read it
+            fileContents.push({ path: absPath, content: '' });
             continue;
           }
           fileContents.push({ path: fp, content: capped }); // cap at 50KB

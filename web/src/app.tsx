@@ -116,6 +116,7 @@ export function App() {
   );
   const [showMobileServerMenu, setShowMobileServerMenu] = useState(false);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => loadSidebarCollapsed());
   const handleToggleSidebar = useCallback(() => {
     setSidebarCollapsed((prev) => {
@@ -1039,7 +1040,7 @@ export function App() {
   // Subscribe to terminal for ALL sessions when connected.
   // The server bridge uses terminal subscriptions to route session-scoped messages
   // (timeline events, command.ack, etc.) to browsers — without subscription,
-  // chat mode wouldn't receive any events. Binary traffic is capped at 6fps daemon-side.
+  // chat mode wouldn't receive any events. Binary traffic is batched at ~24fps daemon-side.
   const sessionNamesKey = sessions.map((s) => s.name).sort().join(',');
   useEffect(() => {
     const ws = wsRef.current;
@@ -1077,13 +1078,18 @@ export function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected, subSessionNamesKey]);
 
-  // When switching to a session in terminal mode, trigger fit + full refresh
+  // When switching to a session in terminal mode, trigger fit.
+  // All sessions are subscribed to PTY streaming, so xterm buffer is already current —
+  // the ResizeObserver handles the fit; no snapshot request needed (it would cause a
+  // redundant full-frame re-render that makes the switch feel slow/flashy).
   useEffect(() => {
     if (!activeSession || viewMode !== 'terminal') return;
+    // Use double-rAF: first rAF waits for display:flex to take effect,
+    // second rAF ensures layout has computed real dimensions.
     requestAnimationFrame(() => {
-      termFitFnsRef.current.get(activeSession)?.();
-      // Request full screen snapshot so terminal content is up-to-date
-      try { wsRef.current?.sendSnapshotRequest(activeSession); } catch { /* ignore */ }
+      requestAnimationFrame(() => {
+        termFitFnsRef.current.get(activeSession)?.();
+      });
     });
   }, [activeSession, viewMode]);
 
@@ -1182,6 +1188,39 @@ export function App() {
     document.addEventListener('keydown', handler);
     return () => document.removeEventListener('keydown', handler);
   }, [isMobile, handleToggleSidebar]);
+
+  // Mobile: swipe-right from left edge opens sidebar overlay
+  useEffect(() => {
+    if (!isMobile) return;
+    let startX = 0;
+    let startY = 0;
+    let tracking = false;
+    const EDGE_ZONE = 30; // px from left edge
+    const SWIPE_THRESHOLD = 60; // px horizontal distance
+    const onStart = (e: TouchEvent) => {
+      const t = e.touches[0];
+      if (t.clientX > EDGE_ZONE) return;
+      startX = t.clientX;
+      startY = t.clientY;
+      tracking = true;
+    };
+    const onEnd = (e: TouchEvent) => {
+      if (!tracking) return;
+      tracking = false;
+      const t = e.changedTouches[0];
+      const dx = t.clientX - startX;
+      const dy = Math.abs(t.clientY - startY);
+      if (dx > SWIPE_THRESHOLD && dx > dy) {
+        setMobileSidebarOpen(true);
+      }
+    };
+    document.addEventListener('touchstart', onStart, { passive: true });
+    document.addEventListener('touchend', onEnd, { passive: true });
+    return () => {
+      document.removeEventListener('touchstart', onStart);
+      document.removeEventListener('touchend', onEnd);
+    };
+  }, [isMobile]);
 
   const handleLogout = useCallback(async () => {
     if (isNative()) {
@@ -1681,12 +1720,13 @@ export function App() {
           <>
             {/* Mobile-only server switcher */}
             <div class="mobile-server-bar">
+              <button class="mobile-sidebar-toggle" onClick={() => setMobileSidebarOpen(true)}>≡</button>
               <div class="mobile-server-switcher-wrap">
                 <button
                   class="mobile-server-btn"
                   onClick={() => setShowMobileServerMenu((o) => !o)}
                 >
-                  ≡ {selectedServerName ?? 'Server'} ▾
+                  {selectedServerName ?? 'Server'} ▾
                 </button>
                 {showMobileServerMenu && (
                   <>
@@ -1878,6 +1918,83 @@ export function App() {
           </>
         )}
       </main>
+
+      {/* Mobile sidebar overlay — full-screen panel with session tree, server list, pinned panels */}
+      {isMobile && mobileSidebarOpen && selectedServerId && (
+        <div class="mobile-sidebar-overlay" onClick={() => setMobileSidebarOpen(false)}>
+          <div class="mobile-sidebar-panel" onClick={(e) => e.stopPropagation()}>
+            <div class="mobile-sidebar-header">
+              <span style={{ fontWeight: 700, fontSize: 14, color: '#e2e8f0' }}>IM.codes</span>
+              <button class="mobile-sidebar-close" onClick={() => setMobileSidebarOpen(false)}>✕</button>
+            </div>
+            <div class="mobile-sidebar-body">
+              {/* Server switcher */}
+              <div style={{ padding: '8px 12px', borderBottom: '1px solid #1e293b' }}>
+                {servers.map((s) => {
+                  const online = isServerOnline(s);
+                  return (
+                    <button
+                      key={s.id}
+                      class={`server-item${s.id === selectedServerId ? ' active' : ''}${online ? '' : ' offline'}`}
+                      onClick={() => { handleSelectServer(s.id, s.name); setMobileSidebarOpen(false); }}
+                    >
+                      <span class="server-item-dot" style={{ color: online ? '#4ade80' : '#475569' }}>
+                        {online ? '●' : '○'}
+                      </span>
+                      {s.name}
+                    </button>
+                  );
+                })}
+              </div>
+              {/* Session tree */}
+              <SessionTree
+                sessions={sessions}
+                subSessions={subSessions}
+                activeSession={activeSession}
+                unreadCounts={unreadCounts}
+                onSelectSession={(name) => {
+                  setActiveSession(name);
+                  setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; });
+                  setMobileSidebarOpen(false);
+                }}
+                onSelectSubSession={(sub) => {
+                  toggleSubSession(sub.id);
+                  setMobileSidebarOpen(false);
+                }}
+                onNewSession={() => { setShowNewSession(true); setMobileSidebarOpen(false); }}
+                onNewSubSession={() => { setShowSubDialog(true); setMobileSidebarOpen(false); }}
+              />
+              {/* P2P ring progress */}
+              {discussions.filter((d) => d.state === 'running' || d.state === 'setup').filter((d) => d.id.startsWith('p2p_')).map((d) => (
+                <P2pRingProgress
+                  key={d.id}
+                  completedRounds={Math.max(0, d.currentRound - 1)}
+                  totalRounds={d.maxRounds}
+                  completedHops={d.completedHops}
+                  totalHops={d.totalHops}
+                  status={d.state}
+                  onClick={() => { setDiscussionInitialId(d.fileId ?? null); setShowDiscussionsPage(true); setMobileSidebarOpen(false); }}
+                />
+              ))}
+            </div>
+            {/* Footer */}
+            <div class="mobile-sidebar-footer">
+              {daemonStats && connected && (
+                <div style={{ fontSize: 11, color: '#64748b', marginBottom: 4 }}>
+                  {daemonStats.daemonVersion && <span>v{daemonStats.daemonVersion} · </span>}
+                  CPU {daemonStats.cpu}% · Load {daemonStats.load1}
+                </div>
+              )}
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                <LanguageSwitcher />
+                <span style={{ fontSize: 10, color: '#475569' }}>
+                  {(() => { try { const d = new Date(__BUILD_TIME__); return `${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {showDiscussionsPage && selectedServerId && (
         <FloatingPanel id="discussions" title="Discussions" onClose={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }} defaultW={800} defaultH={600}>

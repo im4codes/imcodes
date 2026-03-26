@@ -2,6 +2,8 @@
 .spinner { width: 28px; height: 28px; border: 3px solid #334155; border-top-color: #3b82f6; border-radius: 50%; animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 html, body, #app { margin: 0; padding: 0; height: 100%; width: 100%; overflow: hidden; touch-action: pan-x pan-y; }
+/* position:fixed prevents iOS from scrolling the page when the virtual keyboard opens */
+html { position: fixed; }
 :root { --sat: env(safe-area-inset-top, 0px); }
 /* Global: all fixed full-screen overlays respect iOS safe area (status bar/notch) */
 .dialog-overlay, .ask-dialog-overlay, .fb-overlay, .mobile-fb-overlay, .discussions-page { padding-top: var(--sat); }
@@ -361,11 +363,14 @@ body {
 
 /* Mobile server bar — only visible on mobile */
 .mobile-server-bar { display: none; }
+.mobile-sidebar-toggle { display: none; }
 
 /* Mobile responsive */
 @media (max-width: 640px) {
   .sidebar { display: none; }
   .mobile-server-bar { display: flex; align-items: center; justify-content: space-between; padding: 4px 10px; background: #1e293b; border-bottom: 1px solid #334155; flex-shrink: 0; position: relative; z-index: 20; }
+  .mobile-sidebar-toggle { display: block; background: none; border: none; color: #94a3b8; font-size: 18px; cursor: pointer; padding: 4px 8px 4px 0; line-height: 1; flex-shrink: 0; }
+  .mobile-sidebar-toggle:active { color: #e2e8f0; }
   .mobile-server-switcher-wrap { position: relative; }
   .mobile-server-btn { background: none; border: none; color: #94a3b8; font-family: inherit; font-size: 12px; cursor: pointer; padding: 4px 0; }
   .mobile-server-btn:active { color: #e2e8f0; }
@@ -379,6 +384,17 @@ body {
   .controls-input { font-size: 16px; } /* prevent iOS zoom on focus */
   .btn { padding: 8px 10px; font-size: 13px; }
 }
+
+/* Mobile sidebar overlay */
+.mobile-sidebar-overlay { position: fixed; inset: 0; z-index: 3000; background: rgba(0,0,0,0.5); animation: fade-in 0.15s ease; }
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+.mobile-sidebar-panel { position: absolute; top: 0; left: 0; bottom: 0; width: 88%; max-width: 360px; background: #111827; display: flex; flex-direction: column; animation: slide-right 0.2s ease; box-shadow: 4px 0 24px #00000060; }
+@keyframes slide-right { from { transform: translateX(-100%); } to { transform: translateX(0); } }
+.mobile-sidebar-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; padding-top: calc(12px + var(--sat, 0px)); border-bottom: 1px solid #1e293b; flex-shrink: 0; }
+.mobile-sidebar-close { background: none; border: none; color: #64748b; font-size: 18px; cursor: pointer; padding: 4px; line-height: 1; }
+.mobile-sidebar-close:active { color: #e2e8f0; }
+.mobile-sidebar-body { flex: 1; overflow-y: auto; min-height: 0; scrollbar-width: thin; scrollbar-color: #334155 transparent; }
+.mobile-sidebar-footer { flex-shrink: 0; padding: 8px 14px; border-top: 1px solid #1e293b; }
 
 /* ── Chat view ──────────────────────────────────────────────────── */
 .chat-view-wrap { flex: 1; position: relative; overflow: hidden; display: flex; flex-direction: column; }

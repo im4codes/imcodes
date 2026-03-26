@@ -656,12 +656,17 @@ function setLang(lang) {
   applyLang();
 }
 
+// Snapshot original English HTML so switching back to EN works after another language
+const _enSnap = {};
+document.querySelectorAll('[data-i18n]').forEach(el => {
+  _enSnap[el.getAttribute('data-i18n')] = el.innerHTML;
+});
+
 function applyLang() {
-  const dict = I18N[currentLang] || {};
+  const dict = currentLang === 'en' ? _enSnap : (I18N[currentLang] || {});
   document.querySelectorAll('[data-i18n]').forEach(el => {
     const key = el.getAttribute('data-i18n');
     if (dict[key]) el.innerHTML = dict[key];
-    // else: keep original English HTML
   });
   document.querySelectorAll('.lang-switch button').forEach(btn => {
     btn.classList.toggle('active', btn.getAttribute('data-lang') === currentLang);
