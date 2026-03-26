@@ -127,8 +127,7 @@ export function Sidebar({ collapsed, onToggleCollapse, serverId, pinnedPanels: _
   return (
     <div
       class={`sidebar-panel${collapsed ? ' sidebar-panel-collapsed' : ''}${isDragOver ? ' sidebar-panel-drop-active' : ''}`}
-      style={{ width: collapsed ? 0 : width }}
-      aria-hidden={collapsed}
+      style={{ width: collapsed ? 32 : width }}
       onDragOver={handleDragOver}
       onDragEnter={handleDragEnter}
       onDragLeave={handleDragLeave}
