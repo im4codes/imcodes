@@ -1246,8 +1246,8 @@ export function App() {
       const t = e.touches[0];
       const isOpen = mobileSidebarOpen;
       if (!isOpen && t.clientX > EDGE_ZONE) return;
-      // Don't trigger on header area (server bar + tab bar) — buttons live there
-      if (!isOpen && (e.target as HTMLElement)?.closest?.('.mobile-server-bar, .tab-bar')) return;
+      // Don't trigger on server bar — ≡ button and dropdown live there
+      if (!isOpen && (e.target as HTMLElement)?.closest?.('.mobile-server-bar')) return;
       // Record start position but don't activate drag yet — wait for horizontal move
       tracking = true;
       confirmed = false;
@@ -1835,7 +1835,7 @@ export function App() {
           <>
             {/* Mobile-only server switcher */}
             <div class="mobile-server-bar">
-              <button class="mobile-sidebar-toggle" onClick={() => { setMobileSidebarOpen(true); requestAnimationFrame(() => snapSidebar(true)); }}>≡</button>
+              <button class="mobile-sidebar-toggle" onClick={() => { setMobileSidebarOpen(true); requestAnimationFrame(() => applySidebarTransform(1)); }}>≡</button>
               <div class="mobile-server-switcher-wrap">
                 <button
                   class="mobile-server-btn"
