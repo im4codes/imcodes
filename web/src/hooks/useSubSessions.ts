@@ -207,15 +207,13 @@ export function useSubSessions(
     if (!serverId || !ws) return;
     const sub = subSessions.find((s) => s.id === id);
     if (!sub) return;
-    // Stop old session
-    ws.subSessionStop(sub.sessionName);
-    // Close old in PG
-    await patchSubSession(serverId, id, { closedAt: Date.now() }).catch(() => {});
-    // Remove from state
-    setSubSessions((prev) => prev.filter((s) => s.id !== id));
-    // Create new with same params
-    await create(sub.type, sub.shellBin ?? undefined, sub.cwd ?? undefined, sub.label ?? undefined);
-  }, [serverId, ws, subSessions, create]);
+    // In-place restart: daemon kills and recreates with same ID/name.
+    // PG record stays — no close + create cycle.
+    ws.subSessionRestart(sub.sessionName);
+    setSubSessions((prev) => prev.map((s) =>
+      s.id === id ? { ...s, state: 'starting' } : s,
+    ));
+  }, [serverId, ws, subSessions]);
 
   const rename = useCallback(async (id: string, label: string) => {
     if (!serverId) return;
