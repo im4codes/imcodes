@@ -131,7 +131,7 @@ export function buildApp(env: Env) {
     },
     allowHeaders: ['Authorization', 'Content-Type', 'X-CSRF-Token'],
     allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    credentials: false,
+    credentials: true,
   });
   app.use('/api/*', corsMiddleware);
   app.use('/health', corsMiddleware);
