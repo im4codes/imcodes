@@ -286,7 +286,18 @@ export function FileBrowser({
   const [newFolderName, setNewFolderName] = useState('');
   const [modifiedFiles, setModifiedFiles] = useState<Map<string, string>>(new Map()); // path → git code
   // Panel view: 'files' shows tree + changes section; 'changes' shows only changed files
-  const [panelView, setPanelView] = useState<'files' | 'changes'>(defaultTab);
+  // Restore last active tab from localStorage
+  const [panelView, setPanelViewRaw] = useState<'files' | 'changes'>(() => {
+    try {
+      const saved = localStorage.getItem('rcc_fb_tab');
+      if (saved === 'files' || saved === 'changes') return saved;
+    } catch { /* ignore */ }
+    return defaultTab;
+  });
+  const setPanelView = (v: 'files' | 'changes') => {
+    setPanelViewRaw(v);
+    try { localStorage.setItem('rcc_fb_tab', v); } catch { /* ignore */ }
+  };
   const [changesFiles, setChangesFiles] = useState<Array<{ path: string; code: string; additions?: number; deletions?: number }>>([]);
   const pendingChangesRef = useRef(new Set<string>()); // all in-flight changesRootPath git status requestIds
 
