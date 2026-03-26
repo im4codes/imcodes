@@ -194,8 +194,19 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
               bindExistingKey: ch.key, skipCreate: true, skipStore: true,
               parentSession: mName,
             });
-            upsertSession({ ...storeEntry, state: 'running', parentSession: mName, label: ch.displayName || storeEntry.label || ch.key, updatedAt: Date.now() });
-            logger.info({ session: storeEntry.name, ocKey: ch.key, parent: mName }, 'oc-sync: rebuilt runtime for existing sub-session');
+            const newLabel = ch.displayName || storeEntry.label || ch.key;
+            upsertSession({ ...storeEntry, state: 'running', parentSession: mName, label: newLabel, updatedAt: Date.now() });
+            // Update server DB label (may have been stored with sanitized key before displayName fix)
+            const subId = storeEntry.name.replace('deck_sub_', '');
+            try {
+              serverLink.send({
+                type: 'subsession.sync', id: subId, sessionType: 'openclaw',
+                cwd: mainSessionProjectDir(group.agentName), shellBin: null, ccSessionId: null,
+                parentSession: mName, label: newLabel,
+                runtimeType: 'transport', providerId: 'openclaw', providerSessionId: ch.key,
+              });
+            } catch { /* not connected */ }
+            logger.info({ session: storeEntry.name, ocKey: ch.key, parent: mName, label: newLabel }, 'oc-sync: rebuilt runtime for existing sub-session');
           } catch (err) {
             logger.warn({ err, session: storeEntry.name }, 'oc-sync: failed to rebuild runtime');
           }
@@ -217,14 +228,25 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
               parentSession: mName,
             });
             // Update store: mark running, set parentSession + label (may have been missing)
+            const reconnLabel = ch.displayName || existingInStore.label || ch.key;
             upsertSession({
               ...existingInStore,
               state: 'running',
               parentSession: mName,
-              label: ch.displayName || existingInStore.label || ch.key,
+              label: reconnLabel,
               updatedAt: Date.now(),
             });
-            logger.info({ session: existingInStore.name, ocKey: ch.key, parent: mName }, 'oc-sync: reconnected sub-session runtime');
+            // Update server DB label
+            const reconnSubId = existingInStore.name.replace('deck_sub_', '');
+            try {
+              serverLink.send({
+                type: 'subsession.sync', id: reconnSubId, sessionType: 'openclaw',
+                cwd: mainSessionProjectDir(group.agentName), shellBin: null, ccSessionId: null,
+                parentSession: mName, label: reconnLabel,
+                runtimeType: 'transport', providerId: 'openclaw', providerSessionId: ch.key,
+              });
+            } catch { /* not connected */ }
+            logger.info({ session: existingInStore.name, ocKey: ch.key, parent: mName, label: reconnLabel }, 'oc-sync: reconnected sub-session runtime');
           } catch (err) {
             registerProviderRoute(ch.key, existingInStore.name);
             logger.warn({ err, session: existingInStore.name }, 'oc-sync: failed to recreate runtime, route-only fallback');

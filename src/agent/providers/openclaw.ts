@@ -375,7 +375,9 @@ export class OpenClawProvider implements TransportProvider {
     }
 
     if (event === 'agent') {
-      this.handleAgentEvent(frame.payload as AgentEventPayload);
+      const p = frame.payload as AgentEventPayload;
+      logger.info({ provider: this.id, runId: p?.runId, stream: p?.stream, phase: (p?.data as any)?.phase }, 'Received agent event');
+      this.handleAgentEvent(p);
       return;
     }
 
