@@ -221,6 +221,8 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   const [highlightEl, setHighlightEl] = useState<HTMLElement | null>(null);
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; text: string } | null>(null);
+  // Guard: suppress the synthetic click that iOS/Android fires after a long-press touchend
+  const longPressedRef = useRef(false);
 
   const autoScrollRef = useRef(true);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
@@ -454,6 +456,7 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
       startY = t.clientY;
       pressTimer = setTimeout(() => {
         pressTimer = null;
+        longPressedRef.current = true;
         const target = (e.target as HTMLElement).closest?.('.chat-event') as HTMLElement | null;
         if (!target) return;
         // Highlight
@@ -535,6 +538,8 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
             }
           } : undefined}
           onClick={(highlightEl || ctxMenu) ? () => {
+            // Skip the synthetic click fired by iOS/Android after a long-press touchend
+            if (longPressedRef.current) { longPressedRef.current = false; return; }
             if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
             setCtxMenu(null);
           } : undefined}
