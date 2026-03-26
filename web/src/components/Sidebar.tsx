@@ -188,7 +188,7 @@ export function Sidebar({ collapsed, serverId, pinnedPanels: _pinnedPanels, onDr
           onTouchStart={handleResizeTouchStart}
           title={t('sidebar.drag_to_resize', 'Drag to resize')}
         >
-          ↔
+          ◂ ▸
         </div>
       )}
 
