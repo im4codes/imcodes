@@ -92,6 +92,8 @@ interface TabState<T = any> {
   page: number;
   hasMore: boolean;
   loading: boolean;
+  /** Silent background refresh — no loading indicator, just a small spinner */
+  refreshing: boolean;
   error: string | null;
   fetched: boolean; // true once first fetch completed (for lazy load)
 }
@@ -113,7 +115,7 @@ function mapDetectToContext(raw: any): RepoContext {
 }
 
 function emptyTab<T = any>(): TabState<T> {
-  return { items: [], page: 1, hasMore: false, loading: false, error: null, fetched: false };
+  return { items: [], page: 1, hasMore: false, loading: false, refreshing: false, error: null, fetched: false };
 }
 
 // ── Error classification ─────────────────────────────────────────────────────
@@ -304,7 +306,7 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
             const next = { ...prev };
             for (const key of Object.keys(next) as TabKey[]) {
               if (next[key].loading) {
-                next[key] = { ...next[key], loading: false, error: msg.error, fetched: true };
+                next[key] = { ...next[key], loading: false, refreshing: false, error: msg.error, fetched: true };
               }
             }
             return next;
@@ -368,6 +370,7 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
               page: m.page,
               hasMore: m.hasMore,
               loading: false,
+              refreshing: false,
               error: null,
               fetched: true,
             },
@@ -381,7 +384,7 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
 
   /** Silently refresh a tab — keep existing items visible while loading. */
   const silentRefreshTab = useCallback((key: TabKey) => {
-    updateTab(key, { loading: true });
+    updateTab(key, { refreshing: true });
     fetchTab(key, 1, true);
   }, [fetchTab, updateTab]);
 
@@ -936,9 +939,9 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
 
     const renderer = RENDERERS[key];
     return (
-      <PullToRefresh loading={tab.loading} onRefresh={() => silentRefreshTab(key)}>
+      <PullToRefresh loading={tab.loading && !tab.refreshing} onRefresh={() => silentRefreshTab(key)}>
         {tab.items.map(renderer)}
-        {tab.loading && (
+        {tab.loading && !tab.refreshing && (
           <div style={{ padding: 12, textAlign: 'center', color: '#94a3b8', fontSize: 12 }}>
             {t('common.loading')}
           </div>
@@ -1034,8 +1037,8 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
             }}
           >
             {TAB_LABELS[key]}
-            {tabs[key].loading && (
-              <span style={{ marginLeft: 6, fontSize: 10, color: '#94a3b8' }}>...</span>
+            {(tabs[key].loading || tabs[key].refreshing) && (
+              <span style={{ marginLeft: 6, fontSize: 10, color: '#94a3b8', display: 'inline-block', animation: 'spin 1s linear infinite' }}>↻</span>
             )}
           </button>
         ))}
