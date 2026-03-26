@@ -751,7 +751,7 @@ body {
 .session-tree-node--active { background: rgba(99,102,241,0.18); color: #e2e8f0; }
 .session-tree-node--active:hover { background: rgba(99,102,241,0.24); }
 /* Sub-session indent */
-.session-tree-node--sub { padding-left: 22px; font-size: 11px; }
+.session-tree-node--sub { padding-left: 34px; font-size: 11px; }
 
 /* Icon (terminal ▶ or cloud ☁) */
 .session-tree-icon { font-size: 9px; color: #475569; flex-shrink: 0; }
