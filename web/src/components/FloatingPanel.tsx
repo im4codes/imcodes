@@ -15,6 +15,8 @@ interface Props {
   onClose: () => void;
   zIndex?: number;
   onFocus?: () => void;
+  onPin?: () => void;
+  pinTooltip?: string;
   defaultW?: number;
   defaultH?: number;
 }
@@ -39,7 +41,7 @@ function saveGeom(id: string, geom: WindowGeometry) {
   try { localStorage.setItem(`rcc_float_${id}`, JSON.stringify(geom)); } catch { /* ignore */ }
 }
 
-export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onFocus, defaultW = 700, defaultH = 520 }: Props) {
+export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onFocus, onPin, pinTooltip, defaultW = 700, defaultH = 520 }: Props) {
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const [geom, setGeom] = useState(() => loadGeom(id, defaultW, defaultH));
   const geomRef = useRef(geom);
@@ -142,6 +144,13 @@ export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onF
         }}
       >
         <span style={{ flex: 1, fontSize: 12, color: '#94a3b8', fontWeight: 600 }}>{title}</span>
+        {onPin && (
+          <button
+            onClick={onPin}
+            class="subsession-minimize-btn"
+            title={pinTooltip ?? 'Pin to sidebar'}
+          >📌</button>
+        )}
         <button
           onClick={onClose}
           class="subsession-minimize-btn"

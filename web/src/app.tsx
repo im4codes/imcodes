@@ -1851,11 +1851,7 @@ export function App() {
 
             {/* Desktop floating file browser */}
             {!isMobile && showDesktopFileBrowser && wsRef.current && activeSessionInfo && (
-              <FloatingPanel id="filebrowser" title={`📁 ${trans('picker.files')}`} onClose={() => setShowDesktopFileBrowser(false)} defaultW={420} defaultH={500}>
-                {/* Pin-to-sidebar button */}
-                <div style={{ padding: '2px 8px', background: '#111827', borderBottom: '1px solid #1e293b', display: 'flex', justifyContent: 'flex-end' }}>
-                  <button class="subsession-minimize-btn" onClick={pinRepo} title={trans('sidebar.pin_to_sidebar')}>📌</button>
-                </div>
+              <FloatingPanel id="filebrowser" title={`📁 ${trans('picker.files')}`} onClose={() => setShowDesktopFileBrowser(false)} onPin={pinRepo} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={420} defaultH={500}>
                 <FileBrowser
                   ws={wsRef.current}
                   mode="file-multi"
@@ -1933,10 +1929,7 @@ export function App() {
       )}
 
       {showRepoPage && wsRef.current && activeSessionInfo?.projectDir && (
-        <FloatingPanel id="repo" title="Repository" onClose={() => setShowRepoPage(false)} defaultW={800} defaultH={600}>
-          <div style={{ padding: '2px 8px', background: '#111827', borderBottom: '1px solid #1e293b', display: 'flex', justifyContent: 'flex-end' }}>
-            <button class="subsession-minimize-btn" onClick={pinRepo} title={trans('sidebar.pin_to_sidebar')}>📌</button>
-          </div>
+        <FloatingPanel id="repo" title="Repository" onClose={() => setShowRepoPage(false)} onPin={pinRepo} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={800} defaultH={600}>
           <RepoPage ws={wsRef.current} projectDir={activeSessionInfo.projectDir} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
             const id = Date.now();
             const icon = run.status === 'success' ? '✅' : '❌';
