@@ -141,14 +141,8 @@ export function App() {
       // Detect keyboard open: visual viewport significantly smaller than window
       const kbOpen = window.innerHeight - vv.height > 80;
       document.documentElement.classList.toggle('kb-open', kbOpen);
-      // Reset any scroll/offset caused by keyboard opening on mobile
+      // Reset any scroll caused by keyboard opening on mobile
       if (window.scrollY !== 0) window.scrollTo(0, 0);
-      // Compensate for iOS visual viewport offset (keyboard pushes viewport up)
-      if (vv.offsetTop !== 0) {
-        document.documentElement.style.setProperty('--vv-offset', `${vv.offsetTop}px`);
-      } else {
-        document.documentElement.style.removeProperty('--vv-offset');
-      }
     };
     update();
     vv.addEventListener('resize', update);

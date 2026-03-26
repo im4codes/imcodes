@@ -17,8 +17,8 @@ body {
 }
 
 /* Layout — accounts for iOS safe area (status bar/notch) and mobile keyboard (--vvh) */
-/* --vv-offset compensates for iOS visual viewport shift when keyboard opens */
-.layout { display: flex; height: calc(100vh - env(safe-area-inset-top, 0px)); height: calc(var(--vvh, 100dvh) - env(safe-area-inset-top, 0px)); margin-top: env(safe-area-inset-top); transform: translateY(calc(-1 * var(--vv-offset, 0px))); }
+/* Layout — accounts for iOS safe area (status bar/notch) and mobile keyboard (--vvh) */
+.layout { display: flex; height: calc(100vh - env(safe-area-inset-top, 0px)); height: calc(var(--vvh, 100dvh) - env(safe-area-inset-top, 0px)); margin-top: env(safe-area-inset-top); }
 .sidebar { width: 220px; min-width: 180px; background: #1e293b; border-right: 1px solid #334155; display: flex; flex-direction: column; overflow-y: auto; }
 .main { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
 
