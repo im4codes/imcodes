@@ -319,9 +319,12 @@ jobs:
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
           echo "date_tag=${DATE_TAG}" >> "$GITHUB_OUTPUT"
 
-      - name: Get OTA version (commit count)
+      - name: Get OTA version (commit count) and app version (semver)
         id: ota
-        run: echo "version=$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+          echo "version=${COMMIT_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "app_version=$(date -u +%Y.%-m).${COMMIT_COUNT}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -333,6 +336,7 @@ jobs:
           build-args: |
             BUILD_TIME=${{ steps.ts.outputs.value }}
             OTA_VERSION=${{ steps.ota.outputs.version }}
+            APP_VERSION=${{ steps.ota.outputs.app_version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           push: true

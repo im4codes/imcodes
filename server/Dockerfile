@@ -63,7 +63,9 @@ COPY --from=builder /app/updates ./updates
 
 EXPOSE 3000
 
+ARG APP_VERSION=0.0.0
 ENV NODE_ENV=production
+ENV APP_VERSION=${APP_VERSION}
 ENV WEB_DIST_PATH=/app/web/dist
 ENV LANDING_DIST_PATH=/app/landing
 ENV UPDATES_DIST_PATH=/app/updates

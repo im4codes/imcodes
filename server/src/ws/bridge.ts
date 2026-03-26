@@ -238,12 +238,21 @@ export class WsBridge {
 
         this.authenticated = true;
         this.daemonVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : null;
-        logger.info({ serverId: this.serverId }, 'Daemon authenticated');
+        logger.info({ serverId: this.serverId, daemonVersion: this.daemonVersion }, 'Daemon authenticated');
         onAuthenticated?.();
 
         updateServerHeartbeat(db, this.serverId, this.daemonVersion).catch((err) =>
           logger.error({ err }, 'Failed to update heartbeat on auth'),
         );
+
+        // Auto-upgrade: if server version is known and differs from daemon, send upgrade command
+        const serverVersion = process.env.APP_VERSION;
+        if (serverVersion && serverVersion !== '0.0.0' && this.daemonVersion && this.daemonVersion !== serverVersion) {
+          logger.info({ serverId: this.serverId, daemonVersion: this.daemonVersion, serverVersion }, 'Version mismatch — sending daemon.upgrade');
+          setTimeout(() => {
+            try { ws.send(JSON.stringify({ type: 'daemon.upgrade', targetVersion: serverVersion })); } catch { /* ignore */ }
+          }, 5000); // delay to let daemon finish connecting
+        }
 
         // Replay queued messages, skipping terminal.subscribe — refs replay below is authoritative
         for (const queued of this.queue) {

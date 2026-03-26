@@ -413,7 +413,7 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       void handleServerDelete();
       break;
     case 'daemon.upgrade':
-      void handleDaemonUpgrade();
+      void handleDaemonUpgrade(cmd.targetVersion as string | undefined);
       break;
     case 'file.search':
       void handleFileSearch(cmd, serverLink);
@@ -1478,7 +1478,7 @@ async function handleDiscussionStop(cmd: Record<string, unknown>): Promise<void>
  *  3. A short sleep before the restart gives the current daemon time to finish
  *     sending any in-flight messages.
  */
-async function handleDaemonUpgrade(): Promise<void> {
+async function handleDaemonUpgrade(targetVersion?: string): Promise<void> {
   const { spawn } = await import('child_process');
   const { writeFileSync, mkdtempSync, existsSync } = await import('fs');
   const { join, dirname } = await import('path');
@@ -1521,6 +1521,7 @@ launchctl load -w "${plist}"`;
   const npmBin = join(dirname(process.execPath), 'npm');
   const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
 
+  const pkgSpec = targetVersion ? `imcodes@${targetVersion}` : 'imcodes@latest';
   const script = `#!/bin/bash
 LOG="${logFile}"
 echo "=== imcodes upgrade started at $(date) ===" >> "$LOG"
@@ -1536,8 +1537,8 @@ if [ -L "$GLOBAL_PKG" ]; then
 fi
 
 # Attempt npm install — if it fails we still restart to keep the daemon alive
-echo "Installing imcodes@latest..." >> "$LOG"
-if "${npmCmd}" install -g imcodes@latest >> "$LOG" 2>&1; then
+echo "Installing ${pkgSpec}..." >> "$LOG"
+if "${npmCmd}" install -g ${pkgSpec} >> "$LOG" 2>&1; then
   echo "Install succeeded." >> "$LOG"
 else
   echo "Install FAILED (exit $?). Will restart on existing version." >> "$LOG"
