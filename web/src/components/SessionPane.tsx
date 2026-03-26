@@ -15,6 +15,7 @@ import { useTimeline } from '../hooks/useTimeline.js';
 import { getActiveThinkingTs, getActiveStatusText } from '../thinking-utils.js';
 import { recordCost } from '../cost-tracker.js';
 import type { UseQuickDataResult } from './QuickInputPanel.js';
+import { formatLabel } from '../format-label.js';
 import type { WsClient } from '../ws-client.js';
 import type { SessionInfo, TerminalDiff } from '../types.js';
 
@@ -245,7 +246,7 @@ export function SessionPane({
           }}
           onStopProject={onStopProject}
           onRenameSession={onRenameSession}
-          sessionDisplayName={(session.label || session.project) ?? null}
+          sessionDisplayName={session.label ? formatLabel(session.label) : (session.project ?? null)}
           quickData={quickData}
           detectedModel={detectedModel}
           hideShortcuts={false}

@@ -370,7 +370,7 @@ export function SubSessionWindow({
           onSubNew={onRestart}
           onSubStop={onClose}
           onRenameSession={onRename}
-          sessionDisplayName={sub.label ?? agentTag}
+          sessionDisplayName={sub.label ? formatLabel(sub.label) : agentTag}
           activeThinking={!!activeThinkingTs}
           sessions={sessions}
           subSessions={subSessions}
