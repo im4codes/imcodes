@@ -183,9 +183,10 @@ export function SessionPane({
 
   const terminalVisible = isActive && effectiveViewMode === 'terminal';
   const chatVisible = isActive && effectiveViewMode === 'chat';
+  const isShellTerminal = terminalVisible && session.agentType === 'shell';
 
   return (
-    <>
+    <div class={isShellTerminal ? 'shell-terminal-pane' : undefined} style={{ display: 'contents' }}>
       {/* Terminal view: kept alive, shown/hidden via CSS display */}
       <div
         key={`term-${sessionName}`}
@@ -258,6 +259,6 @@ export function SessionPane({
           serverId={serverId}
         />
       )}
-    </>
+    </div>
   );
 }
