@@ -36,11 +36,11 @@ export type ServerMessage =
   | { type: 'pong' }
   | { type: 'subsession.shells'; shells: string[] }
   | { type: 'subsession.response'; sessionName: string; status: 'working' | 'idle'; response?: string }
-  | { type: 'discussion.started'; requestId?: string; discussionId: string; topic: string; maxRounds: number; filePath: string; participants: Array<{ sessionName: string; roleLabel: string; agentType: string; model?: string }> }
-  | { type: 'discussion.update'; discussionId: string; state: string; currentRound: number; maxRounds: number; currentSpeaker?: string; lastResponse?: string }
+  | { type: 'discussion.started'; requestId?: string; discussionId: string; topic: string; maxRounds: number; totalHops?: number; filePath: string; participants: Array<{ sessionName: string; roleLabel: string; agentType: string; model?: string }> }
+  | { type: 'discussion.update'; discussionId: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string; lastResponse?: string }
   | { type: 'discussion.done'; discussionId: string; filePath: string; conclusion: string }
   | { type: 'discussion.error'; discussionId?: string; requestId?: string; error: string }
-  | { type: 'discussion.list'; discussions: Array<{ id: string; topic: string; state: string; currentRound: number; maxRounds: number; currentSpeaker?: string; conclusion?: string; filePath?: string }> }
+  | { type: 'discussion.list'; discussions: Array<{ id: string; topic: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string; conclusion?: string; filePath?: string }> }
   | { type: 'daemon.stats'; daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number }
   | FsLsResponse
   | FsReadResponse

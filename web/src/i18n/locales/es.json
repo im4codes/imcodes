@@ -57,7 +57,7 @@
       "openclaw": "OpenClaw"
     },
     "openclaw_not_connected": "no conectado",
-    "openclaw_connect_hint": "El gateway de OpenClaw no est\u00e1 conectado. Ejecuta el siguiente comando en tu m\u00e1quina daemon:",
+    "openclaw_connect_hint": "El gateway de OpenClaw no está conectado. Ejecuta el siguiente comando en tu máquina daemon:",
     "sessionMode": "Modo de sesión",
     "newSession": "Nueva sesión",
     "bindExisting": "Vincular sesión OC existente",
@@ -233,6 +233,11 @@
     "error": "Error de voz: {{error}}"
   },
   "p2p": {
+    "ring": {
+      "active": "R{{round}}/{{totalRounds}}",
+      "label_active": "Round {{round}}/{{totalRounds}}",
+      "active_hops": "R{{round}}/{{totalRounds}} H{{hop}}/{{totalHops}}"
+    },
     "mode_solo": "Solo",
     "mode_audit": "Auditoría",
     "mode_review": "Revisión",
@@ -405,5 +410,15 @@
     "error": "Error",
     "connectionLost": "Conexión perdida",
     "empty": "Sin mensajes aún"
+  },
+  "sidebar": {
+    "collapse": "Contraer barra lateral",
+    "expand": "Expandir barra lateral",
+    "noSessions": "Sin sesiones",
+    "sessionTree": "Árbol de sesiones",
+    "unpin": "Desanclar panel",
+    "pinned_repo": "Archivos",
+    "session_unavailable": "Sesión no disponible",
+    "drop_to_pin": "Soltar para anclar"
   }
 }

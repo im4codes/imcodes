@@ -1,0 +1,261 @@
+/**
+ * SessionPane — renders the complete session view for a single session.
+ * Encapsulates: ChatView / TerminalView rendering, SessionControls input bar,
+ * useTimeline hook, UsageFooter, and terminal fit/scroll/focus ref management.
+ *
+ * Extracted from app.tsx as part of the sidebar-redesign refactor (task 1.5).
+ */
+
+import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
+import { TerminalView } from './TerminalView.js';
+import { ChatView } from './ChatView.js';
+import { SessionControls } from './SessionControls.js';
+import { UsageFooter } from './UsageFooter.js';
+import { useTimeline } from '../hooks/useTimeline.js';
+import { getActiveThinkingTs, getActiveStatusText } from '../thinking-utils.js';
+import { recordCost } from '../cost-tracker.js';
+import type { UseQuickDataResult } from './QuickInputPanel.js';
+import type { WsClient } from '../ws-client.js';
+import type { SessionInfo, TerminalDiff } from '../types.js';
+
+type ViewMode = 'terminal' | 'chat';
+
+export interface SessionPaneProps {
+  serverId: string;
+  session: SessionInfo;
+  sessions: SessionInfo[];
+  subSessions: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
+  ws: WsClient | null;
+  connected: boolean;
+  /** Whether this pane is the currently active session (controls show/hide). */
+  isActive: boolean;
+  /** Current view mode for this session. */
+  viewMode: ViewMode;
+  /** For future split-view focus highlighting. */
+  focused?: boolean;
+  quickData: UseQuickDataResult;
+  detectedModel?: string;
+
+  // ── Ref-registration callbacks ─────────────────────────────────────────────
+  /** Called with the terminal fit function so app.tsx can call it on resize/reconnect. */
+  onFitFn?: (fn: () => void) => void;
+  /** Called with the terminal scroll-to-bottom function. */
+  onScrollBottomFn?: (fn: () => void) => void;
+  /** Called with the terminal focus function. */
+  onFocusFn?: (fn: () => void) => void;
+  /** Called with the chat scroll-to-bottom function. */
+  onChatScrollFn?: (fn: () => void) => void;
+  /** Called with the chat input element ref so app.tsx can route keystrokes to it. */
+  onInputRef?: (el: HTMLDivElement | null) => void;
+  /** Called with the terminal diff applier for this session. */
+  onDiff?: (apply: (diff: TerminalDiff) => void) => void;
+  /** Called with the terminal history applier for this session. */
+  onHistory?: (apply: (content: string) => void) => void;
+
+  // ── Action callbacks ────────────────────────────────────────────────────────
+  onStopProject?: (project: string) => void;
+  onRenameSession?: () => void;
+  /** Called after shortcut/action button clicks — use to restore xterm focus. */
+  onAfterAction?: () => void;
+  /** Mobile: whether the file browser overlay is open. */
+  mobileFileBrowserOpen?: boolean;
+  /** Mobile: called when the file browser overlay requests close. */
+  onMobileFileBrowserClose?: () => void;
+}
+
+export function SessionPane({
+  serverId,
+  session,
+  sessions,
+  subSessions,
+  ws,
+  connected,
+  isActive,
+  viewMode,
+  quickData,
+  detectedModel,
+  onFitFn,
+  onScrollBottomFn,
+  onFocusFn,
+  onChatScrollFn,
+  onInputRef,
+  onDiff,
+  onHistory,
+  onStopProject,
+  onRenameSession,
+  onAfterAction,
+  mobileFileBrowserOpen,
+  onMobileFileBrowserClose,
+}: SessionPaneProps) {
+  const sessionName = session.name;
+
+  // ── Timeline ────────────────────────────────────────────────────────────────
+  const {
+    events: timelineEvents,
+    loading: timelineLoading,
+    refreshing: timelineRefreshing,
+    loadingOlder: timelineLoadingOlder,
+    addOptimisticUserMessage,
+    loadOlderEvents,
+  } = useTimeline(sessionName, ws);
+
+  // ── Usage & thinking state ──────────────────────────────────────────────────
+  const lastUsage = useMemo(() => {
+    for (let i = timelineEvents.length - 1; i >= 0; i--) {
+      const e = timelineEvents[i];
+      if (e.type === 'usage.update' && e.payload.inputTokens) {
+        return e.payload as { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string };
+      }
+    }
+    return null;
+  }, [timelineEvents]);
+
+  const lastCostEvent = useMemo(() => {
+    for (let i = timelineEvents.length - 1; i >= 0; i--) {
+      if (timelineEvents[i].type === 'usage.update' && timelineEvents[i].payload.costUsd) {
+        return timelineEvents[i].payload as { costUsd: number };
+      }
+    }
+    return null;
+  }, [timelineEvents]);
+
+  useEffect(() => {
+    if (lastCostEvent?.costUsd) {
+      recordCost(sessionName, lastCostEvent.costUsd);
+    }
+  }, [lastCostEvent?.costUsd, sessionName]);
+
+  const activeThinkingTs = useMemo(() => getActiveThinkingTs(timelineEvents), [timelineEvents]);
+  const statusText = useMemo(() => getActiveStatusText(timelineEvents), [timelineEvents]);
+
+  // 1-second tick for thinking elapsed display (only while thinking)
+  const [thinkingNow, setThinkingNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!activeThinkingTs) return;
+    setThinkingNow(Date.now());
+    const id = setInterval(() => setThinkingNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [!!activeThinkingTs]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Effective view mode: transport sessions are always chat
+  const isTransportSession = session.runtimeType === 'transport';
+  const effectiveViewMode: ViewMode = isTransportSession ? 'chat' : viewMode;
+
+  // ── Chat scroll + input ref ─────────────────────────────────────────────────
+  const chatScrollFnRef = useRef<(() => void) | null>(null);
+  const setChatScrollFn = useCallback((fn: () => void) => {
+    chatScrollFnRef.current = fn;
+    onChatScrollFn?.(fn);
+  }, [onChatScrollFn]);
+
+  // Terminal scroll fn (populated by TerminalView, also forwarded to app.tsx via onScrollBottomFn prop)
+  const termScrollFnRef = useRef<(() => void) | null>(null);
+  const handleTermScrollFn = useCallback((fn: () => void) => {
+    termScrollFnRef.current = fn;
+    onScrollBottomFn?.(fn);
+  }, [onScrollBottomFn]);
+
+  // inputRef for SessionControls — expose to app.tsx via onInputRef
+  const inputRef = useRef<HTMLDivElement>(null);
+  // Re-register with app.tsx when session becomes active/inactive
+  useEffect(() => {
+    if (!onInputRef) return;
+    if (isActive) {
+      // SessionControls is now mounted — inputRef.current will be set after first render.
+      // Use rAF to ensure the DOM ref is populated before registering.
+      const id = requestAnimationFrame(() => { onInputRef(inputRef.current); });
+      return () => cancelAnimationFrame(id);
+    } else {
+      onInputRef(null);
+      return undefined;
+    }
+  }, [isActive, onInputRef]);
+
+  // ── Scroll to bottom in whichever view is active ────────────────────────────
+  const scrollToBottom = useCallback(() => {
+    if (effectiveViewMode === 'chat') {
+      chatScrollFnRef.current?.();
+    } else {
+      termScrollFnRef.current?.();
+    }
+  }, [effectiveViewMode]);
+
+  const terminalVisible = isActive && effectiveViewMode === 'terminal';
+  const chatVisible = isActive && effectiveViewMode === 'chat';
+
+  return (
+    <>
+      {/* Terminal view: kept alive, shown/hidden via CSS display */}
+      <div
+        key={`term-${sessionName}`}
+        style={{ display: terminalVisible ? 'flex' : 'none', flex: 1, overflow: 'hidden' }}
+      >
+        <TerminalView
+          sessionName={sessionName}
+          ws={ws}
+          connected={connected}
+          onDiff={onDiff ? (apply) => onDiff(apply) : undefined}
+          onHistory={onHistory ? (apply) => onHistory(apply) : undefined}
+          onFocusFn={onFocusFn}
+          onFitFn={onFitFn}
+          onScrollBottomFn={handleTermScrollFn}
+        />
+      </div>
+
+      {/* Chat view: only rendered when active + in chat mode */}
+      {chatVisible && (
+        <ChatView
+          events={timelineEvents}
+          loading={timelineLoading}
+          refreshing={timelineRefreshing}
+          loadingOlder={timelineLoadingOlder}
+          onLoadOlder={loadOlderEvents}
+          sessionId={sessionName}
+          sessionState={session.state}
+          onScrollBottomFn={setChatScrollFn}
+          workdir={session.projectDir}
+          ws={connected ? ws : null}
+          serverId={serverId}
+        />
+      )}
+
+      {/* Usage footer: shown only when active */}
+      {isActive && (lastUsage || activeThinkingTs || statusText) && (
+        <UsageFooter
+          usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
+          sessionName={sessionName}
+          showCost={!!lastCostEvent}
+          activeThinkingTs={activeThinkingTs}
+          statusText={statusText}
+          now={thinkingNow}
+        />
+      )}
+
+      {/* Session controls: shown only when active */}
+      {isActive && (
+        <SessionControls
+          ws={ws}
+          activeSession={session}
+          inputRef={inputRef}
+          onAfterAction={onAfterAction}
+          onSend={(_name, text) => {
+            addOptimisticUserMessage(text);
+            scrollToBottom();
+          }}
+          onStopProject={onStopProject}
+          onRenameSession={onRenameSession}
+          sessionDisplayName={(session.label || session.project) ?? null}
+          quickData={quickData}
+          detectedModel={detectedModel}
+          hideShortcuts={false}
+          activeThinking={!!activeThinkingTs}
+          mobileFileBrowserOpen={mobileFileBrowserOpen}
+          onMobileFileBrowserClose={onMobileFileBrowserClose}
+          sessions={sessions}
+          subSessions={subSessions}
+          serverId={serverId}
+        />
+      )}
+    </>
+  );
+}

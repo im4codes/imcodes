@@ -233,6 +233,11 @@
     "error": "Ошибка голоса: {{error}}"
   },
   "p2p": {
+    "ring": {
+      "active": "R{{round}}/{{totalRounds}}",
+      "label_active": "Round {{round}}/{{totalRounds}}",
+      "active_hops": "R{{round}}/{{totalRounds}} H{{hop}}/{{totalHops}}"
+    },
     "mode_solo": "Solo",
     "mode_audit": "Аудит",
     "mode_review": "Обзор",
@@ -405,5 +410,15 @@
     "error": "Ошибка",
     "connectionLost": "Соединение потеряно",
     "empty": "Сообщений пока нет"
+  },
+  "sidebar": {
+    "collapse": "Свернуть боковую панель",
+    "expand": "Развернуть боковую панель",
+    "noSessions": "Нет сессий",
+    "sessionTree": "Дерево сессий",
+    "unpin": "Открепить панель",
+    "pinned_repo": "Файлы",
+    "session_unavailable": "Сессия недоступна",
+    "drop_to_pin": "Перетащите для закрепления"
   }
 }

@@ -764,6 +764,9 @@ function pushState(run: P2pRun, serverLink: ServerLink | null): void {
         // UI-ready progress fields (avoids client-side JSON parsing)
         total_count: run.totalTargets + 2, // +2 for Phase 1 (initial) + Phase 3 (summary)
         remaining_count: run.remainingTargets.length,
+        completed_hops_count: run.completedHops.length,
+        current_round: run.currentRound,
+        total_rounds: run.rounds,
         skipped_hops: run.skippedHops,
         // Agent metadata for display
         current_target_label: (() => {

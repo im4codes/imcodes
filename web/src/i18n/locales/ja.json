@@ -233,6 +233,11 @@
     "error": "音声エラー：{{error}}"
   },
   "p2p": {
+    "ring": {
+      "active": "R{{round}}/{{totalRounds}}",
+      "label_active": "Round {{round}}/{{totalRounds}}",
+      "active_hops": "R{{round}}/{{totalRounds}} H{{hop}}/{{totalHops}}"
+    },
     "mode_solo": "Solo",
     "mode_audit": "監査",
     "mode_review": "レビュー",
@@ -405,5 +410,15 @@
     "error": "エラー",
     "connectionLost": "接続が切断されました",
     "empty": "まだメッセージはありません"
+  },
+  "sidebar": {
+    "collapse": "サイドバーを折りたたむ",
+    "expand": "サイドバーを展開する",
+    "noSessions": "セッションがありません",
+    "sessionTree": "セッション一覧",
+    "unpin": "パネルの固定を解除",
+    "pinned_repo": "ファイル",
+    "session_unavailable": "セッションは利用できません",
+    "drop_to_pin": "ドロップして固定"
   }
 }

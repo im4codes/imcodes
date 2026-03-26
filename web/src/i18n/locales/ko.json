@@ -233,6 +233,11 @@
     "error": "음성 오류: {{error}}"
   },
   "p2p": {
+    "ring": {
+      "active": "R{{round}}/{{totalRounds}}",
+      "label_active": "Round {{round}}/{{totalRounds}}",
+      "active_hops": "R{{round}}/{{totalRounds}} H{{hop}}/{{totalHops}}"
+    },
     "mode_solo": "Solo",
     "mode_audit": "감사",
     "mode_review": "리뷰",
@@ -405,5 +410,15 @@
     "error": "오류",
     "connectionLost": "연결이 끊겼습니다",
     "empty": "아직 메시지가 없습니다"
+  },
+  "sidebar": {
+    "collapse": "사이드바 접기",
+    "expand": "사이드바 펼치기",
+    "noSessions": "세션 없음",
+    "sessionTree": "세션 목록",
+    "unpin": "패널 고정 해제",
+    "pinned_repo": "파일",
+    "session_unavailable": "세션을 사용할 수 없습니다",
+    "drop_to_pin": "여기에 놓아 고정"
   }
 }

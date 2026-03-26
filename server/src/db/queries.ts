@@ -574,6 +574,9 @@ export interface DbDiscussion {
   state: string;
   max_rounds: number;
   current_round: number;
+  total_rounds: number;
+  completed_hops: number;
+  total_hops: number;
   current_speaker: string | null;
   participants: string | null;
   file_path: string | null;
@@ -618,6 +621,9 @@ export async function upsertDiscussion(
     state: string;
     maxRounds: number;
     currentRound?: number;
+    totalRounds?: number;
+    completedHops?: number;
+    totalHops?: number;
     currentSpeaker?: string | null;
     participants?: string | null;
     filePath?: string | null;
@@ -630,11 +636,14 @@ export async function upsertDiscussion(
 ): Promise<void> {
   const now = Date.now();
   await db.execute(
-    `INSERT INTO discussions (id, server_id, topic, state, max_rounds, current_round, current_speaker, participants, file_path, conclusion, file_content, error, started_at, finished_at, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+    `INSERT INTO discussions (id, server_id, topic, state, max_rounds, current_round, total_rounds, completed_hops, total_hops, current_speaker, participants, file_path, conclusion, file_content, error, started_at, finished_at, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
      ON CONFLICT(id, server_id) DO UPDATE SET
        state = excluded.state,
        current_round = excluded.current_round,
+       total_rounds = excluded.total_rounds,
+       completed_hops = excluded.completed_hops,
+       total_hops = excluded.total_hops,
        current_speaker = excluded.current_speaker,
        participants = excluded.participants,
        file_path = excluded.file_path,
@@ -645,7 +654,8 @@ export async function upsertDiscussion(
        updated_at = excluded.updated_at`,
     [
       d.id, d.serverId, d.topic, d.state, d.maxRounds,
-      d.currentRound ?? 0, d.currentSpeaker ?? null, d.participants ?? null,
+      d.currentRound ?? 0, d.totalRounds ?? 1, d.completedHops ?? 0, d.totalHops ?? 0,
+      d.currentSpeaker ?? null, d.participants ?? null,
       d.filePath ?? null, d.conclusion ?? null, d.fileContent ?? null, d.error ?? null,
       d.startedAt, d.finishedAt ?? null, now, now,
     ],

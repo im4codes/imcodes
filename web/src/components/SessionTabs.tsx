@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from 'preact/hooks';
 import type { SessionInfo } from '../types.js';
+import { useSyncedPreference } from '../hooks/useSyncedPreference.js';
 
 interface Props {
   sessions: SessionInfo[];
@@ -32,20 +33,15 @@ const AGENT_BADGE: Record<string, { label: string; color: string }> = {
   'opencode':    { label: 'oc', color: '#059669' },
 };
 
-const LS_ORDER = 'rcc_tab_order';
-const LS_PINNED = 'rcc_tab_pinned';
+/** Legacy localStorage keys — read once on first load for migration. */
+const LEGACY_LS_ORDER = 'rcc_tab_order';
+const LEGACY_LS_PINNED = 'rcc_tab_pinned';
 
-function loadOrder(): string[] {
-  try { return JSON.parse(localStorage.getItem(LS_ORDER) ?? '[]'); } catch { return []; }
+function readLegacyOrder(): string[] {
+  try { return JSON.parse(localStorage.getItem(LEGACY_LS_ORDER) ?? '[]'); } catch { return []; }
 }
-function saveOrder(order: string[]) {
-  localStorage.setItem(LS_ORDER, JSON.stringify(order));
-}
-function loadPinned(): Set<string> {
-  try { return new Set(JSON.parse(localStorage.getItem(LS_PINNED) ?? '[]')); } catch { return new Set(); }
-}
-function savePinned(pinned: Set<string>) {
-  localStorage.setItem(LS_PINNED, JSON.stringify([...pinned]));
+function readLegacyPinned(): string[] {
+  try { return JSON.parse(localStorage.getItem(LEGACY_LS_PINNED) ?? '[]'); } catch { return []; }
 }
 
 export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, onAlertDismiss, activeTools, onSelect, onNewSession, onStopProject, onRestartProject, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded }: Props) {
@@ -56,39 +52,55 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   const menuRef = useRef<HTMLDivElement>(null);
   const renameRef = useRef<HTMLInputElement>(null);
 
-  // Persisted order & pinned state
-  const [tabOrder, setTabOrder] = useState<string[]>(loadOrder);
-  const [pinned, setPinned] = useState<Set<string>>(loadPinned);
+  // Persisted order & pinned state via server-synced preferences.
+  // Default to legacy localStorage values so existing users don't lose their arrangement.
+  const [tabOrder, setTabOrder] = useSyncedPreference<string[]>(
+    'tab_order',
+    readLegacyOrder(),
+    500,
+  );
+  const [pinnedArr, setPinnedArr] = useSyncedPreference<string[]>(
+    'tab_pinned',
+    readLegacyPinned(),
+    0,
+  );
+
+  // Derive a Set from the synced array for O(1) lookups.
+  const pinned = useMemo(() => new Set(pinnedArr), [pinnedArr]);
 
   // Drag state
   const dragIdx = useRef<number | null>(null);
   const [dragOverIdx, setDragOverIdx] = useState<number | null>(null);
 
-  // Merge sessions with persisted order: keep known positions, append new ones
+  // Merge sessions with persisted order: keep known positions, prune destroyed,
+  // append unknown sessions to the end.
   const orderedSessions = useMemo(() => {
     const nameSet = new Set(sessions.map((s) => s.name));
-    // Remove stale entries from order
+    // Remove stale entries from order (destroyed sessions).
     const validOrder = tabOrder.filter((n) => nameSet.has(n));
-    // Find new sessions not in order
+    // Find new sessions not yet in order — append to end.
     const newNames = sessions.filter((s) => !validOrder.includes(s.name)).map((s) => s.name);
     const fullOrder = [...validOrder, ...newNames];
 
     const byName = new Map(sessions.map((s) => [s.name, s]));
     const ordered = fullOrder.map((n) => byName.get(n)).filter(Boolean) as SessionInfo[];
 
-    // Pinned first, then unpinned — stable within each group
+    // Pinned first, then unpinned — stable within each group.
     const pinnedArr = ordered.filter((s) => pinned.has(s.name));
     const unpinnedArr = ordered.filter((s) => !pinned.has(s.name));
     return [...pinnedArr, ...unpinnedArr];
   }, [sessions, tabOrder, pinned]);
 
-  // Persist order when it changes
+  // Sync back: when orderedSessions changes (e.g. new session arrives), update
+  // the persisted order so the next render is stable.
   useEffect(() => {
     const newOrder = orderedSessions.map((s) => s.name);
     if (JSON.stringify(newOrder) !== JSON.stringify(tabOrder)) {
       setTabOrder(newOrder);
-      saveOrder(newOrder);
     }
+  // We intentionally omit tabOrder from deps to avoid a render loop — the
+  // comparison inside guards against infinite updates.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [orderedSessions]);
 
   useEffect(() => {
@@ -143,16 +155,15 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
   };
 
   const togglePin = useCallback((name: string) => {
-    setPinned((prev) => {
-      const next = new Set(prev);
-      if (next.has(name)) next.delete(name); else next.add(name);
-      savePinned(next);
-      return next;
+    setPinnedArr((prev) => {
+      const set = new Set(prev);
+      if (set.has(name)) set.delete(name); else set.add(name);
+      return [...set];
     });
     setCtx(null);
-  }, []);
+  }, [setPinnedArr]);
 
-  // Drag handlers
+  // Drag handlers — reorder only within the same group (pinned or unpinned).
   const onDragStart = useCallback((e: DragEvent, idx: number) => {
     dragIdx.current = idx;
     if (e.dataTransfer) {
@@ -170,23 +181,36 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
 
   const onDragOver = useCallback((e: DragEvent, idx: number) => {
     e.preventDefault();
+    const fromIdx = dragIdx.current;
+    if (fromIdx === null) return;
+    // Only allow drag within the same group.
+    const fromPinned = pinned.has(orderedSessions[fromIdx]?.name ?? '');
+    const toPinned = pinned.has(orderedSessions[idx]?.name ?? '');
+    if (fromPinned !== toPinned) {
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'none';
+      return;
+    }
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
     setDragOverIdx(idx);
-  }, []);
+  }, [pinned, orderedSessions]);
 
   const onDrop = useCallback((e: DragEvent, dropIdx: number) => {
     e.preventDefault();
     const fromIdx = dragIdx.current;
     if (fromIdx === null || fromIdx === dropIdx) { setDragOverIdx(null); return; }
 
+    // Enforce same-group constraint.
+    const fromPinned = pinned.has(orderedSessions[fromIdx]?.name ?? '');
+    const toPinned = pinned.has(orderedSessions[dropIdx]?.name ?? '');
+    if (fromPinned !== toPinned) { setDragOverIdx(null); return; }
+
     const names = orderedSessions.map((s) => s.name);
     const [moved] = names.splice(fromIdx, 1);
     names.splice(dropIdx, 0, moved);
     setTabOrder(names);
-    saveOrder(names);
     setDragOverIdx(null);
     dragIdx.current = null;
-  }, [orderedSessions]);
+  }, [orderedSessions, pinned, setTabOrder]);
 
   const menuX = ctx ? Math.min(ctx.x, window.innerWidth - 160) : 0;
   const menuY = ctx ? Math.min(ctx.y, window.innerHeight - 200) : 0;

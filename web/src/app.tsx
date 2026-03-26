@@ -16,10 +16,8 @@ import { LanguageSwitcher } from './components/LanguageSwitcher.js';
 import { LoginPage } from './pages/LoginPage.js';
 import { DashboardPage } from './pages/DashboardPage.js';
 import { SessionTabs } from './components/SessionTabs.js';
-import { TerminalView } from './components/TerminalView.js';
-import { ChatView } from './components/ChatView.js';
 // TransportChatView removed — transport sessions use unified ChatView via timelineEmitter
-import { SessionControls } from './components/SessionControls.js';
+import { SessionPane } from './components/SessionPane.js';
 import { useQuickData } from './components/QuickInputPanel.js';
 import { NewSessionDialog } from './components/NewSessionDialog.js';
 import { SubSessionBar } from './components/SubSessionBar.js';
@@ -33,14 +31,17 @@ import { RepoPage } from './pages/RepoPage.js';
 import { FloatingPanel } from './components/FloatingPanel.js';
 import { SettingsPage } from './pages/SettingsPage.js';
 import { AdminPage } from './pages/AdminPage.js';
+import { ServerIconBar } from './components/ServerIconBar.js';
+import { Sidebar, loadSidebarCollapsed, saveSidebarCollapsed } from './components/Sidebar.js';
+import { SessionTree } from './components/SessionTree.js';
+import { P2pRingProgress } from './components/P2pRingProgress.js';
+import { useUnreadCounts } from './hooks/useUnreadCounts.js';
+import { SidebarPinnedPanel } from './components/SidebarPinnedPanel.js';
+import { useSyncedPreference } from './hooks/useSyncedPreference.js';
 import { useSubSessions } from './hooks/useSubSessions.js';
-import { useTimeline } from './hooks/useTimeline.js';
 import { useProviderStatus } from './hooks/useProviderStatus.js';
 // useSwipeBack now handled inside FloatingPanel for discussion/repo pages
-import { getActiveThinkingTs, getActiveStatusText } from './thinking-utils.js';
 import { WsClient } from './ws-client.js';
-import { UsageFooter } from './components/UsageFooter.js';
-import { recordCost } from './cost-tracker.js';
 import { configure as configureApi, apiFetch, onAuthExpired, getUserPref, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, listP2pRuns, fetchMe } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { getAuthKey, clearAuthKey } from './biometric-auth.js';
@@ -56,6 +57,15 @@ const nativeCallback = typeof window !== 'undefined'
   : null;
 
 type ViewMode = 'terminal' | 'chat';
+
+/** A panel pinned to the sidebar. Uses sessionName as stable identity. */
+export interface PinnedPanel {
+  type: 'subsession' | 'repo';
+  sessionName: string;
+  /** Captured at pin time for repo panels — stable across session switches */
+  projectDir?: string;
+  serverId?: string;
+}
 
 interface AuthState {
   userId: string;
@@ -103,6 +113,13 @@ export function App() {
   );
   const [showMobileServerMenu, setShowMobileServerMenu] = useState(false);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => loadSidebarCollapsed());
+  const handleToggleSidebar = useCallback(() => {
+    setSidebarCollapsed((prev) => {
+      saveSidebarCollapsed(!prev);
+      return !prev;
+    });
+  }, []);
   const [showDesktopFileBrowser, setShowDesktopFileBrowser] = useState(false);
   const [gitChangesCount, setGitChangesCount] = useState(0);
   // File browser geometry now managed by FloatingPanel (id="filebrowser")
@@ -393,6 +410,19 @@ export function App() {
 
   // IDs of currently-open (non-minimized) sub-session windows
   const [openSubIds, setOpenSubIds] = useState<Set<string>>(new Set());
+
+  // Panels pinned to the sidebar — synced to server, write-through cache
+  const [pinnedPanels, setPinnedPanels] = useSyncedPreference<PinnedPanel[]>('sidebar_pinned_panels', [], 0);
+
+  // Per-panel heights (device-local, not synced)
+  const [pinnedPanelHeights, setPinnedPanelHeights] = useState<Record<string, number>>(() => {
+    try {
+      const raw = localStorage.getItem('sidebar_pinned_panel_heights');
+      if (raw) return JSON.parse(raw) as Record<string, number>;
+    } catch { /* ignore */ }
+    return {};
+  });
+
   // z-index per sub-session window
   const [subZIndexes, setSubZIndexes] = useState<Map<string, number>>(new Map());
   const [showSubDialog, setShowSubDialog] = useState(false);
@@ -442,6 +472,8 @@ export function App() {
     state: string;
     currentRound: number;
     maxRounds: number;
+    completedHops: number;
+    totalHops: number;
     currentSpeaker?: string;
     conclusion?: string;
     filePath?: string;
@@ -484,7 +516,7 @@ export function App() {
     else localStorage.removeItem('rcc_session');
     setActiveSessionState(name);
     // scroll chat to bottom on session switch (rAF gives ChatView time to mount)
-    requestAnimationFrame(() => chatScrollFnRef.current?.());
+    if (name) requestAnimationFrame(() => chatScrollFnsRef.current.get(name)?.());
   }, []);
 
   const wsRef = useRef<WsClient | null>(null);
@@ -497,6 +529,10 @@ export function App() {
     connected,
     activeSession,
   );
+
+  // ── Unread counts (sidebar session tree badges) ────────────────────────────
+  const sessionNames = useMemo(() => sessions.map((s) => s.name), [sessions]);
+  const unreadCounts = useUnreadCounts(sessionNames, activeSession, wsRef.current, selectedServerId);
 
   // Auto-create a shell sub-session when switching to a session with none.
   // Only update the ref after we've acted (created or confirmed existing) —
@@ -518,16 +554,72 @@ export function App() {
 
   const diffApplyersRef = useRef<Map<string, (diff: TerminalDiff) => void>>(new Map());
   const historyApplyersRef = useRef<Map<string, (content: string) => void>>(new Map());
-  const inputRef = useRef<HTMLDivElement>(null);
+  // Per-session input refs (chat input element in SessionPane) — used by global keyboard handler
+  const inputRefsMap = useRef<Map<string, HTMLDivElement>>(new Map());
   const termFocusFnsRef = useRef<Map<string, () => void>>(new Map());
   const termFitFnsRef = useRef<Map<string, () => void>>(new Map());
   const termScrollFnsRef = useRef<Map<string, () => void>>(new Map());
-  const chatScrollFnRef = useRef<(() => void) | null>(null);
-  const setChatScrollFn = useCallback((fn: () => void) => { chatScrollFnRef.current = fn; }, []);
+  // Per-session chat scroll functions — registered by SessionPane
+  const chatScrollFnsRef = useRef<Map<string, () => void>>(new Map());
   const openSubIdsRef = useRef(openSubIds);
   openSubIdsRef.current = openSubIds;
   const subSessionsRef = useRef(subSessions);
   subSessionsRef.current = subSessions;
+
+  const savePinnedPanelHeight = useCallback((panelKey: string, height: number) => {
+    setPinnedPanelHeights((prev) => {
+      const next = { ...prev, [panelKey]: height };
+      try { localStorage.setItem('sidebar_pinned_panel_heights', JSON.stringify(next)); } catch { /* ignore */ }
+      return next;
+    });
+  }, []);
+
+  /** Pin a sub-session: remove from openSubIds, add to pinnedPanels. */
+  const pinSubSession = useCallback((subId: string) => {
+    const sub = subSessions.find((s) => s.id === subId);
+    if (!sub) return;
+    const sessionName = sub.sessionName;
+    setOpenSubIds((prev) => { const s = new Set(prev); s.delete(subId); return s; });
+    setPinnedPanels((prev) => {
+      if (prev.some((p) => p.sessionName === sessionName)) return prev;
+      return [...prev, { type: 'subsession', sessionName }];
+    });
+  }, [subSessions, setPinnedPanels]);
+
+  /** Unpin a sub-session: remove from pinnedPanels, re-open as floating. */
+  const unpinSubSession = useCallback((sessionName: string) => {
+    setPinnedPanels((prev) => prev.filter((p) => p.sessionName !== sessionName));
+    const sub = subSessions.find((s) => s.sessionName === sessionName);
+    if (sub) {
+      setOpenSubIds((prev) => new Set([...prev, sub.id]));
+      bringSubToFront(sub.id);
+    }
+  }, [subSessions, setPinnedPanels, bringSubToFront]);
+
+  /** Pin the repo browser: close floating, add to pinnedPanels. */
+  const pinRepo = useCallback(() => {
+    const dir = sessions.find(s => s.name === activeSessionRef.current)?.projectDir;
+    setShowDesktopFileBrowser(false);
+    setPinnedPanels((prev) => {
+      if (prev.some((p) => p.type === 'repo')) return prev;
+      return [...prev, { type: 'repo', sessionName: activeSessionRef.current ?? '__repo__', projectDir: dir, serverId: selectedServerId ?? '' }];
+    });
+  }, [setPinnedPanels, sessions, selectedServerId]);
+
+  /** Unpin the repo browser: remove from pinnedPanels, reopen as floating. */
+  const unpinRepo = useCallback(() => {
+    setPinnedPanels((prev) => prev.filter((p) => p.type !== 'repo'));
+    setShowDesktopFileBrowser(true);
+  }, [setPinnedPanels]);
+
+  /** Generic unpin — dispatches to the appropriate handler. */
+  const unpinPanel = useCallback((panel: PinnedPanel) => {
+    if (panel.type === 'repo') {
+      unpinRepo();
+    } else {
+      unpinSubSession(panel.sessionName);
+    }
+  }, [unpinRepo, unpinSubSession]);
 
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const defaultViewMode: ViewMode = isMobile ? 'chat' : 'terminal';
@@ -553,11 +645,11 @@ export function App() {
       localStorage.setItem('rcc_viewModes', JSON.stringify(updated));
       if (next === 'chat') {
         requestAnimationFrame(() => {
-          chatScrollFnRef.current?.();
+          chatScrollFnsRef.current.get(activeSession)?.();
           // Steal focus from xterm textarea so it stops capturing keystrokes in chat mode.
           // Only on desktop — on mobile we don't want to pop up the keyboard automatically.
           if (!/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
-            inputRef.current?.focus();
+            inputRefsMap.current.get(activeSession)?.focus();
           }
         });
       }
@@ -571,64 +663,8 @@ export function App() {
     if (!isMobile) termFocusFnsRef.current.get(activeSession)?.();
   }, [activeSession, isMobile]);
 
-  // Force scroll to bottom in whichever view is currently active
-  const scrollActiveToBottom = useCallback(() => {
-    if (!activeSession) return;
-    const mode = viewModesRef.current[activeSession] ?? defaultViewMode;
-    if (mode === 'chat') {
-      chatScrollFnRef.current?.();
-    } else {
-      termScrollFnsRef.current.get(activeSession)?.();
-    }
-  }, [activeSession, defaultViewMode]);
-
   // Provider status (hoisted to app level so it's always listening — dialogs mount later)
   const { isProviderConnected, getRemoteSessions, refreshSessions } = useProviderStatus(wsRef.current);
-
-  // Timeline events for chat view
-  const { events: timelineEvents, loading: timelineLoading, refreshing: timelineRefreshing, loadingOlder: timelineLoadingOlder, addOptimisticUserMessage, loadOlderEvents } = useTimeline(activeSession, wsRef.current);
-
-  // Extract latest usage from timeline for the context bar in SessionControls
-  const lastUsage = useMemo(() => {
-    for (let i = timelineEvents.length - 1; i >= 0; i--) {
-      const e = timelineEvents[i];
-      if (e.type === 'usage.update' && e.payload.inputTokens) {
-        return e.payload as { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string };
-      }
-    }
-    return null;
-  }, [timelineEvents]);
-
-  // Cost tracking — extract latest costUsd and record to ledger
-  const lastCostEvent = useMemo(() => {
-    for (let i = timelineEvents.length - 1; i >= 0; i--) {
-      if (timelineEvents[i].type === 'usage.update' && timelineEvents[i].payload.costUsd) {
-        return timelineEvents[i].payload as { costUsd: number };
-      }
-    }
-    return null;
-  }, [timelineEvents]);
-
-  useEffect(() => {
-    if (lastCostEvent?.costUsd && activeSession) {
-      recordCost(activeSession, lastCostEvent.costUsd);
-    }
-  }, [lastCostEvent?.costUsd, activeSession]);
-
-  // Earliest ts of the current continuous thinking sequence (shared logic).
-  const activeThinkingTs = useMemo(() => getActiveThinkingTs(timelineEvents), [timelineEvents]);
-
-  // Extract active agent status (e.g. "Reading file...")
-  const statusText = useMemo(() => getActiveStatusText(timelineEvents), [timelineEvents]);
-
-  // Timer for thinking elapsed display (1s tick only while thinking)
-  const [thinkingNow, setThinkingNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!activeThinkingTs) return;
-    setThinkingNow(Date.now());
-    const id = setInterval(() => setThinkingNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [!!activeThinkingTs]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Set up WebSocket only when a server is selected
   useEffect(() => {
@@ -824,13 +860,13 @@ export function App() {
       if (msg.type === 'discussion.started') {
         setDiscussions((prev) => [
           ...prev,
-          { id: msg.discussionId, topic: msg.topic, state: 'setup', currentRound: 0, maxRounds: msg.maxRounds },
+          { id: msg.discussionId, topic: msg.topic, state: 'setup', currentRound: 0, maxRounds: msg.maxRounds, completedHops: 0, totalHops: msg.totalHops ?? 0 },
         ]);
       }
       if (msg.type === 'discussion.update') {
         setDiscussions((prev) => prev.map((d) =>
           d.id === msg.discussionId
-            ? { ...d, state: msg.state, currentRound: msg.currentRound, maxRounds: msg.maxRounds, currentSpeaker: msg.currentSpeaker }
+            ? { ...d, state: msg.state, currentRound: msg.currentRound, maxRounds: msg.maxRounds, completedHops: msg.completedHops ?? d.completedHops, totalHops: msg.totalHops ?? d.totalHops, currentSpeaker: msg.currentSpeaker }
             : d,
         ));
       }
@@ -855,7 +891,8 @@ export function App() {
           const liveIds = new Set(msg.discussions.map((d: { id: string }) => d.id));
           const dbHistory = prev.filter((d) => !liveIds.has(d.id) && (d.state === 'done' || d.state === 'failed'));
           const activeP2p = prev.filter((d) => d.id.startsWith('p2p_') && d.state !== 'done' && d.state !== 'failed');
-          return [...msg.discussions, ...dbHistory, ...activeP2p];
+          const mapped = msg.discussions.map((d) => ({ ...d, completedHops: d.completedHops ?? 0, totalHops: d.totalHops ?? 0 }));
+          return [...mapped, ...dbHistory, ...activeP2p];
         });
       }
       // ── P2P Quick Discussion progress → map to discussions state ──────────
@@ -872,7 +909,9 @@ export function App() {
         const r = msg.run as Record<string, any>;
         const id = `p2p_${r.id}`;
         const totalCount = r.total_count ?? 3;
-        const remainingCount = r.remaining_count ?? 0;
+        const completedHopsCount = r.completed_hops_count ?? 0;
+        const currentRoundFromDaemon = r.current_round ?? 1;
+        const totalRoundsFromDaemon = r.total_rounds ?? 1;
         const status = String(r.status ?? '');
         const currentTarget = r.current_target_label ?? (r.current_target_session ? String(r.current_target_session).split('_').pop() : undefined);
         const initiatorLabel = r.initiator_label ?? 'brain';
@@ -881,8 +920,7 @@ export function App() {
         // Map P2P status to discussion state
         const state = mapP2pState(status);
 
-        // Current round = total - remaining (Phase 1 counts as round 1)
-        const currentRound = Math.max(1, totalCount - remainingCount);
+        const currentRound = currentRoundFromDaemon;
 
         setDiscussions((prev) => {
           const existing = prev.find((d) => d.id === id);
@@ -901,7 +939,9 @@ export function App() {
             topic: `P2P ${mode} · ${initiatorLabel}`,
             state,
             currentRound,
-            maxRounds: totalCount,
+            maxRounds: totalRoundsFromDaemon,
+            completedHops: completedHopsCount,
+            totalHops: totalCount - 2, // total_count includes Phase 1 + Phase 3; hops = targets only
             currentSpeaker: currentTarget,
             conclusion: state === 'done' ? (r.result_summary ?? undefined) : undefined,
             filePath: undefined,
@@ -1095,7 +1135,7 @@ export function App() {
       const currentViewMode = viewModesRef.current[session] ?? defaultViewMode;
       if (currentViewMode === 'chat') {
         // In chat mode: route Up/Down/Enter to chat input (history nav + send)
-        const chatInput = inputRef.current;
+        const chatInput = inputRefsMap.current.get(session) ?? null;
         if (!chatInput) return;
         if (e.key === 'Enter' || e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'Backspace') {
           e.preventDefault();
@@ -1141,6 +1181,22 @@ export function App() {
     document.addEventListener('keydown', handler);
     return () => document.removeEventListener('keydown', handler);
   }, [activeSession, connected]);
+
+  // Ctrl+B (Cmd+B on Mac) — toggle sidebar collapse (desktop only)
+  useEffect(() => {
+    if (isMobile) return;
+    const handler = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.key !== 'b') return;
+      const el = document.activeElement as HTMLElement | null;
+      const tag = el?.tagName ?? '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (el?.isContentEditable) return;
+      e.preventDefault();
+      handleToggleSidebar();
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [isMobile, handleToggleSidebar]);
 
   const handleLogout = useCallback(async () => {
     if (isNative()) {
@@ -1224,12 +1280,13 @@ export function App() {
     }
     // Load completed discussion history from DB (live ones come via WS)
     try {
-      const dData = await apiFetch<{ discussions: Array<{ id: string; topic: string; state: string; max_rounds: number; file_path: string | null; conclusion: string | null; started_at: number; finished_at: number | null }> }>(`/api/server/${serverId}/discussions`);
+      const dData = await apiFetch<{ discussions: Array<{ id: string; topic: string; state: string; max_rounds: number; total_rounds: number; completed_hops: number; total_hops: number; file_path: string | null; conclusion: string | null; started_at: number; finished_at: number | null }> }>(`/api/server/${serverId}/discussions`);
       const dbDiscussions = dData.discussions
         .filter((d) => d.state === 'done' || d.state === 'failed')
         .map((d) => ({
           id: d.id, topic: d.topic, state: d.state,
-          currentRound: d.max_rounds, maxRounds: d.max_rounds,
+          currentRound: d.max_rounds, maxRounds: d.total_rounds ?? d.max_rounds,
+          completedHops: d.completed_hops ?? 0, totalHops: d.total_hops ?? 0,
           conclusion: d.conclusion ?? undefined, filePath: d.file_path ?? undefined,
         }));
       setDiscussions((prev) => {
@@ -1263,8 +1320,10 @@ export function App() {
                 id: `p2p_${r.id}`,
                 topic: `P2P ${mode} · ${initiatorLabel}`,
                 state,
-                currentRound: Math.max(1, totalCount - remainingCount),
-                maxRounds: totalCount,
+                currentRound: (r as any).current_round ?? Math.max(1, totalCount - remainingCount),
+                maxRounds: (r as any).total_rounds ?? 1,
+                completedHops: (r as any).completed_hops_count ?? 0,
+                totalHops: Math.max(0, totalCount - 2),
                 currentSpeaker: currentTarget,
                 conclusion: state === 'done' ? (r.result_summary ?? undefined) : undefined,
                 filePath: undefined,
@@ -1456,8 +1515,100 @@ export function App() {
 
   return (
     <div class="layout">
-      {/* Sidebar — server list */}
-      <aside class="sidebar">
+      {/* Desktop 3-column: [ServerIconBar][SidebarPanel][MainContent] */}
+      {!isMobile && (
+        <>
+          <ServerIconBar
+            servers={servers}
+            activeServerId={selectedServerId}
+            onSelectServer={handleSelectServer}
+          />
+          <Sidebar
+            collapsed={sidebarCollapsed}
+            onToggleCollapse={handleToggleSidebar}
+            serverId={selectedServerId}
+            pinnedPanels={pinnedPanels}
+            onDropPanel={(type, id) => {
+              if (type === 'subsession') pinSubSession(id);
+            }}
+          >
+            {/* Session tree */}
+            <SessionTree
+              sessions={sessions}
+              subSessions={subSessions}
+              activeSession={activeSession}
+              unreadCounts={unreadCounts}
+              onSelectSession={(name) => {
+                setActiveSession(name);
+                setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; });
+              }}
+              onSelectSubSession={(sub) => {
+                toggleSubSession(sub.id);
+              }}
+            />
+
+            {/* P2P ring progress — show active P2P runs */}
+            {discussions.filter((d) => d.state === 'running' || d.state === 'setup').filter((d) => d.id.startsWith('p2p_')).map((d) => (
+              <P2pRingProgress
+                key={d.id}
+                completedRounds={Math.max(0, d.currentRound - 1)}
+                totalRounds={d.maxRounds}
+                completedHops={d.completedHops}
+                totalHops={d.totalHops}
+                status={d.state}
+                onClick={() => { setDiscussionInitialId(d.fileId ?? null); setShowDiscussionsPage(true); }}
+              />
+            ))}
+
+            {/* Pinned panels */}
+            {pinnedPanels.map((panel) => {
+              const panelKey = `${panel.type}:${panel.sessionName}`;
+              const height = pinnedPanelHeights[panelKey] ?? 240;
+              if (panel.type === 'repo') {
+                if (!wsRef.current || !panel.projectDir) return null;
+                const repoDir = panel.projectDir;
+                return (
+                  <SidebarPinnedPanel
+                    key={panelKey}
+                    panel={panel}
+                    height={height}
+                    onUnpin={() => unpinPanel(panel)}
+                    onResize={(h) => savePinnedPanelHeight(panelKey, h)}
+                    ws={wsRef.current}
+                    connected={connected}
+                    sessions={sessions}
+                    subSessions={subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession }))}
+                    serverId={panel.serverId ?? selectedServerId ?? ''}
+                    projectDir={repoDir}
+                    inputRefsMap={inputRefsMap}
+                    activeSession={panel.sessionName}
+                  />
+                );
+              }
+              // subsession panel — check if session is live locally (task 4.6)
+              const liveSub = subSessions.find((s) => s.sessionName === panel.sessionName);
+              return (
+                <SidebarPinnedPanel
+                  key={panelKey}
+                  panel={panel}
+                  height={height}
+                  onUnpin={() => unpinPanel(panel)}
+                  onResize={(h) => savePinnedPanelHeight(panelKey, h)}
+                  ws={wsRef.current}
+                  connected={connected}
+                  sessions={sessions}
+                  subSessions={subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession }))}
+                  serverId={selectedServerId ?? ''}
+                  liveSubSession={liveSub}
+                />
+              );
+            })}
+          </Sidebar>
+        </>
+      )}
+
+      {/* Sidebar — server list (mobile only; desktop uses ServerIconBar) */}
+      <aside class={`sidebar${!isMobile ? ' sidebar-desktop-hidden' : ''}`}>
         <div class="sidebar-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <span>IM.codes</span>
           <span style={{ display: 'flex', gap: '4px' }}>
@@ -1646,34 +1797,34 @@ export function App() {
               </div>
             )}
 
-            {/* Terminal views: all sessions kept alive, show/hide via CSS */}
-            {sessions.map((s) => {
-                const isActive = s.name === activeSession;
-                const sViewMode = viewModes[s.name] ?? defaultViewMode;
-                const visible = isActive && sViewMode === 'terminal';
-                return (
-                  <div
-                    key={s.name}
-                    style={{ display: visible ? 'flex' : 'none', flex: 1, overflow: 'hidden' }}
-                  >
-                    <TerminalView
-                      sessionName={s.name}
-                      ws={wsRef.current}
-                      connected={connected}
-                      onDiff={(apply) => registerDiffApplyer(s.name, apply)}
-                      onHistory={(apply) => registerHistoryApplyer(s.name, apply)}
-                      onFocusFn={(fn) => { termFocusFnsRef.current.set(s.name, fn); }}
-                      onFitFn={(fn) => { termFitFnsRef.current.set(s.name, fn); }}
-                      onScrollBottomFn={(fn) => { termScrollFnsRef.current.set(s.name, fn); }}
-                    />
-                  </div>
-                );
-              })}
-
-            {/* Chat view for active session in chat mode */}
-            {activeSession && viewMode === 'chat' && (
-              <ChatView events={timelineEvents} loading={timelineLoading} refreshing={timelineRefreshing} loadingOlder={timelineLoadingOlder} onLoadOlder={loadOlderEvents} sessionId={activeSession} sessionState={activeSessionInfo?.state} onScrollBottomFn={setChatScrollFn} workdir={activeSessionInfo?.projectDir} ws={connected ? wsRef.current : null} serverId={selectedServerId ?? undefined} />
-            )}
+            {/* Session panes: all sessions kept alive (terminal views persist), show/hide per active */}
+            {sessions.map((s) => (
+              <SessionPane
+                key={s.name}
+                serverId={selectedServerId ?? ''}
+                session={s}
+                sessions={sessions}
+                subSessions={subSessions.map(sub => ({ sessionName: sub.sessionName, type: sub.type, label: sub.label, state: sub.state, parentSession: sub.parentSession }))}
+                ws={wsRef.current}
+                connected={connected}
+                isActive={s.name === activeSession}
+                viewMode={(viewModes[s.name] ?? defaultViewMode) as ViewMode}
+                quickData={quickData}
+                detectedModel={detectedModels.get(s.name)}
+                onFitFn={(fn) => { termFitFnsRef.current.set(s.name, fn); }}
+                onScrollBottomFn={(fn) => { termScrollFnsRef.current.set(s.name, fn); }}
+                onFocusFn={(fn) => { termFocusFnsRef.current.set(s.name, fn); }}
+                onChatScrollFn={(fn) => { chatScrollFnsRef.current.set(s.name, fn); }}
+                onInputRef={(el) => { if (el) inputRefsMap.current.set(s.name, el); else inputRefsMap.current.delete(s.name); }}
+                onDiff={(apply) => registerDiffApplyer(s.name, apply)}
+                onHistory={(apply) => registerHistoryApplyer(s.name, apply)}
+                onStopProject={handleStopProject}
+                onRenameSession={() => setRenameRequest(s.name)}
+                onAfterAction={focusTerminal}
+                mobileFileBrowserOpen={s.name === activeSession ? showMobileFileBrowser : false}
+                onMobileFileBrowserClose={() => setShowMobileFileBrowser(false)}
+              />
+            ))}
 
             {!activeSession && !sessionsLoaded && (
               <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#475569', flexDirection: 'column', gap: 12 }}>
@@ -1691,21 +1842,15 @@ export function App() {
               </div>
             )}
 
-            {(lastUsage || activeThinkingTs || statusText) && (
-              <UsageFooter
-                usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
-                sessionName={activeSession ?? ''}
-                showCost={!!lastCostEvent}
-                activeThinkingTs={activeThinkingTs}
-                statusText={statusText}
-                now={thinkingNow}
-              />
-            )}
-            <SessionControls ws={wsRef.current} activeSession={activeSessionInfo} inputRef={inputRef} onAfterAction={focusTerminal} onSend={(_name, text) => { addOptimisticUserMessage(text); scrollActiveToBottom(); }} onStopProject={handleStopProject} onRenameSession={() => activeSession && setRenameRequest(activeSession)} sessionDisplayName={(activeSessionInfo?.label || activeSessionInfo?.project) ?? null} quickData={quickData} detectedModel={activeSession ? detectedModels.get(activeSession) : undefined} hideShortcuts={false} activeThinking={!!activeThinkingTs} mobileFileBrowserOpen={showMobileFileBrowser} onMobileFileBrowserClose={() => setShowMobileFileBrowser(false)} sessions={sessions} subSessions={subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession }))} serverId={selectedServerId ?? undefined} />
-
             {/* Desktop floating file browser */}
             {!isMobile && showDesktopFileBrowser && wsRef.current && activeSessionInfo && (
               <FloatingPanel id="filebrowser" title={`📁 ${trans('picker.files')}`} onClose={() => setShowDesktopFileBrowser(false)} defaultW={420} defaultH={500}>
+                {/* Pin-to-sidebar button */}
+                {!sidebarCollapsed && (
+                  <div style={{ padding: '2px 8px', background: '#111827', borderBottom: '1px solid #1e293b', display: 'flex', justifyContent: 'flex-end' }}>
+                    <button class="subsession-minimize-btn" onClick={pinRepo} title={trans('sidebar.unpin')}>📌 {trans('sidebar.drop_to_pin')}</button>
+                  </div>
+                )}
                 <FileBrowser
                   ws={wsRef.current}
                   mode="file-multi"
@@ -1718,9 +1863,10 @@ export function App() {
                     const rel = cwd
                       ? paths.map((p) => '@' + (p.startsWith(cwd + '/') ? p.slice(cwd.length + 1) : p) + ' ')
                       : paths.map((p) => '@' + p + ' ');
-                    if (inputRef.current) {
-                      inputRef.current.textContent = (inputRef.current.textContent || '') + rel.join('');
-                      inputRef.current.focus();
+                    const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
+                    if (inputEl) {
+                      inputEl.textContent = (inputEl.textContent || '') + rel.join('');
+                      inputEl.focus();
                     }
                   }}
                   onClose={() => setShowDesktopFileBrowser(false)}
@@ -1728,8 +1874,8 @@ export function App() {
               </FloatingPanel>
             )}
 
-            {/* Sub-session bar */}
-            {selectedServerId && (
+            {/* Sub-session bar — hidden on desktop when sidebar is expanded (SessionTree shows sub-sessions there) */}
+            {selectedServerId && (isMobile || sidebarCollapsed) && (
               <SubSessionBar
                 subSessions={visibleSubSessions}
                 openIds={openSubIds}
@@ -1817,9 +1963,10 @@ export function App() {
         />
       )}
 
-      {/* Sub-session windows (floating) */}
-      {visibleSubSessions.map((sub) => {
+      {/* Sub-session windows (floating) — only show if not pinned */}
+      {visibleSubSessions.filter((sub) => !pinnedPanels.some((p) => p.type === 'subsession' && p.sessionName === sub.sessionName)).map((sub) => {
         const isOpen = openSubIds.has(sub.id);
+        const isShellOrTransport = sub.type === 'shell' || sub.type === 'script' || sub.type === 'openclaw';
         return (
           <div key={sub.id} style={{ display: isOpen ? 'contents' : 'none' }}>
             <SubSessionWindow
@@ -1838,6 +1985,7 @@ export function App() {
               }}
               zIndex={subZIndexes.get(sub.id) ?? 1000}
               onFocus={() => bringSubToFront(sub.id)}
+              onPin={!isShellOrTransport ? () => pinSubSession(sub.id) : undefined}
               sessions={sessions}
               subSessions={subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession }))}
               serverId={selectedServerId ?? undefined}

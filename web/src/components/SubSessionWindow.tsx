@@ -32,6 +32,8 @@ interface Props {
   onRename: () => void;
   zIndex: number;
   onFocus: () => void;
+  /** Optional: called to pin this sub-session to the sidebar. Only for non-terminal types. */
+  onPin?: () => void;
   sessions?: SessionInfo[];
   subSessions?: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
   serverId?: string;
@@ -62,7 +64,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, zIndex, onFocus, sessions, subSessions, serverId,
+  sub, ws, connected, active, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, zIndex, onFocus, onPin, sessions, subSessions, serverId,
 }: Props) {
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const swipeBackRef = useSwipeBack(isMobile ? onMinimize : null);
@@ -226,6 +228,16 @@ export function SubSessionWindow({
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split('/').pop() ?? 'shell') : sub.type;
   const typeLabel = sub.label ? `${sub.label} · ${agentTag}` : agentTag;
 
+  // Only non-terminal (chat) sub-sessions can be pinned to sidebar
+  const isPinnable = !isShell && !isTransport && onPin;
+
+  // HTML5 drag-to-pin: set dataTransfer so sidebar can read panel type + id
+  const handleDragStart = useCallback((e: DragEvent) => {
+    if (!isPinnable) { e.preventDefault(); return; }
+    e.dataTransfer?.setData('application/x-pinpanel', JSON.stringify({ type: 'subsession', id: sub.id }));
+    e.dataTransfer?.setData('text/plain', sub.id); // fallback
+  }, [isPinnable, sub.id]);
+
   // Usage tracking
   const lastUsage = useMemo(() => {
     for (let i = events.length - 1; i >= 0; i--) {
@@ -286,11 +298,17 @@ export function SubSessionWindow({
       ))}
 
       {/* Header */}
-      <div class="subsession-header" onMouseDown={onHeaderMouseDown}>
+      <div
+        class="subsession-header"
+        onMouseDown={onHeaderMouseDown}
+        draggable={!!isPinnable}
+        onDragStart={handleDragStart}
+      >
         <span class="subsession-drag-icon">⠿</span>
         <span class="subsession-title">{typeLabel}</span>
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
           {!isShell && !isTransport && <button class="subsession-mode-btn" onClick={() => { const next = viewMode === 'chat' ? 'terminal' : 'chat'; setViewMode(next); if (next === 'chat') requestAnimationFrame(() => chatScrollRef.current?.()); }} title={viewMode === 'chat' ? 'Switch to terminal' : 'Switch to chat'}>{viewMode === 'chat' ? '⌨' : '💬'}</button>}
+          {isPinnable && <button class="subsession-minimize-btn" onClick={onPin} title="Pin to sidebar">📌</button>}
           <button class="subsession-minimize-btn" onClick={onMinimize} title="Minimize">▾</button>
           <button class="subsession-close-btn" onClick={onMinimize} title="Hide">×</button>
         </div>

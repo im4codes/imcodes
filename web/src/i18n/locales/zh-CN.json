@@ -233,6 +233,11 @@
     "error": "语音错误：{{error}}"
   },
   "p2p": {
+    "ring": {
+      "active": "R{{round}}/{{totalRounds}}",
+      "label_active": "Round {{round}}/{{totalRounds}}",
+      "active_hops": "R{{round}}/{{totalRounds}} H{{hop}}/{{totalHops}}"
+    },
     "mode_solo": "Solo",
     "mode_audit": "审查",
     "mode_review": "评审",
@@ -405,5 +410,15 @@
     "error": "错误",
     "connectionLost": "连接已断开",
     "empty": "暂无消息"
+  },
+  "sidebar": {
+    "collapse": "收起侧边栏",
+    "expand": "展开侧边栏",
+    "noSessions": "暂无会话",
+    "sessionTree": "会话列表",
+    "unpin": "取消固定",
+    "pinned_repo": "文件",
+    "session_unavailable": "会话不可用",
+    "drop_to_pin": "拖放以固定"
   }
 }

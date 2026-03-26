@@ -233,6 +233,11 @@
     "error": "Voice error: {{error}}"
   },
   "p2p": {
+    "ring": {
+      "active": "R{{round}}/{{totalRounds}}",
+      "label_active": "Round {{round}}/{{totalRounds}}",
+      "active_hops": "R{{round}}/{{totalRounds}} H{{hop}}/{{totalHops}}"
+    },
     "mode_solo": "Solo",
     "mode_audit": "Audit",
     "mode_review": "Review",
@@ -405,5 +410,15 @@
     "error": "Error",
     "connectionLost": "Connection lost",
     "empty": "No messages yet"
+  },
+  "sidebar": {
+    "collapse": "Collapse sidebar",
+    "expand": "Expand sidebar",
+    "noSessions": "No sessions",
+    "sessionTree": "Session tree",
+    "unpin": "Unpin panel",
+    "pinned_repo": "Files",
+    "session_unavailable": "Session unavailable",
+    "drop_to_pin": "Drop to pin"
   }
 }

@@ -707,6 +707,90 @@ body {
 .stop-session-confirm-btn { background: #ef4444 !important; }
 .stop-session-confirm-btn:hover { background: #dc2626 !important; }
 
+/* ── Sidebar redesign (tasks 1.2-1.4) ────────────────────────────────────── */
+
+/* Server icon bar — narrow fixed-width vertical strip (Discord/Slack style) */
+.server-icon-bar { display: flex; flex-direction: column; align-items: center; width: 48px; min-width: 48px; background: #0d1117; border-right: 1px solid #1e293b; padding: 8px 0; gap: 4px; overflow-y: auto; scrollbar-width: none; flex-shrink: 0; }
+.server-icon-bar::-webkit-scrollbar { display: none; }
+.server-icon { position: relative; width: 36px; height: 36px; border-radius: 50%; background: #1e293b; border: 2px solid transparent; color: #94a3b8; font-size: 15px; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background 0.15s, border-color 0.15s, color 0.15s, border-radius 0.15s; padding: 0; flex-shrink: 0; }
+.server-icon:hover { background: #334155; color: #e2e8f0; border-radius: 12px; }
+.server-icon-active { background: #1d4ed8; color: #fff; border-color: #3b82f6; border-radius: 12px; }
+.server-icon-active:hover { background: #1d4ed8; border-radius: 12px; }
+.server-icon-letter { line-height: 1; pointer-events: none; }
+.server-icon-dot { position: absolute; bottom: 1px; right: 1px; width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid #0d1117; pointer-events: none; }
+
+/* Sidebar panel — collapsible, resizable */
+.sidebar-panel { display: flex; flex-direction: column; min-width: 0; background: #111827; border-right: 1px solid #1e293b; position: relative; transition: width 0.2s ease; overflow: hidden; flex-shrink: 0; }
+.sidebar-panel-collapsed { width: 0 !important; border-right: none; }
+.sidebar-panel-header { display: flex; align-items: center; justify-content: flex-end; padding: 4px 6px; border-bottom: 1px solid #1e293b; flex-shrink: 0; min-height: 32px; }
+.sidebar-content { flex: 1; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #334155 transparent; min-height: 0; }
+.sidebar-content::-webkit-scrollbar { width: 4px; }
+.sidebar-content::-webkit-scrollbar-track { background: transparent; }
+.sidebar-content::-webkit-scrollbar-thumb { background: #334155; border-radius: 2px; }
+.sidebar-toggle { background: none; border: none; color: #64748b; cursor: pointer; font-size: 16px; padding: 2px 6px; line-height: 1; border-radius: 4px; transition: color 0.15s, background 0.15s; }
+.sidebar-toggle:hover { color: #e2e8f0; background: #1e293b; }
+.sidebar-resize-handle { position: absolute; top: 0; right: 0; width: 4px; height: 100%; cursor: ew-resize; background: transparent; z-index: 10; transition: background 0.15s; }
+.sidebar-resize-handle:hover { background: rgba(59,130,246,0.4); }
+
+/* ── Session Tree (task 2.1–2.5) ─────────────────────────────────────────── */
+.session-tree { display: flex; flex-direction: column; padding: 4px 0; }
+.session-tree-empty { padding: 12px 16px; color: #475569; font-size: 12px; }
+
+/* Main and sub-session nodes */
+.session-tree-node { display: flex; align-items: center; gap: 5px; width: 100%; padding: 4px 8px; background: none; border: none; color: #94a3b8; font-size: 12px; font-family: inherit; cursor: pointer; text-align: left; border-radius: 4px; transition: background 0.1s, color 0.1s; flex-shrink: 0; overflow: hidden; }
+.session-tree-node:hover { background: rgba(255,255,255,0.06); color: #e2e8f0; }
+.session-tree-node--active { background: rgba(99,102,241,0.18); color: #e2e8f0; }
+.session-tree-node--active:hover { background: rgba(99,102,241,0.24); }
+/* Sub-session indent */
+.session-tree-node--sub { padding-left: 22px; font-size: 11px; }
+
+/* Icon (terminal ▶ or cloud ☁) */
+.session-tree-icon { font-size: 9px; color: #475569; flex-shrink: 0; }
+.session-tree-node--active .session-tree-icon { color: #818cf8; }
+
+/* Label */
+.session-tree-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+
+/* Spacer between label and badges */
+.session-tree-spacer { flex: 1; min-width: 4px; }
+
+/* State dot */
+.session-tree-state-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+
+/* Unread count badge (task 2.4) */
+.sidebar-unread-badge { display: inline-flex; align-items: center; justify-content: center; background: #6366f1; color: #fff; border-radius: 8px; font-size: 10px; font-weight: 700; padding: 0 5px; min-width: 16px; height: 16px; line-height: 1; flex-shrink: 0; }
+
+/* Idle flash animation on session tree nodes (task 2.5) — matches subcard-idle-flash pattern */
+@keyframes sidebar-idle-flash { 0%, 100% { background: transparent; color: #94a3b8; } 50% { background: rgba(239,68,68,0.18); color: #fca5a5; } }
+.sidebar-idle-flash { animation: sidebar-idle-flash 0.5s ease-in-out 6 !important; }
+
+/* On desktop, hide the legacy server-list sidebar (replaced by ServerIconBar) */
+.sidebar-desktop-hidden { display: none !important; }
+
+/* ── Sidebar Pinned Panels (task 4.2, 4.3) ──────────────────────────────── */
+/* Drop zone highlight when dragging a panel over the sidebar */
+.sidebar-panel-drop-active { background: rgba(99,102,241,0.08); }
+.sidebar-drop-zone { position: absolute; inset: 0; border: 2px dashed #6366f1; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #818cf8; font-size: 13px; font-weight: 500; background: rgba(99,102,241,0.10); pointer-events: none; z-index: 100; margin: 4px; }
+
+/* Individual pinned panel container */
+.sidebar-pinned-panel { display: flex; flex-direction: column; border-top: 1px solid #1e293b; background: #0f172a; position: relative; overflow: hidden; flex-shrink: 0; min-height: 100px; }
+
+/* Panel header: title + unpin button */
+.sidebar-pinned-header { display: flex; align-items: center; justify-content: space-between; padding: 4px 8px; background: #111827; border-bottom: 1px solid #1e293b; flex-shrink: 0; min-height: 28px; gap: 4px; }
+.sidebar-pinned-title { font-size: 11px; font-weight: 600; color: #94a3b8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.sidebar-pinned-unpin { background: none; border: none; color: #475569; cursor: pointer; font-size: 14px; padding: 0 4px; line-height: 1; border-radius: 3px; flex-shrink: 0; transition: color 0.15s; }
+.sidebar-pinned-unpin:hover { color: #f87171; }
+
+/* Content area fills remaining height */
+.sidebar-pinned-content { flex: 1; overflow: hidden; min-height: 0; display: flex; flex-direction: column; }
+
+/* Unavailable / stale panel placeholder */
+.sidebar-pinned-unavailable { flex: 1; display: flex; align-items: center; justify-content: center; font-size: 11px; color: #475569; padding: 16px; text-align: center; }
+
+/* Resize handle at the bottom of each pinned panel */
+.sidebar-pinned-resize-handle { height: 4px; cursor: ns-resize; background: transparent; flex-shrink: 0; transition: background 0.15s; }
+.sidebar-pinned-resize-handle:hover { background: rgba(99,102,241,0.4); }
+
 /* Language switcher */
 .lang-switcher { background: #1e293b; border: 1px solid #334155; color: #94a3b8; cursor: pointer; font-size: 11px; padding: 2px 4px; border-radius: 4px; transition: all 0.15s; font-family: inherit; max-width: 120px; }
 .lang-switcher:hover { border-color: #64748b; color: #e2e8f0; }
@@ -943,4 +1027,53 @@ body {
   display: flex; flex-direction: column;
   overflow: hidden;
   flex: 1;
+}
+
+/* ── P2P Ring Progress ── */
+.p2p-ring {
+  position: relative;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  user-select: none;
+}
+.p2p-ring-clickable { cursor: pointer; }
+.p2p-ring-clickable:hover .p2p-ring-progress { stroke: #60a5fa; }
+.p2p-ring-inner {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.p2p-ring svg { display: block; }
+.p2p-ring-track {
+  stroke: #334155;
+}
+.p2p-ring-progress {
+  stroke: #3b82f6;
+  transition: stroke-dasharray 0.5s ease;
+}
+.p2p-ring-text {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  line-height: 1.2;
+  color: #94a3b8;
+  text-align: center;
+  padding: 0 6px;
+  pointer-events: none;
+  word-break: break-all;
+}
+.p2p-ring-label {
+  font-size: 9px;
+  color: #64748b;
+  text-align: center;
+  max-width: 80px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
