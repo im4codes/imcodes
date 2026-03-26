@@ -1828,7 +1828,7 @@ export function App() {
         ) : (
           <>
             {/* Mobile-only server switcher */}
-            <div class="mobile-server-bar" style={isMobile && mobileHideServerBar ? { display: 'none' } : undefined}>
+            <div class="mobile-server-bar">
               <button class="mobile-sidebar-toggle" onClick={() => { setMobileSidebarOpen(true); requestAnimationFrame(() => snapSidebar(true)); }}>≡</button>
               <div class="mobile-server-switcher-wrap">
                 <button
@@ -1890,25 +1890,23 @@ export function App() {
               </div>
             </div>
 
-            {!(isMobile && mobileHideTabBar) && (
-              <SessionTabs
-                sessions={sessions}
-                activeSession={activeSession}
-                connected={connected}
-                latencyMs={latencyMs}
-                idleAlerts={idleAlerts}
-                activeTools={activeTools}
-                onAlertDismiss={(name) => setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; })}
-                onSelect={(name) => { setActiveSession(name); setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; }); }}
-                onNewSession={() => setShowNewSession(true)}
-                onStopProject={handleStopProject}
-                onRestartProject={handleRestartProject}
-                renameRequest={renameRequest}
-                onRenameHandled={() => setRenameRequest(null)}
-                onRenameSession={handleRenameSession}
-                sessionsLoaded={sessionsLoaded}
-              />
-            )}
+            <SessionTabs
+              sessions={sessions}
+              activeSession={activeSession}
+              connected={connected}
+              latencyMs={latencyMs}
+              idleAlerts={idleAlerts}
+              activeTools={activeTools}
+              onAlertDismiss={(name) => setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; })}
+              onSelect={(name) => { setActiveSession(name); setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; }); }}
+              onNewSession={() => setShowNewSession(true)}
+              onStopProject={handleStopProject}
+              onRestartProject={handleRestartProject}
+              renameRequest={renameRequest}
+              onRenameHandled={() => setRenameRequest(null)}
+              onRenameSession={handleRenameSession}
+              sessionsLoaded={sessionsLoaded}
+            />
 
             {/* Desktop view mode toggle — mobile uses the one in mobile-server-bar */}
             {!isMobile && activeSession && (
@@ -2051,26 +2049,28 @@ export function App() {
               </div>
             </div>
             <div class="mobile-sidebar-body">
-              {/* Server switcher */}
-              <div style={{ padding: '8px 12px', borderBottom: '1px solid #1e293b' }}>
-                {servers.map((s) => {
-                  const online = isServerOnline(s);
-                  return (
-                    <button
-                      key={s.id}
-                      class={`server-item${s.id === selectedServerId ? ' active' : ''}${online ? '' : ' offline'}`}
-                      onClick={() => { handleSelectServer(s.id, s.name); setMobileSidebarOpen(false); }}
-                    >
-                      <span class="server-item-dot" style={{ color: online ? '#4ade80' : '#475569' }}>
-                        {online ? '●' : '○'}
-                      </span>
-                      {s.name}
-                    </button>
-                  );
-                })}
-              </div>
-              {/* Session tree */}
-              <SessionTree
+              {/* Server switcher — collapsible via sidebar toggle */}
+              {!mobileHideServerBar && (
+                <div style={{ padding: '8px 12px', borderBottom: '1px solid #1e293b' }}>
+                  {servers.map((s) => {
+                    const online = isServerOnline(s);
+                    return (
+                      <button
+                        key={s.id}
+                        class={`server-item${s.id === selectedServerId ? ' active' : ''}${online ? '' : ' offline'}`}
+                        onClick={() => { handleSelectServer(s.id, s.name); setMobileSidebarOpen(false); }}
+                      >
+                        <span class="server-item-dot" style={{ color: online ? '#4ade80' : '#475569' }}>
+                          {online ? '●' : '○'}
+                        </span>
+                        {s.name}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              {/* Session tree — collapsible via sidebar toggle */}
+              {!mobileHideTabBar && <SessionTree
                 sessions={sessions}
                 subSessions={subSessions}
                 activeSession={activeSession}
@@ -2086,7 +2086,7 @@ export function App() {
                 }}
                 onNewSession={() => { setShowNewSession(true); setMobileSidebarOpen(false); }}
                 onNewSubSession={() => { setShowSubDialog(true); setMobileSidebarOpen(false); }}
-              />
+              />}
               {/* P2P ring progress */}
               {discussions.filter((d) => d.state === 'running' || d.state === 'setup').filter((d) => d.id.startsWith('p2p_')).map((d) => (
                 <P2pRingProgress

@@ -546,7 +546,11 @@ body {
 
 /* ── Sub-session collapsed bar (mobile compact buttons) ──────────────────── */
 .subsession-bar { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 10px; background: #0d1117; border-top: 1px solid #1e293b; transition: max-height 0.2s, padding 0.2s, opacity 0.2s; overflow: hidden; }
+/* Mobile keyboard open: hide everything below input row (sub-session cards, usage footer, shortcuts) */
 .kb-open .subsession-bar { display: none; }
+.kb-open .session-usage-footer { display: none; }
+.kb-open .shortcuts-row { display: none; }
+/* Shell terminal keyboard: also hide the input row itself (xterm receives keystrokes directly) */
 .kb-open .shell-terminal-pane .controls-wrapper { display: none; }
 .subsession-card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 52px; min-height: 52px; padding: 6px 10px; background: #1a2233; border: 1px solid #334155; border-radius: 8px; color: #94a3b8; cursor: pointer; font-family: inherit; font-size: 11px; transition: all 0.15s; }
 .subsession-card:hover, .subsession-card.open { border-color: #3b82f6; background: #1e3a5f; color: #93c5fd; }
