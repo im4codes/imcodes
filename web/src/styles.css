@@ -782,7 +782,7 @@ body {
 .sidebar-drop-zone { position: absolute; inset: 0; border: 2px dashed #6366f1; border-radius: 6px; display: flex; align-items: center; justify-content: center; color: #818cf8; font-size: 13px; font-weight: 500; background: rgba(99,102,241,0.10); pointer-events: none; z-index: 100; margin: 4px; }
 
 /* Individual pinned panel container */
-.sidebar-pinned-panel { display: flex; flex-direction: column; border-top: 1px solid #1e293b; background: #0f172a; position: relative; overflow: hidden; flex-shrink: 0; min-height: 100px; }
+.sidebar-pinned-panel { display: flex; flex-direction: column; border-top: 2px solid #334155; background: #0f172a; position: relative; overflow: hidden; flex-shrink: 0; min-height: 100px; }
 
 /* Panel header: title + unpin button */
 .sidebar-pinned-header { display: flex; align-items: center; justify-content: space-between; padding: 4px 8px; background: #111827; border-bottom: 1px solid #1e293b; flex-shrink: 0; min-height: 28px; gap: 4px; }
