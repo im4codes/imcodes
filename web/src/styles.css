@@ -827,6 +827,7 @@ body {
 .fb-changes-item-badge { font-size: 9px; font-weight: 700; padding: 0 3px; border-radius: 3px; background: rgba(251,191,36,.15); color: #fbbf24; flex-shrink: 0; font-family: monospace; }
 .fb-changes-item-name { color: #e2e8f0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 .fb-changes-item-dir { font-size: 10px; color: #475569; flex-shrink: 0; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fb-changes-item-stats { font-size: 10px; font-family: monospace; margin-left: auto; flex-shrink: 0; white-space: nowrap; }
 .fb-header { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-bottom: 1px solid #334155; font-weight: 600; font-size: 13px; flex-shrink: 0; }
 .fb-close { background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 15px; line-height: 1; padding: 2px 4px; }
 .fb-close:hover { color: #e2e8f0; }

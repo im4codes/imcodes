@@ -1768,13 +1768,30 @@ async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: Serve
     }
 
     const { stdout } = await execAsync('git status --porcelain -u', { cwd: real, timeout: 5000 });
-    const files: Array<{ path: string; code: string }> = [];
+    const files: Array<{ path: string; code: string; additions?: number; deletions?: number }> = [];
     for (const line of stdout.split('\n')) {
       if (!line.trim()) continue;
       const code = line.slice(0, 2).trim();
       const filePath = line.slice(3).trim().replace(/^"(.*)"$/, '$1'); // unquote if needed
       files.push({ path: nodePath.join(real, filePath), code });
     }
+    // Enrich with +/- line stats from git diff --numstat (best-effort)
+    try {
+      const { stdout: numstat } = await execAsync('git diff --numstat HEAD 2>/dev/null || git diff --numstat', { cwd: real, timeout: 5000 });
+      const statsMap = new Map<string, { add: number; del: number }>();
+      for (const line of numstat.split('\n')) {
+        const m = line.match(/^(\d+|-)\t(\d+|-)\t(.+)$/);
+        if (m) {
+          const add = m[1] === '-' ? 0 : parseInt(m[1], 10);
+          const del = m[2] === '-' ? 0 : parseInt(m[2], 10);
+          statsMap.set(nodePath.join(real, m[3].trim()), { add, del });
+        }
+      }
+      for (const f of files) {
+        const s = statsMap.get(f.path);
+        if (s) { f.additions = s.add; f.deletions = s.del; }
+      }
+    } catch { /* ignore — stats are best-effort */ }
     try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', files }); } catch { /* ignore */ }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

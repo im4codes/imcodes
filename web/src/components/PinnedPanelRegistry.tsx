@@ -24,6 +24,8 @@ export interface PanelRenderContext {
   inputRefsMap?: { current: Map<string, HTMLElement> };
   /** For repo/file browser CI events */
   onCiEvent?: (run: { name: string; status: string; conclusion?: string | null }) => void;
+  /** Open a file preview in a large floating window (used by pinned file browser) */
+  onPreviewFile?: (path: string) => void;
 }
 
 export interface PanelTypeRegistration {

@@ -442,6 +442,8 @@ export function App() {
 
   // ── Repo ────────────────────────────────────────────────────────────────────
   const [showRepoPage, setShowRepoPage] = useState(false);
+  /** File path for the floating file preview window (opened from pinned file browser) */
+  const [previewFilePath, setPreviewFilePath] = useState<string | null>(null);
   const [repoContexts, setRepoContexts] = useState<Map<string, any>>(new Map());
   const repoContextsRef = useRef(repoContexts);
   repoContextsRef.current = repoContexts;
@@ -1552,14 +1554,16 @@ export function App() {
             ))}
 
             {/* Pinned panels — generic rendering via registry */}
-            {pinnedPanels.map((panel) => {
+            {pinnedPanels.filter((p) => p.id && p.props).map((panel) => {
               const height = pinnedPanelHeights[panel.id] ?? 240;
+              const props = panel.props ?? {};
               const ctx: PanelRenderContext = {
                 ws: wsRef.current,
                 connected,
-                serverId: (panel.props.serverId as string) ?? selectedServerId ?? '',
+                serverId: (props.serverId as string) ?? selectedServerId ?? '',
                 subSessions: subSessions.map(s => ({ id: s.id, sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, cwd: s.cwd, parentSession: s.parentSession })),
                 inputRefsMap,
+                onPreviewFile: (path) => setPreviewFilePath(path),
               };
               return (
                 <SidebarPinnedPanel
@@ -1898,6 +1902,21 @@ export function App() {
             setToasts((prev) => [...prev, { id, sessionName: '', project: `${icon} ${run.name}`, kind: 'notification', title: run.status === 'success' ? 'CI Passed' : 'CI Failed', message: run.conclusion ?? run.status }]);
             setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 6000);
           }} />
+        </FloatingPanel>
+      )}
+
+      {/* Floating file preview — one file at a time, opened from pinned file browser */}
+      {previewFilePath && wsRef.current && (
+        <FloatingPanel id="file-preview" title={previewFilePath.split('/').pop() ?? 'Preview'} onClose={() => setPreviewFilePath(null)} defaultW={700} defaultH={500}>
+          <FileBrowser
+            ws={wsRef.current}
+            mode="file-single"
+            layout="panel"
+            initialPath={previewFilePath.replace(/\/[^/]+$/, '') || '~'}
+            autoPreviewPath={previewFilePath}
+            hideFooter
+            onConfirm={() => {}}
+          />
         </FloatingPanel>
       )}
 

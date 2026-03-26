@@ -214,6 +214,8 @@ export interface FileBrowserProps {
   serverId?: string;
   onConfirm: (paths: string[]) => void;
   onClose?: () => void;
+  /** When set, file clicks open an external preview (e.g. floating window) instead of inline split */
+  onPreviewFile?: (path: string) => void;
 }
 
 type FsNode = {
@@ -257,6 +259,7 @@ export function FileBrowser({
   serverId,
   onConfirm,
   onClose,
+  onPreviewFile,
 }: FileBrowserProps) {
   const { t } = useTranslation();
   const includeFiles = mode !== 'dir-only';
@@ -281,7 +284,7 @@ export function FileBrowser({
   const [modifiedFiles, setModifiedFiles] = useState<Map<string, string>>(new Map()); // path → git code
   // Panel view: 'files' shows tree + changes section; 'changes' shows only changed files
   const [panelView, setPanelView] = useState<'files' | 'changes'>('files');
-  const [changesFiles, setChangesFiles] = useState<Array<{ path: string; code: string }>>([]);
+  const [changesFiles, setChangesFiles] = useState<Array<{ path: string; code: string; additions?: number; deletions?: number }>>([]);
   const pendingChangesRef = useRef(new Set<string>()); // all in-flight changesRootPath git status requestIds
 
   const loadedRef = useRef(new Set<string>());
@@ -402,7 +405,7 @@ export function FileBrowser({
         if (pendingChangesRef.current.has(msg.requestId)) {
           pendingChangesRef.current.delete(msg.requestId);
           if (msg.status === 'ok' && msg.files) {
-            setChangesFiles(msg.files);
+            setChangesFiles(msg.files as Array<{ path: string; code: string; additions?: number; deletions?: number }>);
             // Also update modifiedFiles map for tree indicators
             setModifiedFiles((prev) => {
               const next = new Map(prev);
@@ -477,6 +480,7 @@ export function FileBrowser({
   }, [ws, includeFiles, t]);
 
   const fetchPreview = useCallback((filePath: string) => {
+    if (onPreviewFile) { onPreviewFile(filePath); return; }
     setPreview({ status: 'loading', path: filePath });
     setShowDiff(false);
     const requestId = ws.fsReadFile(filePath);
@@ -747,7 +751,7 @@ export function FileBrowser({
     M: 'Modified', A: 'Added', D: 'Deleted', R: 'Renamed', C: 'Copied', '??': 'Untracked', '!!': 'Ignored',
   };
   const groupedChanges = useMemo(() => {
-    const groups: Record<string, Array<{ path: string; code: string }>> = {};
+    const groups: Record<string, Array<{ path: string; code: string; additions?: number; deletions?: number }>> = {};
     for (const f of changesFiles) {
       const label = STATUS_LABEL[f.code] ?? f.code;
       if (!groups[label]) groups[label] = [];
@@ -784,6 +788,13 @@ export function FileBrowser({
                   <span class="fb-changes-item-badge">{f.code === '??' ? 'U' : f.code}</span>
                   <span class="fb-changes-item-name">{name}</span>
                   <span class="fb-changes-item-dir">{relPath !== name ? relPath.replace('/' + name, '') : ''}</span>
+                  {(f.additions != null || f.deletions != null) && (
+                    <span class="fb-changes-item-stats">
+                      {f.additions ? <span style={{ color: '#4ade80' }}>+{f.additions}</span> : null}
+                      {f.additions && f.deletions ? ' ' : ''}
+                      {f.deletions ? <span style={{ color: '#f87171' }}>-{f.deletions}</span> : null}
+                    </span>
+                  )}
                 </div>
               );
             })}
