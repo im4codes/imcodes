@@ -123,6 +123,38 @@ export function Sidebar({ collapsed, serverId, pinnedPanels: _pinnedPanels, onDr
     document.addEventListener('mouseup', onMouseUp);
   }, [width, serverId]);
 
+  // Touch support for tablet/iPad resize
+  const handleResizeTouchStart = useCallback((e: TouchEvent) => {
+    e.stopPropagation();
+    isDraggingRef.current = true;
+    startXRef.current = e.touches[0].clientX;
+    startWidthRef.current = width;
+
+    const onTouchMove = (ev: TouchEvent) => {
+      if (!isDraggingRef.current) return;
+      const delta = ev.touches[0].clientX - startXRef.current;
+      const newWidth = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, startWidthRef.current + delta));
+      setWidth(newWidth);
+    };
+
+    const onTouchEnd = (ev: TouchEvent) => {
+      if (!isDraggingRef.current) return;
+      isDraggingRef.current = false;
+      const touch = ev.changedTouches[0];
+      const delta = touch.clientX - startXRef.current;
+      const finalWidth = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, startWidthRef.current + delta));
+      setWidth(finalWidth);
+      if (serverId) {
+        try { localStorage.setItem(LS_WIDTH + serverId, String(finalWidth)); } catch { /* ignore */ }
+      }
+      document.removeEventListener('touchmove', onTouchMove);
+      document.removeEventListener('touchend', onTouchEnd);
+    };
+
+    document.addEventListener('touchmove', onTouchMove, { passive: true });
+    document.addEventListener('touchend', onTouchEnd);
+  }, [width, serverId]);
+
   return (
     <div
       class={`sidebar-panel${collapsed ? ' sidebar-panel-collapsed' : ''}${isDragOver ? ' sidebar-panel-drop-active' : ''}`}
@@ -159,6 +191,7 @@ export function Sidebar({ collapsed, serverId, pinnedPanels: _pinnedPanels, onDr
         <div
           class="sidebar-resize-handle"
           onMouseDown={handleResizeMouseDown}
+          onTouchStart={handleResizeTouchStart}
           aria-hidden="true"
         />
       )}
