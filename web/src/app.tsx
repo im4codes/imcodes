@@ -1457,15 +1457,15 @@ export function App() {
 
   const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
 
-  // Auto-pin file browser to sidebar on first session activation (desktop only).
+  // Auto-pin file browser to sidebar on first session activation.
   // Respects user preference: once they have any pinned panels saved, don't interfere.
   const autoPinnedRef = useRef(false);
   useEffect(() => {
-    if (isMobile || autoPinnedRef.current || !activeSession || !activeSessionInfo?.projectDir) return;
+    if (autoPinnedRef.current || !activeSession || !activeSessionInfo?.projectDir) return;
     if (pinnedPanels.length > 0) { autoPinnedRef.current = true; return; } // user already has panels
     autoPinnedRef.current = true;
     pinPanel('filebrowser', { sessionName: activeSession, projectDir: activeSessionInfo.projectDir, serverId: selectedServerId });
-  }, [activeSession, activeSessionInfo?.projectDir, isMobile, pinnedPanels.length, pinPanel, selectedServerId]);
+  }, [activeSession, activeSessionInfo?.projectDir, pinnedPanels.length, pinPanel, selectedServerId]);
 
   // ── Git changes count for file browser badge ───────────────────────────
   // Refreshes on: initial load, every 30s, and after tool calls (file writes).
@@ -1986,6 +1986,31 @@ export function App() {
                   onClick={() => { setDiscussionInitialId(d.fileId ?? null); setShowDiscussionsPage(true); setMobileSidebarOpen(false); }}
                 />
               ))}
+              {/* Pinned panels — same as desktop sidebar */}
+              {pinnedPanels.filter((p) => p.id && p.props && (p.type !== 'subsession' || !p.props.serverId || p.props.serverId === selectedServerId)).map((panel) => {
+                const height = pinnedPanelHeights[panel.id] ?? 240;
+                const props = panel.props ?? {};
+                const ctx: PanelRenderContext = {
+                  ws: wsRef.current,
+                  connected,
+                  serverId: (props.serverId as string) ?? selectedServerId ?? '',
+                  subSessions: subSessions.map(s => ({ id: s.id, sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, cwd: s.cwd, parentSession: s.parentSession })),
+                  inputRefsMap,
+                  onPreviewFile: (path) => setPreviewFilePath(path),
+                  activeSession,
+                  activeProjectDir: activeSessionInfo?.projectDir,
+                };
+                return (
+                  <SidebarPinnedPanel
+                    key={panel.id}
+                    panel={panel}
+                    height={height}
+                    onUnpin={() => unpinPanel(panel)}
+                    onResize={(h) => savePinnedPanelHeight(panel.id, h)}
+                    ctx={ctx}
+                  />
+                );
+              })}
             </div>
             {/* Footer */}
             <div class="mobile-sidebar-footer">
