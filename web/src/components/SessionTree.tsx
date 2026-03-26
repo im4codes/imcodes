@@ -113,10 +113,15 @@ function SessionNode({
 
   return (
     <button class={classes} onClick={onClick} title={`${agentType} — ${state}`}>
-      {/* Terminal or transport icon */}
-      <span class="session-tree-icon" aria-hidden="true">
-        {isTransport ? '☁' : '▶'}
-      </span>
+      {/* Icon: only for sub-sessions (main sessions use the tree toggle arrow) */}
+      {isSub && (
+        <span class="session-tree-icon" aria-hidden="true">
+          {isTransport ? '☁' : '·'}
+        </span>
+      )}
+      {!isSub && isTransport && (
+        <span class="session-tree-icon" aria-hidden="true">☁</span>
+      )}
 
       {/* Agent type badge */}
       {badge && (
