@@ -1875,7 +1875,7 @@ export function App() {
             )}
 
             {/* Sub-session bar — hidden on desktop when sidebar is expanded (SessionTree shows sub-sessions there) */}
-            {selectedServerId && (isMobile || sidebarCollapsed) && (
+            {selectedServerId && (
               <SubSessionBar
                 subSessions={visibleSubSessions}
                 openIds={openSubIds}
