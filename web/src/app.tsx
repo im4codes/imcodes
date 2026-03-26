@@ -2115,7 +2115,7 @@ export function App() {
                   serverId: (props.serverId as string) ?? selectedServerId ?? '',
                   subSessions: subSessions.map(s => ({ id: s.id, sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, cwd: s.cwd, parentSession: s.parentSession })),
                   inputRefsMap,
-                  onPreviewFile: (path) => { setPreviewFilePath(path); snapSidebar(false); },
+                  onPreviewFile: (path) => { setPreviewFilePath(path); setMobileSidebarOpen(false); },
                   activeSession,
                   activeProjectDir: activeSessionInfo?.projectDir,
                 };
