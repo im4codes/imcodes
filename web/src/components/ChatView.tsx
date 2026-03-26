@@ -220,6 +220,7 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
   const [copied, setCopied] = useState(false);
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   const [highlightEl, setHighlightEl] = useState<HTMLElement | null>(null);
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; text: string } | null>(null);
 
   const autoScrollRef = useRef(true);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
@@ -456,13 +457,30 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
       {refreshing && <div class="chat-refreshing">{t('chat.syncing')}</div>}
       <div class="chat-main">
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} onScroll={preview ? undefined : handleScroll}
-          onContextMenu={!preview ? (e) => {
-            // Highlight the closest chat-event on right-click / long-press
+          onContextMenu={!preview && onQuote ? (e) => {
             const target = (e.target as HTMLElement).closest?.('.chat-event') as HTMLElement | null;
             if (highlightEl) highlightEl.classList.remove('chat-highlight');
-            if (target) { target.classList.add('chat-highlight'); setHighlightEl(target); }
+            if (target) {
+              target.classList.add('chat-highlight');
+              setHighlightEl(target);
+              // Show context menu with "Quote All" for this block
+              const text = (target.textContent ?? '').trim();
+              if (text) {
+                const wrapEl = scrollRef.current?.closest('.chat-view-wrap') as HTMLElement | null;
+                const wrapRect = (wrapEl ?? scrollRef.current!).getBoundingClientRect();
+                const rect = target.getBoundingClientRect();
+                setCtxMenu({
+                  x: Math.min(rect.left + rect.width / 2 - wrapRect.left, wrapRect.width - 60),
+                  y: rect.top - wrapRect.top,
+                  text,
+                });
+              }
+            }
           } : undefined}
-          onClick={highlightEl ? () => { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); } : undefined}
+          onClick={(highlightEl || ctxMenu) ? () => {
+            if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
+            setCtxMenu(null);
+          } : undefined}
         >
           {viewItems.length === 0 && (
             <div class="chat-loading">
@@ -543,6 +561,24 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
                 {t('common.quote', 'Quote')}
               </button>
             )}
+          </div>
+        )}
+        {ctxMenu && !preview && onQuote && (
+          <div
+            class="chat-sel-menu"
+            style={{ left: `${ctxMenu.x}px`, top: `${ctxMenu.y}px` }}
+            onMouseDown={(e) => e.preventDefault()}
+          >
+            <button
+              class="chat-sel-btn"
+              onClick={() => {
+                onQuote(ctxMenu.text);
+                setCtxMenu(null);
+                if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
+              }}
+            >
+              {t('common.quote_block', 'Quote All')}
+            </button>
           </div>
         )}
       </div>

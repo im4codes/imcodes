@@ -9,6 +9,7 @@
     "close": "Close",
     "copy": "Copy",
     "quote": "Quote",
+    "quote_block": "Quote All",
     "copied": "Copied!",
     "generating": "Generating...",
     "starting": "Starting...",

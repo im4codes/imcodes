@@ -9,6 +9,7 @@
     "close": "關閉",
     "copy": "複製",
     "quote": "引用",
+    "quote_block": "引用整段",
     "copied": "已複製！",
     "generating": "生成中...",
     "starting": "啟動中...",
