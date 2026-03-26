@@ -88,7 +88,7 @@ describe('AtPicker', () => {
     expect(screen.queryByText('brain')).toBeNull();
   });
 
-  it('with p2pConfig, only shows enabled config sessions in agents list', () => {
+  it('with p2pConfig, individual agents list shows ALL agents (config only affects @@all)', () => {
     const wsClient = { connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) };
 
     render(
@@ -120,14 +120,13 @@ describe('AtPicker', () => {
 
     fireEvent.click(screen.getByText('agents'));
 
-    // w1 and w3 are enabled — should be visible
+    // All agents visible regardless of config enabled state
     expect(screen.getByText('w1')).toBeDefined();
+    expect(screen.getByText('w2')).toBeDefined();
     expect(screen.getByText('w3')).toBeDefined();
-    // w2 is disabled — should NOT be visible
-    expect(screen.queryByText('w2')).toBeNull();
   });
 
-  it('sessions not in p2pConfig are excluded (strict mode)', () => {
+  it('with p2pConfig, agents not in config are still shown individually', () => {
     const wsClient = { connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) };
 
     render(
@@ -146,7 +145,7 @@ describe('AtPicker', () => {
         p2pConfig={{
           sessions: {
             'deck_sub_w1': { enabled: true, mode: 'audit' },
-            // w2 NOT in config at all — should be excluded
+            // w2 NOT in config — still shown individually
           },
           rounds: 1,
         }}
@@ -158,8 +157,7 @@ describe('AtPicker', () => {
     fireEvent.click(screen.getByText('agents'));
 
     expect(screen.getByText('w1')).toBeDefined();
-    // w2 is not in config — strict mode excludes it
-    expect(screen.queryByText('w2')).toBeNull();
+    expect(screen.getByText('w2')).toBeDefined();
   });
 
   it('shows localized empty-state labels in agents step', () => {

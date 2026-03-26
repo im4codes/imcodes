@@ -359,15 +359,13 @@ export function AtPicker({
         return;
       }
 
-      // Files or Agents list — use same strict config filtering as render path
-      // Fallback: if strict filter yields nothing (stale config), show all agents
+      // Files or Agents list — config only affects @@all rows, individual agents always show all
       const kbConfigMap = p2pConfig ? new Map(Object.entries(p2pConfig.sessions)) : null;
       const kbCfgFiltered = kbConfigMap
         ? agents.filter(a => { const entry = kbConfigMap.get(a.session); return entry ? (entry.enabled && entry.mode !== 'skip') : false; })
         : null;
       const kbCfgActive = kbCfgFiltered && kbCfgFiltered.length > 0;
-      const kbVisibleAgents = kbCfgActive ? kbCfgFiltered : agents;
-      const nonSelfCount = kbVisibleAgents.filter(a => !a.isSelf).length;
+      const nonSelfCount = agents.filter(a => !a.isSelf).length;
       const hasAllRow = category === 'agents' && nonSelfCount > 1;
       const cfgParticipants = kbCfgActive
         ? kbCfgFiltered.map(a => [a.session, kbConfigMap!.get(a.session)!] as [string, { enabled: boolean; mode: string }])
@@ -375,7 +373,7 @@ export function AtPicker({
       const cfgRowCount = category === 'agents' && cfgParticipants.length > 0 ? 2 : 0;
       const regAllOffset = cfgRowCount;
       const agentsOff = regAllOffset + (hasAllRow ? 1 : 0);
-      const count = category === 'files' ? fileResults.length : cfgRowCount + (hasAllRow ? 1 : 0) + kbVisibleAgents.length;
+      const count = category === 'files' ? fileResults.length : cfgRowCount + (hasAllRow ? 1 : 0) + agents.length;
       if (e.key === 'Escape') {
         e.preventDefault();
         setCategory('choose');
@@ -400,7 +398,7 @@ export function AtPicker({
           setModeAgent('__all__'); setModeHighlight(0);
         } else {
           const agentIdx = highlightIdx - agentsOff;
-          const a = kbVisibleAgents[agentIdx];
+          const a = agents[agentIdx];
           if (a) { setModeAgent(a.session); setModeHighlight(0); }
         }
       }
@@ -588,25 +586,20 @@ export function AtPicker({
   }
 
   // ── Agents list ──
-  // When p2pConfig exists, only show sessions that are enabled in config.
-  // Strict filter: sessions not in config are excluded. But if the intersection
-  // between config and live agents is empty (stale config after session recreation),
-  // fall back to showing all agents — treat config as absent.
+  // Config filtering only affects @@all(config) rows — individual agents always show all.
   const cfgMap = p2pConfig ? new Map(Object.entries(p2pConfig.sessions)) : null;
   const cfgFiltered = cfgMap
     ? agents.filter(a => { const e = cfgMap.get(a.session); return e ? (e.enabled && e.mode !== 'skip') : false; })
     : null;
   const cfgActive = cfgFiltered && cfgFiltered.length > 0;
-  const renderVisibleAgents = cfgActive
-    ? cfgFiltered.map(a => ({ ...a, cfgMode: cfgMap!.get(a.session)!.mode }))
-    : agents;
-  const nonSelfAgents = renderVisibleAgents.filter(a => !a.isSelf);
-  const showAll = nonSelfAgents.length > 1;
-  // Config participants — only when config actually matched live agents
+  // Config participants — for @@all(config) preview only
   const configParticipants: [string, { enabled: boolean; mode: string }][] = cfgActive
     ? cfgFiltered.map(a => [a.session, cfgMap!.get(a.session)!] as [string, { enabled: boolean; mode: string }])
     : [];
   const showConfigRows = cfgActive && configParticipants.length > 0;
+  // Individual agents list — always show all (unfiltered)
+  const nonSelfAgents = agents.filter(a => !a.isSelf);
+  const showAll = nonSelfAgents.length > 1;
   const configRowCount = showConfigRows ? 2 : 0; // @all and @all+
   // Index offset: configRows come first, then regular @all, then individual agents
   const regularAllOffset = configRowCount;
@@ -691,11 +684,11 @@ export function AtPicker({
         </div>
       )}
 
-      {/* Individual agents */}
-      {renderVisibleAgents.map((a, idx) => {
+      {/* Individual agents — always show all, unfiltered */}
+      {agents.map((a, idx) => {
         const adjustedIdx = agentsOffset + idx;
         const hl = adjustedIdx === highlightIdx;
-        const cfgMode = 'cfgMode' in a ? (a as { cfgMode?: string }).cfgMode : undefined;
+        const cfgMode = cfgMap ? cfgMap.get(a.session) : undefined;
         return (
           <div
             key={a.session}
@@ -705,7 +698,7 @@ export function AtPicker({
             onMouseEnter={() => setHighlightIdx(adjustedIdx)}
           >
             <span style={{ fontWeight: 500 }}>{a.shortName}</span>
-            <span style={dimStyle}>{a.agentType}{cfgMode ? ` · ${cfgMode}` : ''}</span>
+            <span style={dimStyle}>{a.agentType}{cfgMode?.enabled ? ` · ${cfgMode.mode}` : ''}</span>
             {a.isSelf && <span style={{ color: '#60a5fa', fontSize: 10, marginLeft: 4 }}>({t('p2p.picker.you')})</span>}
             {a.busy && <span style={busyDotStyle} title={t('p2p.picker.busy')} />}
           </div>
