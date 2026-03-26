@@ -1,7 +1,7 @@
 /**
  * SidebarPinnedPanel — a panel pinned to the sidebar.
  * Supports two panel types:
- *   - 'subsession': renders a ChatView for the sub-session (chat only, no terminal)
+ *   - 'subsession': renders ChatView or TerminalView based on session type
  *   - 'repo': renders FileBrowser in compact panel mode
  *
  * Includes a resize handle at the bottom and an unpin (×) button in the header.
@@ -13,6 +13,7 @@
 import { useRef, useCallback, useEffect, useMemo, useState } from 'preact/hooks';
 import type { RefObject } from 'preact';
 import { ChatView } from './ChatView.js';
+import { TerminalView } from './TerminalView.js';
 import { FileBrowser } from './FileBrowser.js';
 import { useTimeline } from '../hooks/useTimeline.js';
 import { useTranslation } from 'react-i18next';
@@ -66,6 +67,19 @@ function SubSessionChatPanel({
       <div class="sidebar-pinned-unavailable">
         {t('sidebar.session_unavailable')}
       </div>
+    );
+  }
+
+  const isShell = liveSubSession.type === 'shell' || liveSubSession.type === 'script';
+
+  if (isShell) {
+    // Shell/script sessions: show terminal view
+    return (
+      <TerminalView
+        sessionName={sessionName}
+        ws={ws}
+        connected={connected}
+      />
     );
   }
 
