@@ -64,7 +64,7 @@ registerPanelType('filebrowser', {
   render: (panel, ctx) => {
     // Follow active tab's project dir; fall back to captured dir at pin time
     const projectDir = ctx.activeProjectDir ?? panel.props?.projectDir as string | undefined;
-    if (!ctx.ws || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
+    if (!ctx.ws || !ctx.connected || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
     const activeSession = ctx.activeSession ?? panel.props?.sessionName as string | undefined;
     return (
       <FileBrowser
@@ -110,7 +110,7 @@ registerPanelType('repopage', {
   render: (panel, ctx) => {
     // Follow active tab's project dir
     const projectDir = ctx.activeProjectDir ?? panel.props?.projectDir as string | undefined;
-    if (!ctx.ws || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
+    if (!ctx.ws || !ctx.connected || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
     return (
       <RepoPage
         ws={ctx.ws}
