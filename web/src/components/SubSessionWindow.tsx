@@ -33,8 +33,8 @@ interface Props {
   onRename: () => void;
   zIndex: number;
   onFocus: () => void;
-  /** Optional: called to pin this sub-session to the sidebar. Only for non-terminal types. */
-  onPin?: () => void;
+  /** Optional: called to pin this sub-session to the sidebar. Passes current viewMode. */
+  onPin?: (viewMode: 'terminal' | 'chat') => void;
   sessions?: SessionInfo[];
   subSessions?: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
   serverId?: string;
@@ -310,7 +310,7 @@ export function SubSessionWindow({
         <span class="subsession-title">{typeLabel}</span>
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
           {!isShell && !isTransport && <button class="subsession-mode-btn" onClick={() => { const next = viewMode === 'chat' ? 'terminal' : 'chat'; setViewMode(next); if (next === 'chat') requestAnimationFrame(() => chatScrollRef.current?.()); }} title={viewMode === 'chat' ? 'Switch to terminal' : 'Switch to chat'}>{viewMode === 'chat' ? '⌨' : '💬'}</button>}
-          {isPinnable && <button class="subsession-minimize-btn" onClick={onPin} title={t('sidebar.pin_to_sidebar')}>📌</button>}
+          {isPinnable && <button class="subsession-minimize-btn" onClick={() => onPin?.(viewMode)} title={t('sidebar.pin_to_sidebar')}>📌</button>}
           <button class="subsession-minimize-btn" onClick={onMinimize} title="Minimize">▾</button>
           <button class="subsession-close-btn" onClick={onMinimize} title="Hide">×</button>
         </div>

@@ -65,6 +65,8 @@ export interface PinnedPanel {
   /** Captured at pin time for repo panels — stable across session switches */
   projectDir?: string;
   serverId?: string;
+  /** Captured at pin time — preserve the view mode the user had when pinning */
+  viewMode?: 'terminal' | 'chat';
 }
 
 interface AuthState {
@@ -575,14 +577,14 @@ export function App() {
   }, []);
 
   /** Pin a sub-session: remove from openSubIds, add to pinnedPanels. */
-  const pinSubSession = useCallback((subId: string) => {
+  const pinSubSession = useCallback((subId: string, viewMode?: 'terminal' | 'chat') => {
     const sub = subSessions.find((s) => s.id === subId);
     if (!sub) return;
     const sessionName = sub.sessionName;
     setOpenSubIds((prev) => { const s = new Set(prev); s.delete(subId); return s; });
     setPinnedPanels((prev) => {
       if (prev.some((p) => p.sessionName === sessionName)) return prev;
-      return [...prev, { type: 'subsession', sessionName }];
+      return [...prev, { type: 'subsession', sessionName, viewMode }];
     });
   }, [subSessions, setPinnedPanels]);
 
@@ -1987,7 +1989,7 @@ export function App() {
               }}
               zIndex={subZIndexes.get(sub.id) ?? 1000}
               onFocus={() => bringSubToFront(sub.id)}
-              onPin={() => pinSubSession(sub.id)}
+              onPin={(vm) => pinSubSession(sub.id, vm)}
               sessions={sessions}
               subSessions={subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession }))}
               serverId={selectedServerId ?? undefined}

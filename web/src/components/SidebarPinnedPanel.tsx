@@ -51,12 +51,14 @@ function SubSessionChatPanel({
   connected,
   serverId,
   liveSubSession,
+  pinnedViewMode,
 }: {
   sessionName: string;
   ws: WsClient | null;
   connected: boolean;
   serverId: string;
   liveSubSession?: SubSession;
+  pinnedViewMode?: 'terminal' | 'chat';
 }) {
   const { t } = useTranslation();
   const { events, refreshing } = useTimeline(sessionName, ws);
@@ -70,10 +72,11 @@ function SubSessionChatPanel({
     );
   }
 
+  // Respect the viewMode captured at pin time; default to chat for non-shell, terminal for shell
   const isShell = liveSubSession.type === 'shell' || liveSubSession.type === 'script';
+  const effectiveMode = pinnedViewMode ?? (isShell ? 'terminal' : 'chat');
 
-  if (isShell) {
-    // Shell/script sessions: show terminal view
+  if (effectiveMode === 'terminal') {
     return (
       <TerminalView
         sessionName={sessionName}
@@ -201,6 +204,7 @@ export function SidebarPinnedPanel({
         connected={connected}
         serverId={serverId}
         liveSubSession={liveSubSession}
+        pinnedViewMode={panel.viewMode}
       />
     );
   };
