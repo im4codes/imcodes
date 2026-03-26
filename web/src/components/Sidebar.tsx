@@ -11,7 +11,6 @@ const DEFAULT_WIDTH = 240;
 
 interface Props {
   collapsed: boolean;
-  onToggleCollapse: () => void;
   serverId: string | null;
   /** Currently pinned panels — used to show drop zone only for droppable types. */
   pinnedPanels?: PinnedPanel[];
@@ -20,7 +19,7 @@ interface Props {
   children?: ComponentChildren;
 }
 
-export function Sidebar({ collapsed, onToggleCollapse, serverId, pinnedPanels: _pinnedPanels, onDropPanel, children }: Props) {
+export function Sidebar({ collapsed, serverId, pinnedPanels: _pinnedPanels, onDropPanel, children }: Props) {
   const { t } = useTranslation();
 
   // ── Drag-over drop zone state ────────────────────────────────────────────

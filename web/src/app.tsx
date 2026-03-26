@@ -1527,7 +1527,6 @@ export function App() {
           />
           <Sidebar
             collapsed={sidebarCollapsed}
-            onToggleCollapse={handleToggleSidebar}
             serverId={selectedServerId}
             pinnedPanels={pinnedPanels}
             onDropPanel={(type, id) => {
