@@ -38,7 +38,7 @@ export function ServerIconBar({ servers, activeServerId, onSelectServer, sidebar
           {sidebarCollapsed ? '☰' : '‹'}
         </button>
       )}
-      {servers.length > 1 && servers.map((server) => {
+      {servers.map((server) => {
         const isActive = server.id === activeServerId;
         const isOnline = server.status !== 'offline' && server.lastHeartbeatAt != null && Date.now() - server.lastHeartbeatAt < 60_000;
         return (
