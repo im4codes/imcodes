@@ -180,18 +180,6 @@ export function Sidebar({ collapsed, serverId, pinnedPanels: _pinnedPanels, onDr
         </div>
       )}
 
-      {/* Resize grip — sits on the border between content and footer */}
-      {!collapsed && (
-        <div
-          class="sidebar-resize-grip"
-          onMouseDown={handleResizeMouseDown}
-          onTouchStart={handleResizeTouchStart}
-          title={t('sidebar.drag_to_resize', 'Drag to resize')}
-        >
-          ◂ ▸
-        </div>
-      )}
-
       {/* Footer: one row — language, build time, copyright */}
       {!collapsed && (
         <div class="sidebar-footer">
@@ -203,7 +191,19 @@ export function Sidebar({ collapsed, serverId, pinnedPanels: _pinnedPanels, onDr
         </div>
       )}
 
-      {/* Right-edge resize handle — only active when not collapsed */}
+      {/* Resize grip — visible pill on the right border edge */}
+      {!collapsed && (
+        <div
+          class="sidebar-resize-grip"
+          onMouseDown={handleResizeMouseDown}
+          onTouchStart={handleResizeTouchStart}
+          title={t('sidebar.drag_to_resize', 'Drag to resize')}
+        >
+          ◂▸
+        </div>
+      )}
+
+      {/* Right-edge resize handle — invisible drag strip */}
       {!collapsed && (
         <div
           class="sidebar-resize-handle"
