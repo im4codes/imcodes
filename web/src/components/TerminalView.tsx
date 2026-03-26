@@ -353,12 +353,14 @@ export function TerminalView({ sessionName, ws, connected, onDiff, onHistory, on
           isTouchingRef.current = true;
           const t = e.touches[0];
           touchStartPosRef.current = { x: t.clientX, y: t.clientY };
-          e.preventDefault(); // block keyboard popup from xterm
+          if (!mobileInput) e.preventDefault(); // block keyboard popup — except for shell sessions
         } : undefined}
         onTouchEnd={isMobile ? () => {
           isTouchingRef.current = false;
           lastTouchEndRef.current = Date.now();
           touchStartPosRef.current = null;
+          // For shell sessions: focus xterm textarea to trigger keyboard
+          if (mobileInput && termRef.current) termRef.current.focus();
         } : undefined}
         onTouchCancel={isMobile ? () => {
           isTouchingRef.current = false;
