@@ -1934,6 +1934,9 @@ export function App() {
 
       {showRepoPage && wsRef.current && activeSessionInfo?.projectDir && (
         <FloatingPanel id="repo" title="Repository" onClose={() => setShowRepoPage(false)} defaultW={800} defaultH={600}>
+          <div style={{ padding: '2px 8px', background: '#111827', borderBottom: '1px solid #1e293b', display: 'flex', justifyContent: 'flex-end' }}>
+            <button class="subsession-minimize-btn" onClick={pinRepo} title={trans('sidebar.pin_to_sidebar')}>📌</button>
+          </div>
           <RepoPage ws={wsRef.current} projectDir={activeSessionInfo.projectDir} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
             const id = Date.now();
             const icon = run.status === 'success' ? '✅' : '❌';
