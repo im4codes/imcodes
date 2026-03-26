@@ -180,6 +180,15 @@ function useIdleFlash(items: Array<{ name: string; state: string }>): Set<string
   return flashing;
 }
 
+// ── Collapse state persistence ────────────────────────────────────────────────
+const LS_COLLAPSED_KEY = 'rcc_tree_collapsed';
+function loadCollapsed(): Set<string> {
+  try { const raw = localStorage.getItem(LS_COLLAPSED_KEY); return raw ? new Set(JSON.parse(raw)) : new Set(); } catch { return new Set(); }
+}
+function saveCollapsed(set: Set<string>) {
+  try { localStorage.setItem(LS_COLLAPSED_KEY, JSON.stringify([...set])); } catch { /* ignore */ }
+}
+
 // ── Main component ────────────────────────────────────────────────────────────
 function SessionTreeInner({
   sessions,
@@ -190,6 +199,29 @@ function SessionTreeInner({
   onSelectSubSession,
 }: Props) {
   const { t } = useTranslation();
+  const [collapsed, setCollapsed] = useState<Set<string>>(loadCollapsed);
+
+  const toggleCollapse = (name: string) => {
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name); else next.add(name);
+      saveCollapsed(next);
+      return next;
+    });
+  };
+
+  const collapseAll = () => {
+    const all = new Set(sessions.map(s => s.name));
+    setCollapsed(all);
+    saveCollapsed(all);
+  };
+
+  const expandAll = () => {
+    setCollapsed(new Set());
+    saveCollapsed(new Set());
+  };
+
+  const allCollapsed = sessions.length > 0 && sessions.every(s => collapsed.has(s.name));
 
   // Memoize the flat item list used for idle-flash detection to avoid
   // creating a new array reference on every render cycle.
@@ -210,8 +242,22 @@ function SessionTreeInner({
     );
   }
 
+  // Check if any session has subs
+  const hasSubs = subSessions.length > 0;
+
   return (
     <div class="session-tree" role="tree" aria-label={t('sidebar.sessionTree', 'Session tree')}>
+      {/* Collapse all / expand all toggle */}
+      {hasSubs && (
+        <button
+          class="session-tree-collapse-all"
+          onClick={allCollapsed ? expandAll : collapseAll}
+          title={allCollapsed ? t('sidebar.expand_all', 'Expand all') : t('sidebar.collapse_all', 'Collapse all')}
+        >
+          {allCollapsed ? '▸' : '▾'} {allCollapsed ? t('sidebar.expand_all', 'Expand all') : t('sidebar.collapse_all', 'Collapse all')}
+        </button>
+      )}
+
       {sessions.map((session) => {
         const sessionLabel = getSessionLabel(session);
         const isActive = session.name === activeSession;
@@ -223,24 +269,36 @@ function SessionTreeInner({
         const children = subSessions.filter(
           (s) => !s.parentSession || s.parentSession === session.name,
         );
+        const isCollapsed = collapsed.has(session.name);
 
         return (
-          <div key={session.name} role="treeitem" aria-expanded={children.length > 0}>
-            {/* Main session node */}
-            <SessionNode
-              label={sessionLabel}
-              agentType={session.agentType}
-              state={session.state}
-              isActive={isActive}
-              isTransport={isTransport}
-              isSub={false}
-              unread={unread}
-              idleFlash={idleFlash}
-              onClick={() => onSelectSession(session.name)}
-            />
+          <div key={session.name} role="treeitem" aria-expanded={!isCollapsed && children.length > 0}>
+            {/* Main session node with collapse toggle */}
+            <div class="session-tree-main-row">
+              {children.length > 0 && (
+                <button
+                  class="session-tree-toggle"
+                  onClick={(e) => { e.stopPropagation(); toggleCollapse(session.name); }}
+                  title={isCollapsed ? 'Expand' : 'Collapse'}
+                >
+                  {isCollapsed ? '▸' : '▾'}
+                </button>
+              )}
+              <SessionNode
+                label={sessionLabel}
+                agentType={session.agentType}
+                state={session.state}
+                isActive={isActive}
+                isTransport={isTransport}
+                isSub={false}
+                unread={unread}
+                idleFlash={idleFlash}
+                onClick={() => onSelectSession(session.name)}
+              />
+            </div>
 
-            {/* Sub-session nodes (indented) */}
-            {children.map((sub) => {
+            {/* Sub-session nodes (indented) — hidden when collapsed */}
+            {!isCollapsed && children.map((sub) => {
               const subLabel = sub.label ?? sub.type;
               const subUnread = unreadCounts.get(sub.sessionName) ?? 0;
               const subIdleFlash = flashingSet.has(sub.sessionName);
