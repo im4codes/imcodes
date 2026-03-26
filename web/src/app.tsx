@@ -1524,6 +1524,10 @@ export function App() {
             onSelectServer={handleSelectServer}
             sidebarCollapsed={sidebarCollapsed}
             onToggleSidebar={handleToggleSidebar}
+            onSettings={() => setShowSettingsPage(true)}
+            onHome={() => setSelectedServerId(null)}
+            isAdmin={isAdmin}
+            onAdmin={() => setShowAdminPage(true)}
           />
           <Sidebar
             collapsed={sidebarCollapsed}

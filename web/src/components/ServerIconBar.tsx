@@ -13,13 +13,17 @@ interface Props {
   onSelectServer: (id: string, name: string) => void;
   sidebarCollapsed?: boolean;
   onToggleSidebar?: () => void;
+  onSettings?: () => void;
+  onHome?: () => void;
+  isAdmin?: boolean;
+  onAdmin?: () => void;
 }
 
 function getInitial(name: string): string {
   return (name || '?').charAt(0).toUpperCase();
 }
 
-export function ServerIconBar({ servers, activeServerId, onSelectServer, sidebarCollapsed, onToggleSidebar }: Props) {
+export function ServerIconBar({ servers, activeServerId, onSelectServer, sidebarCollapsed, onToggleSidebar, onSettings, onHome, isAdmin, onAdmin }: Props) {
   const { t } = useTranslation();
 
   return (
@@ -55,6 +59,26 @@ export function ServerIconBar({ servers, activeServerId, onSelectServer, sidebar
           </button>
         );
       })}
+
+      {/* Spacer — push bottom icons down */}
+      <div style={{ flex: 1 }} />
+
+      {/* Bottom icons: admin, settings, home */}
+      {isAdmin && onAdmin && (
+        <button class="server-icon" onClick={onAdmin} title={t('common.admin', 'Admin')}>
+          🛡
+        </button>
+      )}
+      {onSettings && (
+        <button class="server-icon" onClick={onSettings} title={t('common.settings', 'Settings')}>
+          ⚙
+        </button>
+      )}
+      {onHome && (
+        <button class="server-icon" onClick={onHome} title={t('common.home', 'Home')}>
+          ⌂
+        </button>
+      )}
     </div>
   );
 }
