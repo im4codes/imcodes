@@ -29,7 +29,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   const mode = pinnedViewMode ?? (isShell ? 'terminal' : 'chat');
 
   if (mode === 'terminal') {
-    return <TerminalView sessionName={sessionName} ws={ctx.ws} connected={ctx.connected} />;
+    return <TerminalView sessionName={sessionName} ws={ctx.ws} connected={ctx.connected} mobileInput={isShell} />;
   }
 
   return (

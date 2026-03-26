@@ -327,6 +327,7 @@ export function SubSessionWindow({
             onHistory={(apply) => onHistory(sub.sessionName, apply)}
             onFitFn={(fn) => { termFitFnRef.current = fn; }}
             onScrollBottomFn={onTermScrollBottomFn}
+            mobileInput={isShell}
           />
         </div>
         {viewMode === 'chat' && (

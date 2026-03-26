@@ -17,9 +17,11 @@ interface Props {
   onFitFn?: (fn: () => void) => void;
   /** Receives a function that forces the terminal to scroll to the bottom. */
   onScrollBottomFn?: (fn: () => void) => void;
+  /** When true, allow keyboard input on mobile (for shell/ssh sessions). */
+  mobileInput?: boolean;
 }
 
-export function TerminalView({ sessionName, ws, connected, onDiff, onHistory, onFocusFn, onFitFn, onScrollBottomFn }: Props) {
+export function TerminalView({ sessionName, ws, connected, onDiff, onHistory, onFocusFn, onFitFn, onScrollBottomFn, mobileInput }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -67,9 +69,9 @@ export function TerminalView({ sessionName, ws, connected, onDiff, onHistory, on
       scrollback: 5000,
       allowTransparency: false,
       cursorBlink: true,
-      // On mobile: disable xterm's built-in textarea focus so tapping the
-      // terminal does not pop up the keyboard. Input goes via SessionControls.
-      disableStdin: isMobile,
+      // On mobile: disable xterm stdin unless mobileInput is set (shell sessions
+      // need keyboard for interactive SSH-like input).
+      disableStdin: isMobile && !mobileInput,
     });
 
     // Copy selected text to clipboard on Ctrl+C / Cmd+C when selection exists

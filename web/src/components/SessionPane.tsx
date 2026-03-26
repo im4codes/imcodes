@@ -199,6 +199,7 @@ export function SessionPane({
           onFocusFn={onFocusFn}
           onFitFn={onFitFn}
           onScrollBottomFn={handleTermScrollFn}
+          mobileInput={session.agentType === 'shell'}
         />
       </div>
 
