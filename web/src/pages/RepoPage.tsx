@@ -273,6 +273,12 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
 
   useEffect(() => {
     return ws.onMessage((msg: ServerMessage) => {
+      // WS reconnected — re-detect and re-fetch active tab
+      if (msg.type === 'daemon.reconnected' || (msg.type === 'session.event' && (msg as any).event === 'connected')) {
+        doDetect();
+        return;
+      }
+
       // Detect response
       if (msg.type === REPO_MSG.DETECT_RESPONSE) {
         if (msg.requestId !== detectReqRef.current) return;

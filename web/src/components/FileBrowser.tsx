@@ -334,6 +334,16 @@ export function FileBrowser({
     return ws.onMessage((msg: ServerMessage) => {
       if (!mountedRef.current) return;
 
+      // WS reconnected — clear loaded cache so directories re-fetch on next expand/navigate
+      if (msg.type === 'daemon.reconnected' || (msg.type === 'session.event' && (msg as any).event === 'connected')) {
+        loadedRef.current.clear();
+        pendingRef.current.clear();
+        pendingChangesRef.current.clear();
+        // Re-fetch root and changes
+        fetchDir(startPath);
+        return;
+      }
+
       if (msg.type === 'fs.ls_response') {
         const nodeId = pendingRef.current.get(msg.requestId);
         if (!nodeId) return;
