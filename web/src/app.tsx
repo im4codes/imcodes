@@ -1236,73 +1236,78 @@ export function App() {
   useEffect(() => {
     if (!isMobile) return;
     const drag = sidebarDragRef.current;
-    const EDGE_ZONE = 30;
+    const EDGE_ZONE = 24;           // px from left edge to start tracking
+    const CONFIRM_PX = 10;          // horizontal px before drag activates (avoids eating taps)
     const VELOCITY_THRESHOLD = 0.3; // px/ms — fast flick snaps regardless of position
-    let rafId = 0;
-    let pendingProgress = -1;
+    let tracking = false;           // touchstart was in edge zone, awaiting confirmation
+    let confirmed = false;          // horizontal intent confirmed — drag is live
 
     const onStart = (e: TouchEvent) => {
       const t = e.touches[0];
       const isOpen = mobileSidebarOpen;
-      // Open gesture: touch near left edge when closed
-      // Close gesture: touch anywhere when open
       if (!isOpen && t.clientX > EDGE_ZONE) return;
-      drag.active = true;
+      // Record start position but don't activate drag yet — wait for horizontal move
+      tracking = true;
+      confirmed = false;
+      drag.active = false;
       drag.startX = t.clientX;
       drag.startY = t.clientY;
       drag.lastX = t.clientX;
       drag.lastTs = e.timeStamp;
       drag.opening = !isOpen;
-
-      // If opening, mount the overlay immediately so we can drag it
-      if (!isOpen) {
-        setMobileSidebarOpen(true);
-        // Start fully closed — will be positioned in rAF after mount
-        requestAnimationFrame(() => applySidebarTransform(0));
-      }
     };
 
     const onMove = (e: TouchEvent) => {
-      if (!drag.active) return;
+      if (!tracking) return;
       const t = e.touches[0];
+      const dx = t.clientX - drag.startX;
       const dy = Math.abs(t.clientY - drag.startY);
-      const dx = Math.abs(t.clientX - drag.startX);
-      // Cancel if vertical scroll dominates
-      if (dy > dx * 1.5 && dx < 20) { drag.active = false; return; }
+      const adx = Math.abs(dx);
+
+      // Not yet confirmed — check if this is a horizontal drag
+      if (!confirmed) {
+        // Vertical scroll dominates → cancel
+        if (dy > adx * 1.5 && adx < 20) { tracking = false; return; }
+        // Not enough horizontal movement yet
+        if (adx < CONFIRM_PX) return;
+        // Opening must be rightward, closing must be leftward
+        if (drag.opening && dx < 0) { tracking = false; return; }
+        if (!drag.opening && dx > 0) return; // allow small rightward jitter when closing
+        // Confirmed — activate drag
+        confirmed = true;
+        drag.active = true;
+        if (drag.opening) {
+          setMobileSidebarOpen(true);
+          // Panel starts off-screen; first applySidebarTransform will position it
+        }
+      }
 
       drag.lastX = t.clientX;
       drag.lastTs = e.timeStamp;
 
+      // Apply transform directly — transform/opacity are GPU-composited, no layout thrashing
       const w = getSidebarWidth();
-      if (drag.opening) {
-        pendingProgress = Math.max(0, t.clientX - drag.startX) / w;
-      } else {
-        pendingProgress = 1 + Math.min(0, t.clientX - drag.startX) / w;
-      }
-      if (!rafId) {
-        rafId = requestAnimationFrame(() => {
-          rafId = 0;
-          if (pendingProgress >= 0) applySidebarTransform(pendingProgress);
-        });
-      }
+      const progress = drag.opening
+        ? Math.max(0, t.clientX - drag.startX) / w
+        : 1 + Math.min(0, t.clientX - drag.startX) / w;
+      applySidebarTransform(progress);
     };
 
     const onEnd = (e: TouchEvent) => {
-      if (!drag.active) return;
+      if (!tracking) return;
+      tracking = false;
+      if (!confirmed) return; // was just a tap — let click handlers work
+
       drag.active = false;
       const t = e.changedTouches[0];
       const dt = Math.max(1, e.timeStamp - drag.lastTs);
-      const velocity = (t.clientX - drag.lastX) / dt; // +ve = moving right
+      const velocity = (t.clientX - drag.lastX) / dt;
 
       const w = getSidebarWidth();
-      let progress: number;
-      if (drag.opening) {
-        progress = Math.max(0, t.clientX - drag.startX) / w;
-      } else {
-        progress = 1 + Math.min(0, t.clientX - drag.startX) / w;
-      }
+      const progress = drag.opening
+        ? Math.max(0, t.clientX - drag.startX) / w
+        : 1 + Math.min(0, t.clientX - drag.startX) / w;
 
-      // Decide: snap open or closed based on position + velocity
       const snapOpen = velocity > VELOCITY_THRESHOLD ? true
         : velocity < -VELOCITY_THRESHOLD ? false
         : progress > 0.4;
@@ -1314,7 +1319,6 @@ export function App() {
     document.addEventListener('touchmove', onMove, { passive: true });
     document.addEventListener('touchend', onEnd, { passive: true });
     return () => {
-      if (rafId) cancelAnimationFrame(rafId);
       document.removeEventListener('touchstart', onStart);
       document.removeEventListener('touchmove', onMove);
       document.removeEventListener('touchend', onEnd);
