@@ -424,7 +424,7 @@ body {
 .chat-attachment-dl-btn { background: #172337; border: 1px solid #334155; border-radius: 6px; color: #64748b; padding: 3px 6px; font-size: 11px; cursor: pointer; line-height: 1; }
 .chat-attachment-dl-btn:hover { color: #60a5fa; border-color: #3b82f6; }
 .chat-event { margin: 2px 0; min-width: 0; transition: background 0.15s; border-radius: 6px; }
-.chat-event.chat-highlight { background: rgba(99,102,241,0.15); }
+.chat-event.chat-highlight { background: rgba(52,211,153,0.12); box-shadow: inset 0 0 0 1.5px rgba(52,211,153,0.5); }
 .chat-user { background: #1e3a5f; border-radius: 8px; padding: 6px 12px; align-self: flex-end; max-width: 80%; width: fit-content; text-align: left; word-break: break-all; overflow-wrap: break-word; }
 .chat-user.chat-pending { background: #1e3a5f80; color: #94a3b8; }
 .chat-assistant { padding: 6px 10px; word-break: break-word; overflow-wrap: break-word; line-height: 1.5; background: #161b22; border-radius: 8px; border-left: 2px solid #1e293b; }
