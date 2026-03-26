@@ -569,6 +569,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       {/* Shortcut row — hidden in chat mode */}
       {!hideShortcuts && <div class="shortcuts-row">
         <div class="shortcuts">
+          {/* Quick input trigger — shown here (before Esc) when shell terminal hides input row */}
+          {isShellLike && (
+            <button
+              class="shortcut-btn shell-quick-trigger"
+              title={t('quick_input.title')}
+              onClick={() => setQuickOpen((o) => !o)}
+            >⚡</button>
+          )}
           {SHORTCUTS.map((s) => (
             <button
               key={s.label}

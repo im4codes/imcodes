@@ -17,7 +17,8 @@ body {
 }
 
 /* Layout — accounts for iOS safe area (status bar/notch) and mobile keyboard (--vvh) */
-.layout { display: flex; height: calc(100vh - env(safe-area-inset-top, 0px)); height: calc(var(--vvh, 100dvh) - env(safe-area-inset-top, 0px)); margin-top: env(safe-area-inset-top); }
+/* --vv-offset compensates for iOS visual viewport shift when keyboard opens */
+.layout { display: flex; height: calc(100vh - env(safe-area-inset-top, 0px)); height: calc(var(--vvh, 100dvh) - env(safe-area-inset-top, 0px)); margin-top: env(safe-area-inset-top); transform: translateY(calc(-1 * var(--vv-offset, 0px))); }
 .sidebar { width: 220px; min-width: 180px; background: #1e293b; border-right: 1px solid #334155; display: flex; flex-direction: column; overflow-y: auto; }
 .main { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
 
@@ -553,6 +554,9 @@ body {
 /* Shell terminal keyboard: hide input row (xterm receives keystrokes directly) but keep shortcuts row */
 .kb-open .shell-terminal-pane .controls { display: none; }
 .kb-open .shell-terminal-pane .attachment-badges { display: none; }
+/* Quick input trigger in shortcuts row: hidden by default, shown when shell input row is hidden */
+.shell-quick-trigger { display: none !important; }
+.kb-open .shell-terminal-pane .shell-quick-trigger { display: inline-flex !important; color: #fbbf24 !important; }
 .subsession-card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 52px; min-height: 52px; padding: 6px 10px; background: #1a2233; border: 1px solid #334155; border-radius: 8px; color: #94a3b8; cursor: pointer; font-family: inherit; font-size: 11px; transition: all 0.15s; }
 .subsession-card:hover, .subsession-card.open { border-color: #3b82f6; background: #1e3a5f; color: #93c5fd; }
 .subsession-card-icon { font-size: 13px; font-weight: 700; letter-spacing: -0.5px; line-height: 1; }
