@@ -733,10 +733,10 @@ body {
 .sidebar-resize-handle { position: absolute; top: 0; right: 0; width: 4px; height: 100%; cursor: ew-resize; background: transparent; z-index: 10; transition: background 0.15s; touch-action: none; }
 .sidebar-resize-handle:hover { background: rgba(59,130,246,0.4); }
 @media (pointer: coarse) { .sidebar-resize-handle { width: 12px; right: -4px; } }
-.sidebar-resize-grip { position: absolute; right: -10px; top: 50%; transform: translateY(-50%); z-index: 12; cursor: ew-resize; user-select: none; touch-action: none; font-size: 10px; letter-spacing: 2px; color: #64748b; background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 4px 2px; line-height: 1; display: flex; align-items: center; }
+.sidebar-resize-grip { position: absolute; right: -10px; bottom: 80px; z-index: 12; cursor: ew-resize; user-select: none; touch-action: none; font-size: 10px; letter-spacing: 2px; color: #64748b; background: #1e293b; border: 1px solid #334155; border-radius: 6px; padding: 4px 2px; line-height: 1; display: flex; align-items: center; opacity: 0.5; transition: opacity 0.15s; }
 .sidebar-resize-grip::after { content: ''; position: absolute; top: -12px; bottom: -12px; left: -12px; right: -12px; } /* larger touch target */
-.sidebar-resize-grip:hover { color: #3b82f6; border-color: #3b82f6; }
-.sidebar-resize-grip:active { color: #60a5fa; border-color: #60a5fa; }
+.sidebar-resize-grip:hover { color: #3b82f6; border-color: #3b82f6; opacity: 1; }
+.sidebar-resize-grip:active { color: #60a5fa; border-color: #60a5fa; opacity: 1; }
 .sidebar-footer { flex-shrink: 0; padding: 6px 8px; display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 2px 6px; }
 .sidebar-build-time { font-size: 9px; color: #475569; white-space: nowrap; }
 .sidebar-copyright { font-size: 9px; color: #334155; white-space: nowrap; }
