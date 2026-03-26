@@ -271,9 +271,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
                 {isPinned && <span class="tab-pin">📌</span>}
                 {agentBadge(s.agentType)}
                 {getLabel(s)}
-                {activeTool && (
-                  <span class="tab-tool" title={`Running: ${activeTool}`}>⚙ {activeTool}</span>
-                )}
+                {/* tool call indicator removed — too flashy */}
                 {isActive && (
                   <span class="tab-ws-dot" style={{ color: connected ? latencyColor : '#ef4444' }} title={connected ? (latencyMs != null ? `${latencyMs}ms` : 'Connected') : 'Disconnected'}>
                     ●{connected && latencyMs != null && <span class="tab-latency">{latencyMs}ms</span>}
