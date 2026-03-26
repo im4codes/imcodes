@@ -144,7 +144,9 @@ export class OpenClawProvider implements TransportProvider {
         thinking: 'off',
         idempotencyKey: randomUUID(),
       });
-    } catch {
+      logger.info({ provider: this.id, ocKey }, 'sessions.send succeeded');
+    } catch (err) {
+      logger.debug({ provider: this.id, ocKey, err: (err as Error).message }, 'sessions.send failed, falling back to agent RPC');
       // Fallback to agent RPC (v2026.3.7+)
       await this.rpc('agent', {
         sessionKey: ocKey,
@@ -153,6 +155,7 @@ export class OpenClawProvider implements TransportProvider {
         thinking: 'off',
         idempotencyKey: randomUUID(),
       });
+      logger.info({ provider: this.id, ocKey }, 'agent RPC fallback succeeded');
     }
   }
 

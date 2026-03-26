@@ -771,6 +771,12 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
 
   // Transport sessions — route directly to the provider runtime, bypassing tmux.
   const transportRuntime = getTransportRuntime(sessionName);
+  if (!transportRuntime) {
+    const record = (await import('../store/session-store.js')).getSession(sessionName);
+    if (record?.runtimeType === 'transport') {
+      logger.warn({ sessionName, providerId: record.providerId }, 'session.send: transport session has no runtime — message will go to tmux (will fail)');
+    }
+  }
   if (transportRuntime) {
     const release = await getMutex(sessionName).acquire();
     try {
