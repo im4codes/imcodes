@@ -373,6 +373,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'subsession.stop':
       void handleSubSessionStop(cmd, serverLink);
       break;
+    case 'subsession.restart':
+      void handleSubSessionRestart(cmd, serverLink);
+      break;
     case 'subsession.rebuild_all':
       void handleSubSessionRebuildAll(cmd);
       break;
@@ -1185,6 +1188,43 @@ async function handleSubSessionStop(cmd: Record<string, unknown>, serverLink: Se
     return;
   }
   await stopSubSession(sName, serverLink).catch((e: unknown) => logger.error({ err: e, sName }, 'subsession.stop failed'));
+}
+
+async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const sName = cmd.sessionName as string | undefined;
+  if (!sName) {
+    logger.warn('subsession.restart: missing sessionName');
+    return;
+  }
+  const record = getSession(sName);
+  if (!record) {
+    logger.warn({ sessionName: sName }, 'subsession.restart: session not found in store');
+    return;
+  }
+  const id = sName.replace(/^deck_sub_/, '');
+  try {
+    // Stop without notifying server (preserve PG record)
+    await stopSubSession(sName, null);
+    // Recreate with same ID — fresh agent session IDs
+    await startSubSession({
+      id,
+      type: record.agentType,
+      cwd: record.projectDir || null,
+      parentSession: record.parentSession || null,
+    });
+    // Sync updated state to server
+    try {
+      serverLink.send({
+        type: 'subsession.sync',
+        id,
+        sessionType: record.agentType,
+        cwd: record.projectDir ?? null,
+        parentSession: record.parentSession ?? null,
+      });
+    } catch { /* not connected */ }
+  } catch (e: unknown) {
+    logger.error({ err: e, sessionName: sName }, 'subsession.restart failed');
+  }
 }
 
 async function handleSubSessionRebuildAll(cmd: Record<string, unknown>): Promise<void> {
