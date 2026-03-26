@@ -31,6 +31,9 @@ export async function connectProvider(id: string, config: ProviderConfig): Promi
   wireProviderToRelay(provider);
 
   // Materialize OC sessions before broadcasting status (sessions appear before catalog)
+  if (id === 'openclaw' && !_serverLink) {
+    logger.warn('connectProvider: _serverLink is null — oc-sync skipped (WS not connected yet?)');
+  }
   if (id === 'openclaw' && _serverLink) {
     try {
       const { syncOcSessions } = await import('../daemon/oc-session-sync.js');
@@ -58,13 +61,6 @@ export async function disconnectProvider(id: string): Promise<void> {
   providers.delete(id);
   broadcastProviderStatus(id, false);
   logger.info({ provider: id }, 'Provider disconnected');
-
-  // Remove persisted config so autoReconnectProviders won't restore on restart
-  if (id === 'openclaw') {
-    import('./openclaw-config.js')
-      .then(({ removeConfig }) => removeConfig())
-      .catch((e) => logger.warn({ err: e }, 'Failed to remove openclaw config'));
-  }
 }
 
 export async function disconnectAll(): Promise<void> {
