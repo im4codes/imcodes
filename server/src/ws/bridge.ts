@@ -106,6 +106,7 @@ export class WsBridge {
   private daemonWs: WebSocket | null = null;
   private authenticated = false;
   private daemonVersion: string | null = null;
+  private lastUpgradeSentAt: number | null = null;
   private browserSockets = new Set<WebSocket>();
   private mobileSockets = new Set<WebSocket>();
   private queue: string[] = [];
@@ -245,11 +246,14 @@ export class WsBridge {
           logger.error({ err }, 'Failed to update heartbeat on auth'),
         );
 
-        // Auto-upgrade: if server version is known and differs from daemon, send upgrade command.
+        // Auto-upgrade: once per connection, at most once per 10 minutes.
         // Skip dev versions (0.x.x) — those are local npm-linked development builds.
         const serverVersion = process.env.APP_VERSION;
         const isDev = this.daemonVersion?.startsWith('0.') ?? false;
-        if (serverVersion && serverVersion !== '0.0.0' && this.daemonVersion && this.daemonVersion !== serverVersion && !isDev) {
+        const now = Date.now();
+        const cooldown = this.lastUpgradeSentAt ? (now - this.lastUpgradeSentAt < 10 * 60 * 1000) : false;
+        if (serverVersion && serverVersion !== '0.0.0' && this.daemonVersion && this.daemonVersion !== serverVersion && !isDev && !cooldown) {
+          this.lastUpgradeSentAt = now;
           logger.info({ serverId: this.serverId, daemonVersion: this.daemonVersion, serverVersion }, 'Version mismatch — sending daemon.upgrade');
           setTimeout(() => {
             try { ws.send(JSON.stringify({ type: 'daemon.upgrade', targetVersion: serverVersion })); } catch { /* ignore */ }
