@@ -39,7 +39,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
       refreshing={refreshing}
       sessionId={sessionName}
       sessionState={liveSub.state}
-      ws={ctx.connected ? ctx.ws : null}
+      ws={ctx.ws}
       workdir={liveSub.cwd ?? null}
       serverId={ctx.serverId}
     />
@@ -64,7 +64,7 @@ registerPanelType('filebrowser', {
   render: (panel, ctx) => {
     // Follow active tab's project dir; fall back to captured dir at pin time
     const projectDir = ctx.activeProjectDir ?? panel.props?.projectDir as string | undefined;
-    if (!ctx.ws || !ctx.connected || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
+    if (!ctx.ws || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
     const activeSession = ctx.activeSession ?? panel.props?.sessionName as string | undefined;
     return (
       <FileBrowser
@@ -108,9 +108,9 @@ registerPanelType('repo', {
 registerPanelType('repopage', {
   title: () => 'Repository',
   render: (panel, ctx) => {
-    // Follow active tab's project dir
+    // Follow active tab's project dir — keep mounted during WS reconnect to preserve state
     const projectDir = ctx.activeProjectDir ?? panel.props?.projectDir as string | undefined;
-    if (!ctx.ws || !ctx.connected || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
+    if (!ctx.ws || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
     return (
       <RepoPage
         ws={ctx.ws}
