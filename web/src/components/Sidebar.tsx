@@ -147,6 +147,13 @@ export function Sidebar({ collapsed, serverId, pinnedPanels: _pinnedPanels, onDr
         </div>
       )}
 
+      {/* Build time footer */}
+      {!collapsed && (
+        <div class="sidebar-build-time">
+          {(() => { try { const d = new Date(__BUILD_TIME__); return `Build: ${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
+        </div>
+      )}
+
       {/* Right-edge resize handle — only active when not collapsed */}
       {!collapsed && (
         <div

@@ -731,6 +731,7 @@ body {
 .sidebar-toggle:hover { color: #e2e8f0; background: #1e293b; }
 .sidebar-resize-handle { position: absolute; top: 0; right: 0; width: 4px; height: 100%; cursor: ew-resize; background: transparent; z-index: 10; transition: background 0.15s; }
 .sidebar-resize-handle:hover { background: rgba(59,130,246,0.4); }
+.sidebar-build-time { padding: 4px 8px; font-size: 9px; color: #475569; text-align: center; flex-shrink: 0; border-top: 1px solid #1e293b; }
 
 /* ── Session Tree (task 2.1–2.5) ─────────────────────────────────────────── */
 .session-tree { display: flex; flex-direction: column; padding: 4px 0; }
