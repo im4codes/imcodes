@@ -104,7 +104,8 @@ registerPanelType('repo', {
 registerPanelType('repopage', {
   title: () => 'Repository',
   render: (panel, ctx) => {
-    const projectDir = panel.props?.projectDir as string | undefined;
+    // Follow active tab's project dir
+    const projectDir = ctx.activeProjectDir ?? panel.props?.projectDir as string | undefined;
     if (!ctx.ws || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
     return (
       <RepoPage

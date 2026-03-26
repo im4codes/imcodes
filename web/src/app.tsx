@@ -1521,7 +1521,7 @@ export function App() {
             onDropPanel={(type, id) => {
               if (type === 'subsession') {
                 const sub = subSessions.find(s => s.id === id);
-                if (sub) pinPanel('subsession', { sessionName: sub.sessionName, label: sub.label }, () => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(id); return s; }));
+                if (sub) pinPanel('subsession', { sessionName: sub.sessionName, label: sub.label, serverId: selectedServerId }, () => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(id); return s; }));
               }
             }}
           >
@@ -1553,8 +1553,8 @@ export function App() {
               />
             ))}
 
-            {/* Pinned panels — generic rendering via registry */}
-            {pinnedPanels.filter((p) => p.id && p.props).map((panel) => {
+            {/* Pinned panels — sub-session panels filtered by current server (WS/tmux bound); others always shown */}
+            {pinnedPanels.filter((p) => p.id && p.props && (p.type !== 'subsession' || !p.props.serverId || p.props.serverId === selectedServerId)).map((panel) => {
               const height = pinnedPanelHeights[panel.id] ?? 240;
               const props = panel.props ?? {};
               const ctx: PanelRenderContext = {
@@ -1968,7 +1968,7 @@ export function App() {
               }}
               zIndex={subZIndexes.get(sub.id) ?? 1000}
               onFocus={() => bringSubToFront(sub.id)}
-              onPin={(vm) => pinPanel('subsession', { sessionName: sub.sessionName, viewMode: vm, label: sub.label }, () => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; }))}
+              onPin={(vm) => pinPanel('subsession', { sessionName: sub.sessionName, viewMode: vm, label: sub.label, serverId: selectedServerId }, () => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; }))}
               sessions={sessions}
               subSessions={subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession }))}
               serverId={selectedServerId ?? undefined}
