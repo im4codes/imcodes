@@ -598,7 +598,7 @@ export function App() {
     } else if (panel.type === 'repopage') {
       setShowRepoPage(true);
     } else if (panel.type === 'subsession') {
-      const sub = subSessions.find((s) => s.sessionName === (panel.props.sessionName as string));
+      const sub = subSessions.find((s) => s.sessionName === (panel.props?.sessionName as string));
       if (sub) {
         setOpenSubIds((prev) => new Set([...prev, sub.id]));
         bringSubToFront(sub.id);
@@ -1946,7 +1946,7 @@ export function App() {
       )}
 
       {/* Sub-session windows (floating) — only show if not pinned */}
-      {visibleSubSessions.filter((sub) => !pinnedPanels.some((p) => p.type === 'subsession' && p.props.sessionName === sub.sessionName)).map((sub) => {
+      {visibleSubSessions.filter((sub) => !pinnedPanels.some((p) => p.type === 'subsession' && p.props?.sessionName === sub.sessionName)).map((sub) => {
         const isOpen = openSubIds.has(sub.id);
         return (
           <div key={sub.id} style={{ display: isOpen ? 'contents' : 'none' }}>

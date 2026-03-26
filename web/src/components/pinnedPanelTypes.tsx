@@ -15,8 +15,8 @@ import type { PanelRenderContext } from './PinnedPanelRegistry.js';
 // ── Sub-session panel ────────────────────────────────────────────────────
 
 function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRenderContext }) {
-  const sessionName = panel.props.sessionName as string;
-  const pinnedViewMode = panel.props.viewMode as 'terminal' | 'chat' | undefined;
+  const sessionName = panel.props?.sessionName as string;
+  const pinnedViewMode = panel.props?.viewMode as 'terminal' | 'chat' | undefined;
   const { t } = useTranslation();
   const { events, refreshing } = useTimeline(sessionName, ctx.ws);
   const liveSub = ctx.subSessions.find(s => s.sessionName === sessionName);
@@ -48,8 +48,8 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
 
 registerPanelType('subsession', {
   title: (panel) => {
-    const name = (panel.props.sessionName as string) ?? '';
-    return (panel.props.label as string) ?? name.replace(/^deck_sub_/, '');
+    const name = (panel.props?.sessionName as string) ?? '';
+    return (panel.props?.label as string) ?? name.replace(/^deck_sub_/, '');
   },
   render: (panel, ctx) => <SubSessionContent panel={panel} ctx={ctx} />,
 });
@@ -59,9 +59,9 @@ registerPanelType('subsession', {
 registerPanelType('filebrowser', {
   title: () => '📁 Files',
   render: (panel, ctx) => {
-    const projectDir = panel.props.projectDir as string | undefined;
+    const projectDir = panel.props?.projectDir as string | undefined;
     if (!ctx.ws || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
-    const activeSession = panel.props.sessionName as string | undefined;
+    const activeSession = panel.props?.sessionName as string | undefined;
     return (
       <FileBrowser
         ws={ctx.ws}
@@ -103,7 +103,7 @@ registerPanelType('repo', {
 registerPanelType('repopage', {
   title: () => 'Repository',
   render: (panel, ctx) => {
-    const projectDir = panel.props.projectDir as string | undefined;
+    const projectDir = panel.props?.projectDir as string | undefined;
     if (!ctx.ws || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
     return (
       <RepoPage
