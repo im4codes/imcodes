@@ -1845,7 +1845,6 @@ export function App() {
                 </button>
                 {showMobileServerMenu && (
                   <>
-                  <div class="mobile-server-backdrop" onClick={() => setShowMobileServerMenu(false)} />
                   <div class="mobile-server-menu">
                     <button class="mobile-server-menu-item" onClick={handleBackToDashboard}>
                       ← Home
@@ -1895,6 +1894,7 @@ export function App() {
                 </span>
               </div>
             </div>
+            {showMobileServerMenu && <div class="mobile-server-backdrop" onClick={() => setShowMobileServerMenu(false)} />}
 
             <SessionTabs
               sessions={sessions}
