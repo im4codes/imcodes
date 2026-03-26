@@ -1666,7 +1666,7 @@ export function App() {
   const [connectTimeout, setConnectTimeout] = useState(false);
   useEffect(() => {
     if (auth && selectedServerId && !connected && servers.length === 0) {
-      const t = setTimeout(() => setConnectTimeout(true), 8000);
+      const t = setTimeout(() => setConnectTimeout(true), 5000);
       return () => { clearTimeout(t); setConnectTimeout(false); };
     }
     setConnectTimeout(false);
