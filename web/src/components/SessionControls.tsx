@@ -175,6 +175,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   // Send/action buttons disabled when disconnected or no session
   const disabled = !connected || !hasSession;
   const isClaudeCode = activeSession?.agentType === 'claude-code';
+  const isShellLike = activeSession?.agentType === 'shell' || activeSession?.agentType === 'script';
   const isCodex = activeSession?.agentType === 'codex';
 
   // P2P config loading moved after rootSession declaration below
@@ -634,8 +635,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             )}
           </div>
         )}
-        {/* P2P mode selector */}
-        <div class="shortcuts-model" ref={p2pRef}>
+        {/* P2P mode selector — hidden for shell/script sessions */}
+        {!isShellLike && <div class="shortcuts-model" ref={p2pRef}>
           <button
             class="shortcut-btn"
             onClick={() => setP2pOpen((o) => !o)}
@@ -690,7 +691,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               )}
             </div>
           )}
-        </div>
+        </div>}
       </div>}
 
       {/* Upload progress bar */}
