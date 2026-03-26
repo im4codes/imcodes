@@ -155,6 +155,12 @@ export function App() {
         || el.getAttribute('contenteditable') === 'true'
         || el.classList.contains('xterm-helper-textarea');
       update();
+      // Auto-scroll sidebar body to show focused panel when keyboard opens
+      const sidebarBody = el.closest?.('.mobile-sidebar-body');
+      if (sidebarBody) {
+        const panel = el.closest('.sidebar-pinned-panel') as HTMLElement | null;
+        if (panel) requestAnimationFrame(() => panel.scrollIntoView({ block: 'nearest', behavior: 'smooth' }));
+      }
     };
     const onFocusOut = () => { inputFocused = false; update(); };
     update();
@@ -1233,12 +1239,9 @@ export function App() {
     if (overlay) {
       overlay.style.transition = 'background 0.25s ease';
       overlay.style.background = open ? 'rgba(0,0,0,0.5)' : 'rgba(0,0,0,0)';
-      overlay.addEventListener('transitionend', () => {
-        overlay.style.transition = '';
-        if (!open) setMobileSidebarOpen(false);
-      }, { once: true });
+      overlay.addEventListener('transitionend', () => { overlay.style.transition = ''; }, { once: true });
     }
-    if (open) setMobileSidebarOpen(true);
+    setMobileSidebarOpen(open);
   }, []);
 
   useEffect(() => {
@@ -1844,7 +1847,7 @@ export function App() {
           <>
             {/* Mobile-only server switcher */}
             <div class="mobile-server-bar">
-              <button class="mobile-sidebar-toggle" onClick={() => { setMobileSidebarOpen(true); requestAnimationFrame(() => applySidebarTransform(1)); }}>≡</button>
+              <button class="mobile-sidebar-toggle" onClick={() => { setMobileSidebarOpen(true); applySidebarTransform(1); }}>≡</button>
               <div class="mobile-server-switcher-wrap">
                 <button
                   class="mobile-server-btn"
@@ -2042,9 +2045,9 @@ export function App() {
         )}
       </main>
 
-      {/* Mobile sidebar overlay — full-screen panel with session tree, server list, pinned panels */}
-      {isMobile && mobileSidebarOpen && selectedServerId && (
-        <div ref={sidebarOverlayRef} class="mobile-sidebar-overlay" onClick={() => snapSidebar(false)}>
+      {/* Mobile sidebar overlay — always mounted so pinned panels stay alive, shown/hidden via CSS */}
+      {isMobile && selectedServerId && (
+        <div ref={sidebarOverlayRef} class={`mobile-sidebar-overlay${mobileSidebarOpen ? ' open' : ''}`} onClick={() => snapSidebar(false)}>
           <div ref={sidebarPanelRef} class="mobile-sidebar-panel" onClick={(e) => e.stopPropagation()}>
             <div class="mobile-sidebar-header">
               <span style={{ fontWeight: 700, fontSize: 14, color: '#e2e8f0' }}>IM.codes</span>
@@ -2072,7 +2075,7 @@ export function App() {
                       <button
                         key={s.id}
                         class={`server-item${s.id === selectedServerId ? ' active' : ''}${online ? '' : ' offline'}`}
-                        onClick={() => { handleSelectServer(s.id, s.name); setMobileSidebarOpen(false); }}
+                        onClick={() => { handleSelectServer(s.id, s.name); snapSidebar(false); }}
                       >
                         <span class="server-item-dot" style={{ color: online ? '#4ade80' : '#475569' }}>
                           {online ? '●' : '○'}
@@ -2092,14 +2095,14 @@ export function App() {
                 onSelectSession={(name) => {
                   setActiveSession(name);
                   setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; });
-                  setMobileSidebarOpen(false);
+                  snapSidebar(false);
                 }}
                 onSelectSubSession={(sub) => {
                   toggleSubSession(sub.id);
-                  setMobileSidebarOpen(false);
+                  snapSidebar(false);
                 }}
-                onNewSession={() => { setShowNewSession(true); setMobileSidebarOpen(false); }}
-                onNewSubSession={() => { setShowSubDialog(true); setMobileSidebarOpen(false); }}
+                onNewSession={() => { setShowNewSession(true); snapSidebar(false); }}
+                onNewSubSession={() => { setShowSubDialog(true); snapSidebar(false); }}
               />}
               {/* P2P ring progress */}
               {discussions.filter((d) => d.state === 'running' || d.state === 'setup').filter((d) => d.id.startsWith('p2p_')).map((d) => (
@@ -2110,7 +2113,7 @@ export function App() {
                   completedHops={d.completedHops}
                   totalHops={d.totalHops}
                   status={d.state}
-                  onClick={() => { setDiscussionInitialId(d.fileId ?? null); setShowDiscussionsPage(true); setMobileSidebarOpen(false); }}
+                  onClick={() => { setDiscussionInitialId(d.fileId ?? null); setShowDiscussionsPage(true); snapSidebar(false); }}
                 />
               ))}
               {/* Pinned panels — same as desktop sidebar */}
@@ -2123,7 +2126,7 @@ export function App() {
                   serverId: (props.serverId as string) ?? selectedServerId ?? '',
                   subSessions: subSessions.map(s => ({ id: s.id, sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, cwd: s.cwd, parentSession: s.parentSession })),
                   inputRefsMap,
-                  onPreviewFile: (path) => { setPreviewFilePath(path); setMobileSidebarOpen(false); },
+                  onPreviewFile: (path) => { setPreviewFilePath(path); snapSidebar(false); },
                   activeSession,
                   activeProjectDir: activeSessionInfo?.projectDir,
                 };
