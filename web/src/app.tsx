@@ -1457,6 +1457,16 @@ export function App() {
 
   const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
 
+  // Auto-pin file browser to sidebar on first session activation (desktop only).
+  // Respects user preference: once they have any pinned panels saved, don't interfere.
+  const autoPinnedRef = useRef(false);
+  useEffect(() => {
+    if (isMobile || autoPinnedRef.current || !activeSession || !activeSessionInfo?.projectDir) return;
+    if (pinnedPanels.length > 0) { autoPinnedRef.current = true; return; } // user already has panels
+    autoPinnedRef.current = true;
+    pinPanel('filebrowser', { sessionName: activeSession, projectDir: activeSessionInfo.projectDir, serverId: selectedServerId });
+  }, [activeSession, activeSessionInfo?.projectDir, isMobile, pinnedPanels.length, pinPanel, selectedServerId]);
+
   // ── Git changes count for file browser badge ───────────────────────────
   // Refreshes on: initial load, every 30s, and after tool calls (file writes).
   const refreshGitStatusRef = useRef<(() => void) | null>(null);
