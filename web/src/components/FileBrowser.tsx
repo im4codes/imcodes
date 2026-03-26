@@ -537,6 +537,21 @@ export function FileBrowser({
     if (autoPreviewPath) fetchPreview(autoPreviewPath);
   }, [autoPreviewPath, fetchPreview]);
 
+  // Auto-refresh preview content every 5s when a file is being previewed
+  useEffect(() => {
+    if (preview.status !== 'ok' && preview.status !== 'image') return;
+    if (onPreviewFile) return; // external preview — don't poll here
+    const path = (preview as { path: string }).path;
+    const timer = setInterval(() => {
+      const reqId = ws.fsReadFile(path);
+      pendingReadRef.current.set(reqId, path);
+      // Also refresh diff
+      const diffId = ws.fsGitDiff(path);
+      pendingGitDiffRef.current.set(diffId, path);
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [preview.status, (preview as any).path, ws, onPreviewFile]);
+
   // Rate-limited git status refresh for the changes panel
   const CHANGES_RATE_LIMIT_MS = 5_000;
   const lastChangesRefreshRef = useRef(0);

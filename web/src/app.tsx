@@ -1909,14 +1909,23 @@ export function App() {
 
       {/* Floating file preview — one file at a time, opened from pinned file browser */}
       {previewFilePath && wsRef.current && (
-        <FloatingPanel id="file-preview" title={previewFilePath.split('/').pop() ?? 'Preview'} onClose={() => setPreviewFilePath(null)} defaultW={700} defaultH={500}>
+        <FloatingPanel
+          id="file-preview"
+          title={previewFilePath.split('/').pop() ?? 'Preview'}
+          onClose={() => setPreviewFilePath(null)}
+          defaultW={700}
+          defaultH={500}
+        >
           <FileBrowser
+            key={previewFilePath}
             ws={wsRef.current}
             mode="file-single"
             layout="panel"
             initialPath={previewFilePath.replace(/\/[^/]+$/, '') || '~'}
             autoPreviewPath={previewFilePath}
             hideFooter
+            changesRootPath={activeSessionInfo?.projectDir}
+            refreshTrigger={Date.now()}
             onConfirm={() => {}}
           />
         </FloatingPanel>
