@@ -32,6 +32,8 @@ interface Props {
   onInsertPath?: (path: string) => void;
   /** Session working directory — used to resolve relative paths clicked in chat */
   workdir?: string | null;
+  /** Called when user quotes selected text. */
+  onQuote?: (text: string) => void;
   /** Server ID for file transfer download API. */
   serverId?: string;
 }
@@ -209,7 +211,7 @@ function readPanelOpen(id: string | null | undefined): boolean {
   try { return localStorage.getItem(panelOpenKey(id)) === '1'; } catch { return false; }
 }
 
-export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId }: Props) {
+export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote }: Props) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -217,6 +219,7 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
   const [selMenu, setSelMenu] = useState<SelectionMenu | null>(null);
   const [copied, setCopied] = useState(false);
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
+  const [highlightEl, setHighlightEl] = useState<HTMLElement | null>(null);
 
   const autoScrollRef = useRef(true);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
@@ -452,7 +455,15 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
       )}
       {refreshing && <div class="chat-refreshing">{t('chat.syncing')}</div>}
       <div class="chat-main">
-        <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} onScroll={preview ? undefined : handleScroll}>
+        <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} onScroll={preview ? undefined : handleScroll}
+          onContextMenu={!preview ? (e) => {
+            // Highlight the closest chat-event on right-click / long-press
+            const target = (e.target as HTMLElement).closest?.('.chat-event') as HTMLElement | null;
+            if (highlightEl) highlightEl.classList.remove('chat-highlight');
+            if (target) { target.classList.add('chat-highlight'); setHighlightEl(target); }
+          } : undefined}
+          onClick={highlightEl ? () => { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); } : undefined}
+        >
           {viewItems.length === 0 && (
             <div class="chat-loading">
               {sessionState ? t('chat.session_state', { state: sessionState }) : t('chat.no_events')}
@@ -520,6 +531,18 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
             >
               {copied ? t('common.copied') : t('common.copy')}
             </button>
+            {onQuote && (
+              <button
+                class="chat-sel-btn"
+                onClick={() => {
+                  onQuote(selMenu.text);
+                  setSelMenu(null);
+                  window.getSelection()?.removeAllRanges();
+                }}
+              >
+                {t('common.quote', 'Quote')}
+              </button>
+            )}
           </div>
         )}
       </div>

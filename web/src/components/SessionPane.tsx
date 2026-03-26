@@ -100,6 +100,15 @@ export function SessionPane({
     loadOlderEvents,
   } = useTimeline(sessionName, ws);
 
+  // ── Quotes ────────────────────────────────────────────────────────────────
+  const [quotes, setQuotes] = useState<string[]>([]);
+  const addQuote = useCallback((text: string) => {
+    setQuotes((prev) => [...prev, text]);
+  }, []);
+  const removeQuote = useCallback((index: number) => {
+    setQuotes((prev) => prev.filter((_, i) => i !== index));
+  }, []);
+
   // ── Usage & thinking state ──────────────────────────────────────────────────
   const lastUsage = useMemo(() => {
     for (let i = timelineEvents.length - 1; i >= 0; i--) {
@@ -219,6 +228,7 @@ export function SessionPane({
           workdir={session.projectDir}
           ws={connected ? ws : null}
           serverId={serverId}
+          onQuote={addQuote}
         />
       )}
 
@@ -257,6 +267,8 @@ export function SessionPane({
           sessions={sessions}
           subSessions={subSessions}
           serverId={serverId}
+          quotes={quotes}
+          onRemoveQuote={removeQuote}
         />
       )}
     </div>

@@ -51,6 +51,10 @@ interface Props {
   subSessions?: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
   /** Server ID — required for file upload. */
   serverId?: string;
+  /** Quoted text segments from chat messages. */
+  quotes?: string[];
+  /** Called to remove a quote by index. */
+  onRemoveQuote?: (index: number) => void;
 }
 
 type MenuAction = 'restart' | 'new' | 'stop';
@@ -95,7 +99,7 @@ function loadCodexModel(): CodexModelChoice | null {
   return null;
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote }: Props) {
   const { t } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -319,6 +323,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       }
     }
 
+    // Prepend quotes
+    if (quotes && quotes.length > 0) {
+      const quoteBlock = quotes.map((q) => `> ${q.replace(/\n/g, '\n> ')}`).join('\n\n');
+      text = text ? `${quoteBlock}\n\n${text}` : quoteBlock;
+    }
     // Prepend attachment references
     if (attachments.length > 0) {
       const refs = attachments.map((a) => `@${a.path}`).join(' ');
@@ -334,12 +343,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (divRef.current) divRef.current.textContent = '';
     setHasText(false);
     setAttachments([]);
+    // Clear quotes after send
+    if (quotes && quotes.length > 0) {
+      for (let i = quotes.length - 1; i >= 0; i--) onRemoveQuote?.(i);
+    }
     atSelectionLockRef.current = false;
     atSelectionSnapshotRef.current = '';
     histIdxRef.current = -1;
     draftRef.current = '';
     if (draftKey) sessionStorage.removeItem(draftKey);
-  }, [ws, activeSession, quickData, onSend, attachments, p2pMode, p2pExcludeSameType, p2pSavedConfig]);
+  }, [ws, activeSession, quickData, onSend, attachments, quotes, onRemoveQuote, p2pMode, p2pExcludeSameType, p2pSavedConfig]);
 
   // Voice overlay send handler — applies same P2P mode as text send
   const handleVoiceSend = useCallback((voiceText: string) => {
@@ -729,6 +742,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               <button
                 class="attachment-badge-remove"
                 onClick={() => setAttachments((prev) => prev.filter((_, j) => j !== i))}
+                title={t('common.delete')}
+              >×</button>
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Quote badges — above input row */}
+      {quotes && quotes.length > 0 && (
+        <div class="attachment-badges">
+          {quotes.map((q, i) => (
+            <span key={i} class="attachment-badge quote-badge" title={q}>
+              <span class="attachment-badge-icon">❝</span>
+              <span class="attachment-badge-name">{q.slice(0, 30)}{q.length > 30 ? '…' : ''}</span>
+              <button
+                class="attachment-badge-remove"
+                onClick={() => onRemoveQuote?.(i)}
                 title={t('common.delete')}
               >×</button>
             </span>
