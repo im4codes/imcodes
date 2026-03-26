@@ -1,6 +1,6 @@
 # IM.codes
 
-A purpose-built interface for managing AI coding agents. Remote terminal, multi-agent orchestration, and session management — from any device.
+A purpose-built interface for managing AI coding agents. Remote terminal, multi-agent orchestration, and session management — from any device. First-class support for [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), and [OpenClaw](https://openclaw.com).
 
 ## Screenshots
 
@@ -42,6 +42,10 @@ This is a personal project. I haven't written any code myself — it was built a
 ### Remote Terminal
 
 Full terminal access to your agent sessions from any browser — no SSH, no VPN, no port forwarding. Switch between raw terminal mode (the native CLI experience) and a structured chat view with parsed tool calls, thinking blocks, and streaming output. Real-time PTY streaming at 12fps with zero message limits.
+
+### OpenClaw Integration
+
+Native support for [OpenClaw](https://openclaw.com) as a transport-backed agent provider. Connect to OpenClaw gateway and manage remote AI sessions alongside local tmux-backed agents — same UI, same multi-agent discussions, same pinnable panels. Sessions auto-sync on provider connect, with bidirectional key sanitization and session lifecycle management. OpenClaw sessions appear in the sidebar tree with a cloud icon and work seamlessly with P2P discussions, the @ picker, and all other features.
 
 ### Discord-Style Sidebar
 
@@ -157,7 +161,7 @@ Login at `https://your-domain` with `admin` and the printed password. Bind your 
 - macOS or Linux (tested on both). Windows users need [WSL](https://learn.microsoft.com/en-us/windows/wsl/) — native Windows is not supported since the project uses tmux to manage agent sessions.
 - Node.js >= 20
 - tmux
-- At least one AI coding agent: [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), or [Gemini CLI](https://github.com/google-gemini/gemini-cli)
+- At least one AI coding agent: [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or [OpenClaw](https://openclaw.com)
 
 ## License
 

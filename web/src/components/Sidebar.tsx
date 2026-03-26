@@ -190,7 +190,7 @@ export function Sidebar({ collapsed, serverId, pinnedPanels: _pinnedPanels, onDr
             onTouchStart={handleResizeTouchStart}
             title={t('sidebar.drag_to_resize', 'Drag to resize')}
           >
-            <span class="sidebar-resize-bar-icon">⠿</span>
+            <span class="sidebar-resize-bar-icon">↔</span>
             <span class="sidebar-build-time">
               {(() => { try { const d = new Date(__BUILD_TIME__); return `${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
             </span>
