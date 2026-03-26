@@ -1522,6 +1522,8 @@ export function App() {
             servers={servers}
             activeServerId={selectedServerId}
             onSelectServer={handleSelectServer}
+            sidebarCollapsed={sidebarCollapsed}
+            onToggleSidebar={handleToggleSidebar}
           />
           <Sidebar
             collapsed={sidebarCollapsed}

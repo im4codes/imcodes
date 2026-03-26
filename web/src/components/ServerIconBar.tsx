@@ -11,21 +11,30 @@ interface Props {
   servers: ServerInfo[];
   activeServerId: string | null;
   onSelectServer: (id: string, name: string) => void;
+  sidebarCollapsed?: boolean;
+  onToggleSidebar?: () => void;
 }
 
 function getInitial(name: string): string {
   return (name || '?').charAt(0).toUpperCase();
 }
 
-export function ServerIconBar({ servers, activeServerId, onSelectServer }: Props) {
+export function ServerIconBar({ servers, activeServerId, onSelectServer, sidebarCollapsed, onToggleSidebar }: Props) {
   const { t } = useTranslation();
-
-  // Auto-hide when only 1 server configured
-  if (servers.length <= 1) return null;
 
   return (
     <div class="server-icon-bar" role="navigation" aria-label={t('sidebar.serverNav')}>
-      {servers.map((server) => {
+      {/* Sidebar toggle — always visible */}
+      {onToggleSidebar && (
+        <button
+          class="server-icon sidebar-toggle-icon"
+          onClick={onToggleSidebar}
+          title={sidebarCollapsed ? t('sidebar.expand') : t('sidebar.collapse')}
+        >
+          {sidebarCollapsed ? '☰' : '‹'}
+        </button>
+      )}
+      {servers.length > 1 && servers.map((server) => {
         const isActive = server.id === activeServerId;
         const isOnline = server.status !== 'offline' && server.lastHeartbeatAt != null && Date.now() - server.lastHeartbeatAt < 60_000;
         return (

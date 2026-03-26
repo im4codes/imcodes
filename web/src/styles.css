@@ -721,7 +721,7 @@ body {
 
 /* Sidebar panel — collapsible, resizable */
 .sidebar-panel { display: flex; flex-direction: column; min-width: 0; background: #111827; border-right: 1px solid #1e293b; position: relative; transition: width 0.2s ease; overflow: hidden; flex-shrink: 0; }
-.sidebar-panel-collapsed { width: 32px !important; border-right: 1px solid #1e293b; }
+.sidebar-panel-collapsed { width: 0 !important; border-right: none; }
 .sidebar-panel-header { display: flex; align-items: center; justify-content: flex-end; padding: 4px 6px; border-bottom: 1px solid #1e293b; flex-shrink: 0; min-height: 32px; }
 .sidebar-content { flex: 1; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #334155 transparent; min-height: 0; }
 .sidebar-content::-webkit-scrollbar { width: 4px; }

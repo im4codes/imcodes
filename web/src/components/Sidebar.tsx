@@ -127,24 +127,12 @@ export function Sidebar({ collapsed, onToggleCollapse, serverId, pinnedPanels: _
   return (
     <div
       class={`sidebar-panel${collapsed ? ' sidebar-panel-collapsed' : ''}${isDragOver ? ' sidebar-panel-drop-active' : ''}`}
-      style={{ width: collapsed ? 32 : width }}
+      style={{ width: collapsed ? 0 : width }}
       onDragOver={handleDragOver}
       onDragEnter={handleDragEnter}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
-      {/* Sidebar header with toggle button */}
-      <div class="sidebar-panel-header">
-        <button
-          class="sidebar-toggle"
-          onClick={onToggleCollapse}
-          title={collapsed ? t('sidebar.expand') : t('sidebar.collapse')}
-          aria-label={collapsed ? t('sidebar.expand') : t('sidebar.collapse')}
-        >
-          {collapsed ? '›' : '‹'}
-        </button>
-      </div>
-
       {/* Content area — hidden when collapsed but kept mounted per D6/D5 spec */}
       <div
         class="sidebar-content"
