@@ -916,7 +916,7 @@ function handleGetSessions(serverLink: ServerLink): void {
   }
 }
 
-const RAW_BATCH_FLUSH_MS = 166;          // ~6fps flush interval
+const RAW_BATCH_FLUSH_MS = 83;           // ~12fps flush interval
 const RAW_BATCH_MAX_BYTES = 32 * 1024;   // flush immediately at 32KB
 
 function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): void {

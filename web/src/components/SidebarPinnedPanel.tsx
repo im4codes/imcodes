@@ -1,27 +1,17 @@
 /**
- * SidebarPinnedPanel — a panel pinned to the sidebar.
- * Supports two panel types:
- *   - 'subsession': renders ChatView or TerminalView based on session type
- *   - 'repo': renders FileBrowser in compact panel mode
+ * SidebarPinnedPanel — generic pinned panel container for the sidebar.
+ *
+ * Uses PinnedPanelRegistry to render content based on panel.type.
+ * New panel types only need to register in pinnedPanelTypes.tsx.
  *
  * Includes a resize handle at the bottom and an unpin (×) button in the header.
- *
- * Task 4.2 + 4.3: Generic container with header + content + resize handle.
- * Task 4.6: Shows placeholder if session is not live locally.
  */
 
-import { useRef, useCallback, useEffect, useMemo, useState } from 'preact/hooks';
-import type { RefObject } from 'preact';
-import { ChatView } from './ChatView.js';
-import { TerminalView } from './TerminalView.js';
-import { FileBrowser } from './FileBrowser.js';
-import { RepoPage } from '../pages/RepoPage.js';
-import { useTimeline } from '../hooks/useTimeline.js';
+import { useRef, useCallback, useEffect, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import type { WsClient } from '../ws-client.js';
-import type { SessionInfo } from '../types.js';
 import type { PinnedPanel } from '../app.js';
-import type { SubSession } from '../hooks/useSubSessions.js';
+import { getPanelTitle, renderPanelContent } from './PinnedPanelRegistry.js';
+import type { PanelRenderContext } from './PinnedPanelRegistry.js';
 
 const MIN_HEIGHT = 100;
 
@@ -30,75 +20,7 @@ interface SidebarPinnedPanelProps {
   height: number;
   onUnpin: () => void;
   onResize: (height: number) => void;
-  ws: WsClient | null;
-  connected: boolean;
-  sessions: SessionInfo[];
-  subSessions: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
-  serverId: string;
-  /** For repo panels: the project directory to browse */
-  projectDir?: string;
-  /** For repo panels: input element map for inserting file paths */
-  inputRefsMap?: RefObject<Map<string, HTMLDivElement>>;
-  /** For repo panels: the currently active main session */
-  activeSession?: string | null;
-  /** For sub-session panels: the live sub-session object (null = stale/unavailable) */
-  liveSubSession?: SubSession;
-}
-
-// Small component for a sub-session chat panel
-function SubSessionChatPanel({
-  sessionName,
-  ws,
-  connected,
-  serverId,
-  liveSubSession,
-  pinnedViewMode,
-}: {
-  sessionName: string;
-  ws: WsClient | null;
-  connected: boolean;
-  serverId: string;
-  liveSubSession?: SubSession;
-  pinnedViewMode?: 'terminal' | 'chat';
-}) {
-  const { t } = useTranslation();
-  const { events, refreshing } = useTimeline(sessionName, ws);
-
-  if (!liveSubSession) {
-    // Task 4.6: stale panel — session not live on this device
-    return (
-      <div class="sidebar-pinned-unavailable">
-        {t('sidebar.session_unavailable')}
-      </div>
-    );
-  }
-
-  // Respect the viewMode captured at pin time; default to chat for non-shell, terminal for shell
-  const isShell = liveSubSession.type === 'shell' || liveSubSession.type === 'script';
-  const effectiveMode = pinnedViewMode ?? (isShell ? 'terminal' : 'chat');
-
-  if (effectiveMode === 'terminal') {
-    return (
-      <TerminalView
-        sessionName={sessionName}
-        ws={ws}
-        connected={connected}
-      />
-    );
-  }
-
-  return (
-    <ChatView
-      events={events}
-      loading={false}
-      refreshing={refreshing}
-      sessionId={sessionName}
-      sessionState={liveSubSession.state}
-      ws={connected ? ws : null}
-      workdir={liveSubSession.cwd ?? null}
-      serverId={serverId}
-    />
-  );
+  ctx: PanelRenderContext;
 }
 
 export function SidebarPinnedPanel({
@@ -106,13 +28,7 @@ export function SidebarPinnedPanel({
   height,
   onUnpin,
   onResize,
-  ws,
-  connected,
-  serverId,
-  projectDir,
-  inputRefsMap,
-  activeSession,
-  liveSubSession,
+  ctx,
 }: SidebarPinnedPanelProps) {
   const { t } = useTranslation();
 
@@ -122,10 +38,7 @@ export function SidebarPinnedPanel({
   const startHeightRef = useRef(0);
   const [localHeight, setLocalHeight] = useState(height);
 
-  // Keep local height in sync with prop (on initial mount and external changes)
-  useEffect(() => {
-    setLocalHeight(height);
-  }, [height]);
+  useEffect(() => { setLocalHeight(height); }, [height]);
 
   const handleResizeMouseDown = useCallback((e: MouseEvent) => {
     e.preventDefault();
@@ -147,7 +60,7 @@ export function SidebarPinnedPanel({
       const delta = ev.clientY - startYRef.current;
       const finalH = Math.max(MIN_HEIGHT, startHeightRef.current + delta);
       setLocalHeight(finalH);
-      onResize(finalH); // persist to localStorage via app.tsx
+      onResize(finalH);
       document.removeEventListener('mousemove', onMouseMove);
       document.removeEventListener('mouseup', onMouseUp);
     };
@@ -156,73 +69,8 @@ export function SidebarPinnedPanel({
     document.addEventListener('mouseup', onMouseUp);
   }, [localHeight, onResize]);
 
-  // ── Title ────────────────────────────────────────────────────────────────
-  const title = useMemo(() => {
-    if (panel.type === 'repopage') return 'Repository';
-    if (panel.type === 'filebrowser' || panel.type === 'repo') return t('sidebar.pinned_repo');
-    if (liveSubSession) return liveSubSession.label ?? liveSubSession.type;
-    return panel.sessionName.replace(/^deck_sub_/, '');
-  }, [panel, liveSubSession, t]);
-
-  // ── Content ──────────────────────────────────────────────────────────────
-  const renderContent = () => {
-    if (panel.type === 'repopage') {
-      if (!ws || !projectDir) {
-        return <div class="sidebar-pinned-unavailable">{t('sidebar.session_unavailable')}</div>;
-      }
-      return (
-        <RepoPage
-          ws={ws}
-          projectDir={projectDir}
-          onBack={() => {/* pinned — no back action */}}
-          onCiEvent={() => {/* handled at app level */}}
-        />
-      );
-    }
-    if (panel.type === 'filebrowser' || panel.type === 'repo') {
-      if (!ws || !projectDir) {
-        return (
-          <div class="sidebar-pinned-unavailable">
-            {t('sidebar.session_unavailable')}
-          </div>
-        );
-      }
-      return (
-        <FileBrowser
-          ws={ws}
-          mode="file-multi"
-          layout="panel"
-          initialPath={projectDir}
-          changesRootPath={projectDir}
-          hideFooter={false}
-          onConfirm={(paths) => {
-            const inputEl = activeSession && inputRefsMap?.current
-              ? inputRefsMap.current.get(activeSession)
-              : null;
-            if (inputEl) {
-              const rel = projectDir
-                ? paths.map((p) => '@' + (p.startsWith(projectDir + '/') ? p.slice(projectDir.length + 1) : p) + ' ')
-                : paths.map((p) => '@' + p + ' ');
-              inputEl.textContent = (inputEl.textContent || '') + rel.join('');
-              inputEl.focus();
-            }
-          }}
-        />
-      );
-    }
-
-    // subsession chat panel
-    return (
-      <SubSessionChatPanel
-        sessionName={panel.sessionName}
-        ws={ws}
-        connected={connected}
-        serverId={serverId}
-        liveSubSession={liveSubSession}
-        pinnedViewMode={panel.viewMode}
-      />
-    );
-  };
+  const title = getPanelTitle(panel);
+  const content = renderPanelContent(panel, ctx);
 
   return (
     <div class="sidebar-pinned-panel" style={{ height: localHeight, flexShrink: 0 }}>
@@ -241,10 +89,10 @@ export function SidebarPinnedPanel({
 
       {/* Content area */}
       <div class="sidebar-pinned-content">
-        {renderContent()}
+        {content ?? <div class="sidebar-pinned-unavailable">{t('sidebar.session_unavailable')}</div>}
       </div>
 
-      {/* Resize handle at bottom */}
+      {/* Bottom resize handle */}
       <div
         class="sidebar-pinned-resize-handle"
         onMouseDown={handleResizeMouseDown}

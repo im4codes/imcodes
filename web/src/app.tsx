@@ -37,6 +37,8 @@ import { SessionTree } from './components/SessionTree.js';
 import { P2pRingProgress } from './components/P2pRingProgress.js';
 import { useUnreadCounts } from './hooks/useUnreadCounts.js';
 import { SidebarPinnedPanel } from './components/SidebarPinnedPanel.js';
+import type { PanelRenderContext } from './components/PinnedPanelRegistry.js';
+import './components/pinnedPanelTypes.js'; // register all panel types
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
 import { useSubSessions } from './hooks/useSubSessions.js';
 import { useProviderStatus } from './hooks/useProviderStatus.js';
@@ -60,13 +62,12 @@ type ViewMode = 'terminal' | 'chat';
 
 /** A panel pinned to the sidebar. Uses sessionName as stable identity. */
 export interface PinnedPanel {
-  type: 'subsession' | 'repo' | 'filebrowser' | 'repopage';
-  sessionName: string;
-  /** Captured at pin time — stable across session switches */
-  projectDir?: string;
-  serverId?: string;
-  /** Captured at pin time — preserve the view mode the user had when pinning */
-  viewMode?: 'terminal' | 'chat';
+  /** Unique ID for this pinned panel instance */
+  id: string;
+  /** Panel type — used by registry to determine how to render */
+  type: string;
+  /** Serializable props captured at pin time */
+  props: Record<string, unknown>;
 }
 
 interface AuthState {
@@ -576,64 +577,32 @@ export function App() {
     });
   }, []);
 
-  /** Pin a sub-session: remove from openSubIds, add to pinnedPanels. */
-  const pinSubSession = useCallback((subId: string, viewMode?: 'terminal' | 'chat') => {
-    const sub = subSessions.find((s) => s.id === subId);
-    if (!sub) return;
-    const sessionName = sub.sessionName;
-    setOpenSubIds((prev) => { const s = new Set(prev); s.delete(subId); return s; });
+  /** Generic pin: close the source floating window + add to sidebar pinnedPanels. */
+  const pinPanel = useCallback((type: string, props: Record<string, unknown>, closeSource?: () => void) => {
+    const id = `${type}:${props.sessionName ?? Date.now()}`;
+    closeSource?.();
     setPinnedPanels((prev) => {
-      if (prev.some((p) => p.sessionName === sessionName)) return prev;
-      return [...prev, { type: 'subsession', sessionName, viewMode }];
+      if (prev.some((p) => p.id === id)) return prev;
+      return [...prev, { id, type, props }];
     });
-  }, [subSessions, setPinnedPanels]);
+  }, [setPinnedPanels]);
 
-  /** Unpin a sub-session: remove from pinnedPanels, re-open as floating. */
-  const unpinSubSession = useCallback((sessionName: string) => {
-    setPinnedPanels((prev) => prev.filter((p) => p.sessionName !== sessionName));
-    const sub = subSessions.find((s) => s.sessionName === sessionName);
-    if (sub) {
-      setOpenSubIds((prev) => new Set([...prev, sub.id]));
-      bringSubToFront(sub.id);
-    }
-  }, [subSessions, setPinnedPanels, bringSubToFront]);
-
-  /** Pin file browser: close floating, add to pinnedPanels. */
-  const pinFileBrowser = useCallback(() => {
-    const dir = sessions.find(s => s.name === activeSessionRef.current)?.projectDir;
-    setShowDesktopFileBrowser(false);
-    setPinnedPanels((prev) => {
-      if (prev.some((p) => p.type === 'filebrowser')) return prev;
-      return [...prev, { type: 'filebrowser', sessionName: activeSessionRef.current ?? '__filebrowser__', projectDir: dir, serverId: selectedServerId ?? '' }];
-    });
-  }, [setPinnedPanels, sessions, selectedServerId]);
-
-  /** Pin repo page: close floating, add to pinnedPanels. */
-  const pinRepoPage = useCallback(() => {
-    const dir = sessions.find(s => s.name === activeSessionRef.current)?.projectDir;
-    setShowRepoPage(false);
-    setPinnedPanels((prev) => {
-      if (prev.some((p) => p.type === 'repopage')) return prev;
-      return [...prev, { type: 'repopage', sessionName: activeSessionRef.current ?? '__repopage__', projectDir: dir, serverId: selectedServerId ?? '' }];
-    });
-  }, [setPinnedPanels, sessions, selectedServerId]);
-
-  /** Generic unpin — dispatches to the appropriate handler. */
+  /** Generic unpin: remove from pinnedPanels + reopen the source floating window. */
   const unpinPanel = useCallback((panel: PinnedPanel) => {
-    if (panel.type === 'filebrowser') {
-      setPinnedPanels((prev) => prev.filter((p) => p !== panel));
+    setPinnedPanels((prev) => prev.filter((p) => p.id !== panel.id));
+    // Reopen source window based on type
+    if (panel.type === 'filebrowser' || panel.type === 'repo') {
       setShowDesktopFileBrowser(true);
     } else if (panel.type === 'repopage') {
-      setPinnedPanels((prev) => prev.filter((p) => p !== panel));
       setShowRepoPage(true);
-    } else if (panel.type === 'repo') {
-      // Legacy — treat as filebrowser
-      setPinnedPanels((prev) => prev.filter((p) => p !== panel));
-      setShowDesktopFileBrowser(true);
-    } else {
-      unpinSubSession(panel.sessionName);
+    } else if (panel.type === 'subsession') {
+      const sub = subSessions.find((s) => s.sessionName === (panel.props.sessionName as string));
+      if (sub) {
+        setOpenSubIds((prev) => new Set([...prev, sub.id]));
+        bringSubToFront(sub.id);
+      }
     }
-  }, [setPinnedPanels, unpinSubSession]);
+  }, [setPinnedPanels, subSessions, bringSubToFront]);
 
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const defaultViewMode: ViewMode = isMobile ? 'chat' : 'terminal';
@@ -1548,7 +1517,10 @@ export function App() {
             serverId={selectedServerId}
             pinnedPanels={pinnedPanels}
             onDropPanel={(type, id) => {
-              if (type === 'subsession') pinSubSession(id);
+              if (type === 'subsession') {
+                const sub = subSessions.find(s => s.id === id);
+                if (sub) pinPanel('subsession', { sessionName: sub.sessionName, label: sub.label }, () => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(id); return s; }));
+              }
             }}
           >
             {/* Session tree */}
@@ -1579,46 +1551,24 @@ export function App() {
               />
             ))}
 
-            {/* Pinned panels */}
+            {/* Pinned panels — generic rendering via registry */}
             {pinnedPanels.map((panel) => {
-              const panelKey = `${panel.type}:${panel.sessionName}`;
-              const height = pinnedPanelHeights[panelKey] ?? 240;
-              if (panel.type === 'repo') {
-                if (!wsRef.current || !panel.projectDir) return null;
-                const repoDir = panel.projectDir;
-                return (
-                  <SidebarPinnedPanel
-                    key={panelKey}
-                    panel={panel}
-                    height={height}
-                    onUnpin={() => unpinPanel(panel)}
-                    onResize={(h) => savePinnedPanelHeight(panelKey, h)}
-                    ws={wsRef.current}
-                    connected={connected}
-                    sessions={sessions}
-                    subSessions={subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession }))}
-                    serverId={panel.serverId ?? selectedServerId ?? ''}
-                    projectDir={repoDir}
-                    inputRefsMap={inputRefsMap}
-                    activeSession={panel.sessionName}
-                  />
-                );
-              }
-              // subsession panel — check if session is live locally (task 4.6)
-              const liveSub = subSessions.find((s) => s.sessionName === panel.sessionName);
+              const height = pinnedPanelHeights[panel.id] ?? 240;
+              const ctx: PanelRenderContext = {
+                ws: wsRef.current,
+                connected,
+                serverId: (panel.props.serverId as string) ?? selectedServerId ?? '',
+                subSessions: subSessions.map(s => ({ id: s.id, sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, cwd: s.cwd, parentSession: s.parentSession })),
+                inputRefsMap,
+              };
               return (
                 <SidebarPinnedPanel
-                  key={panelKey}
+                  key={panel.id}
                   panel={panel}
                   height={height}
                   onUnpin={() => unpinPanel(panel)}
-                  onResize={(h) => savePinnedPanelHeight(panelKey, h)}
-                  ws={wsRef.current}
-                  connected={connected}
-                  sessions={sessions}
-                  subSessions={subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession }))}
-                  serverId={selectedServerId ?? ''}
-                  liveSubSession={liveSub}
+                  onResize={(h) => savePinnedPanelHeight(panel.id, h)}
+                  ctx={ctx}
                 />
               );
             })}
@@ -1863,7 +1813,7 @@ export function App() {
 
             {/* Desktop floating file browser */}
             {!isMobile && showDesktopFileBrowser && wsRef.current && activeSessionInfo && (
-              <FloatingPanel id="filebrowser" title={`📁 ${trans('picker.files')}`} onClose={() => setShowDesktopFileBrowser(false)} onPin={pinFileBrowser} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={420} defaultH={500}>
+              <FloatingPanel id="filebrowser" title={`📁 ${trans('picker.files')}`} onClose={() => setShowDesktopFileBrowser(false)} onPin={() => pinPanel('filebrowser', { sessionName: activeSession, projectDir: activeSessionInfo?.projectDir, serverId: selectedServerId }, () => setShowDesktopFileBrowser(false))} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={420} defaultH={500}>
                 <FileBrowser
                   ws={wsRef.current}
                   mode="file-multi"
@@ -1941,7 +1891,7 @@ export function App() {
       )}
 
       {showRepoPage && wsRef.current && activeSessionInfo?.projectDir && (
-        <FloatingPanel id="repo" title="Repository" onClose={() => setShowRepoPage(false)} onPin={pinRepoPage} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={800} defaultH={600}>
+        <FloatingPanel id="repo" title="Repository" onClose={() => setShowRepoPage(false)} onPin={() => pinPanel('repopage', { sessionName: activeSession, projectDir: activeSessionInfo?.projectDir, serverId: selectedServerId }, () => setShowRepoPage(false))} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={800} defaultH={600}>
           <RepoPage ws={wsRef.current} projectDir={activeSessionInfo.projectDir} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
             const id = Date.now();
             const icon = run.status === 'success' ? '✅' : '❌';
@@ -1977,7 +1927,7 @@ export function App() {
       )}
 
       {/* Sub-session windows (floating) — only show if not pinned */}
-      {visibleSubSessions.filter((sub) => !pinnedPanels.some((p) => p.type === 'subsession' && p.sessionName === sub.sessionName)).map((sub) => {
+      {visibleSubSessions.filter((sub) => !pinnedPanels.some((p) => p.type === 'subsession' && p.props.sessionName === sub.sessionName)).map((sub) => {
         const isOpen = openSubIds.has(sub.id);
         return (
           <div key={sub.id} style={{ display: isOpen ? 'contents' : 'none' }}>
@@ -1997,7 +1947,7 @@ export function App() {
               }}
               zIndex={subZIndexes.get(sub.id) ?? 1000}
               onFocus={() => bringSubToFront(sub.id)}
-              onPin={(vm) => pinSubSession(sub.id, vm)}
+              onPin={(vm) => pinPanel('subsession', { sessionName: sub.sessionName, viewMode: vm, label: sub.label }, () => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; }))}
               sessions={sessions}
               subSessions={subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession }))}
               serverId={selectedServerId ?? undefined}
