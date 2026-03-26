@@ -1280,14 +1280,15 @@ export function App() {
         drag.active = true;
         if (drag.opening) {
           setMobileSidebarOpen(true);
-          // Panel starts off-screen; first applySidebarTransform will position it
         }
       }
+
+      // Prevent vertical scroll while sidebar drag is active
+      e.preventDefault();
 
       drag.lastX = t.clientX;
       drag.lastTs = e.timeStamp;
 
-      // Apply transform directly — transform/opacity are GPU-composited, no layout thrashing
       const w = getSidebarWidth();
       const progress = drag.opening
         ? Math.max(0, t.clientX - drag.startX) / w
@@ -1318,7 +1319,7 @@ export function App() {
     };
 
     document.addEventListener('touchstart', onStart, { passive: true });
-    document.addEventListener('touchmove', onMove, { passive: true });
+    document.addEventListener('touchmove', onMove, { passive: false }); // non-passive to allow preventDefault
     document.addEventListener('touchend', onEnd, { passive: true });
     return () => {
       document.removeEventListener('touchstart', onStart);
