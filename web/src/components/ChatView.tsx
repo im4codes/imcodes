@@ -479,40 +479,53 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
     const container = scrollRef.current;
     if (!container) return;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let menuOpened = false;
+    let startX = 0, startY = 0;
 
-    const onStart = (e: TouchEvent) => {
+    // Telegram pattern: eat the touchend + subsequent click after menu opens
+    const cancelEvent = (e: Event) => { e.preventDefault(); e.stopPropagation(); };
+
+    const onTouchStart = (e: TouchEvent) => {
+      if (e.touches.length > 1) return; // multi-touch → cancel
       const t = e.touches[0];
-      const sx = t.clientX, sy = t.clientY;
+      startX = t.clientX; startY = t.clientY;
       const targetEl = e.target as HTMLElement;
+      menuOpened = false;
+
       timer = setTimeout(() => {
         timer = null;
         const chatEvent = targetEl.closest?.('.chat-event') as HTMLElement | null;
-        if (chatEvent) openCtxMenu(chatEvent, sx, sy);
-      }, 450);
+        if (!chatEvent) return;
+        openCtxMenu(chatEvent, startX, startY);
+        menuOpened = true;
+        // One-shot: eat the touchend that follows to prevent synthetic click from closing menu
+        container.addEventListener('touchend', cancelEvent, { once: true, capture: true });
+      }, 400);
     };
-    const cancel = () => { if (timer) { clearTimeout(timer); timer = null; } };
-    let startX = 0, startY = 0;
-    const onTouchStart = (e: TouchEvent) => {
-      const t = e.touches[0];
-      startX = t.clientX; startY = t.clientY;
-      onStart(e);
-    };
+
     const onTouchMove = (e: TouchEvent) => {
       if (!timer) return;
       const t = e.touches[0];
-      if (Math.abs(t.clientX - startX) > 15 || Math.abs(t.clientY - startY) > 15) cancel();
+      if (Math.abs(t.clientX - startX) > 10 || Math.abs(t.clientY - startY) > 10) {
+        clearTimeout(timer); timer = null;
+      }
+    };
+
+    const onTouchEnd = () => {
+      if (timer) { clearTimeout(timer); timer = null; }
     };
 
     container.addEventListener('touchstart', onTouchStart, { passive: true });
     container.addEventListener('touchmove', onTouchMove, { passive: true });
-    container.addEventListener('touchend', cancel, { passive: true });
-    container.addEventListener('touchcancel', cancel, { passive: true });
+    container.addEventListener('touchend', onTouchEnd, { passive: true });
+    container.addEventListener('touchcancel', onTouchEnd, { passive: true });
     return () => {
-      cancel();
+      if (timer) clearTimeout(timer);
       container.removeEventListener('touchstart', onTouchStart);
       container.removeEventListener('touchmove', onTouchMove);
-      container.removeEventListener('touchend', cancel);
-      container.removeEventListener('touchcancel', cancel);
+      container.removeEventListener('touchend', onTouchEnd);
+      container.removeEventListener('touchcancel', onTouchEnd);
+      container.removeEventListener('touchend', cancelEvent, { capture: true } as EventListenerOptions);
     };
   }, [isTouchDevice, preview, openCtxMenu]);
 
