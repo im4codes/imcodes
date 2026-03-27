@@ -386,12 +386,13 @@ export class WsBridge {
         return;
       }
 
-      // Browser rate limit — log-only, never drop. This is the user's own server,
-      // not a public API. Daemon-side concurrency limits provide real protection.
+      // Browser rate limit — drop with error response so frontend can handle it
       {
         const browserId = this.getBrowserId(ws);
         if (!this.browserRateLimiter.check(browserId, BROWSER_RATE_LIMIT, BROWSER_RATE_WINDOW)) {
-          logger.debug({ serverId: this.serverId, type: msg.type }, 'Browser rate limit exceeded (not dropped)');
+          logger.warn({ serverId: this.serverId, type: msg.type }, 'Browser rate limit exceeded — dropped');
+          safeSend(ws, JSON.stringify({ type: 'error', code: 'rate_limited', message: 'Too many requests', originalType: msg.type, requestId: msg.requestId }));
+          return;
         }
       }
 

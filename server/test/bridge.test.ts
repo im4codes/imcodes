@@ -208,14 +208,19 @@ describe('WsBridge', () => {
       expect(daemonWs.sent).toHaveLength(0);
     });
 
-    it('drops after rate limit exceeded', async () => {
+    it('drops with error after rate limit exceeded', async () => {
       const { daemonWs, browserWs } = await setupBridge();
-      for (let i = 0; i < 30; i++) {
+      for (let i = 0; i < 120; i++) {
         browserWs.emit('message', JSON.stringify({ type: 'get_sessions' }));
       }
       const countBefore = daemonWs.sent.length;
       browserWs.emit('message', JSON.stringify({ type: 'get_sessions' }));
+      // Message not forwarded to daemon
       expect(daemonWs.sent.length).toBe(countBefore);
+      // Error sent back to browser
+      const lastBrowserMsg = JSON.parse(browserWs.sent[browserWs.sent.length - 1] as string);
+      expect(lastBrowserMsg.type).toBe('error');
+      expect(lastBrowserMsg.code).toBe('rate_limited');
     });
   });
 
