@@ -9,8 +9,33 @@ import type { Readable } from 'stream';
 
 const execFile = promisify(execFileCb);
 
+/** Ensure tmux server is running. Auto-starts if dead. */
+let tmuxServerChecked = false;
+async function ensureTmuxServer(): Promise<void> {
+  if (tmuxServerChecked) return;
+  try {
+    await execFile('tmux', ['list-sessions']);
+    tmuxServerChecked = true;
+  } catch (e: any) {
+    const stderr = String(e.stderr || e.message || '');
+    if (stderr.includes('no server running') || stderr.includes('No such file or directory') || stderr.includes('error connecting')) {
+      // tmux server is dead — start it
+      await execFile('tmux', ['new-session', '-d', '-s', 'imcodes_init']);
+      // Kill the temp session, server stays alive
+      await execFile('tmux', ['kill-session', '-t', 'imcodes_init']).catch(() => {});
+      tmuxServerChecked = true;
+    } else if (stderr.includes('no sessions')) {
+      // Server running but no sessions — fine
+      tmuxServerChecked = true;
+    } else {
+      throw e;
+    }
+  }
+}
+
 /** Run a tmux command with array args (no shell — safe from injection). */
 async function tmuxRun(...args: string[]): Promise<string> {
+  await ensureTmuxServer();
   const { stdout } = await execFile('tmux', args);
   return stdout.trim();
 }
