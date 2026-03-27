@@ -114,16 +114,26 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
   const [draftW, setDraftW] = useState(String(cardSize.w));
   const [draftH, setDraftH] = useState(String(cardSize.h));
   const [stats, setStats] = useState<DaemonStats | null>(null);
-  const [orderedIds, setOrderedIds] = useState<string[]>(() => load('rcc_subcard_order', []));
+  const orderKey = serverId ? `rcc_subcard_order_${serverId}` : 'rcc_subcard_order';
+  const [orderedIds, setOrderedIds] = useState<string[]>(() => load(orderKey, []));
   const dragIdRef = useRef<string | null>(null);
   const orderedIdsRef = useRef(orderedIds);
   orderedIdsRef.current = orderedIds;
   const reorderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Reset orderedIds when server changes
+  const prevServerIdRef = useRef(serverId);
+  if (prevServerIdRef.current !== serverId) {
+    prevServerIdRef.current = serverId;
+    const saved = load<string[]>(orderKey, []);
+    setOrderedIds(saved);
+    orderedIdsRef.current = saved;
+  }
+
   // Debounced server sync for sub-session order
   const syncOrderToServer = (ids: string[]) => {
     // Always save to localStorage as fallback
-    save('rcc_subcard_order', ids);
+    save(orderKey, ids);
     // Debounce server sync
     if (reorderTimerRef.current) clearTimeout(reorderTimerRef.current);
     reorderTimerRef.current = setTimeout(() => {

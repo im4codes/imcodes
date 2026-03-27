@@ -2,7 +2,7 @@
  * useSubSessions — loads sub-session list from PG, handles create/close,
  * and triggers daemon rebuild on connect.
  */
-import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
 import {
   listSubSessions,
   createSubSession as apiCreate,
@@ -67,7 +67,7 @@ export function useSubSessions(
     load();
 
     return () => { if (timer) clearTimeout(timer); };
-  }, [serverId, connected]);
+  }, [serverId]);
 
   // Rebuild all when daemon connects (once per connection)
   useEffect(() => {
@@ -226,9 +226,12 @@ export function useSubSessions(
   // Filter sub-sessions by active main session (show only those belonging to it).
   // Sub-sessions with no parentSession (null) are always visible — they were created
   // before the parentSession feature or from a context without an active session.
-  const visibleSubSessions = activeSession
-    ? subSessions.filter((s) => !s.parentSession || s.parentSession === activeSession)
-    : subSessions;
+  const visibleSubSessions = useMemo(() =>
+    activeSession
+      ? subSessions.filter((s) => !s.parentSession || s.parentSession === activeSession)
+      : subSessions,
+    [subSessions, activeSession],
+  );
 
   return { subSessions, visibleSubSessions, loadedServerId, create, close, restart, rename };
 }
