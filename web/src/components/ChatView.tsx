@@ -457,12 +457,13 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
     if (text) {
       const mainEl = scrollRef.current?.closest('.chat-main') as HTMLElement | null;
       const mainRect = (mainEl ?? scrollRef.current!).getBoundingClientRect();
-      const rect = target.getBoundingClientRect();
-      // On touch devices, position below the touch point; on desktop, above the element
-      const isTouchEvt = 'touches' in e || isTouchDevice;
+      // Position menu at the actual click/touch point, not the element edge
+      const me = e as MouseEvent;
+      const clientX = me.clientX ?? 0;
+      const clientY = me.clientY ?? 0;
       setCtxMenu({
-        x: Math.min(rect.left + rect.width / 2 - mainRect.left, mainRect.width - 80),
-        y: isTouchEvt ? (rect.bottom - mainRect.top + 8) : (rect.top - mainRect.top),
+        x: Math.max(40, Math.min(clientX - mainRect.left, mainRect.width - 80)),
+        y: clientY - mainRect.top - 40,
         text,
       });
     }
