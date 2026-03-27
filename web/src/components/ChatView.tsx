@@ -212,7 +212,7 @@ function readPanelOpen(id: string | null | undefined): boolean {
   try { return localStorage.getItem(panelOpenKey(id)) === '1'; } catch { return false; }
 }
 
-export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote }: Props) {
+export function ChatView({ events, loading, refreshing: _refreshing, loadingOlder, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote }: Props) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
