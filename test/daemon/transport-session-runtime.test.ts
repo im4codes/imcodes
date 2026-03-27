@@ -93,7 +93,13 @@ describe('TransportSessionRuntime', () => {
     await runtime.initialize(defaultConfig);
     await runtime.send('do something');
     expect(runtime.getStatus()).toBe('thinking');
-    expect(mock.provider.send).toHaveBeenCalledWith('mock-session-123', 'do something');
+    expect(mock.provider.send).toHaveBeenCalledWith('mock-session-123', 'do something', undefined, undefined);
+  });
+
+  it('send() passes description as extraSystemPrompt', async () => {
+    await runtime.initialize({ ...defaultConfig, description: 'You are a frontend expert' });
+    await runtime.send('help me');
+    expect(mock.provider.send).toHaveBeenCalledWith('mock-session-123', 'help me', undefined, 'You are a frontend expert');
   });
 
   it('onDelta callback sets status to streaming', async () => {
