@@ -168,9 +168,16 @@ export function App() {
       inputFocused = tag === 'INPUT' || tag === 'TEXTAREA'
         || el.getAttribute('contenteditable') === 'true'
         || el.classList.contains('xterm-helper-textarea');
+      // Toggle .input-focused instantly on focus (no viewport delay needed)
+      document.documentElement.classList.toggle('input-focused', inputFocused);
       update();
     };
-    const onFocusOut = () => { inputFocused = false; clearTimeout(scrollTimer); update(); };
+    const onFocusOut = () => {
+      inputFocused = false;
+      document.documentElement.classList.remove('input-focused');
+      clearTimeout(scrollTimer);
+      update();
+    };
     update();
     vv.addEventListener('resize', update);
     document.addEventListener('focusin', onFocusIn);
