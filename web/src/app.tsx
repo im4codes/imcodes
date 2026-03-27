@@ -45,7 +45,7 @@ import { useSubSessions } from './hooks/useSubSessions.js';
 import { useProviderStatus } from './hooks/useProviderStatus.js';
 // useSwipeBack now handled inside FloatingPanel for discussion/repo pages
 import { WsClient } from './ws-client.js';
-import { configure as configureApi, apiFetch, onAuthExpired, getUserPref, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, listP2pRuns, fetchMe } from './api.js';
+import { configure as configureApi, apiFetch, onAuthExpired, getUserPref, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { getAuthKey, clearAuthKey } from './biometric-auth.js';
 import { initPushNotifications } from './push-notifications.js';
@@ -1287,93 +1287,20 @@ export function App() {
     }
 
     localStorage.setItem('rcc_server', serverId);
-    if (serverName) { localStorage.setItem('rcc_server_name', serverName); setSelectedServerName(serverName); }
-    setSessions([]);
-    setSessionsLoaded(false);
-    // Clear server-scoped state to prevent cross-server data leaks
-    setDiscussions([]);
-    setRepoContexts(new Map());
+    if (serverName) localStorage.setItem('rcc_server_name', serverName);
 
     // Restore previously selected session for this server
     const savedSession = localStorage.getItem(`rcc_session_${serverId}`);
     if (savedSession) {
-      setActiveSession(savedSession);
       localStorage.setItem('rcc_session', savedSession);
     } else {
-      setActiveSession(null);
+      localStorage.removeItem('rcc_session');
     }
-    setSelectedServerId(serverId);
-    setShowMobileServerMenu(false);
-    // Immediately load sessions from D1
-    try {
-      const data = await apiFetch<{ sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; state: string; project_dir?: string }> }>(`/api/server/${serverId}/sessions`);
-      setSessions(data.sessions.map((s) => ({
-        name: s.name,
-        project: s.project_name,
-        role: s.role as SessionInfo['role'],
-        agentType: s.agent_type,
-        state: s.state as SessionInfo['state'],
-        projectDir: s.project_dir,
-      })));
-    } catch {
-      // fallback: WS will populate sessions on connect
-    }
-    // Load completed discussion history from DB (live ones come via WS)
-    try {
-      const dData = await apiFetch<{ discussions: Array<{ id: string; topic: string; state: string; max_rounds: number; total_rounds: number; completed_hops: number; total_hops: number; file_path: string | null; conclusion: string | null; started_at: number; finished_at: number | null }> }>(`/api/server/${serverId}/discussions`);
-      const dbDiscussions = dData.discussions
-        .filter((d) => d.state === 'done' || d.state === 'failed')
-        .map((d) => ({
-          id: d.id, topic: d.topic, state: d.state,
-          currentRound: d.max_rounds, maxRounds: d.total_rounds ?? d.max_rounds,
-          completedHops: d.completed_hops ?? 0, totalHops: d.total_hops ?? 0,
-          conclusion: d.conclusion ?? undefined, filePath: d.file_path ?? undefined,
-        }));
-      setDiscussions((prev) => {
-        // Merge: keep live WS discussions, add DB history without duplicates
-        const liveIds = new Set(prev.filter((d) => d.state !== 'done' && d.state !== 'failed').map((d) => d.id));
-        const live = prev.filter((d) => liveIds.has(d.id));
-        const history = dbDiscussions.filter((d) => !liveIds.has(d.id));
-        return [...live, ...history];
-      });
-    } catch { /* ignore */ }
-    // Load P2P orchestration run history from DB (hydrate on cold start)
-    try {
-      const runs = await listP2pRuns(serverId);
-      if (runs.length > 0) {
-        setDiscussions((prev) => {
-          const existingIds = new Set(prev.map((d) => d.id));
-          const mapped = runs
-            .filter((r) => !existingIds.has(`p2p_${r.id}`))
-            .map((r) => {
-              const status = String(r.status ?? '');
-              const state = (status === 'completed') ? 'done'
-                : (status === 'failed' || status === 'timed_out' || status === 'cancelled') ? 'failed'
-                : (status === 'running' || status === 'awaiting_next_hop' || status === 'dispatched') ? 'running'
-                : 'setup';
-              const totalCount = r.total_count ?? 3;
-              const remainingCount = r.remaining_count ?? 0;
-              const currentTarget = r.current_target_label ?? (r.current_target_session ? String(r.current_target_session).split('_').pop() : undefined);
-              const initiatorLabel = r.initiator_label ?? 'brain';
-              const mode = r.mode_key ?? 'discuss';
-              return {
-                id: `p2p_${r.id}`,
-                topic: `P2P ${mode} · ${initiatorLabel}`,
-                state,
-                currentRound: (r as any).current_round ?? Math.max(1, totalCount - remainingCount),
-                maxRounds: (r as any).total_rounds ?? 1,
-                completedHops: (r as any).completed_hops_count ?? 0,
-                totalHops: Math.max(0, totalCount - 2),
-                currentSpeaker: currentTarget,
-                conclusion: state === 'done' ? (r.result_summary ?? undefined) : undefined,
-                filePath: undefined,
-              };
-            });
-          return [...prev, ...mapped];
-        });
-      }
-    } catch { /* ignore */ }
-  }, [setActiveSession]);
+
+    // Full page reload — guarantees all components, WS connections, and pinned
+    // panels start fresh with the new server. Avoids stale WS/state bugs.
+    window.location.reload();
+  }, []);
 
   // Push notification tap → navigate to the right server + session.
   // For sub-sessions: activate parent main session first, then open the sub-session window.
