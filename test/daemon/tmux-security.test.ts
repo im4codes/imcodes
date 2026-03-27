@@ -64,11 +64,13 @@ describe('tmux shell-injection prevention', () => {
     // This test verifies that the module only imports execFile
     // If someone reverts to exec(), the mock won't capture those calls
     await tmux.capturePane('deck_test_brain');
-    expect(execFileCalls.length).toBeGreaterThan(0);
-    expect(execFileCalls[0].cmd).toBe('tmux');
+    // Filter out ensureTmuxServer's list-sessions probe
+    const nonProbe = execFileCalls.filter((c) => c.args[0] !== 'list-sessions');
+    expect(nonProbe.length).toBeGreaterThan(0);
+    expect(nonProbe[0].cmd).toBe('tmux');
     // Verify it's an array of args, not a single shell string
-    expect(Array.isArray(execFileCalls[0].args)).toBe(true);
-    expect(execFileCalls[0].args[0]).toBe('capture-pane');
+    expect(Array.isArray(nonProbe[0].args)).toBe(true);
+    expect(nonProbe[0].args[0]).toBe('capture-pane');
   });
 
   it('session names with shell metacharacters are passed as literal args', async () => {
