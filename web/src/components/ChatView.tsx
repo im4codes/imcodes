@@ -490,8 +490,8 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
       ctxMenuFiredRef.current = false;
       timer = setTimeout(() => {
         timer = null;
-        ctxMenuFiredRef.current = true; // prevent native contextmenu from double-firing
         handleContextMenu({ preventDefault: () => {}, target: targetEl, clientX: sx, clientY: sy } as unknown as Event);
+        ctxMenuFiredRef.current = true; // set AFTER handler so it blocks the later native contextmenu, not itself
       }, 450);
     };
     const onMove = (e: TouchEvent) => {
