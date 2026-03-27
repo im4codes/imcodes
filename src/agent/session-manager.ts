@@ -243,9 +243,26 @@ export async function restoreFromStore(): Promise<void> {
   logger.debug({ totalSessions: all.length, liveTmux: live.length }, 'restoreFromStore: starting reconciliation');
   for (const s of all) {
     if (s.state === 'stopped') continue;
-    // Transport sessions don't have tmux panes — skip all tmux reconciliation.
-    // They will reconnect via provider auto-reconnect on next use.
-    if (s.runtimeType === RUNTIME_TYPES.TRANSPORT) continue;
+    // Transport sessions don't have tmux panes — rebuild runtime from store.
+    // Provider must be connected (auto-reconnect runs before restoreFromStore).
+    if (s.runtimeType === RUNTIME_TYPES.TRANSPORT) {
+      if (s.providerId && s.providerSessionId) {
+        try {
+          const provider = getProvider(s.providerId);
+          if (provider) {
+            const runtime = new TransportSessionRuntime(provider, s.name);
+            runtime.setProviderSessionId(s.providerSessionId);
+            transportRuntimes.set(s.name, runtime);
+            registerProviderRoute(s.providerSessionId, s.name);
+            upsertSession({ ...s, state: 'running', updatedAt: Date.now() });
+            logger.info({ session: s.name, providerId: s.providerId, providerSid: s.providerSessionId }, 'Restored transport session runtime');
+          }
+        } catch (err) {
+          logger.warn({ err, session: s.name }, 'Failed to restore transport session runtime');
+        }
+      }
+      continue;
+    }
     // Sub-sessions (deck_sub_*): skip restart/respawn (managed by rebuildSubSessions),
     // but still restore watchers if the tmux session is alive.
     if (s.name.startsWith('deck_sub_')) {

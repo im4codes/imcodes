@@ -39,6 +39,9 @@ export class TransportSessionRuntime implements SessionRuntime {
     );
   }
 
+  /** Set providerSessionId directly (used when restoring from store without calling initialize). */
+  setProviderSessionId(id: string): void { this._providerSessionId = id; }
+
   get providerSessionId(): string | null {
     return this._providerSessionId;
   }
