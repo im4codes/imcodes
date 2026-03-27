@@ -298,18 +298,47 @@ describe('transport-relay (timeline-emitter based)', () => {
   // ── wireProviderToRelay — onError ────────────────────────────────────────
 
   describe('onError', () => {
+    it('emits assistant.text with warning prefix before session.state', () => {
+      const { provider, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireError('sess-err', { code: 'RATE_LIMITED', message: 'Too many requests', recoverable: true });
+
+      // Should emit 2 timeline events: assistant.text + session.state
+      const timelineCalls = emitMock.mock.calls;
+      expect(timelineCalls.length).toBeGreaterThanOrEqual(2);
+
+      // First emit: assistant.text with the warning message
+      const textCall = timelineCalls.find(c => c[1] === 'assistant.text');
+      expect(textCall).toBeDefined();
+      expect(textCall![0]).toBe('sess-err');
+      expect(textCall![2].text).toBe('⚠️ Error: Too many requests');
+      expect(textCall![2].streaming).toBe(false);
+    });
+
     it('emits session.state idle with error message', () => {
       const { provider, fireError } = makeMockProvider();
       wireProviderToRelay(provider);
 
       fireError('sess-err', { code: 'RATE_LIMITED', message: 'Too many requests', recoverable: true });
 
-      expect(emitMock).toHaveBeenCalledOnce();
-      const [sessionId, type, payload] = emitMock.mock.calls[0];
-      expect(sessionId).toBe('sess-err');
-      expect(type).toBe('session.state');
-      expect(payload.state).toBe('idle');
-      expect(payload.error).toBe('Too many requests');
+      const stateCall = emitMock.mock.calls.find(c => c[1] === 'session.state');
+      expect(stateCall).toBeDefined();
+      expect(stateCall![0]).toBe('sess-err');
+      expect(stateCall![2].state).toBe('idle');
+      expect(stateCall![2].error).toBe('Too many requests');
+    });
+
+    it('emits assistant.text BEFORE session.state (order matters for UI)', () => {
+      const { provider, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireError('sess-err', { code: 'PROVIDER_ERROR', message: 'Overloaded', recoverable: true });
+
+      const textIdx = emitMock.mock.calls.findIndex(c => c[1] === 'assistant.text');
+      const stateIdx = emitMock.mock.calls.findIndex(c => c[1] === 'session.state');
+      expect(textIdx).toBeGreaterThanOrEqual(0);
+      expect(stateIdx).toBeGreaterThan(textIdx);
     });
 
     it('caches to JSONL via appendTransportEvent with type session.error', async () => {
@@ -335,6 +364,16 @@ describe('transport-relay (timeline-emitter based)', () => {
       fireError('sess-err', { code: 'AUTH_FAILED', message: 'Bad token', recoverable: false });
 
       expect(send).not.toHaveBeenCalled();
+    });
+
+    it('includes error message in the warning text for different error types', () => {
+      const { provider, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireError('sess-ai', { code: 'PROVIDER_ERROR', message: 'AI service overloaded', recoverable: true });
+
+      const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
+      expect(textCall![2].text).toBe('⚠️ Error: AI service overloaded');
     });
   });
 

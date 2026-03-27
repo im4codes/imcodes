@@ -426,6 +426,148 @@ describe('OpenClawProvider', () => {
       expect(errors).toHaveLength(1);
       expect(errors[0].sessionId).toBe('sess-ns');
     });
+
+    it('extracts error message from data.error field', async () => {
+      await connectProvider(provider);
+
+      const errors: Array<{ sessionId: string; error: ProviderError }> = [];
+      provider.onError((sessionId, error) => errors.push({ sessionId, error }));
+
+      emitAgentEvent({
+        runId: 'run-err-field', stream: 'lifecycle',
+        data: { phase: 'error', error: 'AI service overloaded' },
+        key: 'sess-ef',
+      });
+
+      expect(errors).toHaveLength(1);
+      expect(errors[0].error.message).toBe('AI service overloaded');
+      expect(errors[0].error.code).toBe('PROVIDER_ERROR');
+      expect(errors[0].error.recoverable).toBe(true);
+    });
+
+    it('extracts error message from data.message field as fallback', async () => {
+      await connectProvider(provider);
+
+      const errors: Array<{ sessionId: string; error: ProviderError }> = [];
+      provider.onError((sessionId, error) => errors.push({ sessionId, error }));
+
+      emitAgentEvent({
+        runId: 'run-msg-field', stream: 'lifecycle',
+        data: { phase: 'error', message: 'OAuth token expired' },
+        key: 'sess-mf',
+      });
+
+      expect(errors).toHaveLength(1);
+      expect(errors[0].error.message).toBe('OAuth token expired');
+    });
+
+    it('prefers data.error over data.message when both are present', async () => {
+      await connectProvider(provider);
+
+      const errors: Array<{ sessionId: string; error: ProviderError }> = [];
+      provider.onError((sessionId, error) => errors.push({ sessionId, error }));
+
+      emitAgentEvent({
+        runId: 'run-both-err', stream: 'lifecycle',
+        data: { phase: 'error', error: 'primary error', message: 'secondary message' },
+        key: 'sess-be',
+      });
+
+      expect(errors).toHaveLength(1);
+      expect(errors[0].error.message).toBe('primary error');
+    });
+
+    it('falls back to generic message when data has no error or message fields', async () => {
+      await connectProvider(provider);
+
+      const errors: Array<{ sessionId: string; error: ProviderError }> = [];
+      provider.onError((sessionId, error) => errors.push({ sessionId, error }));
+
+      emitAgentEvent({
+        runId: 'run-no-msg', stream: 'lifecycle',
+        data: { phase: 'error' },
+        key: 'sess-nm',
+      });
+
+      expect(errors).toHaveLength(1);
+      // Should contain a generic fallback message mentioning the session
+      expect(errors[0].error.message).toContain('sess-nm');
+      expect(errors[0].error.message).toContain('error');
+    });
+  });
+
+  // 7b. stream: 'error' events (distinct from lifecycle.error)
+  describe('agent event: stream error', () => {
+    it('fires onError with extracted data.error message on stream error event', async () => {
+      await connectProvider(provider);
+
+      const errors: Array<{ sessionId: string; error: ProviderError }> = [];
+      provider.onError((sessionId, error) => errors.push({ sessionId, error }));
+
+      emitAgentEvent({
+        runId: 'run-stream-err', stream: 'error',
+        data: { error: 'Rate limit exceeded' },
+        key: 'sess-se',
+      });
+
+      expect(errors).toHaveLength(1);
+      expect(errors[0].sessionId).toBe('sess-se');
+      expect(errors[0].error.message).toBe('Rate limit exceeded');
+      expect(errors[0].error.code).toBe('PROVIDER_ERROR');
+      expect(errors[0].error.recoverable).toBe(true);
+    });
+
+    it('fires onError with data.message fallback on stream error event', async () => {
+      await connectProvider(provider);
+
+      const errors: Array<{ sessionId: string; error: ProviderError }> = [];
+      provider.onError((sessionId, error) => errors.push({ sessionId, error }));
+
+      emitAgentEvent({
+        runId: 'run-stream-err-msg', stream: 'error',
+        data: { message: 'Connection timeout' },
+        key: 'sess-sem',
+      });
+
+      expect(errors).toHaveLength(1);
+      expect(errors[0].error.message).toBe('Connection timeout');
+    });
+
+    it('fires onError with generic fallback when stream error has no message fields', async () => {
+      await connectProvider(provider);
+
+      const errors: Array<{ sessionId: string; error: ProviderError }> = [];
+      provider.onError((sessionId, error) => errors.push({ sessionId, error }));
+
+      emitAgentEvent({
+        runId: 'run-stream-err-none', stream: 'error',
+        data: {},
+        key: 'sess-sen',
+      });
+
+      expect(errors).toHaveLength(1);
+      expect(errors[0].error.message).toBe('Unknown agent error');
+    });
+
+    it('uses accumulator sessionId when available for stream error', async () => {
+      await connectProvider(provider);
+
+      const errors: Array<{ sessionId: string; error: ProviderError }> = [];
+      provider.onError((sessionId, error) => errors.push({ sessionId, error }));
+
+      const runId = 'run-stream-err-acc';
+
+      // Start a run first (creates accumulator)
+      emitAgentEvent({ runId, stream: 'lifecycle', data: { phase: 'start' }, key: 'sess-acc-err' });
+
+      // Stream error arrives — should use the accumulator's sessionId
+      emitAgentEvent({ runId, stream: 'error', data: { error: 'Internal failure' }, key: 'different-key' });
+
+      expect(errors).toHaveLength(1);
+      // Should use the sessionId from the accumulator (from lifecycle start), not the event's key
+      expect(errors[0].sessionId).toBe('sess-acc-err');
+      expect(errors[0].error.message).toBe('Internal failure');
+    });
   });
 
   // 8. disconnect()
