@@ -68,6 +68,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
   const { events, refreshing } = isShell ? { events: [], refreshing: false } : useTimeline(sub.sessionName, ws);
   const termScrollRef = useRef<(() => void) | null>(null);
   const cardInputRef = useRef<HTMLInputElement>(null);
+  const previewRef = useRef<HTMLDivElement>(null);
   const agentTag = isShell ? (sub.shellBin?.split('/').pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${sub.label} · ${agentTag}` : agentTag;
   const icon = TYPE_ICON[sub.type] ?? '⚡';
@@ -102,6 +103,12 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
     }
     prevStateRef.current = sub.state;
   }, [sub.state]);
+
+  // Auto-scroll preview to bottom when content updates
+  useEffect(() => {
+    const el = previewRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [events.length, sub.state]);
 
   const lastUsage = useMemo(() => {
     for (let i = events.length - 1; i >= 0; i--) {
@@ -183,8 +190,8 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
         })()}
       </div>
 
-      {/* Preview — native size, clipped by card overflow:hidden, non-interactive */}
-      <div class="subcard-preview">
+      {/* Preview — scrollable, auto-scrolls to bottom on new content */}
+      <div class="subcard-preview" ref={previewRef}>
         {isShell ? (
           <TerminalView
             sessionName={sub.sessionName}
