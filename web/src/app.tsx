@@ -1232,140 +1232,11 @@ export function App() {
   // Mobile sidebar: drag-follow gesture system.
   // - Swipe right from left edge → panel follows finger → snap open/closed on release
   // - When open, swipe left on panel/backdrop → follows finger → snap closed
-  // Uses refs + direct DOM manipulation for 60fps (no React re-renders during drag).
-  const sidebarPanelRef = useRef<HTMLDivElement>(null);
+  // Sidebar: simple open/close via state + CSS transition. No drag gesture (was interfering
+  // with chat long-press and scroll). Open via ≡ button, close via backdrop tap or ✕ button.
   const sidebarOverlayRef = useRef<HTMLDivElement>(null);
-  const sidebarDragRef = useRef({ active: false, startX: 0, startY: 0, lastX: 0, lastTs: 0, opening: false });
-
-  const getSidebarWidth = useCallback(() => {
-    return sidebarPanelRef.current?.offsetWidth ?? Math.min(window.innerWidth * 0.88, 360);
-  }, []);
-
-  // Apply sidebar position directly to DOM (no state updates during drag)
-  const applySidebarTransform = useCallback((progress: number) => {
-    // progress: 0 = fully closed (off-screen left), 1 = fully open
-    const clamped = Math.max(0, Math.min(1, progress));
-    const panel = sidebarPanelRef.current;
-    const overlay = sidebarOverlayRef.current;
-    if (panel) panel.style.transform = `translateX(${(clamped - 1) * 100}%)`;
-    if (overlay) overlay.style.background = `rgba(0,0,0,${clamped * 0.5})`;
-  }, []);
-
-  // Snap to open or closed with a CSS transition
-  const snapSidebar = useCallback((open: boolean) => {
-    const panel = sidebarPanelRef.current;
-    const overlay = sidebarOverlayRef.current;
-    if (panel) {
-      panel.style.transition = 'transform 0.25s cubic-bezier(0.4,0,0.2,1)';
-      panel.style.transform = open ? 'translateX(0)' : 'translateX(-100%)';
-      panel.addEventListener('transitionend', () => { panel.style.transition = ''; }, { once: true });
-    }
-    if (overlay) {
-      overlay.style.transition = 'background 0.25s ease';
-      overlay.style.background = open ? 'rgba(0,0,0,0.5)' : 'rgba(0,0,0,0)';
-      overlay.addEventListener('transitionend', () => { overlay.style.transition = ''; }, { once: true });
-    }
-    setMobileSidebarOpen(open);
-    // Safety: when closing, clear all inline styles after transition to ensure CSS rules take effect
-    if (!open) {
-      setTimeout(() => {
-        if (overlay) { overlay.style.background = ''; overlay.style.transition = ''; }
-        if (panel) { panel.style.transition = ''; }
-      }, 300);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!isMobile) return;
-    const drag = sidebarDragRef.current;
-    const EDGE_ZONE = 24;           // px from left edge to start tracking
-    const CONFIRM_PX = 10;          // horizontal px before drag activates (avoids eating taps)
-    const VELOCITY_THRESHOLD = 0.15; // px/ms — lower = easier to flick
-    let tracking = false;
-    let confirmed = false;
-    let startTs = 0;
-
-    const onStart = (e: TouchEvent) => {
-      const t = e.touches[0];
-      const isOpen = mobileSidebarOpen;
-      if (!isOpen && t.clientX > EDGE_ZONE) return;
-      if (!isOpen && (e.target as HTMLElement)?.closest?.('.mobile-server-bar')) return;
-      tracking = true;
-      confirmed = false;
-      drag.active = false;
-      drag.startX = t.clientX;
-      drag.startY = t.clientY;
-      drag.lastX = t.clientX;
-      drag.lastTs = e.timeStamp;
-      startTs = e.timeStamp;
-      drag.opening = !isOpen;
-    };
-
-    const onMove = (e: TouchEvent) => {
-      if (!tracking) return;
-      const t = e.touches[0];
-      const dx = t.clientX - drag.startX;
-      const dy = Math.abs(t.clientY - drag.startY);
-      const adx = Math.abs(dx);
-
-      if (!confirmed) {
-        // Vertical scroll dominates → cancel
-        if (dy > adx * 2 && adx < 15) { tracking = false; return; }
-        if (adx < CONFIRM_PX) return;
-        // Opening must be rightward
-        if (drag.opening && dx < 0) { tracking = false; return; }
-        confirmed = true;
-        drag.active = true;
-        if (drag.opening) setMobileSidebarOpen(true);
-      }
-
-      e.preventDefault();
-      drag.lastX = t.clientX;
-      drag.lastTs = e.timeStamp;
-
-      const w = getSidebarWidth();
-      const progress = drag.opening
-        ? Math.max(0, t.clientX - drag.startX) / w
-        : 1 + Math.min(0, t.clientX - drag.startX) / w;
-      applySidebarTransform(Math.max(0, Math.min(1, progress)));
-    };
-
-    const onEnd = (e: TouchEvent) => {
-      if (!tracking) return;
-      tracking = false;
-      if (!confirmed) return;
-
-      drag.active = false;
-      const t = e.changedTouches[0];
-      // Use overall velocity (start→end), not last-segment — much more reliable for flick detection
-      const totalDt = Math.max(1, e.timeStamp - startTs);
-      const totalDx = t.clientX - drag.startX;
-      const velocity = totalDx / totalDt; // +ve = rightward
-
-      const w = getSidebarWidth();
-      const progress = drag.opening
-        ? Math.max(0, totalDx) / w
-        : 1 + Math.min(0, totalDx) / w;
-
-      // Snap: flick overrides position. Lower threshold for closing (0.3 vs 0.5 for opening).
-      let snapOpen: boolean;
-      if (velocity > VELOCITY_THRESHOLD) snapOpen = true;
-      else if (velocity < -VELOCITY_THRESHOLD) snapOpen = false;
-      else snapOpen = drag.opening ? progress > 0.3 : progress > 0.5;
-
-      snapSidebar(snapOpen);
-    };
-
-    document.addEventListener('touchstart', onStart, { passive: true });
-    // Non-passive only when sidebar is open (need preventDefault for drag). When closed, use passive.
-    document.addEventListener('touchmove', onMove, { passive: !mobileSidebarOpen });
-    document.addEventListener('touchend', onEnd, { passive: true });
-    return () => {
-      document.removeEventListener('touchstart', onStart);
-      document.removeEventListener('touchmove', onMove);
-      document.removeEventListener('touchend', onEnd);
-    };
-  }, [isMobile, mobileSidebarOpen, getSidebarWidth, applySidebarTransform, snapSidebar]);
+  const sidebarPanelRef = useRef<HTMLDivElement>(null);
+  const closeSidebar = useCallback(() => setMobileSidebarOpen(false), []);
 
   const handleLogout = useCallback(async () => {
     if (isNative()) {
@@ -1906,7 +1777,7 @@ export function App() {
           <>
             {/* Mobile-only server switcher */}
             <div class="mobile-server-bar">
-              <button class="mobile-sidebar-toggle" onClick={() => { setMobileSidebarOpen(true); applySidebarTransform(1); }}>≡</button>
+              <button class="mobile-sidebar-toggle" onClick={() => setMobileSidebarOpen(true)}>≡</button>
               <div class="mobile-server-switcher-wrap">
                 <button
                   class="mobile-server-btn"
@@ -2108,7 +1979,7 @@ export function App() {
 
       {/* Mobile sidebar overlay — always mounted so pinned panels stay alive, shown/hidden via CSS */}
       {isMobile && selectedServerId && (
-        <div ref={sidebarOverlayRef} class={`mobile-sidebar-overlay${mobileSidebarOpen ? ' open' : ''}`} onClick={() => snapSidebar(false)}>
+        <div ref={sidebarOverlayRef} class={`mobile-sidebar-overlay${mobileSidebarOpen ? ' open' : ''}`} onClick={() => closeSidebar()}>
           <div ref={sidebarPanelRef} class="mobile-sidebar-panel" onClick={(e) => e.stopPropagation()}>
             <div class="mobile-sidebar-header">
               <span style={{ fontWeight: 700, fontSize: 14, color: '#e2e8f0' }}>IM.codes</span>
@@ -2123,7 +1994,7 @@ export function App() {
                   onClick={() => setMobileHideTabBar((p) => { const v = !p; localStorage.setItem('mobile_hide_tab_bar', v ? '1' : ''); return v; })}
                   title="Session tabs"
                 >⊞</button>
-                <button class="mobile-sidebar-close" onClick={() => snapSidebar(false)}>✕</button>
+                <button class="mobile-sidebar-close" onClick={() => closeSidebar()}>✕</button>
               </div>
             </div>
             <div class="mobile-sidebar-body">
@@ -2137,7 +2008,7 @@ export function App() {
                       <button
                         key={s.id}
                         class={`server-item${s.id === selectedServerId ? ' active' : ''}${online ? '' : ' offline'}`}
-                        onClick={() => { handleSelectServer(s.id, s.name); snapSidebar(false); }}
+                        onClick={() => { handleSelectServer(s.id, s.name); closeSidebar(); }}
                       >
                         <span class="server-item-dot" style={{ color: online ? '#4ade80' : '#475569' }}>
                           {online ? '●' : '○'}
@@ -2157,14 +2028,14 @@ export function App() {
                 onSelectSession={(name) => {
                   setActiveSession(name);
                   setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; });
-                  snapSidebar(false);
+                  closeSidebar();
                 }}
                 onSelectSubSession={(sub) => {
                   toggleSubSession(sub.id);
-                  snapSidebar(false);
+                  closeSidebar();
                 }}
-                onNewSession={() => { setShowNewSession(true); snapSidebar(false); }}
-                onNewSubSession={() => { setShowSubDialog(true); snapSidebar(false); }}
+                onNewSession={() => { setShowNewSession(true); closeSidebar(); }}
+                onNewSubSession={() => { setShowSubDialog(true); closeSidebar(); }}
               />}
               {/* P2P ring progress */}
               {discussions.filter((d) => d.state === 'running' || d.state === 'setup').filter((d) => d.id.startsWith('p2p_')).map((d) => (
@@ -2175,7 +2046,7 @@ export function App() {
                   completedHops={d.completedHops}
                   totalHops={d.totalHops}
                   status={d.state}
-                  onClick={() => { setDiscussionInitialId(d.fileId ?? null); setShowDiscussionsPage(true); snapSidebar(false); }}
+                  onClick={() => { setDiscussionInitialId(d.fileId ?? null); setShowDiscussionsPage(true); closeSidebar(); }}
                 />
               ))}
               {/* Pinned panels — same as desktop sidebar */}
@@ -2188,7 +2059,7 @@ export function App() {
                   serverId: (props.serverId as string) ?? selectedServerId ?? '',
                   subSessions: subSessionsFull,
                   inputRefsMap,
-                  onPreviewFile: (path) => { setPreviewFilePath(path); snapSidebar(false); },
+                  onPreviewFile: (path) => { setPreviewFilePath(path); closeSidebar(); },
                   activeSession,
                   activeProjectDir: activeSessionInfo?.projectDir,
                 };
