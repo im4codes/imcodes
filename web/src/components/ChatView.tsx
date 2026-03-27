@@ -224,8 +224,6 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
   const highlightElRef = useRef(highlightEl);
   highlightElRef.current = highlightEl;
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; text: string } | null>(null);
-  // Guard: suppress the synthetic click that iOS/Android fires after a long-press touchend
-  const longPressedRef = useRef(false);
 
   const autoScrollRef = useRef(true);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
@@ -445,63 +443,30 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
     return () => document.removeEventListener('selectionchange', onSelChange);
   }, [isTouchDevice]);
 
-  // Mobile: long-press on a message → highlight + show Copy / Quote All menu (no native toolbar)
-  useEffect(() => {
-    if (!isTouchDevice || preview) return;
-    const container = scrollRef.current;
-    if (!container) return;
-    let pressTimer: ReturnType<typeof setTimeout> | null = null;
-    let startX = 0, startY = 0;
-
-    const onTouchStart = (e: TouchEvent) => {
-      const t = e.touches[0];
-      startX = t.clientX;
-      startY = t.clientY;
-      pressTimer = setTimeout(() => {
-        pressTimer = null;
-        longPressedRef.current = true;
-        // Use elementFromPoint — during the hold, Preact may re-render and
-        // replace DOM elements (new messages). e.target would be stale.
-        const el = document.elementFromPoint(startX, startY) as HTMLElement | null;
-        const target = el?.closest?.('.chat-event') as HTMLElement | null;
-        if (!target) return;
-        // Highlight
-        if (highlightElRef.current) highlightElRef.current.classList.remove('chat-highlight');
-        target.classList.add('chat-highlight');
-        setHighlightEl(target);
-        // Show context menu below the touch point
-        const text = (target.textContent ?? '').trim();
-        if (text) {
-          const mainEl = container.closest('.chat-main') as HTMLElement | null;
-          const mainRect = (mainEl ?? container).getBoundingClientRect();
-          setCtxMenu({ x: t.clientX - mainRect.left, y: t.clientY - mainRect.top + 12, text });
-        }
-      }, 500);
-    };
-
-    const onTouchMove = (e: TouchEvent) => {
-      if (!pressTimer) return;
-      const t = e.touches[0];
-      if (Math.abs(t.clientX - startX) > 20 || Math.abs(t.clientY - startY) > 20) {
-        clearTimeout(pressTimer);
-        pressTimer = null;
-      }
-    };
-
-    const onTouchEnd = () => {
-      if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
-    };
-
-    container.addEventListener('touchstart', onTouchStart, { passive: true });
-    container.addEventListener('touchmove', onTouchMove, { passive: true });
-    container.addEventListener('touchend', onTouchEnd, { passive: true });
-    return () => {
-      container.removeEventListener('touchstart', onTouchStart);
-      container.removeEventListener('touchmove', onTouchMove);
-      container.removeEventListener('touchend', onTouchEnd);
-      if (pressTimer) clearTimeout(pressTimer);
-    };
-  }, [isTouchDevice, preview]);
+  // Long-press/right-click context menu handler — works for both desktop and mobile.
+  // iOS fires `contextmenu` on long-press (since iOS 13+), so no custom touch timer needed.
+  const handleContextMenu = useCallback((e: Event) => {
+    if (preview) return;
+    e.preventDefault();
+    const target = (e.target as HTMLElement)?.closest?.('.chat-event') as HTMLElement | null;
+    if (highlightElRef.current) highlightElRef.current.classList.remove('chat-highlight');
+    if (!target) return;
+    target.classList.add('chat-highlight');
+    setHighlightEl(target);
+    const text = (target.textContent ?? '').trim();
+    if (text) {
+      const mainEl = scrollRef.current?.closest('.chat-main') as HTMLElement | null;
+      const mainRect = (mainEl ?? scrollRef.current!).getBoundingClientRect();
+      const rect = target.getBoundingClientRect();
+      // On touch devices, position below the touch point; on desktop, above the element
+      const isTouchEvt = 'touches' in e || isTouchDevice;
+      setCtxMenu({
+        x: Math.min(rect.left + rect.width / 2 - mainRect.left, mainRect.width - 80),
+        y: isTouchEvt ? (rect.bottom - mainRect.top + 8) : (rect.top - mainRect.top),
+        text,
+      });
+    }
+  }, [preview, isTouchDevice]);
 
   if (loading) {
     return <div class="chat-view"><div class="chat-loading">{t('chat.loading')}</div></div>;
@@ -523,30 +488,8 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
       {refreshing && <div class="chat-refreshing">{t('chat.syncing')}</div>}
       <div class="chat-main">
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} onScroll={preview ? undefined : handleScroll}
-          onContextMenu={!preview && !isTouchDevice ? (e) => {
-            e.preventDefault(); // block native context menu
-            // Desktop: right-click highlights message + shows context menu
-            const target = (e.target as HTMLElement).closest?.('.chat-event') as HTMLElement | null;
-            if (highlightElRef.current) highlightElRef.current.classList.remove('chat-highlight');
-            if (target) {
-              target.classList.add('chat-highlight');
-              setHighlightEl(target);
-              const text = (target.textContent ?? '').trim();
-              if (text) {
-                const wrapEl = scrollRef.current?.closest('.chat-view-wrap') as HTMLElement | null;
-                const wrapRect = (wrapEl ?? scrollRef.current!).getBoundingClientRect();
-                const rect = target.getBoundingClientRect();
-                setCtxMenu({
-                  x: Math.min(rect.left + rect.width / 2 - wrapRect.left, wrapRect.width - 60),
-                  y: rect.top - wrapRect.top,
-                  text,
-                });
-              }
-            }
-          } : undefined}
+          onContextMenu={!preview ? handleContextMenu : undefined}
           onClick={(highlightEl || ctxMenu) ? () => {
-            // Skip the synthetic click fired by iOS/Android after a long-press touchend
-            if (longPressedRef.current) { longPressedRef.current = false; return; }
             if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
             setCtxMenu(null);
           } : undefined}
