@@ -177,12 +177,13 @@ export class OpenClawProvider implements TransportProvider {
   async createSession(config: SessionConfig): Promise<string> {
     // bindExistingKey may already be sanitized (from UI), unsanitize for OC RPC
     const ocKey = unsanitizeKey(config.bindExistingKey ?? config.sessionKey);
+    const agentId = config.agentId ?? this.agentId;
     if (!config.skipCreate) {
       try {
         // Prefer sessions.create (v2026.3.24+)
         await this.rpc('sessions.create', {
           key: ocKey,
-          agentId: config.agentId ?? this.agentId,
+          agentId,
           label: config.label ?? ocKey,
         });
       } catch {
@@ -190,9 +191,15 @@ export class OpenClawProvider implements TransportProvider {
         logger.info({ provider: this.id, sessionKey: ocKey }, 'sessions.create unavailable, session will be created on first message');
       }
     }
-    logger.info({ provider: this.id, sessionKey: ocKey }, 'Session created');
+    // OC namespaces sessions as `agent:{agentId}:{key}`. When binding an existing
+    // key the caller already provides the full canonical key; for new sessions we
+    // must construct it so the providerRoute matches events coming back from OC.
+    const canonicalKey = config.bindExistingKey
+      ? ocKey
+      : `agent:${agentId}:${ocKey}`;
+    logger.info({ provider: this.id, sessionKey: ocKey, canonicalKey }, 'Session created');
     // Return sanitized key — all internal code sees `___` instead of `:`
-    return sanitizeKey(ocKey);
+    return sanitizeKey(canonicalKey);
   }
 
   async endSession(_sessionId: string): Promise<void> {
@@ -420,7 +427,7 @@ export class OpenClawProvider implements TransportProvider {
         const sessionId = sanitizeKey(payload.key ?? payload.sessionKey ?? runId);
         const messageId = randomUUID();
         this.runAccumulator.set(runId, { sessionId, messageId, text: '' });
-        logger.debug({ provider: this.id, runId, sessionId }, 'Agent run started');
+        logger.info({ provider: this.id, runId, sessionId, rawKey: payload.key, rawSessionKey: payload.sessionKey }, 'Agent run started');
         return;
       }
 
