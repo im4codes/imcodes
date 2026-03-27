@@ -567,10 +567,12 @@ export function App() {
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
 
-  const setActiveSession = useCallback((name: string | null) => {
+  const setActiveSession = useCallback((name: string | null, opts?: { keepSubWindows?: boolean }) => {
     if (name) localStorage.setItem('rcc_session', name);
     else localStorage.removeItem('rcc_session');
     setActiveSessionState(name);
+    // Minimize all sub-session windows when switching sessions (unless explicitly kept)
+    if (!opts?.keepSubWindows) setOpenSubIds(new Set());
     // scroll chat to bottom on session switch (rAF gives ChatView time to mount)
     if (name) requestAnimationFrame(() => chatScrollFnsRef.current.get(name)?.());
   }, []);
@@ -1319,7 +1321,7 @@ export function App() {
           // Activate parent main session first (or keep current if no parent)
           if (sub?.parentSession) {
             localStorage.setItem('rcc_session', sub.parentSession);
-            setActiveSession(sub.parentSession);
+            setActiveSession(sub.parentSession, { keepSubWindows: true });
           }
           // Open the sub-session window
           setOpenSubIds((prev) => new Set([...prev, subId]));
@@ -1562,7 +1564,7 @@ export function App() {
               }}
               onSelectSubSession={(sub) => {
                 if (sub.parentSession && sub.parentSession !== activeSession) {
-                  setActiveSession(sub.parentSession);
+                  setActiveSession(sub.parentSession, { keepSubWindows: true });
                 }
                 toggleSubSession(sub.id);
               }}
@@ -1971,7 +1973,7 @@ export function App() {
                 }}
                 onSelectSubSession={(sub) => {
                   if (sub.parentSession && sub.parentSession !== activeSession) {
-                    setActiveSession(sub.parentSession);
+                    setActiveSession(sub.parentSession, { keepSubWindows: true });
                   }
                   toggleSubSession(sub.id);
                   closeSidebar();
