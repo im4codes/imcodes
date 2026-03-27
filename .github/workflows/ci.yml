@@ -328,7 +328,7 @@ jobs:
       - name: Get OTA version (commit count) and app version (semver)
         id: ota
         run: |
-          COMMIT_COUNT=$(git rev-list --count HEAD)
+          COMMIT_COUNT=$(( $(git rev-list --count HEAD) + 620 ))
           echo "version=${COMMIT_COUNT}" >> "$GITHUB_OUTPUT"
           echo "app_version=$(date -u +%Y.%-m).${COMMIT_COUNT}" >> "$GITHUB_OUTPUT"
 
@@ -354,7 +354,7 @@ jobs:
         run: |
           git fetch --tags
           # Use YYYY.M as major.minor and total commit count as patch — always valid semver
-          COMMIT_COUNT=$(git rev-list --count HEAD)
+          COMMIT_COUNT=$(( $(git rev-list --count HEAD) + 620 ))
           NPM_VERSION="$(date -u +%Y.%-m).${COMMIT_COUNT}"
           GIT_TAG="v${NPM_VERSION}"
           # Skip if this exact tag already exists (idempotent)
