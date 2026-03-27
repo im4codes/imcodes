@@ -445,44 +445,76 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
     return () => document.removeEventListener('selectionchange', onSelChange);
   }, [isTouchDevice]);
 
-  // Context menu handler — unified for desktop (right-click) and mobile (long-press).
-  // Registered via addEventListener in capture phase to intercept BEFORE the browser shows native menu.
-  const handleContextMenuRef = useRef<((e: Event) => void) | null>(null);
-  handleContextMenuRef.current = (e: Event) => {
-    if (preview) return;
-    e.preventDefault();
-    e.stopPropagation();
-    e.stopImmediatePropagation();
-    const target = (e.target as HTMLElement)?.closest?.('.chat-event') as HTMLElement | null;
+  // Show custom context menu (Copy/Quote) at given position for given target element.
+  const openCtxMenu = useCallback((target: HTMLElement, clientX: number, clientY: number) => {
     if (highlightElRef.current) highlightElRef.current.classList.remove('chat-highlight');
-    if (!target) return;
     target.classList.add('chat-highlight');
     setHighlightEl(target);
     const text = (target.textContent ?? '').trim();
-    if (text) {
-      const mainEl = scrollRef.current?.closest('.chat-main') as HTMLElement | null;
-      const mainRect = (mainEl ?? scrollRef.current!).getBoundingClientRect();
-      const me = e as MouseEvent;
-      const clientX = me.clientX ?? 0;
-      const clientY = me.clientY ?? 0;
-      menuOpenedAtRef.current = Date.now();
-      setCtxMenu({
-        x: Math.max(40, Math.min(clientX - mainRect.left, mainRect.width - 80)),
-        y: Math.max(10, Math.min(clientY - mainRect.top - 40, mainRect.height - 120)),
-        text,
-      });
-    }
-  };
+    if (!text) return;
+    const mainEl = scrollRef.current?.closest('.chat-main') as HTMLElement | null;
+    const mainRect = (mainEl ?? scrollRef.current!).getBoundingClientRect();
+    menuOpenedAtRef.current = Date.now();
+    setCtxMenu({
+      x: Math.max(40, Math.min(clientX - mainRect.left, mainRect.width - 80)),
+      y: Math.max(10, Math.min(clientY - mainRect.top - 40, mainRect.height - 120)),
+      text,
+    });
+  }, []);
 
-  // Attach in capture phase for earliest interception — blocks native menu on iOS
-  useEffect(() => {
+  // Desktop: right-click → contextmenu event → custom menu
+  const handleContextMenu = useCallback((e: Event) => {
     if (preview) return;
+    e.preventDefault();
+    const target = (e.target as HTMLElement)?.closest?.('.chat-event') as HTMLElement | null;
+    if (!target) return;
+    const me = e as MouseEvent;
+    openCtxMenu(target, me.clientX ?? 0, me.clientY ?? 0);
+  }, [preview, openCtxMenu]);
+
+  // Mobile: touch timer long-press (450ms) → custom menu.
+  // Native contextmenu doesn't fire on iOS when user-select:none + touch-callout:none are set.
+  useEffect(() => {
+    if (!isTouchDevice || preview) return;
     const container = scrollRef.current;
     if (!container) return;
-    const handler = (e: Event) => handleContextMenuRef.current?.(e);
-    container.addEventListener('contextmenu', handler, { capture: true });
-    return () => container.removeEventListener('contextmenu', handler, { capture: true });
-  }, [preview]);
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const onStart = (e: TouchEvent) => {
+      const t = e.touches[0];
+      const sx = t.clientX, sy = t.clientY;
+      const targetEl = e.target as HTMLElement;
+      timer = setTimeout(() => {
+        timer = null;
+        const chatEvent = targetEl.closest?.('.chat-event') as HTMLElement | null;
+        if (chatEvent) openCtxMenu(chatEvent, sx, sy);
+      }, 450);
+    };
+    const cancel = () => { if (timer) { clearTimeout(timer); timer = null; } };
+    let startX = 0, startY = 0;
+    const onTouchStart = (e: TouchEvent) => {
+      const t = e.touches[0];
+      startX = t.clientX; startY = t.clientY;
+      onStart(e);
+    };
+    const onTouchMove = (e: TouchEvent) => {
+      if (!timer) return;
+      const t = e.touches[0];
+      if (Math.abs(t.clientX - startX) > 15 || Math.abs(t.clientY - startY) > 15) cancel();
+    };
+
+    container.addEventListener('touchstart', onTouchStart, { passive: true });
+    container.addEventListener('touchmove', onTouchMove, { passive: true });
+    container.addEventListener('touchend', cancel, { passive: true });
+    container.addEventListener('touchcancel', cancel, { passive: true });
+    return () => {
+      cancel();
+      container.removeEventListener('touchstart', onTouchStart);
+      container.removeEventListener('touchmove', onTouchMove);
+      container.removeEventListener('touchend', cancel);
+      container.removeEventListener('touchcancel', cancel);
+    };
+  }, [isTouchDevice, preview, openCtxMenu]);
 
   if (loading) {
     return <div class="chat-view"><div class="chat-loading">{t('chat.loading')}</div></div>;
@@ -504,6 +536,7 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
       {refreshing && <div class="chat-refreshing">{t('chat.syncing')}</div>}
       <div class="chat-main">
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} onScroll={preview ? undefined : handleScroll}
+          onContextMenu={!preview && !isTouchDevice ? handleContextMenu : undefined}
           onClick={(highlightEl || ctxMenu) ? () => {
             // Ignore synthetic click from long-press release (within 400ms of menu opening)
             if (Date.now() - menuOpenedAtRef.current < 400) return;
