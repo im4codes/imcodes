@@ -1161,6 +1161,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
         description,
         bindExistingKey,
         userCreated: true,
+        parentSession: parentSession || undefined,
       });
       // Sync to server DB
       try {
