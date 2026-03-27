@@ -1635,29 +1635,8 @@ async function handleFileSearch(cmd: Record<string, unknown>, serverLink: Server
     const results: Array<{ path: string; basename: string; isDir: boolean; score: number }> = [];
     const queryBase = query.split('/').pop() ?? query;
 
-    // Fuzzy match: check if all query chars appear in target in order
-    function fuzzyMatch(target: string, q: string): boolean {
-      if (!q) return true;
-      let qi = 0;
-      for (let i = 0; i < target.length && qi < q.length; i++) {
-        if (target[i] === q[qi]) qi++;
-      }
-      return qi === q.length;
-    }
-
-    // Score: lower is better. Exact substring > fuzzy. Basename match > path match.
-    function scoreMatch(relPath: string, basename: string, q: string): number {
-      const lowerPath = relPath.toLowerCase();
-      const lowerBase = basename.toLowerCase();
-      const qBase = q.split('/').pop() ?? q;
-      if (lowerBase === qBase) return 0;                          // exact basename
-      if (lowerBase.includes(qBase)) return 1;                    // basename substring
-      if (lowerBase.startsWith(qBase)) return 2;                  // basename prefix
-      if (lowerPath.includes(q)) return 3;                        // full path substring
-      if (fuzzyMatch(lowerPath, q)) return 4;                     // fuzzy path
-      if (fuzzyMatch(lowerBase, qBase)) return 5;                 // fuzzy basename
-      return 99;
-    }
+    const score = fileSearchScore;
+    const fuzzy = fileSearchFuzzyMatch;
 
     async function walk(dir: string, rel: string): Promise<void> {
       if (results.length >= 300) return; // hard cap during walk
@@ -1672,9 +1651,9 @@ async function handleFileSearch(cmd: Record<string, unknown>, serverLink: Server
           if (entry.name.startsWith('.') && entry.name !== '.github') continue;
           // Match directories too
           if (query) {
-            const score = scoreMatch(relPath, entry.name, query);
-            if (score < 99) {
-              results.push({ path: relPath + '/', basename: entry.name, isDir: true, score });
+            const sc = score(relPath, entry.name, query);
+            if (sc < 99) {
+              results.push({ path: relPath + '/', basename: entry.name, isDir: true, score: sc });
             }
           }
           await walk(nodePath.join(dir, entry.name), relPath);
@@ -1682,9 +1661,9 @@ async function handleFileSearch(cmd: Record<string, unknown>, serverLink: Server
           if (!query) {
             results.push({ path: relPath, basename: entry.name, isDir: false, score: 99 });
           } else {
-            const score = scoreMatch(relPath, entry.name, query);
-            if (score < 99) {
-              results.push({ path: relPath, basename: entry.name, isDir: false, score });
+            const sc = score(relPath, entry.name, query);
+            if (sc < 99) {
+              results.push({ path: relPath, basename: entry.name, isDir: false, score: sc });
             }
           }
         }
@@ -1997,6 +1976,34 @@ async function handleListProviderSessions(cmd: Record<string, unknown>, serverLi
     logger.warn({ err, providerId }, 'Failed to list provider sessions');
     serverLink.send({ type: 'provider.sync_sessions', providerId, sessions: [] });
   }
+}
+
+// ── File search scoring (exported for unit testing) ──────────────────────────
+
+/** Fuzzy match: all query chars appear in target in order (case insensitive). */
+export function fileSearchFuzzyMatch(target: string, q: string): boolean {
+  if (!q) return true;
+  const t = target.toLowerCase();
+  const ql = q.toLowerCase();
+  let qi = 0;
+  for (let i = 0; i < t.length && qi < ql.length; i++) {
+    if (t[i] === ql[qi]) qi++;
+  }
+  return qi === ql.length;
+}
+
+/** Score a file/dir match. Lower = better. 99 = no match. */
+export function fileSearchScore(relPath: string, basename: string, q: string): number {
+  const lowerPath = relPath.toLowerCase();
+  const lowerBase = basename.toLowerCase();
+  const qBase = q.split('/').pop() ?? q;
+  if (lowerBase === qBase) return 0;                          // exact basename
+  if (lowerBase.includes(qBase)) return 1;                    // basename substring
+  if (lowerBase.startsWith(qBase)) return 2;                  // basename prefix
+  if (lowerPath.includes(q)) return 3;                        // full path substring
+  if (fileSearchFuzzyMatch(lowerPath, q)) return 4;           // fuzzy path
+  if (fileSearchFuzzyMatch(lowerBase, qBase)) return 5;       // fuzzy basename
+  return 99;
 }
 
 /** Reusable: fetch remote sessions from a provider. */
