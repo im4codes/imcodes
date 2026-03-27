@@ -115,7 +115,7 @@ registerPanelType('repopage', {
     if (!ctx.ws || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
     return (
       <RepoPage
-        key={ctx.serverId}
+        key={`${ctx.serverId}:${projectDir}`}
         ws={ctx.ws}
         projectDir={projectDir}
         onBack={() => {}}
