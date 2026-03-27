@@ -242,24 +242,8 @@ export async function restoreFromStore(): Promise<void> {
   // 1. Restart store sessions missing from tmux; start jsonl-watcher for live ones
   logger.debug({ totalSessions: all.length, liveTmux: live.length }, 'restoreFromStore: starting reconciliation');
   for (const s of all) {
-    // Transport sessions: always rebuild runtime (even if stopped — they may have been
-    // incorrectly marked stopped by the tmux health check on a previous restart).
     if (s.runtimeType === RUNTIME_TYPES.TRANSPORT) {
-      if (s.providerId && s.providerSessionId) {
-        try {
-          const provider = getProvider(s.providerId);
-          if (provider) {
-            const runtime = new TransportSessionRuntime(provider, s.name);
-            runtime.setProviderSessionId(s.providerSessionId);
-            transportRuntimes.set(s.name, runtime);
-            registerProviderRoute(s.providerSessionId, s.name);
-            upsertSession({ ...s, state: 'running', updatedAt: Date.now() });
-            logger.info({ session: s.name, providerId: s.providerId, providerSid: s.providerSessionId }, 'Restored transport session runtime');
-          }
-        } catch (err) {
-          logger.warn({ err, session: s.name }, 'Failed to restore transport session runtime');
-        }
-      }
+      // Handled by restoreTransportSessions() after provider connects
       continue;
     }
     // Sub-sessions (deck_sub_*): skip restart/respawn (managed by rebuildSubSessions),
@@ -629,6 +613,33 @@ export function rebuildProviderRoutes(): void {
 /** Get the transport runtime for a session (if it is a transport session). */
 export function getTransportRuntime(name: string): TransportSessionRuntime | undefined {
   return transportRuntimes.get(name);
+}
+
+/**
+ * Restore transport session runtimes for a specific provider.
+ * Called after provider auto-reconnect succeeds (restoreFromStore runs before provider connects).
+ * Skips sessions that already have a runtime (rebuilt by oc-session-sync).
+ */
+export function restoreTransportSessions(providerId: string): void {
+  const all = storeSessions();
+  for (const s of all) {
+    if (s.runtimeType !== RUNTIME_TYPES.TRANSPORT) continue;
+    if (s.providerId !== providerId) continue;
+    if (!s.providerSessionId) continue;
+    if (transportRuntimes.has(s.name)) continue; // already rebuilt by oc-sync
+    try {
+      const provider = getProvider(s.providerId);
+      if (!provider) continue;
+      const runtime = new TransportSessionRuntime(provider, s.name);
+      runtime.setProviderSessionId(s.providerSessionId);
+      transportRuntimes.set(s.name, runtime);
+      registerProviderRoute(s.providerSessionId, s.name);
+      upsertSession({ ...s, state: 'running', updatedAt: Date.now() });
+      logger.info({ session: s.name, providerId: s.providerId, providerSid: s.providerSessionId }, 'Restored transport session runtime');
+    } catch (err) {
+      logger.warn({ err, session: s.name }, 'Failed to restore transport session runtime');
+    }
+  }
 }
 
 export async function launchTransportSession(opts: LaunchOpts): Promise<void> {

@@ -513,6 +513,14 @@ async function autoReconnectProviders(): Promise<void> {
             agentId: ocConfig.agentId,
           });
           logger.info('OpenClaw gateway reconnected');
+          // Rebuild transport session runtimes that restoreFromStore couldn't
+          // (provider wasn't connected yet at that point).
+          try {
+            const { restoreTransportSessions } = await import('../agent/session-manager.js');
+            await restoreTransportSessions('openclaw');
+          } catch (e) {
+            logger.warn({ err: e }, 'Failed to restore transport sessions after provider connect');
+          }
           return; // success
         } catch (err) {
           logger.warn({ err, attempt }, 'OpenClaw auto-reconnect failed — retrying');
