@@ -11,8 +11,7 @@
 import { PostgreSqlContainer } from '@testcontainers/postgresql';
 
 export async function setup() {
-  // Use AWS ECR public mirror to avoid Docker Hub rate limits in CI
-  const container = await new PostgreSqlContainer('public.ecr.aws/docker/library/postgres:16-alpine').start();
+  const container = await new PostgreSqlContainer('postgres:16-alpine').start();
   process.env.TEST_DATABASE_URL = container.getConnectionUri();
 
   return async function teardown() {
