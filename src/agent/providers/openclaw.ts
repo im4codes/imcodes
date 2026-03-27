@@ -447,15 +447,31 @@ export class OpenClawProvider implements TransportProvider {
         const acc = this.runAccumulator.get(runId);
         const sessionId = acc?.sessionId ?? sanitizeKey(payload.key ?? payload.sessionKey ?? runId);
         this.runAccumulator.delete(runId);
+        // Extract actual error message from OC data (e.g. "AI service overloaded", "OAuth token expired")
+        const errorData = data as { error?: string; message?: string } | undefined;
+        const errorMsg = errorData?.error ?? errorData?.message ?? `Agent run error for session ${sessionId}`;
+        logger.warn({ provider: this.id, runId, sessionId, error: errorMsg }, 'OC agent run error');
         const err = this.makeError(
           PROVIDER_ERROR_CODES.PROVIDER_ERROR,
-          `Agent run error for session ${sessionId}`,
+          errorMsg,
           true,
           data,
         );
         this.errorCallbacks.forEach((cb) => cb(sessionId, err));
         return;
       }
+    }
+
+    if (stream === 'error') {
+      // Standalone error stream (separate from lifecycle.error)
+      const acc = this.runAccumulator.get(runId);
+      const sessionId = acc?.sessionId ?? sanitizeKey(payload.key ?? payload.sessionKey ?? runId);
+      const errorData = data as { error?: string; message?: string } | undefined;
+      const errorMsg = errorData?.error ?? errorData?.message ?? 'Unknown agent error';
+      logger.warn({ provider: this.id, runId, sessionId, error: errorMsg }, 'OC agent stream error');
+      const err = this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, errorMsg, true, data);
+      this.errorCallbacks.forEach((cb) => cb(sessionId, err));
+      return;
     }
 
     if (stream === 'assistant') {

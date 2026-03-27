@@ -85,6 +85,12 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       return;
     }
 
+    // Show error as a visible message in the chat so the user knows what happened
+    timelineEmitter.emit(sessionName, 'assistant.text', {
+      text: `⚠️ Error: ${error.message}`,
+      streaming: false,
+    }, { source: 'daemon', confidence: 'high' });
+
     timelineEmitter.emit(sessionName, 'session.state', {
       state: 'idle',
       error: error.message,
