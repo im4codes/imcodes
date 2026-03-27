@@ -134,7 +134,7 @@ export class OpenClawProvider implements TransportProvider {
     logger.info({ provider: this.id }, 'Disconnected from OpenClaw gateway');
   }
 
-  async send(sessionId: string, message: string, _attachments?: unknown[]): Promise<void> {
+  async send(sessionId: string, message: string, _attachments?: unknown[], extraSystemPrompt?: string): Promise<void> {
     const ocKey = unsanitizeKey(sessionId);
     try {
       // Prefer sessions.send (v2026.3.24+): auto canonicalKey, messageSeq, subagent reactivation
@@ -143,6 +143,7 @@ export class OpenClawProvider implements TransportProvider {
         message,
         thinking: 'off',
         idempotencyKey: randomUUID(),
+        ...(extraSystemPrompt ? { extraSystemPrompt } : {}),
       });
       logger.info({ provider: this.id, ocKey }, 'sessions.send succeeded');
     } catch (err) {
@@ -154,6 +155,7 @@ export class OpenClawProvider implements TransportProvider {
         agentId: this.agentId,
         thinking: 'off',
         idempotencyKey: randomUUID(),
+        ...(extraSystemPrompt ? { extraSystemPrompt } : {}),
       });
       logger.info({ provider: this.id, ocKey }, 'agent RPC fallback succeeded');
     }

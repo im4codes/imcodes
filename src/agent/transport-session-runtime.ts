@@ -13,6 +13,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _providerSessionId: string | null = null;
   /** Guard: true while a send is in flight — prevents concurrent sends. */
   private _sending = false;
+  /** Session description — passed as extraSystemPrompt on each send. */
+  private _description: string | undefined;
   /** Unsubscribe functions for provider callbacks — called in kill(). */
   private _unsubscribes: Array<() => void> = [];
 
@@ -42,6 +44,9 @@ export class TransportSessionRuntime implements SessionRuntime {
   /** Set providerSessionId directly (used when restoring from store without calling initialize). */
   setProviderSessionId(id: string): void { this._providerSessionId = id; }
 
+  /** Set description (used when restoring from store — passed as extraSystemPrompt on send). */
+  setDescription(desc: string): void { this._description = desc; }
+
   get providerSessionId(): string | null {
     return this._providerSessionId;
   }
@@ -54,6 +59,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   /** Initialize the runtime — must be called after construction to create the provider session. */
   async initialize(config: SessionConfig): Promise<void> {
     this._providerSessionId = await this.provider.createSession(config);
+    this._description = config.description;
   }
 
   async send(message: string): Promise<void> {
@@ -75,7 +81,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._status = 'thinking';
     this._sending = true;
     try {
-      await this.provider.send(this._providerSessionId, message);
+      await this.provider.send(this._providerSessionId, message, undefined, this._description);
     } catch (err) {
       // Reset status so session doesn't get stuck at 'thinking'
       this._status = 'idle';

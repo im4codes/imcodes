@@ -634,6 +634,7 @@ export function restoreTransportSessions(providerId: string): void {
       if (!provider) continue;
       const runtime = new TransportSessionRuntime(provider, s.name);
       runtime.setProviderSessionId(s.providerSessionId);
+      if (s.description) runtime.setDescription(s.description);
       transportRuntimes.set(s.name, runtime);
       registerProviderRoute(s.providerSessionId, s.name);
       upsertSession({ ...s, state: 'running', updatedAt: Date.now() });

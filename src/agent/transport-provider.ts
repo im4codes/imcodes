@@ -196,7 +196,7 @@ export interface TransportProvider {
    * @param message    - The user's text message.
    * @param attachments - Optional file/image attachments (only when capabilities.attachments is true).
    */
-  send(sessionId: string, message: string, attachments?: unknown[]): Promise<void>;
+  send(sessionId: string, message: string, attachments?: unknown[], extraSystemPrompt?: string): Promise<void>;
 
   /**
    * Register a callback to receive incremental output deltas while the agent is streaming.
