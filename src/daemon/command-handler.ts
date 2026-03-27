@@ -455,6 +455,17 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'pong':
       // Expected internal messages, ignore silently
       break;
+    case 'openclaw.list_sessions':
+      void (async () => {
+        try {
+          const sessions = await listProviderSessions('openclaw');
+          serverLink.send({ type: 'openclaw.sessions_response', sessions });
+        } catch (err) {
+          logger.warn({ err }, 'openclaw.list_sessions failed');
+          serverLink.send({ type: 'openclaw.sessions_response', sessions: [] });
+        }
+      })();
+      break;
     case REPO_MSG.DETECT:
     case REPO_MSG.LIST_ISSUES:
     case REPO_MSG.LIST_PRS:
