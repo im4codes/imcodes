@@ -30,6 +30,8 @@ export interface PanelRenderContext {
   activeSession?: string | null;
   /** Current active session's project directory — follows tab switches */
   activeProjectDir?: string;
+  /** Quote callback — adds quoted text to the main session's input */
+  onQuote?: (text: string) => void;
 }
 
 export interface PanelTypeRegistration {

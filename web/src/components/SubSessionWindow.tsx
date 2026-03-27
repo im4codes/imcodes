@@ -83,6 +83,10 @@ export function SubSessionWindow({
   // Extract active agent status (e.g. "Reading file...")
   const statusText = useMemo(() => getActiveStatusText(events), [events]);
 
+  const [quotes, setQuotes] = useState<string[]>([]);
+  const addQuote = useCallback((text: string) => setQuotes((prev) => [...prev, text]), []);
+  const removeQuote = useCallback((i: number) => setQuotes((prev) => prev.filter((_, j) => j !== i)), []);
+
   const [thinkingNow, setThinkingNow] = useState(() => Date.now());
   useEffect(() => {
     if (!activeThinkingTs || !active) return;
@@ -341,6 +345,7 @@ export function SubSessionWindow({
             ws={ws}
             workdir={sub.cwd ?? null}
             serverId={serverId}
+            onQuote={addQuote}
           />
         )}
       </div>
@@ -376,6 +381,8 @@ export function SubSessionWindow({
           subSessions={subSessions}
           serverId={serverId}
           detectedModel={lastUsage?.model}
+          quotes={quotes}
+          onRemoveQuote={removeQuote}
         />
       </div>
     </div>

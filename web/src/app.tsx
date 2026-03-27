@@ -1664,6 +1664,14 @@ export function App() {
                 onPreviewFile: (path) => setPreviewFilePath(path),
                 activeSession,
                 activeProjectDir: activeSessionInfo?.projectDir,
+                onQuote: (text) => {
+                  const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
+                  if (inputEl) {
+                    const quote = `> ${text.replace(/\n/g, '\n> ')}\n`;
+                    inputEl.textContent = (inputEl.textContent || '') + quote;
+                    inputEl.focus();
+                  }
+                },
               };
               return (
                 <SidebarPinnedPanel
@@ -2062,6 +2070,14 @@ export function App() {
                   onPreviewFile: (path) => { setPreviewFilePath(path); closeSidebar(); },
                   activeSession,
                   activeProjectDir: activeSessionInfo?.projectDir,
+                  onQuote: (text) => {
+                    const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
+                    if (inputEl) {
+                      const quote = `> ${text.replace(/\n/g, '\n> ')}\n`;
+                      inputEl.textContent = (inputEl.textContent || '') + quote;
+                      inputEl.focus();
+                    }
+                  },
                 };
                 return (
                   <SidebarPinnedPanel

@@ -42,6 +42,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
       ws={ctx.ws}
       workdir={liveSub.cwd ?? null}
       serverId={ctx.serverId}
+      onQuote={ctx.onQuote}
     />
   );
 }
