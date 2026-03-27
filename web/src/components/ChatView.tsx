@@ -4,7 +4,7 @@
  * Supports basic Markdown rendering (code blocks, inline code, bold).
  */
 import { h } from 'preact';
-import { useEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
 import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent, WsClient } from '../ws-client.js';
@@ -362,23 +362,25 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
   }, [events]);
   const prevVisibleTsRef = useRef(lastVisibleTs);
   const hasInitialScrolledRef = useRef(false);
+
+  // Synchronous scroll-to-bottom BEFORE paint on initial history load.
+  // useLayoutEffect runs after DOM mutation but before the browser paints,
+  // so the user never sees content at the top position.
+  useLayoutEffect(() => {
+    if (preview) return;
+    if (!hasInitialScrolledRef.current && lastVisibleTs > 0) {
+      hasInitialScrolledRef.current = true;
+      scrollToBottom();
+    }
+  }, [lastVisibleTs]);
+
+  // Subsequent auto-scroll (new messages while at bottom) — use rAF for smooth updates.
   useEffect(() => {
     const changed = lastVisibleTs !== prevVisibleTsRef.current;
     prevVisibleTsRef.current = lastVisibleTs;
     if (!changed && !preview) return;
-    // Check scroll position inside rAF to avoid race: user may have scrolled
-    // between effect firing and rAF executing. Re-read DOM position instead of
-    // trusting autoScrollRef which may have been set true by a prior scrollToBottom.
     requestAnimationFrame(() => {
       if (preview) { scrollToBottom(); return; }
-      const el = scrollRef.current;
-      if (!el) return;
-      // Force scroll to bottom on initial history load (scrollTop is 0 at top, not at bottom).
-      if (!hasInitialScrolledRef.current && lastVisibleTs > 0) {
-        hasInitialScrolledRef.current = true;
-        scrollToBottom();
-        return;
-      }
       if (autoScrollRef.current) scrollToBottom();
     });
   }, [lastVisibleTs, preview]);
