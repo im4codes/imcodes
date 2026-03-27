@@ -151,8 +151,8 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
     if (group.mainSession) {
       const mainRecord = getSession(mName);
       const needsRuntime = !getTransportRuntime(mName);
-      const hasCustomMainLabel = mainRecord?.label && mainRecord.label !== group.mainSession.displayName && mainRecord.label !== mainSessionLabel(group.agentName);
-      const mainLabel = hasCustomMainLabel ? mainRecord!.label : (group.mainSession.displayName || mainSessionLabel(group.agentName));
+      // Preserve existing label — only fall back to OC displayName if store has none
+      const mainLabel = mainRecord?.label || group.mainSession.displayName || mainSessionLabel(group.agentName);
 
       if (mainExists && needsRuntime) {
         // Session in store but runtime lost (daemon restart / OC reconnect) — recreate runtime
@@ -215,9 +215,8 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
               bindExistingKey: ch.key, skipCreate: true, skipStore: true,
               parentSession: mName,
             });
-            // Preserve user-set label: if store has a label that differs from both OC displayName and raw key, keep it
-            const hasCustomLabel = storeEntry.label && storeEntry.label !== ch.displayName && storeEntry.label !== ch.key;
-            const newLabel = (storeEntry.userCreated || hasCustomLabel) ? storeEntry.label : (ch.displayName || storeEntry.label || ch.key);
+            // Preserve existing label — only set if store has none
+            const newLabel = storeEntry.label || ch.displayName || ch.key;
             upsertSession({ ...storeEntry, state: 'running', parentSession: mName, label: newLabel, updatedAt: Date.now() });
             // Update server DB label (may have been stored with sanitized key before displayName fix)
             const subId = storeEntry.name.replace('deck_sub_', '');
@@ -250,9 +249,8 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
               bindExistingKey: ch.key, skipCreate: true, skipStore: true,
               parentSession: mName,
             });
-            // Update store: mark running, set parentSession + label (preserve user renames)
-            const hasCustomReconnLabel = existingInStore.label && existingInStore.label !== ch.displayName && existingInStore.label !== ch.key;
-            const reconnLabel = hasCustomReconnLabel ? existingInStore.label : (ch.displayName || existingInStore.label || ch.key);
+            // Update store: mark running, set parentSession + label (preserve existing label)
+            const reconnLabel = existingInStore.label || ch.displayName || ch.key;
             upsertSession({
               ...existingInStore,
               state: 'running',
