@@ -1632,11 +1632,35 @@ async function handleFileSearch(cmd: Record<string, unknown>, serverLink: Server
   if (!requestId || !projectDir) return;
 
   try {
-    const results: Array<{ path: string; basename: string }> = [];
+    const results: Array<{ path: string; basename: string; isDir: boolean; score: number }> = [];
     const queryBase = query.split('/').pop() ?? query;
 
+    // Fuzzy match: check if all query chars appear in target in order
+    function fuzzyMatch(target: string, q: string): boolean {
+      if (!q) return true;
+      let qi = 0;
+      for (let i = 0; i < target.length && qi < q.length; i++) {
+        if (target[i] === q[qi]) qi++;
+      }
+      return qi === q.length;
+    }
+
+    // Score: lower is better. Exact substring > fuzzy. Basename match > path match.
+    function scoreMatch(relPath: string, basename: string, q: string): number {
+      const lowerPath = relPath.toLowerCase();
+      const lowerBase = basename.toLowerCase();
+      const qBase = q.split('/').pop() ?? q;
+      if (lowerBase === qBase) return 0;                          // exact basename
+      if (lowerBase.includes(qBase)) return 1;                    // basename substring
+      if (lowerBase.startsWith(qBase)) return 2;                  // basename prefix
+      if (lowerPath.includes(q)) return 3;                        // full path substring
+      if (fuzzyMatch(lowerPath, q)) return 4;                     // fuzzy path
+      if (fuzzyMatch(lowerBase, qBase)) return 5;                 // fuzzy basename
+      return 99;
+    }
+
     async function walk(dir: string, rel: string): Promise<void> {
-      if (results.length >= 200) return; // hard cap during walk
+      if (results.length >= 300) return; // hard cap during walk
       let entries: import('fs').Dirent[];
       try {
         entries = await fsReaddir(dir, { withFileTypes: true });
@@ -1646,10 +1670,22 @@ async function handleFileSearch(cmd: Record<string, unknown>, serverLink: Server
         const relPath = rel ? `${rel}/${entry.name}` : entry.name;
         if (entry.isDirectory()) {
           if (entry.name.startsWith('.') && entry.name !== '.github') continue;
+          // Match directories too
+          if (query) {
+            const score = scoreMatch(relPath, entry.name, query);
+            if (score < 99) {
+              results.push({ path: relPath + '/', basename: entry.name, isDir: true, score });
+            }
+          }
           await walk(nodePath.join(dir, entry.name), relPath);
         } else if (entry.isFile()) {
-          if (!query || relPath.toLowerCase().includes(query)) {
-            results.push({ path: relPath, basename: entry.name });
+          if (!query) {
+            results.push({ path: relPath, basename: entry.name, isDir: false, score: 99 });
+          } else {
+            const score = scoreMatch(relPath, entry.name, query);
+            if (score < 99) {
+              results.push({ path: relPath, basename: entry.name, isDir: false, score });
+            }
           }
         }
       }
@@ -1657,11 +1693,11 @@ async function handleFileSearch(cmd: Record<string, unknown>, serverLink: Server
 
     await walk(projectDir, '');
 
-    // Sort: basename match first, then path match
+    // Sort by score (lower = better match), then alphabetically
     results.sort((a, b) => {
-      const aBase = a.basename.toLowerCase().includes(queryBase) ? 0 : 1;
-      const bBase = b.basename.toLowerCase().includes(queryBase) ? 0 : 1;
-      if (aBase !== bBase) return aBase - bBase;
+      if (a.score !== b.score) return a.score - b.score;
+      // Directories before files at same score
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
       return a.path.localeCompare(b.path);
     });
 
