@@ -446,11 +446,13 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
   }, [isTouchDevice]);
 
   // Context menu handler — unified for desktop (right-click) and mobile (long-press).
-  // Native long-press fires `contextmenu` on both iOS and Android when text selection
-  // is not suppressed (user-select CSS removed). e.preventDefault() blocks the native menu.
-  const handleContextMenu = useCallback((e: Event) => {
+  // Registered via addEventListener in capture phase to intercept BEFORE the browser shows native menu.
+  const handleContextMenuRef = useRef<((e: Event) => void) | null>(null);
+  handleContextMenuRef.current = (e: Event) => {
     if (preview) return;
     e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
     const target = (e.target as HTMLElement)?.closest?.('.chat-event') as HTMLElement | null;
     if (highlightElRef.current) highlightElRef.current.classList.remove('chat-highlight');
     if (!target) return;
@@ -470,6 +472,16 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
         text,
       });
     }
+  };
+
+  // Attach in capture phase for earliest interception — blocks native menu on iOS
+  useEffect(() => {
+    if (preview) return;
+    const container = scrollRef.current;
+    if (!container) return;
+    const handler = (e: Event) => handleContextMenuRef.current?.(e);
+    container.addEventListener('contextmenu', handler, { capture: true });
+    return () => container.removeEventListener('contextmenu', handler, { capture: true });
   }, [preview]);
 
   if (loading) {
@@ -492,7 +504,6 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
       {refreshing && <div class="chat-refreshing">{t('chat.syncing')}</div>}
       <div class="chat-main">
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} onScroll={preview ? undefined : handleScroll}
-          onContextMenu={!preview ? handleContextMenu : undefined}
           onClick={(highlightEl || ctxMenu) ? () => {
             // Ignore synthetic click from long-press release (within 400ms of menu opening)
             if (Date.now() - menuOpenedAtRef.current < 400) return;
