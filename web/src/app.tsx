@@ -1632,6 +1632,9 @@ export function App() {
                 setIdleAlerts((prev) => { const s = new Set(prev); s.delete(name); return s; });
               }}
               onSelectSubSession={(sub) => {
+                if (sub.parentSession && sub.parentSession !== activeSession) {
+                  setActiveSession(sub.parentSession);
+                }
                 toggleSubSession(sub.id);
               }}
               onNewSession={() => setShowNewSession(true)}
@@ -1654,11 +1657,10 @@ export function App() {
             {/* Pinned panels — sub-session panels filtered by current server (WS/tmux bound); others always shown */}
             {pinnedPanels.filter((p) => p.id && p.props && (p.type !== 'subsession' || !p.props.serverId || p.props.serverId === selectedServerId)).map((panel) => {
               const height = pinnedPanelHeights[panel.id] ?? 240;
-              const props = panel.props ?? {};
               const ctx: PanelRenderContext = {
                 ws: wsRef.current,
                 connected,
-                serverId: (props.serverId as string) ?? selectedServerId ?? '',
+                serverId: selectedServerId ?? '',
                 subSessions: subSessionsFull,
                 inputRefsMap,
                 onPreviewFile: (path) => setPreviewFilePath(path),
@@ -2039,6 +2041,9 @@ export function App() {
                   closeSidebar();
                 }}
                 onSelectSubSession={(sub) => {
+                  if (sub.parentSession && sub.parentSession !== activeSession) {
+                    setActiveSession(sub.parentSession);
+                  }
                   toggleSubSession(sub.id);
                   closeSidebar();
                 }}
@@ -2060,11 +2065,10 @@ export function App() {
               {/* Pinned panels — same as desktop sidebar */}
               {pinnedPanels.filter((p) => p.id && p.props && (p.type !== 'subsession' || !p.props.serverId || p.props.serverId === selectedServerId)).map((panel) => {
                 const height = pinnedPanelHeights[panel.id] ?? 240;
-                const props = panel.props ?? {};
                 const ctx: PanelRenderContext = {
                   ws: wsRef.current,
                   connected,
-                  serverId: (props.serverId as string) ?? selectedServerId ?? '',
+                  serverId: selectedServerId ?? '',
                   subSessions: subSessionsFull,
                   inputRefsMap,
                   onPreviewFile: (path) => { setPreviewFilePath(path); closeSidebar(); },

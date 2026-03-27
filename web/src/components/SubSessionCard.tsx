@@ -93,49 +93,31 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
   // Use localW unless the global cardW has changed (reset local override)
   const effectiveW = localW;
 
-  const onResizeMouseDown = useCallback((e: MouseEvent) => {
+  // Pointer-based resize — setPointerCapture routes all pointer events to the
+  // handle element, bypassing the parent's HTML5 draggable mechanism entirely.
+  const onResizePointerDown = useCallback((e: PointerEvent) => {
     e.stopPropagation();
     e.preventDefault();
     draggingRef.current = true;
+    const target = e.currentTarget as HTMLElement;
+    target.setPointerCapture(e.pointerId);
     const startX = e.clientX;
     const startW = effectiveW;
 
-    const onMove = (me: MouseEvent) => {
-      const newW = Math.max(200, Math.min(1200, startW + (me.clientX - startX)));
-      setLocalW(newW);
+    const onMove = (pe: PointerEvent) => {
+      setLocalW(Math.max(200, Math.min(1200, startW + (pe.clientX - startX))));
     };
-    const onUp = (me: MouseEvent) => {
+    const onUp = (pe: PointerEvent) => {
       draggingRef.current = false;
-      const newW = Math.max(200, Math.min(1200, startW + (me.clientX - startX)));
+      const newW = Math.max(200, Math.min(1200, startW + (pe.clientX - startX)));
       setLocalW(newW);
       try { localStorage.setItem(`rcc_subcard_w_${sub.id}`, String(newW)); } catch { /* ignore */ }
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
+      target.releasePointerCapture(pe.pointerId);
+      target.removeEventListener('pointermove', onMove);
+      target.removeEventListener('pointerup', onUp);
     };
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
-  }, [effectiveW, sub.id]);
-
-  // Touch support for mobile resize
-  const onResizeTouchStart = useCallback((e: TouchEvent) => {
-    e.stopPropagation();
-    const startX = e.touches[0].clientX;
-    const startW = effectiveW;
-
-    const onMove = (te: TouchEvent) => {
-      const newW = Math.max(200, Math.min(1200, startW + (te.touches[0].clientX - startX)));
-      setLocalW(newW);
-    };
-    const onEnd = (te: TouchEvent) => {
-      const touch = te.changedTouches[0];
-      const newW = Math.max(200, Math.min(1200, startW + (touch.clientX - startX)));
-      setLocalW(newW);
-      try { localStorage.setItem(`rcc_subcard_w_${sub.id}`, String(newW)); } catch { /* ignore */ }
-      document.removeEventListener('touchmove', onMove);
-      document.removeEventListener('touchend', onEnd);
-    };
-    document.addEventListener('touchmove', onMove, { passive: true });
-    document.addEventListener('touchend', onEnd);
+    target.addEventListener('pointermove', onMove);
+    target.addEventListener('pointerup', onUp);
   }, [effectiveW, sub.id]);
 
   return (
@@ -195,13 +177,10 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
         )}
       </div>
 
-      {/* Right-edge resize handle — draggable=false prevents parent drag-wrap from hijacking */}
+      {/* Resize handle — uses pointer capture to bypass parent's HTML5 draggable */}
       <div
         class="subcard-resize-handle"
-        draggable={false}
-        onMouseDown={onResizeMouseDown}
-        onTouchStart={onResizeTouchStart}
-        onDragStart={(e) => e.preventDefault()}
+        onPointerDown={onResizePointerDown}
         onClick={(e) => e.stopPropagation()}
       />
     </div>
