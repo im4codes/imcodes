@@ -1299,6 +1299,8 @@ export function App() {
 
     // Full page reload — guarantees all components, WS connections, and pinned
     // panels start fresh with the new server. Avoids stale WS/state bugs.
+    // Skip splash on reload — user is already in the app.
+    try { sessionStorage.setItem('skip_splash', '1'); } catch { /* ignore */ }
     window.location.reload();
   }, []);
 
