@@ -215,7 +215,8 @@ export class GitHubProvider implements RepoProvider {
       return { items, page, hasMore: items.length === perPage, projectDir: this.projectDir };
     } catch (err) {
       const code = translateError(err);
-      const error = new Error(`gh error: ${code}`);
+      const stderr = (err as any)?.stderr ?? '';
+      const error = new Error(`gh error: ${code}${stderr ? ` — ${stderr.slice(0, 200)}` : ''}`);
       (error as any).code = code;
       throw error;
     }

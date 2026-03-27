@@ -400,7 +400,7 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
   useEffect(() => {
     if (!tabs.actions.fetched) return;
     const hasRunning = tabs.actions.items.some((r: any) => r.status === 'running' || r.status === 'queued');
-    const interval = hasRunning ? 10_000 : 15_000;
+    const interval = hasRunning ? 30_000 : 60_000;
     const timer = setInterval(() => {
       silentRefreshTab('actions');
     }, interval);
