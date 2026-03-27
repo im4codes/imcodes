@@ -649,6 +649,17 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
               {copied ? t('common.copied') : t('common.copy')}
             </button>
             {onQuote && (
+              <>
+              <button
+                class="chat-sel-btn"
+                onClick={() => {
+                  onQuote(ctxMenu.text);
+                  setCtxMenu(null);
+                  if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
+                }}
+              >
+                {t('common.quote', 'Quote')}
+              </button>
               <button
                 class="chat-sel-btn"
                 onClick={() => {
@@ -659,6 +670,7 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
               >
                 {t('common.quote_block', 'Quote All')}
               </button>
+              </>
             )}
           </div>
         )}
