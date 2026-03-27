@@ -772,11 +772,18 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
 
   // Transport sessions — route directly to the provider runtime, bypassing tmux.
   const transportRuntime = getTransportRuntime(sessionName);
-  if (!transportRuntime) {
-    const record = (await import('../store/session-store.js')).getSession(sessionName);
-    if (record?.runtimeType === 'transport') {
-      logger.warn({ sessionName, providerId: record.providerId }, 'session.send: transport session has no runtime — message will go to tmux (will fail)');
-    }
+  const record = (await import('../store/session-store.js')).getSession(sessionName);
+  if (!transportRuntime && record?.runtimeType === 'transport') {
+    // No runtime — provider not connected. Show error in chat.
+    const errMsg = `Provider ${record.providerId ?? 'unknown'} not connected. Reconnecting...`;
+    logger.warn({ sessionName, providerId: record.providerId }, 'session.send: transport session has no runtime');
+    timelineEmitter.emit(sessionName, 'user.message', { text });
+    timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ ${errMsg}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
+    const errStatus = 'error';
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: errStatus, error: errMsg });
+    try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: errStatus, session: sessionName, error: errMsg }); } catch { /* not connected */ }
+    return;
   }
   if (transportRuntime) {
     const release = await getMutex(sessionName).acquire();
@@ -789,7 +796,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         serverLink.send({ type: 'command.ack', commandId: effectiveId, status, session: sessionName });
       } catch { /* not connected */ }
     } catch (err) {
+      // Send failed — show error in chat
+      const errMsg = err instanceof Error ? err.message : String(err);
       logger.error({ sessionName, err }, 'session.send (transport) failed');
+      timelineEmitter.emit(sessionName, 'user.message', { text });
+      timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Send failed: ${errMsg}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
+      try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch { /* */ }
     } finally {
       release();
     }

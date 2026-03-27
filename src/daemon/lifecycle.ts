@@ -500,16 +500,25 @@ async function autoReconnectProviders(): Promise<void> {
 
     const ocConfig = await loadOcConfig();
     if (ocConfig) {
-      logger.info({ url: ocConfig.url }, 'Auto-reconnecting to OpenClaw gateway...');
-      try {
-        await connectProvider('openclaw', {
-          url: ocConfig.url,
-          token: ocConfig.token,
-          agentId: ocConfig.agentId,
-        });
-        logger.info('OpenClaw gateway reconnected');
-      } catch (err) {
-        logger.warn({ err }, 'OpenClaw auto-reconnect failed — will retry on next connect command');
+      // Retry forever with exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s cap
+      let delay = 1_000;
+      let attempt = 0;
+      while (true) {
+        attempt++;
+        logger.info({ url: ocConfig.url, attempt, nextDelayMs: delay }, 'Auto-reconnecting to OpenClaw gateway...');
+        try {
+          await connectProvider('openclaw', {
+            url: ocConfig.url,
+            token: ocConfig.token,
+            agentId: ocConfig.agentId,
+          });
+          logger.info('OpenClaw gateway reconnected');
+          return; // success
+        } catch (err) {
+          logger.warn({ err, attempt }, 'OpenClaw auto-reconnect failed — retrying');
+          await new Promise((r) => setTimeout(r, delay));
+          delay = Math.min(delay * 2, 30_000);
+        }
       }
     }
   } catch (err) {
