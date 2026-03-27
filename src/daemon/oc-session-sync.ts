@@ -49,6 +49,9 @@ export function isMainSession(sanitizedKey: string): boolean {
 export function shouldFilter(sanitizedKey: string): boolean {
   if (sanitizedKey.includes('___cron___')) return true; // :cron: (defense-in-depth, also filtered by provider)
   if (sanitizedKey.endsWith('___sessions')) return true; // :sessions (OC metadata)
+  // Filter sessions created with our internal names (orphans from old key format bug)
+  if (sanitizedKey.includes('___deck_sub_')) return true;
+  if (sanitizedKey.includes('___deck_agent_')) return true;
   return false;
 }
 

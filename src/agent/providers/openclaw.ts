@@ -204,10 +204,14 @@ export class OpenClawProvider implements TransportProvider {
     return sanitizeKey(canonicalKey);
   }
 
-  async endSession(_sessionId: string): Promise<void> {
-    // OpenClaw does not expose a session-delete RPC in the MVP protocol.
-    // Sessions persist on the gateway; nothing to do locally.
-    // Note: _sessionId is sanitized (___), but unused here.
+  async endSession(sessionId: string): Promise<void> {
+    const ocKey = unsanitizeKey(sessionId);
+    try {
+      await this.rpc('sessions.delete', { key: ocKey });
+      logger.info({ provider: this.id, ocKey }, 'OC session deleted');
+    } catch (err) {
+      logger.debug({ provider: this.id, ocKey, err: (err as Error).message }, 'sessions.delete failed (may not be supported)');
+    }
   }
 
   // ── Optional capabilities ──────────────────────────────────────────────────
