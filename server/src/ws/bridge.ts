@@ -386,15 +386,12 @@ export class WsBridge {
         return;
       }
 
-      // Rate limit — exempt init-burst messages that are critical for UI and easily dropped
-      const rateLimitExempt = msg.type === 'repo.detect'
-        || msg.type === 'timeline.history_request'
-        || (typeof msg.type === 'string' && msg.type.startsWith('repo.'));
-      if (!rateLimitExempt) {
+      // Browser rate limit — log-only, never drop. This is the user's own server,
+      // not a public API. Daemon-side concurrency limits provide real protection.
+      {
         const browserId = this.getBrowserId(ws);
         if (!this.browserRateLimiter.check(browserId, BROWSER_RATE_LIMIT, BROWSER_RATE_WINDOW)) {
-          logger.warn({ serverId: this.serverId, type: msg.type }, 'Browser rate limit exceeded — dropped');
-          return;
+          logger.debug({ serverId: this.serverId, type: msg.type }, 'Browser rate limit exceeded (not dropped)');
         }
       }
 
