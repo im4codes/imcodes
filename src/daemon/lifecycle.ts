@@ -416,7 +416,10 @@ export async function startup(): Promise<DaemonContext> {
         }
       }
       // For session.state idle, attach lastText so push notifications have context
+      // Skip shell/script — they are always idle, no useful notification
       if (event.type === 'session.state' && (event.payload as Record<string, unknown>).state === 'idle') {
+        const rec = listSessions().find((s) => s.name === event.sessionId);
+        if (rec?.agentType === 'shell' || rec?.agentType === 'script') return;
         const lastText = getLastAssistantText(event.sessionId);
         serverLink!.send({ type: 'timeline.event', event, ...(lastText ? { lastText } : {}) });
       } else {
@@ -464,6 +467,8 @@ export async function startup(): Promise<DaemonContext> {
       const record = listSessions().find((s) => s.name === payload.session);
       const projectName = record?.projectName ?? payload.session;
       if (payload.event === 'idle') {
+        // Shell/script sessions are always "idle" — skip to avoid noise
+        if (record?.agentType === 'shell' || record?.agentType === 'script') return;
         // notifySessionIdle is handled by the unified timeline listener below
         // Include last assistant text for push notification context
         const lastText = getLastAssistantText(payload.session);
