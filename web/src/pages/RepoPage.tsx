@@ -227,7 +227,26 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
     }, 10_000);
   }, [ws, projectDir]);
 
-  useEffect(() => { doDetect(); return () => { if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current); }; }, [doDetect]);
+  // Only call doDetect when WS is already connected (e.g. initial mount).
+  // On server switch the new WsClient hasn't connected yet — doDetect would throw.
+  // The daemon.reconnected handler (line 278) will call doDetect once WS is ready.
+  useEffect(() => {
+    if (ws.connected) doDetect();
+    return () => { if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current); };
+  }, [doDetect]);
+
+  // Reset state when ws reference changes (server switch) — clear stale data
+  useEffect(() => {
+    setContext(null);
+    setDetectLoading(true);
+    setDetectError(null);
+    setTabs({ issues: emptyTab(), prs: emptyTab(), branches: emptyTab(), commits: emptyTab(), actions: emptyTab() });
+    setExpandedKey(null);
+    setDetailData(new Map());
+    setDetailState(new Map());
+    pendingRef.current.clear();
+    detectReqRef.current = null;
+  }, [ws]);
 
   // ── Tab data fetching ────────────────────────────────────────────────────
 
@@ -273,8 +292,10 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
 
   useEffect(() => {
     return ws.onMessage((msg: ServerMessage) => {
-      // WS reconnected — re-detect and re-fetch active tab
+      // WS reconnected — clear stale pending requests, re-detect
       if (msg.type === 'daemon.reconnected' || (msg.type === 'session.event' && (msg as any).event === 'connected')) {
+        pendingRef.current.clear();
+        detectReqRef.current = null;
         doDetect();
         return;
       }
