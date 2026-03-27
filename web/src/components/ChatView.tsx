@@ -540,7 +540,7 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
           ⊞
         </button>
       )}
-      {refreshing && <div class="chat-refreshing">{t('chat.syncing')}</div>}
+      {/* refreshing indicator removed — gap-fill is invisible to the user */}
       <div class="chat-main">
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} onScroll={preview ? undefined : handleScroll}
           onContextMenu={!preview && !isTouchDevice ? handleContextMenu : undefined}
