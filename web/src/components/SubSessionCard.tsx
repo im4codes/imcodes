@@ -4,6 +4,7 @@
  * Right-edge drag handle lets user resize width independently per card.
  */
 import { useRef, useState, useCallback, useMemo, useEffect } from 'preact/hooks';
+import { useTranslation } from 'react-i18next';
 import { ChatView } from './ChatView.js';
 import { resolveContextWindow } from '../model-context.js';
 import { shortModelLabel } from '../model-label.js';
@@ -31,6 +32,15 @@ const STATE_BADGE: Record<string, string> = {
   idle: '●',
 };
 
+/** Compact shortcuts for the card input — subset of SessionControls SHORTCUTS */
+const CARD_SHORTCUTS: Array<{ label: string; title: string; data: string }> = [
+  { label: 'Esc',  title: 'Escape',     data: '\x1b' },
+  { label: '^C',   title: 'Ctrl+C',     data: '\x03' },
+  { label: '↑',    title: 'Up arrow',   data: '\x1b[A' },
+  { label: '↵',    title: 'Enter',      data: '\r' },
+  { label: 'Tab',  title: 'Tab',        data: '\t' },
+];
+
 interface Props {
   sub: SubSession;
   ws: WsClient | null;
@@ -53,13 +63,31 @@ function loadCardW(id: string, fallback: number): number {
 }
 
 export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, onDiff, onHistory, cardW = 350, cardH = 250 }: Props) {
+  const { t } = useTranslation();
   const isShell = sub.type === 'shell' || sub.type === 'script';
   const { events, refreshing } = isShell ? { events: [], refreshing: false } : useTimeline(sub.sessionName, ws);
   const termScrollRef = useRef<(() => void) | null>(null);
+  const cardInputRef = useRef<HTMLInputElement>(null);
   const agentTag = isShell ? (sub.shellBin?.split('/').pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${sub.label} · ${agentTag}` : agentTag;
   const icon = TYPE_ICON[sub.type] ?? '⚡';
   const badge = STATE_BADGE[sub.state];
+
+  const handleCardSend = useCallback(() => {
+    const text = cardInputRef.current?.value?.trim();
+    if (!text || !ws || !connected) return;
+    try {
+      ws.sendSessionCommand('send', { sessionName: sub.sessionName, text });
+    } catch { /* ignore */ }
+    cardInputRef.current!.value = '';
+  }, [ws, connected, sub.sessionName]);
+
+  const handleCardShortcut = useCallback((data: string) => {
+    if (!ws || !connected) return;
+    try {
+      ws.sendInput(sub.sessionName, data);
+    } catch { /* ignore */ }
+  }, [ws, connected, sub.sessionName]);
 
   const busy = useMemo(() => isVisuallyBusy(sub.state, !!getActiveThinkingTs(events)), [events, sub.state]);
 
@@ -175,6 +203,37 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
             preview
           />
         )}
+      </div>
+
+      {/* Quick input */}
+      <div class="subcard-input-area" onClick={(e) => e.stopPropagation()}>
+        <div class="subcard-shortcuts">
+          {CARD_SHORTCUTS.map((s) => (
+            <button
+              key={s.label}
+              class="subcard-shortcut-btn"
+              title={s.title}
+              onClick={(e) => { e.stopPropagation(); handleCardShortcut(s.data); }}
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+        <input
+          ref={cardInputRef}
+          class="subcard-input"
+          type="text"
+          placeholder={t('common.send') + '...'}
+          disabled={!connected}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.isComposing) {
+              e.preventDefault();
+              handleCardSend();
+            }
+            e.stopPropagation();
+          }}
+          onClick={(e) => e.stopPropagation()}
+        />
       </div>
 
       {/* Resize handle — uses pointer capture to bypass parent's HTML5 draggable */}
