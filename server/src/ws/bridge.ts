@@ -24,7 +24,7 @@ import logger from '../util/logger.js';
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
 const MAX_BROWSER_PAYLOAD = 65536; // 64KB (subsession.rebuild_all can include many sessions)
-const BROWSER_RATE_LIMIT = 30;    // messages
+const BROWSER_RATE_LIMIT = 60;    // messages (was 30 — too low for desktop with pinned panels)
 const BROWSER_RATE_WINDOW = 10_000; // 10s
 const QUEUE_MAX_BYTES = 1024 * 1024; // 1MB per (session, browser) — increased from 512KB to reduce stream_reset cascades
 
@@ -386,8 +386,11 @@ export class WsBridge {
         return;
       }
 
-      // Rate limit — exempt repo.detect (low-volume, critical for UI, easily dropped during init burst)
-      if (msg.type !== 'repo.detect') {
+      // Rate limit — exempt init-burst messages that are critical for UI and easily dropped
+      const rateLimitExempt = msg.type === 'repo.detect'
+        || msg.type === 'timeline.history_request'
+        || (typeof msg.type === 'string' && msg.type.startsWith('repo.'));
+      if (!rateLimitExempt) {
         const browserId = this.getBrowserId(ws);
         if (!this.browserRateLimiter.check(browserId, BROWSER_RATE_LIMIT, BROWSER_RATE_WINDOW)) {
           logger.warn({ serverId: this.serverId, type: msg.type }, 'Browser rate limit exceeded — dropped');
