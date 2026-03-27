@@ -842,8 +842,8 @@ body {
 .sidebar-pinned-unpin { background: none; border: none; color: #475569; cursor: pointer; font-size: 14px; padding: 0 4px; line-height: 1; border-radius: 3px; flex-shrink: 0; transition: color 0.15s; }
 .sidebar-pinned-unpin:hover { color: #f87171; }
 
-/* Content area fills remaining height */
-.sidebar-pinned-content { flex: 1; overflow: hidden; min-height: 0; display: flex; flex-direction: column; }
+/* Content area fills remaining height — 6px bottom padding for absolute resize handle */
+.sidebar-pinned-content { flex: 1; overflow: hidden; min-height: 0; display: flex; flex-direction: column; padding-bottom: 6px; }
 
 /* Unavailable / stale panel placeholder */
 .sidebar-pinned-unavailable { flex: 1; display: flex; align-items: center; justify-content: center; font-size: 11px; color: #475569; padding: 16px; text-align: center; }
@@ -851,8 +851,8 @@ body {
 /* Resize handle at the bottom of each pinned panel */
 /* When keyboard is open, constrain the focused panel to fit above the keyboard */
 .kb-open .sidebar-pinned-panel:focus-within { max-height: calc(var(--vvh, 100vh) - 80px); }
-.sidebar-pinned-resize-handle { height: 4px; cursor: ns-resize; background: transparent; flex-shrink: 0; transition: background 0.15s; touch-action: none; position: relative; }
-.sidebar-pinned-resize-handle:hover { background: rgba(99,102,241,0.4); }
+.sidebar-pinned-resize-handle { position: absolute; bottom: 0; left: 0; right: 0; height: 6px; cursor: ns-resize; background: #1e293b; transition: background 0.15s; touch-action: none; z-index: 5; }
+.sidebar-pinned-resize-handle:hover { background: rgba(99,102,241,0.5); }
 @media (pointer: coarse) { .sidebar-pinned-resize-handle { height: 14px; } .sidebar-pinned-resize-handle::before { content: ''; position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%); width: 32px; height: 3px; border-radius: 2px; background: #334155; } }
 
 /* Language switcher */
