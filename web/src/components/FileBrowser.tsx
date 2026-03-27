@@ -484,11 +484,19 @@ export function FileBrowser({
     if (inFlight) return;
 
     setData((prev) => updateNode(prev, nodePath, { isLoading: true }));
-    const requestId = ws.fsListDir(nodePath, includeFiles, !!serverId);
+    let requestId: string;
+    try {
+      requestId = ws.fsListDir(nodePath, includeFiles, !!serverId);
+    } catch {
+      setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
+      return;
+    }
     pendingRef.current.set(requestId, nodePath);
     // Fetch git status for this directory
-    const gitId = ws.fsGitStatus(nodePath);
-    pendingGitStatusRef.current.set(gitId, nodePath);
+    try {
+      const gitId = ws.fsGitStatus(nodePath);
+      pendingGitStatusRef.current.set(gitId, nodePath);
+    } catch { /* ws disconnected — skip git status */ }
 
     const timer = setTimeout(() => {
       if (!mountedRef.current) return;
@@ -549,8 +557,23 @@ export function FileBrowser({
     }
   }, [currentLabel, navigateTo]);
 
-  // Load root on mount
-  useEffect(() => { fetchDir(startPath); }, [startPath]);
+  // Load root on mount and re-load when ws changes (server switch).
+  // fetchDir changes when ws changes (useCallback dep), so this also re-runs on server switch.
+  const prevWsRef = useRef(ws);
+  useEffect(() => {
+    if (ws !== prevWsRef.current) {
+      prevWsRef.current = ws;
+      // Clear stale state from previous ws instance
+      loadedRef.current.clear();
+      pendingRef.current.clear();
+      pendingChangesRef.current.clear();
+      for (const timer of timersRef.current.values()) clearTimeout(timer);
+      timersRef.current.clear();
+      setData([{ id: startPath, name: startPath, isDir: true, children: [] }]);
+      setError(null);
+    }
+    fetchDir(startPath);
+  }, [startPath, fetchDir]);
 
   // Auto-preview file on open (e.g. when clicking a path link in chat)
   useEffect(() => {
@@ -563,11 +586,12 @@ export function FileBrowser({
     if (onPreviewFile) return; // external preview — don't poll here
     const path = (preview as { path: string }).path;
     const timer = setInterval(() => {
-      const reqId = ws.fsReadFile(path);
-      pendingReadRef.current.set(reqId, path);
-      // Also refresh diff
-      const diffId = ws.fsGitDiff(path);
-      pendingGitDiffRef.current.set(diffId, path);
+      try {
+        const reqId = ws.fsReadFile(path);
+        pendingReadRef.current.set(reqId, path);
+        const diffId = ws.fsGitDiff(path);
+        pendingGitDiffRef.current.set(diffId, path);
+      } catch { /* ws disconnected */ }
     }, 5000);
     return () => clearInterval(timer);
   }, [preview.status, (preview as any).path, ws, onPreviewFile]);
@@ -583,16 +607,20 @@ export function FileBrowser({
     const elapsed = now - lastChangesRefreshRef.current;
     if (elapsed >= CHANGES_RATE_LIMIT_MS) {
       lastChangesRefreshRef.current = now;
-      const requestId = ws.fsGitStatus(changesRootPath);
-      pendingChangesRef.current.add(requestId);
+      try {
+        const requestId = ws.fsGitStatus(changesRootPath);
+        pendingChangesRef.current.add(requestId);
+      } catch { return; }
     } else {
       // Schedule for when rate limit clears
       if (pendingChangesTimerRef.current) clearTimeout(pendingChangesTimerRef.current);
       pendingChangesTimerRef.current = setTimeout(() => {
         if (!mountedRef.current) return;
         lastChangesRefreshRef.current = Date.now();
-        const requestId = ws.fsGitStatus(changesRootPath);
-        pendingChangesRef.current.add(requestId);
+        try {
+          const requestId = ws.fsGitStatus(changesRootPath);
+          pendingChangesRef.current.add(requestId);
+        } catch { /* ws disconnected */ }
       }, CHANGES_RATE_LIMIT_MS - elapsed);
     }
   }, [changesRootPath, ws]);
