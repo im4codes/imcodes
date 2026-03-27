@@ -40,7 +40,7 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
   }
 
   if (!body.type) return c.json({ error: 'missing_fields' }, 400);
-  const validTypes = ['claude-code', 'codex', 'opencode', 'shell', 'gemini'];
+  const validTypes = ['claude-code', 'codex', 'opencode', 'shell', 'gemini', 'openclaw', 'script'];
   if (!validTypes.includes(body.type)) return c.json({ error: 'invalid_type' }, 400);
 
   // Generate 8-char id
