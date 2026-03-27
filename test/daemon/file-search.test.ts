@@ -1,105 +1,132 @@
 /**
- * Tests for file search fuzzy matching and scoring.
+ * Tests for file search fzf tiebreakers.
  */
 import { describe, it, expect } from 'vitest';
-import { fileSearchFuzzyMatch, fileSearchScore } from '../../src/daemon/command-handler.js';
+import {
+  fileSearchByBasenamePrefix,
+  fileSearchByMatchPosFromEnd,
+  fileSearchByLengthAsc,
+} from '../../src/daemon/command-handler.js';
 
-describe('fileSearchFuzzyMatch', () => {
-  it('empty query matches everything', () => {
-    expect(fileSearchFuzzyMatch('anything', '')).toBe(true);
+function entry(item: string, positions: number[]) {
+  return { item, positions: new Set(positions) };
+}
+
+describe('fileSearchByBasenamePrefix', () => {
+  it('prefers filename match over directory match', () => {
+    const a = entry('src/hooks.ts', [4, 5, 6, 7, 8]); // "hooks" in basename
+    const b = entry('hooks/index.ts', [0, 1, 2, 3, 4]); // "hooks" in directory
+    expect(fileSearchByBasenamePrefix(a, b)).toBeLessThan(0);
   });
 
-  it('exact match', () => {
-    expect(fileSearchFuzzyMatch('hello', 'hello')).toBe(true);
+  it('prefers match closer to start of basename', () => {
+    const a = entry('src/hooks.ts', [4, 5, 6, 7, 8]); // starts at basename pos 0
+    const b = entry('src/xhooks.ts', [5, 6, 7, 8, 9]); // starts at basename pos 1
+    expect(fileSearchByBasenamePrefix(a, b)).toBeLessThan(0);
   });
 
-  it('subsequence match', () => {
-    expect(fileSearchFuzzyMatch('src/commands', 'scmd')).toBe(true);
-    expect(fileSearchFuzzyMatch('src/components', 'scmp')).toBe(true);
+  it('returns 0 for both directory matches', () => {
+    const a = entry('hooks/foo.ts', [0, 1, 2, 3, 4]);
+    const b = entry('hooks/bar.ts', [0, 1, 2, 3, 4]);
+    expect(fileSearchByBasenamePrefix(a, b)).toBe(0);
   });
 
-  it('first letter of each segment', () => {
-    expect(fileSearchFuzzyMatch('session-manager.ts', 'smts')).toBe(true);
-  });
-
-  it('non-contiguous chars in order', () => {
-    expect(fileSearchFuzzyMatch('abcdef', 'ace')).toBe(true);
-    expect(fileSearchFuzzyMatch('abcdef', 'adf')).toBe(true);
-  });
-
-  it('fails when chars not in order', () => {
-    expect(fileSearchFuzzyMatch('abc', 'cba')).toBe(false);
-  });
-
-  it('fails when char missing', () => {
-    expect(fileSearchFuzzyMatch('abc', 'abz')).toBe(false);
-  });
-
-  it('case insensitive', () => {
-    expect(fileSearchFuzzyMatch('ABC', 'abc')).toBe(true);
-    expect(fileSearchFuzzyMatch('abc', 'ABC')).toBe(true);
-    expect(fileSearchFuzzyMatch('SrcComponents', 'scmp')).toBe(true);
-  });
-
-  it('path separator in query', () => {
-    expect(fileSearchFuzzyMatch('src/agent/tmux.ts', 'src/tmux')).toBe(true);
-    expect(fileSearchFuzzyMatch('src/agent/tmux.ts', 'agent/tmux')).toBe(true);
+  it('handles directory paths (trailing slash)', () => {
+    const a = entry('src/hooks/', [4, 5, 6, 7, 8]); // "hooks" is basename
+    const b = entry('hooks/data/', [0, 1, 2, 3, 4]); // "hooks" in parent dir
+    expect(fileSearchByBasenamePrefix(a, b)).toBeLessThan(0);
   });
 });
 
-describe('fileSearchScore', () => {
-  it('exact basename = 0', () => {
-    expect(fileSearchScore('src/agent/tmux.ts', 'tmux.ts', 'tmux.ts')).toBe(0);
+describe('fileSearchByMatchPosFromEnd', () => {
+  it('prefers match closer to end of path', () => {
+    const a = entry('src/utils/hooks.ts', [10, 11, 12, 13, 14]); // near end
+    const b = entry('hooks/utils/index.ts', [0, 1, 2, 3, 4]); // near start
+    expect(fileSearchByMatchPosFromEnd(a, b)).toBeLessThan(0);
   });
 
-  it('basename substring = 1', () => {
-    expect(fileSearchScore('src/agent/tmux.ts', 'tmux.ts', 'tmux')).toBe(1);
+  it('equal distance returns 0', () => {
+    const a = entry('abc.ts', [3, 4]); // dist = 6-4 = 2
+    const b = entry('xyz.ts', [3, 4]); // dist = 6-4 = 2
+    expect(fileSearchByMatchPosFromEnd(a, b)).toBe(0);
+  });
+});
+
+describe('fileSearchByLengthAsc', () => {
+  it('prefers shorter paths', () => {
+    const a = entry('a.ts', []);
+    const b = entry('src/deep/path/a.ts', []);
+    expect(fileSearchByLengthAsc(a, b)).toBeLessThan(0);
   });
 
-  it('full path substring = 3', () => {
-    // query has no /, so qBase = full query; "agent/tmux" qBase = "tmux" → basename substring = 1
-    // Use a query that only matches the full path, not basename alone
-    expect(fileSearchScore('src/agent/session.ts', 'session.ts', 'src/agent')).toBe(3);
+  it('equal length returns 0', () => {
+    const a = entry('ab.ts', []);
+    const b = entry('cd.ts', []);
+    expect(fileSearchByLengthAsc(a, b)).toBe(0);
+  });
+});
+
+describe('fzf integration', () => {
+  it('finds fuzzy matches with correct ranking', async () => {
+    const { Fzf } = await import('fzf');
+    const paths = [
+      'src/hooks/index.ts',
+      'src/hooks.ts',
+      'src/components/hooks.tsx',
+      'src/utils/useHooks.ts',
+      'hooks/',
+      'docs/hooks-guide.md',
+    ];
+    const fzf = new Fzf(paths, {
+      fuzzy: 'v2',
+      forward: false,
+      tiebreakers: [fileSearchByBasenamePrefix, fileSearchByMatchPosFromEnd, fileSearchByLengthAsc],
+    });
+
+    const results = fzf.find('hooks').map((r) => r.item);
+    expect(results.length).toBeGreaterThan(0);
+    // All paths should match
+    expect(results).toContain('src/hooks.ts');
+    expect(results).toContain('hooks/');
   });
 
-  it('fuzzy path match = 4', () => {
-    // "scmd" fuzzy matches "src/commands" path
-    expect(fileSearchScore('src/commands/foo.ts', 'foo.ts', 'scmd')).toBe(4);
+  it('ranks exact basename higher', async () => {
+    const { Fzf } = await import('fzf');
+    const paths = [
+      'very/deep/nested/path/to/tmux.ts',
+      'src/agent/tmux.ts',
+      'src/agent/tmux-wrapper.ts',
+    ];
+    const fzf = new Fzf(paths, {
+      fuzzy: 'v2',
+      forward: false,
+      tiebreakers: [fileSearchByBasenamePrefix, fileSearchByMatchPosFromEnd, fileSearchByLengthAsc],
+    });
+
+    const results = fzf.find('tmux.ts').map((r) => r.item);
+    // Shorter path with exact basename match should rank higher
+    expect(results[0]).toBe('src/agent/tmux.ts');
   });
 
-  it('fuzzy basename match = 5', () => {
-    // "xyzq" only fuzzy matches basename "xayzbqc.ts", not the path "a/xayzbqc.ts"
-    // Need a case where path fuzzy fails but basename fuzzy succeeds
-    // Actually path fuzzy is checked first and is a superset. Score 5 is only hit
-    // when qBase fuzzy matches basename but full q doesn't fuzzy match full path.
-    // This happens when query has / making q != qBase
-    expect(fileSearchScore('lib/manager.ts', 'manager.ts', 'z/mngr')).toBe(5);
+  it('handles case insensitive matching', async () => {
+    const { Fzf } = await import('fzf');
+    const paths = ['src/ChatView.tsx', 'src/chatview.ts'];
+    const fzf = new Fzf(paths, { fuzzy: 'v2', forward: false, tiebreakers: [] });
+
+    const results = fzf.find('chatview').map((r) => r.item);
+    expect(results.length).toBe(2);
   });
 
-  it('no match = 99', () => {
-    expect(fileSearchScore('src/agent/tmux.ts', 'tmux.ts', 'zzz')).toBe(99);
-  });
+  it('matches across path segments', async () => {
+    const { Fzf } = await import('fzf');
+    const paths = [
+      'src/agent/session-manager.ts',
+      'src/store/session-store.ts',
+      'test/daemon/session.test.ts',
+    ];
+    const fzf = new Fzf(paths, { fuzzy: 'v2', forward: false, tiebreakers: [] });
 
-  it('directory matching works', () => {
-    // directory "src/components/" should match query "comp"
-    expect(fileSearchScore('src/components/', 'components', 'comp')).toBe(1);
-  });
-
-  it('directory fuzzy match', () => {
-    // "scmp" fuzzy matches "src/components" path
-    expect(fileSearchScore('src/components/', 'components', 'scmp')).toBe(4);
-  });
-
-  it('scoring priority: exact > substring > path substring > fuzzy > no match', () => {
-    const exact = fileSearchScore('test.ts', 'test.ts', 'test.ts');           // 0
-    const substring = fileSearchScore('src/test.ts', 'test.ts', 'test');       // 1
-    const pathSub = fileSearchScore('src/agent/foo.ts', 'foo.ts', 'src/agent');// 3
-    const fuzzyPath = fileSearchScore('src/test/foo.ts', 'foo.ts', 'stf');     // 4
-    const noMatch = fileSearchScore('abc.ts', 'abc.ts', 'zzz');               // 99
-
-    expect(exact).toBeLessThan(substring);
-    expect(substring).toBeLessThan(pathSub);
-    expect(pathSub).toBeLessThan(fuzzyPath);
-    expect(fuzzyPath).toBeLessThan(noMatch);
+    const results = fzf.find('sessman').map((r) => r.item);
+    expect(results).toContain('src/agent/session-manager.ts');
   });
 });

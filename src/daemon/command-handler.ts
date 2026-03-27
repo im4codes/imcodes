@@ -1627,61 +1627,49 @@ const FILE_SEARCH_EXCLUDES = new Set([
 const FILE_SEARCH_MAX = 20;
 
 async function handleFileSearch(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  const query = (cmd.query as string ?? '').trim().toLowerCase();
+  const query = (cmd.query as string ?? '').trim();
   const projectDir = cmd.projectDir as string | undefined;
   const requestId = cmd.requestId as string | undefined;
   if (!requestId || !projectDir) return;
 
   try {
-    const results: Array<{ path: string; basename: string; isDir: boolean; score: number }> = [];
-    const queryBase = query.split('/').pop() ?? query;
-
-    const score = fileSearchScore;
-    const fuzzy = fileSearchFuzzyMatch;
-
+    // 1. Crawl all files/dirs
+    const allPaths: string[] = [];
     async function walk(dir: string, rel: string): Promise<void> {
-      if (results.length >= 300) return; // hard cap during walk
+      if (allPaths.length >= 20000) return;
       let entries: import('fs').Dirent[];
-      try {
-        entries = await fsReaddir(dir, { withFileTypes: true });
-      } catch { return; }
+      try { entries = await fsReaddir(dir, { withFileTypes: true }); } catch { return; }
       for (const entry of entries) {
         if (FILE_SEARCH_EXCLUDES.has(entry.name)) continue;
         const relPath = rel ? `${rel}/${entry.name}` : entry.name;
         if (entry.isDirectory()) {
           if (entry.name.startsWith('.') && entry.name !== '.github') continue;
-          // Match directories too
-          if (query) {
-            const sc = score(relPath, entry.name, query);
-            if (sc < 99) {
-              results.push({ path: relPath + '/', basename: entry.name, isDir: true, score: sc });
-            }
-          }
+          allPaths.push(relPath + '/');
           await walk(nodePath.join(dir, entry.name), relPath);
         } else if (entry.isFile()) {
-          if (!query) {
-            results.push({ path: relPath, basename: entry.name, isDir: false, score: 99 });
-          } else {
-            const sc = score(relPath, entry.name, query);
-            if (sc < 99) {
-              results.push({ path: relPath, basename: entry.name, isDir: false, score: sc });
-            }
-          }
+          allPaths.push(relPath);
         }
       }
     }
-
     await walk(projectDir, '');
 
-    // Sort by score (lower = better match), then alphabetically
-    results.sort((a, b) => {
-      if (a.score !== b.score) return a.score - b.score;
-      // Directories before files at same score
-      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-      return a.path.localeCompare(b.path);
-    });
+    let top: string[];
+    if (!query) {
+      // No query — return first files alphabetically
+      allPaths.sort();
+      top = allPaths.slice(0, FILE_SEARCH_MAX);
+    } else {
+      // 2. Fuzzy search via fzf
+      const { Fzf } = await import('fzf');
+      const fzf = new Fzf(allPaths, {
+        fuzzy: allPaths.length > 20000 ? 'v1' : 'v2',
+        forward: false,
+        tiebreakers: [fileSearchByBasenamePrefix, fileSearchByMatchPosFromEnd, fileSearchByLengthAsc],
+      });
+      const results = fzf.find(query);
+      top = results.slice(0, FILE_SEARCH_MAX).map((r: { item: string }) => r.item);
+    }
 
-    const top = results.slice(0, FILE_SEARCH_MAX).map((r) => r.path);
     try { serverLink.send({ type: 'file.search_response', requestId, results: top }); } catch { /* ignore */ }
   } catch (err) {
     try { serverLink.send({ type: 'file.search_response', requestId, results: [], error: String(err) }); } catch { /* ignore */ }
@@ -1979,32 +1967,36 @@ async function handleListProviderSessions(cmd: Record<string, unknown>, serverLi
   }
 }
 
-// ── File search scoring (exported for unit testing) ──────────────────────────
+// ── File search tiebreakers for fzf (exported for unit testing) ──────────────
 
-/** Fuzzy match: all query chars appear in target in order (case insensitive). */
-export function fileSearchFuzzyMatch(target: string, q: string): boolean {
-  if (!q) return true;
-  const t = target.toLowerCase();
-  const ql = q.toLowerCase();
-  let qi = 0;
-  for (let i = 0; i < t.length && qi < ql.length; i++) {
-    if (t[i] === ql[qi]) qi++;
-  }
-  return qi === ql.length;
+type FzfEntry = { item: string; positions: Set<number> };
+
+/** Tiebreaker: prefer matches in the basename (filename) over directory path. */
+export function fileSearchByBasenamePrefix(a: FzfEntry, b: FzfEntry): number {
+  const getBasenameStart = (p: string) => {
+    const trimmed = p.endsWith('/') ? p.slice(0, -1) : p;
+    return Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\')) + 1;
+  };
+  const aDiff = Math.min(...a.positions) - getBasenameStart(a.item);
+  const bDiff = Math.min(...b.positions) - getBasenameStart(b.item);
+  const aIsFilename = aDiff >= 0;
+  const bIsFilename = bDiff >= 0;
+  if (aIsFilename && !bIsFilename) return -1;
+  if (!aIsFilename && bIsFilename) return 1;
+  if (aIsFilename && bIsFilename) return aDiff - bDiff;
+  return 0;
 }
 
-/** Score a file/dir match. Lower = better. 99 = no match. */
-export function fileSearchScore(relPath: string, basename: string, q: string): number {
-  const lowerPath = relPath.toLowerCase();
-  const lowerBase = basename.toLowerCase();
-  const qBase = q.split('/').pop() ?? q;
-  if (lowerBase === qBase) return 0;                          // exact basename
-  if (lowerBase.includes(qBase)) return 1;                    // basename substring
-  if (lowerBase.startsWith(qBase)) return 2;                  // basename prefix
-  if (lowerPath.includes(q)) return 3;                        // full path substring
-  if (fileSearchFuzzyMatch(lowerPath, q)) return 4;           // fuzzy path
-  if (fileSearchFuzzyMatch(lowerBase, qBase)) return 5;       // fuzzy basename
-  return 99;
+/** Tiebreaker: prefer matches closer to the end of the path. */
+export function fileSearchByMatchPosFromEnd(a: FzfEntry, b: FzfEntry): number {
+  const maxPosA = Math.max(-1, ...a.positions);
+  const maxPosB = Math.max(-1, ...b.positions);
+  return (a.item.length - maxPosA) - (b.item.length - maxPosB);
+}
+
+/** Tiebreaker: prefer shorter paths. */
+export function fileSearchByLengthAsc(a: FzfEntry, b: FzfEntry): number {
+  return a.item.length - b.item.length;
 }
 
 /** Reusable: fetch remote sessions from a provider. */
