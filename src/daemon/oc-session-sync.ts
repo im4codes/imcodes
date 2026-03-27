@@ -49,10 +49,12 @@ export function isMainSession(sanitizedKey: string): boolean {
 export function shouldFilter(sanitizedKey: string): boolean {
   if (sanitizedKey.includes('___cron___')) return true; // :cron: (defense-in-depth, also filtered by provider)
   if (sanitizedKey.endsWith('___sessions')) return true; // :sessions (OC metadata)
-  // Filter sessions created with our internal names (orphans from old key format bug)
-  if (sanitizedKey.includes('___deck_sub_')) return true;
-  if (sanitizedKey.includes('___deck_agent_')) return true;
   return false;
+}
+
+/** Check if a session key is an orphan (created with our internal name format by old bug) */
+export function isOrphanKey(sanitizedKey: string): boolean {
+  return sanitizedKey.includes('___deck_sub_') || sanitizedKey.includes('___deck_agent_');
 }
 
 // ── Grouping ────────────────────────────────────────────────────────────────
@@ -123,6 +125,21 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
     return;
   }
 
+  // ── Delete orphan sessions (created with internal names by old key format bug) ──
+  let deleted = 0;
+  for (const s of sessions) {
+    if (isOrphanKey(s.key)) {
+      try {
+        await provider.endSession(s.key);
+        deleted++;
+        logger.info({ key: s.key }, 'oc-sync: deleted orphan session from OC gateway');
+      } catch (err) {
+        logger.debug({ err, key: s.key }, 'oc-sync: failed to delete orphan session');
+      }
+    }
+  }
+  if (deleted > 0) logger.info({ deleted }, 'oc-sync: orphan cleanup complete');
+
   const groups = groupByAgent(sessions);
   let created = 0;
 
@@ -134,7 +151,8 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
     if (group.mainSession) {
       const mainRecord = getSession(mName);
       const needsRuntime = !getTransportRuntime(mName);
-      const mainLabel = group.mainSession.displayName || mainSessionLabel(group.agentName);
+      const hasCustomMainLabel = mainRecord?.label && mainRecord.label !== group.mainSession.displayName && mainRecord.label !== mainSessionLabel(group.agentName);
+      const mainLabel = hasCustomMainLabel ? mainRecord!.label : (group.mainSession.displayName || mainSessionLabel(group.agentName));
 
       if (mainExists && needsRuntime) {
         // Session in store but runtime lost (daemon restart / OC reconnect) — recreate runtime
@@ -197,7 +215,9 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
               bindExistingKey: ch.key, skipCreate: true, skipStore: true,
               parentSession: mName,
             });
-            const newLabel = storeEntry.userCreated ? storeEntry.label : (ch.displayName || storeEntry.label || ch.key);
+            // Preserve user-set label: if store has a label that differs from both OC displayName and raw key, keep it
+            const hasCustomLabel = storeEntry.label && storeEntry.label !== ch.displayName && storeEntry.label !== ch.key;
+            const newLabel = (storeEntry.userCreated || hasCustomLabel) ? storeEntry.label : (ch.displayName || storeEntry.label || ch.key);
             upsertSession({ ...storeEntry, state: 'running', parentSession: mName, label: newLabel, updatedAt: Date.now() });
             // Update server DB label (may have been stored with sanitized key before displayName fix)
             const subId = storeEntry.name.replace('deck_sub_', '');
@@ -230,8 +250,9 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
               bindExistingKey: ch.key, skipCreate: true, skipStore: true,
               parentSession: mName,
             });
-            // Update store: mark running, set parentSession + label (may have been missing)
-            const reconnLabel = ch.displayName || existingInStore.label || ch.key;
+            // Update store: mark running, set parentSession + label (preserve user renames)
+            const hasCustomReconnLabel = existingInStore.label && existingInStore.label !== ch.displayName && existingInStore.label !== ch.key;
+            const reconnLabel = hasCustomReconnLabel ? existingInStore.label : (ch.displayName || existingInStore.label || ch.key);
             upsertSession({
               ...existingInStore,
               state: 'running',

@@ -6,6 +6,7 @@ import {
   extractAgentName,
   isMainSession,
   shouldFilter,
+  isOrphanKey,
   groupByAgent,
   mainSessionName,
   mainSessionLabel,
@@ -54,6 +55,24 @@ describe('shouldFilter', () => {
     expect(shouldFilter('agent___main___main')).toBe(false);
     expect(shouldFilter('agent___main___discord___channel___123')).toBe(false);
   });
+
+});
+
+describe('isOrphanKey', () => {
+  it('identifies orphan sessions with deck_sub_ in key', () => {
+    expect(isOrphanKey('agent___main___deck_sub_13200q22')).toBe(true);
+    expect(isOrphanKey('agent___main___deck_sub_abc123')).toBe(true);
+  });
+
+  it('identifies orphan sessions with deck_agent_ in key', () => {
+    expect(isOrphanKey('agent___main___deck_agent___main')).toBe(true);
+  });
+
+  it('does not flag normal sessions', () => {
+    expect(isOrphanKey('agent___main___main')).toBe(false);
+    expect(isOrphanKey('agent___main___discord___channel___123')).toBe(false);
+    expect(isOrphanKey('agent___main___my-deck-channel')).toBe(false);
+  });
 });
 
 // ── Grouping ────────────────────────────────────────────────────────────────
@@ -94,6 +113,17 @@ describe('groupByAgent', () => {
     const pptGroup = groups.find(g => g.agentName === 'ppt')!;
     expect(pptGroup.mainSession).toBeNull();
     expect(pptGroup.channelSessions).toHaveLength(1);
+  });
+
+  it('orphan keys pass through groupByAgent (deleted separately by syncOcSessions)', () => {
+    const withOrphans: RemoteSessionInfo[] = [
+      ...sessions,
+      { key: 'agent___main___deck_sub_abc123', displayName: 'orphan' },
+    ];
+    const groups = groupByAgent(withOrphans);
+    const mainGroup = groups.find(g => g.agentName === 'main')!;
+    // Orphans are in channel sessions — syncOcSessions deletes them before grouping matters
+    expect(mainGroup.channelSessions.some(s => s.key.includes('deck_sub_'))).toBe(true);
   });
 });
 

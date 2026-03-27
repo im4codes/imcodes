@@ -239,6 +239,59 @@ describe('OpenClawProvider', () => {
       replyToLastRpc();
       await sendPromise;
     });
+
+    it('passes extraSystemPrompt when provided', async () => {
+      await connectProvider(provider);
+
+      const sendPromise = provider.send('sess-1', 'Hello', undefined, 'You are a frontend expert');
+
+      const ws = lastWs();
+      const rpcFrame = JSON.parse(ws.sent[ws.sent.length - 1]);
+      expect(rpcFrame.params.extraSystemPrompt).toBe('You are a frontend expert');
+
+      replyToLastRpc();
+      await sendPromise;
+    });
+
+    it('omits extraSystemPrompt when undefined', async () => {
+      await connectProvider(provider);
+
+      const sendPromise = provider.send('sess-1', 'Hello');
+
+      const ws = lastWs();
+      const rpcFrame = JSON.parse(ws.sent[ws.sent.length - 1]);
+      expect(rpcFrame.params.extraSystemPrompt).toBeUndefined();
+
+      replyToLastRpc();
+      await sendPromise;
+    });
+  });
+
+  // 4b. endSession()
+  describe('endSession()', () => {
+    it('sends sessions.delete RPC with unsanitized key', async () => {
+      await connectProvider(provider);
+
+      const endPromise = provider.endSession('agent___main___my-channel');
+
+      const ws = lastWs();
+      const rpcFrame = JSON.parse(ws.sent[ws.sent.length - 1]);
+      expect(rpcFrame.type).toBe('req');
+      expect(rpcFrame.method).toBe('sessions.delete');
+      expect(rpcFrame.params.key).toBe('agent:main:my-channel');
+
+      replyToLastRpc();
+      await endPromise;
+    });
+
+    it('does not throw when sessions.delete fails', async () => {
+      await connectProvider(provider);
+
+      const endPromise = provider.endSession('sess-1');
+
+      replyToLastRpc({ ok: false, error: 'not_found' });
+      await expect(endPromise).resolves.toBeUndefined();
+    });
   });
 
   // 5. Assistant stream -> fires onDelta
