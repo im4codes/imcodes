@@ -43,6 +43,9 @@ export interface SessionRecord {
   description?: string;
   /** Human-readable label for UI display (e.g. "OC:main", "discord:#general"). */
   label?: string;
+  /** True for sessions created by the user (not auto-synced from provider).
+   *  User-created sessions must not be deleted/stopped by sync or health checks. */
+  userCreated?: boolean;
 }
 
 export interface SessionStore {

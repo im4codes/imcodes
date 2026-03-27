@@ -194,7 +194,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
               bindExistingKey: ch.key, skipCreate: true, skipStore: true,
               parentSession: mName,
             });
-            const newLabel = ch.displayName || storeEntry.label || ch.key;
+            const newLabel = storeEntry.userCreated ? storeEntry.label : (ch.displayName || storeEntry.label || ch.key);
             upsertSession({ ...storeEntry, state: 'running', parentSession: mName, label: newLabel, updatedAt: Date.now() });
             // Update server DB label (may have been stored with sanitized key before displayName fix)
             const subId = storeEntry.name.replace('deck_sub_', '');

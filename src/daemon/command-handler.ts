@@ -1160,6 +1160,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
         projectDir: (cwd as string) || process.cwd(),
         description,
         bindExistingKey,
+        userCreated: true,
       });
       // Sync to server DB
       try {

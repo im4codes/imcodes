@@ -569,6 +569,8 @@ export interface LaunchOpts {
   skipCreate?: boolean;
   /** Parent session name for sub-sessions (used to group in UI). */
   parentSession?: string;
+  /** Mark as user-created (not auto-synced from provider). Protected from sync/health cleanup. */
+  userCreated?: boolean;
 }
 
 /** In-memory map of active transport session runtimes */
@@ -685,6 +687,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         description,
         label,
         parentSession,
+        userCreated: opts.userCreated,
       };
       upsertSession(record);
       emitSessionPersist(record, name);
