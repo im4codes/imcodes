@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terms of Service — IM.codes</title>
+<style>
+:root {
+  --bg: #0a0a0a;
+  --fg: #c8c8c8;
+  --dim: #555;
+  --accent: #22c55e;
+  --border: #1a1a1a;
+  --font: 'SF Mono', 'Cascadia Code', 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.7;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.container { max-width: 720px; margin: 0 auto; padding: 60px 24px 80px; }
+h1 { font-size: 20px; font-weight: 600; color: #fff; margin-bottom: 8px; }
+h1 span { color: var(--accent); }
+h2 {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  margin: 32px 0 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+p, li { margin-bottom: 10px; }
+ul { list-style: none; padding-left: 0; }
+ul li::before { content: '-> '; color: var(--accent); }
+footer {
+  margin-top: 48px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+  color: var(--dim);
+  font-size: 12px;
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>IM<span>.</span>codes &mdash; Terms of Service</h1>
+<p style="color: var(--dim); font-size: 13px;">Last updated: March 2026</p>
+
+<h2>License</h2>
+<p>IM.codes is open-source software released under the GNU General Public License v3.0 (GPLv3). You are free to use, modify, and distribute it in accordance with that license.</p>
+
+<h2>Service Description</h2>
+<p>IM.codes provides a chat interface for controlling AI coding agents (Claude Code, Codex, Gemini CLI, OpenCode) via terminal sessions. The service relays commands and output between your browser/mobile app and your local daemon process.</p>
+
+<h2>AI Output Disclaimer</h2>
+<p>AI agents produce output autonomously. IM.codes relays this output but does not generate, verify, or guarantee it. AI-generated code, commands, and responses may be incorrect, incomplete, or harmful. You are responsible for reviewing and validating all AI output before use.</p>
+
+<h2>Self-Hosted Security</h2>
+<p>If you self-host the IM.codes server, you are responsible for:</p>
+<ul>
+  <li>Keeping the server software and dependencies up to date</li>
+  <li>Securing access to your server (TLS, firewalls, authentication)</li>
+  <li>Managing secrets (JWT signing keys, bot encryption keys)</li>
+  <li>Backing up your data</li>
+</ul>
+
+<h2>Hosted Service</h2>
+<p>The hosted service at app.im.codes is provided as-is, without warranty. We make reasonable efforts to keep it available but do not guarantee uptime or data durability. You should maintain your own backups.</p>
+
+<h2>Acceptable Use</h2>
+<p>You agree not to use IM.codes to:</p>
+<ul>
+  <li>Violate any applicable law or regulation</li>
+  <li>Interfere with or disrupt the service for other users</li>
+  <li>Attempt unauthorized access to other users' servers or data</li>
+</ul>
+
+<h2>Limitation of Liability</h2>
+<p>IM.codes is provided "as is" without warranty of any kind. The authors and contributors are not liable for any damages arising from the use of this software, including but not limited to data loss, security breaches, or costs incurred from AI-generated output.</p>
+
+<h2>Changes</h2>
+<p>These terms may be updated. Continued use of the service after changes constitutes acceptance.</p>
+
+<h2>Contact</h2>
+<p>For questions, open an issue on <a href="https://github.com/im4codes/imcodes">GitHub</a>.</p>
+
+<footer>
+  <span><a href="/">IM.codes</a> &middot; <a href="/privacy.html">Privacy</a></span>
+  <span><a href="https://github.com/im4codes/imcodes">source</a></span>
+</footer>
+
+</div>
+</body>
+</html>

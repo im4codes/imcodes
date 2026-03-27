@@ -1,0 +1,10 @@
+  imcodes v0.1.0
+
+  I'll help you implement the authentication system. Here's my plan:
+
+  1. First, I'll create the auth middleware
+  2. Then add the JWT validation logic
+  3. Finally integrate with the route handlers
+
+  Let me start with the middleware...
+⠹

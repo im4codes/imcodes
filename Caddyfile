@@ -1,0 +1,3 @@
+{$DOMAIN} {
+	reverse_proxy server:19138
+}

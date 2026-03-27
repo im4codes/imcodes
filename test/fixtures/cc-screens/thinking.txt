@@ -1,0 +1,7 @@
+  imcodes v0.1.0
+
+  my-project — /home/user/projects/my-project
+
+  > Analyzing the codebase...
+
+⠋ Thinking...

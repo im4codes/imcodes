@@ -1,0 +1,7 @@
+OpenCode v0.1.0
+
+Project: my-project
+
+Working on your request...
+
+Generating code... |

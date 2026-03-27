@@ -1,0 +1,26 @@
+{"timestamp":"2026-03-19T11:09:57.000Z","type":"session_meta","payload":{"id":"11111111-2222-3333-4444-555555555555","cwd":"/redacted/project","cli_version":"0.113.0","source":"cli","model_provider":"openai"}}
+{"timestamp":"2026-03-19T11:09:57.010Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}
+{"timestamp":"2026-03-19T11:09:57.020Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}
+{"timestamp":"2026-03-19T11:09:57.030Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-tools"}}
+{"timestamp":"2026-03-19T11:09:57.040Z","type":"turn_context","payload":{"cwd":"/redacted/project"}}
+{"timestamp":"2026-03-19T11:09:57.050Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}
+{"timestamp":"2026-03-19T11:09:57.060Z","type":"event_msg","payload":{"type":"user_message","message":"[redacted user prompt]","images":[],"local_images":[]}}
+{"timestamp":"2026-03-19T11:09:57.070Z","type":"response_item","payload":{"type":"reasoning"}}
+{"timestamp":"2026-03-19T11:09:57.080Z","type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"[redacted commentary 1]"}}
+{"timestamp":"2026-03-19T11:09:57.090Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}
+{"timestamp":"2026-03-19T11:09:57.100Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"git status --short\",\"workdir\":\"/redacted/project\"}","call_id":"call_a"}}
+{"timestamp":"2026-03-19T11:09:57.110Z","type":"event_msg","payload":{"type":"token_count","info":{}}}
+{"timestamp":"2026-03-19T11:09:57.120Z","type":"response_item","payload":{"type":"function_call_output","output":"[redacted output]","call_id":"call_a"}}
+{"timestamp":"2026-03-19T11:09:57.130Z","type":"response_item","payload":{"type":"reasoning"}}
+{"timestamp":"2026-03-19T11:09:57.140Z","type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"[redacted commentary 2]"}}
+{"timestamp":"2026-03-19T11:09:57.150Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}
+{"timestamp":"2026-03-19T11:09:57.160Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"sed -n '1,40p' src/example.ts\",\"workdir\":\"/redacted/project\"}","call_id":"call_b"}}
+{"timestamp":"2026-03-19T11:09:57.170Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"sed -n '1,80p' test/example.test.ts\",\"workdir\":\"/redacted/project\"}","call_id":"call_c"}}
+{"timestamp":"2026-03-19T11:09:57.180Z","type":"event_msg","payload":{"type":"token_count","info":{}}}
+{"timestamp":"2026-03-19T11:09:57.190Z","type":"response_item","payload":{"type":"function_call_output","output":"[redacted output]","call_id":"call_b"}}
+{"timestamp":"2026-03-19T11:09:57.200Z","type":"response_item","payload":{"type":"function_call_output","output":"[redacted output]","call_id":"call_c"}}
+{"timestamp":"2026-03-19T11:09:57.210Z","type":"response_item","payload":{"type":"reasoning"}}
+{"timestamp":"2026-03-19T11:09:57.220Z","type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"[redacted final answer]"}}
+{"timestamp":"2026-03-19T11:09:57.230Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}
+{"timestamp":"2026-03-19T11:09:57.240Z","type":"event_msg","payload":{"type":"token_count","info":{}}}
+{"timestamp":"2026-03-19T11:09:57.250Z","type":"event_msg","payload":{"type":"task_complete"}}

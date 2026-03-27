@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IM.codes — The IM for agents</title>
+<meta name="description" content="A specialized instant messenger for AI agents. Terminal, files, git, voice, and multi-agent control built in.">
+<style>
+:root {
+  --bg: #0a0a0a;
+  --fg: #c8c8c8;
+  --dim: #555;
+  --accent: #22c55e;
+  --accent2: #3b82f6;
+  --border: #1a1a1a;
+  --code-bg: #111;
+  --font: 'SF Mono', 'Cascadia Code', 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.7;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.container { max-width: 720px; margin: 0 auto; padding: 60px 24px 80px; }
+
+header { margin-bottom: 48px; display: flex; justify-content: space-between; align-items: flex-start; }
+.header-left { }
+h1 { font-size: 20px; font-weight: 600; color: #fff; margin-bottom: 8px; }
+h1 span { color: var(--accent); }
+.tagline { color: var(--dim); font-size: 13px; }
+.lang-switch { display: flex; gap: 6px; margin-top: 4px; }
+.lang-switch button { background: none; border: 1px solid var(--border); color: var(--dim); border-radius: 3px; padding: 2px 8px; cursor: pointer; font-family: var(--font); font-size: 11px; }
+.lang-switch button.active { color: var(--accent); border-color: var(--accent); }
+.lang-switch button:hover { border-color: #333; }
+
+.prompt::before { content: '$ '; color: var(--accent); }
+.prompt { color: #fff; margin-bottom: 4px; }
+.output { color: var(--dim); margin-bottom: 20px; padding-left: 18px; }
+
+.warning { background: #1a1000; border: 1px solid #4a3000; border-radius: 4px; padding: 10px 14px; margin-bottom: 20px; font-size: 12px; color: #fbbf24; }
+
+section { margin-bottom: 40px; }
+h2 {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  margin-bottom: 16px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.screenshots { margin-bottom: 24px; }
+.screenshots p { margin-bottom: 4px; color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
+.screenshots .row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+.screenshots .row a { display: block; border-radius: 4px; overflow: hidden; border: 1px solid var(--border); transition: border-color 0.15s; }
+.screenshots .row a:hover { border-color: #333; }
+.screenshots .row img { display: block; height: auto; }
+.screenshots .row.desktop a { width: 23%; }
+.screenshots .row.desktop img { width: 100%; }
+.screenshots .row.mobile a { width: 18%; }
+.screenshots .row.mobile img { width: 100%; }
+
+.arch {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 20px;
+  font-size: 13px;
+  overflow-x: auto;
+  white-space: pre;
+  line-height: 1.5;
+}
+.arch .label { color: var(--accent2); }
+.arch .arrow { color: var(--dim); }
+.arch .proto { color: var(--accent); }
+
+.features {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px;
+}
+@media (max-width: 540px) { .features { grid-template-columns: 1fr; } }
+.feat {
+  padding: 12px 14px;
+  border-radius: 4px;
+}
+.feat-name { color: #fff; font-size: 13px; }
+.feat-desc { color: var(--dim); font-size: 12px; margin-top: 2px; }
+
+.install-block {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 16px 20px;
+  position: relative;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.install-block:hover { border-color: #333; }
+.install-block code { color: #fff; font-size: 14px; }
+.install-block code span { color: var(--accent); }
+.install-block .copy-hint {
+  position: absolute;
+  right: 16px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--dim);
+  font-size: 11px;
+  transition: color 0.15s;
+}
+.install-block:hover .copy-hint { color: var(--fg); }
+
+.steps { list-style: none; counter-reset: step; }
+.steps li {
+  counter-increment: step;
+  padding: 6px 0;
+  padding-left: 28px;
+  position: relative;
+  color: var(--fg);
+}
+.steps li::before {
+  content: counter(step);
+  position: absolute;
+  left: 0;
+  color: var(--dim);
+  font-size: 12px;
+  width: 20px;
+  text-align: right;
+}
+.steps code {
+  background: var(--code-bg);
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 13px;
+  color: #fff;
+}
+
+.code-block {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 12px 16px;
+  font-size: 13px;
+  overflow-x: auto;
+  white-space: pre;
+  margin: 8px 0 16px;
+  color: #fff;
+}
+.code-block .comment { color: var(--dim); }
+
+.agents {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+.agent-tag {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--fg);
+}
+
+.reqs { color: var(--dim); font-size: 13px; }
+.reqs li { padding: 3px 0; list-style: none; }
+.reqs li::before { content: '→ '; color: var(--accent); }
+
+footer {
+  margin-top: 48px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+  color: var(--dim);
+  font-size: 12px;
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.cursor {
+  display: inline-block;
+  width: 8px;
+  height: 15px;
+  background: var(--accent);
+  margin-left: 2px;
+  animation: blink 1s step-end infinite;
+  vertical-align: text-bottom;
+}
+@keyframes blink { 50% { opacity: 0; } }
+
+.lightbox { display: none; position: fixed; inset: 0; z-index: 9000; background: rgba(0,0,0,0.92); align-items: center; justify-content: center; }
+.lightbox.open { display: flex; }
+.lightbox img { max-width: 90vw; max-height: 85vh; border-radius: 6px; box-shadow: 0 4px 40px rgba(0,0,0,0.6); }
+.lightbox .lb-close { position: absolute; top: 16px; right: 20px; background: none; border: none; color: #888; font-size: 28px; cursor: pointer; z-index: 1; }
+.lightbox .lb-close:hover { color: #fff; }
+.lightbox .lb-nav { position: absolute; top: 50%; transform: translateY(-50%); background: none; border: none; color: #666; font-size: 36px; cursor: pointer; padding: 12px; user-select: none; }
+.lightbox .lb-nav:hover { color: #fff; }
+.lightbox .lb-prev { left: 8px; }
+.lightbox .lb-next { right: 8px; }
+.lightbox .lb-counter { position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%); color: #555; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<header>
+  <div class="header-left">
+    <h1>IM<span>.</span>codes</h1>
+    <div class="tagline" data-i18n="tagline">The IM for agents</div>
+  </div>
+  <div class="lang-switch">
+    <button onclick="setLang('en')" data-lang="en" class="active">EN</button>
+    <button onclick="setLang('zh-CN')" data-lang="zh-CN">简中</button>
+    <button onclick="setLang('zh-TW')" data-lang="zh-TW">繁中</button>
+    <button onclick="setLang('ja')" data-lang="ja">日本語</button>
+    <button onclick="setLang('ko')" data-lang="ko">한국어</button>
+    <button onclick="setLang('es')" data-lang="es">ES</button>
+    <button onclick="setLang('ru')" data-lang="ru">RU</button>
+  </div>
+</header>
+
+<section>
+  <div class="prompt">imcodes bind https://app.im.codes/bind/&lt;key&gt;<span class="cursor"></span></div>
+  <div class="output" data-i18n="hero_output">bound to app.im.codes &middot; daemon started &middot; registered as system service</div>
+</section>
+
+<section class="warning" data-i18n="self_host_warning">
+  <strong>Self-hosting is strongly recommended.</strong> <code>app.im.codes</code> is a shared test instance with no uptime guarantees — it may be rate-limited, targeted, or unavailable. This is a personal project with no commercial support. For anything beyond evaluation, deploy on your own infrastructure.
+</section>
+
+<section>
+  <h2 data-i18n="h_screenshots">screenshots</h2>
+  <div class="screenshots">
+    <p>Desktop</p>
+    <div class="row desktop">
+      <a href="#" onclick="openLightbox(0);return false"><img src="imcodes-sidebar.png" alt="Sidebar" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(1);return false"><img src="imcodes0.png" alt="Desktop 1" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(2);return false"><img src="imcodes1.png" alt="Desktop 2" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(3);return false"><img src="imcodes2.png" alt="Desktop 3" loading="lazy" /></a>
+    </div>
+    <p>iPad / Tablet</p>
+    <div class="row" style="margin-bottom:12px"><a href="#" onclick="openLightbox(4);return false" style="width:40%;border-radius:4px;overflow:hidden;border:1px solid var(--border)"><img src="imcodes-ipad.png" alt="iPad" style="width:100%;display:block" loading="lazy" /></a></div>
+    <p>Mobile</p>
+    <div class="row mobile">
+      <a href="#" onclick="openLightbox(5);return false"><img src="imcodes-m1.png" alt="Mobile 1" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(6);return false"><img src="imcodes-m2.png" alt="Mobile 2" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(7);return false"><img src="imcodes-m3.png" alt="Mobile 3" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(8);return false"><img src="imcodes-m4.png" alt="Mobile 4" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(9);return false"><img src="imcodes-m0.png" alt="Mobile 5" loading="lazy" /></a>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2 data-i18n="h_why">why</h2>
+  <p style="color:var(--fg); margin-bottom:16px;" data-i18n="why_text">
+    Since 2026, developers talk to agents. Agents write code, run tools, and manage workflows. But generic chat apps were never built for this. IM.codes is a dedicated messaging layer for AI agents: remote terminals that work like SSH without the SSH, a chat view that understands agent output, and multi-agent workflows that let you coordinate different models on the same task.
+  </p>
+</section>
+
+<section>
+  <h2 data-i18n="h_features">features</h2>
+  <div class="features">
+    <div class="feat"><div class="feat-name" data-i18n="f_remote_name">remote terminal</div><div class="feat-desc" data-i18n="f_remote_desc">browser & mobile, no SSH/VPN, real-time PTY streaming at 12fps</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_chat_name">terminal + chat</div><div class="feat-desc" data-i18n="f_chat_desc">raw CLI or structured view with parsed tool calls</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_openclaw_name">OpenClaw support</div><div class="feat-desc" data-i18n="f_openclaw_desc">chat with OpenClaw agents — plus terminal, files, and git that OC alone doesn't offer</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_sidebar_name">Discord-style sidebar</div><div class="feat-desc" data-i18n="f_sidebar_desc">server icons, session tree, unread badges, idle flash</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_discuss_name">multi-agent discussions</div><div class="feat-desc" data-i18n="f_discuss_desc">discuss, audit, review across providers with ring progress</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_picker_name">@ picker</div><div class="feat-desc" data-i18n="f_picker_desc">@files, @@agents, @@all(config) for group dispatch</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_multi_name">multi-server</div><div class="feat-desc" data-i18n="f_multi_desc">manage agents across machines from one dashboard</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_pin_name">pinnable panels</div><div class="feat-desc" data-i18n="f_pin_desc">drag any window to sidebar, cross-device sync</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_sub_name">sub-sessions</div><div class="feat-desc" data-i18n="f_sub_desc">spawn parallel agents on the fly</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_file_name">file browser & git</div><div class="feat-desc" data-i18n="f_file_desc">tree view, upload/download, +/- stats, floating preview</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_repo_name">repository dashboard</div><div class="feat-desc" data-i18n="f_repo_desc">issues, PRs, branches, commits, CI/CD</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_sync_name">cross-device sync</div><div class="feat-desc" data-i18n="f_sync_desc">tab order, pinned tabs & panels synced to server</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_mobile_name">mobile & notifications</div><div class="feat-desc" data-i18n="f_mobile_desc">biometric auth, push notifications, shell keyboard input</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_i18n_name">7 languages</div><div class="feat-desc" data-i18n="f_i18n_desc">EN, 中文, 繁體, ES, RU, JA, KO</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_stream_name">real-time stream</div><div class="feat-desc" data-i18n="f_stream_desc">live output, zero polling, zero message limits</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_self_name">self-hosted</div><div class="feat-desc" data-i18n="f_self_desc">your infra, your data, one-command deploy</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_ota_name">OTA updates</div><div class="feat-desc" data-i18n="f_ota_desc">upgrade daemons from the web UI</div></div>
+  </div>
+</section>
+
+<section>
+  <h2 data-i18n="h_arch">architecture</h2>
+  <div class="arch"><span class="label">You</span> <span class="arrow">(browser / mobile)</span>
+ <span class="arrow">│</span> <span class="proto">WebSocket</span>
+<span class="label">Server</span> <span class="arrow">(self-hosted, relays connections)</span>
+ <span class="arrow">│</span> <span class="proto">WebSocket</span>
+<span class="label">Daemon</span> <span class="arrow">(your machine, manages sessions)</span>
+ <span class="arrow">│</span> <span class="proto">tmux</span>
+<span class="label">Agents</span> <span class="arrow">(Claude Code / Codex / Gemini CLI / OpenClaw and more)</span></div>
+  <p style="color:var(--dim); font-size:13px; margin-top:12px;" data-i18n="arch_desc">The daemon runs on your dev machine and manages agent sessions through tmux. The server relays connections between your devices and the daemon. Everything stays on your infrastructure.</p>
+</section>
+
+<section>
+  <h2 data-i18n="h_install">install</h2>
+  <div class="install-block" onclick="copy(this)">
+    <code><span>$</span> npm install -g imcodes</code>
+    <div class="copy-hint" data-i18n="copy_hint">click to copy</div>
+  </div>
+</section>
+
+<section>
+  <h2 data-i18n="h_quick">quick start</h2>
+  <ol class="steps">
+    <li data-i18n="qs_1">Use <a href="https://app.im.codes">app.im.codes</a> or self-host the server</li>
+    <li data-i18n="qs_2">Run <code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code></li>
+    <li data-i18n="qs_3">Open the dashboard &mdash; your agents are live</li>
+  </ol>
+</section>
+
+<section>
+  <h2 data-i18n="h_selfhost">self-host</h2>
+  <p style="color:var(--fg); margin-bottom:12px; font-size:13px;" data-i18n="sh_intro">Deploy server + daemon on a single machine. Requires Docker and a domain with DNS pointing to the server.</p>
+  <div class="code-block">npm install -g imcodes
+mkdir imcodes && cd imcodes
+imcodes setup --domain imc.example.com</div>
+  <p style="color:var(--dim); font-size:12px; margin-bottom:16px;" data-i18n="sh_desc">Generates all config, starts PostgreSQL + server + Caddy with automatic HTTPS, creates admin account, and binds the local daemon. Credentials printed at the end.</p>
+  <p style="color:var(--fg); font-size:13px; margin-bottom:8px;" data-i18n="sh_connect">To connect additional machines:</p>
+  <div class="code-block">npm install -g imcodes
+imcodes bind https://imc.example.com/bind/&lt;api-key&gt;</div>
+  <p style="color:var(--fg); font-size:13px; margin-top:16px; margin-bottom:8px;" data-i18n="sh_manual">Manual setup:</p>
+  <div class="code-block">git clone https://github.com/im4codes/imcodes.git && cd imcodes
+./gen-env.sh imc.example.com <span class="comment"># generates .env, prints admin password</span>
+docker compose up -d</div>
+</section>
+
+<section>
+  <h2 data-i18n="h_agents">supported agents</h2>
+  <div class="agents">
+    <a class="agent-tag" href="https://github.com/anthropics/claude-code">Claude Code</a>
+    <a class="agent-tag" href="https://github.com/openai/codex">Codex</a>
+    <a class="agent-tag" href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>
+    <a class="agent-tag" href="https://openclaw.com">OpenClaw</a>
+    <span class="agent-tag">Shell</span>
+    <span class="agent-tag" style="color:var(--dim);border-style:dashed">+ more</span>
+  </div>
+</section>
+
+<section>
+  <h2 data-i18n="h_reqs">requirements</h2>
+  <ul class="reqs">
+    <li data-i18n="req_os">macOS or Linux (<a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> on Windows)</li>
+    <li>Node.js &ge; 20</li>
+    <li>tmux</li>
+  </ul>
+</section>
+
+<section>
+  <h2 data-i18n="h_about">about</h2>
+  <p style="color:var(--dim); font-size:13px;" data-i18n="about_text">
+    Personal project. Built almost entirely by
+    <a href="https://github.com/anthropics/claude-code">Claude Code</a>,
+    with contributions from
+    <a href="https://github.com/openai/codex">Codex</a> and
+    <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>.
+  </p>
+</section>
+
+<footer>
+  <span>MIT &middot; <a href="https://github.com/im4codes/imcodes">source</a> &middot; <a href="privacy.html">privacy</a> &middot; <a href="terms.html">terms</a> &middot; <a href="support.html">support</a></span>
+  <span><a href="https://app.im.codes">app.im.codes</a></span>
+</footer>
+
+</div>
+
+<div class="lightbox" id="lightbox" onclick="if(event.target===this)closeLightbox()">
+  <button class="lb-close" onclick="closeLightbox()">&times;</button>
+  <button class="lb-nav lb-prev" onclick="navLightbox(-1)">&#8249;</button>
+  <img id="lb-img" src="" alt="" />
+  <button class="lb-nav lb-next" onclick="navLightbox(1)">&#8250;</button>
+  <div class="lb-counter" id="lb-counter"></div>
+</div>
+
+<script>
+const I18N = {
+  en: {},
+  'zh-CN': {
+    tagline: '为 AI 代理而生的即时通讯',
+    hero_output: '已绑定 app.im.codes · 守护进程已启动 · 已注册为系统服务',
+    self_host_warning: '<strong>强烈建议自行部署。</strong><code>app.im.codes</code> 是共享测试实例，无可用性保证，可能被限流、攻击或不可用。这是个人项目，不提供商用保障。正式使用请部署到自己的服务器。',
+    h_screenshots: '截图', h_why: '为什么', h_features: '功能', h_arch: '架构', h_install: '安装', h_quick: '快速开始', h_selfhost: '自托管部署', h_agents: '支持的代理', h_reqs: '系统要求', h_about: '关于',
+    why_text: '2026 年起，开发者开始和 AI 代理对话。代理写代码、运行工具、管理工作流。但通用聊天工具从来不是为此而生的。IM.codes 是 AI 代理的专用消息层：无需 SSH 的远程终端、理解代理输出的聊天视图、以及让不同模型协同工作的多代理工作流。',
+    f_remote_name: '远程终端', f_remote_desc: '浏览器和手机访问，无需 SSH/VPN，实时 PTY 推流',
+    f_chat_name: '终端 + 聊天', f_chat_desc: '原生 CLI 或结构化视图，解析工具调用',
+    f_discuss_name: '多代理讨论', f_discuss_desc: '跨供应商讨论、审计、审查',
+    f_multi_name: '多服务器', f_multi_desc: '一个面板管理所有机器上的代理',
+    f_sub_name: '子会话', f_sub_desc: '随时启动并行代理',
+    f_file_name: '文件浏览器', f_file_desc: '浏览、上传下载、Git 差异、浮动预览',
+    f_mobile_name: '移动端和通知', f_mobile_desc: '生物认证，代理需要注意时推送通知',
+    f_ota_name: 'OTA 更新', f_ota_desc: '从 Web UI 升级守护进程',
+    f_stream_name: '实时推流', f_stream_desc: '零轮询、零消息限制',
+    f_self_name: '自托管', f_self_desc: '你的服务器，你的数据，一键部署',
+    f_openclaw_name: 'OpenClaw 支持',
+    f_openclaw_desc: '与 OpenClaw 代理聊天——还有终端、文件和 Git 等 OC 没有的功能',
+    f_sidebar_name: 'Discord 风格侧边栏',
+    f_sidebar_desc: '服务器图标、会话树、未读徽章、空闲闪烁',
+    f_picker_name: '@ 选择器',
+    f_picker_desc: '@文件、@@代理、@@all(config) 群组派发',
+    f_pin_name: '可固定面板',
+    f_pin_desc: '拖拽窗口到侧边栏，跨设备同步',
+    f_repo_name: '仓库面板',
+    f_repo_desc: 'Issues、PR、分支、提交、CI/CD',
+    f_sync_name: '跨设备同步',
+    f_sync_desc: '标签顺序、固定标签和面板同步到服务器',
+    f_i18n_name: '7 种语言',
+    f_i18n_desc: '中英日韩俄西 + 繁体中文',
+    arch_desc: '守护进程运行在你的开发机上，通过 tmux 管理代理会话。服务端在你的设备和守护进程之间中转连接。所有数据留在你的基础设施内。',
+    copy_hint: '点击复制',
+    qs_1: '使用 <a href="https://app.im.codes">app.im.codes</a> 或自行部署服务端',
+    qs_2: '运行 <code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code>',
+    qs_3: '打开面板 —— 你的代理已上线',
+    sh_intro: '在一台机器上部署服务端和守护进程。需要 Docker 和指向该服务器的域名。',
+    sh_desc: '自动生成配置、启动 PostgreSQL + 服务端 + Caddy（自动 HTTPS）、创建管理员账户并绑定本地守护进程。凭证在最后打印。',
+    sh_connect: '连接其他机器：', sh_manual: '手动部署：',
+    req_os: 'macOS 或 Linux（Windows 需要 <a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a>）',
+    about_text: '个人项目。几乎完全由 <a href="https://github.com/anthropics/claude-code">Claude Code</a> 构建，<a href="https://github.com/openai/codex">Codex</a> 和 <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> 也有重要贡献。',
+  },
+  'zh-TW': {
+    tagline: '為 AI 代理而生的即時通訊',
+    hero_output: '已綁定 app.im.codes · 守護程序已啟動 · 已註冊為系統服務',
+    self_host_warning: '<strong>強烈建議自行部署。</strong><code>app.im.codes</code> 是共享測試實例，無可用性保證，可能被限流、攻擊或不可用。這是個人專案，不提供商用保障。正式使用請部署到自己的伺服器。',
+    h_screenshots: '截圖', h_why: '為什麼', h_features: '功能', h_arch: '架構', h_install: '安裝', h_quick: '快速開始', h_selfhost: '自託管部署', h_agents: '支援的代理', h_reqs: '系統需求', h_about: '關於',
+    why_text: '2026 年起，開發者開始和 AI 代理對話。代理寫程式碼、運行工具、管理工作流。但通用聊天工具從來不是為此而生的。IM.codes 是 AI 代理的專用訊息層：無需 SSH 的遠端終端機、理解代理輸出的聊天視圖、以及讓不同模型協同工作的多代理工作流。',
+    f_remote_name: '遠端終端機', f_remote_desc: '瀏覽器和手機存取，無需 SSH/VPN，即時 PTY 串流',
+    f_chat_name: '終端機 + 聊天', f_chat_desc: '原生 CLI 或結構化檢視，解析工具呼叫',
+    f_discuss_name: '多代理討論', f_discuss_desc: '跨供應商討論、稽核、審查',
+    f_multi_name: '多伺服器', f_multi_desc: '一個面板管理所有機器上的代理',
+    f_sub_name: '子會話', f_sub_desc: '隨時啟動並行代理',
+    f_file_name: '檔案瀏覽器', f_file_desc: '瀏覽、上傳下載、Git 差異、浮動預覽',
+    f_mobile_name: '行動版和通知', f_mobile_desc: '生物辨識認證，代理需要關注時推播通知',
+    f_ota_name: 'OTA 更新', f_ota_desc: '從 Web UI 升級守護程序',
+    f_stream_name: '即時串流', f_stream_desc: '零輪詢、零訊息限制',
+    f_self_name: '自託管', f_self_desc: '你的伺服器，你的資料，一鍵部署',
+    f_openclaw_name: 'OpenClaw 支援',
+    f_openclaw_desc: '與 OpenClaw 代理聊天——還有終端、檔案和 Git 等 OC 沒有的功能',
+    f_sidebar_name: 'Discord 風格側邊欄',
+    f_sidebar_desc: '伺服器圖示、會話樹、未讀徽章、閒置閃爍',
+    f_picker_name: '@ 選擇器',
+    f_picker_desc: '@檔案、@@代理、@@all(config) 群組派發',
+    f_pin_name: '可固定面板',
+    f_pin_desc: '拖曳視窗到側邊欄，跨裝置同步',
+    f_repo_name: '儲存庫面板',
+    f_repo_desc: 'Issues、PR、分支、提交、CI/CD',
+    f_sync_name: '跨裝置同步',
+    f_sync_desc: '標籤順序、固定標籤和面板同步到伺服器',
+    f_i18n_name: '7 種語言',
+    f_i18n_desc: '中英日韓俄西 + 繁體中文',
+    arch_desc: '守護程序運行在你的開發機上，透過 tmux 管理代理會話。伺服器在你的裝置和守護程序之間中轉連線。所有資料留在你的基礎設施內。',
+    copy_hint: '點擊複製',
+    qs_1: '使用 <a href="https://app.im.codes">app.im.codes</a> 或自行部署伺服器',
+    qs_2: '執行 <code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code>',
+    qs_3: '開啟面板 —— 你的代理已上線',
+    sh_intro: '在一台機器上部署伺服器和守護程序。需要 Docker 和指向該伺服器的網域。',
+    sh_desc: '自動產生設定、啟動 PostgreSQL + 伺服器 + Caddy（自動 HTTPS）、建立管理員帳戶並綁定本地守護程序。憑證在最後列印。',
+    sh_connect: '連接其他機器：', sh_manual: '手動部署：',
+    req_os: 'macOS 或 Linux（Windows 需要 <a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a>）',
+    about_text: '個人專案。幾乎完全由 <a href="https://github.com/anthropics/claude-code">Claude Code</a> 建構，<a href="https://github.com/openai/codex">Codex</a> 和 <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> 也有重要貢獻。',
+  },
+  ja: {
+    tagline: 'AIエージェントのためのIM',
+    hero_output: 'app.im.codes にバインド完了 · デーモン起動 · システムサービスとして登録',
+    self_host_warning: '<strong>セルフホスティングを強く推奨します。</strong><code>app.im.codes</code> は共有テストインスタンスであり、稼働保証はありません。レート制限、攻撃対象、利用不可の可能性があります。個人プロジェクトのため商用サポートはありません。評価以外の用途では自社インフラにデプロイしてください。',
+    h_screenshots: 'スクリーンショット', h_why: '背景', h_features: '機能', h_arch: 'アーキテクチャ', h_install: 'インストール', h_quick: 'クイックスタート', h_selfhost: 'セルフホスト', h_agents: '対応エージェント', h_reqs: '要件', h_about: '概要',
+    why_text: '2026年から、開発者はAIエージェントと会話するようになりました。エージェントはコードを書き、ツールを実行し、ワークフローを管理します。しかし汎用チャットアプリはこのために作られていません。IM.codesはAIエージェント専用のメッセージングレイヤーです：SSHなしのリモートターミナル、エージェント出力を理解するチャットビュー、異なるモデルを協調させるマルチエージェントワークフロー。',
+    f_remote_name: 'リモートターミナル', f_remote_desc: 'ブラウザ＆モバイル、SSH/VPN不要、リアルタイムPTYストリーミング',
+    f_chat_name: 'ターミナル＋チャット', f_chat_desc: 'ネイティブCLIまたは構造化ビュー',
+    f_discuss_name: 'マルチエージェント議論', f_discuss_desc: 'プロバイダー間で議論・監査・レビュー',
+    f_multi_name: 'マルチサーバー', f_multi_desc: '複数マシンのエージェントを一元管理',
+    f_sub_name: 'サブセッション', f_sub_desc: '並列エージェントを即座に起動',
+    f_file_name: 'ファイルブラウザ', f_file_desc: '閲覧、アップロード/ダウンロード、Git差分、フローティングプレビュー',
+    f_mobile_name: 'モバイル＆通知', f_mobile_desc: '生体認証、エージェントが注意を必要とする時にプッシュ通知',
+    f_ota_name: 'OTAアップデート', f_ota_desc: 'Web UIからデーモンを更新',
+    f_stream_name: 'リアルタイムストリーム', f_stream_desc: 'ポーリングなし、メッセージ制限なし',
+    f_self_name: 'セルフホスト', f_self_desc: '自分のインフラ、自分のデータ、ワンコマンドデプロイ',
+    f_openclaw_name: 'OpenClaw対応',
+    f_openclaw_desc: 'OpenClawエージェントとチャット — さらにターミナル、ファイル、Gitも',
+    f_sidebar_name: 'Discordスタイルサイドバー',
+    f_sidebar_desc: 'サーバーアイコン、セッションツリー、未読バッジ',
+    f_picker_name: '@ ピッカー',
+    f_picker_desc: '@ファイル、@@エージェント、@@all(config)',
+    f_pin_name: 'ピン留めパネル',
+    f_pin_desc: 'ウィンドウをサイドバーにドラッグ、クロスデバイス同期',
+    f_repo_name: 'リポジトリダッシュボード',
+    f_repo_desc: 'Issues、PR、ブランチ、コミット、CI/CD',
+    f_sync_name: 'クロスデバイス同期',
+    f_sync_desc: 'タブ順序、ピン留めタブ・パネルをサーバーに同期',
+    f_i18n_name: '7言語',
+    f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
+    arch_desc: 'デーモンは開発マシンで動作し、tmuxでエージェントセッションを管理します。サーバーはデバイスとデーモン間の接続を中継します。すべてのデータは自社インフラ内に留まります。',
+    copy_hint: 'クリックでコピー',
+    qs_1: '<a href="https://app.im.codes">app.im.codes</a> を使用するか、サーバーをセルフホスト',
+    qs_2: '<code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code> を実行',
+    qs_3: 'ダッシュボードを開く — エージェントが稼働中',
+    sh_intro: '1台のマシンにサーバーとデーモンをデプロイ。DockerとDNS設定済みのドメインが必要です。',
+    sh_desc: '設定を自動生成、PostgreSQL + サーバー + Caddy（自動HTTPS）を起動、管理者アカウントを作成しローカルデーモンをバインド。認証情報は最後に表示されます。',
+    sh_connect: '追加マシンの接続：', sh_manual: '手動セットアップ：',
+    req_os: 'macOS または Linux（Windowsは <a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> が必要）',
+    about_text: '個人プロジェクト。ほぼ全てを <a href="https://github.com/anthropics/claude-code">Claude Code</a> が構築、<a href="https://github.com/openai/codex">Codex</a> と <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> も重要な貢献。',
+  },
+  ko: {
+    tagline: 'AI 에이전트를 위한 IM',
+    hero_output: 'app.im.codes에 바인딩 완료 · 데몬 시작됨 · 시스템 서비스로 등록됨',
+    self_host_warning: '<strong>셀프 호스팅을 강력히 권장합니다.</strong> <code>app.im.codes</code>는 공유 테스트 인스턴스로 가동 보장이 없으며, 속도 제한, 공격 대상이 되거나 사용 불가할 수 있습니다. 개인 프로젝트로 상업적 지원은 제공되지 않습니다. 평가 이외의 용도에는 자체 인프라에 배포하세요.',
+    h_screenshots: '스크린샷', h_why: '배경', h_features: '기능', h_arch: '아키텍처', h_install: '설치', h_quick: '빠른 시작', h_selfhost: '셀프 호스팅', h_agents: '지원 에이전트', h_reqs: '요구사항', h_about: '소개',
+    why_text: '2026년부터 개발자는 AI 에이전트와 대화합니다. 에이전트는 코드를 작성하고, 도구를 실행하고, 워크플로우를 관리합니다. 하지만 범용 채팅 앱은 이를 위해 만들어지지 않았습니다. IM.codes는 AI 에이전트를 위한 전용 메시징 레이어입니다: SSH 없는 원격 터미널, 에이전트 출력을 이해하는 채팅 뷰, 다양한 모델을 조율하는 멀티 에이전트 워크플로우.',
+    f_remote_name: '원격 터미널', f_remote_desc: '브라우저 & 모바일, SSH/VPN 불필요, 실시간 PTY 스트리밍',
+    f_chat_name: '터미널 + 채팅', f_chat_desc: '네이티브 CLI 또는 구조화된 뷰',
+    f_discuss_name: '멀티 에이전트 토론', f_discuss_desc: '프로바이더 간 토론, 감사, 리뷰',
+    f_multi_name: '멀티 서버', f_multi_desc: '하나의 대시보드에서 모든 머신의 에이전트 관리',
+    f_sub_name: '서브 세션', f_sub_desc: '병렬 에이전트 즉시 생성',
+    f_file_name: '파일 브라우저', f_file_desc: '탐색, 업로드/다운로드, Git 차이, 플로팅 미리보기',
+    f_mobile_name: '모바일 & 알림', f_mobile_desc: '생체 인증, 에이전트가 주의를 필요로 할 때 푸시 알림',
+    f_ota_name: 'OTA 업데이트', f_ota_desc: '웹 UI에서 데몬 업그레이드',
+    f_stream_name: '실시간 스트림', f_stream_desc: '폴링 없음, 메시지 제한 없음',
+    f_self_name: '셀프 호스팅', f_self_desc: '내 인프라, 내 데이터, 원커맨드 배포',
+    f_openclaw_name: 'OpenClaw 지원',
+    f_openclaw_desc: 'OpenClaw 에이전트와 채팅 — 터미널, 파일, Git까지',
+    f_sidebar_name: 'Discord 스타일 사이드바',
+    f_sidebar_desc: '서버 아이콘, 세션 트리, 읽지 않은 배지',
+    f_picker_name: '@ 피커',
+    f_picker_desc: '@파일, @@에이전트, @@all(config) 그룹 디스패치',
+    f_pin_name: '고정 패널',
+    f_pin_desc: '창을 사이드바로 드래그, 크로스 디바이스 동기화',
+    f_repo_name: '리포지토리 대시보드',
+    f_repo_desc: 'Issues, PR, 브랜치, 커밋, CI/CD',
+    f_sync_name: '크로스 디바이스 동기화',
+    f_sync_desc: '탭 순서, 고정 탭 및 패널 서버 동기화',
+    f_i18n_name: '7개 언어',
+    f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
+    arch_desc: '데몬은 개발 머신에서 실행되며 tmux를 통해 에이전트 세션을 관리합니다. 서버는 디바이스와 데몬 간의 연결을 중계합니다. 모든 데이터는 자체 인프라에 유지됩니다.',
+    copy_hint: '클릭하여 복사',
+    qs_1: '<a href="https://app.im.codes">app.im.codes</a> 사용 또는 서버 셀프 호스팅',
+    qs_2: '<code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code> 실행',
+    qs_3: '대시보드 열기 — 에이전트가 실행 중',
+    sh_intro: '단일 머신에 서버와 데몬을 배포합니다. Docker와 서버를 가리키는 도메인이 필요합니다.',
+    sh_desc: '모든 설정 자동 생성, PostgreSQL + 서버 + Caddy(자동 HTTPS) 시작, 관리자 계정 생성 및 로컬 데몬 바인딩. 자격 증명은 마지막에 출력됩니다.',
+    sh_connect: '추가 머신 연결:', sh_manual: '수동 설정:',
+    req_os: 'macOS 또는 Linux (Windows는 <a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> 필요)',
+    about_text: '개인 프로젝트. 거의 전적으로 <a href="https://github.com/anthropics/claude-code">Claude Code</a>가 구축, <a href="https://github.com/openai/codex">Codex</a>와 <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>도 중요한 기여.',
+  },
+  es: {
+    tagline: 'El IM para agentes',
+    hero_output: 'vinculado a app.im.codes · daemon iniciado · registrado como servicio del sistema',
+    self_host_warning: '<strong>Se recomienda encarecidamente el autoalojamiento.</strong> <code>app.im.codes</code> es una instancia de prueba compartida sin garantías de disponibilidad — puede tener límites, ser objetivo de ataques o no estar disponible. Este es un proyecto personal sin soporte comercial. Para uso más allá de la evaluación, despliega en tu propia infraestructura.',
+    h_screenshots: 'capturas', h_why: 'por qué', h_features: 'características', h_arch: 'arquitectura', h_install: 'instalar', h_quick: 'inicio rápido', h_selfhost: 'autoalojamiento', h_agents: 'agentes compatibles', h_reqs: 'requisitos', h_about: 'acerca de',
+    why_text: 'Desde 2026, los desarrolladores hablan con agentes. Los agentes escriben código, ejecutan herramientas y gestionan flujos de trabajo. Pero las apps de chat genéricas nunca fueron diseñadas para esto. IM.codes es una capa de mensajería dedicada para agentes IA: terminales remotas sin SSH, una vista de chat que entiende la salida del agente, y flujos multi-agente para coordinar diferentes modelos en la misma tarea.',
+    f_remote_name: 'terminal remota', f_remote_desc: 'navegador y móvil, sin SSH/VPN, streaming PTY en tiempo real',
+    f_chat_name: 'terminal + chat', f_chat_desc: 'CLI nativo o vista estructurada con llamadas de herramientas',
+    f_discuss_name: 'discusiones multi-agente', f_discuss_desc: 'discutir, auditar, revisar entre proveedores',
+    f_multi_name: 'multi-servidor', f_multi_desc: 'gestiona agentes en todas las máquinas desde un panel',
+    f_sub_name: 'sub-sesiones', f_sub_desc: 'lanza agentes paralelos al instante',
+    f_file_name: 'explorador de archivos', f_file_desc: 'explorar, subir/descargar, diffs de Git, vista previa flotante',
+    f_mobile_name: 'móvil y notificaciones', f_mobile_desc: 'auth biométrica, push cuando los agentes necesitan atención',
+    f_ota_name: 'actualizaciones OTA', f_ota_desc: 'actualiza daemons desde la interfaz web',
+    f_stream_name: 'stream en tiempo real', f_stream_desc: 'sin polling, sin límite de mensajes',
+    f_self_name: 'autoalojado', f_self_desc: 'tu infraestructura, tus datos, despliegue con un comando',
+    f_openclaw_name: 'soporte OpenClaw',
+    f_openclaw_desc: 'chatea con agentes OpenClaw — además terminal, archivos y Git que OC no ofrece',
+    f_sidebar_name: 'barra lateral estilo Discord',
+    f_sidebar_desc: 'iconos de servidor, árbol de sesiones, insignias no leídas',
+    f_picker_name: 'selector @',
+    f_picker_desc: '@archivos, @@agentes, @@all(config)',
+    f_pin_name: 'paneles fijables',
+    f_pin_desc: 'arrastra ventanas a la barra lateral, sincronización multi-dispositivo',
+    f_repo_name: 'panel de repositorio',
+    f_repo_desc: 'issues, PRs, ramas, commits, CI/CD',
+    f_sync_name: 'sincronización multi-dispositivo',
+    f_sync_desc: 'orden de pestañas, pestañas y paneles fijados sincronizados',
+    f_i18n_name: '7 idiomas',
+    f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
+    arch_desc: 'El daemon se ejecuta en tu máquina de desarrollo y gestiona sesiones de agentes a través de tmux. El servidor retransmite conexiones entre tus dispositivos y el daemon. Todo permanece en tu infraestructura.',
+    copy_hint: 'clic para copiar',
+    qs_1: 'Usa <a href="https://app.im.codes">app.im.codes</a> o autoaloja el servidor',
+    qs_2: 'Ejecuta <code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code>',
+    qs_3: 'Abre el panel — tus agentes están activos',
+    sh_intro: 'Despliega servidor + daemon en una sola máquina. Requiere Docker y un dominio con DNS apuntando al servidor.',
+    sh_desc: 'Genera toda la configuración, inicia PostgreSQL + servidor + Caddy con HTTPS automático, crea la cuenta admin y vincula el daemon local. Las credenciales se imprimen al final.',
+    sh_connect: 'Para conectar máquinas adicionales:', sh_manual: 'Configuración manual:',
+    req_os: 'macOS o Linux (<a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> en Windows)',
+    about_text: 'Proyecto personal. Construido casi en su totalidad por <a href="https://github.com/anthropics/claude-code">Claude Code</a>, con contribuciones de <a href="https://github.com/openai/codex">Codex</a> y <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>.',
+  },
+  ru: {
+    tagline: 'IM для агентов',
+    hero_output: 'привязан к app.im.codes · демон запущен · зарегистрирован как системная служба',
+    self_host_warning: '<strong>Настоятельно рекомендуется самостоятельный хостинг.</strong> <code>app.im.codes</code> — общий тестовый экземпляр без гарантий доступности. Может быть ограничен, атакован или недоступен. Это личный проект без коммерческой поддержки. Для использования помимо тестирования разверните на собственной инфраструктуре.',
+    h_screenshots: 'скриншоты', h_why: 'зачем', h_features: 'возможности', h_arch: 'архитектура', h_install: 'установка', h_quick: 'быстрый старт', h_selfhost: 'свой сервер', h_agents: 'поддерживаемые агенты', h_reqs: 'требования', h_about: 'о проекте',
+    why_text: 'С 2026 года разработчики разговаривают с агентами. Агенты пишут код, запускают инструменты и управляют рабочими процессами. Но универсальные чат-приложения не были для этого созданы. IM.codes — это выделенный слой обмена сообщениями для AI-агентов: удалённые терминалы без SSH, чат-вид, понимающий вывод агентов, и мульти-агентные рабочие процессы для координации разных моделей.',
+    f_remote_name: 'удалённый терминал', f_remote_desc: 'браузер и мобильный, без SSH/VPN, PTY-стриминг в реальном времени',
+    f_chat_name: 'терминал + чат', f_chat_desc: 'нативный CLI или структурированный вид',
+    f_discuss_name: 'мульти-агентные обсуждения', f_discuss_desc: 'обсуждение, аудит, ревью между провайдерами',
+    f_multi_name: 'мульти-сервер', f_multi_desc: 'управление агентами на всех машинах с одной панели',
+    f_sub_name: 'под-сессии', f_sub_desc: 'мгновенный запуск параллельных агентов',
+    f_file_name: 'файловый браузер', f_file_desc: 'просмотр, загрузка/скачивание, Git-диффы, плавающий превью',
+    f_mobile_name: 'мобильная версия и уведомления', f_mobile_desc: 'биометрическая аутентификация, push-уведомления',
+    f_ota_name: 'OTA-обновления', f_ota_desc: 'обновление демонов через веб-интерфейс',
+    f_stream_name: 'стриминг в реальном времени', f_stream_desc: 'без опроса, без лимитов сообщений',
+    f_self_name: 'свой сервер', f_self_desc: 'ваша инфраструктура, ваши данные, развёртывание одной командой',
+    f_openclaw_name: 'поддержка OpenClaw',
+    f_openclaw_desc: 'чат с агентами OpenClaw — плюс терминал, файлы и Git, которых нет в OC',
+    f_sidebar_name: 'боковая панель в стиле Discord',
+    f_sidebar_desc: 'иконки серверов, дерево сессий, бейджи непрочитанных',
+    f_picker_name: 'выбор @',
+    f_picker_desc: '@файлы, @@агенты, @@all(config)',
+    f_pin_name: 'закрепляемые панели',
+    f_pin_desc: 'перетащите окно на боковую панель, кросс-девайс синхронизация',
+    f_repo_name: 'панель репозитория',
+    f_repo_desc: 'issues, PRs, ветки, коммиты, CI/CD',
+    f_sync_name: 'кросс-девайс синхронизация',
+    f_sync_desc: 'порядок вкладок, закреплённые вкладки и панели синхронизированы',
+    f_i18n_name: '7 языков',
+    f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
+    arch_desc: 'Демон работает на вашей машине разработки и управляет сессиями агентов через tmux. Сервер передаёт соединения между вашими устройствами и демоном. Все данные остаются на вашей инфраструктуре.',
+    copy_hint: 'нажмите для копирования',
+    qs_1: 'Используйте <a href="https://app.im.codes">app.im.codes</a> или разверните свой сервер',
+    qs_2: 'Выполните <code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code>',
+    qs_3: 'Откройте панель — ваши агенты работают',
+    sh_intro: 'Разверните сервер + демон на одной машине. Требуется Docker и домен с DNS, указывающим на сервер.',
+    sh_desc: 'Автоматически генерирует конфигурацию, запускает PostgreSQL + сервер + Caddy с автоматическим HTTPS, создаёт учётную запись администратора и привязывает локальный демон. Данные для входа выводятся в конце.',
+    sh_connect: 'Подключение дополнительных машин:', sh_manual: 'Ручная настройка:',
+    req_os: 'macOS или Linux (<a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> для Windows)',
+    about_text: 'Личный проект. Почти полностью создан <a href="https://github.com/anthropics/claude-code">Claude Code</a>, со значительным вкладом <a href="https://github.com/openai/codex">Codex</a> и <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>.',
+  },
+};
+
+const LANG_MAP = { 'zh': 'zh-CN', 'zh-Hans': 'zh-CN', 'zh-Hant': 'zh-TW' };
+const SUPPORTED = ['en', 'zh-CN', 'zh-TW', 'ja', 'ko', 'es', 'ru'];
+
+function detectLang() {
+  const saved = localStorage.getItem('im_lang');
+  if (saved && SUPPORTED.includes(saved)) return saved;
+  const nav = navigator.language || '';
+  const mapped = LANG_MAP[nav] || LANG_MAP[nav.split('-')[0]];
+  if (mapped) return mapped;
+  const base = nav.split('-')[0];
+  return SUPPORTED.find(s => s === nav || s.startsWith(base)) || 'en';
+}
+
+let currentLang = detectLang();
+
+function setLang(lang) {
+  currentLang = lang;
+  localStorage.setItem('im_lang', lang);
+  applyLang();
+}
+
+// Snapshot original English HTML so switching back to EN works after another language
+const _enSnap = {};
+document.querySelectorAll('[data-i18n]').forEach(el => {
+  _enSnap[el.getAttribute('data-i18n')] = el.innerHTML;
+});
+
+function applyLang() {
+  const dict = currentLang === 'en' ? _enSnap : (I18N[currentLang] || {});
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const key = el.getAttribute('data-i18n');
+    if (dict[key]) el.innerHTML = dict[key];
+  });
+  document.querySelectorAll('.lang-switch button').forEach(btn => {
+    btn.classList.toggle('active', btn.getAttribute('data-lang') === currentLang);
+  });
+  document.documentElement.lang = currentLang === 'en' ? 'en' : currentLang;
+}
+
+function copy(el) {
+  navigator.clipboard.writeText('npm install -g imcodes');
+  const hint = el.querySelector('.copy-hint');
+  const orig = hint.textContent;
+  hint.textContent = { 'zh-CN': '已复制！', 'zh-TW': '已複製！', ja: 'コピーしました！', ko: '복사됨!', es: '¡copiado!', ru: 'скопировано!' }[currentLang] || 'copied!';
+  setTimeout(() => hint.textContent = orig, 1500);
+}
+
+applyLang();
+
+// Lightbox
+const LB_IMAGES = ['imcodes-sidebar.png','imcodes0.png','imcodes1.png','imcodes2.png','imcodes-ipad.png','imcodes-m1.png','imcodes-m2.png','imcodes-m3.png','imcodes-m4.png','imcodes-m0.png'];
+let lbIdx = 0;
+function openLightbox(i) {
+  lbIdx = i;
+  document.getElementById('lb-img').src = LB_IMAGES[i];
+  document.getElementById('lb-counter').textContent = (i + 1) + ' / ' + LB_IMAGES.length;
+  document.getElementById('lightbox').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+function closeLightbox() {
+  document.getElementById('lightbox').classList.remove('open');
+  document.body.style.overflow = '';
+}
+function navLightbox(dir) {
+  lbIdx = (lbIdx + dir + LB_IMAGES.length) % LB_IMAGES.length;
+  openLightbox(lbIdx);
+}
+document.addEventListener('keydown', function(e) {
+  if (!document.getElementById('lightbox').classList.contains('open')) return;
+  if (e.key === 'Escape') closeLightbox();
+  else if (e.key === 'ArrowLeft') navLightbox(-1);
+  else if (e.key === 'ArrowRight') navLightbox(1);
+});
+</script>
+</body>
+</html>

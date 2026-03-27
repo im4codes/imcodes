@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy Policy — IM.codes</title>
+<style>
+:root {
+  --bg: #0a0a0a;
+  --fg: #c8c8c8;
+  --dim: #555;
+  --accent: #22c55e;
+  --border: #1a1a1a;
+  --font: 'SF Mono', 'Cascadia Code', 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.7;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.container { max-width: 720px; margin: 0 auto; padding: 60px 24px 80px; }
+h1 { font-size: 20px; font-weight: 600; color: #fff; margin-bottom: 8px; }
+h1 span { color: var(--accent); }
+h2 {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  margin: 32px 0 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+p, li { margin-bottom: 10px; }
+ul { list-style: none; padding-left: 0; }
+ul li::before { content: '-> '; color: var(--accent); }
+footer {
+  margin-top: 48px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+  color: var(--dim);
+  font-size: 12px;
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>IM<span>.</span>codes &mdash; Privacy Policy</h1>
+<p style="color: var(--dim); font-size: 13px;">Last updated: March 2026</p>
+
+<h2>Data Storage</h2>
+<p>IM.codes is a self-hosted platform. Your data is stored on your own server or on app.im.codes if you use the hosted service. We do not operate centralized data collection infrastructure.</p>
+
+<h2>What We Store</h2>
+<ul>
+  <li>Account credentials (hashed passwords or passkeys)</li>
+  <li>Server and session configuration</li>
+  <li>Chat messages and terminal output relayed through the server</li>
+  <li>Push notification tokens (if enabled)</li>
+</ul>
+
+<h2>Data Ownership</h2>
+<p>You own your data. All data resides on infrastructure you control (self-hosted) or on the hosted service you opt into. You can export or delete your data at any time.</p>
+
+<h2>Third-Party Sharing</h2>
+<p>We do not sell, share, or transfer your data to third parties. The server acts as a relay between your browser/mobile app and your daemon — data passes through but is not harvested or analyzed.</p>
+
+<h2>Account Deletion</h2>
+<p>You can delete your account and all associated data from the app settings. For self-hosted instances, removing the server removes all data. On the hosted service, account deletion permanently removes all stored data.</p>
+
+<h2>Cookies &amp; Analytics</h2>
+<p>The web app uses localStorage for session preferences (theme, language, server URL). No third-party analytics or tracking cookies are used.</p>
+
+<h2>Security</h2>
+<p>All connections use HTTPS/WSS. Bot credentials are encrypted with AES-256-GCM at rest. Authentication uses JWT tokens with configurable signing keys.</p>
+
+<h2>Contact</h2>
+<p>For privacy questions, open an issue on <a href="https://github.com/im4codes/imcodes">GitHub</a>.</p>
+
+<footer>
+  <span><a href="/">IM.codes</a> &middot; <a href="/terms.html">Terms</a></span>
+  <span><a href="https://github.com/im4codes/imcodes">source</a></span>
+</footer>
+
+</div>
+</body>
+</html>

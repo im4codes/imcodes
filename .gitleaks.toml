@@ -1,0 +1,7 @@
+[allowlist]
+# Test fixture files use deterministic fake keys/tokens — not real secrets
+paths = [
+  '''server/test/.*\.test\.ts''',
+  '''test/.*\.test\.ts''',
+  '''worker/test/.*\.test\.ts''',
+]

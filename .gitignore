@@ -1,0 +1,57 @@
+node_modules/
+dist/
+coverage/
+*.log
+.env
+.env.*
+!.env.example
+*.local
+
+# Secrets — never commit
+wrangler.toml
+.dev.vars
+*.pem
+*.key
+
+# Build outputs
+web/dist/
+worker/dist/
+mobile/ios/
+mobile/android/
+
+# Deploy/sync scripts with server-specific info
+scripts/deploy.sh
+scripts/sync-from-remote.sh
+scripts/sync-to-remote.sh
+
+# Discussion and plans (private)
+docs/plan/
+
+# Claude Code skills/agents cache
+web/.agents/
+web/skills/
+web/skills-lock.json
+
+# Legacy discussion files
+imc_files/
+
+# App Store assets
+web/store-assets/
+
+# Server deployment config — contains IPs, domains, env var values (private)
+docs/*.local.md
+
+# Agent memory and skills (private)
+.claude/
+.codex/
+
+# System
+.DS_Store
+Thumbs.db
+openspec/
+
+# P2P sandbox temp files
+.p2p-*.md
+.imcodes-prompt-*.md
+tmp/
+.imc/
