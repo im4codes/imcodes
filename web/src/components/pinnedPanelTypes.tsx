@@ -69,6 +69,7 @@ registerPanelType('filebrowser', {
     const activeSession = ctx.activeSession ?? panel.props?.sessionName as string | undefined;
     return (
       <FileBrowser
+        key={ctx.serverId}
         ws={ctx.ws}
         mode="file-multi"
         layout="panel"
@@ -114,6 +115,7 @@ registerPanelType('repopage', {
     if (!ctx.ws || !projectDir) return <div class="sidebar-pinned-unavailable">No project dir</div>;
     return (
       <RepoPage
+        key={ctx.serverId}
         ws={ctx.ws}
         projectDir={projectDir}
         onBack={() => {}}
