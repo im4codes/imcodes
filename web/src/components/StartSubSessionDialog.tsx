@@ -31,7 +31,7 @@ const OPENCLAW_AGENT = { id: 'openclaw', label: 'OpenClaw', icon: '🦞' };
 
 type OpenClawMode = 'new' | 'bind';
 
-export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected, getRemoteSessions, refreshSessions, onStart, onClose }: Props) {
+export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _isProviderConnected, getRemoteSessions, refreshSessions, onStart, onClose }: Props) {
   const { t } = useTranslation();
   const [type, setType] = useState('claude-code');
   const [shells, setShells] = useState<string[]>([]);
@@ -49,7 +49,6 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected, get
   const [ocDescription, setOcDescription] = useState('');
   const [ocSelectedSession, setOcSelectedSession] = useState('');
 
-  const openClawAvailable = isProviderConnected('openclaw');
   // Remote sessions come from the provider status hook (pushed on connect, cached in DB)
   const ocRemoteSessions = getRemoteSessions('openclaw');
 
@@ -319,7 +318,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected, get
 
         <div class="dialog-footer">
           <button class="btn btn-secondary" onClick={onClose}>Cancel</button>
-          <button class="btn btn-primary" onClick={handleStart} disabled={type === 'openclaw' && !openClawAvailable}>Launch</button>
+          <button class="btn btn-primary" onClick={handleStart}>Launch</button>
         </div>
       </div>
     </div>
