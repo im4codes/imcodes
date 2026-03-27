@@ -570,6 +570,8 @@ function startHealthPoller(): void {
     const sessions = listSessions();
     for (const s of sessions) {
       if (s.state === 'stopped' || s.state === 'error') continue;
+      // Transport sessions have no tmux pane — skip tmux health checks
+      if (s.runtimeType === 'transport') continue;
       // Sub-sessions: auto-restart dead panes, mark stopped if tmux session gone entirely
       if (s.name.startsWith('deck_sub_')) {
         try {
