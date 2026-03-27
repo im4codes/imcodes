@@ -242,9 +242,8 @@ export async function restoreFromStore(): Promise<void> {
   // 1. Restart store sessions missing from tmux; start jsonl-watcher for live ones
   logger.debug({ totalSessions: all.length, liveTmux: live.length }, 'restoreFromStore: starting reconciliation');
   for (const s of all) {
-    if (s.state === 'stopped') continue;
-    // Transport sessions don't have tmux panes — rebuild runtime from store.
-    // Provider must be connected (auto-reconnect runs before restoreFromStore).
+    // Transport sessions: always rebuild runtime (even if stopped — they may have been
+    // incorrectly marked stopped by the tmux health check on a previous restart).
     if (s.runtimeType === RUNTIME_TYPES.TRANSPORT) {
       if (s.providerId && s.providerSessionId) {
         try {
