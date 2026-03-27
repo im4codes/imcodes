@@ -389,9 +389,9 @@ body {
 }
 
 /* Mobile sidebar overlay — always mounted, shown/hidden via .open class */
-.mobile-sidebar-overlay { position: fixed; inset: 0; z-index: 3000; background: rgba(0,0,0,0); pointer-events: none; visibility: hidden; }
-.mobile-sidebar-overlay.open { pointer-events: auto; visibility: visible; }
-.mobile-sidebar-panel { position: absolute; top: 0; left: 0; width: 88%; max-width: 360px; height: var(--vvh, 100%); background: #111827; display: flex; flex-direction: column; box-shadow: 4px 0 24px #00000060; transform: translateX(-100%); will-change: transform; pointer-events: auto; }
+.mobile-sidebar-overlay { position: fixed; inset: 0; z-index: 3000; background: rgba(0,0,0,0); pointer-events: none; }
+.mobile-sidebar-overlay.open { pointer-events: auto; }
+.mobile-sidebar-panel { position: absolute; top: 0; left: 0; width: 88%; max-width: 360px; height: var(--vvh, 100%); background: #111827; display: flex; flex-direction: column; box-shadow: 4px 0 24px #00000060; transform: translateX(-100%); will-change: transform; }
 .mobile-sidebar-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; padding-top: calc(12px + var(--sat, 0px)); border-bottom: 1px solid #1e293b; flex-shrink: 0; }
 .mobile-sidebar-close { background: none; border: none; color: #64748b; font-size: 18px; cursor: pointer; padding: 4px; line-height: 1; }
 .mobile-sidebar-close:active { color: #e2e8f0; }

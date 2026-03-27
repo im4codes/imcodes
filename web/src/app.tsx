@@ -1250,6 +1250,13 @@ export function App() {
       overlay.addEventListener('transitionend', () => { overlay.style.transition = ''; }, { once: true });
     }
     setMobileSidebarOpen(open);
+    // Safety: when closing, clear all inline styles after transition to ensure CSS rules take effect
+    if (!open) {
+      setTimeout(() => {
+        if (overlay) { overlay.style.background = ''; overlay.style.transition = ''; }
+        if (panel) { panel.style.transition = ''; }
+      }, 300);
+    }
   }, []);
 
   useEffect(() => {

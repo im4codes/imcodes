@@ -221,6 +221,8 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
   const [copied, setCopied] = useState(false);
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   const [highlightEl, setHighlightEl] = useState<HTMLElement | null>(null);
+  const highlightElRef = useRef(highlightEl);
+  highlightElRef.current = highlightEl;
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; text: string } | null>(null);
   // Guard: suppress the synthetic click that iOS/Android fires after a long-press touchend
   const longPressedRef = useRef(false);
@@ -461,7 +463,7 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
         const target = (e.target as HTMLElement).closest?.('.chat-event') as HTMLElement | null;
         if (!target) return;
         // Highlight
-        if (highlightEl) highlightEl.classList.remove('chat-highlight');
+        if (highlightElRef.current) highlightElRef.current.classList.remove('chat-highlight');
         target.classList.add('chat-highlight');
         setHighlightEl(target);
         // Show context menu below the touch point
@@ -496,7 +498,7 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
       container.removeEventListener('touchend', onTouchEnd);
       if (pressTimer) clearTimeout(pressTimer);
     };
-  }, [isTouchDevice, preview, highlightEl]);
+  }, [isTouchDevice, preview]);
 
   if (loading) {
     return <div class="chat-view"><div class="chat-loading">{t('chat.loading')}</div></div>;
@@ -522,7 +524,7 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
             e.preventDefault(); // block native context menu
             // Desktop: right-click highlights message + shows context menu
             const target = (e.target as HTMLElement).closest?.('.chat-event') as HTMLElement | null;
-            if (highlightEl) highlightEl.classList.remove('chat-highlight');
+            if (highlightElRef.current) highlightElRef.current.classList.remove('chat-highlight');
             if (target) {
               target.classList.add('chat-highlight');
               setHighlightEl(target);
