@@ -1796,11 +1796,11 @@ export function App() {
                 {showMobileServerMenu && (
                   <>
                   <div class="mobile-server-menu">
-                    <button class="mobile-server-menu-item" onClick={handleBackToDashboard}>
+                    <button class="mobile-server-menu-item" onClick={() => { setShowMobileServerMenu(false); handleBackToDashboard(); }}>
                       ← Home
                     </button>
                     {isNative() && (
-                      <button class="mobile-server-menu-item mobile-server-menu-change" onClick={handleChangeServer}>
+                      <button class="mobile-server-menu-item mobile-server-menu-change" onClick={() => { setShowMobileServerMenu(false); handleChangeServer(); }}>
                         ⇄ Switch Cloud Server
                       </button>
                     )}

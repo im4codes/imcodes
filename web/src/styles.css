@@ -371,7 +371,7 @@ body {
 /* Mobile responsive */
 @media (max-width: 640px) {
   .sidebar { display: none; }
-  .mobile-server-bar { display: flex; align-items: center; justify-content: space-between; padding: 4px 10px; background: #1e293b; border-bottom: 1px solid #334155; flex-shrink: 0; position: relative; z-index: 20; }
+  .mobile-server-bar { display: flex; align-items: center; justify-content: space-between; padding: 4px 10px; background: #1e293b; border-bottom: 1px solid #334155; flex-shrink: 0; position: relative; z-index: 50; }
   .mobile-sidebar-toggle { display: block; background: none; border: none; color: #94a3b8; font-size: 18px; cursor: pointer; padding: 4px 8px 4px 0; line-height: 1; flex-shrink: 0; }
   .mobile-sidebar-toggle:active { color: #e2e8f0; }
   .mobile-server-switcher-wrap { position: relative; }
