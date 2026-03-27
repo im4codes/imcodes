@@ -479,7 +479,6 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
     const container = scrollRef.current;
     if (!container) return;
     let timer: ReturnType<typeof setTimeout> | null = null;
-    let menuOpened = false;
     let startX = 0, startY = 0;
 
     // Telegram pattern: eat the touchend + subsequent click after menu opens
@@ -490,14 +489,11 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
       const t = e.touches[0];
       startX = t.clientX; startY = t.clientY;
       const targetEl = e.target as HTMLElement;
-      menuOpened = false;
-
       timer = setTimeout(() => {
         timer = null;
         const chatEvent = targetEl.closest?.('.chat-event') as HTMLElement | null;
         if (!chatEvent) return;
         openCtxMenu(chatEvent, startX, startY);
-        menuOpened = true;
         // One-shot: eat the touchend that follows to prevent synthetic click from closing menu
         container.addEventListener('touchend', cancelEvent, { once: true, capture: true });
       }, 400);
