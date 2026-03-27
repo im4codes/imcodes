@@ -170,6 +170,12 @@ export function App() {
         || el.classList.contains('xterm-helper-textarea');
       // Toggle .input-focused instantly on focus (no viewport delay needed)
       document.documentElement.classList.toggle('input-focused', inputFocused);
+      // Aggressively reset scroll — iOS visual viewport push
+      if (inputFocused) {
+        window.scrollTo(0, 0);
+        document.body.scrollTop = 0;
+        document.documentElement.scrollTop = 0;
+      }
       update();
     };
     const onFocusOut = () => {
@@ -1352,7 +1358,8 @@ export function App() {
     };
 
     document.addEventListener('touchstart', onStart, { passive: true });
-    document.addEventListener('touchmove', onMove, { passive: false }); // non-passive to allow preventDefault
+    // Non-passive only when sidebar is open (need preventDefault for drag). When closed, use passive.
+    document.addEventListener('touchmove', onMove, { passive: !mobileSidebarOpen });
     document.addEventListener('touchend', onEnd, { passive: true });
     return () => {
       document.removeEventListener('touchstart', onStart);
@@ -1925,7 +1932,7 @@ export function App() {
                         <button
                           key={s.id}
                           class={`mobile-server-menu-item${s.id === selectedServerId ? ' active' : ''}`}
-                          onClick={() => handleSelectServer(s.id, s.name)}
+                          onClick={() => { handleSelectServer(s.id, s.name); setShowMobileServerMenu(false); }}
                         >
                           <span style={{ color: online ? '#4ade80' : '#475569' }}>{online ? '●' : '○'}</span>
                           {' '}{s.name}
