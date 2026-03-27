@@ -186,7 +186,10 @@ export function useSubSessions(
         ws?.subSessionStart(sub.id, type, shellBin, cwd, ccSessionId, activeSession);
       }
       return sub;
-    } catch {
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('Sub-session create failed:', msg);
+      alert(`Failed to create session: ${msg}`);
       return null;
     }
   }, [serverId, ws, activeSession]);
