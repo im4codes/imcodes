@@ -119,7 +119,17 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
     return null;
   }, [events]);
 
-  const modelLabel = useMemo(() => shortModelLabel(lastUsage?.model), [lastUsage]);
+  // Model may appear in any usage.update event — not only ones with inputTokens
+  const detectedModel = useMemo(() => {
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i].type === 'usage.update' && events[i].payload.model) {
+        return events[i].payload.model as string;
+      }
+    }
+    return null;
+  }, [events]);
+
+  const modelLabel = useMemo(() => shortModelLabel(detectedModel ?? lastUsage?.model), [detectedModel, lastUsage]);
 
   // Per-card width override (persisted in localStorage)
   const [localW, setLocalW] = useState(() => loadCardW(sub.id, cardW));
@@ -169,7 +179,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
         {busy && <span class="subcard-running">●</span>}
         {modelLabel && <span class="subcard-model">{modelLabel}</span>}
         {lastUsage && (() => {
-          const ctx = resolveContextWindow(lastUsage.contextWindow, lastUsage.model);
+          const ctx = resolveContextWindow(lastUsage.contextWindow, detectedModel ?? lastUsage.model);
           const total = lastUsage.inputTokens + lastUsage.cacheTokens;
           const totalPct = Math.min(100, total / ctx * 100);
           const cachePct = Math.min(totalPct, lastUsage.cacheTokens / ctx * 100);
@@ -177,7 +187,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
           const fmt = (n: number) => n >= 1000000 ? `${(n / 1000000).toFixed(n % 1000000 === 0 ? 0 : 1)}M` : n >= 1000 ? `${(n / 1000).toFixed(0)}k` : String(n);
           const pctStr = totalPct < 1 ? totalPct.toFixed(1) : totalPct.toFixed(0);
           const tip = [
-            lastUsage.model ?? '',
+            detectedModel ?? lastUsage.model ?? '',
             `Context: ${fmt(total)} / ${fmt(ctx)} (${pctStr}%)`,
             `  New: ${fmt(lastUsage.inputTokens)}  Cache: ${fmt(lastUsage.cacheTokens)}`,
           ].filter(Boolean).join('\n');

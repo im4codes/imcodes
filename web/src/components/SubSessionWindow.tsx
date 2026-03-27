@@ -255,6 +255,16 @@ export function SubSessionWindow({
     return null;
   }, [events]);
 
+  // Model may appear in any usage.update event — not only ones with inputTokens
+  const detectedModel = useMemo(() => {
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i].type === 'usage.update' && events[i].payload.model) {
+        return String(events[i].payload.model);
+      }
+    }
+    return undefined;
+  }, [events]);
+
   const lastCostEvent = useMemo(() => {
     for (let i = events.length - 1; i >= 0; i--) {
       if (events[i].type === 'usage.update' && events[i].payload.costUsd) {
@@ -380,7 +390,7 @@ export function SubSessionWindow({
           sessions={sessions}
           subSessions={subSessions}
           serverId={serverId}
-          detectedModel={lastUsage?.model}
+          detectedModel={detectedModel ?? lastUsage?.model}
           quotes={quotes}
           onRemoveQuote={removeQuote}
         />
