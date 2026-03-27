@@ -36,6 +36,11 @@ export function useProviderStatus(ws: WsClient | null) {
           return next;
         });
       }
+      // On daemon reconnect, provider status cache in bridge is refreshed.
+      // Request session list which also triggers a fresh status push.
+      if (msg.type === 'daemon.reconnected') {
+        try { ws.send({ type: 'provider.list_sessions', providerId: 'openclaw' }); } catch { /* */ }
+      }
     });
 
     return unsub;
