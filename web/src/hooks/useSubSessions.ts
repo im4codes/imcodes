@@ -165,7 +165,8 @@ export function useSubSessions(
     if (!serverId) return null;
     try {
       const ccSessionId = type === 'claude-code' ? crypto.randomUUID() : undefined;
-      const res = await apiCreate(serverId, { type, shellBin, cwd, label, ccSessionId, parentSession: activeSession ?? null });
+      const description = extra?.description as string | undefined;
+      const res = await apiCreate(serverId, { type, shellBin, cwd, label, ccSessionId, parentSession: activeSession ?? null, description });
       const sub: SubSession = {
         ...res.subSession,
         sessionName: res.sessionName,

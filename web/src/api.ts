@@ -303,7 +303,7 @@ export async function listSubSessions(serverId: string): Promise<SubSessionData[
 
 export async function createSubSession(
   serverId: string,
-  body: { type: string; shellBin?: string; cwd?: string; label?: string; ccSessionId?: string; parentSession?: string | null },
+  body: { type: string; shellBin?: string; cwd?: string; label?: string; ccSessionId?: string; parentSession?: string | null; description?: string },
 ): Promise<{ id: string; sessionName: string; subSession: SubSessionData }> {
   const res = await apiFetch<{ id: string; sessionName: string; subSession: {
     id: string; server_id: string; type: string; shell_bin: string | null;

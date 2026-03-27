@@ -511,7 +511,7 @@ export async function updateSubSession(
   db: Database,
   id: string,
   serverId: string,
-  fields: { label?: string | null; closed_at?: number | null; gemini_session_id?: string | null; sort_order?: number | null },
+  fields: { label?: string | null; closed_at?: number | null; gemini_session_id?: string | null; sort_order?: number | null; description?: string | null; cwd?: string | null },
 ): Promise<void> {
   const parts: string[] = [];
   const vals: unknown[] = [];
@@ -520,6 +520,8 @@ export async function updateSubSession(
   if ('closed_at' in fields) { parts.push(`closed_at = $${idx++}`); vals.push(fields.closed_at ?? null); }
   if ('gemini_session_id' in fields) { parts.push(`gemini_session_id = $${idx++}`); vals.push(fields.gemini_session_id ?? null); }
   if ('sort_order' in fields) { parts.push(`sort_order = $${idx++}`); vals.push(fields.sort_order ?? null); }
+  if ('description' in fields) { parts.push(`description = $${idx++}`); vals.push(fields.description ?? null); }
+  if ('cwd' in fields) { parts.push(`cwd = $${idx++}`); vals.push(fields.cwd ?? null); }
   if (parts.length === 0) return;
   parts.push(`updated_at = $${idx++}`);
   vals.push(Date.now());

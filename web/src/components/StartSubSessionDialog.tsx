@@ -46,7 +46,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   // OpenClaw-specific state
   const [ocMode, setOcMode] = useState<OpenClawMode>('new');
   const [ocSessionKey, setOcSessionKey] = useState('');
-  const [ocDescription, setOcDescription] = useState('');
+  const [description, setDescription] = useState('');
   const [ocSelectedSession, setOcSelectedSession] = useState('');
 
   // Remote sessions come from the provider status hook (pushed on connect, cached in DB)
@@ -88,19 +88,20 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   }, [type, ocMode, ocSessionKey]);
 
   const handleStart = () => {
+    const desc = description.trim() || undefined;
     if (type === 'script') {
       if (!scriptCmd.trim()) return;
       const interval = Math.max(1, parseInt(scriptInterval, 10) || 5);
       const escaped = scriptCmd.trim().replace(/'/g, "'\\''");
       const wrapper = `bash -c 'while true; do clear; ${escaped}; sleep ${interval}; done'`;
-      onStart('script', wrapper, cwd || undefined, label || scriptCmd.trim().slice(0, 30));
+      onStart('script', wrapper, cwd || undefined, label || scriptCmd.trim().slice(0, 30), desc ? { description: desc } : undefined);
       return;
     }
     if (type === 'openclaw') {
       const extra =
         ocMode === 'bind'
-          ? { ocMode: 'bind', ocSessionId: ocSelectedSession }
-          : { ocMode: 'new', ocSessionKey: ocSessionKey.trim(), ocDescription: ocDescription.trim() };
+          ? { ocMode: 'bind', ocSessionId: ocSelectedSession, description: desc }
+          : { ocMode: 'new', ocSessionKey: ocSessionKey.trim(), description: desc };
       onStart('openclaw', undefined, cwd || undefined, label || undefined, extra);
       return;
     }
@@ -108,7 +109,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     if (type === 'shell' && selectedShell) {
       void saveUserPref('default_shell', selectedShell).catch(() => {});
     }
-    onStart(type, selectedShell, cwd || undefined, label || undefined);
+    onStart(type, selectedShell, cwd || undefined, label || undefined, desc ? { description: desc } : undefined);
   };
 
   return (
@@ -262,17 +263,6 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                 </div>
               )}
 
-              <div>
-                <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.description')}</div>
-                <textarea
-                  class="input"
-                  placeholder={t('session.descriptionPlaceholder')}
-                  value={ocDescription}
-                  onInput={(e) => setOcDescription((e.target as HTMLTextAreaElement).value)}
-                  rows={3}
-                  style={{ width: '100%', resize: 'vertical' }}
-                />
-              </div>
             </>
           )}
 
@@ -312,6 +302,19 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
               value={label}
               onInput={(e) => setLabel((e.target as HTMLInputElement).value)}
               style={{ width: '100%' }}
+            />
+          </div>
+
+          {/* Description / persona */}
+          <div>
+            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.description')}</div>
+            <textarea
+              class="input"
+              placeholder={t('session.descriptionPlaceholder')}
+              value={description}
+              onInput={(e) => setDescription((e.target as HTMLTextAreaElement).value)}
+              rows={2}
+              style={{ width: '100%', resize: 'vertical' }}
             />
           </div>
         </div>
