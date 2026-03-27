@@ -460,7 +460,10 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
       pressTimer = setTimeout(() => {
         pressTimer = null;
         longPressedRef.current = true;
-        const target = (e.target as HTMLElement).closest?.('.chat-event') as HTMLElement | null;
+        // Use elementFromPoint — during the hold, Preact may re-render and
+        // replace DOM elements (new messages). e.target would be stale.
+        const el = document.elementFromPoint(startX, startY) as HTMLElement | null;
+        const target = el?.closest?.('.chat-event') as HTMLElement | null;
         if (!target) return;
         // Highlight
         if (highlightElRef.current) highlightElRef.current.classList.remove('chat-highlight');
@@ -479,7 +482,7 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
     const onTouchMove = (e: TouchEvent) => {
       if (!pressTimer) return;
       const t = e.touches[0];
-      if (Math.abs(t.clientX - startX) > 10 || Math.abs(t.clientY - startY) > 10) {
+      if (Math.abs(t.clientX - startX) > 20 || Math.abs(t.clientY - startY) > 20) {
         clearTimeout(pressTimer);
         pressTimer = null;
       }

@@ -146,8 +146,11 @@ export function App() {
       const shrink = window.innerHeight - vv.height;
       const kbOpen = shrink > 40 || (inputFocused && shrink > 15);
       document.documentElement.classList.toggle('kb-open', kbOpen);
-      // Reset any scroll caused by keyboard opening on mobile
-      if (window.scrollY !== 0) window.scrollTo(0, 0);
+      // Reset any scroll/offset caused by keyboard opening on mobile.
+      // Always reset — iOS can have vv.offsetTop > 0 even when scrollY is 0.
+      window.scrollTo(0, 0);
+      document.body.scrollTop = 0;
+      document.documentElement.scrollTop = 0;
       // Auto-scroll sidebar panel into view when viewport settles (keyboard done animating).
       // Debounced 100ms — resize fires multiple times during animation, we want the final one.
       if (kbOpen && inputFocused) {
