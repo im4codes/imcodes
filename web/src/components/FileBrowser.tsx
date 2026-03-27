@@ -331,6 +331,15 @@ export function FileBrowser({
 
   // Listen for fs.ls_response and fs.read_response
   useEffect(() => {
+    // If WS is already connected when handler registers (e.g. server switch where
+    // the connected event fired before this effect ran), clear cache and re-fetch.
+    if (ws.connected) {
+      loadedRef.current.clear();
+      pendingRef.current.clear();
+      pendingChangesRef.current.clear();
+      fetchDir(startPath);
+    }
+
     return ws.onMessage((msg: ServerMessage) => {
       if (!mountedRef.current) return;
 

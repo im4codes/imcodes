@@ -200,7 +200,21 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
 
   const detectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const prevWsRef = useRef(ws);
+
   const doDetect = useCallback(() => {
+    // On ws change (server switch): reset stale state from previous server
+    if (prevWsRef.current !== ws) {
+      prevWsRef.current = ws;
+      setContext(null);
+      setTabs({ issues: emptyTab(), prs: emptyTab(), branches: emptyTab(), commits: emptyTab(), actions: emptyTab() });
+      setExpandedKey(null);
+      setDetailData(new Map());
+      setDetailState(new Map());
+      pendingRef.current.clear();
+      detectReqRef.current = null;
+    }
+
     setDetectLoading(true);
     setDetectError(null);
 
@@ -208,6 +222,8 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
     try {
       rid = ws.repoDetect(projectDir);
     } catch (err) {
+      // If WS isn't connected yet, stay in loading — the connected handler will retry
+      if (!ws.connected) return;
       setDetectError(`Send failed: ${err instanceof Error ? err.message : String(err)}`);
       setDetectLoading(false);
       return;
@@ -227,26 +243,7 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
     }, 10_000);
   }, [ws, projectDir]);
 
-  // Only call doDetect when WS is already connected (e.g. initial mount).
-  // On server switch the new WsClient hasn't connected yet — doDetect would throw.
-  // The daemon.reconnected handler (line 278) will call doDetect once WS is ready.
-  useEffect(() => {
-    if (ws.connected) doDetect();
-    return () => { if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current); };
-  }, [doDetect]);
-
-  // Reset state when ws reference changes (server switch) — clear stale data
-  useEffect(() => {
-    setContext(null);
-    setDetectLoading(true);
-    setDetectError(null);
-    setTabs({ issues: emptyTab(), prs: emptyTab(), branches: emptyTab(), commits: emptyTab(), actions: emptyTab() });
-    setExpandedKey(null);
-    setDetailData(new Map());
-    setDetailState(new Map());
-    pendingRef.current.clear();
-    detectReqRef.current = null;
-  }, [ws]);
+  useEffect(() => { doDetect(); return () => { if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current); }; }, [doDetect]);
 
   // ── Tab data fetching ────────────────────────────────────────────────────
 
