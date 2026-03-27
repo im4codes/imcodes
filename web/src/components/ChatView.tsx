@@ -224,7 +224,7 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
   const highlightElRef = useRef(highlightEl);
   highlightElRef.current = highlightEl;
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; text: string } | null>(null);
-  // Timestamp when ctx menu was opened — clicks within 300ms are synthetic (from long-press release)
+  // Timestamp when ctx menu was opened — clicks within 400ms are synthetic (from long-press release)
   const menuOpenedAtRef = useRef(0);
 
   const autoScrollRef = useRef(true);
@@ -466,7 +466,7 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
       menuOpenedAtRef.current = Date.now();
       setCtxMenu({
         x: Math.max(40, Math.min(clientX - mainRect.left, mainRect.width - 80)),
-        y: clientY - mainRect.top - 40,
+        y: Math.max(10, Math.min(clientY - mainRect.top - 40, mainRect.height - 120)),
         text,
       });
     }
@@ -494,8 +494,8 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} onScroll={preview ? undefined : handleScroll}
           onContextMenu={!preview ? handleContextMenu : undefined}
           onClick={(highlightEl || ctxMenu) ? () => {
-            // Ignore synthetic click from long-press release (within 300ms of menu opening)
-            if (Date.now() - menuOpenedAtRef.current < 300) return;
+            // Ignore synthetic click from long-press release (within 400ms of menu opening)
+            if (Date.now() - menuOpenedAtRef.current < 400) return;
             if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
             setCtxMenu(null);
           } : undefined}
