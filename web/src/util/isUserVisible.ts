@@ -22,6 +22,9 @@ const VISIBLE_TYPES = new Set([
   'ask.question',
 ]);
 
-export function isUserVisible(event: { type: string }): boolean {
-  return VISIBLE_TYPES.has(event.type);
+export function isUserVisible(event: { type: string; payload?: { streaming?: boolean } }): boolean {
+  if (!VISIBLE_TYPES.has(event.type)) return false;
+  // Streaming deltas are intermediate updates to the same message — only count the final one.
+  if (event.type === 'assistant.text' && event.payload?.streaming === true) return false;
+  return true;
 }
