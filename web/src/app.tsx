@@ -1280,17 +1280,16 @@ export function App() {
     const drag = sidebarDragRef.current;
     const EDGE_ZONE = 24;           // px from left edge to start tracking
     const CONFIRM_PX = 10;          // horizontal px before drag activates (avoids eating taps)
-    const VELOCITY_THRESHOLD = 0.3; // px/ms — fast flick snaps regardless of position
-    let tracking = false;           // touchstart was in edge zone, awaiting confirmation
-    let confirmed = false;          // horizontal intent confirmed — drag is live
+    const VELOCITY_THRESHOLD = 0.15; // px/ms — lower = easier to flick
+    let tracking = false;
+    let confirmed = false;
+    let startTs = 0;
 
     const onStart = (e: TouchEvent) => {
       const t = e.touches[0];
       const isOpen = mobileSidebarOpen;
       if (!isOpen && t.clientX > EDGE_ZONE) return;
-      // Don't trigger on server bar — ≡ button and dropdown live there
       if (!isOpen && (e.target as HTMLElement)?.closest?.('.mobile-server-bar')) return;
-      // Record start position but don't activate drag yet — wait for horizontal move
       tracking = true;
       confirmed = false;
       drag.active = false;
@@ -1298,6 +1297,7 @@ export function App() {
       drag.startY = t.clientY;
       drag.lastX = t.clientX;
       drag.lastTs = e.timeStamp;
+      startTs = e.timeStamp;
       drag.opening = !isOpen;
     };
 
@@ -1308,26 +1308,18 @@ export function App() {
       const dy = Math.abs(t.clientY - drag.startY);
       const adx = Math.abs(dx);
 
-      // Not yet confirmed — check if this is a horizontal drag
       if (!confirmed) {
         // Vertical scroll dominates → cancel
-        if (dy > adx * 1.5 && adx < 20) { tracking = false; return; }
-        // Not enough horizontal movement yet
+        if (dy > adx * 2 && adx < 15) { tracking = false; return; }
         if (adx < CONFIRM_PX) return;
-        // Opening must be rightward, closing must be leftward
+        // Opening must be rightward
         if (drag.opening && dx < 0) { tracking = false; return; }
-        if (!drag.opening && dx > 0) return; // allow small rightward jitter when closing
-        // Confirmed — activate drag
         confirmed = true;
         drag.active = true;
-        if (drag.opening) {
-          setMobileSidebarOpen(true);
-        }
+        if (drag.opening) setMobileSidebarOpen(true);
       }
 
-      // Prevent vertical scroll while sidebar drag is active
       e.preventDefault();
-
       drag.lastX = t.clientX;
       drag.lastTs = e.timeStamp;
 
@@ -1335,27 +1327,31 @@ export function App() {
       const progress = drag.opening
         ? Math.max(0, t.clientX - drag.startX) / w
         : 1 + Math.min(0, t.clientX - drag.startX) / w;
-      applySidebarTransform(progress);
+      applySidebarTransform(Math.max(0, Math.min(1, progress)));
     };
 
     const onEnd = (e: TouchEvent) => {
       if (!tracking) return;
       tracking = false;
-      if (!confirmed) return; // was just a tap — let click handlers work
+      if (!confirmed) return;
 
       drag.active = false;
       const t = e.changedTouches[0];
-      const dt = Math.max(1, e.timeStamp - drag.lastTs);
-      const velocity = (t.clientX - drag.lastX) / dt;
+      // Use overall velocity (start→end), not last-segment — much more reliable for flick detection
+      const totalDt = Math.max(1, e.timeStamp - startTs);
+      const totalDx = t.clientX - drag.startX;
+      const velocity = totalDx / totalDt; // +ve = rightward
 
       const w = getSidebarWidth();
       const progress = drag.opening
-        ? Math.max(0, t.clientX - drag.startX) / w
-        : 1 + Math.min(0, t.clientX - drag.startX) / w;
+        ? Math.max(0, totalDx) / w
+        : 1 + Math.min(0, totalDx) / w;
 
-      const snapOpen = velocity > VELOCITY_THRESHOLD ? true
-        : velocity < -VELOCITY_THRESHOLD ? false
-        : progress > 0.4;
+      // Snap: flick overrides position. Lower threshold for closing (0.3 vs 0.5 for opening).
+      let snapOpen: boolean;
+      if (velocity > VELOCITY_THRESHOLD) snapOpen = true;
+      else if (velocity < -VELOCITY_THRESHOLD) snapOpen = false;
+      else snapOpen = drag.opening ? progress > 0.3 : progress > 0.5;
 
       snapSidebar(snapOpen);
     };
