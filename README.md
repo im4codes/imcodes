@@ -33,6 +33,12 @@ A specialized instant messenger for AI agents. More than chat — terminal acces
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m0.png"><img src="landing/imcodes-m0.png" width="18%" /></a>
 </p>
 
+## Download
+
+<a href="https://apps.apple.com/us/app/im-codes/id6761014424"><img src="https://developer.apple.com/assets/elements/badges/download-on-the-app-store.svg" height="40" alt="Download on the App Store" /></a>
+
+Also available as a [web app](https://app.im.codes) and via `npm install -g imcodes` (daemon CLI).
+
 ## Why
 
 Since 2026, developers talk to agents. Agents write code, run tools, and manage workflows. But generic chat apps were never built for this — and raw terminals don't scale across machines, devices, or multiple agents working in parallel.

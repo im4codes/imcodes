@@ -305,6 +305,14 @@ footer {
 </section>
 
 <section>
+  <h2 data-i18n="h_download">download</h2>
+  <div style="display: flex; gap: 16px; align-items: center; flex-wrap: wrap; margin-bottom: 16px;">
+    <a href="https://apps.apple.com/us/app/im-codes/id6761014424" target="_blank" rel="noopener"><img src="https://developer.apple.com/assets/elements/badges/download-on-the-app-store.svg" height="40" alt="Download on the App Store" style="display:block;" /></a>
+    <span style="color: var(--dim); font-size: 12px;" data-i18n="also_web">Also available as a <a href="https://app.im.codes">web app</a></span>
+  </div>
+</section>
+
+<section>
   <h2 data-i18n="h_install">install</h2>
   <div class="install-block" onclick="copy(this)">
     <code><span>$</span> npm install -g imcodes</code>
@@ -391,7 +399,8 @@ const I18N = {
     tagline: '为 AI 代理而生的即时通讯',
     hero_output: '已绑定 app.im.codes · 守护进程已启动 · 已注册为系统服务',
     self_host_warning: '<strong>强烈建议自行部署。</strong><code>app.im.codes</code> 是共享测试实例，无可用性保证，可能被限流、攻击或不可用。这是个人项目，不提供商用保障。正式使用请部署到自己的服务器。',
-    h_screenshots: '截图', h_why: '为什么', h_features: '功能', h_arch: '架构', h_install: '安装', h_quick: '快速开始', h_selfhost: '自托管部署', h_agents: '支持的代理', h_reqs: '系统要求', h_about: '关于',
+    h_screenshots: '截图', h_why: '为什么', h_features: '功能', h_arch: '架构', h_download: '下载', h_install: '安装', h_quick: '快速开始', h_selfhost: '自托管部署', h_agents: '支持的代理', h_reqs: '系统要求', h_about: '关于',
+    also_web: '也可作为 <a href="https://app.im.codes">网页版</a> 使用',
     why_text: '2026 年起，开发者开始和 AI 代理对话。代理写代码、运行工具、管理工作流。但通用聊天工具从来不是为此而生的。IM.codes 是 AI 代理的专用消息层：无需 SSH 的远程终端、理解代理输出的聊天视图、以及让不同模型协同工作的多代理工作流。',
     f_remote_name: '远程终端', f_remote_desc: '浏览器和手机访问，无需 SSH/VPN，实时 PTY 推流',
     f_chat_name: '终端 + 聊天', f_chat_desc: '原生 CLI 或结构化视图，解析工具调用',
@@ -432,7 +441,8 @@ const I18N = {
     tagline: '為 AI 代理而生的即時通訊',
     hero_output: '已綁定 app.im.codes · 守護程序已啟動 · 已註冊為系統服務',
     self_host_warning: '<strong>強烈建議自行部署。</strong><code>app.im.codes</code> 是共享測試實例，無可用性保證，可能被限流、攻擊或不可用。這是個人專案，不提供商用保障。正式使用請部署到自己的伺服器。',
-    h_screenshots: '截圖', h_why: '為什麼', h_features: '功能', h_arch: '架構', h_install: '安裝', h_quick: '快速開始', h_selfhost: '自託管部署', h_agents: '支援的代理', h_reqs: '系統需求', h_about: '關於',
+    h_screenshots: '截圖', h_why: '為什麼', h_features: '功能', h_arch: '架構', h_download: '下載', h_install: '安裝', h_quick: '快速開始', h_selfhost: '自託管部署', h_agents: '支援的代理', h_reqs: '系統需求', h_about: '關於',
+    also_web: '也可作為 <a href="https://app.im.codes">網頁版</a> 使用',
     why_text: '2026 年起，開發者開始和 AI 代理對話。代理寫程式碼、運行工具、管理工作流。但通用聊天工具從來不是為此而生的。IM.codes 是 AI 代理的專用訊息層：無需 SSH 的遠端終端機、理解代理輸出的聊天視圖、以及讓不同模型協同工作的多代理工作流。',
     f_remote_name: '遠端終端機', f_remote_desc: '瀏覽器和手機存取，無需 SSH/VPN，即時 PTY 串流',
     f_chat_name: '終端機 + 聊天', f_chat_desc: '原生 CLI 或結構化檢視，解析工具呼叫',
@@ -473,7 +483,8 @@ const I18N = {
     tagline: 'AIエージェントのためのIM',
     hero_output: 'app.im.codes にバインド完了 · デーモン起動 · システムサービスとして登録',
     self_host_warning: '<strong>セルフホスティングを強く推奨します。</strong><code>app.im.codes</code> は共有テストインスタンスであり、稼働保証はありません。レート制限、攻撃対象、利用不可の可能性があります。個人プロジェクトのため商用サポートはありません。評価以外の用途では自社インフラにデプロイしてください。',
-    h_screenshots: 'スクリーンショット', h_why: '背景', h_features: '機能', h_arch: 'アーキテクチャ', h_install: 'インストール', h_quick: 'クイックスタート', h_selfhost: 'セルフホスト', h_agents: '対応エージェント', h_reqs: '要件', h_about: '概要',
+    h_screenshots: 'スクリーンショット', h_why: '背景', h_features: '機能', h_arch: 'アーキテクチャ', h_download: 'ダウンロード', h_install: 'インストール', h_quick: 'クイックスタート', h_selfhost: 'セルフホスト', h_agents: '対応エージェント', h_reqs: '要件', h_about: '概要',
+    also_web: '<a href="https://app.im.codes">ウェブ版</a>もあります',
     why_text: '2026年から、開発者はAIエージェントと会話するようになりました。エージェントはコードを書き、ツールを実行し、ワークフローを管理します。しかし汎用チャットアプリはこのために作られていません。IM.codesはAIエージェント専用のメッセージングレイヤーです：SSHなしのリモートターミナル、エージェント出力を理解するチャットビュー、異なるモデルを協調させるマルチエージェントワークフロー。',
     f_remote_name: 'リモートターミナル', f_remote_desc: 'ブラウザ＆モバイル、SSH/VPN不要、リアルタイムPTYストリーミング',
     f_chat_name: 'ターミナル＋チャット', f_chat_desc: 'ネイティブCLIまたは構造化ビュー',
@@ -514,7 +525,8 @@ const I18N = {
     tagline: 'AI 에이전트를 위한 IM',
     hero_output: 'app.im.codes에 바인딩 완료 · 데몬 시작됨 · 시스템 서비스로 등록됨',
     self_host_warning: '<strong>셀프 호스팅을 강력히 권장합니다.</strong> <code>app.im.codes</code>는 공유 테스트 인스턴스로 가동 보장이 없으며, 속도 제한, 공격 대상이 되거나 사용 불가할 수 있습니다. 개인 프로젝트로 상업적 지원은 제공되지 않습니다. 평가 이외의 용도에는 자체 인프라에 배포하세요.',
-    h_screenshots: '스크린샷', h_why: '배경', h_features: '기능', h_arch: '아키텍처', h_install: '설치', h_quick: '빠른 시작', h_selfhost: '셀프 호스팅', h_agents: '지원 에이전트', h_reqs: '요구사항', h_about: '소개',
+    h_screenshots: '스크린샷', h_why: '배경', h_features: '기능', h_arch: '아키텍처', h_download: '다운로드', h_install: '설치', h_quick: '빠른 시작', h_selfhost: '셀프 호스팅', h_agents: '지원 에이전트', h_reqs: '요구사항', h_about: '소개',
+    also_web: '<a href="https://app.im.codes">웹 앱</a>으로도 이용 가능',
     why_text: '2026년부터 개발자는 AI 에이전트와 대화합니다. 에이전트는 코드를 작성하고, 도구를 실행하고, 워크플로우를 관리합니다. 하지만 범용 채팅 앱은 이를 위해 만들어지지 않았습니다. IM.codes는 AI 에이전트를 위한 전용 메시징 레이어입니다: SSH 없는 원격 터미널, 에이전트 출력을 이해하는 채팅 뷰, 다양한 모델을 조율하는 멀티 에이전트 워크플로우.',
     f_remote_name: '원격 터미널', f_remote_desc: '브라우저 & 모바일, SSH/VPN 불필요, 실시간 PTY 스트리밍',
     f_chat_name: '터미널 + 채팅', f_chat_desc: '네이티브 CLI 또는 구조화된 뷰',
@@ -555,7 +567,8 @@ const I18N = {
     tagline: 'El IM para agentes',
     hero_output: 'vinculado a app.im.codes · daemon iniciado · registrado como servicio del sistema',
     self_host_warning: '<strong>Se recomienda encarecidamente el autoalojamiento.</strong> <code>app.im.codes</code> es una instancia de prueba compartida sin garantías de disponibilidad — puede tener límites, ser objetivo de ataques o no estar disponible. Este es un proyecto personal sin soporte comercial. Para uso más allá de la evaluación, despliega en tu propia infraestructura.',
-    h_screenshots: 'capturas', h_why: 'por qué', h_features: 'características', h_arch: 'arquitectura', h_install: 'instalar', h_quick: 'inicio rápido', h_selfhost: 'autoalojamiento', h_agents: 'agentes compatibles', h_reqs: 'requisitos', h_about: 'acerca de',
+    h_screenshots: 'capturas', h_why: 'por qué', h_features: 'características', h_arch: 'arquitectura', h_download: 'descargar', h_install: 'instalar', h_quick: 'inicio rápido', h_selfhost: 'autoalojamiento', h_agents: 'agentes compatibles', h_reqs: 'requisitos', h_about: 'acerca de',
+    also_web: 'También disponible como <a href="https://app.im.codes">app web</a>',
     why_text: 'Desde 2026, los desarrolladores hablan con agentes. Los agentes escriben código, ejecutan herramientas y gestionan flujos de trabajo. Pero las apps de chat genéricas nunca fueron diseñadas para esto. IM.codes es una capa de mensajería dedicada para agentes IA: terminales remotas sin SSH, una vista de chat que entiende la salida del agente, y flujos multi-agente para coordinar diferentes modelos en la misma tarea.',
     f_remote_name: 'terminal remota', f_remote_desc: 'navegador y móvil, sin SSH/VPN, streaming PTY en tiempo real',
     f_chat_name: 'terminal + chat', f_chat_desc: 'CLI nativo o vista estructurada con llamadas de herramientas',
@@ -596,7 +609,8 @@ const I18N = {
     tagline: 'IM для агентов',
     hero_output: 'привязан к app.im.codes · демон запущен · зарегистрирован как системная служба',
     self_host_warning: '<strong>Настоятельно рекомендуется самостоятельный хостинг.</strong> <code>app.im.codes</code> — общий тестовый экземпляр без гарантий доступности. Может быть ограничен, атакован или недоступен. Это личный проект без коммерческой поддержки. Для использования помимо тестирования разверните на собственной инфраструктуре.',
-    h_screenshots: 'скриншоты', h_why: 'зачем', h_features: 'возможности', h_arch: 'архитектура', h_install: 'установка', h_quick: 'быстрый старт', h_selfhost: 'свой сервер', h_agents: 'поддерживаемые агенты', h_reqs: 'требования', h_about: 'о проекте',
+    h_screenshots: 'скриншоты', h_why: 'зачем', h_features: 'возможности', h_arch: 'архитектура', h_download: 'скачать', h_install: 'установка', h_quick: 'быстрый старт', h_selfhost: 'свой сервер', h_agents: 'поддерживаемые агенты', h_reqs: 'требования', h_about: 'о проекте',
+    also_web: 'Также доступно как <a href="https://app.im.codes">веб-приложение</a>',
     why_text: 'С 2026 года разработчики разговаривают с агентами. Агенты пишут код, запускают инструменты и управляют рабочими процессами. Но универсальные чат-приложения не были для этого созданы. IM.codes — это выделенный слой обмена сообщениями для AI-агентов: удалённые терминалы без SSH, чат-вид, понимающий вывод агентов, и мульти-агентные рабочие процессы для координации разных моделей.',
     f_remote_name: 'удалённый терминал', f_remote_desc: 'браузер и мобильный, без SSH/VPN, PTY-стриминг в реальном времени',
     f_chat_name: 'терминал + чат', f_chat_desc: 'нативный CLI или структурированный вид',
