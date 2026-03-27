@@ -1595,7 +1595,7 @@ export function App() {
   }
 
   return (
-    <div class="layout">
+    <div class="layout" key={selectedServerId ?? ''}>
       {/* Desktop 3-column: [ServerIconBar][SidebarPanel][MainContent] */}
       {!isMobile && (
         <>
