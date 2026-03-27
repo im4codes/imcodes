@@ -525,10 +525,6 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
     };
   }, [isTouchDevice, preview, openCtxMenu]);
 
-  if (loading) {
-    return <div class="chat-view"><div class="chat-loading">{t('chat.loading')}</div></div>;
-  }
-
   const canShowFilePanel = !preview && !!ws;
 
   return (
@@ -553,12 +549,14 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
             setCtxMenu(null);
           } : undefined}
         >
-          {viewItems.length === 0 && (
+          {loading ? (
+            <div class="chat-loading">{t('chat.loading')}</div>
+          ) : viewItems.length === 0 ? (
             <div class="chat-loading">
               {sessionState ? t('chat.session_state', { state: sessionState }) : t('chat.no_events')}
             </div>
-          )}
-          {!preview && onLoadOlder && viewItems.length > 0 && (
+          ) : null}
+          {!loading && !preview && onLoadOlder && viewItems.length > 0 && (
             <div style={{ textAlign: 'center', padding: '8px 0' }}>
               <button
                 class="btn btn-sm"
@@ -570,7 +568,7 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
               </button>
             </div>
           )}
-          {viewItems.map((item, idx) => {
+          {!loading && viewItems.map((item, idx) => {
             const nextItem = viewItems[idx + 1];
             const nextTs = nextItem?.ts ?? nextItem?.event?.ts;
             const onPathClick = ws && !preview ? (p: string) => setFileBrowserPath(p) : undefined;
@@ -586,7 +584,7 @@ export function ChatView({ events, loading, refreshing, loadingOlder, onLoadOlde
               <ChatEvent key={item.key} event={item.event!} nextTs={nextTs} onPathClick={onPathClick} serverId={serverId} />
             );
           })}
-          <div ref={bottomRef} />
+          {!loading && <div ref={bottomRef} />}
         </div>
         {!preview && showScrollBtn && (
           <button
