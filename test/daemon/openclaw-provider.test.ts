@@ -198,7 +198,8 @@ describe('OpenClawProvider', () => {
       replyToLastRpc({ ok: true });
 
       const key = await createPromise;
-      expect(key).toBe('my-session');
+      // New sessions get canonical OC key: agent:{agentId}:{sessionKey}
+      expect(key).toBe('agent___main___my-session');
     });
 
     it('uses bindExistingKey over sessionKey when provided', async () => {
