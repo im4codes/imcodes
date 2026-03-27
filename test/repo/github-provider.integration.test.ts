@@ -26,8 +26,8 @@ const REPOS = {
   vscode: { owner: 'microsoft', repo: 'vscode' },
 } as const;
 
-describe.skipIf(!ghAvailable)('GitHubProvider integration — facebook/react', { retry: 2 }, () => {
-  const provider = new GitHubProvider(REPOS.react.owner, REPOS.react.repo, process.cwd());
+describe.skipIf(!ghAvailable)('GitHubProvider integration — microsoft/vscode (issues)', { retry: 2 }, () => {
+  const provider = new GitHubProvider(REPOS.vscode.owner, REPOS.vscode.repo, process.cwd());
 
   describe('listIssues', () => {
     it('returns issues with correct shape', async () => {
@@ -56,7 +56,7 @@ describe.skipIf(!ghAvailable)('GitHubProvider integration — facebook/react', {
     it('supports state=closed filter', async () => {
       const result = await provider.listIssues({ state: 'closed', perPage: 20 });
 
-      // After jq PR filtering some pages may have fewer items, but react has many closed issues
+      // After jq PR filtering some pages may have fewer items, but vscode has many closed issues
       expect(result.items.length).toBeGreaterThan(0);
       for (const issue of result.items) {
         expect(issue.state).toBe('closed');
@@ -130,7 +130,7 @@ describe.skipIf(!ghAvailable)('GitHubProvider integration — facebook/react', {
     it('returns multiple branches', async () => {
       const result = await provider.listBranches();
 
-      // facebook/react has many branches
+      // microsoft/vscode has many branches
       expect(result.items.length).toBeGreaterThan(10);
     });
   });
