@@ -15,15 +15,17 @@ import logger from '../util/logger.js';
 import { REPO_MSG } from '../shared/repo-types.js';
 
 // ---------------------------------------------------------------------------
-// Concurrency limiter — max 3 concurrent CLI calls per projectDir
+// Concurrency limiter — max 20 concurrent CLI calls per projectDir, 15s queue timeout
 // ---------------------------------------------------------------------------
 
-const MAX_CONCURRENT = 3;
+const MAX_CONCURRENT = 20;
+const QUEUE_TIMEOUT_MS = 15_000;
 
 interface QueueEntry {
   fn: () => Promise<void>;
   resolve: () => void;
   reject: (err: unknown) => void;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 const inflightCounts = new Map<string, number>();
@@ -41,14 +43,24 @@ async function withConcurrencyLimit(projectDir: string, fn: () => Promise<void>)
     return;
   }
 
-  // Queue excess
+  // Queue excess with timeout
   await new Promise<void>((resolve, reject) => {
     let q = queues.get(projectDir);
     if (!q) {
       q = [];
       queues.set(projectDir, q);
     }
-    q.push({ fn, resolve, reject });
+    const timer = setTimeout(() => {
+      // Remove from queue and reject
+      const queue = queues.get(projectDir);
+      if (queue) {
+        const idx = queue.findIndex((e) => e.resolve === resolve);
+        if (idx >= 0) queue.splice(idx, 1);
+        if (queue.length === 0) queues.delete(projectDir);
+      }
+      reject(new Error('Queue timeout'));
+    }, QUEUE_TIMEOUT_MS);
+    q.push({ fn, resolve, reject, timer });
   });
 }
 
@@ -63,6 +75,7 @@ function release(projectDir: string): void {
   const q = queues.get(projectDir);
   if (q && q.length > 0) {
     const next = q.shift()!;
+    clearTimeout(next.timer);
     if (q.length === 0) queues.delete(projectDir);
     inflightCounts.set(projectDir, (inflightCounts.get(projectDir) ?? 0) + 1);
     next.fn().then(
