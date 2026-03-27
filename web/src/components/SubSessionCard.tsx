@@ -195,11 +195,13 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
         )}
       </div>
 
-      {/* Right-edge resize handle */}
+      {/* Right-edge resize handle — draggable=false prevents parent drag-wrap from hijacking */}
       <div
         class="subcard-resize-handle"
+        draggable={false}
         onMouseDown={onResizeMouseDown}
         onTouchStart={onResizeTouchStart}
+        onDragStart={(e) => e.preventDefault()}
         onClick={(e) => e.stopPropagation()}
       />
     </div>
