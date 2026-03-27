@@ -22,13 +22,18 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
   // Voice zone: [insertPos, insertPos+voiceLen) is the active voice segment
   const insertPosRef = useRef(0);
   const voiceLenRef = useRef(0);
-  // Guard: ignore partial callbacks while restarting session
-  const restartingRef = useRef(false);
+  // Session token: monotonic counter — partials with stale token are discarded
+  const sessionTokenRef = useRef(0);
   // Track listening state in a ref so event handlers always see current value
   const listeningRef = useRef(false);
+  // Guard: true while a programmatic write (partial callback) is in progress
+  const programmaticWriteRef = useRef(false);
+  // Guard: true while overlay is open
+  const openRef = useRef(false);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open) { openRef.current = false; return; }
+    openRef.current = true;
     const init = initialText ?? '';
     if (taRef.current) { taRef.current.value = init; taRef.current.focus(); }
     setHasText(!!init.trim());
@@ -37,7 +42,7 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
     listeningRef.current = false;
     insertPosRef.current = init.length;
     voiceLenRef.current = 0;
-    restartingRef.current = false;
+    sessionTokenRef.current++;
     setBars(Array(BAR_COUNT).fill(2));
     barsRef.current = Array(BAR_COUNT).fill(2);
 
@@ -63,9 +68,11 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
     };
     vv?.addEventListener('resize', onResize);
 
-    const timer = setTimeout(() => startSession(0), 150);
+    // Start voice session at end of initial text (not 0)
+    const timer = setTimeout(() => startSession(init.length), 150);
     return () => {
       clearTimeout(timer);
+      openRef.current = false;
       vv?.removeEventListener('resize', onResize);
       VoiceInput.onAudioLevel(null);
       VoiceInput.stopListening();
@@ -76,15 +83,18 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
 
   /** Start a new recognition session, inserting at given position */
   const startSession = useCallback(async (atPos: number) => {
+    if (!openRef.current) return;
     const ta = taRef.current;
     if (!ta) return;
+    const token = ++sessionTokenRef.current;
     insertPosRef.current = atPos;
     voiceLenRef.current = 0;
 
     try {
       const ok = await VoiceInput.startListening((partial) => {
-        // Ignore callbacks arriving during a restart
-        if (restartingRef.current) return;
+        // Discard if session token changed (stale callback from old session)
+        if (sessionTokenRef.current !== token) return;
+        if (!openRef.current) return;
         const ta = taRef.current;
         if (!ta) return;
         const pos = insertPosRef.current;
@@ -94,7 +104,9 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
         // Add a space separator if needed
         const needSpace = before.length > 0 && !before.endsWith(' ') && !before.endsWith('\n') && oldLen === 0;
         const sep = needSpace ? ' ' : '';
+        programmaticWriteRef.current = true;
         ta.value = before + sep + partial + after;
+        programmaticWriteRef.current = false;
         const newVoiceLen = partial.length;
         const actualPos = pos + sep.length;
         if (sep.length > 0) insertPosRef.current = actualPos;
@@ -108,31 +120,34 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
         ta.scrollTop = ta.scrollHeight;
         setHasText(!!ta.value.trim());
       });
-      if (ok) {
+      // Check guards after async — overlay may have closed or session may have changed
+      if (ok && sessionTokenRef.current === token && openRef.current) {
         setListening(true);
         listeningRef.current = true;
       }
     } catch { /* ignore */ }
   }, []);
 
-  /** Stop current session, commit voice zone, restart at new cursor */
-  const restartAtCursor = useCallback(async (newPos: number) => {
-    restartingRef.current = true;
+  /** Stop current session and commit voice zone */
+  const commitAndStop = useCallback(async () => {
+    sessionTokenRef.current++;
     await VoiceInput.stopListening();
     setListening(false);
     listeningRef.current = false;
+    // Commit: advance insertPos past the committed voice text
+    insertPosRef.current += voiceLenRef.current;
     voiceLenRef.current = 0;
-    restartingRef.current = false;
-    // Start new session at the saved position
+  }, []);
+
+  /** Stop, commit, then restart at new cursor position */
+  const restartAtCursor = useCallback(async (newPos: number) => {
+    await commitAndStop();
     await startSession(newPos);
-  }, [startSession]);
+  }, [commitAndStop, startSession]);
 
   const handleToggle = useCallback(async () => {
     if (listeningRef.current) {
-      await VoiceInput.stopListening();
-      setListening(false);
-      listeningRef.current = false;
-      voiceLenRef.current = 0;
+      await commitAndStop();
       setBars(Array(BAR_COUNT).fill(2));
       barsRef.current = Array(BAR_COUNT).fill(2);
     } else {
@@ -140,11 +155,12 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
       const pos = ta ? (ta.selectionStart ?? ta.value.length) : 0;
       startSession(pos);
     }
-  }, [startSession]);
+  }, [startSession, commitAndStop]);
 
   const handleSend = useCallback(() => {
     const text = (taRef.current?.value ?? '').trim();
     if (!text) return;
+    sessionTokenRef.current++;
     VoiceInput.stopListening();
     setListening(false);
     listeningRef.current = false;
@@ -153,33 +169,37 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
   }, [onSend, onClose]);
 
   const handleClose = useCallback(() => {
+    sessionTokenRef.current++;
     VoiceInput.stopListening();
     setListening(false);
     listeningRef.current = false;
     onClose();
   }, [onClose]);
 
-  /** Detect cursor move via multiple events (onSelect unreliable on iOS).
-   *  If cursor moved outside the active voice zone while listening, restart session. */
+  /** User manually edited the textarea — commit voice zone and stop recognition */
+  const handleInput = useCallback(() => {
+    setHasText(!!(taRef.current?.value?.trim()));
+    // Ignore programmatic writes from partial callbacks
+    if (programmaticWriteRef.current) return;
+    // User typed/pasted/deleted — commit current voice segment and stop
+    if (listeningRef.current) {
+      void commitAndStop();
+    }
+  }, [commitAndStop]);
+
+  /** Cursor moved outside the active voice zone while listening — restart at new position */
   const handleCursorChange = useCallback(() => {
-    if (restartingRef.current) return;
+    // Skip if not listening or if a programmatic write just moved the cursor
+    if (!listeningRef.current || programmaticWriteRef.current) return;
     const ta = taRef.current;
     if (!ta) return;
     const cursor = ta.selectionStart;
-
-    // Use ref for listening state (closures capture stale state values)
-    if (!listeningRef.current) return;
     const voiceStart = insertPosRef.current;
     const voiceEnd = voiceStart + voiceLenRef.current;
-    // If cursor moved outside the active voice zone, restart session at new position
     if (cursor < voiceStart || cursor > voiceEnd) {
-      restartAtCursor(cursor);
+      void restartAtCursor(cursor);
     }
   }, [restartAtCursor]);
-
-  const handleInput = useCallback(() => {
-    setHasText(!!(taRef.current?.value?.trim()));
-  }, []);
 
   if (!open) return null;
 
