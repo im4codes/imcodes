@@ -927,10 +927,13 @@ const ChatEvent = memo(function ChatEvent({ event, nextTs, onPathClick, serverId
         starting: 'Session starting...',
         stopped: 'Session stopped',
       };
+      const inline = state === 'idle' || state === 'running';
       return (
-        <div class="chat-event chat-system">
-          {stateLabel[state] ?? state}
-          <ChatTime ts={event.ts} />
+        <div class="chat-event chat-system" style={inline ? { display: 'flex', alignItems: 'center', gap: 8 } : undefined}>
+          <span>{stateLabel[state] ?? state}</span>
+          {inline
+            ? <span class="chat-bubble-time" style={{ display: 'inline', margin: 0 }}>{new Date(event.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+            : <ChatTime ts={event.ts} />}
         </div>
       );
     }
