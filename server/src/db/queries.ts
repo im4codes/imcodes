@@ -55,6 +55,7 @@ export interface DbCronJob {
   project_name: string | null;
   target_role: string;
   target_session_name: string | null;
+  timezone: string | null;
   status: string;
   last_run_at: number | null;
   next_run_at: number | null;

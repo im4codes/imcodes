@@ -52,7 +52,7 @@ export async function jobDispatchCron(env: Env): Promise<void> {
       const bridge = WsBridge.get(job.server_id);
       if (!bridge.isDaemonConnected()) {
         logger.debug({ jobId: job.id }, 'Cron skipped: daemon offline');
-        const nextRun = calculateNextRun(job.cron_expr, now);
+        const nextRun = calculateNextRun(job.cron_expr, now, job.timezone);
         await env.DB.execute('UPDATE cron_jobs SET next_run_at = $1 WHERE id = $2', [nextRun, job.id]);
         await logExecution(env, job.id, 'skipped_offline');
         continue;
@@ -106,9 +106,10 @@ async function logExecution(env: Env, jobId: string, status: string, detail?: st
   ).catch((err) => logger.error({ jobId, err }, 'Failed to log cron execution'));
 }
 
-function calculateNextRun(cronExpr: string, fromMs: number): number {
+function calculateNextRun(cronExpr: string, fromMs: number, timezone?: string | null): number {
   try {
-    const job = new Cron(cronExpr);
+    const opts = timezone ? { timezone } : undefined;
+    const job = new Cron(cronExpr, opts);
     const next = job.nextRun(new Date(fromMs));
     return next ? next.getTime() : fromMs + 60_000;
   } catch {

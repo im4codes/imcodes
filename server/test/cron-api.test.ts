@@ -90,12 +90,14 @@ function makeMockDb() {
           cron_expr: params[4],
           project_name: params[5],
           target_role: params[6],
-          action: params[7],
-          status: params[8],
-          next_run_at: params[9],
-          expires_at: params[10],
-          created_at: params[11],
-          updated_at: params[11],
+          target_session_name: params[7],
+          action: params[8],
+          timezone: params[9],
+          status: params[10],
+          next_run_at: params[11],
+          expires_at: params[12],
+          created_at: params[13],
+          updated_at: params[13],
           last_run_at: null,
         });
       }
@@ -646,6 +648,65 @@ describe('Cron API routes', () => {
       expect(res.status).toBe(403);
       const body = await res.json() as Record<string, unknown>;
       expect(body.error).toBe('forbidden');
+    });
+  });
+
+  // ── Timezone support ──────────────────────────────────────────────────
+
+  describe('POST /api/cron (timezone)', () => {
+    it('accepts timezone and stores it', async () => {
+      const res = await app.request('/api/cron', jsonReq('POST', '', {
+        name: 'tz-test',
+        cronExpr: '0 9 * * *',
+        serverId: 'srv-1',
+        projectName: 'proj',
+        targetRole: 'brain',
+        action: { type: 'command', command: 'hello' },
+        timezone: 'Asia/Shanghai',
+      }));
+      expect(res.status).toBe(201);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.timezone).toBe('Asia/Shanghai');
+    });
+
+    it('calculates next_run_at respecting timezone', async () => {
+      // Create two identical jobs with different timezones — next_run_at should differ
+      const res1 = await app.request('/api/cron', jsonReq('POST', '', {
+        name: 'tz-utc',
+        cronExpr: '0 9 * * *',
+        serverId: 'srv-1',
+        projectName: 'proj',
+        targetRole: 'brain',
+        action: { type: 'command', command: 'hello' },
+        timezone: 'UTC',
+      }));
+      const res2 = await app.request('/api/cron', jsonReq('POST', '', {
+        name: 'tz-shanghai',
+        cronExpr: '0 9 * * *',
+        serverId: 'srv-1',
+        projectName: 'proj',
+        targetRole: 'brain',
+        action: { type: 'command', command: 'hello' },
+        timezone: 'Asia/Shanghai',
+      }));
+      const body1 = await res1.json() as Record<string, unknown>;
+      const body2 = await res2.json() as Record<string, unknown>;
+      // UTC 9:00 and Shanghai 9:00 (UTC+8 = UTC 1:00) should produce different next_run_at
+      expect(body1.nextRunAt).not.toBe(body2.nextRunAt);
+    });
+
+    it('works without timezone (defaults to server time)', async () => {
+      const res = await app.request('/api/cron', jsonReq('POST', '', {
+        name: 'no-tz',
+        cronExpr: '0 9 * * *',
+        serverId: 'srv-1',
+        projectName: 'proj',
+        targetRole: 'brain',
+        action: { type: 'command', command: 'hello' },
+      }));
+      expect(res.status).toBe(201);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.timezone).toBeNull();
     });
   });
 });

@@ -545,6 +545,7 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
       targetRole,
       targetSessionName: targetSessionName ?? null,
       action,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       expiresAt: expiresAt ? new Date(expiresAt).getTime() : null,
     };
 

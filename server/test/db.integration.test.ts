@@ -138,6 +138,36 @@ describe('runMigrations', () => {
     // Cleanup
     await db.execute('DELETE FROM cron_jobs WHERE id = $1', [jobId]);
   });
+
+  it('cron_jobs timezone column round-trip', async () => {
+    const uid = 'mig-tz-user-' + Math.random().toString(36).slice(2);
+    const sid = 'mig-tz-srv-' + Math.random().toString(36).slice(2);
+    await createUser(db, uid);
+    await createServer(db, sid, uid, 'tz-srv', 'hash-tz');
+
+    const jobId = 'mig-tz-job-' + Math.random().toString(36).slice(2);
+    await db.execute(
+      `INSERT INTO cron_jobs (id, server_id, user_id, name, cron_expr, project_name, target_role, action, timezone, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)`,
+      [jobId, sid, uid, 'tz-job', '0 9 * * *', 'proj', 'brain', '{"type":"command","command":"test"}', 'Asia/Shanghai', 'active', Date.now()],
+    );
+
+    const row = await db.queryOne<{ timezone: string | null }>(
+      'SELECT timezone FROM cron_jobs WHERE id = $1',
+      [jobId],
+    );
+    expect(row?.timezone).toBe('Asia/Shanghai');
+
+    // NULL timezone (server default)
+    await db.execute('UPDATE cron_jobs SET timezone = NULL WHERE id = $1', [jobId]);
+    const row2 = await db.queryOne<{ timezone: string | null }>(
+      'SELECT timezone FROM cron_jobs WHERE id = $1',
+      [jobId],
+    );
+    expect(row2?.timezone).toBeNull();
+
+    await db.execute('DELETE FROM cron_jobs WHERE id = $1', [jobId]);
+  });
 });
 
 // ── 2. Database wrapper ─────────────────────────────────────────────────────

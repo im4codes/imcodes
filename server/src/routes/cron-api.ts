@@ -48,6 +48,7 @@ const cronJobCreateSchema = z.object({
   targetRole: z.string().regex(rolePattern).default('brain'),
   targetSessionName: z.string().regex(sessionNamePattern).optional(),
   action: cronActionSchema,
+  timezone: z.string().min(1).max(64).optional(),
   expiresAt: z.number().nullable().optional(),
 });
 
@@ -58,13 +59,15 @@ const cronJobUpdateSchema = z.object({
   targetRole: z.string().regex(rolePattern).optional(),
   targetSessionName: z.string().regex(sessionNamePattern).nullable().optional(),
   action: cronActionSchema.optional(),
+  timezone: z.string().min(1).max(64).optional(),
   expiresAt: z.number().nullable().optional(),
 });
 
 /** Validate cron expression and enforce minimum 5-minute interval. Returns next run time or error string. */
-function validateCronExpr(cronExpr: string): { nextRunAt: number } | { error: string } {
+function validateCronExpr(cronExpr: string, timezone?: string): { nextRunAt: number } | { error: string } {
   try {
-    const job = new Cron(cronExpr);
+    const opts = timezone ? { timezone } : undefined;
+    const job = new Cron(cronExpr, opts);
     const first = job.nextRun();
     if (!first) return { error: 'invalid_cron_expression' };
     const second = job.nextRun(first);
@@ -105,12 +108,12 @@ cronApiRoutes.post('/', requireAuth(), async (c) => {
   const parsed = cronJobCreateSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body', issues: parsed.error.issues }, 400);
 
-  const { name, cronExpr, serverId, projectName, targetRole, targetSessionName, action, expiresAt } = parsed.data;
+  const { name, cronExpr, serverId, projectName, targetRole, targetSessionName, action, timezone, expiresAt } = parsed.data;
 
   const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
 
-  const validation = validateCronExpr(cronExpr);
+  const validation = validateCronExpr(cronExpr, timezone);
   if ('error' in validation) {
     return c.json({ error: validation.error, ...(validation.error === 'cron_interval_too_short' ? { minIntervalMinutes: 5 } : {}) }, 400);
   }
@@ -119,14 +122,14 @@ cronApiRoutes.post('/', requireAuth(), async (c) => {
   const now = Date.now();
 
   await c.env.DB.execute(
-    `INSERT INTO cron_jobs (id, server_id, user_id, name, cron_expr, project_name, target_role, target_session_name, action, status, next_run_at, expires_at, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)`,
-    [id, serverId, userId, name, cronExpr, projectName, targetRole, targetSessionName ?? null, JSON.stringify(action), CRON_STATUS.ACTIVE, validation.nextRunAt, expiresAt ?? null, now],
+    `INSERT INTO cron_jobs (id, server_id, user_id, name, cron_expr, project_name, target_role, target_session_name, action, timezone, status, next_run_at, expires_at, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)`,
+    [id, serverId, userId, name, cronExpr, projectName, targetRole, targetSessionName ?? null, JSON.stringify(action), timezone ?? null, CRON_STATUS.ACTIVE, validation.nextRunAt, expiresAt ?? null, now],
   );
 
   await logAudit({ userId, action: 'cron.create', details: { id, name, cronExpr, projectName } }, c.env.DB);
 
-  return c.json({ id, name, cronExpr, projectName, targetRole, targetSessionName: targetSessionName ?? null, action, status: CRON_STATUS.ACTIVE, nextRunAt: validation.nextRunAt, expiresAt: expiresAt ?? null }, 201);
+  return c.json({ id, name, cronExpr, projectName, targetRole, targetSessionName: targetSessionName ?? null, action, timezone: timezone ?? null, status: CRON_STATUS.ACTIVE, nextRunAt: validation.nextRunAt, expiresAt: expiresAt ?? null }, 201);
 });
 
 // PUT /api/cron/:id — update a cron job
@@ -152,8 +155,9 @@ cronApiRoutes.put('/:id', requireAuth(), async (c) => {
   // Re-validate cron expression if changed
   let nextRunAt: number | undefined;
   const newCronExpr = updates.cronExpr;
+  const effectiveTz = updates.timezone ?? job.timezone ?? undefined;
   if (newCronExpr && newCronExpr !== job.cron_expr) {
-    const validation = validateCronExpr(newCronExpr);
+    const validation = validateCronExpr(newCronExpr, effectiveTz);
     if ('error' in validation) {
       return c.json({ error: validation.error, ...(validation.error === 'cron_interval_too_short' ? { minIntervalMinutes: 5 } : {}) }, 400);
     }
@@ -171,6 +175,7 @@ cronApiRoutes.put('/:id', requireAuth(), async (c) => {
   if (updates.targetRole !== undefined) { sets.push(`target_role = $${idx++}`); vals.push(updates.targetRole); }
   if (updates.targetSessionName !== undefined) { sets.push(`target_session_name = $${idx++}`); vals.push(updates.targetSessionName); }
   if (updates.action !== undefined) { sets.push(`action = $${idx++}`); vals.push(JSON.stringify(updates.action)); }
+  if (updates.timezone !== undefined) { sets.push(`timezone = $${idx++}`); vals.push(updates.timezone); }
   if (updates.expiresAt !== undefined) { sets.push(`expires_at = $${idx++}`); vals.push(updates.expiresAt); }
   if (nextRunAt !== undefined) { sets.push(`next_run_at = $${idx++}`); vals.push(nextRunAt); }
 
