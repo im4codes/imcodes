@@ -20,17 +20,20 @@ const FIXTURES = new URL('../fixtures', import.meta.url).pathname;
 
 describe.skipIf(SKIP)('Multi-session parallel dispatch', () => {
   beforeAll(async () => {
+    // Ensure tmux server is running before parallel session creates
+    const { ensureTmuxServer } = await import('../../src/agent/tmux.js');
+    await ensureTmuxServer();
+
     await Promise.all([
       killSession(BRAIN_SESSION).catch(() => {}),
       killSession(WORKER1_SESSION).catch(() => {}),
       killSession(WORKER2_SESSION).catch(() => {}),
     ]);
 
-    await Promise.all([
-      newSession(BRAIN_SESSION, `bash ${FIXTURES}/mock-brain.sh`, { cwd: tmpdir() }),
-      newSession(WORKER1_SESSION, `bash ${FIXTURES}/mock-agent.sh`, { cwd: tmpdir() }),
-      newSession(WORKER2_SESSION, `bash ${FIXTURES}/mock-agent.sh`, { cwd: tmpdir() }),
-    ]);
+    // Create sessions sequentially to avoid tmux server race on CI
+    await newSession(BRAIN_SESSION, `bash ${FIXTURES}/mock-brain.sh`, { cwd: tmpdir() });
+    await newSession(WORKER1_SESSION, `bash ${FIXTURES}/mock-agent.sh`, { cwd: tmpdir() });
+    await newSession(WORKER2_SESSION, `bash ${FIXTURES}/mock-agent.sh`, { cwd: tmpdir() });
 
     // Allow sessions to initialize
     await new Promise((r) => setTimeout(r, 1000));
