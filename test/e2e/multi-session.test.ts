@@ -20,10 +20,6 @@ const FIXTURES = new URL('../fixtures', import.meta.url).pathname;
 
 describe.skipIf(SKIP)('Multi-session parallel dispatch', () => {
   beforeAll(async () => {
-    // Ensure tmux server is running before parallel session creates
-    const { ensureTmuxServer } = await import('../../src/agent/tmux.js');
-    await ensureTmuxServer();
-
     await Promise.all([
       killSession(BRAIN_SESSION).catch(() => {}),
       killSession(WORKER1_SESSION).catch(() => {}),
