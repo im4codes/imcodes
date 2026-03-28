@@ -1920,8 +1920,8 @@ export function App() {
 
       {/* Mobile sidebar overlay — always mounted so pinned panels stay alive, shown/hidden via CSS */}
       {isMobile && selectedServerId && (
-        <div ref={sidebarOverlayRef} class={`mobile-sidebar-overlay${mobileSidebarOpen ? ' open' : ''}`} onClick={() => closeSidebar()}>
-          <div ref={sidebarPanelRef} class="mobile-sidebar-panel" onClick={(e) => e.stopPropagation()}>
+        <div ref={sidebarOverlayRef} class={`mobile-sidebar-overlay${mobileSidebarOpen ? ' open' : ''}`} onPointerDown={(e) => { if (e.target === e.currentTarget) closeSidebar(); }}>
+          <div ref={sidebarPanelRef} class="mobile-sidebar-panel">
             <div class="mobile-sidebar-header">
               <span style={{ fontWeight: 700, fontSize: 14, color: '#e2e8f0' }}>IM.codes</span>
               <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
