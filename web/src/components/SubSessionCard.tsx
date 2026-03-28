@@ -14,6 +14,8 @@ import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import { getActiveThinkingTs, isVisuallyBusy } from '../thinking-utils.js';
+import { SessionControls } from './SessionControls.js';
+import type { SessionInfo } from '../types.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
@@ -32,14 +34,6 @@ const STATE_BADGE: Record<string, string> = {
   idle: '●',
 };
 
-/** Compact shortcuts for the card input — subset of SessionControls SHORTCUTS */
-const CARD_SHORTCUTS: Array<{ label: string; title: string; data: string }> = [
-  { label: 'Esc',  title: 'Escape',     data: '\x1b' },
-  { label: '^C',   title: 'Ctrl+C',     data: '\x03' },
-  { label: '↑',    title: 'Up arrow',   data: '\x1b[A' },
-  { label: '↵',    title: 'Enter',      data: '\r' },
-  { label: 'Tab',  title: 'Tab',        data: '\t' },
-];
 
 interface Props {
   sub: SubSession;
@@ -52,6 +46,10 @@ interface Props {
   onHistory: (sessionName: string, apply: (c: string) => void) => void;
   cardW?: number;
   cardH?: number;
+  quickData?: import('./QuickInputPanel.js').UseQuickDataResult;
+  sessions?: import('../types.js').SessionInfo[];
+  subSessions?: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
+  serverId?: string;
 }
 
 function loadCardW(id: string, fallback: number): number {
@@ -62,7 +60,7 @@ function loadCardW(id: string, fallback: number): number {
   return fallback;
 }
 
-export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, onDiff, onHistory, cardW = 350, cardH = 250 }: Props) {
+export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId }: Props) {
   const { t } = useTranslation();
   const isShell = sub.type === 'shell' || sub.type === 'script';
   const { events, refreshing } = isShell ? { events: [], refreshing: false } : useTimeline(sub.sessionName, ws);
@@ -74,6 +72,17 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
   const icon = TYPE_ICON[sub.type] ?? '⚡';
   const badge = STATE_BADGE[sub.state];
 
+  // Build a SessionInfo for SessionControls compact mode
+  const sessionInfo = useMemo<SessionInfo>(() => ({
+    name: sub.sessionName,
+    project: sub.sessionName,
+    role: 'w1',
+    agentType: sub.type,
+    state: (sub.state as SessionInfo['state']) ?? 'unknown',
+    label: sub.label ?? null,
+    projectDir: sub.cwd ?? undefined,
+  }), [sub.sessionName, sub.type, sub.state, sub.label, sub.cwd]);
+
   const handleCardSend = useCallback(() => {
     const text = cardInputRef.current?.value?.trim();
     if (!text || !ws || !connected) return;
@@ -83,12 +92,6 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
     cardInputRef.current!.value = '';
   }, [ws, connected, sub.sessionName]);
 
-  const handleCardShortcut = useCallback((data: string) => {
-    if (!ws || !connected) return;
-    try {
-      ws.sendInput(sub.sessionName, data);
-    } catch { /* ignore */ }
-  }, [ws, connected, sub.sessionName]);
 
   const busy = useMemo(() => isVisuallyBusy(sub.state, !!getActiveThinkingTs(events)), [events, sub.state]);
 
@@ -222,35 +225,36 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
         )}
       </div>
 
-      {/* Quick input */}
+      {/* Compact input — reuses SessionControls with @picker, ⚡, 📎, paste upload */}
       <div class="subcard-input-area" onClick={(e) => e.stopPropagation()}>
-        <div class="subcard-shortcuts">
-          {CARD_SHORTCUTS.map((s) => (
-            <button
-              key={s.label}
-              class="subcard-shortcut-btn"
-              title={s.title}
-              onClick={(e) => { e.stopPropagation(); handleCardShortcut(s.data); }}
-            >
-              {s.label}
-            </button>
-          ))}
-        </div>
-        <input
-          ref={cardInputRef}
-          class="subcard-input"
-          type="text"
-          placeholder={t('common.send') + '...'}
-          disabled={!connected}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.isComposing) {
-              e.preventDefault();
-              handleCardSend();
-            }
-            e.stopPropagation();
-          }}
-          onClick={(e) => e.stopPropagation()}
-        />
+        {quickData ? (
+          <SessionControls
+            ws={ws}
+            activeSession={sessionInfo}
+            quickData={quickData}
+            compact
+            hideShortcuts
+            sessions={sessions}
+            subSessions={subSessions}
+            serverId={serverId}
+          />
+        ) : (
+          <input
+            ref={cardInputRef}
+            class="subcard-input"
+            type="text"
+            placeholder={t('common.send') + '...'}
+            disabled={!connected}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.isComposing) {
+                e.preventDefault();
+                handleCardSend();
+              }
+              e.stopPropagation();
+            }}
+            onClick={(e) => e.stopPropagation()}
+          />
+        )}
       </div>
 
       {/* Resize handle — uses pointer capture to bypass parent's HTML5 draggable */}

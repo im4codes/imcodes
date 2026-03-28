@@ -64,6 +64,12 @@ interface Props {
   subUsages?: Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string }>;
   /** ID of the currently focused (topmost) sub-session window. */
   focusedSubId?: string | null;
+  /** Quick data for compact SessionControls in cards. */
+  quickData?: import('./QuickInputPanel.js').UseQuickDataResult;
+  /** All sessions — for @ picker. */
+  sessions?: import('../types.js').SessionInfo[];
+  /** All sub-sessions slim — for @ picker. */
+  allSubSessions?: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
 }
 
 const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -107,7 +113,7 @@ function formatUptime(seconds: number): string {
   return d > 0 ? `${d}d ${h}h` : `${h}h`;
 }
 
-export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId }: Props) {
+export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId, quickData, sessions, allSubSessions }: Props) {
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
   const [collapsed, setCollapsed] = useState(isMobile);
   const [showSizePanel, setShowSizePanel] = useState(false);
@@ -444,6 +450,10 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
                 onHistory={onHistory}
                 cardW={cardSize.w}
                 cardH={cardSize.h}
+                quickData={quickData}
+                sessions={sessions}
+                subSessions={allSubSessions}
+                serverId={serverId}
               />
             </div>
           ))}

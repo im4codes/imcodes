@@ -57,6 +57,8 @@ interface Props {
   quotes?: string[];
   /** Called to remove a quote by index. */
   onRemoveQuote?: (index: number) => void;
+  /** Compact mode for sub-session cards — only input, @, ⚡, 📎, send. */
+  compact?: boolean;
 }
 
 type MenuAction = 'restart' | 'new' | 'stop';
@@ -101,7 +103,7 @@ function loadCodexModel(): CodexModelChoice | null {
   return null;
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, compact }: Props) {
   const { t } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -452,10 +454,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (document.body.scrollTop !== 0) document.body.scrollTop = 0;
   };
 
-  // Plain-text only paste
+  // Paste: upload files from clipboard, or insert plain text
   const handlePaste = (e: Event) => {
+    const ce = e as ClipboardEvent;
+    const files = ce.clipboardData?.files;
+    if (files && files.length > 0) {
+      e.preventDefault();
+      void handleFileUpload(files);
+      return;
+    }
     e.preventDefault();
-    const text = (e as ClipboardEvent).clipboardData?.getData('text/plain') ?? '';
+    const text = ce.clipboardData?.getData('text/plain') ?? '';
     document.execCommand('insertText', false, text);
     setHasText(!!(divRef.current?.textContent?.trim()));
   };
@@ -587,9 +596,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         />
       </div>
     )}
-    <div class={`controls-wrapper${isVisuallyBusy(activeSession?.state, !!activeThinking) ? ' controls-wrapper-running' : ''}`}>
-      {/* Shortcut row — hidden in chat mode */}
-      {!hideShortcuts && <div class="shortcuts-row">
+    <div class={`controls-wrapper${!compact && isVisuallyBusy(activeSession?.state, !!activeThinking) ? ' controls-wrapper-running' : ''}`}>
+      {/* Shortcut row — hidden in chat mode and compact mode */}
+      {!hideShortcuts && !compact && <div class="shortcuts-row">
         <div class="shortcuts">
           {/* Quick input trigger — shown here (before Esc) when shell terminal hides input row */}
           {isShellLike && (
@@ -1036,8 +1045,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           </button>
         )}
 
-        {/* Menu button */}
-        <div class="menu-wrap" ref={menuRef}>
+        {/* Menu button — hidden in compact mode */}
+        {!compact && <div class="menu-wrap" ref={menuRef}>
           <button
             class="btn btn-secondary"
             onClick={() => { setMenuOpen((o) => !o); setConfirm(null); }}
@@ -1084,7 +1093,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               </button>
             </div>
           )}
-        </div>
+        </div>}
       </div>
     </div>
     <VoiceOverlay open={voiceOpen} onClose={() => setVoiceOpen(false)} onSend={handleVoiceSend} initialText={divRef.current?.textContent ?? ''} />
