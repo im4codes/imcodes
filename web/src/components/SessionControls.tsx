@@ -500,6 +500,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const handleMenuAction = (action: MenuAction) => {
     if (!ws || !activeSession) return;
     if (confirm === action) {
+      // Final confirmation dialog for destructive actions
+      const confirmMsg = action === 'stop' ? t('session.confirm_stop_dialog') : action === 'restart' ? t('session.confirm_restart_dialog') : t('session.confirm_new_dialog');
+      if (!window.confirm(confirmMsg)) {
+        setConfirm(null);
+        if (confirmTimerRef.current) clearTimeout(confirmTimerRef.current);
+        return;
+      }
       if (action === 'restart') {
         onSubRestart
           ? onSubRestart()
