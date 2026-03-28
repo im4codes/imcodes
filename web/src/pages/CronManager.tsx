@@ -4,6 +4,7 @@ import { apiFetch } from '../api.js';
 import type { CronAction, CronJobStatus } from '@shared/cron-types';
 import { CRON_STATUS } from '@shared/cron-types';
 import type { SessionInfo } from '../types.js';
+import { formatLabel } from '../format-label.js';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -70,10 +71,30 @@ function execStatusLabel(status: string, t: (key: string) => string): string {
   return status;
 }
 
-function mainRoles(sessions: SessionInfo[]): string[] {
-  return sessions
-    .filter(s => /^(brain|w\d+)$/.test(s.role) && !s.name.startsWith('deck_sub_'))
-    .map(s => s.role);
+/** Get main sessions (brain + workers), excluding sub-sessions. */
+function mainSessions(sessions: SessionInfo[]): SessionInfo[] {
+  return sessions.filter(s => /^(brain|w\d+)$/.test(s.role) && !s.name.startsWith('deck_sub_'));
+}
+
+/** Display label for a session: label or project/W{N}, like P2P config panel. */
+function sessionDisplayLabel(s: SessionInfo): string {
+  if (s.label) return formatLabel(s.label);
+  return s.role === 'brain' ? s.project : `W${s.name.split('_w')[1] ?? '?'}`;
+}
+
+/** Short agent type badge. */
+const AGENT_ABBR: Record<string, string> = {
+  'claude-code': 'cc', codex: 'cx', opencode: 'oc', gemini: 'gm', shell: 'sh',
+};
+function agentBadge(agentType: string): string {
+  return AGENT_ABBR[agentType] ?? agentType.slice(0, 3);
+}
+
+/** Resolve a role to its display label from sessions list. */
+function roleToDisplay(role: string, sessions: SessionInfo[]): string {
+  const s = sessions.find(x => x.role === role && !x.name.startsWith('deck_sub_'));
+  if (!s) return role;
+  return `${sessionDisplayLabel(s)} (${agentBadge(s.agentType)})`;
 }
 
 // ── Component ────────────────────────────────────────────────────────────
@@ -149,7 +170,7 @@ export function CronManager({ serverId, projectName, sessions, onBack }: Props) 
   };
 
   // ── Render ─────────────────────────────────────────────────────────────
-  const roles = mainRoles(sessions);
+  const eligible = mainSessions(sessions);
 
   return (
     <div style={{ maxWidth: '700px', margin: '0 auto', padding: '20px' }}>
@@ -170,7 +191,7 @@ export function CronManager({ serverId, projectName, sessions, onBack }: Props) 
         <CronForm
           serverId={serverId}
           projectName={projectName}
-          roles={roles}
+          sessions={eligible}
           job={editingJob}
           onDone={handleFormDone}
           onCancel={() => { setShowForm(false); setEditingJob(null); }}
@@ -197,7 +218,7 @@ export function CronManager({ serverId, projectName, sessions, onBack }: Props) 
 
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 16px', fontSize: '13px', color: '#94a3b8', marginBottom: '10px' }}>
               <div>{t('cron.schedule')}: <span style={{ color: '#cbd5e1' }}>{job.cron_expr}</span></div>
-              <div>{t('cron.target')}: <span style={{ color: '#cbd5e1' }}>{job.target_role}</span></div>
+              <div>{t('cron.target')}: <span style={{ color: '#cbd5e1' }}>{roleToDisplay(job.target_role, sessions)}</span></div>
               <div>{t('cron.last_run')}: <span style={{ color: '#cbd5e1' }}>{fmtTime(job.last_run_at)}</span></div>
               <div>{t('cron.next_run')}: <span style={{ color: '#cbd5e1' }}>{fmtTime(job.next_run_at)}</span></div>
               {job.expires_at && <div>{t('cron.expires_at')}: <span style={{ color: '#cbd5e1' }}>{fmtTime(job.expires_at)}</span></div>}
@@ -210,7 +231,7 @@ export function CronManager({ serverId, projectName, sessions, onBack }: Props) 
             )}
             {action?.type === 'p2p' && (
               <div style={{ background: '#0f172a', borderRadius: '6px', padding: '8px 10px', fontSize: '13px', color: '#cbd5e1', marginBottom: '10px' }}>
-                P2P: {action.topic} ({action.mode}, {action.participants?.join(', ')})
+                P2P: {action.topic} <span style={{ opacity: 0.6 }}>({action.mode}, {action.participants?.map(r => roleToDisplay(r, sessions)).join(', ')})</span>
               </div>
             )}
 
@@ -254,13 +275,13 @@ export function CronManager({ serverId, projectName, sessions, onBack }: Props) 
 interface CronFormProps {
   serverId: string;
   projectName: string;
-  roles: string[];
+  sessions: SessionInfo[];
   job: CronJob | null; // null = create, non-null = edit
   onDone: () => void;
   onCancel: () => void;
 }
 
-function CronForm({ serverId, projectName, roles, job, onDone, onCancel }: CronFormProps) {
+function CronForm({ serverId, projectName, sessions, job, onDone, onCancel }: CronFormProps) {
   const { t } = useTranslation();
   const isEdit = !!job;
   const existingAction = job ? parseAction(job.action) : null;
@@ -319,7 +340,7 @@ function CronForm({ serverId, projectName, roles, job, onDone, onCancel }: CronF
   };
 
   const p2pModes = ['audit', 'review', 'discuss', 'brainstorm'];
-  const availableRoles = roles.filter(r => r !== targetRole);
+  const otherSessions = sessions.filter(s => s.role !== targetRole);
 
   return (
     <div style={{ ...cardStyle, border: '1px solid #334155' }}>
@@ -337,8 +358,12 @@ function CronForm({ serverId, projectName, roles, job, onDone, onCancel }: CronF
 
         <label style={labelStyle}>{t('cron.target')}</label>
         <select style={{ ...inputStyle, appearance: 'auto' as string }} value={targetRole} onChange={e => setTargetRole((e.target as HTMLSelectElement).value)}>
-          {roles.length === 0 && <option value="brain">brain</option>}
-          {roles.map(r => <option key={r} value={r}>{r}</option>)}
+          {sessions.length === 0 && <option value="brain">brain</option>}
+          {sessions.map(s => (
+            <option key={s.role} value={s.role}>
+              {sessionDisplayLabel(s)} ({agentBadge(s.agentType)})
+            </option>
+          ))}
         </select>
 
         <label style={labelStyle}>{t('cron.action_type')}</label>
@@ -391,19 +416,18 @@ function CronForm({ serverId, projectName, roles, job, onDone, onCancel }: CronF
             </div>
 
             <label style={labelStyle}>{t('cron.p2p_participants')}</label>
-            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '10px' }}>
-              {availableRoles.map(r => (
-                <label key={r} style={{ color: '#e2e8f0', fontSize: '13px', cursor: 'pointer' }}>
+            <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', marginBottom: '10px' }}>
+              {otherSessions.map(s => (
+                <label key={s.role} style={{ color: '#e2e8f0', fontSize: '13px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}>
                   <input
                     type="checkbox"
-                    checked={p2pParticipants.includes(r)}
-                    onChange={() => setP2pParticipants(prev => prev.includes(r) ? prev.filter(x => x !== r) : [...prev, r])}
-                    style={{ marginRight: '4px' }}
+                    checked={p2pParticipants.includes(s.role)}
+                    onChange={() => setP2pParticipants(prev => prev.includes(s.role) ? prev.filter(x => x !== s.role) : [...prev, s.role])}
                   />
-                  {r}
+                  {sessionDisplayLabel(s)} <span style={{ opacity: 0.5, fontSize: '11px' }}>({agentBadge(s.agentType)})</span>
                 </label>
               ))}
-              {availableRoles.length === 0 && <span style={{ color: '#64748b', fontSize: '13px' }}>No other sessions available</span>}
+              {otherSessions.length === 0 && <span style={{ color: '#64748b', fontSize: '13px' }}>No other sessions available</span>}
             </div>
           </>
         )}
