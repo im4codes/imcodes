@@ -56,6 +56,7 @@ export interface SessionPaneProps {
   // ── Action callbacks ────────────────────────────────────────────────────────
   onStopProject?: (project: string) => void;
   onRenameSession?: () => void;
+  onSettings?: () => void;
   /** Called after shortcut/action button clicks — use to restore xterm focus. */
   onAfterAction?: () => void;
   /** Mobile: whether the file browser overlay is open. */
@@ -84,6 +85,7 @@ export function SessionPane({
   onHistory,
   onStopProject,
   onRenameSession,
+  onSettings,
   onAfterAction,
   mobileFileBrowserOpen,
   onMobileFileBrowserClose,
@@ -257,6 +259,7 @@ export function SessionPane({
           }}
           onStopProject={onStopProject}
           onRenameSession={onRenameSession}
+          onSettings={onSettings}
           sessionDisplayName={session.label ? formatLabel(session.label) : (session.project ?? null)}
           quickData={quickData}
           detectedModel={detectedModel}

@@ -37,6 +37,7 @@ export interface SessionInfo {
   state: 'running' | 'idle' | 'stopped' | 'error' | 'unknown';
   label?: string | null;
   projectDir?: string;
+  description?: string | null;
   /** Runtime backing: 'process' for tmux-backed, 'transport' for network-backed. */
   runtimeType?: 'process' | 'transport';
 }

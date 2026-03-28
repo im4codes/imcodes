@@ -24,6 +24,7 @@ import { NewSessionDialog } from './components/NewSessionDialog.js';
 import { SubSessionBar } from './components/SubSessionBar.js';
 import { SubSessionWindow } from './components/SubSessionWindow.js';
 import { StartSubSessionDialog } from './components/StartSubSessionDialog.js';
+import { SessionSettingsDialog } from './components/SessionSettingsDialog.js';
 import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } from './components/StartDiscussionDialog.js';
 import { AskQuestionDialog, type PendingQuestion } from './components/AskQuestionDialog.js';
 import { ServerContextMenu, DeleteServerDialog } from './components/ServerContextMenu.js';
@@ -32,6 +33,7 @@ import { RepoPage } from './pages/RepoPage.js';
 import { FloatingPanel } from './components/FloatingPanel.js';
 import { SettingsPage } from './pages/SettingsPage.js';
 import { AdminPage } from './pages/AdminPage.js';
+import { CronManager } from './pages/CronManager.js';
 import { ServerIconBar } from './components/ServerIconBar.js';
 import { Sidebar, loadSidebarCollapsed, saveSidebarCollapsed } from './components/Sidebar.js';
 import { SessionTree } from './components/SessionTree.js';
@@ -480,6 +482,7 @@ export function App() {
   // z-index per sub-session window
   const [subZIndexes, setSubZIndexes] = useState<Map<string, number>>(new Map());
   const [showSubDialog, setShowSubDialog] = useState(false);
+  const [settingsTarget, setSettingsTarget] = useState<{ sessionName: string; subId?: string; label: string; description: string; cwd: string; type: string; parentSession?: string | null } | null>(null);
 
   // Derive focused (topmost) sub-session from z-indexes + open set
   const focusedSubId = useMemo(() => {
@@ -501,6 +504,7 @@ export function App() {
 
   // ── Settings / Admin ────────────────────────────────────────────────────────
   const [showSettingsPage, setShowSettingsPage] = useState(false);
+  const [showCronManager, setShowCronManager] = useState(false);
   const [showAdminPage, setShowAdminPage] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
   const [userDisplayName, setUserDisplayName] = useState<string | null>(null);
@@ -1835,6 +1839,7 @@ export function App() {
                 onHistory={(apply) => registerHistoryApplyer(s.name, apply)}
                 onStopProject={handleStopProject}
                 onRenameSession={() => setRenameRequest(s.name)}
+                onSettings={() => setSettingsTarget({ sessionName: s.name, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null })}
                 onAfterAction={focusTerminal}
                 mobileFileBrowserOpen={s.name === activeSession ? showMobileFileBrowser : false}
                 onMobileFileBrowserClose={() => setShowMobileFileBrowser(false)}
@@ -2110,6 +2115,20 @@ export function App() {
         </div>
       )}
 
+      {showCronManager && selectedServerId && (() => {
+        const cronProject = sessions.find(s => s.name === activeSession)?.project;
+        return cronProject ? (
+          <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)', overflow: 'auto' }}>
+            <CronManager
+              serverId={selectedServerId}
+              projectName={cronProject}
+              sessions={sessions}
+              onBack={() => setShowCronManager(false)}
+            />
+          </div>
+        ) : null;
+      })()}
+
       {showAdminPage && (
         <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)' }}>
           <AdminPage onBack={() => setShowAdminPage(false)} />
@@ -2144,6 +2163,7 @@ export function App() {
                 const label = prompt('Rename sub-session:', sub.label ?? '');
                 if (label !== null) renameSubSession(sub.id, label);
               }}
+              onSettings={() => setSettingsTarget({ sessionName: sub.sessionName, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession })}
               zIndex={subZIndexes.get(sub.id) ?? 1000}
               onFocus={() => bringSubToFront(sub.id)}
               onPin={(vm) => pinPanel('subsession', { sessionName: sub.sessionName, viewMode: vm, label: sub.label, serverId: selectedServerId }, () => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; }))}
@@ -2216,6 +2236,33 @@ export function App() {
             }
           }}
           onClose={() => setShowSubDialog(false)}
+        />
+      )}
+
+      {settingsTarget && selectedServerId && (
+        <SessionSettingsDialog
+          serverId={selectedServerId}
+          sessionName={settingsTarget.sessionName}
+          subSessionId={settingsTarget.subId}
+          label={settingsTarget.label}
+          description={settingsTarget.description}
+          cwd={settingsTarget.cwd}
+          type={settingsTarget.type}
+          parentSession={settingsTarget.parentSession}
+          onClose={() => setSettingsTarget(null)}
+          onSaved={(fields) => {
+            if (settingsTarget.subId) {
+              // Sub-session: update local state
+              // useSubSessions handles label via rename; description/cwd not in local state yet
+            } else {
+              // Main session: update sessions list with new label
+              if (fields.label !== undefined) {
+                setSessions((prev) => prev.map((s) =>
+                  s.name === settingsTarget.sessionName ? { ...s, label: fields.label ?? null } : s
+                ));
+              }
+            }
+          }}
         />
       )}
 

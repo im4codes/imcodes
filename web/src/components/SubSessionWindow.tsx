@@ -32,6 +32,7 @@ interface Props {
   onClose: () => void;
   onRestart: () => void;
   onRename: () => void;
+  onSettings?: () => void;
   zIndex: number;
   onFocus: () => void;
   /** Optional: called to pin this sub-session to the sidebar. Passes current viewMode. */
@@ -66,7 +67,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, zIndex, onFocus, onPin, sessions, subSessions, serverId,
+  sub, ws, connected, active, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, zIndex, onFocus, onPin, sessions, subSessions, serverId,
 }: Props) {
   const { t } = useTranslation();
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -385,6 +386,7 @@ export function SubSessionWindow({
           onSubNew={onRestart}
           onSubStop={onClose}
           onRenameSession={onRename}
+          onSettings={onSettings}
           sessionDisplayName={sub.label ? formatLabel(sub.label) : agentTag}
           activeThinking={!!activeThinkingTs}
           sessions={sessions}

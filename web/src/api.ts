@@ -282,6 +282,7 @@ export interface SubSessionData {
   ccSessionId?: string | null;
   geminiSessionId?: string | null;
   parentSession?: string | null;
+  description?: string | null;
 }
 
 export async function listSubSessions(serverId: string): Promise<SubSessionData[]> {
