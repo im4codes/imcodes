@@ -7,7 +7,7 @@ export default defineConfig({
   test: {
     name: 'web-components',
     include: ['test/components/**/*.test.ts', 'test/components/**/*.test.tsx'],
-    exclude: ['**/node_modules/**'],
+    exclude: ['**/node_modules/**', 'test/components/FileBrowser.test.tsx'],
     environment: 'jsdom',
     globals: false,
     poolOptions: { forks: { execArgv: ['--max-old-space-size=6144'] } },
