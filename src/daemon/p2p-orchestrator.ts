@@ -777,22 +777,22 @@ function pushState(run: P2pRun, serverLink: ServerLink | null): void {
         current_target_label: (() => {
           if (!run.currentTargetSession) return null;
           const rec = getSession(run.currentTargetSession);
-          const name = shortName(run.currentTargetSession);
+          const label = rec?.label || shortName(run.currentTargetSession);
           const agentType = rec?.agentType ?? '';
-          return agentType ? `${name} (${agentType})` : name;
+          return agentType ? `${label} (${agentType})` : label;
         })(),
         initiator_label: (() => {
           const rec = getSession(run.initiatorSession);
-          const name = shortName(run.initiatorSession);
+          const label = rec?.label || shortName(run.initiatorSession);
           const agentType = rec?.agentType ?? '';
-          return agentType ? `${name} (${agentType})` : name;
+          return agentType ? `${label} (${agentType})` : label;
         })(),
         // Full node list for segmented progress display — includes completed, active, pending, skipped
         all_nodes: (() => {
           type NodeInfo = { session: string; label: string; agentType: string; status: 'done' | 'active' | 'pending' | 'skipped' };
           const nodes: NodeInfo[] = [];
           const skippedSet = new Set(run.skippedHops);
-          const getInfo = (s: string) => { const r = getSession(s); return { label: shortName(s), agentType: r?.agentType ?? 'unknown' }; };
+          const getInfo = (s: string) => { const r = getSession(s); return { label: r?.label || shortName(s), agentType: r?.agentType ?? 'unknown' }; };
 
           // Phase 1: initiator initial analysis
           const init = getInfo(run.initiatorSession);

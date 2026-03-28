@@ -15,6 +15,8 @@ interface LiveDiscussion {
   state: string;
   currentRound: number;
   maxRounds: number;
+  completedHops?: number;
+  totalHops?: number;
   nodes?: P2pNode[];
 }
 
@@ -124,7 +126,13 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
                   </div>
                 )}
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-                  <span style={{ fontSize: 12, color: '#e2e8f0' }}>⚖️ {d.topic || 'Discussion'}</span>
+                  <span style={{ fontSize: 12, color: '#e2e8f0' }}>
+                    ⚖️ {d.topic || 'Discussion'}
+                    <span style={{ fontSize: 10, color: '#64748b', marginLeft: 6 }}>
+                      R{d.currentRound}/{d.maxRounds}
+                      {d.totalHops != null && d.totalHops > 0 && ` · H${d.completedHops ?? 0}/${d.totalHops}`}
+                    </span>
+                  </span>
                   {onStopDiscussion && (
                     <button class="btn btn-sm btn-danger" style={{ fontSize: 10, padding: '1px 6px' }} onClick={() => onStopDiscussion(d.id)}>Stop</button>
                   )}

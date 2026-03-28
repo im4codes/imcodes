@@ -19,6 +19,12 @@ interface P2pRun {
   result_summary: string | null;
   error: string | null;
   mode_key: string;
+  initiator_label?: string | null;
+  current_target_label?: string | null;
+  current_round?: number;
+  total_rounds?: number;
+  completed_hops_count?: number;
+  total_count?: number;
 }
 
 interface P2pChainStatusProps {
@@ -162,13 +168,16 @@ export function P2pChainStatus({ run, onCancel }: P2pChainStatusProps) {
     return parseTargets(run.remaining_targets);
   }, [run.remaining_targets]);
 
+  const initiatorDisplay = run.initiator_label || shortSession(run.initiator_session);
+  const currentTargetDisplay = run.current_target_label || (run.current_target_session ? shortSession(run.current_target_session) : null);
+
   // Build chain nodes: initiator -> each target -> initiator (return)
   const chainNodes = useMemo(() => {
     const nodes: Array<{ label: string; mode?: string; icon: string; color: string }> = [];
 
     // Initiator (start)
     nodes.push({
-      label: shortSession(run.initiator_session),
+      label: initiatorDisplay,
       icon: '',
       color: '#60a5fa',
     });
@@ -177,7 +186,7 @@ export function P2pChainStatus({ run, onCancel }: P2pChainStatusProps) {
     if (run.current_target_session) {
       const isCurrent = cat === 'active';
       nodes.push({
-        label: shortSession(run.current_target_session),
+        label: currentTargetDisplay || shortSession(run.current_target_session),
         mode: run.mode_key,
         icon: isCurrent ? STATUS_ICON.active : STATUS_ICON.completed,
         color: isCurrent ? STATUS_COLORS.active : STATUS_COLORS.completed,
@@ -196,13 +205,13 @@ export function P2pChainStatus({ run, onCancel }: P2pChainStatusProps) {
 
     // Return to initiator
     nodes.push({
-      label: shortSession(run.initiator_session),
+      label: initiatorDisplay,
       icon: cat === 'completed' ? STATUS_ICON.completed : STATUS_ICON.queued,
       color: cat === 'completed' ? STATUS_COLORS.completed : STATUS_COLORS.queued,
     });
 
     return nodes;
-  }, [run, cat, remaining]);
+  }, [run, cat, remaining, initiatorDisplay, currentTargetDisplay]);
 
   return (
     <div style={containerStyle}>
@@ -224,16 +233,24 @@ export function P2pChainStatus({ run, onCancel }: P2pChainStatusProps) {
         ))}
       </div>
 
-      {/* Status badge + cancel */}
+      {/* Status badge + round/hop progress + cancel */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <span style={badgeStyle(cat)}>{run.status}</span>
+        {run.total_rounds != null && run.total_rounds > 0 && (
+          <span style={{ fontSize: 11, color: '#94a3b8' }}>
+            {t('p2p.chain.round', { current: run.current_round ?? 1, total: run.total_rounds, defaultValue: 'Round {{current}}/{{total}}' })}
+            {run.total_count != null && run.total_count > 2 && (
+              <> · {t('p2p.chain.hop', { completed: run.completed_hops_count ?? 0, total: run.total_count - 2, defaultValue: 'Hop {{completed}}/{{total}}' })}</>
+            )}
+          </span>
+        )}
         {isActive(run.status) && (
           <button
             type="button"
             style={cancelBtnStyle}
             onClick={() => onCancel(run.id)}
           >
-            Cancel
+            {t('common.cancel', 'Cancel')}
           </button>
         )}
       </div>
