@@ -497,5 +497,20 @@
     "no_participants": "没有其他可用会话",
     "show_all_projects": "所有项目",
     "view_discussion": "查看 P2P 讨论 →"
+  },
+  "fileBrowser": {
+    "edit": "编辑",
+    "preview": "预览",
+    "save": "保存",
+    "saving": "保存中…",
+    "unsavedChanges": "您有未保存的更改，确认放弃？",
+    "conflictTitle": "文件已被外部修改",
+    "conflictKeepMine": "保留我的更改",
+    "conflictUseDisk": "使用磁盘版本",
+    "conflictCancel": "取消",
+    "saveSuccess": "已保存",
+    "saveError": "保存失败",
+    "fileTooLarge": "文件过大，无法保存（> 1 MB）",
+    "saveTimeout": "保存超时 — 请重新加载文件"
   }
 }

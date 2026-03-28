@@ -11,6 +11,7 @@ import type {
   FsReadResponse,
   FsGitStatusResponse,
   FsGitDiffResponse,
+  FsWriteResponse,
 } from '../../src/shared/transport/fs.js';
 
 export type MessageHandler = (msg: ServerMessage) => void;
@@ -56,6 +57,7 @@ export type ServerMessage =
   | { type: 'p2p.list_discussions_response'; discussions: Array<{ id: string; fileName: string; preview: string; mtime: number }> }
   | { type: 'p2p.read_discussion_response'; id?: string; content?: string; error?: string }
   | FsGitDiffResponse
+  | FsWriteResponse
   | { type: 'repo.detect_response'; requestId: string; projectDir: string; context: any }
   | { type: 'repo.issues_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
   | { type: 'repo.prs_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
@@ -314,6 +316,13 @@ export class WsClient {
   fsReadFile(path: string): string {
     const requestId = crypto.randomUUID();
     this.send({ type: 'fs.read', path, requestId });
+    return requestId;
+  }
+
+  /** Write a file via the daemon. Returns requestId for matching the response. */
+  fsWriteFile(path: string, content: string, expectedMtime?: number): string {
+    const requestId = crypto.randomUUID();
+    this.send({ type: 'fs.write', path, content, expectedMtime, requestId });
     return requestId;
   }
 

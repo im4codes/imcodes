@@ -497,5 +497,20 @@
     "no_participants": "他に利用可能なセッションがありません",
     "show_all_projects": "全プロジェクト",
     "view_discussion": "P2P ディスカッションを見る →"
+  },
+  "fileBrowser": {
+    "edit": "編集",
+    "preview": "プレビュー",
+    "save": "保存",
+    "saving": "保存中…",
+    "unsavedChanges": "未保存の変更があります。破棄しますか？",
+    "conflictTitle": "ファイルが外部で変更されました",
+    "conflictKeepMine": "自分の変更を維持",
+    "conflictUseDisk": "ディスク版を使用",
+    "conflictCancel": "キャンセル",
+    "saveSuccess": "保存しました",
+    "saveError": "保存に失敗しました",
+    "fileTooLarge": "ファイルが大きすぎて保存できません（> 1 MB）",
+    "saveTimeout": "保存がタイムアウトしました — ファイルを再読み込みしてください"
   }
 }

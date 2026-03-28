@@ -37,6 +37,28 @@ export interface FsReadResponse extends FsBaseResponse {
   previewReason?: 'too_large' | 'binary' | 'unknown_type';
   /** Controlled download handle ID for this file. */
   downloadId?: string;
+  /** File's last modified time in milliseconds (for conflict detection). */
+  mtime?: number;
+}
+
+export interface FsWriteRequest {
+  type: 'fs.write';
+  requestId: string;
+  path: string;
+  content: string;
+  /** mtime from last read; omit = force write */
+  expectedMtime?: number;
+}
+
+export interface FsWriteResponse extends Omit<FsBaseResponse, 'status'> {
+  type: 'fs.write_response';
+  status: 'ok' | 'error' | 'conflict';
+  /** New mtime after successful write */
+  mtime?: number;
+  /** Conflict: current file content on disk (capped at 1MB) */
+  diskContent?: string;
+  /** Conflict: current mtime on disk */
+  diskMtime?: number;
 }
 
 export interface FsGitStatusResponse extends FsBaseResponse {

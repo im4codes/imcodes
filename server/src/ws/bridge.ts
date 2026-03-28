@@ -149,6 +149,9 @@ export class WsBridge {
   private pendingFsGitDiffRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
   private pendingFileSearchRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
 
+  /** Per-request fs.write pending map. */
+  private pendingFsWriteRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
+
   /**
    * File transfer correlation: requestId → { resolve, reject, timer }.
    * Used by HTTP upload/download handlers to await daemon responses.
@@ -435,6 +438,13 @@ export class WsBridge {
         this.pendingFileSearchRequests.set(reqId, { socket: ws, timer });
       }
 
+      // Track fs.write requests for single-cast response routing
+      if (msg.type === 'fs.write' && typeof msg.requestId === 'string') {
+        const reqId = msg.requestId;
+        const timer = setTimeout(() => this.pendingFsWriteRequests.delete(reqId), 30_000);
+        this.pendingFsWriteRequests.set(reqId, { socket: ws, timer });
+      }
+
       // Track terminal subscriptions for binary routing + ref-counted daemon forwarding
       if (msg.type === 'terminal.subscribe' && typeof msg.session === 'string') {
         const sessionName = msg.session;
@@ -550,6 +560,22 @@ export class WsBridge {
         if (pending) {
           clearTimeout(pending.timer);
           this.pendingFsGitDiffRequests.delete(requestId);
+          if (pending.socket.readyState === WebSocket.OPEN) {
+            pending.socket.send(JSON.stringify(msg));
+          }
+        }
+      }
+      return;
+    }
+
+    // ── fs.write_response: single-cast back to requesting browser ────────────
+    if (type === 'fs.write_response') {
+      const requestId = msg.requestId as string | undefined;
+      if (requestId) {
+        const pending = this.pendingFsWriteRequests.get(requestId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.pendingFsWriteRequests.delete(requestId);
           if (pending.socket.readyState === WebSocket.OPEN) {
             pending.socket.send(JSON.stringify(msg));
           }

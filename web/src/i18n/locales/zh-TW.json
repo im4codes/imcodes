@@ -497,5 +497,20 @@
     "no_participants": "沒有其他可用工作階段",
     "show_all_projects": "所有專案",
     "view_discussion": "檢視 P2P 討論 →"
+  },
+  "fileBrowser": {
+    "edit": "編輯",
+    "preview": "預覽",
+    "save": "儲存",
+    "saving": "儲存中…",
+    "unsavedChanges": "您有未儲存的變更，確認放棄？",
+    "conflictTitle": "檔案已被外部修改",
+    "conflictKeepMine": "保留我的變更",
+    "conflictUseDisk": "使用磁碟版本",
+    "conflictCancel": "取消",
+    "saveSuccess": "已儲存",
+    "saveError": "儲存失敗",
+    "fileTooLarge": "檔案過大，無法儲存（> 1 MB）",
+    "saveTimeout": "儲存逾時 — 請重新載入檔案"
   }
 }

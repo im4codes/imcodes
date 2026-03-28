@@ -282,6 +282,17 @@ export function FileBrowser({
   const [showDiff, setShowDiff] = useState(false);
   const [lightbox, setLightbox] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+
+  // Editor state
+  const [isEditing, setIsEditing] = useState(false);
+  const [editContent, setEditContent] = useState('');
+  const [originalMtime, setOriginalMtime] = useState<number | undefined>(undefined);
+  const [isDirty, setIsDirty] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'success' | 'error' | 'timeout'>('idle');
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [conflictData, setConflictData] = useState<{ diskContent: string; diskMtime: number } | null>(null);
+  const pendingWriteRef = useRef(new Map<string, string>()); // requestId → filePath
+
   const [newFolderParent, setNewFolderParent] = useState<string | null>(null);
   const [newFolderName, setNewFolderName] = useState('');
   const [modifiedFiles, setModifiedFiles] = useState<Map<string, string>>(new Map()); // path → git code
@@ -323,6 +334,7 @@ export function FileBrowser({
       pendingGitStatusRef.current.clear();
       pendingGitDiffRef.current.clear();
       pendingChangesRef.current.clear();
+      pendingWriteRef.current.clear();
       if (pendingChangesTimerRef.current) clearTimeout(pendingChangesTimerRef.current);
       for (const timer of timersRef.current.values()) clearTimeout(timer);
       timersRef.current.clear();
@@ -414,6 +426,11 @@ export function FileBrowser({
           return;
         }
 
+        // Store mtime for conflict detection
+        if (msg.mtime !== undefined) {
+          setOriginalMtime(msg.mtime);
+        }
+
         const filename = filePath.split('/').pop() ?? '';
         const { html, isMarkdown } = highlightCode(content, filename);
         setPreview((prev) => {
@@ -421,6 +438,34 @@ export function FileBrowser({
           const existing = prev.status === 'ok' && prev.path === filePath ? prev : null;
           return { status: 'ok', path: filePath, content, html, isMarkdown, diff: existing?.diff, diffHtml: existing?.diffHtml, downloadId: dlId };
         });
+        return;
+      }
+
+      if (msg.type === 'fs.write_response') {
+        const filePath = pendingWriteRef.current.get(msg.requestId);
+        if (!filePath) return;
+        pendingWriteRef.current.delete(msg.requestId);
+
+        if (msg.status === 'ok') {
+          setOriginalMtime(msg.mtime);
+          setIsDirty(false);
+          setSaveStatus('success');
+          setSaveError(null);
+          setTimeout(() => setSaveStatus((s) => s === 'success' ? 'idle' : s), 2000);
+        } else if (msg.status === 'conflict') {
+          setSaveStatus('idle');
+          setConflictData({
+            diskContent: msg.diskContent ?? '',
+            diskMtime: msg.diskMtime ?? 0,
+          });
+        } else {
+          setSaveStatus('error');
+          const errMsg = msg.error === 'file_too_large' ? t('fileBrowser.fileTooLarge')
+            : msg.error === 'forbidden_path' ? t('fileBrowser.saveError')
+            : t('fileBrowser.saveError');
+          setSaveError(errMsg);
+          setTimeout(() => setSaveStatus((s) => s === 'error' ? 'idle' : s), 3000);
+        }
         return;
       }
 
@@ -512,6 +557,17 @@ export function FileBrowser({
 
   const fetchPreview = useCallback((filePath: string) => {
     if (onPreviewFile) { onPreviewFile(filePath); return; }
+    // Warn if switching files with unsaved changes
+    if (isDirty) {
+      if (!window.confirm(t('fileBrowser.unsavedChanges'))) return;
+    }
+    setIsEditing(false);
+    setIsDirty(false);
+    setEditContent('');
+    setOriginalMtime(undefined);
+    setSaveStatus('idle');
+    setSaveError(null);
+    setConflictData(null);
     setPreview({ status: 'loading', path: filePath });
     setShowDiff(false);
     const requestId = ws.fsReadFile(filePath);
@@ -519,7 +575,37 @@ export function FileBrowser({
     // Also fetch git diff in parallel
     const diffId = ws.fsGitDiff(filePath);
     pendingGitDiffRef.current.set(diffId, filePath);
-  }, [ws]);
+  }, [ws, isDirty, t]);
+
+  const handleSave = useCallback(() => {
+    if (!isEditing || !isDirty || preview.status !== 'ok') return;
+    setSaveStatus('saving');
+    setSaveError(null);
+    const requestId = ws.fsWriteFile(preview.path, editContent, originalMtime);
+    pendingWriteRef.current.set(requestId, preview.path);
+    // 30s timeout
+    setTimeout(() => {
+      if (pendingWriteRef.current.has(requestId)) {
+        pendingWriteRef.current.delete(requestId);
+        setSaveStatus('timeout');
+        setSaveError(t('fileBrowser.saveTimeout'));
+        setTimeout(() => setSaveStatus((s) => s === 'timeout' ? 'idle' : s), 4000);
+      }
+    }, 30_000);
+  }, [isEditing, isDirty, preview, editContent, originalMtime, ws, t]);
+
+  // Keyboard shortcut: Cmd+S / Ctrl+S
+  useEffect(() => {
+    if (!isEditing) return;
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 's') {
+        e.preventDefault();
+        if (isDirty) handleSave();
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [isEditing, isDirty, handleSave]);
 
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
 
@@ -580,10 +666,11 @@ export function FileBrowser({
     if (autoPreviewPath) fetchPreview(autoPreviewPath);
   }, [autoPreviewPath, fetchPreview]);
 
-  // Auto-refresh preview content every 5s when a file is being previewed
+  // Auto-refresh preview content every 5s when a file is being previewed (paused during editing)
   useEffect(() => {
     if (preview.status !== 'ok' && preview.status !== 'image') return;
     if (onPreviewFile) return; // external preview — don't poll here
+    if (isEditing) return; // pause auto-refresh while editing
     const path = (preview as { path: string }).path;
     const timer = setInterval(() => {
       try {
@@ -594,7 +681,7 @@ export function FileBrowser({
       } catch { /* ws disconnected */ }
     }, 5000);
     return () => clearInterval(timer);
-  }, [preview.status, (preview as any).path, ws, onPreviewFile]);
+  }, [preview.status, (preview as any).path, ws, onPreviewFile, isEditing]);
 
   // Rate-limited git status refresh for the changes panel
   const CHANGES_RATE_LIMIT_MS = 5_000;
@@ -730,13 +817,96 @@ export function FileBrowser({
   );
 
   const hasDiff = preview.status === 'ok' && !!preview.diff;
+  // Edit button is only shown for text files (not binary/image/too-large/error)
+  const canEdit = preview.status === 'ok' && !preview.isMarkdown
+    ? true
+    : preview.status === 'ok' && preview.isMarkdown
+    ? true
+    : false;
+  // canEdit is true only when preview.status === 'ok' (no encoding/binary/error)
+
+  const conflictDialog = conflictData ? (
+    <div class="fb-conflict-overlay">
+      <div class="fb-conflict-dialog">
+        <div class="fb-conflict-title">{t('fileBrowser.conflictTitle')}</div>
+        <div class="fb-conflict-actions">
+          <button
+            class="btn btn-primary"
+            onClick={() => {
+              setConflictData(null);
+              if (preview.status !== 'ok') return;
+              setSaveStatus('saving');
+              setSaveError(null);
+              // Force write without expectedMtime
+              const requestId = ws.fsWriteFile(preview.path, editContent);
+              pendingWriteRef.current.set(requestId, preview.path);
+            }}
+          >{t('fileBrowser.conflictKeepMine')}</button>
+          <button
+            class="btn btn-secondary"
+            onClick={() => {
+              setEditContent(conflictData.diskContent);
+              setOriginalMtime(conflictData.diskMtime);
+              setIsDirty(false);
+              setConflictData(null);
+            }}
+          >{t('fileBrowser.conflictUseDisk')}</button>
+          <button
+            class="btn btn-secondary"
+            onClick={() => setConflictData(null)}
+          >{t('fileBrowser.conflictCancel')}</button>
+        </div>
+      </div>
+    </div>
+  ) : null;
 
   const previewPane = hasPreview ? (
     <div class="fb-preview">
       <div class="fb-preview-header">
-        <button class="fb-preview-back" onClick={() => setPreview({ status: 'idle' })}>←</button>
+        <button class="fb-preview-back" onClick={() => {
+          if (isDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
+          setIsEditing(false);
+          setIsDirty(false);
+          setPreview({ status: 'idle' });
+        }}>←</button>
         <span class="fb-preview-name">{previewPath!.split('/').pop()}</span>
-        {hasDiff && (
+        {canEdit && !isEditing && (
+          <button
+            class="fb-diff-toggle"
+            onClick={() => {
+              setEditContent(preview.status === 'ok' ? preview.content : '');
+              setIsDirty(false);
+              setIsEditing(true);
+            }}
+          >{t('fileBrowser.edit')}</button>
+        )}
+        {isEditing && (
+          <>
+            <button
+              class="fb-diff-toggle"
+              onClick={() => {
+                if (isDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
+                setIsEditing(false);
+                setIsDirty(false);
+              }}
+            >{t('fileBrowser.preview')}</button>
+            <button
+              class={`fb-diff-toggle fb-save-btn${isDirty ? ' fb-save-dirty' : ''}${saveStatus === 'saving' ? ' fb-save-saving' : ''}`}
+              disabled={saveStatus === 'saving' || !isDirty}
+              onClick={handleSave}
+            >
+              {saveStatus === 'saving' ? t('fileBrowser.saving') : t('fileBrowser.save')}
+              {isDirty && saveStatus !== 'saving' && <span class="fb-dirty-dot" />}
+            </button>
+            {(saveStatus === 'success') && (
+              <span class="fb-save-success">{t('fileBrowser.saveSuccess')}</span>
+            )}
+            {(saveStatus === 'error' || saveStatus === 'timeout') && saveError && (
+              <span class="fb-save-error">{saveError}</span>
+            )}
+          </>
+        )}
+        {!isEditing && hasDiff && (
           <button
             class={`fb-diff-toggle${showDiff ? ' active' : ''}`}
             onClick={() => setShowDiff((v) => !v)}
@@ -764,8 +934,14 @@ export function FileBrowser({
             {downloadError || t('upload.download_file')}
           </button>
         )}
-        <button class="fb-close" onClick={() => setPreview({ status: 'idle' })}>✕</button>
+        <button class="fb-close" onClick={() => {
+          if (isDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
+          setIsEditing(false);
+          setIsDirty(false);
+          setPreview({ status: 'idle' });
+        }}>✕</button>
       </div>
+      {conflictDialog}
       <div class="fb-preview-content">
         {preview.status === 'loading' && (
           <div class="fb-preview-loading">
@@ -781,12 +957,24 @@ export function FileBrowser({
             <img src={preview.dataUrl} alt={preview.path.split('/').pop() ?? ''} onClick={() => setLightbox(preview.dataUrl)} style={{ cursor: 'zoom-in' }} />
           </div>
         )}
-        {preview.status === 'ok' && !showDiff && (
+        {preview.status === 'ok' && isEditing && (
+          <textarea
+            class="fb-editor-textarea"
+            value={editContent}
+            onInput={(e) => {
+              const val = (e.target as HTMLTextAreaElement).value;
+              setEditContent(val);
+              setIsDirty(preview.status === 'ok' ? val !== preview.content : true);
+            }}
+            spellcheck={false}
+          />
+        )}
+        {preview.status === 'ok' && !isEditing && !showDiff && (
           preview.isMarkdown
             ? <div class="fb-preview-md" dangerouslySetInnerHTML={{ __html: preview.html }} />
             : <pre class="fb-preview-code hljs"><code dangerouslySetInnerHTML={{ __html: preview.html }} /></pre>
         )}
-        {preview.status === 'ok' && showDiff && preview.diffHtml && (
+        {preview.status === 'ok' && !isEditing && showDiff && preview.diffHtml && (
           <div class="fb-diff" dangerouslySetInnerHTML={{ __html: preview.diffHtml }} />
         )}
       </div>

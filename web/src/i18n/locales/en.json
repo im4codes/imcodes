@@ -497,5 +497,20 @@
     "no_participants": "No other sessions available",
     "show_all_projects": "All projects",
     "view_discussion": "View P2P Discussion →"
+  },
+  "fileBrowser": {
+    "edit": "Edit",
+    "preview": "Preview",
+    "save": "Save",
+    "saving": "Saving…",
+    "unsavedChanges": "You have unsaved changes. Discard them?",
+    "conflictTitle": "File modified externally",
+    "conflictKeepMine": "Keep my changes",
+    "conflictUseDisk": "Use disk version",
+    "conflictCancel": "Cancel",
+    "saveSuccess": "Saved",
+    "saveError": "Save failed",
+    "fileTooLarge": "File too large to save (> 1 MB)",
+    "saveTimeout": "Save timed out — please reload file"
   }
 }

@@ -1521,4 +1521,104 @@ describe('WsBridge', () => {
       expect(statusMsgs[1].connected).toBe(false);
     });
   });
+
+  // ── fs.write routing ──────────────────────────────────────────────────────
+
+  describe('fs.write routing', () => {
+    async function setupAuthBridge() {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      return { bridge, daemonWs, browserWs };
+    }
+
+    it('relays fs.write from browser to daemon', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+
+      browserWs.emit('message', JSON.stringify({
+        type: 'fs.write',
+        requestId: 'write-req-1',
+        path: '/home/user/test.txt',
+        content: 'hello',
+      }));
+      await flushAsync();
+
+      const forwarded = daemonWs.sentStrings.find((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === 'fs.write'; } catch { return false; }
+      });
+      expect(forwarded).toBeDefined();
+      const msg = JSON.parse(forwarded!);
+      expect(msg.requestId).toBe('write-req-1');
+      expect(msg.content).toBe('hello');
+    });
+
+    it('single-casts fs.write_response back to originating browser only', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs1 = new MockWs();
+      bridge.handleBrowserConnection(browserWs1 as never, 'user-1', makeDb('valid-hash'));
+
+      const browserWs2 = new MockWs();
+      bridge.handleBrowserConnection(browserWs2 as never, 'user-2', makeDb('valid-hash'));
+
+      // Browser 1 sends fs.write
+      browserWs1.emit('message', JSON.stringify({
+        type: 'fs.write',
+        requestId: 'write-req-single',
+        path: '/home/user/file.txt',
+        content: 'data',
+      }));
+      await flushAsync();
+
+      // Reset sent arrays
+      browserWs1.sent.length = 0;
+      browserWs2.sent.length = 0;
+
+      // Daemon sends back fs.write_response
+      daemonWs.emit('message', JSON.stringify({
+        type: 'fs.write_response',
+        requestId: 'write-req-single',
+        path: '/home/user/file.txt',
+        status: 'ok',
+        mtime: 1700000000000,
+      }));
+      await flushAsync();
+
+      // Only browser 1 should receive the response
+      expect(browserWs1.sentStrings.length).toBe(1);
+      expect(browserWs2.sentStrings.length).toBe(0);
+
+      const resp = JSON.parse(browserWs1.sentStrings[0]);
+      expect(resp.type).toBe('fs.write_response');
+      expect(resp.status).toBe('ok');
+      expect(resp.mtime).toBe(1700000000000);
+    });
+
+    it('does not broadcast fs.write_response (no pending map entry = silent drop)', async () => {
+      const { daemonWs, browserWs } = await setupAuthBridge();
+      browserWs.sent.length = 0;
+
+      // Daemon sends response for an unknown requestId (not in pending map)
+      daemonWs.emit('message', JSON.stringify({
+        type: 'fs.write_response',
+        requestId: 'unknown-req',
+        path: '/home/user/file.txt',
+        status: 'ok',
+        mtime: 1700000000000,
+      }));
+      await flushAsync();
+
+      // Should not be broadcast to any browser
+      expect(browserWs.sentStrings.filter(s => s.includes('fs.write_response'))).toHaveLength(0);
+    });
+  });
 });

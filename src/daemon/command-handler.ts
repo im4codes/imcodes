@@ -21,7 +21,7 @@ import {
 } from './subsession-manager.js';
 import logger from '../util/logger.js';
 import { homedir } from 'os';
-import { readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, stat as fsStat } from 'node:fs/promises';
+import { readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, stat as fsStat, writeFile as fsWriteFile } from 'node:fs/promises';
 import * as nodePath from 'node:path';
 import { exec as execCb } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -434,6 +434,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       break;
     case 'fs.mkdir':
       void handleFsMkdir(cmd, serverLink);
+      break;
+    case 'fs.write':
+      void handleFsWrite(cmd, serverLink);
       break;
     case 'p2p.cancel':
       void handleP2pCancel(cmd, serverLink);
@@ -1767,10 +1770,11 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
       return;
     }
 
+    const mtime = stats.mtimeMs;
     if (mimeType) {
       const buf = await fsReadFileRaw(real);
       const content = buf.toString('base64');
-      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', content, encoding: 'base64', mimeType, downloadId: handle.id }); } catch { /* ignore */ }
+      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', content, encoding: 'base64', mimeType, downloadId: handle.id, mtime }); } catch { /* ignore */ }
     } else {
       const content = await fsReadFileRaw(real, 'utf-8');
       // Check for binary content
@@ -1779,7 +1783,7 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
         try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'binary_file', previewReason: 'binary', downloadId: handle.id }); } catch { /* ignore */ }
         return;
       }
-      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', content, downloadId: handle.id }); } catch { /* ignore */ }
+      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', content, downloadId: handle.id, mtime }); } catch { /* ignore */ }
     }
   } catch (err) {
     try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
@@ -1904,6 +1908,90 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
     try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, resolvedPath: real, status: 'ok' }); } catch { /* ignore */ }
   } catch (err) {
     try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
+  }
+}
+
+/** fs.write — write a file (with optional mtime conflict detection) */
+async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const rawPath = cmd.path as string | undefined;
+  const requestId = cmd.requestId as string | undefined;
+  const content = cmd.content as string | undefined;
+  if (!rawPath || !requestId || content === undefined) return;
+
+  const expectedMtime = typeof cmd.expectedMtime === 'number' ? cmd.expectedMtime : undefined;
+
+  const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
+  const resolved = nodePath.resolve(expanded);
+
+  // Size check first (cheap, before any I/O)
+  if (Buffer.byteLength(content, 'utf-8') > 1_048_576) {
+    try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: 'file_too_large' }); } catch { /* ignore */ }
+    return;
+  }
+
+  // Determine if file exists to choose sandbox validation strategy
+  let fileExists = false;
+  try {
+    await fsStat(resolved);
+    fileExists = true;
+  } catch {
+    fileExists = false;
+  }
+
+  if (fileExists) {
+    // Existing file: realpath of target must be within FS_ALLOWED_ROOTS
+    try {
+      const real = await fsRealpath(resolved);
+      const allowed = FS_ALLOWED_ROOTS.some((root) => real === root || real.startsWith(root + nodePath.sep));
+      if (!allowed) {
+        try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
+        return;
+      }
+
+      // mtime conflict check
+      if (expectedMtime !== undefined) {
+        const stats = await fsStat(real);
+        if (stats.mtimeMs !== expectedMtime) {
+          // Read disk content (capped at 1MB)
+          let diskContent: string | undefined;
+          try {
+            const diskBuf = await fsReadFileRaw(real, 'utf-8');
+            diskContent = Buffer.byteLength(diskBuf, 'utf-8') > 1_048_576
+              ? diskBuf.slice(0, 1_048_576)
+              : diskBuf;
+          } catch { /* ignore read errors for conflict content */ }
+          try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'conflict', diskContent, diskMtime: stats.mtimeMs }); } catch { /* ignore */ }
+          return;
+        }
+      }
+
+      // Write the file
+      await fsWriteFile(real, content, 'utf-8');
+      const newStats = await fsStat(real);
+      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', mtime: newStats.mtimeMs }); } catch { /* ignore */ }
+    } catch (err) {
+      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
+    }
+  } else {
+    // New file: realpath of parent must be within FS_ALLOWED_ROOTS
+    const parent = nodePath.dirname(resolved);
+    try {
+      const realParent = await fsRealpath(parent);
+      const allowed = FS_ALLOWED_ROOTS.some((root) => realParent === root || realParent.startsWith(root + nodePath.sep));
+      if (!allowed) {
+        try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
+        return;
+      }
+      // Write the file
+      await fsWriteFile(resolved, content, 'utf-8');
+      const newStats = await fsStat(resolved);
+      const real = await fsRealpath(resolved);
+      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', mtime: newStats.mtimeMs }); } catch { /* ignore */ }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isNotFound = msg.includes('ENOENT') || msg.includes('no such file');
+      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: isNotFound ? 'parent_not_found' : msg }); } catch { /* ignore */ }
+    }
   }
 }
 

@@ -497,5 +497,20 @@
     "no_participants": "No hay otras sesiones disponibles",
     "show_all_projects": "Todos los proyectos",
     "view_discussion": "Ver discusión P2P →"
+  },
+  "fileBrowser": {
+    "edit": "Editar",
+    "preview": "Vista previa",
+    "save": "Guardar",
+    "saving": "Guardando…",
+    "unsavedChanges": "Tiene cambios sin guardar. ¿Descartarlos?",
+    "conflictTitle": "El archivo fue modificado externamente",
+    "conflictKeepMine": "Mantener mis cambios",
+    "conflictUseDisk": "Usar versión del disco",
+    "conflictCancel": "Cancelar",
+    "saveSuccess": "Guardado",
+    "saveError": "Error al guardar",
+    "fileTooLarge": "Archivo demasiado grande para guardar (> 1 MB)",
+    "saveTimeout": "Tiempo de espera de guardado agotado — vuelva a cargar el archivo"
   }
 }
