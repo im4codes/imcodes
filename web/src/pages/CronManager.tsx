@@ -99,7 +99,7 @@ function roleToDisplay(role: string, sessions: SessionInfo[]): string {
 
 // ── Component ────────────────────────────────────────────────────────────
 
-export function CronManager({ serverId, projectName, sessions, onBack }: Props) {
+export function CronManager({ serverId, projectName, sessions, onBack: _onBack }: Props) {
   const { t } = useTranslation();
   const [jobs, setJobs] = useState<CronJob[]>([]);
   const [loading, setLoading] = useState(true);

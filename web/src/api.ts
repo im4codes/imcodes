@@ -291,6 +291,7 @@ export async function listSubSessions(serverId: string): Promise<SubSessionData[
     cwd: string | null; label: string | null; closed_at: number | null;
     created_at: number; updated_at: number; cc_session_id: string | null;
     gemini_session_id: string | null; parent_session: string | null;
+    description: string | null;
   }> }>(`/api/server/${serverId}/sub-sessions`);
   return res.subSessions.map((s) => ({
     id: s.id, serverId: s.server_id, type: s.type,
@@ -299,6 +300,7 @@ export async function listSubSessions(serverId: string): Promise<SubSessionData[
     ccSessionId: s.cc_session_id,
     geminiSessionId: s.gemini_session_id,
     parentSession: s.parent_session,
+    description: s.description,
   }));
 }
 

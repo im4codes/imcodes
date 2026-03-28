@@ -416,7 +416,7 @@ export function App() {
     if (!auth || !selectedServerId) return;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 5_000); // 5s timeout — don't block UI on slow network
-    apiFetch<{ sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; state: string; project_dir?: string }> }>(
+    apiFetch<{ sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; agent_version?: string; state: string; project_dir?: string; runtime_type?: 'process' | 'transport'; label?: string | null; description?: string | null }> }>(
       `/api/server/${selectedServerId}/sessions`,
       { signal: ctrl.signal },
     ).then((data) => {
@@ -426,10 +426,14 @@ export function App() {
         project: s.project_name,
         role: s.role as SessionInfo['role'],
         agentType: s.agent_type,
+        agentVersion: s.agent_version,
         // Start as 'unknown' — DB state may be stale (idle not persisted back to DB).
         // Daemon will send live state via WebSocket shortly after connecting.
         state: 'unknown' as SessionInfo['state'],
         projectDir: s.project_dir,
+        runtimeType: s.runtime_type,
+        label: s.label ?? null,
+        description: s.description ?? null,
       }));
       setSessions(mapped);
       // Only mark loaded if we got data — empty means daemon hasn't synced yet,
@@ -585,7 +589,7 @@ export function App() {
   const [daemonStats, setDaemonStats] = useState<{ daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number } | null>(null);
 
   // ── Sub-sessions ───────────────────────────────────────────────────────────
-  const { subSessions, visibleSubSessions, loadedServerId, create: createSubSession, close: closeSubSession, restart: restartSubSession, rename: renameSubSession } = useSubSessions(
+  const { subSessions, visibleSubSessions, loadedServerId, create: createSubSession, close: closeSubSession, restart: restartSubSession, rename: renameSubSession, updateLocal: updateSubLocal } = useSubSessions(
     (nativeReady && auth) ? selectedServerId : null,
     wsRef.current,
     connected,
@@ -782,9 +786,10 @@ export function App() {
             agentType: s.agentType,
             agentVersion: s.agentVersion,
             state: s.state as SessionInfo['state'],
-            projectDir: existing?.projectDir,
+            projectDir: s.projectDir ?? existing?.projectDir,
             runtimeType: s.runtimeType,
-            label: (s as any).label ?? existing?.label,
+            label: s.label ?? existing?.label,
+            description: s.description ?? existing?.description,
           };
         }));
         setSessionsLoaded(true);
@@ -1898,6 +1903,8 @@ export function App() {
                 subSessions={visibleSubSessions}
                 openIds={openSubIds}
                 onOpen={toggleSubSession}
+                onClose={closeSubSession}
+                onRestart={restartSubSession}
                 onNew={() => setShowSubDialog(true)}
                 onViewDiscussions={() => { setDiscussionInitialId(null); setShowDiscussionsPage(true); }}
                 onViewDiscussion={(fileId) => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); }}
@@ -2268,15 +2275,21 @@ export function App() {
           onClose={() => setSettingsTarget(null)}
           onSaved={(fields) => {
             if (settingsTarget.subId) {
-              // Sub-session: update local state
-              // useSubSessions handles label via rename; description/cwd not in local state yet
+              // Sub-session: update local state to reflect saved label/description/cwd
+              updateSubLocal(settingsTarget.subId, {
+                label: fields.label !== undefined ? (fields.label ?? null) : undefined,
+                description: fields.description !== undefined ? (fields.description ?? null) : undefined,
+                cwd: fields.cwd !== undefined ? (fields.cwd ?? null) : undefined,
+              });
             } else {
-              // Main session: update sessions list with new label
-              if (fields.label !== undefined) {
-                setSessions((prev) => prev.map((s) =>
-                  s.name === settingsTarget.sessionName ? { ...s, label: fields.label ?? null } : s
-                ));
-              }
+              // Main session: update sessions list with saved fields
+              setSessions((prev) => prev.map((s) => {
+                if (s.name !== settingsTarget.sessionName) return s;
+                const updated = { ...s };
+                if (fields.label !== undefined) updated.label = fields.label ?? null;
+                if (fields.description !== undefined) updated.description = fields.description ?? null;
+                return updated;
+              }));
             }
           }}
         />

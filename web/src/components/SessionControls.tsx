@@ -125,6 +125,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
   const [confirm, setConfirm] = useState<MenuAction | null>(null);
+  const [confirmLevel, setConfirmLevel] = useState(0); // 0=none, 1=first warning, 2=second warning (sub-session only)
   const menuRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef<HTMLDivElement>(null);
   const p2pRef = useRef<HTMLDivElement>(null);
@@ -198,6 +199,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (menuOpen && menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setMenuOpen(false);
         setConfirm(null);
+        setConfirmLevel(0);
       }
       if (modelOpen && modelRef.current && !modelRef.current.contains(e.target as Node)) {
         setModelOpen(false);
@@ -502,44 +504,64 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     onAfterAction?.();
   };
 
-  const startConfirm = (action: MenuAction) => {
+  const resetConfirm = () => {
+    setConfirm(null);
+    setConfirmLevel(0);
+    if (confirmTimerRef.current) clearTimeout(confirmTimerRef.current);
+  };
+
+  const startConfirm = (action: MenuAction, level = 1) => {
     if (confirmTimerRef.current) clearTimeout(confirmTimerRef.current);
     setConfirm(action);
-    confirmTimerRef.current = setTimeout(() => setConfirm(null), 3000);
+    setConfirmLevel(level);
+    confirmTimerRef.current = setTimeout(resetConfirm, 3000);
   };
 
   const handleMenuAction = (action: MenuAction) => {
     if (!ws || !activeSession) return;
-    if (confirm === action) {
-      // Final confirmation dialog for destructive actions
-      const confirmMsg = action === 'stop' ? t('session.confirm_stop_dialog') : action === 'restart' ? t('session.confirm_restart_dialog') : t('session.confirm_new_dialog');
-      if (!window.confirm(confirmMsg)) {
-        setConfirm(null);
-        if (confirmTimerRef.current) clearTimeout(confirmTimerRef.current);
-        return;
-      }
-      if (action === 'restart') {
-        onSubRestart
-          ? onSubRestart()
-          : ws.sendSessionCommand('restart', { project: activeSession.project });
-      } else if (action === 'new') {
-        onSubNew
-          ? onSubNew()
-          : ws.sendSessionCommand('restart', { project: activeSession.project, fresh: true });
-      } else {
-        onSubStop
-          ? onSubStop()
-          : onStopProject
-            ? onStopProject(activeSession.project)
-            : ws.sendSessionCommand('stop', { project: activeSession.project });
-      }
-      setMenuOpen(false);
-      setConfirm(null);
-      if (confirmTimerRef.current) clearTimeout(confirmTimerRef.current);
-      onAfterAction?.();
-    } else {
-      startConfirm(action);
+    const isSub = !!onSubStop;
+
+    if (confirm !== action) {
+      // Step 1 — first click: button text changes to warn
+      startConfirm(action, 1);
+      return;
     }
+
+    if (isSub && confirmLevel < 2) {
+      // Step 2 (sub-session only) — second click: button text changes to danger
+      startConfirm(action, 2);
+      return;
+    }
+
+    // Final step — show window.confirm dialog with full details
+    const subParams = isSub ? { type: activeSession.agentType ?? '?', label: activeSession.label || '—', name: activeSession.name } : undefined;
+    const confirmMsg = action === 'stop'
+      ? (isSub ? t('session.confirm_sub_stop_dialog', subParams) : t('session.confirm_stop_dialog'))
+      : action === 'restart'
+        ? (isSub ? t('session.confirm_sub_restart_dialog', subParams) : t('session.confirm_restart_dialog'))
+        : (isSub ? t('session.confirm_sub_new_dialog', subParams) : t('session.confirm_new_dialog'));
+    if (!window.confirm(confirmMsg)) {
+      resetConfirm();
+      return;
+    }
+    if (action === 'restart') {
+      onSubRestart
+        ? onSubRestart()
+        : ws.sendSessionCommand('restart', { project: activeSession.project });
+    } else if (action === 'new') {
+      onSubNew
+        ? onSubNew()
+        : ws.sendSessionCommand('restart', { project: activeSession.project, fresh: true });
+    } else {
+      onSubStop
+        ? onSubStop()
+        : onStopProject
+          ? onStopProject(activeSession.project)
+          : ws.sendSessionCommand('stop', { project: activeSession.project });
+    }
+    setMenuOpen(false);
+    resetConfirm();
+    onAfterAction?.();
   };
 
   const handleModelSelect = (m: ModelChoice) => {
@@ -1049,7 +1071,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         {!compact && <div class="menu-wrap" ref={menuRef}>
           <button
             class="btn btn-secondary"
-            onClick={() => { setMenuOpen((o) => !o); setConfirm(null); }}
+            onClick={() => { setMenuOpen((o) => !o); resetConfirm(); }}
             disabled={disabled}
             title={t('session.actions')}
             style={{ padding: '6px 10px' }}
@@ -1059,16 +1081,20 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           {menuOpen && (
             <div class="menu-dropdown">
               <button
-                class={`menu-item ${confirm === 'restart' ? 'menu-item-warn' : ''}`}
+                class={`menu-item ${confirm === 'restart' ? (confirmLevel >= 2 ? 'menu-item-danger' : 'menu-item-warn') : ''}`}
                 onClick={() => handleMenuAction('restart')}
               >
-                {confirm === 'restart' ? t('session.confirm_restart') : t('session.restart')}
+                {confirm === 'restart'
+                  ? (confirmLevel >= 2 ? t('session.confirm_sub_restart_2', { label: activeSession?.label || activeSession?.name }) : t('session.confirm_restart'))
+                  : t('session.restart')}
               </button>
               <button
-                class={`menu-item ${confirm === 'new' ? 'menu-item-warn' : ''}`}
+                class={`menu-item ${confirm === 'new' ? (confirmLevel >= 2 ? 'menu-item-danger' : 'menu-item-warn') : ''}`}
                 onClick={() => handleMenuAction('new')}
               >
-                {confirm === 'new' ? t('session.confirm_new') : t('session.new')}
+                {confirm === 'new'
+                  ? (confirmLevel >= 2 ? t('session.confirm_sub_new_2', { label: activeSession?.label || activeSession?.name }) : t('session.confirm_new'))
+                  : t('session.new')}
               </button>
               <button
                 class="menu-item"
@@ -1089,7 +1115,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 class={`menu-item ${confirm === 'stop' ? 'menu-item-danger' : ''}`}
                 onClick={() => handleMenuAction('stop')}
               >
-                {confirm === 'stop' ? t('session.confirm_stop') : t('session.stop')}
+                {confirm === 'stop'
+                  ? (confirmLevel >= 2 ? t('session.confirm_sub_stop_2', { label: activeSession?.label || activeSession?.name }) : t('session.confirm_stop'))
+                  : t('session.stop')}
               </button>
             </div>
           )}

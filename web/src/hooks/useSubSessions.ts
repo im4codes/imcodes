@@ -227,6 +227,13 @@ export function useSubSessions(
     ));
   }, [serverId]);
 
+  /** Update local state for a sub-session (does NOT write to DB — caller handles that). */
+  const updateLocal = useCallback((id: string, fields: Partial<Pick<SubSession, 'label' | 'description' | 'cwd'>>) => {
+    setSubSessions((prev) => prev.map((s) =>
+      s.id === id ? { ...s, ...fields } : s,
+    ));
+  }, []);
+
   // Filter sub-sessions by active main session (show only those belonging to it).
   // Sub-sessions with no parentSession (null) are always visible — they were created
   // before the parentSession feature or from a context without an active session.
@@ -237,5 +244,5 @@ export function useSubSessions(
     [subSessions, activeSession],
   );
 
-  return { subSessions, visibleSubSessions, loadedServerId, create, close, restart, rename };
+  return { subSessions, visibleSubSessions, loadedServerId, create, close, restart, rename, updateLocal };
 }

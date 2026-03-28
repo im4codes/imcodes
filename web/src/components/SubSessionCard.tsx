@@ -42,6 +42,8 @@ interface Props {
   isOpen: boolean;
   isFocused?: boolean;
   onOpen: () => void;
+  onClose?: () => void;
+  onRestart?: () => void;
   onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void;
   onHistory: (sessionName: string, apply: (c: string) => void) => void;
   cardW?: number;
@@ -60,7 +62,7 @@ function loadCardW(id: string, fallback: number): number {
   return fallback;
 }
 
-export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId }: Props) {
+export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId }: Props) {
   const { t } = useTranslation();
   const isShell = sub.type === 'shell' || sub.type === 'script';
   const { events, refreshing } = isShell ? { events: [], refreshing: false } : useTimeline(sub.sessionName, ws);
@@ -234,6 +236,8 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
             quickData={quickData}
             compact
             hideShortcuts
+            onSubStop={onClose}
+            onSubRestart={onRestart}
             sessions={sessions}
             subSessions={subSessions}
             serverId={serverId}
