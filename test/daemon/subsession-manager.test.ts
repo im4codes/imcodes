@@ -39,6 +39,7 @@ vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
   startWatching: startWatchingMock,
   stopWatching: vi.fn(),
   isWatching: isWatchingMock,
+  preClaimFile: vi.fn(),
   claudeProjectDir: (dir: string) => `/mock-claude-projects/${dir.replace(/\//g, '-')}`,
   findJsonlPathBySessionId: (dir: string, id: string) => `/mock-claude-projects/${dir.replace(/\//g, '-')}/${id}.jsonl`,
   ensureClaudeSessionFile: vi.fn().mockResolvedValue('/mock/seed.jsonl'),

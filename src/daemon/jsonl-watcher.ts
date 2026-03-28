@@ -395,6 +395,37 @@ interface WatcherState {
 
 const watchers = new Map<string, WatcherState>();
 
+/**
+ * Persistent ownership registry: maps JSONL file UUID (from filename) → watcher sessionName.
+ * Unlike claimedFiles, this is NOT released on rotation — once a UUID is known to belong
+ * to a watcher, it stays registered until that watcher is stopped.  This prevents a
+ * sub-session from grabbing the main session's file even if the main session rotates
+ * (which would release the old claim in a transient-claim model).
+ */
+const ownedFileIds = new Map<string, string>(); // fileUuid → sessionName
+
+function fileUuid(filePath: string): string {
+  return basename(filePath, '.jsonl');
+}
+
+/** Register a file UUID as belonging to a watcher (called on activate). */
+function registerOwnership(sessionName: string, filePath: string): void {
+  ownedFileIds.set(fileUuid(filePath), sessionName);
+}
+
+/** Returns true if the file's UUID is owned by a DIFFERENT watcher. */
+function isOwnedByOther(sessionName: string, filePath: string): boolean {
+  const owner = ownedFileIds.get(fileUuid(filePath));
+  return !!owner && owner !== sessionName;
+}
+
+/** Release all owned UUIDs for a watcher (called on stop). */
+function releaseOwnership(sessionName: string): void {
+  for (const [uuid, name] of ownedFileIds) {
+    if (name === sessionName) ownedFileIds.delete(uuid);
+  }
+}
+
 /** Which session has claimed each JSONL file path (prevents cross-session stealing). */
 const claimedFiles = new Map<string, string>(); // filePath → sessionName
 
@@ -405,6 +436,7 @@ export function preClaimFile(sessionName: string, filePath: string): void {
     if (sn === sessionName) { claimedFiles.delete(fp); break; }
   }
   claimedFiles.set(filePath, sessionName);
+  registerOwnership(sessionName, filePath);
 }
 
 function releaseFiles(sessionName: string): void {
@@ -416,7 +448,9 @@ function releaseFiles(sessionName: string): void {
 /** Returns true if filePath is unclaimed or already claimed by sessionName. */
 function canClaim(sessionName: string, filePath: string): boolean {
   const owner = claimedFiles.get(filePath);
-  return !owner || owner === sessionName;
+  if (owner && owner !== sessionName) return false;
+  // Also reject if the UUID is owned by another watcher (persistent check)
+  return !isOwnedByOther(sessionName, filePath);
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -572,6 +606,7 @@ async function emitRecentHistory(sessionName: string, filePath: string): Promise
  */
 async function activateFile(sessionName: string, state: WatcherState, filePath: string): Promise<void> {
   preClaimFile(sessionName, filePath);
+  registerOwnership(sessionName, filePath);
   state.pendingPartialLine = '';
   try {
     const s = await stat(filePath);
@@ -631,12 +666,14 @@ export function stopWatching(sessionName: string): void {
   if (state.pollTimer) clearInterval(state.pollTimer);
   watchers.delete(sessionName);
   releaseFiles(sessionName);
+  releaseOwnership(sessionName);
 }
 
 /**
  * Start watching a specific JSONL file (CC sub-sessions with known --session-id path).
  * Pre-claims the path immediately so the main session's watchDir can't steal it,
  * then polls until the file appears, replays history, and tails new content.
+ * Supports rotation to newer files (CC creates new JSONL on context overflow).
  */
 export async function startWatchingFile(sessionName: string, filePath: string): Promise<void> {
   if (watchers.has(sessionName)) stopWatching(sessionName);
@@ -681,7 +718,6 @@ export async function startWatchingFile(sessionName: string, filePath: string): 
     await drainNewLines(sessionName, state);
 
     // Fallback rotation scan every 10s (5 ticks × 2s) in case fs.watch misses events.
-    // Primary rotation detection is via fs.watch in watchFile() which fires instantly.
     pollCount++;
     if (pollCount % 5 === 0 && state.activeFile) {
       try {
@@ -699,7 +735,6 @@ export async function startWatchingFile(sessionName: string, filePath: string): 
 }
 
 async function watchFile(sessionName: string, state: WatcherState, filePath: string): Promise<void> {
-  let lastActiveWrite = Date.now();
   try {
     const dir = dirname(filePath);
     const watcher = watch(dir, { persistent: false, signal: state.abort.signal });
@@ -712,15 +747,19 @@ async function watchFile(sessionName: string, state: WatcherState, filePath: str
       if (changedFile === state.activeFile) {
         await drainNewLines(sessionName, state);
       } else if (canClaim(sessionName, changedFile)) {
-        // A different JSONL file is being written to — CC started a new conversation.
-        // Switch immediately, no stale timeout.
-        logger.info({ sessionName, oldFile: basename(state.activeFile ?? ''), newFile: event.filename },
-          'jsonl-watcher: new file detected via fs.watch, switching (CC rotation)');
-        try {
-          await activateFile(sessionName, state, changedFile);
-          state.status = 'active';
-        } catch {
-          logger.warn({ sessionName, file: changedFile }, 'jsonl-watcher: failed to switch to newer file');
+        // A different JSONL file is being written — CC may have rotated (context overflow).
+        // Only switch if the new file is actually newer to avoid grabbing another session's file
+        // whose claim was momentarily released (matches watchDir's checkNewer guard).
+        const isNewer = await checkNewer(changedFile, state.activeFile);
+        if (isNewer || !state.activeFile) {
+          logger.info({ sessionName, oldFile: basename(state.activeFile ?? ''), newFile: event.filename },
+            'jsonl-watcher: new file detected via fs.watch, switching (CC rotation)');
+          try {
+            await activateFile(sessionName, state, changedFile);
+            state.status = 'active';
+          } catch {
+            logger.warn({ sessionName, file: changedFile }, 'jsonl-watcher: failed to switch to newer file');
+          }
         }
       }
     }

@@ -66,7 +66,10 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   } as any);
 
   if (agentType === 'claude-code' && sub.ccSessionId && sub.cwd) {
-    const { ensureClaudeSessionFile } = await import('./jsonl-watcher.js');
+    const { ensureClaudeSessionFile, preClaimFile, findJsonlPathBySessionId } = await import('./jsonl-watcher.js');
+    // Pre-claim BEFORE creating the seed file so the main session's watchDir
+    // cannot steal the new file during the gap between creation and watcher start.
+    preClaimFile(sessionName, findJsonlPathBySessionId(sub.cwd, sub.ccSessionId));
     await ensureClaudeSessionFile(sub.ccSessionId, sub.cwd).catch((e) =>
       logger.warn({ err: e, sessionName, ccSessionId: sub.ccSessionId }, 'Failed to ensure Claude seed session file for sub-session'),
     );
@@ -144,7 +147,7 @@ export async function stopSubSession(sessionName: string, serverLink?: { send(ms
 }
 
 export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promise<void> {
-  const { startWatchingFile, findJsonlPathBySessionId, ensureClaudeSessionFile, isWatching } = await import('./jsonl-watcher.js');
+  const { startWatchingFile, findJsonlPathBySessionId, ensureClaudeSessionFile, preClaimFile, isWatching } = await import('./jsonl-watcher.js');
   const { startWatchingById, isWatching: isCodexWatching, isFileClaimedByOther } = await import('./codex-watcher.js');
   const { startWatching: startGeminiWatching, startWatchingDiscovered: startGeminiWatchingDiscovered, isWatching: isGeminiWatching } = await import('./gemini-watcher.js');
 
@@ -157,6 +160,8 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
       const stored = getSession(sessionName);
       const effectiveCcSessionId = sub.ccSessionId ?? stored?.ccSessionId;
       if (sub.type === 'claude-code' && effectiveCcSessionId && sub.cwd && !isWatching(sessionName)) {
+        // Pre-claim before seed creation to prevent main session's watchDir from stealing the file
+        preClaimFile(sessionName, findJsonlPathBySessionId(sub.cwd, effectiveCcSessionId));
         await ensureClaudeSessionFile(effectiveCcSessionId, sub.cwd).catch((e) =>
           logger.warn({ err: e, sessionName, ccSessionId: effectiveCcSessionId }, 'Failed to ensure Claude seed session file during sub-session rebuild'),
         );
