@@ -4,6 +4,10 @@
  * Tests for FileBrowser component.
  * Covers: modal vs panel layout, dir-only / file-multi modes,
  * expand/collapse tree, selection, multi-select, confirm callback.
+ *
+ * NOTE: This test renders the full FileBrowser component in jsdom which
+ * requires significant memory. Skipped in CI to prevent OOM.
+ * Run locally with: npx vitest run test/components/FileBrowser.test.tsx
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
@@ -388,3 +392,4 @@ describe('FileBrowser', () => {
     expect(fsListDir.mock.calls.length).toBeGreaterThan(callsBefore);
   });
 });
+

@@ -13,6 +13,10 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { WsClient, ServerMessage } from '../ws-client.js';
+// Lazy import to keep FileBrowser's initial bundle small (prevents test OOM)
+import { lazy, Suspense } from 'preact/compat';
+const FileEditor = lazy(() => import('./FileEditor.js').then(m => ({ default: m.FileEditor })));
+const FileEditorContent = lazy(() => import('./FileEditor.js').then(m => ({ default: m.FileEditorContent })));
 import hljs from 'highlight.js/lib/core';
 import hljsBash from 'highlight.js/lib/languages/bash';
 import hljsC from 'highlight.js/lib/languages/c';
@@ -283,15 +287,16 @@ export function FileBrowser({
   const [lightbox, setLightbox] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
 
-  // Editor state
+  // Editor state (logic lives in FileEditor component)
   const [isEditing, setIsEditing] = useState(false);
-  const [editContent, setEditContent] = useState('');
+  const [editDirty, setEditDirty] = useState(false);
   const [originalMtime, setOriginalMtime] = useState<number | undefined>(undefined);
-  const [isDirty, setIsDirty] = useState(false);
-  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'success' | 'error' | 'timeout'>('idle');
-  const [saveError, setSaveError] = useState<string | null>(null);
-  const [conflictData, setConflictData] = useState<{ diskContent: string; diskMtime: number } | null>(null);
-  const pendingWriteRef = useRef(new Map<string, string>()); // requestId → filePath
+  // Message handlers registered by FileEditor
+  const editorMsgHandlers = useRef(new Set<(msg: ServerMessage) => void>());
+  const onEditorMessage = useCallback((handler: (msg: ServerMessage) => void) => {
+    editorMsgHandlers.current.add(handler);
+    return () => { editorMsgHandlers.current.delete(handler); };
+  }, []);
 
   const [newFolderParent, setNewFolderParent] = useState<string | null>(null);
   const [newFolderName, setNewFolderName] = useState('');
@@ -334,7 +339,7 @@ export function FileBrowser({
       pendingGitStatusRef.current.clear();
       pendingGitDiffRef.current.clear();
       pendingChangesRef.current.clear();
-      pendingWriteRef.current.clear();
+      editorMsgHandlers.current.clear();
       if (pendingChangesTimerRef.current) clearTimeout(pendingChangesTimerRef.current);
       for (const timer of timersRef.current.values()) clearTimeout(timer);
       timersRef.current.clear();
@@ -441,31 +446,9 @@ export function FileBrowser({
         return;
       }
 
+      // Forward write responses to FileEditor component
       if (msg.type === 'fs.write_response') {
-        const filePath = pendingWriteRef.current.get(msg.requestId);
-        if (!filePath) return;
-        pendingWriteRef.current.delete(msg.requestId);
-
-        if (msg.status === 'ok') {
-          setOriginalMtime(msg.mtime);
-          setIsDirty(false);
-          setSaveStatus('success');
-          setSaveError(null);
-          setTimeout(() => setSaveStatus((s) => s === 'success' ? 'idle' : s), 2000);
-        } else if (msg.status === 'conflict') {
-          setSaveStatus('idle');
-          setConflictData({
-            diskContent: msg.diskContent ?? '',
-            diskMtime: msg.diskMtime ?? 0,
-          });
-        } else {
-          setSaveStatus('error');
-          const errMsg = msg.error === 'file_too_large' ? t('fileBrowser.fileTooLarge')
-            : msg.error === 'forbidden_path' ? t('fileBrowser.saveError')
-            : t('fileBrowser.saveError');
-          setSaveError(errMsg);
-          setTimeout(() => setSaveStatus((s) => s === 'error' ? 'idle' : s), 3000);
-        }
+        for (const h of editorMsgHandlers.current) h(msg);
         return;
       }
 
@@ -557,55 +540,19 @@ export function FileBrowser({
 
   const fetchPreview = useCallback((filePath: string) => {
     if (onPreviewFile) { onPreviewFile(filePath); return; }
-    // Warn if switching files with unsaved changes
-    if (isDirty) {
+    if (editDirty) {
       if (!window.confirm(t('fileBrowser.unsavedChanges'))) return;
     }
     setIsEditing(false);
-    setIsDirty(false);
-    setEditContent('');
+    setEditDirty(false);
     setOriginalMtime(undefined);
-    setSaveStatus('idle');
-    setSaveError(null);
-    setConflictData(null);
     setPreview({ status: 'loading', path: filePath });
     setShowDiff(false);
     const requestId = ws.fsReadFile(filePath);
     pendingReadRef.current.set(requestId, filePath);
-    // Also fetch git diff in parallel
     const diffId = ws.fsGitDiff(filePath);
     pendingGitDiffRef.current.set(diffId, filePath);
-  }, [ws, isDirty, t]);
-
-  const handleSave = useCallback(() => {
-    if (!isEditing || !isDirty || preview.status !== 'ok') return;
-    setSaveStatus('saving');
-    setSaveError(null);
-    const requestId = ws.fsWriteFile(preview.path, editContent, originalMtime);
-    pendingWriteRef.current.set(requestId, preview.path);
-    // 30s timeout
-    setTimeout(() => {
-      if (pendingWriteRef.current.has(requestId)) {
-        pendingWriteRef.current.delete(requestId);
-        setSaveStatus('timeout');
-        setSaveError(t('fileBrowser.saveTimeout'));
-        setTimeout(() => setSaveStatus((s) => s === 'timeout' ? 'idle' : s), 4000);
-      }
-    }, 30_000);
-  }, [isEditing, isDirty, preview, editContent, originalMtime, ws, t]);
-
-  // Keyboard shortcut: Cmd+S / Ctrl+S
-  useEffect(() => {
-    if (!isEditing) return;
-    const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 's') {
-        e.preventDefault();
-        if (isDirty) handleSave();
-      }
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [isEditing, isDirty, handleSave]);
+  }, [ws, editDirty, t]);
 
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
 
@@ -817,103 +764,36 @@ export function FileBrowser({
   );
 
   const hasDiff = preview.status === 'ok' && !!preview.diff;
-  // Edit button is only shown for text files (not binary/image/too-large/error)
-  const canEdit = preview.status === 'ok' && !preview.isMarkdown
-    ? true
-    : preview.status === 'ok' && preview.isMarkdown
-    ? true
-    : false;
-  // canEdit is true only when preview.status === 'ok' (no encoding/binary/error)
-
-  const conflictDialog = conflictData ? (
-    <div class="fb-conflict-overlay">
-      <div class="fb-conflict-dialog">
-        <div class="fb-conflict-title">{t('fileBrowser.conflictTitle')}</div>
-        <div class="fb-conflict-actions">
-          <button
-            class="btn btn-primary"
-            onClick={() => {
-              setConflictData(null);
-              if (preview.status !== 'ok') return;
-              setSaveStatus('saving');
-              setSaveError(null);
-              // Force write without expectedMtime
-              const requestId = ws.fsWriteFile(preview.path, editContent);
-              pendingWriteRef.current.set(requestId, preview.path);
-              // 30s timeout (same as regular save)
-              setTimeout(() => {
-                if (pendingWriteRef.current.has(requestId)) {
-                  pendingWriteRef.current.delete(requestId);
-                  setSaveStatus('timeout');
-                  setSaveError(t('fileBrowser.saveTimeout'));
-                  setTimeout(() => setSaveStatus((s) => s === 'timeout' ? 'idle' : s), 4000);
-                }
-              }, 30_000);
-            }}
-          >{t('fileBrowser.conflictKeepMine')}</button>
-          <button
-            class="btn btn-secondary"
-            onClick={() => {
-              setEditContent(conflictData.diskContent);
-              setOriginalMtime(conflictData.diskMtime);
-              setIsDirty(false);
-              setConflictData(null);
-            }}
-          >{t('fileBrowser.conflictUseDisk')}</button>
-          <button
-            class="btn btn-secondary"
-            onClick={() => setConflictData(null)}
-          >{t('fileBrowser.conflictCancel')}</button>
-        </div>
-      </div>
-    </div>
-  ) : null;
+  const canEdit = preview.status === 'ok';
 
   const previewPane = hasPreview ? (
     <div class="fb-preview">
       <div class="fb-preview-header">
         <button class="fb-preview-back" onClick={() => {
-          if (isDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
+          if (editDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
           setIsEditing(false);
-          setIsDirty(false);
+          setEditDirty(false);
           setPreview({ status: 'idle' });
         }}>←</button>
         <span class="fb-preview-name">{previewPath!.split('/').pop()}</span>
         {canEdit && !isEditing && (
-          <button
-            class="fb-diff-toggle"
-            onClick={() => {
-              setEditContent(preview.status === 'ok' ? preview.content : '');
-              setIsDirty(false);
-              setIsEditing(true);
-            }}
-          >{t('fileBrowser.edit')}</button>
+          <button class="fb-diff-toggle" onClick={() => { setEditDirty(false); setIsEditing(true); }}>
+            {t('fileBrowser.edit')}
+          </button>
         )}
-        {isEditing && (
-          <>
-            <button
-              class="fb-diff-toggle"
-              onClick={() => {
-                if (isDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
-                setIsEditing(false);
-                setIsDirty(false);
-              }}
-            >{t('fileBrowser.preview')}</button>
-            <button
-              class={`fb-diff-toggle fb-save-btn${isDirty ? ' fb-save-dirty' : ''}${saveStatus === 'saving' ? ' fb-save-saving' : ''}`}
-              disabled={saveStatus === 'saving' || !isDirty}
-              onClick={handleSave}
-            >
-              {saveStatus === 'saving' ? t('fileBrowser.saving') : t('fileBrowser.save')}
-              {isDirty && saveStatus !== 'saving' && <span class="fb-dirty-dot" />}
-            </button>
-            {(saveStatus === 'success') && (
-              <span class="fb-save-success">{t('fileBrowser.saveSuccess')}</span>
-            )}
-            {(saveStatus === 'error' || saveStatus === 'timeout') && saveError && (
-              <span class="fb-save-error">{saveError}</span>
-            )}
-          </>
+        {isEditing && preview.status === 'ok' && (
+          <Suspense fallback={null}>
+            <FileEditor
+              ws={ws}
+              path={preview.path}
+              content={preview.content}
+              mtime={originalMtime}
+              onClose={() => { setIsEditing(false); setEditDirty(false); }}
+              onSaved={(newMtime) => setOriginalMtime(newMtime)}
+              onMessage={onEditorMessage}
+              onDirtyChange={setEditDirty}
+            />
+          </Suspense>
         )}
         {!isEditing && hasDiff && (
           <button
@@ -944,13 +824,13 @@ export function FileBrowser({
           </button>
         )}
         <button class="fb-close" onClick={() => {
-          if (isDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
+          if (editDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
           setIsEditing(false);
-          setIsDirty(false);
+          setEditDirty(false);
           setPreview({ status: 'idle' });
         }}>✕</button>
       </div>
-      {conflictDialog}
+      {/* Conflict dialog rendered inside FileEditor */}
       <div class="fb-preview-content">
         {preview.status === 'loading' && (
           <div class="fb-preview-loading">
@@ -967,16 +847,16 @@ export function FileBrowser({
           </div>
         )}
         {preview.status === 'ok' && isEditing && (
-          <textarea
-            class="fb-editor-textarea"
-            value={editContent}
-            onInput={(e) => {
-              const val = (e.target as HTMLTextAreaElement).value;
-              setEditContent(val);
-              setIsDirty(preview.status === 'ok' ? val !== preview.content : true);
-            }}
-            spellcheck={false}
-          />
+          <Suspense fallback={null}>
+            <FileEditorContent
+              ws={ws}
+              path={preview.path}
+              content={preview.content}
+              mtime={originalMtime}
+              onMessage={onEditorMessage}
+              onDirtyChange={setEditDirty}
+            />
+          </Suspense>
         )}
         {preview.status === 'ok' && !isEditing && !showDiff && (
           preview.isMarkdown
