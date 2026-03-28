@@ -495,6 +495,7 @@
     "status_skipped_busy": "已跳過（忙碌）",
     "status_error": "錯誤",
     "no_participants": "沒有其他可用工作階段",
-    "show_all_projects": "所有專案"
+    "show_all_projects": "所有專案",
+    "view_discussion": "檢視 P2P 討論 →"
   }
 }

@@ -780,6 +780,21 @@ export class WsBridge {
       return;
     }
 
+    // ── Cron→P2P linking: update execution detail with discussion ID ──────
+    if (type === 'cron.p2p_linked' && this.db) {
+      const { jobId, discussionId } = msg as { jobId: string; discussionId: string };
+      if (jobId && discussionId) {
+        void this.db.execute(
+          `UPDATE cron_executions SET detail = $1 WHERE id = (
+             SELECT id FROM cron_executions WHERE job_id = $2 ORDER BY created_at DESC LIMIT 1
+           )`,
+          [`p2p:${discussionId}`, jobId],
+        ).catch(() => {});
+      }
+      this.broadcastToBrowsers(JSON.stringify({ type: 'cron.p2p_linked', jobId, discussionId }));
+      return;
+    }
+
     // ── P2P orchestration run persistence + broadcast ────────────────────────
     if (type === 'p2p.run_save' && this.db) {
       void upsertOrchestrationRun(this.db, msg.run as any).catch(() => {});

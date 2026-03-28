@@ -47,6 +47,7 @@ interface Props {
   subSessions?: SubSessionSlim[];
   activeSession?: string | null;
   onBack: () => void;
+  onViewDiscussion?: (fileId: string) => void;
 }
 
 // ── Styles ───────────────────────────────────────────────────────────────
@@ -112,7 +113,7 @@ function roleToDisplay(role: string, sessions: SessionInfo[], projectName?: stri
 
 // ── Component ────────────────────────────────────────────────────────────
 
-export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession: _activeSession, onBack: _onBack }: Props) {
+export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession: _activeSession, onBack: _onBack, onViewDiscussion }: Props) {
   const { t } = useTranslation();
   const [jobs, setJobs] = useState<CronJob[]>([]);
   const [loading, setLoading] = useState(true);
@@ -297,7 +298,13 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
                 <span style={{ color: exec.status === 'dispatched' ? '#4ade80' : exec.status === 'error' ? '#f87171' : '#fbbf24' }}>
                   {execStatusLabel(exec.status, t)}
                 </span>
-                {exec.detail && <span style={{ flex: 1, color: '#64748b' }}>{exec.detail}</span>}
+                {exec.detail && (exec.detail.startsWith('p2p:') && onViewDiscussion
+                  ? <button type="button" onClick={() => onViewDiscussion(exec.detail!.slice(4))}
+                      style={{ flex: 1, color: '#60a5fa', background: 'none', border: 'none', cursor: 'pointer', fontSize: '12px', textAlign: 'left', padding: 0, textDecoration: 'underline' }}>
+                      {t('cron.view_discussion')}
+                    </button>
+                  : <span style={{ flex: 1, color: '#64748b' }}>{exec.detail}</span>
+                )}
               </div>
             ))}
           </div>

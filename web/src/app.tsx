@@ -2150,6 +2150,7 @@ export function App() {
               subSessions={subSessionsSlim}
               activeSession={activeSession}
               onBack={() => setShowCronManager(false)}
+              onViewDiscussion={(fileId) => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); }}
             />
           </FloatingPanel>
         ) : null;

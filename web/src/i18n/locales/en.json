@@ -495,6 +495,7 @@
     "status_skipped_busy": "Skipped (busy)",
     "status_error": "Error",
     "no_participants": "No other sessions available",
-    "show_all_projects": "All projects"
+    "show_all_projects": "All projects",
+    "view_discussion": "View P2P Discussion →"
   }
 }
