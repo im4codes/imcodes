@@ -548,7 +548,7 @@ body {
 .subcard-ctx-cache { position: absolute; left: 0; top: 0; height: 100%; background: #818cf8; border-radius: 2px; }
 
 .subcard-preview { flex: 1; overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; justify-content: flex-end; }
-.subcard-resize-handle { position: absolute; top: 0; right: 0; width: 6px; height: 100%; cursor: ew-resize; background: transparent; z-index: 10; transition: background 0.15s; touch-action: none; }
+.subcard-resize-handle { position: absolute; top: 0; right: -6px; width: 16px; height: 100%; cursor: ew-resize; background: transparent; z-index: 10; transition: background 0.15s; touch-action: none; }
 .subcard-resize-handle:hover { background: rgba(59,130,246,0.4); }
 .subcard-input-area { flex-shrink: 0; border-top: 1px solid #1e293b; background: #0d1117; padding: 4px 6px; display: flex; flex-direction: column; gap: 3px; }
 .subcard-shortcuts { display: flex; gap: 3px; }
