@@ -7,6 +7,7 @@ import { ChatView } from './ChatView.js';
 import { TerminalView } from './TerminalView.js';
 import { FileBrowser } from './FileBrowser.js';
 import { RepoPage } from '../pages/RepoPage.js';
+import { CronManager } from '../pages/CronManager.js';
 import { useTimeline } from '../hooks/useTimeline.js';
 import { useTranslation } from 'react-i18next';
 import type { PinnedPanel } from '../app.js';
@@ -120,6 +121,27 @@ registerPanelType('repopage', {
         projectDir={projectDir}
         onBack={() => {}}
         onCiEvent={ctx.onCiEvent ?? (() => {})}
+      />
+    );
+  },
+});
+
+// ── Cron manager panel ──────────────────────────────────────────────────
+
+registerPanelType('cronmanager', {
+  title: () => 'Scheduled Tasks',
+  render: (panel, ctx) => {
+    // Derive project from active session, fall back to pinned prop
+    const projectName = (ctx.sessions?.find(s => s.name === ctx.activeSession)?.project
+      ?? panel.props?.projectName as string | undefined);
+    if (!projectName) return <div class="sidebar-pinned-unavailable">No project</div>;
+    return (
+      <CronManager
+        key={`${ctx.serverId}:${projectName}`}
+        serverId={ctx.serverId}
+        projectName={projectName}
+        sessions={(ctx.sessions ?? []) as any}
+        onBack={() => {}}
       />
     );
   },

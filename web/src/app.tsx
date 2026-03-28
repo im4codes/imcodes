@@ -654,6 +654,8 @@ export function App() {
       setShowDesktopFileBrowser(true);
     } else if (panel.type === 'repopage') {
       setShowRepoPage(true);
+    } else if (panel.type === 'cronmanager') {
+      setShowCronManager(true);
     } else if (panel.type === 'subsession') {
       const sub = subSessions.find((s) => s.sessionName === (panel.props?.sessionName as string));
       if (sub) {
@@ -1601,6 +1603,7 @@ export function App() {
                 onPreviewFile: (path) => setPreviewFilePath(path),
                 activeSession,
                 activeProjectDir: activeSessionInfo?.projectDir,
+                sessions,
                 onQuote: (text) => {
                   const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
                   if (inputEl) {
@@ -1918,6 +1921,9 @@ export function App() {
                 onViewCron={() => setShowCronManager(true)}
                 subUsages={subUsages}
                 focusedSubId={focusedSubId}
+                quickData={quickData}
+                sessions={sessions}
+                allSubSessions={subSessionsSlim}
               />
             )}
           </>
@@ -2011,6 +2017,7 @@ export function App() {
                   onPreviewFile: (path) => { setPreviewFilePath(path); closeSidebar(); },
                   activeSession,
                   activeProjectDir: activeSessionInfo?.projectDir,
+                  sessions,
                   onQuote: (text) => {
                     const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
                     if (inputEl) {
@@ -2119,14 +2126,22 @@ export function App() {
       {showCronManager && selectedServerId && (() => {
         const cronProject = sessions.find(s => s.name === activeSession)?.project;
         return cronProject ? (
-          <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)', overflow: 'auto' }}>
+          <FloatingPanel
+            id="cron"
+            title={trans('cron.title')}
+            onClose={() => setShowCronManager(false)}
+            onPin={() => pinPanel('cronmanager', { sessionName: activeSession, projectName: cronProject, serverId: selectedServerId }, () => setShowCronManager(false))}
+            pinTooltip={trans('sidebar.pin_to_sidebar')}
+            defaultW={700}
+            defaultH={550}
+          >
             <CronManager
               serverId={selectedServerId}
               projectName={cronProject}
               sessions={sessions}
               onBack={() => setShowCronManager(false)}
             />
-          </div>
+          </FloatingPanel>
         ) : null;
       })()}
 

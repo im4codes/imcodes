@@ -32,6 +32,8 @@ export interface PanelRenderContext {
   activeProjectDir?: string;
   /** Quote callback — adds quoted text to the main session's input */
   onQuote?: (text: string) => void;
+  /** Main sessions list — for panels that need session info (e.g., cron manager) */
+  sessions?: Array<{ name: string; project: string; role: string; agentType: string; label?: string | null; state: string; runtimeType?: string }>;
 }
 
 export interface PanelTypeRegistration {

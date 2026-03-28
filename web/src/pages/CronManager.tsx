@@ -174,9 +174,7 @@ export function CronManager({ serverId, projectName, sessions, onBack }: Props) 
 
   return (
     <div style={{ maxWidth: '700px', margin: '0 auto', padding: '20px' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '20px' }}>
-        <button onClick={onBack} style={{ ...btnSecondary, padding: '6px 12px' }}>&larr;</button>
-        <h2 style={{ color: '#e2e8f0', margin: 0, fontSize: '20px' }}>{t('cron.title')}</h2>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
         <div style={{ flex: 1 }} />
         {!showForm && (
           <button onClick={() => { setEditingJob(null); setShowForm(true); }} style={btnPrimary}>
