@@ -112,6 +112,8 @@ jobs:
         run: npm ci
         working-directory: web
       - run: npm run test:web
+        env:
+          NODE_OPTIONS: '--max-old-space-size=4096'
 
   # ── Server unit tests ─────────────────────────────────────────────────────
 
