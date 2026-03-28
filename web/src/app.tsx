@@ -1926,7 +1926,13 @@ export function App() {
                 onHistory={registerHistoryApplyer}
                 serverId={selectedServerId}
                 onViewRepo={() => setShowRepoPage(true)}
-                onViewCron={() => setShowCronManager(true)}
+                onViewCron={() => {
+                  const cronProject = sessions.find(s => s.name === activeSession)?.project;
+                  if (cronProject) {
+                    // Pin directly to sidebar instead of floating window
+                    pinPanel('cronmanager', { sessionName: activeSession, projectName: cronProject, serverId: selectedServerId }, () => {});
+                  }
+                }}
                 subUsages={subUsages}
                 focusedSubId={focusedSubId}
                 quickData={quickData}

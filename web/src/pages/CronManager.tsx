@@ -203,7 +203,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   };
 
   return (
-    <div style={{ maxWidth: '700px', margin: '0 auto', padding: '12px 20px' }}>
+    <div style={{ width: '90%', maxWidth: '700px', margin: '0 auto', padding: '12px 0', height: '100%', overflow: 'auto' }}>
       {/* Toolbar: show-all toggle + add button */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px' }}>
         <label style={{ color: '#94a3b8', fontSize: '12px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}>
