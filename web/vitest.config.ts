@@ -18,5 +18,10 @@ export default defineConfig({
     exclude: ['**/node_modules/**'],
     environment: 'jsdom',
     globals: false,
+    poolOptions: {
+      forks: {
+        execArgv: ['--max-old-space-size=4096'],
+      },
+    },
   },
 });
