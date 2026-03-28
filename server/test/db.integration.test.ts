@@ -35,6 +35,7 @@ import {
   deleteDbSession,
   updateSessionLabel,
   updateProjectName,
+  updateSession,
   getQuickData,
   upsertQuickData,
   getUserPref,
@@ -404,6 +405,30 @@ describe('sessions', () => {
     const sessions = await getDbSessionsByServer(db, serverId);
     const s = sessions.find(s => s.name === 'deck_proj_brain');
     expect(s?.project_name).toBe('new-proj');
+  });
+
+  it('updateSession sets description and project_dir', async () => {
+    await updateSession(db, serverId, 'deck_proj_brain', { description: 'A test persona', project_dir: '/home/new' });
+    const sessions = await getDbSessionsByServer(db, serverId);
+    const s = sessions.find(s => s.name === 'deck_proj_brain');
+    expect(s?.description).toBe('A test persona');
+    expect(s?.project_dir).toBe('/home/new');
+  });
+
+  it('updateSession sets label without affecting other fields', async () => {
+    await updateSession(db, serverId, 'deck_proj_brain', { label: 'Updated Label' });
+    const sessions = await getDbSessionsByServer(db, serverId);
+    const s = sessions.find(s => s.name === 'deck_proj_brain');
+    expect(s?.label).toBe('Updated Label');
+    expect(s?.description).toBe('A test persona'); // unchanged from previous test
+  });
+
+  it('updateSubSession sets description and cwd', async () => {
+    await createSubSession(db, 'desc-sub-1', serverId, 'shell', null, '/old/path', 'test-sub', null);
+    await updateSubSession(db, 'desc-sub-1', serverId, { description: 'Shell persona', cwd: '/new/path' });
+    const sub = await getSubSessionById(db, 'desc-sub-1', serverId);
+    expect(sub?.description).toBe('Shell persona');
+    expect(sub?.cwd).toBe('/new/path');
   });
 
   it('deleteDbSession removes session', async () => {

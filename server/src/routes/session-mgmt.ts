@@ -1,6 +1,6 @@
 import { Hono, type Context } from 'hono';
 import type { Env } from '../env.js';
-import { getServerById, getDbSessionsByServer, upsertDbSession, deleteDbSession, updateSessionLabel, updateProjectName } from '../db/queries.js';
+import { getServerById, getDbSessionsByServer, upsertDbSession, deleteDbSession, updateSessionLabel, updateProjectName, updateSession } from '../db/queries.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { randomHex } from '../security/crypto.js';
 import { WsBridge } from '../ws/bridge.js';
@@ -79,6 +79,30 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/label', async (c) => {
 
   const label = typeof body.label === 'string' && body.label.trim() ? body.label.trim() : null;
   await updateSessionLabel(c.env.DB, serverId, sessionName, label);
+  return c.json({ ok: true });
+});
+
+/** PATCH /api/server/:id/sessions/:name — update session settings (label, description, cwd) */
+sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const sessionName = c.req.param('name')!;
+  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+
+  let body: { label?: string | null; description?: string | null; cwd?: string | null };
+  try {
+    body = await c.req.json() as typeof body;
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400);
+  }
+
+  const fields: { label?: string | null; description?: string | null; project_dir?: string | null } = {};
+  if ('label' in body) fields.label = body.label ?? null;
+  if ('description' in body) fields.description = body.description ?? null;
+  if ('cwd' in body) fields.project_dir = body.cwd ?? null;
+
+  await updateSession(c.env.DB, serverId, sessionName, fields);
   return c.json({ ok: true });
 });
 

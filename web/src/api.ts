@@ -331,9 +331,20 @@ export async function createSubSession(
 export async function patchSubSession(
   serverId: string,
   subId: string,
-  body: { label?: string | null; closedAt?: number | null },
+  body: { label?: string | null; closedAt?: number | null; description?: string | null; cwd?: string | null },
 ): Promise<void> {
   await apiFetch(`/api/server/${serverId}/sub-sessions/${subId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(body),
+  });
+}
+
+export async function patchSession(
+  serverId: string,
+  sessionName: string,
+  body: { label?: string | null; description?: string | null; cwd?: string | null },
+): Promise<void> {
+  await apiFetch(`/api/server/${serverId}/sessions/${sessionName}`, {
     method: 'PATCH',
     body: JSON.stringify(body),
   });

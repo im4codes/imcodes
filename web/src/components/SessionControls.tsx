@@ -26,6 +26,8 @@ interface Props {
   onStopProject?: (project: string) => void;
   /** Called when Rename is selected in the menu. */
   onRenameSession?: () => void;
+  /** Called when Settings is selected in the menu. */
+  onSettings?: () => void;
   /** Display name (rename label) for the active session — shown in placeholder. */
   sessionDisplayName?: string | null;
   /** Quick data hook result from parent (loaded once at app level). */
@@ -99,7 +101,7 @@ function loadCodexModel(): CodexModelChoice | null {
   return null;
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote }: Props) {
   const { t } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -1065,6 +1067,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               >
                 {t('session.rename')}
               </button>
+              {onSettings && (
+                <button
+                  class="menu-item"
+                  onClick={() => { onSettings(); setMenuOpen(false); }}
+                >
+                  {t('session.settings')}
+                </button>
+              )}
               <div class="menu-divider" />
               <button
                 class={`menu-item ${confirm === 'stop' ? 'menu-item-danger' : ''}`}

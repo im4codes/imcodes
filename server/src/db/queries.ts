@@ -402,6 +402,28 @@ export async function updateProjectName(db: Database, serverId: string, sessionN
   );
 }
 
+export async function updateSession(
+  db: Database,
+  serverId: string,
+  name: string,
+  fields: { label?: string | null; description?: string | null; project_dir?: string | null },
+): Promise<void> {
+  const parts: string[] = [];
+  const vals: unknown[] = [];
+  let idx = 1;
+  if ('label' in fields) { parts.push(`label = $${idx++}`); vals.push(fields.label ?? null); }
+  if ('description' in fields) { parts.push(`description = $${idx++}`); vals.push(fields.description ?? null); }
+  if ('project_dir' in fields) { parts.push(`project_dir = $${idx++}`); vals.push(fields.project_dir ?? null); }
+  if (parts.length === 0) return;
+  parts.push(`updated_at = $${idx++}`);
+  vals.push(Date.now());
+  vals.push(serverId, name);
+  await db.execute(
+    `UPDATE sessions SET ${parts.join(', ')} WHERE server_id = $${idx++} AND name = $${idx++}`,
+    vals,
+  );
+}
+
 // ── Quick data ────────────────────────────────────────────────────────────
 
 const EMPTY_QUICK_DATA: QuickData = { history: [], sessionHistory: {}, commands: [], phrases: [] };
