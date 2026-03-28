@@ -38,6 +38,7 @@ interface DiscussionSummary {
   maxRounds: number;
   currentSpeaker?: string;
   conclusion?: string;
+  error?: string;
   filePath?: string;
   fileId?: string;
   nodes?: P2pNode[];
@@ -355,7 +356,12 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
                     </>
                   )}
                   {d.state === 'failed' && (
-                    <div class="discussion-status failed">✕ Failed</div>
+                    <>
+                      <div class="discussion-status failed">✕ Failed</div>
+                      {d.error && (
+                        <div class="discussion-conclusion" style={{ color: '#f87171' }}>{d.error}</div>
+                      )}
+                    </>
                   )}
                 </div>
               </div>

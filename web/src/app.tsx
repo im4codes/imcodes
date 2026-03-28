@@ -919,7 +919,7 @@ export function App() {
       if (msg.type === 'discussion.error') {
         if (msg.discussionId) {
           setDiscussions((prev) => prev.map((d) =>
-            d.id === msg.discussionId ? { ...d, state: 'failed' } : d,
+            d.id === msg.discussionId ? { ...d, state: 'failed', error: msg.error ?? undefined } : d,
           ));
         }
       }
@@ -983,6 +983,7 @@ export function App() {
             totalHops: totalCount - 2, // total_count includes Phase 1 + Phase 3; hops = targets only
             currentSpeaker: currentTarget,
             conclusion: state === 'done' ? (r.result_summary ?? undefined) : undefined,
+            error: state === 'failed' ? (r.error ?? undefined) : undefined,
             filePath: undefined,
             fileId,
             nodes,
@@ -1908,7 +1909,7 @@ export function App() {
                 onNew={() => setShowSubDialog(true)}
                 onViewDiscussions={() => { setDiscussionInitialId(null); setShowDiscussionsPage(true); }}
                 onViewDiscussion={(fileId) => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); }}
-                discussions={discussions.filter((d) => d.state !== 'done' && d.state !== 'failed')}
+                discussions={discussions.filter((d) => d.state !== 'done')}
                 onStopDiscussion={(id) => {
                   if (id.startsWith('p2p_')) {
                     // P2P runs use p2p.cancel with the actual run ID (strip p2p_ prefix)
