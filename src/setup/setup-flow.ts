@@ -13,12 +13,12 @@
 
 import { randomBytes, createHash } from 'node:crypto';
 import { writeFile, readFile, mkdir } from 'node:fs/promises';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync, readFileSync } from 'node:fs';
 import { execSync, execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 import { homedir, hostname } from 'node:os';
-import { DOCKER_COMPOSE_TEMPLATE, caddyfileTemplate, envTemplate } from './templates.js';
+import { dockerComposeTemplate, caddyfileTemplate, envTemplate } from './templates.js';
 
 const CREDS_DIR = join(homedir(), '.imcodes');
 const CREDS_PATH = join(CREDS_DIR, 'server.json');
@@ -92,6 +92,55 @@ function run(cmd: string, cwd: string): void {
 
 function runQuiet(cmd: string, cwd: string): string {
   return execSync(cmd, { cwd, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+}
+
+// ── Mirror mode detection ───────────────────────────────────────────────────
+
+const DOCKER_HUB_MIRRORS = [
+  'https://docker.1ms.run',
+  'https://docker.m.daocloud.io',
+];
+const GHCR_MIRROR_PREFIX = 'ghcr.nju.edu.cn';
+
+/** Detect if Docker Hub is reachable. If not, enable mirror mode. */
+function detectMirrorMode(): boolean {
+  try {
+    execSync('curl -sf --connect-timeout 3 --max-time 5 https://hub.docker.com/ -o /dev/null', { stdio: 'ignore' });
+    return false; // reachable → direct mode
+  } catch {
+    return true;  // blocked → mirror mode
+  }
+}
+
+/** Check if daemon.json already has registry mirrors configured. */
+function hasDaemonMirrors(): boolean {
+  const daemonJson = '/etc/docker/daemon.json';
+  try {
+    if (!existsSync(daemonJson)) return false;
+    const content = JSON.parse(readFileSync(daemonJson, 'utf8'));
+    const mirrors = content['registry-mirrors'];
+    return Array.isArray(mirrors) && mirrors.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Configure Docker daemon registry mirrors via daemon.json (skip if already configured). */
+function setupDaemonMirrors(enable: boolean): void {
+  if (!enable) return;
+  if (hasDaemonMirrors()) {
+    log('Docker Hub mirrors already configured in daemon.json. Skipping.');
+    return;
+  }
+  const daemonJson = '/etc/docker/daemon.json';
+  try {
+    const config = JSON.stringify({ 'registry-mirrors': DOCKER_HUB_MIRRORS }, null, 2);
+    writeFileSync(daemonJson, config);
+    execSync('systemctl restart docker', { stdio: 'ignore' });
+    log('Docker Hub mirrors configured (daemon.json).');
+  } catch {
+    log('Could not configure daemon.json (non-root or systemctl unavailable). Skipping.');
+  }
 }
 
 // ── Prerequisite checks ──────────────────────────────────────────────────────
@@ -201,7 +250,7 @@ async function persistSecrets(dir: string, secrets: SetupSecrets): Promise<void>
   }, null, 2), { encoding: 'utf8', mode: 0o600 });
 }
 
-async function writeConfigs(dir: string, domain: string, secrets: SetupSecrets): Promise<void> {
+async function writeConfigs(dir: string, domain: string, secrets: SetupSecrets, mirrorMode: boolean): Promise<void> {
   await writeFile(join(dir, '.env'), envTemplate({
     domain,
     postgresPassword: secrets.postgresPassword,
@@ -209,7 +258,9 @@ async function writeConfigs(dir: string, domain: string, secrets: SetupSecrets):
     adminPassword: secrets.adminPassword,
   }));
 
-  await writeFile(join(dir, 'docker-compose.yml'), DOCKER_COMPOSE_TEMPLATE);
+  await writeFile(join(dir, 'docker-compose.yml'), dockerComposeTemplate(
+    mirrorMode ? { ghcrPrefix: GHCR_MIRROR_PREFIX } : undefined,
+  ));
   await writeFile(join(dir, 'Caddyfile'), caddyfileTemplate(domain));
 }
 
@@ -405,15 +456,25 @@ export async function setupFlow(domain: string, opts: { force?: boolean } = {}):
     secrets = generateSecrets();
   }
 
-  // 3. Write config files (always write to ensure they match current secrets)
+  // 3. Detect mirror mode (hub.docker.com unreachable → use mirrors)
+  log('Detecting network...');
+  const mirrorMode = detectMirrorMode();
+  if (mirrorMode) {
+    log('Mirror mode: hub.docker.com unreachable, using registry mirrors.');
+    setupDaemonMirrors(true);
+  } else {
+    log('Direct mode: hub.docker.com reachable.');
+  }
+
+  // 4. Write config files (always write to ensure they match current secrets)
   if (!resumed) {
     log('Generating configuration...');
   } else {
     log('Updating configuration files...');
   }
-  await writeConfigs(dir, domain, secrets);
+  await writeConfigs(dir, domain, secrets, mirrorMode);
   await persistSecrets(dir, secrets);
-  log('Created .env, docker-compose.yml, Caddyfile');
+  log(`Created .env, docker-compose.yml, Caddyfile${mirrorMode ? ' (mirror mode)' : ''}`);
 
   // 4. Start PostgreSQL (skip if already healthy)
   if (isServiceHealthy(compose, dir, 'postgres')) {

@@ -1,6 +1,8 @@
 /** Embedded deployment templates for `imcodes setup`. */
 
-export const DOCKER_COMPOSE_TEMPLATE = `services:
+export function dockerComposeTemplate(opts?: { ghcrPrefix?: string }): string {
+  const ghcr = opts?.ghcrPrefix ?? 'ghcr.io';
+  return `services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -17,7 +19,7 @@ export const DOCKER_COMPOSE_TEMPLATE = `services:
       retries: 5
 
   server:
-    image: ghcr.io/im4codes/imcodes:latest
+    image: ${ghcr}/im4codes/imcodes:latest
     restart: unless-stopped
     ports:
       - "127.0.0.1:19138:19138"
@@ -69,6 +71,10 @@ volumes:
   caddy_data:
   caddy_config:
 `;
+}
+
+/** @deprecated Use dockerComposeTemplate() instead. */
+export const DOCKER_COMPOSE_TEMPLATE = dockerComposeTemplate();
 
 export function caddyfileTemplate(domain: string): string {
   return `${domain} {
