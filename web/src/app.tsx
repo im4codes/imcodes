@@ -1435,6 +1435,10 @@ export function App() {
     if (pinnedPanels.length > 0) { autoPinnedRef.current = true; return; } // user already has panels
     autoPinnedRef.current = true;
     pinPanel('filebrowser', { sessionName: activeSession, projectDir: activeSessionInfo.projectDir, serverId: selectedServerId });
+    const cronProject = sessions.find(s => s.name === activeSession)?.project;
+    if (cronProject) {
+      pinPanel('cronmanager', { sessionName: activeSession, projectName: cronProject, serverId: selectedServerId });
+    }
   }, [activeSession, activeSessionInfo?.projectDir, pinnedPanels.length, pinPanel, selectedServerId]);
 
   // ── Git changes count for file browser badge ───────────────────────────
@@ -1926,13 +1930,7 @@ export function App() {
                 onHistory={registerHistoryApplyer}
                 serverId={selectedServerId}
                 onViewRepo={() => setShowRepoPage(true)}
-                onViewCron={() => {
-                  const cronProject = sessions.find(s => s.name === activeSession)?.project;
-                  if (cronProject) {
-                    // Pin directly to sidebar instead of floating window
-                    pinPanel('cronmanager', { sessionName: activeSession, projectName: cronProject, serverId: selectedServerId }, () => {});
-                  }
-                }}
+                onViewCron={() => setShowCronManager(true)}
                 subUsages={subUsages}
                 focusedSubId={focusedSubId}
                 quickData={quickData}
