@@ -2147,6 +2147,8 @@ export function App() {
               serverId={selectedServerId}
               projectName={cronProject}
               sessions={sessions}
+              subSessions={subSessionsSlim}
+              activeSession={activeSession}
               onBack={() => setShowCronManager(false)}
             />
           </FloatingPanel>

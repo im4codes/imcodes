@@ -260,7 +260,7 @@ describe('Cron API routes', () => {
         action: {
           type: 'p2p',
           topic: 'Code review',
-          mode: 'debate',
+          mode: 'review',
           participants: ['brain', 'w1'],
           rounds: 3,
         },
@@ -270,7 +270,7 @@ describe('Cron API routes', () => {
       expect(body.action).toEqual({
         type: 'p2p',
         topic: 'Code review',
-        mode: 'debate',
+        mode: 'review',
         participants: ['brain', 'w1'],
         rounds: 3,
       });
@@ -282,7 +282,7 @@ describe('Cron API routes', () => {
         action: {
           type: 'p2p',
           topic: 'Code review',
-          mode: 'debate',
+          mode: 'review',
           participants: [],
         },
       }));
@@ -541,6 +541,111 @@ describe('Cron API routes', () => {
       expect(res.status).toBe(200);
       const body = await res.json() as { executions: unknown[] };
       expect(body.executions).toHaveLength(2);
+    });
+
+    it('returns 403 when resolveServerRole is none', async () => {
+      mockDb.cronJobs.set('job-exec-forbidden', {
+        id: 'job-exec-forbidden',
+        server_id: 'srv-1',
+        user_id: 'user-1',
+        name: 'Forbidden Exec',
+        cron_expr: '0 9 * * *',
+        project_name: 'myapp',
+        target_role: 'brain',
+        action: JSON.stringify({ type: 'command', command: '/status' }),
+        status: CRON_STATUS.ACTIVE,
+        next_run_at: Date.now() + 86400000,
+        expires_at: null,
+        created_at: Date.now(),
+        updated_at: Date.now(),
+        last_run_at: null,
+      });
+
+      mockResolveServerRole.mockResolvedValue('none');
+      const res = await app.request('/api/cron/job-exec-forbidden/executions', { method: 'GET' });
+      expect(res.status).toBe(403);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.error).toBe('forbidden');
+    });
+  });
+
+  // ── Sub-session targeting (POST) ──────────────────────────────────────
+
+  describe('POST /api/cron (sub-session targeting)', () => {
+    const baseBody = {
+      name: 'Sub-session job',
+      cronExpr: '0 9 * * *',
+      serverId: 'srv-1',
+      projectName: 'myapp',
+      targetRole: 'brain',
+      action: { type: 'command', command: '/status' },
+    };
+
+    it('accepts valid targetSessionName', async () => {
+      const res = await app.request('/api/cron', jsonReq('POST', '/api/cron', {
+        ...baseBody,
+        targetSessionName: 'deck_sub_abc123',
+      }));
+      expect(res.status).toBe(201);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.targetSessionName).toBe('deck_sub_abc123');
+    });
+
+    it('rejects invalid targetSessionName pattern', async () => {
+      const res = await app.request('/api/cron', jsonReq('POST', '/api/cron', {
+        ...baseBody,
+        targetSessionName: '../etc/passwd',
+      }));
+      expect(res.status).toBe(400);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.error).toBe('invalid_body');
+    });
+
+    it('validates P2P mode against shared constants', async () => {
+      const res = await app.request('/api/cron', jsonReq('POST', '/api/cron', {
+        ...baseBody,
+        action: {
+          type: 'p2p',
+          topic: 'Code review',
+          mode: 'nonexistent_mode',
+          participants: ['brain', 'w1'],
+        },
+      }));
+      expect(res.status).toBe(400);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.error).toBe('invalid_body');
+    });
+  });
+
+  // ── Auth gap: PATCH /status and GET /executions check resolveServerRole ──
+
+  describe('PATCH /api/cron/:id/status (auth)', () => {
+    it('returns 403 when resolveServerRole is none', async () => {
+      mockDb.cronJobs.set('job-auth-patch', {
+        id: 'job-auth-patch',
+        server_id: 'srv-1',
+        user_id: 'user-1',
+        name: 'Auth Patch Job',
+        cron_expr: '0 9 * * *',
+        project_name: 'myapp',
+        target_role: 'brain',
+        action: JSON.stringify({ type: 'command', command: '/status' }),
+        status: CRON_STATUS.ACTIVE,
+        next_run_at: Date.now() + 86400000,
+        expires_at: null,
+        created_at: Date.now(),
+        updated_at: Date.now(),
+        last_run_at: null,
+      });
+
+      mockResolveServerRole.mockResolvedValue('none');
+      const res = await app.request(
+        '/api/cron/job-auth-patch/status',
+        jsonReq('PATCH', '', { status: CRON_STATUS.PAUSED }),
+      );
+      expect(res.status).toBe(403);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.error).toBe('forbidden');
     });
   });
 });

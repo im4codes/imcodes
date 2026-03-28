@@ -7,23 +7,38 @@ import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 import { CRON_STATUS } from '../../../shared/cron-types.js';
+import { P2P_MODE_KEYS } from '../../../shared/p2p-modes.js';
 
 export const cronApiRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
 const MIN_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
 const rolePattern = /^(brain|w\d+)$/;
+const sessionNamePattern = /^deck_sub_[a-zA-Z0-9_-]+$/;
 
-const cronActionSchema = z.discriminatedUnion('type', [
+const cronParticipantSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('role'), value: z.string().regex(rolePattern) }),
+  z.object({ type: z.literal('session'), value: z.string().regex(sessionNamePattern) }),
+]);
+
+const cronActionSchemaRaw = z.discriminatedUnion('type', [
   z.object({ type: z.literal('command'), command: z.string().min(1) }),
   z.object({
     type: z.literal('p2p'),
     topic: z.string().min(1),
-    mode: z.string().min(1),
-    participants: z.array(z.string().regex(rolePattern)).min(1),
+    mode: z.enum(P2P_MODE_KEYS),
+    // Legacy: plain role strings (backward compat with existing DB rows)
+    participants: z.array(z.string().regex(rolePattern)).optional(),
+    // New: discriminated entries supporting both roles and session names
+    participantEntries: z.array(cronParticipantSchema).optional(),
     rounds: z.number().int().min(1).max(6).optional(),
   }),
 ]);
+// Refine outside discriminatedUnion to avoid Zod type incompatibility
+const cronActionSchema = cronActionSchemaRaw.refine(d => {
+  if (d.type !== 'p2p') return true;
+  return (d.participants?.length ?? 0) + (d.participantEntries?.length ?? 0) > 0;
+}, { message: 'At least one participant required (via participants or participantEntries)' });
 
 const cronJobCreateSchema = z.object({
   name: z.string().min(1).max(100),
@@ -31,6 +46,7 @@ const cronJobCreateSchema = z.object({
   serverId: z.string().min(1),
   projectName: z.string().min(1).max(64),
   targetRole: z.string().regex(rolePattern).default('brain'),
+  targetSessionName: z.string().regex(sessionNamePattern).optional(),
   action: cronActionSchema,
   expiresAt: z.number().nullable().optional(),
 });
@@ -40,6 +56,7 @@ const cronJobUpdateSchema = z.object({
   cronExpr: z.string().min(1).optional(),
   projectName: z.string().min(1).max(64).optional(),
   targetRole: z.string().regex(rolePattern).optional(),
+  targetSessionName: z.string().regex(sessionNamePattern).nullable().optional(),
   action: cronActionSchema.optional(),
   expiresAt: z.number().nullable().optional(),
 });
@@ -88,7 +105,7 @@ cronApiRoutes.post('/', requireAuth(), async (c) => {
   const parsed = cronJobCreateSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body', issues: parsed.error.issues }, 400);
 
-  const { name, cronExpr, serverId, projectName, targetRole, action, expiresAt } = parsed.data;
+  const { name, cronExpr, serverId, projectName, targetRole, targetSessionName, action, expiresAt } = parsed.data;
 
   const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
@@ -102,14 +119,14 @@ cronApiRoutes.post('/', requireAuth(), async (c) => {
   const now = Date.now();
 
   await c.env.DB.execute(
-    `INSERT INTO cron_jobs (id, server_id, user_id, name, cron_expr, project_name, target_role, action, status, next_run_at, expires_at, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)`,
-    [id, serverId, userId, name, cronExpr, projectName, targetRole, JSON.stringify(action), CRON_STATUS.ACTIVE, validation.nextRunAt, expiresAt ?? null, now],
+    `INSERT INTO cron_jobs (id, server_id, user_id, name, cron_expr, project_name, target_role, target_session_name, action, status, next_run_at, expires_at, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)`,
+    [id, serverId, userId, name, cronExpr, projectName, targetRole, targetSessionName ?? null, JSON.stringify(action), CRON_STATUS.ACTIVE, validation.nextRunAt, expiresAt ?? null, now],
   );
 
   await logAudit({ userId, action: 'cron.create', details: { id, name, cronExpr, projectName } }, c.env.DB);
 
-  return c.json({ id, name, cronExpr, projectName, targetRole, action, status: CRON_STATUS.ACTIVE, nextRunAt: validation.nextRunAt, expiresAt: expiresAt ?? null }, 201);
+  return c.json({ id, name, cronExpr, projectName, targetRole, targetSessionName: targetSessionName ?? null, action, status: CRON_STATUS.ACTIVE, nextRunAt: validation.nextRunAt, expiresAt: expiresAt ?? null }, 201);
 });
 
 // PUT /api/cron/:id — update a cron job
@@ -152,6 +169,7 @@ cronApiRoutes.put('/:id', requireAuth(), async (c) => {
   if (updates.cronExpr !== undefined) { sets.push(`cron_expr = $${idx++}`); vals.push(updates.cronExpr); }
   if (updates.projectName !== undefined) { sets.push(`project_name = $${idx++}`); vals.push(updates.projectName); }
   if (updates.targetRole !== undefined) { sets.push(`target_role = $${idx++}`); vals.push(updates.targetRole); }
+  if (updates.targetSessionName !== undefined) { sets.push(`target_session_name = $${idx++}`); vals.push(updates.targetSessionName); }
   if (updates.action !== undefined) { sets.push(`action = $${idx++}`); vals.push(JSON.stringify(updates.action)); }
   if (updates.expiresAt !== undefined) { sets.push(`expires_at = $${idx++}`); vals.push(updates.expiresAt); }
   if (nextRunAt !== undefined) { sets.push(`next_run_at = $${idx++}`); vals.push(nextRunAt); }
@@ -181,11 +199,14 @@ cronApiRoutes.patch('/:id/status', requireAuth(), async (c) => {
     return c.json({ error: 'invalid_status' }, 400);
   }
 
-  const job = await c.env.DB.queryOne<{ status: string }>(
-    'SELECT status FROM cron_jobs WHERE id = $1 AND user_id = $2',
+  const job = await c.env.DB.queryOne<{ status: string; server_id: string }>(
+    'SELECT status, server_id FROM cron_jobs WHERE id = $1 AND user_id = $2',
     [jobId, userId],
   );
   if (!job) return c.json({ error: 'not_found' }, 404);
+
+  const role = await resolveServerRole(c.env.DB, job.server_id, userId);
+  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
 
   if (newStatus === CRON_STATUS.ACTIVE && job.status !== CRON_STATUS.PAUSED) {
     return c.json({ error: 'cannot_resume', currentStatus: job.status }, 400);
@@ -232,6 +253,9 @@ cronApiRoutes.get('/:id/executions', requireAuth(), async (c) => {
     [jobId, userId],
   );
   if (!job) return c.json({ error: 'not_found' }, 404);
+
+  const role = await resolveServerRole(c.env.DB, job.server_id, userId);
+  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
 
   const executions = await c.env.DB.query(
     'SELECT id, status, detail, created_at FROM cron_executions WHERE job_id = $1 ORDER BY created_at DESC LIMIT $2',

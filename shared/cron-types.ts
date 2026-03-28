@@ -7,11 +7,19 @@ export interface CronCommandAction {
   command: string;
 }
 
+/** A participant can be identified by main-session role or direct sub-session name. */
+export type CronParticipant =
+  | { type: 'role'; value: string }
+  | { type: 'session'; value: string };
+
 export interface CronP2pAction {
   type: 'p2p';
   topic: string;
   mode: string;
-  participants: string[];
+  /** @deprecated Use `participantEntries` for new jobs. Kept for backward compat with existing DB rows. */
+  participants?: string[];
+  /** Discriminated participant list — supports both roles and direct session names. */
+  participantEntries?: CronParticipant[];
   rounds?: number;
 }
 
@@ -30,6 +38,8 @@ export interface CronDispatchMessage {
   serverId: string;
   projectName: string;
   targetRole: string;
+  /** Direct session name for sub-session targeting (e.g. deck_sub_xxx). When set, overrides targetRole. */
+  targetSessionName?: string;
   action: CronAction;
 }
 

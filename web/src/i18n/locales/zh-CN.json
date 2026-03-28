@@ -483,6 +483,7 @@
     "status_sent": "已发送",
     "status_skipped_offline": "已跳过（离线）",
     "status_skipped_busy": "已跳过（忙碌）",
-    "status_error": "错误"
+    "status_error": "错误",
+    "no_participants": "没有其他可用会话"
   }
 }

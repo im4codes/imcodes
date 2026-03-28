@@ -483,6 +483,7 @@
     "status_sent": "送信済み",
     "status_skipped_offline": "スキップ（オフライン）",
     "status_skipped_busy": "スキップ（ビジー）",
-    "status_error": "エラー"
+    "status_error": "エラー",
+    "no_participants": "他に利用可能なセッションがありません"
   }
 }

@@ -17,7 +17,7 @@ export async function jobDispatchCron(env: Env): Promise<void> {
   const dueJobs = await env.DB.query<DbCronJob>(
     `WITH due AS (
        SELECT id FROM cron_jobs
-       WHERE status = 'active' AND next_run_at <= $1
+       WHERE status = $2 AND next_run_at <= $1
          AND (expires_at IS NULL OR expires_at >= $1)
        ORDER BY next_run_at ASC
        LIMIT 50
@@ -26,7 +26,7 @@ export async function jobDispatchCron(env: Env): Promise<void> {
      UPDATE cron_jobs SET last_run_at = $1
      FROM due WHERE cron_jobs.id = due.id
      RETURNING cron_jobs.*`,
-    [now],
+    [now, CRON_STATUS.ACTIVE],
   );
 
   // Periodic cleanup of old execution history (~1% of ticks)
@@ -59,6 +59,9 @@ export async function jobDispatchCron(env: Env): Promise<void> {
       }
 
       // Dispatch to daemon
+      if (!job.target_role) {
+        logger.warn({ jobId: job.id }, 'Cron: target_role is NULL, defaulting to brain');
+      }
       const msg: CronDispatchMessage = {
         type: CRON_MSG.DISPATCH,
         jobId: job.id,
@@ -66,6 +69,7 @@ export async function jobDispatchCron(env: Env): Promise<void> {
         serverId: job.server_id,
         projectName: job.project_name ?? '',
         targetRole: job.target_role ?? 'brain',
+        ...(job.target_session_name ? { targetSessionName: job.target_session_name } : {}),
         action,
       };
       bridge.sendToDaemon(JSON.stringify(msg));

@@ -483,6 +483,7 @@
     "status_sent": "已傳送",
     "status_skipped_offline": "已跳過（離線）",
     "status_skipped_busy": "已跳過（忙碌）",
-    "status_error": "錯誤"
+    "status_error": "錯誤",
+    "no_participants": "沒有其他可用工作階段"
   }
 }

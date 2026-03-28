@@ -2,7 +2,7 @@
  * Daemon-side cron job executor.
  * Receives dispatched cron jobs and sends commands to target sessions.
  */
-import type { CronDispatchMessage } from '../../shared/cron-types.js';
+import type { CronDispatchMessage, CronParticipant } from '../../shared/cron-types.js';
 import { sendKeys } from '../agent/tmux.js';
 import { getSession } from '../store/session-store.js';
 import { sessionName, getTransportRuntime } from '../agent/session-manager.js';
@@ -14,18 +14,33 @@ import logger from '../util/logger.js';
 const BUSY_STATES = new Set(['streaming', 'thinking', 'tool_running', 'permission']);
 
 export async function executeCronJob(msg: CronDispatchMessage, serverLink: ServerLink): Promise<void> {
-  const { jobId, jobName, projectName, targetRole, action } = msg;
+  const { jobId, jobName, projectName, targetRole, targetSessionName, action } = msg;
 
-  if (!/^(brain|w\d+)$/.test(targetRole)) {
-    logger.warn({ jobId, targetRole }, 'Cron: invalid target role');
-    return;
+  // Resolve target session: prefer direct session name, fall back to role-based construction
+  let name: string;
+  if (targetSessionName) {
+    name = targetSessionName;
+  } else {
+    if (!/^(brain|w\d+)$/.test(targetRole)) {
+      logger.warn({ jobId, targetRole }, 'Cron: invalid target role');
+      return;
+    }
+    name = sessionName(projectName, targetRole as 'brain' | `w${number}`);
   }
 
-  const name = sessionName(projectName, targetRole as 'brain' | `w${number}`);
   const session = getSession(name);
   if (!session) {
     logger.warn({ jobId, sessionName: name }, 'Cron: target session not found, skipping');
     return;
+  }
+
+  // Cross-project guard: verify sub-session belongs to the expected project
+  if (targetSessionName && session.parentSession) {
+    const expectedPrefix = `deck_${projectName}_`;
+    if (!session.parentSession.startsWith(expectedPrefix)) {
+      logger.warn({ jobId, targetSessionName, projectName, parentSession: session.parentSession }, 'Cron: cross-project sub-session targeting blocked');
+      return;
+    }
   }
 
   // Busy check — skip tmux detection for transport sessions
@@ -64,14 +79,27 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
   }
 
   if (action.type === 'p2p') {
-    const { topic, mode, participants, rounds } = action;
+    const { topic, mode, rounds } = action;
 
-    const targets: P2pTarget[] = (participants ?? [])
-      .map(role => ({
-        session: sessionName(projectName, role as 'brain' | `w${number}`),
-        mode,
-      }))
-      .filter(t => !!getSession(t.session));
+    // Resolve participants: support both legacy string[] and new discriminated entries
+    const resolveParticipant = (p: CronParticipant | string): string => {
+      if (typeof p === 'string') return sessionName(projectName, p as 'brain' | `w${number}`);
+      return p.type === 'session' ? p.value : sessionName(projectName, p.value as 'brain' | `w${number}`);
+    };
+
+    const allParticipants: (CronParticipant | string)[] = [
+      ...(action.participantEntries ?? []),
+      ...(action.participants ?? []),
+    ];
+
+    const seen = new Set<string>();
+    const targets: P2pTarget[] = allParticipants
+      .map(p => ({ session: resolveParticipant(p), mode }))
+      .filter(t => {
+        if (seen.has(t.session)) return false;
+        seen.add(t.session);
+        return !!getSession(t.session);
+      });
 
     if (targets.length === 0) {
       logger.warn({ jobId, jobName }, 'Cron: no valid P2P participants, skipping');

@@ -135,12 +135,17 @@ registerPanelType('cronmanager', {
     const projectName = (ctx.sessions?.find(s => s.name === ctx.activeSession)?.project
       ?? panel.props?.projectName as string | undefined);
     if (!projectName) return <div class="sidebar-pinned-unavailable">No project</div>;
+    const subSessionsSlim = ctx.subSessions.map(s => ({
+      sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession,
+    }));
     return (
       <CronManager
         key={`${ctx.serverId}:${projectName}`}
         serverId={ctx.serverId}
         projectName={projectName}
         sessions={(ctx.sessions ?? []) as any}
+        subSessions={subSessionsSlim}
+        activeSession={ctx.activeSession}
         onBack={() => {}}
       />
     );

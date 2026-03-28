@@ -483,6 +483,7 @@
     "status_sent": "Enviado",
     "status_skipped_offline": "Omitido (sin conexión)",
     "status_skipped_busy": "Omitido (ocupado)",
-    "status_error": "Error"
+    "status_error": "Error",
+    "no_participants": "No hay otras sesiones disponibles"
   }
 }

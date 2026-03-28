@@ -483,6 +483,7 @@
     "status_sent": "Отправлено",
     "status_skipped_offline": "Пропущено (не в сети)",
     "status_skipped_busy": "Пропущено (занят)",
-    "status_error": "Ошибка"
+    "status_error": "Ошибка",
+    "no_participants": "Нет других доступных сессий"
   }
 }

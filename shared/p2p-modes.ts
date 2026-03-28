@@ -77,6 +77,9 @@ export const BUILT_IN_MODES: P2pMode[] = [
   },
 ];
 
+/** All valid P2P mode keys as a const tuple — use for Zod enum validation. */
+export const P2P_MODE_KEYS = BUILT_IN_MODES.map((m) => m.key) as unknown as readonly [string, ...string[]];
+
 /** Look up a mode by key. Returns undefined if not found. */
 export function getP2pMode(key: string): P2pMode | undefined {
   return BUILT_IN_MODES.find((m) => m.key === key);

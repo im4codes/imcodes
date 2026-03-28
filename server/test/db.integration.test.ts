@@ -82,7 +82,7 @@ describe('runMigrations', () => {
     const tables = [
       'users', 'platform_identities', 'servers', 'channel_bindings',
       'platform_bots', 'api_keys', 'refresh_tokens', 'idempotency_records',
-      'audit_log', 'pending_binds', 'sessions', 'cron_jobs',
+      'audit_log', 'pending_binds', 'sessions', 'cron_jobs', 'cron_executions',
       'teams', 'team_members', 'push_subscriptions',
     ];
 
@@ -97,6 +97,46 @@ describe('runMigrations', () => {
 
   it('is idempotent — second run does not throw', async () => {
     await expect(runMigrations(db)).resolves.not.toThrow();
+  });
+
+  it('cron_jobs has target_session_name column (migration 029)', async () => {
+    const col = await db.queryOne<{ column_name: string }>(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_name = 'cron_jobs' AND column_name = 'target_session_name'`,
+      [],
+    );
+    expect(col).not.toBeNull();
+  });
+
+  it('cron_jobs target_session_name round-trip insert and read', async () => {
+    const uid = 'mig-cron-user-' + Math.random().toString(36).slice(2);
+    const sid = 'mig-cron-srv-' + Math.random().toString(36).slice(2);
+    await createUser(db, uid);
+    await createServer(db, sid, uid, 'mig-srv', 'hash-mig');
+
+    const jobId = 'mig-test-job-' + Math.random().toString(36).slice(2);
+    await db.execute(
+      `INSERT INTO cron_jobs (id, server_id, user_id, name, cron_expr, project_name, target_role, target_session_name, action, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)`,
+      [jobId, sid, uid, 'test-job', '0 9 * * *', 'proj', 'brain', 'deck_sub_abc123', '{"type":"command","command":"test"}', 'active', Date.now()],
+    );
+
+    const row = await db.queryOne<{ target_session_name: string | null }>(
+      'SELECT target_session_name FROM cron_jobs WHERE id = $1',
+      [jobId],
+    );
+    expect(row?.target_session_name).toBe('deck_sub_abc123');
+
+    // Verify NULL works
+    await db.execute('UPDATE cron_jobs SET target_session_name = NULL WHERE id = $1', [jobId]);
+    const row2 = await db.queryOne<{ target_session_name: string | null }>(
+      'SELECT target_session_name FROM cron_jobs WHERE id = $1',
+      [jobId],
+    );
+    expect(row2?.target_session_name).toBeNull();
+
+    // Cleanup
+    await db.execute('DELETE FROM cron_jobs WHERE id = $1', [jobId]);
   });
 });
 

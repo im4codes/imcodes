@@ -377,4 +377,79 @@ describe('executeCronJob', () => {
       expect.stringContaining('unknown action type'),
     );
   });
+
+  // ── Sub-session targeting ──────────────────────────────────────────────
+
+  it('sends command to sub-session when targetSessionName is set', async () => {
+    const subSession = makeSession({ name: 'deck_sub_abc123', projectDir: '/home/user/myapp' });
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(subSession);
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
+
+    await executeCronJob(
+      makeMsg({ targetSessionName: 'deck_sub_abc123' }),
+      mockServerLink,
+    );
+
+    // Should use targetSessionName directly, not construct via sessionName()
+    expect(sessionName).not.toHaveBeenCalled();
+    expect(getSession).toHaveBeenCalledWith('deck_sub_abc123');
+    expect(sendKeys).toHaveBeenCalledWith(
+      'deck_sub_abc123',
+      'review the codebase',
+      { cwd: '/home/user/myapp' },
+    );
+  });
+
+  it('skips role validation when targetSessionName is set', async () => {
+    const subSession = makeSession({ name: 'deck_sub_xyz' });
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(subSession);
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
+
+    // targetRole is invalid, but targetSessionName takes precedence
+    await executeCronJob(
+      makeMsg({ targetRole: 'not_a_valid_role', targetSessionName: 'deck_sub_xyz' }),
+      mockServerLink,
+    );
+
+    // Should NOT warn about invalid role — targetSessionName bypasses role validation
+    expect(logger.warn).not.toHaveBeenCalledWith(
+      expect.objectContaining({ targetRole: 'not_a_valid_role' }),
+      expect.stringContaining('invalid target role'),
+    );
+    expect(sendKeys).toHaveBeenCalled();
+  });
+
+  it('resolves sub-session P2P participants from participantEntries', async () => {
+    const brainSession = makeSession();
+    const subSession = makeSession({ name: 'deck_sub_worker1' });
+
+    (getSession as ReturnType<typeof vi.fn>).mockImplementation((name: string) => {
+      if (name === 'deck_myapp_brain') return brainSession;
+      if (name === 'deck_sub_worker1') return subSession;
+      return null;
+    });
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
+
+    const msg = makeMsg({
+      action: {
+        type: 'p2p',
+        topic: 'architecture review',
+        mode: 'review',
+        participantEntries: [
+          { type: 'session', value: 'deck_sub_worker1' },
+        ],
+      },
+    });
+
+    await executeCronJob(msg, mockServerLink);
+
+    expect(startP2pRun).toHaveBeenCalledWith(
+      'deck_myapp_brain',
+      [{ session: 'deck_sub_worker1', mode: 'review' }],
+      'architecture review',
+      [],
+      mockServerLink,
+      1,
+    );
+  });
 });

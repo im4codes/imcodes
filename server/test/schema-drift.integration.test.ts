@@ -63,7 +63,7 @@ const SCHEMA_MAP: Array<[string, string[]]> = [
   ]],
   ['cron_jobs', [
     'id', 'server_id', 'user_id', 'name', 'cron_expr', 'action',
-    'project_name', 'target_role', 'status', 'last_run_at', 'next_run_at',
+    'project_name', 'target_role', 'target_session_name', 'status', 'last_run_at', 'next_run_at',
     'expires_at', 'created_at', 'updated_at',
   ]],
   ['cron_executions', [
