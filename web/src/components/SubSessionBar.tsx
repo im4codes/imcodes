@@ -64,6 +64,8 @@ interface Props {
   subUsages?: Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string }>;
   /** ID of the currently focused (topmost) sub-session window. */
   focusedSubId?: string | null;
+  /** Active main session name — used to scope card ordering per parent. */
+  activeSession?: string | null;
 }
 
 const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -107,7 +109,7 @@ function formatUptime(seconds: number): string {
   return d > 0 ? `${d}d ${h}h` : `${h}h`;
 }
 
-export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId }: Props) {
+export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId, activeSession }: Props) {
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
   const [collapsed, setCollapsed] = useState(isMobile);
   const [showSizePanel, setShowSizePanel] = useState(false);
@@ -115,17 +117,17 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
   const [draftW, setDraftW] = useState(String(cardSize.w));
   const [draftH, setDraftH] = useState(String(cardSize.h));
   const [stats, setStats] = useState<DaemonStats | null>(null);
-  const orderKey = serverId ? `rcc_subcard_order_${serverId}` : 'rcc_subcard_order';
+  const orderKey = serverId ? `rcc_subcard_order_${serverId}_${activeSession ?? ''}` : 'rcc_subcard_order';
   const [orderedIds, setOrderedIds] = useState<string[]>(() => load(orderKey, []));
   const dragIdRef = useRef<string | null>(null);
   const orderedIdsRef = useRef(orderedIds);
   orderedIdsRef.current = orderedIds;
   const reorderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Reset orderedIds when server changes
-  const prevServerIdRef = useRef(serverId);
-  if (prevServerIdRef.current !== serverId) {
-    prevServerIdRef.current = serverId;
+  // Reset orderedIds when server or active session changes
+  const prevOrderKeyRef = useRef(orderKey);
+  if (prevOrderKeyRef.current !== orderKey) {
+    prevOrderKeyRef.current = orderKey;
     const saved = load<string[]>(orderKey, []);
     setOrderedIds(saved);
     orderedIdsRef.current = saved;
