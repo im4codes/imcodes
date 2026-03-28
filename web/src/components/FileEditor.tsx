@@ -14,6 +14,17 @@ import { json } from '@codemirror/lang-json';
 import { html } from '@codemirror/lang-html';
 import { css } from '@codemirror/lang-css';
 import { markdown } from '@codemirror/lang-markdown';
+import { java } from '@codemirror/lang-java';
+import { cpp } from '@codemirror/lang-cpp';
+import { rust } from '@codemirror/lang-rust';
+import { go } from '@codemirror/lang-go';
+import { sql } from '@codemirror/lang-sql';
+import { php } from '@codemirror/lang-php';
+import { xml } from '@codemirror/lang-xml';
+import { yaml } from '@codemirror/lang-yaml';
+import { sass } from '@codemirror/lang-sass';
+import { less } from '@codemirror/lang-less';
+import { wast } from '@codemirror/lang-wast';
 import { oneDark } from '@codemirror/theme-one-dark';
 
 export interface FileEditorProps {
@@ -21,7 +32,6 @@ export interface FileEditorProps {
   path: string;
   content: string;
   mtime: number | undefined;
-  onClose: () => void;
   /** Called after successful save with new mtime */
   onSaved: (newMtime: number) => void;
   /** Subscribe to WS messages — returns unsubscribe fn */
@@ -36,16 +46,27 @@ function getLanguageExtension(path: string) {
   switch (ext) {
     case 'ts': case 'tsx': return javascript({ typescript: true, jsx: ext === 'tsx' });
     case 'js': case 'jsx': case 'mjs': case 'cjs': return javascript({ jsx: ext === 'jsx' });
-    case 'py': return python();
-    case 'json': case 'jsonc': return json();
-    case 'html': case 'htm': case 'xml': case 'svg': return html();
+    case 'py': case 'pyi': case 'pyw': return python();
+    case 'json': case 'jsonc': case 'json5': return json();
+    case 'html': case 'htm': return html();
     case 'css': return css();
-    case 'md': case 'mdx': return markdown();
+    case 'md': case 'mdx': case 'markdown': return markdown();
+    case 'java': case 'kt': case 'kts': return java();
+    case 'c': case 'h': case 'cpp': case 'cc': case 'cxx': case 'hpp': case 'hxx': case 'hh': return cpp();
+    case 'rs': return rust();
+    case 'go': return go();
+    case 'sql': case 'sqlite': case 'ddl': return sql();
+    case 'php': return php();
+    case 'xml': case 'svg': case 'xsl': case 'xsd': case 'wsdl': case 'plist': return xml();
+    case 'yaml': case 'yml': return yaml();
+    case 'sass': case 'scss': return sass({ indented: ext === 'sass' });
+    case 'less': return less();
+    case 'wat': case 'wast': return wast();
     default: return null;
   }
 }
 
-export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessage, onDirtyChange }: FileEditorProps) {
+export function FileEditor({ ws, path, content, mtime, onSaved, onMessage, onDirtyChange }: FileEditorProps) {
   const { t } = useTranslation();
   const [originalMtime, setOriginalMtime] = useState(mtime);
   const [isDirty, setIsDirty] = useState(false);
@@ -115,13 +136,6 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
     <>
       {/* Toolbar buttons — rendered inline in parent's header */}
       <button
-        class="fb-diff-toggle"
-        onClick={() => {
-          if (isDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
-          onClose();
-        }}
-      >{t('fileBrowser.preview')}</button>
-      <button
         class={`fb-diff-toggle fb-save-btn${isDirty ? ' fb-save-dirty' : ''}${saveStatus === 'saving' ? ' fb-save-saving' : ''}`}
         disabled={saveStatus === 'saving' || !isDirty}
         onClick={() => doSave()}
@@ -136,7 +150,7 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
 }
 
 /** Editor content area — CodeMirror editor + conflict dialog */
-export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage, onDirtyChange }: Omit<FileEditorProps, 'onClose' | 'onSaved'> & { onDirtyChange?: (dirty: boolean) => void }) {
+export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage, onDirtyChange }: Omit<FileEditorProps, 'onSaved'> & { onDirtyChange?: (dirty: boolean) => void }) {
   const { t } = useTranslation();
   const [isDirty, setIsDirty] = useState(false);
   const [conflictData, setConflictData] = useState<{ diskContent: string; diskMtime: number } | null>(null);

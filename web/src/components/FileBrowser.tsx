@@ -17,7 +17,6 @@ import type { WsClient, ServerMessage } from '../ws-client.js';
 import { lazy, Suspense } from 'preact/compat';
 const FileEditor = lazy(() => import('./FileEditor.js').then(m => ({ default: m.FileEditor })));
 const FileEditorContent = lazy(() => import('./FileEditor.js').then(m => ({ default: m.FileEditorContent })));
-const FilePreviewPane = lazy(() => import('./FilePreviewPane.js'));
 import { downloadAttachment } from '../api.js';
 
 function escapeHtml(s: string): string {
@@ -198,7 +197,6 @@ export function FileBrowser({
   const [downloadError, setDownloadError] = useState<string | null>(null);
 
   // Editor state (logic lives in FileEditor component)
-  const [isEditing, setIsEditing] = useState(false);
   const [editDirty, setEditDirty] = useState(false);
   const [originalMtime, setOriginalMtime] = useState<number | undefined>(undefined);
   // Message handlers registered by FileEditor
@@ -451,7 +449,6 @@ export function FileBrowser({
     if (editDirty) {
       if (!window.confirm(t('fileBrowser.unsavedChanges'))) return;
     }
-    setIsEditing(false);
     setEditDirty(false);
     setOriginalMtime(undefined);
     setPreview({ status: 'loading', path: filePath });
@@ -525,7 +522,7 @@ export function FileBrowser({
   useEffect(() => {
     if (preview.status !== 'ok' && preview.status !== 'image') return;
     if (onPreviewFile) return; // external preview — don't poll here
-    if (isEditing) return; // pause auto-refresh while editing
+    if (editDirty) return; // pause auto-refresh while editing
     const path = (preview as { path: string }).path;
     const timer = setInterval(() => {
       try {
@@ -536,7 +533,7 @@ export function FileBrowser({
       } catch { /* ws disconnected */ }
     }, 5000);
     return () => clearInterval(timer);
-  }, [preview.status, (preview as any).path, ws, onPreviewFile, isEditing]);
+  }, [preview.status, (preview as any).path, ws, onPreviewFile, editDirty]);
 
   // Rate-limited git status refresh for the changes panel
   const CHANGES_RATE_LIMIT_MS = 5_000;
@@ -672,38 +669,30 @@ export function FileBrowser({
   );
 
   const hasDiff = preview.status === 'ok' && !!preview.diff;
-  const canEdit = preview.status === 'ok';
 
   const previewPane = hasPreview ? (
     <div class="fb-preview">
       <div class="fb-preview-header">
         <button class="fb-preview-back" onClick={() => {
           if (editDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
-          setIsEditing(false);
           setEditDirty(false);
           setPreview({ status: 'idle' });
         }}>←</button>
         <span class="fb-preview-name">{previewPath!.split('/').pop()}</span>
-        {canEdit && !isEditing && (
-          <button class="fb-diff-toggle" onClick={() => { setEditDirty(false); setIsEditing(true); }}>
-            {t('fileBrowser.edit')}
-          </button>
-        )}
-        {isEditing && preview.status === 'ok' && (
+        {preview.status === 'ok' && (
           <Suspense fallback={null}>
             <FileEditor
               ws={ws}
               path={preview.path}
               content={preview.content}
               mtime={originalMtime}
-              onClose={() => { setIsEditing(false); setEditDirty(false); }}
               onSaved={(newMtime) => setOriginalMtime(newMtime)}
               onMessage={onEditorMessage}
               onDirtyChange={setEditDirty}
             />
           </Suspense>
         )}
-        {!isEditing && hasDiff && (
+        {hasDiff && (
           <button
             class={`fb-diff-toggle${showDiff ? ' active' : ''}`}
             onClick={() => setShowDiff((v) => !v)}
@@ -733,7 +722,6 @@ export function FileBrowser({
         )}
         <button class="fb-close" onClick={() => {
           if (editDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
-          setIsEditing(false);
           setEditDirty(false);
           setPreview({ status: 'idle' });
         }}>✕</button>
@@ -754,7 +742,7 @@ export function FileBrowser({
             <img src={preview.dataUrl} alt={preview.path.split('/').pop() ?? ''} onClick={() => setLightbox(preview.dataUrl)} style={{ cursor: 'zoom-in' }} />
           </div>
         )}
-        {preview.status === 'ok' && isEditing && (
+        {preview.status === 'ok' && !showDiff && (
           <Suspense fallback={null}>
             <FileEditorContent
               ws={ws}
@@ -766,12 +754,7 @@ export function FileBrowser({
             />
           </Suspense>
         )}
-        {preview.status === 'ok' && !isEditing && !showDiff && (
-          <Suspense fallback={<div class="fb-preview-loading"><div class="fb-loading-spinner" /></div>}>
-            <FilePreviewPane content={preview.content} path={preview.path} />
-          </Suspense>
-        )}
-        {preview.status === 'ok' && !isEditing && showDiff && preview.diffHtml && (
+        {preview.status === 'ok' && showDiff && preview.diffHtml && (
           <div class="fb-diff" dangerouslySetInnerHTML={{ __html: preview.diffHtml }} />
         )}
       </div>

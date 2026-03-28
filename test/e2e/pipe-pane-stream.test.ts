@@ -34,11 +34,22 @@ async function collectStream(stream: NodeJS.ReadableStream, ms: number): Promise
   return Buffer.concat(chunks);
 }
 
+/** Retry helper for flaky tmux operations (server can crash between tests in CI) */
+async function retry<T>(fn: () => Promise<T>, attempts = 3, delayMs = 500): Promise<T> {
+  for (let i = 0; i < attempts; i++) {
+    try { return await fn(); } catch (err) {
+      if (i === attempts - 1) throw err;
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  throw new Error('unreachable');
+}
+
 describe.skipIf(SKIP)('pipe-pane stream e2e (task 8.5)', () => {
   beforeEach(async () => {
     await killSession(SESSION_A).catch(() => {});
     await killSession(SESSION_B).catch(() => {});
-    await newSession(SESSION_A, 'bash', { cwd: '/tmp' });
+    await retry(() => newSession(SESSION_A, 'bash', { cwd: '/tmp' }));
     await new Promise((r) => setTimeout(r, 300));
   });
 
@@ -79,7 +90,7 @@ describe.skipIf(SKIP)('pipe-pane stream e2e (task 8.5)', () => {
   // ── Task 8.5 check 3: multi-session isolation ───────────────────────────────
 
   it('two sessions pipe independently — no cross-session data leak', async () => {
-    await newSession(SESSION_B, 'bash', { cwd: '/tmp' });
+    await retry(() => newSession(SESSION_B, 'bash', { cwd: '/tmp' }));
     await new Promise((r) => setTimeout(r, 300));
 
     const paneIdA = await getPaneId(SESSION_A);
