@@ -69,7 +69,7 @@ registerPanelType('filebrowser', {
     const activeSession = ctx.activeSession ?? panel.props?.sessionName as string | undefined;
     return (
       <FileBrowser
-        key={ctx.serverId}
+        key={`${ctx.serverId}:${projectDir}`}
         ws={ctx.ws}
         mode="file-multi"
         layout="panel"
