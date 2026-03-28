@@ -26,6 +26,8 @@ export default defineWorkspace([
         'server/test/proxy-addr.test.ts',
         'server/test/password-auth.test.ts',
         'server/test/admin.test.ts',
+        'server/test/cron-api.test.ts',
+        'server/test/job-dispatch.test.ts',
         '**/node_modules/**',
       ],
       environment: 'node',
