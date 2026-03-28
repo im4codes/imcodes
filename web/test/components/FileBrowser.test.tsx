@@ -5,13 +5,38 @@
  * Covers: modal vs panel layout, dir-only / file-multi modes,
  * expand/collapse tree, selection, multi-select, confirm callback.
  *
- * NOTE: This test renders the full FileBrowser component in jsdom which
- * requires significant memory. Skipped in CI to prevent OOM.
- * Run locally with: npx vitest run test/components/FileBrowser.test.tsx
+ * Heavy hljs/marked imports are mocked to prevent OOM in jsdom.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, act, cleanup } from '@testing-library/preact';
+
+// Mock hljs + marked to prevent 20 grammar registrations from OOMing jsdom
+vi.mock('highlight.js/lib/core', () => ({
+  default: { registerLanguage: () => {}, highlight: () => ({ value: '' }), highlightAuto: () => ({ value: '' }) },
+}));
+vi.mock('highlight.js/lib/languages/bash', () => ({ default: {} }));
+vi.mock('highlight.js/lib/languages/c', () => ({ default: {} }));
+vi.mock('highlight.js/lib/languages/cpp', () => ({ default: {} }));
+vi.mock('highlight.js/lib/languages/css', () => ({ default: {} }));
+vi.mock('highlight.js/lib/languages/dockerfile', () => ({ default: {} }));
+vi.mock('highlight.js/lib/languages/go', () => ({ default: {} }));
+vi.mock('highlight.js/lib/languages/java', () => ({ default: {} }));
+vi.mock('highlight.js/lib/languages/javascript', () => ({ default: {} }));
+vi.mock('highlight.js/lib/languages/json', () => ({ default: {} }));
+vi.mock('highlight.js/lib/languages/kotlin', () => ({ default: {} }));
+vi.mock('highlight.js/lib/languages/lua', () => ({ default: {} }));
+vi.mock('highlight.js/lib/languages/python', () => ({ default: {} }));
+vi.mock('highlight.js/lib/languages/ruby', () => ({ default: {} }));
+vi.mock('highlight.js/lib/languages/rust', () => ({ default: {} }));
+vi.mock('highlight.js/lib/languages/scala', () => ({ default: {} }));
+vi.mock('highlight.js/lib/languages/sql', () => ({ default: {} }));
+vi.mock('highlight.js/lib/languages/swift', () => ({ default: {} }));
+vi.mock('highlight.js/lib/languages/typescript', () => ({ default: {} }));
+vi.mock('highlight.js/lib/languages/xml', () => ({ default: {} }));
+vi.mock('highlight.js/lib/languages/yaml', () => ({ default: {} }));
+vi.mock('marked', () => ({ marked: (s: string) => s }));
+
 import { FileBrowser } from '../../src/components/FileBrowser.js';
 import type { WsClient, ServerMessage } from '../../src/ws-client.js';
 
