@@ -2,16 +2,20 @@
  * `imcodes setup --domain <domain>` — one-click server + daemon deployment.
  *
  * 1. Check prerequisites (docker, docker compose, ports)
- * 2. Generate .env, docker-compose.yml, Caddyfile
+ * 2. Generate .env, docker-compose.yml, Caddyfile (or reuse existing)
  * 3. Two-phase Docker startup (postgres → server → bootstrap DB → caddy)
  * 4. Self-bind daemon (write server.json, install service)
  * 5. Print credentials
+ *
+ * Supports resumable execution: if .env already exists, secrets are read from
+ * it and only missing steps are executed. Use --force to regenerate everything.
  */
 
 import { randomBytes, createHash } from 'node:crypto';
-import { writeFile, mkdir } from 'node:fs/promises';
+import { writeFile, readFile, mkdir } from 'node:fs/promises';
 import { existsSync, writeFileSync } from 'node:fs';
 import { execSync, execFileSync } from 'node:child_process';
+import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 import { homedir, hostname } from 'node:os';
 import { DOCKER_COMPOSE_TEMPLATE, caddyfileTemplate, envTemplate } from './templates.js';
@@ -36,6 +40,37 @@ function log(msg: string): void {
 function fatal(msg: string): never {
   console.error(`\n  Error: ${msg}`);
   process.exit(1);
+}
+
+async function confirm(prompt: string): Promise<boolean> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(`  ${prompt} [y/N] `, (answer) => {
+      rl.close();
+      resolve(answer.trim().toLowerCase() === 'y');
+    });
+  });
+}
+
+/** Stop and remove all containers, volumes, and config files for a clean reinstall. */
+function teardown(compose: string, dir: string): void {
+  log('Stopping and removing all containers and volumes...');
+  try {
+    execSync(
+      `${compose} -f ${join(dir, 'docker-compose.yml')} --env-file ${join(dir, '.env')} down -v --remove-orphans`,
+      { cwd: dir, stdio: 'inherit' },
+    );
+  } catch {
+    // compose down may fail if services never started — that's fine
+  }
+  // Remove generated config files
+  for (const file of ['.env', '.setup-secrets.json', 'docker-compose.yml', 'Caddyfile']) {
+    const p = join(dir, file);
+    if (existsSync(p)) {
+      execSync(`rm -f "${p}"`);
+    }
+  }
+  log('Previous setup removed.');
 }
 
 /** Try `docker compose` (v2 plugin) then `docker-compose` (v1 standalone). */
@@ -75,12 +110,6 @@ function checkPrerequisites(): string {
   return compose;
 }
 
-function checkExistingSetup(dir: string, force: boolean): void {
-  if (existsSync(join(dir, '.env')) && !force) {
-    fatal('Setup already exists in this directory. Use --force to overwrite.');
-  }
-}
-
 function checkDns(domain: string): void {
   try {
     const result = execFileSync('dig', ['+short', domain], { encoding: 'utf8', timeout: 5000 }).trim();
@@ -116,6 +145,62 @@ function generateSecrets(): SetupSecrets {
   };
 }
 
+/** Parse existing .env to recover secrets that were generated in a previous run. */
+function parseEnvFile(content: string): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx === -1) continue;
+    env[trimmed.slice(0, eqIdx)] = trimmed.slice(eqIdx + 1);
+  }
+  return env;
+}
+
+/** Read existing .env + setup-secrets.json to recover all secrets for resume. */
+async function recoverSecrets(dir: string): Promise<SetupSecrets | null> {
+  const envPath = join(dir, '.env');
+  const secretsPath = join(dir, '.setup-secrets.json');
+
+  if (!existsSync(envPath)) return null;
+
+  const envContent = await readFile(envPath, 'utf8');
+  const env = parseEnvFile(envContent);
+
+  // .setup-secrets.json stores the non-env secrets (serverToken, serverId, apiKey*)
+  if (!existsSync(secretsPath)) return null;
+
+  try {
+    const raw = JSON.parse(await readFile(secretsPath, 'utf8'));
+    return {
+      postgresPassword: env['POSTGRES_PASSWORD'] ?? raw.postgresPassword,
+      jwtSigningKey: env['JWT_SIGNING_KEY'] ?? raw.jwtSigningKey,
+      adminPassword: env['DEFAULT_ADMIN_PASSWORD'] ?? raw.adminPassword,
+      serverToken: raw.serverToken,
+      serverId: raw.serverId,
+      apiKeyRaw: raw.apiKeyRaw,
+      apiKeyId: raw.apiKeyId,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Persist non-env secrets so we can recover them on resume. */
+async function persistSecrets(dir: string, secrets: SetupSecrets): Promise<void> {
+  const secretsPath = join(dir, '.setup-secrets.json');
+  await writeFile(secretsPath, JSON.stringify({
+    postgresPassword: secrets.postgresPassword,
+    jwtSigningKey: secrets.jwtSigningKey,
+    adminPassword: secrets.adminPassword,
+    serverToken: secrets.serverToken,
+    serverId: secrets.serverId,
+    apiKeyRaw: secrets.apiKeyRaw,
+    apiKeyId: secrets.apiKeyId,
+  }, null, 2), { encoding: 'utf8', mode: 0o600 });
+}
+
 async function writeConfigs(dir: string, domain: string, secrets: SetupSecrets): Promise<void> {
   await writeFile(join(dir, '.env'), envTemplate({
     domain,
@@ -138,20 +223,25 @@ function composeCmdQuiet(compose: string, dir: string, args: string): string {
   return runQuiet(`${compose} -f ${join(dir, 'docker-compose.yml')} --env-file ${join(dir, '.env')} ${args}`, dir);
 }
 
+/** Check if a service is already running and healthy. */
+function isServiceHealthy(compose: string, dir: string, service: string): boolean {
+  try {
+    const health = composeCmdQuiet(compose, dir, `ps --format json ${service}`);
+    for (const line of health.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const obj = JSON.parse(line);
+        if (obj.Health === 'healthy' || obj.State === 'running') return true;
+      } catch { /* not JSON */ }
+    }
+  } catch { /* not running */ }
+  return false;
+}
+
 async function waitForService(compose: string, dir: string, service: string, timeoutMs = 30_000): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    try {
-      const health = composeCmdQuiet(compose, dir, `ps --format json ${service}`);
-      // docker compose ps --format json outputs one JSON object per line
-      for (const line of health.split('\n')) {
-        if (!line.trim()) continue;
-        try {
-          const obj = JSON.parse(line);
-          if (obj.Health === 'healthy' || obj.State === 'running') return;
-        } catch { /* not JSON */ }
-      }
-    } catch { /* not ready */ }
+    if (isServiceHealthy(compose, dir, service)) return;
     await new Promise(r => setTimeout(r, 2000));
   }
   fatal(`Timed out waiting for ${service} to be ready.`);
@@ -276,49 +366,94 @@ export async function setupFlow(domain: string, opts: { force?: boolean } = {}):
 
   console.log('\n  IM.codes Setup\n');
 
-  // 1. Prerequisites
+  // 1. Prerequisites (check before touching any files)
   log('Checking prerequisites...');
   const compose = checkPrerequisites();
-  checkExistingSetup(dir, opts.force ?? false);
   checkDns(domain);
 
-  // 2. Generate config
-  log('Generating configuration...');
-  const secrets = generateSecrets();
+  // 2. Recover or generate secrets
+  let secrets: SetupSecrets;
+  let resumed = false;
+
+  if (opts.force && existsSync(join(dir, '.env'))) {
+    console.warn('\n  ⚠  --force will destroy the existing setup:');
+    console.warn('     • Stop and remove all Docker containers');
+    console.warn('     • Delete all data volumes (PostgreSQL data, Caddy certs)');
+    console.warn('     • Regenerate all secrets and credentials');
+    console.warn('     • All existing users, sessions, and API keys will be lost\n');
+    const ok = await confirm('Are you sure you want to start fresh?');
+    if (!ok) {
+      log('Aborted.');
+      process.exit(0);
+    }
+    teardown(compose, dir);
+  }
+
+  if (!opts.force) {
+    const existing = await recoverSecrets(dir);
+    if (existing) {
+      secrets = existing;
+      resumed = true;
+      log('Resuming previous setup (existing .env + secrets found).');
+    } else if (existsSync(join(dir, '.env'))) {
+      // .env exists but no .setup-secrets.json — can't safely resume
+      fatal('Incomplete setup state: .env exists but secrets file is missing. Use --force to start fresh.');
+    } else {
+      secrets = generateSecrets();
+    }
+  } else {
+    secrets = generateSecrets();
+  }
+
+  // 3. Write config files (always write to ensure they match current secrets)
+  if (!resumed) {
+    log('Generating configuration...');
+  } else {
+    log('Updating configuration files...');
+  }
   await writeConfigs(dir, domain, secrets);
+  await persistSecrets(dir, secrets);
   log('Created .env, docker-compose.yml, Caddyfile');
 
-  // 3. Phase 1: Start PostgreSQL
-  log('Starting PostgreSQL...');
-  composeCmd(compose, dir, 'up -d postgres');
-  await waitForService(compose, dir, 'postgres');
-  log('PostgreSQL ready.');
+  // 4. Start PostgreSQL (skip if already healthy)
+  if (isServiceHealthy(compose, dir, 'postgres')) {
+    log('PostgreSQL already running.');
+  } else {
+    log('Starting PostgreSQL...');
+    composeCmd(compose, dir, 'up -d postgres');
+    await waitForService(compose, dir, 'postgres');
+    log('PostgreSQL ready.');
+  }
 
-  // 4. Phase 2: Start server (runs migrations + creates admin)
-  log('Starting server...');
-  composeCmd(compose, dir, 'up -d server');
-  // Wait a bit for migrations + admin creation
-  await new Promise(r => setTimeout(r, 5000));
-  await waitForService(compose, dir, 'server');
-  log('Server ready.');
+  // 5. Start server (skip if already healthy)
+  if (isServiceHealthy(compose, dir, 'server')) {
+    log('Server already running.');
+  } else {
+    log('Starting server...');
+    composeCmd(compose, dir, 'up -d server');
+    // Wait a bit for migrations + admin creation
+    await new Promise(r => setTimeout(r, 5000));
+    await waitForService(compose, dir, 'server');
+    log('Server ready.');
+  }
 
-  // 5. Phase 3: Bootstrap database (api_keys + servers)
+  // 6. Bootstrap database (idempotent — handles duplicates gracefully)
   log('Bootstrapping database...');
   bootstrapDatabase(compose, dir, secrets);
   log('Database bootstrapped.');
 
-  // 6. Phase 4: Start remaining services
+  // 7. Start remaining services
   log('Starting Caddy and Watchtower...');
   composeCmd(compose, dir, 'up -d');
   log('All services running.');
 
-  // 7. Self-bind
+  // 8. Self-bind
   log('Binding daemon to local server...');
   await selfBind(secrets);
   installService();
   log('Daemon bound and running.');
 
-  // 8. Print summary
+  // 9. Print summary
   const bindUrl = `https://${domain}/bind/${secrets.apiKeyRaw}`;
   console.log(`
   ┌──────────────────────────────────────────────────────┐

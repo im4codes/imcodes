@@ -174,7 +174,15 @@ passkeyRoutes.post('/register/begin', async (c) => {
   }
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const parsed = registerBeginSchema.safeParse(body);
-  const displayName = parsed.data?.displayName ?? 'IM.codes User';
+  let displayName = parsed.data?.displayName;
+
+  // For existing users adding a new passkey, look up their display_name from DB
+  if (!displayName && existingUserId) {
+    const user = await getUserById(c.env.DB, existingUserId);
+    displayName = user?.display_name || undefined;
+  }
+  displayName = displayName || 'IM.codes User';
+
   const { rpId } = getRpInfo(c);
 
   // Exclude already-registered credentials for this user
@@ -260,6 +268,10 @@ passkeyRoutes.post('/register/complete', async (c) => {
   if (!userId) {
     userId = randomHex(16);
     await createUser(c.env.DB, userId);
+    // Save the display name from registration to the user record
+    if (pending.displayName && pending.displayName !== 'IM.codes User') {
+      await c.env.DB.execute('UPDATE users SET display_name = $1 WHERE id = $2', [pending.displayName, userId]);
+    }
     // Check if new registrations require admin approval
     const { getSetting, updateUserStatus } = await import('../db/queries.js');
     const requireApproval = await getSetting(c.env.DB, 'require_approval');

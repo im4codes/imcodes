@@ -1182,15 +1182,54 @@ export class WsBridge {
     const sessionName = String(msg.session ?? msg.sessionId ?? '');
     const eventType = String(msg.type ?? '');
 
+    // Prefer label/parentLabel from daemon message (has full context including sub-sessions)
+    const daemonLabel = msg.label ? String(msg.label) : undefined;
+    const daemonParentLabel = msg.parentLabel ? String(msg.parentLabel) : undefined;
+
     // Look up session metadata for human-readable push content
-    const sessionRow = await db.queryOne<{ project_name: string; agent_type: string; label: string | null }>(
+    // Check sessions table first, then sub_sessions for sub-session names
+    let sessionRow = await db.queryOne<{ project_name: string; agent_type: string; label: string | null }>(
       'SELECT project_name, agent_type, label FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
       [this.serverId, sessionName],
     ).catch(() => null);
 
-    const displayName = sessionRow?.label || sessionRow?.project_name || sessionName;
-    const agentType = sessionRow?.agent_type ?? '';
-    const agentLabel = agentType ? ` (${agentType})` : '';
+    let subType: string | undefined;
+    if (!sessionRow) {
+      // Try sub_sessions table: session name is deck_sub_{id}
+      const subMatch = sessionName.match(/^deck_sub_([a-zA-Z0-9]+)$/);
+      const subRow = subMatch ? await db.queryOne<{ type: string; label: string | null; parent_session: string }>(
+        'SELECT type, label, parent_session FROM sub_sessions WHERE server_id = $1 AND id = $2 LIMIT 1',
+        [this.serverId, subMatch[1]],
+      ).catch(() => null) : null;
+      if (subRow) {
+        subType = subRow.type;
+        // Look up parent session for context
+        if (!daemonParentLabel && subRow.parent_session) {
+          const parentRow = await db.queryOne<{ project_name: string; label: string | null }>(
+            'SELECT project_name, label FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
+            [this.serverId, subRow.parent_session],
+          ).catch(() => null);
+          if (parentRow) {
+            sessionRow = { project_name: parentRow.project_name, agent_type: subRow.type, label: subRow.label };
+          }
+        }
+      }
+    }
+
+    // Build display name: label > project_name > session ID
+    const label = daemonLabel || sessionRow?.label;
+    const agentType = subType || sessionRow?.agent_type || String(msg.agentType ?? '');
+    const parentContext = daemonParentLabel || sessionRow?.project_name;
+
+    let displayName: string;
+    if (label) {
+      displayName = parentContext ? `${parentContext} · ${label}` : label;
+    } else if (agentType && parentContext) {
+      displayName = `${parentContext} · ${agentType}`;
+    } else {
+      displayName = parentContext || sessionName;
+    }
+    const agentLabel = agentType && label ? ` (${agentType})` : '';
     const lastText = String(msg.lastText ?? msg.message ?? '').slice(0, 200);
 
     let title: string;

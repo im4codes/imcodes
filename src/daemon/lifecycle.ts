@@ -466,15 +466,19 @@ export async function startup(): Promise<DaemonContext> {
     try {
       const record = listSessions().find((s) => s.name === payload.session);
       const projectName = record?.projectName ?? payload.session;
+      // Build human-readable display label: prefer label, then project name, then session ID
+      const sessionLabel = record?.label || undefined;
+      const parentRecord = record?.parentSession ? listSessions().find((s) => s.name === record.parentSession) : undefined;
+      const parentLabel = parentRecord?.label || parentRecord?.projectName || undefined;
       if (payload.event === 'idle') {
         // Shell/script sessions are always "idle" — skip to avoid noise
         if (record?.agentType === 'shell' || record?.agentType === 'script') return;
         // notifySessionIdle is handled by the unified timeline listener below
         // Include last assistant text for push notification context
         const lastText = getLastAssistantText(payload.session);
-        serverLink.send({ type: 'session.idle', session: payload.session, project: projectName, agentType: payload.agentType, ...(lastText ? { lastText } : {}) });
+        serverLink.send({ type: 'session.idle', session: payload.session, project: projectName, agentType: payload.agentType, ...(lastText ? { lastText } : {}), ...(sessionLabel ? { label: sessionLabel } : {}), ...(parentLabel ? { parentLabel } : {}) });
       } else if (payload.event === 'notification') {
-        serverLink.send({ type: 'session.notification', session: payload.session, project: projectName, title: payload.title, message: payload.message });
+        serverLink.send({ type: 'session.notification', session: payload.session, project: projectName, title: payload.title, message: payload.message, ...(sessionLabel ? { label: sessionLabel } : {}), ...(parentLabel ? { parentLabel } : {}) });
       } else if (payload.event === 'tool_start') {
         serverLink.send({ type: 'session.tool', session: payload.session, tool: payload.tool });
       } else if (payload.event === 'tool_end') {

@@ -877,7 +877,19 @@ export function App() {
       if (msg.type === 'session.idle') {
         const sessionName = msg.session as string;
         if (!sessionName) return;
-        const project = (msg.project as string) || sessionName;
+        // Build human-readable display: prefer label, fall back to project name, then session ID
+        const label = msg.label as string | undefined;
+        const parentLabel = msg.parentLabel as string | undefined;
+        const agentType = msg.agentType as string | undefined;
+        const rawProject = (msg.project as string) || sessionName;
+        let displayProject: string;
+        if (label) {
+          displayProject = parentLabel ? `${parentLabel} · ${label}` : label;
+        } else if (agentType && parentLabel) {
+          displayProject = `${parentLabel} · ${agentType}`;
+        } else {
+          displayProject = rawProject;
+        }
         if (!sessionName.startsWith('deck_sub_')) {
           // Main session: update state + tab alert
           setSessions((prev) => prev.map((s) => s.name === sessionName ? { ...s, state: 'idle' as SessionInfo['state'] } : s));
@@ -886,14 +898,22 @@ export function App() {
         }
         // Always show a toast (main + sub sessions)
         const id = Date.now();
-        setToasts((prev) => [...prev, { id, sessionName, project, kind: 'idle' }]);
+        setToasts((prev) => [...prev, { id, sessionName, project: displayProject, kind: 'idle' }]);
         setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 5000);
       }
       if (msg.type === 'session.notification') {
         const sessionName = msg.session;
-        const project = msg.project || sessionName;
+        const label = msg.label as string | undefined;
+        const parentLabel = msg.parentLabel as string | undefined;
+        const rawProject = msg.project || sessionName;
+        let displayProject: string;
+        if (label) {
+          displayProject = parentLabel ? `${parentLabel} · ${label}` : label;
+        } else {
+          displayProject = rawProject;
+        }
         const id = Date.now();
-        setToasts((prev) => [...prev, { id, sessionName, project, kind: 'notification', title: msg.title, message: msg.message }]);
+        setToasts((prev) => [...prev, { id, sessionName, project: displayProject, kind: 'notification', title: msg.title, message: msg.message }]);
         setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 8000);
       }
       if (msg.type === 'discussion.started') {

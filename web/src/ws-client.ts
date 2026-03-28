@@ -22,8 +22,8 @@ export type ServerMessage =
   | { type: 'terminal.stream_reset'; session: string; reason: string }
   | { type: 'session.event'; event: string; session: string; state: string }
   | { type: 'session.error'; project: string; message: string }
-  | { type: 'session.idle'; session: string; project: string; agentType: string }
-  | { type: 'session.notification'; session: string; project: string; title: string; message: string }
+  | { type: 'session.idle'; session: string; project: string; agentType: string; label?: string; parentLabel?: string }
+  | { type: 'session.notification'; session: string; project: string; title: string; message: string; label?: string; parentLabel?: string }
   | { type: 'session.tool'; session: string; tool: string | null }
   | { type: 'daemon.reconnected' }
   | { type: 'daemon.disconnected' }
