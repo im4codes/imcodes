@@ -840,6 +840,15 @@ export function FileBrowser({
               // Force write without expectedMtime
               const requestId = ws.fsWriteFile(preview.path, editContent);
               pendingWriteRef.current.set(requestId, preview.path);
+              // 30s timeout (same as regular save)
+              setTimeout(() => {
+                if (pendingWriteRef.current.has(requestId)) {
+                  pendingWriteRef.current.delete(requestId);
+                  setSaveStatus('timeout');
+                  setSaveError(t('fileBrowser.saveTimeout'));
+                  setTimeout(() => setSaveStatus((s) => s === 'timeout' ? 'idle' : s), 4000);
+                }
+              }, 30_000);
             }}
           >{t('fileBrowser.conflictKeepMine')}</button>
           <button
