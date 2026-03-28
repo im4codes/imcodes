@@ -309,11 +309,11 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
 
 // ── Cron Schedule Picker ─────────────────────────────────────────────────
 
-const MINUTES = ['0', '5', '10', '15', '20', '30', '45'];
-const HOURS = Array.from({ length: 24 }, (_, i) => String(i));
-const DAYS_OF_MONTH = ['*', ...Array.from({ length: 31 }, (_, i) => String(i + 1))];
-const MONTHS = ['*', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'];
-const WEEKDAYS = [
+const MINUTE_OPTS = ['0', '5', '10', '15', '20', '30', '45', '*/5', '*/10', '*/15', '*/30'];
+const HOUR_OPTS = ['*', ...Array.from({ length: 24 }, (_, i) => String(i))];
+const DOM_OPTS = ['*', ...Array.from({ length: 31 }, (_, i) => String(i + 1))];
+const MONTH_OPTS = ['*', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'];
+const DOW_OPTS = [
   { value: '*', label: 'Any' },
   { value: '1-5', label: 'Weekdays' },
   { value: '0,6', label: 'Weekends' },
@@ -321,6 +321,18 @@ const WEEKDAYS = [
   { value: '3', label: 'Wed' }, { value: '4', label: 'Thu' },
   { value: '5', label: 'Fri' }, { value: '6', label: 'Sat' }, { value: '0', label: 'Sun' },
 ];
+
+/** Check if all 5 fields can be represented by the picker dropdowns. */
+function isPickerCompatible(expr: string): boolean {
+  const p = parseCronParts(expr);
+  if (!p) return false;
+  const dowValues = DOW_OPTS.map(w => w.value);
+  return MINUTE_OPTS.includes(p.minute)
+    && HOUR_OPTS.includes(p.hour)
+    && DOM_OPTS.includes(p.dom)
+    && MONTH_OPTS.includes(p.month)
+    && dowValues.includes(p.dow);
+}
 
 const PRESETS = [
   { label: 'Every 5 min', value: '*/5 * * * *' },
@@ -344,12 +356,9 @@ interface CronPickerProps {
 }
 
 function CronSchedulePicker({ value, onChange, t }: CronPickerProps) {
-  const [mode, setMode] = useState<'picker' | 'advanced'>(() => {
-    const parts = parseCronParts(value);
-    if (!parts) return 'advanced';
-    // If minute uses intervals (*/N), that's fine for picker
-    return 'picker';
-  });
+  const [mode, setMode] = useState<'picker' | 'advanced'>(() =>
+    isPickerCompatible(value) ? 'picker' : 'advanced',
+  );
 
   const parts = parseCronParts(value) ?? { minute: '0', hour: '9', dom: '*', month: '*', dow: '*' };
 
@@ -358,12 +367,22 @@ function CronSchedulePicker({ value, onChange, t }: CronPickerProps) {
     onChange(`${p.minute} ${p.hour} ${p.dom} ${p.month} ${p.dow}`);
   };
 
+  /** Build options list, injecting the current value if it's not in the standard list. */
+  const withCurrent = (opts: string[], current: string) =>
+    opts.includes(current) ? opts : [...opts, current];
+
   const selectStyle: Record<string, string> = {
     padding: '6px 8px', background: '#0f172a', border: '1px solid #334155',
     borderRadius: '6px', color: '#e2e8f0', fontSize: '13px', appearance: 'auto',
     flex: '1', minWidth: '0',
   };
   const fieldLabel: Record<string, string> = { fontSize: '11px', color: '#64748b', marginBottom: '2px' };
+
+  const minuteLabel = (m: string) => m.startsWith('*/') ? m : (m === '0' ? ':00' : `:${m.padStart(2, '0')}`);
+  const hourLabel = (h: string) => h === '*' ? t('cron.every_hour') : `${h.padStart(2, '0')}:00`;
+
+  const dowValues = DOW_OPTS.map(w => w.value);
+  const currentDowInList = dowValues.includes(parts.dow);
 
   return (
     <div style={{ marginBottom: '10px' }}>
@@ -398,40 +417,36 @@ function CronSchedulePicker({ value, onChange, t }: CronPickerProps) {
           <div style={{ flex: 1 }}>
             <div style={fieldLabel}>{t('cron.field_minute')}</div>
             <select style={selectStyle} value={parts.minute} onChange={e => update('minute', (e.target as HTMLSelectElement).value)}>
-              {MINUTES.map(m => <option key={m} value={m}>{m === '0' ? ':00' : `:${m.padStart(2, '0')}`}</option>)}
-              <option value="*/5">*/5</option>
-              <option value="*/10">*/10</option>
-              <option value="*/15">*/15</option>
-              <option value="*/30">*/30</option>
+              {withCurrent(MINUTE_OPTS, parts.minute).map(m => <option key={m} value={m}>{minuteLabel(m)}</option>)}
             </select>
           </div>
           {/* Hour */}
           <div style={{ flex: 1 }}>
             <div style={fieldLabel}>{t('cron.field_hour')}</div>
             <select style={selectStyle} value={parts.hour} onChange={e => update('hour', (e.target as HTMLSelectElement).value)}>
-              <option value="*">{t('cron.every_hour')}</option>
-              {HOURS.map(h => <option key={h} value={h}>{h.padStart(2, '0')}:00</option>)}
+              {withCurrent(HOUR_OPTS, parts.hour).map(h => <option key={h} value={h}>{hourLabel(h)}</option>)}
             </select>
           </div>
           {/* Day of month */}
           <div style={{ flex: 1 }}>
             <div style={fieldLabel}>{t('cron.field_day')}</div>
             <select style={selectStyle} value={parts.dom} onChange={e => update('dom', (e.target as HTMLSelectElement).value)}>
-              {DAYS_OF_MONTH.map(d => <option key={d} value={d}>{d === '*' ? t('cron.any') : d}</option>)}
+              {withCurrent(DOM_OPTS, parts.dom).map(d => <option key={d} value={d}>{d === '*' ? t('cron.any') : d}</option>)}
             </select>
           </div>
           {/* Month */}
           <div style={{ flex: 1 }}>
             <div style={fieldLabel}>{t('cron.field_month')}</div>
             <select style={selectStyle} value={parts.month} onChange={e => update('month', (e.target as HTMLSelectElement).value)}>
-              {MONTHS.map(m => <option key={m} value={m}>{m === '*' ? t('cron.any') : m}</option>)}
+              {withCurrent(MONTH_OPTS, parts.month).map(m => <option key={m} value={m}>{m === '*' ? t('cron.any') : m}</option>)}
             </select>
           </div>
           {/* Day of week */}
           <div style={{ flex: 1.3 }}>
             <div style={fieldLabel}>{t('cron.field_weekday')}</div>
             <select style={selectStyle} value={parts.dow} onChange={e => update('dow', (e.target as HTMLSelectElement).value)}>
-              {WEEKDAYS.map(w => <option key={w.value} value={w.value}>{w.label}</option>)}
+              {DOW_OPTS.map(w => <option key={w.value} value={w.value}>{w.label}</option>)}
+              {!currentDowInList && <option value={parts.dow}>{parts.dow}</option>}
             </select>
           </div>
         </div>
