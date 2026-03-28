@@ -82,6 +82,7 @@ function execStatusLabel(status: string, t: (key: string) => string): string {
   if (status === 'skipped_offline') return t('cron.status_skipped_offline');
   if (status === 'skipped_busy') return t('cron.status_skipped_busy');
   if (status === 'error') return t('cron.status_error');
+  if (status === 'manual_trigger') return t('cron.status_manual_trigger');
   return status;
 }
 
@@ -159,6 +160,16 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
     try {
       await apiFetch(`/api/cron/${job.id}`, { method: 'DELETE' });
       setJobs(prev => prev.filter(j => j.id !== job.id));
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
+  const handleTriggerNow = async (job: CronJob) => {
+    if (!window.confirm(t('cron.confirm_trigger'))) return;
+    try {
+      await apiFetch(`/api/cron/${job.id}/trigger`, { method: 'POST' });
+      await loadJobs();
     } catch (err) {
       setError(String(err));
     }
@@ -249,6 +260,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
                   {job.status === CRON_STATUS.ACTIVE ? t('cron.pause') : t('cron.resume')}
                 </button>
               )}
+              <button onClick={() => handleTriggerNow(job)} style={{ ...btnSecondary, padding: '3px 8px', fontSize: '12px' }}>▶</button>
               <button onClick={() => handleEdit(job)} style={{ ...btnSecondary, padding: '3px 8px', fontSize: '12px' }}>✎</button>
               <button onClick={() => handleDelete(job)} style={{ ...btnDanger, padding: '3px 8px', fontSize: '12px' }}>✕</button>
               <button onClick={() => openHistory(job.id)} style={{ ...btnSecondary, padding: '3px 8px', fontSize: '12px', marginLeft: 'auto' }}>

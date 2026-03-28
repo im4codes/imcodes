@@ -10,6 +10,41 @@ import { randomHex } from '../security/crypto.js';
 import { CRON_MSG, CRON_STATUS, type CronAction, type CronDispatchMessage } from '../../../shared/cron-types.js';
 import logger from '../util/logger.js';
 
+/** Immediately dispatch a single cron job (for manual "Run Now" trigger). */
+export async function dispatchJobNow(env: Env, job: DbCronJob): Promise<void> {
+  let action: CronAction;
+  try {
+    action = JSON.parse(job.action);
+  } catch {
+    await logExecution(env, job.id, 'error', 'Invalid action JSON');
+    throw new Error('invalid_action');
+  }
+
+  const bridge = WsBridge.get(job.server_id);
+  if (!bridge.isDaemonConnected()) {
+    await logExecution(env, job.id, 'skipped_offline');
+    throw new Error('daemon_offline');
+  }
+
+  if (!job.target_role) {
+    logger.warn({ jobId: job.id }, 'Cron manual trigger: target_role is NULL, defaulting to brain');
+  }
+  const msg: CronDispatchMessage = {
+    type: CRON_MSG.DISPATCH,
+    jobId: job.id,
+    jobName: job.name,
+    serverId: job.server_id,
+    projectName: job.project_name ?? '',
+    targetRole: job.target_role ?? 'brain',
+    ...(job.target_session_name ? { targetSessionName: job.target_session_name } : {}),
+    action,
+  };
+  bridge.sendToDaemon(JSON.stringify(msg));
+
+  await logExecution(env, job.id, 'manual_trigger');
+  logger.info({ jobId: job.id, jobName: job.name }, 'Cron job manually triggered');
+}
+
 export async function jobDispatchCron(env: Env): Promise<void> {
   const now = Date.now();
 

@@ -496,7 +496,9 @@
     "status_error": "错误",
     "no_participants": "没有其他可用会话",
     "show_all_projects": "所有项目",
-    "view_discussion": "查看 P2P 讨论 →"
+    "view_discussion": "查看 P2P 讨论 →",
+    "confirm_trigger": "立即执行此任务？",
+    "status_manual_trigger": "手动触发"
   },
   "fileBrowser": {
     "edit": "编辑",

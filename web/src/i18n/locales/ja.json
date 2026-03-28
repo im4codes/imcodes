@@ -496,7 +496,9 @@
     "status_error": "エラー",
     "no_participants": "他に利用可能なセッションがありません",
     "show_all_projects": "全プロジェクト",
-    "view_discussion": "P2P ディスカッションを見る →"
+    "view_discussion": "P2P ディスカッションを見る →",
+    "confirm_trigger": "このタスクを今すぐ実行しますか？",
+    "status_manual_trigger": "手動実行"
   },
   "fileBrowser": {
     "edit": "編集",

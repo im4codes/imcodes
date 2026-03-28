@@ -496,7 +496,9 @@
     "status_error": "Ошибка",
     "no_participants": "Нет других доступных сессий",
     "show_all_projects": "Все проекты",
-    "view_discussion": "Просмотр P2P обсуждения →"
+    "view_discussion": "Просмотр P2P обсуждения →",
+    "confirm_trigger": "Выполнить эту задачу сейчас?",
+    "status_manual_trigger": "Вручную"
   },
   "fileBrowser": {
     "edit": "Редактировать",

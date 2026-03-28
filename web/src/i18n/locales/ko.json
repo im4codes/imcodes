@@ -496,7 +496,9 @@
     "status_error": "오류",
     "no_participants": "사용 가능한 다른 세션이 없습니다",
     "show_all_projects": "모든 프로젝트",
-    "view_discussion": "P2P 토론 보기 →"
+    "view_discussion": "P2P 토론 보기 →",
+    "confirm_trigger": "이 작업을 지금 실행하시겠습니까?",
+    "status_manual_trigger": "수동 실행"
   },
   "fileBrowser": {
     "edit": "편집",

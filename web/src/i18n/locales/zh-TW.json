@@ -496,7 +496,9 @@
     "status_error": "錯誤",
     "no_participants": "沒有其他可用工作階段",
     "show_all_projects": "所有專案",
-    "view_discussion": "檢視 P2P 討論 →"
+    "view_discussion": "檢視 P2P 討論 →",
+    "confirm_trigger": "立即執行此任務？",
+    "status_manual_trigger": "手動觸發"
   },
   "fileBrowser": {
     "edit": "編輯",

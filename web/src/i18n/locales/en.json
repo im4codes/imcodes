@@ -496,7 +496,9 @@
     "status_error": "Error",
     "no_participants": "No other sessions available",
     "show_all_projects": "All projects",
-    "view_discussion": "View P2P Discussion →"
+    "view_discussion": "View P2P Discussion →",
+    "confirm_trigger": "Run this task now?",
+    "status_manual_trigger": "Manual"
   },
   "fileBrowser": {
     "edit": "Edit",

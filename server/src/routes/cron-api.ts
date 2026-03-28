@@ -8,6 +8,7 @@ import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 import { CRON_STATUS } from '../../../shared/cron-types.js';
 import { P2P_MODE_KEYS } from '../../../shared/p2p-modes.js';
+import { dispatchJobNow } from '../cron/job-dispatch.js';
 
 export const cronApiRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -243,6 +244,31 @@ cronApiRoutes.delete('/:id', requireAuth(), async (c) => {
   await c.env.DB.execute('DELETE FROM cron_jobs WHERE id = $1', [jobId]);
 
   await logAudit({ userId, action: 'cron.delete', details: { id: jobId } }, c.env.DB);
+  return c.json({ ok: true });
+});
+
+// POST /api/cron/:id/trigger — immediately dispatch a cron job
+cronApiRoutes.post('/:id/trigger', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const jobId = c.req.param('id');
+
+  const job = await c.env.DB.queryOne<DbCronJob>(
+    'SELECT * FROM cron_jobs WHERE id = $1 AND user_id = $2',
+    [jobId, userId],
+  );
+  if (!job) return c.json({ error: 'not_found' }, 404);
+
+  const role = await resolveServerRole(c.env.DB, job.server_id, userId);
+  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+
+  try {
+    await dispatchJobNow(c.env, job);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return c.json({ error: msg }, 400);
+  }
+
+  await logAudit({ userId, action: 'cron.manual_trigger', details: { id: jobId } }, c.env.DB);
   return c.json({ ok: true });
 });
 
