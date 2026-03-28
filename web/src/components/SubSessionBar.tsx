@@ -64,8 +64,6 @@ interface Props {
   subUsages?: Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string }>;
   /** ID of the currently focused (topmost) sub-session window. */
   focusedSubId?: string | null;
-  /** Active main session name — used to scope card ordering per parent. */
-  activeSession?: string | null;
 }
 
 const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -109,7 +107,7 @@ function formatUptime(seconds: number): string {
   return d > 0 ? `${d}d ${h}h` : `${h}h`;
 }
 
-export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId, activeSession }: Props) {
+export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId }: Props) {
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
   const [collapsed, setCollapsed] = useState(isMobile);
   const [showSizePanel, setShowSizePanel] = useState(false);
@@ -117,99 +115,28 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
   const [draftW, setDraftW] = useState(String(cardSize.w));
   const [draftH, setDraftH] = useState(String(cardSize.h));
   const [stats, setStats] = useState<DaemonStats | null>(null);
-  const orderKey = serverId ? `rcc_subcard_order_${serverId}_${activeSession ?? ''}` : 'rcc_subcard_order';
-  const [orderedIds, setOrderedIds] = useState<string[]>(() => load(orderKey, []));
+  // DB sort_order is the authority — subSessions arrive pre-sorted from server.
+  // Local dragOrder only tracks in-session drag reorder (synced back to DB via reorderSubSessions).
+  const [dragOrder, setDragOrder] = useState<string[] | null>(null);
   const dragIdRef = useRef<string | null>(null);
-  const orderedIdsRef = useRef(orderedIds);
-  orderedIdsRef.current = orderedIds;
   const reorderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Reset orderedIds when server or active session changes
-  const prevOrderKeyRef = useRef(orderKey);
-  if (prevOrderKeyRef.current !== orderKey) {
-    prevOrderKeyRef.current = orderKey;
-    const saved = load<string[]>(orderKey, []);
-    setOrderedIds(saved);
-    orderedIdsRef.current = saved;
-  }
+  // Reset drag order when subSessions change (new data from DB)
+  useEffect(() => { setDragOrder(null); }, [subSessions]);
 
-  // Debounced server sync for sub-session order
   const syncOrderToServer = (ids: string[]) => {
-    // Always save to localStorage as fallback
-    save(orderKey, ids);
-    // Debounce server sync
     if (reorderTimerRef.current) clearTimeout(reorderTimerRef.current);
     reorderTimerRef.current = setTimeout(() => {
       if (serverId) reorderSubSessions(serverId, ids).catch(() => {});
     }, 500);
   };
-  const prevSubIdsRef = useRef<string[]>([]);
-  const removedPositionsRef = useRef<Map<string, number>>(new Map());
 
-  // Preserve ordering across restart: track removed session positions, place new sessions there
-  useEffect(() => {
-    const prevIds = prevSubIdsRef.current;
-    const currIds = subSessions.map((s) => s.id);
-
-    // Save positions of sessions that disappeared
-    const disappeared = prevIds.filter((id) => !currIds.includes(id));
-    for (const id of disappeared) {
-      const pos = orderedIdsRef.current.indexOf(id);
-      if (pos !== -1) removedPositionsRef.current.set(id, pos);
-    }
-
-    // Place newly appeared sessions at saved positions (restart case)
-    const appeared = currIds.filter((id) => !prevIds.includes(id));
-    if (appeared.length > 0 && removedPositionsRef.current.size > 0) {
-      setOrderedIds((prev) => {
-        const next = [...prev];
-        for (const newId of appeared) {
-          const entries = [...removedPositionsRef.current.entries()];
-          if (entries.length > 0) {
-            const [oldId, pos] = entries[0];
-            removedPositionsRef.current.delete(oldId);
-            const idx = next.indexOf(oldId);
-            if (idx !== -1) {
-              next[idx] = newId;
-            } else {
-              next.splice(Math.min(pos, next.length), 0, newId);
-            }
-          }
-        }
-        syncOrderToServer(next);
-        return next;
-      });
-    }
-
-    prevSubIdsRef.current = currIds;
-  }, [subSessions]); // orderedIds deliberately omitted to avoid loops
-
-  // Auto-initialize orderedIds from server order when empty or incomplete
-  useEffect(() => {
-    if (subSessions.length === 0) return;
-    const currentIds = subSessions.map((s) => s.id);
-    const hasAll = currentIds.every((id) => orderedIdsRef.current.includes(id));
-    if (!hasAll) {
-      setOrderedIds((prev) => {
-        const known = prev.filter((id) => currentIds.includes(id));
-        const newOnes = currentIds.filter((id) => !known.includes(id));
-        const merged = [...known, ...newOnes];
-        syncOrderToServer(merged);
-        return merged;
-      });
-    }
-  }, [subSessions]);
-
-  // Merge server order with persisted order: keep known positions, append new sessions at end.
-  // Uses Set for O(n) membership checks instead of O(n²) .some()/.includes().
+  // Use drag order if active, otherwise DB order (subSessions is pre-sorted)
   const orderedSessions = useMemo(() => {
+    if (!dragOrder) return subSessions;
     const sessionMap = new Map(subSessions.map((s) => [s.id, s]));
-    const sessionIdSet = new Set(sessionMap.keys());
-    const known = orderedIds.filter((id) => sessionIdSet.has(id));
-    const knownSet = new Set(known);
-    const newOnes = subSessions.filter((s) => !knownSet.has(s.id)).map((s) => s.id);
-    return [...known, ...newOnes].map((id) => sessionMap.get(id)!).filter(Boolean);
-  }, [subSessions, orderedIds]);
+    return dragOrder.map((id) => sessionMap.get(id)).filter(Boolean) as SubSession[];
+  }, [subSessions, dragOrder]);
 
   useEffect(() => {
     if (!ws) return;
@@ -482,17 +409,15 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
                 dragIdRef.current = sub.id;
                 e.dataTransfer!.effectAllowed = 'move';
                 (e.currentTarget as HTMLElement).style.opacity = '0.5';
+                // Initialize dragOrder from current displayed order
+                if (!dragOrder) setDragOrder(orderedSessions.map((s) => s.id));
               }}
               onDragOver={(e) => {
                 e.preventDefault();
                 e.dataTransfer!.dropEffect = 'move';
                 if (!dragIdRef.current || dragIdRef.current === sub.id) return;
-                setOrderedIds((prev) => {
-                  // Always build a complete list: persisted order + any new sessions appended
-                  const allIds = orderedSessions.map((s) => s.id);
-                  const known = prev.filter((id) => allIds.includes(id));
-                  const newOnes = allIds.filter((id) => !known.includes(id));
-                  const ids = [...known, ...newOnes];
+                setDragOrder((prev) => {
+                  const ids = prev ?? orderedSessions.map((s) => s.id);
                   const from = ids.indexOf(dragIdRef.current!);
                   const to = ids.indexOf(sub.id);
                   if (from === -1 || to === -1) return prev;
@@ -505,10 +430,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
               onDragEnd={(e) => {
                 dragIdRef.current = null;
                 (e.currentTarget as HTMLElement).style.opacity = '';
-                setOrderedIds((current) => {
-                  syncOrderToServer(current);
-                  return current;
-                });
+                if (dragOrder) syncOrderToServer(dragOrder);
               }}
             >
               <SubSessionCard

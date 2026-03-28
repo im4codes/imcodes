@@ -1918,7 +1918,6 @@ export function App() {
                 onViewCron={() => setShowCronManager(true)}
                 subUsages={subUsages}
                 focusedSubId={focusedSubId}
-                activeSession={activeSession}
               />
             )}
           </>
