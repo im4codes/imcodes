@@ -20,7 +20,7 @@ export default defineConfig({
     globals: false,
     poolOptions: {
       forks: {
-        execArgv: ['--max-old-space-size=4096'],
+        execArgv: ['--max-old-space-size=6144'],
       },
     },
   },
