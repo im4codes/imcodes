@@ -1016,6 +1016,10 @@ body {
 .diff-file-header { background: #1c2128; color: #8b949e; padding: 4px 10px; font-size: 11px; border-top: 1px solid #21262d; border-bottom: 1px solid #21262d; line-height: 20px; }
 /* Row hover */
 .diff-row-change:hover .diff-cell, .diff-row-ctx:hover .diff-cell { filter: brightness(1.15); }
+/* CodeMirror 6 editor container */
+.fb-editor-cm { height: 100%; overflow: auto; }
+.fb-editor-cm .cm-editor { height: 100%; }
+.fb-editor-cm .cm-scroller { overflow: auto; }
 /* highlight.js token colors (github-dark compatible) */
 .hljs { background: #0f172a; color: #e2e8f0; }
 .hljs-keyword, .hljs-selector-tag, .hljs-built_in { color: #c792ea; }

@@ -1,10 +1,20 @@
 /**
  * FileEditor — inline text editor for FileBrowser with save + conflict detection.
+ * Uses CodeMirror 6 for syntax highlighting, line numbers, and code editing.
  * Extracted from FileBrowser to keep component weight manageable for tests.
  */
 import { useState, useCallback, useEffect, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { WsClient, ServerMessage } from '../ws-client.js';
+import { EditorView, basicSetup } from 'codemirror';
+import { EditorState } from '@codemirror/state';
+import { javascript } from '@codemirror/lang-javascript';
+import { python } from '@codemirror/lang-python';
+import { json } from '@codemirror/lang-json';
+import { html } from '@codemirror/lang-html';
+import { css } from '@codemirror/lang-css';
+import { markdown } from '@codemirror/lang-markdown';
+import { oneDark } from '@codemirror/theme-one-dark';
 
 export interface FileEditorProps {
   ws: WsClient;
@@ -18,6 +28,21 @@ export interface FileEditorProps {
   onMessage: (handler: (msg: ServerMessage) => void) => (() => void);
   /** Notify parent when dirty state changes */
   onDirtyChange?: (dirty: boolean) => void;
+}
+
+/** Detect CodeMirror language extension from file path */
+function getLanguageExtension(path: string) {
+  const ext = path.split('.').pop()?.toLowerCase() ?? '';
+  switch (ext) {
+    case 'ts': case 'tsx': return javascript({ typescript: true, jsx: ext === 'tsx' });
+    case 'js': case 'jsx': case 'mjs': case 'cjs': return javascript({ jsx: ext === 'jsx' });
+    case 'py': return python();
+    case 'json': case 'jsonc': return json();
+    case 'html': case 'htm': case 'xml': case 'svg': return html();
+    case 'css': return css();
+    case 'md': case 'mdx': return markdown();
+    default: return null;
+  }
 }
 
 export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessage, onDirtyChange }: FileEditorProps) {
@@ -110,13 +135,16 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
   );
 }
 
-/** Editor content area — textarea + conflict dialog */
+/** Editor content area — CodeMirror editor + conflict dialog */
 export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage, onDirtyChange }: Omit<FileEditorProps, 'onClose' | 'onSaved'> & { onDirtyChange?: (dirty: boolean) => void }) {
   const { t } = useTranslation();
-  const [editContent, setEditContent] = useState(content);
   const [isDirty, setIsDirty] = useState(false);
   const [conflictData, setConflictData] = useState<{ diskContent: string; diskMtime: number } | null>(null);
   const pendingWriteRef = useRef(new Map<string, string>());
+  const containerRef = useRef<HTMLDivElement>(null);
+  const viewRef = useRef<EditorView | null>(null);
+  // Keep a ref to current content for conflict resolution
+  const currentContentRef = useRef(content);
 
   useEffect(() => { onDirtyChange?.(isDirty); }, [isDirty, onDirtyChange]);
 
@@ -132,6 +160,61 @@ export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage,
     });
   }, [onMessage]);
 
+  // Initialize CodeMirror editor
+  useEffect(() => {
+    if (!containerRef.current) return;
+
+    const langExt = getLanguageExtension(path);
+    const extensions = [
+      basicSetup,
+      oneDark,
+      EditorView.updateListener.of((update) => {
+        if (update.docChanged) {
+          const newContent = update.state.doc.toString();
+          currentContentRef.current = newContent;
+          const dirty = newContent !== content;
+          setIsDirty(dirty);
+          onDirtyChange?.(dirty);
+        }
+      }),
+      EditorView.theme({
+        '&': { height: '100%', fontSize: '12px', fontFamily: "'Menlo', 'Monaco', 'Consolas', monospace" },
+        '.cm-scroller': { overflow: 'auto' },
+      }),
+    ];
+    if (langExt) extensions.push(langExt);
+
+    const state = EditorState.create({
+      doc: content,
+      extensions,
+    });
+
+    const view = new EditorView({
+      state,
+      parent: containerRef.current,
+    });
+    viewRef.current = view;
+
+    return () => {
+      view.destroy();
+      viewRef.current = null;
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [path]); // Re-create editor when path changes
+
+  // When content prop changes externally (e.g. file reload), update editor if not dirty
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    if (isDirty) return; // Don't overwrite user's edits
+    const currentDoc = view.state.doc.toString();
+    if (currentDoc === content) return;
+    view.dispatch({
+      changes: { from: 0, to: view.state.doc.length, insert: content },
+    });
+    currentContentRef.current = content;
+  }, [content, isDirty]);
+
   return (
     <>
       {conflictData && (
@@ -141,11 +224,18 @@ export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage,
             <div class="fb-conflict-actions">
               <button class="btn btn-primary" onClick={() => {
                 setConflictData(null);
-                const requestId = ws.fsWriteFile(path, editContent);
+                const requestId = ws.fsWriteFile(path, currentContentRef.current);
                 pendingWriteRef.current.set(requestId, path);
               }}>{t('fileBrowser.conflictKeepMine')}</button>
               <button class="btn btn-secondary" onClick={() => {
-                setEditContent(conflictData.diskContent);
+                // Replace editor content with disk version
+                const view = viewRef.current;
+                if (view) {
+                  view.dispatch({
+                    changes: { from: 0, to: view.state.doc.length, insert: conflictData.diskContent },
+                  });
+                  currentContentRef.current = conflictData.diskContent;
+                }
                 setIsDirty(false);
                 setConflictData(null);
               }}>{t('fileBrowser.conflictUseDisk')}</button>
@@ -156,16 +246,7 @@ export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage,
           </div>
         </div>
       )}
-      <textarea
-        class="fb-editor-textarea"
-        value={editContent}
-        onInput={(e) => {
-          const val = (e.target as HTMLTextAreaElement).value;
-          setEditContent(val);
-          setIsDirty(val !== content);
-        }}
-        spellcheck={false}
-      />
+      <div ref={containerRef} class="fb-editor-cm" />
     </>
   );
 }

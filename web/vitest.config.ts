@@ -15,7 +15,7 @@ export default defineConfig({
   test: {
     name: 'web',
     include: ['test/**/*.test.ts', 'test/**/*.test.tsx'],
-    exclude: ['**/node_modules/**', 'test/components/FileBrowser.test.tsx'],
+    exclude: ['**/node_modules/**'],
     environment: 'jsdom',
     globals: false,
     poolOptions: {
