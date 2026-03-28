@@ -450,6 +450,16 @@
     "name_placeholder": "Напр., Ежедневная проверка CI",
     "schedule": "Расписание",
     "schedule_help": "Cron-выражение (напр., 0 9 * * 1-5 = будни в 9 утра)",
+    "mode_picker": "Визуальный выбор",
+    "mode_advanced": "Расширенный (cron)",
+    "advanced_help": "Формат: мин час день месяц деньНедели — напр. 0 9 * * 1-5 = будни в 9 утра",
+    "field_minute": "Минута",
+    "field_hour": "Час",
+    "field_day": "День",
+    "field_month": "Месяц",
+    "field_weekday": "День недели",
+    "every_hour": "Каждый час",
+    "any": "Любой",
     "target": "Целевая сессия",
     "action_type": "Тип действия",
     "action_command": "Команда",
@@ -484,6 +494,7 @@
     "status_skipped_offline": "Пропущено (не в сети)",
     "status_skipped_busy": "Пропущено (занят)",
     "status_error": "Ошибка",
-    "no_participants": "Нет других доступных сессий"
+    "no_participants": "Нет других доступных сессий",
+    "show_all_projects": "Все проекты"
   }
 }

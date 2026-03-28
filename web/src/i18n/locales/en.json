@@ -450,6 +450,16 @@
     "name_placeholder": "e.g., Daily CI check",
     "schedule": "Schedule",
     "schedule_help": "Cron expression (e.g., 0 9 * * 1-5 = weekdays at 9am)",
+    "mode_picker": "Visual picker",
+    "mode_advanced": "Advanced (cron)",
+    "advanced_help": "Format: minute hour day month weekday — e.g., 0 9 * * 1-5 = weekdays at 9am",
+    "field_minute": "Minute",
+    "field_hour": "Hour",
+    "field_day": "Day",
+    "field_month": "Month",
+    "field_weekday": "Weekday",
+    "every_hour": "Every hour",
+    "any": "Any",
     "target": "Target Session",
     "action_type": "Action Type",
     "action_command": "Command",
@@ -484,6 +494,7 @@
     "status_skipped_offline": "Skipped (offline)",
     "status_skipped_busy": "Skipped (busy)",
     "status_error": "Error",
-    "no_participants": "No other sessions available"
+    "no_participants": "No other sessions available",
+    "show_all_projects": "All projects"
   }
 }

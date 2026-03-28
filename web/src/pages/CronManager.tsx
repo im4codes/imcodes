@@ -6,6 +6,7 @@ import { CRON_STATUS } from '@shared/cron-types';
 import { BUILT_IN_MODES } from '@shared/p2p-modes';
 import type { SessionInfo } from '../types.js';
 import { formatLabel } from '../format-label.js';
+import { FloatingPanel } from '../components/FloatingPanel.js';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -116,22 +117,28 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   const [jobs, setJobs] = useState<CronJob[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [showForm, setShowForm] = useState(false);
+  const [showAll, setShowAll] = useState(() => localStorage.getItem('rcc_cron_show_all') === '1');
+  // Sub-panel state: 'form' for create/edit, 'history:jobId' for execution log
+  const [subPanel, setSubPanel] = useState<string | null>(null);
   const [editingJob, setEditingJob] = useState<CronJob | null>(null);
-  const [expandedHistory, setExpandedHistory] = useState<string | null>(null);
   const [historyData, setHistoryData] = useState<Record<string, CronExecution[]>>({});
+
+  const toggleShowAll = () => {
+    setShowAll(prev => { const v = !prev; localStorage.setItem('rcc_cron_show_all', v ? '1' : ''); return v; });
+  };
 
   // ── Load jobs ──────────────────────────────────────────────────────────
   const loadJobs = useCallback(async () => {
     try {
-      const res = await apiFetch<{ jobs: CronJob[] }>(`/api/cron?serverId=${serverId}&projectName=${projectName}`);
+      const q = showAll ? `serverId=${serverId}` : `serverId=${serverId}&projectName=${projectName}`;
+      const res = await apiFetch<{ jobs: CronJob[] }>(`/api/cron?${q}`);
       setJobs(res.jobs);
     } catch (err) {
       setError(String(err));
     } finally {
       setLoading(false);
     }
-  }, [serverId, projectName]);
+  }, [serverId, projectName, showAll]);
 
   useEffect(() => { loadJobs(); }, [loadJobs]);
 
@@ -158,21 +165,17 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
 
   const handleEdit = (job: CronJob) => {
     setEditingJob(job);
-    setShowForm(true);
+    setSubPanel('form');
   };
 
   const handleFormDone = () => {
-    setShowForm(false);
+    setSubPanel(null);
     setEditingJob(null);
     loadJobs();
   };
 
-  const toggleHistory = async (jobId: string) => {
-    if (expandedHistory === jobId) {
-      setExpandedHistory(null);
-      return;
-    }
-    setExpandedHistory(jobId);
+  const openHistory = async (jobId: string) => {
+    setSubPanel(`history:${jobId}`);
     if (!historyData[jobId]) {
       try {
         const res = await apiFetch<{ executions: CronExecution[] }>(`/api/cron/${jobId}/executions?limit=20`);
@@ -187,109 +190,259 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   const mainNames = new Set(eligible.map(s => s.name));
   const scopedSubs = subSessions.filter(s => s.parentSession && mainNames.has(s.parentSession));
 
+  const historyJobId = subPanel?.startsWith('history:') ? subPanel.slice(8) : null;
+  const historyJob = historyJobId ? jobs.find(j => j.id === historyJobId) : null;
+
+  const displayTarget = (job: CronJob) => {
+    if (job.target_session_name) {
+      const sub = subSessions.find(s => s.sessionName === job.target_session_name);
+      return sub?.label ? formatLabel(sub.label) : job.target_session_name.replace('deck_sub_', '');
+    }
+    return roleToDisplay(job.target_role, sessions, job.project_name);
+  };
+
   return (
-    <div style={{ maxWidth: '700px', margin: '0 auto', padding: '20px' }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
+    <div style={{ maxWidth: '700px', margin: '0 auto', padding: '12px 20px' }}>
+      {/* Toolbar: show-all toggle + add button */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px' }}>
+        <label style={{ color: '#94a3b8', fontSize: '12px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}>
+          <input type="checkbox" checked={showAll} onChange={toggleShowAll} />
+          {t('cron.show_all_projects')}
+        </label>
         <div style={{ flex: 1 }} />
-        {!showForm && (
-          <button onClick={() => { setEditingJob(null); setShowForm(true); }} style={btnPrimary}>
-            + {t('cron.create')}
-          </button>
-        )}
+        <button onClick={() => { setEditingJob(null); setSubPanel('form'); }}
+          style={{ padding: '3px 10px', background: '#3b82f6', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '16px', lineHeight: 1 }}
+          title={t('cron.create')}>+</button>
       </div>
 
-      {error && <div style={{ color: '#f87171', marginBottom: '12px', fontSize: '13px' }}>{error}</div>}
-
-      {showForm && (
-        <CronForm
-          serverId={serverId}
-          projectName={projectName}
-          sessions={eligible}
-          subSessions={scopedSubs}
-          job={editingJob}
-          onDone={handleFormDone}
-          onCancel={() => { setShowForm(false); setEditingJob(null); }}
-        />
-      )}
+      {error && <div style={{ color: '#f87171', marginBottom: '8px', fontSize: '13px' }}>{error}</div>}
 
       {loading && <div style={{ color: '#94a3b8', textAlign: 'center', padding: '40px' }}>{t('common.loading')}</div>}
 
-      {!loading && jobs.length === 0 && !showForm && (
+      {!loading && jobs.length === 0 && (
         <div style={{ color: '#64748b', textAlign: 'center', padding: '40px' }}>{t('cron.no_tasks')}</div>
       )}
 
       {jobs.map(job => {
         const action = parseAction(job.action);
-        const isExpanded = expandedHistory === job.id;
         return (
-          <div key={job.id} style={cardStyle}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '8px' }}>
-              <span style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '15px', flex: 1 }}>{job.name}</span>
-              <span style={{ color: statusColors[job.status] ?? '#94a3b8', fontSize: '12px', fontWeight: 600, textTransform: 'uppercase' }}>
+          <div key={job.id} style={{ ...cardStyle, padding: '12px 16px', marginBottom: '10px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
+              <span style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '14px', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{job.name}</span>
+              {showAll && <span style={{ color: '#64748b', fontSize: '11px', flexShrink: 0 }}>{job.project_name}</span>}
+              <span style={{ color: statusColors[job.status] ?? '#94a3b8', fontSize: '11px', fontWeight: 600, textTransform: 'uppercase', flexShrink: 0 }}>
                 {t(`cron.${job.status}`)}
               </span>
             </div>
 
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 16px', fontSize: '13px', color: '#94a3b8', marginBottom: '10px' }}>
-              <div>{t('cron.schedule')}: <span style={{ color: '#cbd5e1' }}>{job.cron_expr}</span></div>
-              <div>{t('cron.target')}: <span style={{ color: '#cbd5e1' }}>{job.target_session_name
-                ? (subSessions.find(s => s.sessionName === job.target_session_name)?.label
-                    ? formatLabel(subSessions.find(s => s.sessionName === job.target_session_name)!.label!)
-                    : job.target_session_name.replace('deck_sub_', ''))
-                : roleToDisplay(job.target_role, sessions, job.project_name)}</span></div>
-              <div>{t('cron.last_run')}: <span style={{ color: '#cbd5e1' }}>{fmtTime(job.last_run_at)}</span></div>
-              <div>{t('cron.next_run')}: <span style={{ color: '#cbd5e1' }}>{fmtTime(job.next_run_at)}</span></div>
-              {job.expires_at && <div>{t('cron.expires_at')}: <span style={{ color: '#cbd5e1' }}>{fmtTime(job.expires_at)}</span></div>}
+            <div style={{ display: 'flex', gap: '12px', fontSize: '12px', color: '#94a3b8', marginBottom: '8px', flexWrap: 'wrap' }}>
+              <span style={{ fontFamily: 'monospace', color: '#cbd5e1' }}>{job.cron_expr}</span>
+              <span>→ {displayTarget(job)}</span>
+              {action?.type === 'p2p' && <span style={{ opacity: 0.6 }}>P2P {action.mode}</span>}
+              {action?.type === 'command' && <span style={{ opacity: 0.6, maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{action.command}</span>}
             </div>
 
-            {action?.type === 'command' && (
-              <div style={{ background: '#0f172a', borderRadius: '6px', padding: '8px 10px', fontSize: '13px', color: '#cbd5e1', marginBottom: '10px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '80px', overflow: 'auto' }}>
-                {action.command}
-              </div>
-            )}
-            {action?.type === 'p2p' && (
-              <div style={{ background: '#0f172a', borderRadius: '6px', padding: '8px 10px', fontSize: '13px', color: '#cbd5e1', marginBottom: '10px' }}>
-                P2P: {action.topic} <span style={{ opacity: 0.6 }}>({action.mode}, {[
-                  ...(action.participants?.map(r => roleToDisplay(r, sessions, job.project_name)) ?? []),
-                  ...(action.participantEntries?.filter(e => e.type === 'session').map(e => {
-                    const sub = subSessions.find(s => s.sessionName === e.value);
-                    return sub?.label ? formatLabel(sub.label) : e.value.replace('deck_sub_', '');
-                  }) ?? []),
-                ].join(', ')})</span>
-              </div>
-            )}
-
-            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+            <div style={{ display: 'flex', gap: '6px', fontSize: '12px' }}>
               {(job.status === CRON_STATUS.ACTIVE || job.status === CRON_STATUS.PAUSED) && (
-                <button onClick={() => handlePauseResume(job)} style={btnSecondary}>
+                <button onClick={() => handlePauseResume(job)} style={{ ...btnSecondary, padding: '3px 8px', fontSize: '12px' }}>
                   {job.status === CRON_STATUS.ACTIVE ? t('cron.pause') : t('cron.resume')}
                 </button>
               )}
-              <button onClick={() => handleEdit(job)} style={btnSecondary}>{t('cron.edit')}</button>
-              <button onClick={() => handleDelete(job)} style={btnDanger}>{t('common.delete')}</button>
-              <button onClick={() => toggleHistory(job.id)} style={{ ...btnSecondary, marginLeft: 'auto' }}>
-                {t('cron.history')} {isExpanded ? '▲' : '▼'}
+              <button onClick={() => handleEdit(job)} style={{ ...btnSecondary, padding: '3px 8px', fontSize: '12px' }}>✎</button>
+              <button onClick={() => handleDelete(job)} style={{ ...btnDanger, padding: '3px 8px', fontSize: '12px' }}>✕</button>
+              <button onClick={() => openHistory(job.id)} style={{ ...btnSecondary, padding: '3px 8px', fontSize: '12px', marginLeft: 'auto' }}>
+                {t('cron.history')}
               </button>
             </div>
-
-            {isExpanded && (
-              <div style={{ marginTop: '10px', borderTop: '1px solid #334155', paddingTop: '10px' }}>
-                {!historyData[job.id] && <div style={{ color: '#64748b', fontSize: '13px' }}>{t('common.loading')}</div>}
-                {historyData[job.id]?.length === 0 && <div style={{ color: '#64748b', fontSize: '13px' }}>{t('cron.no_history')}</div>}
-                {historyData[job.id]?.map(exec => (
-                  <div key={exec.id} style={{ display: 'flex', gap: '12px', fontSize: '12px', color: '#94a3b8', padding: '3px 0' }}>
-                    <span style={{ minWidth: '140px' }}>{fmtTime(exec.created_at)}</span>
-                    <span style={{ color: exec.status === 'dispatched' ? '#4ade80' : exec.status === 'error' ? '#f87171' : '#fbbf24' }}>
-                      {execStatusLabel(exec.status, t)}
-                    </span>
-                    {exec.detail && <span>{exec.detail}</span>}
-                  </div>
-                ))}
-              </div>
-            )}
           </div>
         );
       })}
+
+      {/* Sub-panel: Create/Edit form — FloatingPanel */}
+      {subPanel === 'form' && (
+        <FloatingPanel
+          id="cron-form"
+          title={editingJob ? t('cron.edit') : t('cron.create')}
+          onClose={() => { setSubPanel(null); setEditingJob(null); }}
+          defaultW={500} defaultH={600}
+        >
+          <div style={{ padding: '16px', overflow: 'auto', height: '100%' }}>
+            <CronForm
+              serverId={serverId}
+              projectName={projectName}
+              sessions={eligible}
+              subSessions={scopedSubs}
+              job={editingJob}
+              onDone={handleFormDone}
+              onCancel={() => { setSubPanel(null); setEditingJob(null); }}
+            />
+          </div>
+        </FloatingPanel>
+      )}
+
+      {/* Sub-panel: Execution history — FloatingPanel */}
+      {historyJobId && historyJob && (
+        <FloatingPanel
+          id={`cron-history-${historyJobId}`}
+          title={`${t('cron.history')} · ${historyJob.name}`}
+          onClose={() => setSubPanel(null)}
+          defaultW={480} defaultH={400}
+        >
+          <div style={{ padding: '12px', overflow: 'auto', height: '100%' }}>
+            {!historyData[historyJobId] && <div style={{ color: '#64748b', fontSize: '13px' }}>{t('common.loading')}</div>}
+            {historyData[historyJobId]?.length === 0 && <div style={{ color: '#64748b', fontSize: '13px' }}>{t('cron.no_history')}</div>}
+            {historyData[historyJobId]?.map(exec => (
+              <div key={exec.id} style={{ display: 'flex', gap: '12px', fontSize: '12px', color: '#94a3b8', padding: '4px 0', borderBottom: '1px solid #1e293b' }}>
+                <span style={{ minWidth: '140px' }}>{fmtTime(exec.created_at)}</span>
+                <span style={{ color: exec.status === 'dispatched' ? '#4ade80' : exec.status === 'error' ? '#f87171' : '#fbbf24' }}>
+                  {execStatusLabel(exec.status, t)}
+                </span>
+                {exec.detail && <span style={{ flex: 1, color: '#64748b' }}>{exec.detail}</span>}
+              </div>
+            ))}
+          </div>
+        </FloatingPanel>
+      )}
+    </div>
+  );
+}
+
+// ── Cron Schedule Picker ─────────────────────────────────────────────────
+
+const MINUTES = ['0', '5', '10', '15', '20', '30', '45'];
+const HOURS = Array.from({ length: 24 }, (_, i) => String(i));
+const DAYS_OF_MONTH = ['*', ...Array.from({ length: 31 }, (_, i) => String(i + 1))];
+const MONTHS = ['*', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'];
+const WEEKDAYS = [
+  { value: '*', label: 'Any' },
+  { value: '1-5', label: 'Weekdays' },
+  { value: '0,6', label: 'Weekends' },
+  { value: '1', label: 'Mon' }, { value: '2', label: 'Tue' },
+  { value: '3', label: 'Wed' }, { value: '4', label: 'Thu' },
+  { value: '5', label: 'Fri' }, { value: '6', label: 'Sat' }, { value: '0', label: 'Sun' },
+];
+
+const PRESETS = [
+  { label: 'Every 5 min', value: '*/5 * * * *' },
+  { label: 'Every 30 min', value: '*/30 * * * *' },
+  { label: 'Hourly', value: '0 * * * *' },
+  { label: 'Daily 9am', value: '0 9 * * *' },
+  { label: 'Weekdays 9am', value: '0 9 * * 1-5' },
+  { label: 'Weekly Mon 9am', value: '0 9 * * 1' },
+];
+
+function parseCronParts(expr: string): { minute: string; hour: string; dom: string; month: string; dow: string } | null {
+  const parts = expr.trim().split(/\s+/);
+  if (parts.length !== 5) return null;
+  return { minute: parts[0], hour: parts[1], dom: parts[2], month: parts[3], dow: parts[4] };
+}
+
+interface CronPickerProps {
+  value: string;
+  onChange: (v: string) => void;
+  t: (key: string) => string;
+}
+
+function CronSchedulePicker({ value, onChange, t }: CronPickerProps) {
+  const [mode, setMode] = useState<'picker' | 'advanced'>(() => {
+    const parts = parseCronParts(value);
+    if (!parts) return 'advanced';
+    // If minute uses intervals (*/N), that's fine for picker
+    return 'picker';
+  });
+
+  const parts = parseCronParts(value) ?? { minute: '0', hour: '9', dom: '*', month: '*', dow: '*' };
+
+  const update = (field: string, val: string) => {
+    const p = { ...parts, [field]: val };
+    onChange(`${p.minute} ${p.hour} ${p.dom} ${p.month} ${p.dow}`);
+  };
+
+  const selectStyle: Record<string, string> = {
+    padding: '6px 8px', background: '#0f172a', border: '1px solid #334155',
+    borderRadius: '6px', color: '#e2e8f0', fontSize: '13px', appearance: 'auto',
+    flex: '1', minWidth: '0',
+  };
+  const fieldLabel: Record<string, string> = { fontSize: '11px', color: '#64748b', marginBottom: '2px' };
+
+  return (
+    <div style={{ marginBottom: '10px' }}>
+      {/* Mode toggle + presets */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
+        <button type="button" onClick={() => setMode(m => m === 'picker' ? 'advanced' : 'picker')}
+          style={{ padding: '3px 8px', background: '#334155', color: '#94a3b8', border: 'none', borderRadius: '4px', fontSize: '11px', cursor: 'pointer' }}>
+          {mode === 'picker' ? t('cron.mode_advanced') : t('cron.mode_picker')}
+        </button>
+        {mode === 'picker' && (
+          <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
+            {PRESETS.map(p => (
+              <button key={p.value} type="button" onClick={() => onChange(p.value)}
+                style={{ padding: '2px 6px', background: value === p.value ? '#3b82f6' : '#1e293b', color: value === p.value ? '#fff' : '#94a3b8', border: '1px solid #334155', borderRadius: '4px', fontSize: '10px', cursor: 'pointer' }}>
+                {p.label}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {mode === 'advanced' ? (
+        <>
+          <input style={inputStyle} value={value} onInput={e => onChange((e.target as HTMLInputElement).value)} placeholder="0 9 * * 1-5" required />
+          <div style={{ color: '#64748b', fontSize: '11px', marginTop: '-6px', marginBottom: '4px' }}>
+            {t('cron.advanced_help')}
+          </div>
+        </>
+      ) : (
+        <div style={{ display: 'flex', gap: '8px' }}>
+          {/* Minute */}
+          <div style={{ flex: 1 }}>
+            <div style={fieldLabel}>{t('cron.field_minute')}</div>
+            <select style={selectStyle} value={parts.minute} onChange={e => update('minute', (e.target as HTMLSelectElement).value)}>
+              {MINUTES.map(m => <option key={m} value={m}>{m === '0' ? ':00' : `:${m.padStart(2, '0')}`}</option>)}
+              <option value="*/5">*/5</option>
+              <option value="*/10">*/10</option>
+              <option value="*/15">*/15</option>
+              <option value="*/30">*/30</option>
+            </select>
+          </div>
+          {/* Hour */}
+          <div style={{ flex: 1 }}>
+            <div style={fieldLabel}>{t('cron.field_hour')}</div>
+            <select style={selectStyle} value={parts.hour} onChange={e => update('hour', (e.target as HTMLSelectElement).value)}>
+              <option value="*">{t('cron.every_hour')}</option>
+              {HOURS.map(h => <option key={h} value={h}>{h.padStart(2, '0')}:00</option>)}
+            </select>
+          </div>
+          {/* Day of month */}
+          <div style={{ flex: 1 }}>
+            <div style={fieldLabel}>{t('cron.field_day')}</div>
+            <select style={selectStyle} value={parts.dom} onChange={e => update('dom', (e.target as HTMLSelectElement).value)}>
+              {DAYS_OF_MONTH.map(d => <option key={d} value={d}>{d === '*' ? t('cron.any') : d}</option>)}
+            </select>
+          </div>
+          {/* Month */}
+          <div style={{ flex: 1 }}>
+            <div style={fieldLabel}>{t('cron.field_month')}</div>
+            <select style={selectStyle} value={parts.month} onChange={e => update('month', (e.target as HTMLSelectElement).value)}>
+              {MONTHS.map(m => <option key={m} value={m}>{m === '*' ? t('cron.any') : m}</option>)}
+            </select>
+          </div>
+          {/* Day of week */}
+          <div style={{ flex: 1.3 }}>
+            <div style={fieldLabel}>{t('cron.field_weekday')}</div>
+            <select style={selectStyle} value={parts.dow} onChange={e => update('dow', (e.target as HTMLSelectElement).value)}>
+              {WEEKDAYS.map(w => <option key={w.value} value={w.value}>{w.label}</option>)}
+            </select>
+          </div>
+        </div>
+      )}
+
+      {/* Preview: show the raw expression */}
+      {mode === 'picker' && (
+        <div style={{ color: '#64748b', fontSize: '11px', marginTop: '6px', fontFamily: 'monospace' }}>
+          {value || '—'}
+        </div>
+      )}
     </div>
   );
 }
@@ -417,8 +570,7 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
         <input style={inputStyle} value={name} onInput={e => setName((e.target as HTMLInputElement).value)} placeholder={t('cron.name_placeholder')} required />
 
         <label style={labelStyle}>{t('cron.schedule')}</label>
-        <input style={inputStyle} value={cronExpr} onInput={e => setCronExpr((e.target as HTMLInputElement).value)} placeholder="0 9 * * 1-5" required />
-        <div style={{ color: '#64748b', fontSize: '11px', marginTop: '-6px', marginBottom: '10px' }}>{t('cron.schedule_help')}</div>
+        <CronSchedulePicker value={cronExpr} onChange={setCronExpr} t={t} />
 
         <label style={labelStyle}>{t('cron.target')}</label>
         <select style={{ ...inputStyle, appearance: 'auto' as string }} value={targetValue} onChange={e => handleTargetChange((e.target as HTMLSelectElement).value)}>

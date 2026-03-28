@@ -450,6 +450,16 @@
     "name_placeholder": "例：毎日のCIチェック",
     "schedule": "スケジュール",
     "schedule_help": "Cron式（例：0 9 * * 1-5 = 平日の午前9時）",
+    "mode_picker": "ビジュアル選択",
+    "mode_advanced": "詳細 (cron)",
+    "advanced_help": "形式：分 時 日 月 曜日 — 例: 0 9 * * 1-5 = 平日午前9時",
+    "field_minute": "分",
+    "field_hour": "時",
+    "field_day": "日",
+    "field_month": "月",
+    "field_weekday": "曜日",
+    "every_hour": "毎時",
+    "any": "任意",
     "target": "対象セッション",
     "action_type": "アクション種別",
     "action_command": "コマンド",
@@ -484,6 +494,7 @@
     "status_skipped_offline": "スキップ（オフライン）",
     "status_skipped_busy": "スキップ（ビジー）",
     "status_error": "エラー",
-    "no_participants": "他に利用可能なセッションがありません"
+    "no_participants": "他に利用可能なセッションがありません",
+    "show_all_projects": "全プロジェクト"
   }
 }

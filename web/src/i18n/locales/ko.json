@@ -450,6 +450,16 @@
     "name_placeholder": "예: 매일 CI 검사",
     "schedule": "스케줄",
     "schedule_help": "Cron 표현식 (예: 0 9 * * 1-5 = 평일 오전 9시)",
+    "mode_picker": "시각적 선택",
+    "mode_advanced": "고급 (cron)",
+    "advanced_help": "형식: 분 시 일 월 요일 — 예: 0 9 * * 1-5 = 평일 오전 9시",
+    "field_minute": "분",
+    "field_hour": "시",
+    "field_day": "일",
+    "field_month": "월",
+    "field_weekday": "요일",
+    "every_hour": "매시간",
+    "any": "모두",
     "target": "대상 세션",
     "action_type": "작업 유형",
     "action_command": "명령",
@@ -484,6 +494,7 @@
     "status_skipped_offline": "건너뜀 (오프라인)",
     "status_skipped_busy": "건너뜀 (사용 중)",
     "status_error": "오류",
-    "no_participants": "사용 가능한 다른 세션이 없습니다"
+    "no_participants": "사용 가능한 다른 세션이 없습니다",
+    "show_all_projects": "모든 프로젝트"
   }
 }

@@ -450,6 +450,16 @@
     "name_placeholder": "例如：每日 CI 檢查",
     "schedule": "排程",
     "schedule_help": "Cron 運算式（例如：0 9 * * 1-5 = 工作日上午9點）",
+    "mode_picker": "視覺化選擇",
+    "mode_advanced": "進階 (cron)",
+    "advanced_help": "格式：分 時 日 月 週 — 例如 0 9 * * 1-5 = 工作日上午9點",
+    "field_minute": "分鐘",
+    "field_hour": "小時",
+    "field_day": "日",
+    "field_month": "月",
+    "field_weekday": "週",
+    "every_hour": "每小時",
+    "any": "任意",
     "target": "目標工作階段",
     "action_type": "操作類型",
     "action_command": "指令",
@@ -484,6 +494,7 @@
     "status_skipped_offline": "已跳過（離線）",
     "status_skipped_busy": "已跳過（忙碌）",
     "status_error": "錯誤",
-    "no_participants": "沒有其他可用工作階段"
+    "no_participants": "沒有其他可用工作階段",
+    "show_all_projects": "所有專案"
   }
 }

@@ -450,6 +450,16 @@
     "name_placeholder": "例如：每日 CI 检查",
     "schedule": "调度计划",
     "schedule_help": "Cron 表达式（例如：0 9 * * 1-5 = 工作日上午9点）",
+    "mode_picker": "可视化选择",
+    "mode_advanced": "高级 (cron)",
+    "advanced_help": "格式：分 时 日 月 周 — 例如 0 9 * * 1-5 = 工作日上午9点",
+    "field_minute": "分钟",
+    "field_hour": "小时",
+    "field_day": "日",
+    "field_month": "月",
+    "field_weekday": "周",
+    "every_hour": "每小时",
+    "any": "任意",
     "target": "目标会话",
     "action_type": "操作类型",
     "action_command": "命令",
@@ -484,6 +494,7 @@
     "status_skipped_offline": "已跳过（离线）",
     "status_skipped_busy": "已跳过（忙碌）",
     "status_error": "错误",
-    "no_participants": "没有其他可用会话"
+    "no_participants": "没有其他可用会话",
+    "show_all_projects": "所有项目"
   }
 }

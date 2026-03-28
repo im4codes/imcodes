@@ -450,6 +450,16 @@
     "name_placeholder": "Ej., Verificación CI diaria",
     "schedule": "Programación",
     "schedule_help": "Expresión cron (ej., 0 9 * * 1-5 = días laborables a las 9am)",
+    "mode_picker": "Selector visual",
+    "mode_advanced": "Avanzado (cron)",
+    "advanced_help": "Formato: minuto hora día mes díaSemana — ej. 0 9 * * 1-5 = días laborales a las 9am",
+    "field_minute": "Minuto",
+    "field_hour": "Hora",
+    "field_day": "Día",
+    "field_month": "Mes",
+    "field_weekday": "Día de semana",
+    "every_hour": "Cada hora",
+    "any": "Cualquiera",
     "target": "Sesión destino",
     "action_type": "Tipo de acción",
     "action_command": "Comando",
@@ -484,6 +494,7 @@
     "status_skipped_offline": "Omitido (sin conexión)",
     "status_skipped_busy": "Omitido (ocupado)",
     "status_error": "Error",
-    "no_participants": "No hay otras sesiones disponibles"
+    "no_participants": "No hay otras sesiones disponibles",
+    "show_all_projects": "Todos los proyectos"
   }
 }
