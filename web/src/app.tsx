@@ -1915,6 +1915,7 @@ export function App() {
                 onHistory={registerHistoryApplyer}
                 serverId={selectedServerId}
                 onViewRepo={() => setShowRepoPage(true)}
+                onViewCron={() => setShowCronManager(true)}
                 subUsages={subUsages}
                 focusedSubId={focusedSubId}
               />

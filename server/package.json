@@ -16,6 +16,7 @@
   "dependencies": {
     "@hono/node-server": "^1.13.0",
     "@simplewebauthn/server": "^10.0.1",
+    "croner": "^10.0.1",
     "hono": "^4.0.0",
     "jose": "^6.2.1",
     "node-cron": "^3.0.0",

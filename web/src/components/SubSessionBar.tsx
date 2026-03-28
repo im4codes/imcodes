@@ -51,6 +51,7 @@ interface Props {
   onViewDiscussions?: () => void;
   onViewDiscussion?: (fileId: string) => void;
   onViewRepo?: () => void;
+  onViewCron?: () => void;
 
   discussions?: DiscussionSummary[];
   onStopDiscussion?: (id: string) => void;
@@ -106,7 +107,7 @@ function formatUptime(seconds: number): string {
   return d > 0 ? `${d}d ${h}h` : `${h}h`;
 }
 
-export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId }: Props) {
+export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId }: Props) {
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
   const [collapsed, setCollapsed] = useState(isMobile);
   const [showSizePanel, setShowSizePanel] = useState(false);
@@ -306,6 +307,11 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onNew, onViewDiscu
             }}
           >
             🔀
+          </button>
+        )}
+        {onViewCron && (
+          <button class="subcard-toolbar-btn" onClick={onViewCron} title="Scheduled Tasks" style={{ marginLeft: 4, fontSize: 11 }}>
+            ⏰
           </button>
         )}
       </div>

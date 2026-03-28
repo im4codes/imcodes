@@ -1,24 +1,82 @@
 import { Hono } from 'hono';
+import { Cron } from 'croner';
 import { z } from 'zod';
 import type { Env } from '../env.js';
-import { requireAuth } from '../security/authorization.js';
+import type { DbCronJob } from '../db/queries.js';
+import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
+import { CRON_STATUS } from '../../../shared/cron-types.js';
 
 export const cronApiRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
-const cronJobSchema = z.object({
+const MIN_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+const rolePattern = /^(brain|w\d+)$/;
+
+const cronActionSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('command'), command: z.string().min(1) }),
+  z.object({
+    type: z.literal('p2p'),
+    topic: z.string().min(1),
+    mode: z.string().min(1),
+    participants: z.array(z.string().regex(rolePattern)).min(1),
+    rounds: z.number().int().min(1).max(6).optional(),
+  }),
+]);
+
+const cronJobCreateSchema = z.object({
   name: z.string().min(1).max(100),
-  schedule: z.string().min(1),  // cron expression
-  action: z.string().min(1),    // action type/payload
+  cronExpr: z.string().min(1),
+  serverId: z.string().min(1),
+  projectName: z.string().min(1).max(64),
+  targetRole: z.string().regex(rolePattern).default('brain'),
+  action: cronActionSchema,
+  expiresAt: z.number().nullable().optional(),
 });
 
-// GET /api/cron — list user's cron jobs
+const cronJobUpdateSchema = z.object({
+  name: z.string().min(1).max(100).optional(),
+  cronExpr: z.string().min(1).optional(),
+  projectName: z.string().min(1).max(64).optional(),
+  targetRole: z.string().regex(rolePattern).optional(),
+  action: cronActionSchema.optional(),
+  expiresAt: z.number().nullable().optional(),
+});
+
+/** Validate cron expression and enforce minimum 5-minute interval. Returns next run time or error string. */
+function validateCronExpr(cronExpr: string): { nextRunAt: number } | { error: string } {
+  try {
+    const job = new Cron(cronExpr);
+    const first = job.nextRun();
+    if (!first) return { error: 'invalid_cron_expression' };
+    const second = job.nextRun(first);
+    if (second && (second.getTime() - first.getTime()) < MIN_INTERVAL_MS) {
+      return { error: 'cron_interval_too_short' };
+    }
+    return { nextRunAt: first.getTime() };
+  } catch {
+    return { error: 'invalid_cron_expression' };
+  }
+}
+
+// GET /api/cron — list user's cron jobs, optionally filtered by server/project
 cronApiRoutes.get('/', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
+  const serverId = c.req.query('serverId') || null;
+  const projectName = c.req.query('projectName') || null;
+
+  if (serverId) {
+    const role = await resolveServerRole(c.env.DB, serverId, userId);
+    if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+  }
+
   const jobs = await c.env.DB.query(
-    "SELECT * FROM cron_jobs WHERE user_id = $1 ORDER BY created_at DESC",
-    [userId],
+    `SELECT * FROM cron_jobs WHERE user_id = $1
+       AND ($2::text IS NULL OR server_id = $2)
+       AND ($3::text IS NULL OR project_name = $3)
+     ORDER BY created_at DESC`,
+    [userId, serverId, projectName],
   );
   return c.json({ jobs });
 });
@@ -27,21 +85,31 @@ cronApiRoutes.get('/', requireAuth(), async (c) => {
 cronApiRoutes.post('/', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const body = await c.req.json().catch(() => null);
-  const parsed = cronJobSchema.safeParse(body);
+  const parsed = cronJobCreateSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body', issues: parsed.error.issues }, 400);
 
-  const { name, schedule, action } = parsed.data;
+  const { name, cronExpr, serverId, projectName, targetRole, action, expiresAt } = parsed.data;
+
+  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+
+  const validation = validateCronExpr(cronExpr);
+  if ('error' in validation) {
+    return c.json({ error: validation.error, ...(validation.error === 'cron_interval_too_short' ? { minIntervalMinutes: 5 } : {}) }, 400);
+  }
+
   const id = randomHex(16);
   const now = Date.now();
 
   await c.env.DB.execute(
-    "INSERT INTO cron_jobs (id, user_id, name, schedule, action, status, next_run_at, created_at) VALUES ($1, $2, $3, $4, $5, 'active', $6, $7)",
-    [id, userId, name, schedule, action, now + 60_000, now],
+    `INSERT INTO cron_jobs (id, server_id, user_id, name, cron_expr, project_name, target_role, action, status, next_run_at, expires_at, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)`,
+    [id, serverId, userId, name, cronExpr, projectName, targetRole, JSON.stringify(action), CRON_STATUS.ACTIVE, validation.nextRunAt, expiresAt ?? null, now],
   );
 
-  await logAudit({ userId, action: 'cron.create', details: { id, name, schedule } }, c.env.DB);
+  await logAudit({ userId, action: 'cron.create', details: { id, name, cronExpr, projectName } }, c.env.DB);
 
-  return c.json({ id, name, schedule, action, status: 'active' }, 201);
+  return c.json({ id, name, cronExpr, projectName, targetRole, action, status: CRON_STATUS.ACTIVE, nextRunAt: validation.nextRunAt, expiresAt: expiresAt ?? null }, 201);
 });
 
 // PUT /api/cron/:id — update a cron job
@@ -49,21 +117,86 @@ cronApiRoutes.put('/:id', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const jobId = c.req.param('id');
   const body = await c.req.json().catch(() => null);
-  const parsed = cronJobSchema.partial().safeParse(body);
-  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  const parsed = cronJobUpdateSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body', issues: parsed.error.issues }, 400);
 
-  const job = await c.env.DB.queryOne(
+  const job = await c.env.DB.queryOne<DbCronJob>(
     'SELECT * FROM cron_jobs WHERE id = $1 AND user_id = $2',
     [jobId, userId],
   );
   if (!job) return c.json({ error: 'not_found' }, 404);
 
+  const role = await resolveServerRole(c.env.DB, job.server_id, userId);
+  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+
   const updates = parsed.data;
-  if (updates.name) await c.env.DB.execute('UPDATE cron_jobs SET name = $1 WHERE id = $2', [updates.name, jobId]);
-  if (updates.schedule) await c.env.DB.execute('UPDATE cron_jobs SET schedule = $1 WHERE id = $2', [updates.schedule, jobId]);
-  if (updates.action) await c.env.DB.execute('UPDATE cron_jobs SET action = $1 WHERE id = $2', [updates.action, jobId]);
+  const now = Date.now();
+
+  // Re-validate cron expression if changed
+  let nextRunAt: number | undefined;
+  const newCronExpr = updates.cronExpr;
+  if (newCronExpr && newCronExpr !== job.cron_expr) {
+    const validation = validateCronExpr(newCronExpr);
+    if ('error' in validation) {
+      return c.json({ error: validation.error, ...(validation.error === 'cron_interval_too_short' ? { minIntervalMinutes: 5 } : {}) }, 400);
+    }
+    nextRunAt = validation.nextRunAt;
+  }
+
+  // Build dynamic UPDATE
+  const sets: string[] = ['updated_at = $1'];
+  const vals: unknown[] = [now];
+  let idx = 2;
+
+  if (updates.name !== undefined) { sets.push(`name = $${idx++}`); vals.push(updates.name); }
+  if (updates.cronExpr !== undefined) { sets.push(`cron_expr = $${idx++}`); vals.push(updates.cronExpr); }
+  if (updates.projectName !== undefined) { sets.push(`project_name = $${idx++}`); vals.push(updates.projectName); }
+  if (updates.targetRole !== undefined) { sets.push(`target_role = $${idx++}`); vals.push(updates.targetRole); }
+  if (updates.action !== undefined) { sets.push(`action = $${idx++}`); vals.push(JSON.stringify(updates.action)); }
+  if (updates.expiresAt !== undefined) { sets.push(`expires_at = $${idx++}`); vals.push(updates.expiresAt); }
+  if (nextRunAt !== undefined) { sets.push(`next_run_at = $${idx++}`); vals.push(nextRunAt); }
+
+  // Reset expired/error jobs to paused on edit
+  if (job.status === CRON_STATUS.EXPIRED || job.status === CRON_STATUS.ERROR) {
+    sets.push(`status = $${idx++}`); vals.push(CRON_STATUS.PAUSED);
+  }
+
+  vals.push(jobId);
+  await c.env.DB.execute(
+    `UPDATE cron_jobs SET ${sets.join(', ')} WHERE id = $${idx}`,
+    vals,
+  );
 
   await logAudit({ userId, action: 'cron.update', details: { id: jobId } }, c.env.DB);
+  return c.json({ ok: true });
+});
+
+// PATCH /api/cron/:id/status — pause/resume (only active ↔ paused)
+cronApiRoutes.patch('/:id/status', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const jobId = c.req.param('id');
+  const body = await c.req.json().catch(() => null);
+  const newStatus = (body as Record<string, unknown> | null)?.status;
+  if (newStatus !== CRON_STATUS.ACTIVE && newStatus !== CRON_STATUS.PAUSED) {
+    return c.json({ error: 'invalid_status' }, 400);
+  }
+
+  const job = await c.env.DB.queryOne<{ status: string }>(
+    'SELECT status FROM cron_jobs WHERE id = $1 AND user_id = $2',
+    [jobId, userId],
+  );
+  if (!job) return c.json({ error: 'not_found' }, 404);
+
+  if (newStatus === CRON_STATUS.ACTIVE && job.status !== CRON_STATUS.PAUSED) {
+    return c.json({ error: 'cannot_resume', currentStatus: job.status }, 400);
+  }
+
+  await c.env.DB.execute(
+    'UPDATE cron_jobs SET status = $1, updated_at = $2 WHERE id = $3',
+    [newStatus, Date.now(), jobId],
+  );
+
+  await logAudit({ userId, action: 'cron.status', details: { id: jobId, status: newStatus } }, c.env.DB);
   return c.json({ ok: true });
 });
 
@@ -72,13 +205,37 @@ cronApiRoutes.delete('/:id', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const jobId = c.req.param('id');
 
-  const result = await c.env.DB.execute(
-    'DELETE FROM cron_jobs WHERE id = $1 AND user_id = $2',
+  const job = await c.env.DB.queryOne<{ server_id: string }>(
+    'SELECT server_id FROM cron_jobs WHERE id = $1 AND user_id = $2',
     [jobId, userId],
   );
+  if (!job) return c.json({ error: 'not_found' }, 404);
 
-  if (result.changes === 0) return c.json({ error: 'not_found' }, 404);
+  const role = await resolveServerRole(c.env.DB, job.server_id, userId);
+  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+
+  await c.env.DB.execute('DELETE FROM cron_jobs WHERE id = $1', [jobId]);
 
   await logAudit({ userId, action: 'cron.delete', details: { id: jobId } }, c.env.DB);
   return c.json({ ok: true });
+});
+
+// GET /api/cron/:id/executions — execution history for a cron job
+cronApiRoutes.get('/:id/executions', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const jobId = c.req.param('id');
+  const limitParam = parseInt(c.req.query('limit') || '20', 10);
+  const limit = Math.min(Math.max(1, limitParam), 100);
+
+  const job = await c.env.DB.queryOne<{ server_id: string }>(
+    'SELECT server_id FROM cron_jobs WHERE id = $1 AND user_id = $2',
+    [jobId, userId],
+  );
+  if (!job) return c.json({ error: 'not_found' }, 404);
+
+  const executions = await c.env.DB.query(
+    'SELECT id, status, detail, created_at FROM cron_executions WHERE job_id = $1 ORDER BY created_at DESC LIMIT $2',
+    [jobId, limit],
+  );
+  return c.json({ executions });
 });

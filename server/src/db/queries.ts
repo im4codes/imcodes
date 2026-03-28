@@ -52,11 +52,14 @@ export interface DbCronJob {
   name: string;
   cron_expr: string;
   action: string;
-  enabled: number;
-  status: string | null;
+  project_name: string | null;
+  target_role: string;
+  status: string;
   last_run_at: number | null;
   next_run_at: number | null;
+  expires_at: number | null;
   created_at: number;
+  updated_at: number | null;
 }
 
 export interface DbSession {
@@ -443,17 +446,6 @@ export async function upsertQuickData(db: Database, userId: string, data: QuickD
     'INSERT INTO user_quick_data (user_id, data, updated_at) VALUES ($1, $2, $3) ON CONFLICT(user_id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at',
     [userId, JSON.stringify(data), Date.now()],
   );
-}
-
-// ── Cron jobs ─────────────────────────────────────────────────────────────
-
-export async function getDueCronJobs(db: Database): Promise<DbCronJob[]> {
-  const now = Date.now();
-  return db.query<DbCronJob>('SELECT * FROM cron_jobs WHERE enabled = 1 AND next_run_at <= $1', [now]);
-}
-
-export async function updateCronJobRun(db: Database, id: string, lastRunAt: number, nextRunAt: number): Promise<void> {
-  await db.execute('UPDATE cron_jobs SET last_run_at = $1, next_run_at = $2 WHERE id = $3', [lastRunAt, nextRunAt, id]);
 }
 
 // ── Sub-sessions ──────────────────────────────────────────────────────────

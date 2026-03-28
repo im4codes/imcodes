@@ -28,6 +28,8 @@ import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, type P2pTarget } from './p2p-orchestrator.js';
 import { P2P_CONFIG_MODE, type P2pSessionConfig } from '../../shared/p2p-modes.js';
+import { CRON_MSG } from '../../shared/cron-types.js';
+import { executeCronJob } from './cron-executor.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { getProvider } from '../agent/provider-registry.js';
 import { copyFile, mkdir } from 'node:fs/promises';
@@ -447,6 +449,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       break;
     case TRANSPORT_MSG.LIST_SESSIONS:
       void handleListProviderSessions(cmd, serverLink);
+      break;
+    case CRON_MSG.DISPATCH:
+      void executeCronJob(cmd as unknown as import('../../shared/cron-types.js').CronDispatchMessage, serverLink);
       break;
     case 'auth_ok':
     case 'heartbeat':
