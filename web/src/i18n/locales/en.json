@@ -513,6 +513,7 @@
     "status_error": "Error",
     "no_participants": "No other sessions available",
     "show_all_projects": "All projects",
+    "show_all_servers": "All servers",
     "view_discussion": "View P2P Discussion →",
     "confirm_trigger": "Run this task now?",
     "status_manual_trigger": "Manual"

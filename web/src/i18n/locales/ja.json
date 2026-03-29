@@ -513,6 +513,7 @@
     "status_error": "エラー",
     "no_participants": "他に利用可能なセッションがありません",
     "show_all_projects": "全プロジェクト",
+    "show_all_servers": "全サーバー",
     "view_discussion": "P2P ディスカッションを見る →",
     "confirm_trigger": "このタスクを今すぐ実行しますか？",
     "status_manual_trigger": "手動実行"

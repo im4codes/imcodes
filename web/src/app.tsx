@@ -1660,6 +1660,7 @@ export function App() {
                 activeSession,
                 activeProjectDir: activeSessionInfo?.projectDir,
                 sessions,
+                servers: servers.map(s => ({ id: s.id, name: s.name })),
                 onQuote: (text) => {
                   const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
                   if (inputEl) {
@@ -2134,6 +2135,7 @@ export function App() {
                   activeSession,
                   activeProjectDir: activeSessionInfo?.projectDir,
                   sessions,
+                  servers: servers.map(s => ({ id: s.id, name: s.name })),
                   onQuote: (text) => {
                     const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
                     if (inputEl) {
@@ -2261,6 +2263,7 @@ export function App() {
               activeSession={activeSession}
               onBack={() => setShowCronManager(false)}
               onViewDiscussion={(fileId) => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); }}
+              servers={servers.map(s => ({ id: s.id, name: s.name }))}
             />
           </FloatingPanel>
         ) : null;

@@ -513,6 +513,7 @@
     "status_error": "Ошибка",
     "no_participants": "Нет других доступных сессий",
     "show_all_projects": "Все проекты",
+    "show_all_servers": "Все серверы",
     "view_discussion": "Просмотр P2P обсуждения →",
     "confirm_trigger": "Выполнить эту задачу сейчас?",
     "status_manual_trigger": "Вручную"

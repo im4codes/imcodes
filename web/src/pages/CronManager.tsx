@@ -12,6 +12,7 @@ import { FloatingPanel } from '../components/FloatingPanel.js';
 
 interface CronJob {
   id: string;
+  server_id: string;
   name: string;
   cron_expr: string;
   project_name: string;
@@ -23,6 +24,11 @@ interface CronJob {
   next_run_at: number | null;
   expires_at: number | null;
   created_at: number;
+}
+
+interface ServerSlim {
+  id: string;
+  name: string;
 }
 
 interface CronExecution {
@@ -48,6 +54,7 @@ interface Props {
   activeSession?: string | null;
   onBack: () => void;
   onViewDiscussion?: (fileId: string) => void;
+  servers?: ServerSlim[];
 }
 
 // ── Styles ───────────────────────────────────────────────────────────────
@@ -114,25 +121,27 @@ function roleToDisplay(role: string, sessions: SessionInfo[], projectName?: stri
 
 // ── Component ────────────────────────────────────────────────────────────
 
-export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession: _activeSession, onBack: _onBack, onViewDiscussion }: Props) {
+export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession: _activeSession, onBack: _onBack, onViewDiscussion, servers = [] }: Props) {
   const { t } = useTranslation();
   const [jobs, setJobs] = useState<CronJob[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [showAll, setShowAll] = useState(() => localStorage.getItem('rcc_cron_show_all') === '1');
+  const [showAllServers, setShowAllServers] = useState(() => localStorage.getItem('rcc_cron_show_all') === '1');
   // Sub-panel state: 'form' for create/edit, 'history:jobId' for execution log
   const [subPanel, setSubPanel] = useState<string | null>(null);
   const [editingJob, setEditingJob] = useState<CronJob | null>(null);
   const [historyData, setHistoryData] = useState<Record<string, CronExecution[]>>({});
 
+  const serverNameMap = new Map(servers.map(s => [s.id, s.name]));
+
   const toggleShowAll = () => {
-    setShowAll(prev => { const v = !prev; localStorage.setItem('rcc_cron_show_all', v ? '1' : ''); return v; });
+    setShowAllServers(prev => { const v = !prev; localStorage.setItem('rcc_cron_show_all', v ? '1' : ''); return v; });
   };
 
   // ── Load jobs ──────────────────────────────────────────────────────────
   const loadJobs = useCallback(async () => {
     try {
-      const q = showAll ? `serverId=${serverId}` : `serverId=${serverId}&projectName=${projectName}`;
+      const q = showAllServers ? '' : `serverId=${serverId}&projectName=${projectName}`;
       const res = await apiFetch<{ jobs: CronJob[] }>(`/api/cron?${q}`);
       setJobs(res.jobs);
     } catch (err) {
@@ -140,7 +149,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
     } finally {
       setLoading(false);
     }
-  }, [serverId, projectName, showAll]);
+  }, [serverId, projectName, showAllServers]);
 
   useEffect(() => { loadJobs(); }, [loadJobs]);
 
@@ -218,8 +227,8 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
       {/* Toolbar: show-all toggle + add button */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px' }}>
         <label style={{ color: '#94a3b8', fontSize: '12px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}>
-          <input type="checkbox" checked={showAll} onChange={toggleShowAll} />
-          {t('cron.show_all_projects')}
+          <input type="checkbox" checked={showAllServers} onChange={toggleShowAll} />
+          {t('cron.show_all_servers')}
         </label>
         <div style={{ flex: 1 }} />
         <button onClick={() => { setEditingJob(null); setSubPanel('form'); }}
@@ -241,7 +250,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
           <div key={job.id} style={{ ...cardStyle, padding: '12px 16px', marginBottom: '10px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
               <span style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '14px', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{job.name}</span>
-              {showAll && <span style={{ color: '#64748b', fontSize: '11px', flexShrink: 0 }}>{job.project_name}</span>}
+              {showAllServers && <span style={{ color: '#64748b', fontSize: '11px', flexShrink: 0 }}>{serverNameMap.get(job.server_id) ?? job.server_id.slice(0, 6)} / {job.project_name}</span>}
               <span style={{ color: statusColors[job.status] ?? '#94a3b8', fontSize: '11px', fontWeight: 600, textTransform: 'uppercase', flexShrink: 0 }}>
                 {t(`cron.${job.status}`)}
               </span>

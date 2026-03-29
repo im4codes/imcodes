@@ -150,6 +150,7 @@ registerPanelType('cronmanager', {
         subSessions={subSessionsSlim}
         activeSession={ctx.activeSession}
         onBack={() => {}}
+        servers={ctx.servers}
       />
     );
   },
