@@ -23,7 +23,7 @@ export type ServerMessage =
   | { type: 'session.event'; event: string; session: string; state: string }
   | { type: 'session.error'; project: string; message: string }
   | { type: 'session.idle'; session: string; project: string; agentType: string; label?: string; parentLabel?: string }
-  | { type: 'session.notification'; session: string; project: string; title: string; message: string; label?: string; parentLabel?: string }
+  | { type: 'session.notification'; session: string; project: string; title: string; message: string; agentType?: string; label?: string; parentLabel?: string }
   | { type: 'session.tool'; session: string; tool: string | null }
   | { type: 'daemon.reconnected' }
   | { type: 'daemon.disconnected' }
