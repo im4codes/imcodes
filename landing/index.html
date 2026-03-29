@@ -253,12 +253,15 @@ footer {
     <div class="row" style="margin-bottom:12px"><a href="#" onclick="openLightbox(4);return false" style="width:40%;border-radius:4px;overflow:hidden;border:1px solid var(--border)"><img src="imcodes-ipad.png" alt="iPad" style="width:100%;display:block" loading="lazy" /></a></div>
     <p>Mobile</p>
     <div class="row mobile">
-      <a href="#" onclick="openLightbox(5);return false"><img src="imcodes-m5.png" alt="Mobile Files" loading="lazy" /></a>
-      <a href="#" onclick="openLightbox(6);return false"><img src="imcodes-m1.png" alt="Mobile 1" loading="lazy" /></a>
-      <a href="#" onclick="openLightbox(7);return false"><img src="imcodes-m2.png" alt="Mobile 2" loading="lazy" /></a>
-      <a href="#" onclick="openLightbox(8);return false"><img src="imcodes-m3.png" alt="Mobile 3" loading="lazy" /></a>
-      <a href="#" onclick="openLightbox(9);return false"><img src="imcodes-m4.png" alt="Mobile 4" loading="lazy" /></a>
-      <a href="#" onclick="openLightbox(10);return false"><img src="imcodes-m0.png" alt="Mobile 5" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(5);return false"><img src="imcodes-m6.png" alt="Scheduled Tasks & CI/CD" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(6);return false"><img src="imcodes-m7.png" alt="Execution History" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(7);return false"><img src="imcodes-m8.png" alt="Local Web Preview" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(8);return false"><img src="imcodes-m5.png" alt="Mobile Files" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(9);return false"><img src="imcodes-m1.png" alt="Mobile 1" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(10);return false"><img src="imcodes-m2.png" alt="Mobile 2" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(11);return false"><img src="imcodes-m3.png" alt="Mobile 3" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(12);return false"><img src="imcodes-m4.png" alt="Mobile 4" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(13);return false"><img src="imcodes-m0.png" alt="Mobile 5" loading="lazy" /></a>
     </div>
   </div>
 </section>
@@ -284,6 +287,8 @@ footer {
     <div class="feat"><div class="feat-name" data-i18n="f_sub_name">sub-sessions</div><div class="feat-desc" data-i18n="f_sub_desc">spawn parallel agents on the fly</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_file_name">file browser & git</div><div class="feat-desc" data-i18n="f_file_desc">tree view, upload/download, +/- stats, floating preview</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_repo_name">repository dashboard</div><div class="feat-desc" data-i18n="f_repo_desc">issues, PRs, branches, commits, CI/CD</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_cron_name">scheduled tasks</div><div class="feat-desc" data-i18n="f_cron_desc">cron-style automation, timezone-aware, execution history with jump-to-session</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_preview_name">local web preview</div><div class="feat-desc" data-i18n="f_preview_desc">preview localhost from any device via secure tunnel, supports HMR</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_sync_name">cross-device sync</div><div class="feat-desc" data-i18n="f_sync_desc">tab order, pinned tabs & panels synced to server</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_mobile_name">mobile & notifications</div><div class="feat-desc" data-i18n="f_mobile_desc">biometric auth, push notifications, shell keyboard input</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_i18n_name">7 languages</div><div class="feat-desc" data-i18n="f_i18n_desc">EN, 中文, 繁體, ES, RU, JA, KO</div></div>
@@ -423,6 +428,10 @@ const I18N = {
     f_pin_desc: '拖拽窗口到侧边栏，跨设备同步',
     f_repo_name: '仓库面板',
     f_repo_desc: 'Issues、PR、分支、提交、CI/CD',
+    f_cron_name: '定时任务',
+    f_cron_desc: 'Cron 定时自动化，时区感知，执行历史可跳转到会话',
+    f_preview_name: '本地预览',
+    f_preview_desc: '安全隧道预览 localhost，支持 HMR 热更新',
     f_sync_name: '跨设备同步',
     f_sync_desc: '标签顺序、固定标签和面板同步到服务器',
     f_i18n_name: '7 种语言',
@@ -465,6 +474,10 @@ const I18N = {
     f_pin_desc: '拖曳視窗到側邊欄，跨裝置同步',
     f_repo_name: '儲存庫面板',
     f_repo_desc: 'Issues、PR、分支、提交、CI/CD',
+    f_cron_name: '排程任務',
+    f_cron_desc: 'Cron 定時自動化，時區感知，執行歷史可跳轉至會話',
+    f_preview_name: '本地預覽',
+    f_preview_desc: '安全隧道預覽 localhost，支援 HMR 熱更新',
     f_sync_name: '跨裝置同步',
     f_sync_desc: '標籤順序、固定標籤和面板同步到伺服器',
     f_i18n_name: '7 種語言',
@@ -507,6 +520,10 @@ const I18N = {
     f_pin_desc: 'ウィンドウをサイドバーにドラッグ、クロスデバイス同期',
     f_repo_name: 'リポジトリダッシュボード',
     f_repo_desc: 'Issues、PR、ブランチ、コミット、CI/CD',
+    f_cron_name: 'スケジュールタスク',
+    f_cron_desc: 'Cron 定期自動化、タイムゾーン対応、実行履歴からセッションへジャンプ',
+    f_preview_name: 'ローカルプレビュー',
+    f_preview_desc: 'セキュアトンネルで localhost をプレビュー、HMR 対応',
     f_sync_name: 'クロスデバイス同期',
     f_sync_desc: 'タブ順序、ピン留めタブ・パネルをサーバーに同期',
     f_i18n_name: '7言語',
@@ -549,6 +566,10 @@ const I18N = {
     f_pin_desc: '창을 사이드바로 드래그, 크로스 디바이스 동기화',
     f_repo_name: '리포지토리 대시보드',
     f_repo_desc: 'Issues, PR, 브랜치, 커밋, CI/CD',
+    f_cron_name: '예약 작업',
+    f_cron_desc: 'Cron 자동화, 시간대 인식, 실행 기록에서 세션으로 이동',
+    f_preview_name: '로컬 웹 미리보기',
+    f_preview_desc: '보안 터널로 localhost 미리보기, HMR 지원',
     f_sync_name: '크로스 디바이스 동기화',
     f_sync_desc: '탭 순서, 고정 탭 및 패널 서버 동기화',
     f_i18n_name: '7개 언어',
@@ -591,6 +612,10 @@ const I18N = {
     f_pin_desc: 'arrastra ventanas a la barra lateral, sincronización multi-dispositivo',
     f_repo_name: 'panel de repositorio',
     f_repo_desc: 'issues, PRs, ramas, commits, CI/CD',
+    f_cron_name: 'tareas programadas',
+    f_cron_desc: 'automatización cron, zona horaria, historial de ejecución con salto a sesión',
+    f_preview_name: 'vista previa local',
+    f_preview_desc: 'vista previa de localhost por túnel seguro, soporta HMR',
     f_sync_name: 'sincronización multi-dispositivo',
     f_sync_desc: 'orden de pestañas, pestañas y paneles fijados sincronizados',
     f_i18n_name: '7 idiomas',
@@ -633,6 +658,10 @@ const I18N = {
     f_pin_desc: 'перетащите окно на боковую панель, кросс-девайс синхронизация',
     f_repo_name: 'панель репозитория',
     f_repo_desc: 'issues, PRs, ветки, коммиты, CI/CD',
+    f_cron_name: 'запланированные задачи',
+    f_cron_desc: 'cron-автоматизация, часовые пояса, история выполнения с переходом к сессии',
+    f_preview_name: 'локальный предпросмотр',
+    f_preview_desc: 'предпросмотр localhost через безопасный туннель, поддержка HMR',
     f_sync_name: 'кросс-девайс синхронизация',
     f_sync_desc: 'порядок вкладок, закреплённые вкладки и панели синхронизированы',
     f_i18n_name: '7 языков',
@@ -700,7 +729,7 @@ function copy(el) {
 applyLang();
 
 // Lightbox
-const LB_IMAGES = ['imcodes-sidebar.png','imcodes0.png','imcodes1.png','imcodes2.png','imcodes-ipad.png','imcodes-m5.png','imcodes-m1.png','imcodes-m2.png','imcodes-m3.png','imcodes-m4.png','imcodes-m0.png'];
+const LB_IMAGES = ['imcodes-sidebar.png','imcodes0.png','imcodes1.png','imcodes2.png','imcodes-ipad.png','imcodes-m6.png','imcodes-m7.png','imcodes-m8.png','imcodes-m5.png','imcodes-m1.png','imcodes-m2.png','imcodes-m3.png','imcodes-m4.png','imcodes-m0.png'];
 let lbIdx = 0;
 function openLightbox(i) {
   lbIdx = i;
