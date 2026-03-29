@@ -159,7 +159,7 @@
     </style>
   </head>
   <body>
-    <script>try{if(sessionStorage.getItem('skip_splash')){sessionStorage.removeItem('skip_splash');document.write('<style>#splash{display:none!important}</style>')}}catch(e){}</script>
+    <script>try{if(sessionStorage.getItem('server_switch')){sessionStorage.removeItem('server_switch');document.write('<style>#splash{display:none!important}</style><div id="switch-overlay" style="position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:#0a0e1a;flex-direction:column;gap:16px"><div class="spinner" style="width:32px;height:32px;border:2px solid #1e293b;border-top-color:#00ffb4;border-radius:50%;animation:spin .6s linear infinite"></div><div style="color:#64748b;font-size:14px;font-family:ui-monospace,monospace">Switching server\u2026</div></div><style>@keyframes spin{to{transform:rotate(360deg)}}</style>')}else if(sessionStorage.getItem('skip_splash')){sessionStorage.removeItem('skip_splash');document.write('<style>#splash{display:none!important}</style>')}}catch(e){}</script>
     <div id="splash">
       <div class="splash-scan"></div>
       <div class="splash-logo">

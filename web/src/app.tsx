@@ -262,6 +262,12 @@ export function App() {
     return () => clearTimeout(t);
   }, []);
 
+  // Dismiss server-switch overlay once app has mounted
+  useEffect(() => {
+    const el = document.getElementById('switch-overlay');
+    if (el) el.remove();
+  }, []);
+
   // Native: init push notifications after login
   useEffect(() => {
     if (!auth || !isNative()) return;
@@ -1357,8 +1363,7 @@ export function App() {
 
     // Full page reload — guarantees all components, WS connections, and pinned
     // panels start fresh with the new server. Avoids stale WS/state bugs.
-    // Skip splash — the in-app loading screen handles the transition.
-    try { sessionStorage.setItem('skip_splash', '1'); } catch { /* ignore */ }
+    try { sessionStorage.setItem('server_switch', '1'); } catch { /* ignore */ }
     window.location.reload();
   }, []);
 
@@ -1567,15 +1572,15 @@ export function App() {
   // After 8s, show escape buttons so the user is never stuck.
   const [connectTimeout, setConnectTimeout] = useState(false);
   useEffect(() => {
-    if (auth && selectedServerId && !sessionsLoaded && !connected) {
+    if (auth && selectedServerId && !connected && servers.length === 0) {
       const t = setTimeout(() => setConnectTimeout(true), 5000);
       return () => { clearTimeout(t); setConnectTimeout(false); };
     }
     setConnectTimeout(false);
     return undefined;
-  }, [auth, selectedServerId, sessionsLoaded, connected]);
+  }, [auth, selectedServerId, connected, servers.length]);
 
-  if (auth && selectedServerId && !sessionsLoaded && !connected) {
+  if (auth && selectedServerId && !sessionsLoaded && !connected && servers.length === 0) {
     return (
       <div style={{ position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0a0e1a', flexDirection: 'column', gap: 16 }}>
         <div class="spinner" style={{ width: 32, height: 32 }} />
