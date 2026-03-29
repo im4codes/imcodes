@@ -142,9 +142,9 @@ jobs:
           cache: 'npm'
           cache-dependency-path: package-lock.json
       - run: npm ci
-      - run: npm run test:server
       - run: npm ci
         working-directory: server
+      - run: npm run test:server
       - name: Run server-native tests (auth-flow, proxy-addr — require server/node_modules)
         run: npm test
         working-directory: server
