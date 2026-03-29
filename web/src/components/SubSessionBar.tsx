@@ -130,14 +130,16 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
   const dragIdRef = useRef<string | null>(null);
   const reorderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Reset drag order when subSessions change (new data from DB)
-  useEffect(() => { setDragOrder(null); }, [subSessions]);
+  // Reset drag order only when session membership changes (add/remove),
+  // NOT on state updates (idle/running) which just change the array reference.
+  const sessionIdList = subSessions.map(s => s.id).join(',');
+  useEffect(() => { setDragOrder(null); }, [sessionIdList]);
 
   const syncOrderToServer = (ids: string[]) => {
     if (reorderTimerRef.current) clearTimeout(reorderTimerRef.current);
     reorderTimerRef.current = setTimeout(() => {
       if (serverId) reorderSubSessions(serverId, ids).catch(() => {});
-    }, 500);
+    }, 150);
   };
 
   // Use drag order if active, otherwise DB order (subSessions is pre-sorted)
