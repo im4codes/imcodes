@@ -156,7 +156,7 @@ export function resolveTarget(from: string, to: string): ResolveResult {
 
   const availableNames = siblings.map((s) => s.label || s.name);
 
-  if (to === '--all') {
+  if (to === '*' || to === '--all') {
     const targets = siblings.slice(0, MAX_BROADCAST_RECIPIENTS);
     if (targets.length === 0) {
       return { ok: false, error: 'no sibling sessions found', available: availableNames };
@@ -343,12 +343,14 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
     return { status: 429, body: { ok: false, error: 'rate limit exceeded' } };
   }
 
-  // Resolve target (count ALL attempts toward rate limit, not just successes)
-  recordSend(from);
+  // Resolve target
   const result = resolveTarget(from, to);
   if (!result.ok) {
     return { status: 404, body: { ok: false, error: result.error, available: result.available } };
   }
+
+  // Record send after successful resolution (prevents invalid senders from polluting rate-limit map)
+  recordSend(from);
 
   // Deliver to each target
   const delivered: string[] = [];
@@ -437,6 +439,37 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
     }
 
     const url = req.url;
+
+    if (url === '/list') {
+      try {
+        const body = await readBody(req);
+        const parsed = JSON.parse(body) as { from?: string };
+        const from = parsed.from || '';
+        const fromRecord = from ? getSession(from) : null;
+        const allSess = listSessions();
+        const siblings = fromRecord
+          ? allSess.filter((s) => {
+              if (s.name === from) return false;
+              if (fromRecord.parentSession) {
+                return s.parentSession === fromRecord.parentSession || s.name === fromRecord.parentSession;
+              }
+              return s.projectName === fromRecord.projectName || s.parentSession === from;
+            })
+          : allSess;
+        const sessions = siblings.map((s) => ({
+          name: s.name,
+          label: s.label || undefined,
+          agentType: s.agentType,
+          state: s.state,
+        }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, sessions }));
+      } catch {
+        res.writeHead(400);
+        res.end(JSON.stringify({ ok: false, error: 'bad request' }));
+      }
+      return;
+    }
 
     if (url === '/send') {
       // Content-Type validation for /send

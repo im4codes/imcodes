@@ -364,7 +364,6 @@ program
           const res = await postToHookServer(hookPort, '/send', {
             from,
             to: opts.type,
-            toType: 'agentType',
             message,
             ...(files ? { files } : {}),
             depth: 0,
@@ -390,6 +389,7 @@ program
     }
 
     // Fallback: direct tmux sendKeys (original behavior for backward compat)
+    console.warn('Warning: hook server unavailable — using direct send (no --files, --all, --type, queue, or label resolution).');
     if (!resolvedTarget) {
       console.error('Error: target is required for direct send (hook server not available).');
       process.exit(1);
@@ -451,7 +451,12 @@ async function postToHookServer(port: number, path: string, body: Record<string,
 /** Print the result of a /send call to stdout. */
 function printSendResult(res: Record<string, unknown>): void {
   if (res.ok) {
-    if (res.queued) {
+    // Broadcast response: delivered/queued are arrays
+    if (Array.isArray(res.delivered)) {
+      if (res.delivered.length > 0) console.log(`Sent to ${res.delivered.length} sessions: ${(res.delivered as string[]).join(', ')}`);
+      if (Array.isArray(res.queued) && res.queued.length > 0) console.log(`Queued for ${res.queued.length}: ${(res.queued as string[]).join(', ')}`);
+      if (Array.isArray(res.errors) && res.errors.length > 0) console.warn(`Errors: ${(res.errors as string[]).join('; ')}`);
+    } else if (res.queued) {
       console.log(`Message queued for ${res.target ?? 'target'} (agent busy).`);
     } else {
       console.log(`Sent to ${res.target ?? 'target'}.`);
