@@ -507,6 +507,7 @@
     "interval_too_short": "最小間隔は5分です",
     "history": "実行履歴",
     "no_history": "まだ実行記録はありません",
+    "no_detail": "出力なし",
     "status_sent": "送信済み",
     "status_skipped_offline": "スキップ（オフライン）",
     "status_skipped_busy": "スキップ（ビジー）",

@@ -507,6 +507,7 @@
     "interval_too_short": "최소 간격은 5분입니다",
     "history": "실행 기록",
     "no_history": "아직 실행 기록이 없습니다",
+    "no_detail": "캡처된 출력 없음",
     "status_sent": "전송됨",
     "status_skipped_offline": "건너뜀 (오프라인)",
     "status_skipped_busy": "건너뜀 (사용 중)",

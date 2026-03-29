@@ -507,6 +507,7 @@
     "interval_too_short": "Minimum interval is 5 minutes",
     "history": "Execution History",
     "no_history": "No executions yet",
+    "no_detail": "No output captured",
     "status_sent": "Sent",
     "status_skipped_offline": "Skipped (offline)",
     "status_skipped_busy": "Skipped (busy)",

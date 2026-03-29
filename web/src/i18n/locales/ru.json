@@ -507,6 +507,7 @@
     "interval_too_short": "Минимальный интервал — 5 минут",
     "history": "История выполнения",
     "no_history": "Выполнений пока нет",
+    "no_detail": "Вывод не захвачен",
     "status_sent": "Отправлено",
     "status_skipped_offline": "Пропущено (не в сети)",
     "status_skipped_busy": "Пропущено (занят)",

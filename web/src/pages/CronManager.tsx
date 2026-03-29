@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback } from 'preact/hooks';
+import { useState, useEffect, useCallback, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
+import { marked } from 'marked';
 import { apiFetch } from '../api.js';
 import type { CronAction, CronJobStatus } from '@shared/cron-types';
 import { CRON_STATUS } from '@shared/cron-types';
@@ -404,7 +405,7 @@ function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServ
   onViewDiscussion?: (fileId: string) => void;
   t: (key: string) => string;
 }) {
-  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [detailExec, setDetailExec] = useState<CrossJobExecution | null>(null);
 
   if (loading) return <div style={{ color: '#94a3b8', textAlign: 'center', padding: '40px' }}>{t('common.loading')}</div>;
   if (!executions || executions.length === 0) return <div style={{ color: '#64748b', textAlign: 'center', padding: '40px' }}>{t('cron.no_history')}</div>;
@@ -412,19 +413,16 @@ function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServ
   return (
     <div>
       {executions.map(exec => {
-        const isExpanded = expandedId === exec.id;
         const hasDetail = !!exec.detail && !exec.detail.startsWith('p2p:');
         const hasP2p = !!exec.detail?.startsWith('p2p:');
-        const isClickable = hasDetail || hasP2p;
         const action = parseAction(exec.action);
 
         return (
           <div key={exec.id}
-            style={{ ...cardStyle, padding: '10px 14px', marginBottom: '6px', cursor: isClickable ? 'pointer' : 'default' }}
-            onClick={() => isClickable && setExpandedId(isExpanded ? null : exec.id)}
+            style={{ ...cardStyle, padding: '10px 14px', marginBottom: '6px', cursor: hasDetail ? 'pointer' : 'default' }}
+            onClick={() => hasDetail && setDetailExec(exec)}
           >
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
-              {isClickable && <span style={{ color: '#475569', fontSize: '10px', width: '12px', flexShrink: 0 }}>{isExpanded ? '▼' : '▶'}</span>}
               <span style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '13px', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {exec.job_name}
               </span>
@@ -445,14 +443,27 @@ function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServ
                 </button>
               )}
             </div>
-            {isExpanded && hasDetail && (
-              <pre style={{ color: '#cbd5e1', fontSize: '11px', marginTop: '6px', padding: '8px 10px', background: '#0f172a', borderRadius: '4px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '300px', overflow: 'auto', lineHeight: 1.5 }}>
-                {exec.detail}
+            {/* 3-5 line preview */}
+            {hasDetail && (
+              <pre style={{ color: '#64748b', fontSize: '11px', marginTop: '4px', padding: '4px 6px', background: '#0f172a', borderRadius: '4px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '4.5em', overflow: 'hidden', lineHeight: 1.4 }}>
+                {exec.detail!.slice(0, 300)}
               </pre>
             )}
           </div>
         );
       })}
+
+      {/* Detail floating panel */}
+      {detailExec && (
+        <FloatingPanel
+          id={`exec-detail-${detailExec.id}`}
+          title={`${detailExec.job_name} · ${fmtTime(detailExec.created_at)}`}
+          onClose={() => setDetailExec(null)}
+          defaultW={600} defaultH={500}
+        >
+          <ExecDetailView exec={detailExec} t={t} />
+        </FloatingPanel>
+      )}
     </div>
   );
 }
@@ -472,7 +483,7 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, t }: {
   onViewDiscussion?: (fileId: string) => void;
   t: (key: string) => string;
 }) {
-  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [detailExec, setDetailExec] = useState<CronExecution | null>(null);
   const action = parseAction(job.action);
 
   return (
@@ -496,19 +507,15 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, t }: {
       {!executions && <div style={{ color: '#64748b', fontSize: '13px', textAlign: 'center', padding: '20px' }}>{t('common.loading')}</div>}
       {executions?.length === 0 && <div style={{ color: '#64748b', fontSize: '13px', textAlign: 'center', padding: '20px' }}>{t('cron.no_history')}</div>}
       {executions?.map(exec => {
-        const isExpanded = expandedId === exec.id;
         const hasDetail = !!exec.detail && !exec.detail.startsWith('p2p:');
         const hasP2p = !!exec.detail?.startsWith('p2p:');
-        const isClickable = hasDetail || hasP2p;
 
         return (
           <div key={exec.id}
-            style={{ fontSize: '12px', color: '#94a3b8', borderRadius: '6px', marginBottom: '4px', background: isExpanded ? '#1e293b' : 'transparent', cursor: isClickable ? 'pointer' : 'default' }}
-            onClick={() => isClickable && setExpandedId(isExpanded ? null : exec.id)}
+            style={{ fontSize: '12px', color: '#94a3b8', borderRadius: '6px', marginBottom: '4px', padding: '6px 8px', cursor: hasDetail ? 'pointer' : 'default' }}
+            onClick={() => hasDetail && setDetailExec(exec)}
           >
-            <div style={{ display: 'flex', gap: '10px', alignItems: 'center', padding: '6px 8px' }}>
-              {isClickable && <span style={{ color: '#475569', fontSize: '10px', width: '12px', flexShrink: 0 }}>{isExpanded ? '▼' : '▶'}</span>}
-              {!isClickable && <span style={{ width: '12px', flexShrink: 0 }} />}
+            <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
               <span style={{ minWidth: '130px', fontSize: '11px' }}>{fmtTime(exec.created_at)}</span>
               <span style={{ color: execStatusColor(exec.status), fontWeight: 600, fontSize: '11px' }}>
                 {execStatusLabel(exec.status, t)}
@@ -519,20 +526,55 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, t }: {
                   {t('cron.view_discussion')}
                 </button>
               )}
-              {hasDetail && !isExpanded && (
-                <span style={{ color: '#475569', fontSize: '11px', marginLeft: 'auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '200px' }}>
-                  {exec.detail!.slice(0, 60)}…
-                </span>
-              )}
             </div>
-            {isExpanded && hasDetail && (
-              <pre style={{ color: '#cbd5e1', fontSize: '11px', margin: '0 8px 8px', padding: '8px 10px', background: '#0f172a', borderRadius: '4px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '300px', overflow: 'auto', lineHeight: 1.5 }}>
-                {exec.detail}
+            {/* 3-5 line preview */}
+            {hasDetail && (
+              <pre style={{ color: '#64748b', fontSize: '11px', marginTop: '4px', padding: '4px 6px', background: '#0f172a', borderRadius: '4px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '4.5em', overflow: 'hidden', lineHeight: 1.4 }}>
+                {exec.detail!.slice(0, 300)}
               </pre>
             )}
           </div>
         );
       })}
+
+      {/* Detail floating panel */}
+      {detailExec && (
+        <FloatingPanel
+          id={`exec-detail-${detailExec.id}`}
+          title={`${job.name} · ${fmtTime(detailExec.created_at)}`}
+          onClose={() => setDetailExec(null)}
+          defaultW={600} defaultH={500}
+        >
+          <ExecDetailView exec={detailExec} t={t} />
+        </FloatingPanel>
+      )}
+    </div>
+  );
+}
+
+// ── Execution Detail View (FloatingPanel content, renders markdown) ──────
+
+function ExecDetailView({ exec, t }: { exec: { status: string; detail: string | null; created_at: number }; t: (key: string) => string }) {
+  const html = useMemo(() => {
+    if (!exec.detail) return '';
+    try { return marked(exec.detail, { breaks: true }) as string; } catch { return exec.detail; }
+  }, [exec.detail]);
+
+  return (
+    <div style={{ padding: '16px', overflow: 'auto', height: '100%' }}>
+      <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '12px', fontSize: '12px' }}>
+        <span style={{ color: '#94a3b8' }}>{fmtTime(exec.created_at)}</span>
+        <span style={{ color: execStatusColor(exec.status), fontWeight: 600 }}>{execStatusLabel(exec.status, t)}</span>
+      </div>
+      {exec.detail ? (
+        <div
+          class="exec-detail-md"
+          style={{ color: '#cbd5e1', fontSize: '13px', lineHeight: 1.6 }}
+          dangerouslySetInnerHTML={{ __html: html }}
+        />
+      ) : (
+        <div style={{ color: '#64748b', fontSize: '13px' }}>{t('cron.no_detail')}</div>
+      )}
     </div>
   );
 }

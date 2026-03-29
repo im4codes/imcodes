@@ -507,6 +507,7 @@
     "interval_too_short": "最小间隔为5分钟",
     "history": "执行历史",
     "no_history": "暂无执行记录",
+    "no_detail": "未捕获输出",
     "status_sent": "已发送",
     "status_skipped_offline": "已跳过（离线）",
     "status_skipped_busy": "已跳过（忙碌）",
