@@ -100,7 +100,7 @@ export function SessionPane({
     loadingOlder: timelineLoadingOlder,
     addOptimisticUserMessage,
     loadOlderEvents,
-  } = useTimeline(sessionName, ws);
+  } = useTimeline(sessionName, ws, serverId);
 
   // ── Quotes ────────────────────────────────────────────────────────────────
   const [quotes, setQuotes] = useState<string[]>([]);

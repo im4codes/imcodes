@@ -188,4 +188,32 @@ describe('TimelineDB — memory fallback mode', () => {
     const results = await db.getEvents('session-a', 100);
     expect(results.map((e) => e.seq)).toEqual([1, 2, 3]);
   });
+
+  it('cross-server isolation via serverId:sessionId cache key', async () => {
+    // Simulate two servers with the same session name but different cacheKeys
+    const serverA_key = 'server-a:deck_cd_brain';
+    const serverB_key = 'server-b:deck_cd_brain';
+
+    await db.putEvent(makeEvent({ sessionId: serverA_key, seq: 1, epoch: 100, eventId: 'a1', payload: { text: 'from server A' } }));
+    await db.putEvent(makeEvent({ sessionId: serverB_key, seq: 1, epoch: 100, eventId: 'b1', payload: { text: 'from server B' } }));
+
+    const resultsA = await db.getRecentEvents(serverA_key);
+    expect(resultsA).toHaveLength(1);
+    expect(resultsA[0].payload.text).toBe('from server A');
+
+    const resultsB = await db.getRecentEvents(serverB_key);
+    expect(resultsB).toHaveLength(1);
+    expect(resultsB[0].payload.text).toBe('from server B');
+  });
+
+  it('getLastSeqAndEpoch is isolated by cacheKey', async () => {
+    await db.putEvent(makeEvent({ sessionId: 'srv1:sess', seq: 5, epoch: 100, eventId: 's1' }));
+    await db.putEvent(makeEvent({ sessionId: 'srv2:sess', seq: 10, epoch: 200, eventId: 's2' }));
+
+    const r1 = await db.getLastSeqAndEpoch('srv1:sess');
+    expect(r1).toEqual({ seq: 5, epoch: 100 });
+
+    const r2 = await db.getLastSeqAndEpoch('srv2:sess');
+    expect(r2).toEqual({ seq: 10, epoch: 200 });
+  });
 });

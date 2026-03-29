@@ -22,7 +22,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   const sessionName = panel.props?.sessionName as string;
   const pinnedViewMode = panel.props?.viewMode as 'terminal' | 'chat' | undefined;
   const { t } = useTranslation();
-  const { events, refreshing } = useTimeline(sessionName, ctx.ws);
+  const { events, refreshing } = useTimeline(sessionName, ctx.ws, ctx.serverId);
   const liveSub = ctx.subSessions.find(s => s.sessionName === sessionName);
 
   if (!liveSub) {

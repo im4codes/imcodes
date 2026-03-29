@@ -75,7 +75,7 @@ export function SubSessionWindow({
 
   // Always pass sessionName + ws so useTimeline keeps its cache warm.
   // active flag is only for rendering — timeline state should persist across minimize/restore.
-  const { events, refreshing } = useTimeline(sub.sessionName, ws);
+  const { events, refreshing } = useTimeline(sub.sessionName, ws, serverId);
   const quickData = useQuickData();
 
   // Earliest ts of the current continuous thinking sequence (shared logic).
