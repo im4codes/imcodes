@@ -593,7 +593,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     onAfterAction?.();
   };
 
-  const placeholder = !hasSession ? t('session.no_session') : !connected ? t('session.send_queued') : t('session.send_placeholder', { name: sessionDisplayName ?? activeSession?.name ?? 'session' });
+  const placeholder = !hasSession ? t('session.no_session') : !connected ? t('session.send_queued') : t('session.send_placeholder', { name: sessionDisplayName ?? activeSession?.label ?? activeSession?.project ?? 'session' });
 
   return (
     <>
