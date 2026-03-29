@@ -568,8 +568,8 @@ function ExecDetailView({ exec, t }: { exec: { status: string; detail: string | 
       </div>
       {exec.detail ? (
         <div
-          class="exec-detail-md"
-          style={{ color: '#cbd5e1', fontSize: '13px', lineHeight: 1.6 }}
+          class="discussions-markdown"
+          style={{ fontSize: '13px' }}
           dangerouslySetInnerHTML={{ __html: html }}
         />
       ) : (

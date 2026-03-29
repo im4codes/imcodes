@@ -706,14 +706,6 @@ body {
 .discussions-markdown strong { color: #f1f5f9; }
 .discussions-markdown a { color: #60a5fa; text-decoration: none; }
 .discussions-markdown a:hover { text-decoration: underline; }
-.exec-detail-md a { color: #93c5fd; text-decoration: none; }
-.exec-detail-md a:hover { text-decoration: underline; color: #bfdbfe; }
-.exec-detail-md code { background: #1e293b; padding: 2px 6px; border-radius: 3px; font-size: 12px; color: #f59e0b; }
-.exec-detail-md pre { background: #0f172a; border: 1px solid #334155; border-radius: 6px; padding: 12px; overflow-x: auto; margin: 12px 0; }
-.exec-detail-md pre code { background: none; padding: 0; color: #e2e8f0; }
-.exec-detail-md h1, .exec-detail-md h2, .exec-detail-md h3 { color: #f1f5f9; margin: 16px 0 8px; }
-.exec-detail-md ul, .exec-detail-md ol { padding-left: 20px; }
-.exec-detail-md blockquote { border-left: 3px solid #475569; padding-left: 12px; color: #94a3b8; margin: 8px 0; }
 .discussions-detail { flex: 1; overflow-y: auto; display: flex; flex-direction: column; }
 .discussions-detail-header { padding: 16px; border-bottom: 1px solid #1e293b; }
 .discussions-detail-header h3 { margin: 0 0 8px; font-size: 16px; }
