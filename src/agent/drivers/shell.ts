@@ -10,7 +10,7 @@ export class ShellDriver implements AgentDriver {
   buildLaunchCommand(_sessionName: string, opts?: LaunchOptions): string {
     const bin = (opts as { shellBin?: string } | undefined)?.shellBin
       ?? process.env.SHELL
-      ?? '/bin/bash';
+      ?? (process.platform === 'win32' ? (process.env.COMSPEC ?? 'powershell.exe') : '/bin/bash');
     const cwd = opts?.cwd ? `cd ${JSON.stringify(opts.cwd)} && ` : '';
     return `${cwd}${bin}`;
   }

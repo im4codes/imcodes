@@ -789,8 +789,8 @@ body {
 .sidebar-resize-grip:hover { color: #3b82f6; border-color: #3b82f6; opacity: 1; }
 .sidebar-resize-grip:active { color: #60a5fa; border-color: #60a5fa; opacity: 1; }
 .sidebar-footer { flex-shrink: 0; padding: 6px 8px; display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 2px 6px; }
-.sidebar-build-time { font-size: 9px; color: #475569; white-space: nowrap; }
-.sidebar-copyright { font-size: 9px; color: #334155; white-space: nowrap; }
+.sidebar-build-time { font-size: 9px; color: #94a3b8; white-space: nowrap; }
+.sidebar-copyright { font-size: 9px; color: #94a3b8; white-space: nowrap; }
 
 /* ── Session Tree (task 2.1–2.5) ─────────────────────────────────────────── */
 .session-tree { display: flex; flex-direction: column; padding: 4px 0; }
