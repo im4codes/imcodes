@@ -263,7 +263,8 @@ program
   .option('--all', 'Broadcast to all sibling sessions')
   .option('--type <agentType>', 'Target by agent type instead of label')
   .option('--list', 'List available sibling sessions')
-  .action(async (target: string | undefined, messageParts: string[] | undefined, opts: { files?: string; all?: boolean; type?: string; list?: boolean }) => {
+  .option('--reply', 'Ask the target to send its response back via imcodes send')
+  .action(async (target: string | undefined, messageParts: string[] | undefined, opts: { files?: string; all?: boolean; type?: string; list?: boolean; reply?: boolean }) => {
     const { detectSenderSession } = await import('./util/detect-session.js');
 
     // ── --list mode: show available siblings ───────────────────────────────
@@ -345,6 +346,11 @@ program
     if (hookPort) {
       try {
         const from = await detectSenderSession().catch(() => 'cli');
+
+        // --reply: append callback instruction so the target knows to reply
+        if (opts.reply && from !== 'cli') {
+          message += `\n\nAfter completing the above task, send your response using: imcodes send "${from}" "<your response>"`;
+        }
 
         if (opts.all) {
           // Broadcast mode
