@@ -29,6 +29,7 @@ export type CronAction = CronCommandAction | CronP2pAction;
 
 export const CRON_MSG = {
   DISPATCH: 'cron.dispatch',
+  COMMAND_RESULT: 'cron.command_result',
 } as const;
 
 export interface CronDispatchMessage {

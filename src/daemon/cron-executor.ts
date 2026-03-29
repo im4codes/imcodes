@@ -3,11 +3,14 @@
  * Receives dispatched cron jobs and sends commands to target sessions.
  */
 import type { CronDispatchMessage, CronParticipant } from '../../shared/cron-types.js';
+import { CRON_MSG } from '../../shared/cron-types.js';
 import { sendKeys } from '../agent/tmux.js';
 import { getSession } from '../store/session-store.js';
 import { sessionName, getTransportRuntime } from '../agent/session-manager.js';
 import { detectStatusAsync, type AgentType } from '../agent/detect.js';
 import { startP2pRun, type P2pTarget } from './p2p-orchestrator.js';
+import { timelineEmitter } from './timeline-emitter.js';
+import type { TimelineEvent } from './timeline-event.js';
 import type { ServerLink } from './server-link.js';
 import logger from '../util/logger.js';
 
@@ -75,6 +78,9 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
     } else {
       await sendKeys(name, action.command, { cwd: session.projectDir });
     }
+
+    // Capture agent response: collect assistant.text events until session goes idle
+    collectCommandResult(name, jobId, serverLink);
     return;
   }
 
@@ -116,4 +122,37 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
   }
 
   logger.warn({ jobId, actionType: (action as Record<string, unknown>).type }, 'Cron: unknown action type');
+}
+
+/** Collect assistant output after a cron command until session goes idle, then send result to server. */
+function collectCommandResult(sessionId: string, jobId: string, serverLink: ServerLink): void {
+  const MAX_WAIT_MS = 5 * 60 * 1000; // 5 min max
+  const MAX_DETAIL_LEN = 4000;
+  const collected: string[] = [];
+  const startTs = Date.now();
+
+  const handler = (e: TimelineEvent) => {
+    if (e.sessionId !== sessionId) return;
+    if (Date.now() - startTs > MAX_WAIT_MS) { cleanup(); return; }
+
+    if (e.type === 'assistant.text' && typeof e.payload.text === 'string') {
+      collected.push(e.payload.text);
+    }
+
+    if (e.type === 'session.state' && e.payload.state === 'idle' && collected.length > 0) {
+      const detail = collected.join('\n').slice(0, MAX_DETAIL_LEN);
+      try {
+        serverLink.send({ type: CRON_MSG.COMMAND_RESULT, jobId, detail });
+      } catch { /* not critical */ }
+      cleanup();
+    }
+  };
+
+  const unsub = timelineEmitter.on(handler);
+  const timer = setTimeout(cleanup, MAX_WAIT_MS);
+
+  function cleanup() {
+    clearTimeout(timer);
+    unsub();
+  }
 }

@@ -314,17 +314,23 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
             {!historyData[historyJobId] && <div style={{ color: '#64748b', fontSize: '13px' }}>{t('common.loading')}</div>}
             {historyData[historyJobId]?.length === 0 && <div style={{ color: '#64748b', fontSize: '13px' }}>{t('cron.no_history')}</div>}
             {historyData[historyJobId]?.map(exec => (
-              <div key={exec.id} style={{ display: 'flex', gap: '12px', fontSize: '12px', color: '#94a3b8', padding: '4px 0', borderBottom: '1px solid #1e293b' }}>
-                <span style={{ minWidth: '140px' }}>{fmtTime(exec.created_at)}</span>
-                <span style={{ color: exec.status === 'dispatched' ? '#4ade80' : exec.status === 'error' ? '#f87171' : '#fbbf24' }}>
-                  {execStatusLabel(exec.status, t)}
-                </span>
-                {exec.detail && (exec.detail.startsWith('p2p:') && onViewDiscussion
-                  ? <button type="button" onClick={() => onViewDiscussion(exec.detail!.slice(4))}
-                      style={{ flex: 1, color: '#60a5fa', background: 'none', border: 'none', cursor: 'pointer', fontSize: '12px', textAlign: 'left', padding: 0, textDecoration: 'underline' }}>
+              <div key={exec.id} style={{ fontSize: '12px', color: '#94a3b8', padding: '6px 0', borderBottom: '1px solid #1e293b' }}>
+                <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+                  <span style={{ minWidth: '140px' }}>{fmtTime(exec.created_at)}</span>
+                  <span style={{ color: exec.status === 'dispatched' ? '#4ade80' : exec.status === 'manual_trigger' ? '#60a5fa' : exec.status === 'error' ? '#f87171' : '#fbbf24' }}>
+                    {execStatusLabel(exec.status, t)}
+                  </span>
+                  {exec.detail?.startsWith('p2p:') && onViewDiscussion && (
+                    <button type="button" onClick={() => onViewDiscussion(exec.detail!.slice(4))}
+                      style={{ color: '#60a5fa', background: 'none', border: 'none', cursor: 'pointer', fontSize: '12px', padding: 0, textDecoration: 'underline' }}>
                       {t('cron.view_discussion')}
                     </button>
-                  : <span style={{ flex: 1, color: '#64748b' }}>{exec.detail}</span>
+                  )}
+                </div>
+                {exec.detail && !exec.detail.startsWith('p2p:') && (
+                  <pre style={{ color: '#94a3b8', fontSize: '11px', marginTop: '4px', padding: '6px 8px', background: '#0f172a', borderRadius: '4px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '200px', overflow: 'auto', lineHeight: 1.4 }}>
+                    {exec.detail}
+                  </pre>
                 )}
               </div>
             ))}
