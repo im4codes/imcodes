@@ -25,10 +25,16 @@ import {
   PREVIEW_MSG,
   PREVIEW_TERMINAL_OUTCOME,
   packPreviewBinaryFrame,
+  packPreviewWsFrame,
   parsePreviewBinaryFrame,
+  parsePreviewWsFrame,
   type PreviewErrorMessage,
   type PreviewResponseStartMessage,
+  type PreviewWsCloseMessage,
+  type PreviewWsErrorMessage,
+  type PreviewWsOpenedMessage,
 } from '../../../shared/preview-types.js';
+import { LocalWebPreviewRegistry } from '../preview/registry.js';
 import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions } from '../db/queries.js';
 import logger from '../util/logger.js';
 
@@ -127,6 +133,24 @@ type PendingPreviewRequest = {
   rejectStart: (err: Error) => void;
 };
 
+// ── WS tunnel state ───────────────────────────────────────────────────────────
+
+interface WsTunnelState {
+  /** The browser-side WebSocket for this tunnel. */
+  browserWs: WebSocket;
+  previewId: string;
+  idleTimer: ReturnType<typeof setTimeout> | null;
+  openTimer: ReturnType<typeof setTimeout> | null;
+  state: 'pending' | 'active';
+  /** Messages queued while waiting for preview.ws.opened. */
+  messageQueue: Buffer[];
+  queueBytes: number;
+  createdAt: number;
+}
+
+// Periodic cleanup interval handle (module-level, shared across all bridge instances)
+let cleanupSweepHandle: ReturnType<typeof setInterval> | null = null;
+
 // ── WsBridge ─────────────────────────────────────────────────────────────────
 
 export class WsBridge {
@@ -193,6 +217,9 @@ export class WsBridge {
 
   private pendingPreviewRequests = new Map<string, PendingPreviewRequest>();
 
+  /** Active preview WS tunnels: wsId → WsTunnelState */
+  private previewWsTunnels = new Map<string, WsTunnelState>();
+
   /**
    * Per-session daemon subscription reference count.
    * Forward terminal.subscribe to daemon only on 0→1.
@@ -207,7 +234,18 @@ export class WsBridge {
    */
   private terminalQueues = new Map<string, Map<WebSocket, TerminalForwardQueue>>();
 
-  private constructor(private serverId: string) {}
+  private constructor(private serverId: string) {
+    // Start periodic cleanup sweep (shared across all bridge instances)
+    if (!cleanupSweepHandle) {
+      cleanupSweepHandle = setInterval(() => {
+        for (const bridge of WsBridge.instances.values()) {
+          bridge.sweepStaleTunnels();
+        }
+      }, 60_000);
+      // Don't keep the process alive just for cleanup
+      cleanupSweepHandle.unref?.();
+    }
+  }
 
   static get(serverId: string): WsBridge {
     let bridge = WsBridge.instances.get(serverId);
@@ -369,6 +407,8 @@ export class WsBridge {
         this.authenticated = false;
         this.rejectAllPendingFileTransfers('daemon_disconnected');
         this.rejectAllPendingPreviewRequests('daemon_disconnected');
+        // Close all preview WS tunnels — daemon is gone
+        this.closeAllPreviewWsTunnels(1001, 'daemon disconnected');
         // Clear provider statuses — daemon is gone, providers are unreachable
         for (const [providerId] of this.providerStatus) {
           this.broadcastToBrowsers(JSON.stringify({ type: TRANSPORT_MSG.PROVIDER_STATUS, providerId, connected: false }));
@@ -543,6 +583,20 @@ export class WsBridge {
    */
   private relayToBrowsers(msg: Record<string, unknown>): void {
     const type = msg.type as string;
+
+    // ── Preview WS tunnel control messages ──────────────────────────────────
+    if (type === PREVIEW_MSG.WS_OPENED) {
+      this.resolvePreviewWsOpened(msg as unknown as PreviewWsOpenedMessage);
+      return;
+    }
+    if (type === PREVIEW_MSG.WS_ERROR) {
+      this.handlePreviewWsError(msg as unknown as PreviewWsErrorMessage);
+      return;
+    }
+    if (type === PREVIEW_MSG.WS_CLOSE) {
+      this.handlePreviewWsClose(msg as unknown as PreviewWsCloseMessage);
+      return;
+    }
 
     if (type === PREVIEW_MSG.RESPONSE_START) {
       this.resolvePreviewStart(msg as unknown as PreviewResponseStartMessage);
@@ -985,6 +1039,17 @@ export class WsBridge {
   }
 
   private routeBinaryFrame(data: Buffer): void {
+    // WS_DATA frames (type 0x04) are handled separately — parsePreviewBinaryFrame returns null for them.
+    if (data.length > 0 && data[0] === PREVIEW_BINARY_FRAME.WS_DATA) {
+      const wsFrame = parsePreviewWsFrame(data);
+      if (wsFrame) {
+        this.relayWsDataToBrowser(wsFrame.wsId, wsFrame.isBinary, wsFrame.payload);
+      } else {
+        logger.warn({ serverId: this.serverId }, 'Binary frame: malformed WS_DATA frame');
+      }
+      return;
+    }
+
     const previewFrame = parsePreviewBinaryFrame(data);
     if (previewFrame && previewFrame.frameType === PREVIEW_BINARY_FRAME.RESPONSE_BODY) {
       this.pushPreviewResponseChunk(previewFrame.requestId, previewFrame.payload);
@@ -1406,6 +1471,295 @@ export class WsBridge {
     }
   }
 
+  // ── Preview WS Tunnel ──────────────────────────────────────────────────────
+
+  /**
+   * Create a new WS tunnel in pending state.
+   * Sends preview.ws.open to daemon and starts open timeout timer.
+   */
+  createPreviewWsTunnel(
+    wsId: string,
+    previewId: string,
+    port: number,
+    path: string,
+    browserWs: WebSocket,
+    headers: Record<string, string>,
+    protocols: string[],
+  ): void {
+    const openTimer = setTimeout(() => {
+      const tunnel = this.previewWsTunnels.get(wsId);
+      if (!tunnel) return;
+      logger.warn({ serverId: this.serverId, wsId, previewId }, 'Preview WS tunnel open timeout');
+      try { tunnel.browserWs.close(1001, 'open timeout'); } catch { /* ignore */ }
+      this.cleanupTunnel(wsId);
+    }, PREVIEW_LIMITS.WS_OPEN_TIMEOUT_MS);
+
+    const tunnel: WsTunnelState = {
+      browserWs,
+      previewId,
+      idleTimer: null,
+      openTimer,
+      state: 'pending',
+      messageQueue: [],
+      queueBytes: 0,
+      createdAt: Date.now(),
+    };
+    this.previewWsTunnels.set(wsId, tunnel);
+
+    // Wire browser WS events
+    browserWs.on('message', (data: Buffer | string, isBinary: boolean) => {
+      this.handleBrowserWsTunnelMessage(wsId, data, isBinary);
+    });
+
+    browserWs.on('close', (code: number, reason: Buffer) => {
+      this.handleBrowserWsTunnelClose(wsId, code, reason.toString());
+    });
+
+    browserWs.on('error', () => {
+      this.handleBrowserWsTunnelClose(wsId, 1011, 'error');
+    });
+
+    // Send preview.ws.open to daemon
+    this.sendPreviewControl({
+      type: PREVIEW_MSG.WS_OPEN,
+      wsId,
+      previewId,
+      port,
+      path,
+      headers,
+      protocols,
+    });
+  }
+
+  /**
+   * Called when daemon sends preview.ws.opened.
+   * Transitions tunnel to active state, flushes queued messages.
+   */
+  private resolvePreviewWsOpened(msg: PreviewWsOpenedMessage): void {
+    const tunnel = this.previewWsTunnels.get(msg.wsId);
+    if (!tunnel) return;
+
+    // Cancel open timeout
+    if (tunnel.openTimer) {
+      clearTimeout(tunnel.openTimer);
+      tunnel.openTimer = null;
+    }
+
+    tunnel.state = 'active';
+
+    // Flush queued messages to daemon
+    for (const queued of tunnel.messageQueue) {
+      const isBinary = (queued[0] & 0x01) !== 0;
+      const payload = queued.subarray(1);
+      if (this.daemonWs && this.authenticated) {
+        try {
+          this.daemonWs.send(packPreviewWsFrame(msg.wsId, isBinary, payload));
+        } catch (err) {
+          logger.warn({ serverId: this.serverId, wsId: msg.wsId, err }, 'Failed to flush queued WS message to daemon');
+        }
+      }
+    }
+    tunnel.messageQueue = [];
+    tunnel.queueBytes = 0;
+
+    // Start idle timer
+    this.resetWsTunnelIdleTimer(msg.wsId);
+
+    logger.info({ serverId: this.serverId, wsId: msg.wsId, previewId: tunnel.previewId, protocol: msg.protocol }, 'Preview WS tunnel active');
+  }
+
+  /**
+   * Called when daemon sends preview.ws.error.
+   * Closes browser WS with 1011 and cleans up.
+   */
+  private handlePreviewWsError(msg: PreviewWsErrorMessage): void {
+    const tunnel = this.previewWsTunnels.get(msg.wsId);
+    if (!tunnel) return;
+    logger.warn({ serverId: this.serverId, wsId: msg.wsId, error: msg.error }, 'Preview WS tunnel error from daemon');
+    try { tunnel.browserWs.close(1011, 'upstream error'); } catch { /* ignore */ }
+    this.cleanupTunnel(msg.wsId);
+  }
+
+  /**
+   * Called when daemon sends preview.ws.close.
+   * Forwards close frame to browser WS and cleans up.
+   */
+  private handlePreviewWsClose(msg: PreviewWsCloseMessage): void {
+    const tunnel = this.previewWsTunnels.get(msg.wsId);
+    if (!tunnel) return;
+    try { tunnel.browserWs.close(msg.code, msg.reason); } catch { /* ignore */ }
+    this.cleanupTunnel(msg.wsId);
+  }
+
+  /**
+   * Relay a WS_DATA frame from daemon to the browser WS.
+   */
+  private relayWsDataToBrowser(wsId: string, isBinary: boolean, payload: Buffer): void {
+    const tunnel = this.previewWsTunnels.get(wsId);
+    if (!tunnel || tunnel.state !== 'active') return;
+
+    // Enforce max message size
+    if (payload.length > PREVIEW_LIMITS.MAX_WS_MESSAGE_BYTES) {
+      logger.warn({ serverId: this.serverId, wsId, size: payload.length }, 'Preview WS: daemon→browser message too large — closing with 1009');
+      try { tunnel.browserWs.close(1009, 'message too large'); } catch { /* ignore */ }
+      this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId, code: 1009, reason: 'message too large' });
+      this.cleanupTunnel(wsId);
+      return;
+    }
+
+    this.resetWsTunnelIdleTimer(wsId);
+    LocalWebPreviewRegistry.get(this.serverId).touch(tunnel.previewId);
+
+    try {
+      tunnel.browserWs.send(payload, { binary: isBinary });
+    } catch (err) {
+      logger.warn({ serverId: this.serverId, wsId, err }, 'Failed to relay WS_DATA to browser');
+    }
+  }
+
+  /**
+   * Handle message from browser on a WS tunnel connection.
+   */
+  private handleBrowserWsTunnelMessage(wsId: string, data: Buffer | string, isBinary: boolean): void {
+    const tunnel = this.previewWsTunnels.get(wsId);
+    if (!tunnel) return;
+
+    const payload = Buffer.isBuffer(data) ? data : Buffer.from(data as string);
+
+    // Enforce max message size
+    if (payload.length > PREVIEW_LIMITS.MAX_WS_MESSAGE_BYTES) {
+      logger.warn({ serverId: this.serverId, wsId, size: payload.length }, 'Preview WS: browser→daemon message too large — closing with 1009');
+      try { tunnel.browserWs.close(1009, 'message too large'); } catch { /* ignore */ }
+      this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId, code: 1009, reason: 'message too large' });
+      this.cleanupTunnel(wsId);
+      return;
+    }
+
+    if (tunnel.state === 'pending') {
+      // Queue message while waiting for preview.ws.opened
+      // Encode binary flag in first byte: 1=binary, 0=text
+      const flagByte = Buffer.allocUnsafe(1);
+      flagByte[0] = isBinary ? 1 : 0;
+      const entry = Buffer.concat([flagByte, payload]);
+      const newBytes = tunnel.queueBytes + entry.length;
+
+      if (newBytes > PREVIEW_LIMITS.MAX_WS_PENDING_QUEUE_BYTES) {
+        logger.warn({ serverId: this.serverId, wsId }, 'Preview WS: pending queue overflow — closing with 1008');
+        try { tunnel.browserWs.close(1008, 'policy violation'); } catch { /* ignore */ }
+        this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId, code: 1008, reason: 'policy violation' });
+        this.cleanupTunnel(wsId);
+        return;
+      }
+
+      tunnel.messageQueue.push(entry);
+      tunnel.queueBytes = newBytes;
+      return;
+    }
+
+    // Active state — relay to daemon
+    this.resetWsTunnelIdleTimer(wsId);
+    LocalWebPreviewRegistry.get(this.serverId).touch(tunnel.previewId);
+
+    if (this.daemonWs && this.authenticated) {
+      try {
+        this.daemonWs.send(packPreviewWsFrame(wsId, isBinary, payload));
+      } catch (err) {
+        logger.warn({ serverId: this.serverId, wsId, err }, 'Failed to relay browser WS message to daemon');
+      }
+    }
+  }
+
+  /**
+   * Handle browser-side WS close on a tunnel connection.
+   * Notifies daemon and cleans up.
+   */
+  private handleBrowserWsTunnelClose(wsId: string, code: number, reason: string): void {
+    const tunnel = this.previewWsTunnels.get(wsId);
+    if (!tunnel) return;
+    this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId, code, reason });
+    this.cleanupTunnel(wsId);
+  }
+
+  /**
+   * Close all WS tunnels for a given previewId.
+   * Called when the preview expires or is stopped.
+   */
+  closeAllPreviewWsForPreview(previewId: string): void {
+    for (const [wsId, tunnel] of this.previewWsTunnels) {
+      if (tunnel.previewId !== previewId) continue;
+      try { tunnel.browserWs.close(1001, 'preview closed'); } catch { /* ignore */ }
+      this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId, code: 1001, reason: 'preview closed' });
+      this.cleanupTunnel(wsId);
+    }
+  }
+
+  /**
+   * Close all WS tunnels. Called on daemon disconnect.
+   */
+  private closeAllPreviewWsTunnels(code: number, reason: string): void {
+    for (const [wsId, tunnel] of this.previewWsTunnels) {
+      try { tunnel.browserWs.close(code, reason); } catch { /* ignore */ }
+      this.cleanupTunnel(wsId);
+    }
+  }
+
+  /**
+   * Clean up a single tunnel entry (timers, map removal).
+   * Does NOT close the browserWs or send preview.ws.close — callers handle that.
+   */
+  private cleanupTunnel(wsId: string): void {
+    const tunnel = this.previewWsTunnels.get(wsId);
+    if (!tunnel) return;
+    if (tunnel.idleTimer) { clearTimeout(tunnel.idleTimer); tunnel.idleTimer = null; }
+    if (tunnel.openTimer) { clearTimeout(tunnel.openTimer); tunnel.openTimer = null; }
+    this.previewWsTunnels.delete(wsId);
+    this.maybeCleanup();
+  }
+
+  /**
+   * Reset (or start) the idle timer for a tunnel.
+   */
+  private resetWsTunnelIdleTimer(wsId: string): void {
+    const tunnel = this.previewWsTunnels.get(wsId);
+    if (!tunnel) return;
+    if (tunnel.idleTimer) clearTimeout(tunnel.idleTimer);
+    tunnel.idleTimer = setTimeout(() => {
+      const t = this.previewWsTunnels.get(wsId);
+      if (!t) return;
+      logger.info({ serverId: this.serverId, wsId, previewId: t.previewId }, 'Preview WS tunnel idle timeout — closing with 1000');
+      try { t.browserWs.close(1000, 'idle timeout'); } catch { /* ignore */ }
+      this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId, code: 1000, reason: 'idle timeout' });
+      this.cleanupTunnel(wsId);
+    }, PREVIEW_LIMITS.WS_IDLE_TIMEOUT_MS);
+  }
+
+  /**
+   * Periodic cleanup: remove tunnel entries where browser WS is no longer open.
+   * Defense-in-depth against missed close events.
+   */
+  sweepStaleTunnels(): void {
+    for (const [wsId, tunnel] of this.previewWsTunnels) {
+      if (tunnel.browserWs.readyState !== WebSocket.OPEN) {
+        logger.info({ serverId: this.serverId, wsId }, 'Preview WS tunnel sweep: removing stale entry');
+        this.cleanupTunnel(wsId);
+      }
+    }
+  }
+
+  /** Count WS tunnels for a given previewId. Used by route to enforce per-preview limit. */
+  getPreviewWsCount(previewId: string): number {
+    let count = 0;
+    for (const tunnel of this.previewWsTunnels.values()) {
+      if (tunnel.previewId === previewId) count++;
+    }
+    return count;
+  }
+
+  /** Total WS tunnel count across all previews. Used by route to enforce per-server limit. */
+  getServerWsCount(): number {
+    return this.previewWsTunnels.size;
+  }
+
   // ── Push notifications ──────────────────────────────────────────────────────
 
   /** Dedup: last push timestamp per session to avoid duplicate notifications. */
@@ -1475,9 +1829,9 @@ export class WsBridge {
     let displayName: string;
     const typeSuffix = agentType ? `(${agentType})` : '';
     if (isSub) {
-      const subId = sessionName.replace(/^deck_sub_/, '');
-      const name = label || subId;
-      displayName = `${name}${typeSuffix}${parentContext ? `@${parentContext}` : ''}`;
+      // Prefer label, fallback to agentType, last resort raw ID
+      const name = label || agentType || sessionName.replace(/^deck_sub_/, '');
+      displayName = `${name}${label ? typeSuffix : ''}${parentContext ? `@${parentContext}` : ''}`;
     } else {
       const name = label || parentContext || sessionName;
       displayName = `${name}${typeSuffix}`;
@@ -1526,7 +1880,7 @@ export class WsBridge {
   }
 
   private maybeCleanup(): void {
-    if (!this.daemonWs && this.browserSockets.size === 0) {
+    if (!this.daemonWs && this.browserSockets.size === 0 && this.previewWsTunnels.size === 0) {
       this.browserRateLimiter.stop();
       WsBridge.instances.delete(this.serverId);
     }

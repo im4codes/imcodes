@@ -75,6 +75,22 @@ export class LocalWebPreviewRegistry {
     return this.toPreviewRecord(preview);
   }
 
+  /**
+   * Touch a preview's idle TTL, resetting lastAccessAt to now.
+   * Called when WS tunnel traffic is active so HMR connections keep the preview alive.
+   * Returns false if the preview is expired or not found.
+   */
+  touch(id: string): boolean {
+    const preview = this.previews.get(id);
+    if (!preview) return false;
+    if (preview.expiresAt <= Date.now()) {
+      this.previews.delete(id);
+      return false;
+    }
+    preview.lastAccessAt = Date.now();
+    return true;
+  }
+
   close(id: string, userId: string): boolean {
     const preview = this.previews.get(id);
     if (!preview || preview.userId !== userId) return false;

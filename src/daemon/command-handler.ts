@@ -461,6 +461,8 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case PREVIEW_MSG.REQUEST:
     case PREVIEW_MSG.REQUEST_END:
     case PREVIEW_MSG.ABORT:
+    case PREVIEW_MSG.WS_OPEN:
+    case PREVIEW_MSG.WS_CLOSE:
       if (handlePreviewCommand(cmd, serverLink)) break;
       break;
     case 'auth_ok':

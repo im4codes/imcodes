@@ -1,4 +1,5 @@
 import { PassThrough } from 'node:stream';
+import WebSocket from 'ws';
 import type { ServerLink } from './server-link.js';
 import logger from '../util/logger.js';
 import {
@@ -8,9 +9,13 @@ import {
   PREVIEW_MSG,
   PREVIEW_TERMINAL_OUTCOME,
   packPreviewBinaryFrame,
+  packPreviewWsFrame,
   parsePreviewBinaryFrame,
+  parsePreviewWsFrame,
   type PreviewRequestMessage,
   type PreviewTerminalOutcome,
+  type PreviewWsOpenMessage,
+  type PreviewWsCloseMessage,
 } from '../../shared/preview-types.js';
 import { normalizePreviewUpstreamPath } from '../../shared/preview-policy.js';
 
@@ -26,6 +31,35 @@ type PendingPreviewRequest = {
 
 const pendingPreviewRequests = new Map<string, PendingPreviewRequest>();
 const LOOPBACK_HOST = '127.0.0.1';
+
+// ── Preview registry: tracks previewId → port so WS tunnel can validate port ─
+// Populated when HTTP requests arrive. The server always sends the correct port,
+// but we cross-check to defend against confused-deputy scenarios.
+const previewPortRegistry = new Map<string, number>();
+
+// ── Active WS tunnels: wsId (dashless hex) → upstream WebSocket ──────────────
+const activeWsTunnels = new Map<string, WebSocket>();
+
+/** Normalize wsId to dashless 32-char hex (UUIDs have dashes, raw hex does not). */
+function normalizeWsId(wsId: string): string {
+  return wsId.replace(/-/g, '');
+}
+
+function sendWsError(serverLink: ServerLink, wsId: string, error: string): void {
+  try {
+    serverLink.send({ type: PREVIEW_MSG.WS_ERROR, wsId, error });
+  } catch {
+    // disconnected
+  }
+}
+
+function cleanupWsTunnel(wsId: string): void {
+  const ws = activeWsTunnels.get(wsId);
+  activeWsTunnels.delete(wsId);
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.close(); } catch { /* ignore */ }
+  }
+}
 
 function getSetCookieValues(headers: Headers): string[] {
   const withGetSetCookie = headers as Headers & { getSetCookie?: () => string[] };
@@ -177,6 +211,11 @@ export function handlePreviewCommand(cmd: Record<string, unknown>, serverLink: S
       return true;
     }
 
+    // Register previewId → port for later WS tunnel port validation.
+    if (typeof msg.previewId === 'string') {
+      previewPortRegistry.set(msg.previewId, msg.port);
+    }
+
     const bodyStream = msg.hasBody ? new PassThrough() : null;
     bodyStream?.on('error', () => {
       // Expected on abort / limit enforcement. The terminal outcome is reported separately.
@@ -215,10 +254,141 @@ export function handlePreviewCommand(cmd: Record<string, unknown>, serverLink: S
     return true;
   }
 
+  if (cmd.type === PREVIEW_MSG.WS_OPEN) {
+    const msg = cmd as unknown as PreviewWsOpenMessage;
+    if (typeof msg.wsId !== 'string' || typeof msg.previewId !== 'string' || typeof msg.port !== 'number' || typeof msg.path !== 'string') {
+      return true;
+    }
+    handlePreviewWsOpen(msg, serverLink);
+    return true;
+  }
+
+  if (cmd.type === PREVIEW_MSG.WS_CLOSE) {
+    const msg = cmd as unknown as PreviewWsCloseMessage;
+    if (typeof msg.wsId !== 'string') return true;
+    handlePreviewWsCloseFromServer(msg);
+    return true;
+  }
+
   return false;
 }
 
+// ── WS tunnel: open upstream connection ──────────────────────────────────────
+
+function handlePreviewWsOpen(msg: PreviewWsOpenMessage, serverLink: ServerLink): void {
+  const wsId = normalizeWsId(msg.wsId);
+
+  // Validate port range.
+  if (msg.port < 1 || msg.port > 65535 || !Number.isInteger(msg.port)) {
+    sendWsError(serverLink, msg.wsId, 'invalid port');
+    return;
+  }
+
+  // Validate port matches registered preview port (if known).
+  const registeredPort = previewPortRegistry.get(msg.previewId);
+  if (registeredPort !== undefined && registeredPort !== msg.port) {
+    logger.warn({ wsId, previewId: msg.previewId, msgPort: msg.port, registeredPort }, 'Preview WS port mismatch');
+    sendWsError(serverLink, msg.wsId, 'port mismatch');
+    return;
+  }
+
+  // Sanitize the path.
+  const sanitizedPath = normalizePreviewUpstreamPath(msg.path);
+
+  const upstreamUrl = `ws://${LOOPBACK_HOST}:${msg.port}${sanitizedPath}`;
+  logger.debug({ wsId, url: upstreamUrl }, 'Preview WS: connecting to upstream');
+
+  // Connect to upstream. Pass subprotocols if provided; strip Sec-WebSocket-Extensions
+  // (extension negotiation cannot be preserved end-to-end through a message-level relay).
+  const protocols = Array.isArray(msg.protocols) && msg.protocols.length > 0 ? msg.protocols : undefined;
+  const upstreamWs = new WebSocket(upstreamUrl, protocols, {
+    headers: { host: `${LOOPBACK_HOST}:${msg.port}` },
+  });
+
+  // Track before open fires, so WS_CLOSE from server during handshake is handled.
+  activeWsTunnels.set(wsId, upstreamWs);
+
+  let opened = false;
+
+  upstreamWs.on('open', () => {
+    opened = true;
+    logger.debug({ wsId }, 'Preview WS: upstream connected');
+    try {
+      serverLink.send({
+        type: PREVIEW_MSG.WS_OPENED,
+        wsId: msg.wsId,
+        protocol: upstreamWs.protocol || undefined,
+      });
+    } catch {
+      // Server disconnected — clean up upstream.
+      cleanupWsTunnel(wsId);
+    }
+  });
+
+  upstreamWs.on('unexpected-response', (_req, res) => {
+    if (opened) return;
+    const status = res.statusCode ?? 0;
+    const statusText = res.statusMessage ?? '';
+    const errMsg = statusText
+      ? `upstream rejected: ${status} ${statusText}`
+      : `upstream rejected: ${status}`;
+    logger.warn({ wsId, status }, 'Preview WS: upstream rejected upgrade');
+    cleanupWsTunnel(wsId);
+    sendWsError(serverLink, msg.wsId, errMsg);
+  });
+
+  upstreamWs.on('error', (err) => {
+    if (opened) {
+      // Error after open — just log; close event will fire next.
+      logger.warn({ wsId, err: err.message }, 'Preview WS: upstream error after open');
+      return;
+    }
+    cleanupWsTunnel(wsId);
+    sendWsError(serverLink, msg.wsId, `connection failed: ${err.message}`);
+  });
+
+  upstreamWs.on('message', (data: WebSocket.RawData, isBinaryMsg: boolean) => {
+    // Enforce message size limit.
+    const payload = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
+    if (payload.length > PREVIEW_LIMITS.MAX_WS_MESSAGE_BYTES) {
+      logger.warn({ wsId, size: payload.length }, 'Preview WS: upstream message exceeds size limit, closing tunnel');
+      cleanupWsTunnel(wsId);
+      try {
+        serverLink.send({ type: PREVIEW_MSG.WS_CLOSE, wsId: msg.wsId, code: 1009, reason: 'Message Too Big' });
+      } catch { /* ignore */ }
+      return;
+    }
+    serverLink.sendBinary(packPreviewWsFrame(msg.wsId, isBinaryMsg, payload));
+  });
+
+  upstreamWs.on('close', (code, reasonBuf) => {
+    const reason = Buffer.isBuffer(reasonBuf) ? reasonBuf.toString('utf8') : String(reasonBuf ?? '');
+    logger.debug({ wsId, code, reason }, 'Preview WS: upstream closed');
+    activeWsTunnels.delete(wsId);
+    try {
+      serverLink.send({ type: PREVIEW_MSG.WS_CLOSE, wsId: msg.wsId, code, reason });
+    } catch { /* ignore */ }
+  });
+}
+
+// ── WS tunnel: handle close from server ──────────────────────────────────────
+
+function handlePreviewWsCloseFromServer(msg: PreviewWsCloseMessage): void {
+  const wsId = normalizeWsId(msg.wsId);
+  const ws = activeWsTunnels.get(wsId);
+  if (!ws) return;
+  activeWsTunnels.delete(wsId);
+  try {
+    ws.close(msg.code, msg.reason);
+  } catch { /* ignore */ }
+}
+
 export function handlePreviewBinaryFrame(data: Buffer, serverLink: ServerLink): boolean {
+  // Dispatch based on first byte: 0x04 is a WS_DATA frame, others are HTTP relay frames.
+  if (data.length > 0 && data[0] === PREVIEW_BINARY_FRAME.WS_DATA) {
+    return handlePreviewWsDataFrame(data, serverLink);
+  }
+
   const frame = parsePreviewBinaryFrame(data);
   if (!frame || frame.frameType !== PREVIEW_BINARY_FRAME.REQUEST_BODY) return false;
   const pending = pendingPreviewRequests.get(frame.requestId);
@@ -234,5 +404,41 @@ export function handlePreviewBinaryFrame(data: Buffer, serverLink: ServerLink): 
   }
 
   pending.bodyStream?.write(frame.payload);
+  return true;
+}
+
+// ── WS tunnel: relay incoming WS_DATA frame to upstream ──────────────────────
+
+function handlePreviewWsDataFrame(data: Buffer, serverLink: ServerLink): boolean {
+  const parsed = parsePreviewWsFrame(data);
+  if (!parsed) return false;
+
+  // Enforce message size limit from server → upstream direction.
+  if (parsed.payload.length > PREVIEW_LIMITS.MAX_WS_MESSAGE_BYTES) {
+    const ws = activeWsTunnels.get(parsed.wsId);
+    if (ws) {
+      activeWsTunnels.delete(parsed.wsId);
+      try { ws.close(1009, 'Message Too Big'); } catch { /* ignore */ }
+    }
+    try {
+      serverLink.send({ type: PREVIEW_MSG.WS_CLOSE, wsId: parsed.wsId, code: 1009, reason: 'Message Too Big' });
+    } catch { /* ignore */ }
+    return true;
+  }
+
+  const upstreamWs = activeWsTunnels.get(parsed.wsId);
+  if (!upstreamWs) return true; // tunnel already closed — silently discard
+
+  if (upstreamWs.readyState !== WebSocket.OPEN) return true;
+
+  try {
+    if (parsed.isBinary) {
+      upstreamWs.send(parsed.payload);
+    } else {
+      upstreamWs.send(parsed.payload.toString('utf8'));
+    }
+  } catch (err) {
+    logger.warn({ wsId: parsed.wsId, err: (err as Error).message }, 'Preview WS: error forwarding to upstream');
+  }
   return true;
 }

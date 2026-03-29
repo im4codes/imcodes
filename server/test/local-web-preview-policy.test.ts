@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   filterPreviewResponseHeaders,
+  isWebSocketUpgrade,
   rewritePreviewRedirectLocation,
   rewriteSetCookieHeader,
   sanitizePreviewRequestHeaders,
@@ -135,5 +136,133 @@ describe('local web preview policy', () => {
     expect(rewritten).toContain(`href="${prefix}/docs?q=1"`);
     expect(rewritten).toContain(`src="${prefix}/logo.png"`);
     expect(rewritten).toContain(`var PREVIEW_PORT=3000`);
+  });
+
+  it('runtime patch script includes WebSocket constructor patch', () => {
+    const html = '<html><head></head><body></body></html>';
+    const rewritten = rewritePreviewHtmlDocument(html, 'server123', 'preview123', 3000, 'tok123');
+    expect(rewritten).toContain('window.WebSocket');
+    expect(rewritten).toContain('OriginalWebSocket');
+    expect(rewritten).toContain('PatchedWebSocket');
+    expect(rewritten).toContain('rewriteWsUrl');
+  });
+});
+
+describe('isWebSocketUpgrade', () => {
+  it('returns true for Upgrade: websocket (lowercase)', () => {
+    const headers = new Headers({ upgrade: 'websocket' });
+    expect(isWebSocketUpgrade(headers)).toBe(true);
+  });
+
+  it('returns true for Upgrade: WebSocket (mixed case)', () => {
+    const headers = new Headers({ upgrade: 'WebSocket' });
+    expect(isWebSocketUpgrade(headers)).toBe(true);
+  });
+
+  it('returns true for Upgrade: WEBSOCKET (uppercase)', () => {
+    const headers = new Headers({ upgrade: 'WEBSOCKET' });
+    expect(isWebSocketUpgrade(headers)).toBe(true);
+  });
+
+  it('returns false when upgrade header is absent', () => {
+    const headers = new Headers({ 'content-type': 'text/html' });
+    expect(isWebSocketUpgrade(headers)).toBe(false);
+  });
+
+  it('returns false when upgrade header is a different value', () => {
+    const headers = new Headers({ upgrade: 'h2c' });
+    expect(isWebSocketUpgrade(headers)).toBe(false);
+  });
+});
+
+describe('sanitizePreviewRequestHeaders — WebSocket upgrade', () => {
+  it('preserves connection, upgrade, sec-websocket-key, sec-websocket-version, sec-websocket-protocol on WS upgrade', () => {
+    const headers = new Headers({
+      connection: 'Upgrade',
+      upgrade: 'websocket',
+      'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==',
+      'sec-websocket-version': '13',
+      'sec-websocket-protocol': 'chat, superchat',
+      'sec-websocket-extensions': 'permessage-deflate',
+      host: 'im.codes',
+      'content-type': 'text/plain',
+    });
+
+    const sanitized = sanitizePreviewRequestHeaders(headers, 'preview123');
+
+    expect(sanitized['connection']).toBe('Upgrade');
+    expect(sanitized['upgrade']).toBe('websocket');
+    expect(sanitized['sec-websocket-key']).toBe('dGhlIHNhbXBsZSBub25jZQ==');
+    expect(sanitized['sec-websocket-version']).toBe('13');
+    expect(sanitized['sec-websocket-protocol']).toBe('chat, superchat');
+    expect(sanitized['host']).toBeUndefined();
+  });
+
+  it('strips sec-websocket-extensions on WS upgrade', () => {
+    const headers = new Headers({
+      upgrade: 'websocket',
+      'sec-websocket-extensions': 'permessage-deflate; client_max_window_bits',
+    });
+
+    const sanitized = sanitizePreviewRequestHeaders(headers, 'preview123');
+
+    expect(sanitized['sec-websocket-extensions']).toBeUndefined();
+  });
+
+  it('still strips hop-by-hop headers that are not WS-specific (e.g. keep-alive, te)', () => {
+    const headers = new Headers({
+      upgrade: 'websocket',
+      'keep-alive': 'timeout=5',
+      te: 'trailers',
+      'x-custom': 'value',
+    });
+
+    const sanitized = sanitizePreviewRequestHeaders(headers, 'preview123');
+
+    expect(sanitized['keep-alive']).toBeUndefined();
+    expect(sanitized['te']).toBeUndefined();
+    expect(sanitized['x-custom']).toBe('value');
+  });
+});
+
+describe('sanitizePreviewRequestHeaders — non-WebSocket (existing behavior)', () => {
+  it('strips all hop-by-hop headers including connection and upgrade for normal HTTP', () => {
+    const headers = new Headers({
+      connection: 'keep-alive',
+      upgrade: 'h2c',
+      'keep-alive': 'timeout=5',
+      'transfer-encoding': 'chunked',
+      te: 'trailers',
+      trailer: 'Expires',
+      'proxy-authenticate': 'Basic',
+      'proxy-authorization': 'Basic abc',
+      'content-type': 'application/json',
+      host: 'im.codes',
+    });
+
+    const sanitized = sanitizePreviewRequestHeaders(headers, 'preview123');
+
+    expect(sanitized['connection']).toBeUndefined();
+    expect(sanitized['upgrade']).toBeUndefined();
+    expect(sanitized['keep-alive']).toBeUndefined();
+    expect(sanitized['transfer-encoding']).toBeUndefined();
+    expect(sanitized['te']).toBeUndefined();
+    expect(sanitized['trailer']).toBeUndefined();
+    expect(sanitized['proxy-authenticate']).toBeUndefined();
+    expect(sanitized['proxy-authorization']).toBeUndefined();
+    expect(sanitized['host']).toBeUndefined();
+    expect(sanitized['content-type']).toBe('application/json');
+  });
+
+  it('strips sec-websocket-extensions even on non-WS requests', () => {
+    const headers = new Headers({
+      'sec-websocket-extensions': 'permessage-deflate',
+      'x-custom': 'value',
+    });
+
+    const sanitized = sanitizePreviewRequestHeaders(headers, 'preview123');
+
+    expect(sanitized['sec-websocket-extensions']).toBeUndefined();
+    expect(sanitized['x-custom']).toBe('value');
   });
 });

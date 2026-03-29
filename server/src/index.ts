@@ -37,6 +37,10 @@ import { preferencesRoutes } from './routes/preferences.js';
 import { fileTransferRoutes } from './routes/file-transfer.js';
 import { passkeyRoutes } from './routes/passkey-auth.js';
 import { localWebPreviewRoutes } from './routes/local-web-preview.js';
+import { LocalWebPreviewRegistry } from './preview/registry.js';
+import { sanitizePreviewRequestHeaders } from '../../shared/preview-policy.js';
+import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM, PREVIEW_LIMITS } from '../../shared/preview-types.js';
+import { COOKIE_SESSION, COOKIE_PREVIEW_ACCESS } from '../../shared/cookie-names.js';
 import { healthCheckCron } from './cron/health-check.js';
 import { jobDispatchCron } from './cron/job-dispatch.js';
 import { WsBridge } from './ws/bridge.js';
@@ -287,6 +291,14 @@ function setupWebSocketUpgrade(server: import('node:http').Server, env: Env) {
 
   server.on('upgrade', async (req: IncomingMessage, socket, head) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
+
+    // Preview WebSocket tunnel: /api/server/:id/local-web/:previewId/*
+    const previewWsMatch = url.pathname.match(/^\/api\/server\/([^/]+)\/local-web\/([^/]+)(\/.*)?$/);
+    if (previewWsMatch) {
+      await handlePreviewWsUpgrade(previewWsMatch[1]!, previewWsMatch[2]!, previewWsMatch[3] ?? '/', req, socket, head, url, wss, env);
+      return;
+    }
+
     const match = url.pathname.match(/^\/api\/server\/([^/]+)\/ws$/);
     if (!match) { socket.destroy(); return; }
 
@@ -362,6 +374,131 @@ function validateOrigin(origin: string, env: Env): boolean {
   if (nativeOrigins.includes(origin)) return true;
   if (!env.ALLOWED_ORIGINS) return env.NODE_ENV === 'development';
   return env.ALLOWED_ORIGINS.split(',').map((s) => s.trim()).includes(origin);
+}
+
+// ── Preview WebSocket upgrade handler ─────────────────────────────────────────
+
+async function handlePreviewWsUpgrade(
+  serverId: string,
+  previewId: string,
+  rawPath: string,
+  req: IncomingMessage,
+  socket: import('node:stream').Duplex,
+  head: Buffer,
+  url: URL,
+  wss: WebSocketServer,
+  env: Env,
+): Promise<void> {
+  // 1. Validate Origin
+  const origin = req.headers['origin'] ?? '';
+  if (!validateOrigin(origin, env)) {
+    socket.write('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  // 2. Resolve preview access token from query param or cookie header
+  const previewAccessToken = url.searchParams.get(PREVIEW_ACCESS_TOKEN_QUERY_PARAM)
+    ?? parseCookieHeader(req.headers['cookie'] ?? '', COOKIE_PREVIEW_ACCESS)
+    ?? null;
+
+  // 3. Try session auth (cookie JWT); if no session auth, fall back to preview access token
+  let userId: string | null = null;
+  const sessionCookieToken = parseCookieHeader(req.headers['cookie'] ?? '', COOKIE_SESSION);
+  if (sessionCookieToken && env.JWT_SIGNING_KEY) {
+    const payload = verifyJwt(sessionCookieToken, env.JWT_SIGNING_KEY);
+    if (payload && typeof payload.sub === 'string' && payload.type !== 'ws-ticket') {
+      userId = payload.sub;
+    }
+  }
+
+  const registry = LocalWebPreviewRegistry.get(serverId);
+
+  if (!userId && previewAccessToken) {
+    const fromToken = registry.authorizeWithAccessToken(previewId, previewAccessToken);
+    if (fromToken) {
+      userId = fromToken.userId;
+    }
+  }
+
+  if (!userId) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  // 4. Verify previewId exists and is not expired
+  const preview = registry.get(previewId);
+  if (!preview) {
+    socket.write('HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  if (preview.userId !== userId) {
+    socket.write('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  // 5. Check per-preview and per-server WS tunnel limits
+  const bridge = WsBridge.get(serverId);
+  if (bridge.getPreviewWsCount(previewId) >= PREVIEW_LIMITS.MAX_WS_PER_PREVIEW) {
+    socket.write('HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nContent-Length: 0\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  if (bridge.getServerWsCount() >= PREVIEW_LIMITS.MAX_WS_PER_SERVER) {
+    socket.write('HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  // 6. Verify daemon is connected
+  if (!bridge.isDaemonConnected()) {
+    socket.write(`HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n`);
+    socket.destroy();
+    return;
+  }
+
+  // 7. Extract upstream path (strip preview route prefix)
+  const upstreamPath = rawPath || '/';
+  const upstreamPathWithQuery = `${upstreamPath}${url.search}`;
+
+  // 8. Sanitize headers for upstream
+  const reqHeaders = new Headers(req.headers as Record<string, string>);
+  const sanitizedHeaders = sanitizePreviewRequestHeaders(reqHeaders, previewId);
+
+  // Extract subprotocols from Sec-WebSocket-Protocol header
+  const protocolHeader = req.headers['sec-websocket-protocol'] ?? '';
+  const protocols = protocolHeader ? protocolHeader.split(',').map((p) => p.trim()).filter(Boolean) : [];
+
+  // 9. Generate wsId (32 hex chars, consistent with requestId format)
+  const wsId = crypto.randomUUID().replace(/-/g, '');
+
+  logger.info({
+    serverId,
+    previewId,
+    wsId,
+    path: upstreamPathWithQuery,
+    protocols,
+  }, 'Preview WS tunnel upgrade');
+
+  // 10. Accept WS upgrade and hand off to bridge
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    bridge.createPreviewWsTunnel(wsId, previewId, preview.port, upstreamPathWithQuery, ws, sanitizedHeaders, protocols);
+  });
+}
+
+/**
+ * Simple cookie header parser — extracts a single named cookie value.
+ */
+function parseCookieHeader(cookieHeader: string, name: string): string | null {
+  for (const part of cookieHeader.split(';')) {
+    const [k, ...rest] = part.split('=');
+    if (k?.trim() === name) return rest.join('=').trim();
+  }
+  return null;
 }
 
 // ── Cron ──────────────────────────────────────────────────────────────────────

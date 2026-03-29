@@ -61,12 +61,37 @@ export function normalizePreviewUpstreamPath(path: string): string {
   return search ? `${normalizedPath.replace(/\/+/g, '/') }?${search}` : normalizedPath.replace(/\/+/g, '/');
 }
 
+// Headers that must pass through for WebSocket upgrade requests (would otherwise be stripped).
+const WS_UPGRADE_PRESERVE_HEADERS = new Set([
+  'connection',
+  'upgrade',
+  'sec-websocket-key',
+  'sec-websocket-version',
+  'sec-websocket-protocol',
+]);
+
+// sec-websocket-extensions is stripped even on WS upgrades: extension negotiation
+// cannot be preserved end-to-end through a message-level relay.
+const WS_UPGRADE_STRIP_HEADERS = new Set([
+  'sec-websocket-extensions',
+]);
+
+export function isWebSocketUpgrade(headers: Headers): boolean {
+  return headers.get('upgrade')?.toLowerCase() === 'websocket';
+}
+
 export function sanitizePreviewRequestHeaders(headers: Headers, previewId: string): Record<string, string> {
   const out: Record<string, string> = {};
+  const isWs = isWebSocketUpgrade(headers);
   headers.forEach((value, rawName) => {
     const name = rawName.toLowerCase();
-    if (PREVIEW_HOP_BY_HOP_HEADERS.has(name)) return;
     if (name === 'host' || name === 'content-length') return;
+    if (WS_UPGRADE_STRIP_HEADERS.has(name)) return;
+    if (isWs && WS_UPGRADE_PRESERVE_HEADERS.has(name)) {
+      out[name] = value;
+      return;
+    }
+    if (PREVIEW_HOP_BY_HOP_HEADERS.has(name)) return;
     if (name === 'cookie') {
       const upstreamCookie = buildUpstreamCookieHeader(previewId, value);
       if (upstreamCookie) out.cookie = upstreamCookie;
