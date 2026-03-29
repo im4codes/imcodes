@@ -1,4 +1,4 @@
-import { execFile as execFileCb, spawn } from 'child_process';
+import { execFile as execFileCb, execFileSync, spawn } from 'child_process';
 import { createHash } from 'crypto';
 import { promisify } from 'util';
 import * as fs from 'fs';
@@ -7,7 +7,85 @@ import * as os from 'os';
 import * as path from 'path';
 import type { Readable } from 'stream';
 
+import {
+  weztermNewSession,
+  weztermKillSession,
+  weztermSessionExists,
+  weztermListSessions,
+  weztermSendText,
+  weztermSendEnter,
+  weztermSendKey,
+  weztermCapturePane,
+  weztermRespawnPane,
+  weztermGetPaneCwd,
+  weztermGetPaneId,
+  weztermIsPaneAlive,
+  weztermGetPanePids,
+  registerPane,
+} from './wezterm.js';
+
 const execFile = promisify(execFileCb);
+
+// ── Backend detection ───────────────────────────────────────────────────────────
+
+export type TerminalBackend = 'tmux' | 'wezterm';
+
+/**
+ * Error thrown when a tmux-only feature is called on an unsupported backend.
+ * Callers can catch this to degrade gracefully.
+ */
+export class UnsupportedBackendError extends Error {
+  public readonly backend: TerminalBackend;
+  public readonly feature: string;
+  constructor(backend: TerminalBackend, feature: string) {
+    super(`Feature "${feature}" is not supported on the "${backend}" backend`);
+    this.name = 'UnsupportedBackendError';
+    this.backend = backend;
+    this.feature = feature;
+  }
+}
+
+/**
+ * Detect the terminal multiplexer backend. Runs once at module load (sync).
+ *
+ * Priority: $IMCODES_MUX env → win32 platform → `which tmux` → `which wezterm` → error.
+ */
+function detectBackend(): TerminalBackend {
+  // 1. Explicit override via env
+  const envMux = process.env.IMCODES_MUX;
+  if (envMux === 'tmux' || envMux === 'wezterm') return envMux;
+
+  // 2. Windows defaults to WezTerm (tmux not available natively)
+  if (process.platform === 'win32') return 'wezterm';
+
+  // 3. Probe for tmux
+  try {
+    execFileSync('which', ['tmux'], { stdio: 'ignore' });
+    return 'tmux';
+  } catch { /* not found */ }
+
+  // 4. Probe for wezterm
+  try {
+    execFileSync('which', ['wezterm'], { stdio: 'ignore' });
+    return 'wezterm';
+  } catch { /* not found */ }
+
+  throw new Error(
+    'No terminal multiplexer found. Install tmux (Linux/macOS) or WezTerm (Windows/Linux/macOS), ' +
+    'or set $IMCODES_MUX to "tmux" or "wezterm".',
+  );
+}
+
+/** The backend for this daemon process. Detected once at module load. */
+export const BACKEND: TerminalBackend = detectBackend();
+
+// ── Require tmux backend helper ─────────────────────────────────────────────────
+
+function requireTmux(feature: string): void {
+  if (BACKEND !== 'tmux') throw new UnsupportedBackendError(BACKEND, feature);
+}
+
+// ── tmux internals (unchanged) ──────────────────────────────────────────────────
 
 /** Ensure tmux server is running. Auto-starts if dead. */
 let tmuxServerChecked = false;
@@ -40,11 +118,34 @@ async function tmuxRun(...args: string[]): Promise<string> {
   return stdout.trim();
 }
 
+// ── Raw send primitives (backend-dispatched) ────────────────────────────────────
+
+/** Send text literally to a session (no Enter). Backend-dispatched. */
+async function rawSendText(session: string, text: string): Promise<void> {
+  if (BACKEND === 'wezterm') {
+    await weztermSendText(session, text);
+  } else {
+    await tmuxRun('send-keys', '-t', session, '-l', '--', text);
+  }
+}
+
+/** Send Enter key to a session. Backend-dispatched. */
+async function rawSendEnter(session: string): Promise<void> {
+  if (BACKEND === 'wezterm') {
+    await weztermSendEnter(session);
+  } else {
+    await tmuxRun('send-keys', '-t', session, 'Enter');
+  }
+}
+
+// ── Portable exports (backend-dispatched) ───────────────────────────────────────
+
 /**
- * Capture the visible content of a tmux pane (scrollback history).
+ * Capture the visible content of a pane (scrollback history).
  * Returns lines as a string array.
  */
 export async function capturePane(session: string, lines = 50): Promise<string[]> {
+  if (BACKEND === 'wezterm') return weztermCapturePane(session, lines);
   const raw = await tmuxRun('capture-pane', '-p', '-t', session, '-S', `-${lines}`);
   return raw.split('\n');
 }
@@ -54,6 +155,7 @@ export async function capturePane(session: string, lines = 50): Promise<string[]
  * Used for terminal streaming — gives exactly the rows the user sees.
  */
 export async function capturePaneVisible(session: string): Promise<string> {
+  requireTmux('capturePaneVisible');
   return tmuxRun('capture-pane', '-e', '-p', '-t', session);
 }
 
@@ -62,6 +164,7 @@ export async function capturePaneVisible(session: string): Promise<string> {
  * -S -N starts N lines before visible top; -E -1 ends at the line before visible row 0.
  */
 export async function capturePaneHistory(session: string, lines = 1000): Promise<string> {
+  requireTmux('capturePaneHistory');
   return tmuxRun('capture-pane', '-e', '-p', '-t', session, '-S', `-${lines}`, '-E', '-1');
 }
 
@@ -70,6 +173,7 @@ export async function capturePaneHistory(session: string, lines = 1000): Promise
  * Useful for detecting if an agent is at an input prompt (cursor on ">" or "›" line).
  */
 export async function getCursorLine(session: string): Promise<string> {
+  requireTmux('getCursorLine');
   const cursorY = parseInt(await tmuxRun('display-message', '-t', session, '-p', '#{cursor_y}'), 10);
   const lines = (await tmuxRun('capture-pane', '-p', '-t', session)).split('\n');
   return lines[cursorY] ?? '';
@@ -83,7 +187,7 @@ export interface SendKeysOptions {
 }
 
 /**
- * Send text then Enter to a tmux session.
+ * Send text then Enter to a session.
  *
  * **Default (no cwd)** — for CC and agents that handle bracketed paste:
  * - Short text (≤200, single line): `send-keys -l`
@@ -100,28 +204,28 @@ export async function sendKeys(session: string, keys: string, opts?: SendKeysOpt
 
   if (isLong) {
     // Write to temp file + send read instruction
-    // With cwd: file in project dir (Gemini sandbox), without: /tmp (CC etc.)
+    // With cwd: file in project dir (Gemini sandbox), without: os.tmpdir() (CC etc.)
     const hash = createHash('md5').update(session + Date.now()).digest('hex').slice(0, 8);
     const fileName = `.imcodes-prompt-${hash}.md`;
-    const filePath = opts?.cwd ? path.join(opts.cwd, fileName) : `/tmp/${fileName}`;
+    const filePath = opts?.cwd ? path.join(opts.cwd, fileName) : path.join(os.tmpdir(), fileName);
     await fsp.writeFile(filePath, keys, { encoding: 'utf-8', mode: 0o600 });
     const instruction = `Read and execute all instructions in @${filePath}`;
-    await tmuxRun('send-keys', '-t', session, '-l', '--', instruction);
+    await rawSendText(session, instruction);
     setTimeout(() => fsp.unlink(filePath).catch(() => {}), 120_000);
   } else {
-    // Short text: simple send-keys (no shell quoting needed with execFile)
-    await tmuxRun('send-keys', '-t', session, '-l', '--', keys);
+    // Short text: simple send (no shell quoting needed with execFile)
+    await rawSendText(session, keys);
   }
 
   // Delay before Enter
   const delay = isLong ? 500 : Math.min(80 + Math.floor(keys.length / 10) * 5, 1000);
   await new Promise<void>((r) => setTimeout(r, delay));
-  await tmuxRun('send-keys', '-t', session, 'Enter');
+  await rawSendEnter(session);
 
   // Safety net: 3s delayed Enter for long text (empty-line Enter is a no-op)
   if (isLong) {
     setTimeout(async () => {
-      try { await tmuxRun('send-keys', '-t', session, 'Enter'); } catch { /* ignore */ }
+      try { await rawSendEnter(session); } catch { /* ignore */ }
     }, 3_000);
   }
 }
@@ -139,13 +243,13 @@ async function sendKeysChunked(session: string, text: string): Promise<void> {
     const line = lines[i];
     for (let offset = 0; offset < line.length; offset += CHUNK_SIZE) {
       const chunk = line.slice(offset, offset + CHUNK_SIZE);
-      await tmuxRun('send-keys', '-t', session, '-l', '--', chunk);
+      await rawSendText(session, chunk);
       if (offset + CHUNK_SIZE < line.length) {
         await new Promise<void>((r) => setTimeout(r, CHUNK_DELAY_MS));
       }
     }
     if (i < lines.length - 1) {
-      await tmuxRun('send-keys', '-t', session, 'Enter');
+      await rawSendEnter(session);
       await new Promise<void>((r) => setTimeout(r, LINE_DELAY_MS));
     }
   }
@@ -156,7 +260,11 @@ export const sendKeysDelayedEnter = sendKeys;
 
 /** Send raw keys without appending Enter (e.g. for Ctrl-C). */
 export async function sendKey(session: string, key: string): Promise<void> {
-  await tmuxRun('send-keys', '-t', session, key);
+  if (BACKEND === 'wezterm') {
+    await weztermSendKey(session, key);
+  } else {
+    await tmuxRun('send-keys', '-t', session, key);
+  }
 }
 
 export interface NewSessionOptions {
@@ -164,8 +272,26 @@ export interface NewSessionOptions {
   env?: Record<string, string>;
 }
 
-/** Create a new detached tmux session. Throws if it already exists. */
+/** Create a new detached session. Throws if it already exists. */
 export async function newSession(name: string, command?: string, opts?: NewSessionOptions): Promise<void> {
+  if (BACKEND === 'wezterm') {
+    // WezTerm: env vars are not natively supported via spawn flags.
+    // Build a command string that exports env vars before the actual command.
+    let fullCommand = command;
+    if (opts?.env && Object.keys(opts.env).length > 0) {
+      const exports = Object.entries(opts.env)
+        .map(([k, v]) => `export ${k}=${shellQuote(v)}`)
+        .join('; ');
+      fullCommand = command ? `${exports}; ${command}` : exports;
+    }
+    const paneId = await weztermNewSession(name, fullCommand, { cwd: opts?.cwd });
+    // Persist pane_id to session store — callers (session-manager) call upsertSession
+    // with paneId after newSession returns. We register it in wezterm.ts internally.
+    // The paneId is available via getPaneId() for the caller to persist.
+    void paneId;
+    return;
+  }
+
   const args = ['new-session', '-d', '-s', name];
   if (opts?.cwd) args.push('-c', opts.cwd);
   if (opts?.env) {
@@ -184,8 +310,12 @@ export async function newSession(name: string, command?: string, opts?: NewSessi
   }
 }
 
-/** Kill a tmux session by name. Does not throw if it doesn't exist. */
+/** Kill a session by name. Does not throw if it doesn't exist. */
 export async function killSession(name: string): Promise<void> {
+  if (BACKEND === 'wezterm') {
+    await weztermKillSession(name);
+    return;
+  }
   try {
     await tmuxRun('kill-session', '-t', name);
   } catch {
@@ -193,8 +323,9 @@ export async function killSession(name: string): Promise<void> {
   }
 }
 
-/** List all tmux sessions. Returns session names. */
+/** List all sessions. Returns session names. */
 export async function listSessions(): Promise<string[]> {
+  if (BACKEND === 'wezterm') return weztermListSessions();
   try {
     const raw = await tmuxRun('list-sessions', '-F', '#{session_name}');
     return raw.split('\n').filter(Boolean);
@@ -205,14 +336,16 @@ export async function listSessions(): Promise<string[]> {
   }
 }
 
-/** Check if a tmux session exists. */
+/** Check if a session exists. */
 export async function sessionExists(name: string): Promise<boolean> {
+  if (BACKEND === 'wezterm') return weztermSessionExists(name);
   const sessions = await listSessions();
   return sessions.includes(name);
 }
 
-/** Check if the pane process in a tmux session is still alive (not dead from remain-on-exit). */
+/** Check if the pane process in a session is still alive (not dead from remain-on-exit). */
 export async function isPaneAlive(name: string): Promise<boolean> {
+  if (BACKEND === 'wezterm') return weztermIsPaneAlive(name);
   try {
     const raw = await tmuxRun('list-panes', '-t', name, '-F', '#{pane_dead}');
     return raw.trim() === '0';
@@ -223,16 +356,23 @@ export async function isPaneAlive(name: string): Promise<boolean> {
 
 /** Respawn a dead pane (remain-on-exit) with a new command. */
 export async function respawnPane(name: string, command: string): Promise<void> {
+  if (BACKEND === 'wezterm') {
+    await weztermRespawnPane(name, command);
+    return;
+  }
   await tmuxRun('respawn-pane', '-t', name, '-k', command);
 }
 
-/** Resize a tmux session window to the given dimensions. */
+/** Resize a session window to the given dimensions. tmux-only. */
 export async function resizeSession(name: string, cols: number, rows: number): Promise<void> {
+  requireTmux('resizeSession');
   await tmuxRun('resize-window', '-t', name, '-x', String(cols), '-y', String(rows));
 }
 
-/** Get the pane size (cols x rows) of a tmux session. */
+/** Get the pane size (cols x rows) of a session. */
 export async function getPaneSize(session: string): Promise<{ cols: number; rows: number }> {
+  // TODO: WezTerm parity — query pane dimensions from `wezterm cli list --format json`
+  if (BACKEND !== 'tmux') return { cols: 80, rows: 24 };
   try {
     const raw = await tmuxRun('display-message', '-p', '-t', session, '#{pane_width} #{pane_height}');
     const [cols, rows] = raw.split(' ').map(Number);
@@ -242,32 +382,62 @@ export async function getPaneSize(session: string): Promise<{ cols: number; rows
   }
 }
 
-/** Read the tmux paste buffer (used for CC /copy output). */
+/** Read the tmux paste buffer (used for CC /copy output). tmux-only. */
 export async function showBuffer(): Promise<string> {
+  requireTmux('showBuffer');
   return tmuxRun('show-buffer');
 }
 
-/** Get the pane ID of the first pane in a tmux session (e.g. "%42"). */
+/** Get the pane ID of the first pane in a session (opaque backend-specific identifier). */
 export async function getPaneId(session: string): Promise<string> {
+  if (BACKEND === 'wezterm') return weztermGetPaneId(session);
   return tmuxRun('display-message', '-p', '-t', session, '#{pane_id}');
 }
 
 /** Get the current working directory of the first pane of a session. */
 export async function getPaneCwd(session: string): Promise<string> {
+  if (BACKEND === 'wezterm') return weztermGetPaneCwd(session);
   return tmuxRun('display-message', '-p', '-t', session, '#{pane_current_path}');
 }
 
 /** Get the start command of the first pane of a session. */
 export async function getPaneStartCommand(session: string): Promise<string> {
+  requireTmux('getPaneStartCommand');
   return tmuxRun('display-message', '-p', '-t', session, '#{pane_start_command}');
 }
 
-/** Delete the tmux paste buffer (clipboard cleanup after CC /copy). */
+/** Delete the tmux paste buffer (clipboard cleanup after CC /copy). tmux-only. */
 export async function deleteBuffer(): Promise<void> {
+  requireTmux('deleteBuffer');
   try {
     await tmuxRun('delete-buffer');
   } catch {
     // buffer may not exist
+  }
+}
+
+/**
+ * Get the PIDs of processes running in a session's panes.
+ * Backend-dispatched. Replaces direct `tmux list-panes` calls from callers.
+ */
+export async function getPanePids(name: string): Promise<string[]> {
+  if (BACKEND === 'wezterm') return weztermGetPanePids(name);
+  try {
+    const raw = await tmuxRun('list-panes', '-t', name, '-F', '#{pane_pid}');
+    return raw.trim().split('\n').filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Restore the WezTerm name→pane_id mapping from a persisted SessionRecord.
+ * Called during daemon startup / session reconcile for WezTerm backend.
+ * No-op on tmux backend.
+ */
+export function restoreWeztermPane(name: string, paneId: string): void {
+  if (BACKEND === 'wezterm') {
+    registerPane(name, paneId);
   }
 }
 
@@ -311,11 +481,14 @@ function isCtrlCRateLimited(session: string): boolean {
 }
 
 /**
- * Send raw terminal input to a tmux session.
+ * Send raw terminal input to a session.
  * Maps xterm escape sequences to tmux key names; literal text uses -l flag.
  * Used for keyboard passthrough from the browser terminal.
+ * tmux-only — xterm→tmux key translation is tmux-specific.
  */
 export async function sendRawInput(session: string, data: string): Promise<void> {
+  requireTmux('sendRawInput');
+
   // Check escape sequence map first
   const tmuxKey = XTERM_KEY_MAP[data];
   if (tmuxKey) {
@@ -341,7 +514,7 @@ export async function sendRawInput(session: string, data: string): Promise<void>
   await tmuxRun('send-keys', '-t', session, '-l', '--', data);
 }
 
-// ── pipe-pane streaming ───────────────────────────────────────────────────────
+// ── pipe-pane streaming (tmux-only) ─────────────────────────────────────────────
 
 /** Shell-quote a string using single-quote wrapping. */
 function shellQuote(str: string): string {
@@ -362,9 +535,10 @@ let pipePaneCapability: boolean | null = null;
 
 /**
  * Check if tmux supports `pipe-pane -O` (requires tmux >= 2.6).
- * Result is cached after first call.
+ * Result is cached after first call. tmux-only.
  */
 export async function checkPipePaneCapability(): Promise<boolean> {
+  requireTmux('checkPipePaneCapability');
   if (pipePaneCapability !== null) return pipePaneCapability;
   try {
     const { stdout } = await execFile('tmux', ['-V']);
@@ -406,12 +580,14 @@ function destroyPipeStream(stream: Readable, fd: number, needsManualClose: boole
 }
 
 /**
- * Start a `tmux pipe-pane -O` raw PTY stream for a session.
+ * Start a `tmux pipe-pane -O` raw PTY stream for a session. tmux-only.
  * Uses a PID-scoped FIFO: O_RDWR on macOS (blocking reads in libuv thread pool),
  * O_RDWR|O_NONBLOCK on Linux (epoll-based non-blocking via net.Socket).
  * Returns a ReadStream and a cleanup function.
  */
 export async function startPipePaneStream(session: string, paneId: string): Promise<PipePaneHandle> {
+  requireTmux('startPipePaneStream');
+
   if (!SESSION_PATTERN.test(session)) {
     throw new Error(`Invalid session name for pipe-pane: ${session}`);
   }
@@ -504,10 +680,11 @@ export async function startPipePaneStream(session: string, paneId: string): Prom
 }
 
 /**
- * Stop an active pipe-pane stream for a session.
+ * Stop an active pipe-pane stream for a session. tmux-only.
  * No-op if no active stream exists.
  */
 export async function stopPipePaneStream(session: string): Promise<void> {
+  requireTmux('stopPipePaneStream');
   const info = activePipes.get(session);
   if (!info) return;
   activePipes.delete(session);

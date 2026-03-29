@@ -11,7 +11,7 @@ import { notifySessionIdle, listP2pRuns } from './p2p-orchestrator.js';
 import { handlePreviewBinaryFrame } from './preview-relay.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { timelineStore } from './timeline-store.js';
-import { startHookServer } from './hook-server.js';
+import { startHookServer, drainQueue } from './hook-server.js';
 import { setupCCHooks } from '../agent/signal.js';
 import type http from 'http';
 import net from 'node:net';
@@ -316,10 +316,11 @@ export async function startup(): Promise<DaemonContext> {
     }
   });
 
-  // Wire timeline idle events → P2P orchestrator (covers all agent types: CC, codex, gemini, etc.)
+  // Wire timeline idle events → P2P orchestrator + queued message drain (covers all agent types: CC, codex, gemini, etc.)
   timelineEmitter.on((e) => {
     if (e.type === 'session.state' && (e.payload as Record<string, unknown>).state === 'idle') {
       notifySessionIdle(e.sessionId);
+      void drainQueue(e.sessionId);
     }
   });
 

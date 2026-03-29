@@ -21,7 +21,7 @@ import { homedir } from 'os';
 import { timelineEmitter } from './timeline-emitter.js';
 import logger from '../util/logger.js';
 import { resolveContextWindow } from '../util/model-context.js';
-import { readProjectMemory } from './memory-inject.js';
+import { readProjectMemory, appendAgentSendDocs } from './memory-inject.js';
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
@@ -99,7 +99,8 @@ export async function ensureClaudeSessionFile(sessionId: string, cwd: string): P
   await mkdir(dir, { recursive: true });
 
   const timestamp = new Date().toISOString();
-  const memory = await readProjectMemory(cwd).catch(() => null);
+  const rawMemory = await readProjectMemory(cwd).catch(() => null);
+  const memory = appendAgentSendDocs(rawMemory);
   const seedLine = JSON.stringify({
     type: 'user',
     message: {

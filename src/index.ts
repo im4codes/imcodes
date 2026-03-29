@@ -256,18 +256,217 @@ program
 
 program
   .command('send')
-  .description('Send a message to a session')
-  .argument('<session>', 'Session name (e.g. deck_myapp_brain) or project:role (e.g. myapp:w1)')
-  .argument('<message...>', 'Message text')
-  .action(async (session: string, messageParts: string[]) => {
-    const message = messageParts.join(' ');
+  .description('Send a message to a session (via hook server IPC or direct tmux)')
+  .argument('[target]', 'Target: label, session name, or project:role')
+  .argument('[message...]', 'Message text')
+  .option('--files <paths>', 'Comma-separated file paths to include')
+  .option('--all', 'Broadcast to all sibling sessions')
+  .option('--type <agentType>', 'Target by agent type instead of label')
+  .option('--list', 'List available sibling sessions')
+  .action(async (target: string | undefined, messageParts: string[] | undefined, opts: { files?: string; all?: boolean; type?: string; list?: boolean }) => {
+    const { detectSenderSession } = await import('./util/detect-session.js');
+
+    // ── --list mode: show available siblings ───────────────────────────────
+    if (opts.list) {
+      // Try hook server first, fall back to session store
+      const hookPort = readHookPort();
+      if (hookPort) {
+        try {
+          const res = await postToHookServer(hookPort, '/list', {
+            from: await detectSenderSession().catch(() => ''),
+          });
+          if (res.ok && Array.isArray(res.sessions)) {
+            if (res.sessions.length === 0) {
+              console.log('No sibling sessions found.');
+            } else {
+              for (const s of res.sessions as Array<{ name: string; label?: string; agentType: string; state: string }>) {
+                const label = s.label ? ` (${s.label})` : '';
+                console.log(`  ${s.name.padEnd(35)} ${s.agentType.padEnd(14)} ${s.state}${label}`);
+              }
+            }
+            return;
+          }
+        } catch {
+          // Hook server unavailable — fall back to direct store read
+        }
+      }
+
+      // Direct store fallback
+      await loadStore();
+      let from: string | undefined;
+      try { from = await detectSenderSession(); } catch { /* unknown sender */ }
+      const allSessions = listSessions();
+      const sender = from ? allSessions.find((s) => s.name === from) : undefined;
+      const siblings = sender
+        ? allSessions.filter((s) => s.parentSession === sender.parentSession && s.name !== sender.name)
+        : allSessions;
+
+      if (siblings.length === 0) {
+        console.log('No sibling sessions found.');
+        return;
+      }
+      for (const s of siblings) {
+        const label = s.label ? ` (${s.label})` : '';
+        console.log(`  ${s.name.padEnd(35)} ${s.agentType.padEnd(14)} ${s.state}${label}`);
+      }
+      return;
+    }
+
+    // ── Send mode ──────────────────────────────────────────────────────────
+
+    // When --all or --type is used, target positional arg is not a target but part of the message.
+    // Reassemble: "imcodes send --all hello world" → target="hello", messageParts=["world"]
+    let message: string;
+    let resolvedTarget: string | undefined;
+    if (opts.all || opts.type) {
+      // No target needed — all positional args form the message
+      const parts = [target, ...(messageParts ?? [])].filter(Boolean);
+      message = parts.join(' ');
+      resolvedTarget = undefined;
+    } else {
+      if (!target) {
+        console.error('Error: target is required unless --all or --type is specified.');
+        process.exit(1);
+      }
+      resolvedTarget = target;
+      message = messageParts?.join(' ') ?? '';
+    }
+
+    if (!message) {
+      console.error('Error: message is required.');
+      process.exit(1);
+    }
+
+    // Parse --files into array
+    const files = opts.files ? opts.files.split(',').map((f) => f.trim()).filter(Boolean) : undefined;
+
+    // Try hook server IPC first (preferred — daemon handles target resolution, queuing, etc.)
+    const hookPort = readHookPort();
+    if (hookPort) {
+      try {
+        const from = await detectSenderSession().catch(() => 'cli');
+
+        if (opts.all) {
+          // Broadcast mode
+          const res = await postToHookServer(hookPort, '/send', {
+            from,
+            to: '*',
+            message,
+            ...(files ? { files } : {}),
+            depth: 0,
+          });
+          printSendResult(res);
+          return;
+        }
+
+        if (opts.type) {
+          // Target by agent type
+          const res = await postToHookServer(hookPort, '/send', {
+            from,
+            to: opts.type,
+            toType: 'agentType',
+            message,
+            ...(files ? { files } : {}),
+            depth: 0,
+          });
+          printSendResult(res);
+          return;
+        }
+
+        // Standard target (label or session name)
+        const res = await postToHookServer(hookPort, '/send', {
+          from,
+          to: resolvedTarget!,
+          message,
+          ...(files ? { files } : {}),
+          depth: 0,
+        });
+        printSendResult(res);
+        return;
+      } catch (err) {
+        // Hook server unavailable — fall back to direct tmux send
+        logger.debug({ err }, 'Hook server unavailable, falling back to direct send');
+      }
+    }
+
+    // Fallback: direct tmux sendKeys (original behavior for backward compat)
+    if (!resolvedTarget) {
+      console.error('Error: target is required for direct send (hook server not available).');
+      process.exit(1);
+    }
     // Support shorthand "project:role"
-    const name = session.includes(':')
-      ? sessionName(session.split(':')[0], session.split(':')[1] as 'brain' | `w${number}`)
-      : session;
+    const name = resolvedTarget.includes(':')
+      ? sessionName(resolvedTarget.split(':')[0], resolvedTarget.split(':')[1] as 'brain' | `w${number}`)
+      : resolvedTarget;
     await sendKeys(name, message);
     console.log(`Sent to ${name}`);
   });
+
+/** Read hook server port from ~/.imcodes/hook-port. Returns null if unavailable. */
+function readHookPort(): number | null {
+  try {
+    const portPath = join(homedir(), '.imcodes', 'hook-port');
+    const raw = readFileSync(portPath, 'utf8').trim();
+    const port = parseInt(raw, 10);
+    return Number.isFinite(port) && port > 1024 && port < 65536 ? port : null;
+  } catch {
+    return null;
+  }
+}
+
+/** POST JSON to the hook server and return parsed response. */
+async function postToHookServer(port: number, path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const http = await import('http');
+  const data = JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        hostname: '127.0.0.1',
+        port,
+        path,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(data),
+        },
+      },
+      (res) => {
+        let responseBody = '';
+        res.on('data', (chunk: Buffer) => { responseBody += chunk.toString(); });
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(responseBody) as Record<string, unknown>);
+          } catch {
+            reject(new Error(`Invalid JSON response: ${responseBody}`));
+          }
+        });
+      },
+    );
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+
+/** Print the result of a /send call to stdout. */
+function printSendResult(res: Record<string, unknown>): void {
+  if (res.ok) {
+    if (res.queued) {
+      console.log(`Message queued for ${res.target ?? 'target'} (agent busy).`);
+    } else {
+      console.log(`Sent to ${res.target ?? 'target'}.`);
+    }
+  } else {
+    console.error(`Error: ${res.error ?? 'unknown error'}`);
+    if (Array.isArray(res.available) && res.available.length > 0) {
+      console.error('Available targets:');
+      for (const t of res.available) {
+        console.error(`  ${t}`);
+      }
+    }
+    process.exit(1);
+  }
+}
 
 program
   .command('bind')

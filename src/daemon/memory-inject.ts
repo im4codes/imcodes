@@ -57,8 +57,9 @@ async function findGeminiSessionFile(sessionId: string): Promise<string | null> 
  * Retries for up to 3s to handle Gemini's async file write timing.
  */
 export async function injectGeminiMemory(sessionId: string, cwd: string): Promise<void> {
-  const memory = await readProjectMemory(cwd);
-  if (!memory) return;
+  const rawMemory = await readProjectMemory(cwd);
+  const memory = appendAgentSendDocs(rawMemory);
+  // memory is always non-null now since appendAgentSendDocs guarantees content
 
   // Retry: Gemini writes the session file slightly after emitting 'init'
   let filePath: string | null = null;
@@ -97,6 +98,46 @@ export async function injectGeminiMemory(sessionId: string, cwd: string): Promis
   session.lastUpdated = new Date().toISOString();
   await writeFile(filePath, JSON.stringify(session, null, 2), 'utf8');
   logger.info({ sessionId, filePath }, 'memory-inject: injected project memory into Gemini session');
+}
+
+// ── Inter-agent communication docs ──────────────────────────────────────────────
+
+/**
+ * Documentation for `imcodes send` that gets injected into agent prompts.
+ * This enables agents to communicate with sibling sessions.
+ */
+const AGENT_SEND_DOCS = `
+## Inter-Agent Communication
+
+You can send messages to other agent sessions managed by the same daemon.
+
+To send a message to another agent session:
+  imcodes send "<label-or-session-name>" "<message>"
+  imcodes send "<label-or-session-name>" "<message>" --files file1.ts,file2.ts
+
+To broadcast to all sibling sessions:
+  imcodes send --all "<message>"
+
+To target by agent type:
+  imcodes send --type codex "<message>"
+
+Use \`imcodes send --list\` to see available sibling sessions.
+
+Notes:
+- Messages are delivered via the daemon's hook server. If the target is busy, the message is queued.
+- The \`--files\` flag attaches file references; format depends on the target agent type.
+- Your session identity is auto-detected from $IMCODES_SESSION.
+`.trim();
+
+/**
+ * Append inter-agent communication docs to a memory string.
+ * Returns the combined memory with send docs appended.
+ */
+export function appendAgentSendDocs(memory: string | null): string {
+  if (memory?.trim()) {
+    return `${memory.trim()}\n\n${AGENT_SEND_DOCS}`;
+  }
+  return AGENT_SEND_DOCS;
 }
 
 // ── Codex rollout helpers ──────────────────────────────────────────────────────

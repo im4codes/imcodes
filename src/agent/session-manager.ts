@@ -712,6 +712,8 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   }
 
   const { name, projectName, role, agentType, projectDir, skipStore, extraEnv, fresh } = opts;
+  // Inject IMCODES_SESSION so agents can auto-detect their own session identity
+  const mergedEnv: Record<string, string> = { IMCODES_SESSION: name, ...extraEnv };
   const driver = getDriver(agentType);
   const agentVersion = await getAgentVersion(agentType);
 
@@ -807,7 +809,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     } else {
       launchCmd = driver.buildLaunchCommand(name, { cwd: projectDir, fresh, ccSessionId, codexSessionId, geminiSessionId });
     }
-    await newSession(name, launchCmd, { cwd: projectDir, env: extraEnv });
+    await newSession(name, launchCmd, { cwd: projectDir, env: mergedEnv });
     logger.info({ session: name, agentType, ccSessionId, codexSessionId, geminiSessionId }, 'Launched session');
   }
 

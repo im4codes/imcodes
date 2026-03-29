@@ -10,7 +10,7 @@ import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(exec);
 import { timelineEmitter } from './timeline-emitter.js';
-import { readProjectMemory, buildCodexMemoryEntry } from './memory-inject.js';
+import { readProjectMemory, buildCodexMemoryEntry, appendAgentSendDocs } from './memory-inject.js';
 import logger from '../util/logger.js';
 import { updateSessionState } from '../store/session-store.js';
 import { resolveContextWindow } from '../util/model-context.js';
@@ -370,8 +370,9 @@ export async function ensureSessionFile(uuid: string, cwd: string): Promise<stri
 
   // Inject project memory so the agent starts with project context loaded.
   // Also required: `codex resume` needs at least one entry beyond session_meta.
-  const memory = await readProjectMemory(cwd);
-  const lines = [meta, buildCodexMemoryEntry(memory ?? '(new session)', isoNow)];
+  const rawMemory = await readProjectMemory(cwd);
+  const memory = appendAgentSendDocs(rawMemory);
+  const lines = [meta, buildCodexMemoryEntry(memory, isoNow)];
 
   await writeFile(filePath, lines.join('\n') + '\n', 'utf8');
   logger.info({ uuid, filePath, hasMemory: !!memory }, 'codex-watcher: created bootstrapped session file');

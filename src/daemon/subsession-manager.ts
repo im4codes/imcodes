@@ -79,7 +79,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     } as any) ?? launchCmd;
   }
 
-  await newSession(sessionName, launchCmd, { cwd: sub.cwd ?? undefined });
+  await newSession(sessionName, launchCmd, { cwd: sub.cwd ?? undefined, env: { IMCODES_SESSION: sessionName } });
   timelineEmitter.emit(sessionName, 'session.state', { state: 'started' });
 
   upsertSession({
