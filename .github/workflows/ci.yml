@@ -110,7 +110,7 @@ jobs:
       - run: npm ci
       - run: npm run build
       - name: Run WezTerm backend unit tests
-        run: npx vitest run --project daemon -- test/agent/wezterm.test.ts test/daemon/hook-send.test.ts test/daemon/env-injection.test.ts test/cli/send.test.ts
+        run: npx vitest run test/agent/wezterm.test.ts test/daemon/hook-send.test.ts test/daemon/env-injection.test.ts test/cli/send.test.ts
         env:
           IMCODES_MUX: wezterm
 
