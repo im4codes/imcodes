@@ -906,7 +906,11 @@ export function FileBrowser({
           );
         })}
       </div>
-      {error && <span class="fb-error-inline">{error}</span>}
+      <button
+        class={`fb-nav-btn${error ? ' fb-nav-btn-error' : ''}`}
+        title={error || 'Refresh'}
+        onClick={() => { loadedRef.current.clear(); setError(null); fetchDir(currentLabel); }}
+      >{error ? '⚠' : '↻'}</button>
       <label class="fb-nav-hidden-toggle" title={t('file_browser.show_hidden')}>
         <input type="checkbox" checked={showHidden} onChange={(e) => setShowHidden((e.target as HTMLInputElement).checked)} />
         {' ·'}

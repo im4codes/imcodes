@@ -912,6 +912,8 @@ body {
 .fb-nav-btn { background: none; border: 1px solid #334155; border-radius: 4px; color: #64748b; cursor: pointer; padding: 2px 7px; font-size: 13px; line-height: 1.4; }
 .fb-nav-btn:hover:not(:disabled) { color: #e2e8f0; border-color: #475569; }
 .fb-nav-btn:disabled { opacity: 0.3; cursor: default; }
+.fb-nav-btn-error { color: #f87171; border-color: #7f1d1d; }
+.fb-nav-btn-error:hover { color: #fca5a5; border-color: #991b1b; }
 .fb-breadcrumb-segments { display: flex; align-items: center; gap: 2px; overflow: hidden; flex: 1; min-width: 0; }
 .fb-breadcrumb-seg { color: #94a3b8; cursor: pointer; padding: 1px 4px; border-radius: 3px; font-size: 12px; white-space: nowrap; }
 .fb-breadcrumb-seg:hover { color: #e2e8f0; background: #1e293b; }
