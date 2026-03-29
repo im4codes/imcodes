@@ -232,7 +232,18 @@ localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
         relay.abort(PREVIEW_ERROR.UPSTREAM_ERROR);
         return c.json({ error: PREVIEW_ERROR.UPSTREAM_ERROR, message: 'preview redirect rejected' }, 502);
       }
-      upstreamHeaders.set('location', rewritten);
+      // Append access token to redirect URL so iOS cross-site iframes stay authenticated
+      if (previewAccessToken && !rewritten.includes(PREVIEW_ACCESS_TOKEN_QUERY_PARAM)) {
+        try {
+          const redirectUrl = new URL(rewritten, c.req.url);
+          redirectUrl.searchParams.set(PREVIEW_ACCESS_TOKEN_QUERY_PARAM, previewAccessToken);
+          upstreamHeaders.set('location', `${redirectUrl.pathname}${redirectUrl.search}${redirectUrl.hash}`);
+        } catch {
+          upstreamHeaders.set('location', rewritten);
+        }
+      } else {
+        upstreamHeaders.set('location', rewritten);
+      }
     }
 
     const responseHeaders = filterPreviewResponseHeaders(upstreamHeaders);
@@ -257,7 +268,7 @@ localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
 
     if (shouldRewritePreviewHtml(responseHeaders)) {
       const html = await new Response(started.body).text();
-      const rewrittenHtml = rewritePreviewHtmlDocument(html, serverId, previewId, preview.port);
+      const rewrittenHtml = rewritePreviewHtmlDocument(html, serverId, previewId, preview.port, previewAccessToken ?? undefined);
       responseHeaders.delete('content-length');
       return new Response(rewrittenHtml, {
         status: started.status,
