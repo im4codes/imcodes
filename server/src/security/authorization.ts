@@ -3,7 +3,6 @@
  * Enforces owner/admin/member/unauthenticated permission matrix.
  */
 import type { Context, Next } from 'hono';
-import { getCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
 import { sha256Hex, verifyJwt } from './crypto.js';
@@ -23,9 +22,9 @@ interface AuthContext {
  * Priority: rcc_session cookie → Authorization: Bearer (API key / JWT).
  * Bearer is preserved for daemon server-token, API keys, and CLI clients.
  */
-async function resolveAuth(c: Context<{ Bindings: Env }>): Promise<AuthContext | null> {
+export async function resolveAuth(c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>): Promise<AuthContext | null> {
   // Task 1: Try HttpOnly session cookie first (browser sessions)
-  const cookieToken = getCookie(c, COOKIE_SESSION);
+  const cookieToken = getCookieFromHeader(c.req.header('Cookie'), COOKIE_SESSION);
   if (cookieToken && c.env.JWT_SIGNING_KEY) {
     const payload = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
     if (payload && typeof payload.sub === 'string' && payload.type !== 'ws-ticket') {
@@ -72,6 +71,18 @@ async function resolveAuth(c: Context<{ Bindings: Env }>): Promise<AuthContext |
   if (typeof payload.sub !== 'string') return null;
   if (payload.type === 'ws-ticket') return null; // reject single-use WebSocket tickets
   return { userId: payload.sub, role: (payload.role as Role) ?? 'member' };
+}
+
+function getCookieFromHeader(cookieHeader: string | undefined, name: string): string | undefined {
+  if (!cookieHeader) return undefined;
+  const parts = cookieHeader.split(/;\s*/);
+  for (const part of parts) {
+    const eq = part.indexOf('=');
+    if (eq <= 0) continue;
+    if (part.slice(0, eq) !== name) continue;
+    return decodeURIComponent(part.slice(eq + 1));
+  }
+  return undefined;
 }
 
 // ── Permission matrix ─────────────────────────────────────────────────────────

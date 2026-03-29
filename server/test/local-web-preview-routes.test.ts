@@ -3,7 +3,8 @@ import { buildApp } from '../src/index.js';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
 import { sha256Hex, signJwt } from '../src/security/crypto.js';
-import { COOKIE_CSRF, COOKIE_SESSION, HEADER_CSRF } from '../../shared/cookie-names.js';
+import { COOKIE_CSRF, COOKIE_PREVIEW_ACCESS, COOKIE_SESSION, HEADER_CSRF } from '../../shared/cookie-names.js';
+import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '../../shared/preview-types.js';
 
 type ServerRow = { id: string; user_id: string; team_id: string | null; token_hash: string };
 type ApiKeyRow = { id: string; user_id: string; key_hash: string; revoked_at: number | null; grace_expires_at: number | null };
@@ -70,12 +71,14 @@ function makeEnv(db: Database): Env {
 }
 
 describe('local web preview routes', () => {
-  const serverId = 'srv-preview-routes';
-  const userId = 'user-preview';
+  let serverId = 'srv-preview-routes';
+  let userId = 'user-preview';
   let db: ReturnType<typeof makeMemDb>;
   let app: ReturnType<typeof buildApp>;
 
   beforeEach(() => {
+    serverId = `srv-preview-routes-${Math.random().toString(36).slice(2)}`;
+    userId = `user-preview-${Math.random().toString(36).slice(2)}`;
     db = makeMemDb();
     db.seedServer({ id: serverId, user_id: userId, team_id: null, token_hash: sha256Hex('daemon-token') });
     db.seedApiKey({ id: 'key1', user_id: userId, key_hash: sha256Hex('deck_test_key'), revoked_at: null, grace_expires_at: null });
@@ -108,7 +111,9 @@ describe('local web preview routes', () => {
       body: JSON.stringify({ port: 3000, path: '/' }),
     });
     expect(createOk.status).toBe(200);
-    const created = await createOk.json() as { preview: { id: string } };
+    const created = await createOk.json() as { preview: { id: string; accessToken: string; url: string } };
+    expect(created.preview.accessToken).toMatch(/^[a-f0-9]{48}$/);
+    expect(created.preview.url).toContain(`${PREVIEW_ACCESS_TOKEN_QUERY_PARAM}=`);
 
     const closeNoCsrf = await app.request(`/api/server/${serverId}/local-web-preview/${created.preview.id}`, {
       method: 'DELETE',
@@ -149,6 +154,27 @@ describe('local web preview routes', () => {
       },
     });
     expect(proxyRes.status).toBe(403);
+  });
+
+  it('allows preview proxy requests with a valid preview access token and sets a preview cookie', async () => {
+    const createRes = await app.request(`/api/server/${serverId}/local-web-preview`, {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer deck_test_key',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ port: 3000, path: '/' }),
+    });
+    expect(createRes.status).toBe(200);
+    const created = await createRes.json() as { preview: { id: string; accessToken: string } };
+
+    const proxyRes = await app.request(
+      `/api/server/${serverId}/local-web/${created.preview.id}/?${PREVIEW_ACCESS_TOKEN_QUERY_PARAM}=${created.preview.accessToken}`,
+      { method: 'GET' },
+    );
+
+    expect([503, 502]).toContain(proxyRes.status);
+    expect(proxyRes.headers.get('set-cookie')).toContain(`${COOKIE_PREVIEW_ACCESS}=${created.preview.accessToken}`);
   });
 
   it('rate limits preview proxy requests per user/server', async () => {

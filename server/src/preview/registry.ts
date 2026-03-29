@@ -1,5 +1,9 @@
-import { randomHex } from '../security/crypto.js';
+import { randomHex, sha256Hex } from '../security/crypto.js';
 import { PREVIEW_LIMITS, type PreviewRecord } from '../../../shared/preview-types.js';
+
+type InternalPreviewRecord = PreviewRecord & {
+  accessTokenHash: string;
+};
 
 function normalizePreviewPath(path: string | undefined): string {
   if (!path || path.trim() === '') return '/';
@@ -9,7 +13,7 @@ function normalizePreviewPath(path: string | undefined): string {
 
 export class LocalWebPreviewRegistry {
   private static instances = new Map<string, LocalWebPreviewRegistry>();
-  private previews = new Map<string, PreviewRecord>();
+  private previews = new Map<string, InternalPreviewRecord>();
 
   static get(serverId: string): LocalWebPreviewRegistry {
     let instance = this.instances.get(serverId);
@@ -22,14 +26,15 @@ export class LocalWebPreviewRegistry {
 
   private constructor(private readonly serverId: string) {}
 
-  create(userId: string, port: number, path?: string): PreviewRecord {
+  create(userId: string, port: number, path?: string): { preview: PreviewRecord; accessToken: string } {
     this.cleanup();
     const activeCount = [...this.previews.values()].filter((p) => p.userId === userId).length;
     if (activeCount >= PREVIEW_LIMITS.MAX_ACTIVE_PREVIEWS_PER_USER_PER_SERVER) {
       throw new Error('preview_limit_exceeded');
     }
     const now = Date.now();
-    const preview: PreviewRecord = {
+    const accessToken = randomHex(24);
+    const preview: InternalPreviewRecord = {
       id: randomHex(24),
       serverId: this.serverId,
       userId,
@@ -38,9 +43,13 @@ export class LocalWebPreviewRegistry {
       createdAt: now,
       expiresAt: now + PREVIEW_LIMITS.DEFAULT_TTL_MS,
       lastAccessAt: now,
+      accessTokenHash: sha256Hex(accessToken),
     };
     this.previews.set(preview.id, preview);
-    return preview;
+    return {
+      preview: this.toPreviewRecord(preview),
+      accessToken,
+    };
   }
 
   get(id: string): PreviewRecord | null {
@@ -51,7 +60,19 @@ export class LocalWebPreviewRegistry {
       return null;
     }
     preview.lastAccessAt = Date.now();
-    return preview;
+    return this.toPreviewRecord(preview);
+  }
+
+  authorizeWithAccessToken(id: string, accessToken: string): PreviewRecord | null {
+    const preview = this.previews.get(id) ?? null;
+    if (!preview) return null;
+    if (preview.expiresAt <= Date.now()) {
+      this.previews.delete(id);
+      return null;
+    }
+    if (sha256Hex(accessToken) !== preview.accessTokenHash) return null;
+    preview.lastAccessAt = Date.now();
+    return this.toPreviewRecord(preview);
   }
 
   close(id: string, userId: string): boolean {
@@ -68,6 +89,19 @@ export class LocalWebPreviewRegistry {
         this.previews.delete(id);
       }
     }
+  }
+
+  private toPreviewRecord(preview: InternalPreviewRecord): PreviewRecord {
+    return {
+      id: preview.id,
+      serverId: preview.serverId,
+      userId: preview.userId,
+      port: preview.port,
+      path: preview.path,
+      createdAt: preview.createdAt,
+      expiresAt: preview.expiresAt,
+      lastAccessAt: preview.lastAccessAt,
+    };
   }
 }
 

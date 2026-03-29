@@ -20,10 +20,11 @@ describe('LocalWebPreviewRegistry', () => {
 
   it('creates opaque preview ids and updates access time on get', () => {
     const registry = getRegistry();
-    const preview = registry.create('user1', 3000, '/docs');
+    const { preview, accessToken } = registry.create('user1', 3000, '/docs');
 
     expect(preview.id).toMatch(/^[a-f0-9]{48}$/);
     expect(preview.id).not.toContain('3000');
+    expect(accessToken).toMatch(/^[a-f0-9]{48}$/);
 
     vi.setSystemTime(now + 5_000);
     const loaded = registry.get(preview.id);
@@ -40,11 +41,11 @@ describe('LocalWebPreviewRegistry', () => {
 
   it('expires previews by ttl and idle timeout', () => {
     const registry = getRegistry();
-    const ttlPreview = registry.create('user1', 3000, '/');
+    const ttlPreview = registry.create('user1', 3000, '/').preview;
     vi.setSystemTime(now + PREVIEW_LIMITS.DEFAULT_TTL_MS + 1);
     expect(registry.get(ttlPreview.id)).toBeNull();
 
-    const idlePreview = registry.create('user1', 3001, '/');
+    const idlePreview = registry.create('user1', 3001, '/').preview;
     const idleCreatedAt = now + PREVIEW_LIMITS.DEFAULT_TTL_MS + 1;
     vi.setSystemTime(idleCreatedAt + PREVIEW_LIMITS.DEFAULT_IDLE_TTL_MS + 1);
     registry.cleanup();
@@ -53,9 +54,17 @@ describe('LocalWebPreviewRegistry', () => {
 
   it('only allows owner to close preview', () => {
     const registry = getRegistry();
-    const preview = registry.create('user1', 3000, '/');
+    const { preview } = registry.create('user1', 3000, '/');
     expect(registry.close(preview.id, 'user2')).toBe(false);
     expect(registry.close(preview.id, 'user1')).toBe(true);
     expect(registry.get(preview.id)).toBeNull();
+  });
+
+  it('authorizes access with the preview access token', () => {
+    const registry = getRegistry();
+    const { preview, accessToken } = registry.create('user1', 3000, '/');
+
+    expect(registry.authorizeWithAccessToken(preview.id, accessToken)?.id).toBe(preview.id);
+    expect(registry.authorizeWithAccessToken(preview.id, 'wrong-token')).toBeNull();
   });
 });

@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
+import { getCookie, setCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
-import { requireAuth, resolveServerRole } from '../security/authorization.js';
+import { requireAuth, resolveAuth, resolveServerRole } from '../security/authorization.js';
 import { LocalWebPreviewRegistry, normalizeLocalPreviewPath } from '../preview/registry.js';
 import { MemoryRateLimiter } from '../ws/rate-limiter.js';
 import { rewritePreviewHtmlDocument, shouldRewritePreviewHtml } from '../preview/policy.js';
@@ -13,6 +14,7 @@ import {
   sanitizePreviewRequestHeaders,
 } from '../../../shared/preview-policy.js';
 import {
+  PREVIEW_ACCESS_TOKEN_QUERY_PARAM,
   PREVIEW_ERROR,
   PREVIEW_LIMITS,
   PREVIEW_MSG,
@@ -22,10 +24,9 @@ import { WsBridge } from '../ws/bridge.js';
 import { randomHex } from '../security/crypto.js';
 import logger from '../util/logger.js';
 import { z } from 'zod';
+import { COOKIE_PREVIEW_ACCESS } from '../../../shared/cookie-names.js';
 
 export const localWebPreviewRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
-
-localWebPreviewRoutes.use('/*', requireAuth());
 
 const createSchema = z.object({
   port: z.number().int().min(1).max(65535),
@@ -51,7 +52,29 @@ function getSetCookieValues(headers: Headers): string[] {
   return [];
 }
 
-localWebPreviewRoutes.post('/:id/local-web-preview', async (c) => {
+function buildPreviewAccessCookiePath(serverId: string, previewId: string): string {
+  return `/api/server/${serverId}/local-web/${previewId}`;
+}
+
+function buildPreviewInitialUrl(serverId: string, previewId: string, path: string, accessToken: string): string {
+  const initialPath = path === '/' ? '/' : path;
+  const url = new URL(`http://preview.invalid/api/server/${serverId}/local-web/${previewId}${initialPath}`);
+  url.searchParams.set(PREVIEW_ACCESS_TOKEN_QUERY_PARAM, accessToken);
+  return `${url.pathname}${url.search}`;
+}
+
+function setPreviewAccessCookie(c: Parameters<typeof setCookie>[0], serverId: string, previewId: string, accessToken: string): void {
+  const isSecure = new URL(c.req.url).protocol === 'https:';
+  setCookie(c, COOKIE_PREVIEW_ACCESS, accessToken, {
+    path: buildPreviewAccessCookiePath(serverId, previewId),
+    httpOnly: true,
+    secure: isSecure,
+    sameSite: 'Strict',
+    maxAge: Math.floor(PREVIEW_LIMITS.DEFAULT_TTL_MS / 1000),
+  });
+}
+
+localWebPreviewRoutes.post('/:id/local-web-preview', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
   const role = await resolveServerRole(c.env.DB, serverId, userId);
@@ -63,7 +86,7 @@ localWebPreviewRoutes.post('/:id/local-web-preview', async (c) => {
 
   try {
     const registry = LocalWebPreviewRegistry.get(serverId);
-    const preview = registry.create(userId, parsed.data.port, normalizeLocalPreviewPath(parsed.data.path));
+    const { preview, accessToken } = registry.create(userId, parsed.data.port, normalizeLocalPreviewPath(parsed.data.path));
     return c.json({
       ok: true,
       preview: {
@@ -72,7 +95,8 @@ localWebPreviewRoutes.post('/:id/local-web-preview', async (c) => {
         port: preview.port,
         path: preview.path,
         expiresAt: preview.expiresAt,
-        url: `/api/server/${serverId}/local-web/${preview.id}${preview.path === '/' ? '/' : preview.path}`,
+        accessToken,
+        url: buildPreviewInitialUrl(serverId, preview.id, preview.path, accessToken),
       },
     });
   } catch (err) {
@@ -83,7 +107,7 @@ localWebPreviewRoutes.post('/:id/local-web-preview', async (c) => {
   }
 });
 
-localWebPreviewRoutes.delete('/:id/local-web-preview/:previewId', async (c) => {
+localWebPreviewRoutes.delete('/:id/local-web-preview/:previewId', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
   const role = await resolveServerRole(c.env.DB, serverId, userId);
@@ -95,10 +119,25 @@ localWebPreviewRoutes.delete('/:id/local-web-preview/:previewId', async (c) => {
 });
 
 localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
-  const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
   const previewId = c.req.param('previewId')!;
-  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  const registry = LocalWebPreviewRegistry.get(serverId);
+  const previewAccessToken = new URL(c.req.url).searchParams.get(PREVIEW_ACCESS_TOKEN_QUERY_PARAM) ?? getCookie(c, COOKIE_PREVIEW_ACCESS) ?? null;
+  const auth = await resolveAuth(c);
+
+  let userId: string | null = auth?.userId ?? null;
+  let role = auth ? await resolveServerRole(c.env.DB, serverId, auth.userId) : 'none';
+
+  const previewFromToken = !auth && previewAccessToken
+    ? registry.authorizeWithAccessToken(previewId, previewAccessToken)
+    : null;
+
+  if (!auth && !previewFromToken) return c.json({ error: 'unauthorized' }, 401);
+  if (!auth && previewFromToken) {
+    userId = previewFromToken.userId;
+    role = await resolveServerRole(c.env.DB, serverId, previewFromToken.userId);
+  }
+  if (!userId) return c.json({ error: 'unauthorized' }, 401);
   if (role === 'none') return c.json({ error: PREVIEW_ERROR.FORBIDDEN }, 403);
 
   const rateKey = `${serverId}:${userId}`;
@@ -106,9 +145,12 @@ localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
     return c.json({ error: PREVIEW_ERROR.LIMIT_EXCEEDED }, 429);
   }
 
-  const preview = LocalWebPreviewRegistry.get(serverId).get(previewId);
+  const preview = registry.get(previewId);
   if (!preview) return c.json({ error: PREVIEW_ERROR.PREVIEW_EXPIRED }, 404);
   if (preview.userId !== userId) return c.json({ error: PREVIEW_ERROR.FORBIDDEN }, 403);
+  if (previewAccessToken) {
+    setPreviewAccessCookie(c, serverId, previewId, previewAccessToken);
+  }
 
   const bridge = WsBridge.get(serverId);
   if (!bridge.isDaemonConnected()) {

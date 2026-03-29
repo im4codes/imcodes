@@ -22,6 +22,7 @@ describe('createLocalWebPreview', () => {
       preview: {
         id: 'preview-123',
         url: '/api/server/server-1/local-web/preview-123/docs',
+        accessToken: 'preview-token-123',
         serverId: 'server-1',
         port: 3000,
         path: '/docs',
@@ -38,6 +39,7 @@ describe('createLocalWebPreview', () => {
     expect(result).toEqual({
       previewId: 'preview-123',
       previewUrl: '/api/server/server-1/local-web/preview-123/docs',
+      previewAccessToken: 'preview-token-123',
       serverId: 'server-1',
       port: 3000,
       path: '/docs',

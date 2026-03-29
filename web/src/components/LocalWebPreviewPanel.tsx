@@ -101,7 +101,7 @@ export function LocalWebPreviewPanel({ serverId, port, path, onDraftChange }: Pr
         return null;
       }
 
-      const previewUrl = response.previewUrl ?? buildLocalWebPreviewProxyUrl(serverId, response.previewId, normalizedPath);
+      const previewUrl = response.previewUrl ?? buildLocalWebPreviewProxyUrl(serverId, response.previewId, normalizedPath, response.previewAccessToken);
       const nextPreview = { previewId: response.previewId, previewUrl };
       const previous = currentPreviewRef.current;
       currentPreviewRef.current = nextPreview;

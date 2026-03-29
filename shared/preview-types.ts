@@ -16,6 +16,8 @@ export const PREVIEW_MSG = {
   ERROR: 'preview.error',
 } as const;
 
+export const PREVIEW_ACCESS_TOKEN_QUERY_PARAM = 'preview_access_token';
+
 export type PreviewMessageType = (typeof PREVIEW_MSG)[keyof typeof PREVIEW_MSG];
 
 export const PREVIEW_BINARY_FRAME = {
@@ -81,7 +83,10 @@ export interface CreatePreviewRequest {
 
 export interface CreatePreviewResponse {
   ok: true;
-  preview: Pick<PreviewRecord, 'id' | 'serverId' | 'port' | 'path' | 'expiresAt'> & { url: string };
+  preview: Pick<PreviewRecord, 'id' | 'serverId' | 'port' | 'path' | 'expiresAt'> & {
+    url: string;
+    accessToken: string;
+  };
 }
 
 export interface PreviewRequestMessage {

@@ -5,6 +5,7 @@
  */
 
 import { COOKIE_SESSION, COOKIE_CSRF, HEADER_CSRF } from '@shared/cookie-names.js';
+import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '@shared/preview-types.js';
 
 let _baseUrl = '';
 let _onAuthExpired: ((reason?: string) => void) | null = null;
@@ -51,10 +52,18 @@ export function normalizeLocalWebPreviewPath(path: string): string {
 }
 
 /** Build the same-origin or absolute proxy URL for a local web preview. */
-export function buildLocalWebPreviewProxyUrl(serverId: string, previewId: string, path = '/'): string {
+export function buildLocalWebPreviewProxyUrl(serverId: string, previewId: string, path = '/', accessToken?: string): string {
+  return buildLocalWebPreviewProxyUrlWithToken(serverId, previewId, path, accessToken);
+}
+
+export function buildLocalWebPreviewProxyUrlWithToken(serverId: string, previewId: string, path = '/', accessToken?: string): string {
   const base = getApiBaseUrl();
   const normalizedPath = normalizeLocalWebPreviewPath(path);
-  return `${base}/api/server/${encodeURIComponent(serverId)}/local-web/${encodeURIComponent(previewId)}${normalizedPath}`;
+  const url = new URL(`${base}/api/server/${encodeURIComponent(serverId)}/local-web/${encodeURIComponent(previewId)}${normalizedPath}`);
+  if (accessToken) {
+    url.searchParams.set(PREVIEW_ACCESS_TOKEN_QUERY_PARAM, accessToken);
+  }
+  return url.toString();
 }
 
 /** Register a callback invoked when the session expires and refresh fails. */
@@ -207,6 +216,7 @@ async function rawFetch(path: string, opts: RequestInit = {}): Promise<Response>
 export interface LocalWebPreviewCreateResponse {
   previewId: string;
   previewUrl?: string;
+  previewAccessToken?: string;
   serverId?: string;
   port: number;
   path: string;
@@ -218,6 +228,7 @@ interface RawLocalWebPreviewCreateResponse {
   preview?: {
     id: string;
     url?: string;
+    accessToken?: string;
     serverId?: string;
     port: number;
     path: string;
@@ -225,6 +236,7 @@ interface RawLocalWebPreviewCreateResponse {
   };
   previewId?: string;
   previewUrl?: string;
+  previewAccessToken?: string;
   serverId?: string;
   port?: number;
   path?: string;
@@ -249,6 +261,7 @@ export async function createLocalWebPreview(
     return {
       previewId: response.preview.id,
       previewUrl: response.preview.url,
+      previewAccessToken: response.preview.accessToken,
       serverId: response.preview.serverId,
       port: response.preview.port,
       path: response.preview.path,
@@ -260,6 +273,7 @@ export async function createLocalWebPreview(
     return {
       previewId: response.previewId,
       previewUrl: response.previewUrl,
+      previewAccessToken: response.previewAccessToken,
       serverId: response.serverId,
       port: response.port,
       path: response.path,
