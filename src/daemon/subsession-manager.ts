@@ -202,15 +202,42 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
 }
 
 export async function detectShells(): Promise<string[]> {
-  const CANDIDATES = ['fish', 'zsh', 'bash', 'sh'];
-  const SEARCH_PATHS = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'];
   const shells: string[] = [];
-  const envShell = process.env.SHELL;
-  if (envShell && existsSync(envShell)) shells.push(envShell);
-  for (const dir of SEARCH_PATHS) {
-    for (const candidate of CANDIDATES) {
-      const full = `${dir}/${candidate}`;
-      if (existsSync(full) && !shells.includes(full)) shells.push(full);
+
+  if (process.platform === 'win32') {
+    // Windows: check for PowerShell, pwsh, cmd, wsl
+    const sysRoot = process.env.SystemRoot ?? 'C:\\Windows';
+    const winCandidates = [
+      `${sysRoot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
+      'pwsh.exe',
+      `${sysRoot}\\System32\\cmd.exe`,
+      `${sysRoot}\\System32\\wsl.exe`,
+    ];
+    // Also check COMSPEC
+    const comspec = process.env.COMSPEC;
+    if (comspec && existsSync(comspec) && !shells.includes(comspec)) shells.push(comspec);
+    for (const candidate of winCandidates) {
+      if (existsSync(candidate) && !shells.includes(candidate)) shells.push(candidate);
+    }
+    // Check if pwsh (PowerShell 7+) is on PATH
+    if (!shells.some((s) => s.includes('pwsh'))) {
+      try {
+        const { execSync } = await import('child_process');
+        const pwshPath = execSync('where pwsh.exe', { encoding: 'utf-8', timeout: 3000 }).trim().split('\n')[0];
+        if (pwshPath && existsSync(pwshPath) && !shells.includes(pwshPath)) shells.push(pwshPath);
+      } catch { /* not found */ }
+    }
+  } else {
+    // Unix: check common shell paths
+    const CANDIDATES = ['fish', 'zsh', 'bash', 'sh'];
+    const SEARCH_PATHS = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'];
+    const envShell = process.env.SHELL;
+    if (envShell && existsSync(envShell)) shells.push(envShell);
+    for (const dir of SEARCH_PATHS) {
+      for (const candidate of CANDIDATES) {
+        const full = `${dir}/${candidate}`;
+        if (existsSync(full) && !shells.includes(full)) shells.push(full);
+      }
     }
   }
   return shells;

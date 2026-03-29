@@ -30,7 +30,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
   const [starting, setStarting] = useState(false);
   const [showDirBrowser, setShowDirBrowser] = useState(false);
   const [shells, setShells] = useState<string[]>([]);
-  const [shellBin, setShellBin] = useState<string>('/bin/bash');
+  const [shellBin, setShellBin] = useState<string>(navigator.platform?.startsWith('Win') ? 'powershell.exe' : '/bin/bash');
 
   // OpenClaw-specific state
   const [ocMode, setOcMode] = useState<OpenClawMode>('new');
@@ -178,7 +178,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
           <div class="input-with-browse">
             <input
               type="text"
-              placeholder="~/projects/my-project"
+              placeholder={navigator.platform?.startsWith('Win') ? 'C:\\Users\\you\\projects' : '~/projects/my-project'}
               value={dir}
               disabled={starting}
               onInput={(e) => setDir((e.target as HTMLInputElement).value)}
@@ -325,7 +325,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
           ) : (
             <input
               type="text"
-              placeholder="/bin/bash"
+              placeholder={navigator.platform?.startsWith('Win') ? 'powershell.exe' : '/bin/bash'}
               value={shellBin}
               disabled={starting}
               onInput={(e) => setShellBin((e.target as HTMLInputElement).value)}

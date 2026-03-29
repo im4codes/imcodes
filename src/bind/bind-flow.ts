@@ -106,8 +106,10 @@ export async function bindFlow(bindUrl: string, deviceName?: string, opts?: { fo
   await writeFile(CREDS_PATH, JSON.stringify(creds, null, 2), { encoding: 'utf8', mode: 0o600 });
   logger.info({ serverId, serverName }, 'Daemon bound');
 
-  // Install tmux if missing
-  await ensureTmux();
+  // Install terminal multiplexer if missing (tmux on Unix, WezTerm on Windows)
+  if (process.platform !== 'win32') {
+    await ensureTmux();
+  }
 
   // Install system service
   if (process.platform === 'darwin') {
@@ -116,6 +118,9 @@ export async function bindFlow(bindUrl: string, deviceName?: string, opts?: { fo
   } else if (process.platform === 'linux') {
     await installSystemdService();
     console.log('\nDaemon installed as a systemd user service — starts automatically on login.');
+  } else if (process.platform === 'win32') {
+    await installWindowsStartup();
+    console.log('\nDaemon installed as a startup shortcut — starts automatically on login.');
   } else {
     console.log('\nRun "imcodes start" to start the daemon.');
   }
@@ -136,11 +141,30 @@ function restartDaemon(): void {
       } else {
         execSync('sudo systemctl restart imcodes', { stdio: 'ignore' });
       }
+    } else if (process.platform === 'win32') {
+      // Kill existing daemon and relaunch via startup script
+      try { execSync('taskkill /f /im node.exe /fi "WINDOWTITLE eq imcodes*"', { stdio: 'ignore' }); } catch { /* ignore */ }
+      const startupVbs = join(homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'imcodes-daemon.vbs');
+      if (existsSyncFs(startupVbs)) {
+        execSync(`wscript "${startupVbs}"`, { stdio: 'ignore' });
+      }
     }
     console.log('Daemon restarted.');
   } catch {
     console.log('Could not restart daemon automatically. Run "imcodes restart" manually.');
   }
+}
+
+async function installWindowsStartup(): Promise<void> {
+  // Create a VBS launcher in the user's Startup folder so the daemon starts on login
+  const startupDir = join(homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup');
+  await mkdir(startupDir, { recursive: true });
+  const vbsPath = join(startupDir, 'imcodes-daemon.vbs');
+  // Use wscript to run node in background without a visible console window
+  const npmGlobalBin = execSync('npm prefix -g', { encoding: 'utf8' }).trim();
+  const imcodesCmd = join(npmGlobalBin, 'imcodes.cmd');
+  const vbs = `Set WshShell = CreateObject("WScript.Shell")\nWshShell.Run """${imcodesCmd}"" start", 0, False\n`;
+  await writeFile(vbsPath, vbs, 'utf8');
 }
 
 async function ensureTmux(): Promise<void> {

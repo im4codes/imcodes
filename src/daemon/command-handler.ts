@@ -1626,7 +1626,9 @@ sleep 60 && rm -rf "${scriptDir}" &
 // ── File system browser ────────────────────────────────────────────────────
 
 const UPLOAD_DIR = nodePath.join(homedir(), '.imcodes', 'uploads');
-const FS_ALLOWED_ROOTS = [homedir(), UPLOAD_DIR, '/tmp', '/private/tmp'];
+const FS_ALLOWED_ROOTS = process.platform === 'win32'
+  ? [homedir(), UPLOAD_DIR, process.env.TEMP ?? 'C:\\Temp']
+  : [homedir(), UPLOAD_DIR, '/tmp', '/private/tmp'];
 
 // ── P2P cancel/status handlers ────────────────────────────────────────────
 
