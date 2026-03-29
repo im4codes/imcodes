@@ -1360,46 +1360,34 @@ export function App() {
     window.location.reload();
   }, []);
 
-  // Push notification tap → navigate to the right server + session.
-  // For sub-sessions: activate parent main session first, then open the sub-session window.
-  //
-  // Key issue: handleSelectServer calls window.location.reload() which kills all
-  // subsequent navigation. So if a server switch is needed, we store the target
-  // session in localStorage and let the post-reload startup code handle it.
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const { serverId: sid, session, quote } = (e as CustomEvent).detail ?? {};
-      const currentServer = localStorage.getItem('rcc_server');
-      const needsServerSwitch = sid && sid !== currentServer;
+  // Pending navigation target for sub-sessions that haven't loaded yet
+  const [pendingNav, setPendingNav] = useState<{ session: string; quote?: string } | null>(() => {
+    // Post-reload: pick up pending push target from localStorage (set before server switch reload)
+    const target = localStorage.getItem('rcc_push_target');
+    if (!target) return null;
+    localStorage.removeItem('rcc_push_target');
+    const quote = localStorage.getItem('rcc_push_quote') ?? undefined;
+    if (quote) localStorage.removeItem('rcc_push_quote');
+    return { session: target, quote };
+  });
 
-      if (needsServerSwitch) {
-        // Store target session so post-reload code can navigate to it
-        if (session) localStorage.setItem('rcc_push_target', session as string);
-        if (quote) localStorage.setItem('rcc_push_quote', quote as string);
-        handleSelectServer(sid!);
-        return; // reload will happen — don't run session nav below
-      }
-
-      if (session) {
-        navigateToSession(session as string, quote as string | undefined);
-      }
-    };
-    window.addEventListener('deck:navigate', handler);
-    return () => window.removeEventListener('deck:navigate', handler);
-  }, [handleSelectServer, setActiveSession, bringSubToFront]);
-
-  // Helper: navigate to a session (main or sub) without reload
+  // Helper: navigate to a session (main or sub) without reload.
+  // For sub-sessions, if sub-session data isn't loaded yet, queues a pending nav.
   const navigateToSession = useCallback((session: string, quote?: string) => {
     const subMatch = session.match(/^deck_sub_(.+)$/);
     if (subMatch) {
       const subId = subMatch[1];
       const sub = subSessionsRef.current.find((s) => s.id === subId);
-      // Activate parent main session first (or keep current if no parent)
-      if (sub?.parentSession) {
+      if (!sub) {
+        // Sub-sessions not loaded yet — queue for retry when they arrive
+        setPendingNav({ session, quote });
+        return;
+      }
+      // Activate parent main session first
+      if (sub.parentSession) {
         localStorage.setItem('rcc_session', sub.parentSession);
         setActiveSession(sub.parentSession, { keepSubWindows: true });
       }
-      // Open the sub-session window
       setOpenSubIds((prev) => new Set([...prev, subId]));
       bringSubToFront(subId);
     } else {
@@ -1420,17 +1408,50 @@ export function App() {
     }
   }, [setActiveSession, bringSubToFront]);
 
-  // Post-reload: check if we have a pending push navigation target (set before server switch reload)
+  // Reactive: when sub-sessions load and we have a pending nav, retry navigation
   useEffect(() => {
-    const target = localStorage.getItem('rcc_push_target');
-    if (!target) return;
-    localStorage.removeItem('rcc_push_target');
-    const quote = localStorage.getItem('rcc_push_quote') ?? undefined;
-    if (quote) localStorage.removeItem('rcc_push_quote');
-    // Delay to let WS connect and sub-sessions load
-    const timer = setTimeout(() => navigateToSession(target, quote), 1500);
+    if (!pendingNav) return;
+    const subMatch = pendingNav.session.match(/^deck_sub_(.+)$/);
+    if (!subMatch) {
+      navigateToSession(pendingNav.session, pendingNav.quote);
+      setPendingNav(null);
+      return;
+    }
+    const sub = subSessions.find((s) => s.id === subMatch[1]);
+    if (sub) {
+      navigateToSession(pendingNav.session, pendingNav.quote);
+      setPendingNav(null);
+    }
+  }, [pendingNav, subSessions, navigateToSession]);
+
+  // Safety timeout: if pending nav isn't resolved within 8s, clear it
+  useEffect(() => {
+    if (!pendingNav) return;
+    const timer = setTimeout(() => setPendingNav(null), 8000);
     return () => clearTimeout(timer);
-  }, [navigateToSession]);
+  }, [pendingNav]);
+
+  // Push notification tap → navigate to the right server + session.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { serverId: sid, session, quote } = (e as CustomEvent).detail ?? {};
+      const currentServer = localStorage.getItem('rcc_server');
+      const needsServerSwitch = sid && sid !== currentServer;
+
+      if (needsServerSwitch) {
+        if (session) localStorage.setItem('rcc_push_target', session as string);
+        if (quote) localStorage.setItem('rcc_push_quote', quote as string);
+        handleSelectServer(sid!);
+        return;
+      }
+
+      if (session) {
+        navigateToSession(session as string, quote as string | undefined);
+      }
+    };
+    window.addEventListener('deck:navigate', handler);
+    return () => window.removeEventListener('deck:navigate', handler);
+  }, [handleSelectServer, navigateToSession]);
 
   const handleBackToDashboard = useCallback(() => {
     localStorage.removeItem('rcc_server');
