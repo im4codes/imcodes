@@ -262,12 +262,6 @@ export function App() {
     return () => clearTimeout(t);
   }, []);
 
-  // Dismiss server-switch overlay once app has mounted
-  useEffect(() => {
-    const el = document.getElementById('switch-overlay');
-    if (el) el.remove();
-  }, []);
-
   // Native: init push notifications after login
   useEffect(() => {
     if (!auth || !isNative()) return;
@@ -1363,7 +1357,6 @@ export function App() {
 
     // Full page reload — guarantees all components, WS connections, and pinned
     // panels start fresh with the new server. Avoids stale WS/state bugs.
-    try { sessionStorage.setItem('server_switch', '1'); } catch { /* ignore */ }
     window.location.reload();
   }, []);
 
