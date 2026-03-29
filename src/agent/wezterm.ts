@@ -128,7 +128,7 @@ export async function weztermSendText(name: string, text: string): Promise<void>
 /** Send Enter key to a WezTerm pane. */
 export async function weztermSendEnter(name: string): Promise<void> {
   const paneId = requirePaneId(name);
-  await weztermRun('send-text', '--pane-id', paneId, '--no-paste', '--', '\r');
+  await weztermRun('send-text', '--pane-id', paneId, '--no-paste', '--', '\n');
 }
 
 /** Send a raw key to a WezTerm pane (e.g. ctrl-c). */

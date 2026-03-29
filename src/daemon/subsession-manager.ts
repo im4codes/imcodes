@@ -2,7 +2,7 @@
  * Sub-session manager — creates/stops/rebuilds tmux sessions for sub-sessions.
  */
 
-import { newSession, killSession, sessionExists } from '../agent/tmux.js';
+import { newSession, killSession, sessionExists, getPanePids } from '../agent/tmux.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
@@ -111,16 +111,16 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
 /** Validate that a session name matches the expected pattern to prevent injection. */
 const SAFE_SESSION_NAME_RE = /^deck_sub_[a-zA-Z0-9_-]+$/;
 
-/** Kill all processes running inside a tmux session's panes before killing the session itself.
- *  This prevents orphan agent processes that hold session UUIDs after the tmux session is gone. */
+/** Kill all processes running inside a session's panes before killing the session itself.
+ *  This prevents orphan agent processes that hold session UUIDs after the session is gone.
+ *  Uses the backend-aware getPanePids() export from tmux.ts. */
 async function killSessionProcesses(sessionName: string): Promise<void> {
   if (!SAFE_SESSION_NAME_RE.test(sessionName)) {
     logger.warn({ sessionName }, 'Rejected invalid session name in killSessionProcesses');
     return;
   }
   try {
-    const { stdout } = await execFileAsync('tmux', ['list-panes', '-t', sessionName, '-F', '#{pane_pid}']);
-    const pids = stdout.trim().split('\n').filter(Boolean);
+    const pids = await getPanePids(sessionName);
     for (const pid of pids) {
       if (!/^\d+$/.test(pid)) continue; // only allow numeric PIDs
       // Kill all children of the shell (the actual agent process), then the shell itself

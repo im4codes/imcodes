@@ -171,13 +171,9 @@ export function resolveTarget(from: string, to: string): ResolveResult {
     return { ok: false, error: `ambiguous target "${to}" matches ${byLabel.length} sessions`, available: availableNames };
   }
 
-  // 2. Match by session name (exact)
+  // 2. Match by session name (exact, siblings only — no cross-project)
   const byName = siblings.filter((s) => s.name === to);
   if (byName.length === 1) return { ok: true, targets: [byName[0]] };
-
-  // Also check all sessions (not just siblings) for exact name match
-  const exactMatch = allSessions.find((s) => s.name === to && s.name !== from);
-  if (exactMatch) return { ok: true, targets: [exactMatch] };
 
   // 3. Match by agent type
   const byType = siblings.filter((s) => s.agentType === to);
@@ -276,23 +272,30 @@ export async function drainQueue(sessionName: string): Promise<void> {
   if (!queue || queue.length === 0) return;
 
   const now = Date.now();
-  messageQueue.delete(sessionName);
 
-  const record = getSession(sessionName);
-  if (!record) return;
-
-  for (const msg of queue) {
+  // Drain ONE message at a time. After sending, the session goes running → idle,
+  // which triggers drainQueue again for the next message. This prevents burst-injecting
+  // the entire backlog into a session that can only process one message at a time.
+  while (queue.length > 0) {
+    const msg = queue.shift()!;
     if (now - msg.queuedAt > QUEUE_EXPIRY_MS) {
       logger.debug({ target: sessionName, from: msg.from }, 'Skipping expired queued message');
-      continue;
+      continue; // skip expired, try next
     }
+    // Found a non-expired message — deliver it and stop
+    const record = getSession(sessionName);
+    if (!record) break;
     try {
       await dispatchMessage(record, msg.message);
       logger.info({ target: sessionName, from: msg.from }, 'Delivered queued message');
     } catch (err) {
       logger.warn({ err, target: sessionName, from: msg.from }, 'Failed to deliver queued message');
     }
+    // Stop after one delivery — next idle transition will drain the next message
+    break;
   }
+  // Clean up empty queue entry
+  if (queue.length === 0) messageQueue.delete(sessionName);
 }
 
 /** Get current queue for a target (for testing) */
@@ -325,6 +328,11 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
     return { status: 400, body: { ok: false, error: 'missing required fields: from, to, message' } };
   }
 
+  // Reject unsupported fields until Phase 2 implementation
+  if ((body.files && body.files.length > 0) || body.context) {
+    return { status: 501, body: { ok: false, error: 'files and context are not yet supported — send plain message only' } };
+  }
+
   // Circuit breaker: depth limit
   if (depth >= MAX_SEND_DEPTH) {
     return { status: 429, body: { ok: false, error: 'depth limit exceeded' } };
@@ -335,14 +343,12 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
     return { status: 429, body: { ok: false, error: 'rate limit exceeded' } };
   }
 
-  // Resolve target
+  // Resolve target (count ALL attempts toward rate limit, not just successes)
+  recordSend(from);
   const result = resolveTarget(from, to);
   if (!result.ok) {
     return { status: 404, body: { ok: false, error: result.error, available: result.available } };
   }
-
-  // Record the send for rate limiting
-  recordSend(from);
 
   // Deliver to each target
   const delivered: string[] = [];
@@ -404,6 +410,7 @@ function readBody(req: http.IncomingMessage): Promise<string> {
       if (size > MAX_BODY_SIZE) {
         rejected = true;
         reject(new Error('body too large'));
+        req.resume(); // drain remaining data without storing
         return;
       }
       body += chunk.toString();
