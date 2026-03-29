@@ -280,6 +280,9 @@ jobs:
       - name: Install web deps
         run: npm ci
         working-directory: web
+      - name: Install server deps
+        run: npm ci
+        working-directory: server
       - run: npm run build
       - name: Set version
         run: npm version ${{ needs.docker.outputs.npm_version }} --no-git-tag-version
