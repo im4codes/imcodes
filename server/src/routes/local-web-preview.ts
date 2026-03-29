@@ -119,7 +119,7 @@ localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
   const upstreamPath = getUpstreamPath(requestUrl, serverId, previewId);
   const sanitizedHeaders = sanitizePreviewRequestHeaders(c.req.raw.headers, previewId);
   const hasBody = !['GET', 'HEAD'].includes(c.req.method) && c.req.raw.body !== null;
-  const relay = bridge.createPreviewRelay(requestId, PREVIEW_LIMITS.REQUEST_TIMEOUT_MS);
+  const relay = bridge.createPreviewRelay(requestId, PREVIEW_LIMITS.RESPONSE_START_TIMEOUT_MS);
 
   c.req.raw.signal.addEventListener('abort', () => {
     relay.abort('browser_disconnect');

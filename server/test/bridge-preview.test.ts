@@ -108,8 +108,54 @@ describe('WsBridge preview relay', () => {
     const relay = bridge.createPreviewRelay('req-timeout', 25);
 
     vi.advanceTimersByTime(30);
-    await expect(relay.start).rejects.toThrow('preview relay timeout');
+    await expect(relay.start).rejects.toThrow('preview relay response start timeout');
     expect(daemon.sentStrings.some((msg) => msg.includes(`"type":"${PREVIEW_MSG.ABORT}"`) && msg.includes('req-timeout'))).toBe(true);
+  });
+
+  it('keeps an sse-style relay alive while chunks continue arriving before idle timeout', async () => {
+    vi.useFakeTimers();
+    const { bridge, daemon } = await setupBridge();
+    const relay = bridge.createPreviewRelay('req-sse', 25);
+
+    daemon.emit('message', Buffer.from(JSON.stringify({
+      type: PREVIEW_MSG.RESPONSE_START,
+      requestId: 'req-sse',
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    })), false);
+
+    const started = await relay.start;
+    const reader = started.body.getReader();
+
+    daemon.emit('message', packPreviewBinaryFrame(PREVIEW_BINARY_FRAME.RESPONSE_BODY, 'req-sse', Buffer.from('data: one\n\n')), true);
+    await reader.read();
+
+    vi.advanceTimersByTime(110_000);
+    daemon.emit('message', packPreviewBinaryFrame(PREVIEW_BINARY_FRAME.RESPONSE_BODY, 'req-sse', Buffer.from('data: two\n\n')), true);
+    const second = await reader.read();
+
+    expect(Buffer.from(second.value ?? []).toString()).toBe('data: two\n\n');
+    expect(daemon.sentStrings.some((msg) => msg.includes(`"type":"${PREVIEW_MSG.ABORT}"`) && msg.includes('req-sse'))).toBe(false);
+  });
+
+  it('times out an sse-style relay after idle timeout following response start', async () => {
+    vi.useFakeTimers();
+    const { bridge, daemon } = await setupBridge();
+    const relay = bridge.createPreviewRelay('req-sse-idle', 25);
+
+    daemon.emit('message', Buffer.from(JSON.stringify({
+      type: PREVIEW_MSG.RESPONSE_START,
+      requestId: 'req-sse-idle',
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    })), false);
+
+    const started = await relay.start;
+    const reader = started.body.getReader();
+
+    vi.advanceTimersByTime(120_001);
+    await expect(reader.read()).rejects.toThrow('preview relay stream idle timeout');
+    expect(daemon.sentStrings.some((msg) => msg.includes(`"type":"${PREVIEW_MSG.ABORT}"`) && msg.includes('req-sse-idle'))).toBe(true);
   });
 
   it('sends binary request body frames to daemon', async () => {

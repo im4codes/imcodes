@@ -116,4 +116,47 @@ describe('daemon preview relay', () => {
       code: PREVIEW_ERROR.LIMIT_EXCEEDED,
     }));
   });
+
+  it('does not time out an sse-style upstream while chunks keep arriving before idle timeout', async () => {
+    vi.useFakeTimers();
+    const serverLink = createServerLink();
+    fetchMock.mockResolvedValue({
+      status: 200,
+      statusText: 'OK',
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
+      body: Readable.from((async function* () {
+        yield Buffer.from('data: one\n\n');
+        await new Promise((r) => setTimeout(r, 110_000));
+        yield Buffer.from('data: two\n\n');
+      })()),
+    });
+
+    handlePreviewCommand({
+      type: PREVIEW_MSG.REQUEST,
+      requestId: 'req-sse',
+      previewId: 'preview-sse',
+      port: 3000,
+      method: 'GET',
+      path: '/events',
+      headers: {},
+      hasBody: false,
+    }, serverLink as never);
+
+    await vi.runAllTimersAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: PREVIEW_MSG.RESPONSE_START,
+      requestId: 'req-sse',
+      status: 200,
+    }));
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: PREVIEW_MSG.RESPONSE_END,
+      requestId: 'req-sse',
+    }));
+    expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: PREVIEW_MSG.ERROR,
+      requestId: 'req-sse',
+      code: PREVIEW_ERROR.TIMEOUT,
+    }));
+  });
 });

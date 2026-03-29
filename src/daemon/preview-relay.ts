@@ -21,6 +21,7 @@ type PendingPreviewRequest = {
   responseBytes: number;
   timedOut: boolean;
   timer: ReturnType<typeof setTimeout>;
+  timerMode: 'start' | 'idle';
 };
 
 const pendingPreviewRequests = new Map<string, PendingPreviewRequest>();
@@ -98,6 +99,23 @@ function cleanupPreviewRequest(requestId: string): PendingPreviewRequest | null 
   return pending;
 }
 
+function resetPreviewTimeout(
+  requestId: string,
+  timeoutMs: number,
+  mode: 'start' | 'idle',
+): void {
+  const pending = pendingPreviewRequests.get(requestId);
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  pending.timerMode = mode;
+  pending.timer = setTimeout(() => {
+    const active = pendingPreviewRequests.get(requestId);
+    if (!active) return;
+    active.timedOut = true;
+    active.abortController.abort();
+  }, timeoutMs);
+}
+
 async function runPreviewFetch(serverLink: ServerLink, msg: PreviewRequestMessage, pending: PendingPreviewRequest): Promise<void> {
   const targetUrl = new URL(normalizePreviewUpstreamPath(msg.path), `http://${LOOPBACK_HOST}:${msg.port}`);
   try {
@@ -117,6 +135,7 @@ async function runPreviewFetch(serverLink: ServerLink, msg: PreviewRequestMessag
       statusText: response.statusText,
       headers: responseHeadersToRecord(response.headers),
     });
+    resetPreviewTimeout(msg.requestId, PREVIEW_LIMITS.STREAM_IDLE_TIMEOUT_MS, 'idle');
 
     if (response.body) {
       for await (const chunk of response.body) {
@@ -128,6 +147,7 @@ async function runPreviewFetch(serverLink: ServerLink, msg: PreviewRequestMessag
           cleanupPreviewRequest(msg.requestId);
           return;
         }
+        resetPreviewTimeout(msg.requestId, PREVIEW_LIMITS.STREAM_IDLE_TIMEOUT_MS, 'idle');
         serverLink.sendBinary(packPreviewBinaryFrame(PREVIEW_BINARY_FRAME.RESPONSE_BODY, msg.requestId, buffer));
       }
     }
@@ -171,7 +191,8 @@ export function handlePreviewCommand(cmd: Record<string, unknown>, serverLink: S
         if (!active) return;
         active.timedOut = true;
         active.abortController.abort();
-      }, PREVIEW_LIMITS.REQUEST_TIMEOUT_MS),
+      }, PREVIEW_LIMITS.RESPONSE_START_TIMEOUT_MS),
+      timerMode: 'start',
     };
     pendingPreviewRequests.set(msg.requestId, pending);
     void runPreviewFetch(serverLink, msg, pending);

@@ -122,6 +122,7 @@ type PendingPreviewRequest = {
   terminalOutcome: string | null;
   responseBytes: number;
   timer: ReturnType<typeof setTimeout>;
+  timerMode: 'start' | 'idle';
   resolveStart: (payload: PreviewStartPayload) => void;
   rejectStart: (err: Error) => void;
 };
@@ -1152,7 +1153,7 @@ export class WsBridge {
     }
   }
 
-  createPreviewRelay(requestId: string, timeoutMs = PREVIEW_LIMITS.REQUEST_TIMEOUT_MS): {
+  createPreviewRelay(requestId: string, timeoutMs = PREVIEW_LIMITS.RESPONSE_START_TIMEOUT_MS): {
     start: Promise<PreviewStartPayload & { body: ReadableStream<Uint8Array> }>;
     abort: (reason?: string) => void;
   } {
@@ -1183,7 +1184,7 @@ export class WsBridge {
         type: PREVIEW_MSG.ERROR,
         requestId,
         code: PREVIEW_ERROR.TIMEOUT,
-        message: 'preview relay timeout',
+        message: 'preview relay response start timeout',
         terminalOutcome: PREVIEW_TERMINAL_OUTCOME.TIMEOUT,
       });
       this.sendPreviewControl({ type: PREVIEW_MSG.ABORT, requestId, reason: PREVIEW_ERROR.TIMEOUT });
@@ -1196,6 +1197,7 @@ export class WsBridge {
       terminalOutcome: null,
       responseBytes: 0,
       timer,
+      timerMode: 'start',
       resolveStart: (payload) => resolveStart({ ...payload, body: readable }),
       rejectStart,
     });
@@ -1277,6 +1279,7 @@ export class WsBridge {
     if (!pending || pending.terminalOutcome) return;
     if (pending.started) return;
     pending.started = true;
+    this.resetPreviewTimeout(msg.requestId, PREVIEW_LIMITS.STREAM_IDLE_TIMEOUT_MS, 'idle');
     pending.resolveStart({
       status: msg.status,
       statusText: msg.statusText,
@@ -1311,7 +1314,27 @@ export class WsBridge {
       return;
     }
 
+    this.resetPreviewTimeout(requestId, PREVIEW_LIMITS.STREAM_IDLE_TIMEOUT_MS, 'idle');
     pending.controller.enqueue(chunk);
+  }
+
+  private resetPreviewTimeout(requestId: string, timeoutMs: number, mode: 'start' | 'idle'): void {
+    const pending = this.pendingPreviewRequests.get(requestId);
+    if (!pending || pending.terminalOutcome) return;
+    clearTimeout(pending.timer);
+    pending.timerMode = mode;
+    pending.timer = setTimeout(() => {
+      const active = this.pendingPreviewRequests.get(requestId);
+      if (!active || active.terminalOutcome) return;
+      this.failPreviewRequest({
+        type: PREVIEW_MSG.ERROR,
+        requestId,
+        code: PREVIEW_ERROR.TIMEOUT,
+        message: mode === 'start' ? 'preview relay response start timeout' : 'preview relay stream idle timeout',
+        terminalOutcome: PREVIEW_TERMINAL_OUTCOME.TIMEOUT,
+      });
+      this.sendPreviewControl({ type: PREVIEW_MSG.ABORT, requestId, reason: PREVIEW_ERROR.TIMEOUT });
+    }, timeoutMs);
   }
 
   private completePreviewRequest(requestId: string, outcome: string): void {
