@@ -37,6 +37,7 @@
   },
   "dependencies": {
     "commander": "^12.1.0",
+    "croner": "^10.0.1",
     "fzf": "^0.5.2",
     "octokit": "^4.0.2",
     "pino": "^9.5.0",
