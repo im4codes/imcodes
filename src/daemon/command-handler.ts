@@ -1626,9 +1626,16 @@ sleep 60 && rm -rf "${scriptDir}" &
 // ── File system browser ────────────────────────────────────────────────────
 
 const UPLOAD_DIR = nodePath.join(homedir(), '.imcodes', 'uploads');
-const FS_ALLOWED_ROOTS = process.platform === 'win32'
-  ? [homedir(), UPLOAD_DIR, process.env.TEMP ?? 'C:\\Temp']
+// On Windows, don't restrict paths — projects commonly live on any drive (D:\code, etc.)
+// The daemon runs as the user, so OS-level permissions are the real security boundary.
+const FS_ALLOWED_ROOTS: string[] | null = process.platform === 'win32'
+  ? null
   : [homedir(), UPLOAD_DIR, '/tmp', '/private/tmp'];
+
+function isPathAllowed(realPath: string): boolean {
+  if (!FS_ALLOWED_ROOTS) return true; // no restriction (Windows)
+  return FS_ALLOWED_ROOTS.some((root) => realPath === root || realPath.startsWith(root + nodePath.sep));
+}
 
 // ── P2P cancel/status handlers ────────────────────────────────────────────
 
@@ -1721,7 +1728,7 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
 
   try {
     const real = await fsRealpath(resolved);
-    const allowed = FS_ALLOWED_ROOTS.some((root) => real === root || real.startsWith(root + nodePath.sep));
+    const allowed = isPathAllowed(real);
     if (!allowed) {
       try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
       return;
@@ -1771,7 +1778,7 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
 
   try {
     const real = await fsRealpath(resolved);
-    const allowed = FS_ALLOWED_ROOTS.some((root) => real === root || real.startsWith(root + nodePath.sep));
+    const allowed = isPathAllowed(real);
     if (!allowed) {
       try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
       return;
@@ -1825,7 +1832,7 @@ async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: Serve
 
   try {
     const real = await fsRealpath(resolved);
-    const allowed = FS_ALLOWED_ROOTS.some((root) => real === root || real.startsWith(root + nodePath.sep));
+    const allowed = isPathAllowed(real);
     if (!allowed) {
       try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
       return;
@@ -1876,7 +1883,7 @@ async function handleFsGitDiff(cmd: Record<string, unknown>, serverLink: ServerL
 
   try {
     const real = await fsRealpath(resolved);
-    const allowed = FS_ALLOWED_ROOTS.some((root) => real === root || real.startsWith(root + nodePath.sep));
+    const allowed = isPathAllowed(real);
     if (!allowed) {
       try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
       return;
@@ -1915,7 +1922,7 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
   const parent = nodePath.dirname(resolved);
   try {
     const realParent = await fsRealpath(parent);
-    const allowed = FS_ALLOWED_ROOTS.some((root) => realParent === root || realParent.startsWith(root + nodePath.sep));
+    const allowed = isPathAllowed(realParent);
     if (!allowed) {
       try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
       return;
@@ -1966,7 +1973,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
     // Existing file: realpath of target must be within FS_ALLOWED_ROOTS
     try {
       const real = await fsRealpath(resolved);
-      const allowed = FS_ALLOWED_ROOTS.some((root) => real === root || real.startsWith(root + nodePath.sep));
+      const allowed = isPathAllowed(real);
       if (!allowed) {
         try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
         return;
@@ -2001,7 +2008,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
     const parent = nodePath.dirname(resolved);
     try {
       const realParent = await fsRealpath(parent);
-      const allowed = FS_ALLOWED_ROOTS.some((root) => realParent === root || realParent.startsWith(root + nodePath.sep));
+      const allowed = isPathAllowed(realParent);
       if (!allowed) {
         try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
         return;

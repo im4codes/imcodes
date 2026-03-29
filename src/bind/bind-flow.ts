@@ -1,5 +1,5 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
-import { existsSync as existsSyncFs } from 'fs';
+import { existsSync as existsSyncFs, readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir, hostname } from 'os';
 import { execSync } from 'child_process';
@@ -142,11 +142,16 @@ function restartDaemon(): void {
         execSync('sudo systemctl restart imcodes', { stdio: 'ignore' });
       }
     } else if (process.platform === 'win32') {
-      // Kill existing daemon and relaunch via startup script
-      try { execSync('taskkill /f /im node.exe /fi "WINDOWTITLE eq imcodes*"', { stdio: 'ignore' }); } catch { /* ignore */ }
-      const startupVbs = join(homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'imcodes-daemon.vbs');
-      if (existsSyncFs(startupVbs)) {
-        execSync(`wscript "${startupVbs}"`, { stdio: 'ignore' });
+      // Kill existing daemon via PID file (safe — doesn't affect other Node processes)
+      const pidFile = join(homedir(), '.imcodes', 'daemon.pid');
+      try {
+        const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
+        if (pid) execSync(`taskkill /f /pid ${pid}`, { stdio: 'ignore' });
+      } catch { /* not running */ }
+      // Relaunch via startup script
+      const startupCmd = join(homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'imcodes-daemon.cmd');
+      if (existsSyncFs(startupCmd)) {
+        execSync(`"${startupCmd}"`, { stdio: 'ignore' });
       }
     }
     console.log('Daemon restarted.');
@@ -156,15 +161,18 @@ function restartDaemon(): void {
 }
 
 async function installWindowsStartup(): Promise<void> {
-  // Create a VBS launcher in the user's Startup folder so the daemon starts on login
+  // Create a CMD batch in the user's Startup folder (less likely to trigger AV than VBS)
   const startupDir = join(homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup');
   await mkdir(startupDir, { recursive: true });
-  const vbsPath = join(startupDir, 'imcodes-daemon.vbs');
-  // Use wscript to run node in background without a visible console window
-  const npmGlobalBin = execSync('npm prefix -g', { encoding: 'utf8' }).trim();
-  const imcodesCmd = join(npmGlobalBin, 'imcodes.cmd');
-  const vbs = `Set WshShell = CreateObject("WScript.Shell")\nWshShell.Run """${imcodesCmd}"" start", 0, False\n`;
-  await writeFile(vbsPath, vbs, 'utf8');
+  // Remove old VBS if present (migration from previous approach)
+  const oldVbs = join(startupDir, 'imcodes-daemon.vbs');
+  try { await import('fs/promises').then((fs) => fs.unlink(oldVbs)); } catch { /* ignore */ }
+  const cmdPath = join(startupDir, 'imcodes-daemon.cmd');
+  // Use process.execPath for reliable Node resolution (works with nvm, pnpm, etc.)
+  const nodeExe = process.execPath;
+  const imcodesScript = join(__dirname, '..', 'index.js');
+  const cmd = `@echo off\r\nstart /min "" "${nodeExe}" "${imcodesScript}" start\r\n`;
+  await writeFile(cmdPath, cmd, 'utf8');
 }
 
 async function ensureTmux(): Promise<void> {
