@@ -57,8 +57,8 @@ export function previewRoutePrefix(serverId: string, previewId: string): string 
 export function normalizePreviewUpstreamPath(path: string): string {
   if (!path) return '/';
   const [pathname, search = ''] = path.split('?', 2);
-  const normalizedPath = `/${pathname}`.replace(/\/+/g, '/').replace(/\/+/g, '/').replace(/\/+/g, '/').replace(/\/+/g, '/');
-  return search ? `${normalizedPath.replace(/\/+/g, '/') }?${search}` : normalizedPath.replace(/\/+/g, '/');
+  const normalizedPath = `/${pathname}`.replace(/\/+/g, '/');
+  return search ? `${normalizedPath}?${search}` : normalizedPath;
 }
 
 // Headers that must pass through for WebSocket upgrade requests (would otherwise be stripped).
@@ -137,16 +137,15 @@ export function rewriteSetCookieHeader(params: {
 
   let sameSiteWritten = false;
   for (const attr of attrs) {
-    const [rawAttrName, ...rest] = attr.split('=');
+    const [rawAttrName] = attr.split('=');
     const attrName = rawAttrName.toLowerCase();
-    const attrValue = rest.join('=');
     if (attrName === 'domain') continue;
     if (attrName === 'path') continue;
     if (attrName === 'samesite') {
       sameSiteWritten = true;
-      const normalized = attrValue.toLowerCase();
-      if (normalized === 'strict') rewritten.push('SameSite=Strict');
-      else rewritten.push('SameSite=Strict');
+      // Intentional: always force Strict regardless of upstream value.
+      // Preview cookies must not leak cross-site.
+      rewritten.push('SameSite=Strict');
       continue;
     }
     if (attrName === 'secure' || attrName === 'httponly') {
@@ -160,23 +159,37 @@ export function rewriteSetCookieHeader(params: {
   return rewritten.join('; ');
 }
 
+/** All hostnames treated as loopback for preview URL rewriting. */
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]', '::1', '0.0.0.0']);
+
+export function isLoopbackHost(hostname: string): boolean {
+  return LOOPBACK_HOSTS.has(hostname);
+}
+
 export function shouldRewritePreviewRedirect(location: string, port: number): boolean {
   try {
     const url = new URL(location, `http://127.0.0.1:${port}`);
-    return (url.hostname === '127.0.0.1' || url.hostname === '[::1]' || url.hostname === '::1')
-      && Number(url.port || '80') === port;
+    return isLoopbackHost(url.hostname) && Number(url.port || '80') === port;
   } catch {
     return false;
   }
 }
 
+/**
+ * Rewrite a redirect Location header for the preview proxy.
+ * - Loopback URLs → rewritten to preview route prefix
+ * - Non-loopback URLs (e.g. OAuth providers) → passed through unchanged
+ */
 export function rewritePreviewRedirectLocation(params: {
   location: string;
   serverId: string;
   previewId: string;
   port: number;
-}): string | null {
-  if (!shouldRewritePreviewRedirect(params.location, params.port)) return null;
+}): string {
+  if (!shouldRewritePreviewRedirect(params.location, params.port)) {
+    // Non-loopback redirect (e.g. external OAuth) — pass through unchanged
+    return params.location;
+  }
   const url = new URL(params.location, `http://127.0.0.1:${params.port}`);
   return `${previewRoutePrefix(params.serverId, params.previewId)}${url.pathname}${url.search}`;
 }

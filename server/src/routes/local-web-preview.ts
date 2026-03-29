@@ -113,8 +113,14 @@ localWebPreviewRoutes.delete('/:id/local-web-preview/:previewId', requireAuth(),
   const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (role === 'none') return c.json({ error: PREVIEW_ERROR.FORBIDDEN }, 403);
 
-  const ok = LocalWebPreviewRegistry.get(serverId).close(c.req.param('previewId')!, userId);
+  const previewIdParam = c.req.param('previewId')!;
+  const ok = LocalWebPreviewRegistry.get(serverId).close(previewIdParam, userId);
   if (!ok) return c.json({ error: PREVIEW_ERROR.PREVIEW_NOT_FOUND }, 404);
+  // Notify daemon to clean up preview port registry
+  const bridge = WsBridge.get(serverId);
+  if (bridge.isDaemonConnected()) {
+    bridge.sendPreviewControl({ type: PREVIEW_MSG.CLOSE, previewId: previewIdParam });
+  }
   return c.json({ ok: true });
 });
 
@@ -228,12 +234,9 @@ localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
         previewId,
         port: preview.port,
       });
-      if (!rewritten) {
-        relay.abort(PREVIEW_ERROR.UPSTREAM_ERROR);
-        return c.json({ error: PREVIEW_ERROR.UPSTREAM_ERROR, message: 'preview redirect rejected' }, 502);
-      }
-      // Append access token to redirect URL so iOS cross-site iframes stay authenticated
-      if (previewAccessToken && !rewritten.includes(PREVIEW_ACCESS_TOKEN_QUERY_PARAM)) {
+      // Only append access token for loopback redirects (rewritten to preview prefix)
+      const isLoopbackRedirect = rewritten !== location;
+      if (isLoopbackRedirect && previewAccessToken && !rewritten.includes(PREVIEW_ACCESS_TOKEN_QUERY_PARAM)) {
         try {
           const redirectUrl = new URL(rewritten, c.req.url);
           redirectUrl.searchParams.set(PREVIEW_ACCESS_TOKEN_QUERY_PARAM, previewAccessToken);

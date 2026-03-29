@@ -263,6 +263,12 @@ export function handlePreviewCommand(cmd: Record<string, unknown>, serverLink: S
     return true;
   }
 
+  if (cmd.type === PREVIEW_MSG.CLOSE) {
+    const previewId = cmd.previewId as string | undefined;
+    if (previewId) clearPreviewPort(previewId);
+    return true;
+  }
+
   if (cmd.type === PREVIEW_MSG.WS_CLOSE) {
     const msg = cmd as unknown as PreviewWsCloseMessage;
     if (typeof msg.wsId !== 'string') return true;
@@ -271,6 +277,11 @@ export function handlePreviewCommand(cmd: Record<string, unknown>, serverLink: S
   }
 
   return false;
+}
+
+/** Remove a preview from the port registry when the preview is closed. */
+export function clearPreviewPort(previewId: string): void {
+  previewPortRegistry.delete(previewId);
 }
 
 // ── WS tunnel: open upstream connection ──────────────────────────────────────

@@ -30,7 +30,8 @@ describe('local web preview policy', () => {
     expect(rewriteSetCookieHeader({ previewId: 'p', serverId: 's', header: `${COOKIE_CSRF}=x; Path=/` })).toBeNull();
   });
 
-  it('rewrites only same-loopback same-port redirects', () => {
+  it('rewrites loopback redirects and passes through non-loopback', () => {
+    // Same-port loopback → rewritten
     expect(rewritePreviewRedirectLocation({
       location: 'http://127.0.0.1:3000/docs?q=1',
       serverId: 'server123',
@@ -38,19 +39,21 @@ describe('local web preview policy', () => {
       port: 3000,
     })).toBe('/api/server/server123/local-web/preview123/docs?q=1');
 
+    // Different port → passed through unchanged (not loopback match)
     expect(rewritePreviewRedirectLocation({
       location: 'http://127.0.0.1:3001/docs',
       serverId: 'server123',
       previewId: 'preview123',
       port: 3000,
-    })).toBeNull();
+    })).toBe('http://127.0.0.1:3001/docs');
 
+    // External URL → passed through unchanged
     expect(rewritePreviewRedirectLocation({
       location: 'https://example.com/docs',
       serverId: 'server123',
       previewId: 'preview123',
       port: 3000,
-    })).toBeNull();
+    })).toBe('https://example.com/docs');
   });
 
   it('strips embedding-hostile headers on all preview responses', () => {
@@ -66,13 +69,20 @@ describe('local web preview policy', () => {
     expect(filtered.get('cache-control')).toBe('no-cache');
   });
 
-  it('does not rewrite localhost redirects outside literal loopback hosts', () => {
+  it('rewrites localhost and 0.0.0.0 redirects as loopback', () => {
     expect(rewritePreviewRedirectLocation({
       location: 'http://localhost:3000/docs',
       serverId: 'server123',
       previewId: 'preview123',
       port: 3000,
-    })).toBeNull();
+    })).toBe('/api/server/server123/local-web/preview123/docs');
+
+    expect(rewritePreviewRedirectLocation({
+      location: 'http://0.0.0.0:3000/app',
+      serverId: 'server123',
+      previewId: 'preview123',
+      port: 3000,
+    })).toBe('/api/server/server123/local-web/preview123/app');
   });
 
   it('forwards only preview-scoped cookies upstream and strips host header', () => {

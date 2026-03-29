@@ -15,11 +15,22 @@ export class LocalWebPreviewRegistry {
   private static instances = new Map<string, LocalWebPreviewRegistry>();
   private previews = new Map<string, InternalPreviewRecord>();
 
+  private static cleanupHandle: ReturnType<typeof setInterval> | null = null;
+
   static get(serverId: string): LocalWebPreviewRegistry {
     let instance = this.instances.get(serverId);
     if (!instance) {
       instance = new LocalWebPreviewRegistry(serverId);
       this.instances.set(serverId, instance);
+    }
+    // Start periodic cleanup sweep (shared across all registries)
+    if (!this.cleanupHandle) {
+      this.cleanupHandle = setInterval(() => {
+        for (const registry of LocalWebPreviewRegistry.instances.values()) {
+          registry.cleanup();
+        }
+      }, 5 * 60 * 1000); // every 5 minutes
+      this.cleanupHandle.unref?.();
     }
     return instance;
   }
