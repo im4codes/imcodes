@@ -36,8 +36,7 @@ interface Props {
   onStopDiscussion?: (id: string) => void;
 }
 
-// Configure marked for safe rendering
-marked.setOptions({ breaks: true, gfm: true });
+// Global marked config (breaks, gfm, target=_blank) is set in main.tsx
 
 export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], onStopDiscussion }: Props) {
   const [discussions, setDiscussions] = useState<P2pDiscussion[]>([]);
