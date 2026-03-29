@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
+import { isNative } from '../native.js';
 import {
   buildLocalWebPreviewProxyUrl,
   closeLocalWebPreview,
@@ -133,18 +134,13 @@ export function LocalWebPreviewPanel({ serverId, port, path, onDraftChange }: Pr
 
   const handleOpenInNewTab = useCallback(async () => {
     const existing = currentPreviewRef.current;
-    if (existing?.previewUrl) {
-      window.open(existing.previewUrl, '_blank', 'noopener,noreferrer');
-      return;
-    }
-    const tab = window.open('about:blank', '_blank', 'noopener,noreferrer');
-    const next = await openPreview();
-    if (next?.previewUrl) {
-      if (tab) {
-        tab.location.href = next.previewUrl;
-      } else {
-        window.open(next.previewUrl, '_blank', 'noopener,noreferrer');
-      }
+    const url = existing?.previewUrl ?? (await openPreview())?.previewUrl;
+    if (!url) return;
+    if (isNative()) {
+      const { Browser } = await import('@capacitor/browser');
+      await Browser.open({ url });
+    } else {
+      window.open(url, '_blank', 'noopener,noreferrer');
     }
   }, [openPreview]);
 
@@ -236,7 +232,7 @@ export function LocalWebPreviewPanel({ serverId, port, path, onDraftChange }: Pr
             key={preview.previewId}
             src={preview.previewUrl}
             title={t('localWebPreview.title')}
-            sandbox="allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts"
+            sandbox="allow-forms allow-modals allow-popups allow-same-origin allow-scripts"
             referrerPolicy="no-referrer"
             style={{ width: '100%', height: '100%', border: 'none', background: '#020617' }}
             onLoad={() => setIframeLoaded(true)}
