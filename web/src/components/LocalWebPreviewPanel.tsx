@@ -102,7 +102,9 @@ export function LocalWebPreviewPanel({ serverId, port, path, onDraftChange }: Pr
         return null;
       }
 
-      const previewUrl = response.previewUrl ?? buildLocalWebPreviewProxyUrl(serverId, response.previewId, normalizedPath, response.previewAccessToken);
+      // Always build absolute URL — server returns a relative path that breaks
+      // on iOS Capacitor where the origin is capacitor://localhost, not the remote server.
+      const previewUrl = buildLocalWebPreviewProxyUrl(serverId, response.previewId, normalizedPath, response.previewAccessToken);
       const nextPreview = { previewId: response.previewId, previewUrl };
       const previous = currentPreviewRef.current;
       currentPreviewRef.current = nextPreview;
