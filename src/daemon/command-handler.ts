@@ -4,7 +4,7 @@
  */
 import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, type ProjectConfig } from '../agent/session-manager.js';
 import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey } from '../agent/tmux.js';
-import { listSessions, getSession } from '../store/session-store.js';
+import { listSessions, getSession, upsertSession } from '../store/session-store.js';
 import { routeMessage, type InboundMessage, type RouterContext } from '../router/message-router.js';
 import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js';
 import type { ServerLink } from './server-link.js';
@@ -392,6 +392,18 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'subsession.set_model':
       void handleSubSessionSetModel(cmd, serverLink);
       break;
+    case 'subsession.rename': {
+      const sName = cmd.sessionName as string | undefined;
+      const label = cmd.label as string | undefined;
+      if (sName && label !== undefined) {
+        const record = getSession(sName);
+        if (record) {
+          upsertSession({ ...record, label, updatedAt: Date.now() });
+          logger.info({ sessionName: sName, label }, 'subsession.rename: label updated');
+        }
+      }
+      break;
+    }
     case 'ask.answer':
       void handleAskAnswer(cmd);
       break;

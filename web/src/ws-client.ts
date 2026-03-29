@@ -252,6 +252,10 @@ export class WsClient {
     this.send({ type: 'subsession.read_response', sessionName });
   }
 
+  subSessionRename(sessionName: string, label: string): void {
+    this.send({ type: 'subsession.rename', sessionName, label });
+  }
+
   subSessionSetModel(sessionName: string, model: string, cwd?: string): void {
     this.send({ type: 'subsession.set_model', sessionName, model, cwd });
   }
