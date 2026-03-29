@@ -192,15 +192,16 @@ describe('FileBrowser', () => {
     expect(getByText('documents')).toBeDefined();
   });
 
-  it('shows error message on fs.ls_response with status error', async () => {
+  it('shows error indicator on fs.ls_response with status error', async () => {
     const { ws, respondError } = makeWsFactory();
-    const { getByText } = render(
+    const { getByTitle } = render(
       <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath="/home/user" onConfirm={vi.fn()} onClose={vi.fn()} />,
     );
 
     await act(async () => { respondError('forbidden_path'); });
 
-    expect(getByText('forbidden_path')).toBeDefined();
+    // Error shown as ⚠ button with error message in title tooltip
+    expect(getByTitle('forbidden_path')).toBeDefined();
   });
 
   it('does not re-fetch already loaded directories', async () => {
