@@ -5,6 +5,7 @@ import {
   rewriteSetCookieHeader,
   sanitizePreviewRequestHeaders,
 } from '../../shared/preview-policy.js';
+import { rewritePreviewHtmlDocument } from '../src/preview/policy.js';
 import { COOKIE_CSRF, COOKIE_SESSION } from '../../shared/cookie-names.js';
 
 describe('local web preview policy', () => {
@@ -84,5 +85,34 @@ describe('local web preview policy', () => {
     expect(sanitized.host).toBeUndefined();
     expect(sanitized.origin).toBe('https://public.example');
     expect(sanitized.cookie).toBe('sid=abc; theme=dark');
+  });
+
+  it('rewrites root-relative html links and assets into the preview namespace', () => {
+    const html = `
+      <html>
+        <head>
+          <base href="/" />
+          <link rel="stylesheet" href="/assets/app.css" />
+        </head>
+        <body style="background-image:url('/bg.png')">
+          <a href="/docs">Docs</a>
+          <form action="/submit"></form>
+          <img src="/logo.png" srcset="/logo.png 1x, /logo@2x.png 2x" />
+          <meta http-equiv="refresh" content="0; url=/login">
+        </body>
+      </html>
+    `;
+
+    const rewritten = rewritePreviewHtmlDocument(html, 'server123', 'preview123');
+    const prefix = '/api/server/server123/local-web/preview123';
+
+    expect(rewritten).toContain(`<base href="${prefix}/"`);
+    expect(rewritten).toContain(`href="${prefix}/assets/app.css"`);
+    expect(rewritten).toContain(`href="${prefix}/docs"`);
+    expect(rewritten).toContain(`action="${prefix}/submit"`);
+    expect(rewritten).toContain(`src="${prefix}/logo.png"`);
+    expect(rewritten).toContain(`srcset="${prefix}/logo.png 1x, ${prefix}/logo@2x.png 2x"`);
+    expect(rewritten).toContain(`url('${prefix}/bg.png')`);
+    expect(rewritten).toContain(`content="0; url=${prefix}/login"`);
   });
 });

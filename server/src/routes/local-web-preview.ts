@@ -3,6 +3,7 @@ import type { Env } from '../env.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { LocalWebPreviewRegistry, normalizeLocalPreviewPath } from '../preview/registry.js';
 import { MemoryRateLimiter } from '../ws/rate-limiter.js';
+import { rewritePreviewHtmlDocument, shouldRewritePreviewHtml } from '../preview/policy.js';
 import {
   filterPreviewResponseHeaders,
   normalizePreviewUpstreamPath,
@@ -211,6 +212,17 @@ localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
         return redactPreviewHeaders(loggedHeaders);
       })(),
     }, 'Preview proxy response');
+
+    if (shouldRewritePreviewHtml(responseHeaders)) {
+      const html = await new Response(started.body).text();
+      const rewrittenHtml = rewritePreviewHtmlDocument(html, serverId, previewId);
+      responseHeaders.delete('content-length');
+      return new Response(rewrittenHtml, {
+        status: started.status,
+        statusText: started.statusText,
+        headers: responseHeaders,
+      });
+    }
 
     return new Response(started.body, {
       status: started.status,

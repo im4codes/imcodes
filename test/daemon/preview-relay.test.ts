@@ -61,6 +61,7 @@ describe('daemon preview relay', () => {
     expect((init.headers as Headers).get('host')).toBe('127.0.0.1:3000');
     expect((init.headers as Headers).get('origin')).toBeNull();
     expect((init.headers as Headers).get('referer')).toBeNull();
+    expect((init.headers as Headers).get('accept-encoding')).toBe('identity');
   });
 
   it('emits upstream unreachable on fetch failure', async () => {

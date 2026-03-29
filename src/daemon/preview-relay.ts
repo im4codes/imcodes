@@ -56,9 +56,11 @@ function buildUpstreamHeaders(input: Record<string, string>, port: number): Head
     if (lower === 'host') continue;
     if (lower === 'origin') continue;
     if (lower === 'referer') continue;
+    if (lower === 'accept-encoding') continue;
     headers.set(name, value);
   }
   headers.set('host', `${LOOPBACK_HOST}:${port}`);
+  headers.set('accept-encoding', 'identity');
   return headers;
 }
 
