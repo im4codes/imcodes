@@ -482,7 +482,7 @@ export async function startup(): Promise<DaemonContext> {
         const lastText = getLastAssistantText(payload.session);
         serverLink.send({ type: 'session.idle', session: payload.session, project: projectName, agentType: payload.agentType, ...(lastText ? { lastText } : {}), ...(sessionLabel ? { label: sessionLabel } : {}), ...(parentLabel ? { parentLabel } : {}) });
       } else if (payload.event === 'notification') {
-        serverLink.send({ type: 'session.notification', session: payload.session, project: projectName, agentType: payload.agentType, title: payload.title, message: payload.message, ...(sessionLabel ? { label: sessionLabel } : {}), ...(parentLabel ? { parentLabel } : {}) });
+        serverLink.send({ type: 'session.notification', session: payload.session, project: projectName, agentType: record?.agentType ?? '', title: payload.title, message: payload.message, ...(sessionLabel ? { label: sessionLabel } : {}), ...(parentLabel ? { parentLabel } : {}) });
       } else if (payload.event === 'tool_start') {
         serverLink.send({ type: 'session.tool', session: payload.session, tool: payload.tool });
       } else if (payload.event === 'tool_end') {
