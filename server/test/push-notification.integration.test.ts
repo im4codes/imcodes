@@ -87,7 +87,7 @@ async function setupAuthenticatedDaemon() {
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 describe('push notification content', () => {
-  it('includes server name and project name in title', async () => {
+  it('includes server name, project name, and agent type in title', async () => {
     const { dispatchPush } = await import('../src/routes/push.js');
     const { daemonWs } = await setupAuthenticatedDaemon();
 
@@ -101,6 +101,7 @@ describe('push notification content', () => {
     const payload = vi.mocked(dispatchPush).mock.calls[0][0];
     expect(payload.title).toContain('my-dev-machine');
     expect(payload.title).toContain('my-project');
+    expect(payload.title).toContain('claude-code');
     expect(payload.userId).toBe(userId);
   });
 

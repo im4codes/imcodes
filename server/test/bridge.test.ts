@@ -1160,6 +1160,7 @@ describe('WsBridge', () => {
       const payload = call[0];
       expect(payload.title).toContain('my-server');
       expect(payload.title).toContain('codedeck');
+      expect(payload.title).toContain('claude-code');
       expect(payload.body).toContain('Done implementing');
     });
 

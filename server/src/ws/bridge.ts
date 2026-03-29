@@ -1473,14 +1473,14 @@ export class WsBridge {
     const isSub = sessionName.startsWith('deck_sub_');
 
     let displayName: string;
+    const typeSuffix = agentType ? `(${agentType})` : '';
     if (isSub) {
       const subId = sessionName.replace(/^deck_sub_/, '');
       const name = label || subId;
-      displayName = `${name}${agentType ? `(${agentType})` : ''}${parentContext ? `@${parentContext}` : ''}`;
-    } else if (label) {
-      displayName = parentContext ? `${parentContext} · ${label}` : label;
+      displayName = `${name}${typeSuffix}${parentContext ? `@${parentContext}` : ''}`;
     } else {
-      displayName = parentContext || sessionName;
+      const name = label || parentContext || sessionName;
+      displayName = `${name}${typeSuffix}`;
     }
     const agentLabel = '';
     const lastText = String(msg.lastText ?? msg.message ?? '').slice(0, 200);

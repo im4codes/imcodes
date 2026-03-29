@@ -900,14 +900,14 @@ export function App() {
         const agentType = msg.agentType as string | undefined;
         const rawProject = (msg.project as string) || sessionName;
         let displayProject: string;
+        const typeSuffix = agentType ? `(${agentType})` : '';
         if (sessionName.startsWith('deck_sub_')) {
           const subId = sessionName.replace(/^deck_sub_/, '');
           const name = label || subId;
-          displayProject = `${name}${agentType ? `(${agentType})` : ''}${parentLabel ? `@${parentLabel}` : ''}`;
-        } else if (label) {
-          displayProject = parentLabel ? `${parentLabel} · ${label}` : label;
+          displayProject = `${name}${typeSuffix}${parentLabel ? `@${parentLabel}` : ''}`;
         } else {
-          displayProject = rawProject;
+          const name = label || rawProject;
+          displayProject = `${name}${typeSuffix}`;
         }
         if (!sessionName.startsWith('deck_sub_')) {
           // Main session: update state + tab alert
