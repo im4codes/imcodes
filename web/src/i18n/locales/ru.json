@@ -519,7 +519,9 @@
     "exec_all": "Все",
     "view_discussion": "Просмотр P2P обсуждения →",
     "confirm_trigger": "Выполнить эту задачу сейчас?",
-    "status_manual_trigger": "Вручную"
+    "status_manual_trigger": "Вручную",
+    "go_to_session": "Перейти к сессии",
+    "go_and_quote": "Перейти и процитировать"
   },
   "fileBrowser": {
     "edit": "Редактировать",

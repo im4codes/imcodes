@@ -519,7 +519,9 @@
     "exec_all": "전체",
     "view_discussion": "P2P 토론 보기 →",
     "confirm_trigger": "이 작업을 지금 실행하시겠습니까?",
-    "status_manual_trigger": "수동 실행"
+    "status_manual_trigger": "수동 실행",
+    "go_to_session": "세션으로 이동",
+    "go_and_quote": "이동 후 결과 인용"
   },
   "fileBrowser": {
     "edit": "편집",

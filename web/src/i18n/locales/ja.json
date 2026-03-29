@@ -519,7 +519,9 @@
     "exec_all": "すべて",
     "view_discussion": "P2P ディスカッションを見る →",
     "confirm_trigger": "このタスクを今すぐ実行しますか？",
-    "status_manual_trigger": "手動実行"
+    "status_manual_trigger": "手動実行",
+    "go_to_session": "セッションへ移動",
+    "go_and_quote": "移動して結果を引用"
   },
   "fileBrowser": {
     "edit": "編集",

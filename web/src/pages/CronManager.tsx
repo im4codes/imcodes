@@ -46,6 +46,7 @@ interface CrossJobExecution extends CronExecution {
   project_name: string;
   cron_expr: string;
   target_role: string;
+  target_session_name?: string | null;
   action: string;
 }
 
@@ -65,6 +66,7 @@ interface Props {
   activeSession?: string | null;
   onBack: () => void;
   onViewDiscussion?: (fileId: string) => void;
+  onNavigateSession?: (sessionName: string, quote?: string) => void;
   servers?: ServerSlim[];
 }
 
@@ -130,9 +132,15 @@ function roleToDisplay(role: string, sessions: SessionInfo[], projectName?: stri
   return `${sessionDisplayLabel(s)} (${agentBadge(s.agentType)})`;
 }
 
+/** Resolve the target session name from an execution record. */
+function resolveExecSession(exec: CrossJobExecution): string {
+  if (exec.target_session_name) return exec.target_session_name;
+  return `deck_${exec.project_name}_${exec.target_role}`;
+}
+
 // ── Component ────────────────────────────────────────────────────────────
 
-export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession: _activeSession, onBack: _onBack, onViewDiscussion, servers = [] }: Props) {
+export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession: _activeSession, onBack: _onBack, onViewDiscussion, onNavigateSession, servers = [] }: Props) {
   const { t } = useTranslation();
   const [jobs, setJobs] = useState<CronJob[]>([]);
   const [loading, setLoading] = useState(true);
@@ -306,6 +314,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
           serverNameMap={serverNameMap}
           showAllServers={showAllServers}
           onViewDiscussion={onViewDiscussion}
+          onNavigateSession={onNavigateSession}
           t={t}
         />
       )}
@@ -387,6 +396,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
             executions={historyData[historyJobId] ?? null}
             job={historyJob}
             onViewDiscussion={onViewDiscussion}
+            onNavigateSession={onNavigateSession}
             t={t}
           />
         </FloatingPanel>
@@ -397,12 +407,13 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
 
 // ── Cross-Job Execution List ─────────────────────────────────────────────
 
-function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServers, onViewDiscussion, t }: {
+function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServers, onViewDiscussion, onNavigateSession, t }: {
   executions: CrossJobExecution[] | null;
   loading: boolean;
   serverNameMap: Map<string, string>;
   showAllServers: boolean;
   onViewDiscussion?: (fileId: string) => void;
+  onNavigateSession?: (sessionName: string, quote?: string) => void;
   t: (key: string) => string;
 }) {
   const [detailExec, setDetailExec] = useState<CrossJobExecution | null>(null);
@@ -438,8 +449,19 @@ function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServ
               {action?.type === 'command' && <span style={{ maxWidth: '150px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{action.command}</span>}
               {hasP2p && onViewDiscussion && (
                 <button type="button" onClick={(e) => { e.stopPropagation(); onViewDiscussion(exec.detail!.slice(4)); }}
-                  style={{ color: '#60a5fa', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline', marginLeft: 'auto' }}>
+                  style={{ color: '#60a5fa', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline' }}>
                   {t('cron.view_discussion')}
+                </button>
+              )}
+              {onNavigateSession && (exec.status === 'dispatched' || exec.status === 'manual_trigger') && (
+                <button type="button" onClick={(e) => {
+                  e.stopPropagation();
+                  const session = resolveExecSession(exec);
+                  onNavigateSession(session, hasDetail ? exec.detail!.slice(0, 500) : undefined);
+                }}
+                  style={{ color: '#00ffb4', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline', marginLeft: 'auto' }}
+                  title={hasDetail ? t('cron.go_and_quote') : t('cron.go_to_session')}>
+                  {t('cron.go_to_session')} →
                 </button>
               )}
             </div>
@@ -461,7 +483,7 @@ function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServ
           onClose={() => setDetailExec(null)}
           defaultW={600} defaultH={500}
         >
-          <ExecDetailView exec={detailExec} t={t} />
+          <ExecDetailView exec={detailExec} onNavigateSession={onNavigateSession ? () => onNavigateSession(resolveExecSession(detailExec), detailExec.detail?.slice(0, 500)) : undefined} t={t} />
         </FloatingPanel>
       )}
     </div>
@@ -477,12 +499,14 @@ const execStatusColor = (status: string): string => {
   return '#fbbf24';
 };
 
-function CronHistoryPanel({ executions, job, onViewDiscussion, t }: {
+function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession, t }: {
   executions: CronExecution[] | null;
   job: CronJob;
   onViewDiscussion?: (fileId: string) => void;
+  onNavigateSession?: (sessionName: string, quote?: string) => void;
   t: (key: string) => string;
 }) {
+  const jobSessionName = job.target_session_name ?? `deck_${job.project_name}_${job.target_role}`;
   const [detailExec, setDetailExec] = useState<CronExecution | null>(null);
   const action = parseAction(job.action);
 
@@ -522,8 +546,17 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, t }: {
               </span>
               {hasP2p && onViewDiscussion && (
                 <button type="button" onClick={(e) => { e.stopPropagation(); onViewDiscussion(exec.detail!.slice(4)); }}
-                  style={{ color: '#60a5fa', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline', marginLeft: 'auto' }}>
+                  style={{ color: '#60a5fa', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline' }}>
                   {t('cron.view_discussion')}
+                </button>
+              )}
+              {onNavigateSession && (exec.status === 'dispatched' || exec.status === 'manual_trigger') && (
+                <button type="button" onClick={(e) => {
+                  e.stopPropagation();
+                  onNavigateSession(jobSessionName, hasDetail ? exec.detail!.slice(0, 500) : undefined);
+                }}
+                  style={{ color: '#00ffb4', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline', marginLeft: 'auto' }}>
+                  {t('cron.go_to_session')} →
                 </button>
               )}
             </div>
@@ -554,7 +587,7 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, t }: {
 
 // ── Execution Detail View (FloatingPanel content, renders markdown) ──────
 
-function ExecDetailView({ exec, t }: { exec: { status: string; detail: string | null; created_at: number }; t: (key: string) => string }) {
+function ExecDetailView({ exec, onNavigateSession, t }: { exec: { status: string; detail: string | null; created_at: number }; onNavigateSession?: () => void; t: (key: string) => string }) {
   const html = useMemo(() => {
     if (!exec.detail) return '';
     try { return marked(exec.detail, { breaks: true }) as string; } catch { return exec.detail; }
@@ -565,6 +598,12 @@ function ExecDetailView({ exec, t }: { exec: { status: string; detail: string | 
       <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '12px', fontSize: '12px' }}>
         <span style={{ color: '#94a3b8' }}>{fmtTime(exec.created_at)}</span>
         <span style={{ color: execStatusColor(exec.status), fontWeight: 600 }}>{execStatusLabel(exec.status, t)}</span>
+        {onNavigateSession && exec.detail && (
+          <button type="button" onClick={onNavigateSession}
+            style={{ ...btnSecondary, marginLeft: 'auto', fontSize: '11px', padding: '4px 10px' }}>
+            {t('cron.go_and_quote')} →
+          </button>
+        )}
       </div>
       {exec.detail ? (
         <div

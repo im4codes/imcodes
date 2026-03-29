@@ -286,7 +286,7 @@ cronApiRoutes.get('/executions', requireAuth(), async (c) => {
     const rows = await c.env.DB.query(
       `SELECT DISTINCT ON (j.id)
          e.id, e.job_id, e.status, e.detail, e.created_at,
-         j.name AS job_name, j.server_id, j.project_name, j.cron_expr, j.target_role, j.action
+         j.name AS job_name, j.server_id, j.project_name, j.cron_expr, j.target_role, j.target_session_name, j.action
        FROM cron_executions e
        JOIN cron_jobs j ON j.id = e.job_id
        WHERE j.user_id = $1
@@ -300,7 +300,7 @@ cronApiRoutes.get('/executions', requireAuth(), async (c) => {
   // mode=all: all executions sorted by time
   const rows = await c.env.DB.query(
     `SELECT e.id, e.job_id, e.status, e.detail, e.created_at,
-       j.name AS job_name, j.server_id, j.project_name, j.cron_expr, j.target_role, j.action
+       j.name AS job_name, j.server_id, j.project_name, j.cron_expr, j.target_role, j.target_session_name, j.action
      FROM cron_executions e
      JOIN cron_jobs j ON j.id = e.job_id
      WHERE j.user_id = $1

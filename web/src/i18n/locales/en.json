@@ -519,7 +519,9 @@
     "exec_all": "All",
     "view_discussion": "View P2P Discussion →",
     "confirm_trigger": "Run this task now?",
-    "status_manual_trigger": "Manual"
+    "status_manual_trigger": "Manual",
+    "go_to_session": "Go to session",
+    "go_and_quote": "Go & quote result"
   },
   "fileBrowser": {
     "edit": "Edit",

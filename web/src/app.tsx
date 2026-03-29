@@ -1364,7 +1364,7 @@ export function App() {
   // For sub-sessions: activate parent main session first, then open the sub-session window.
   useEffect(() => {
     const handler = (e: Event) => {
-      const { serverId: sid, session } = (e as CustomEvent).detail ?? {};
+      const { serverId: sid, session, quote } = (e as CustomEvent).detail ?? {};
       if (sid) handleSelectServer(sid);
       if (session) {
         // Check if this is a sub-session (deck_sub_xxx)
@@ -1383,6 +1383,19 @@ export function App() {
         } else {
           localStorage.setItem('rcc_session', session);
           setActiveSession(session);
+        }
+        // Insert quoted text into the session's chat input
+        if (quote && typeof quote === 'string') {
+          setTimeout(() => {
+            const inputEl = inputRefsMap.current.get(session as string);
+            if (!inputEl) return;
+            const quoteLines = (quote as string).trim().split('\n').map((l: string) => `> ${l}`).join('\n');
+            inputEl.textContent = (inputEl.textContent || '') + quoteLines + '\n';
+            inputEl.focus();
+            // Move cursor to end
+            const sel = window.getSelection();
+            if (sel) { sel.selectAllChildren(inputEl); sel.collapseToEnd(); }
+          }, 200);
         }
       }
     };
@@ -2266,6 +2279,9 @@ export function App() {
               sessions={sessions}
               subSessions={subSessionsSlim}
               activeSession={activeSession}
+              onNavigateSession={(sessionName, quote) => {
+                window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: sessionName, quote } }));
+              }}
               onBack={() => setShowCronManager(false)}
               onViewDiscussion={(fileId) => { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); }}
               servers={servers.map(s => ({ id: s.id, name: s.name }))}
