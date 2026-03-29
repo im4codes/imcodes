@@ -11,6 +11,7 @@
  *   That's it — no other files need changing.
  */
 import type { ComponentChildren } from 'preact';
+import type { TFunction } from 'i18next';
 import type { WsClient } from '../ws-client.js';
 import type { PinnedPanel } from '../app.js';
 
@@ -34,6 +35,10 @@ export interface PanelRenderContext {
   onQuote?: (text: string) => void;
   /** Main sessions list — for panels that need session info (e.g., cron manager) */
   sessions?: Array<{ name: string; project: string; role: string; agentType: string; label?: string | null; state: string; runtimeType?: string }>;
+  /** Translation function for panel headers and status copy. */
+  t: TFunction;
+  /** Persist declarative pinned-panel props updates. */
+  updatePanelProps?: (panelId: string, props: Record<string, unknown>) => void;
 }
 
 export interface PanelTypeRegistration {

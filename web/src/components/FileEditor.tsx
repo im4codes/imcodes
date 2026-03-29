@@ -32,6 +32,7 @@ export interface FileEditorProps {
   path: string;
   content: string;
   mtime: number | undefined;
+  onClose: () => void;
   /** Called after successful save with new mtime */
   onSaved: (newMtime: number) => void;
   /** Subscribe to WS messages — returns unsubscribe fn */
@@ -66,7 +67,7 @@ function getLanguageExtension(path: string) {
   }
 }
 
-export function FileEditor({ ws, path, content, mtime, onSaved, onMessage, onDirtyChange }: FileEditorProps) {
+export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessage, onDirtyChange }: FileEditorProps) {
   const { t } = useTranslation();
   const [originalMtime, setOriginalMtime] = useState(mtime);
   const [isDirty, setIsDirty] = useState(false);
@@ -135,6 +136,7 @@ export function FileEditor({ ws, path, content, mtime, onSaved, onMessage, onDir
   return (
     <>
       {/* Toolbar buttons — rendered inline in parent's header */}
+      <button class="fb-diff-toggle" onClick={onClose}>{t('fileBrowser.preview')}</button>
       <button
         class={`fb-diff-toggle fb-save-btn${isDirty ? ' fb-save-dirty' : ''}${saveStatus === 'saving' ? ' fb-save-saving' : ''}`}
         disabled={saveStatus === 'saving' || !isDirty}
@@ -150,7 +152,7 @@ export function FileEditor({ ws, path, content, mtime, onSaved, onMessage, onDir
 }
 
 /** Editor content area — CodeMirror editor + conflict dialog */
-export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage, onDirtyChange }: Omit<FileEditorProps, 'onSaved'> & { onDirtyChange?: (dirty: boolean) => void }) {
+export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage, onDirtyChange }: Omit<FileEditorProps, 'onClose' | 'onSaved'> & { onDirtyChange?: (dirty: boolean) => void }) {
   const { t } = useTranslation();
   const [isDirty, setIsDirty] = useState(false);
   const [conflictData, setConflictData] = useState<{ diskContent: string; diskMtime: number } | null>(null);

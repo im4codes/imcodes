@@ -33,6 +33,30 @@ export function configure(baseUrl: string): void {
   _baseUrl = baseUrl.replace(/\/$/, '');
 }
 
+/** Return the configured API base URL, or the current origin when same-origin. */
+export function getApiBaseUrl(): string {
+  return _baseUrl || window.location.origin;
+}
+
+/** Normalize the initial preview document path so it always starts with `/` and preserves query/hash. */
+export function normalizeLocalWebPreviewPath(path: string): string {
+  const trimmed = path.trim();
+  if (!trimmed) return '/';
+  try {
+    const url = new URL(trimmed, 'http://localhost.invalid/');
+    return `${url.pathname}${url.search}${url.hash}`;
+  } catch {
+    return trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+  }
+}
+
+/** Build the same-origin or absolute proxy URL for a local web preview. */
+export function buildLocalWebPreviewProxyUrl(serverId: string, previewId: string, path = '/'): string {
+  const base = getApiBaseUrl();
+  const normalizedPath = normalizeLocalWebPreviewPath(path);
+  return `${base}/api/server/${encodeURIComponent(serverId)}/local-web/${encodeURIComponent(previewId)}${normalizedPath}`;
+}
+
 /** Register a callback invoked when the session expires and refresh fails. */
 export function onAuthExpired(cb: (reason?: string) => void): void {
   _onAuthExpired = cb;
@@ -178,6 +202,36 @@ async function rawFetch(path: string, opts: RequestInit = {}): Promise<Response>
   // require Access-Control-Allow-Credentials from the server (cross-origin from capacitor://).
   // Web (cookie auth): include credentials so HttpOnly cookies are sent.
   return fetch(`${_baseUrl}${path}`, { ...opts, headers, credentials: _apiKey ? 'omit' : 'include' });
+}
+
+export interface LocalWebPreviewCreateResponse {
+  previewId: string;
+  previewUrl?: string;
+  serverId?: string;
+  port: number;
+  path: string;
+  expiresAt?: string | number | null;
+}
+
+export interface LocalWebPreviewCloseResponse {
+  ok: true;
+}
+
+export async function createLocalWebPreview(
+  serverId: string,
+  port: number,
+  path = '/',
+): Promise<LocalWebPreviewCreateResponse> {
+  return apiFetch(`/api/server/${encodeURIComponent(serverId)}/local-web-preview`, {
+    method: 'POST',
+    body: JSON.stringify({ port, path: normalizeLocalWebPreviewPath(path) }),
+  });
+}
+
+export async function closeLocalWebPreview(serverId: string, previewId: string): Promise<LocalWebPreviewCloseResponse> {
+  return apiFetch(`/api/server/${encodeURIComponent(serverId)}/local-web-preview/${encodeURIComponent(previewId)}`, {
+    method: 'DELETE',
+  });
 }
 
 export async function apiFetch<T = unknown>(

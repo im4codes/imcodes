@@ -1,0 +1,234 @@
+import { Hono } from 'hono';
+import type { Env } from '../env.js';
+import { requireAuth, resolveServerRole } from '../security/authorization.js';
+import { LocalWebPreviewRegistry, normalizeLocalPreviewPath } from '../preview/registry.js';
+import { MemoryRateLimiter } from '../ws/rate-limiter.js';
+import {
+  filterPreviewResponseHeaders,
+  normalizePreviewUpstreamPath,
+  redactPreviewHeaders,
+  rewritePreviewRedirectLocation,
+  rewriteSetCookieHeader,
+  sanitizePreviewRequestHeaders,
+} from '../../../shared/preview-policy.js';
+import {
+  PREVIEW_ERROR,
+  PREVIEW_LIMITS,
+  PREVIEW_MSG,
+  type CreatePreviewRequest,
+} from '../../../shared/preview-types.js';
+import { WsBridge } from '../ws/bridge.js';
+import { randomHex } from '../security/crypto.js';
+import logger from '../util/logger.js';
+import { z } from 'zod';
+
+export const localWebPreviewRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
+
+localWebPreviewRoutes.use('/*', requireAuth());
+
+const createSchema = z.object({
+  port: z.number().int().min(1).max(65535),
+  path: z.string().max(1024).optional(),
+});
+
+const previewRateLimiter = new MemoryRateLimiter();
+
+function getUpstreamPath(url: URL, serverId: string, previewId: string): string {
+  const prefix = `/api/server/${serverId}/local-web/${previewId}`;
+  const pathname = url.pathname.startsWith(prefix) ? url.pathname.slice(prefix.length) || '/' : '/';
+  return normalizePreviewUpstreamPath(`${pathname}${url.search}`);
+}
+
+function getSetCookieValues(headers: Headers): string[] {
+  const withGetSetCookie = headers as Headers & { getSetCookie?: () => string[] };
+  if (typeof withGetSetCookie.getSetCookie === 'function') {
+    return withGetSetCookie.getSetCookie();
+  }
+  if (headers.has('set-cookie')) {
+    logger.warn({}, 'Preview response Set-Cookie stripping fallback triggered; getSetCookie() unavailable');
+  }
+  return [];
+}
+
+localWebPreviewRoutes.post('/:id/local-web-preview', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  if (role === 'none') return c.json({ error: PREVIEW_ERROR.FORBIDDEN }, 403);
+
+  const body = await c.req.json().catch(() => null);
+  const parsed = createSchema.safeParse(body satisfies CreatePreviewRequest | null);
+  if (!parsed.success) return c.json({ error: PREVIEW_ERROR.INVALID_PORT }, 400);
+
+  try {
+    const registry = LocalWebPreviewRegistry.get(serverId);
+    const preview = registry.create(userId, parsed.data.port, normalizeLocalPreviewPath(parsed.data.path));
+    return c.json({
+      ok: true,
+      preview: {
+        id: preview.id,
+        serverId: preview.serverId,
+        port: preview.port,
+        path: preview.path,
+        expiresAt: preview.expiresAt,
+        url: `/api/server/${serverId}/local-web/${preview.id}${preview.path === '/' ? '/' : preview.path}`,
+      },
+    });
+  } catch (err) {
+    if (err instanceof Error && err.message === 'preview_limit_exceeded') {
+      return c.json({ error: PREVIEW_ERROR.LIMIT_EXCEEDED, maxActive: PREVIEW_LIMITS.MAX_ACTIVE_PREVIEWS_PER_USER_PER_SERVER }, 429);
+    }
+    throw err;
+  }
+});
+
+localWebPreviewRoutes.delete('/:id/local-web-preview/:previewId', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  if (role === 'none') return c.json({ error: PREVIEW_ERROR.FORBIDDEN }, 403);
+
+  const ok = LocalWebPreviewRegistry.get(serverId).close(c.req.param('previewId')!, userId);
+  if (!ok) return c.json({ error: PREVIEW_ERROR.PREVIEW_NOT_FOUND }, 404);
+  return c.json({ ok: true });
+});
+
+localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const previewId = c.req.param('previewId')!;
+  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  if (role === 'none') return c.json({ error: PREVIEW_ERROR.FORBIDDEN }, 403);
+
+  const rateKey = `${serverId}:${userId}`;
+  if (!previewRateLimiter.check(rateKey, PREVIEW_LIMITS.MAX_REQUESTS_PER_WINDOW, PREVIEW_LIMITS.REQUEST_RATE_WINDOW_MS)) {
+    return c.json({ error: PREVIEW_ERROR.LIMIT_EXCEEDED }, 429);
+  }
+
+  const preview = LocalWebPreviewRegistry.get(serverId).get(previewId);
+  if (!preview) return c.json({ error: PREVIEW_ERROR.PREVIEW_EXPIRED }, 404);
+  if (preview.userId !== userId) return c.json({ error: PREVIEW_ERROR.FORBIDDEN }, 403);
+
+  const bridge = WsBridge.get(serverId);
+  if (!bridge.isDaemonConnected()) {
+    return c.json({ error: PREVIEW_ERROR.DAEMON_OFFLINE }, 503);
+  }
+
+  const requestId = randomHex(16);
+  const requestUrl = new URL(c.req.url);
+  const upstreamPath = getUpstreamPath(requestUrl, serverId, previewId);
+  const sanitizedHeaders = sanitizePreviewRequestHeaders(c.req.raw.headers, previewId);
+  const hasBody = !['GET', 'HEAD'].includes(c.req.method) && c.req.raw.body !== null;
+  const relay = bridge.createPreviewRelay(requestId, PREVIEW_LIMITS.REQUEST_TIMEOUT_MS);
+
+  c.req.raw.signal.addEventListener('abort', () => {
+    relay.abort('browser_disconnect');
+  }, { once: true });
+
+  logger.info({
+    serverId,
+    previewId,
+    requestId,
+    method: c.req.method,
+    path: upstreamPath,
+    headers: redactPreviewHeaders(sanitizedHeaders),
+  }, 'Preview proxy request');
+
+  try {
+    bridge.sendPreviewControl({
+      type: PREVIEW_MSG.REQUEST,
+      requestId,
+      previewId,
+      port: preview.port,
+      method: c.req.method,
+      path: upstreamPath,
+      headers: sanitizedHeaders,
+      hasBody,
+    });
+
+    let requestBytes = 0;
+    if (hasBody && c.req.raw.body) {
+      const reader = c.req.raw.body.getReader();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          requestBytes += value.byteLength;
+          if (requestBytes > PREVIEW_LIMITS.MAX_REQUEST_BYTES) {
+            relay.abort(PREVIEW_ERROR.LIMIT_EXCEEDED);
+            return c.json({ error: PREVIEW_ERROR.LIMIT_EXCEEDED }, 413);
+          }
+          bridge.sendPreviewRequestBodyChunk(requestId, value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    }
+
+    bridge.sendPreviewControl({ type: PREVIEW_MSG.REQUEST_END, requestId });
+
+    const started = await relay.start;
+    const upstreamHeaders = new Headers();
+    for (const [name, value] of Object.entries(started.headers)) {
+      if (Array.isArray(value)) {
+        for (const item of value) upstreamHeaders.append(name, item);
+      } else {
+        upstreamHeaders.append(name, value);
+      }
+    }
+
+    const location = upstreamHeaders.get('location');
+    if (location) {
+      const rewritten = rewritePreviewRedirectLocation({
+        location,
+        serverId,
+        previewId,
+        port: preview.port,
+      });
+      if (!rewritten) {
+        relay.abort(PREVIEW_ERROR.UPSTREAM_ERROR);
+        return c.json({ error: PREVIEW_ERROR.UPSTREAM_ERROR, message: 'preview redirect rejected' }, 502);
+      }
+      upstreamHeaders.set('location', rewritten);
+    }
+
+    const responseHeaders = filterPreviewResponseHeaders(upstreamHeaders);
+    for (const header of getSetCookieValues(upstreamHeaders)) {
+      const rewritten = rewriteSetCookieHeader({ previewId, serverId, header });
+      if (rewritten) responseHeaders.append('Set-Cookie', rewritten);
+    }
+
+    logger.info({
+      serverId,
+      previewId,
+      requestId,
+      status: started.status,
+      headers: (() => {
+        const loggedHeaders: Record<string, string> = {};
+        responseHeaders.forEach((value, name) => {
+          loggedHeaders[name] = value;
+        });
+        return redactPreviewHeaders(loggedHeaders);
+      })(),
+    }, 'Preview proxy response');
+
+    return new Response(started.body, {
+      status: started.status,
+      statusText: started.statusText,
+      headers: responseHeaders,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message === PREVIEW_ERROR.LIMIT_EXCEEDED) return c.json({ error: PREVIEW_ERROR.LIMIT_EXCEEDED }, 413);
+    if (message === PREVIEW_ERROR.TIMEOUT) return c.json({ error: PREVIEW_ERROR.TIMEOUT }, 504);
+    if (message === PREVIEW_ERROR.UPSTREAM_UNREACHABLE) return c.json({ error: PREVIEW_ERROR.UPSTREAM_UNREACHABLE }, 502);
+    if (message === PREVIEW_ERROR.DAEMON_OFFLINE || message === 'daemon_disconnected' || message === 'daemon_error') {
+      return c.json({ error: PREVIEW_ERROR.DAEMON_OFFLINE }, 503);
+    }
+    if (message === PREVIEW_ERROR.ABORTED || message === 'browser_disconnect') {
+      return new Response(null, { status: 499 });
+    }
+    logger.warn({ serverId, previewId, requestId, err }, 'Preview proxy failed');
+    return c.json({ error: PREVIEW_ERROR.UPSTREAM_ERROR }, 502);
+  }
+});

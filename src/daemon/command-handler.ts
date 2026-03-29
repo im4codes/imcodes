@@ -79,6 +79,8 @@ import { handleRepoCommand } from './repo-handler.js';
 import { handleFileUpload, handleFileDownload, initFileTransfer, startCleanupTimer, createProjectFileHandle, lookupAttachment } from './file-transfer-handler.js';
 import { FILE_TRANSFER_LIMITS } from '../shared/transport/file-transfer.js';
 import { REPO_MSG } from '../shared/repo-types.js';
+import { handlePreviewCommand } from './preview-relay.js';
+import { PREVIEW_MSG } from '../../shared/preview-types.js';
 
 // ── Common MIME map for file metadata ────────────────────────────────────────
 
@@ -455,6 +457,11 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       break;
     case CRON_MSG.DISPATCH:
       void executeCronJob(cmd as unknown as import('../../shared/cron-types.js').CronDispatchMessage, serverLink);
+      break;
+    case PREVIEW_MSG.REQUEST:
+    case PREVIEW_MSG.REQUEST_END:
+    case PREVIEW_MSG.ABORT:
+      if (handlePreviewCommand(cmd, serverLink)) break;
       break;
     case 'auth_ok':
     case 'heartbeat':

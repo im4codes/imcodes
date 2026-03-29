@@ -11,17 +11,18 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, act, cleanup } from '@testing-library/preact';
 
-// Mock heavy lazy-loaded subcomponents to prevent OOM in jsdom.
-// FilePreviewPane imports hljs (20 language grammars) + marked — the real OOM source.
-// FileEditor imports CodeMirror. Neither is needed for tree/selection tests.
-vi.mock('../../src/components/FilePreviewPane.js', () => ({
-  FilePreviewPane: () => null,
-  default: () => null,
-}));
+// Mock FileEditor.js to prevent Vitest's SSR module graph from evaluating
+// 17 CodeMirror/Lezer imports (causes OOM in jsdom). vi.mock is hoisted but
+// Vitest still resolves the module graph for dependency analysis — this mock
+// ensures the heavy module is replaced before evaluation.
 vi.mock('../../src/components/FileEditor.js', () => ({
   FileEditor: () => null,
   FileEditorContent: () => null,
-  default: () => null,
+}));
+// Mock the lazy wrapper that imports FileEditor.
+vi.mock('../../src/components/file-editor-lazy.js', () => ({
+  FileEditor: () => null,
+  FileEditorContent: () => null,
 }));
 
 import { FileBrowser } from '../../src/components/FileBrowser.js';
@@ -31,24 +32,27 @@ import type { WsClient, ServerMessage } from '../../src/ws-client.js';
 afterEach(cleanup);
 
 // ── i18n stub ─────────────────────────────────────────────────────────────
-vi.mock('react-i18next', () => ({
-  useTranslation: () => ({
-    t: (key: string, opts?: Record<string, unknown>) => {
-      const map: Record<string, string> = {
-        'file_browser.title_dir': 'Select Directory',
-        'file_browser.title_file': 'Select Files',
-        'file_browser.select': 'Select',
-        'file_browser.insert': `Insert ${opts?.count ?? 0}`,
-        'file_browser.browse': 'Browse',
-        'file_browser.show_hidden': 'Hidden',
-        'file_browser.selected_count': `${opts?.count ?? 0} selected`,
-        'file_browser.timeout': 'Request timed out',
-        'common.cancel': 'Cancel',
-      };
-      return map[key] ?? key;
-    },
-  }),
-}));
+vi.mock('react-i18next', () => {
+  // t must be reference-stable — a new function ref each render causes
+  // fetchPreview to be recreated, triggering infinite re-renders via
+  // the autoPreviewPath useEffect.
+  const map: Record<string, string> = {
+    'file_browser.title_dir': 'Select Directory',
+    'file_browser.title_file': 'Select Files',
+    'file_browser.select': 'Select',
+    'file_browser.browse': 'Browse',
+    'file_browser.show_hidden': 'Hidden',
+    'file_browser.timeout': 'Request timed out',
+    'common.cancel': 'Cancel',
+  };
+  const t = (key: string, opts?: Record<string, unknown>) => {
+    if (key === 'file_browser.insert') return `Insert ${opts?.count ?? 0}`;
+    if (key === 'file_browser.selected_count') return `${opts?.count ?? 0} selected`;
+    return map[key] ?? key;
+  };
+  const translation = { t };
+  return { useTranslation: () => translation };
+});
 
 // ── WsClient factory ──────────────────────────────────────────────────────
 

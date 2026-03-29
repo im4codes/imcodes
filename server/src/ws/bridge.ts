@@ -18,6 +18,17 @@ import { MemoryRateLimiter } from './rate-limiter.js';
 import { sha256Hex } from '../security/crypto.js';
 import { REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
+import {
+  PREVIEW_BINARY_FRAME,
+  PREVIEW_ERROR,
+  PREVIEW_LIMITS,
+  PREVIEW_MSG,
+  PREVIEW_TERMINAL_OUTCOME,
+  packPreviewBinaryFrame,
+  parsePreviewBinaryFrame,
+  type PreviewErrorMessage,
+  type PreviewResponseStartMessage,
+} from '../../../shared/preview-types.js';
 import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions } from '../db/queries.js';
 import logger from '../util/logger.js';
 
@@ -98,6 +109,23 @@ function parseRawFrameSession(data: Buffer): string | null {
   return data.subarray(3, 3 + nameLen).toString('utf8');
 }
 
+type PreviewStartPayload = {
+  status: number;
+  statusText?: string;
+  headers: Record<string, string | string[]>;
+};
+
+type PendingPreviewRequest = {
+  readable: ReadableStream<Uint8Array>;
+  controller: ReadableStreamDefaultController<Uint8Array> | null;
+  started: boolean;
+  terminalOutcome: string | null;
+  responseBytes: number;
+  timer: ReturnType<typeof setTimeout>;
+  resolveStart: (payload: PreviewStartPayload) => void;
+  rejectStart: (err: Error) => void;
+};
+
 // ── WsBridge ─────────────────────────────────────────────────────────────────
 
 export class WsBridge {
@@ -161,6 +189,8 @@ export class WsBridge {
     reject: (err: Error) => void;
     timer: ReturnType<typeof setTimeout>;
   }>();
+
+  private pendingPreviewRequests = new Map<string, PendingPreviewRequest>();
 
   /**
    * Per-session daemon subscription reference count.
@@ -330,6 +360,7 @@ export class WsBridge {
         this.daemonWs = null;
         this.authenticated = false;
         this.rejectAllPendingFileTransfers('daemon_disconnected');
+        this.rejectAllPendingPreviewRequests('daemon_disconnected');
         // Clear provider statuses — daemon is gone, providers are unreachable
         for (const [providerId] of this.providerStatus) {
           this.broadcastToBrowsers(JSON.stringify({ type: TRANSPORT_MSG.PROVIDER_STATUS, providerId, connected: false }));
@@ -347,6 +378,7 @@ export class WsBridge {
     ws.on('error', (err) => {
       logger.error({ serverId: this.serverId, err }, 'Daemon WS error');
       this.rejectAllPendingFileTransfers('daemon_error');
+      this.rejectAllPendingPreviewRequests('daemon_error');
     });
   }
 
@@ -503,6 +535,21 @@ export class WsBridge {
    */
   private relayToBrowsers(msg: Record<string, unknown>): void {
     const type = msg.type as string;
+
+    if (type === PREVIEW_MSG.RESPONSE_START) {
+      this.resolvePreviewStart(msg as unknown as PreviewResponseStartMessage);
+      return;
+    }
+
+    if (type === PREVIEW_MSG.RESPONSE_END) {
+      this.completePreviewRequest((msg.requestId as string | undefined) ?? '', PREVIEW_TERMINAL_OUTCOME.RESPONSE_END);
+      return;
+    }
+
+    if (type === PREVIEW_MSG.ERROR) {
+      this.failPreviewRequest(msg as unknown as PreviewErrorMessage);
+      return;
+    }
 
     // ── fs.ls_response: single-cast back to requesting browser ────────────────
     if (type === 'fs.ls_response') {
@@ -916,6 +963,12 @@ export class WsBridge {
   }
 
   private routeBinaryFrame(data: Buffer): void {
+    const previewFrame = parsePreviewBinaryFrame(data);
+    if (previewFrame && previewFrame.frameType === PREVIEW_BINARY_FRAME.RESPONSE_BODY) {
+      this.pushPreviewResponseChunk(previewFrame.requestId, previewFrame.payload);
+      return;
+    }
+
     const sessionName = parseRawFrameSession(data);
     if (!sessionName) {
       logger.warn({ serverId: this.serverId }, 'Binary frame: invalid v1 header');
@@ -1099,6 +1152,69 @@ export class WsBridge {
     }
   }
 
+  createPreviewRelay(requestId: string, timeoutMs = PREVIEW_LIMITS.REQUEST_TIMEOUT_MS): {
+    start: Promise<PreviewStartPayload & { body: ReadableStream<Uint8Array> }>;
+    abort: (reason?: string) => void;
+  } {
+    if (!this.isDaemonConnected()) {
+      throw new Error(PREVIEW_ERROR.DAEMON_OFFLINE);
+    }
+
+    let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
+    let resolveStart!: (payload: PreviewStartPayload & { body: ReadableStream<Uint8Array> }) => void;
+    let rejectStart!: (err: Error) => void;
+
+    const readable = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        controllerRef = controller;
+      },
+      cancel: () => {
+        this.abortPreviewRequest(requestId, PREVIEW_ERROR.ABORTED, true);
+      },
+    });
+
+    const start = new Promise<PreviewStartPayload & { body: ReadableStream<Uint8Array> }>((resolve, reject) => {
+      resolveStart = resolve;
+      rejectStart = reject;
+    });
+
+    const timer = setTimeout(() => {
+      this.failPreviewRequest({
+        type: PREVIEW_MSG.ERROR,
+        requestId,
+        code: PREVIEW_ERROR.TIMEOUT,
+        message: 'preview relay timeout',
+        terminalOutcome: PREVIEW_TERMINAL_OUTCOME.TIMEOUT,
+      });
+      this.sendPreviewControl({ type: PREVIEW_MSG.ABORT, requestId, reason: PREVIEW_ERROR.TIMEOUT });
+    }, timeoutMs);
+
+    this.pendingPreviewRequests.set(requestId, {
+      readable,
+      controller: controllerRef,
+      started: false,
+      terminalOutcome: null,
+      responseBytes: 0,
+      timer,
+      resolveStart: (payload) => resolveStart({ ...payload, body: readable }),
+      rejectStart,
+    });
+
+    return {
+      start,
+      abort: (reason) => this.abortPreviewRequest(requestId, reason ?? PREVIEW_ERROR.ABORTED, true),
+    };
+  }
+
+  sendPreviewControl(message: Record<string, unknown>): void {
+    this.sendToDaemon(JSON.stringify(message));
+  }
+
+  sendPreviewRequestBodyChunk(requestId: string, payload: Uint8Array): void {
+    if (!this.daemonWs || !this.authenticated) throw new Error(PREVIEW_ERROR.DAEMON_OFFLINE);
+    this.daemonWs.send(packPreviewBinaryFrame(PREVIEW_BINARY_FRAME.REQUEST_BODY, requestId, payload));
+  }
+
   // ── File transfer correlation ──────────────────────────────────────────────
 
   /** Returns true if the daemon WebSocket is connected and authenticated. */
@@ -1154,6 +1270,96 @@ export class WsBridge {
     this.pendingFileTransfers.delete(requestId);
     pending.resolve(msg);
     return true;
+  }
+
+  private resolvePreviewStart(msg: PreviewResponseStartMessage): void {
+    const pending = this.pendingPreviewRequests.get(msg.requestId);
+    if (!pending || pending.terminalOutcome) return;
+    if (pending.started) return;
+    pending.started = true;
+    pending.resolveStart({
+      status: msg.status,
+      statusText: msg.statusText,
+      headers: msg.headers,
+    });
+  }
+
+  private pushPreviewResponseChunk(requestId: string, chunk: Buffer): void {
+    const pending = this.pendingPreviewRequests.get(requestId);
+    if (!pending || pending.terminalOutcome) return;
+    if (!pending.started || !pending.controller) {
+      this.failPreviewRequest({
+        type: PREVIEW_MSG.ERROR,
+        requestId,
+        code: PREVIEW_ERROR.INVALID_REQUEST,
+        message: 'preview response body arrived before response start',
+        terminalOutcome: PREVIEW_TERMINAL_OUTCOME.ERROR,
+      });
+      return;
+    }
+
+    pending.responseBytes += chunk.length;
+    if (pending.responseBytes > PREVIEW_LIMITS.MAX_RESPONSE_BYTES) {
+      this.failPreviewRequest({
+        type: PREVIEW_MSG.ERROR,
+        requestId,
+        code: PREVIEW_ERROR.LIMIT_EXCEEDED,
+        message: 'preview response exceeded max bytes',
+        terminalOutcome: PREVIEW_TERMINAL_OUTCOME.LIMIT_EXCEEDED,
+      });
+      this.sendPreviewControl({ type: PREVIEW_MSG.ABORT, requestId, reason: PREVIEW_ERROR.LIMIT_EXCEEDED });
+      return;
+    }
+
+    pending.controller.enqueue(chunk);
+  }
+
+  private completePreviewRequest(requestId: string, outcome: string): void {
+    const pending = this.pendingPreviewRequests.get(requestId);
+    if (!pending || pending.terminalOutcome) return;
+    pending.terminalOutcome = outcome;
+    clearTimeout(pending.timer);
+    if (!pending.started) {
+      pending.rejectStart(new Error(outcome));
+    } else {
+      pending.controller?.close();
+    }
+    this.pendingPreviewRequests.delete(requestId);
+  }
+
+  private failPreviewRequest(msg: PreviewErrorMessage): void {
+    const pending = this.pendingPreviewRequests.get(msg.requestId);
+    if (!pending || pending.terminalOutcome) return;
+    pending.terminalOutcome = msg.terminalOutcome ?? PREVIEW_TERMINAL_OUTCOME.ERROR;
+    clearTimeout(pending.timer);
+    const error = new Error(msg.message || msg.code);
+    if (!pending.started) pending.rejectStart(error);
+    else pending.controller?.error(error);
+    this.pendingPreviewRequests.delete(msg.requestId);
+    logger.warn({
+      serverId: this.serverId,
+      requestId: msg.requestId,
+      code: msg.code,
+      message: msg.message,
+    }, 'Preview relay failed');
+  }
+
+  private abortPreviewRequest(requestId: string, reason: string, propagate: boolean): void {
+    const pending = this.pendingPreviewRequests.get(requestId);
+    if (!pending || pending.terminalOutcome) return;
+    pending.terminalOutcome = PREVIEW_TERMINAL_OUTCOME.ABORTED;
+    clearTimeout(pending.timer);
+    const error = new Error(reason);
+    if (!pending.started) pending.rejectStart(error);
+    else pending.controller?.error(error);
+    this.pendingPreviewRequests.delete(requestId);
+    if (propagate) this.sendPreviewControl({ type: PREVIEW_MSG.ABORT, requestId, reason });
+  }
+
+  private rejectAllPendingPreviewRequests(reason: string): void {
+    for (const requestId of this.pendingPreviewRequests.keys()) {
+      this.abortPreviewRequest(requestId, reason, false);
+    }
   }
 
   // ── Push notifications ──────────────────────────────────────────────────────

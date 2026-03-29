@@ -442,6 +442,23 @@
     "collapse_all": "全部折叠",
     "drag_to_resize": "拖动调整宽度"
   },
+  "localWebPreview": {
+    "title": "本地网页预览",
+    "port": "端口",
+    "path": "路径",
+    "open": "打开",
+    "refresh": "刷新",
+    "openInNewTab": "在新标签页打开",
+    "closePreview": "关闭预览",
+    "sandboxNote": "预览在受 sandbox 限制的 iframe 中运行。某些应用在新标签页中效果更好。",
+    "invalidPort": "请输入 1 到 65535 之间的端口。",
+    "openFailed": "打开本地预览失败。",
+    "opening": "正在打开预览…",
+    "empty": "输入本机端口和路径后即可打开预览。",
+    "noServer": "请先选择一个服务器。",
+    "previewing": "预览中：",
+    "initialPathNote": "这个路径只决定初始打开页面；加载后，后续导航按端口范围处理，而不是按这个路径限制。"
+  },
   "cron": {
     "title": "定时任务",
     "create": "新建任务",

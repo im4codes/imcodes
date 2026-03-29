@@ -442,6 +442,23 @@
     "collapse_all": "全部折疊",
     "drag_to_resize": "拖動調整寬度"
   },
+  "localWebPreview": {
+    "title": "本機網頁預覽",
+    "port": "連接埠",
+    "path": "路徑",
+    "open": "開啟",
+    "refresh": "重新整理",
+    "openInNewTab": "在新分頁開啟",
+    "closePreview": "關閉預覽",
+    "sandboxNote": "預覽會在受 sandbox 限制的 iframe 中執行。某些應用在新分頁中效果更好。",
+    "invalidPort": "請輸入 1 到 65535 之間的連接埠。",
+    "openFailed": "開啟本機預覽失敗。",
+    "opening": "正在開啟預覽…",
+    "empty": "輸入本機連接埠與路徑後即可開啟預覽。",
+    "noServer": "請先選擇伺服器。",
+    "previewing": "預覽中：",
+    "initialPathNote": "這個路徑只決定初始開啟頁面；載入後，後續導覽是依埠範圍處理，而不是依這個路徑限制。"
+  },
   "cron": {
     "title": "排程任務",
     "create": "新增任務",

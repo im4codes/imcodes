@@ -442,6 +442,23 @@
     "collapse_all": "모두 접기",
     "drag_to_resize": "드래그하여 크기 조절"
   },
+  "localWebPreview": {
+    "title": "로컬 웹 미리보기",
+    "port": "포트",
+    "path": "경로",
+    "open": "열기",
+    "refresh": "새로고침",
+    "openInNewTab": "새 탭에서 열기",
+    "closePreview": "미리보기 닫기",
+    "sandboxNote": "미리보기는 sandbox가 적용된 iframe에서 실행됩니다. 일부 앱은 새 탭에서 더 잘 동작합니다.",
+    "invalidPort": "1에서 65535 사이의 포트를 입력하세요.",
+    "openFailed": "로컬 미리보기를 열지 못했습니다.",
+    "opening": "미리보기를 여는 중…",
+    "empty": "로컬 포트와 경로를 입력한 다음 미리보기를 여세요.",
+    "noServer": "먼저 서버를 선택하세요.",
+    "previewing": "미리보기 중：",
+    "initialPathNote": "이 경로는 처음 여는 페이지만 지정합니다. 로드 후 탐색 범위는 이 경로가 아니라 포트 기준입니다."
+  },
   "cron": {
     "title": "예약 작업",
     "create": "새 작업",

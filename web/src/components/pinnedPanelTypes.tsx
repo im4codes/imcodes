@@ -8,10 +8,13 @@ import { TerminalView } from './TerminalView.js';
 import { FileBrowser } from './FileBrowser.js';
 import { RepoPage } from '../pages/RepoPage.js';
 import { CronManager } from '../pages/CronManager.js';
+import { LocalWebPreviewPanel } from './LocalWebPreviewPanel.js';
 import { useTimeline } from '../hooks/useTimeline.js';
 import { useTranslation } from 'react-i18next';
 import type { PinnedPanel } from '../app.js';
 import type { PanelRenderContext } from './PinnedPanelRegistry.js';
+
+export const LOCAL_WEB_PREVIEW_PANEL_TYPE = 'localwebpreview';
 
 // ── Sub-session panel ────────────────────────────────────────────────────
 
@@ -147,6 +150,37 @@ registerPanelType('cronmanager', {
         subSessions={subSessionsSlim}
         activeSession={ctx.activeSession}
         onBack={() => {}}
+      />
+    );
+  },
+});
+
+// ── Local web preview panel ──────────────────────────────────────────────
+
+registerPanelType(LOCAL_WEB_PREVIEW_PANEL_TYPE, {
+  title: (panel, ctx) => {
+    const port = panel.props?.port as string | number | undefined;
+    const path = (panel.props?.path as string | undefined)?.trim() || '/';
+    const suffix = path && path !== '/' ? `${port ? `:${port}` : ''}${path}` : (port ? `:${port}` : '');
+    const label = ctx?.t('localWebPreview.title') ?? 'Local Web Preview';
+    return `🌐 ${label}${suffix}`;
+  },
+  render: (panel, ctx) => {
+    const serverId = (panel.props?.serverId as string | undefined) ?? ctx.serverId;
+    if (!serverId) return <div class="sidebar-pinned-unavailable">No server selected</div>;
+    return (
+      <LocalWebPreviewPanel
+        serverId={serverId}
+        port={panel.props?.port as string | number | undefined}
+        path={panel.props?.path as string | undefined}
+        onDraftChange={({ port, path }) => {
+          ctx.updatePanelProps?.(panel.id, {
+            ...panel.props,
+            serverId,
+            port,
+            path,
+          });
+        }}
       />
     );
   },

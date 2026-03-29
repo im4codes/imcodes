@@ -442,6 +442,23 @@
     "collapse_all": "Contraer todo",
     "drag_to_resize": "Arrastra para cambiar el tamaño"
   },
+  "localWebPreview": {
+    "title": "Vista previa web local",
+    "port": "Puerto",
+    "path": "Ruta",
+    "open": "Abrir",
+    "refresh": "Actualizar",
+    "openInNewTab": "Abrir en una nueva pestaña",
+    "closePreview": "Cerrar vista previa",
+    "sandboxNote": "La vista previa se ejecuta en un iframe con sandbox. Algunas apps funcionan mejor en una pestaña nueva.",
+    "invalidPort": "Introduce un puerto entre 1 y 65535.",
+    "openFailed": "No se pudo abrir la vista previa local.",
+    "opening": "Abriendo vista previa…",
+    "empty": "Introduce un puerto local y una ruta, luego abre la vista previa.",
+    "noServer": "Selecciona primero un servidor.",
+    "previewing": "Vista previa:",
+    "initialPathNote": "La ruta solo establece la página inicial. Después de cargar, la navegación queda limitada por el puerto, no por esta ruta."
+  },
   "cron": {
     "title": "Tareas programadas",
     "create": "Nueva tarea",

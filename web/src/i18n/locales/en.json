@@ -442,6 +442,23 @@
     "collapse_all": "Collapse all",
     "drag_to_resize": "Drag to resize"
   },
+  "localWebPreview": {
+    "title": "Local Web Preview",
+    "port": "Port",
+    "path": "Path",
+    "open": "Open",
+    "refresh": "Refresh",
+    "openInNewTab": "Open in new tab",
+    "closePreview": "Close preview",
+    "sandboxNote": "The preview runs in a sandboxed iframe. Some apps may work better in a new tab.",
+    "invalidPort": "Enter a port between 1 and 65535.",
+    "openFailed": "Failed to open local preview.",
+    "opening": "Opening preview…",
+    "empty": "Enter a localhost port and path, then open the preview.",
+    "noServer": "Select a server first.",
+    "previewing": "Previewing:",
+    "initialPathNote": "Path sets only the initial page. After load, navigation is scoped by port, not by this path."
+  },
   "cron": {
     "title": "Scheduled Tasks",
     "create": "New Task",

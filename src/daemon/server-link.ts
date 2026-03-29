@@ -30,10 +30,12 @@ export interface ServerLinkOpts {
 }
 
 export type MessageHandler = (msg: unknown) => void;
+export type BinaryMessageHandler = (data: Buffer) => void;
 
 export class ServerLink {
   private ws: WebSocket | null = null;
   private handlers: MessageHandler[] = [];
+  private binaryHandlers: BinaryMessageHandler[] = [];
   private heartbeatTimer?: ReturnType<typeof setInterval>;
   private statsTimer?: ReturnType<typeof setInterval>;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
@@ -101,9 +103,13 @@ export class ServerLink {
     ws.addEventListener('message', (event: MessageEvent) => {
       if (this.ws !== ws) return; // stale socket
       this.lastPong = Date.now();
-      const raw = typeof event.data === 'string' ? event.data : event.data.toString();
+      if (typeof event.data !== 'string') {
+        const buffer = Buffer.isBuffer(event.data) ? event.data : Buffer.from(event.data as ArrayBuffer);
+        for (const h of this.binaryHandlers) h(buffer);
+        return;
+      }
       try {
-        const msg = JSON.parse(raw);
+        const msg = JSON.parse(event.data);
         for (const h of this.handlers) h(msg);
       } catch {
         // ignore parse errors
@@ -149,6 +155,10 @@ export class ServerLink {
 
   onMessage(handler: MessageHandler): void {
     this.handlers.push(handler);
+  }
+
+  onBinaryMessage(handler: BinaryMessageHandler): void {
+    this.binaryHandlers.push(handler);
   }
 
   disconnect(): void {

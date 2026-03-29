@@ -8,6 +8,7 @@ import { ServerLink } from './server-link.js';
 import { handleWebCommand, setRouterContext } from './command-handler.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
 import { notifySessionIdle, listP2pRuns } from './p2p-orchestrator.js';
+import { handlePreviewBinaryFrame } from './preview-relay.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { timelineStore } from './timeline-store.js';
 import { startHookServer } from './hook-server.js';
@@ -243,6 +244,9 @@ export async function startup(): Promise<DaemonContext> {
     serverLink = new ServerLink({ workerUrl: workerUrl!, serverId, token });
     serverLink.onMessage((msg) => {
       handleWebCommand(msg, serverLink!);
+    });
+    serverLink.onBinaryMessage((data) => {
+      handlePreviewBinaryFrame(data, serverLink!);
     });
     serverLink.connect();
 

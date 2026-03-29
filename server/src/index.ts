@@ -36,6 +36,7 @@ import { discussionRoutes } from './routes/discussions.js';
 import { preferencesRoutes } from './routes/preferences.js';
 import { fileTransferRoutes } from './routes/file-transfer.js';
 import { passkeyRoutes } from './routes/passkey-auth.js';
+import { localWebPreviewRoutes } from './routes/local-web-preview.js';
 import { healthCheckCron } from './cron/health-check.js';
 import { jobDispatchCron } from './cron/job-dispatch.js';
 import { WsBridge } from './ws/bridge.js';
@@ -154,6 +155,7 @@ export function buildApp(env: Env) {
   app.route('/api/server', subSessionRoutes);
   app.route('/api/server', discussionRoutes);
   app.route('/api/server', fileTransferRoutes);
+  app.route('/api/server', localWebPreviewRoutes);
   app.route('/api/preferences', preferencesRoutes);
   app.route('/api/auth/passkey', passkeyRoutes);
   app.route('/api/admin', adminRoutes);

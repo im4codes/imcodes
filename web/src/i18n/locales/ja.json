@@ -442,6 +442,23 @@
     "collapse_all": "すべて折りたたむ",
     "drag_to_resize": "ドラッグしてサイズ変更"
   },
+  "localWebPreview": {
+    "title": "ローカルWebプレビュー",
+    "port": "ポート",
+    "path": "パス",
+    "open": "開く",
+    "refresh": "更新",
+    "openInNewTab": "新しいタブで開く",
+    "closePreview": "プレビューを閉じる",
+    "sandboxNote": "プレビューは sandbox 制限付き iframe で実行されます。一部のアプリは新しいタブのほうが適しています。",
+    "invalidPort": "1 から 65535 の間のポートを入力してください。",
+    "openFailed": "ローカルプレビューを開けませんでした。",
+    "opening": "プレビューを開いています…",
+    "empty": "ローカルポートとパスを入力してからプレビューを開いてください。",
+    "noServer": "先にサーバーを選択してください。",
+    "previewing": "プレビュー中：",
+    "initialPathNote": "このパスは最初に開くページだけを指定します。読み込み後の移動範囲はこのパスではなくポート単位です。"
+  },
   "cron": {
     "title": "スケジュールタスク",
     "create": "新規タスク",

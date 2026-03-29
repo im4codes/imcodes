@@ -42,12 +42,14 @@ import { useUnreadCounts } from './hooks/useUnreadCounts.js';
 import { SidebarPinnedPanel } from './components/SidebarPinnedPanel.js';
 import type { PanelRenderContext } from './components/PinnedPanelRegistry.js';
 import './components/pinnedPanelTypes.js'; // register all panel types
+import { LOCAL_WEB_PREVIEW_PANEL_TYPE } from './components/pinnedPanelTypes.js';
+import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
 import { useSubSessions } from './hooks/useSubSessions.js';
 import { useProviderStatus } from './hooks/useProviderStatus.js';
 // useSwipeBack now handled inside FloatingPanel for discussion/repo pages
 import { WsClient } from './ws-client.js';
-import { configure as configureApi, apiFetch, onAuthExpired, getUserPref, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe } from './api.js';
+import { configure as configureApi, apiFetch, onAuthExpired, getUserPref, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, normalizeLocalWebPreviewPath } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { getAuthKey, clearAuthKey } from './biometric-auth.js';
 import { initPushNotifications } from './push-notifications.js';
@@ -130,6 +132,9 @@ export function App() {
     });
   }, []);
   const [showDesktopFileBrowser, setShowDesktopFileBrowser] = useState(false);
+  const [showDesktopLocalWebPreview, setShowDesktopLocalWebPreview] = useState(false);
+  const [localWebPreviewPort, setLocalWebPreviewPort] = useState('');
+  const [localWebPreviewPath, setLocalWebPreviewPath] = useState('/');
   const [gitChangesCount, setGitChangesCount] = useState(0);
   // File browser geometry now managed by FloatingPanel (id="filebrowser")
   const [serverCtxMenu, setServerCtxMenu] = useState<{ server: ServerInfo; x: number; y: number } | null>(null);
@@ -642,12 +647,20 @@ export function App() {
 
   /** Generic pin: close the source floating window + add to sidebar pinnedPanels. */
   const pinPanel = useCallback((type: string, props: Record<string, unknown>, closeSource?: () => void) => {
-    const id = `${type}:${props.sessionName ?? Date.now()}`;
+    const id = type === LOCAL_WEB_PREVIEW_PANEL_TYPE
+      ? `${type}:${props.serverId ?? selectedServerId ?? ''}:${props.port ?? ''}:${String(props.path ?? '/')}`
+      : `${type}:${props.sessionName ?? Date.now()}`;
     closeSource?.();
     setPinnedPanels((prev) => {
       if (prev.some((p) => p.id === id)) return prev;
       return [...prev, { id, type, props }];
     });
+  }, [selectedServerId, setPinnedPanels]);
+
+  const updatePinnedPanelProps = useCallback((panelId: string, props: Record<string, unknown>) => {
+    setPinnedPanels((prev) => prev.map((panel) => (
+      panel.id === panelId ? { ...panel, props } : panel
+    )));
   }, [setPinnedPanels]);
 
   /** Generic unpin: remove from pinnedPanels + reopen the source floating window. */
@@ -660,6 +673,10 @@ export function App() {
       setShowRepoPage(true);
     } else if (panel.type === 'cronmanager') {
       setShowCronManager(true);
+    } else if (panel.type === LOCAL_WEB_PREVIEW_PANEL_TYPE) {
+      setLocalWebPreviewPort(String(panel.props?.port ?? ''));
+      setLocalWebPreviewPath(String(panel.props?.path ?? '/'));
+      setShowDesktopLocalWebPreview(true);
     } else if (panel.type === 'subsession') {
       const sub = subSessions.find((s) => s.sessionName === (panel.props?.sessionName as string));
       if (sub) {
@@ -1446,6 +1463,15 @@ export function App() {
     subSessions.map(s => ({ id: s.id, sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, cwd: s.cwd, parentSession: s.parentSession })),
     [subSessions]
   );
+  const visiblePinnedPanels = useMemo(() =>
+    pinnedPanels.filter((p) => (
+      p.id
+      && p.props
+      && (p.type !== 'subsession' || !p.props.serverId || p.props.serverId === selectedServerId)
+      && (p.type !== LOCAL_WEB_PREVIEW_PANEL_TYPE || !p.props.serverId || p.props.serverId === selectedServerId)
+    )),
+    [pinnedPanels, selectedServerId]
+  );
 
   // Auto-pin file browser to sidebar on first session activation.
   // Respects user preference: once they have any pinned panels saved, don't interfere.
@@ -1622,7 +1648,7 @@ export function App() {
             ))}
 
             {/* Pinned panels — sub-session panels filtered by current server (WS/tmux bound); others always shown */}
-            {pinnedPanels.filter((p) => p.id && p.props && (p.type !== 'subsession' || !p.props.serverId || p.props.serverId === selectedServerId)).map((panel) => {
+            {visiblePinnedPanels.map((panel) => {
               const height = pinnedPanelHeights[panel.id] ?? 240;
               const ctx: PanelRenderContext = {
                 ws: wsRef.current,
@@ -1642,6 +1668,8 @@ export function App() {
                     inputEl.focus();
                   }
                 },
+                t: trans,
+                updatePanelProps: updatePinnedPanelProps,
               };
               return (
                 <SidebarPinnedPanel
@@ -1801,6 +1829,9 @@ export function App() {
                     {gitChangesCount > 0 && <span class="file-badge">{gitChangesCount}</span>}
                   </button>
                 )}
+                <button class="view-toggle" title={trans('localWebPreview.title')} onClick={() => setShowDesktopLocalWebPreview((o) => !o)} style={{ position: 'relative' }}>
+                  🌐
+                </button>
                 {!isTransportSession && (
                   <button class="view-toggle" onClick={toggleViewMode}>
                     {viewMode === 'chat' ? '⌨' : '💬'}
@@ -1833,12 +1864,34 @@ export function App() {
               sessionsLoaded={sessionsLoaded}
             />
 
+            {/* Desktop local preview shortcut — available even before a session is active */}
+            {!isMobile && selectedServerId && !activeSession && (
+              <div class="desktop-view-toggle">
+                <button
+                  class="view-toggle"
+                  title={trans('localWebPreview.title')}
+                  onClick={() => setShowDesktopLocalWebPreview((o) => !o)}
+                  style={{ position: 'relative' }}
+                >
+                  🌐
+                </button>
+              </div>
+            )}
+
             {/* Desktop view mode toggle — mobile uses the one in mobile-server-bar */}
             {!isMobile && activeSession && (
               <div class="desktop-view-toggle">
                 <button class="view-toggle" title={trans('picker.files')} onClick={() => setShowDesktopFileBrowser(o => !o)} style={{ position: 'relative' }}>
                   📁
                   {gitChangesCount > 0 && <span class="file-badge">{gitChangesCount}</span>}
+                </button>
+                <button
+                  class="view-toggle"
+                  title={trans('localWebPreview.title')}
+                  onClick={() => setShowDesktopLocalWebPreview((o) => !o)}
+                  style={{ position: 'relative' }}
+                >
+                  🌐
                 </button>
                 {!isTransportSession && (
                   <button class="view-toggle" onClick={toggleViewMode}>
@@ -1918,6 +1971,37 @@ export function App() {
                     }
                   }}
                   onClose={() => setShowDesktopFileBrowser(false)}
+                />
+              </FloatingPanel>
+            )}
+
+            {/* Desktop floating local web preview */}
+            {showDesktopLocalWebPreview && selectedServerId && (
+              <FloatingPanel
+                id={`local-web-preview-${selectedServerId}`}
+                title={trans('localWebPreview.title')}
+                onClose={() => setShowDesktopLocalWebPreview(false)}
+                onPin={
+                  localWebPreviewPort.trim() && /^\d+$/.test(localWebPreviewPort.trim())
+                    ? () => pinPanel(
+                        LOCAL_WEB_PREVIEW_PANEL_TYPE,
+                        { serverId: selectedServerId, port: localWebPreviewPort.trim(), path: normalizeLocalWebPreviewPath(localWebPreviewPath) },
+                        () => setShowDesktopLocalWebPreview(false),
+                      )
+                    : undefined
+                }
+                pinTooltip={trans('sidebar.pin_to_sidebar')}
+                defaultW={860}
+                defaultH={640}
+              >
+                <LocalWebPreviewPanel
+                  serverId={selectedServerId}
+                  port={localWebPreviewPort}
+                  path={localWebPreviewPath}
+                  onDraftChange={({ port, path }) => {
+                    setLocalWebPreviewPort(port);
+                    setLocalWebPreviewPath(path);
+                  }}
                 />
               </FloatingPanel>
             )}
@@ -2038,7 +2122,7 @@ export function App() {
                 />
               ))}
               {/* Pinned panels — same as desktop sidebar */}
-              {pinnedPanels.filter((p) => p.id && p.props && (p.type !== 'subsession' || !p.props.serverId || p.props.serverId === selectedServerId)).map((panel) => {
+              {visiblePinnedPanels.map((panel) => {
                 const height = pinnedPanelHeights[panel.id] ?? 240;
                 const ctx: PanelRenderContext = {
                   ws: wsRef.current,
@@ -2058,6 +2142,8 @@ export function App() {
                       inputEl.focus();
                     }
                   },
+                  t: trans,
+                  updatePanelProps: updatePinnedPanelProps,
                 };
                 return (
                   <SidebarPinnedPanel
