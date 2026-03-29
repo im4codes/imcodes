@@ -1394,17 +1394,22 @@ export function App() {
       localStorage.setItem('rcc_session', session);
       setActiveSession(session);
     }
-    // Insert quoted text into the session's chat input
+    // Insert quoted text into the session's chat input (retry until input mounts)
     if (quote) {
-      setTimeout(() => {
+      let attempts = 0;
+      const tryInsertQuote = () => {
         const inputEl = inputRefsMap.current.get(session);
-        if (!inputEl) return;
-        const quoteLines = quote.trim().split('\n').map((l: string) => `> ${l}`).join('\n');
-        inputEl.textContent = (inputEl.textContent || '') + quoteLines + '\n';
-        inputEl.focus();
-        const sel = window.getSelection();
-        if (sel) { sel.selectAllChildren(inputEl); sel.collapseToEnd(); }
-      }, 200);
+        if (inputEl) {
+          const quoteLines = quote.trim().split('\n').map((l: string) => `> ${l}`).join('\n');
+          inputEl.textContent = (inputEl.textContent || '') + quoteLines + '\n';
+          inputEl.focus();
+          const sel = window.getSelection();
+          if (sel) { sel.selectAllChildren(inputEl); sel.collapseToEnd(); }
+        } else if (++attempts < 10) {
+          setTimeout(tryInsertQuote, 300);
+        }
+      };
+      setTimeout(tryInsertQuote, 200);
     }
   }, [setActiveSession, bringSubToFront]);
 
