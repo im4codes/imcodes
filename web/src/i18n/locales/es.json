@@ -514,6 +514,8 @@
     "no_participants": "No hay otras sesiones disponibles",
     "show_all_projects": "Todos los proyectos",
     "show_all_servers": "Todos los servidores",
+    "exec_latest": "Último",
+    "exec_all": "Todos",
     "view_discussion": "Ver discusión P2P →",
     "confirm_trigger": "¿Ejecutar esta tarea ahora?",
     "status_manual_trigger": "Manual"

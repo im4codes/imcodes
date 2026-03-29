@@ -272,6 +272,46 @@ cronApiRoutes.post('/:id/trigger', requireAuth(), async (c) => {
   return c.json({ ok: true });
 });
 
+// GET /api/cron/executions — cross-job execution list
+// mode=latest: most recent execution per job; mode=all: all executions sorted by time
+cronApiRoutes.get('/executions', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const mode = c.req.query('mode') || 'all';
+  const serverId = c.req.query('serverId') || null;
+  const limitParam = parseInt(c.req.query('limit') || '50', 10);
+  const limit = Math.min(Math.max(1, limitParam), 200);
+
+  if (mode === 'latest') {
+    // One row per job: most recent execution with job info
+    const rows = await c.env.DB.query(
+      `SELECT DISTINCT ON (j.id)
+         e.id, e.job_id, e.status, e.detail, e.created_at,
+         j.name AS job_name, j.server_id, j.project_name, j.cron_expr, j.target_role, j.action
+       FROM cron_executions e
+       JOIN cron_jobs j ON j.id = e.job_id
+       WHERE j.user_id = $1
+         AND ($2::text IS NULL OR j.server_id = $2)
+       ORDER BY j.id, e.created_at DESC`,
+      [userId, serverId],
+    );
+    return c.json({ executions: rows });
+  }
+
+  // mode=all: all executions sorted by time
+  const rows = await c.env.DB.query(
+    `SELECT e.id, e.job_id, e.status, e.detail, e.created_at,
+       j.name AS job_name, j.server_id, j.project_name, j.cron_expr, j.target_role, j.action
+     FROM cron_executions e
+     JOIN cron_jobs j ON j.id = e.job_id
+     WHERE j.user_id = $1
+       AND ($2::text IS NULL OR j.server_id = $2)
+     ORDER BY e.created_at DESC
+     LIMIT $3`,
+    [userId, serverId, limit],
+  );
+  return c.json({ executions: rows });
+});
+
 // GET /api/cron/:id/executions — execution history for a cron job
 cronApiRoutes.get('/:id/executions', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;

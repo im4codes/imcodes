@@ -514,6 +514,8 @@
     "no_participants": "没有其他可用会话",
     "show_all_projects": "所有项目",
     "show_all_servers": "所有服务器",
+    "exec_latest": "最近",
+    "exec_all": "全部",
     "view_discussion": "查看 P2P 讨论 →",
     "confirm_trigger": "立即执行此任务？",
     "status_manual_trigger": "手动触发"

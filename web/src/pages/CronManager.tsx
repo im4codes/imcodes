@@ -38,6 +38,16 @@ interface CronExecution {
   created_at: number;
 }
 
+interface CrossJobExecution extends CronExecution {
+  job_id: string;
+  job_name: string;
+  server_id: string;
+  project_name: string;
+  cron_expr: string;
+  target_role: string;
+  action: string;
+}
+
 interface SubSessionSlim {
   sessionName: string;
   type: string;
@@ -131,6 +141,11 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   const [subPanel, setSubPanel] = useState<string | null>(null);
   const [editingJob, setEditingJob] = useState<CronJob | null>(null);
   const [historyData, setHistoryData] = useState<Record<string, CronExecution[]>>({});
+  // Tab: 'tasks' or 'executions'
+  const [tab, setTab] = useState<'tasks' | 'executions'>('tasks');
+  const [execMode, setExecMode] = useState<'latest' | 'all'>('latest');
+  const [crossExecs, setCrossExecs] = useState<CrossJobExecution[] | null>(null);
+  const [crossExecsLoading, setCrossExecsLoading] = useState(false);
 
   const serverNameMap = new Map(servers.map(s => [s.id, s.name]));
 
@@ -152,6 +167,22 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   }, [serverId, projectName, showAllServers]);
 
   useEffect(() => { loadJobs(); }, [loadJobs]);
+
+  // ── Load cross-job executions ──────────────────────────────────────────
+  const loadCrossExecs = useCallback(async () => {
+    setCrossExecsLoading(true);
+    try {
+      const q = showAllServers ? `mode=${execMode}` : `mode=${execMode}&serverId=${serverId}`;
+      const res = await apiFetch<{ executions: CrossJobExecution[] }>(`/api/cron/executions?${q}`);
+      setCrossExecs(res.executions);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setCrossExecsLoading(false);
+    }
+  }, [serverId, showAllServers, execMode]);
+
+  useEffect(() => { if (tab === 'executions') loadCrossExecs(); }, [tab, loadCrossExecs]);
 
   // ── Actions ────────────────────────────────────────────────────────────
   const handlePauseResume = async (job: CronJob) => {
@@ -217,34 +248,75 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
   const displayTarget = (job: CronJob) => {
     if (job.target_session_name) {
       const sub = subSessions.find(s => s.sessionName === job.target_session_name);
-      return sub?.label ? formatLabel(sub.label) : job.target_session_name.replace('deck_sub_', '');
+      return sub?.label ? formatLabel(sub.label) : sub?.type || job.target_session_name.replace('deck_sub_', '');
     }
     return roleToDisplay(job.target_role, sessions, job.project_name);
   };
 
   return (
     <div style={{ width: '90%', maxWidth: '700px', margin: '0 auto', padding: '12px 0', height: '100%', overflow: 'auto' }}>
-      {/* Toolbar: show-all toggle + add button */}
+      {/* Toolbar: tabs + show-all toggle + add button */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px' }}>
+        <div style={{ display: 'flex', gap: '2px', background: '#0f172a', borderRadius: '6px', padding: '2px' }}>
+          <button onClick={() => setTab('tasks')}
+            style={{ padding: '3px 10px', borderRadius: '4px', border: 'none', cursor: 'pointer', fontSize: '12px', fontWeight: 600,
+              background: tab === 'tasks' ? '#334155' : 'transparent', color: tab === 'tasks' ? '#e2e8f0' : '#64748b' }}>
+            {t('cron.title')}
+          </button>
+          <button onClick={() => setTab('executions')}
+            style={{ padding: '3px 10px', borderRadius: '4px', border: 'none', cursor: 'pointer', fontSize: '12px', fontWeight: 600,
+              background: tab === 'executions' ? '#334155' : 'transparent', color: tab === 'executions' ? '#e2e8f0' : '#64748b' }}>
+            {t('cron.history')}
+          </button>
+        </div>
         <label style={{ color: '#94a3b8', fontSize: '12px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}>
           <input type="checkbox" checked={showAllServers} onChange={toggleShowAll} />
           {t('cron.show_all_servers')}
         </label>
         <div style={{ flex: 1 }} />
-        <button onClick={() => { setEditingJob(null); setSubPanel('form'); }}
-          style={{ padding: '3px 10px', background: '#3b82f6', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '16px', lineHeight: 1 }}
-          title={t('cron.create')}>+</button>
+        {tab === 'executions' && (
+          <div style={{ display: 'flex', gap: '2px', background: '#0f172a', borderRadius: '6px', padding: '2px' }}>
+            <button onClick={() => setExecMode('latest')}
+              style={{ padding: '2px 8px', borderRadius: '4px', border: 'none', cursor: 'pointer', fontSize: '11px',
+                background: execMode === 'latest' ? '#334155' : 'transparent', color: execMode === 'latest' ? '#e2e8f0' : '#64748b' }}>
+              {t('cron.exec_latest')}
+            </button>
+            <button onClick={() => setExecMode('all')}
+              style={{ padding: '2px 8px', borderRadius: '4px', border: 'none', cursor: 'pointer', fontSize: '11px',
+                background: execMode === 'all' ? '#334155' : 'transparent', color: execMode === 'all' ? '#e2e8f0' : '#64748b' }}>
+              {t('cron.exec_all')}
+            </button>
+          </div>
+        )}
+        {tab === 'tasks' && (
+          <button onClick={() => { setEditingJob(null); setSubPanel('form'); }}
+            style={{ padding: '3px 10px', background: '#3b82f6', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '16px', lineHeight: 1 }}
+            title={t('cron.create')}>+</button>
+        )}
       </div>
 
       {error && <div style={{ color: '#f87171', marginBottom: '8px', fontSize: '13px' }}>{error}</div>}
 
-      {loading && <div style={{ color: '#94a3b8', textAlign: 'center', padding: '40px' }}>{t('common.loading')}</div>}
+      {/* ── Executions tab ── */}
+      {tab === 'executions' && (
+        <CrossJobExecutionList
+          executions={crossExecs}
+          loading={crossExecsLoading}
+          serverNameMap={serverNameMap}
+          showAllServers={showAllServers}
+          onViewDiscussion={onViewDiscussion}
+          t={t}
+        />
+      )}
 
-      {!loading && jobs.length === 0 && (
+      {/* ── Tasks tab ── */}
+      {tab === 'tasks' && loading && <div style={{ color: '#94a3b8', textAlign: 'center', padding: '40px' }}>{t('common.loading')}</div>}
+
+      {tab === 'tasks' && !loading && jobs.length === 0 && (
         <div style={{ color: '#64748b', textAlign: 'center', padding: '40px' }}>{t('cron.no_tasks')}</div>
       )}
 
-      {jobs.map(job => {
+      {tab === 'tasks' && jobs.map(job => {
         const action = parseAction(job.action);
         return (
           <div key={job.id} style={{ ...cardStyle, padding: '12px 16px', marginBottom: '10px' }}>
@@ -318,6 +390,69 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
           />
         </FloatingPanel>
       )}
+    </div>
+  );
+}
+
+// ── Cross-Job Execution List ─────────────────────────────────────────────
+
+function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServers, onViewDiscussion, t }: {
+  executions: CrossJobExecution[] | null;
+  loading: boolean;
+  serverNameMap: Map<string, string>;
+  showAllServers: boolean;
+  onViewDiscussion?: (fileId: string) => void;
+  t: (key: string) => string;
+}) {
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+
+  if (loading) return <div style={{ color: '#94a3b8', textAlign: 'center', padding: '40px' }}>{t('common.loading')}</div>;
+  if (!executions || executions.length === 0) return <div style={{ color: '#64748b', textAlign: 'center', padding: '40px' }}>{t('cron.no_history')}</div>;
+
+  return (
+    <div>
+      {executions.map(exec => {
+        const isExpanded = expandedId === exec.id;
+        const hasDetail = !!exec.detail && !exec.detail.startsWith('p2p:');
+        const hasP2p = !!exec.detail?.startsWith('p2p:');
+        const isClickable = hasDetail || hasP2p;
+        const action = parseAction(exec.action);
+
+        return (
+          <div key={exec.id}
+            style={{ ...cardStyle, padding: '10px 14px', marginBottom: '6px', cursor: isClickable ? 'pointer' : 'default' }}
+            onClick={() => isClickable && setExpandedId(isExpanded ? null : exec.id)}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+              {isClickable && <span style={{ color: '#475569', fontSize: '10px', width: '12px', flexShrink: 0 }}>{isExpanded ? '▼' : '▶'}</span>}
+              <span style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '13px', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {exec.job_name}
+              </span>
+              <span style={{ color: execStatusColor(exec.status), fontWeight: 600, fontSize: '11px' }}>
+                {execStatusLabel(exec.status, t)}
+              </span>
+            </div>
+            <div style={{ display: 'flex', gap: '10px', fontSize: '11px', color: '#64748b', flexWrap: 'wrap' }}>
+              <span>{fmtTime(exec.created_at)}</span>
+              {showAllServers && <span>{serverNameMap.get(exec.server_id) ?? exec.server_id.slice(0, 6)} / {exec.project_name}</span>}
+              <span>→ {exec.target_role}</span>
+              {action?.type === 'p2p' && <span>P2P {action.mode}</span>}
+              {action?.type === 'command' && <span style={{ maxWidth: '150px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{action.command}</span>}
+              {hasP2p && onViewDiscussion && (
+                <button type="button" onClick={(e) => { e.stopPropagation(); onViewDiscussion(exec.detail!.slice(4)); }}
+                  style={{ color: '#60a5fa', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline', marginLeft: 'auto' }}>
+                  {t('cron.view_discussion')}
+                </button>
+              )}
+            </div>
+            {isExpanded && hasDetail && (
+              <pre style={{ color: '#cbd5e1', fontSize: '11px', marginTop: '6px', padding: '8px 10px', background: '#0f172a', borderRadius: '4px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '300px', overflow: 'auto', lineHeight: 1.5 }}>
+                {exec.detail}
+              </pre>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -694,7 +829,7 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
           {subSessions.length > 0 && <option disabled>──────────</option>}
           {subSessions.map(s => (
             <option key={s.sessionName} value={`sub:${s.sessionName}`}>
-              {s.label ? formatLabel(s.label) : s.sessionName.replace('deck_sub_', '')} ({agentBadge(s.type)})
+              {s.label ? formatLabel(s.label) : s.type} ({agentBadge(s.type)})
             </option>
           ))}
         </select>
@@ -767,7 +902,7 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
                     checked={p2pParticipants.includes(s.sessionName)}
                     onChange={() => setP2pParticipants(prev => prev.includes(s.sessionName) ? prev.filter(x => x !== s.sessionName) : [...prev, s.sessionName])}
                   />
-                  {s.label ? formatLabel(s.label) : s.sessionName.replace('deck_sub_', '')} <span style={{ opacity: 0.5, fontSize: '11px' }}>({agentBadge(s.type)})</span>
+                  {s.label ? formatLabel(s.label) : s.type} <span style={{ opacity: 0.5, fontSize: '11px' }}>({agentBadge(s.type)})</span>
                 </label>
               ))}
               {otherMainSessions.length === 0 && otherSubSessions.length === 0 && <span style={{ color: '#64748b', fontSize: '13px' }}>{t('cron.no_participants')}</span>}
