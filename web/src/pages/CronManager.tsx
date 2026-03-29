@@ -308,35 +308,96 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
           id={`cron-history-${historyJobId}`}
           title={`${t('cron.history')} · ${historyJob.name}`}
           onClose={() => setSubPanel(null)}
-          defaultW={480} defaultH={400}
+          defaultW={520} defaultH={460}
         >
-          <div style={{ padding: '12px', overflow: 'auto', height: '100%' }}>
-            {!historyData[historyJobId] && <div style={{ color: '#64748b', fontSize: '13px' }}>{t('common.loading')}</div>}
-            {historyData[historyJobId]?.length === 0 && <div style={{ color: '#64748b', fontSize: '13px' }}>{t('cron.no_history')}</div>}
-            {historyData[historyJobId]?.map(exec => (
-              <div key={exec.id} style={{ fontSize: '12px', color: '#94a3b8', padding: '6px 0', borderBottom: '1px solid #1e293b' }}>
-                <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
-                  <span style={{ minWidth: '140px' }}>{fmtTime(exec.created_at)}</span>
-                  <span style={{ color: exec.status === 'dispatched' ? '#4ade80' : exec.status === 'manual_trigger' ? '#60a5fa' : exec.status === 'error' ? '#f87171' : '#fbbf24' }}>
-                    {execStatusLabel(exec.status, t)}
-                  </span>
-                  {exec.detail?.startsWith('p2p:') && onViewDiscussion && (
-                    <button type="button" onClick={() => onViewDiscussion(exec.detail!.slice(4))}
-                      style={{ color: '#60a5fa', background: 'none', border: 'none', cursor: 'pointer', fontSize: '12px', padding: 0, textDecoration: 'underline' }}>
-                      {t('cron.view_discussion')}
-                    </button>
-                  )}
-                </div>
-                {exec.detail && !exec.detail.startsWith('p2p:') && (
-                  <pre style={{ color: '#94a3b8', fontSize: '11px', marginTop: '4px', padding: '6px 8px', background: '#0f172a', borderRadius: '4px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '200px', overflow: 'auto', lineHeight: 1.4 }}>
-                    {exec.detail}
-                  </pre>
-                )}
-              </div>
-            ))}
-          </div>
+          <CronHistoryPanel
+            executions={historyData[historyJobId] ?? null}
+            job={historyJob}
+            onViewDiscussion={onViewDiscussion}
+            t={t}
+          />
         </FloatingPanel>
       )}
+    </div>
+  );
+}
+
+// ── Execution History Panel ──────────────────────────────────────────────
+
+const execStatusColor = (status: string): string => {
+  if (status === 'dispatched') return '#4ade80';
+  if (status === 'manual_trigger') return '#60a5fa';
+  if (status === 'error') return '#f87171';
+  return '#fbbf24';
+};
+
+function CronHistoryPanel({ executions, job, onViewDiscussion, t }: {
+  executions: CronExecution[] | null;
+  job: CronJob;
+  onViewDiscussion?: (fileId: string) => void;
+  t: (key: string) => string;
+}) {
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const action = parseAction(job.action);
+
+  return (
+    <div style={{ padding: '12px', overflow: 'auto', height: '100%' }}>
+      {/* Job summary header */}
+      <div style={{ padding: '8px 10px', background: '#0f172a', borderRadius: '6px', marginBottom: '12px', fontSize: '12px', color: '#94a3b8' }}>
+        <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', marginBottom: '4px' }}>
+          <span><strong style={{ color: '#cbd5e1' }}>{t('cron.schedule')}:</strong> <code style={{ color: '#e2e8f0' }}>{job.cron_expr}</code></span>
+          <span><strong style={{ color: '#cbd5e1' }}>{t('cron.target')}:</strong> {job.target_session_name ?? job.target_role}</span>
+        </div>
+        {action?.type === 'command' && (
+          <div style={{ marginTop: '2px' }}><strong style={{ color: '#cbd5e1' }}>{t('cron.action_command')}:</strong> <code style={{ color: '#e2e8f0' }}>{action.command}</code></div>
+        )}
+        {action?.type === 'p2p' && (
+          <div style={{ marginTop: '2px' }}><strong style={{ color: '#cbd5e1' }}>P2P:</strong> {action.mode} · {action.rounds ?? 1} {t('cron.p2p_rounds').toLowerCase()}</div>
+        )}
+        {job.next_run_at && <div style={{ marginTop: '4px', fontSize: '11px', color: '#64748b' }}>{t('cron.next_run')}: {fmtTime(job.next_run_at)}</div>}
+      </div>
+
+      {/* Execution list */}
+      {!executions && <div style={{ color: '#64748b', fontSize: '13px', textAlign: 'center', padding: '20px' }}>{t('common.loading')}</div>}
+      {executions?.length === 0 && <div style={{ color: '#64748b', fontSize: '13px', textAlign: 'center', padding: '20px' }}>{t('cron.no_history')}</div>}
+      {executions?.map(exec => {
+        const isExpanded = expandedId === exec.id;
+        const hasDetail = !!exec.detail && !exec.detail.startsWith('p2p:');
+        const hasP2p = !!exec.detail?.startsWith('p2p:');
+        const isClickable = hasDetail || hasP2p;
+
+        return (
+          <div key={exec.id}
+            style={{ fontSize: '12px', color: '#94a3b8', borderRadius: '6px', marginBottom: '4px', background: isExpanded ? '#1e293b' : 'transparent', cursor: isClickable ? 'pointer' : 'default' }}
+            onClick={() => isClickable && setExpandedId(isExpanded ? null : exec.id)}
+          >
+            <div style={{ display: 'flex', gap: '10px', alignItems: 'center', padding: '6px 8px' }}>
+              {isClickable && <span style={{ color: '#475569', fontSize: '10px', width: '12px', flexShrink: 0 }}>{isExpanded ? '▼' : '▶'}</span>}
+              {!isClickable && <span style={{ width: '12px', flexShrink: 0 }} />}
+              <span style={{ minWidth: '130px', fontSize: '11px' }}>{fmtTime(exec.created_at)}</span>
+              <span style={{ color: execStatusColor(exec.status), fontWeight: 600, fontSize: '11px' }}>
+                {execStatusLabel(exec.status, t)}
+              </span>
+              {hasP2p && onViewDiscussion && (
+                <button type="button" onClick={(e) => { e.stopPropagation(); onViewDiscussion(exec.detail!.slice(4)); }}
+                  style={{ color: '#60a5fa', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline', marginLeft: 'auto' }}>
+                  {t('cron.view_discussion')}
+                </button>
+              )}
+              {hasDetail && !isExpanded && (
+                <span style={{ color: '#475569', fontSize: '11px', marginLeft: 'auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '200px' }}>
+                  {exec.detail!.slice(0, 60)}…
+                </span>
+              )}
+            </div>
+            {isExpanded && hasDetail && (
+              <pre style={{ color: '#cbd5e1', fontSize: '11px', margin: '0 8px 8px', padding: '8px 10px', background: '#0f172a', borderRadius: '4px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '300px', overflow: 'auto', lineHeight: 1.5 }}>
+                {exec.detail}
+              </pre>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
