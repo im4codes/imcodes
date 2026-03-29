@@ -20,6 +20,9 @@ interface ActivePreview {
   previewUrl: string;
 }
 
+const LOCAL_PORT_KEY = 'imcodes_local_preview_port';
+const LOCAL_PATH_KEY = 'imcodes_local_preview_path';
+
 function parsePort(text: string): number | null {
   const trimmed = text.trim();
   if (!trimmed) return null;
@@ -30,8 +33,8 @@ function parsePort(text: string): number | null {
 
 export function LocalWebPreviewPanel({ serverId, port, path, onDraftChange }: Props) {
   const { t } = useTranslation();
-  const [portText, setPortText] = useState(() => String(port ?? ''));
-  const [pathText, setPathText] = useState(() => path ?? '/');
+  const [portText, setPortText] = useState(() => String(port ?? localStorage.getItem(LOCAL_PORT_KEY) ?? ''));
+  const [pathText, setPathText] = useState(() => path ?? localStorage.getItem(LOCAL_PATH_KEY) ?? '/');
   const [preview, setPreview] = useState<ActivePreview | null>(null);
   const [loading, setLoading] = useState(false);
   const [iframeLoaded, setIframeLoaded] = useState(false);
@@ -54,6 +57,10 @@ export function LocalWebPreviewPanel({ serverId, port, path, onDraftChange }: Pr
   onDraftChangeRef.current = onDraftChange;
   useEffect(() => {
     onDraftChangeRef.current?.({ port: portText, path: pathText });
+    try {
+      if (portText) localStorage.setItem(LOCAL_PORT_KEY, portText);
+      if (pathText && pathText !== '/') localStorage.setItem(LOCAL_PATH_KEY, pathText);
+    } catch { /* quota exceeded or private mode */ }
   }, [portText, pathText]);
 
   const normalizedPath = useMemo(() => normalizeLocalWebPreviewPath(pathText), [pathText]);
