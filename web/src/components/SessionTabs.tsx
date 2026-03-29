@@ -127,7 +127,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
 
   const getLabel = (s: SessionInfo) => {
     if (s.label) return formatLabel(s.label);
-    return s.role === 'brain' ? `🧠 ${s.project}` : `W${s.name.split('_w')[1] ?? '?'}`;
+    return s.role === 'brain' ? s.project : `W${s.name.split('_w')[1] ?? '?'}`;
   };
 
   const agentBadge = (agentType: string) => {
