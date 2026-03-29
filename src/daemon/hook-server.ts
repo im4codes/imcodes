@@ -142,10 +142,11 @@ export function resolveTarget(from: string, to: string): ResolveResult {
     return { ok: false, error: 'sender session not found', available: [] };
   }
 
-  // Determine siblings: sessions sharing the same parent or project
+  // Determine siblings: sessions sharing the same parent or project (exclude stopped)
   const allSessions = listSessions();
   const siblings = allSessions.filter((s) => {
     if (s.name === from) return false; // exclude self
+    if (s.state === 'stopped') return false; // exclude stopped sessions
     // Sub-sessions: match by parentSession
     if (fromRecord.parentSession) {
       return s.parentSession === fromRecord.parentSession || s.name === fromRecord.parentSession;
@@ -205,7 +206,16 @@ async function isSessionBusy(record: SessionRecord): Promise<boolean> {
     }
   }
 
-  // Process session: capture pane and detect status
+  // Process session: check session store state first (more reliable for codex/gemini
+  // which track state via watchers, not pane capture heuristics)
+  if (record.state === 'idle' || record.state === 'stopped' || record.state === 'error') {
+    return false;
+  }
+  if (record.state === 'running') {
+    return true;
+  }
+
+  // Fallback: capture pane and detect status for unknown/ambiguous states
   try {
     const { capturePane } = await import('../agent/tmux.js');
     const lines = await capturePane(record.name);
@@ -352,25 +362,15 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
   // Record send after successful resolution (prevents invalid senders from polluting rate-limit map)
   recordSend(from);
 
-  // Deliver to each target
+  // Deliver to each target — always send immediately (no queue-when-busy)
   const delivered: string[] = [];
   const queued: string[] = [];
   const errors: string[] = [];
 
   for (const target of result.targets) {
     try {
-      const busy = await isSessionBusy(target);
-      if (busy) {
-        const ok = enqueue(target.name, { from, message, queuedAt: Date.now(), depth });
-        if (ok) {
-          queued.push(target.name);
-        } else {
-          errors.push(`${target.name}: queue full`);
-        }
-      } else {
-        await dispatchMessage(target, message);
-        delivered.push(target.name);
-      }
+      await dispatchMessage(target, message);
+      delivered.push(target.name);
     } catch (err) {
       errors.push(`${target.name}: ${(err as Error).message}`);
     }
@@ -450,12 +450,13 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
         const siblings = fromRecord
           ? allSess.filter((s) => {
               if (s.name === from) return false;
+              if (s.state === 'stopped') return false;
               if (fromRecord.parentSession) {
                 return s.parentSession === fromRecord.parentSession || s.name === fromRecord.parentSession;
               }
               return s.projectName === fromRecord.projectName || s.parentSession === from;
             })
-          : allSess;
+          : allSess.filter((s) => s.state !== 'stopped');
         const sessions = siblings.map((s) => ({
           name: s.name,
           label: s.label || undefined,

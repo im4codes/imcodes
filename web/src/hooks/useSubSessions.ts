@@ -81,6 +81,7 @@ export function useSubSessions(
       ccSessionId: s.ccSessionId,
       geminiSessionId: s.geminiSessionId,
       parentSession: s.parentSession,
+      label: s.label,
     })));
   }, [connected, ws, subSessions]);
 

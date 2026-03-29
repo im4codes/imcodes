@@ -304,9 +304,9 @@ describe('Hook server /send endpoint', () => {
     });
   });
 
-  // ── Queue-when-busy ──────────────────────────────────────────────────────
+  // ── Queue-when-busy (disabled — messages always delivered immediately) ───
 
-  describe('Queue-when-busy', () => {
+  describe.skip('Queue-when-busy', () => {
     it('queues message when target is busy', async () => {
       const brain = makeSession({ name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code' });
       const w1 = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'codex' });
@@ -362,9 +362,9 @@ describe('Hook server /send endpoint', () => {
     });
   });
 
-  // ── Queue drain ──────────────────────────────────────────────────────────
+  // ── Queue drain (disabled — no queue) ───────────────────────────────────
 
-  describe('Queue drain', () => {
+  describe.skip('Queue drain', () => {
     it('drains queued messages when session becomes idle via /notify', async () => {
       const brain = makeSession({ name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code' });
       const w1 = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'claude-code' });

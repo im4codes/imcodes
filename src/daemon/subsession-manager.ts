@@ -22,6 +22,7 @@ export interface SubSessionRecord {
   type: string;
   shellBin?: string | null;
   cwd?: string | null;
+  label?: string | null;
   ccSessionId?: string | null;
   codexSessionId?: string | null;
   codexModel?: string | null;
@@ -84,7 +85,8 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
 
   upsertSession({
     name: sessionName, projectName: sessionName, agentType: sub.type, agentVersion, role: 'w1', state: 'running',
-    projectDir: sub.cwd ?? '', ccSessionId: sub.ccSessionId ?? undefined,
+    projectDir: sub.cwd ?? '', label: sub.label ?? undefined,
+    ccSessionId: sub.ccSessionId ?? undefined,
     codexSessionId: sub.codexSessionId ?? undefined,
     geminiSessionId: sub.geminiSessionId ?? undefined,
     parentSession: sub.parentSession ?? undefined,
@@ -184,7 +186,8 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
       const effectiveGeminiSessionId = sub.geminiSessionId ?? stored?.geminiSessionId;
       upsertSession({
         name: sessionName, projectName: sessionName, agentType: sub.type, agentVersion: stored?.agentVersion ?? await getAgentVersion(sub.type as AgentType, sub.shellBin ?? undefined), role: 'w1', state: 'running',
-        projectDir: sub.cwd ?? '', ccSessionId: effectiveCcSessionId ?? undefined,
+        projectDir: sub.cwd ?? '', label: sub.label ?? stored?.label ?? undefined,
+        ccSessionId: effectiveCcSessionId ?? undefined,
         codexSessionId: effectiveCodexSessionId ?? undefined,
         geminiSessionId: effectiveGeminiSessionId ?? undefined,
         parentSession: sub.parentSession ?? stored?.parentSession,
