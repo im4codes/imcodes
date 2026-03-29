@@ -331,4 +331,77 @@ Use `imcodes send --list` to see available sibling sessions.
 - [ ] `--files` agent-type-aware 渲染
 - [ ] `--list` / `--status` 查看 siblings
 - [ ] 投递确认（target idle 后回传通知 sender）
-- [ ] Windows daemon 生命周期（无 systemd — 后台 Node.js 进程或 Windows Service）
+
+## Daemon 常驻服务（`imcodes bind` 自动注册）
+
+`imcodes bind` 连接 server 后自动注册为系统常驻服务，开机自启。`imcodes unbind` 反向清理。
+
+### 跨平台实现
+
+| 平台 | 服务机制 | 服务文件 |
+|------|---------|---------|
+| Linux | systemd user service | `~/.config/systemd/user/imcodes.service` |
+| macOS | launchd | `~/Library/LaunchAgents/codes.im.imcodes.plist` |
+| Windows | Windows Service 或 Startup 脚本 | `sc create` 或 `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\imcodes.vbs` |
+
+### 流程
+
+```
+imcodes bind <server-url> --token <token>
+  1. 保存 server 配置到 ~/.imcodes/server.json
+  2. 检测当前平台
+  3. 生成对应的服务配置文件
+  4. 注册并启动服务
+     - Linux: systemctl --user enable --now imcodes
+     - macOS: launchctl load ~/Library/LaunchAgents/codes.im.imcodes.plist
+     - Windows: sc create imcodes ... && sc start imcodes
+
+imcodes unbind
+  1. 停止并移除服务
+     - Linux: systemctl --user disable --now imcodes
+     - macOS: launchctl unload ...
+     - Windows: sc stop imcodes && sc delete imcodes
+  2. 清理 ~/.imcodes/server.json
+```
+
+### 服务配置模板
+
+**Linux (systemd):**
+```ini
+[Unit]
+Description=IM.codes Daemon
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/env node /path/to/imcodes/dist/index.js start
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+**macOS (launchd):**
+```xml
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>codes.im.imcodes</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <string>/path/to/imcodes/dist/index.js</string>
+    <string>start</string>
+  </array>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+```
+
+### 实现阶段
+
+属于 Phase 1c（`imcodes send` 同期），因为 daemon 必须常驻才能接收 `/send` 请求：
+- [ ] 平台检测 + 服务文件生成
+- [ ] `imcodes bind` 自动注册服务
+- [ ] `imcodes unbind` 清理服务
+- [ ] `imcodes status` 显示服务状态
