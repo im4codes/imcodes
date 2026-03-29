@@ -75,6 +75,34 @@ imcodes send "Cx" "run tests" --reply
 imcodes send --all "migration complete, check your end"
 ```
 
+Beyond agent-to-agent chat, you can use `script` sessions to build custom automation. A Python script running in a script session can call `imcodes send` to trigger agents based on any external event:
+
+```python
+# monitor.py — watch a log file, trigger agent when errors appear
+import subprocess, time
+
+while True:
+    with open("/var/log/app.log") as f:
+        for line in f:
+            if "ERROR" in line:
+                subprocess.run([
+                    "imcodes", "send", "Claude",
+                    f"Fix this error and write the patch to /tmp/fix.patch:\n{line}"
+                ])
+    time.sleep(30)
+```
+
+```bash
+# Webhook → agent: GitHub webhook handler triggers code review
+curl -X POST https://your-server/webhook -d '{"pr": 42}' \
+  && imcodes send "Gemini" "review PR #42, write summary to /tmp/review.md"
+
+# CI → agent: post-build trigger
+imcodes send "Claude" "tests failed on main, check CI log at /tmp/ci.log and fix" --reply
+```
+
+Use cases: log monitoring → auto-fix, webhook-triggered code review, CI failure auto-diagnosis, scheduled data pipeline checks, custom approval workflows with output written to specific files for human review.
+
 ### Multi-Agent Discussions & Audit
 
 Single-model output shouldn't be trusted blindly. Spawn quick discussion rounds where multiple agents — across different providers — review, audit, or brainstorm on the same topic. Each agent reads prior contributions and adds their own. Modes include `discuss`, `audit`, `review`, and `brainstorm`. Ring progress indicator shows round/hop completion in the sidebar. Works across Claude Code, Codex, and Gemini CLI, including sandboxed agents.
