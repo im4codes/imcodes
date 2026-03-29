@@ -924,16 +924,17 @@ export function App() {
         const sessionName = msg.session;
         const label = msg.label as string | undefined;
         const parentLabel = msg.parentLabel as string | undefined;
+        const agentType = msg.agentType as string | undefined;
         const rawProject = msg.project || sessionName;
+        const typeSuffix = agentType ? `(${agentType})` : '';
         let displayProject: string;
         if (sessionName.startsWith('deck_sub_')) {
           const subId = sessionName.replace(/^deck_sub_/, '');
           const name = label || subId;
-          displayProject = `${name}${parentLabel ? `@${parentLabel}` : ''}`;
-        } else if (label) {
-          displayProject = parentLabel ? `${parentLabel} · ${label}` : label;
+          displayProject = `${name}${typeSuffix}${parentLabel ? `@${parentLabel}` : ''}`;
         } else {
-          displayProject = rawProject;
+          const name = label || rawProject;
+          displayProject = `${name}${typeSuffix}`;
         }
         const id = Date.now();
         setToasts((prev) => [...prev, { id, sessionName, project: displayProject, kind: 'notification', title: msg.title, message: msg.message }]);
