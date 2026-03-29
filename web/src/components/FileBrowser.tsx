@@ -259,6 +259,8 @@ export function FileBrowser({
   }, []);
 
   // Listen for fs.ls_response and fs.read_response
+  // IMPORTANT: Every setState call is guarded by mountedRef to prevent crashes
+  // when responses arrive after component unmount (race condition with FloatingPanel close).
   useEffect(() => {
     return ws.onMessage((msg: ServerMessage) => {
       if (!mountedRef.current) return;
@@ -269,7 +271,7 @@ export function FileBrowser({
         pendingRef.current.clear();
         pendingChangesRef.current.clear();
         // Re-fetch root and changes
-        fetchDir(startPath);
+        if (mountedRef.current) fetchDir(startPath);
         return;
       }
 
@@ -280,6 +282,8 @@ export function FileBrowser({
 
         const timer = timersRef.current.get(msg.requestId);
         if (timer) { clearTimeout(timer); timersRef.current.delete(msg.requestId); }
+
+        if (!mountedRef.current) return;
 
         if (msg.status === 'error') {
           setError(msg.error ?? 'Unknown error');
@@ -310,7 +314,7 @@ export function FileBrowser({
         if (highlightPath && highlightPath.startsWith(resolvedParent + '/')) {
           const nextSegment = highlightPath.slice(resolvedParent.length + 1).split('/')[0];
           const child = children.find((c) => c.name === nextSegment && c.isDir);
-          if (child) setTimeout(() => fetchDir(child.id), 0);
+          if (child) setTimeout(() => { if (mountedRef.current) fetchDir(child.id); }, 0);
         }
         return;
       }
@@ -319,6 +323,8 @@ export function FileBrowser({
         const filePath = pendingReadRef.current.get(msg.requestId);
         if (!filePath) return;
         pendingReadRef.current.delete(msg.requestId);
+
+        if (!mountedRef.current) return;
 
         const dlId = msg.downloadId;
 
@@ -366,9 +372,9 @@ export function FileBrowser({
         // Check if this is a changesRootPath request
         if (pendingChangesRef.current.has(msg.requestId)) {
           pendingChangesRef.current.delete(msg.requestId);
+          if (!mountedRef.current) return;
           if (msg.status === 'ok' && msg.files) {
             setChangesFiles(msg.files as Array<{ path: string; code: string; additions?: number; deletions?: number }>);
-            // Also update modifiedFiles map for tree indicators
             setModifiedFiles((prev) => {
               const next = new Map(prev);
               for (const f of msg.files!) next.set(f.path, f.code);
@@ -380,10 +386,10 @@ export function FileBrowser({
         const dirPath = pendingGitStatusRef.current.get(msg.requestId);
         if (!dirPath) return;
         pendingGitStatusRef.current.delete(msg.requestId);
+        if (!mountedRef.current) return;
         if (msg.status === 'ok' && msg.files) {
           setModifiedFiles((prev) => {
             const next = new Map(prev);
-            // Remove stale entries for this dir
             for (const [k] of next) {
               if (k.startsWith(dirPath + '/')) next.delete(k);
             }
@@ -400,6 +406,7 @@ export function FileBrowser({
         const filePath = pendingGitDiffRef.current.get(msg.requestId);
         if (!filePath) return;
         pendingGitDiffRef.current.delete(msg.requestId);
+        if (!mountedRef.current) return;
         if (msg.status === 'ok') {
           const diff = msg.diff ?? '';
           const diffHtml = diff ? renderDiff(diff) : '';
@@ -409,7 +416,6 @@ export function FileBrowser({
             }
             return prev;
           });
-          // Don't auto-switch to diff view — preserve user's current view choice
         }
         return;
       }
@@ -530,6 +536,7 @@ export function FileBrowser({
     if (isEditing) return; // pause auto-refresh while editing
     const path = (preview as { path: string }).path;
     const timer = setInterval(() => {
+      if (!mountedRef.current) return;
       try {
         const reqId = ws.fsReadFile(path);
         pendingReadRef.current.set(reqId, path);
