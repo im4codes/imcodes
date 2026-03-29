@@ -62,6 +62,16 @@ Chat with [OpenClaw](https://openclaw.com) agents directly in [IM.codes](https:/
 
 Server icon bar for instant multi-server switching. Hierarchical session tree with collapsible sub-sessions, unread message badges, and idle flash animation when agents finish tasks. Pin any floating window (file browser, repository, sub-session chat) to the sidebar for persistent access. Language switcher and build info at the bottom.
 
+### Agent-to-Agent Communication
+
+Agents can message each other directly using `imcodes send`. An agent running in one session can ask a sibling to review code, run tests, or coordinate on a task — no user intervention needed. Target resolution by label, session name, or agent type. `--reply` flag instructs the target to send its response back automatically. Built-in circuit breakers prevent abuse (depth limit, rate limiting, broadcast cap).
+
+```bash
+imcodes send "Plan" "review the changes in src/api.ts"
+imcodes send "Cx" "run tests" --reply
+imcodes send --all "migration complete, check your end"
+```
+
 ### Multi-Agent Discussions & Audit
 
 Single-model output shouldn't be trusted blindly. Spawn quick discussion rounds where multiple agents — across different providers — review, audit, or brainstorm on the same topic. Each agent reads prior contributions and adds their own. Modes include `discuss`, `audit`, `review`, and `brainstorm`. Ring progress indicator shows round/hop completion in the sidebar. Works across Claude Code, Codex, and Gemini CLI, including sandboxed agents.
@@ -109,12 +119,13 @@ You (browser / mobile)
         ↓ WebSocket
 Server (self-hosted)
         ↓ WebSocket
-Daemon (your machine, manages tmux)
-        ↓ tmux / transport
+Daemon (your machine)
+        ↓ tmux / WezTerm / transport
 AI Agents (Claude Code / Codex / Gemini CLI / OpenClaw)
+        ↔ imcodes send (agent-to-agent)
 ```
 
-The daemon runs on your dev machine and manages agent sessions through tmux (process-backed) or network protocols (transport-backed, e.g. OpenClaw gateway). The server relays connections between your devices and the daemon. Everything stays on your infrastructure.
+The daemon runs on your dev machine and manages agent sessions through tmux or WezTerm (process-backed) or network protocols (transport-backed, e.g. OpenClaw gateway). Agents can communicate with each other via `imcodes send`. The server relays connections between your devices and the daemon. Everything stays on your infrastructure.
 
 ## Install
 
@@ -169,9 +180,10 @@ Login at `https://your-domain` with `admin` and the printed password. Bind your 
 
 ## Requirements
 
-- macOS or Linux (tested on both). Windows users need [WSL](https://learn.microsoft.com/en-us/windows/wsl/) — native Windows is not supported since the project uses tmux to manage agent sessions.
+- macOS or Linux (tested on both)
+- **Windows (experimental)**: Native support via [WezTerm](https://wezfurlong.org/wezterm/) as terminal multiplexer. Install WezTerm, then `npm install -g imcodes`. WSL also works.
 - Node.js >= 20
-- tmux
+- Terminal multiplexer: [tmux](https://github.com/tmux/tmux) (Linux/macOS) or [WezTerm](https://wezfurlong.org/wezterm/) (Windows/Linux/macOS). Auto-detected at startup.
 - At least one AI coding agent: [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or [OpenClaw](https://openclaw.com)
 
 ## License
