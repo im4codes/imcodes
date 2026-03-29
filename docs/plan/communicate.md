@@ -29,28 +29,22 @@ imcodes send --list
 
 **P2P 讨论** 不需要单独命令 — agent 直接在输出中使用 `@@all` 或 `@@Label` 语法，daemon 的 brain-dispatcher / message-router 已有 `@@` 解析能力，自动拆包走 P2P orchestrator。
 
-## 安全架构
+## 安全
 
-### Hook Server 认证（Phase 1 前置条件）
+### 浏览器跨域防护
 
-现有 hook server (`localhost:51913`) 无认证，端口号写在 `~/.imcodes/hook-port` 中，任何本地进程可直接访问。浏览器可通过 simple POST（无 CORS preflight）跨域请求 localhost。添加 `/send` 端点前**必须**先保护整个 hook server。
+唯一需要防的攻击面：恶意网页通过 `fetch('http://localhost:51913/send')` 注入按键。
 
-```
-Daemon 启动:
-  1. 生成 32 字节随机 secret → hex 字符串
-  2. 写入 ~/.imcodes/hook-secret (mode 0600)
-  3. hook-port 文件也设为 mode 0600
-  4. 所有 hook server 端点验证 Authorization: Bearer <secret>
-  5. 验证 Content-Type: application/json（强制 CORS preflight）
-  6. 请求体大小限制: 1MB
+**方案：** hook server 要求 `Content-Type: application/json`。浏览器对 JSON content-type 强制 CORS preflight（OPTIONS），hook server 不返回任何 CORS header → 浏览器自动拦截，请求发不出去。
 
-Agent 启动:
-  1. IMCODES_HOOK_SECRET 注入到 env（与 IMCODES_SESSION 一起）
-  2. CLI 读取 env（快）→ 回退读文件
+CLI / agent 调用不经过浏览器，不受 CORS 影响，零额外成本。
 
-现有 hook 调用方:
-  - CC stop hook、signal handler 等需同步更新，发请求时带 Authorization header
-```
+**不做 token/secret 认证。** 本机同用户进程可以读文件、dump 内存、ptrace — 任何 shared secret 都能被同用户进程秒读，无实际安全价值。
+
+### 其他防护
+
+- 请求体大小限制: 1MB
+- hook-port 文件 mode 0600（防其他用户读取，共享机器场景）
 
 ### 消息安全
 
@@ -80,10 +74,10 @@ Agent 不需要知道自己是谁。CLI 自动检测：
 
 > **不使用全局文件回退（如 `~/.imcodes/current-session`）。** 多个并发 session 会竞争同一文件，全局文件在多 session 架构下本质错误。
 
-**`IMCODES_SESSION` + `IMCODES_HOOK_SECRET` 注入时机：**
+**`IMCODES_SESSION` 注入时机：**
 - daemon 控制所有 agent 的启动命令（`buildLaunchCommand`），在启动时注入：
   ```bash
-  IMCODES_SESSION=deck_sub_xxx IMCODES_HOOK_SECRET=abc123 claude --resume ...
+  IMCODES_SESSION=deck_sub_xxx claude --resume ...
   ```
 - Transport (OpenClaw) — spawn 进程时传 env
 - CC SDK 调用 — 调用方设 env
@@ -95,18 +89,16 @@ Agent 不需要知道自己是谁。CLI 自动检测：
 Agent (in session)
   → imcodes send CLI (已有命令，扩展)
     → reads $IMCODES_SESSION (or $TMUX_PANE fallback)
-    → reads $IMCODES_HOOK_SECRET (or ~/.imcodes/hook-secret fallback)
     → reads ~/.imcodes/hook-port
-    → POST http://localhost:{port}/send (Authorization: Bearer <secret>)
+    → POST http://localhost:{port}/send (Content-Type: application/json)
       → daemon hook-server handler:
-        1. 验证 Authorization header
-        2. 验证 Content-Type: application/json
-        3. 验证 from session 存在 + 深度计数器 + 频率限制
-        4. 从 from 的 parentSession 找同域 siblings
-        5. 按 label/type/name 解析 target
-        6. 检查 target 状态（idle → 立即发送，running → 排队，stopped → 拒绝）
-        7. sanitizeMessage → sendKeys 注入
-        8. 返回 { ok: true, target, delivered | queued }
+        1. 验证 Content-Type: application/json（阻止浏览器跨域）
+        2. 验证 from session 存在 + 深度计数器 + 频率限制
+        3. 从 from 的 parentSession 找同域 siblings
+        4. 按 label/type/name 解析 target
+        5. 检查 target 状态（idle → 立即发送，running → 排队，stopped → 拒绝）
+        6. sanitizeMessage → sendKeys 注入
+        7. 返回 { ok: true, target, delivered | queued }
 ```
 
 ## Hook Server 端点
@@ -237,18 +229,17 @@ Use `imcodes send --list` to see available sibling sessions.
 
 ## 实现阶段
 
-### Phase 1: 安全的 `imcodes send`（tmux only）
-- [ ] **认证:** hook server 全端点 shared-secret 认证 + Content-Type 校验
-- [ ] **文件权限:** hook-port、hook-secret 文件 mode 0600
-- [ ] **Env 注入:** 所有 agent driver launch command 注入 `IMCODES_SESSION` + `IMCODES_HOOK_SECRET`
+### Phase 1: `imcodes send`（tmux only）
+- [ ] **CORS 防护:** hook server 所有端点要求 `Content-Type: application/json`（阻止浏览器跨域）
+- [ ] **请求限制:** body 大小 1MB，hook-port 文件 mode 0600
+- [ ] **Env 注入:** 所有 agent driver launch command 注入 `IMCODES_SESSION`
 - [ ] **扩展现有 CLI:** `src/index.ts` 的 `imcodes send` 增加 label 解析 + hook server IPC
-- [ ] **Hook 端点:** `POST /send`（认证、校验、body 大小限制）
+- [ ] **Hook 端点:** `POST /send`
 - [ ] **目标解析:** label/name/type → session name，含碰撞处理
 - [ ] **消息清洗:** sanitizeMessage（控制字符、tmux 前缀、长度限制）
 - [ ] **Queue-when-busy:** running 状态排队，idle 时投递，5min 过期
 - [ ] **防护:** 循环深度计数器 (max 3) + 频率限制 (10/min/source) + `--all` 上限 (8)
 - [ ] **Prompt 注入:** memory-inject.ts 自动注入 `imcodes send` 文档
-- [ ] **更新现有 hook 调用方:** CC stop hook 等加 Authorization header
 
 ### Phase 2: 增强
 - [ ] `--files` agent-type-aware 渲染
