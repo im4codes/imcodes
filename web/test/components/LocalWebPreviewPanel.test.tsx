@@ -76,7 +76,7 @@ describe('LocalWebPreviewPanel', () => {
     });
 
     fireEvent.click(screen.getByText('Open in new tab'));
-    expect(openSpy).toHaveBeenCalledWith('/api/server/server1/local-web/preview1/', '_blank', 'noopener,noreferrer');
+    expect(openSpy).toHaveBeenCalledWith('/api/server/server1/local-web/preview1/docs', '_blank', 'noopener,noreferrer');
   });
 
   it('recreates preview when refresh is clicked after path edit', async () => {
