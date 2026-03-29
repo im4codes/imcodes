@@ -173,62 +173,84 @@ export function LocalWebPreviewPanel({ serverId, port, path, onDraftChange }: Pr
     void openPreview();
   }, [isReady, openPreview]);
 
+  const [collapsed, setCollapsed] = useState(false);
+
   const previewStatus = preview
     ? `${t('localWebPreview.previewing')} ${preview.previewUrl}`
     : t('localWebPreview.empty');
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, height: '100%', minHeight: 0, padding: 10, color: '#cbd5e1' }}>
-      <form onSubmit={handleSubmit} style={{ display: 'grid', gridTemplateColumns: '88px 1fr auto', gap: 8, alignItems: 'end' }}>
-        <label style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
-          <span style={{ fontSize: 11, color: '#94a3b8' }}>{t('localWebPreview.port')}</span>
-          <input
-            class="input"
-            inputMode="numeric"
-            placeholder="3000"
-            value={portText}
-            onInput={(e) => setPortText((e.currentTarget as HTMLInputElement).value)}
-          />
-        </label>
-        <label style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
-          <span style={{ fontSize: 11, color: '#94a3b8' }}>{t('localWebPreview.path')}</span>
-          <input
-            class="input"
-            placeholder="/"
-            value={pathText}
-            onInput={(e) => setPathText((e.currentTarget as HTMLInputElement).value)}
-          />
-        </label>
-        <button class="btn btn-primary" type="submit" disabled={!isReady || loading}>
-          {loading ? t('common.loading') : t('localWebPreview.open')}
-        </button>
-      </form>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: collapsed ? 0 : 8, height: '100%', minHeight: 0, padding: collapsed ? 0 : 10, color: '#cbd5e1' }}>
+      {!collapsed && (
+        <>
+          <form onSubmit={handleSubmit} style={{ display: 'grid', gridTemplateColumns: '88px 1fr auto', gap: 8, alignItems: 'end' }}>
+            <label style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
+              <span style={{ fontSize: 11, color: '#94a3b8' }}>{t('localWebPreview.port')}</span>
+              <input
+                class="input"
+                inputMode="numeric"
+                placeholder="3000"
+                value={portText}
+                onInput={(e) => setPortText((e.currentTarget as HTMLInputElement).value)}
+              />
+            </label>
+            <label style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
+              <span style={{ fontSize: 11, color: '#94a3b8' }}>{t('localWebPreview.path')}</span>
+              <input
+                class="input"
+                placeholder="/"
+                value={pathText}
+                onInput={(e) => setPathText((e.currentTarget as HTMLInputElement).value)}
+              />
+            </label>
+            <button class="btn btn-primary" type="submit" disabled={!isReady || loading}>
+              {loading ? t('common.loading') : t('localWebPreview.open')}
+            </button>
+          </form>
 
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-        <button class="btn btn-secondary" type="button" onClick={() => void openPreview()} disabled={!isReady || loading}>
-          {t('localWebPreview.refresh')}
-        </button>
-        <button class="btn btn-secondary" type="button" onClick={() => void handleOpenInNewTab()} disabled={!isReady || loading}>
-          {t('localWebPreview.openInNewTab')}
-        </button>
-        <button class="btn btn-secondary" type="button" onClick={handleClosePreview} disabled={!preview && !loading}>
-          {t('localWebPreview.closePreview')}
-        </button>
-        <span style={{ fontSize: 11, color: '#64748b' }}>
-          {t('localWebPreview.sandboxNote')}
-        </span>
-        <span style={{ fontSize: 11, color: '#64748b' }}>
-          {t('localWebPreview.initialPathNote')}
-        </span>
-      </div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            <button class="btn btn-secondary" type="button" onClick={() => void openPreview()} disabled={!isReady || loading}>
+              {t('localWebPreview.refresh')}
+            </button>
+            <button class="btn btn-secondary" type="button" onClick={() => void handleOpenInNewTab()} disabled={!isReady || loading}>
+              {t('localWebPreview.openInNewTab')}
+            </button>
+            <button class="btn btn-secondary" type="button" onClick={handleClosePreview} disabled={!preview && !loading}>
+              {t('localWebPreview.closePreview')}
+            </button>
+            <span style={{ fontSize: 11, color: '#64748b' }}>
+              {t('localWebPreview.sandboxNote')}
+            </span>
+          </div>
 
-      {error && (
-        <div style={{ color: '#fda4af', fontSize: 12, lineHeight: 1.4, background: '#450a0a', border: '1px solid #7f1d1d', borderRadius: 6, padding: '8px 10px' }}>
-          {error}
+          {error && (
+            <div style={{ color: '#fda4af', fontSize: 12, lineHeight: 1.4, background: '#450a0a', border: '1px solid #7f1d1d', borderRadius: 6, padding: '8px 10px' }}>
+              {error}
+            </div>
+          )}
+        </>
+      )}
+
+      {collapsed && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 8px', background: '#1e293b', borderBottom: '1px solid #334155', flexShrink: 0 }}>
+          <button class="btn btn-secondary" type="button" onClick={() => void openPreview()} disabled={!isReady || loading} style={{ padding: '2px 8px', fontSize: 11 }}>
+            {t('localWebPreview.refresh')}
+          </button>
+          <span style={{ flex: 1, fontSize: 11, color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            :{portText}{pathText !== '/' ? pathText : ''}
+          </span>
+          <button onClick={() => setCollapsed(false)} style={{ background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer', fontSize: 14, padding: '2px 4px' }} title="Expand toolbar">▾</button>
         </div>
       )}
 
-      <div style={{ flex: 1, minHeight: 0, position: 'relative', background: '#020617', border: '1px solid #1e293b', borderRadius: 8, overflow: 'hidden' }}>
+      <div style={{ flex: 1, minHeight: 0, position: 'relative', background: '#020617', border: collapsed ? 'none' : '1px solid #1e293b', borderRadius: collapsed ? 0 : 8, overflow: 'hidden' }}>
+        {!collapsed && preview && (
+          <button
+            onClick={() => setCollapsed(true)}
+            style={{ position: 'absolute', top: 4, right: 4, zIndex: 10, background: 'rgba(15,23,42,0.7)', border: '1px solid #334155', borderRadius: 4, color: '#94a3b8', cursor: 'pointer', fontSize: 12, padding: '2px 6px', lineHeight: 1 }}
+            title="Collapse toolbar"
+          >▴</button>
+        )}
         {preview ? (
           <iframe
             key={preview.previewId}
