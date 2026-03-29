@@ -215,7 +215,7 @@ localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
 
     if (shouldRewritePreviewHtml(responseHeaders)) {
       const html = await new Response(started.body).text();
-      const rewrittenHtml = rewritePreviewHtmlDocument(html, serverId, previewId);
+      const rewrittenHtml = rewritePreviewHtmlDocument(html, serverId, previewId, preview.port);
       responseHeaders.delete('content-length');
       return new Response(rewrittenHtml, {
         status: started.status,

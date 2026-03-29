@@ -103,7 +103,7 @@ describe('local web preview policy', () => {
       </html>
     `;
 
-    const rewritten = rewritePreviewHtmlDocument(html, 'server123', 'preview123');
+    const rewritten = rewritePreviewHtmlDocument(html, 'server123', 'preview123', 3000);
     const prefix = '/api/server/server123/local-web/preview123';
 
     expect(rewritten).toContain(`<base href="${prefix}/"`);
@@ -114,5 +114,26 @@ describe('local web preview policy', () => {
     expect(rewritten).toContain(`srcset="${prefix}/logo.png 1x, ${prefix}/logo@2x.png 2x"`);
     expect(rewritten).toContain(`url('${prefix}/bg.png')`);
     expect(rewritten).toContain(`content="0; url=${prefix}/login"`);
+    expect(rewritten).toContain('data-imcodes-preview-runtime');
+    expect(rewritten).toContain(`var PREFIX=${JSON.stringify(prefix)}`);
+    expect(rewritten).toContain('Location.prototype.assign');
+    expect(rewritten).toContain('Location.prototype.replace');
+  });
+
+  it('rewrites absolute localhost urls that target the current preview port', () => {
+    const html = `
+      <html><head></head><body>
+        <a href="http://localhost:3000/docs?q=1">Docs</a>
+        <img src="http://127.0.0.1:3000/logo.png" />
+        <script>fetch("http://localhost:3000/api/data");location.assign("http://127.0.0.1:3000/next");</script>
+      </body></html>
+    `;
+
+    const rewritten = rewritePreviewHtmlDocument(html, 'server123', 'preview123', 3000);
+    const prefix = '/api/server/server123/local-web/preview123';
+
+    expect(rewritten).toContain(`href="${prefix}/docs?q=1"`);
+    expect(rewritten).toContain(`src="${prefix}/logo.png"`);
+    expect(rewritten).toContain(`var PREVIEW_PORT=3000`);
   });
 });
