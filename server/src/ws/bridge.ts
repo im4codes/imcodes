@@ -135,7 +135,7 @@ export class WsBridge {
   private daemonWs: WebSocket | null = null;
   private authenticated = false;
   private daemonVersion: string | null = null;
-  private lastUpgradeSentAt: number | null = null;
+  private upgradeAttempts = 0;
   private browserSockets = new Set<WebSocket>();
   private mobileSockets = new Set<WebSocket>();
   private queue: string[] = [];
@@ -280,18 +280,25 @@ export class WsBridge {
           logger.error({ err }, 'Failed to update heartbeat on auth'),
         );
 
-        // Auto-upgrade: once per connection, at most once per 10 minutes.
+        // Auto-upgrade: on each reconnect, retry up to 3 times with 10-minute intervals.
         // Skip dev versions (0.x.x) — those are local npm-linked development builds.
         const serverVersion = process.env.APP_VERSION;
         const isDev = this.daemonVersion?.startsWith('0.') ?? false;
-        const now = Date.now();
-        const cooldown = this.lastUpgradeSentAt ? (now - this.lastUpgradeSentAt < 10 * 60 * 1000) : false;
-        if (serverVersion && serverVersion !== '0.0.0' && this.daemonVersion && this.daemonVersion !== serverVersion && !isDev && !cooldown) {
-          this.lastUpgradeSentAt = now;
-          logger.info({ serverId: this.serverId, daemonVersion: this.daemonVersion, serverVersion }, 'Version mismatch — sending daemon.upgrade');
-          setTimeout(() => {
-            try { ws.send(JSON.stringify({ type: 'daemon.upgrade', targetVersion: serverVersion })); } catch { /* ignore */ }
-          }, 5000);
+        if (serverVersion && serverVersion !== '0.0.0' && this.daemonVersion && this.daemonVersion !== serverVersion && !isDev) {
+          this.upgradeAttempts = (this.upgradeAttempts ?? 0) + 1;
+          if (this.upgradeAttempts <= 3) {
+            logger.info({ serverId: this.serverId, daemonVersion: this.daemonVersion, serverVersion, attempt: this.upgradeAttempts }, 'Version mismatch — sending daemon.upgrade');
+            setTimeout(() => {
+              try { ws.send(JSON.stringify({ type: 'daemon.upgrade', targetVersion: serverVersion })); } catch { /* ignore */ }
+            }, 5000);
+            // Schedule retry: if daemon reconnects with the same old version after 10 min, the counter is already incremented.
+            // If daemon doesn't reconnect (upgrade succeeded and restarted), the next auth will have matching version → no upgrade sent.
+          } else {
+            logger.warn({ serverId: this.serverId, daemonVersion: this.daemonVersion, serverVersion, attempts: this.upgradeAttempts }, 'Version mismatch — max upgrade attempts reached, giving up');
+          }
+        } else {
+          // Version matches or not applicable — reset retry counter
+          this.upgradeAttempts = 0;
         }
 
         // Replay queued messages, skipping terminal.subscribe — refs replay below is authoritative

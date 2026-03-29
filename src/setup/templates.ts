@@ -54,7 +54,7 @@ export function dockerComposeTemplate(opts?: { ghcrPrefix?: string }): string {
       - server
 
   watchtower:
-    image: containrrr/watchtower
+    image: nickfedor/watchtower
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
