@@ -213,6 +213,24 @@ export interface LocalWebPreviewCreateResponse {
   expiresAt?: string | number | null;
 }
 
+interface RawLocalWebPreviewCreateResponse {
+  ok?: boolean;
+  preview?: {
+    id: string;
+    url?: string;
+    serverId?: string;
+    port: number;
+    path: string;
+    expiresAt?: string | number | null;
+  };
+  previewId?: string;
+  previewUrl?: string;
+  serverId?: string;
+  port?: number;
+  path?: string;
+  expiresAt?: string | number | null;
+}
+
 export interface LocalWebPreviewCloseResponse {
   ok: true;
 }
@@ -222,10 +240,34 @@ export async function createLocalWebPreview(
   port: number,
   path = '/',
 ): Promise<LocalWebPreviewCreateResponse> {
-  return apiFetch(`/api/server/${encodeURIComponent(serverId)}/local-web-preview`, {
+  const response = await apiFetch<RawLocalWebPreviewCreateResponse>(`/api/server/${encodeURIComponent(serverId)}/local-web-preview`, {
     method: 'POST',
     body: JSON.stringify({ port, path: normalizeLocalWebPreviewPath(path) }),
   });
+
+  if (response.preview) {
+    return {
+      previewId: response.preview.id,
+      previewUrl: response.preview.url,
+      serverId: response.preview.serverId,
+      port: response.preview.port,
+      path: response.preview.path,
+      expiresAt: response.preview.expiresAt,
+    };
+  }
+
+  if (response.previewId && typeof response.port === 'number' && typeof response.path === 'string') {
+    return {
+      previewId: response.previewId,
+      previewUrl: response.previewUrl,
+      serverId: response.serverId,
+      port: response.port,
+      path: response.path,
+      expiresAt: response.expiresAt,
+    };
+  }
+
+  throw new Error('Invalid preview create response');
 }
 
 export async function closeLocalWebPreview(serverId: string, previewId: string): Promise<LocalWebPreviewCloseResponse> {
