@@ -272,9 +272,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     });
   }, [p2pConfigKey]);
 
-  /** Build a short display label for the input box — the full token is sent via WS extra fields. */
-  const buildAgentLabel = (session: string, _mode: string) =>
-    session === '__all__' ? '@@all' : `@@${session.replace(/^deck_sub_/, '')}`;
+  /** Build a short display label for the input box — prefer sub-session label over raw ID. */
+  const buildAgentLabel = (session: string, _mode: string) => {
+    if (session === '__all__') return '@@all';
+    const sub = (subSessions ?? []).find(s => s.sessionName === session);
+    const display = sub?.label || session.replace(/^deck_sub_/, '');
+    return `@@${display}`;
+  };
 
   /** Pending @-selected P2P targets + their display labels for removal at send time. */
   const pendingAtTargetsRef = useRef<Array<{ session: string; mode: string; label: string }>>([]);

@@ -894,17 +894,17 @@ export function App() {
       if (msg.type === 'session.idle') {
         const sessionName = msg.session as string;
         if (!sessionName) return;
-        // Format: label(type)@mainSession — fallback label to sub-session ID
-        const label = msg.label as string | undefined;
+        // Format: label(type)@mainSession — fallback to local subSessions label, then agentType
+        const localSub = subSessions.find(s => s.sessionName === sessionName);
+        const label = (msg.label as string | undefined) || localSub?.label || undefined;
         const parentLabel = msg.parentLabel as string | undefined;
-        const agentType = msg.agentType as string | undefined;
+        const agentType = (msg.agentType as string | undefined) || localSub?.type || undefined;
         const rawProject = (msg.project as string) || sessionName;
         let displayProject: string;
         const typeSuffix = agentType ? `(${agentType})` : '';
         if (sessionName.startsWith('deck_sub_')) {
-          const subId = sessionName.replace(/^deck_sub_/, '');
-          const name = label || subId;
-          displayProject = `${name}${typeSuffix}${parentLabel ? `@${parentLabel}` : ''}`;
+          const name = label || agentType || sessionName.replace(/^deck_sub_/, '');
+          displayProject = `${name}${label ? typeSuffix : ''}${parentLabel ? `@${parentLabel}` : ''}`;
         } else {
           const name = label || rawProject;
           displayProject = `${name}${typeSuffix}`;
@@ -922,16 +922,16 @@ export function App() {
       }
       if (msg.type === 'session.notification') {
         const sessionName = msg.session;
-        const label = msg.label as string | undefined;
+        const localSub = subSessions.find(s => s.sessionName === sessionName);
+        const label = (msg.label as string | undefined) || localSub?.label || undefined;
         const parentLabel = msg.parentLabel as string | undefined;
-        const agentType = msg.agentType as string | undefined;
+        const agentType = (msg.agentType as string | undefined) || localSub?.type || undefined;
         const rawProject = msg.project || sessionName;
         const typeSuffix = agentType ? `(${agentType})` : '';
         let displayProject: string;
         if (sessionName.startsWith('deck_sub_')) {
-          const subId = sessionName.replace(/^deck_sub_/, '');
-          const name = label || subId;
-          displayProject = `${name}${typeSuffix}${parentLabel ? `@${parentLabel}` : ''}`;
+          const name = label || agentType || sessionName.replace(/^deck_sub_/, '');
+          displayProject = `${name}${label ? typeSuffix : ''}${parentLabel ? `@${parentLabel}` : ''}`;
         } else {
           const name = label || rawProject;
           displayProject = `${name}${typeSuffix}`;

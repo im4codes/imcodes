@@ -290,8 +290,8 @@ describe('SessionControls', () => {
     fireEvent.click(screen.getByText('Worker Alpha'));
     fireEvent.click(screen.getByText('audit'));
 
-    // Input shows short @@label (double-@ = P2P, single-@ = file ref)
-    expect(input.textContent).toBe('@@worker-alpha ');
+    // Input shows @@label when sub-session has a label (not the raw session ID)
+    expect(input.textContent).toBe('@@Worker Alpha ');
     getSelectionSpy.mockRestore();
   });
 
