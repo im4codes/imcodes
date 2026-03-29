@@ -245,6 +245,9 @@ jobs:
       - name: Install web deps (needed for tsx component tests)
         run: npm ci
         working-directory: web
+      - name: Install server deps (needed for server route tests)
+        run: npm ci
+        working-directory: server
       - run: npm run build
       - run: npm run test:coverage
       - name: Upload to Codecov
