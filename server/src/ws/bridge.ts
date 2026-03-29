@@ -876,6 +876,20 @@ export class WsBridge {
       return;
     }
 
+    // ── Cron command result: update execution detail with agent response ──
+    if (type === 'cron.command_result' && this.db) {
+      const { jobId, detail } = msg as { jobId: string; detail: string };
+      if (jobId && detail) {
+        void this.db.execute(
+          `UPDATE cron_executions SET detail = $1 WHERE id = (
+             SELECT id FROM cron_executions WHERE job_id = $2 ORDER BY created_at DESC LIMIT 1
+           )`,
+          [detail.slice(0, 4000), jobId],
+        ).catch(() => {});
+      }
+      return;
+    }
+
     // ── P2P orchestration run persistence + broadcast ────────────────────────
     if (type === 'p2p.run_save' && this.db) {
       void upsertOrchestrationRun(this.db, msg.run as any).catch(() => {});
@@ -1452,20 +1466,23 @@ export class WsBridge {
       }
     }
 
-    // Build display name: label > project_name > session ID
+    // Build display name: label(type)@mainSession — fallback label to sub-session ID
     const label = daemonLabel || sessionRow?.label;
     const agentType = subType || sessionRow?.agent_type || String(msg.agentType ?? '');
     const parentContext = daemonParentLabel || sessionRow?.project_name;
+    const isSub = sessionName.startsWith('deck_sub_');
 
     let displayName: string;
-    if (label) {
+    if (isSub) {
+      const subId = sessionName.replace(/^deck_sub_/, '');
+      const name = label || subId;
+      displayName = `${name}${agentType ? `(${agentType})` : ''}${parentContext ? `@${parentContext}` : ''}`;
+    } else if (label) {
       displayName = parentContext ? `${parentContext} · ${label}` : label;
-    } else if (agentType && parentContext) {
-      displayName = `${parentContext} · ${agentType}`;
     } else {
       displayName = parentContext || sessionName;
     }
-    const agentLabel = agentType && label ? ` (${agentType})` : '';
+    const agentLabel = '';
     const lastText = String(msg.lastText ?? msg.message ?? '').slice(0, 200);
 
     let title: string;

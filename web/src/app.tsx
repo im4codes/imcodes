@@ -894,16 +894,18 @@ export function App() {
       if (msg.type === 'session.idle') {
         const sessionName = msg.session as string;
         if (!sessionName) return;
-        // Build human-readable display: prefer label, fall back to project name, then session ID
+        // Format: label(type)@mainSession — fallback label to sub-session ID
         const label = msg.label as string | undefined;
         const parentLabel = msg.parentLabel as string | undefined;
         const agentType = msg.agentType as string | undefined;
         const rawProject = (msg.project as string) || sessionName;
         let displayProject: string;
-        if (label) {
+        if (sessionName.startsWith('deck_sub_')) {
+          const subId = sessionName.replace(/^deck_sub_/, '');
+          const name = label || subId;
+          displayProject = `${name}${agentType ? `(${agentType})` : ''}${parentLabel ? `@${parentLabel}` : ''}`;
+        } else if (label) {
           displayProject = parentLabel ? `${parentLabel} · ${label}` : label;
-        } else if (agentType && parentLabel) {
-          displayProject = `${parentLabel} · ${agentType}`;
         } else {
           displayProject = rawProject;
         }
@@ -924,7 +926,11 @@ export function App() {
         const parentLabel = msg.parentLabel as string | undefined;
         const rawProject = msg.project || sessionName;
         let displayProject: string;
-        if (label) {
+        if (sessionName.startsWith('deck_sub_')) {
+          const subId = sessionName.replace(/^deck_sub_/, '');
+          const name = label || subId;
+          displayProject = `${name}${parentLabel ? `@${parentLabel}` : ''}`;
+        } else if (label) {
           displayProject = parentLabel ? `${parentLabel} · ${label}` : label;
         } else {
           displayProject = rawProject;
