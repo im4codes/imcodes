@@ -126,7 +126,7 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
 
 /** Collect assistant output after a cron command until session goes idle, then send result to server. */
 function collectCommandResult(sessionId: string, jobId: string, serverLink: ServerLink): void {
-  const MAX_WAIT_MS = 5 * 60 * 1000; // 5 min max
+  const MAX_WAIT_MS = 10 * 60 * 1000; // 10 min max
   const MAX_DETAIL_LEN = 4000;
   const collected: string[] = [];
   const startTs = Date.now();
