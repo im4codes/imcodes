@@ -57,7 +57,7 @@ Agent (in session)
         1. 验证 from session 存在
         2. 从 from 的 parentSession 找同域 siblings
         3. 按 label/type/name 解析 target
-        4. tmux sendKeys 注入消息到 target pane
+        4. mux.sendKeys 注入消息到 target pane
         5. 返回 { ok: true, target: "deck_sub_xxx" }
 ```
 
@@ -82,14 +82,88 @@ Agent (in session)
 3. **agent type** 匹配（claude-code / codex / gemini）— 多个匹配时报错
 4. 找不到 → 返回错误 + 可用 session 列表
 
+## 终端复用器抽象层（TerminalMux）
+
+现有 `src/agent/tmux.ts` 直接调 tmux 命令，所有上层代码都耦合 tmux。
+抽出统一接口，启动时自动检测系统可用的终端复用器（tmux / WezTerm），实例化对应实现。
+
+### 接口定义
+
+```typescript
+// src/agent/mux.ts
+interface TerminalMux {
+  name: string;  // 'tmux' | 'wezterm'
+  newSession(name: string, cmd: string, opts?: { cwd?: string; env?: Record<string, string> }): Promise<void>;
+  killSession(name: string): Promise<void>;
+  sessionExists(name: string): Promise<boolean>;
+  listSessions(): Promise<string[]>;
+  sendKeys(name: string, keys: string): Promise<void>;
+  capturePane(name: string): Promise<string[]>;
+  respawnPane(name: string, cmd: string): Promise<void>;
+  getPaneCwd(name: string): Promise<string>;
+  getPaneId(name: string): Promise<string | undefined>;
+  getPaneCommand(name: string): Promise<string>;
+}
+```
+
+### 实现
+
+```
+src/agent/mux.ts              — interface + auto-detect + export singleton
+src/agent/mux/tmux.ts         — tmux 实现（从现有 tmux.ts 迁移）
+src/agent/mux/wezterm.ts      — WezTerm 实现
+```
+
+### 自动检测
+
+```typescript
+// src/agent/mux.ts
+async function detect(): Promise<TerminalMux> {
+  // 1. 检查 $IMCODES_MUX 环境变量（用户强制指定）
+  // 2. which tmux → TmuxMux
+  // 3. which wezterm → WezTermMux
+  // 4. 都没有 → 报错退出
+}
+
+export const mux = await detect();
+```
+
+### 迁移路径
+
+现有 `src/agent/tmux.ts` 导出的函数：
+- `newSession()` → `mux.newSession()`
+- `killSession()` → `mux.killSession()`
+- `sessionExists()` → `mux.sessionExists()`
+- `tmuxListSessions()` → `mux.listSessions()`
+- `sendKeys()` → `mux.sendKeys()`
+- `capturePane()` → `mux.capturePane()`
+- `respawnPane()` → `mux.respawnPane()`
+- `getPaneCwd()` → `mux.getPaneCwd()`
+- `getPaneId()` → `mux.getPaneId()`
+- `getPaneCommand()` → `mux.getPaneCommand()`
+
+上层调用方（session-manager、subsession-manager、command-handler、brain-dispatcher 等）改为 `import { mux } from './mux.js'`，调用 `mux.xxx()` 而非直接 `import { sendKeys } from './tmux.js'`。
+
+### WezTerm 对应命令
+
+| 操作 | tmux | WezTerm CLI |
+|------|------|------------|
+| 新建 session | `tmux new-session -d -s name 'cmd'` | `wezterm cli spawn --new-window --window-name name -- cmd` |
+| 关闭 session | `tmux kill-session -t name` | `wezterm cli kill-pane --pane-id id` |
+| 列出 sessions | `tmux list-sessions -F '#S'` | `wezterm cli list --format json` |
+| 发送按键 | `tmux send-keys -t name 'text' Enter` | `wezterm cli send-text --pane-id id 'text\n'` |
+| 捕获输出 | `tmux capture-pane -t name -p` | `wezterm cli get-text --pane-id id` |
+| 查进程 | `tmux list-panes -t name -F '#{pane_pid}'` | `wezterm cli list --format json` (含 pid) |
+
 ## 跨平台支持
 
-| 平台 | 终端复用器 | 身份检测 | sendKeys |
-|------|-----------|---------|----------|
-| Linux/macOS | tmux | $IMCODES_SESSION > $TMUX_PANE | tmux send-keys |
-| Windows | WezTerm (规划中) | $IMCODES_SESSION | WezTerm CLI / ConPTY |
-| Transport (OC) | 无 tmux | $IMCODES_SESSION | provider API |
-| CC SDK | 无 tmux | $IMCODES_SESSION | SDK stdin pipe |
+| 平台 | 终端复用器 | 身份检测 | TerminalMux 实现 |
+|------|-----------|---------|-----------------|
+| Linux/macOS | tmux | $IMCODES_SESSION > $TMUX_PANE | TmuxMux |
+| Windows | WezTerm | $IMCODES_SESSION | WezTermMux |
+| Linux/macOS (alt) | WezTerm | $IMCODES_SESSION | WezTermMux |
+| Transport (OC) | 无 | $IMCODES_SESSION | provider API (不走 mux) |
+| CC SDK | 无 | $IMCODES_SESSION | SDK stdin pipe (不走 mux) |
 
 ## CLAUDE.md / Agent Prompt 集成
 
@@ -107,20 +181,23 @@ Use `imcodes send --list` to see available sibling sessions.
 
 ## 实现阶段
 
-### Phase 1: 基础 send
+### Phase 1: TerminalMux 抽象层 + Windows 支持
+- [ ] 定义 `TerminalMux` interface（`src/agent/mux.ts`）
+- [ ] 从 `tmux.ts` 迁移到 `src/agent/mux/tmux.ts` 实现
+- [ ] 实现 `src/agent/mux/wezterm.ts`（WezTerm CLI）
+- [ ] 自动检测逻辑（`$IMCODES_MUX` > which tmux > which wezterm）
+- [ ] 迁移所有上层调用方：session-manager、subsession-manager、command-handler 等
 - [ ] 给所有 agent driver 的 launch command 注入 `IMCODES_SESSION` env var
+
+### Phase 2: imcodes send
 - [ ] CLI: `imcodes send` 子命令（commander）
 - [ ] Hook server: `POST /send` 端点
 - [ ] 目标解析（label → session name）
-- [ ] tmux sendKeys 注入
-
-### Phase 2: 跨平台
-- [ ] Windows WezTerm 集成
-- [ ] Transport session 支持（通过 provider API）
-- [ ] CC SDK 直接调用支持
+- [ ] `mux.sendKeys()` 注入消息
+- [ ] `imcodes send --list` 列出可用 sessions
 
 ### Phase 3: 增强
-- [ ] `imcodes send --list` 列出可用 sessions
 - [ ] `imcodes send --status` 查看 siblings 状态
 - [ ] 结果回传（target 完成后通知 sender）
+- [ ] Transport session 支持（通过 provider API，不走 mux）
 - [ ] 支持附件/二进制文件传递
