@@ -110,7 +110,7 @@ export async function jobDispatchCron(env: Env): Promise<void> {
       bridge.sendToDaemon(JSON.stringify(msg));
 
       // Advance schedule
-      const nextRun = calculateNextRun(job.cron_expr, now);
+      const nextRun = calculateNextRun(job.cron_expr, now, job.timezone);
       await env.DB.execute('UPDATE cron_jobs SET next_run_at = $1 WHERE id = $2', [nextRun, job.id]);
 
       // Auto-expire if next run is past expiration
