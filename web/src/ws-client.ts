@@ -3,7 +3,7 @@
  * Handles auth, reconnect, and message dispatch.
  */
 import type { TerminalDiff } from './types.js';
-import { apiFetch } from './api.js';
+import { apiFetch, ApiError } from './api.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import type {
@@ -437,8 +437,10 @@ export class WsClient {
         body: JSON.stringify({ serverId: this.serverId }),
       });
       ticket = data.ticket;
-    } catch {
+    } catch (err) {
       this._connecting = false;
+      // Auth expired (401) → onAuthExpired already fired, don't keep reconnecting
+      if (err instanceof ApiError && err.status === 401) return;
       this.scheduleReconnect();
       return;
     }
