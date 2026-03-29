@@ -47,9 +47,13 @@ export function LocalWebPreviewPanel({ serverId, port, path, onDraftChange }: Pr
     setPathText(path ?? '/');
   }, [path]);
 
+  // Use ref to avoid infinite loop: onDraftChange is a new closure every render
+  // from the pinned panel registry, so including it in deps would cause re-render cycles.
+  const onDraftChangeRef = useRef(onDraftChange);
+  onDraftChangeRef.current = onDraftChange;
   useEffect(() => {
-    onDraftChange?.({ port: portText, path: pathText });
-  }, [onDraftChange, portText, pathText]);
+    onDraftChangeRef.current?.({ port: portText, path: pathText });
+  }, [portText, pathText]);
 
   const normalizedPath = useMemo(() => normalizeLocalWebPreviewPath(pathText), [pathText]);
   const parsedPort = useMemo(() => parsePort(portText), [portText]);
