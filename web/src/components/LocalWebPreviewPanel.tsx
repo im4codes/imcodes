@@ -236,7 +236,7 @@ export function LocalWebPreviewPanel({ serverId, port, path, onDraftChange }: Pr
             key={preview.previewId}
             src={preview.previewUrl}
             title={t('localWebPreview.title')}
-            sandbox="allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-scripts"
+            sandbox="allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts"
             referrerPolicy="no-referrer"
             style={{ width: '100%', height: '100%', border: 'none', background: '#020617' }}
             onLoad={() => setIframeLoaded(true)}

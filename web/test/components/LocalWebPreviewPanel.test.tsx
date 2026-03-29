@@ -55,7 +55,7 @@ describe('LocalWebPreviewPanel', () => {
     closeLocalWebPreview.mockResolvedValue({ ok: true });
   });
 
-  it('renders sandboxed iframe without allow-same-origin after open', async () => {
+  it('renders sandboxed iframe with allow-same-origin after open', async () => {
     render(<LocalWebPreviewPanel serverId="server1" port="3000" path="/" />);
 
     await act(async () => {
@@ -64,7 +64,7 @@ describe('LocalWebPreviewPanel', () => {
 
     const iframe = await screen.findByTitle('Local Web Preview');
     expect(iframe?.getAttribute('sandbox')).toContain('allow-scripts');
-    expect(iframe?.getAttribute('sandbox')).not.toContain('allow-same-origin');
+    expect(iframe?.getAttribute('sandbox')).toContain('allow-same-origin');
   });
 
   it('opens the active preview url in a new tab', async () => {
