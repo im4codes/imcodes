@@ -160,7 +160,9 @@ async function installWindowsStartup(): Promise<void> {
 
 /** Ensure terminal backend + system service are installed. Shared by bind and re-bind. */
 async function ensureServiceInstalled(): Promise<void> {
-  if (process.platform !== 'win32') {
+  if (process.platform === 'win32') {
+    await ensureWezTerm();
+  } else {
     await ensureTmux();
   }
 
@@ -176,6 +178,18 @@ async function ensureServiceInstalled(): Promise<void> {
   } else {
     console.log('\nRun "imcodes start" to start the daemon.');
   }
+}
+
+async function ensureWezTerm(): Promise<void> {
+  try {
+    execSync('wezterm --version', { stdio: 'ignore' });
+    return;
+  } catch {
+    // not found
+  }
+  console.error('WezTerm is required on Windows. Install from https://wezfurlong.org/wezterm/installation.html');
+  console.error('After installing, make sure "wezterm" is in your PATH, then re-run "imcodes bind".');
+  process.exit(1);
 }
 
 async function ensureTmux(): Promise<void> {
