@@ -89,11 +89,17 @@ export async function weztermNewSession(
   command?: string,
   opts?: WeztermNewSessionOptions,
 ): Promise<string> {
-  const args: string[] = ['spawn'];
-  if (opts?.cwd) args.push('--cwd', opts.cwd);
-  if (command) args.push('--', command);
-  // wezterm cli spawn prints the pane_id to stdout
-  const raw = await weztermRun(...args);
+  const baseArgs: string[] = [];
+  if (opts?.cwd) baseArgs.push('--cwd', opts.cwd);
+  if (command) baseArgs.push('--', command);
+  // Try spawn without --new-window first (works when a window exists).
+  // If it fails (no focused pane — headless/background), retry with --new-window.
+  let raw: string;
+  try {
+    raw = await weztermRun('spawn', ...baseArgs);
+  } catch {
+    raw = await weztermRun('spawn', '--new-window', ...baseArgs);
+  }
   const paneId = raw.trim();
   registerPane(name, paneId);
 
