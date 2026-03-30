@@ -61,6 +61,18 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
     ws?.send({ type: 'p2p.read_discussion', id });
   }, [ws]);
 
+  // Auto-refresh selected discussion content every 5s (like file browser preview)
+  useEffect(() => {
+    if (!selected || !ws) return;
+    const timer = setInterval(() => {
+      if (!pendingReadIdRef.current) {
+        pendingReadIdRef.current = selected;
+        ws.send({ type: 'p2p.read_discussion', id: selected });
+      }
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [selected, ws]);
+
   // Auto-select initialSelectedId: try immediately (even before list loads)
   const initialAppliedRef = useRef(false);
   useEffect(() => {
