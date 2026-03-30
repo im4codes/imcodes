@@ -196,15 +196,21 @@ program
     // Check daemon process status
     let daemonPid: string | null = null;
     let daemonRunning = false;
+    const pidFile = join(homedir(), '.imcodes', 'daemon.pid');
     try {
-      const out = execSync('systemctl --user show imcodes --property=MainPID --value 2>/dev/null', { encoding: 'utf8' }).trim();
-      if (out && out !== '0') { daemonPid = out; daemonRunning = true; }
-    } catch { /* not using systemd or not installed */ }
-    if (!daemonRunning) {
+      const storedPid = readFileSync(pidFile, 'utf8').trim();
+      if (storedPid) {
+        daemonPid = storedPid;
+        // Check if process is actually running
+        try { process.kill(parseInt(storedPid, 10), 0); daemonRunning = true; } catch { /* not running */ }
+      }
+    } catch { /* no PID file */ }
+    // Fallback: systemd (Linux only)
+    if (!daemonRunning && process.platform === 'linux') {
       try {
-        const out = execSync('pgrep -f "imcodes start" 2>/dev/null', { encoding: 'utf8' }).trim();
-        if (out) { daemonPid = out.split('\n')[0]; daemonRunning = true; }
-      } catch { /* not running */ }
+        const out = execSync('systemctl --user show imcodes --property=MainPID --value 2>/dev/null', { encoding: 'utf8' }).trim();
+        if (out && out !== '0') { daemonPid = out; daemonRunning = true; }
+      } catch { /* not using systemd */ }
     }
 
     if (opts.json) {
