@@ -93,8 +93,14 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
         if (msg.mtime) onSaved(msg.mtime);
         setTimeout(() => setSaveStatus((s) => s === 'success' ? 'idle' : s), 2000);
       } else if (msg.status === 'conflict') {
-        setSaveStatus('idle');
-        // Conflict handled by FileEditorContent
+        // File changed on disk since last read — update mtime and retry as force-write
+        if (msg.diskMtime) setOriginalMtime(msg.diskMtime);
+        setSaveStatus('error');
+        setSaveError(t('fileBrowser.conflictTitle', 'File changed on disk'));
+        setTimeout(() => setSaveStatus((s) => s === 'error' ? 'idle' : s), 3000);
+        // Auto force-save: user explicitly clicked Save, honor their intent
+        const retryId = ws.fsWriteFile(path, editContentRef.current);
+        pendingWriteRef.current.set(retryId, path);
       } else {
         setSaveStatus('error');
         setSaveError(msg.error === 'file_too_large' ? t('fileBrowser.fileTooLarge') : t('fileBrowser.saveError'));
