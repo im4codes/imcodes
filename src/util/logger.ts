@@ -47,14 +47,17 @@ function buildLogger(): pino.Logger {
     });
   }
 
-  // Daemon mode: always write to file + console
+  // Daemon mode: always write to file, console only if stdout is a TTY (not a broken pipe)
   try { mkdirSync(LOG_DIR, { recursive: true }); } catch { /* ignore */ }
   rotateLogs();
 
   const streams: pino.StreamEntry[] = [
     { level: 'info', stream: pino.destination({ dest: LOG_FILE, append: true, sync: false }) },
-    { level: 'info', stream: process.stdout },
   ];
+  // Only add stdout if it's a real TTY (avoids EPIPE crash when daemon runs detached)
+  if (process.stdout.isTTY) {
+    streams.push({ level: 'info', stream: process.stdout });
+  }
 
   return pino(
     { level: process.env.LOG_LEVEL ?? 'info' },
