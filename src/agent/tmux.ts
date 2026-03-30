@@ -23,6 +23,7 @@ import {
   weztermGetPanePids,
   weztermCapturePaneVisible,
   weztermResizePane,
+  weztermSendRawInput,
   startWeztermPollingStream,
   registerPane,
 } from './wezterm.js';
@@ -497,7 +498,10 @@ function isCtrlCRateLimited(session: string): boolean {
  * tmux-only — xterm→tmux key translation is tmux-specific.
  */
 export async function sendRawInput(session: string, data: string): Promise<void> {
-  requireTmux('sendRawInput');
+  if (BACKEND === 'wezterm') {
+    await weztermSendRawInput(session, data);
+    return;
+  }
 
   // Check escape sequence map first
   const tmuxKey = XTERM_KEY_MAP[data];

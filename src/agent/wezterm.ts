@@ -196,14 +196,37 @@ export async function weztermSendText(name: string, text: string): Promise<void>
 /** Send Enter key to a WezTerm pane. */
 export async function weztermSendEnter(name: string): Promise<void> {
   const paneId = requirePaneId(name);
-  await weztermRun('send-text', '--pane-id', paneId, '--no-paste', '--', '\n');
+  // Use \r (carriage return) — WezTerm translates to Enter key event
+  await weztermRun('send-text', '--pane-id', paneId, '--no-paste', '--', '\r');
 }
 
 /** Send a raw key to a WezTerm pane (e.g. ctrl-c). */
 export async function weztermSendKey(name: string, key: string): Promise<void> {
   const paneId = requirePaneId(name);
-  // WezTerm send-text with --no-paste sends raw bytes
   await weztermRun('send-text', '--pane-id', paneId, '--no-paste', '--', key);
+}
+
+/**
+ * Send raw terminal input to a WezTerm pane.
+ * Handles xterm escape sequences, ctrl keys, and regular text.
+ * WezTerm's send-text --no-paste accepts raw bytes directly.
+ */
+export async function weztermSendRawInput(name: string, data: string): Promise<void> {
+  const paneId = requirePaneId(name);
+
+  // Ctrl+C rate limiting
+  if (data === '\x03') {
+    const now = Date.now();
+    const key = `ctrlc-${name}`;
+    const last = (weztermSendRawInput as any)[key] as number | undefined;
+    if (last && now - last < 1500) return; // rate limit
+    (weztermSendRawInput as any)[key] = now;
+  }
+
+  // Map \r to Enter (carriage return), keep all escape sequences as-is
+  // WezTerm send-text --no-paste passes raw bytes to the PTY
+  const mapped = data === '\r' ? '\r' : data;
+  await weztermRun('send-text', '--pane-id', paneId, '--no-paste', '--', mapped);
 }
 
 /**
