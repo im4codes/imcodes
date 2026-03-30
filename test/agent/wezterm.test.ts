@@ -15,19 +15,17 @@ const execFileMock = vi.mocked(execFileCb);
 
 // Helper to make execFile mock resolve with { stdout, stderr }
 function mockExecFileResolves(stdout: string, stderr = ''): void {
-  execFileMock.mockImplementation((_cmd: any, _args: any, cb: any) => {
-    if (typeof cb === 'function') {
-      cb(null, { stdout, stderr });
-    }
+  execFileMock.mockImplementation((...fnArgs: any[]) => {
+    const cb = fnArgs.find((a: any) => typeof a === 'function');
+    if (cb) cb(null, { stdout, stderr });
     return undefined as any;
   });
 }
 
 function mockExecFileRejectsOnce(error: Error): void {
-  execFileMock.mockImplementationOnce((_cmd: any, _args: any, cb: any) => {
-    if (typeof cb === 'function') {
-      cb(error, { stdout: '', stderr: '' });
-    }
+  execFileMock.mockImplementationOnce((...fnArgs: any[]) => {
+    const cb = fnArgs.find((a: any) => typeof a === 'function');
+    if (cb) cb(error, { stdout: '', stderr: '' });
     return undefined as any;
   });
 }
@@ -78,6 +76,7 @@ describe('weztermNewSession', () => {
     expect(execFileMock).toHaveBeenCalledWith(
       'wezterm',
       ['cli', 'spawn', '--cwd', '/home/user/proj', '--', 'bash'],
+      expect.objectContaining({ windowsHide: true }),
       expect.any(Function),
     );
 
@@ -93,6 +92,7 @@ describe('weztermNewSession', () => {
     expect(execFileMock).toHaveBeenCalledWith(
       'wezterm',
       ['cli', 'spawn', '--', 'bash'],
+      expect.objectContaining({ windowsHide: true }),
       expect.any(Function),
     );
   });
@@ -105,6 +105,7 @@ describe('weztermNewSession', () => {
     expect(execFileMock).toHaveBeenCalledWith(
       'wezterm',
       ['cli', 'spawn'],
+      expect.objectContaining({ windowsHide: true }),
       expect.any(Function),
     );
   });
@@ -120,6 +121,7 @@ describe('weztermKillSession', () => {
     expect(execFileMock).toHaveBeenCalledWith(
       'wezterm',
       ['cli', 'kill-pane', '--pane-id', '42'],
+      expect.objectContaining({ windowsHide: true }),
       expect.any(Function),
     );
 
@@ -187,6 +189,7 @@ describe('weztermSendText', () => {
     expect(execFileMock).toHaveBeenCalledWith(
       'wezterm',
       ['cli', 'send-text', '--pane-id', '42', '--no-paste', '--', 'hello world'],
+      expect.objectContaining({ windowsHide: true }),
       expect.any(Function),
     );
   });
@@ -206,6 +209,7 @@ describe('weztermSendEnter', () => {
     expect(execFileMock).toHaveBeenCalledWith(
       'wezterm',
       ['cli', 'send-text', '--pane-id', '42', '--no-paste', '--', '\n'],
+      expect.objectContaining({ windowsHide: true }),
       expect.any(Function),
     );
   });
@@ -221,6 +225,7 @@ describe('weztermSendKey', () => {
     expect(execFileMock).toHaveBeenCalledWith(
       'wezterm',
       ['cli', 'send-text', '--pane-id', '42', '--no-paste', '--', '\x03'],
+      expect.objectContaining({ windowsHide: true }),
       expect.any(Function),
     );
   });
@@ -237,6 +242,7 @@ describe('weztermCapturePane', () => {
     expect(execFileMock).toHaveBeenCalledWith(
       'wezterm',
       ['cli', 'get-text', '--pane-id', '42'],
+      expect.objectContaining({ windowsHide: true }),
       expect.any(Function),
     );
     expect(result).toHaveLength(10);
