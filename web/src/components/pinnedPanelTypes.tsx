@@ -91,6 +91,7 @@ registerPanelType('filebrowser', {
               ? paths.map((p) => '@' + (p.startsWith(projectDir + '/') ? p.slice(projectDir.length + 1) : p) + ' ')
               : paths.map((p) => '@' + p + ' ');
             inputEl.textContent = (inputEl.textContent || '') + rel.join('');
+            inputEl.dispatchEvent(new Event('input', { bubbles: true }));
             inputEl.focus();
           }
         }}

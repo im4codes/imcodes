@@ -1410,6 +1410,7 @@ export function App() {
         if (inputEl) {
           const quoteLines = quote.trim().split('\n').map((l: string) => `> ${l}`).join('\n');
           inputEl.textContent = (inputEl.textContent || '') + quoteLines + '\n';
+          inputEl.dispatchEvent(new Event('input', { bubbles: true }));
           inputEl.focus();
           const sel = window.getSelection();
           if (sel) { sel.selectAllChildren(inputEl); sel.collapseToEnd(); }
@@ -1754,6 +1755,7 @@ export function App() {
                   if (inputEl) {
                     const quote = `> ${text.replace(/\n/g, '\n> ')}\n`;
                     inputEl.textContent = (inputEl.textContent || '') + quote;
+                    inputEl.dispatchEvent(new Event('input', { bubbles: true }));
                     inputEl.focus();
                   }
                 },
@@ -2056,6 +2058,7 @@ export function App() {
                     const inputEl = activeSession ? inputRefsMap.current.get(activeSession) : null;
                     if (inputEl) {
                       inputEl.textContent = (inputEl.textContent || '') + rel.join('');
+                      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
                       inputEl.focus();
                     }
                   }}

@@ -158,6 +158,15 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
 
   const serverNameMap = new Map(servers.map(s => [s.id, s.name]));
 
+  // Wrap onNavigateSession to close internal panels before navigating
+  const handleNavigateSession = useMemo(() => {
+    if (!onNavigateSession) return undefined;
+    return (sessionName: string, quote?: string) => {
+      setSubPanel(null);
+      onNavigateSession(sessionName, quote);
+    };
+  }, [onNavigateSession]);
+
   const toggleShowAll = () => {
     setShowAllServers(prev => { const v = !prev; localStorage.setItem('rcc_cron_show_all', v ? '1' : ''); return v; });
   };
@@ -314,7 +323,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
           serverNameMap={serverNameMap}
           showAllServers={showAllServers}
           onViewDiscussion={onViewDiscussion}
-          onNavigateSession={onNavigateSession}
+          onNavigateSession={handleNavigateSession}
           t={t}
         />
       )}
@@ -396,7 +405,7 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
             executions={historyData[historyJobId] ?? null}
             job={historyJob}
             onViewDiscussion={onViewDiscussion}
-            onNavigateSession={onNavigateSession}
+            onNavigateSession={handleNavigateSession}
             t={t}
           />
         </FloatingPanel>
