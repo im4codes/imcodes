@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Mock tmux functions before any imports that pull them in
 vi.mock('../../src/agent/tmux.js', () => ({
+  BACKEND: 'tmux',
   capturePaneVisible: vi.fn(),
   capturePaneHistory: vi.fn(),
   getPaneId: vi.fn().mockResolvedValue('%1'),

@@ -16,7 +16,7 @@
  */
 
 import type { Readable } from 'stream';
-import { capturePaneVisible, capturePaneHistory, getPaneId, getPaneSize, sessionExists, startPipePaneStream, stopPipePaneStream } from '../agent/tmux.js';
+import { BACKEND, capturePaneVisible, capturePaneHistory, getPaneId, getPaneSize, sessionExists, startPipePaneStream, stopPipePaneStream } from '../agent/tmux.js';
 import { getSession, upsertSession } from '../store/session-store.js';
 import { processRawPtyData, resetParser } from './terminal-parser.js';
 import { isWatching } from './jsonl-watcher.js';
@@ -133,6 +133,17 @@ export class TerminalStreamer {
       // Continue — raw stream may still recover state
     }
 
+    // ConPTY: replay raw screen buffer after snapshot for accurate terminal state
+    if (BACKEND === 'conpty') {
+      try {
+        const { conptyGetScreenBuffer } = await import('../agent/conpty.js');
+        const screen = conptyGetScreenBuffer(sessionName);
+        if (screen && this.subscribers.get(sessionName)?.has(subscriber)) {
+          try { subscriber.sendRaw?.(Buffer.from(screen)); } catch { /* ignore */ }
+        }
+      } catch { /* conpty not available */ }
+    }
+
     // 2. Flush buffered raw bytes immediately after snapshot — never block live
     //    PTY forwarding for history capture (which can be slow under load).
     subState.snapshotPending = false;
@@ -207,6 +218,21 @@ export class TerminalStreamer {
 
         for (const [sub] of subs) {
           try { sub.send(diff); } catch { /* ignore */ }
+        }
+
+        // ConPTY: ring buffer snapshot is approximate (no cursor/ANSI state).
+        // Replay recent raw PTY output so xterm.js can render the real screen.
+        if (BACKEND === 'conpty') {
+          try {
+            const { conptyGetScreenBuffer } = await import('../agent/conpty.js');
+            const screen = conptyGetScreenBuffer(sessionName);
+            if (screen) {
+              const buf = Buffer.from(screen);
+              for (const [sub] of subs) {
+                try { sub.sendRaw?.(buf); } catch { /* ignore */ }
+              }
+            }
+          } catch { /* conpty not available */ }
         }
 
         timelineEmitter.emit(sessionName, 'terminal.snapshot', { lines, cols: size.cols, rows: size.rows });
