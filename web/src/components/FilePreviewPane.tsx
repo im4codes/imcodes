@@ -3,6 +3,7 @@
  * Extracted from FileBrowser to keep heavy hljs/marked imports out of the
  * main FileBrowser bundle (prevents test OOM when importing FileBrowser).
  */
+import { pathBasename } from '../util/path-utils.js';
 import hljs from 'highlight.js/lib/core';
 import hljsBash from 'highlight.js/lib/languages/bash';
 import hljsC from 'highlight.js/lib/languages/c';
@@ -106,7 +107,7 @@ export interface FilePreviewPaneProps {
 
 /** Renders highlighted code or markdown. Lazy-loaded by FileBrowser. */
 export function FilePreviewPane({ content, path }: FilePreviewPaneProps) {
-  const filename = path.split(/[/\\]/).pop() ?? '';
+  const filename = pathBasename(path);
   const { html, isMarkdown } = highlightCode(content, filename);
   if (isMarkdown) {
     return <div class="fb-preview-md" dangerouslySetInnerHTML={{ __html: html }} />;
