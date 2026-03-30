@@ -1672,6 +1672,7 @@ export function App() {
             servers={servers}
             activeServerId={selectedServerId}
             onSelectServer={handleSelectServer}
+            onServerContextMenu={(server, x, y) => setServerCtxMenu({ server, x, y })}
             sidebarCollapsed={sidebarCollapsed}
             onToggleSidebar={handleToggleSidebar}
             onSettings={() => setShowSettingsPage(true)}

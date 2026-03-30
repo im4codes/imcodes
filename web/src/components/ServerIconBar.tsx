@@ -5,12 +5,14 @@ interface ServerInfo {
   name: string;
   status: string;
   lastHeartbeatAt: number | null;
+  createdAt: number;
 }
 
 interface Props {
   servers: ServerInfo[];
   activeServerId: string | null;
   onSelectServer: (id: string, name: string) => void;
+  onServerContextMenu?: (server: ServerInfo, x: number, y: number) => void;
   sidebarCollapsed?: boolean;
   onToggleSidebar?: () => void;
   onSettings?: () => void;
@@ -23,7 +25,7 @@ function getInitial(name: string): string {
   return (name || '?').charAt(0).toUpperCase();
 }
 
-export function ServerIconBar({ servers, activeServerId, onSelectServer, sidebarCollapsed, onToggleSidebar, onSettings, onHome, isAdmin, onAdmin }: Props) {
+export function ServerIconBar({ servers, activeServerId, onSelectServer, onServerContextMenu, sidebarCollapsed, onToggleSidebar, onSettings, onHome, isAdmin, onAdmin }: Props) {
   const { t } = useTranslation();
 
   return (
@@ -49,6 +51,7 @@ export function ServerIconBar({ servers, activeServerId, onSelectServer, sidebar
             aria-label={server.name}
             aria-pressed={isActive}
             onClick={() => onSelectServer(server.id, server.name)}
+            onContextMenu={(e: MouseEvent) => { e.preventDefault(); onServerContextMenu?.(server, e.clientX, e.clientY); }}
           >
             <span class="server-icon-letter">{getInitial(server.name)}</span>
             <span
