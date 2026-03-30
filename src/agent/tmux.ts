@@ -239,13 +239,18 @@ export interface SendKeysOptions {
 export async function sendKeys(session: string, keys: string, opts?: SendKeysOptions): Promise<void> {
   if (BACKEND === 'conpty') {
     const c = await conpty();
+    const isLong = keys.length > 200 || keys.includes('\n');
     await c.conptySendText(session, keys);
     // Delay before Enter — agents (Codex etc.) need time to process input text
-    const delay = keys.length > 200 || keys.includes('\n')
-      ? 500
-      : Math.min(80 + Math.floor(keys.length / 10) * 5, 1000);
+    const delay = isLong ? 500 : Math.min(80 + Math.floor(keys.length / 10) * 5, 1000);
     await new Promise<void>((r) => setTimeout(r, delay));
     await c.conptySendEnter(session);
+    // Safety net: 3s delayed Enter for long text (empty-line Enter is a no-op)
+    if (isLong) {
+      setTimeout(async () => {
+        try { c.conptySendEnter(session); } catch { /* ignore */ }
+      }, 3_000);
+    }
     return;
   }
 
