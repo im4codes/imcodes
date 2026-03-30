@@ -392,10 +392,10 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
     skippedHops: run.skippedHops,
   }, { source: 'daemon' });
 
-  // Keep in memory for a bit so status queries work, then clean up run + file
-  setTimeout(async () => {
+  // Keep in memory for a bit so status queries work, then clean up run entry only.
+  // Discussion files are kept on disk (in .imc/discussions/) for history access.
+  setTimeout(() => {
     activeRuns.delete(run.id);
-    try { await unlink(run.contextFilePath); } catch { /* already deleted or missing */ }
   }, 60_000);
 }
 

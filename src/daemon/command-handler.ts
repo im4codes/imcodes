@@ -1411,7 +1411,19 @@ async function handleP2pListDiscussions(_cmd: Record<string, unknown>, serverLin
 async function handleP2pReadDiscussion(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const id = cmd.id as string | undefined;
   if (!id) { serverLink.send({ type: 'p2p.read_discussion_response', error: 'missing_id' }); return; }
-  // Search across all known project .imc/discussions/ directories
+
+  // 1. Check active P2P runs first (in-memory, always fresh)
+  for (const run of listP2pRuns()) {
+    if (run.id === id || run.discussionId === id) {
+      try {
+        const content = await fsReadFileRaw(run.contextFilePath, 'utf8');
+        serverLink.send({ type: 'p2p.read_discussion_response', id, content });
+        return;
+      } catch { /* file may not exist yet */ }
+    }
+  }
+
+  // 2. Search across all known project .imc/discussions/ directories
   const projectDirs = new Set<string>();
   for (const s of listSessions()) {
     if (s.projectDir) projectDirs.add(s.projectDir);

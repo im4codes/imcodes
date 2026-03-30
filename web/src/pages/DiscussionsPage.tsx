@@ -43,6 +43,8 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
   const [selected, setSelected] = useState<string | null>(initialSelectedId ?? null);
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  // Track which id we last requested, to prevent stale response overwriting current selection
+  const pendingReadIdRef = useRef<string | null>(null);
 
   const loadList = useCallback(() => {
     if (!ws) return;
@@ -52,16 +54,32 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
 
   useEffect(() => { loadList(); }, [loadList]);
 
-  // Auto-select initialSelectedId once list is loaded
+  const selectDiscussion = useCallback((id: string) => {
+    setSelected(id);
+    setContent(null);
+    pendingReadIdRef.current = id;
+    ws?.send({ type: 'p2p.read_discussion', id });
+  }, [ws]);
+
+  // Auto-select initialSelectedId: try immediately (even before list loads)
   const initialAppliedRef = useRef(false);
   useEffect(() => {
-    if (initialAppliedRef.current || !initialSelectedId || discussions.length === 0) return;
-    const match = discussions.find((d) => d.id === initialSelectedId || d.id.includes(initialSelectedId));
-    if (match && selected !== match.id) {
-      initialAppliedRef.current = true;
-      selectDiscussion(match.id);
+    if (initialAppliedRef.current || !initialSelectedId) return;
+    // Try to match in list
+    if (discussions.length > 0) {
+      const match = discussions.find((d) => d.id === initialSelectedId || d.id.includes(initialSelectedId));
+      if (match) {
+        initialAppliedRef.current = true;
+        selectDiscussion(match.id);
+        return;
+      }
     }
-  }, [discussions, initialSelectedId]);
+    // Even if not in list yet (active run), try to read directly
+    if (selected === initialSelectedId && content === null && !pendingReadIdRef.current) {
+      pendingReadIdRef.current = initialSelectedId;
+      ws?.send({ type: 'p2p.read_discussion', id: initialSelectedId });
+    }
+  }, [discussions, initialSelectedId, selected, content, ws, selectDiscussion]);
 
   useEffect(() => {
     if (!ws) return;
@@ -71,20 +89,34 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
         setLoading(false);
       }
       if (msg.type === 'p2p.read_discussion_response') {
+        // Only accept response matching the most recent request (prevent stale overwrite)
+        const responseId = (msg as any).id as string | undefined;
+        if (responseId && pendingReadIdRef.current && responseId !== pendingReadIdRef.current) return;
+        pendingReadIdRef.current = null;
         if (msg.error) {
           setContent('(Failed to load)');
         } else {
           setContent(msg.content as string);
         }
       }
+      // Auto-refresh: when a P2P run updates and we're viewing that discussion, reload content
+      if (msg.type === 'p2p.run_update') {
+        const run = (msg as any).run;
+        if (!run) return;
+        // Refresh list to pick up new/updated discussions
+        loadList();
+        // If we're viewing this discussion's file, reload content
+        const runFileId = run.discussion_id ? String(run.discussion_id) : run.id;
+        if (selected && (selected === runFileId || selected.includes(run.id))) {
+          // Debounce: don't reload if we already have a pending read
+          if (!pendingReadIdRef.current) {
+            pendingReadIdRef.current = selected;
+            ws?.send({ type: 'p2p.read_discussion', id: selected });
+          }
+        }
+      }
     });
-  }, [ws]);
-
-  const selectDiscussion = (id: string) => {
-    setSelected(id);
-    setContent(null);
-    ws?.send({ type: 'p2p.read_discussion', id });
-  };
+  }, [ws, selected, loadList]);
 
   const formatTime = (ts: number) => new Date(ts).toLocaleString();
 
