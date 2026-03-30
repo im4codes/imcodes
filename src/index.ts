@@ -272,7 +272,8 @@ program
   .option('--all', 'Broadcast to all sibling sessions')
   .option('--type <agentType>', 'Target by agent type instead of label')
   .option('--list', 'List available sibling sessions')
-  .option('--reply', 'Ask the target to send its response back via imcodes send')
+  .option('--reply', 'Ask the target to send its response back (default: true)')
+  .option('--no-reply', 'Disable automatic reply instruction')
   .action(async (target: string | undefined, messageParts: string[] | undefined, opts: { files?: string; all?: boolean; type?: string; list?: boolean; reply?: boolean }) => {
     const { detectSenderSession } = await import('./util/detect-session.js');
 
