@@ -150,6 +150,12 @@ registerPanelType('cronmanager', {
         subSessions={subSessionsSlim}
         activeSession={ctx.activeSession}
         onBack={() => {}}
+        onNavigateSession={(sessionName, quote) => {
+          window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: sessionName, quote } }));
+        }}
+        onViewDiscussion={(fileId) => {
+          window.dispatchEvent(new CustomEvent('deck:view-discussion', { detail: { fileId } }));
+        }}
         servers={ctx.servers}
       />
     );

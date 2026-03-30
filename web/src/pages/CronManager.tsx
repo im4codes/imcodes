@@ -578,7 +578,7 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession
           onClose={() => setDetailExec(null)}
           defaultW={600} defaultH={500}
         >
-          <ExecDetailView exec={detailExec} t={t} />
+          <ExecDetailView exec={detailExec} onNavigateSession={onNavigateSession ? () => onNavigateSession(jobSessionName, detailExec.detail?.slice(0, 500)) : undefined} t={t} />
         </FloatingPanel>
       )}
     </div>

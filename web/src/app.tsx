@@ -1455,7 +1455,14 @@ export function App() {
       }
     };
     window.addEventListener('deck:navigate', handler);
-    return () => window.removeEventListener('deck:navigate', handler);
+
+    const discussionHandler = (e: Event) => {
+      const { fileId } = (e as CustomEvent).detail ?? {};
+      if (fileId) { setDiscussionInitialId(fileId); setShowDiscussionsPage(true); }
+    };
+    window.addEventListener('deck:view-discussion', discussionHandler);
+
+    return () => { window.removeEventListener('deck:navigate', handler); window.removeEventListener('deck:view-discussion', discussionHandler); };
   }, [handleSelectServer, navigateToSession]);
 
   const handleBackToDashboard = useCallback(() => {
@@ -2335,6 +2342,7 @@ export function App() {
               subSessions={subSessionsSlim}
               activeSession={activeSession}
               onNavigateSession={(sessionName, quote) => {
+                setShowCronManager(false);
                 window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: sessionName, quote } }));
               }}
               onBack={() => setShowCronManager(false)}
