@@ -276,13 +276,15 @@ export interface NewSessionOptions {
 export async function newSession(name: string, command?: string, opts?: NewSessionOptions): Promise<void> {
   if (BACKEND === 'wezterm') {
     // WezTerm: env vars are not natively supported via spawn flags.
-    // Build a command string that exports env vars before the actual command.
+    // Build a command string that sets env vars before the actual command.
     let fullCommand = command;
     if (opts?.env && Object.keys(opts.env).length > 0) {
+      const isWin = process.platform === 'win32';
       const exports = Object.entries(opts.env)
-        .map(([k, v]) => `export ${k}=${shellQuote(v)}`)
-        .join('; ');
-      fullCommand = command ? `${exports}; ${command}` : exports;
+        .map(([k, v]) => isWin ? `set ${k}=${v}` : `export ${k}=${shellQuote(v)}`)
+        .join(isWin ? '& ' : '; ');
+      const sep = isWin ? '& ' : '; ';
+      fullCommand = command ? `${exports}${sep}${command}` : exports;
     }
     const paneId = await weztermNewSession(name, fullCommand, { cwd: opts?.cwd });
     // Persist pane_id to session store — callers (session-manager) call upsertSession

@@ -1,5 +1,5 @@
 import { spawn } from 'child_process';
-import type { AgentDriver, LaunchOptions, DeleteBufferFn } from './base.js';
+import { cwdPrefix, type AgentDriver, type LaunchOptions, type DeleteBufferFn } from './base.js';
 import type { AgentStatus } from '../detect.js';
 import { detectStatus } from '../detect.js';
 
@@ -95,7 +95,7 @@ export class GeminiDriver implements AgentDriver {
   }
 
   buildLaunchCommand(_sessionName: string, opts?: LaunchOptions): string {
-    const cwd = opts?.cwd ? `cd ${JSON.stringify(opts.cwd)} && ` : '';
+    const cwd = cwdPrefix(opts?.cwd);
     if (opts?.geminiSessionId) {
       return `${cwd}gemini --yolo --resume ${opts.geminiSessionId}`;
     }

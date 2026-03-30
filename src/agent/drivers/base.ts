@@ -16,6 +16,14 @@ export interface LaunchOptions {
   geminiSessionId?: string;
 }
 
+/** Build a cd prefix for shell commands. Uses Windows syntax on win32. */
+export function cwdPrefix(cwd?: string): string {
+  if (!cwd) return '';
+  const quoted = JSON.stringify(cwd);
+  if (process.platform === 'win32') return `cd /d ${quoted} & `;
+  return `cd ${quoted} && `;
+}
+
 export interface AgentDriver {
   readonly type: AgentType;
   /** Primary idle prompt character(s) */

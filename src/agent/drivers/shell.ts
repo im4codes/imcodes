@@ -1,4 +1,4 @@
-import type { AgentDriver, LaunchOptions } from './base.js';
+import { cwdPrefix, type AgentDriver, type LaunchOptions } from './base.js';
 import type { AgentStatus } from '../detect.js';
 import { detectStatus } from '../detect.js';
 
@@ -11,7 +11,7 @@ export class ShellDriver implements AgentDriver {
     const bin = (opts as { shellBin?: string } | undefined)?.shellBin
       ?? process.env.SHELL
       ?? (process.platform === 'win32' ? (process.env.COMSPEC ?? 'powershell.exe') : '/bin/bash');
-    const cwd = opts?.cwd ? `cd ${JSON.stringify(opts.cwd)} && ` : '';
+    const cwd = cwdPrefix(opts?.cwd);
     return `${cwd}${bin}`;
   }
 

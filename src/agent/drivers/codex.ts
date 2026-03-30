@@ -1,4 +1,5 @@
 import type { AgentDriver, LaunchOptions } from './base.js';
+import { cwdPrefix } from './base.js';
 import type { AgentStatus } from '../detect.js';
 import { detectStatus } from '../detect.js';
 
@@ -18,7 +19,7 @@ export class CodexDriver implements AgentDriver {
   readonly spinnerChars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
 
   buildLaunchCommand(_sessionName: string, opts?: LaunchOptions): string {
-    const cwd = opts?.cwd ? `cd ${JSON.stringify(opts.cwd)} && ` : '';
+    const cwd = cwdPrefix(opts?.cwd);
     const modelFlag = opts?.codexModel ? ` -m ${JSON.stringify(opts.codexModel)}` : '';
     if (opts?.codexSessionId) {
       return `${cwd}codex${modelFlag} -s danger-full-access resume ${opts.codexSessionId}`;

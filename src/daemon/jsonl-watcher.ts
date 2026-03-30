@@ -25,9 +25,9 @@ import { readProjectMemory, appendAgentSendDocs } from './memory-inject.js';
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
-/** Compute Claude Code project key: replace path separators with '-'. */
+/** Compute Claude Code project key: replace path separators and drive colons with '-'. */
 function claudeProjectKey(absPath: string): string {
-  return absPath.replace(/\/+$/, '').replace(/[/\\]/g, '-');
+  return absPath.replace(/\/+$/, '').replace(/[/\\:]/g, '-');
 }
 
 /** Return the ~/.claude/projects/{key} directory for a given work dir. */

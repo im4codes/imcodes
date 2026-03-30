@@ -1,4 +1,5 @@
 import type { AgentDriver, LaunchOptions, DeleteBufferFn } from './base.js';
+import { cwdPrefix } from './base.js';
 import type { AgentStatus } from '../detect.js';
 import { detectStatus } from '../detect.js';
 
@@ -37,22 +38,19 @@ export class ClaudeCodeDriver implements AgentDriver {
   readonly spinnerChars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
   buildLaunchCommand(_sessionName: string, opts?: LaunchOptions): string {
-    const cwd = opts?.cwd ? `cd ${JSON.stringify(opts.cwd)} && ` : '';
+    const cwd = cwdPrefix(opts?.cwd);
     if (opts?.ccSessionId) {
-      // Sub-session: use deterministic session ID, always fresh start for that UUID
       return `${cwd}claude --dangerously-skip-permissions --session-id ${opts.ccSessionId}`;
     }
     if (opts?.fresh) {
       return `${cwd}claude --dangerously-skip-permissions`;
     }
-    // Default: resume last conversation; fall back to fresh if no history
     return `${cwd}claude --dangerously-skip-permissions -c || claude --dangerously-skip-permissions`;
   }
 
   buildResumeCommand(_sessionName: string, opts?: LaunchOptions): string {
-    const cwd = opts?.cwd ? `cd ${JSON.stringify(opts.cwd)} && ` : '';
+    const cwd = cwdPrefix(opts?.cwd);
     if (opts?.ccSessionId) {
-      // Resume specific session by UUID
       return `${cwd}claude --dangerously-skip-permissions --resume ${opts.ccSessionId}`;
     }
     return this.buildLaunchCommand(_sessionName, opts);

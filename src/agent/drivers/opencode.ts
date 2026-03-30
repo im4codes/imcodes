@@ -1,6 +1,6 @@
 import { promises as fs } from 'fs';
 import path from 'path';
-import type { AgentDriver, LaunchOptions } from './base.js';
+import { cwdPrefix, type AgentDriver, type LaunchOptions } from './base.js';
 import type { AgentStatus } from '../detect.js';
 import { detectStatus } from '../detect.js';
 
@@ -10,7 +10,7 @@ export class OpenCodeDriver implements AgentDriver {
   readonly spinnerChars = ['|', '/', '-', '\\'];
 
   buildLaunchCommand(_sessionName: string, opts?: LaunchOptions): string {
-    const cwd = opts?.cwd ? `cd ${JSON.stringify(opts.cwd)} && ` : '';
+    const cwd = cwdPrefix(opts?.cwd);
     if (opts?.fresh) {
       return `${cwd}opencode`;
     }
