@@ -1,7 +1,7 @@
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
 FROM node:24-alpine AS builder
 
-RUN apk add --no-cache zip
+RUN apk add --no-cache zip python3 make gcc g++
 
 WORKDIR /app
 

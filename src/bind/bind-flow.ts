@@ -4,6 +4,7 @@ import { join } from 'path';
 import { homedir, hostname } from 'os';
 import { execSync, spawn } from 'child_process';
 import logger from '../util/logger.js';
+import { BACKEND } from '../agent/tmux.js';
 
 const CREDS_DIR = join(homedir(), '.imcodes');
 const CREDS_PATH = join(CREDS_DIR, 'server.json');
@@ -209,7 +210,10 @@ async function installWindowsStartup(): Promise<void> {
 /** Ensure terminal backend + system service are installed. Shared by bind and re-bind. */
 async function ensureServiceInstalled(): Promise<void> {
   if (process.platform === 'win32') {
-    await ensureWezTerm();
+    if ((BACKEND as string) !== 'conpty') {
+      await ensureWezTerm();
+    }
+    // ConPTY is built-in on Windows 10+, nothing to install
   } else {
     await ensureTmux();
   }

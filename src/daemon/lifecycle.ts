@@ -1,6 +1,6 @@
 import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession } from '../store/session-store.js';
 import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes } from '../agent/session-manager.js';
-import { sessionExists, isPaneAlive } from '../agent/tmux.js';
+import { sessionExists, isPaneAlive, BACKEND } from '../agent/tmux.js';
 import { detectMemoryBackend } from '../memory/detector.js';
 import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
@@ -562,6 +562,22 @@ async function autoReconnectProviders(): Promise<void> {
 export async function shutdown(exitCode = 0): Promise<void> {
   logger.info('Daemon shutting down');
 
+  // Kill all ConPTY sessions (they don't survive daemon exit like tmux)
+  if ((BACKEND as string) === 'conpty') {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const conpty: any = await import('../agent/conpty.js' as string);
+      const names: string[] = conpty.conptyListSessions();
+      for (const name of names) {
+        try {
+          conpty.conptyKillSession(name);
+        } catch (e) {
+          logger.warn({ err: e, session: name }, 'Failed to kill ConPTY session during shutdown');
+        }
+      }
+    } catch { /* conpty not available */ }
+  }
+
   try {
     const { disconnectAll } = await import('../agent/provider-registry.js');
     await disconnectAll();
@@ -579,8 +595,12 @@ export async function shutdown(exitCode = 0): Promise<void> {
 
   if (lockServer) releaseInstanceLock(lockServer);
 
-  // tmux sessions are intentionally NOT killed — they keep running
-  logger.info('Daemon stopped (tmux sessions left running)');
+  if ((BACKEND as string) === 'conpty') {
+    logger.info('Daemon stopped (ConPTY sessions killed)');
+  } else {
+    // tmux/wezterm sessions are intentionally NOT killed — they keep running
+    logger.info('Daemon stopped (tmux sessions left running)');
+  }
   process.exit(exitCode);
 }
 

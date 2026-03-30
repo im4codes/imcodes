@@ -13,6 +13,10 @@ vi.mock('child_process', async (importOriginal) => {
 
 const execFileMock = vi.mocked(execFileCb);
 
+// WezTerm tests only run when IMCODES_MUX=wezterm is set.
+// On other backends (tmux, conpty) these tests are skipped.
+const isWeztermBackend = process.env.IMCODES_MUX === 'wezterm';
+
 // Helper to make execFile mock resolve with { stdout, stderr }
 // When passthrough=false (default): returns JSON list for 'list' commands (for ensureWeztermServer + findExistingWindowId), raw stdout for others
 // When passthrough=true: always returns the given stdout (for tests that set their own list JSON)
@@ -40,6 +44,7 @@ function mockExecFileRejectsOnce(error: Error): void {
   });
 }
 
+describe.skipIf(!isWeztermBackend)('wezterm backend', () => {
 // We need to re-import the module fresh for each test to get clean state
 let wezterm: typeof import('../../src/agent/wezterm.js');
 
@@ -341,3 +346,4 @@ describe('weztermGetPanePids', () => {
     expect(pids).toEqual([]);
   });
 });
+}); // end describe.skipIf(!isWeztermBackend)

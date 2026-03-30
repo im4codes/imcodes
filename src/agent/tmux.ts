@@ -1,5 +1,6 @@
 import { execFile as execFileCb, execFileSync, spawn } from 'child_process';
 import { createHash } from 'crypto';
+import { createRequire } from 'module';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as fsp from 'fs/promises';
@@ -33,7 +34,7 @@ const execFile = promisify(execFileCb);
 
 // ── Backend detection ───────────────────────────────────────────────────────────
 
-export type TerminalBackend = 'tmux' | 'wezterm';
+export type TerminalBackend = 'tmux' | 'wezterm' | 'conpty';
 
 /**
  * Error thrown when a tmux-only feature is called on an unsupported backend.
@@ -59,9 +60,23 @@ function detectBackend(): TerminalBackend {
   // 1. Explicit override via env
   const envMux = process.env.IMCODES_MUX;
   if (envMux === 'tmux' || envMux === 'wezterm') return envMux;
+  if (envMux === 'conpty') {
+    if (process.platform !== 'win32' && !process.env.IMCODES_TEST) {
+      throw new Error('IMCODES_MUX=conpty is only supported on Windows');
+    }
+    return 'conpty';
+  }
 
-  // 2. Windows defaults to WezTerm (tmux not available natively)
-  if (process.platform === 'win32') return 'wezterm';
+  // 2. Windows defaults to ConPTY
+  if (process.platform === 'win32') {
+    try {
+      const req = createRequire(process.cwd() + '/package.json');
+      req.resolve('node-pty');
+      return 'conpty';
+    } catch {
+      throw new Error('node-pty not found. Reinstall imcodes.');
+    }
+  }
 
   // 3. Probe for tmux
   try {
@@ -76,13 +91,20 @@ function detectBackend(): TerminalBackend {
   } catch { /* not found */ }
 
   throw new Error(
-    'No terminal multiplexer found. Install tmux (Linux/macOS) or WezTerm (Windows/Linux/macOS), ' +
-    'or set $IMCODES_MUX to "tmux" or "wezterm".',
+    'No terminal multiplexer found. Install tmux (Linux/macOS), or set $IMCODES_MUX.',
   );
 }
 
 /** The backend for this daemon process. Detected once at module load. */
 export const BACKEND: TerminalBackend = detectBackend();
+
+// ── Lazy-load ConPTY module ──────────────────────────────────────────────────────
+// Avoids crash when node-pty is not installed (non-Windows setups).
+let _conpty: typeof import('./conpty.js') | null = null;
+async function conpty() {
+  if (!_conpty) _conpty = await import('./conpty.js');
+  return _conpty;
+}
 
 // ── Require tmux backend helper ─────────────────────────────────────────────────
 
@@ -150,6 +172,10 @@ async function rawSendEnter(session: string): Promise<void> {
  * Returns lines as a string array.
  */
 export async function capturePane(session: string, lines = 50): Promise<string[]> {
+  if (BACKEND === 'conpty') {
+    const c = await conpty();
+    return c.conptyCapturePane(session, lines);
+  }
   if (BACKEND === 'wezterm') return weztermCapturePane(session, lines);
   const raw = await tmuxRun('capture-pane', '-p', '-t', session, '-S', `-${lines}`);
   return raw.split('\n');
@@ -160,6 +186,10 @@ export async function capturePane(session: string, lines = 50): Promise<string[]
  * Used for terminal streaming — gives exactly the rows the user sees.
  */
 export async function capturePaneVisible(session: string): Promise<string> {
+  if (BACKEND === 'conpty') {
+    const c = await conpty();
+    return c.conptyCapturePane(session, 50).join('\n');
+  }
   if (BACKEND === 'wezterm') {
     return weztermCapturePaneVisible(session);
   }
@@ -207,6 +237,13 @@ export interface SendKeysOptions {
  * Always sends Enter after text. Long text gets a 3s safety-net Enter.
  */
 export async function sendKeys(session: string, keys: string, opts?: SendKeysOptions): Promise<void> {
+  if (BACKEND === 'conpty') {
+    const c = await conpty();
+    await c.conptySendText(session, keys);
+    await c.conptySendEnter(session);
+    return;
+  }
+
   const isLong = keys.length > 200 || keys.includes('\n');
 
   if (isLong) {
@@ -267,6 +304,11 @@ export const sendKeysDelayedEnter = sendKeys;
 
 /** Send raw keys without appending Enter (e.g. for Ctrl-C). */
 export async function sendKey(session: string, key: string): Promise<void> {
+  if (BACKEND === 'conpty') {
+    const c = await conpty();
+    await c.conptySendKey(session, key);
+    return;
+  }
   if (BACKEND === 'wezterm') {
     await weztermSendKey(session, key);
   } else {
@@ -281,6 +323,11 @@ export interface NewSessionOptions {
 
 /** Create a new detached session. Throws if it already exists. */
 export async function newSession(name: string, command?: string, opts?: NewSessionOptions): Promise<void> {
+  if (BACKEND === 'conpty') {
+    const c = await conpty();
+    await c.conptyNewSession(name, command ?? '', opts);
+    return;
+  }
   if (BACKEND === 'wezterm') {
     // WezTerm: env vars are not natively supported via spawn flags.
     // Build a command string that sets env vars before the actual command.
@@ -321,6 +368,11 @@ export async function newSession(name: string, command?: string, opts?: NewSessi
 
 /** Kill a session by name. Does not throw if it doesn't exist. */
 export async function killSession(name: string): Promise<void> {
+  if (BACKEND === 'conpty') {
+    const c = await conpty();
+    c.conptyKillSession(name);
+    return;
+  }
   if (BACKEND === 'wezterm') {
     await weztermKillSession(name);
     return;
@@ -334,6 +386,10 @@ export async function killSession(name: string): Promise<void> {
 
 /** List all sessions. Returns session names. */
 export async function listSessions(): Promise<string[]> {
+  if (BACKEND === 'conpty') {
+    const c = await conpty();
+    return c.conptyListSessions();
+  }
   if (BACKEND === 'wezterm') return weztermListSessions();
   try {
     const raw = await tmuxRun('list-sessions', '-F', '#{session_name}');
@@ -347,6 +403,10 @@ export async function listSessions(): Promise<string[]> {
 
 /** Check if a session exists. */
 export async function sessionExists(name: string): Promise<boolean> {
+  if (BACKEND === 'conpty') {
+    const c = await conpty();
+    return c.conptySessionExists(name);
+  }
   if (BACKEND === 'wezterm') return weztermSessionExists(name);
   const sessions = await listSessions();
   return sessions.includes(name);
@@ -354,6 +414,10 @@ export async function sessionExists(name: string): Promise<boolean> {
 
 /** Check if the pane process in a session is still alive (not dead from remain-on-exit). */
 export async function isPaneAlive(name: string): Promise<boolean> {
+  if (BACKEND === 'conpty') {
+    const c = await conpty();
+    return c.conptyIsPaneAlive(name);
+  }
   if (BACKEND === 'wezterm') return weztermIsPaneAlive(name);
   try {
     const raw = await tmuxRun('list-panes', '-t', name, '-F', '#{pane_dead}');
@@ -365,6 +429,11 @@ export async function isPaneAlive(name: string): Promise<boolean> {
 
 /** Respawn a dead pane (remain-on-exit) with a new command. */
 export async function respawnPane(name: string, command: string): Promise<void> {
+  if (BACKEND === 'conpty') {
+    const c = await conpty();
+    await c.conptyRespawnPane(name, command);
+    return;
+  }
   if (BACKEND === 'wezterm') {
     await weztermRespawnPane(name, command);
     return;
@@ -374,6 +443,11 @@ export async function respawnPane(name: string, command: string): Promise<void> 
 
 /** Resize a session window to the given dimensions. */
 export async function resizeSession(name: string, cols: number, rows: number): Promise<void> {
+  if (BACKEND === 'conpty') {
+    const c = await conpty();
+    c.conptyResize(name, cols, rows);
+    return;
+  }
   if (BACKEND === 'wezterm') {
     await weztermResizePane(name, cols, rows);
     return;
@@ -383,6 +457,10 @@ export async function resizeSession(name: string, cols: number, rows: number): P
 
 /** Get the pane size (cols x rows) of a session. */
 export async function getPaneSize(session: string): Promise<{ cols: number; rows: number }> {
+  if (BACKEND === 'conpty') {
+    const c = await conpty();
+    return c.conptyGetPaneSize(session);
+  }
   if (BACKEND === 'wezterm') {
     return weztermGetPaneSize(session);
   }
@@ -403,12 +481,20 @@ export async function showBuffer(): Promise<string> {
 
 /** Get the pane ID of the first pane in a session (opaque backend-specific identifier). */
 export async function getPaneId(session: string): Promise<string> {
+  if (BACKEND === 'conpty') {
+    const c = await conpty();
+    return String(c.conptyGetPid(session));
+  }
   if (BACKEND === 'wezterm') return weztermGetPaneId(session);
   return tmuxRun('display-message', '-p', '-t', session, '#{pane_id}');
 }
 
 /** Get the current working directory of the first pane of a session. */
 export async function getPaneCwd(session: string): Promise<string> {
+  if (BACKEND === 'conpty') {
+    const c = await conpty();
+    return c.conptyGetPaneCwd(session);
+  }
   if (BACKEND === 'wezterm') return weztermGetPaneCwd(session);
   return tmuxRun('display-message', '-p', '-t', session, '#{pane_current_path}');
 }
@@ -434,6 +520,10 @@ export async function deleteBuffer(): Promise<void> {
  * Backend-dispatched. Replaces direct `tmux list-panes` calls from callers.
  */
 export async function getPanePids(name: string): Promise<string[]> {
+  if (BACKEND === 'conpty') {
+    const c = await conpty();
+    return c.conptyGetPanePids(name);
+  }
   if (BACKEND === 'wezterm') return weztermGetPanePids(name);
   try {
     const raw = await tmuxRun('list-panes', '-t', name, '-F', '#{pane_pid}');
@@ -452,6 +542,7 @@ export function restoreWeztermPane(name: string, paneId: string): void {
   if (BACKEND === 'wezterm') {
     registerPane(name, paneId);
   }
+  // conpty and tmux: no-op
 }
 
 // Map xterm.js escape sequences → tmux key names
@@ -500,6 +591,17 @@ function isCtrlCRateLimited(session: string): boolean {
  * tmux-only — xterm→tmux key translation is tmux-specific.
  */
 export async function sendRawInput(session: string, data: string): Promise<void> {
+  // Ctrl+C rate limiting — applies to ALL backends
+  if (data.length === 1 && data.charCodeAt(0) === 3) {
+    if (isCtrlCRateLimited(session)) return;
+  }
+
+  if (BACKEND === 'conpty') {
+    const c = await conpty();
+    c.conptySendText(session, data);
+    return;
+  }
+
   if (BACKEND === 'wezterm') {
     await weztermSendRawInput(session, data);
     return;
@@ -516,7 +618,6 @@ export async function sendRawInput(session: string, data: string): Promise<void>
   if (data.length === 1) {
     const code = data.charCodeAt(0);
     if (code >= 1 && code <= 26) {
-      if (code === 3 && isCtrlCRateLimited(session)) return;
       const letter = String.fromCharCode(code + 96);
       await tmuxRun('send-keys', '-t', session, `C-${letter}`);
       return;
@@ -554,6 +655,7 @@ let pipePaneCapability: boolean | null = null;
  * Result is cached after first call. tmux-only.
  */
 export async function checkPipePaneCapability(): Promise<boolean> {
+  if (BACKEND === 'conpty') return true;
   requireTmux('checkPipePaneCapability');
   if (pipePaneCapability !== null) return pipePaneCapability;
   try {
@@ -602,6 +704,22 @@ function destroyPipeStream(stream: Readable, fd: number, needsManualClose: boole
  * Returns a ReadStream and a cleanup function.
  */
 export async function startPipePaneStream(session: string, paneId: string): Promise<PipePaneHandle> {
+  if (BACKEND === 'conpty') {
+    const c = await conpty();
+    const { Readable } = await import('stream');
+    const readable = new Readable({ read() {} });
+    const unsub = c.conptySubscribe(session, (data: string) => {
+      readable.push(data);
+    });
+    return {
+      stream: readable,
+      cleanup: async () => {
+        unsub();
+        readable.push(null);
+      },
+    };
+  }
+
   if (BACKEND === 'wezterm') {
     return startWeztermPollingStream(session);
   }
@@ -702,6 +820,8 @@ export async function startPipePaneStream(session: string, paneId: string): Prom
  * No-op if no active stream exists.
  */
 export async function stopPipePaneStream(session: string): Promise<void> {
+  // ConPTY: cleanup is handled by startPipePaneStream's cleanup fn; no-op here.
+  if (BACKEND === 'conpty') return;
   requireTmux('stopPipePaneStream');
   const info = activePipes.get(session);
   if (!info) return;
@@ -717,6 +837,7 @@ export async function stopPipePaneStream(session: string): Promise<void> {
  * Only removes dirs scoped to the current process.pid.
  */
 export async function cleanupOrphanFifos(): Promise<void> {
+  if (BACKEND === 'conpty') return;
   const tmpDir = os.tmpdir();
   const prefix = `imcodes-pty-${process.pid}-`;
   try {
