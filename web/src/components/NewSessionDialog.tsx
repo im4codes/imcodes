@@ -30,7 +30,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
   const [starting, setStarting] = useState(false);
   const [showDirBrowser, setShowDirBrowser] = useState(false);
   const [shells, setShells] = useState<string[]>([]);
-  const [shellBin, setShellBin] = useState<string>(navigator.platform?.startsWith('Win') ? 'powershell.exe' : '/bin/bash');
+  const [shellBin, setShellBin] = useState<string>('');
 
   // OpenClaw-specific state
   const [ocMode, setOcMode] = useState<OpenClawMode>('new');
@@ -40,10 +40,11 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
   const [ocLoadingSessions, setOcLoadingSessions] = useState(false);
   const [ocSelectedSession, setOcSelectedSession] = useState('');
 
-  // Load saved shell preference from server, then detect available shells
+  // Load saved shell preference — will be validated against daemon's detected list later
+  const [savedShellPref, setSavedShellPref] = useState<string | null>(null);
   useEffect(() => {
     void getUserPref(DEFAULT_SHELL_KEY).then((saved) => {
-      if (typeof saved === 'string' && saved) setShellBin(saved);
+      if (typeof saved === 'string' && saved) setSavedShellPref(saved);
     }).catch(() => {});
   }, []);
 
@@ -53,8 +54,13 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
       if (msg.type === 'subsession.shells') {
         const list = msg.shells as string[];
         setShells(list);
-        // Keep saved preference if it's available, otherwise pick first
-        setShellBin((prev) => (list.includes(prev) ? prev : (list[0] ?? prev)));
+        // Use saved preference only if daemon actually has that shell; otherwise pick first detected
+        const preferred = savedShellPref;
+        if (preferred && list.includes(preferred)) {
+          setShellBin(preferred);
+        } else {
+          setShellBin(list[0] ?? '');
+        }
       }
       // Listen for openclaw remote session list response
       const raw = msg as unknown as Record<string, unknown>;
@@ -178,7 +184,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
           <div class="input-with-browse">
             <input
               type="text"
-              placeholder={navigator.platform?.startsWith('Win') ? 'C:\\Users\\you\\projects' : '~/projects/my-project'}
+              placeholder="~/projects/my-project"
               value={dir}
               disabled={starting}
               onInput={(e) => setDir((e.target as HTMLInputElement).value)}
@@ -325,7 +331,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
           ) : (
             <input
               type="text"
-              placeholder={navigator.platform?.startsWith('Win') ? 'powershell.exe' : '/bin/bash'}
+              placeholder="/bin/bash"
               value={shellBin}
               disabled={starting}
               onInput={(e) => setShellBin((e.target as HTMLInputElement).value)}
