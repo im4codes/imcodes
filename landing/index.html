@@ -366,9 +366,9 @@ docker compose up -d</div>
 <section>
   <h2 data-i18n="h_reqs">requirements</h2>
   <ul class="reqs">
-    <li data-i18n="req_os">macOS, Linux, or Windows (experimental)</li>
+    <li data-i18n="req_os">macOS, Linux, or Windows (native experimental; <a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> fully supported)</li>
     <li>Node.js &ge; 20</li>
-    <li data-i18n="req_mux">tmux (Linux/macOS). Windows uses ConPTY (built-in).</li>
+    <li data-i18n="req_mux">tmux (Linux/macOS/WSL). Windows native uses ConPTY (built-in).</li>
   </ul>
 </section>
 
@@ -444,8 +444,8 @@ const I18N = {
     sh_intro: '在一台机器上部署服务端和守护进程。需要 Docker 和指向该服务器的域名。',
     sh_desc: '自动生成配置、启动 PostgreSQL + 服务端 + Caddy（自动 HTTPS）、创建管理员账户并绑定本地守护进程。凭证在最后打印。',
     sh_connect: '连接其他机器：', sh_manual: '手动部署：',
-    req_os: 'macOS、Linux 或 Windows（试验性）',
-    req_mux: 'tmux（Linux/macOS）。Windows 使用 ConPTY（内置）。',
+    req_os: 'macOS、Linux 或 Windows（原生试验性；<a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> 完全支持）',
+    req_mux: 'tmux（Linux/macOS/WSL）。Windows 原生使用 ConPTY（内置）。',
     about_text: '个人项目。几乎完全由 <a href="https://github.com/anthropics/claude-code">Claude Code</a> 构建，<a href="https://github.com/openai/codex">Codex</a> 和 <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> 也有重要贡献。',
   },
   'zh-TW': {
@@ -491,8 +491,8 @@ const I18N = {
     sh_intro: '在一台機器上部署伺服器和守護程序。需要 Docker 和指向該伺服器的網域。',
     sh_desc: '自動產生設定、啟動 PostgreSQL + 伺服器 + Caddy（自動 HTTPS）、建立管理員帳戶並綁定本地守護程序。憑證在最後列印。',
     sh_connect: '連接其他機器：', sh_manual: '手動部署：',
-    req_os: 'macOS、Linux 或 Windows（試驗性）',
-    req_mux: 'tmux（Linux/macOS）。Windows 使用 ConPTY（內建）。',
+    req_os: 'macOS、Linux 或 Windows（原生試驗性；<a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> 完全支援）',
+    req_mux: 'tmux（Linux/macOS/WSL）。Windows 原生使用 ConPTY（內建）。',
     about_text: '個人專案。幾乎完全由 <a href="https://github.com/anthropics/claude-code">Claude Code</a> 建構，<a href="https://github.com/openai/codex">Codex</a> 和 <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> 也有重要貢獻。',
   },
   ja: {
@@ -538,8 +538,8 @@ const I18N = {
     sh_intro: '1台のマシンにサーバーとデーモンをデプロイ。DockerとDNS設定済みのドメインが必要です。',
     sh_desc: '設定を自動生成、PostgreSQL + サーバー + Caddy（自動HTTPS）を起動、管理者アカウントを作成しローカルデーモンをバインド。認証情報は最後に表示されます。',
     sh_connect: '追加マシンの接続：', sh_manual: '手動セットアップ：',
-    req_os: 'macOS、Linux、または Windows（実験的）',
-    req_mux: 'tmux（Linux/macOS）。Windows は ConPTY（組み込み）を使用。',
+    req_os: 'macOS、Linux、または Windows（ネイティブは実験的、<a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> は完全対応）',
+    req_mux: 'tmux（Linux/macOS/WSL）。Windows ネイティブは ConPTY（組み込み）を使用。',
     about_text: '個人プロジェクト。ほぼ全てを <a href="https://github.com/anthropics/claude-code">Claude Code</a> が構築、<a href="https://github.com/openai/codex">Codex</a> と <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> も重要な貢献。',
   },
   ko: {
@@ -585,8 +585,8 @@ const I18N = {
     sh_intro: '단일 머신에 서버와 데몬을 배포합니다. Docker와 서버를 가리키는 도메인이 필요합니다.',
     sh_desc: '모든 설정 자동 생성, PostgreSQL + 서버 + Caddy(자동 HTTPS) 시작, 관리자 계정 생성 및 로컬 데몬 바인딩. 자격 증명은 마지막에 출력됩니다.',
     sh_connect: '추가 머신 연결:', sh_manual: '수동 설정:',
-    req_os: 'macOS, Linux 또는 Windows (실험적)',
-    req_mux: 'tmux (Linux/macOS). Windows는 ConPTY (기본 내장) 사용.',
+    req_os: 'macOS, Linux 또는 Windows (네이티브 실험적; <a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> 완전 지원)',
+    req_mux: 'tmux (Linux/macOS/WSL). Windows 네이티브는 ConPTY (기본 내장) 사용.',
     about_text: '개인 프로젝트. 거의 전적으로 <a href="https://github.com/anthropics/claude-code">Claude Code</a>가 구축, <a href="https://github.com/openai/codex">Codex</a>와 <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>도 중요한 기여.',
   },
   es: {
@@ -632,8 +632,8 @@ const I18N = {
     sh_intro: 'Despliega servidor + daemon en una sola máquina. Requiere Docker y un dominio con DNS apuntando al servidor.',
     sh_desc: 'Genera toda la configuración, inicia PostgreSQL + servidor + Caddy con HTTPS automático, crea la cuenta admin y vincula el daemon local. Las credenciales se imprimen al final.',
     sh_connect: 'Para conectar máquinas adicionales:', sh_manual: 'Configuración manual:',
-    req_os: 'macOS, Linux o Windows (experimental)',
-    req_mux: 'tmux (Linux/macOS). Windows usa ConPTY (integrado).',
+    req_os: 'macOS, Linux o Windows (nativo experimental; <a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> totalmente soportado)',
+    req_mux: 'tmux (Linux/macOS/WSL). Windows nativo usa ConPTY (integrado).',
     about_text: 'Proyecto personal. Construido casi en su totalidad por <a href="https://github.com/anthropics/claude-code">Claude Code</a>, con contribuciones de <a href="https://github.com/openai/codex">Codex</a> y <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>.',
   },
   ru: {
@@ -679,8 +679,8 @@ const I18N = {
     sh_intro: 'Разверните сервер + демон на одной машине. Требуется Docker и домен с DNS, указывающим на сервер.',
     sh_desc: 'Автоматически генерирует конфигурацию, запускает PostgreSQL + сервер + Caddy с автоматическим HTTPS, создаёт учётную запись администратора и привязывает локальный демон. Данные для входа выводятся в конце.',
     sh_connect: 'Подключение дополнительных машин:', sh_manual: 'Ручная настройка:',
-    req_os: 'macOS, Linux или Windows (экспериментально)',
-    req_mux: 'tmux (Linux/macOS). Windows использует ConPTY (встроенный).',
+    req_os: 'macOS, Linux или Windows (нативная поддержка экспериментальная; <a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> полностью поддерживается)',
+    req_mux: 'tmux (Linux/macOS/WSL). Нативный Windows использует ConPTY (встроенный).',
     about_text: 'Личный проект. Почти полностью создан <a href="https://github.com/anthropics/claude-code">Claude Code</a>, со значительным вкладом <a href="https://github.com/openai/codex">Codex</a> и <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>.',
   },
 };
