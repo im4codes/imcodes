@@ -14,10 +14,20 @@ vi.mock('child_process', async (importOriginal) => {
 const execFileMock = vi.mocked(execFileCb);
 
 // Helper to make execFile mock resolve with { stdout, stderr }
-function mockExecFileResolves(stdout: string, stderr = ''): void {
+// When passthrough=false (default): returns JSON list for 'list' commands (for ensureWeztermServer + findExistingWindowId), raw stdout for others
+// When passthrough=true: always returns the given stdout (for tests that set their own list JSON)
+function mockExecFileResolves(stdout: string, stderr = '', passthrough = false): void {
   execFileMock.mockImplementation((...fnArgs: any[]) => {
     const cb = fnArgs.find((a: any) => typeof a === 'function');
-    if (cb) cb(null, { stdout, stderr });
+    if (!cb) return undefined as any;
+    if (!passthrough) {
+      const args = fnArgs.find((a: any) => Array.isArray(a)) as string[] | undefined;
+      if (args && args.includes('list')) {
+        cb(null, { stdout: '[{"pane_id": 1, "window_id": 0}]', stderr: '' });
+        return undefined as any;
+      }
+    }
+    cb(null, { stdout, stderr });
     return undefined as any;
   });
 }
@@ -72,10 +82,10 @@ describe('weztermNewSession', () => {
 
     await wezterm.weztermNewSession('test_session', 'bash', { cwd: '/home/user/proj' });
 
-    // Verify execFile was called with correct args
+    // Verify execFile was called with spawn + --window-id (existing window found)
     expect(execFileMock).toHaveBeenCalledWith(
       'wezterm',
-      ['cli', 'spawn', '--cwd', '/home/user/proj', '--', 'bash'],
+      ['cli', 'spawn', '--window-id', '0', '--cwd', '/home/user/proj', '--', 'bash'],
       expect.objectContaining({ windowsHide: true }),
       expect.any(Function),
     );
@@ -91,7 +101,7 @@ describe('weztermNewSession', () => {
 
     expect(execFileMock).toHaveBeenCalledWith(
       'wezterm',
-      ['cli', 'spawn', '--', 'bash'],
+      ['cli', 'spawn', '--window-id', '0', '--', 'bash'],
       expect.objectContaining({ windowsHide: true }),
       expect.any(Function),
     );
@@ -104,7 +114,7 @@ describe('weztermNewSession', () => {
 
     expect(execFileMock).toHaveBeenCalledWith(
       'wezterm',
-      ['cli', 'spawn'],
+      ['cli', 'spawn', '--window-id', '0'],
       expect.objectContaining({ windowsHide: true }),
       expect.any(Function),
     );
@@ -138,7 +148,7 @@ describe('weztermKillSession', () => {
 describe('weztermSessionExists', () => {
   it('returns true when pane_id is in wezterm list output', async () => {
     wezterm.registerPane('test_session', '42');
-    mockExecFileResolves(JSON.stringify([{ pane_id: 42 }, { pane_id: 99 }]));
+    mockExecFileResolves(JSON.stringify([{ pane_id: 42 }, { pane_id: 99 }]), '', true);
 
     const exists = await wezterm.weztermSessionExists('test_session');
     expect(exists).toBe(true);
@@ -164,7 +174,7 @@ describe('weztermListSessions', () => {
   it('returns only tracked sessions that exist in wezterm', async () => {
     wezterm.registerPane('deck_proj_brain', '10');
     wezterm.registerPane('deck_proj_w1', '20');
-    mockExecFileResolves(JSON.stringify([{ pane_id: 10 }, { pane_id: 30 }]));
+    mockExecFileResolves(JSON.stringify([{ pane_id: 10 }, { pane_id: 30 }]), '', true);
 
     const sessions = await wezterm.weztermListSessions();
     expect(sessions).toEqual(['deck_proj_brain']);
@@ -272,7 +282,7 @@ describe('weztermGetPaneCwd', () => {
     mockExecFileResolves(JSON.stringify([
       { pane_id: 42, cwd: 'file:///home/user/project' },
       { pane_id: 99, cwd: 'file:///home/user/other' },
-    ]));
+    ]), '', true);
 
     const cwd = await wezterm.weztermGetPaneCwd('test_session');
     expect(cwd).toBe('file:///home/user/project');
@@ -298,7 +308,7 @@ describe('weztermGetPaneId', () => {
 describe('weztermIsPaneAlive', () => {
   it('returns true when pane is in list', async () => {
     wezterm.registerPane('test_session', '42');
-    mockExecFileResolves(JSON.stringify([{ pane_id: 42, is_active: true }]));
+    mockExecFileResolves(JSON.stringify([{ pane_id: 42, is_active: true }]), '', true);
 
     expect(await wezterm.weztermIsPaneAlive('test_session')).toBe(true);
   });
@@ -321,7 +331,7 @@ describe('weztermGetPanePids', () => {
     mockExecFileResolves(JSON.stringify([
       { pane_id: 42, pid: 12345 },
       { pane_id: 99, pid: 67890 },
-    ]));
+    ]), '', true);
 
     const pids = await wezterm.weztermGetPanePids('test_session');
     expect(pids).toEqual(['12345']);

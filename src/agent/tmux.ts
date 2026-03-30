@@ -281,9 +281,9 @@ export async function newSession(name: string, command?: string, opts?: NewSessi
     if (opts?.env && Object.keys(opts.env).length > 0) {
       const isWin = process.platform === 'win32';
       const exports = Object.entries(opts.env)
-        .map(([k, v]) => isWin ? `set ${k}=${v}` : `export ${k}=${shellQuote(v)}`)
-        .join(isWin ? '& ' : '; ');
-      const sep = isWin ? '& ' : '; ';
+        .map(([k, v]) => isWin ? `set "${k}=${v}"` : `export ${k}=${shellQuote(v)}`)
+        .join(isWin ? ' && ' : '; ');
+      const sep = isWin ? ' && ' : '; ';
       fullCommand = command ? `${exports}${sep}${command}` : exports;
     }
     const paneId = await weztermNewSession(name, fullCommand, { cwd: opts?.cwd });

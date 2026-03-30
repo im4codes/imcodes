@@ -81,34 +81,52 @@ export interface WeztermNewSessionOptions {
 }
 
 /**
+ * Find the first existing WezTerm window_id, or return null if none exist.
+ * Used to spawn new tabs inside an existing window instead of creating new windows.
+ */
+async function findExistingWindowId(): Promise<number | null> {
+  try {
+    const raw = await weztermRun('list', '--format', 'json');
+    const panes = JSON.parse(raw) as Array<{ window_id: number }>;
+    if (panes.length > 0) return panes[0].window_id;
+  } catch { /* no windows */ }
+  return null;
+}
+
+/**
  * Create a new WezTerm pane via `wezterm cli spawn`.
  * Returns the pane_id (parsed from stdout).
+ *
+ * Strategy:
+ * 1. If an existing window is found, spawn a new tab in it (--window-id).
+ * 2. If no window exists, spawn with --new-window to create one.
+ *
+ * This avoids the "pane-id was not specified and $WEZTERM_PANE is not set"
+ * error that occurs when running `wezterm cli spawn` without context.
  */
 export async function weztermNewSession(
   name: string,
   command?: string,
   opts?: WeztermNewSessionOptions,
 ): Promise<string> {
+  await ensureWeztermServer();
+
   const baseArgs: string[] = [];
   if (opts?.cwd) baseArgs.push('--cwd', opts.cwd);
   if (command) baseArgs.push('--', command);
-  // Try spawn without --new-window first (works when a window exists).
-  // If it fails (no focused pane — headless/background), retry with --new-window.
+
   let raw: string;
-  try {
-    raw = await weztermRun('spawn', ...baseArgs);
-  } catch {
+  const windowId = await findExistingWindowId();
+  if (windowId !== null) {
+    raw = await weztermRun('spawn', '--window-id', String(windowId), ...baseArgs);
+  } else {
     raw = await weztermRun('spawn', '--new-window', ...baseArgs);
   }
   const paneId = raw.trim();
+  if (!paneId) {
+    throw new Error(`WezTerm spawn returned empty pane_id for session: ${name}`);
+  }
   registerPane(name, paneId);
-
-  // Set environment variables on the pane via send-text if needed.
-  // WezTerm CLI spawn does not support -e flag for env vars natively,
-  // so we prepend env exports to the command or handle them externally.
-  // For now, env vars are baked into the command string by the caller.
-  // TODO: If WezTerm adds --env support, use it here.
-
   return paneId;
 }
 
