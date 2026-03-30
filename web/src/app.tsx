@@ -769,7 +769,7 @@ export function App() {
             }
             return prev.map((s) => s.name === msg.session ? { ...s, state: msg.state as SessionInfo['state'] } : s);
           });
-          // Active session stopped → navigate back after a short grace period
+          // Active session stopped → navigate back after a grace period
           // (allows restart to re-create the session before navigating away)
           if (msg.event === 'stopped' && msg.session === activeSessionRef.current) {
             if (stoppedNavTimerRef.current) clearTimeout(stoppedNavTimerRef.current);
@@ -778,11 +778,19 @@ export function App() {
               if (activeSessionRef.current === msg.session) {
                 setActiveSession(null);
               }
-            }, 3000);
+            }, 8000);
           }
+          // Cancel navigate-away if the same project restarts (any role: brain/worker)
           if (msg.event === 'started' && stoppedNavTimerRef.current) {
-            clearTimeout(stoppedNavTimerRef.current);
-            stoppedNavTimerRef.current = null;
+            const stoppedSession = activeSessionRef.current;
+            if (stoppedSession) {
+              const stoppedProject = stoppedSession.replace(/^deck_/, '').replace(/_(brain|w\d+)$/, '');
+              const startedProject = (msg.session as string).replace(/^deck_/, '').replace(/_(brain|w\d+)$/, '');
+              if (stoppedProject === startedProject) {
+                clearTimeout(stoppedNavTimerRef.current);
+                stoppedNavTimerRef.current = null;
+              }
+            }
           }
         }
       }
