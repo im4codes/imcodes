@@ -20,7 +20,9 @@ A specialized instant messenger for AI agents. More than chat — terminal acces
 ### iPad / Tablet
 
 <p>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-ipad.png"><img src="landing/imcodes-ipad.png" width="40%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-ipad.png"><img src="landing/imcodes-ipad.png" width="32%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-ipad2.png"><img src="landing/imcodes-ipad2.png" width="32%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-ipad3.png"><img src="landing/imcodes-ipad3.png" width="32%" /></a>
 </p>
 
 ### Mobile
