@@ -152,15 +152,21 @@ let lockServer: net.Server | null = null;
  *  The lock auto-releases when the process exits (even on crash).
  *  @param sockPath — override for testing; defaults to ~/.imcodes/daemon.sock */
 export async function acquireInstanceLock(sockPath?: string): Promise<net.Server> {
-  const p = sockPath ?? path.join(os.homedir(), '.imcodes', 'daemon.sock');
-  fs.mkdirSync(path.dirname(p), { recursive: true });
+  // Windows: use a named pipe instead of Unix domain socket (UDS has path length limits and AV issues)
+  const p = process.platform === 'win32'
+    ? '\\\\.\\pipe\\imcodes-daemon-lock'
+    : (sockPath ?? path.join(os.homedir(), '.imcodes', 'daemon.sock'));
+
+  if (process.platform !== 'win32') {
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+  }
 
   return new Promise((resolve, reject) => {
     const server = net.createServer();
 
     server.on('error', (err: NodeJS.ErrnoException) => {
       if (err.code === 'EADDRINUSE') {
-        // Socket exists — check if another daemon is actually alive
+        // Socket/pipe exists — check if another daemon is actually alive
         const client = net.connect(p, () => {
           // Connection succeeded → another daemon is running
           client.destroy();
@@ -168,7 +174,9 @@ export async function acquireInstanceLock(sockPath?: string): Promise<net.Server
         });
         client.on('error', () => {
           // Connection failed → stale socket from a crashed process, reclaim it
-          try { fs.unlinkSync(p); } catch { /* ignore */ }
+          if (process.platform !== 'win32') {
+            try { fs.unlinkSync(p); } catch { /* ignore */ }
+          }
           server.listen(p, () => resolve(server));
         });
       } else {
@@ -183,8 +191,10 @@ export async function acquireInstanceLock(sockPath?: string): Promise<net.Server
 /** Release a single-instance lock. */
 export function releaseInstanceLock(server: net.Server, sockPath?: string): void {
   server.close();
-  const p = sockPath ?? path.join(os.homedir(), '.imcodes', 'daemon.sock');
-  try { fs.unlinkSync(p); } catch { /* ignore */ }
+  if (process.platform !== 'win32') {
+    const p = sockPath ?? path.join(os.homedir(), '.imcodes', 'daemon.sock');
+    try { fs.unlinkSync(p); } catch { /* ignore */ }
+  }
 }
 
 /** Startup sequence: config → store → memory → sessions → server link */

@@ -154,7 +154,7 @@ async function installWindowsStartup(): Promise<void> {
   // Use process.execPath for reliable Node resolution (works with nvm, pnpm, etc.)
   const nodeExe = process.execPath;
   const imcodesScript = join(__dirname, '..', 'index.js');
-  const cmd = `@echo off\r\nstart /min "" "${nodeExe}" "${imcodesScript}" start\r\n`;
+  const cmd = `@echo off\r\nchcp 65001 >nul 2>&1\r\nstart /min "" "${nodeExe}" "${imcodesScript}" start --foreground\r\n`;
   await writeFile(cmdPath, cmd, 'utf8');
 }
 
