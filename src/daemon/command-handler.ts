@@ -1569,6 +1569,38 @@ if [ -n "$STALE_PID" ] && kill -0 "$STALE_PID" 2>/dev/null; then
   kill -0 "$STALE_PID" 2>/dev/null && kill -9 "$STALE_PID" 2>/dev/null
 fi
 launchctl load -w "${plist}"`;
+  } else if (process.platform === 'win32') {
+    // Windows: generate a CMD batch script
+    const npmBin = join(dirname(process.execPath), 'npm.cmd');
+    const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
+    const pkgSpec = targetVersion ? `imcodes@${targetVersion}` : 'imcodes@latest';
+    const pidFile = join(homedir(), '.imcodes', 'daemon.pid');
+    const startupCmd = join(homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'imcodes-daemon.cmd');
+
+    const batchPath = join(scriptDir, 'upgrade.cmd');
+    const batch = `@echo off\r
+echo === imcodes upgrade started at %date% %time% === >> "${logFile}"\r
+timeout /t 3 /nobreak > nul\r
+echo Installing ${pkgSpec}... >> "${logFile}"\r
+"${npmCmd}" install -g ${pkgSpec} >> "${logFile}" 2>&1\r
+if %errorlevel% equ 0 (echo Install succeeded. >> "${logFile}") else (echo Install FAILED. >> "${logFile}")\r
+echo Restarting daemon... >> "${logFile}"\r
+for /f %%p in ('type "${pidFile}" 2^>nul') do taskkill /f /pid %%p >nul 2>&1\r
+if exist "${startupCmd}" start "" "${startupCmd}"\r
+echo === upgrade done at %date% %time% === >> "${logFile}"\r
+`;
+
+    writeFileSync(batchPath, batch);
+
+    const child = spawn('cmd.exe', ['/c', batchPath], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.unref();
+
+    logger.info({ log: logFile }, 'daemon.upgrade: Windows upgrade script spawned');
+    return;
   } else {
     logger.warn('daemon.upgrade: unsupported platform, cannot restart service');
     return;

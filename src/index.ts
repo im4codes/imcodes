@@ -6,7 +6,7 @@ import { loadStore, listSessions } from './store/session-store.js';
 import { sendKeys } from './agent/tmux.js';
 import { bindFlow } from './bind/bind-flow.js';
 import logger from './util/logger.js';
-import { execSync } from 'child_process';
+import { execSync, spawn } from 'child_process';
 import { homedir } from 'os';
 import { existsSync, realpathSync, readFileSync, writeFileSync } from 'fs';
 import { resolve, join, dirname } from 'path';
@@ -566,10 +566,10 @@ program
 
     if (isGlobal) {
       // Installed via npm — use the same node/npm that's running this process
-      const npmBin = resolve(dirname(process.execPath), 'npm');
+      const npmBin = resolve(dirname(process.execPath), process.platform === 'win32' ? 'npm.cmd' : 'npm');
       const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
       try {
-        execSync(`${npmCmd} install -g ${pkg}`, { stdio: 'inherit' });
+        execSync(`"${npmCmd}" install -g ${pkg}`, { stdio: 'inherit' });
       } catch {
         console.error('npm install failed.');
         process.exit(1);
@@ -612,6 +612,18 @@ program
           console.log('Restarting daemon via systemd...');
           execSync('sudo systemctl daemon-reload && sudo systemctl restart imcodes', { stdio: 'inherit' });
         } catch { /* no service — skip */ }
+      }
+    } else if (platform === 'win32') {
+      // Kill existing daemon via PID file and relaunch
+      const pidFile = resolve(homedir(), '.imcodes', 'daemon.pid');
+      try {
+        const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
+        if (pid) { try { execSync(`taskkill /f /pid ${pid}`, { stdio: 'ignore' }); } catch { /* not running */ } }
+      } catch { /* no PID file */ }
+      const startupCmd = resolve(homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'imcodes-daemon.cmd');
+      if (existsSync(startupCmd)) {
+        console.log('Restarting daemon...');
+        spawn(startupCmd, [], { detached: true, stdio: 'ignore', shell: true }).unref();
       }
     }
     console.log('Done.');
