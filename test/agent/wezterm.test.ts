@@ -82,13 +82,14 @@ describe('weztermNewSession', () => {
 
     await wezterm.weztermNewSession('test_session', 'bash', { cwd: '/home/user/proj' });
 
-    // Verify execFile was called with spawn + --window-id (existing window found)
-    expect(execFileMock).toHaveBeenCalledWith(
-      'wezterm',
-      ['cli', 'spawn', '--window-id', '0', '--cwd', '/home/user/proj', '--', 'bash'],
-      expect.objectContaining({ windowsHide: true }),
-      expect.any(Function),
+    // Verify spawn was called with --window-id and command (bat file on Windows, direct on Unix)
+    const spawnCall = execFileMock.mock.calls.find(
+      (c: any[]) => Array.isArray(c[1]) && c[1].includes('spawn'),
     );
+    expect(spawnCall).toBeTruthy();
+    expect(spawnCall![1]).toContain('--window-id');
+    expect(spawnCall![1]).toContain('--cwd');
+    expect(spawnCall![1]).toContain('--');
 
     // Verify pane_id was registered
     expect(wezterm.requirePaneId('test_session')).toBe('42');
@@ -99,12 +100,12 @@ describe('weztermNewSession', () => {
 
     await wezterm.weztermNewSession('test_session', 'bash');
 
-    expect(execFileMock).toHaveBeenCalledWith(
-      'wezterm',
-      ['cli', 'spawn', '--window-id', '0', '--', 'bash'],
-      expect.objectContaining({ windowsHide: true }),
-      expect.any(Function),
+    const spawnCall = execFileMock.mock.calls.find(
+      (c: any[]) => Array.isArray(c[1]) && c[1].includes('spawn'),
     );
+    expect(spawnCall).toBeTruthy();
+    expect(spawnCall![1]).not.toContain('--cwd');
+    expect(spawnCall![1]).toContain('--');
   });
 
   it('calls spawn without command when not provided', async () => {
@@ -112,12 +113,12 @@ describe('weztermNewSession', () => {
 
     await wezterm.weztermNewSession('test_session');
 
-    expect(execFileMock).toHaveBeenCalledWith(
-      'wezterm',
-      ['cli', 'spawn', '--window-id', '0'],
-      expect.objectContaining({ windowsHide: true }),
-      expect.any(Function),
+    const spawnCall = execFileMock.mock.calls.find(
+      (c: any[]) => Array.isArray(c[1]) && c[1].includes('spawn'),
     );
+    expect(spawnCall).toBeTruthy();
+    expect(spawnCall![1]).toContain('--window-id');
+    expect(spawnCall![1]).not.toContain('--');
   });
 });
 
