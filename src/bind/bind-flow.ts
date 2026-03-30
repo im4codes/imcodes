@@ -71,7 +71,7 @@ export async function bindFlow(bindUrl: string, deviceName?: string, opts?: { fo
       await mkdir(CREDS_DIR, { recursive: true });
       await writeFile(CREDS_PATH, JSON.stringify(creds, null, 2), { encoding: 'utf8', mode: 0o600 });
       console.log(`\nRe-bound! Device "${serverName}" updated.`);
-      if (process.platform !== 'win32') await ensureTmux();
+      await ensureServiceInstalled();
       restartDaemon();
       return;
     }
@@ -106,24 +106,7 @@ export async function bindFlow(bindUrl: string, deviceName?: string, opts?: { fo
   await writeFile(CREDS_PATH, JSON.stringify(creds, null, 2), { encoding: 'utf8', mode: 0o600 });
   logger.info({ serverId, serverName }, 'Daemon bound');
 
-  // Install terminal multiplexer if missing (tmux on Unix, WezTerm on Windows)
-  if (process.platform !== 'win32') {
-    await ensureTmux();
-  }
-
-  // Install system service
-  if (process.platform === 'darwin') {
-    await installLaunchAgent();
-    console.log('\nDaemon installed as a launch agent — starts automatically on login.');
-  } else if (process.platform === 'linux') {
-    await installSystemdService();
-    console.log('\nDaemon installed as a systemd user service — starts automatically on login.');
-  } else if (process.platform === 'win32') {
-    await installWindowsStartup();
-    console.log('\nDaemon installed as a startup shortcut — starts automatically on login.');
-  } else {
-    console.log('\nRun "imcodes start" to start the daemon.');
-  }
+  await ensureServiceInstalled();
 
   console.log(`\nBound! Device "${serverName}" is ready.`);
   console.log(`Open ${workerUrl} to see it online.`);
@@ -173,6 +156,26 @@ async function installWindowsStartup(): Promise<void> {
   const imcodesScript = join(__dirname, '..', 'index.js');
   const cmd = `@echo off\r\nstart /min "" "${nodeExe}" "${imcodesScript}" start\r\n`;
   await writeFile(cmdPath, cmd, 'utf8');
+}
+
+/** Ensure terminal backend + system service are installed. Shared by bind and re-bind. */
+async function ensureServiceInstalled(): Promise<void> {
+  if (process.platform !== 'win32') {
+    await ensureTmux();
+  }
+
+  if (process.platform === 'darwin') {
+    await installLaunchAgent();
+    console.log('\nDaemon installed as a launch agent — starts automatically on login.');
+  } else if (process.platform === 'linux') {
+    await installSystemdService();
+    console.log('\nDaemon installed as a systemd user service — starts automatically on login.');
+  } else if (process.platform === 'win32') {
+    await installWindowsStartup();
+    console.log('\nDaemon installed as a startup shortcut — starts automatically on login.');
+  } else {
+    console.log('\nRun "imcodes start" to start the daemon.');
+  }
 }
 
 async function ensureTmux(): Promise<void> {
