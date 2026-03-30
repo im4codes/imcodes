@@ -19,9 +19,8 @@ export interface LaunchOptions {
 /** Build a cd prefix for shell commands. Uses Windows syntax on win32. */
 export function cwdPrefix(cwd?: string): string {
   if (!cwd) return '';
-  const quoted = JSON.stringify(cwd);
-  if (process.platform === 'win32') return `cd /d ${quoted} & `;
-  return `cd ${quoted} && `;
+  if (process.platform === 'win32') return `cd /d "${cwd}" && `;
+  return `cd ${JSON.stringify(cwd)} && `;
 }
 
 export interface AgentDriver {
