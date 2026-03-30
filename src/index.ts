@@ -660,6 +660,22 @@ program
       } else {
         execSync('sudo systemctl restart imcodes', { stdio: 'inherit' });
       }
+    } else if (platform === 'win32') {
+      // Kill via PID file
+      const pidFile = resolve(homedir(), '.imcodes', 'daemon.pid');
+      try {
+        const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
+        if (pid) { try { execSync(`taskkill /f /pid ${pid}`, { stdio: 'ignore' }); } catch { /* not running */ } }
+      } catch { /* no PID file */ }
+      // Relaunch
+      const startupCmd = resolve(homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'imcodes-daemon.cmd');
+      if (existsSync(startupCmd)) {
+        console.log('Restarting daemon...');
+        spawn(startupCmd, [], { detached: true, stdio: 'ignore', shell: true }).unref();
+      } else {
+        console.log('No startup script found. Run "imcodes bind" first.');
+        process.exit(1);
+      }
     } else {
       console.error(`Unsupported platform: ${platform}`); process.exit(1);
     }
