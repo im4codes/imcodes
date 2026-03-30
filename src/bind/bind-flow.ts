@@ -23,7 +23,7 @@ interface ServerCredentials {
  * Main entry point.
  * Usage: imcodes bind https://app.im.codes/bind/<apiKey> [device-name]
  */
-export async function bindFlow(bindUrl: string, deviceName?: string, opts?: { force?: boolean }): Promise<void> {
+export async function bindFlow(bindUrl: string, deviceName?: string, _opts?: { force?: boolean }): Promise<void> {
   // Parse the bind URL
   let url: URL;
   try {
@@ -171,7 +171,7 @@ async function installWindowsStartup(): Promise<void> {
       '/RL', 'HIGHEST',
       '/F',
     ].join(' '), { stdio: 'ignore' });
-  } catch (err) {
+  } catch {
     // schtasks may require elevation — fall back to startup folder CMD
     console.warn('Task Scheduler registration failed (may need admin). Falling back to Startup folder.');
     await mkdir(startupDir, { recursive: true });

@@ -16,6 +16,7 @@ import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { Readable } from 'stream';
 
 const execFile = promisify(execFileCb);
 
@@ -380,7 +381,7 @@ export function startWeztermPollingStream(name: string): {
   stream: import('stream').Readable;
   cleanup: () => Promise<void>;
 } {
-  const { Readable } = require('stream') as typeof import('stream');
+  // Readable imported at top level
   const stream = new Readable({ read() {} });
   let stopped = false;
   let lastContent = '';
