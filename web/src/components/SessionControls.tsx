@@ -108,7 +108,7 @@ function loadCodexModel(): CodexModelChoice | null {
 }
 
 export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact }: Props) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
   const [voiceOpen, setVoiceOpen] = useState(false);
@@ -352,6 +352,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
         if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
       }
+    }
+
+    // Pass user locale for P2P language instruction
+    if (extra.p2pAtTargets || extra.p2pMode) {
+      extra.p2pLocale = i18n.language;
     }
 
     // Prepend quotes

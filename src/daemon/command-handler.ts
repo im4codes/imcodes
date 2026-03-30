@@ -675,7 +675,8 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // ── P2P routing: structured WS fields (new) or inline @@tokens (legacy) ──
   const p2pSessionConfig = (cmd as any).p2pSessionConfig as P2pSessionConfig | undefined;
   let p2pRounds = (cmd as any).p2pRounds as number | undefined;
-  const p2pExtraPrompt = (cmd as any).p2pExtraPrompt as string | undefined;
+  let p2pExtraPrompt = (cmd as any).p2pExtraPrompt as string | undefined;
+  const p2pLocale = (cmd as any).p2pLocale as string | undefined;
   const p2pModeField = (cmd as any).p2pMode as string | undefined;
   const p2pAtTargets = (cmd as any).p2pAtTargets as Array<{ session: string; mode: string }> | undefined;
 
@@ -791,6 +792,16 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           }
           fileContents.push({ path: fp, content: capped }); // cap at 50KB
         } catch { /* ignore unreadable files */ }
+      }
+      // Auto-append language instruction based on user's locale (unless extraPrompt already specifies language)
+      if (p2pLocale && p2pLocale !== 'en' && !p2pExtraPrompt?.match(/语言|language|lang|中文|日本語|한국어|español|русский/i)) {
+        const LOCALE_NAMES: Record<string, string> = {
+          'zh-CN': 'Chinese (Simplified)', 'zh-TW': 'Chinese (Traditional)',
+          'ja': 'Japanese', 'ko': 'Korean', 'es': 'Spanish', 'ru': 'Russian',
+        };
+        const langName = LOCALE_NAMES[p2pLocale] ?? p2pLocale;
+        const langInstr = `Conduct the discussion in ${langName} so the user can understand.`;
+        p2pExtraPrompt = p2pExtraPrompt ? `${p2pExtraPrompt}\n${langInstr}` : langInstr;
       }
       const run = await startP2pRun(sessionName, tokens.agents, tokens.cleanText, fileContents, serverLink, p2pRounds, p2pExtraPrompt);
       const status = isLegacy ? 'accepted_legacy' : 'accepted';
