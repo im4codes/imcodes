@@ -25,10 +25,15 @@ import { readProjectMemory, appendAgentSendDocs } from './memory-inject.js';
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
-/** Compute Claude Code project key: replace path separators and drive colons with '-'. */
-function claudeProjectKey(absPath: string): string {
-  return absPath.replace(/\/+$/, '').replace(/[/\\:]/g, '-');
+/** Compute a filesystem-safe project key from an absolute path.
+ *  Replaces / \ and : with '-'. Used by Claude Code and Codex watchers.
+ *  Exported for reuse and testing. */
+export function projectPathKey(absPath: string): string {
+  return absPath.replace(/\/+$/, '').replace(/[/\\\\:]/g, '-');
 }
+
+// Keep old name as alias for internal use
+const claudeProjectKey = projectPathKey;
 
 /** Return the ~/.claude/projects/{key} directory for a given work dir. */
 export function claudeProjectDir(workDir: string): string {
