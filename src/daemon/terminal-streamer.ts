@@ -278,24 +278,28 @@ export class TerminalStreamer {
   // ── Pipe lifecycle ──────────────────────────────────────────────────────────
 
   private async startPipe(sessionName: string, retryCount: number): Promise<void> {
-    const session = getSession(sessionName);
-    let paneId = session?.paneId;
-    if (!paneId) {
-      // Session created before paneId persistence — fetch dynamically from tmux
-      const fetched = getPaneId(sessionName);
-      paneId = fetched != null ? await fetched.catch(() => undefined) : undefined;
-      if (paneId && session != null) {
-        upsertSession({ ...session, paneId });
+    // ConPTY doesn't need paneId — it uses session name directly from the in-memory map
+    let paneId: string | undefined;
+    if (BACKEND !== 'conpty') {
+      const session = getSession(sessionName);
+      paneId = session?.paneId;
+      if (!paneId) {
+        // Session created before paneId persistence — fetch dynamically from tmux
+        const fetched = getPaneId(sessionName);
+        paneId = fetched != null ? await fetched.catch(() => undefined) : undefined;
+        if (paneId && session != null) {
+          upsertSession({ ...session, paneId });
+        }
       }
-    }
-    if (!paneId) {
-      logger.error({ sessionName }, 'Cannot start pipe-pane: paneId not available — restart session to fix');
-      // Do not remove subscribers: they can still receive on-demand snapshots
-      return;
+      if (!paneId) {
+        logger.error({ sessionName }, 'Cannot start pipe-pane: paneId not available — restart session to fix');
+        // Do not remove subscribers: they can still receive on-demand snapshots
+        return;
+      }
     }
 
     try {
-      const { stream, cleanup } = await startPipePaneStream(sessionName, paneId);
+      const { stream, cleanup } = await startPipePaneStream(sessionName, paneId ?? '');
 
       const pipeState: PipeState = { stream, cleanup, retryCount };
       this.pipes.set(sessionName, pipeState);

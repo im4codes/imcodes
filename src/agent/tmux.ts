@@ -718,7 +718,7 @@ export async function startPipePaneStream(session: string, paneId: string): Prom
   if (BACKEND === 'conpty') {
     const c = await conpty();
     const { Readable } = await import('stream');
-    const readable = new Readable({ read() {} });
+    const readable = new Readable({ read() {}, highWaterMark: 0 });
     const unsub = c.conptySubscribe(session, (data: string) => {
       readable.push(data);
     });
