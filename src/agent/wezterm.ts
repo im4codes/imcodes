@@ -40,8 +40,37 @@ export function requirePaneId(name: string): string {
 
 // ── WezTerm CLI wrappers ────────────────────────────────────────────────────────
 
+/** Ensure WezTerm multiplexer is running. Auto-starts if not. */
+let weztermServerChecked = false;
+async function ensureWeztermServer(): Promise<void> {
+  if (weztermServerChecked) return;
+  try {
+    await execFile('wezterm', ['cli', 'list', '--format', 'json'], { windowsHide: true });
+    weztermServerChecked = true;
+    return;
+  } catch {
+    // Not running — start it
+  }
+  const { spawn: spawnProc } = await import('child_process');
+  const child = spawnProc('wezterm', ['start', '--daemonize'], {
+    detached: true, stdio: 'ignore', windowsHide: true,
+  });
+  child.unref();
+  // Wait up to 10s for multiplexer to become available
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 500));
+    try {
+      await execFile('wezterm', ['cli', 'list', '--format', 'json'], { windowsHide: true });
+      weztermServerChecked = true;
+      return;
+    } catch { /* not ready yet */ }
+  }
+  throw new Error('WezTerm multiplexer did not start within 10 seconds');
+}
+
 /** Run a wezterm cli command and return trimmed stdout. */
 async function weztermRun(...args: string[]): Promise<string> {
+  await ensureWeztermServer();
   const { stdout } = await execFile('wezterm', ['cli', ...args], { windowsHide: true });
   return stdout.trim();
 }
