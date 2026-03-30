@@ -874,10 +874,12 @@ body {
 .fb-overlay { position: fixed; inset: 0; z-index: 1000; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; }
 .fb-modal { background: #1e293b; border: 1px solid #334155; border-radius: 10px; width: min(92vw, 680px); max-height: 84vh; display: flex; flex-direction: column; box-shadow: 0 8px 32px rgba(0,0,0,.5); overflow: hidden; }
 .fb-panel { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
-/* Panel layout: vertical split (tree on top, preview on bottom) instead of side-by-side */
-.fb-panel .fb-body-split { flex-direction: column; }
-.fb-panel .fb-body-split .fb-files-and-changes.fb-tree-split { flex: 0 0 auto; max-height: 40%; max-width: none; min-width: 0; border-right: none; border-bottom: 1px solid #334155; overflow-y: auto; }
-.fb-panel .fb-body-split .fb-preview { flex: 1; }
+/* Panel layout: remove max-width cap so tree can be resized freely */
+.fb-panel .fb-files-and-changes.fb-tree-split { max-width: none; }
+.fb-panel .fb-body-split .fb-tree { max-width: none; }
+/* Draggable resize handle between tree and preview */
+.fb-resize-handle { width: 4px; cursor: col-resize; background: transparent; flex-shrink: 0; transition: background .15s; position: relative; z-index: 1; }
+.fb-resize-handle:hover, .fb-resize-handle:active { background: #3b82f6; }
 /* Panel tabs (Files | Changes) */
 .fb-panel-tabs { display: flex; border-bottom: 1px solid #334155; flex-shrink: 0; }
 .fb-panel-tab { flex: 1; background: none; border: none; border-bottom: 2px solid transparent; color: #64748b; cursor: pointer; padding: 6px 10px; font-size: 12px; font-weight: 500; transition: color .15s; display: flex; align-items: center; justify-content: center; gap: 4px; }

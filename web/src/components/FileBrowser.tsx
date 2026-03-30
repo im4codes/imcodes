@@ -218,6 +218,11 @@ export function FileBrowser({
   const [modifiedFiles, setModifiedFiles] = useState<Map<string, string>>(new Map()); // path → git code
   // Panel view: 'files' shows tree + changes section; 'changes' shows only changed files
   // Restore last active tab from localStorage
+  const [treeWidth, setTreeWidth] = useState<number>(() => {
+    try { const v = localStorage.getItem('rcc_fb_tree_width'); return v ? parseInt(v, 10) : 240; } catch { return 240; }
+  });
+  useEffect(() => { try { localStorage.setItem('rcc_fb_tree_width', String(treeWidth)); } catch {} }, [treeWidth]);
+
   const [panelView, setPanelViewRaw] = useState<'files' | 'changes'>(() => {
     try {
       const saved = localStorage.getItem('rcc_fb_tab');
@@ -1053,10 +1058,24 @@ export function FileBrowser({
           {breadcrumb}
           {newFolderDialog}
           <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}${changesRootPath && changesFiles.length > 0 ? ' fb-body-with-changes' : ''}`}>
-            <div class={`fb-files-and-changes${hasPreview ? ' fb-tree-split' : ''}`}>
+            <div class={`fb-files-and-changes${hasPreview ? ' fb-tree-split' : ''}`} style={hasPreview && treeWidth ? { flex: 'none', width: treeWidth } : undefined}>
               {tree}
               {changesSection}
             </div>
+            {hasPreview && (
+              <div
+                class="fb-resize-handle"
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  const startX = e.clientX;
+                  const startW = treeWidth || 240;
+                  const onMove = (ev: MouseEvent) => setTreeWidth(Math.max(120, Math.min(600, startW + ev.clientX - startX)));
+                  const onUp = () => { document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); };
+                  document.addEventListener('mousemove', onMove);
+                  document.addEventListener('mouseup', onUp);
+                }}
+              />
+            )}
             {previewPane}
           </div>
           {footer}
