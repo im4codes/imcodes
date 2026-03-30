@@ -71,8 +71,8 @@ export async function bindFlow(bindUrl: string, deviceName?: string, opts?: { fo
       await mkdir(CREDS_DIR, { recursive: true });
       await writeFile(CREDS_PATH, JSON.stringify(creds, null, 2), { encoding: 'utf8', mode: 0o600 });
       console.log(`\nRe-bound! Device "${serverName}" updated.`);
-      await ensureTmux();
-      await restartDaemon();
+      if (process.platform !== 'win32') await ensureTmux();
+      restartDaemon();
       return;
     }
     // Token invalid (server deleted) — fall through to normal bind but keep same serverId not possible,
