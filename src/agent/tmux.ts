@@ -188,6 +188,10 @@ export async function capturePane(session: string, lines = 50): Promise<string[]
 export async function capturePaneVisible(session: string): Promise<string> {
   if (BACKEND === 'conpty') {
     const c = await conpty();
+    // Use raw screen buffer (with ANSI codes) for accurate snapshot
+    const screen = c.conptyGetScreenBuffer(session);
+    if (screen) return screen;
+    // Fallback to ring buffer if screen buffer is empty
     return c.conptyCapturePane(session, 50).join('\n');
   }
   if (BACKEND === 'wezterm') {
@@ -455,6 +459,7 @@ export async function respawnPane(name: string, command: string): Promise<void> 
 export async function resizeSession(name: string, cols: number, rows: number): Promise<void> {
   if (BACKEND === 'conpty') {
     const c = await conpty();
+    c.conptyClearScreenBuffer(name);
     c.conptyResize(name, cols, rows);
     return;
   }

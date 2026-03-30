@@ -55,10 +55,14 @@ async function getNodePty(): Promise<NodePtyModule> {
 
 const MAX_LINES = 500;
 
+/** Max bytes to keep in the raw screen buffer for snapshot/capturePaneVisible. */
+const MAX_SCREEN_BUFFER = 64 * 1024; // 64KB
+
 interface ConptySession {
   pty: IPty;
   ringBuffer: string[];              // last MAX_LINES lines for capturePane
   rawBuffer: string;                 // partial line accumulator
+  screenBuffer: string;              // recent raw output (with ANSI) for snapshot
   onDataCallbacks: Set<(data: string) => void>;
   exited: boolean;                   // set true on onExit (NOT based on exitCode)
   exitCode: number | null;
@@ -132,6 +136,7 @@ export async function conptyNewSession(
     pty,
     ringBuffer: [],
     rawBuffer: '',
+    screenBuffer: '',
     onDataCallbacks: new Set(),
     exited: false,
     exitCode: null,
@@ -142,6 +147,11 @@ export async function conptyNewSession(
 
   pty.onData((data: string) => {
     feedRingBuffer(session, data);
+    // Keep recent raw output for snapshot (capturePaneVisible)
+    session.screenBuffer += data;
+    if (session.screenBuffer.length > MAX_SCREEN_BUFFER) {
+      session.screenBuffer = session.screenBuffer.slice(-MAX_SCREEN_BUFFER);
+    }
     for (const cb of session.onDataCallbacks) {
       try { cb(data); } catch { /* don't let subscriber errors crash the session */ }
     }
@@ -228,6 +238,25 @@ export function conptySendKey(name: string, key: string): void {
       session.pty.write(key);
     }
   }
+}
+
+/**
+ * Get the raw screen buffer (recent PTY output with ANSI codes).
+ * Used by capturePaneVisible for snapshot delivery.
+ * Returns empty string if session not found.
+ */
+export function conptyGetScreenBuffer(name: string): string {
+  const session = sessions.get(name);
+  if (!session) return '';
+  return session.screenBuffer;
+}
+
+/**
+ * Clear and reset the screen buffer (e.g. after resize).
+ */
+export function conptyClearScreenBuffer(name: string): void {
+  const session = sessions.get(name);
+  if (session) session.screenBuffer = '';
 }
 
 /**
