@@ -1541,6 +1541,13 @@ async function handleDaemonUpgrade(targetVersion?: string): Promise<void> {
   const { join, dirname } = await import('path');
   const { tmpdir, homedir } = await import('os');
 
+  // Skip if we're already at the target version (prevents upgrade loops)
+  const { DAEMON_VERSION } = await import('../util/version.js');
+  if (targetVersion && DAEMON_VERSION === targetVersion) {
+    logger.info({ daemonVersion: DAEMON_VERSION, targetVersion }, 'daemon.upgrade: already at target version, skipping');
+    return;
+  }
+
   logger.info('daemon.upgrade: preparing upgrade script');
 
   const scriptDir = mkdtempSync(join(tmpdir(), 'imcodes-upgrade-'));
