@@ -202,6 +202,9 @@ export function FileBrowser({
     try { return localStorage.getItem(PREF_KEY) === '1'; } catch { return false; }
   });
   const [editDirty, setEditDirty] = useState(false);
+  const editDirtyRef = useRef(false);
+  // Keep ref in sync with state
+  useEffect(() => { editDirtyRef.current = editDirty; }, [editDirty]);
   const [originalMtime, setOriginalMtime] = useState<number | undefined>(undefined);
   // Message handlers registered by FileEditor
   const editorMsgHandlers = useRef(new Set<(msg: ServerMessage) => void>());
@@ -468,7 +471,7 @@ export function FileBrowser({
 
   const fetchPreview = useCallback((filePath: string) => {
     if (onPreviewFile) { onPreviewFile(filePath); return; }
-    if (editDirty) {
+    if (editDirtyRef.current) {
       if (!window.confirm(t('fileBrowser.unsavedChanges'))) return;
     }
     setEditDirty(false);
@@ -480,7 +483,7 @@ export function FileBrowser({
     pendingReadRef.current.set(requestId, filePath);
     const diffId = ws.fsGitDiff(filePath);
     pendingGitDiffRef.current.set(diffId, filePath);
-  }, [ws, editDirty, t]);
+  }, [ws, t]);
 
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
 
