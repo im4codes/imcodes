@@ -222,7 +222,7 @@ Login at `https://your-domain` with `admin` and the printed password. Bind your 
 - macOS or Linux (tested on both)
 - **Windows (experimental)**: Native support via [ConPTY](https://devblogs.microsoft.com/commandline/windows-command-line-introducing-the-windows-pseudo-console-conpty/) (built-in on Windows 10+). Just `npm install -g imcodes` — no extra software needed. WSL also works.
 - Node.js >= 20
-- Terminal multiplexer: [tmux](https://github.com/tmux/tmux) (Linux/macOS). Windows uses ConPTY (auto-detected). Legacy [WezTerm](https://wezfurlong.org/wezterm/) support available via `IMCODES_MUX=wezterm`.
+- Terminal multiplexer: [tmux](https://github.com/tmux/tmux) (Linux/macOS). Windows uses ConPTY (auto-detected, built-in).
 - At least one AI coding agent: [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or [OpenClaw](https://openclaw.com)
 
 ## License
