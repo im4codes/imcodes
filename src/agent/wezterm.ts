@@ -291,10 +291,15 @@ export async function weztermSendRawInput(name: string, data: string): Promise<v
  */
 export async function weztermCapturePane(name: string, lines = 50): Promise<string[]> {
   const paneId = requirePaneId(name);
-  const raw = await weztermRun('get-text', '--pane-id', paneId);
-  const allLines = raw.split('\n');
-  // Return last N lines to match tmux capturePane behavior
-  return allLines.slice(-lines);
+  // Use --start-line/--end-line to avoid capturing full scrollback (major perf win on Windows)
+  try {
+    const raw = await weztermRun('get-text', '--pane-id', paneId, '--start-line', '0', '--end-line', String(lines));
+    return raw.split('\n');
+  } catch {
+    // Fallback for older WezTerm without --start-line support
+    const raw = await weztermRun('get-text', '--pane-id', paneId);
+    return raw.split('\n').slice(-lines);
+  }
 }
 
 /**
@@ -352,14 +357,25 @@ export async function weztermGetPanePids(name: string): Promise<string[]> {
   }
 }
 
-/** Capture visible pane content with ANSI escape codes (for terminal streaming). */
-export async function weztermCapturePaneVisible(name: string): Promise<string> {
+/** Get pane dimensions by session name. Uses cached values when possible. */
+export async function weztermGetPaneSize(name: string): Promise<{ cols: number; rows: number }> {
+  const paneId = nameToPane.get(name);
+  if (!paneId) return { cols: 80, rows: 24 };
+  return getPaneDimensions(paneId);
+}
+
+/** Capture visible pane content with ANSI escape codes (for terminal streaming).
+ *  Uses --start-line/--end-line to avoid capturing scrollback (major perf win on Windows). */
+export async function weztermCapturePaneVisible(name: string, rows = 50): Promise<string> {
   const paneId = requirePaneId(name);
   try {
-    return await weztermRun('get-text', '--pane-id', paneId, '--escapes');
+    return await weztermRun('get-text', '--pane-id', paneId, '--escapes', '--start-line', '0', '--end-line', String(rows));
   } catch {
-    // --escapes may not be supported in all WezTerm versions, fall back to plain
-    return await weztermRun('get-text', '--pane-id', paneId);
+    try {
+      return await weztermRun('get-text', '--pane-id', paneId, '--start-line', '0', '--end-line', String(rows));
+    } catch {
+      return await weztermRun('get-text', '--pane-id', paneId);
+    }
   }
 }
 
@@ -373,39 +389,66 @@ export async function weztermResizePane(name: string, cols: number, rows: number
   }
 }
 
+// Cached pane dimensions: paneId → { cols, rows }
+const paneDimCache = new Map<string, { cols: number; rows: number; ts: number }>();
+const DIM_CACHE_TTL_MS = 10_000;
+
+async function getPaneDimensions(paneId: string): Promise<{ cols: number; rows: number }> {
+  const cached = paneDimCache.get(paneId);
+  if (cached && Date.now() - cached.ts < DIM_CACHE_TTL_MS) return cached;
+  try {
+    const raw = await weztermRun('list', '--format', 'json');
+    const panes = JSON.parse(raw) as Array<{ pane_id: number; size?: { cols: number; rows: number }; cols?: number; rows?: number }>;
+    const pane = panes.find((p) => String(p.pane_id) === paneId);
+    const cols = pane?.size?.cols ?? pane?.cols ?? 80;
+    const rows = pane?.size?.rows ?? pane?.rows ?? 24;
+    const dim = { cols, rows, ts: Date.now() };
+    paneDimCache.set(paneId, dim);
+    return dim;
+  } catch {
+    return { cols: 80, rows: 24 };
+  }
+}
+
 /**
  * Polling-based terminal stream for WezTerm (no pipe-pane equivalent).
- * Periodically captures visible pane content and emits it as a readable stream.
+ * Optimizations:
+ *  - Uses --start-line 0 --end-line <rows> to skip scrollback (saves 1-3s on Windows)
+ *  - No --escapes for polling (plain text is faster; escapes only for snapshots)
+ *  - Adaptive polling: 250ms when content is changing, 1000ms when idle
  */
 export function startWeztermPollingStream(name: string): {
   stream: import('stream').Readable;
   cleanup: () => Promise<void>;
 } {
-  // Readable imported at top level
   const stream = new Readable({ read() {} });
   let stopped = false;
   let lastContent = '';
   const paneId = nameToPane.get(name);
+  let idleCount = 0;
 
   const poll = async () => {
     while (!stopped && paneId) {
       try {
-        let content: string;
-        try {
-          content = await weztermRun('get-text', '--pane-id', paneId, '--escapes');
-        } catch {
-          content = await weztermRun('get-text', '--pane-id', paneId);
-        }
+        const dim = await getPaneDimensions(paneId);
+        const content = await weztermRun(
+          'get-text', '--pane-id', paneId,
+          '--start-line', '0', '--end-line', String(dim.rows),
+        );
         if (content !== lastContent) {
           lastContent = content;
+          idleCount = 0;
           stream.push(content + '\n');
+        } else {
+          idleCount++;
         }
       } catch {
-        // pane gone or WezTerm not running
         if (!stopped) stream.push(null);
         return;
       }
-      await new Promise<void>((r) => setTimeout(r, 100)); // ~10fps
+      // Adaptive interval: 250ms when active, ramp up to 1000ms when idle
+      const interval = idleCount < 3 ? 250 : idleCount < 10 ? 500 : 1000;
+      await new Promise<void>((r) => setTimeout(r, interval));
     }
   };
 

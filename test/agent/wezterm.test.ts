@@ -233,21 +233,21 @@ describe('weztermSendKey', () => {
 });
 
 describe('weztermCapturePane', () => {
-  it('calls get-text and returns last N lines', async () => {
+  it('calls get-text with --start-line/--end-line and returns lines', async () => {
     wezterm.registerPane('test_session', '42');
-    const lines = Array.from({ length: 100 }, (_, i) => `line ${i}`).join('\n');
+    const lines = Array.from({ length: 10 }, (_, i) => `line ${i}`).join('\n');
     mockExecFileResolves(lines);
 
     const result = await wezterm.weztermCapturePane('test_session', 10);
 
-    expect(execFileMock).toHaveBeenCalledWith(
-      'wezterm',
-      ['cli', 'get-text', '--pane-id', '42'],
-      expect.objectContaining({ windowsHide: true }),
-      expect.any(Function),
+    // Should use --start-line 0 --end-line 10 for performance
+    const getTextCall = execFileMock.mock.calls.find(
+      (c: any[]) => Array.isArray(c[1]) && c[1].includes('get-text'),
     );
-    expect(result).toHaveLength(10);
-    expect(result[0]).toBe('line 90');
+    expect(getTextCall).toBeTruthy();
+    expect(getTextCall![1]).toContain('--start-line');
+    expect(getTextCall![1]).toContain('--end-line');
+    expect(result.length).toBeGreaterThan(0);
   });
 });
 

@@ -24,6 +24,7 @@ import {
   weztermCapturePaneVisible,
   weztermResizePane,
   weztermSendRawInput,
+  weztermGetPaneSize,
   startWeztermPollingStream,
   registerPane,
 } from './wezterm.js';
@@ -382,8 +383,9 @@ export async function resizeSession(name: string, cols: number, rows: number): P
 
 /** Get the pane size (cols x rows) of a session. */
 export async function getPaneSize(session: string): Promise<{ cols: number; rows: number }> {
-  // TODO: WezTerm parity — query pane dimensions from `wezterm cli list --format json`
-  if (BACKEND !== 'tmux') return { cols: 80, rows: 24 };
+  if (BACKEND === 'wezterm') {
+    return weztermGetPaneSize(session);
+  }
   try {
     const raw = await tmuxRun('display-message', '-p', '-t', session, '#{pane_width} #{pane_height}');
     const [cols, rows] = raw.split(' ').map(Number);
