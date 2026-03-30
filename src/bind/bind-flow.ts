@@ -187,8 +187,19 @@ async function ensureWezTerm(): Promise<void> {
   } catch {
     // not found
   }
-  console.error('WezTerm is required on Windows. Install from https://wezfurlong.org/wezterm/installation.html');
-  console.error('After installing, make sure "wezterm" is in your PATH, then re-run "imcodes bind".');
+  console.error('\n╭─────────────────────────────────────────────────────╮');
+  console.error('│  WezTerm is required on Windows                     │');
+  console.error('╰─────────────────────────────────────────────────────╯');
+  console.error('\nInstall via winget (recommended):');
+  console.error('  winget install wez.wezterm\n');
+  console.error('Or via Chocolatey:');
+  console.error('  choco install wezterm\n');
+  console.error('Or download manually:');
+  console.error('  https://wezfurlong.org/wezterm/installation.html\n');
+  console.error('After installing, add WezTerm to PATH:');
+  console.error('  [Environment]::SetEnvironmentVariable("Path", $env:Path + ";C:\\Program Files\\WezTerm", "User")\n');
+  console.error('Then restart your terminal and re-run:');
+  console.error('  imcodes bind <url>\n');
   process.exit(1);
 }
 
