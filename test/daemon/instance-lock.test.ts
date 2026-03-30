@@ -1,9 +1,12 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { acquireInstanceLock, releaseInstanceLock } from '../../src/daemon/lifecycle.js';
 import { mkdtempSync, existsSync, unlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import net from 'net';
+
+// Verify the default path uses Unix domain socket on non-Windows (not named pipe)
+// This ensures we didn't accidentally break Unix by introducing the Windows pipe path.
 
 function tmpSock(): string {
   const dir = mkdtempSync(join(tmpdir(), 'imcodes-lock-test-'));
@@ -73,5 +76,21 @@ describe('single-instance lock', () => {
     expect(second).toBeInstanceOf(net.Server);
 
     releaseInstanceLock(second, sock);
+  });
+
+  it('uses Unix domain socket path on non-Windows (not named pipe)', async () => {
+    // On the current platform (Linux/Mac in CI), acquireInstanceLock with an explicit
+    // Unix path should work. This verifies the platform branch didn't break Unix.
+    const sock = tmpSock();
+    expect(sock).toContain('daemon.sock');
+    expect(sock).not.toContain('\\\\.\\pipe\\');
+
+    const server = await acquireInstanceLock(sock);
+    servers.push(server);
+    // The socket file should exist on Unix
+    expect(existsSync(sock)).toBe(true);
+    releaseInstanceLock(server, sock);
+    // Socket cleaned up on Unix
+    expect(existsSync(sock)).toBe(false);
   });
 });

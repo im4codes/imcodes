@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { pathBasename, isAbsolutePath, detectSeparator, pathDirname } from '../src/util/path-utils.js';
 
+// These tests ensure Windows path support doesn't break Unix behavior.
+// Each describe block tests Unix FIRST, then Windows, so any Unix regression is caught.
+
 describe('pathBasename', () => {
   // Unix paths
   it('extracts filename from Unix absolute path', () => {
@@ -130,5 +133,50 @@ describe('pathDirname', () => {
   });
   it('gets parent for deeply nested Windows path', () => {
     expect(pathDirname('D:\\code\\project\\src')).toBe('D:/code/project');
+  });
+  it('handles Windows drive root with trailing backslash', () => {
+    // Drive root stays as drive root (stripping trailing \ then popping leaves C:, fixed to C:\)
+    expect(pathDirname('C:\\')).toBe('C:\\');
+  });
+});
+
+// ── Unix regression safety ─────────────────────────────────────────────────
+// These tests specifically guard against regressions introduced by Windows compat changes.
+// If any of these fail, it means a Windows fix broke Unix behavior.
+
+describe('Unix regression safety', () => {
+  it('pathBasename works for typical Unix project paths', () => {
+    expect(pathBasename('/home/user/projects/myapp/src/index.ts')).toBe('index.ts');
+    expect(pathBasename('/usr/local/bin/node')).toBe('node');
+    expect(pathBasename('/etc/nginx/nginx.conf')).toBe('nginx.conf');
+  });
+
+  it('pathDirname preserves Unix path semantics', () => {
+    expect(pathDirname('/home/user/file.ts')).toBe('/home/user');
+    expect(pathDirname('/usr/bin/node')).toBe('/usr/bin');
+    expect(pathDirname('/file.ts')).toBe('/');
+    expect(pathDirname('/')).toBe('/');
+  });
+
+  it('isAbsolutePath correctly identifies Unix paths', () => {
+    expect(isAbsolutePath('/home/user')).toBe(true);
+    expect(isAbsolutePath('/')).toBe(true);
+    expect(isAbsolutePath('~/projects')).toBe(true);
+    expect(isAbsolutePath('src/index.ts')).toBe(false);
+    expect(isAbsolutePath('./src')).toBe(false);
+    expect(isAbsolutePath('../parent')).toBe(false);
+  });
+
+  it('detectSeparator returns / for all Unix paths', () => {
+    expect(detectSeparator('/home/user')).toBe('/');
+    expect(detectSeparator('~/projects/app')).toBe('/');
+    expect(detectSeparator('src/index.ts')).toBe('/');
+    expect(detectSeparator('file.txt')).toBe('/');
+  });
+
+  it('pathDirname never returns backslash for pure Unix paths', () => {
+    const result = pathDirname('/home/user/projects/app/src/index.ts');
+    expect(result).not.toContain('\\');
+    expect(result).toBe('/home/user/projects/app/src');
   });
 });

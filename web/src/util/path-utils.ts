@@ -24,10 +24,13 @@ export function detectSeparator(p: string): '/' | '\\' {
 
 /** Get parent directory (handles both separators). */
 export function pathDirname(p: string): string {
-  const segs = p.replace(/[/\\]+$/, '').split(/[/\\]/);
+  const stripped = p.replace(/[/\\]+$/, '');
+  // Windows drive root (C: after stripping \) → return C:\
+  if (/^[A-Za-z]:$/.test(stripped)) return stripped + '\\';
+  const segs = stripped.split(/[/\\]/);
   segs.pop();
   let result = segs.join('/') || '/';
-  // Ensure Windows drive root has trailing backslash: C: → C:\
+  // Parent is a drive root: C: → C:\
   if (/^[A-Za-z]:$/.test(result)) result += '\\';
   return result;
 }
