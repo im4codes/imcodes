@@ -190,8 +190,11 @@ program
     await loadStore();
     const sessions = listSessions(opts.project);
     const creds = await loadCredentials();
-    const liveTmux = await tmuxList().catch(() => [] as string[]);
-    const liveSet = new Set(liveTmux);
+    let liveSet = new Set<string>();
+    try {
+      const liveTmux = await tmuxList();
+      liveSet = new Set(liveTmux);
+    } catch { /* tmux/wezterm not available — skip live check */ }
 
     // Check daemon process status
     let daemonPid: string | null = null;

@@ -42,7 +42,7 @@ export function requirePaneId(name: string): string {
 
 /** Run a wezterm cli command and return trimmed stdout. */
 async function weztermRun(...args: string[]): Promise<string> {
-  const { stdout } = await execFile('wezterm', ['cli', ...args]);
+  const { stdout } = await execFile('wezterm', ['cli', ...args], { windowsHide: true });
   return stdout.trim();
 }
 
@@ -102,9 +102,9 @@ export async function weztermSessionExists(name: string): Promise<boolean> {
   }
 }
 
-/** List all tracked WezTerm session names. */
+/** List all tracked WezTerm session names. Returns empty if WezTerm is not available. */
 export async function weztermListSessions(): Promise<string[]> {
-  // Validate tracked panes against WezTerm's actual state
+  if (nameToPane.size === 0) return []; // no tracked sessions — skip WezTerm probe
   try {
     const raw = await weztermRun('list', '--format', 'json');
     const panes = JSON.parse(raw) as Array<{ pane_id: number }>;
