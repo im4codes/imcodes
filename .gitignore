@@ -49,6 +49,7 @@ docs/*.local.md
 .DS_Store
 Thumbs.db
 openspec/
+.github/skills/openspec-*/
 
 # P2P sandbox temp files
 .p2p-*.md
