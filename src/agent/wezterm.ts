@@ -257,3 +257,71 @@ export async function weztermGetPanePids(name: string): Promise<string[]> {
     return [];
   }
 }
+
+/** Capture visible pane content with ANSI escape codes (for terminal streaming). */
+export async function weztermCapturePaneVisible(name: string): Promise<string> {
+  const paneId = requirePaneId(name);
+  try {
+    return await weztermRun('get-text', '--pane-id', paneId, '--escapes');
+  } catch {
+    // --escapes may not be supported in all WezTerm versions, fall back to plain
+    return await weztermRun('get-text', '--pane-id', paneId);
+  }
+}
+
+/** Resize a WezTerm pane to the given dimensions. */
+export async function weztermResizePane(name: string, cols: number, rows: number): Promise<void> {
+  const paneId = requirePaneId(name);
+  try {
+    await weztermRun('set-pane-size', '--pane-id', paneId, '--cols', String(cols), '--rows', String(rows));
+  } catch {
+    // set-pane-size may not be available in older WezTerm — silently skip
+  }
+}
+
+/**
+ * Polling-based terminal stream for WezTerm (no pipe-pane equivalent).
+ * Periodically captures visible pane content and emits it as a readable stream.
+ */
+export function startWeztermPollingStream(name: string): {
+  stream: import('stream').Readable;
+  cleanup: () => Promise<void>;
+} {
+  const { Readable } = require('stream') as typeof import('stream');
+  const stream = new Readable({ read() {} });
+  let stopped = false;
+  let lastContent = '';
+  const paneId = nameToPane.get(name);
+
+  const poll = async () => {
+    while (!stopped && paneId) {
+      try {
+        let content: string;
+        try {
+          content = await weztermRun('get-text', '--pane-id', paneId, '--escapes');
+        } catch {
+          content = await weztermRun('get-text', '--pane-id', paneId);
+        }
+        if (content !== lastContent) {
+          lastContent = content;
+          stream.push(content + '\n');
+        }
+      } catch {
+        // pane gone or WezTerm not running
+        if (!stopped) stream.push(null);
+        return;
+      }
+      await new Promise<void>((r) => setTimeout(r, 100)); // ~10fps
+    }
+  };
+
+  void poll();
+
+  return {
+    stream,
+    cleanup: async () => {
+      stopped = true;
+      try { stream.push(null); } catch { /* already ended */ }
+    },
+  };
+}

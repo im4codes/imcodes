@@ -21,6 +21,9 @@ import {
   weztermGetPaneId,
   weztermIsPaneAlive,
   weztermGetPanePids,
+  weztermCapturePaneVisible,
+  weztermResizePane,
+  startWeztermPollingStream,
   registerPane,
 } from './wezterm.js';
 
@@ -155,7 +158,9 @@ export async function capturePane(session: string, lines = 50): Promise<string[]
  * Used for terminal streaming — gives exactly the rows the user sees.
  */
 export async function capturePaneVisible(session: string): Promise<string> {
-  requireTmux('capturePaneVisible');
+  if (BACKEND === 'wezterm') {
+    return weztermCapturePaneVisible(session);
+  }
   return tmuxRun('capture-pane', '-e', '-p', '-t', session);
 }
 
@@ -365,9 +370,12 @@ export async function respawnPane(name: string, command: string): Promise<void> 
   await tmuxRun('respawn-pane', '-t', name, '-k', command);
 }
 
-/** Resize a session window to the given dimensions. tmux-only. */
+/** Resize a session window to the given dimensions. */
 export async function resizeSession(name: string, cols: number, rows: number): Promise<void> {
-  requireTmux('resizeSession');
+  if (BACKEND === 'wezterm') {
+    await weztermResizePane(name, cols, rows);
+    return;
+  }
   await tmuxRun('resize-window', '-t', name, '-x', String(cols), '-y', String(rows));
 }
 
@@ -588,7 +596,9 @@ function destroyPipeStream(stream: Readable, fd: number, needsManualClose: boole
  * Returns a ReadStream and a cleanup function.
  */
 export async function startPipePaneStream(session: string, paneId: string): Promise<PipePaneHandle> {
-  requireTmux('startPipePaneStream');
+  if (BACKEND === 'wezterm') {
+    return startWeztermPollingStream(session);
+  }
 
   if (!SESSION_PATTERN.test(session)) {
     throw new Error(`Invalid session name for pipe-pane: ${session}`);
