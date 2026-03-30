@@ -293,10 +293,12 @@ export function FileBrowser({
 
         const resolvedParent = msg.resolvedPath ?? nodeId;
         const entries = msg.entries ?? [];
+        // Use the same path separator as the resolved parent (Windows \ vs Unix /)
+        const pathSep = resolvedParent.includes('\\') ? '\\' : '/';
         const children: FsNode[] = entries
           .filter((e) => showHidden || !e.hidden)
           .map((e) => ({
-            id: `${resolvedParent}/${e.name}`,
+            id: `${resolvedParent}${pathSep}${e.name}`,
             name: e.name,
             isDir: e.isDir,
             hidden: e.hidden,
@@ -306,13 +308,23 @@ export function FileBrowser({
         loadedRef.current.add(nodeId);
         if (resolvedParent !== nodeId) loadedRef.current.add(resolvedParent);
 
-        setData((prev) => updateNode(prev, nodeId, { id: resolvedParent, name: resolvedParent.split('/').pop() || resolvedParent, children, isLoading: false }));
+        setData((prev) => updateNode(prev, nodeId, { id: resolvedParent, name: resolvedParent.split(/[/\\]/).pop() || resolvedParent, children, isLoading: false }));
+        // Keep the node expanded after its ID changes from alias (e.g. '~') to resolved path
+        if (resolvedParent !== nodeId) {
+          setExpandedPaths((prev) => {
+            if (!prev.has(nodeId)) return prev;
+            const next = new Set(prev);
+            next.delete(nodeId);
+            next.add(resolvedParent);
+            return next;
+          });
+        }
         setCurrentLabel(resolvedParent);
         setError(null);
 
         // If highlightPath is under this dir, auto-expand
-        if (highlightPath && highlightPath.startsWith(resolvedParent + '/')) {
-          const nextSegment = highlightPath.slice(resolvedParent.length + 1).split('/')[0];
+        if (highlightPath && (highlightPath.startsWith(resolvedParent + '/') || highlightPath.startsWith(resolvedParent + '\\'))) {
+          const nextSegment = highlightPath.slice(resolvedParent.length + 1).split(/[/\\]/)[0];
           const child = children.find((c) => c.name === nextSegment && c.isDir);
           if (child) setTimeout(() => { if (mountedRef.current) fetchDir(child.id); }, 0);
         }
@@ -499,9 +511,12 @@ export function FileBrowser({
   }, [jumpTo]);
 
   const goUp = useCallback(() => {
-    const parts = currentLabel.replace(/\/$/, '').split('/');
+    // Handle both Unix (/) and Windows (\) path separators
+    const normalized = currentLabel.replace(/\/$/, '').replace(/\\$/, '');
+    const sep = normalized.includes('\\') ? '\\' : '/';
+    const parts = normalized.split(sep);
     if (parts.length > 1) {
-      const parent = parts.slice(0, -1).join('/') || '/';
+      const parent = parts.slice(0, -1).join(sep) || sep;
       navigateTo(parent);
     }
   }, [currentLabel, navigateTo]);
