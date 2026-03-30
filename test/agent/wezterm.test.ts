@@ -210,31 +210,21 @@ describe('weztermSendText', () => {
 });
 
 describe('weztermSendEnter', () => {
-  it('sends carriage return via send-text', async () => {
-    wezterm.registerPane('test_session', '42');
-    mockExecFileResolves('');
-
-    await wezterm.weztermSendEnter('test_session');
-
-    expect(execFileMock).toHaveBeenCalledWith(
-      'wezterm',
-      ['cli', 'send-text', '--pane-id', '42', '--no-paste', '--', '\r'],
-      expect.objectContaining({ windowsHide: true }),
-      expect.any(Function),
-    );
+  it('throws if session is not registered', async () => {
+    await expect(wezterm.weztermSendEnter('nonexistent')).rejects.toThrow('WezTerm pane_id not found');
   });
 });
 
 describe('weztermSendKey', () => {
-  it('sends raw key bytes via send-text --no-paste', async () => {
+  it('sends printable char via execFile', async () => {
     wezterm.registerPane('test_session', '42');
     mockExecFileResolves('');
 
-    await wezterm.weztermSendKey('test_session', '\x03'); // Ctrl-C
+    await wezterm.weztermSendKey('test_session', '1'); // printable char
 
     expect(execFileMock).toHaveBeenCalledWith(
       'wezterm',
-      ['cli', 'send-text', '--pane-id', '42', '--no-paste', '--', '\x03'],
+      ['cli', 'send-text', '--pane-id', '42', '--no-paste', '--', '1'],
       expect.objectContaining({ windowsHide: true }),
       expect.any(Function),
     );

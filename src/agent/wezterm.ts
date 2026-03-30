@@ -196,8 +196,18 @@ export async function weztermSendText(name: string, text: string): Promise<void>
 /** Send Enter key to a WezTerm pane. */
 export async function weztermSendEnter(name: string): Promise<void> {
   const paneId = requirePaneId(name);
-  // Use \r (carriage return) — WezTerm translates to Enter key event
-  await weztermRun('send-text', '--pane-id', paneId, '--no-paste', '--', '\r');
+  // Use stdin pipe to send \r — avoids Windows argv mangling of control characters
+  const { spawn: spawnProc } = await import('child_process');
+  await new Promise<void>((resolve, reject) => {
+    const child = spawnProc('wezterm', ['cli', 'send-text', '--pane-id', paneId, '--no-paste'], {
+      stdio: ['pipe', 'ignore', 'ignore'],
+      windowsHide: true,
+    });
+    child.stdin!.write('\r');
+    child.stdin!.end();
+    child.on('close', (code) => code === 0 ? resolve() : reject(new Error(`exit ${code}`)));
+    child.on('error', reject);
+  });
 }
 
 // Map tmux key names → escape sequences / raw bytes for WezTerm
@@ -223,14 +233,34 @@ const TMUX_KEY_TO_ESCAPE: Record<string, string> = {
   'F9': '\x1b[20~', 'F10': '\x1b[21~', 'F11': '\x1b[23~', 'F12': '\x1b[24~',
 };
 
-/** Send a key to a WezTerm pane. Maps tmux key names to escape sequences. */
+/** Send a key to a WezTerm pane. Maps tmux key names to escape sequences.
+ *  Uses stdin pipe for control characters to avoid Windows argv mangling. */
 export async function weztermSendKey(name: string, key: string): Promise<void> {
   const paneId = requirePaneId(name);
-  // Map tmux key name → escape sequence; Ctrl+letter → raw byte; otherwise send literal
   const mapped = TMUX_KEY_TO_ESCAPE[key]
     ?? (key.match(/^C-([a-z])$/) ? String.fromCharCode(key.charCodeAt(2) - 96) : null)
     ?? key;
-  await weztermRun('send-text', '--pane-id', paneId, '--no-paste', '--', mapped);
+  // For printable single chars (like '1'), use argv; for control/escape chars, use stdin pipe
+  if (mapped.length === 1 && mapped.charCodeAt(0) >= 32 && mapped.charCodeAt(0) < 127) {
+    await weztermRun('send-text', '--pane-id', paneId, '--no-paste', '--', mapped);
+  } else {
+    await weztermSendViaStdin(paneId, mapped);
+  }
+}
+
+/** Send raw bytes to a WezTerm pane via stdin pipe (avoids argv control char issues). */
+async function weztermSendViaStdin(paneId: string, data: string): Promise<void> {
+  const { spawn: spawnProc } = await import('child_process');
+  await new Promise<void>((resolve, reject) => {
+    const child = spawnProc('wezterm', ['cli', 'send-text', '--pane-id', paneId, '--no-paste'], {
+      stdio: ['pipe', 'ignore', 'ignore'],
+      windowsHide: true,
+    });
+    child.stdin!.write(data);
+    child.stdin!.end();
+    child.on('close', (code) => code === 0 ? resolve() : reject(new Error(`wezterm send-text exit ${code}`)));
+    child.on('error', reject);
+  });
 }
 
 /**
@@ -250,10 +280,8 @@ export async function weztermSendRawInput(name: string, data: string): Promise<v
     (weztermSendRawInput as any)[key] = now;
   }
 
-  // Map \r to Enter (carriage return), keep all escape sequences as-is
-  // WezTerm send-text --no-paste passes raw bytes to the PTY
-  const mapped = data === '\r' ? '\r' : data;
-  await weztermRun('send-text', '--pane-id', paneId, '--no-paste', '--', mapped);
+  // Use stdin pipe for all raw input — avoids Windows argv mangling of control chars
+  await weztermSendViaStdin(paneId, data);
 }
 
 /**
