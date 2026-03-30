@@ -105,9 +105,21 @@ export async function conptyNewSession(
 
   const cols = opts?.cols ?? 200;
   const rows = opts?.rows ?? 50;
-  const cwd = opts?.cwd ?? process.cwd();
+  // Normalize cwd: forward slashes → backslashes on Windows (node-pty's CreateProcess requires native paths)
+  const rawCwd = opts?.cwd ?? process.cwd();
+  const cwd = process.platform === 'win32' ? rawCwd.replace(/\//g, '\\') : rawCwd;
 
-  const pty = spawn('cmd.exe', ['/c', cmd], {
+  // Strip redundant cwdPrefix from the command string.
+  // Drivers prepend `cd /d "C:\path" && ` or `cd "path" && ` for tmux/wezterm,
+  // but ConPTY sets cwd via pty.spawn({ cwd }) — the cd prefix is redundant
+  // and causes double-escaping issues under cmd.exe /c.
+  let cleanCmd = cmd;
+  const cdMatch = cleanCmd.match(/^cd\s+(?:\/d\s+)?(?:"[^"]*"|[^\s&]+)\s*&&\s*/i);
+  if (cdMatch) {
+    cleanCmd = cleanCmd.slice(cdMatch[0].length);
+  }
+
+  const pty = spawn('cmd.exe', ['/c', cleanCmd], {
     cwd,
     env: { ...process.env, ...opts?.env } as Record<string, string>,
     cols,

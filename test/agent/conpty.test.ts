@@ -103,6 +103,26 @@ describe('conpty backend', () => {
       expect(conpty.conptySessionExists('test-session')).toBe(true);
     });
 
+    it('strips redundant cd /d prefix from command', async () => {
+      await conpty.conptyNewSession('cd-strip', 'cd /d "C:\\Users\\admin" && claude --resume abc', {
+        cwd: 'C:\\Users\\admin',
+      });
+
+      expect(spawnMock).toHaveBeenCalledWith('cmd.exe', ['/c', 'claude --resume abc'], expect.objectContaining({
+        cwd: expect.any(String),
+      }));
+    });
+
+    it('strips cd prefix without /d flag', async () => {
+      await conpty.conptyNewSession('cd-strip2', 'cd "C:\\path" && some-cmd', {
+        cwd: 'C:\\path',
+      });
+
+      expect(spawnMock).toHaveBeenCalledWith('cmd.exe', ['/c', 'some-cmd'], expect.objectContaining({
+        cwd: expect.any(String),
+      }));
+    });
+
     it('uses default cols=200, rows=50 when not specified', async () => {
       await conpty.conptyNewSession('test-defaults', 'cmd');
 
