@@ -10,6 +10,7 @@
   "bin": {
     "imcodes": "./dist/src/index.js"
   },
+  "type": "module",
   "main": "./dist/src/index.js",
   "files": [
     "dist/",
