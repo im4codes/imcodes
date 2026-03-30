@@ -55,15 +55,18 @@ export async function checkIdleSignal(session: string): Promise<IdleSignal | nul
 }
 
 // Common preamble for all hook scripts: get deck_ session name or exit.
-// Layer 1 (fast): TMUX_PANE must be set (proves we're inside tmux) and we
-// query the session that OWNS this pane (-t "$TMUX_PANE") instead of the
-// most-recently-attached client. Without -t, a CC started in a non-deck
-// terminal while the user is attached to a deck_ session would misroute.
+// Cross-platform: prefer $IMCODES_SESSION (injected by session-manager at launch),
+// fall back to tmux $TMUX_PANE for backward compatibility.
 // Layer 2 (precise): verified server-side in hook-server.ts (session must
 // exist in store and be a claude-code agent).
 const SESSION_PREAMBLE = `\
-[ -z "$TMUX_PANE" ] && exit 0
-SESSION_NAME=$(tmux display-message -p -t "$TMUX_PANE" '#S' 2>/dev/null || echo "")
+if [ -n "$IMCODES_SESSION" ]; then
+  SESSION_NAME="$IMCODES_SESSION"
+elif [ -n "$TMUX_PANE" ]; then
+  SESSION_NAME=$(tmux display-message -p -t "$TMUX_PANE" '#S' 2>/dev/null || echo "")
+else
+  exit 0
+fi
 [ -z "$SESSION_NAME" ] && exit 0
 case "$SESSION_NAME" in
   deck_*) ;;
@@ -88,7 +91,7 @@ function buildStopScript(port: number): string {
 INPUT=$(cat)
 
 # Avoid infinite loop when CC continues due to a stop hook
-STOP_HOOK_ACTIVE=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('stop_hook_active','false'))" 2>/dev/null || echo "false")
+STOP_HOOK_ACTIVE=$(echo "$INPUT" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{console.log(JSON.parse(d).stop_hook_active||'false')}catch{console.log('false')}})" 2>/dev/null || echo "false")
 [ "$STOP_HOOK_ACTIVE" = "true" ] && exit 0
 
 ${SESSION_PREAMBLE}
@@ -107,13 +110,13 @@ INPUT=$(cat)
 
 ${SESSION_PREAMBLE}
 
-TITLE=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('title',''))" 2>/dev/null || echo "")
-MESSAGE=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',''))" 2>/dev/null || echo "")
+TITLE=$(echo "$INPUT" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{console.log(JSON.parse(d).title||'')}catch{console.log('')}})" 2>/dev/null || echo "")
+MESSAGE=$(echo "$INPUT" | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{console.log(JSON.parse(d).message||'')}catch{console.log('')}})" 2>/dev/null || echo "")
 
 # Skip empty notifications
 [ -z "$TITLE" ] && [ -z "$MESSAGE" ] && exit 0
 
-PAYLOAD=$(python3 -c "import json,sys; print(json.dumps({'event':'notification','session':'$SESSION_NAME','title':'$TITLE','message':'$MESSAGE'}))" 2>/dev/null || echo "")
+PAYLOAD=$(node -e "console.log(JSON.stringify({event:'notification',session:'$SESSION_NAME',title:'$TITLE',message:'$MESSAGE'}))" 2>/dev/null || echo "")
 [ -z "$PAYLOAD" ] && exit 0
 
 ${CURL_BASE(port)} \\
@@ -130,13 +133,11 @@ INPUT=$(cat)
 
 ${SESSION_PREAMBLE}
 
-PAYLOAD=$(echo "$INPUT" | SESSION_NAME="$SESSION_NAME" python3 -c "
-import sys, json, os
-data = json.load(sys.stdin)
-tool = data.get('tool_name', 'unknown')
-tool_input = data.get('tool_input', {})
-session = os.environ.get('SESSION_NAME', '')
-print(json.dumps({'event':'tool_start','session':session,'tool':tool,'tool_input':tool_input}))
+PAYLOAD=$(echo "$INPUT" | SESSION_NAME="$SESSION_NAME" node -e "
+let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
+try{const o=JSON.parse(d);const s=process.env.SESSION_NAME||'';
+console.log(JSON.stringify({event:'tool_start',session:s,tool:o.tool_name||'unknown',tool_input:o.tool_input||{}}))}
+catch{console.log(JSON.stringify({event:'tool_start',session:process.env.SESSION_NAME||'',tool:'unknown'}))}})
 " 2>/dev/null)
 
 [ -z "$PAYLOAD" ] && PAYLOAD="{\\"event\\":\\"tool_start\\",\\"session\\":\\"$SESSION_NAME\\",\\"tool\\":\\"unknown\\"}"
