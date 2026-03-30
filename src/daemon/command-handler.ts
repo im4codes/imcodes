@@ -1585,15 +1585,30 @@ launchctl load -w "${plist}"`;
     const startupCmd = join(homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'imcodes-daemon.cmd');
 
     const batchPath = join(scriptDir, 'upgrade.cmd');
+    const targetVer = targetVersion ?? 'latest';
+    const imcodesCmd = join(dirname(process.execPath), 'imcodes.cmd');
+    const verifyCmd = existsSync(imcodesCmd) ? `"${imcodesCmd}"` : 'imcodes';
     const batch = `@echo off\r
 echo === imcodes upgrade started at %date% %time% === >> "${logFile}"\r
 timeout /t 3 /nobreak > nul\r
 echo Installing ${pkgSpec}... >> "${logFile}"\r
 "${npmCmd}" install -g ${pkgSpec} >> "${logFile}" 2>&1\r
-if %errorlevel% equ 0 (echo Install succeeded. >> "${logFile}") else (echo Install FAILED. >> "${logFile}")\r
+if %errorlevel% neq 0 (\r
+  echo Install FAILED — keeping current daemon running. >> "${logFile}"\r
+  goto :done\r
+)\r
+echo Install succeeded. Verifying version... >> "${logFile}"\r
+for /f "tokens=*" %%v in ('${verifyCmd} --version 2^>nul') do set INSTALLED_VER=%%v\r
+echo Installed version: %INSTALLED_VER%, target: ${targetVer} >> "${logFile}"\r
+if "${targetVer}"=="latest" goto :restart\r
+if "%INSTALLED_VER%"=="${targetVer}" goto :restart\r
+echo Version mismatch after install — keeping current daemon running. >> "${logFile}"\r
+goto :done\r
+:restart\r
 echo Restarting daemon... >> "${logFile}"\r
 for /f %%p in ('type "${pidFile}" 2^>nul') do taskkill /f /pid %%p >nul 2>&1\r
 if exist "${startupCmd}" start "" "${startupCmd}"\r
+:done\r
 echo === upgrade done at %date% %time% === >> "${logFile}"\r
 `;
 
@@ -1618,6 +1633,7 @@ echo === upgrade done at %date% %time% === >> "${logFile}"\r
   const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
 
   const pkgSpec = targetVersion ? `imcodes@${targetVersion}` : 'imcodes@latest';
+  const targetVer = targetVersion ?? 'latest';
   const script = `#!/bin/bash
 LOG="${logFile}"
 echo "=== imcodes upgrade started at $(date) ===" >> "$LOG"
@@ -1632,15 +1648,27 @@ if [ -L "$GLOBAL_PKG" ]; then
   ${npmCmd} uninstall -g imcodes >> "$LOG" 2>&1 || true
 fi
 
-# Attempt npm install — if it fails we still restart to keep the daemon alive
+# Attempt npm install — only restart if install succeeds
 echo "Installing ${pkgSpec}..." >> "$LOG"
-if "${npmCmd}" install -g ${pkgSpec} >> "$LOG" 2>&1; then
-  echo "Install succeeded." >> "$LOG"
-else
-  echo "Install FAILED (exit $?). Will restart on existing version." >> "$LOG"
+if ! "${npmCmd}" install -g ${pkgSpec} >> "$LOG" 2>&1; then
+  echo "Install FAILED (exit $?). Keeping current daemon running." >> "$LOG"
+  echo "=== upgrade aborted at $(date) ===" >> "$LOG"
+  sleep 60 && rm -rf "${scriptDir}" &
+  exit 0
+fi
+echo "Install succeeded." >> "$LOG"
+
+# Verify installed version matches target (skip for "latest")
+INSTALLED_VER=$(imcodes --version 2>/dev/null || echo "unknown")
+echo "Installed version: $INSTALLED_VER, target: ${targetVer}" >> "$LOG"
+if [ "${targetVer}" != "latest" ] && [ "$INSTALLED_VER" != "${targetVer}" ]; then
+  echo "Version mismatch after install — keeping current daemon running." >> "$LOG"
+  echo "=== upgrade aborted at $(date) ===" >> "$LOG"
+  sleep 60 && rm -rf "${scriptDir}" &
+  exit 0
 fi
 
-# Always restart the service
+# Install succeeded and version verified — restart the service
 echo "Restarting service..." >> "$LOG"
 ${restartCmd} >> "$LOG" 2>&1 || echo "Restart command failed (exit $?)" >> "$LOG"
 
