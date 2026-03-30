@@ -1916,12 +1916,14 @@ export function App() {
                     {viewMode === 'chat' ? '⌨' : '💬'}
                   </button>
                 )}
-                <span class={`badge ${connected ? (daemonOnline ? 'badge-online' : 'badge-connecting') : connecting ? 'badge-connecting' : 'badge-offline'}`} style={{ fontSize: 10 }}>
-                  {connected ? (daemonOnline ? '● Online' : (<><span class="connecting-dot" />{' Daemon Offline'}</>)) : connecting ? (<><span class="connecting-dot" />{' Connecting'}</>) : '○ Offline'}
-                </span>
-                <span style={{ fontSize: 9, color: '#475569' }}>
-                  {(() => { try { const d = new Date(__BUILD_TIME__); return `v${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
-                </span>
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 0, lineHeight: 1.2 }}>
+                  <span class={`badge ${connected ? (daemonOnline ? 'badge-online' : 'badge-connecting') : connecting ? 'badge-connecting' : 'badge-offline'}`} style={{ fontSize: 10 }}>
+                    {connected ? (daemonOnline ? '● Online' : (<><span class="connecting-dot" />{' Daemon Offline'}</>)) : connecting ? (<><span class="connecting-dot" />{' Connecting'}</>) : '○ Offline'}
+                  </span>
+                  <span style={{ fontSize: 9, color: '#475569' }}>
+                    {(() => { try { const d = new Date(__BUILD_TIME__); return `v${d.getMonth()+1}/${d.getDate()} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`; } catch { return ''; } })()}
+                  </span>
+                </div>
               </div>
             </div>
             {showMobileServerMenu && <div class="mobile-server-backdrop" onClick={() => setShowMobileServerMenu(false)} />}
