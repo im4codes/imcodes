@@ -57,6 +57,10 @@ interface Props {
   quotes?: string[];
   /** Called to remove a quote by index. */
   onRemoveQuote?: (index: number) => void;
+  /** Text to append into the input when arriving from "Go & quote". */
+  pendingPrefillText?: string | null;
+  /** Called after pendingPrefillText has been applied. */
+  onPendingPrefillApplied?: () => void;
   /** Compact mode for sub-session cards — only input, @, ⚡, 📎, send. */
   compact?: boolean;
 }
@@ -103,7 +107,7 @@ function loadCodexModel(): CodexModelChoice | null {
   return null;
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, compact }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact }: Props) {
   const { t } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -147,6 +151,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   useEffect(() => {
     if (inputRef) (inputRef as { current: HTMLDivElement | null }).current = divRef.current;
   });
+
+  useEffect(() => {
+    if (!pendingPrefillText || !divRef.current) return;
+    divRef.current.textContent = (divRef.current.textContent || '') + pendingPrefillText;
+    setHasText(!!divRef.current.textContent.trim());
+    divRef.current.dispatchEvent(new Event('input', { bubbles: true }));
+    divRef.current.focus();
+    try {
+      const sel = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(divRef.current);
+      range.collapse(false);
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+    } catch { /* ignore selection API failures */ }
+    onPendingPrefillApplied?.();
+  }, [pendingPrefillText, onPendingPrefillApplied]);
 
   // Persist input draft across unmount/remount (sub-session minimize/restore)
   const draftKey = activeSession ? `rcc_draft_${activeSession.name}` : null;

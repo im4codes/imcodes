@@ -63,6 +63,10 @@ export interface SessionPaneProps {
   mobileFileBrowserOpen?: boolean;
   /** Mobile: called when the file browser overlay requests close. */
   onMobileFileBrowserClose?: () => void;
+  /** Text to prefill into the input when a navigation action carries a quote. */
+  pendingPrefillText?: string | null;
+  /** Called after pendingPrefillText has been consumed by the input. */
+  onPendingPrefillApplied?: () => void;
 }
 
 export function SessionPane({
@@ -89,6 +93,8 @@ export function SessionPane({
   onAfterAction,
   mobileFileBrowserOpen,
   onMobileFileBrowserClose,
+  pendingPrefillText,
+  onPendingPrefillApplied,
 }: SessionPaneProps) {
   const sessionName = session.name;
 
@@ -272,6 +278,8 @@ export function SessionPane({
           serverId={serverId}
           quotes={quotes}
           onRemoveQuote={removeQuote}
+          pendingPrefillText={pendingPrefillText}
+          onPendingPrefillApplied={onPendingPrefillApplied}
         />
       )}
     </div>

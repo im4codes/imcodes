@@ -1378,6 +1378,7 @@ export function App() {
     if (quote) localStorage.removeItem('rcc_push_quote');
     return { session: target, quote };
   });
+  const [pendingPrefills, setPendingPrefills] = useState<Record<string, string>>({});
 
   // Helper: navigate to a session (main or sub) without reload.
   // For sub-sessions, if sub-session data isn't loaded yet, queues a pending nav.
@@ -1402,23 +1403,9 @@ export function App() {
       localStorage.setItem('rcc_session', session);
       setActiveSession(session);
     }
-    // Insert quoted text into the session's chat input (retry until input mounts)
     if (quote) {
-      let attempts = 0;
-      const tryInsertQuote = () => {
-        const inputEl = inputRefsMap.current.get(session);
-        if (inputEl) {
-          const quoteLines = quote.trim().split('\n').map((l: string) => `> ${l}`).join('\n');
-          inputEl.textContent = (inputEl.textContent || '') + quoteLines + '\n';
-          inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-          inputEl.focus();
-          const sel = window.getSelection();
-          if (sel) { sel.selectAllChildren(inputEl); sel.collapseToEnd(); }
-        } else if (++attempts < 10) {
-          setTimeout(tryInsertQuote, 300);
-        }
-      };
-      setTimeout(tryInsertQuote, 200);
+      const quoteText = `${quote.trim().split('\n').map((l: string) => `> ${l}`).join('\n')}\n`;
+      setPendingPrefills((prev) => ({ ...prev, [session]: (prev[session] || '') + quoteText }));
     }
   }, [setActiveSession, bringSubToFront]);
 
@@ -2020,6 +2007,13 @@ export function App() {
                 onAfterAction={focusTerminal}
                 mobileFileBrowserOpen={s.name === activeSession ? showMobileFileBrowser : false}
                 onMobileFileBrowserClose={() => setShowMobileFileBrowser(false)}
+                pendingPrefillText={pendingPrefills[s.name] ?? null}
+                onPendingPrefillApplied={() => setPendingPrefills((prev) => {
+                  if (!(s.name in prev)) return prev;
+                  const next = { ...prev };
+                  delete next[s.name];
+                  return next;
+                })}
               />
               </ErrorBoundary>
             ))}
@@ -2405,6 +2399,13 @@ export function App() {
               sessions={sessions}
               subSessions={subSessionsSlim}
               serverId={selectedServerId ?? undefined}
+              pendingPrefillText={pendingPrefills[sub.sessionName] ?? null}
+              onPendingPrefillApplied={() => setPendingPrefills((prev) => {
+                if (!(sub.sessionName in prev)) return prev;
+                const next = { ...prev };
+                delete next[sub.sessionName];
+                return next;
+              })}
             />
           </div>
         );

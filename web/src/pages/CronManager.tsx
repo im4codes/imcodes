@@ -470,7 +470,7 @@ function CrossJobExecutionList({ executions, loading, serverNameMap, showAllServ
                 }}
                   style={{ color: '#00ffb4', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline', marginLeft: 'auto' }}
                   title={hasDetail ? t('cron.go_and_quote') : t('cron.go_to_session')}>
-                  {t('cron.go_to_session')} →
+                  {t(hasDetail ? 'cron.go_and_quote' : 'cron.go_to_session')} →
                 </button>
               )}
             </div>
@@ -564,8 +564,9 @@ function CronHistoryPanel({ executions, job, onViewDiscussion, onNavigateSession
                   e.stopPropagation();
                   onNavigateSession(jobSessionName, hasDetail ? exec.detail!.slice(0, 500) : undefined);
                 }}
-                  style={{ color: '#00ffb4', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline', marginLeft: 'auto' }}>
-                  {t('cron.go_to_session')} →
+                  style={{ color: '#00ffb4', background: 'none', border: 'none', cursor: 'pointer', fontSize: '11px', padding: 0, textDecoration: 'underline', marginLeft: 'auto' }}
+                  title={hasDetail ? t('cron.go_and_quote') : t('cron.go_to_session')}>
+                  {t(hasDetail ? 'cron.go_and_quote' : 'cron.go_to_session')} →
                 </button>
               )}
             </div>

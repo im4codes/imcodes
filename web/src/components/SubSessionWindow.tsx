@@ -40,6 +40,8 @@ interface Props {
   sessions?: SessionInfo[];
   subSessions?: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
   serverId?: string;
+  pendingPrefillText?: string | null;
+  onPendingPrefillApplied?: () => void;
 }
 
 type ViewMode = 'terminal' | 'chat';
@@ -67,7 +69,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, zIndex, onFocus, onPin, sessions, subSessions, serverId,
+  sub, ws, connected, active, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, zIndex, onFocus, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied,
 }: Props) {
   const { t } = useTranslation();
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -395,6 +397,8 @@ export function SubSessionWindow({
           detectedModel={detectedModel ?? lastUsage?.model}
           quotes={quotes}
           onRemoveQuote={removeQuote}
+          pendingPrefillText={pendingPrefillText}
+          onPendingPrefillApplied={onPendingPrefillApplied}
         />
       </div>
     </div>
