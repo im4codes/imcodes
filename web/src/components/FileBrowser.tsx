@@ -516,7 +516,9 @@ export function FileBrowser({
     const sep = normalized.includes('\\') ? '\\' : '/';
     const parts = normalized.split(sep);
     if (parts.length > 1) {
-      const parent = parts.slice(0, -1).join(sep) || sep;
+      let parent = parts.slice(0, -1).join(sep) || sep;
+      // Ensure Windows drive root has trailing backslash: C: → C:\
+      if (/^[A-Za-z]:$/.test(parent)) parent += '\\';
       navigateTo(parent);
     }
   }, [currentLabel, navigateTo]);

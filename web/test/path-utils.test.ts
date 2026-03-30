@@ -122,7 +122,13 @@ describe('pathDirname', () => {
   it('gets parent of Windows file path', () => {
     expect(pathDirname('C:\\Users\\user\\file.ts')).toBe('C:/Users/user');
   });
-  it('gets drive root for top-level Windows file', () => {
-    expect(pathDirname('C:\\file.ts')).toBe('C:');
+  it('gets drive root with trailing backslash for top-level Windows file', () => {
+    expect(pathDirname('C:\\file.ts')).toBe('C:\\');
+  });
+  it('gets drive root for Windows directory one level deep', () => {
+    expect(pathDirname('C:\\Users')).toBe('C:\\');
+  });
+  it('gets parent for deeply nested Windows path', () => {
+    expect(pathDirname('D:\\code\\project\\src')).toBe('D:/code/project');
   });
 });

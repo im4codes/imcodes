@@ -26,6 +26,8 @@ export function detectSeparator(p: string): '/' | '\\' {
 export function pathDirname(p: string): string {
   const segs = p.replace(/[/\\]+$/, '').split(/[/\\]/);
   segs.pop();
-  const result = segs.join('/');
-  return result || '/';
+  let result = segs.join('/') || '/';
+  // Ensure Windows drive root has trailing backslash: C: → C:\
+  if (/^[A-Za-z]:$/.test(result)) result += '\\';
+  return result;
 }
