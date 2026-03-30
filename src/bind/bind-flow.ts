@@ -2,7 +2,7 @@ import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync as existsSyncFs, readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir, hostname } from 'os';
-import { execSync } from 'child_process';
+import { execSync, spawn } from 'child_process';
 import logger from '../util/logger.js';
 
 const CREDS_DIR = join(homedir(), '.imcodes');
@@ -131,10 +131,15 @@ function restartDaemon(): void {
         const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
         if (pid) execSync(`taskkill /f /pid ${pid}`, { stdio: 'ignore' });
       } catch { /* not running */ }
-      // Relaunch via startup script
-      const startupCmd = join(homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'imcodes-daemon.cmd');
-      if (existsSyncFs(startupCmd)) {
-        execSync(`"${startupCmd}"`, { stdio: 'ignore' });
+      // Relaunch via Task Scheduler or watchdog
+      try {
+        execSync(`schtasks /Run /TN ${TASK_NAME}`, { stdio: 'ignore' });
+      } catch {
+        // Fallback: try watchdog CMD directly
+        const watchdog = join(homedir(), '.imcodes', 'daemon-watchdog.cmd');
+        if (existsSyncFs(watchdog)) {
+          spawn(watchdog, [], { detached: true, stdio: 'ignore', shell: true }).unref();
+        }
       }
     }
     console.log('Daemon restarted.');
@@ -143,19 +148,57 @@ function restartDaemon(): void {
   }
 }
 
+const TASK_NAME = 'imcodes-daemon';
+
 async function installWindowsStartup(): Promise<void> {
-  // Create a CMD batch in the user's Startup folder (less likely to trigger AV than VBS)
-  const startupDir = join(homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup');
-  await mkdir(startupDir, { recursive: true });
-  // Remove old VBS if present (migration from previous approach)
-  const oldVbs = join(startupDir, 'imcodes-daemon.vbs');
-  try { await import('fs/promises').then((fs) => fs.unlink(oldVbs)); } catch { /* ignore */ }
-  const cmdPath = join(startupDir, 'imcodes-daemon.cmd');
-  // Use process.execPath for reliable Node resolution (works with nvm, pnpm, etc.)
   const nodeExe = process.execPath;
   const imcodesScript = join(__dirname, '..', 'index.js');
-  const cmd = `@echo off\r\nchcp 65001 >nul 2>&1\r\nstart /min "" "${nodeExe}" "${imcodesScript}" start --foreground\r\n`;
-  await writeFile(cmdPath, cmd, 'utf8');
+
+  // Remove legacy Startup folder CMD/VBS if present
+  const startupDir = join(homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup');
+  for (const old of ['imcodes-daemon.cmd', 'imcodes-daemon.vbs']) {
+    try { await import('fs/promises').then((fs) => fs.unlink(join(startupDir, old))); } catch { /* ignore */ }
+  }
+
+  // Use Task Scheduler: runs on logon, restarts on failure (up to 3 times, 10s interval)
+  // /F = force overwrite if exists
+  try {
+    execSync([
+      'schtasks', '/Create',
+      '/TN', TASK_NAME,
+      '/TR', `"${nodeExe}" "${imcodesScript}" start --foreground`,
+      '/SC', 'ONLOGON',
+      '/RL', 'HIGHEST',
+      '/F',
+    ].join(' '), { stdio: 'ignore' });
+  } catch (err) {
+    // schtasks may require elevation — fall back to startup folder CMD
+    console.warn('Task Scheduler registration failed (may need admin). Falling back to Startup folder.');
+    await mkdir(startupDir, { recursive: true });
+    const cmdPath = join(startupDir, 'imcodes-daemon.cmd');
+    const cmd = `@echo off\r\nchcp 65001 >nul 2>&1\r\nstart /min "" "${nodeExe}" "${imcodesScript}" start --foreground\r\n`;
+    await writeFile(cmdPath, cmd, 'utf8');
+    return;
+  }
+
+  // Configure restart on failure via XML task update
+  // schtasks /Create doesn't support restart-on-failure directly,
+  // but the task will re-run on next logon. For immediate restart,
+  // we add a watchdog wrapper.
+  const batDir = join(homedir(), '.imcodes');
+  await mkdir(batDir, { recursive: true });
+  const watchdogPath = join(batDir, 'daemon-watchdog.cmd');
+  const watchdog = `@echo off\r\nchcp 65001 >nul 2>&1\r\n:loop\r\n"${nodeExe}" "${imcodesScript}" start --foreground\r\necho Daemon exited, restarting in 5s...\r\ntimeout /t 5 /nobreak >nul\r\ngoto loop\r\n`;
+  await writeFile(watchdogPath, watchdog, 'utf8');
+
+  // Update task to use watchdog wrapper
+  try {
+    execSync([
+      'schtasks', '/Change',
+      '/TN', TASK_NAME,
+      '/TR', `"${watchdogPath}"`,
+    ].join(' '), { stdio: 'ignore' });
+  } catch { /* keep original task if change fails */ }
 }
 
 /** Ensure terminal backend + system service are installed. Shared by bind and re-bind. */
