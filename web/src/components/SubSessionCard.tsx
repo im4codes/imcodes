@@ -69,7 +69,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
   const termScrollRef = useRef<(() => void) | null>(null);
   const cardInputRef = useRef<HTMLInputElement>(null);
   const previewRef = useRef<HTMLDivElement>(null);
-  const agentTag = isShell ? (sub.shellBin?.split('/').pop() ?? 'shell') : sub.type;
+  const agentTag = isShell ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${sub.label} · ${agentTag}` : agentTag;
   const icon = TYPE_ICON[sub.type] ?? '⚡';
   const badge = STATE_BADGE[sub.state];

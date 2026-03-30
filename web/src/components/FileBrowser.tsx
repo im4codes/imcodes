@@ -642,7 +642,7 @@ export function FileBrowser({
       setSelectedPaths(new Set([nodeId]));
     }
     if (isDir) {
-      const path = nodeId.split('/').pop() || nodeId;
+      const path = nodeId.split(/[/\\]/).pop() || nodeId;
       void path;
       setCurrentLabel(nodeId);
     }
@@ -706,7 +706,7 @@ export function FileBrowser({
           setEditDirty(false);
           setPreview({ status: 'idle' });
         }}>←</button>
-        <span class="fb-preview-name">{previewPath!.split('/').pop()}</span>
+        <span class="fb-preview-name">{previewPath!.split(/[/\\]/).pop()}</span>
         {preview.status === 'ok' && !isEditing && (
           <button class="fb-diff-toggle" onClick={() => {
             setIsEditing(true);
@@ -780,7 +780,7 @@ export function FileBrowser({
         )}
         {preview.status === 'image' && (
           <div class="fb-preview-image">
-            <img src={preview.dataUrl} alt={preview.path.split('/').pop() ?? ''} onClick={() => setLightbox(preview.dataUrl)} style={{ cursor: 'zoom-in' }} />
+            <img src={preview.dataUrl} alt={preview.path.split(/[/\\]/).pop() ?? ''} onClick={() => setLightbox(preview.dataUrl)} style={{ cursor: 'zoom-in' }} />
           </div>
         )}
         {preview.status === 'ok' && isEditing && (
@@ -856,7 +856,7 @@ export function FileBrowser({
           <div key={label} class="fb-changes-group">
             <div class="fb-changes-group-label">{label} ({files.length})</div>
             {files.map((f) => {
-              const name = f.path.split('/').pop() ?? f.path;
+              const name = f.path.split(/[/\\]/).pop() ?? f.path;
               const relPath = changesRootPath ? f.path.replace(changesRootPath + '/', '') : f.path;
               return (
                 <div
@@ -884,30 +884,45 @@ export function FileBrowser({
     </div>
   ) : null;
 
-  // Build breadcrumb segments from currentLabel
+  // Build breadcrumb segments from currentLabel (handles Unix / and Windows \ paths)
   const breadcrumbSegments = useMemo(() => {
     const label = currentLabel;
-    if (label === '~' || (!label.startsWith('/') && !label.startsWith('~'))) {
-      // Treat as single root segment
-      return [{ label, path: label }];
+    if (label === '~' || label === '~/' || label === '~\\') {
+      return [{ label: '~', path: '~' }];
     }
-    if (label.startsWith('~/')) {
-      const rest = label.slice(2).split('/').filter(Boolean);
+    if (label.startsWith('~/') || label.startsWith('~\\')) {
+      const sep = label.includes('\\') ? '\\' : '/';
+      const rest = label.slice(2).split(/[/\\]/).filter(Boolean);
       const segs: { label: string; path: string }[] = [{ label: '~', path: '~' }];
       for (let i = 0; i < rest.length; i++) {
-        segs.push({ label: rest[i], path: '~/' + rest.slice(0, i + 1).join('/') });
+        segs.push({ label: rest[i], path: '~' + sep + rest.slice(0, i + 1).join(sep) });
       }
       return segs;
     }
-    // Absolute path starting with /
-    const parts = label.replace(/\/$/, '').split('/');
-    // parts[0] === '' for absolute paths
-    const segs: { label: string; path: string }[] = [{ label: '/', path: '/' }];
-    for (let i = 1; i < parts.length; i++) {
-      if (!parts[i]) continue;
-      segs.push({ label: parts[i], path: parts.slice(0, i + 1).join('/') || '/' });
+    // Windows drive letter path: C:\Users\... or D:/projects/...
+    const driveMatch = label.match(/^([A-Za-z]:)[/\\]?/);
+    if (driveMatch) {
+      const sep = label.includes('\\') ? '\\' : '/';
+      const root = driveMatch[1] + sep;
+      const rest = label.slice(root.length).split(/[/\\]/).filter(Boolean);
+      const segs: { label: string; path: string }[] = [{ label: root, path: root }];
+      for (let i = 0; i < rest.length; i++) {
+        segs.push({ label: rest[i], path: root + rest.slice(0, i + 1).join(sep) });
+      }
+      return segs;
     }
-    return segs;
+    // Unix absolute path starting with /
+    if (label.startsWith('/')) {
+      const parts = label.replace(/\/$/, '').split('/');
+      const segs: { label: string; path: string }[] = [{ label: '/', path: '/' }];
+      for (let i = 1; i < parts.length; i++) {
+        if (!parts[i]) continue;
+        segs.push({ label: parts[i], path: parts.slice(0, i + 1).join('/') || '/' });
+      }
+      return segs;
+    }
+    // Relative or unknown — single segment
+    return [{ label, path: label }];
   }, [currentLabel]);
 
   const breadcrumb = (

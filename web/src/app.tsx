@@ -2304,7 +2304,7 @@ export function App() {
       {previewFilePath && wsRef.current && (
         <FloatingPanel
           id="file-preview"
-          title={previewFilePath.split('/').pop() ?? 'Preview'}
+          title={previewFilePath.split(/[/\\]/).pop() ?? 'Preview'}
           onClose={() => setPreviewFilePath(null)}
           defaultW={700}
           defaultH={500}

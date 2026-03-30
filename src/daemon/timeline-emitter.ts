@@ -6,6 +6,7 @@
 import { createHash } from 'crypto';
 import { readFileSync } from 'fs';
 import { resolve, basename } from 'path';
+import { tmpdir } from 'os';
 import type { TimelineEvent, TimelineEventType, TimelineSource, TimelineConfidence } from './timeline-event.js';
 import { timelineStore } from './timeline-store.js';
 
@@ -18,7 +19,8 @@ function isTrustedTempPath(filePath: string): boolean {
   // Must match the exact temp file naming pattern
   if (!/^\.imcodes-prompt-[0-9a-f]+\.md$/.test(name)) return false;
   // Must be in /tmp or a project directory (no .. traversal)
-  if (resolved.startsWith('/tmp/') || resolved.startsWith('/private/tmp/')) return true;
+  const tmp = tmpdir();
+  if (resolved.startsWith(tmp + '/') || resolved.startsWith(tmp + '\\') || resolved.startsWith('/tmp/') || resolved.startsWith('/private/tmp/')) return true;
   // Project directory: resolved path should not contain .. and file is at root of some dir
   if (filePath !== resolved) return false; // path contained .. or was relative
   return true;

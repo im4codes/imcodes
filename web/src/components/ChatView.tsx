@@ -721,22 +721,22 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
         </div>
       )}
       {fileBrowserPath && ws && (
-        <FloatingPanel id="chat-file-preview" title={`📄 ${fileBrowserPath.split('/').pop() ?? 'File'}`} onClose={() => setFileBrowserPath(null)} defaultW={600} defaultH={500}>
+        <FloatingPanel id="chat-file-preview" title={`📄 ${fileBrowserPath.split(/[/\\]/).pop() ?? 'File'}`} onClose={() => setFileBrowserPath(null)} defaultW={600} defaultH={500}>
           <FileBrowser
             ws={ws}
             mode="file-single"
             layout="panel"
             initialPath={(() => {
-              const isAbsolute = fileBrowserPath.startsWith('/') || fileBrowserPath.startsWith('~');
+              const isAbsolute = fileBrowserPath.startsWith('/') || fileBrowserPath.startsWith('~') || /^[A-Za-z]:[/\\]/.test(fileBrowserPath);
               const resolved = isAbsolute ? fileBrowserPath : `${workdir ?? '~'}/${fileBrowserPath}`;
               return resolved.includes('.') && !resolved.endsWith('/')
-                ? resolved.split('/').slice(0, -1).join('/') || '~'
+                ? resolved.split(/[/\\]/).slice(0, -1).join('/') || '~'
                 : resolved;
             })()}
-            highlightPath={fileBrowserPath.startsWith('/') || fileBrowserPath.startsWith('~')
+            highlightPath={fileBrowserPath.startsWith('/') || fileBrowserPath.startsWith('~') || /^[A-Za-z]:[/\\]/.test(fileBrowserPath)
               ? fileBrowserPath
               : `${workdir ?? '~'}/${fileBrowserPath}`}
-            autoPreviewPath={fileBrowserPath.startsWith('/') || fileBrowserPath.startsWith('~')
+            autoPreviewPath={fileBrowserPath.startsWith('/') || fileBrowserPath.startsWith('~') || /^[A-Za-z]:[/\\]/.test(fileBrowserPath)
               ? fileBrowserPath
               : `${workdir ?? '~'}/${fileBrowserPath}`}
             onConfirm={(paths) => {

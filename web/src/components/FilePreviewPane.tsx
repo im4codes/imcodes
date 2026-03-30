@@ -106,7 +106,7 @@ export interface FilePreviewPaneProps {
 
 /** Renders highlighted code or markdown. Lazy-loaded by FileBrowser. */
 export function FilePreviewPane({ content, path }: FilePreviewPaneProps) {
-  const filename = path.split('/').pop() ?? '';
+  const filename = path.split(/[/\\]/).pop() ?? '';
   const { html, isMarkdown } = highlightCode(content, filename);
   if (isMarkdown) {
     return <div class="fb-preview-md" dangerouslySetInnerHTML={{ __html: html }} />;

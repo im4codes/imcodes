@@ -233,7 +233,7 @@ export function SubSessionWindow({
     document.addEventListener('mouseup', onUp);
   }, [onFocus]);
 
-  const agentTag = sub.type === 'shell' ? (sub.shellBin?.split('/').pop() ?? 'shell') : sub.type;
+  const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const typeLabel = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
 
   // Only non-terminal (chat) sub-sessions can be pinned to sidebar

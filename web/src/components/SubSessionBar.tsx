@@ -376,7 +376,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
       {collapsed && subSessions.length > 0 && (
         <div class="subsession-bar" style={{ borderTop: 'none' }}>
           {orderedSessions.map((sub) => {
-            const agentTag = sub.type === 'shell' ? (sub.shellBin?.split('/').pop() ?? 'shell') : sub.type;
+            const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
             const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
             const abbr = TYPE_ABBR[sub.type] ?? agentTag.slice(0, 2);
             const isOpen = openIds.has(sub.id);
