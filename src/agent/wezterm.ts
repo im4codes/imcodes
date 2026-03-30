@@ -13,6 +13,9 @@
 
 import { execFile as execFileCb } from 'child_process';
 import { promisify } from 'util';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 
 const execFile = promisify(execFileCb);
 
@@ -113,7 +116,19 @@ export async function weztermNewSession(
 
   const baseArgs: string[] = [];
   if (opts?.cwd) baseArgs.push('--cwd', opts.cwd);
-  if (command) baseArgs.push('--', command);
+
+  // On Windows, wezterm cli spawn passes args directly to CreateProcess (no shell).
+  // Shell commands (set, cd /d, &&) won't work. Write to a temp .bat file instead.
+  let tmpBat: string | null = null;
+  if (command && process.platform === 'win32') {
+    const batDir = path.join(os.homedir(), '.imcodes', 'tmp');
+    fs.mkdirSync(batDir, { recursive: true });
+    tmpBat = path.join(batDir, `session-${name}.bat`);
+    fs.writeFileSync(tmpBat, `@echo off\r\n${command}\r\n`, 'utf8');
+    baseArgs.push('--', tmpBat);
+  } else if (command) {
+    baseArgs.push('--', command);
+  }
 
   let raw: string;
   const windowId = await findExistingWindowId();
