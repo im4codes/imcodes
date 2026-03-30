@@ -135,10 +135,10 @@ function restartDaemon(): void {
       try {
         execSync(`schtasks /Run /TN ${TASK_NAME}`, { stdio: 'ignore' });
       } catch {
-        // Fallback: try watchdog CMD directly
-        const watchdog = join(homedir(), '.imcodes', 'daemon-watchdog.cmd');
-        if (existsSyncFs(watchdog)) {
-          spawn(watchdog, [], { detached: true, stdio: 'ignore', shell: true }).unref();
+        // Fallback: try VBS launcher (hidden window)
+        const vbs = join(homedir(), '.imcodes', 'daemon-launcher.vbs');
+        if (existsSyncFs(vbs)) {
+          spawn('wscript', [vbs], { detached: true, stdio: 'ignore' }).unref();
         }
       }
     }
@@ -188,15 +188,20 @@ async function installWindowsStartup(): Promise<void> {
   const batDir = join(homedir(), '.imcodes');
   await mkdir(batDir, { recursive: true });
   const watchdogPath = join(batDir, 'daemon-watchdog.cmd');
-  const watchdog = `@echo off\r\nchcp 65001 >nul 2>&1\r\n:loop\r\n"${nodeExe}" "${imcodesScript}" start --foreground\r\necho Daemon exited, restarting in 5s...\r\ntimeout /t 5 /nobreak >nul\r\ngoto loop\r\n`;
+  // VBS launcher to run watchdog CMD hidden (no visible window)
+  const vbsPath = join(batDir, 'daemon-launcher.vbs');
+  const vbs = `Set WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${watchdogPath}""", 0, False\r\n`;
+  await writeFile(vbsPath, vbs, 'utf8');
+
+  const watchdog = `@echo off\r\nchcp 65001 >nul 2>&1\r\n:loop\r\n"${nodeExe}" "${imcodesScript}" start --foreground >nul 2>&1\r\ntimeout /t 5 /nobreak >nul\r\ngoto loop\r\n`;
   await writeFile(watchdogPath, watchdog, 'utf8');
 
-  // Update task to use watchdog wrapper
+  // Update task to use VBS launcher (runs watchdog CMD hidden — no visible window)
   try {
     execSync([
       'schtasks', '/Change',
       '/TN', TASK_NAME,
-      '/TR', `"${watchdogPath}"`,
+      '/TR', `wscript "${vbsPath}"`,
     ].join(' '), { stdio: 'ignore' });
   } catch { /* keep original task if change fails */ }
 }

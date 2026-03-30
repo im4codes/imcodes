@@ -633,9 +633,9 @@ program
       try {
         execSync('schtasks /Run /TN imcodes-daemon', { stdio: 'ignore' });
       } catch {
-        const watchdog = resolve(homedir(), '.imcodes', 'daemon-watchdog.cmd');
-        if (existsSync(watchdog)) {
-          spawn(watchdog, [], { detached: true, stdio: 'ignore', shell: true }).unref();
+        const vbs = resolve(homedir(), '.imcodes', 'daemon-launcher.vbs');
+        if (existsSync(vbs)) {
+          spawn('wscript', [vbs], { detached: true, stdio: 'ignore' }).unref();
         }
       }
     }
@@ -676,9 +676,9 @@ program
       try {
         execSync('schtasks /Run /TN imcodes-daemon', { stdio: 'ignore' });
       } catch {
-        const watchdog = resolve(homedir(), '.imcodes', 'daemon-watchdog.cmd');
-        if (existsSync(watchdog)) {
-          spawn(watchdog, [], { detached: true, stdio: 'ignore', shell: true }).unref();
+        const vbs = resolve(homedir(), '.imcodes', 'daemon-launcher.vbs');
+        if (existsSync(vbs)) {
+          spawn('wscript', [vbs], { detached: true, stdio: 'ignore' }).unref();
         } else {
           console.log('No service found. Run "imcodes bind" first.');
           process.exit(1);
