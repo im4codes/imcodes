@@ -210,7 +210,7 @@ describe('weztermSendText', () => {
 });
 
 describe('weztermSendEnter', () => {
-  it('sends newline via send-text', async () => {
+  it('sends carriage return via send-text', async () => {
     wezterm.registerPane('test_session', '42');
     mockExecFileResolves('');
 
@@ -218,7 +218,7 @@ describe('weztermSendEnter', () => {
 
     expect(execFileMock).toHaveBeenCalledWith(
       'wezterm',
-      ['cli', 'send-text', '--pane-id', '42', '--no-paste', '--', '\n'],
+      ['cli', 'send-text', '--pane-id', '42', '--no-paste', '--', '\r'],
       expect.objectContaining({ windowsHide: true }),
       expect.any(Function),
     );
