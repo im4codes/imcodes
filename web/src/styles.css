@@ -1018,10 +1018,21 @@ body {
 .diff-file-header { background: #1c2128; color: #8b949e; padding: 4px 10px; font-size: 11px; border-top: 1px solid #21262d; border-bottom: 1px solid #21262d; line-height: 20px; }
 /* Row hover */
 .diff-row-change:hover .diff-cell, .diff-row-ctx:hover .diff-cell { filter: brightness(1.15); }
+/* Editor save button states */
+.fb-save-btn { position: relative; }
+.fb-save-btn.fb-save-dirty { border-color: #f59e0b !important; color: #f59e0b !important; background: rgba(245,158,11,.1) !important; }
+.fb-save-btn.fb-save-dirty:hover { background: rgba(245,158,11,.2) !important; }
+.fb-save-btn.fb-save-saving { border-color: #3b82f6 !important; color: #3b82f6 !important; opacity: 0.7; }
+.fb-dirty-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #f59e0b; margin-left: 4px; vertical-align: middle; }
+.fb-save-success { color: #4ade80; font-size: 11px; margin-left: 6px; }
+.fb-save-error { color: #f87171; font-size: 11px; margin-left: 6px; }
 /* CodeMirror 6 editor container */
 .fb-editor-cm { height: 100%; overflow: auto; }
 .fb-editor-cm .cm-editor { height: 100%; }
 .fb-editor-cm .cm-scroller { overflow: auto; }
+/* Modified line gutters (IDE-style green bar for changed lines) */
+.fb-editor-cm .cm-editor .cm-changedLine { border-left: 3px solid #3fb950 !important; }
+.fb-editor-cm .cm-editor .cm-addedLine { border-left: 3px solid #3fb950 !important; }
 /* highlight.js token colors (github-dark compatible) */
 .hljs { background: #0f172a; color: #e2e8f0; }
 .hljs-keyword, .hljs-selector-tag, .hljs-built_in { color: #c792ea; }
