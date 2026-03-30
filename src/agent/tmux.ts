@@ -240,6 +240,11 @@ export async function sendKeys(session: string, keys: string, opts?: SendKeysOpt
   if (BACKEND === 'conpty') {
     const c = await conpty();
     await c.conptySendText(session, keys);
+    // Delay before Enter — agents (Codex etc.) need time to process input text
+    const delay = keys.length > 200 || keys.includes('\n')
+      ? 500
+      : Math.min(80 + Math.floor(keys.length / 10) * 5, 1000);
+    await new Promise<void>((r) => setTimeout(r, delay));
     await c.conptySendEnter(session);
     return;
   }
