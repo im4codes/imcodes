@@ -564,7 +564,8 @@ body {
 
 
 /* ── Sub-session collapsed bar (mobile compact buttons) ──────────────────── */
-.subsession-bar { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 10px; background: #0d1117; border-top: 1px solid #1e293b; transition: max-height 0.2s, padding 0.2s, opacity 0.2s; overflow: hidden; }
+.subsession-bar { display: flex; flex-wrap: nowrap; gap: 6px; padding: 8px 10px; background: #0d1117; border-top: 1px solid #1e293b; transition: max-height 0.2s, padding 0.2s, opacity 0.2s; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+.subsession-bar::-webkit-scrollbar { display: none; }
 /* Mobile: when input/terminal gets focus, hide elements below input.
    .input-focused is toggled instantly on focusin/focusout (no viewport delay).
    .kb-open is kept as fallback for viewport-based detection. */
@@ -582,7 +583,7 @@ body {
 /* Quick input trigger in shortcuts row: hidden by default, shown when shell input is hidden */
 .shell-quick-trigger { display: none !important; }
 .kb-open .shell-terminal-pane .shell-quick-trigger { display: inline-flex !important; color: #fbbf24 !important; }
-.subsession-card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 52px; min-height: 52px; padding: 6px 10px; background: #1a2233; border: 1px solid #334155; border-radius: 8px; color: #94a3b8; cursor: pointer; font-family: inherit; font-size: 11px; transition: all 0.15s; }
+.subsession-card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 52px; min-height: 52px; padding: 6px 10px; background: #1a2233; border: 1px solid #334155; border-radius: 8px; color: #94a3b8; cursor: pointer; font-family: inherit; font-size: 11px; transition: all 0.15s; flex-shrink: 0; }
 .subsession-card:hover, .subsession-card.open { border-color: #3b82f6; background: #1e3a5f; color: #93c5fd; }
 .subsession-card-icon { font-size: 13px; font-weight: 700; letter-spacing: -0.5px; line-height: 1; }
 .subsession-card-label { font-size: 10px; color: #64748b; }
