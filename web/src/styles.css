@@ -564,7 +564,7 @@ body {
 
 
 /* ── Sub-session collapsed bar (mobile compact buttons) ──────────────────── */
-.subsession-bar { display: flex; flex-wrap: nowrap; gap: 6px; padding: 8px 10px; background: #0d1117; border-top: 1px solid #1e293b; transition: max-height 0.2s, padding 0.2s, opacity 0.2s; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+.subsession-bar { display: flex; flex-wrap: nowrap; gap: 6px; padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0px)); background: #0d1117; border-top: 1px solid #1e293b; transition: max-height 0.2s, padding 0.2s, opacity 0.2s; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
 .subsession-bar::-webkit-scrollbar { display: none; }
 /* Mobile: when input/terminal gets focus, hide elements below input.
    .input-focused is toggled instantly on focusin/focusout (no viewport delay).
