@@ -611,68 +611,8 @@ program
       try { execSync('timeout /t 3 /nobreak >nul', { stdio: 'ignore' }); } catch { /* ok */ }
     }
 
-    console.log(`Upgrading to ${pkg}...`);
-
-    if (isGlobal) {
-      // Installed via npm — use the same node/npm that's running this process
-      const npmBin = resolve(dirname(process.execPath), platform === 'win32' ? 'npm.cmd' : 'npm');
-      const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
-      try {
-        execSync(`"${npmCmd}" install -g ${pkg}`, { stdio: 'inherit' });
-      } catch {
-        console.error('npm install failed.');
-        process.exit(1);
-      }
-    } else {
-      // Git clone — pull and rebuild
-      const projectRoot = PROJECT_ROOT;
-      try {
-        if (platform === 'win32') {
-          execSync('git pull', { cwd: projectRoot, stdio: 'inherit' });
-          execSync('npm run build', { cwd: projectRoot, stdio: 'inherit' });
-        } else {
-          execSync('git pull && npm run build', { cwd: projectRoot, stdio: 'inherit' });
-        }
-      } catch {
-        console.error('Git pull / build failed.');
-        process.exit(1);
-      }
-    }
-
-    // Show new version
-    try {
-      if (platform === 'win32') {
-        const newVer = execSync(`"${selfPath}" --version`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
-        console.log(`Upgraded to v${newVer}`);
-      } else {
-        const newVer = execSync(`${selfPath} --version 2>/dev/null || echo unknown`, { encoding: 'utf8' }).trim();
-        console.log(`Upgraded to v${newVer}`);
-      }
-    } catch { /* ignore */ }
-
-    // Restart daemon
-    ensureServiceForeground();
-    if (platform === 'darwin') {
-      const plist = resolve(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
-      if (existsSync(plist)) {
-        console.log('Restarting daemon via launchctl...');
-        try { execSync(`launchctl unload "${plist}" 2>/dev/null`, { stdio: 'pipe' }); } catch { /* ok */ }
-        killStaleImcodesProcesses();
-        execSync(`launchctl load "${plist}"`, { stdio: 'inherit' });
-      }
-    } else if (platform === 'linux') {
-      const userService = resolve(homedir(), '.config/systemd/user/imcodes.service');
-      if (existsSync(userService)) {
-        console.log('Restarting daemon via systemd...');
-        execSync('systemctl --user daemon-reload && systemctl --user restart imcodes', { stdio: 'inherit' });
-      } else {
-        try {
-          console.log('Restarting daemon via systemd...');
-          execSync('sudo systemctl daemon-reload && sudo systemctl restart imcodes', { stdio: 'inherit' });
-        } catch { /* no service — skip */ }
-      }
-    } else if (platform === 'win32') {
-      // Daemon was already killed above, just relaunch
+    // Helper to relaunch the Windows watchdog — called in finally to guarantee restart
+    const relaunchWindowsDaemon = () => {
       console.log('Restarting daemon...');
       try {
         execSync('schtasks /Run /TN imcodes-daemon', { stdio: 'ignore' });
@@ -682,8 +622,71 @@ program
           spawn('wscript', [vbs], { detached: true, stdio: 'ignore' }).unref();
         }
       }
+    };
+
+    try {
+      console.log(`Upgrading to ${pkg}...`);
+
+      if (isGlobal) {
+        // Installed via npm — use the same node/npm that's running this process
+        const npmBin = resolve(dirname(process.execPath), platform === 'win32' ? 'npm.cmd' : 'npm');
+        const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
+        execSync(`"${npmCmd}" install -g ${pkg}`, { stdio: 'inherit' });
+      } else {
+        // Git clone — pull and rebuild
+        const projectRoot = PROJECT_ROOT;
+        if (platform === 'win32') {
+          execSync('git pull', { cwd: projectRoot, stdio: 'inherit' });
+          execSync('npm run build', { cwd: projectRoot, stdio: 'inherit' });
+        } else {
+          execSync('git pull && npm run build', { cwd: projectRoot, stdio: 'inherit' });
+        }
+      }
+
+      // Show new version
+      try {
+        if (platform === 'win32') {
+          const newVer = execSync(`"${selfPath}" --version`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
+          console.log(`Upgraded to v${newVer}`);
+        } else {
+          const newVer = execSync(`${selfPath} --version 2>/dev/null || echo unknown`, { encoding: 'utf8' }).trim();
+          console.log(`Upgraded to v${newVer}`);
+        }
+      } catch { /* ignore */ }
+
+      // Restart daemon
+      ensureServiceForeground();
+      if (platform === 'darwin') {
+        const plist = resolve(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
+        if (existsSync(plist)) {
+          console.log('Restarting daemon via launchctl...');
+          try { execSync(`launchctl unload "${plist}" 2>/dev/null`, { stdio: 'pipe' }); } catch { /* ok */ }
+          killStaleImcodesProcesses();
+          execSync(`launchctl load "${plist}"`, { stdio: 'inherit' });
+        }
+      } else if (platform === 'linux') {
+        const userService = resolve(homedir(), '.config/systemd/user/imcodes.service');
+        if (existsSync(userService)) {
+          console.log('Restarting daemon via systemd...');
+          execSync('systemctl --user daemon-reload && systemctl --user restart imcodes', { stdio: 'inherit' });
+        } else {
+          try {
+            console.log('Restarting daemon via systemd...');
+            execSync('sudo systemctl daemon-reload && sudo systemctl restart imcodes', { stdio: 'inherit' });
+          } catch { /* no service — skip */ }
+        }
+      } else if (platform === 'win32') {
+        relaunchWindowsDaemon();
+      }
+      console.log('Done.');
+    } catch (err) {
+      // On Windows, always relaunch the watchdog even if upgrade failed
+      if (platform === 'win32') {
+        console.error('Upgrade failed, relaunching daemon with previous version...');
+        relaunchWindowsDaemon();
+      }
+      throw err;
     }
-    console.log('Done.');
   });
 
 program
