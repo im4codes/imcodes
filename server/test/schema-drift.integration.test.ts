@@ -80,6 +80,7 @@ const SCHEMA_MAP: Array<[string, string[]]> = [
     'closed_at', 'created_at', 'updated_at',
     'cc_session_id', 'gemini_session_id', 'parent_session', 'sort_order',
     'runtime_type', 'provider_id', 'provider_session_id', 'description',
+    'cc_preset_id',
   ]],
   ['discussions', [
     'id', 'server_id', 'topic', 'state', 'max_rounds', 'current_round',

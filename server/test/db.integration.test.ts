@@ -863,6 +863,39 @@ describe('composite PK multi-server isolation', () => {
       expect(row?.gemini_session_id).toBe('gemini-uuid-123');
     });
   });
+
+  describe('sub_session ccPresetId persistence', () => {
+    const subId = 'ccpreset-test-sub';
+
+    it('createSubSession persists ccPresetId', async () => {
+      await createSubSession(db, subId, serverA, 'claude-code', null, '/cc', null, null, null, null, null, null, null, null, 'MiniMax');
+      const row = await getSubSessionById(db, subId, serverA);
+      expect(row?.cc_preset_id).toBe('MiniMax');
+    });
+
+    it('updateSubSession can set and clear ccPresetId', async () => {
+      await createSubSession(db, subId, serverA, 'claude-code', null, '/cc', null, null);
+      await updateSubSession(db, subId, serverA, { cc_preset_id: 'DeepSeek' });
+      const row = await getSubSessionById(db, subId, serverA);
+      expect(row?.cc_preset_id).toBe('DeepSeek');
+
+      await updateSubSession(db, subId, serverA, { cc_preset_id: null });
+      const row2 = await getSubSessionById(db, subId, serverA);
+      expect(row2?.cc_preset_id).toBeNull();
+    });
+
+    it('upsert with null fields preserves existing non-null values (COALESCE)', async () => {
+      // Initial: full record with description + ccPresetId
+      // arg[12]=description, arg[13]=ccPresetId (14 positional params: pos 3-16)
+      await createSubSession(db, subId, serverA, 'claude-code', null, '/cc', 'my-label', null, null, null, null, null, null, 'persona prompt', 'MiniMax');
+      // Re-upsert with nulls — COALESCE should keep existing values
+      await createSubSession(db, subId, serverA, 'claude-code', null, '/cc-updated', null, null, null, null, null, null, null, null, null);
+      const row = await getSubSessionById(db, subId, serverA);
+      expect(row?.cc_preset_id).toBe('MiniMax');       // preserved, not clobbered
+      expect(row?.description).toBe('persona prompt'); // preserved, not clobbered
+      expect(row?.label).toBe('my-label');             // label uses COALESCE, also preserved
+    });
+  });
 });
 
 // ── 13. Transport session metadata persistence ───────────────────────────────

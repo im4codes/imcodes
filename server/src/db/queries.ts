@@ -470,6 +470,7 @@ export interface DbSubSession {
   provider_id: string | null;
   provider_session_id: string | null;
   description: string | null;
+  cc_preset_id: string | null;
 }
 
 export async function getSubSessionsByServer(db: Database, serverId: string): Promise<DbSubSession[]> {
@@ -512,22 +513,23 @@ export async function createSubSession(
   providerId: string | null = null,
   providerSessionId: string | null = null,
   description: string | null = null,
+  ccPresetId: string | null = null,
 ): Promise<DbSubSession> {
   const now = Date.now();
   await db.execute(
-    `INSERT INTO sub_sessions (id, server_id, type, shell_bin, cwd, label, closed_at, cc_session_id, gemini_session_id, parent_session, runtime_type, provider_id, provider_session_id, description, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-     ON CONFLICT (id, server_id) DO UPDATE SET type = EXCLUDED.type, shell_bin = EXCLUDED.shell_bin, cwd = EXCLUDED.cwd, label = COALESCE(EXCLUDED.label, sub_sessions.label), closed_at = NULL, cc_session_id = EXCLUDED.cc_session_id, gemini_session_id = EXCLUDED.gemini_session_id, parent_session = EXCLUDED.parent_session, runtime_type = EXCLUDED.runtime_type, provider_id = EXCLUDED.provider_id, provider_session_id = EXCLUDED.provider_session_id, description = EXCLUDED.description, updated_at = EXCLUDED.updated_at`,
-    [id, serverId, type, shellBin, cwd, label, ccSessionId, geminiSessionId, parentSession, runtimeType, providerId, providerSessionId, description, now, now],
+    `INSERT INTO sub_sessions (id, server_id, type, shell_bin, cwd, label, closed_at, cc_session_id, gemini_session_id, parent_session, runtime_type, provider_id, provider_session_id, description, created_at, updated_at, cc_preset_id)
+     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+     ON CONFLICT (id, server_id) DO UPDATE SET type = EXCLUDED.type, shell_bin = EXCLUDED.shell_bin, cwd = EXCLUDED.cwd, label = COALESCE(EXCLUDED.label, sub_sessions.label), closed_at = NULL, cc_session_id = COALESCE(EXCLUDED.cc_session_id, sub_sessions.cc_session_id), gemini_session_id = COALESCE(EXCLUDED.gemini_session_id, sub_sessions.gemini_session_id), parent_session = COALESCE(EXCLUDED.parent_session, sub_sessions.parent_session), runtime_type = COALESCE(EXCLUDED.runtime_type, sub_sessions.runtime_type), provider_id = COALESCE(EXCLUDED.provider_id, sub_sessions.provider_id), provider_session_id = COALESCE(EXCLUDED.provider_session_id, sub_sessions.provider_session_id), description = COALESCE(EXCLUDED.description, sub_sessions.description), updated_at = EXCLUDED.updated_at, cc_preset_id = COALESCE(EXCLUDED.cc_preset_id, sub_sessions.cc_preset_id)`,
+    [id, serverId, type, shellBin, cwd, label, ccSessionId, geminiSessionId, parentSession, runtimeType, providerId, providerSessionId, description, now, now, ccPresetId],
   );
-  return { id, server_id: serverId, type, shell_bin: shellBin, cwd, label, closed_at: null, cc_session_id: ccSessionId, gemini_session_id: geminiSessionId, parent_session: parentSession, sort_order: null, runtime_type: runtimeType, provider_id: providerId, provider_session_id: providerSessionId, description, created_at: now, updated_at: now };
+  return { id, server_id: serverId, type, shell_bin: shellBin, cwd, label, closed_at: null, cc_session_id: ccSessionId, gemini_session_id: geminiSessionId, parent_session: parentSession, sort_order: null, runtime_type: runtimeType, provider_id: providerId, provider_session_id: providerSessionId, description, created_at: now, updated_at: now, cc_preset_id: ccPresetId };
 }
 
 export async function updateSubSession(
   db: Database,
   id: string,
   serverId: string,
-  fields: { label?: string | null; closed_at?: number | null; gemini_session_id?: string | null; sort_order?: number | null; description?: string | null; cwd?: string | null },
+  fields: { label?: string | null; closed_at?: number | null; gemini_session_id?: string | null; sort_order?: number | null; description?: string | null; cwd?: string | null; cc_preset_id?: string | null },
 ): Promise<void> {
   const parts: string[] = [];
   const vals: unknown[] = [];
@@ -538,6 +540,7 @@ export async function updateSubSession(
   if ('sort_order' in fields) { parts.push(`sort_order = $${idx++}`); vals.push(fields.sort_order ?? null); }
   if ('description' in fields) { parts.push(`description = $${idx++}`); vals.push(fields.description ?? null); }
   if ('cwd' in fields) { parts.push(`cwd = $${idx++}`); vals.push(fields.cwd ?? null); }
+  if ('cc_preset_id' in fields) { parts.push(`cc_preset_id = $${idx++}`); vals.push(fields.cc_preset_id ?? null); }
   if (parts.length === 0) return;
   parts.push(`updated_at = $${idx++}`);
   vals.push(Date.now());

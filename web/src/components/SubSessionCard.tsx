@@ -183,6 +183,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
         {badge && <span class="subcard-badge">{badge}</span>}
         {busy && <span class="subcard-running">●</span>}
         {modelLabel && <span class="subcard-model">{modelLabel}</span>}
+        {sub.ccPresetId && <span class="subcard-custom-api" title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
         {lastUsage && (() => {
           const ctx = resolveContextWindow(lastUsage.contextWindow, detectedModel ?? lastUsage.model);
           const total = lastUsage.inputTokens + lastUsage.cacheTokens;

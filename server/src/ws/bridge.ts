@@ -816,6 +816,8 @@ export class WsBridge {
         (msg.runtimeType as string) || null,
         (msg.providerId as string) || null,
         (msg.providerSessionId as string) || null,
+        (msg.description as string) || null,
+        (msg.ccPresetId as string) || null,
       ).then(() => {
         // Notify browsers so sub-session appears immediately without page refresh
         this.broadcastToBrowsers(JSON.stringify({
@@ -826,6 +828,7 @@ export class WsBridge {
           cwd: msg.cwd || null,
           label: msg.label || null,
           parentSession: msg.parentSession || null,
+          ccPresetId: (msg.ccPresetId as string) || null,
           state: 'running',
         }));
       }).catch((e) => logger.error({ err: e, id: msg.id }, 'Failed to sync sub-session to DB'));

@@ -32,7 +32,7 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
   const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (role !== 'owner' && role !== 'admin') return c.json({ error: 'forbidden' }, 403);
 
-  let body: { type?: string; shellBin?: string; cwd?: string; label?: string; cc_session_id?: string; gemini_session_id?: string; parent_session?: string; description?: string };
+  let body: { type?: string; shellBin?: string; cwd?: string; label?: string; cc_session_id?: string; gemini_session_id?: string; parent_session?: string; description?: string; cc_preset_id?: string };
   try {
     body = await c.req.json() as typeof body;
   } catch {
@@ -62,6 +62,7 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
     body.parent_session ?? null,
     null, null, null,
     body.description ?? null,
+    body.cc_preset_id ?? null,
   );
 
   const sessionName = `deck_sub_${id}`;
@@ -99,18 +100,19 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
   const existing = await getSubSessionById(c.env.DB, subId, serverId);
   if (!existing) return c.json({ error: 'not_found' }, 404);
 
-  let body: { label?: string | null; closedAt?: number | null; description?: string | null; cwd?: string | null };
+  let body: { label?: string | null; closedAt?: number | null; description?: string | null; cwd?: string | null; ccPresetId?: string | null };
   try {
     body = await c.req.json() as typeof body;
   } catch {
     return c.json({ error: 'invalid_json' }, 400);
   }
 
-  const fields: { label?: string | null; closed_at?: number | null; description?: string | null; cwd?: string | null } = {};
+  const fields: { label?: string | null; closed_at?: number | null; description?: string | null; cwd?: string | null; cc_preset_id?: string | null } = {};
   if ('label' in body) fields.label = body.label ?? null;
   if ('closedAt' in body) fields.closed_at = body.closedAt ?? null;
   if ('description' in body) fields.description = body.description ?? null;
   if ('cwd' in body) fields.cwd = body.cwd ?? null;
+  if ('ccPresetId' in body) fields.cc_preset_id = body.ccPresetId ?? null;
 
   await updateSubSession(c.env.DB, subId, serverId, fields);
   return c.json({ ok: true });

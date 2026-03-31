@@ -34,7 +34,7 @@ import { repoCache } from '../repo/cache.js';
 function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string): void {
   if (ccSessionId) {
     const jsonlPath = findJsonlPathBySessionId(projectDir, ccSessionId);
-    startWatchingFile(sessionName, jsonlPath).catch((e) =>
+    startWatchingFile(sessionName, jsonlPath, ccSessionId).catch((e) =>
       logger.warn({ err: e, session: sessionName }, 'jsonl-watcher startWatchingFile failed'),
     );
   } else {
@@ -504,7 +504,7 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
   const mergedEnv: Record<string, string> = { IMCODES_SESSION: record.name };
   if (record.ccPreset && record.agentType === 'claude-code') {
     const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
-    Object.assign(mergedEnv, await resolvePresetEnv(record.ccPreset));
+    Object.assign(mergedEnv, await resolvePresetEnv(record.ccPreset, ccSessionId));
   }
   const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
   const envPrefix = Object.entries(mergedEnv).map(([k, v]) => `export ${k}=${sq(v)}`).join('; ');
@@ -757,6 +757,12 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ccSessionId = ccSessionId ?? randomUUID();
     }
     // If exists and no stored UUID: ccSessionId stays undefined → fall back to dir scan
+  }
+
+  // Cache context window for preset so watcher can use it in usage.update
+  if (opts.ccPreset && agentType === 'claude-code') {
+    const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
+    await resolvePresetEnv(opts.ccPreset, ccSessionId);
   }
 
   // No seed file creation for CC — CC ≥2.1.88 crashes on --resume with our seed format.

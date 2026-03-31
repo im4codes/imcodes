@@ -82,6 +82,7 @@ export function useSubSessions(
       geminiSessionId: s.geminiSessionId,
       parentSession: s.parentSession,
       label: s.label,
+      ccPresetId: s.ccPresetId,
     })));
   }, [connected, ws, subSessions]);
 
@@ -167,7 +168,8 @@ export function useSubSessions(
     try {
       const ccSessionId = type === 'claude-code' ? crypto.randomUUID() : undefined;
       const description = extra?.description as string | undefined;
-      const res = await apiCreate(serverId, { type, shellBin, cwd, label, ccSessionId, parentSession: activeSession ?? null, description });
+      const ccPresetId = extra?.ccPreset as string | undefined;
+      const res = await apiCreate(serverId, { type, shellBin, cwd, label, ccSessionId, parentSession: activeSession ?? null, description, ccPresetId });
       const sub: SubSession = {
         ...res.subSession,
         sessionName: res.sessionName,

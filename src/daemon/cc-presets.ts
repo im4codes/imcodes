@@ -25,6 +25,9 @@ export interface CcPreset {
 
 let cachedPresets: CcPreset[] | null = null;
 
+/** ccSessionId → contextWindow (set when preset env is resolved for a session). */
+const sessionContextWindows = new Map<string, number>();
+
 /** Model env vars that should all match ANTHROPIC_MODEL when set. */
 const MODEL_ALIASES = [
   'ANTHROPIC_SMALL_FAST_MODEL',
@@ -59,7 +62,7 @@ export async function getPreset(name: string): Promise<CcPreset | undefined> {
  * Resolve a preset name to env vars ready for session launch.
  * Auto-fills MODEL_ALIASES from ANTHROPIC_MODEL if set.
  */
-export async function resolvePresetEnv(presetName: string): Promise<Record<string, string>> {
+export async function resolvePresetEnv(presetName: string, ccSessionId?: string): Promise<Record<string, string>> {
   const preset = await getPreset(presetName);
   if (!preset) return {};
   const env = { ...preset.env };
@@ -72,6 +75,8 @@ export async function resolvePresetEnv(presetName: string): Promise<Record<strin
   // Set context window hint as env var so daemon can report it in usage events
   if (preset.contextWindow) {
     env['IMCODES_CONTEXT_WINDOW'] = String(preset.contextWindow);
+    // Also cache for watcher lookup
+    if (ccSessionId) sessionContextWindows.set(ccSessionId, preset.contextWindow);
   }
   logger.debug({ preset: presetName, keys: Object.keys(env) }, 'Resolved CC preset env');
   return env;
@@ -87,4 +92,9 @@ export function getPresetInitMessage(preset: CcPreset): string {
 
 export function invalidateCache(): void {
   cachedPresets = null;
+}
+
+/** Look up cached contextWindow for a CC session UUID. Returns undefined if not found. */
+export function getSessionContextWindow(ccSessionId: string): number | undefined {
+  return sessionContextWindows.get(ccSessionId);
 }

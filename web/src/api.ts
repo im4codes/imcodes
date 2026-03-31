@@ -393,6 +393,7 @@ export interface SubSessionData {
   geminiSessionId?: string | null;
   parentSession?: string | null;
   description?: string | null;
+  ccPresetId?: string | null;
 }
 
 export async function listSubSessions(serverId: string): Promise<SubSessionData[]> {
@@ -401,7 +402,7 @@ export async function listSubSessions(serverId: string): Promise<SubSessionData[
     cwd: string | null; label: string | null; closed_at: number | null;
     created_at: number; updated_at: number; cc_session_id: string | null;
     gemini_session_id: string | null; parent_session: string | null;
-    description: string | null;
+    description: string | null; cc_preset_id: string | null;
   }> }>(`/api/server/${serverId}/sub-sessions`);
   return res.subSessions.map((s) => ({
     id: s.id, serverId: s.server_id, type: s.type,
@@ -411,21 +412,22 @@ export async function listSubSessions(serverId: string): Promise<SubSessionData[
     geminiSessionId: s.gemini_session_id,
     parentSession: s.parent_session,
     description: s.description,
+    ccPresetId: s.cc_preset_id,
   }));
 }
 
 export async function createSubSession(
   serverId: string,
-  body: { type: string; shellBin?: string; cwd?: string; label?: string; ccSessionId?: string; parentSession?: string | null; description?: string },
+  body: { type: string; shellBin?: string; cwd?: string; label?: string; ccSessionId?: string; parentSession?: string | null; description?: string; ccPresetId?: string },
 ): Promise<{ id: string; sessionName: string; subSession: SubSessionData }> {
   const res = await apiFetch<{ id: string; sessionName: string; subSession: {
     id: string; server_id: string; type: string; shell_bin: string | null;
     cwd: string | null; label: string | null; closed_at: number | null;
     created_at: number; updated_at: number; cc_session_id: string | null;
-    parent_session: string | null;
+    parent_session: string | null; cc_preset_id: string | null;
   } }>(`/api/server/${serverId}/sub-sessions`, {
     method: 'POST',
-    body: JSON.stringify({ ...body, cc_session_id: body.ccSessionId ?? null, parent_session: body.parentSession ?? null }),
+    body: JSON.stringify({ ...body, cc_session_id: body.ccSessionId ?? null, parent_session: body.parentSession ?? null, cc_preset_id: body.ccPresetId ?? null }),
   });
   const s = res.subSession;
   return {
@@ -437,6 +439,7 @@ export async function createSubSession(
       closedAt: s.closed_at, createdAt: s.created_at, updatedAt: s.updated_at,
       ccSessionId: s.cc_session_id,
       parentSession: s.parent_session,
+      ccPresetId: s.cc_preset_id,
     },
   };
 }
@@ -444,7 +447,7 @@ export async function createSubSession(
 export async function patchSubSession(
   serverId: string,
   subId: string,
-  body: { label?: string | null; closedAt?: number | null; description?: string | null; cwd?: string | null },
+  body: { label?: string | null; closedAt?: number | null; description?: string | null; cwd?: string | null; ccPresetId?: string | null },
 ): Promise<void> {
   await apiFetch(`/api/server/${serverId}/sub-sessions/${subId}`, {
     method: 'PATCH',

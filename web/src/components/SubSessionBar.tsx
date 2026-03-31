@@ -483,6 +483,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
                 <span class="subsession-card-icon">{abbr}</span>
                 <span class="subsession-card-label">{sub.label ? formatLabel(sub.label).slice(0, 12) : agentTag.slice(0, 6)}</span>
                 {model && <span class="subsession-card-model">{model}</span>}
+                {sub.ccPresetId && <span class="subsession-card-custom-api" title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
                 {sub.state === 'starting' && <span class="subsession-card-badge">…</span>}
                 {ctxPct > 0 && (
                   <span class="subsession-card-ctx" style={{ width: '100%' }}>

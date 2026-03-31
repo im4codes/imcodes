@@ -1290,6 +1290,8 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
         shellBin: shellBin ?? null,
         ccSessionId: ccSessionId ?? null,
         parentSession: parentSession ?? null,
+        ccPresetId: ccPreset ?? null,
+        description: description ?? null,
       });
     } catch { /* not connected */ }
   } catch (e: unknown) {
@@ -1341,7 +1343,11 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
         id,
         sessionType: record.agentType,
         cwd: record.projectDir ?? null,
+        ccSessionId: record.ccSessionId ?? null,
+        geminiSessionId: record.geminiSessionId ?? null,
         parentSession: record.parentSession ?? null,
+        ccPresetId: record.ccPreset ?? null,
+        description: record.description ?? null,
       });
     } catch { /* not connected */ }
   } catch (e: unknown) {

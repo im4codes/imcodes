@@ -293,6 +293,8 @@ export async function startup(): Promise<DaemonContext> {
             ccSessionId: session.ccSessionId ?? null,
             geminiSessionId: session.geminiSessionId ?? null,
             parentSession: session.parentSession ?? null,
+            ccPresetId: session.ccPreset ?? null,
+            description: session.description ?? null,
           });
         } catch { /* ignore */ }
       }

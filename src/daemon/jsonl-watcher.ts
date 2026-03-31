@@ -21,6 +21,7 @@ import { homedir } from 'os';
 import { timelineEmitter } from './timeline-emitter.js';
 import logger from '../util/logger.js';
 import { resolveContextWindow } from '../util/model-context.js';
+import { getSessionContextWindow } from './cc-presets.js';
 import { readProjectMemory, appendAgentSendDocs } from './memory-inject.js';
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
@@ -349,10 +350,11 @@ function parseLine(sessionName: string, line: string, lineByteOffset?: number): 
     const usage = msg['usage'] as { input_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } | undefined;
     const model = msg['model'] as string | undefined;
     if (usage && typeof usage.input_tokens === 'number') {
+      const presetCtx = watchers.get(sessionName)?.ccSessionId ? getSessionContextWindow(watchers.get(sessionName)!.ccSessionId!) : undefined;
       timelineEmitter.emit(sessionName, 'usage.update', {
         inputTokens: usage.input_tokens + (usage.cache_creation_input_tokens ?? 0),
         cacheTokens: usage.cache_read_input_tokens ?? 0,
-        contextWindow: resolveContextWindow(undefined, model),
+        contextWindow: resolveContextWindow(presetCtx, model),
         ...(model ? { model } : {}),
       }, { source: 'daemon', confidence: 'high' });
     }
@@ -406,6 +408,8 @@ interface WatcherState {
   pendingPartialLine: string;
   /** Watcher health status — distinguishes registered-but-not-working from truly active. */
   status: WatcherStatus;
+  /** CC session UUID — used to look up preset contextWindow for usage events. */
+  ccSessionId?: string;
 }
 
 const watchers = new Map<string, WatcherState>();
@@ -505,10 +509,11 @@ async function emitRecentHistory(sessionName: string, filePath: string): Promise
         const usage = msg?.['usage'] as { input_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } | undefined;
         const model = msg?.['model'] as string | undefined;
         if (usage && typeof usage.input_tokens === 'number') {
+          const presetCtx = watchers.get(sessionName)?.ccSessionId ? getSessionContextWindow(watchers.get(sessionName)!.ccSessionId!) : undefined;
           lastUsagePayload = {
             inputTokens: usage.input_tokens + (usage.cache_creation_input_tokens ?? 0),
             cacheTokens: usage.cache_read_input_tokens ?? 0,
-            contextWindow: resolveContextWindow(undefined, model),
+            contextWindow: resolveContextWindow(presetCtx, model),
             ...(model ? { model } : {}),
           };
         }
@@ -634,7 +639,7 @@ async function activateFile(sessionName: string, state: WatcherState, filePath: 
   await emitRecentHistory(sessionName, filePath);
 }
 
-export async function startWatching(sessionName: string, workDir: string): Promise<void> {
+export async function startWatching(sessionName: string, workDir: string, ccSessionId?: string): Promise<void> {
   if (watchers.has(sessionName)) stopWatching(sessionName);
 
   const projectDir = claudeProjectDir(workDir);
@@ -642,10 +647,13 @@ export async function startWatching(sessionName: string, workDir: string): Promi
     projectDir, activeFile: null, fileOffset: 0,
     abort: new AbortController(), stopped: false,
     pendingPartialLine: '', status: 'waiting_for_file',
+    ccSessionId,
   };
   watchers.set(sessionName, state);
 
-  logger.warn({ session: sessionName }, 'jsonl-watcher: falling back to directory scan (no ccSessionId)');
+  if (!ccSessionId) {
+    logger.warn({ session: sessionName }, 'jsonl-watcher: falling back to directory scan (no ccSessionId)');
+  }
 
   // Find the current active JSONL file; only claim an unclaimed one.
   const latest = await findLatestJsonl(projectDir);
@@ -690,7 +698,7 @@ export function stopWatching(sessionName: string): void {
  * then polls until the file appears, replays history, and tails new content.
  * Supports rotation to newer files (CC creates new JSONL on context overflow).
  */
-export async function startWatchingFile(sessionName: string, filePath: string): Promise<void> {
+export async function startWatchingFile(sessionName: string, filePath: string, ccSessionId?: string): Promise<void> {
   if (watchers.has(sessionName)) stopWatching(sessionName);
 
   // Pre-claim before file exists so the main session watcher cannot steal it.
@@ -700,6 +708,7 @@ export async function startWatchingFile(sessionName: string, filePath: string): 
     projectDir: dirname(filePath), activeFile: null, fileOffset: 0,
     abort: new AbortController(), stopped: false,
     pendingPartialLine: '', status: 'waiting_for_file',
+    ccSessionId,
   };
   watchers.set(sessionName, state);
 

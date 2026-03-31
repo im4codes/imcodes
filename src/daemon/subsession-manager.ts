@@ -91,7 +91,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   let presetInitMessage: string | undefined;
   if (sub.ccPreset && agentType === 'claude-code') {
     const { resolvePresetEnv, getPreset, getPresetInitMessage } = await import('./cc-presets.js');
-    const presetEnv = await resolvePresetEnv(sub.ccPreset);
+    const presetEnv = await resolvePresetEnv(sub.ccPreset, sub.ccSessionId ?? undefined);
     Object.assign(launchEnv, presetEnv);
     const preset = await getPreset(sub.ccPreset);
     if (preset) presetInitMessage = getPresetInitMessage(preset);
@@ -143,7 +143,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   // Start Watchers
   if (agentType === 'claude-code' && sub.ccSessionId && sub.cwd) {
     const { startWatchingFile, findJsonlPathBySessionId } = await import('./jsonl-watcher.js');
-    startWatchingFile(sessionName, findJsonlPathBySessionId(sub.cwd, sub.ccSessionId));
+    startWatchingFile(sessionName, findJsonlPathBySessionId(sub.cwd, sub.ccSessionId), sub.ccSessionId);
   } else if (agentType === 'codex' && sub.codexSessionId) {
     const { startWatchingById } = await import('./codex-watcher.js');
     void startWatchingById(sessionName, sub.codexSessionId, sub.codexModel ?? undefined);
