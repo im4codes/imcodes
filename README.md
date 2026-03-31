@@ -2,7 +2,7 @@
 
 **The IM for agents.**
 
-A specialized instant messenger for AI agents. More than chat — terminal access, file browsing, git diffs, voice input, and multi-agent orchestration built in. Works with [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), and more.
+A specialized instant messenger for AI agents. Keep long-running coding-agent sessions within reach from mobile or web, with terminal access, file browsing, git views, localhost preview, notifications, and multi-agent workflows built in. Works with [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), and more.
 
 > **Disclaimer:** This is an actively developed personal open-source project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk. Breaking changes may happen at any time without notice.
 
@@ -46,9 +46,11 @@ Also available as a [web app](https://app.im.codes) and via `npm install -g imco
 
 ## Why
 
-Since 2026, developers talk to agents. Agents write code, run tools, and manage workflows. But generic chat apps were never built for this — and raw terminals don't scale across machines, devices, or multiple agents working in parallel.
+When you leave your desk, most coding-agent workflows fall apart. The agent is still running in a terminal, but continuing the work usually means SSH, tmux attach, remote desktop hacks, or waiting until you're back at your laptop.
 
-[IM.codes](https://im.codes) is a dedicated messaging layer for AI agents: remote terminals that work like SSH without the SSH, a chat view that understands agent output, and multi-agent workflows that let you coordinate different models on the same task.
+[IM.codes](https://im.codes) keeps those sessions within reach from mobile or web: open the terminal, inspect files and git changes, preview localhost from another device, get notified when work finishes, and keep multiple agents moving on your own infrastructure.
+
+It is not another AI IDE or a generic remote terminal. It is the messaging/control layer around terminal-based coding agents.
 
 This is a personal project. I haven't written any code myself — it was built almost entirely by [Claude Code](https://github.com/anthropics/claude-code), with significant contributions from [Codex](https://github.com/openai/codex) and [Gemini CLI](https://github.com/google-gemini/gemini-cli).
 
@@ -58,13 +60,25 @@ This is a personal project. I haven't written any code myself — it was built a
 
 Full terminal access to your agent sessions from any browser — no SSH, no VPN, no port forwarding. Switch between raw terminal mode (the native CLI experience) and a structured chat view with parsed tool calls, thinking blocks, and streaming output. Real-time PTY streaming at 12fps with zero message limits.
 
+### File Browser & Git Changes
+
+Browse project files with a tree view. Upload files, images, and photos from any device — download files directly from the server. Changes tab shows git status with per-file `+additions`/`-deletions` line counts in color. Click a file to open a floating preview window with syntax highlighting, diff view, and auto-refresh every 5s. Pin the file browser to the sidebar — it follows the active tab's project directory automatically.
+
+### Local Web Preview
+
+Preview your local dev server from any device — phone, tablet, or remote browser — without deploying. The daemon proxies `localhost` traffic through a secure WebSocket tunnel to the server. HTML rewriting and a runtime patch handle URL remapping so links, fetch, and WebSocket connections just work. Supports HMR/hot-reload via WebSocket tunneling. No public URLs, no third-party tunnels — traffic stays within your IM.codes server.
+
+### Mobile & Notifications
+
+Full mobile support with biometric auth and push notifications. Shell sessions allow interactive keyboard input on mobile (SSH-like). Sub-session preview cards always show latest messages. Toast notifications navigate directly to the relevant session.
+
+### Multi-Agent Discussions & Audit
+
+Single-model output shouldn't be trusted blindly. Spawn quick discussion rounds where multiple agents — across different providers — review, audit, or brainstorm on the same topic. Each agent reads prior contributions and adds their own. Modes include `discuss`, `audit`, `review`, and `brainstorm`. Ring progress indicator shows round/hop completion in the sidebar. Works across Claude Code, Codex, and Gemini CLI, including sandboxed agents.
+
 ### OpenClaw Integration
 
-Chat with [OpenClaw](https://openclaw.com) agents directly in [IM.codes](https://im.codes) — plus terminal, file browser, git diffs, and multi-agent discussions that OpenClaw alone doesn't offer.
-
-### Discord-Style Sidebar
-
-Server icon bar for instant multi-server switching. Hierarchical session tree with collapsible sub-sessions, unread message badges, and idle flash animation when agents finish tasks. Pin any floating window (file browser, repository, sub-session chat) to the sidebar for persistent access. Language switcher and build info at the bottom.
+[IM.codes](https://im.codes) is a mobile/web companion for [OpenClaw](https://openclaw.com), not a replacement. It keeps your OpenClaw sessions within reach from phone or browser, with terminal access, file browsing, git views, notifications, and localhost preview built in.
 
 ### Agent-to-Agent Communication
 
@@ -103,11 +117,6 @@ imcodes send "Claude" "tests failed on main, check CI log at /tmp/ci.log and fix
 ```
 
 Use cases: log monitoring → auto-fix, webhook-triggered code review, CI failure auto-diagnosis, scheduled data pipeline checks, custom approval workflows with output written to specific files for human review.
-
-### Multi-Agent Discussions & Audit
-
-Single-model output shouldn't be trusted blindly. Spawn quick discussion rounds where multiple agents — across different providers — review, audit, or brainstorm on the same topic. Each agent reads prior contributions and adds their own. Modes include `discuss`, `audit`, `review`, and `brainstorm`. Ring progress indicator shows round/hop completion in the sidebar. Works across Claude Code, Codex, and Gemini CLI, including sandboxed agents.
-
 ### @ Picker — Smart Agent & File Selection
 
 Type `@` to search project files, `@@` to select agents for P2P dispatch. `@@all(config)` sends to all configured agents with saved per-session P2P settings (mode, rounds, participants). Custom round counts via `@@all+`. The picker integrates with the structured WS routing — daemon handles all expansion, frontend stays clean.
@@ -116,13 +125,13 @@ Type `@` to search project files, `@@` to select agents for P2P dispatch. `@@all
 
 Connect multiple dev machines to one dashboard. Each machine runs a lightweight daemon that manages local agent sessions via tmux. See all servers and sessions at a glance — start, stop, restart, or switch between them instantly. Sub-sessions let you spawn additional agents from within a running session for parallel tasks. Draggable tabs with pin support and right-click context menus.
 
+### Discord-Style Sidebar
+
+Server icon bar for instant multi-server switching. Hierarchical session tree with collapsible sub-sessions, unread message badges, and idle flash animation when agents finish tasks. Pin any floating window (file browser, repository, sub-session chat) to the sidebar for persistent access. Language switcher and build info at the bottom.
+
 ### Pinnable Panels
 
 Drag any floating window to the sidebar to pin it as a persistent panel. Supports file browser, repository page, sub-session chat, and terminal views. Panels are resizable, server-synced (cross-device), and auto-recover on reconnect. Generic registry — new panel types register in one file.
-
-### File Browser & Git Changes
-
-Browse project files with a tree view. Upload files, images, and photos from any device — download files directly from the server. Changes tab shows git status with per-file `+additions`/`-deletions` line counts in color. Click a file to open a floating preview window with syntax highlighting, diff view, and auto-refresh every 5s. Pin the file browser to the sidebar — it follows the active tab's project directory automatically.
 
 ### Repository Dashboard
 
@@ -132,17 +141,9 @@ View issues, pull requests, branches, commits, and CI/CD runs directly in the ap
 
 Automate recurring agent workflows with cron-style scheduling. Create scheduled tasks that send commands to specific sessions or trigger multi-agent P2P discussions on a timetable. Visual cron picker for common intervals, timezone-aware scheduling, and manual "Run Now" for testing. Execution history with expandable result detail — click any record to navigate to the target session and quote the result for follow-up. Cross-job execution list with Latest/All modes and multi-server filtering.
 
-### Local Web Preview
-
-Preview your local dev server from any device — phone, tablet, or remote browser — without deploying. The daemon proxies `localhost` traffic through a secure WebSocket tunnel to the server. HTML rewriting and a runtime patch handle URL remapping so links, fetch, and WebSocket connections just work. Supports HMR/hot-reload via WebSocket tunneling. No public URLs, no third-party tunnels — traffic stays within your IM.codes server.
-
 ### Cross-Device Sync
 
 Tab order, pinned tabs, and pinned sidebar panels sync across devices via the server preferences API. Write-through cache pattern: localStorage for instant render, debounced server PUT for cross-device consistency. Timestamped payloads for conflict resolution. Device-specific state (sidebar width, panel heights, view mode) stays local.
-
-### Mobile & Notifications
-
-Full mobile support with biometric auth and push notifications. Shell sessions allow interactive keyboard input on mobile (SSH-like). Sub-session preview cards always show latest messages. Toast notifications navigate directly to the relevant session.
 
 ### Internationalization
 
@@ -151,6 +152,14 @@ Full mobile support with biometric auth and push notifications. Shell sessions a
 ### OTA Updates
 
 Daemon self-upgrades via npm. Trigger from the web UI for one device or all devices at once.
+
+## What IM.codes is not
+
+- Not another AI IDE
+- Not just a chat wrapper
+- Not just a remote terminal client
+- Not a replacement for Claude Code, Codex, Gemini CLI, or OpenClaw
+- It is the messaging/control layer around them
 
 ## Architecture
 
@@ -177,13 +186,13 @@ npm install -g imcodes
 
 > **Self-hosting is strongly recommended.** The shared instance at `app.im.codes` is for testing only — it comes with no uptime guarantees, may be rate-limited, and could be targeted. This is a personal project with no commercial support. For anything beyond evaluation, deploy the server on your own infrastructure.
 
-Use [app.im.codes](https://app.im.codes) to try it out, or self-host for production use.
+Use [app.im.codes](https://app.im.codes) for evaluation, or self-host for anything real.
 
 ```bash
 imcodes bind https://app.im.codes/bind/<api-key>
 ```
 
-This binds your machine, starts the daemon, and registers it as a system service.
+This binds your machine, starts the daemon, registers it as a system service, and brings the machine into the web/mobile dashboard.
 
 ## Self-Host
 
