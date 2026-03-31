@@ -51,26 +51,6 @@ async function getNodePty(): Promise<NodePtyModule> {
   return nodePty;
 }
 
-// ── Command parser ──────────────────────────────────────────────────────────────
-
-/** Parse a command string into binary + args, handling quoted strings. */
-function parseCommand(cmd: string): { file: string; args: string[] } {
-  const tokens: string[] = [];
-  let current = '';
-  let inDouble = false;
-  for (let i = 0; i < cmd.length; i++) {
-    const ch = cmd[i];
-    if (ch === '"') { inDouble = !inDouble; continue; }
-    if (ch === ' ' && !inDouble) {
-      if (current) { tokens.push(current); current = ''; }
-      continue;
-    }
-    current += ch;
-  }
-  if (current) tokens.push(current);
-  return { file: tokens[0] ?? cmd, args: tokens.slice(1) };
-}
-
 // ── Session state ───────────────────────────────────────────────────────────────
 
 const MAX_LINES = 500;
@@ -143,15 +123,7 @@ export async function conptyNewSession(
     cleanCmd = cleanCmd.slice(cdMatch[0].length);
   }
 
-  // Parse command into binary + args. Spawn directly (no cmd.exe /c wrapper)
-  // to avoid double echo: cmd.exe's ENABLE_ECHO_INPUT + child shell's own echo.
-  // Fall back to cmd.exe /c only for commands containing shell operators (&&, |, >).
-  const needsShell = /[&|><^]/.test(cleanCmd);
-  const { file, args } = needsShell
-    ? { file: 'cmd.exe', args: ['/c', cleanCmd] }
-    : parseCommand(cleanCmd);
-
-  const pty = spawn(file, args, {
+  const pty = spawn('cmd.exe', ['/c', cleanCmd], {
     cwd,
     env: { ...process.env, ...opts?.env } as Record<string, string>,
     cols,
