@@ -62,7 +62,19 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     await ensureSessionFile(sub.codexSessionId, sub.cwd ?? process.cwd()).catch(() => {});
   }
 
-  let launchCmd = driver.buildLaunchCommand(sessionName, {
+  // For CC: if a JSONL already exists (restart), use --resume instead of --session-id
+  // (CC rejects --session-id with "already in use" when the file exists).
+  // For new sessions, --session-id lets CC create its own JSONL.
+  let useResume = false;
+  if (agentType === 'claude-code' && sub.ccSessionId && sub.cwd) {
+    const { preClaimFile, findJsonlPathBySessionId } = await import('./jsonl-watcher.js');
+    const jsonlPath = findJsonlPathBySessionId(sub.cwd, sub.ccSessionId);
+    preClaimFile(sessionName, jsonlPath);
+    const { existsSync } = await import('node:fs');
+    if (existsSync(jsonlPath)) useResume = true;
+  }
+
+  const launchOpts = {
     cwd: sub.cwd ?? undefined,
     ...(sub.shellBin ? { shellBin: sub.shellBin } : {}),
     ...(sub.ccSessionId ? { ccSessionId: sub.ccSessionId } : {}),
@@ -70,15 +82,10 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     ...(sub.codexSessionId ? { codexSessionId: sub.codexSessionId ?? undefined } : {}),
     ...(sub.geminiSessionId ? { geminiSessionId: sub.geminiSessionId } : {}),
     ...(sub.fresh ? { fresh: true } : {}),
-  } as any);
-
-  // Pre-claim the JSONL path so the main session's watchDir doesn't steal it.
-  // Don't create seed files or use --resume — CC ≥2.1.88 crashes with our seed format.
-  // --session-id lets CC create its own JSONL on first interaction.
-  if (agentType === 'claude-code' && sub.ccSessionId && sub.cwd) {
-    const { preClaimFile, findJsonlPathBySessionId } = await import('./jsonl-watcher.js');
-    preClaimFile(sessionName, findJsonlPathBySessionId(sub.cwd, sub.ccSessionId));
-  }
+  } as any;
+  const launchCmd = useResume
+    ? (driver.buildResumeCommand(sessionName, launchOpts) ?? driver.buildLaunchCommand(sessionName, launchOpts))
+    : driver.buildLaunchCommand(sessionName, launchOpts);
 
   // Resolve CC env preset if specified
   const launchEnv: Record<string, string> = { IMCODES_SESSION: sessionName };

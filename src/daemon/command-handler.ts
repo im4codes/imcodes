@@ -1331,6 +1331,8 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
       ccSessionId: record.ccSessionId ?? null,
       codexSessionId: record.codexSessionId ?? null,
       geminiSessionId: record.geminiSessionId ?? null,
+      ccPreset: record.ccPreset ?? null,
+      description: record.description ?? null,
     });
     // Sync updated state to server
     try {
