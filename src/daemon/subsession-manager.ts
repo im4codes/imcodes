@@ -84,13 +84,26 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
 
   // Resolve CC env preset if specified
   const launchEnv: Record<string, string> = { IMCODES_SESSION: sessionName };
+  let presetInitMessage: string | undefined;
   if (sub.ccPreset && agentType === 'claude-code') {
-    const { resolvePresetEnv } = await import('./cc-presets.js');
+    const { resolvePresetEnv, getPreset, getPresetInitMessage } = await import('./cc-presets.js');
     const presetEnv = await resolvePresetEnv(sub.ccPreset);
     Object.assign(launchEnv, presetEnv);
+    const preset = await getPreset(sub.ccPreset);
+    if (preset) presetInitMessage = getPresetInitMessage(preset);
   }
 
   await newSession(sessionName, launchCmd, { cwd: sub.cwd ?? undefined, env: launchEnv });
+
+  // Inject preset init message after session starts
+  if (presetInitMessage) {
+    const { sendKeys } = await import('../agent/tmux.js');
+    setTimeout(async () => {
+      try {
+        await sendKeys(sessionName, presetInitMessage!);
+      } catch { /* session may not be ready yet */ }
+    }, 5000);
+  }
   timelineEmitter.emit(sessionName, 'session.state', { state: 'started' });
 
   upsertSession({

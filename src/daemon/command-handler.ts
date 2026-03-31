@@ -570,6 +570,19 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     };
     await startProject(config);
     logger.info({ project }, 'Session started via web');
+
+    // Inject preset init message after session starts
+    if (ccPresetName && agentType === 'claude-code') {
+      const { getPreset, getPresetInitMessage } = await import('./cc-presets.js');
+      const preset = await getPreset(ccPresetName);
+      if (preset) {
+        const brainSession = `deck_${project}_brain`;
+        const msg = getPresetInitMessage(preset);
+        setTimeout(async () => {
+          try { await sendKeysDelayedEnter(brainSession, msg); } catch { /* session may not be ready */ }
+        }, 5000);
+      }
+    }
   } catch (err) {
     logger.error({ project, err }, 'session.start failed');
     const message = err instanceof Error ? err.message : String(err);

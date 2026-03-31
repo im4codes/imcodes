@@ -56,7 +56,7 @@ export type ServerMessage =
   | { type: 'p2p.status_response'; runId?: string; run?: any; runs?: any[] }
   | { type: 'p2p.list_discussions_response'; discussions: Array<{ id: string; fileName: string; preview: string; mtime: number }> }
   | { type: 'p2p.read_discussion_response'; id?: string; content?: string; error?: string }
-  | { type: 'cc.presets.list_response'; presets: Array<{ name: string; env: Record<string, string> }> }
+  | { type: 'cc.presets.list_response'; presets: Array<{ name: string; env: Record<string, string>; contextWindow?: number }> }
   | { type: 'cc.presets.save_response'; ok: boolean }
   | FsGitDiffResponse
   | FsWriteResponse

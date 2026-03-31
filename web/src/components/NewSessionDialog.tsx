@@ -79,7 +79,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
       }
     });
     ws.subSessionDetectShells?.();
-    ws.send({ type: 'cc.presets.list' });
+    try { ws.send({ type: 'cc.presets.list' }); } catch { /* ws may not support send in test */ }
     return unsub;
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ws]);
