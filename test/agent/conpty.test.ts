@@ -112,14 +112,6 @@ describe('conpty backend', () => {
       }));
     });
 
-    it('uses cmd.exe /c for interactive shell binaries to preserve visible typing', async () => {
-      await conpty.conptyNewSession('bash-shell', '"C:\\Program Files\\Git\\bin\\bash.exe"', { cwd: 'C:\\Users\\admin' });
-
-      expect(spawnMock).toHaveBeenCalledWith('cmd.exe', ['/c', '"C:\\Program Files\\Git\\bin\\bash.exe"'], expect.objectContaining({
-        cwd: expect.any(String),
-      }));
-    });
-
     it('strips redundant cd /d prefix from command', async () => {
       await conpty.conptyNewSession('cd-strip', 'cd /d "C:\\Users\\admin" && claude --resume abc', {
         cwd: 'C:\\Users\\admin',
@@ -144,7 +136,7 @@ describe('conpty backend', () => {
     it('uses default cols=200, rows=50 when not specified', async () => {
       await conpty.conptyNewSession('test-defaults', 'cmd');
 
-      expect(spawnMock).toHaveBeenCalledWith('cmd.exe', ['/c', 'cmd'], expect.objectContaining({
+      expect(spawnMock).toHaveBeenCalledWith('cmd', [], expect.objectContaining({
         cols: 200,
         rows: 50,
       }));

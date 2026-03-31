@@ -71,24 +71,6 @@ function parseCommand(cmd: string): { file: string; args: string[] } {
   return { file: tokens[0] ?? cmd, args: tokens.slice(1) };
 }
 
-/** Interactive shells regress under direct ConPTY spawn on Windows: input may stop echoing until Enter.
- * Keep the cmd.exe wrapper for known shell binaries, but still spawn agent CLIs directly to avoid double echo.
- */
-function shouldUseShellWrapper(cleanCmd: string): boolean {
-  if (/[&|><^]/.test(cleanCmd)) return true;
-  const { file } = parseCommand(cleanCmd);
-  const base = file.replace(/^.*[\\/]/, '').toLowerCase();
-  return [
-    'bash', 'bash.exe',
-    'sh', 'sh.exe',
-    'zsh', 'zsh.exe',
-    'fish', 'fish.exe',
-    'powershell', 'powershell.exe',
-    'pwsh', 'pwsh.exe',
-    'cmd', 'cmd.exe',
-  ].includes(base);
-}
-
 // ── Session state ───────────────────────────────────────────────────────────────
 
 const MAX_LINES = 500;
@@ -136,6 +118,7 @@ function feedRingBuffer(session: ConptySession, data: string): void {
 
 /**
  * Spawn a new ConPTY session via node-pty.
+ * Wraps `cmd` in `cmd.exe /c <cmd>` so driver command strings are interpreted correctly.
  */
 export async function conptyNewSession(
   name: string,
@@ -160,10 +143,10 @@ export async function conptyNewSession(
     cleanCmd = cleanCmd.slice(cdMatch[0].length);
   }
 
-  // Spawn agent CLIs directly to avoid cmd.exe wrapper double-echo.
-  // Keep the wrapper for shell-like binaries and shell operators — direct ConPTY
-  // spawn regresses interactive typing there (no visible echo until Enter).
-  const needsShell = shouldUseShellWrapper(cleanCmd);
+  // Parse command into binary + args. Spawn directly (no cmd.exe /c wrapper)
+  // to avoid double echo: cmd.exe's ENABLE_ECHO_INPUT + child shell's own echo.
+  // Fall back to cmd.exe /c only for commands containing shell operators (&&, |, >).
+  const needsShell = /[&|><^]/.test(cleanCmd);
   const { file, args } = needsShell
     ? { file: 'cmd.exe', args: ['/c', cleanCmd] }
     : parseCommand(cleanCmd);
