@@ -282,8 +282,35 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
               ⚙
             </button>
             <span class="subcard-toolbar-label">Subs ({subSessions.length})</span>
+            {/* Desktop: full stats in expanded toolbar */}
+            {stats && (
+              <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`}>
+                {stats.daemonVersion && (
+                  <>
+                    <span style={{ color: '#94a3b8' }}>v{stats.daemonVersion}</span>
+                    <span style={{ color: '#94a3b8' }}> · </span>
+                  </>
+                )}
+                <span style={{ color: stats.cpu > 80 ? '#f87171' : stats.cpu > 50 ? '#fbbf24' : '#4ade80' }}>
+                  CPU {stats.cpu}%
+                </span>
+                <span style={{ color: '#94a3b8' }}> · </span>
+                <span style={{ color: '#60a5fa' }}>
+                  Mem {(() => { const gb = stats.memUsed / (1024 ** 3); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(stats.memUsed / (1024 ** 2)).toFixed(0)}M`; })()}
+                </span>
+                <span style={{ color: '#94a3b8' }}> · </span>
+                <span style={{ color: '#a78bfa' }}>
+                  Load {stats.load1}
+                </span>
+                <span style={{ color: '#94a3b8' }}> · </span>
+                <span style={{ color: '#94a3b8' }}>
+                  {formatUptime(stats.uptime)}
+                </span>
+              </span>
+            )}
           </>
         )}
+        {/* Mobile: compact stats in collapsed toolbar */}
         {collapsed && stats && (() => {
           const memGb = stats.memUsed / (1024 ** 3);
           const memStr = memGb >= 1 ? `${memGb.toFixed(1)}G` : `${(stats.memUsed / (1024 ** 2)).toFixed(0)}M`;
