@@ -578,15 +578,34 @@ program
   .option('--version <ver>', 'Install specific version instead of latest')
   .action((opts: { version?: string }) => {
     const pkg = opts.version ? `imcodes@${opts.version}` : 'imcodes@latest';
-    console.log(`Upgrading to ${pkg}...`);
+    const platform = process.platform;
 
     // Detect package manager: npm global or from a git clone?
     const selfPath = realpathSync(process.argv[1]);
     const isGlobal = selfPath.includes('node_modules');
 
+    // Windows: must stop daemon BEFORE install — Windows locks files in use.
+    // Stop scheduled task and kill process so npm can overwrite the files.
+    if (platform === 'win32') {
+      console.log('Stopping daemon before upgrade (Windows file locks)...');
+      try { execSync('schtasks /End /TN imcodes-daemon', { stdio: 'ignore' }); } catch { /* ok */ }
+      const pidFile = resolve(homedir(), '.imcodes', 'daemon.pid');
+      try {
+        const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
+        if (pid) {
+          // Kill process tree to release all file handles
+          try { execSync(`taskkill /f /t /pid ${pid}`, { stdio: 'ignore' }); } catch { /* not running */ }
+        }
+      } catch { /* no PID file */ }
+      // Wait for file handles to be released
+      try { execSync('timeout /t 2 /nobreak >nul', { stdio: 'ignore' }); } catch { /* ok */ }
+    }
+
+    console.log(`Upgrading to ${pkg}...`);
+
     if (isGlobal) {
       // Installed via npm — use the same node/npm that's running this process
-      const npmBin = resolve(dirname(process.execPath), process.platform === 'win32' ? 'npm.cmd' : 'npm');
+      const npmBin = resolve(dirname(process.execPath), platform === 'win32' ? 'npm.cmd' : 'npm');
       const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
       try {
         execSync(`"${npmCmd}" install -g ${pkg}`, { stdio: 'inherit' });
@@ -598,7 +617,12 @@ program
       // Git clone — pull and rebuild
       const projectRoot = PROJECT_ROOT;
       try {
-        execSync('git pull && npm run build', { cwd: projectRoot, stdio: 'inherit' });
+        if (platform === 'win32') {
+          execSync('git pull', { cwd: projectRoot, stdio: 'inherit' });
+          execSync('npm run build', { cwd: projectRoot, stdio: 'inherit' });
+        } else {
+          execSync('git pull && npm run build', { cwd: projectRoot, stdio: 'inherit' });
+        }
       } catch {
         console.error('Git pull / build failed.');
         process.exit(1);
@@ -607,13 +631,17 @@ program
 
     // Show new version
     try {
-      const newVer = execSync(`${realpathSync(process.argv[1])} --version 2>/dev/null || echo unknown`, { encoding: 'utf8' }).trim();
-      console.log(`Upgraded to v${newVer}`);
+      if (platform === 'win32') {
+        const newVer = execSync(`"${selfPath}" --version`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
+        console.log(`Upgraded to v${newVer}`);
+      } else {
+        const newVer = execSync(`${selfPath} --version 2>/dev/null || echo unknown`, { encoding: 'utf8' }).trim();
+        console.log(`Upgraded to v${newVer}`);
+      }
     } catch { /* ignore */ }
 
     // Restart daemon
     ensureServiceForeground();
-    const platform = process.platform;
     if (platform === 'darwin') {
       const plist = resolve(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
       if (existsSync(plist)) {
@@ -634,12 +662,7 @@ program
         } catch { /* no service — skip */ }
       }
     } else if (platform === 'win32') {
-      // Kill existing daemon via PID file and relaunch
-      const pidFile = resolve(homedir(), '.imcodes', 'daemon.pid');
-      try {
-        const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
-        if (pid) { try { execSync(`taskkill /f /pid ${pid}`, { stdio: 'ignore' }); } catch { /* not running */ } }
-      } catch { /* no PID file */ }
+      // Daemon was already killed above, just relaunch
       console.log('Restarting daemon...');
       try {
         execSync('schtasks /Run /TN imcodes-daemon', { stdio: 'ignore' });
