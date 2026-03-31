@@ -584,109 +584,79 @@ program
     const selfPath = realpathSync(process.argv[1]);
     const isGlobal = selfPath.includes('node_modules');
 
-    // Windows: must stop daemon AND watchdog BEFORE install — Windows locks files in use.
-    // The watchdog (daemon-watchdog.cmd) is an infinite loop that relaunches the daemon
-    // every 5s, so killing just the daemon node process isn't enough.
-    if (platform === 'win32') {
-      console.log('Stopping daemon and watchdog before upgrade (Windows file locks)...');
-      // 1. Stop the scheduled task so it won't re-trigger
-      try { execSync('schtasks /End /TN imcodes-daemon', { stdio: 'ignore' }); } catch { /* ok */ }
-      // 2. Kill the watchdog cmd.exe loop (runs daemon-watchdog.cmd)
-      try { execSync('taskkill /f /fi "WINDOWTITLE eq daemon-watchdog*"', { stdio: 'ignore' }); } catch { /* ok */ }
-      // Also kill by command line matching the watchdog script
-      try { execSync(`wmic process where "CommandLine like '%%daemon-watchdog%%'" call terminate`, { stdio: 'ignore' }); } catch { /* ok */ }
-      // 3. Kill the daemon node process via PID file
-      const pidFile = resolve(homedir(), '.imcodes', 'daemon.pid');
-      try {
-        const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
-        if (pid) {
-          try { execSync(`taskkill /f /t /pid ${pid}`, { stdio: 'ignore' }); } catch { /* not running */ }
-        }
-      } catch { /* no PID file */ }
-      // 4. Belt-and-suspenders: kill any remaining imcodes node processes (except self)
-      try {
-        execSync(`wmic process where "CommandLine like '%%imcodes%%start%%--foreground%%' and ProcessId != ${process.pid}" call terminate`, { stdio: 'ignore' });
-      } catch { /* ok */ }
-      // Wait for file handles to be released
-      try { execSync('timeout /t 3 /nobreak >nul', { stdio: 'ignore' }); } catch { /* ok */ }
-    }
+    console.log(`Upgrading to ${pkg}...`);
 
-    // Helper to relaunch the Windows watchdog — called in finally to guarantee restart
-    const relaunchWindowsDaemon = () => {
-      console.log('Restarting daemon...');
+    // Step 1: Install new version (do NOT kill daemon — upgrade may be running from
+    // a daemon-managed session, so killing it would kill ourselves).
+    if (isGlobal) {
+      const npmBin = resolve(dirname(process.execPath), platform === 'win32' ? 'npm.cmd' : 'npm');
+      const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
       try {
-        execSync('schtasks /Run /TN imcodes-daemon', { stdio: 'ignore' });
-      } catch {
-        const vbs = resolve(homedir(), '.imcodes', 'daemon-launcher.vbs');
-        if (existsSync(vbs)) {
-          spawn('wscript', [vbs], { detached: true, stdio: 'ignore' }).unref();
-        }
-      }
-    };
-
-    try {
-      console.log(`Upgrading to ${pkg}...`);
-
-      if (isGlobal) {
-        // Installed via npm — use the same node/npm that's running this process
-        const npmBin = resolve(dirname(process.execPath), platform === 'win32' ? 'npm.cmd' : 'npm');
-        const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
         execSync(`"${npmCmd}" install -g ${pkg}`, { stdio: 'inherit' });
-      } else {
-        // Git clone — pull and rebuild
-        const projectRoot = PROJECT_ROOT;
+      } catch {
+        console.error('npm install failed.');
+        process.exit(1);
+      }
+    } else {
+      const projectRoot = PROJECT_ROOT;
+      try {
         if (platform === 'win32') {
           execSync('git pull', { cwd: projectRoot, stdio: 'inherit' });
           execSync('npm run build', { cwd: projectRoot, stdio: 'inherit' });
         } else {
           execSync('git pull && npm run build', { cwd: projectRoot, stdio: 'inherit' });
         }
+      } catch {
+        console.error('Git pull / build failed.');
+        process.exit(1);
       }
-
-      // Show new version
-      try {
-        if (platform === 'win32') {
-          const newVer = execSync(`"${selfPath}" --version`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
-          console.log(`Upgraded to v${newVer}`);
-        } else {
-          const newVer = execSync(`${selfPath} --version 2>/dev/null || echo unknown`, { encoding: 'utf8' }).trim();
-          console.log(`Upgraded to v${newVer}`);
-        }
-      } catch { /* ignore */ }
-
-      // Restart daemon
-      ensureServiceForeground();
-      if (platform === 'darwin') {
-        const plist = resolve(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
-        if (existsSync(plist)) {
-          console.log('Restarting daemon via launchctl...');
-          try { execSync(`launchctl unload "${plist}" 2>/dev/null`, { stdio: 'pipe' }); } catch { /* ok */ }
-          killStaleImcodesProcesses();
-          execSync(`launchctl load "${plist}"`, { stdio: 'inherit' });
-        }
-      } else if (platform === 'linux') {
-        const userService = resolve(homedir(), '.config/systemd/user/imcodes.service');
-        if (existsSync(userService)) {
-          console.log('Restarting daemon via systemd...');
-          execSync('systemctl --user daemon-reload && systemctl --user restart imcodes', { stdio: 'inherit' });
-        } else {
-          try {
-            console.log('Restarting daemon via systemd...');
-            execSync('sudo systemctl daemon-reload && sudo systemctl restart imcodes', { stdio: 'inherit' });
-          } catch { /* no service — skip */ }
-        }
-      } else if (platform === 'win32') {
-        relaunchWindowsDaemon();
-      }
-      console.log('Done.');
-    } catch (err) {
-      // On Windows, always relaunch the watchdog even if upgrade failed
-      if (platform === 'win32') {
-        console.error('Upgrade failed, relaunching daemon with previous version...');
-        relaunchWindowsDaemon();
-      }
-      throw err;
     }
+
+    // Show new version
+    try {
+      if (platform === 'win32') {
+        const newVer = execSync(`"${selfPath}" --version`, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }).trim();
+        console.log(`Upgraded to v${newVer}`);
+      } else {
+        const newVer = execSync(`${selfPath} --version 2>/dev/null || echo unknown`, { encoding: 'utf8' }).trim();
+        console.log(`Upgraded to v${newVer}`);
+      }
+    } catch { /* ignore */ }
+
+    // Step 2: Restart daemon so it picks up the new code.
+    // The daemon's own watchdog loop will relaunch with the new version after exit.
+    ensureServiceForeground();
+    if (platform === 'darwin') {
+      const plist = resolve(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
+      if (existsSync(plist)) {
+        console.log('Restarting daemon via launchctl...');
+        try { execSync(`launchctl unload "${plist}" 2>/dev/null`, { stdio: 'pipe' }); } catch { /* ok */ }
+        killStaleImcodesProcesses();
+        execSync(`launchctl load "${plist}"`, { stdio: 'inherit' });
+      }
+    } else if (platform === 'linux') {
+      const userService = resolve(homedir(), '.config/systemd/user/imcodes.service');
+      if (existsSync(userService)) {
+        console.log('Restarting daemon via systemd...');
+        execSync('systemctl --user daemon-reload && systemctl --user restart imcodes', { stdio: 'inherit' });
+      } else {
+        try {
+          console.log('Restarting daemon via systemd...');
+          execSync('sudo systemctl daemon-reload && sudo systemctl restart imcodes', { stdio: 'inherit' });
+        } catch { /* no service — skip */ }
+      }
+    } else if (platform === 'win32') {
+      // Kill daemon process — watchdog will auto-relaunch with new version in ~5s.
+      console.log('Restarting daemon (watchdog will relaunch with new version)...');
+      const pidFile = resolve(homedir(), '.imcodes', 'daemon.pid');
+      try {
+        const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
+        if (pid && pid !== process.pid) {
+          try { execSync(`taskkill /f /pid ${pid}`, { stdio: 'ignore' }); } catch { /* not running */ }
+        }
+      } catch { /* no PID file */ }
+    }
+    console.log('Done.');
   });
 
 program
