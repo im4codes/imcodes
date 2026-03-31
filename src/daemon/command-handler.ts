@@ -1661,25 +1661,50 @@ launchctl load -w "${plist}"`;
     const targetVer = targetVersion ?? 'latest';
     const imcodesCmd = join(dirname(process.execPath), 'imcodes.cmd');
     const verifyCmd = existsSync(imcodesCmd) ? `"${imcodesCmd}"` : 'imcodes';
+    // Windows silent upgrade: download first (npm pack), then kill daemon, then install from local tgz.
+    // This avoids file-lock failures — npm install -g can't overwrite running .cmd/.js files.
     const batch = `@echo off\r
 echo === imcodes upgrade started at %date% %time% === >> "${logFile}"\r
-timeout /t 3 /nobreak > nul\r
-echo Installing ${pkgSpec}... >> "${logFile}"\r
-"${npmCmd}" install -g ${pkgSpec} >> "${logFile}" 2>&1\r
+\r
+echo Step 1: Downloading ${pkgSpec} to temp dir... >> "${logFile}"\r
+cd /d "${scriptDir}"\r
+"${npmCmd}" pack ${pkgSpec} >> "${logFile}" 2>&1\r
 if %errorlevel% neq 0 (\r
-  echo Install FAILED — keeping current daemon running. >> "${logFile}"\r
+  echo Download FAILED — keeping current daemon running. >> "${logFile}"\r
   goto :done\r
 )\r
+echo Download succeeded. >> "${logFile}"\r
+\r
+REM Find the downloaded .tgz file\r
+set "TGZ_FILE="\r
+for %%f in ("${scriptDir}\\imcodes-*.tgz") do set "TGZ_FILE=%%f"\r
+if "%TGZ_FILE%"=="" (\r
+  echo No .tgz found after npm pack — aborting. >> "${logFile}"\r
+  goto :done\r
+)\r
+echo Downloaded: %TGZ_FILE% >> "${logFile}"\r
+\r
+echo Step 2: Stopping daemon... >> "${logFile}"\r
+for /f %%p in ('type "${pidFile}" 2^>nul') do (\r
+  echo Killing PID %%p >> "${logFile}"\r
+  taskkill /f /pid %%p >nul 2>&1\r
+)\r
+REM Wait for process to fully exit and release file locks\r
+timeout /t 3 /nobreak > nul\r
+\r
+echo Step 3: Installing from local tgz... >> "${logFile}"\r
+"${npmCmd}" install -g "%TGZ_FILE%" >> "${logFile}" 2>&1\r
+if %errorlevel% neq 0 (\r
+  echo Install FAILED — restarting old daemon. >> "${logFile}"\r
+  goto :restart\r
+)\r
+\r
 echo Install succeeded. Verifying version... >> "${logFile}"\r
 for /f "tokens=*" %%v in ('${verifyCmd} --version 2^>nul') do set INSTALLED_VER=%%v\r
 echo Installed version: %INSTALLED_VER%, target: ${targetVer} >> "${logFile}"\r
-if "${targetVer}"=="latest" goto :restart\r
-if "%INSTALLED_VER%"=="${targetVer}" goto :restart\r
-echo Version mismatch after install — keeping current daemon running. >> "${logFile}"\r
-goto :done\r
+\r
 :restart\r
-echo Restarting daemon... >> "${logFile}"\r
-for /f %%p in ('type "${pidFile}" 2^>nul') do taskkill /f /pid %%p >nul 2>&1\r
+echo Step 4: Restarting daemon... >> "${logFile}"\r
 if exist "${startupCmd}" start "" "${startupCmd}"\r
 :done\r
 echo === upgrade done at %date% %time% === >> "${logFile}"\r
