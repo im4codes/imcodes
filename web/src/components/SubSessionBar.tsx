@@ -129,6 +129,9 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
   const [dragOrder, setDragOrder] = useState<string[] | null>(null);
   const dragIdRef = useRef<string | null>(null);
   const reorderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Touch-drag state for collapsed bar (persists across re-renders)
+  const touchDragRef = useRef<{ id: string | null; active: boolean; timer: ReturnType<typeof setTimeout> | null }>({ id: null, active: false, timer: null });
+  const collapsedBarRef = useRef<HTMLDivElement | null>(null);
 
   // Reset drag order only when session membership changes (add/remove),
   // NOT on state updates (idle/running) which just change the array reference.
@@ -374,72 +377,79 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
 
       {/* Collapsed: compact buttons (all platforms) — long-press to reorder */}
       {collapsed && subSessions.length > 0 && (
-        <div class="subsession-bar" style={{ borderTop: 'none' }} ref={(el) => {
-          // Touch-based reorder for collapsed bar (HTML5 drag doesn't work on mobile)
-          if (!el) return;
-          let longPressTimer: ReturnType<typeof setTimeout> | null = null;
-          let dragId: string | null = null;
-          let dragging = false;
-
-          const findBtnId = (target: EventTarget | null): string | null => {
-            let node = target as HTMLElement | null;
-            while (node && node !== el) {
-              if (node.dataset.subId) return node.dataset.subId;
-              node = node.parentElement;
-            }
-            return null;
-          };
-
-          el.ontouchstart = (e) => {
-            const id = findBtnId(e.target);
+        <div class="subsession-bar" style={{ borderTop: 'none' }} ref={collapsedBarRef}
+          onTouchStart={(e) => {
+            const el = collapsedBarRef.current;
+            if (!el) return;
+            let node = e.target as HTMLElement | null;
+            let id: string | null = null;
+            while (node && node !== el) { if (node.dataset.subId) { id = node.dataset.subId; break; } node = node.parentElement; }
             if (!id) return;
-            longPressTimer = setTimeout(() => {
-              dragId = id;
-              dragging = true;
-              if (!dragOrder) setDragOrder(orderedSessions.map((s) => s.id));
-              // Visual feedback
+            const td = touchDragRef.current;
+            td.timer = setTimeout(() => {
+              td.id = id;
+              td.active = true;
+              setDragOrder(orderedSessions.map((s) => s.id));
               const btn = el.querySelector(`[data-sub-id="${id}"]`) as HTMLElement | null;
               if (btn) btn.style.opacity = '0.5';
-              // Prevent scroll while dragging
               el.style.overflowX = 'hidden';
             }, 400);
-          };
-
-          el.ontouchmove = (e) => {
-            if (longPressTimer && !dragging) { clearTimeout(longPressTimer); longPressTimer = null; return; }
-            if (!dragging || !dragId) return;
+          }}
+          onTouchMove={(e) => {
+            const td = touchDragRef.current;
+            if (td.timer && !td.active) { clearTimeout(td.timer); td.timer = null; return; }
+            if (!td.active || !td.id) return;
             e.preventDefault();
             const touch = e.touches[0];
             const targetEl = document.elementFromPoint(touch.clientX, touch.clientY);
-            const overId = findBtnId(targetEl);
-            if (overId && overId !== dragId) {
+            let node = targetEl as HTMLElement | null;
+            const el = collapsedBarRef.current;
+            let overId: string | null = null;
+            while (node && node !== el) { if (node.dataset.subId) { overId = node.dataset.subId; break; } node = node.parentElement; }
+            if (overId && overId !== td.id) {
+              const draggedId = td.id;
               setDragOrder((prev) => {
                 const ids = prev ?? orderedSessions.map((s) => s.id);
-                const from = ids.indexOf(dragId!);
-                const to = ids.indexOf(overId);
+                const from = ids.indexOf(draggedId);
+                const to = ids.indexOf(overId!);
                 if (from === -1 || to === -1) return prev;
                 const next = [...ids];
                 next.splice(from, 1);
-                next.splice(to, 0, dragId!);
+                next.splice(to, 0, draggedId);
                 return next;
               });
             }
-          };
-
-          const endDrag = () => {
-            if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
-            if (dragging && dragId) {
-              const btn = el.querySelector(`[data-sub-id="${dragId}"]`) as HTMLElement | null;
-              if (btn) btn.style.opacity = '';
-              el.style.overflowX = '';
+          }}
+          onTouchEnd={() => {
+            const td = touchDragRef.current;
+            if (td.timer) { clearTimeout(td.timer); td.timer = null; }
+            if (td.active && td.id) {
+              const el = collapsedBarRef.current;
+              if (el) {
+                const btn = el.querySelector(`[data-sub-id="${td.id}"]`) as HTMLElement | null;
+                if (btn) btn.style.opacity = '';
+                el.style.overflowX = '';
+              }
               if (dragOrder) syncOrderToServer(dragOrder);
             }
-            dragId = null;
-            dragging = false;
-          };
-          el.ontouchend = endDrag;
-          el.ontouchcancel = endDrag;
-        }}>
+            td.id = null;
+            td.active = false;
+          }}
+          onTouchCancel={() => {
+            const td = touchDragRef.current;
+            if (td.timer) { clearTimeout(td.timer); td.timer = null; }
+            if (td.active && td.id) {
+              const el = collapsedBarRef.current;
+              if (el) {
+                const btn = el.querySelector(`[data-sub-id="${td.id}"]`) as HTMLElement | null;
+                if (btn) btn.style.opacity = '';
+                el.style.overflowX = '';
+              }
+            }
+            td.id = null;
+            td.active = false;
+          }}
+        >
           {orderedSessions.map((sub) => {
             const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
             const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
