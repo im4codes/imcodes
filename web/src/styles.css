@@ -708,6 +708,8 @@ body {
 .discussions-markdown a { color: #60a5fa; text-decoration: none; }
 .discussions-markdown a:hover { text-decoration: underline; }
 .discussions-detail { flex: 1; overflow-y: auto; display: flex; flex-direction: column; }
+.discussions-back-btn { display: none; background: none; border: none; color: #3b82f6; cursor: pointer; padding: 8px 16px; font-size: 14px; text-align: left; flex-shrink: 0; }
+@media (max-width: 768px) { .discussions-back-btn { display: block; } }
 .discussions-detail-header { padding: 16px; border-bottom: 1px solid #1e293b; }
 .discussions-detail-header h3 { margin: 0 0 8px; font-size: 16px; }
 .discussions-detail-meta { font-size: 13px; color: #94a3b8; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
@@ -728,8 +730,13 @@ body {
 .discussions-file-content summary { font-size: 13px; color: #94a3b8; cursor: pointer; padding: 8px; }
 .discussions-file-content pre { background: #0f172a; border: 1px solid #1e293b; border-radius: 6px; padding: 12px; font-size: 12px; color: #94a3b8; overflow-x: auto; white-space: pre-wrap; max-height: 400px; overflow-y: auto; }
 @media (max-width: 768px) {
-  .discussions-layout { flex-direction: column; }
-  .discussions-list { width: 100%; max-height: 40vh; border-right: none; border-bottom: 1px solid #1e293b; }
+  .discussions-layout { flex-direction: column; position: relative; }
+  .discussions-list { width: 100%; border-right: none; border-bottom: 1px solid #1e293b; flex: 1; overflow-y: auto; }
+  /* When a discussion is selected on mobile, detail goes full-screen over the list */
+  .discussions-layout .discussions-detail-fullscreen {
+    position: absolute; inset: 0; z-index: 10; background: #0a0e1a;
+    display: flex; flex-direction: column; overflow-y: auto;
+  }
 }
 
 /* AskQuestionDialog */

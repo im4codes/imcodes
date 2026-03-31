@@ -218,9 +218,17 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
           ))}
         </div>
 
-        <div class="discussions-detail">
+        <div class={`discussions-detail${selected ? ' discussions-detail-fullscreen' : ''}`}>
           {!selected && (
             <div class="discussions-empty">Select a discussion to view</div>
+          )}
+          {selected && (
+            <button
+              class="discussions-back-btn"
+              onClick={() => { setSelected(null); setContent(null); }}
+            >
+              ← Back
+            </button>
           )}
           {selected && content === null && (
             <div class="discussions-empty">Loading...</div>
