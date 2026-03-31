@@ -318,9 +318,9 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
           return (
             <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`} style={{ whiteSpace: 'nowrap', fontSize: 10 }}>
               {stats.daemonVersion && <span style={{ color: '#94a3b8' }}>v{stats.daemonVersion} </span>}
-              <span style={{ color: stats.cpu > 80 ? '#f87171' : stats.cpu > 50 ? '#fbbf24' : '#4ade80' }}>⚙️{stats.cpu}%</span>
+              <span style={{ color: stats.cpu > 80 ? '#f87171' : stats.cpu > 50 ? '#fbbf24' : '#4ade80' }}><span style={{ fontSize: 8 }}>⚙️</span>{stats.cpu}%</span>
               {' '}
-              <span style={{ color: '#60a5fa' }}>🧠{memUsed}/{memTotal}</span>
+              <span style={{ color: '#60a5fa' }}><span style={{ fontSize: 8 }}>🧠</span>{memUsed}/{memTotal}</span>
               {' '}
               <span style={{ color: '#a78bfa' }}>≡{stats.load1}</span>
             </span>
