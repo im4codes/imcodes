@@ -55,9 +55,12 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const [ccInitPrompt, setCcInitPrompt] = useState<string>('');
   const [showPresetEditor, setShowPresetEditor] = useState(false);
   const [newPresetName, setNewPresetName] = useState('');
-  const [newPresetEnv, setNewPresetEnv] = useState('');
+  const [newPresetBaseUrl, setNewPresetBaseUrl] = useState('');
+  const [newPresetToken, setNewPresetToken] = useState('');
+  const [newPresetModel, setNewPresetModel] = useState('');
   const [newPresetCtx, setNewPresetCtx] = useState('');
-  const [newPresetInit, setNewPresetInit] = useState('');
+  const DEFAULT_INIT_MSG = 'For web searches, use: curl -s "https://html.duckduckgo.com/html/?q=QUERY" | head -200. Replace QUERY with URL-encoded search terms.';
+  const [newPresetInit, setNewPresetInit] = useState(DEFAULT_INIT_MSG);
   const [presetError, setPresetError] = useState('');
 
   // Remote sessions come from the provider status hook (pushed on connect, cached in DB)
@@ -309,23 +312,35 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                 <div style={{ background: '#0f172a', border: '1px solid #334155', borderRadius: 6, padding: 10, fontSize: 11 }}>
                   <div style={{ color: '#64748b', marginBottom: 4, fontSize: 10 }}>Stored locally (~/.imcodes/cc-presets.json)</div>
                   {presetError && <div style={{ color: '#ef4444', fontSize: 11, marginBottom: 4 }}>{presetError}</div>}
-                  <input class="input" placeholder="Name" value={newPresetName} onInput={(e) => setNewPresetName((e.target as HTMLInputElement).value)} style={{ width: '100%', marginBottom: 4, fontSize: 11 }} />
-                  <textarea class="input" placeholder='{"ANTHROPIC_BASE_URL":"...","ANTHROPIC_AUTH_TOKEN":"...","ANTHROPIC_MODEL":"..."}' value={newPresetEnv} rows={2} onInput={(e) => setNewPresetEnv((e.target as HTMLTextAreaElement).value)} style={{ width: '100%', marginBottom: 4, fontSize: 10, fontFamily: 'monospace', resize: 'vertical' }} />
-                  <input class="input" placeholder="Context window (e.g. 200000)" value={newPresetCtx} onInput={(e) => setNewPresetCtx((e.target as HTMLInputElement).value)} style={{ width: '100%', marginBottom: 4, fontSize: 11 }} />
-                  <textarea class="input" placeholder="Init message (default: DuckDuckGo search)" value={newPresetInit} rows={1} onInput={(e) => setNewPresetInit((e.target as HTMLTextAreaElement).value)} style={{ width: '100%', marginBottom: 6, fontSize: 11, resize: 'vertical' }} />
-                  <button type="button" class="btn btn-primary" style={{ fontSize: 11, padding: '3px 10px' }} disabled={!newPresetName.trim() || !newPresetEnv.trim()}
+                  {[
+                    { label: 'Preset Name', ph: 'e.g. MiniMax', val: newPresetName, set: setNewPresetName },
+                    { label: 'API Base URL', ph: 'https://api.minimax.io/anthropic', val: newPresetBaseUrl, set: setNewPresetBaseUrl },
+                    { label: 'API Key', ph: 'your-api-key', val: newPresetToken, set: setNewPresetToken, type: 'password' as const },
+                    { label: 'Model', ph: 'e.g. MiniMax-M2.7', val: newPresetModel, set: setNewPresetModel },
+                    { label: 'Context Window', ph: 'e.g. 200000', val: newPresetCtx, set: setNewPresetCtx },
+                  ].map(({ label, ph, val, set, type }) => (
+                    <div key={label} style={{ marginBottom: 4 }}>
+                      <div style={{ fontSize: 9, color: '#64748b', marginBottom: 1 }}>{label}</div>
+                      <input class="input" type={type ?? 'text'} placeholder={ph} value={val} onInput={(e) => set((e.target as HTMLInputElement).value)} style={{ width: '100%', fontSize: 11 }} />
+                    </div>
+                  ))}
+                  <div style={{ marginBottom: 4 }}>
+                    <div style={{ fontSize: 9, color: '#64748b', marginBottom: 1 }}>Init Message</div>
+                    <textarea class="input" value={newPresetInit} rows={2} onInput={(e) => setNewPresetInit((e.target as HTMLTextAreaElement).value)} style={{ width: '100%', fontSize: 10, resize: 'vertical' }} />
+                  </div>
+                  <button type="button" class="btn btn-primary" style={{ fontSize: 11, padding: '3px 10px' }} disabled={!newPresetName.trim() || !newPresetBaseUrl.trim()}
                     onClick={() => {
-                      try {
-                        const env = JSON.parse(newPresetEnv);
-                        const preset: any = { name: newPresetName.trim(), env };
-                        if (newPresetCtx) preset.contextWindow = parseInt(newPresetCtx, 10);
-                        if (newPresetInit.trim()) preset.initMessage = newPresetInit.trim();
-                        const updated = [...ccPresets.filter(p => p.name !== preset.name), preset];
-                        setCcPresets(updated);
-                        try { ws?.send({ type: 'cc.presets.save', presets: updated }); } catch {}
-                        setNewPresetName(''); setNewPresetEnv(''); setNewPresetCtx(''); setNewPresetInit('');
-                        setCcPreset(preset.name); setPresetError('');
-                      } catch { setPresetError('Invalid JSON'); }
+                      const env: Record<string, string> = { ANTHROPIC_BASE_URL: newPresetBaseUrl.trim(), CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' };
+                      if (newPresetToken.trim()) env['ANTHROPIC_AUTH_TOKEN'] = newPresetToken.trim();
+                      if (newPresetModel.trim()) env['ANTHROPIC_MODEL'] = newPresetModel.trim();
+                      const preset: any = { name: newPresetName.trim(), env };
+                      if (newPresetCtx) preset.contextWindow = parseInt(newPresetCtx, 10);
+                      if (newPresetInit.trim()) preset.initMessage = newPresetInit.trim();
+                      const updated = [...ccPresets.filter(p => p.name !== preset.name), preset];
+                      setCcPresets(updated);
+                      try { ws?.send({ type: 'cc.presets.save', presets: updated }); } catch {}
+                      setNewPresetName(''); setNewPresetBaseUrl(''); setNewPresetToken(''); setNewPresetModel(''); setNewPresetCtx(''); setNewPresetInit(DEFAULT_INIT_MSG);
+                      setCcPreset(preset.name); setPresetError('');
                     }}
                   >Save</button>
                   {ccPresets.length > 0 && (
@@ -334,7 +349,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                         <div key={p.name} style={{ display: 'flex', justifyContent: 'space-between', padding: '2px 0', fontSize: 11 }}>
                           <span style={{ color: '#e2e8f0' }}>{p.name} <span style={{ color: '#475569' }}>{p.env['ANTHROPIC_MODEL'] ?? ''}</span></span>
                           <div style={{ display: 'flex', gap: 4 }}>
-                            <button type="button" style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', fontSize: 10 }} onClick={() => { setNewPresetName(p.name); setNewPresetEnv(JSON.stringify(p.env, null, 2)); setNewPresetCtx(p.contextWindow ? String(p.contextWindow) : ''); setNewPresetInit(p.initMessage ?? ''); }}>Edit</button>
+                            <button type="button" style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', fontSize: 10 }} onClick={() => { setNewPresetName(p.name); setNewPresetBaseUrl(p.env['ANTHROPIC_BASE_URL'] ?? ''); setNewPresetToken(p.env['ANTHROPIC_AUTH_TOKEN'] ?? ''); setNewPresetModel(p.env['ANTHROPIC_MODEL'] ?? ''); setNewPresetCtx(p.contextWindow ? String(p.contextWindow) : ''); setNewPresetInit(p.initMessage ?? DEFAULT_INIT_MSG); }}>Edit</button>
                             <button type="button" style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: 10 }} onClick={() => { const u = ccPresets.filter(x => x.name !== p.name); setCcPresets(u); try { ws?.send({ type: 'cc.presets.save', presets: u }); } catch {} if (ccPreset === p.name) setCcPreset(''); }}>Del</button>
                           </div>
                         </div>

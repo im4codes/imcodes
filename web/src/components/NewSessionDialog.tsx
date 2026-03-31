@@ -39,9 +39,12 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
   const [showPresetEditor, setShowPresetEditor] = useState(false);
   // New preset form
   const [newPresetName, setNewPresetName] = useState('');
-  const [newPresetEnv, setNewPresetEnv] = useState('');
+  const [newPresetBaseUrl, setNewPresetBaseUrl] = useState('');
+  const [newPresetToken, setNewPresetToken] = useState('');
+  const [newPresetModel, setNewPresetModel] = useState('');
   const [newPresetCtx, setNewPresetCtx] = useState('');
-  const [newPresetInit, setNewPresetInit] = useState('');
+  const DEFAULT_INIT_MSG = 'For web searches, use: curl -s "https://html.duckduckgo.com/html/?q=QUERY" | head -200. Replace QUERY with URL-encoded search terms.';
+  const [newPresetInit, setNewPresetInit] = useState(DEFAULT_INIT_MSG);
 
   // OpenClaw-specific state
   const [ocMode, setOcMode] = useState<OpenClawMode>('new');
@@ -279,46 +282,45 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
             {/* Inline preset editor */}
             {showPresetEditor && (
               <div style={{ background: '#0f172a', border: '1px solid #334155', borderRadius: 6, padding: 12, marginBottom: 12, fontSize: 12 }}>
-                <div style={{ marginBottom: 4, fontWeight: 600, color: '#94a3b8' }}>Add New Preset</div>
-                <div style={{ fontSize: 10, color: '#475569', marginBottom: 8 }}>Stored locally on daemon machine (~/.imcodes/cc-presets.json). Not synced to server.</div>
-                <input
-                  type="text" placeholder="Name (e.g. MiniMax)" value={newPresetName}
-                  onInput={(e) => setNewPresetName((e.target as HTMLInputElement).value)}
-                  style={{ width: '100%', background: '#1e293b', border: '1px solid #334155', color: '#e2e8f0', padding: '6px 8px', borderRadius: 4, marginBottom: 6, fontSize: 12, boxSizing: 'border-box' }}
-                />
-                <textarea
-                  placeholder={'ENV vars (JSON):\n{"ANTHROPIC_BASE_URL":"...","ANTHROPIC_AUTH_TOKEN":"...","ANTHROPIC_MODEL":"..."}'}
-                  value={newPresetEnv} rows={3}
-                  onInput={(e) => setNewPresetEnv((e.target as HTMLTextAreaElement).value)}
-                  style={{ width: '100%', background: '#1e293b', border: '1px solid #334155', color: '#e2e8f0', padding: '6px 8px', borderRadius: 4, marginBottom: 6, fontSize: 11, fontFamily: 'monospace', resize: 'vertical', boxSizing: 'border-box' }}
-                />
-                <input
-                  type="text" placeholder="Context window (e.g. 200000 or 1000000)" value={newPresetCtx}
-                  onInput={(e) => setNewPresetCtx((e.target as HTMLInputElement).value)}
-                  style={{ width: '100%', background: '#1e293b', border: '1px solid #334155', color: '#e2e8f0', padding: '6px 8px', borderRadius: 4, marginBottom: 6, fontSize: 12, boxSizing: 'border-box' }}
-                />
-                <textarea
-                  placeholder="Init message (optional — default: DuckDuckGo search instruction)" value={newPresetInit} rows={2}
-                  onInput={(e) => setNewPresetInit((e.target as HTMLTextAreaElement).value)}
-                  style={{ width: '100%', background: '#1e293b', border: '1px solid #334155', color: '#e2e8f0', padding: '6px 8px', borderRadius: 4, marginBottom: 8, fontSize: 12, resize: 'vertical', boxSizing: 'border-box' }}
-                />
-                <div style={{ display: 'flex', gap: 6 }}>
-                  <button type="button" disabled={!newPresetName.trim() || !newPresetEnv.trim()} style={{ background: '#1d4ed8', border: 'none', color: '#fff', padding: '4px 12px', borderRadius: 4, cursor: 'pointer', fontSize: 12, opacity: !newPresetName.trim() || !newPresetEnv.trim() ? 0.5 : 1 }}
-                    onClick={() => {
-                      try {
-                        const env = JSON.parse(newPresetEnv);
-                        const preset: any = { name: newPresetName.trim(), env };
-                        if (newPresetCtx) preset.contextWindow = parseInt(newPresetCtx, 10);
-                        if (newPresetInit.trim()) preset.initMessage = newPresetInit.trim();
-                        const updated = [...ccPresets.filter(p => p.name !== preset.name), preset];
-                        setCcPresets(updated);
-                        try { ws?.send({ type: 'cc.presets.save', presets: updated }); } catch {}
-                        setNewPresetName(''); setNewPresetEnv(''); setNewPresetCtx(''); setNewPresetInit('');
-                        setCcPreset(preset.name);
-                      } catch { setError('Invalid JSON in env vars'); }
-                    }}
-                  >Save</button>
+                <div style={{ marginBottom: 4, fontWeight: 600, color: '#94a3b8' }}>Add / Edit Preset</div>
+                <div style={{ fontSize: 10, color: '#475569', marginBottom: 8 }}>Stored locally on daemon (~/.imcodes/cc-presets.json)</div>
+                {[
+                  { label: 'Preset Name', ph: 'e.g. MiniMax', val: newPresetName, set: setNewPresetName },
+                  { label: 'API Base URL', ph: 'https://api.minimax.io/anthropic', val: newPresetBaseUrl, set: setNewPresetBaseUrl },
+                  { label: 'API Key', ph: 'your-api-key', val: newPresetToken, set: setNewPresetToken, type: 'password' as const },
+                  { label: 'Model', ph: 'e.g. MiniMax-M2.7', val: newPresetModel, set: setNewPresetModel },
+                  { label: 'Context Window', ph: 'e.g. 200000 or 1000000', val: newPresetCtx, set: setNewPresetCtx },
+                ].map(({ label, ph, val, set, type }) => (
+                  <div key={label} style={{ marginBottom: 5 }}>
+                    <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2 }}>{label}</div>
+                    <input type={type ?? 'text'} placeholder={ph} value={val}
+                      onInput={(e) => set((e.target as HTMLInputElement).value)}
+                      style={{ width: '100%', background: '#1e293b', border: '1px solid #334155', color: '#e2e8f0', padding: '5px 8px', borderRadius: 4, fontSize: 12, boxSizing: 'border-box' }}
+                    />
+                  </div>
+                ))}
+                <div style={{ marginBottom: 6 }}>
+                  <div style={{ fontSize: 10, color: '#64748b', marginBottom: 2 }}>Init Message (sent after session starts)</div>
+                  <textarea value={newPresetInit} rows={2}
+                    onInput={(e) => setNewPresetInit((e.target as HTMLTextAreaElement).value)}
+                    style={{ width: '100%', background: '#1e293b', border: '1px solid #334155', color: '#e2e8f0', padding: '5px 8px', borderRadius: 4, fontSize: 11, resize: 'vertical', boxSizing: 'border-box' }}
+                  />
                 </div>
+                <button type="button" disabled={!newPresetName.trim() || !newPresetBaseUrl.trim()} style={{ background: '#1d4ed8', border: 'none', color: '#fff', padding: '4px 12px', borderRadius: 4, cursor: 'pointer', fontSize: 12, opacity: !newPresetName.trim() || !newPresetBaseUrl.trim() ? 0.5 : 1 }}
+                  onClick={() => {
+                    const env: Record<string, string> = { ANTHROPIC_BASE_URL: newPresetBaseUrl.trim(), CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' };
+                    if (newPresetToken.trim()) env['ANTHROPIC_AUTH_TOKEN'] = newPresetToken.trim();
+                    if (newPresetModel.trim()) env['ANTHROPIC_MODEL'] = newPresetModel.trim();
+                    const preset: any = { name: newPresetName.trim(), env };
+                    if (newPresetCtx) preset.contextWindow = parseInt(newPresetCtx, 10);
+                    if (newPresetInit.trim()) preset.initMessage = newPresetInit.trim();
+                    const updated = [...ccPresets.filter(p => p.name !== preset.name), preset];
+                    setCcPresets(updated);
+                    try { ws?.send({ type: 'cc.presets.save', presets: updated }); } catch {}
+                    setNewPresetName(''); setNewPresetBaseUrl(''); setNewPresetToken(''); setNewPresetModel(''); setNewPresetCtx(''); setNewPresetInit(DEFAULT_INIT_MSG);
+                    setCcPreset(preset.name);
+                  }}
+                >Save Preset</button>
 
                 {/* Existing presets — edit/delete */}
                 {ccPresets.length > 0 && (
@@ -331,9 +333,11 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
                           <button type="button" style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', fontSize: 11 }}
                             onClick={() => {
                               setNewPresetName(p.name);
-                              setNewPresetEnv(JSON.stringify(p.env, null, 2));
+                              setNewPresetBaseUrl(p.env['ANTHROPIC_BASE_URL'] ?? '');
+                              setNewPresetToken(p.env['ANTHROPIC_AUTH_TOKEN'] ?? '');
+                              setNewPresetModel(p.env['ANTHROPIC_MODEL'] ?? '');
                               setNewPresetCtx(p.contextWindow ? String(p.contextWindow) : '');
-                              setNewPresetInit(p.initMessage ?? '');
+                              setNewPresetInit(p.initMessage ?? DEFAULT_INIT_MSG);
                             }}
                           >Edit</button>
                           <button type="button" style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: 11 }}
