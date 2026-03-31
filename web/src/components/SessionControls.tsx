@@ -552,17 +552,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     const isSub = !!onSubStop;
     const isStop = action === 'stop';
 
-    if (isSub && isStop) {
-      // Sub-session stop: no confirmation
-      onSubStop();
-      setMenuOpen(false); resetConfirm(); onAfterAction?.();
-      return;
-    }
-
-    if (isSub && !isStop) {
-      // Sub-session restart/new: 1-click confirmation
+    if (isSub) {
+      // Sub-session stop: 2-level (warn → execute), restart/new: 1-click
       if (confirm !== action) { startConfirm(action, 1); return; }
-      if (action === 'restart') {
+      if (action === 'stop') {
+        onSubStop();
+      } else if (action === 'restart') {
         onSubRestart ? onSubRestart() : ws.sendSessionCommand('restart', { project: activeSession.project });
       } else {
         onSubNew ? onSubNew() : ws.sendSessionCommand('restart', { project: activeSession.project, fresh: true });

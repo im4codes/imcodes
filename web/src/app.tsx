@@ -760,6 +760,10 @@ export function App() {
         if (msg.event === 'disconnected') { setConnected(false); setConnecting(true); setDaemonOnline(false); }
         if (msg.session && !msg.session.startsWith('deck_sub_')) {
           setSessions((prev) => {
+            // Stopped → remove the tab immediately
+            if (msg.event === 'stopped') {
+              return prev.filter((s) => s.name !== msg.session);
+            }
             const existing = prev.find((s) => s.name === msg.session);
             if (!existing && msg.session) {
               // Parse project name from session name pattern: deck_{project}_{role}
