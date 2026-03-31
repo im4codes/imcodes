@@ -177,7 +177,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
         td.active = true;
         setDragOrder(orderedSessionsRef.current.map((s) => s.id));
         const btn = el.querySelector(`[data-sub-id="${id}"]`) as HTMLElement | null;
-        if (btn) btn.style.opacity = '0.5';
+        if (btn) { btn.style.transform = 'scale(1.18)'; btn.style.boxShadow = '0 0 10px rgba(251,191,36,0.6)'; btn.style.borderColor = '#f59e0b'; btn.style.zIndex = '2'; }
         el.style.overflowX = 'hidden';
         window.getSelection()?.removeAllRanges();
       }, 400);
@@ -209,7 +209,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
       if (td.timer) { clearTimeout(td.timer); td.timer = null; }
       if (td.active && td.id) {
         const btn = el.querySelector(`[data-sub-id="${td.id}"]`) as HTMLElement | null;
-        if (btn) btn.style.opacity = '';
+        if (btn) { btn.style.transform = ''; btn.style.boxShadow = ''; btn.style.borderColor = ''; btn.style.zIndex = ''; }
         el.style.overflowX = '';
         if (dragOrderRef.current) syncOrderToServer(dragOrderRef.current);
       }
