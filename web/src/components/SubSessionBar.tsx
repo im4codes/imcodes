@@ -151,6 +151,87 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
     const sessionMap = new Map(subSessions.map((s) => [s.id, s]));
     return dragOrder.map((id) => sessionMap.get(id)).filter(Boolean) as SubSession[];
   }, [subSessions, dragOrder]);
+  const orderedSessionsRef = useRef(orderedSessions);
+  orderedSessionsRef.current = orderedSessions;
+  const dragOrderRef = useRef(dragOrder);
+  dragOrderRef.current = dragOrder;
+
+  // Touch-based reorder for collapsed bar — must use addEventListener({ passive: false })
+  // so touchmove can preventDefault (passive listeners can't).
+  useEffect(() => {
+    const el = collapsedBarRef.current;
+    if (!el) return;
+    const td = touchDragRef.current;
+
+    const findBtnId = (target: EventTarget | null): string | null => {
+      let node = target as HTMLElement | null;
+      while (node && node !== el) { if (node.dataset.subId) return node.dataset.subId; node = node.parentElement; }
+      return null;
+    };
+
+    const onStart = (e: TouchEvent) => {
+      const id = findBtnId(e.target);
+      if (!id) return;
+      td.timer = setTimeout(() => {
+        td.id = id;
+        td.active = true;
+        setDragOrder(orderedSessionsRef.current.map((s) => s.id));
+        const btn = el.querySelector(`[data-sub-id="${id}"]`) as HTMLElement | null;
+        if (btn) btn.style.opacity = '0.5';
+        el.style.overflowX = 'hidden';
+        window.getSelection()?.removeAllRanges();
+      }, 400);
+    };
+
+    const onMove = (e: TouchEvent) => {
+      if (td.timer && !td.active) { clearTimeout(td.timer); td.timer = null; return; }
+      if (!td.active || !td.id) return;
+      e.preventDefault(); // works because { passive: false }
+      const touch = e.touches[0];
+      const targetEl = document.elementFromPoint(touch.clientX, touch.clientY);
+      const overId = findBtnId(targetEl);
+      if (overId && overId !== td.id) {
+        const draggedId = td.id;
+        setDragOrder((prev) => {
+          const ids = prev ?? orderedSessionsRef.current.map((s) => s.id);
+          const from = ids.indexOf(draggedId);
+          const to = ids.indexOf(overId);
+          if (from === -1 || to === -1) return prev;
+          const next = [...ids];
+          next.splice(from, 1);
+          next.splice(to, 0, draggedId);
+          return next;
+        });
+      }
+    };
+
+    const onEnd = () => {
+      if (td.timer) { clearTimeout(td.timer); td.timer = null; }
+      if (td.active && td.id) {
+        const btn = el.querySelector(`[data-sub-id="${td.id}"]`) as HTMLElement | null;
+        if (btn) btn.style.opacity = '';
+        el.style.overflowX = '';
+        if (dragOrderRef.current) syncOrderToServer(dragOrderRef.current);
+      }
+      td.id = null;
+      td.active = false;
+    };
+
+    const onContext = (e: Event) => { if (td.active) e.preventDefault(); };
+
+    el.addEventListener('touchstart', onStart, { passive: true });
+    el.addEventListener('touchmove', onMove, { passive: false });
+    el.addEventListener('touchend', onEnd);
+    el.addEventListener('touchcancel', onEnd);
+    el.addEventListener('contextmenu', onContext);
+    return () => {
+      el.removeEventListener('touchstart', onStart);
+      el.removeEventListener('touchmove', onMove);
+      el.removeEventListener('touchend', onEnd);
+      el.removeEventListener('touchcancel', onEnd);
+      el.removeEventListener('contextmenu', onContext);
+    };
+  }, [collapsed, syncOrderToServer]);
 
   useEffect(() => {
     if (!ws) return;
@@ -377,82 +458,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
 
       {/* Collapsed: compact buttons (all platforms) — long-press to reorder */}
       {collapsed && subSessions.length > 0 && (
-        <div class="subsession-bar" style={{ borderTop: 'none' }} ref={collapsedBarRef}
-          onContextMenu={(e) => { if (touchDragRef.current.active) e.preventDefault(); }}
-          onTouchStart={(e) => {
-            const el = collapsedBarRef.current;
-            if (!el) return;
-            let node = e.target as HTMLElement | null;
-            let id: string | null = null;
-            while (node && node !== el) { if (node.dataset.subId) { id = node.dataset.subId; break; } node = node.parentElement; }
-            if (!id) return;
-            const td = touchDragRef.current;
-            td.timer = setTimeout(() => {
-              td.id = id;
-              td.active = true;
-              setDragOrder(orderedSessions.map((s) => s.id));
-              const btn = el.querySelector(`[data-sub-id="${id}"]`) as HTMLElement | null;
-              if (btn) btn.style.opacity = '0.5';
-              el.style.overflowX = 'hidden';
-              // Prevent text selection context menu on iOS
-              if (window.getSelection) window.getSelection()?.removeAllRanges();
-            }, 400);
-          }}
-          onTouchMove={(e) => {
-            const td = touchDragRef.current;
-            if (td.timer && !td.active) { clearTimeout(td.timer); td.timer = null; return; }
-            if (!td.active || !td.id) return;
-            e.preventDefault();
-            const touch = e.touches[0];
-            const targetEl = document.elementFromPoint(touch.clientX, touch.clientY);
-            let node = targetEl as HTMLElement | null;
-            const el = collapsedBarRef.current;
-            let overId: string | null = null;
-            while (node && node !== el) { if (node.dataset.subId) { overId = node.dataset.subId; break; } node = node.parentElement; }
-            if (overId && overId !== td.id) {
-              const draggedId = td.id;
-              setDragOrder((prev) => {
-                const ids = prev ?? orderedSessions.map((s) => s.id);
-                const from = ids.indexOf(draggedId);
-                const to = ids.indexOf(overId!);
-                if (from === -1 || to === -1) return prev;
-                const next = [...ids];
-                next.splice(from, 1);
-                next.splice(to, 0, draggedId);
-                return next;
-              });
-            }
-          }}
-          onTouchEnd={() => {
-            const td = touchDragRef.current;
-            if (td.timer) { clearTimeout(td.timer); td.timer = null; }
-            if (td.active && td.id) {
-              const el = collapsedBarRef.current;
-              if (el) {
-                const btn = el.querySelector(`[data-sub-id="${td.id}"]`) as HTMLElement | null;
-                if (btn) btn.style.opacity = '';
-                el.style.overflowX = '';
-              }
-              if (dragOrder) syncOrderToServer(dragOrder);
-            }
-            td.id = null;
-            td.active = false;
-          }}
-          onTouchCancel={() => {
-            const td = touchDragRef.current;
-            if (td.timer) { clearTimeout(td.timer); td.timer = null; }
-            if (td.active && td.id) {
-              const el = collapsedBarRef.current;
-              if (el) {
-                const btn = el.querySelector(`[data-sub-id="${td.id}"]`) as HTMLElement | null;
-                if (btn) btn.style.opacity = '';
-                el.style.overflowX = '';
-              }
-            }
-            td.id = null;
-            td.active = false;
-          }}
-        >
+        <div class="subsession-bar" style={{ borderTop: 'none' }} ref={collapsedBarRef}>
           {orderedSessions.map((sub) => {
             const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
             const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
