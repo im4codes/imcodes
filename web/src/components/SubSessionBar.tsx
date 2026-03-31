@@ -312,15 +312,19 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
         )}
         {/* Mobile: compact stats in collapsed toolbar */}
         {collapsed && stats && (() => {
-          const fmt = (b: number) => { const g = b / (1024 ** 3); return g >= 1 ? `${g.toFixed(1)}G` : `${(b / (1024 ** 2)).toFixed(0)}M`; };
-          const memUsed = fmt(stats.memUsed);
-          const memTotal = fmt(stats.memTotal);
+          const totalGb = stats.memTotal / (1024 ** 3);
+          const useG = totalGb >= 1;
+          const div = useG ? 1024 ** 3 : 1024 ** 2;
+          const unit = useG ? 'G' : 'M';
+          const memUsed = (stats.memUsed / div).toFixed(1);
+          const memTotal = useG ? totalGb.toFixed(1) : (stats.memTotal / div).toFixed(0);
+          const ei = { fontSize: '0.65em', verticalAlign: 'middle' } as const;
           return (
-            <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`} style={{ whiteSpace: 'nowrap', fontSize: 10 }}>
+            <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal}${unit} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`} style={{ whiteSpace: 'nowrap', fontSize: 10 }}>
               {stats.daemonVersion && <span style={{ color: '#94a3b8' }}>v{stats.daemonVersion} </span>}
-              <span style={{ color: stats.cpu > 80 ? '#f87171' : stats.cpu > 50 ? '#fbbf24' : '#4ade80' }}><span style={{ fontSize: 8 }}>⚙️</span>{stats.cpu}%</span>
+              <span style={{ color: stats.cpu > 80 ? '#f87171' : stats.cpu > 50 ? '#fbbf24' : '#4ade80' }}><span style={ei}>⚙️</span>{stats.cpu}%</span>
               {' '}
-              <span style={{ color: '#60a5fa' }}><span style={{ fontSize: 8 }}>🧠</span>{memUsed}/{memTotal}</span>
+              <span style={{ color: '#60a5fa' }}><span style={ei}>🧠</span>{memUsed}/{memTotal}{unit}</span>
               {' '}
               <span style={{ color: '#a78bfa' }}>≡{stats.load1}</span>
             </span>
