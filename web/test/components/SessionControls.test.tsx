@@ -142,7 +142,7 @@ describe('SessionControls', () => {
     expect(input.textContent).toBe('');
   });
 
-  it('stop action appears in menu and calls ws.sendSessionCommand after confirm dialog', () => {
+  it('stop action requires 3-level confirmation for main session', () => {
     const ws = makeWs();
     // Mock window.confirm to auto-accept
     const origConfirm = window.confirm;
@@ -151,12 +151,17 @@ describe('SessionControls', () => {
       render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session', project: 'my-project' })} quickData={makeQuickData() as any} />);
       // Open the ⋯ menu
       fireEvent.click(screen.getByTitle('actions'));
-      // Click stop once (triggers confirm mode — button text changes to confirm_stop)
+      // Click 1: triggers level 1 (warn)
       const stopBtn = screen.getByRole('button', { name: /stop/i });
       fireEvent.click(stopBtn);
-      // Click the now-confirmed stop button again (triggers window.confirm dialog)
-      const confirmBtn = screen.getByRole('button', { name: /stop/i });
-      fireEvent.click(confirmBtn);
+      expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+      // Click 2: triggers level 2 (danger)
+      const warnBtn = screen.getByRole('button', { name: /stop/i });
+      fireEvent.click(warnBtn);
+      expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+      // Click 3: triggers window.confirm dialog → executes stop
+      const dangerBtn = screen.getByRole('button', { name: /stop/i });
+      fireEvent.click(dangerBtn);
       expect(ws.sendSessionCommand).toHaveBeenCalledWith('stop', { project: 'my-project' });
     } finally {
       window.confirm = origConfirm;

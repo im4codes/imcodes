@@ -568,6 +568,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       brainType: agentType as ProjectConfig['brainType'],
       workerTypes: [],
       extraEnv,
+      ccPreset: ccPresetName,
     };
     await startProject(config);
     logger.info({ project }, 'Session started via web');
@@ -1257,6 +1258,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
 
   const ccPreset = cmd.ccPreset as string | null | undefined;
   const subCcInitPrompt = cmd.ccInitPrompt as string | null | undefined;
+  const description = cmd.description as string | null | undefined;
 
   try {
     await startSubSession({
@@ -1269,6 +1271,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
       geminiSessionId,
       ccPreset,
       ccInitPrompt: subCcInitPrompt,
+      description,
       fresh: type === 'gemini' && !geminiSessionId,
       _fileSnapshot: fileSnapshot,
       _onGeminiDiscovered: fileSnapshot ? (sessionId: string) => {

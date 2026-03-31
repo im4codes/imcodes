@@ -103,22 +103,31 @@ export async function ensureClaudeSessionFile(sessionId: string, cwd: string): P
   const dir = dirname(filePath);
   await mkdir(dir, { recursive: true });
 
-  const timestamp = new Date().toISOString();
-  const rawMemory = await readProjectMemory(cwd).catch(() => null);
-  const memory = appendAgentSendDocs(rawMemory);
+  // Keep content minimal — CC reads CLAUDE.md on its own.
+  // Complex content (with special chars from CLAUDE.md/memory) can crash CC's session picker.
+  const content = `Restored/bootstrapped Claude Code session for project: ${cwd}`;
+  // CC ≥2.1.88: --resume crashes if the JSONL key order or spacing differs from
+  // CC's own output format. Line 1 (user) uses JSON.stringify (key order matches CC).
+  // Lines 2+3 use hardcoded templates to guarantee byte-identical format.
+  const { randomUUID } = await import('node:crypto');
+  const ts = new Date(Date.now() - 3600_000).toISOString();
   const seedLine = JSON.stringify({
     type: 'user',
-    message: {
-      role: 'user',
-      content: buildSeedText(cwd, memory),
-    },
-    timestamp,
+    message: { role: 'user', content },
+    timestamp: ts,
     cwd,
     sessionId,
     version: '2.1.79',
   });
-  await writeFile(filePath, seedLine + '\n', 'utf8');
-  logger.info({ sessionId, filePath, hasMemory: !!memory }, 'jsonl-watcher: created Claude seed transcript');
+  const msgId = randomUUID();
+  const escapedCwd = JSON.stringify(cwd).slice(1, -1);
+  const data = [
+    seedLine,
+    `{"type":"file-history-snapshot","messageId":"${msgId}","snapshot":{"messageId":"${msgId}","trackedFileBackups":{},"timestamp":"${ts}"},"isSnapshotUpdate":false}`,
+    `{"parentUuid":null,"isSidechain":false,"type":"assistant","uuid":"${randomUUID()}","timestamp":"${ts}","message":{"id":"${randomUUID()}","container":null,"model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","stop_sequence":"","type":"message","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":null,"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":null,"iterations":null,"speed":null},"content":[{"type":"text","text":"No response requested."}],"context_management":null},"isApiErrorMessage":false,"userType":"external","entrypoint":"cli","cwd":"${escapedCwd}","sessionId":"${sessionId}","version":"2.1.81","gitBranch":"master"}`,
+  ].join('\n') + '\n';
+  await writeFile(filePath, data, 'utf8');
+  logger.info({ sessionId, filePath }, 'jsonl-watcher: created Claude seed transcript');
   return filePath;
 }
 

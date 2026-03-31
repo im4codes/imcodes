@@ -1473,12 +1473,19 @@ export function App() {
 
   const handleStopProject = useCallback((project: string) => {
     if (!wsRef.current) return;
+    // Close all sub-sessions belonging to this project first
+    const mainSessionName = `deck_${project}_brain`;
+    for (const sub of subSessionsRef.current) {
+      if (sub.parentSession === mainSessionName) {
+        closeSubSession(sub.id);
+      }
+    }
     wsRef.current.sendSessionCommand('stop', { project });
     setSessions((prev) => prev.filter((s) => s.project !== project));
     if (sessions.some((s) => s.project === project && s.name === activeSession)) {
       setActiveSession(null);
     }
-  }, [sessions, activeSession, setActiveSession]);
+  }, [sessions, activeSession, setActiveSession, closeSubSession]);
 
   const handleRestartProject = useCallback((project: string, fresh?: boolean) => {
     wsRef.current?.sendSessionCommand('restart', { project, ...(fresh ? { fresh: true } : {}) });

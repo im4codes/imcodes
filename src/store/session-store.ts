@@ -42,6 +42,8 @@ export interface SessionRecord {
   providerSessionId?: string;
   /** Session description — used for persona/system prompt injection. */
   description?: string;
+  /** CC env preset name — persisted so respawn can re-inject the same env vars. */
+  ccPreset?: string;
   /** Human-readable label for UI display (e.g. "OC:main", "discord:#general"). */
   label?: string;
   /** True for sessions created by the user (not auto-synced from provider).

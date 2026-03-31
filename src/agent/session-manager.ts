@@ -22,12 +22,11 @@ import {
 } from '../store/session-store.js';
 import logger from '../util/logger.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
-import { startWatching, startWatchingFile, stopWatching, isWatching, ensureClaudeSessionFile, findJsonlPathBySessionId } from '../daemon/jsonl-watcher.js';
+import { startWatching, startWatchingFile, stopWatching, isWatching, findJsonlPathBySessionId } from '../daemon/jsonl-watcher.js';
 import { startWatching as startCodexWatching, startWatchingSpecificFile as startCodexWatchingFile, startWatchingById as startCodexWatchingById, stopWatching as stopCodexWatching, isWatching as isCodexWatching, findRolloutPathByUuid, extractNewRolloutUuid, ensureSessionFile as ensureCodexSessionFile } from '../daemon/codex-watcher.js';
 import { startWatching as startGeminiWatching, startWatchingLatest as startGeminiWatchingLatest, stopWatching as stopGeminiWatching, isWatching as isGeminiWatching } from '../daemon/gemini-watcher.js';
 import { randomUUID } from 'node:crypto';
 
-import { existsSync } from 'node:fs';
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
 
@@ -125,6 +124,8 @@ export interface ProjectConfig {
   fresh?: boolean;
   /** Extra env vars merged into session launch (e.g. CC API preset). */
   extraEnv?: Record<string, string>;
+  /** CC env preset name — persisted for respawn env injection. */
+  ccPreset?: string;
 }
 
 export function getDriver(type: AgentType): AgentDriver {
@@ -146,9 +147,9 @@ export function sessionName(project: string, role: 'brain' | `w${number}`): stri
 
 /** Start all sessions for a project (brain + workers). */
 export async function startProject(config: ProjectConfig): Promise<void> {
-  const { name, dir, brainType, workerTypes, fresh, extraEnv } = config;
+  const { name, dir, brainType, workerTypes, fresh, extraEnv, ccPreset } = config;
 
-  await launchSession({ name: sessionName(name, 'brain'), projectName: name, role: 'brain', agentType: brainType, projectDir: dir, fresh, extraEnv });
+  await launchSession({ name: sessionName(name, 'brain'), projectName: name, role: 'brain', agentType: brainType, projectDir: dir, fresh, extraEnv, ccPreset });
 
   for (let i = 0; i < workerTypes.length; i++) {
     const role = `w${i + 1}` as `w${number}`;
@@ -505,26 +506,23 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     logger.info({ session: record.name, ccSessionId }, 'Allocated missing ccSessionId before respawn');
   }
 
-  if (record.agentType === 'claude-code' && ccSessionId) {
-    await ensureClaudeSessionFile(ccSessionId, projectDir).catch((e) =>
-      logger.warn({ err: e, session: record.name, ccSessionId }, 'Failed to ensure Claude seed session file before respawn'),
-    );
+  // Respawn: CC already has a real JSONL with conversation history.
+  // Use --resume (CC's own JSONL works fine, only our seed files crash).
+  // --session-id would reject "already in use".
+  const cmd = driver.buildResumeCommand(record.name, { cwd: projectDir, ccSessionId, codexSessionId: record.codexSessionId, geminiSessionId: record.geminiSessionId })
+    ?? driver.buildLaunchCommand(record.name, { cwd: projectDir, ccSessionId, codexSessionId: record.codexSessionId, geminiSessionId: record.geminiSessionId });
+
+  // Re-inject CC preset env on respawn (same env as initial launch)
+  const mergedEnv: Record<string, string> = { IMCODES_SESSION: record.name };
+  if (record.ccPreset && record.agentType === 'claude-code') {
+    const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
+    const presetEnv = await resolvePresetEnv(record.ccPreset);
+    Object.assign(mergedEnv, presetEnv);
   }
 
-  // Build the resume command (same logic as launchSession)
-  let cmd: string;
-  if (record.agentType === 'claude-code' && ccSessionId) {
-    const jsonlPath = findJsonlPathBySessionId(projectDir, ccSessionId);
-    if (existsSync(jsonlPath)) {
-      cmd = driver.buildResumeCommand(record.name, { cwd: projectDir, ccSessionId }) ?? driver.buildLaunchCommand(record.name, { cwd: projectDir, ccSessionId });
-    } else {
-      cmd = driver.buildLaunchCommand(record.name, { cwd: projectDir, ccSessionId });
-    }
-  } else {
-    cmd = driver.buildResumeCommand(record.name, { cwd: projectDir, ccSessionId, codexSessionId: record.codexSessionId, geminiSessionId: record.geminiSessionId }) ?? driver.buildLaunchCommand(record.name, { cwd: projectDir, ccSessionId, codexSessionId: record.codexSessionId, geminiSessionId: record.geminiSessionId });
-  }
-
-  await respawnPane(record.name, cmd);
+  // respawnPane doesn't support env — kill + newSession instead
+  await killSession(record.name).catch(() => {});
+  await newSession(record.name, cmd, { cwd: projectDir, env: mergedEnv });
 
   const updated: SessionRecord = {
     ...record,
@@ -541,7 +539,24 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     geminiSessionId: record.geminiSessionId,
   });
 
-  logger.info({ session: record.name, agentType: record.agentType }, 'Respawned dead pane');
+  // Re-inject description + preset init message after respawn
+  const initParts: string[] = [];
+  if (record.description) {
+    initParts.push(`[Context — absorb silently, do not respond to this message]\n${record.description}`);
+  }
+  if (record.ccPreset && record.agentType === 'claude-code') {
+    const { getPreset, getPresetInitMessage } = await import('../daemon/cc-presets.js');
+    const preset = await getPreset(record.ccPreset);
+    if (preset) initParts.push(getPresetInitMessage(preset));
+  }
+  if (initParts.length > 0) {
+    const initMsg = initParts.join('\n\n');
+    setTimeout(async () => {
+      try { await sendKeys(record.name, initMsg); } catch { /* session may not be ready */ }
+    }, 5000);
+  }
+
+  logger.info({ session: record.name, agentType: record.agentType, ccPreset: record.ccPreset }, 'Respawned session');
   return true;
 }
 
@@ -565,6 +580,8 @@ export interface LaunchOpts {
   label?: string;
   /** Session description for transport sessions (persona/system prompt injection). */
   description?: string;
+  /** CC env preset name — resolved to env vars at launch, persisted for respawn. */
+  ccPreset?: string;
   /** Bind to an existing remote session key instead of creating a new one. */
   bindExistingKey?: string;
   /** Skip the sessions.create RPC — session already exists on provider (auto-sync bind). */
@@ -747,11 +764,8 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     // If exists and no stored UUID: ccSessionId stays undefined → fall back to dir scan
   }
 
-  if (agentType === 'claude-code' && ccSessionId) {
-    await ensureClaudeSessionFile(ccSessionId, projectDir).catch((e) =>
-      logger.warn({ err: e, session: name, ccSessionId }, 'Failed to ensure Claude seed session file'),
-    );
-  }
+  // No seed file creation for CC — CC ≥2.1.88 crashes on --resume with our seed format.
+  // --session-id lets CC create its own JSONL on first interaction.
 
   // For Codex sessions: resolve codexSessionId from opts or store.
   // If the stored UUID's rollout file no longer exists on disk, clear it so we
@@ -798,19 +812,9 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   }
 
   if (!exists) {
-    // For CC sessions with an existing JSONL file: use --resume instead of --session-id.
-    // Claude 2.1+ rejects --session-id when the UUID already has a JSONL on disk ("already in use").
-    let launchCmd: string;
-    if (agentType === 'claude-code' && ccSessionId) {
-      const jsonlPath = findJsonlPathBySessionId(projectDir, ccSessionId);
-      if (existsSync(jsonlPath)) {
-        launchCmd = driver.buildResumeCommand(name, { cwd: projectDir, ccSessionId }) ?? driver.buildLaunchCommand(name, { cwd: projectDir, fresh, ccSessionId, codexSessionId, geminiSessionId });
-      } else {
-        launchCmd = driver.buildLaunchCommand(name, { cwd: projectDir, fresh, ccSessionId, codexSessionId, geminiSessionId });
-      }
-    } else {
-      launchCmd = driver.buildLaunchCommand(name, { cwd: projectDir, fresh, ccSessionId, codexSessionId, geminiSessionId });
-    }
+    // New session: use --session-id for CC (fresh UUID, no JSONL exists yet).
+    // No seed file creation — CC ≥2.1.88 crashes on --resume with our seed format.
+    const launchCmd = driver.buildLaunchCommand(name, { cwd: projectDir, fresh, ccSessionId, codexSessionId, geminiSessionId });
     await newSession(name, launchCmd, { cwd: projectDir, env: mergedEnv });
     logger.info({ session: name, agentType, ccSessionId, codexSessionId, geminiSessionId }, 'Launched session');
   }
@@ -855,6 +859,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ...(ccSessionId ? { ccSessionId } : {}),
       ...(codexSessionId ? { codexSessionId } : {}),
       ...(geminiSessionId ? { geminiSessionId } : {}),
+      ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),
     };
     upsertSession(record);
     emitSessionPersist(record, name);

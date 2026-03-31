@@ -763,11 +763,12 @@ describe('WsBridge', () => {
       expect(browserWs.sentStrings).toHaveLength(0);
     });
 
-    it('unknown message type → discarded, not broadcast (default-deny)', async () => {
+    it('unknown message type → broadcast to all browsers (default-allow)', async () => {
       const { daemonWs, browserWs } = await setupBrowserNoSub();
       daemonWs.emit('message', JSON.stringify({ type: 'future.unknown.type', data: 'secret' }));
       await flushAsync();
-      expect(browserWs.sentStrings).toHaveLength(0);
+      expect(browserWs.sentStrings).toHaveLength(1);
+      expect(JSON.parse(browserWs.sentStrings[0]).type).toBe('future.unknown.type');
     });
 
     it('session_list → broadcast to all browsers (whitelist)', async () => {
@@ -1289,14 +1290,14 @@ describe('WsBridge', () => {
       expect(transportMsgs.length).toBe(0);
     });
 
-    it('discards unknown message types (default-deny)', async () => {
+    it('forwards unknown message types to browsers (default-allow)', async () => {
       const { daemonWs, browserWs } = await setupAuthenticatedBridge();
       browserWs.sent.length = 0;
       daemonWs.emit('message', JSON.stringify({ type: 'totally.unknown.type', foo: 'bar' }));
       await flushAsync();
-      // No message should reach browser
+      // Default-allow: unknown types are broadcast to all browsers
       const msgs = browserWs.sentStrings.filter(s => JSON.parse(s).type === 'totally.unknown.type');
-      expect(msgs.length).toBe(0);
+      expect(msgs.length).toBe(1);
     });
 
     it('provider.status broadcasts to ALL connected browsers', async () => {

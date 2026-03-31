@@ -32,6 +32,8 @@ export interface SubSessionRecord {
   ccPreset?: string | null;
   /** Extra init prompt injected after session starts. */
   ccInitPrompt?: string | null;
+  /** Session description/persona — injected as background info on start and respawn. */
+  description?: string | null;
   fresh?: boolean;
   _fileSnapshot?: Set<string>;
   _onGeminiDiscovered?: (sessionId: string) => void;
@@ -70,18 +72,12 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     ...(sub.fresh ? { fresh: true } : {}),
   } as any);
 
+  // Pre-claim the JSONL path so the main session's watchDir doesn't steal it.
+  // Don't create seed files or use --resume — CC ≥2.1.88 crashes with our seed format.
+  // --session-id lets CC create its own JSONL on first interaction.
   if (agentType === 'claude-code' && sub.ccSessionId && sub.cwd) {
-    const { ensureClaudeSessionFile, preClaimFile, findJsonlPathBySessionId } = await import('./jsonl-watcher.js');
-    // Pre-claim BEFORE creating the seed file so the main session's watchDir
-    // cannot steal the new file during the gap between creation and watcher start.
+    const { preClaimFile, findJsonlPathBySessionId } = await import('./jsonl-watcher.js');
     preClaimFile(sessionName, findJsonlPathBySessionId(sub.cwd, sub.ccSessionId));
-    await ensureClaudeSessionFile(sub.ccSessionId, sub.cwd).catch((e) =>
-      logger.warn({ err: e, sessionName, ccSessionId: sub.ccSessionId }, 'Failed to ensure Claude seed session file for sub-session'),
-    );
-    launchCmd = driver.buildResumeCommand(sessionName, {
-      cwd: sub.cwd ?? undefined,
-      ccSessionId: sub.ccSessionId ?? undefined,
-    } as any) ?? launchCmd;
   }
 
   // Resolve CC env preset if specified
@@ -97,9 +93,12 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
 
   await newSession(sessionName, launchCmd, { cwd: sub.cwd ?? undefined, env: launchEnv });
 
-  // Inject preset init message + extra init prompt after session starts
-  let initMsg = presetInitMessage ?? '';
-  if (sub.ccInitPrompt) initMsg = initMsg ? `${initMsg}\n\n${sub.ccInitPrompt}` : sub.ccInitPrompt;
+  // Inject description + preset init message + extra init prompt after session starts
+  const initParts: string[] = [];
+  if (sub.description) initParts.push(`[Context — absorb silently, do not respond to this message]\n${sub.description}`);
+  if (presetInitMessage) initParts.push(presetInitMessage);
+  if (sub.ccInitPrompt) initParts.push(sub.ccInitPrompt);
+  const initMsg = initParts.join('\n\n');
   if (initMsg) {
     const { sendKeys } = await import('../agent/tmux.js');
     setTimeout(async () => {
@@ -117,6 +116,8 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     codexSessionId: sub.codexSessionId ?? undefined,
     geminiSessionId: sub.geminiSessionId ?? undefined,
     parentSession: sub.parentSession ?? undefined,
+    ccPreset: sub.ccPreset ?? undefined,
+    description: sub.description ?? undefined,
     restarts: 0, restartTimestamps: [], createdAt: Date.now(), updatedAt: Date.now()
   });
 

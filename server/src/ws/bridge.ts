@@ -570,16 +570,10 @@ export class WsBridge {
   // ── Relay helpers ──────────────────────────────────────────────────────────
 
   /**
-   * Relay a daemon→browser message using a strict default-deny routing policy.
-   *
-   * Rules:
-   *  - Session-scoped types MUST carry a session identifier. If missing → discard + warn.
-   *  - Only explicitly whitelisted types may be broadcast to all browsers.
-   *  - Any unrecognised type is discarded (never broadcast).
-   *
-   * Broadcast whitelist: session_list, session_event, daemon.reconnected
-   * Session-scoped:      terminal_update, timeline.*, command.ack,
-   *                      subsession.response, session.idle/notification/tool
+   * Relay a daemon→browser message. Default-allow: unrecognised types are
+   * broadcast to all browsers. Session-scoped types still require a session
+   * identifier (missing → discard + warn). DB-only types (discussion.save,
+   * subsession.sync, etc.) are consumed server-side and never forwarded.
    */
   private relayToBrowsers(msg: Record<string, unknown>): void {
     const type = msg.type as string;
@@ -978,18 +972,6 @@ export class WsBridge {
       return;
     }
 
-    // ── CC presets responses → broadcast to browsers ────────────
-    if (type === 'cc.presets.list_response' || type === 'cc.presets.save_response') {
-      this.broadcastToBrowsers(JSON.stringify(msg));
-      return;
-    }
-
-    // ── P2P discussion list/read responses → broadcast to browsers ────────────
-    if (type === 'p2p.list_discussions_response' || type === 'p2p.read_discussion_response') {
-      this.broadcastToBrowsers(JSON.stringify(msg));
-      return;
-    }
-
     // Repo messages: use shared constants to prevent type-name drift between daemon and bridge
     if ((REPO_RELAY_TYPES as Set<string>).has(type)) {
       this.broadcastToBrowsers(JSON.stringify(msg));
@@ -1040,8 +1022,8 @@ export class WsBridge {
       return;
     }
 
-    // ── Default-deny: unknown type → discard ──────────────────────────────────
-    logger.warn({ serverId: this.serverId, type }, 'relayToBrowsers: unknown message type — discarded (default-deny)');
+    // ── Default-allow: forward unrecognised types to all browsers ─────────────
+    this.broadcastToBrowsers(JSON.stringify(msg));
   }
 
   private routeBinaryFrame(data: Buffer): void {

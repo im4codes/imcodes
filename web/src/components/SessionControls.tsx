@@ -551,43 +551,50 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (!ws || !activeSession) return;
     const isSub = !!onSubStop;
 
-    if (confirm !== action) {
-      // Step 1 — first click: button text changes to warn
-      startConfirm(action, 1);
+    if (isSub) {
+      // Sub-session: single click, no multi-step confirmation
+      if (action === 'stop') {
+        onSubStop();
+      } else if (action === 'restart') {
+        onSubRestart ? onSubRestart() : ws.sendSessionCommand('restart', { project: activeSession.project });
+      } else {
+        onSubNew ? onSubNew() : ws.sendSessionCommand('restart', { project: activeSession.project, fresh: true });
+      }
+      setMenuOpen(false);
+      resetConfirm();
+      onAfterAction?.();
       return;
     }
 
-    if (isSub && confirmLevel < 2) {
-      // Step 2 (sub-session only) — second click: button text changes to danger
+    // Main session: 3-level confirmation (click → warn → danger → confirm dialog)
+    if (confirm !== action) {
+      startConfirm(action, 1);
+      return;
+    }
+    if (confirmLevel < 2) {
       startConfirm(action, 2);
       return;
     }
 
-    // Final step — show window.confirm dialog with full details
-    const subParams = isSub ? { type: activeSession.agentType ?? '?', label: activeSession.label || '—', name: activeSession.name } : undefined;
+    // Level 3 — show window.confirm dialog with full details
     const confirmMsg = action === 'stop'
-      ? (isSub ? t('session.confirm_sub_stop_dialog', subParams) : t('session.confirm_stop_dialog'))
+      ? t('session.confirm_stop_dialog')
       : action === 'restart'
-        ? (isSub ? t('session.confirm_sub_restart_dialog', subParams) : t('session.confirm_restart_dialog'))
-        : (isSub ? t('session.confirm_sub_new_dialog', subParams) : t('session.confirm_new_dialog'));
+        ? t('session.confirm_restart_dialog')
+        : t('session.confirm_new_dialog');
     if (!window.confirm(confirmMsg)) {
       resetConfirm();
       return;
     }
+    // Main session actions (sub already handled above)
     if (action === 'restart') {
-      onSubRestart
-        ? onSubRestart()
-        : ws.sendSessionCommand('restart', { project: activeSession.project });
+      ws.sendSessionCommand('restart', { project: activeSession.project });
     } else if (action === 'new') {
-      onSubNew
-        ? onSubNew()
-        : ws.sendSessionCommand('restart', { project: activeSession.project, fresh: true });
+      ws.sendSessionCommand('restart', { project: activeSession.project, fresh: true });
     } else {
-      onSubStop
-        ? onSubStop()
-        : onStopProject
-          ? onStopProject(activeSession.project)
-          : ws.sendSessionCommand('stop', { project: activeSession.project });
+      onStopProject
+        ? onStopProject(activeSession.project)
+        : ws.sendSessionCommand('stop', { project: activeSession.project });
     }
     setMenuOpen(false);
     resetConfirm();
