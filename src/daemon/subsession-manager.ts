@@ -100,10 +100,10 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   await newSession(sessionName, launchCmd, { cwd: sub.cwd ?? undefined, env: launchEnv });
 
   // Rebind pipe-pane stream — on restart (stopSubSession killed the old tmux session),
-  // the streamer's pipe broke and rebind may have failed because the session didn't exist yet.
-  // Now the new session exists, so retryPipeIfSubscribers will reconnect.
+  // the streamer's pipe broke and scheduleRebind may have a pending timer that will fail.
+  // rebindSession clears old state + timers, then starts a fresh pipe.
   const { terminalStreamer } = await import('./terminal-streamer.js');
-  terminalStreamer.retryPipeIfSubscribers(sessionName);
+  void terminalStreamer.rebindSession(sessionName);
 
   // Auto-dismiss startup prompts, then inject init message
   const initParts: string[] = [];
