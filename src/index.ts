@@ -691,22 +691,20 @@ program
           try { execSync(`taskkill /f /pid ${pid}`, { stdio: 'ignore' }); } catch { /* not running */ }
         }
       } catch { /* no PID file */ }
-      // Check if the watchdog is running — if not, start it
+      // Ensure watchdog is running — it will restart the daemon in ~5s
       const vbs = resolve(homedir(), '.imcodes', 'daemon-launcher.vbs');
       let watchdogRunning = false;
       try {
         const taskInfo = execSync('schtasks /Query /TN imcodes-daemon /FO CSV /NH', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
         watchdogRunning = taskInfo.includes('Running');
       } catch { /* no scheduled task */ }
-      if (!watchdogRunning && existsSync(vbs)) {
-        spawn('wscript', [vbs], { detached: true, stdio: 'ignore' }).unref();
-      } else if (!watchdogRunning) {
-        // No watchdog at all — spawn daemon directly
-        const imcodesCmd = resolve(dirname(process.execPath), 'imcodes.cmd');
-        const bin = existsSync(imcodesCmd) ? imcodesCmd : 'imcodes';
-        spawn('cmd.exe', ['/c', 'start', '/b', '', bin, 'daemon'], {
-          detached: true, stdio: 'ignore', windowsHide: true,
-        }).unref();
+      if (!watchdogRunning) {
+        if (existsSync(vbs)) {
+          spawn('wscript', [vbs], { detached: true, stdio: 'ignore' }).unref();
+        } else {
+          console.error('Watchdog not found. Run "imcodes bind" first.');
+          process.exit(1);
+        }
       }
       console.log('Daemon will restart in ~5 seconds (via watchdog).');
     } else {
