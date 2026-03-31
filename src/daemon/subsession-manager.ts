@@ -101,11 +101,14 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   await newSession(sessionName, launchCmd, { cwd: sub.cwd ?? undefined, env: launchEnv });
 
   // Inject description + preset init message + extra init prompt after session starts
+  // All injected content is wrapped under a single silent-absorb prefix.
   const initParts: string[] = [];
-  if (sub.description) initParts.push(`[Context — absorb silently, do not respond to this message]\n${sub.description}`);
+  if (sub.description) initParts.push(sub.description);
   if (presetInitMessage) initParts.push(presetInitMessage);
   if (sub.ccInitPrompt) initParts.push(sub.ccInitPrompt);
-  const initMsg = initParts.join('\n\n');
+  const initMsg = initParts.length > 0
+    ? `[Context — absorb silently, do not respond to this message]\n${initParts.join('\n\n')}`
+    : '';
   if (initMsg) {
     const { sendKeys } = await import('../agent/tmux.js');
     setTimeout(async () => {

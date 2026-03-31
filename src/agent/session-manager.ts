@@ -541,16 +541,14 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
 
   // Re-inject description + preset init message after respawn
   const initParts: string[] = [];
-  if (record.description) {
-    initParts.push(`[Context — absorb silently, do not respond to this message]\n${record.description}`);
-  }
+  if (record.description) initParts.push(record.description);
   if (record.ccPreset && record.agentType === 'claude-code') {
     const { getPreset, getPresetInitMessage } = await import('../daemon/cc-presets.js');
     const preset = await getPreset(record.ccPreset);
     if (preset) initParts.push(getPresetInitMessage(preset));
   }
   if (initParts.length > 0) {
-    const initMsg = initParts.join('\n\n');
+    const initMsg = `[Context — absorb silently, do not respond to this message]\n${initParts.join('\n\n')}`;
     setTimeout(async () => {
       try { await sendKeys(record.name, initMsg); } catch { /* session may not be ready */ }
     }, 5000);
