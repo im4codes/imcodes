@@ -494,30 +494,21 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     return false;
   }
 
-  // Kill old session completely, then re-launch via the same path as new sessions.
-  // This avoids --resume issues and ensures env, postLaunch, init message all work identically.
-  await killSession(record.name).catch(() => {});
+  const driver = getDriver(record.agentType as AgentType);
+  const ccSessionId = record.ccSessionId;
+  const projectDir = record.projectDir;
+  const cmd = driver.buildResumeCommand(record.name, { cwd: projectDir, ccSessionId, codexSessionId: record.codexSessionId, geminiSessionId: record.geminiSessionId })
+    ?? driver.buildLaunchCommand(record.name, { cwd: projectDir, ccSessionId, codexSessionId: record.codexSessionId, geminiSessionId: record.geminiSessionId });
 
-  // Resolve CC preset env for re-injection
-  let extraEnv: Record<string, string> | undefined;
+  // Env injection: respawnPane doesn't support -e, prepend exports to the command
+  const mergedEnv: Record<string, string> = { IMCODES_SESSION: record.name };
   if (record.ccPreset && record.agentType === 'claude-code') {
     const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
-    extraEnv = await resolvePresetEnv(record.ccPreset);
+    Object.assign(mergedEnv, await resolvePresetEnv(record.ccPreset));
   }
-
-  await launchSession({
-    name: record.name,
-    projectName: record.projectName,
-    role: record.role as 'brain' | `w${number}`,
-    agentType: record.agentType as AgentType,
-    projectDir: record.projectDir,
-    ccSessionId: record.ccSessionId,
-    codexSessionId: record.codexSessionId,
-    geminiSessionId: record.geminiSessionId,
-    extraEnv,
-    ccPreset: record.ccPreset,
-    skipStore: true, // we update the store ourselves below
-  });
+  const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+  const envPrefix = Object.entries(mergedEnv).map(([k, v]) => `export ${k}=${sq(v)}`).join('; ');
+  await respawnPane(record.name, `${envPrefix}; ${cmd}`);
 
   const updated: SessionRecord = {
     ...record,
@@ -528,11 +519,20 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
   };
   upsertSession(updated);
 
-  // Re-inject description + preset init message after postLaunch completes
-  const driver = getDriver(record.agentType as AgentType);
+  startStructuredWatcher(record.name, record.agentType as AgentType, projectDir, {
+    ccSessionId,
+    codexSessionId: record.codexSessionId,
+    geminiSessionId: record.geminiSessionId,
+  });
+
+  // postLaunch (auto-dismiss startup prompts) + init message injection
   const injectInit = async () => {
-    // postLaunch already ran inside launchSession — wait a bit for agent to settle
-    await new Promise<void>((r) => setTimeout(r, 2000));
+    if (driver.postLaunch) {
+      await driver.postLaunch(
+        () => capturePane(record.name),
+        (key: string) => sendKey(record.name, key),
+      ).catch(() => {});
+    }
     const initParts: string[] = [];
     if (record.description) initParts.push(record.description);
     if (record.ccPreset && record.agentType === 'claude-code') {
@@ -804,20 +804,9 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
 
   if (!exists) {
     // CC: if JSONL already exists (restart via killSession+newSession), use --resume to
-    // continue the conversation. Otherwise use --session-id for fresh start.
-    let launchCmd: string;
-    if (agentType === 'claude-code' && ccSessionId) {
-      const jsonlPath = findJsonlPathBySessionId(projectDir, ccSessionId);
-      const { existsSync } = await import('node:fs');
-      if (existsSync(jsonlPath)) {
-        launchCmd = driver.buildResumeCommand(name, { cwd: projectDir, ccSessionId })
-          ?? driver.buildLaunchCommand(name, { cwd: projectDir, fresh, ccSessionId, codexSessionId, geminiSessionId });
-      } else {
-        launchCmd = driver.buildLaunchCommand(name, { cwd: projectDir, fresh, ccSessionId, codexSessionId, geminiSessionId });
-      }
-    } else {
-      launchCmd = driver.buildLaunchCommand(name, { cwd: projectDir, fresh, ccSessionId, codexSessionId, geminiSessionId });
-    }
+    // launchSession is only for NEW tmux sessions (--session-id for CC).
+    // Restarts go through respawnSession which uses respawnPane + --resume.
+    const launchCmd = driver.buildLaunchCommand(name, { cwd: projectDir, fresh, ccSessionId, codexSessionId, geminiSessionId });
     await newSession(name, launchCmd, { cwd: projectDir, env: mergedEnv });
     logger.info({ session: name, agentType, ccSessionId, codexSessionId, geminiSessionId }, 'Launched session');
   }
