@@ -375,12 +375,12 @@ export function useTimeline(
         // will bring back any messages that were actually processed.
         setEvents((prev) => {
           const cleaned = prev.filter((e) => !(e.type === 'user.message' && e.payload.pending));
-          if (cleaned.length !== prev.length && sessionId) eventsCache.set(sessionId, cleaned);
+          if (cleaned.length !== prev.length && cacheKey) eventsCache.set(cacheKey, cleaned);
           return cleaned;
         });
         if (ws && sessionId) {
           setRefreshing(true);
-          const cached = eventsCache.get(sessionId);
+          const cached = cacheKey ? eventsCache.get(cacheKey) : undefined;
           const afterTs = cached && cached.length > 0 ? Math.max(...cached.map((e) => e.ts)) : undefined;
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500, afterTs);
         }
@@ -394,7 +394,7 @@ export function useTimeline(
       // epoch mismatch and seq desync issues on mobile (app killed/backgrounded).
       if (msg.type === 'session.event' && (msg as { event: string }).event === 'connected') {
         if (ws && sessionId) {
-          const cached = eventsCache.get(sessionId);
+          const cached = cacheKey ? eventsCache.get(cacheKey) : undefined;
           const afterTs = cached && cached.length > 0 ? Math.max(...cached.map((e) => e.ts)) : undefined;
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500, afterTs);
         }
