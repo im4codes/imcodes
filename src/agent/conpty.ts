@@ -69,6 +69,8 @@ interface ConptySession {
   cols: number;                      // cached from spawn/resize
   rows: number;                      // cached from spawn/resize
   cwd: string;                       // cached from spawn (no runtime CWD query available)
+  echoStrip: string;                 // pending echo bytes to strip (ConPTY input passthrough)
+  echoTimer: ReturnType<typeof setTimeout> | null;
 }
 
 const sessions = new Map<string, ConptySession>();
@@ -143,17 +145,35 @@ export async function conptyNewSession(
     cols,
     rows,
     cwd,
+    echoStrip: '',
+    echoTimer: null,
   };
 
   pty.onData((data: string) => {
-    feedRingBuffer(session, data);
+    // ConPTY echo suppression: ConPTY passes VT input back as output (known issue).
+    // Windows Terminal strips this internally; we must do it ourselves.
+    // After pty.write(text), we expect the same bytes to appear in onData as phantom echo.
+    let cleaned = data;
+    if (session.echoStrip.length > 0) {
+      let i = 0;
+      while (i < cleaned.length && i < session.echoStrip.length && cleaned[i] === session.echoStrip[i]) {
+        i++;
+      }
+      if (i > 0) {
+        session.echoStrip = session.echoStrip.slice(i);
+        cleaned = cleaned.slice(i);
+      }
+    }
+    if (!cleaned) return;
+
+    feedRingBuffer(session, cleaned);
     // Keep recent raw output for snapshot (capturePaneVisible)
-    session.screenBuffer += data;
+    session.screenBuffer += cleaned;
     if (session.screenBuffer.length > MAX_SCREEN_BUFFER) {
       session.screenBuffer = session.screenBuffer.slice(-MAX_SCREEN_BUFFER);
     }
     for (const cb of session.onDataCallbacks) {
-      try { cb(data); } catch { /* don't let subscriber errors crash the session */ }
+      try { cb(cleaned); } catch { /* don't let subscriber errors crash the session */ }
     }
   });
 
@@ -208,6 +228,11 @@ export function conptyListSessions(): string[] {
 export function conptySendText(name: string, text: string): void {
   const session = sessions.get(name);
   if (!session) return;
+  // Track for echo suppression — ConPTY will pass this back as phantom output
+  session.echoStrip += text;
+  // Clear stale echo buffer after 500ms of no input
+  if (session.echoTimer) clearTimeout(session.echoTimer);
+  session.echoTimer = setTimeout(() => { session.echoStrip = ''; session.echoTimer = null; }, 500);
   session.pty.write(text);
 }
 
@@ -215,6 +240,7 @@ export function conptySendText(name: string, text: string): void {
 export function conptySendEnter(name: string): void {
   const session = sessions.get(name);
   if (!session) return;
+  session.echoStrip += '\r';
   session.pty.write('\r');
 }
 
@@ -227,17 +253,12 @@ export function conptySendKey(name: string, key: string): void {
   const session = sessions.get(name);
   if (!session) return;
   const escape = TMUX_KEY_TO_ESCAPE[key];
-  if (escape) {
-    session.pty.write(escape);
-  } else {
-    // Handle C-<letter> ctrl sequences
+  const data = escape ?? (() => {
     const ctrlMatch = key.match(/^C-([a-z])$/);
-    if (ctrlMatch) {
-      session.pty.write(String.fromCharCode(ctrlMatch[1].charCodeAt(0) - 96));
-    } else {
-      session.pty.write(key);
-    }
-  }
+    return ctrlMatch ? String.fromCharCode(ctrlMatch[1].charCodeAt(0) - 96) : key;
+  })();
+  session.echoStrip += data;
+  session.pty.write(data);
 }
 
 /**
