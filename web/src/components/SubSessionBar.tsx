@@ -105,11 +105,6 @@ function save(key: string, value: unknown) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* ignore */ }
 }
 
-function formatBytes(bytes: number): string {
-  const gb = bytes / (1024 ** 3);
-  return gb >= 1 ? `${gb.toFixed(1)}G` : `${(bytes / (1024 ** 2)).toFixed(0)}M`;
-}
-
 function formatUptime(seconds: number): string {
   const d = Math.floor(seconds / 86400);
   const h = Math.floor((seconds % 86400) / 3600);
@@ -287,32 +282,24 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
               ⚙
             </button>
             <span class="subcard-toolbar-label">Subs ({subSessions.length})</span>
-            {stats && (
-              <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`}>
-                {stats.daemonVersion && (
-                  <>
-                    <span style={{ color: '#94a3b8' }}>v{stats.daemonVersion}</span>
-                    <span style={{ color: '#94a3b8' }}> · </span>
-                  </>
-                )}
-                <span style={{ color: stats.cpu > 80 ? '#f87171' : stats.cpu > 50 ? '#fbbf24' : '#4ade80' }}>
-                  CPU {stats.cpu}%
-                </span>
-                <span style={{ color: '#94a3b8' }}> · </span>
-                <span style={{ color: '#60a5fa' }}>
-                  Mem {formatBytes(stats.memUsed)}/{formatBytes(stats.memTotal)}
-                </span>
-                <span style={{ color: '#94a3b8' }}> · </span>
-                <span style={{ color: '#a78bfa' }}>
-                  Load {stats.load1}
-                </span>
-                <span style={{ color: '#94a3b8' }}> · </span>
-                <span style={{ color: '#94a3b8' }}>
-                  {formatUptime(stats.uptime)}
-                </span>
-              </span>
-            )}
           </>
+        )}
+        {collapsed && stats && (
+          <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`}>
+            {stats.daemonVersion && (
+              <>
+                <span style={{ color: '#94a3b8' }}>v{stats.daemonVersion}</span>
+                <span style={{ color: '#94a3b8' }}> · </span>
+              </>
+            )}
+            <span style={{ color: stats.cpu > 80 ? '#f87171' : stats.cpu > 50 ? '#fbbf24' : '#4ade80' }}>
+              CPU {stats.cpu}%
+            </span>
+            <span style={{ color: '#94a3b8' }}> · </span>
+            <span style={{ color: '#a78bfa' }}>
+              Load {stats.load1}
+            </span>
+          </span>
         )}
         <button class="subcard-toolbar-add" onClick={onNew} title="New sub-session">+</button>
         {onViewDiscussions && (
