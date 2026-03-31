@@ -51,6 +51,26 @@ async function getNodePty(): Promise<NodePtyModule> {
   return nodePty;
 }
 
+// ── Command parser ──────────────────────────────────────────────────────────────
+
+/** Parse a command string into binary + args, handling quoted strings. */
+function parseCommand(cmd: string): { file: string; args: string[] } {
+  const tokens: string[] = [];
+  let current = '';
+  let inDouble = false;
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i];
+    if (ch === '"') { inDouble = !inDouble; continue; }
+    if (ch === ' ' && !inDouble) {
+      if (current) { tokens.push(current); current = ''; }
+      continue;
+    }
+    current += ch;
+  }
+  if (current) tokens.push(current);
+  return { file: tokens[0] ?? cmd, args: tokens.slice(1) };
+}
+
 // ── Session state ───────────────────────────────────────────────────────────────
 
 const MAX_LINES = 500;
@@ -69,8 +89,6 @@ interface ConptySession {
   cols: number;                      // cached from spawn/resize
   rows: number;                      // cached from spawn/resize
   cwd: string;                       // cached from spawn (no runtime CWD query available)
-  echoStrip: string;                 // pending echo bytes to strip (ConPTY input passthrough)
-  echoTimer: ReturnType<typeof setTimeout> | null;
 }
 
 const sessions = new Map<string, ConptySession>();
@@ -125,12 +143,19 @@ export async function conptyNewSession(
     cleanCmd = cleanCmd.slice(cdMatch[0].length);
   }
 
-  const pty = spawn('cmd.exe', ['/c', cleanCmd], {
+  // Parse command into binary + args. Spawn directly (no cmd.exe /c wrapper)
+  // to avoid double echo: cmd.exe's ENABLE_ECHO_INPUT + child shell's own echo.
+  // Fall back to cmd.exe /c only for commands containing shell operators (&&, |, >).
+  const needsShell = /[&|><^]/.test(cleanCmd);
+  const { file, args } = needsShell
+    ? { file: 'cmd.exe', args: ['/c', cleanCmd] }
+    : parseCommand(cleanCmd);
+
+  const pty = spawn(file, args, {
     cwd,
     env: { ...process.env, ...opts?.env } as Record<string, string>,
     cols,
     rows,
-    // node-pty on Windows uses ConPTY by default
     useConpty: true,
   });
 
@@ -145,35 +170,17 @@ export async function conptyNewSession(
     cols,
     rows,
     cwd,
-    echoStrip: '',
-    echoTimer: null,
   };
 
   pty.onData((data: string) => {
-    // ConPTY echo suppression: ConPTY passes VT input back as output (known issue).
-    // Windows Terminal strips this internally; we must do it ourselves.
-    // After pty.write(text), we expect the same bytes to appear in onData as phantom echo.
-    let cleaned = data;
-    if (session.echoStrip.length > 0) {
-      let i = 0;
-      while (i < cleaned.length && i < session.echoStrip.length && cleaned[i] === session.echoStrip[i]) {
-        i++;
-      }
-      if (i > 0) {
-        session.echoStrip = session.echoStrip.slice(i);
-        cleaned = cleaned.slice(i);
-      }
-    }
-    if (!cleaned) return;
-
-    feedRingBuffer(session, cleaned);
+    feedRingBuffer(session, data);
     // Keep recent raw output for snapshot (capturePaneVisible)
-    session.screenBuffer += cleaned;
+    session.screenBuffer += data;
     if (session.screenBuffer.length > MAX_SCREEN_BUFFER) {
       session.screenBuffer = session.screenBuffer.slice(-MAX_SCREEN_BUFFER);
     }
     for (const cb of session.onDataCallbacks) {
-      try { cb(cleaned); } catch { /* don't let subscriber errors crash the session */ }
+      try { cb(data); } catch { /* don't let subscriber errors crash the session */ }
     }
   });
 
@@ -228,11 +235,6 @@ export function conptyListSessions(): string[] {
 export function conptySendText(name: string, text: string): void {
   const session = sessions.get(name);
   if (!session) return;
-  // Track for echo suppression — ConPTY will pass this back as phantom output
-  session.echoStrip += text;
-  // Clear stale echo buffer after 500ms of no input
-  if (session.echoTimer) clearTimeout(session.echoTimer);
-  session.echoTimer = setTimeout(() => { session.echoStrip = ''; session.echoTimer = null; }, 500);
   session.pty.write(text);
 }
 
@@ -240,7 +242,6 @@ export function conptySendText(name: string, text: string): void {
 export function conptySendEnter(name: string): void {
   const session = sessions.get(name);
   if (!session) return;
-  session.echoStrip += '\r';
   session.pty.write('\r');
 }
 
@@ -253,12 +254,16 @@ export function conptySendKey(name: string, key: string): void {
   const session = sessions.get(name);
   if (!session) return;
   const escape = TMUX_KEY_TO_ESCAPE[key];
-  const data = escape ?? (() => {
+  if (escape) {
+    session.pty.write(escape);
+  } else {
     const ctrlMatch = key.match(/^C-([a-z])$/);
-    return ctrlMatch ? String.fromCharCode(ctrlMatch[1].charCodeAt(0) - 96) : key;
-  })();
-  session.echoStrip += data;
-  session.pty.write(data);
+    if (ctrlMatch) {
+      session.pty.write(String.fromCharCode(ctrlMatch[1].charCodeAt(0) - 96));
+    } else {
+      session.pty.write(key);
+    }
+  }
 }
 
 /**
