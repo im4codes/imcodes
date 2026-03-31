@@ -682,33 +682,33 @@ program
         execSync('sudo systemctl restart imcodes', { stdio: 'inherit' });
       }
     } else if (platform === 'win32') {
-      // Kill via PID file
+      // Kill daemon via PID file — the watchdog loop (created by `imcodes bind`)
+      // will automatically restart it in ~5 seconds.
       const pidFile = resolve(homedir(), '.imcodes', 'daemon.pid');
       try {
         const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
-        if (pid) { try { execSync(`taskkill /f /pid ${pid}`, { stdio: 'ignore' }); } catch { /* not running */ } }
-      } catch { /* no PID file */ }
-      // Wait for process to fully exit
-      try { execSync('timeout /t 2 /nobreak >nul 2>&1', { stdio: 'ignore' }); } catch { /* ignore */ }
-      // Relaunch: try scheduler first, then VBS, then direct spawn as fallback
-      console.log('Restarting daemon...');
-      let started = false;
-      try { execSync('schtasks /Run /TN imcodes-daemon', { stdio: 'ignore' }); started = true; } catch { /* no task */ }
-      if (!started) {
-        const vbs = resolve(homedir(), '.imcodes', 'daemon-launcher.vbs');
-        if (existsSync(vbs)) {
-          spawn('wscript', [vbs], { detached: true, stdio: 'ignore' }).unref();
-          started = true;
+        if (pid && pid !== process.pid) {
+          try { execSync(`taskkill /f /pid ${pid}`, { stdio: 'ignore' }); } catch { /* not running */ }
         }
-      }
-      if (!started) {
-        // Direct spawn as last resort — find imcodes binary and launch daemon
+      } catch { /* no PID file */ }
+      // Check if the watchdog is running — if not, start it
+      const vbs = resolve(homedir(), '.imcodes', 'daemon-launcher.vbs');
+      let watchdogRunning = false;
+      try {
+        const taskInfo = execSync('schtasks /Query /TN imcodes-daemon /FO CSV /NH', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
+        watchdogRunning = taskInfo.includes('Running');
+      } catch { /* no scheduled task */ }
+      if (!watchdogRunning && existsSync(vbs)) {
+        spawn('wscript', [vbs], { detached: true, stdio: 'ignore' }).unref();
+      } else if (!watchdogRunning) {
+        // No watchdog at all — spawn daemon directly
         const imcodesCmd = resolve(dirname(process.execPath), 'imcodes.cmd');
         const bin = existsSync(imcodesCmd) ? imcodesCmd : 'imcodes';
         spawn('cmd.exe', ['/c', 'start', '/b', '', bin, 'daemon'], {
           detached: true, stdio: 'ignore', windowsHide: true,
         }).unref();
       }
+      console.log('Daemon will restart in ~5 seconds (via watchdog).');
     } else {
       console.error(`Unsupported platform: ${platform}`); process.exit(1);
     }
