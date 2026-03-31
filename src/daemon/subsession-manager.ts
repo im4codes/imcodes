@@ -62,9 +62,8 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     await ensureSessionFile(sub.codexSessionId, sub.cwd ?? process.cwd()).catch(() => {});
   }
 
-  // For CC: if a JSONL already exists (restart), use --resume instead of --session-id
-  // (CC rejects --session-id with "already in use" when the file exists).
-  // For new sessions, --session-id lets CC create its own JSONL.
+  // CC: if JSONL exists (restart), use --resume to continue the conversation.
+  // If no JSONL (new session), use --session-id. Never delete the JSONL.
   let useResume = false;
   if (agentType === 'claude-code' && sub.ccSessionId && sub.cwd) {
     const { preClaimFile, findJsonlPathBySessionId } = await import('./jsonl-watcher.js');
