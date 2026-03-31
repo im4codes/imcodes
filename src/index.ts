@@ -688,18 +688,26 @@ program
         const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
         if (pid) { try { execSync(`taskkill /f /pid ${pid}`, { stdio: 'ignore' }); } catch { /* not running */ } }
       } catch { /* no PID file */ }
-      // Relaunch via Task Scheduler or watchdog
+      // Wait for process to fully exit
+      try { execSync('timeout /t 2 /nobreak >nul 2>&1', { stdio: 'ignore' }); } catch { /* ignore */ }
+      // Relaunch: try scheduler first, then VBS, then direct spawn as fallback
       console.log('Restarting daemon...');
-      try {
-        execSync('schtasks /Run /TN imcodes-daemon', { stdio: 'ignore' });
-      } catch {
+      let started = false;
+      try { execSync('schtasks /Run /TN imcodes-daemon', { stdio: 'ignore' }); started = true; } catch { /* no task */ }
+      if (!started) {
         const vbs = resolve(homedir(), '.imcodes', 'daemon-launcher.vbs');
         if (existsSync(vbs)) {
           spawn('wscript', [vbs], { detached: true, stdio: 'ignore' }).unref();
-        } else {
-          console.log('No service found. Run "imcodes bind" first.');
-          process.exit(1);
+          started = true;
         }
+      }
+      if (!started) {
+        // Direct spawn as last resort — find imcodes binary and launch daemon
+        const imcodesCmd = resolve(dirname(process.execPath), 'imcodes.cmd');
+        const bin = existsSync(imcodesCmd) ? imcodesCmd : 'imcodes';
+        spawn('cmd.exe', ['/c', 'start', '/b', '', bin, 'daemon'], {
+          detached: true, stdio: 'ignore', windowsHide: true,
+        }).unref();
       }
     } else {
       console.error(`Unsupported platform: ${platform}`); process.exit(1);
