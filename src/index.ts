@@ -584,21 +584,31 @@ program
     const selfPath = realpathSync(process.argv[1]);
     const isGlobal = selfPath.includes('node_modules');
 
-    // Windows: must stop daemon BEFORE install — Windows locks files in use.
-    // Stop scheduled task and kill process so npm can overwrite the files.
+    // Windows: must stop daemon AND watchdog BEFORE install — Windows locks files in use.
+    // The watchdog (daemon-watchdog.cmd) is an infinite loop that relaunches the daemon
+    // every 5s, so killing just the daemon node process isn't enough.
     if (platform === 'win32') {
-      console.log('Stopping daemon before upgrade (Windows file locks)...');
+      console.log('Stopping daemon and watchdog before upgrade (Windows file locks)...');
+      // 1. Stop the scheduled task so it won't re-trigger
       try { execSync('schtasks /End /TN imcodes-daemon', { stdio: 'ignore' }); } catch { /* ok */ }
+      // 2. Kill the watchdog cmd.exe loop (runs daemon-watchdog.cmd)
+      try { execSync('taskkill /f /fi "WINDOWTITLE eq daemon-watchdog*"', { stdio: 'ignore' }); } catch { /* ok */ }
+      // Also kill by command line matching the watchdog script
+      try { execSync(`wmic process where "CommandLine like '%%daemon-watchdog%%'" call terminate`, { stdio: 'ignore' }); } catch { /* ok */ }
+      // 3. Kill the daemon node process via PID file
       const pidFile = resolve(homedir(), '.imcodes', 'daemon.pid');
       try {
         const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
         if (pid) {
-          // Kill process tree to release all file handles
           try { execSync(`taskkill /f /t /pid ${pid}`, { stdio: 'ignore' }); } catch { /* not running */ }
         }
       } catch { /* no PID file */ }
+      // 4. Belt-and-suspenders: kill any remaining imcodes node processes (except self)
+      try {
+        execSync(`wmic process where "CommandLine like '%%imcodes%%start%%--foreground%%' and ProcessId != ${process.pid}" call terminate`, { stdio: 'ignore' });
+      } catch { /* ok */ }
       // Wait for file handles to be released
-      try { execSync('timeout /t 2 /nobreak >nul', { stdio: 'ignore' }); } catch { /* ok */ }
+      try { execSync('timeout /t 3 /nobreak >nul', { stdio: 'ignore' }); } catch { /* ok */ }
     }
 
     console.log(`Upgrading to ${pkg}...`);
