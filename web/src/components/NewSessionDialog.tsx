@@ -33,8 +33,15 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
   const [shellBin, setShellBin] = useState<string>('');
 
   // CC env presets
-  const [ccPresets, setCcPresets] = useState<Array<{ name: string; env: Record<string, string> }>>([]);
+  const [ccPresets, setCcPresets] = useState<Array<{ name: string; env: Record<string, string>; contextWindow?: number; initMessage?: string }>>([]);
   const [ccPreset, setCcPreset] = useState<string>('');
+  const [ccInitPrompt, setCcInitPrompt] = useState<string>('');
+  const [showPresetEditor, setShowPresetEditor] = useState(false);
+  // New preset form
+  const [newPresetName, setNewPresetName] = useState('');
+  const [newPresetEnv, setNewPresetEnv] = useState('');
+  const [newPresetCtx, setNewPresetCtx] = useState('');
+  const [newPresetInit, setNewPresetInit] = useState('');
 
   // OpenClaw-specific state
   const [ocMode, setOcMode] = useState<OpenClawMode>('new');
@@ -151,7 +158,11 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
           : { ocMode: 'new', ocSessionKey: ocSessionKey.trim(), ocDescription: ocDescription.trim() };
       ws.sendSessionCommand('start', { project: project.trim(), dir: dir.trim(), agentType, ...extra });
     } else {
-      ws.sendSessionCommand('start', { project: project.trim(), dir: dir.trim(), agentType, ...(ccPreset ? { ccPreset } : {}) });
+      ws.sendSessionCommand('start', {
+        project: project.trim(), dir: dir.trim(), agentType,
+        ...(ccPreset ? { ccPreset } : {}),
+        ...(ccInitPrompt.trim() ? { ccInitPrompt: ccInitPrompt.trim() } : {}),
+      });
     }
   };
 
@@ -237,22 +248,124 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
           </select>
         </div>
 
-        {/* CC env preset selector */}
-        {agentType === 'claude-code' && ccPresets.length > 0 && (
-          <div class="form-group">
-            <label>API Provider</label>
-            <select
-              value={ccPreset}
-              disabled={starting}
-              onChange={(e) => setCcPreset((e.target as HTMLSelectElement).value)}
-              style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#e2e8f0', padding: '8px 12px', borderRadius: 4, fontFamily: 'inherit' }}
-            >
-              <option value="">Default (Anthropic)</option>
-              {ccPresets.map((p) => (
-                <option key={p.name} value={p.name}>{p.name}{p.env['ANTHROPIC_MODEL'] ? ` (${p.env['ANTHROPIC_MODEL']})` : ''}</option>
-              ))}
-            </select>
-          </div>
+        {/* CC env preset selector + editor */}
+        {agentType === 'claude-code' && (
+          <>
+            <div class="form-group">
+              <label style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span>API Provider</span>
+                <button type="button" style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', fontSize: 12, padding: 0 }} onClick={() => setShowPresetEditor(!showPresetEditor)}>
+                  {showPresetEditor ? '▾ Close' : '+ Add / Edit'}
+                </button>
+              </label>
+              {ccPresets.length > 0 && (
+                <select
+                  value={ccPreset}
+                  disabled={starting}
+                  onChange={(e) => setCcPreset((e.target as HTMLSelectElement).value)}
+                  style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#e2e8f0', padding: '8px 12px', borderRadius: 4, fontFamily: 'inherit' }}
+                >
+                  <option value="">Default (Anthropic)</option>
+                  {ccPresets.map((p) => (
+                    <option key={p.name} value={p.name}>{p.name}{p.env['ANTHROPIC_MODEL'] ? ` (${p.env['ANTHROPIC_MODEL']})` : ''}</option>
+                  ))}
+                </select>
+              )}
+              {ccPresets.length === 0 && !showPresetEditor && (
+                <div style={{ fontSize: 12, color: '#475569', padding: '4px 0' }}>Default (Anthropic) — click "+ Add / Edit" to configure</div>
+              )}
+            </div>
+
+            {/* Inline preset editor */}
+            {showPresetEditor && (
+              <div style={{ background: '#0f172a', border: '1px solid #334155', borderRadius: 6, padding: 12, marginBottom: 12, fontSize: 12 }}>
+                <div style={{ marginBottom: 4, fontWeight: 600, color: '#94a3b8' }}>Add New Preset</div>
+                <div style={{ fontSize: 10, color: '#475569', marginBottom: 8 }}>Stored locally on daemon machine (~/.imcodes/cc-presets.json). Not synced to server.</div>
+                <input
+                  type="text" placeholder="Name (e.g. MiniMax)" value={newPresetName}
+                  onInput={(e) => setNewPresetName((e.target as HTMLInputElement).value)}
+                  style={{ width: '100%', background: '#1e293b', border: '1px solid #334155', color: '#e2e8f0', padding: '6px 8px', borderRadius: 4, marginBottom: 6, fontSize: 12, boxSizing: 'border-box' }}
+                />
+                <textarea
+                  placeholder={'ENV vars (JSON):\n{"ANTHROPIC_BASE_URL":"...","ANTHROPIC_AUTH_TOKEN":"...","ANTHROPIC_MODEL":"..."}'}
+                  value={newPresetEnv} rows={3}
+                  onInput={(e) => setNewPresetEnv((e.target as HTMLTextAreaElement).value)}
+                  style={{ width: '100%', background: '#1e293b', border: '1px solid #334155', color: '#e2e8f0', padding: '6px 8px', borderRadius: 4, marginBottom: 6, fontSize: 11, fontFamily: 'monospace', resize: 'vertical', boxSizing: 'border-box' }}
+                />
+                <input
+                  type="text" placeholder="Context window (e.g. 200000 or 1000000)" value={newPresetCtx}
+                  onInput={(e) => setNewPresetCtx((e.target as HTMLInputElement).value)}
+                  style={{ width: '100%', background: '#1e293b', border: '1px solid #334155', color: '#e2e8f0', padding: '6px 8px', borderRadius: 4, marginBottom: 6, fontSize: 12, boxSizing: 'border-box' }}
+                />
+                <textarea
+                  placeholder="Init message (optional — default: DuckDuckGo search instruction)" value={newPresetInit} rows={2}
+                  onInput={(e) => setNewPresetInit((e.target as HTMLTextAreaElement).value)}
+                  style={{ width: '100%', background: '#1e293b', border: '1px solid #334155', color: '#e2e8f0', padding: '6px 8px', borderRadius: 4, marginBottom: 8, fontSize: 12, resize: 'vertical', boxSizing: 'border-box' }}
+                />
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <button type="button" disabled={!newPresetName.trim() || !newPresetEnv.trim()} style={{ background: '#1d4ed8', border: 'none', color: '#fff', padding: '4px 12px', borderRadius: 4, cursor: 'pointer', fontSize: 12, opacity: !newPresetName.trim() || !newPresetEnv.trim() ? 0.5 : 1 }}
+                    onClick={() => {
+                      try {
+                        const env = JSON.parse(newPresetEnv);
+                        const preset: any = { name: newPresetName.trim(), env };
+                        if (newPresetCtx) preset.contextWindow = parseInt(newPresetCtx, 10);
+                        if (newPresetInit.trim()) preset.initMessage = newPresetInit.trim();
+                        const updated = [...ccPresets.filter(p => p.name !== preset.name), preset];
+                        setCcPresets(updated);
+                        try { ws?.send({ type: 'cc.presets.save', presets: updated }); } catch {}
+                        setNewPresetName(''); setNewPresetEnv(''); setNewPresetCtx(''); setNewPresetInit('');
+                        setCcPreset(preset.name);
+                      } catch { setError('Invalid JSON in env vars'); }
+                    }}
+                  >Save</button>
+                </div>
+
+                {/* Existing presets — edit/delete */}
+                {ccPresets.length > 0 && (
+                  <div style={{ marginTop: 10, borderTop: '1px solid #334155', paddingTop: 8 }}>
+                    <div style={{ color: '#64748b', fontSize: 11, marginBottom: 4 }}>Saved presets:</div>
+                    {ccPresets.map((p) => (
+                      <div key={p.name} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '3px 0', fontSize: 12 }}>
+                        <span style={{ color: '#e2e8f0' }}>{p.name} <span style={{ color: '#475569' }}>{p.env['ANTHROPIC_MODEL'] ?? ''}</span></span>
+                        <div style={{ display: 'flex', gap: 4 }}>
+                          <button type="button" style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', fontSize: 11 }}
+                            onClick={() => {
+                              setNewPresetName(p.name);
+                              setNewPresetEnv(JSON.stringify(p.env, null, 2));
+                              setNewPresetCtx(p.contextWindow ? String(p.contextWindow) : '');
+                              setNewPresetInit(p.initMessage ?? '');
+                            }}
+                          >Edit</button>
+                          <button type="button" style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: 11 }}
+                            onClick={() => {
+                              const updated = ccPresets.filter(x => x.name !== p.name);
+                              setCcPresets(updated);
+                              try { ws?.send({ type: 'cc.presets.save', presets: updated }); } catch {}
+                              if (ccPreset === p.name) setCcPreset('');
+                            }}
+                          >Delete</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Extra init prompt for this launch */}
+            {ccPreset && (
+              <div class="form-group">
+                <label>Extra init prompt (optional)</label>
+                <textarea
+                  placeholder="Additional instruction injected after session starts..."
+                  value={ccInitPrompt} rows={2}
+                  onInput={(e) => setCcInitPrompt((e.target as HTMLTextAreaElement).value)}
+                  disabled={starting}
+                  style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#e2e8f0', padding: '8px 12px', borderRadius: 4, fontFamily: 'inherit', resize: 'vertical', fontSize: 13 }}
+                />
+              </div>
+            )}
+          </>
         )}
 
         {/* Session description / persona (all agent types) */}

@@ -542,6 +542,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
   const agentType = (cmd.agentType as string) || 'claude-code';
   const dir = expandTilde((cmd.dir as string) || '~');
   const ccPresetName = cmd.ccPreset as string | undefined;
+  const ccInitPrompt = cmd.ccInitPrompt as string | undefined;
 
   if (!project) {
     logger.warn('session.start: missing project name');
@@ -572,12 +573,16 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     logger.info({ project }, 'Session started via web');
 
     // Inject preset init message after session starts
-    if (ccPresetName && agentType === 'claude-code') {
-      const { getPreset, getPresetInitMessage } = await import('./cc-presets.js');
-      const preset = await getPreset(ccPresetName);
-      if (preset) {
-        const brainSession = `deck_${project}_brain`;
-        const msg = getPresetInitMessage(preset);
+    if (agentType === 'claude-code' && (ccPresetName || ccInitPrompt)) {
+      const brainSession = `deck_${project}_brain`;
+      let msg = '';
+      if (ccPresetName) {
+        const { getPreset, getPresetInitMessage } = await import('./cc-presets.js');
+        const preset = await getPreset(ccPresetName);
+        if (preset) msg = getPresetInitMessage(preset);
+      }
+      if (ccInitPrompt) msg = msg ? `${msg}\n\n${ccInitPrompt}` : ccInitPrompt;
+      if (msg) {
         setTimeout(async () => {
           try { await sendKeysDelayedEnter(brainSession, msg); } catch { /* session may not be ready */ }
         }, 5000);
@@ -1251,6 +1256,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
   }
 
   const ccPreset = cmd.ccPreset as string | null | undefined;
+  const subCcInitPrompt = cmd.ccInitPrompt as string | null | undefined;
 
   try {
     await startSubSession({
@@ -1262,6 +1268,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
       parentSession,
       geminiSessionId,
       ccPreset,
+      ccInitPrompt: subCcInitPrompt,
       fresh: type === 'gemini' && !geminiSessionId,
       _fileSnapshot: fileSnapshot,
       _onGeminiDiscovered: fileSnapshot ? (sessionId: string) => {

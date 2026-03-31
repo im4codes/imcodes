@@ -30,6 +30,8 @@ export interface SubSessionRecord {
   parentSession?: string | null;
   /** CC env preset name (e.g. "MiniMax", "DeepSeek"). Resolves to env vars at launch. */
   ccPreset?: string | null;
+  /** Extra init prompt injected after session starts. */
+  ccInitPrompt?: string | null;
   fresh?: boolean;
   _fileSnapshot?: Set<string>;
   _onGeminiDiscovered?: (sessionId: string) => void;
@@ -95,12 +97,14 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
 
   await newSession(sessionName, launchCmd, { cwd: sub.cwd ?? undefined, env: launchEnv });
 
-  // Inject preset init message after session starts
-  if (presetInitMessage) {
+  // Inject preset init message + extra init prompt after session starts
+  let initMsg = presetInitMessage ?? '';
+  if (sub.ccInitPrompt) initMsg = initMsg ? `${initMsg}\n\n${sub.ccInitPrompt}` : sub.ccInitPrompt;
+  if (initMsg) {
     const { sendKeys } = await import('../agent/tmux.js');
     setTimeout(async () => {
       try {
-        await sendKeys(sessionName, presetInitMessage!);
+        await sendKeys(sessionName, initMsg);
       } catch { /* session may not be ready yet */ }
     }, 5000);
   }
