@@ -378,6 +378,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
       {/* Collapsed: compact buttons (all platforms) — long-press to reorder */}
       {collapsed && subSessions.length > 0 && (
         <div class="subsession-bar" style={{ borderTop: 'none' }} ref={collapsedBarRef}
+          onContextMenu={(e) => { if (touchDragRef.current.active) e.preventDefault(); }}
           onTouchStart={(e) => {
             const el = collapsedBarRef.current;
             if (!el) return;
@@ -393,6 +394,8 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
               const btn = el.querySelector(`[data-sub-id="${id}"]`) as HTMLElement | null;
               if (btn) btn.style.opacity = '0.5';
               el.style.overflowX = 'hidden';
+              // Prevent text selection context menu on iOS
+              if (window.getSelection) window.getSelection()?.removeAllRanges();
             }, 400);
           }}
           onTouchMove={(e) => {
