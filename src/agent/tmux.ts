@@ -70,7 +70,7 @@ function detectBackend(): TerminalBackend {
   // 2. Windows defaults to ConPTY
   if (process.platform === 'win32') {
     try {
-      const req = createRequire(process.cwd() + '/package.json');
+      const req = createRequire(import.meta.url);
       req.resolve('node-pty');
       return 'conpty';
     } catch {
