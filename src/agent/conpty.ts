@@ -97,8 +97,35 @@ function feedRingBuffer(session: ConptySession, data: string): void {
 // ── Exported functions ──────────────────────────────────────────────────────────
 
 /**
+ * Parse a command string into executable + args for direct spawn.
+ * Handles double-quoted arguments (Windows CommandLineToArgvW semantics).
+ */
+function splitCommand(cmd: string): { file: string; args: string[] } {
+  const tokens: string[] = [];
+  let i = 0;
+  while (i < cmd.length) {
+    // skip whitespace
+    while (i < cmd.length && cmd[i] === ' ') i++;
+    if (i >= cmd.length) break;
+    let token = '';
+    if (cmd[i] === '"') {
+      // quoted token — collect until closing quote
+      i++; // skip opening quote
+      while (i < cmd.length && cmd[i] !== '"') { token += cmd[i]; i++; }
+      if (i < cmd.length) i++; // skip closing quote
+    } else {
+      // unquoted token
+      while (i < cmd.length && cmd[i] !== ' ') { token += cmd[i]; i++; }
+    }
+    tokens.push(token);
+  }
+  return { file: tokens[0] ?? cmd, args: tokens.slice(1) };
+}
+
+/**
  * Spawn a new ConPTY session via node-pty.
- * Wraps `cmd` in `cmd.exe /c <cmd>` so driver command strings are interpreted correctly.
+ * Spawns the command directly (no cmd.exe /c wrapper) to avoid double echo
+ * caused by cmd.exe's ENABLE_ECHO_INPUT overlapping with the child's own echo.
  */
 export async function conptyNewSession(
   name: string,
@@ -115,15 +142,16 @@ export async function conptyNewSession(
 
   // Strip redundant cwdPrefix from the command string.
   // Drivers prepend `cd /d "C:\path" && ` or `cd "path" && ` for tmux/wezterm,
-  // but ConPTY sets cwd via pty.spawn({ cwd }) — the cd prefix is redundant
-  // and causes double-escaping issues under cmd.exe /c.
+  // but ConPTY sets cwd via pty.spawn({ cwd }) — the cd prefix is redundant.
   let cleanCmd = cmd;
   const cdMatch = cleanCmd.match(/^cd\s+(?:\/d\s+)?(?:"[^"]*"|[^\s&]+)\s*&&\s*/i);
   if (cdMatch) {
     cleanCmd = cleanCmd.slice(cdMatch[0].length);
   }
 
-  const pty = spawn('cmd.exe', ['/c', cleanCmd], {
+  // Spawn directly — no cmd.exe /c wrapper (causes double echo).
+  const { file, args } = splitCommand(cleanCmd);
+  const pty = spawn(file, args, {
     cwd,
     env: { ...process.env, ...opts?.env } as Record<string, string>,
     cols,

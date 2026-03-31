@@ -93,7 +93,7 @@ describe('conpty backend', () => {
         rows: 40,
       });
 
-      expect(spawnMock).toHaveBeenCalledWith('cmd.exe', ['/c', 'echo hello'], {
+      expect(spawnMock).toHaveBeenCalledWith('echo', ['hello'], {
         cwd: '/tmp',
         env: expect.objectContaining({ FOO: 'bar' }),
         cols: 120,
@@ -108,7 +108,7 @@ describe('conpty backend', () => {
         cwd: 'C:\\Users\\admin',
       });
 
-      expect(spawnMock).toHaveBeenCalledWith('cmd.exe', ['/c', 'claude --resume abc'], expect.objectContaining({
+      expect(spawnMock).toHaveBeenCalledWith('claude', ['--resume', 'abc'], expect.objectContaining({
         cwd: expect.any(String),
       }));
     });
@@ -118,7 +118,7 @@ describe('conpty backend', () => {
         cwd: 'C:\\path',
       });
 
-      expect(spawnMock).toHaveBeenCalledWith('cmd.exe', ['/c', 'some-cmd'], expect.objectContaining({
+      expect(spawnMock).toHaveBeenCalledWith('some-cmd', [], expect.objectContaining({
         cwd: expect.any(String),
       }));
     });
@@ -126,7 +126,7 @@ describe('conpty backend', () => {
     it('uses default cols=200, rows=50 when not specified', async () => {
       await conpty.conptyNewSession('test-defaults', 'cmd');
 
-      expect(spawnMock).toHaveBeenCalledWith('cmd.exe', ['/c', 'cmd'], expect.objectContaining({
+      expect(spawnMock).toHaveBeenCalledWith('cmd', [], expect.objectContaining({
         cols: 200,
         rows: 50,
       }));
@@ -478,7 +478,7 @@ describe('conpty backend', () => {
 
       expect(conpty.conptySessionExists('respawn-test')).toBe(true);
       // Should have spawned with new command but preserved CWD
-      expect(spawnMock).toHaveBeenLastCalledWith('cmd.exe', ['/c', 'new-cmd'], expect.objectContaining({
+      expect(spawnMock).toHaveBeenLastCalledWith('new-cmd', [], expect.objectContaining({
         cwd: '/old/path',
       }));
     });
