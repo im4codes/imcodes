@@ -39,6 +39,10 @@ export interface FileEditorProps {
   onMessage: (handler: (msg: ServerMessage) => void) => (() => void);
   /** Notify parent when dirty state changes */
   onDirtyChange?: (dirty: boolean) => void;
+  /** Current editor content from parent/FileBrowser */
+  currentContent?: string;
+  /** Live content updates from CodeMirror */
+  onContentChange?: (content: string) => void;
 }
 
 /** Detect CodeMirror language extension from file path */
@@ -67,16 +71,13 @@ function getLanguageExtension(path: string) {
   }
 }
 
-export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessage, onDirtyChange }: FileEditorProps) {
+export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessage, onDirtyChange, currentContent }: FileEditorProps) {
   const { t } = useTranslation();
   const [originalMtime, setOriginalMtime] = useState(mtime);
   const [isDirty, setIsDirty] = useState(false);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'success' | 'error' | 'timeout'>('idle');
   const [saveError, setSaveError] = useState<string | null>(null);
   const pendingWriteRef = useRef(new Map<string, string>());
-  // Track latest content from FileEditorContent for save
-  const editContentRef = useRef(content);
-
   // Listen for fs.write_response
   useEffect(() => {
     return onMessage((msg) => {
@@ -99,7 +100,7 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
         setSaveError(t('fileBrowser.conflictTitle', 'File changed on disk'));
         setTimeout(() => setSaveStatus((s) => s === 'error' ? 'idle' : s), 3000);
         // Auto force-save: user explicitly clicked Save, honor their intent
-        const retryId = ws.fsWriteFile(path, editContentRef.current);
+        const retryId = ws.fsWriteFile(path, currentContent ?? content);
         pendingWriteRef.current.set(retryId, path);
       } else {
         setSaveStatus('error');
@@ -107,12 +108,12 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
         setTimeout(() => setSaveStatus((s) => s === 'error' ? 'idle' : s), 3000);
       }
     });
-  }, [onMessage, onSaved, t]);
+  }, [onMessage, onSaved, t, ws, path, currentContent, content]);
 
   const doSave = useCallback((forceWrite = false) => {
     setSaveStatus('saving');
     setSaveError(null);
-    const requestId = ws.fsWriteFile(path, editContentRef.current, forceWrite ? undefined : originalMtime);
+    const requestId = ws.fsWriteFile(path, currentContent ?? content, forceWrite ? undefined : originalMtime);
     pendingWriteRef.current.set(requestId, path);
     setTimeout(() => {
       if (pendingWriteRef.current.has(requestId)) {
@@ -122,7 +123,7 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
         setTimeout(() => setSaveStatus((s) => s === 'timeout' ? 'idle' : s), 4000);
       }
     }, 30_000);
-  }, [ws, path, originalMtime, t]);
+  }, [ws, path, originalMtime, t, currentContent, content]);
 
   // Cmd+S / Ctrl+S
   useEffect(() => {
@@ -158,7 +159,7 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
 }
 
 /** Editor content area — CodeMirror editor + conflict dialog */
-export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage, onDirtyChange }: Omit<FileEditorProps, 'onClose' | 'onSaved'> & { onDirtyChange?: (dirty: boolean) => void }) {
+export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage, onDirtyChange, onContentChange }: Omit<FileEditorProps, 'onClose' | 'onSaved'>) {
   const { t } = useTranslation();
   const [isDirty, setIsDirty] = useState(false);
   const [conflictData, setConflictData] = useState<{ diskContent: string; diskMtime: number } | null>(null);
@@ -197,6 +198,7 @@ export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage,
           const dirty = newContent !== content;
           setIsDirty(dirty);
           onDirtyChange?.(dirty);
+          onContentChange?.(newContent);
         }
       }),
       EditorView.theme({
@@ -235,7 +237,8 @@ export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage,
       changes: { from: 0, to: view.state.doc.length, insert: content },
     });
     currentContentRef.current = content;
-  }, [content, isDirty]);
+    onContentChange?.(content);
+  }, [content, isDirty, onContentChange]);
 
   return (
     <>
@@ -257,6 +260,7 @@ export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage,
                     changes: { from: 0, to: view.state.doc.length, insert: conflictData.diskContent },
                   });
                   currentContentRef.current = conflictData.diskContent;
+                  onContentChange?.(conflictData.diskContent);
                 }
                 setIsDirty(false);
                 setConflictData(null);

@@ -29,13 +29,16 @@ function canShowEditButton(preview: {
  * Returns the requestId that would be passed to fsWriteFile.
  */
 function simulateSave(opts: {
-  editContent: string;
+  currentContent: string;
+  originalContent: string;
   originalMtime: number | undefined;
   previewPath: string;
   ws: { fsWriteFile: (path: string, content: string, mtime?: number) => string };
 }): string {
-  const { editContent, originalMtime, previewPath, ws } = opts;
-  return ws.fsWriteFile(previewPath, editContent, originalMtime);
+  const { currentContent, originalContent, originalMtime, previewPath, ws } = opts;
+  // Save must use the live editor content, not the original file content.
+  void originalContent;
+  return ws.fsWriteFile(previewPath, currentContent, originalMtime);
 }
 
 /**
@@ -90,7 +93,8 @@ describe('FileBrowser save triggers fsWriteFile', () => {
   it('calls fsWriteFile with path, content, and originalMtime', () => {
     const wsStub = { fsWriteFile: vi.fn().mockReturnValue('req-123') };
     const requestId = simulateSave({
-      editContent: 'new content',
+      currentContent: 'new content',
+      originalContent: 'old content',
       originalMtime: 1700000000000,
       previewPath: '/home/user/file.txt',
       ws: wsStub,
@@ -107,7 +111,8 @@ describe('FileBrowser save triggers fsWriteFile', () => {
   it('calls fsWriteFile without mtime when originalMtime is undefined', () => {
     const wsStub = { fsWriteFile: vi.fn().mockReturnValue('req-456') };
     simulateSave({
-      editContent: 'content',
+      currentContent: 'content',
+      originalContent: '',
       originalMtime: undefined,
       previewPath: '/home/user/new.txt',
       ws: wsStub,
@@ -117,6 +122,28 @@ describe('FileBrowser save triggers fsWriteFile', () => {
       '/home/user/new.txt',
       'content',
       undefined,
+    );
+  });
+
+  it('uses the live edited content instead of the original file content', () => {
+    const wsStub = { fsWriteFile: vi.fn().mockReturnValue('req-789') };
+    simulateSave({
+      currentContent: 'edited content',
+      originalContent: 'original content',
+      originalMtime: 1700000000000,
+      previewPath: '/home/user/file.txt',
+      ws: wsStub,
+    });
+
+    expect(wsStub.fsWriteFile).toHaveBeenCalledWith(
+      '/home/user/file.txt',
+      'edited content',
+      1700000000000,
+    );
+    expect(wsStub.fsWriteFile).not.toHaveBeenCalledWith(
+      '/home/user/file.txt',
+      'original content',
+      1700000000000,
     );
   });
 });

@@ -202,6 +202,7 @@ export function FileBrowser({
     try { return localStorage.getItem(PREF_KEY) === '1'; } catch { return false; }
   });
   const [editDirty, setEditDirty] = useState(false);
+  const [editContent, setEditContent] = useState('');
   const editDirtyRef = useRef(false);
   // Keep ref in sync with state
   useEffect(() => { editDirtyRef.current = editDirty; }, [editDirty]);
@@ -373,6 +374,7 @@ export function FileBrowser({
         if (msg.mtime !== undefined) {
           setOriginalMtime(msg.mtime);
         }
+        setEditContent(content);
 
         setPreview((prev) => {
           // Merge diff if already fetched
@@ -480,6 +482,7 @@ export function FileBrowser({
       if (!window.confirm(t('fileBrowser.unsavedChanges'))) return;
     }
     setEditDirty(false);
+    setEditContent('');
     setOriginalMtime(undefined);
     setIsEditing(() => { try { return localStorage.getItem(PREF_KEY) === '1'; } catch { return false; } });
     setPreview({ status: 'loading', path: filePath });
@@ -729,6 +732,7 @@ export function FileBrowser({
               ws={ws}
               path={preview.path}
               content={preview.content}
+              currentContent={editContent}
               mtime={originalMtime}
               onClose={() => {
                 if (editDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
@@ -736,9 +740,15 @@ export function FileBrowser({
                 setEditDirty(false);
                 try { localStorage.setItem(PREF_KEY, '0'); } catch {}
               }}
-              onSaved={(newMtime) => setOriginalMtime(newMtime)}
+              onSaved={(newMtime) => {
+                setOriginalMtime(newMtime);
+                setPreview((prev) => prev.status === 'ok' && prev.path === preview.path
+                  ? { ...prev, content: editContent, diff: undefined, diffHtml: undefined }
+                  : prev);
+              }}
               onMessage={onEditorMessage}
               onDirtyChange={setEditDirty}
+              onContentChange={setEditContent}
             />
           </Suspense>
         )}
@@ -799,9 +809,11 @@ export function FileBrowser({
               ws={ws}
               path={preview.path}
               content={preview.content}
+              currentContent={editContent}
               mtime={originalMtime}
               onMessage={onEditorMessage}
               onDirtyChange={setEditDirty}
+              onContentChange={setEditContent}
             />
           </Suspense>
         )}
