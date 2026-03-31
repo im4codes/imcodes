@@ -123,6 +123,8 @@ export interface ProjectConfig {
   workerTypes: AgentType[]; // one entry per worker slot
   /** When true, start fresh sessions without resuming last conversation. */
   fresh?: boolean;
+  /** Extra env vars merged into session launch (e.g. CC API preset). */
+  extraEnv?: Record<string, string>;
 }
 
 export function getDriver(type: AgentType): AgentDriver {
@@ -144,9 +146,9 @@ export function sessionName(project: string, role: 'brain' | `w${number}`): stri
 
 /** Start all sessions for a project (brain + workers). */
 export async function startProject(config: ProjectConfig): Promise<void> {
-  const { name, dir, brainType, workerTypes, fresh } = config;
+  const { name, dir, brainType, workerTypes, fresh, extraEnv } = config;
 
-  await launchSession({ name: sessionName(name, 'brain'), projectName: name, role: 'brain', agentType: brainType, projectDir: dir, fresh });
+  await launchSession({ name: sessionName(name, 'brain'), projectName: name, role: 'brain', agentType: brainType, projectDir: dir, fresh, extraEnv });
 
   for (let i = 0; i < workerTypes.length; i++) {
     const role = `w${i + 1}` as `w${number}`;

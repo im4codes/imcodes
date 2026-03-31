@@ -32,6 +32,10 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
   const [shells, setShells] = useState<string[]>([]);
   const [shellBin, setShellBin] = useState<string>('');
 
+  // CC env presets
+  const [ccPresets, setCcPresets] = useState<Array<{ name: string; env: Record<string, string> }>>([]);
+  const [ccPreset, setCcPreset] = useState<string>('');
+
   // OpenClaw-specific state
   const [ocMode, setOcMode] = useState<OpenClawMode>('new');
   const [ocSessionKey, setOcSessionKey] = useState('');
@@ -62,6 +66,10 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
           setShellBin(list[0] ?? '');
         }
       }
+      // Listen for CC presets response
+      if (msg.type === 'cc.presets.list_response') {
+        setCcPresets((msg as any).presets ?? []);
+      }
       // Listen for openclaw remote session list response
       const raw = msg as unknown as Record<string, unknown>;
       if (raw['type'] === 'openclaw.sessions_response') {
@@ -71,6 +79,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
       }
     });
     ws.subSessionDetectShells?.();
+    ws.send({ type: 'cc.presets.list' });
     return unsub;
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ws]);
@@ -142,7 +151,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
           : { ocMode: 'new', ocSessionKey: ocSessionKey.trim(), ocDescription: ocDescription.trim() };
       ws.sendSessionCommand('start', { project: project.trim(), dir: dir.trim(), agentType, ...extra });
     } else {
-      ws.sendSessionCommand('start', { project: project.trim(), dir: dir.trim(), agentType });
+      ws.sendSessionCommand('start', { project: project.trim(), dir: dir.trim(), agentType, ...(ccPreset ? { ccPreset } : {}) });
     }
   };
 
@@ -227,6 +236,24 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
             <option value="openclaw">{t('session.agentType.openclaw')}</option>
           </select>
         </div>
+
+        {/* CC env preset selector */}
+        {agentType === 'claude-code' && ccPresets.length > 0 && (
+          <div class="form-group">
+            <label>API Provider</label>
+            <select
+              value={ccPreset}
+              disabled={starting}
+              onChange={(e) => setCcPreset((e.target as HTMLSelectElement).value)}
+              style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#e2e8f0', padding: '8px 12px', borderRadius: 4, fontFamily: 'inherit' }}
+            >
+              <option value="">Default (Anthropic)</option>
+              {ccPresets.map((p) => (
+                <option key={p.name} value={p.name}>{p.name}{p.env['ANTHROPIC_MODEL'] ? ` (${p.env['ANTHROPIC_MODEL']})` : ''}</option>
+              ))}
+            </select>
+          </div>
+        )}
 
         {/* Session description / persona (all agent types) */}
         <div class="form-group">

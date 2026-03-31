@@ -28,6 +28,8 @@ export interface SubSessionRecord {
   codexModel?: string | null;
   geminiSessionId?: string | null;
   parentSession?: string | null;
+  /** CC env preset name (e.g. "MiniMax", "DeepSeek"). Resolves to env vars at launch. */
+  ccPreset?: string | null;
   fresh?: boolean;
   _fileSnapshot?: Set<string>;
   _onGeminiDiscovered?: (sessionId: string) => void;
@@ -80,7 +82,15 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     } as any) ?? launchCmd;
   }
 
-  await newSession(sessionName, launchCmd, { cwd: sub.cwd ?? undefined, env: { IMCODES_SESSION: sessionName } });
+  // Resolve CC env preset if specified
+  const launchEnv: Record<string, string> = { IMCODES_SESSION: sessionName };
+  if (sub.ccPreset && agentType === 'claude-code') {
+    const { resolvePresetEnv } = await import('./cc-presets.js');
+    const presetEnv = await resolvePresetEnv(sub.ccPreset);
+    Object.assign(launchEnv, presetEnv);
+  }
+
+  await newSession(sessionName, launchCmd, { cwd: sub.cwd ?? undefined, env: launchEnv });
   timelineEmitter.emit(sessionName, 'session.state', { state: 'started' });
 
   upsertSession({

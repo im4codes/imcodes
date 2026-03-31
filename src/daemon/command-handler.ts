@@ -458,6 +458,12 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'p2p.status':
       void handleP2pStatus(cmd, serverLink);
       break;
+    case 'cc.presets.list':
+      void handleCcPresetsList(serverLink);
+      break;
+    case 'cc.presets.save':
+      void handleCcPresetsSave(cmd, serverLink);
+      break;
     case 'file.upload':
       void handleFileUpload(cmd, serverLink);
       break;
@@ -535,6 +541,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
   const project = cmd.project as string | undefined;
   const agentType = (cmd.agentType as string) || 'claude-code';
   const dir = expandTilde((cmd.dir as string) || '~');
+  const ccPresetName = cmd.ccPreset as string | undefined;
 
   if (!project) {
     logger.warn('session.start: missing project name');
@@ -542,6 +549,13 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
   }
 
   try {
+    // Resolve CC env preset if specified
+    let extraEnv: Record<string, string> | undefined;
+    if (ccPresetName && agentType === 'claude-code') {
+      const { resolvePresetEnv } = await import('./cc-presets.js');
+      extraEnv = await resolvePresetEnv(ccPresetName);
+    }
+
     // If project already has sessions, teardown first (keep store records)
     const existing = listSessions(project);
     if (existing.length > 0) {
@@ -552,6 +566,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       dir,
       brainType: agentType as ProjectConfig['brainType'],
       workerTypes: [],
+      extraEnv,
     };
     await startProject(config);
     logger.info({ project }, 'Session started via web');
@@ -1222,6 +1237,8 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     return;
   }
 
+  const ccPreset = cmd.ccPreset as string | null | undefined;
+
   try {
     await startSubSession({
       id,
@@ -1231,6 +1248,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
       ccSessionId,
       parentSession,
       geminiSessionId,
+      ccPreset,
       fresh: type === 'gemini' && !geminiSessionId,
       _fileSnapshot: fileSnapshot,
       _onGeminiDiscovered: fileSnapshot ? (sessionId: string) => {
@@ -2220,4 +2238,21 @@ export async function listProviderSessions(providerId: string): Promise<Array<{ 
   if (!provider) return [];
   if (!provider.capabilities.sessionRestore || !provider.listSessions) return [];
   return provider.listSessions();
+}
+
+// ── CC env presets ────────────────────────────────────────────────────────
+
+async function handleCcPresetsList(serverLink: ServerLink): Promise<void> {
+  const { loadPresets } = await import('./cc-presets.js');
+  const presets = await loadPresets();
+  serverLink.send({ type: 'cc.presets.list_response', presets });
+}
+
+async function handleCcPresetsSave(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const presets = cmd.presets as Array<{ name: string; env: Record<string, string> }> | undefined;
+  if (!presets) return;
+  const { savePresets, invalidateCache } = await import('./cc-presets.js');
+  invalidateCache();
+  await savePresets(presets);
+  serverLink.send({ type: 'cc.presets.save_response', ok: true });
 }
