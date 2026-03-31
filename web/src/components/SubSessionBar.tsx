@@ -326,7 +326,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
               {' '}
               <span style={{ color: '#60a5fa' }}><span style={ei}>🧠</span>{memUsed}/{memTotal}{unit}</span>
               {' '}
-              <span style={{ color: '#a78bfa' }}>≡{stats.load1}</span>
+              <span style={{ color: '#a78bfa' }}>≡{Number(stats.load1).toFixed(1)}</span>
             </span>
           );
         })()}
