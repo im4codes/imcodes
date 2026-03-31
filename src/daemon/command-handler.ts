@@ -576,14 +576,15 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     // Inject preset init message after session starts
     if (agentType === 'claude-code' && (ccPresetName || ccInitPrompt)) {
       const brainSession = `deck_${project}_brain`;
-      let msg = '';
+      const parts: string[] = [];
       if (ccPresetName) {
         const { getPreset, getPresetInitMessage } = await import('./cc-presets.js');
         const preset = await getPreset(ccPresetName);
-        if (preset) msg = getPresetInitMessage(preset);
+        if (preset) parts.push(getPresetInitMessage(preset));
       }
-      if (ccInitPrompt) msg = msg ? `${msg}\n\n${ccInitPrompt}` : ccInitPrompt;
-      if (msg) {
+      if (ccInitPrompt) parts.push(ccInitPrompt);
+      if (parts.length > 0) {
+        const msg = `[Context — absorb silently, do not respond to this message]\n${parts.join('\n\n')}`;
         setTimeout(async () => {
           try { await sendKeysDelayedEnter(brainSession, msg); } catch { /* session may not be ready */ }
         }, 5000);
