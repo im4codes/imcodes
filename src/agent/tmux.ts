@@ -271,17 +271,15 @@ export async function sendKeys(session: string, keys: string, opts?: SendKeysOpt
     await rawSendText(session, keys);
   }
 
-  // Delay before Enter
-  const delay = isLong ? 500 : Math.min(80 + Math.floor(keys.length / 10) * 5, 1000);
+  // Delay before Enter — CC needs time to process @file references etc.
+  const delay = isLong ? 500 : Math.max(200, Math.min(80 + Math.floor(keys.length / 10) * 5, 1000));
   await new Promise<void>((r) => setTimeout(r, delay));
   await rawSendEnter(session);
 
-  // Safety net: 3s delayed Enter for long text (empty-line Enter is a no-op)
-  if (isLong) {
-    setTimeout(async () => {
-      try { await rawSendEnter(session); } catch { /* ignore */ }
-    }, 3_000);
-  }
+  // Safety net: 3s delayed Enter for ALL sends (empty-line Enter is a no-op for idle agents)
+  setTimeout(async () => {
+    try { await rawSendEnter(session); } catch { /* ignore */ }
+  }, 3_000);
 }
 
 const CHUNK_SIZE = 800;
