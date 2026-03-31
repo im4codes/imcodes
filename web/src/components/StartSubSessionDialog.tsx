@@ -58,10 +58,12 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const [newPresetBaseUrl, setNewPresetBaseUrl] = useState('');
   const [newPresetToken, setNewPresetToken] = useState('');
   const [newPresetModel, setNewPresetModel] = useState('');
-  const [newPresetCtx, setNewPresetCtx] = useState('');
+  const [newPresetCtx, setNewPresetCtx] = useState('1000000');
+  const [newPresetCustomEnv, setNewPresetCustomEnv] = useState<Array<{ key: string; value: string }>>([]);
   const DEFAULT_INIT_MSG = 'For web searches, use: curl -s "https://html.duckduckgo.com/html/?q=QUERY" | head -200. Replace QUERY with URL-encoded search terms.';
   const [newPresetInit, setNewPresetInit] = useState(DEFAULT_INIT_MSG);
   const [presetError, setPresetError] = useState('');
+  const fmtCtx = (v: string) => { const n = parseInt(v, 10); if (!n) return ''; if (n >= 1000000) return `${(n/1000000).toFixed(n%1000000===0?0:1)}M`; if (n >= 1000) return `${(n/1000).toFixed(0)}K`; return String(n); };
 
   // Remote sessions come from the provider status hook (pushed on connect, cached in DB)
   const ocRemoteSessions = getRemoteSessions('openclaw');
@@ -313,17 +315,33 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                   <div style={{ color: '#64748b', marginBottom: 4, fontSize: 10 }}>Stored locally (~/.imcodes/cc-presets.json)</div>
                   {presetError && <div style={{ color: '#ef4444', fontSize: 11, marginBottom: 4 }}>{presetError}</div>}
                   {[
-                    { label: 'Preset Name', ph: 'e.g. MiniMax', val: newPresetName, set: setNewPresetName },
-                    { label: 'API Base URL', ph: 'https://api.minimax.io/anthropic', val: newPresetBaseUrl, set: setNewPresetBaseUrl },
-                    { label: 'API Key', ph: 'your-api-key', val: newPresetToken, set: setNewPresetToken, type: 'password' as const },
-                    { label: 'Model', ph: 'e.g. MiniMax-M2.7', val: newPresetModel, set: setNewPresetModel },
-                    { label: 'Context Window', ph: 'e.g. 200000', val: newPresetCtx, set: setNewPresetCtx },
-                  ].map(({ label, ph, val, set, type }) => (
+                    { label: 'Preset Name', envKey: '', ph: 'e.g. MiniMax', val: newPresetName, set: setNewPresetName },
+                    { label: 'API Base URL', envKey: 'ANTHROPIC_BASE_URL', ph: 'https://api.minimax.io/anthropic', val: newPresetBaseUrl, set: setNewPresetBaseUrl },
+                    { label: 'API Key', envKey: 'ANTHROPIC_AUTH_TOKEN', ph: 'your-api-key', val: newPresetToken, set: setNewPresetToken, type: 'password' as const },
+                    { label: 'Model', envKey: 'ANTHROPIC_MODEL', ph: 'e.g. MiniMax-M2.7', val: newPresetModel, set: setNewPresetModel },
+                  ].map(({ label, envKey, ph, val, set, type }) => (
                     <div key={label} style={{ marginBottom: 4 }}>
-                      <div style={{ fontSize: 9, color: '#64748b', marginBottom: 1 }}>{label}</div>
+                      <div style={{ fontSize: 9, color: '#64748b', marginBottom: 1 }}>{label}{envKey && <span style={{ color: '#334155', marginLeft: 4 }}>{envKey}</span>}</div>
                       <input class="input" type={type ?? 'text'} placeholder={ph} value={val} onInput={(e) => set((e.target as HTMLInputElement).value)} style={{ width: '100%', fontSize: 11 }} />
                     </div>
                   ))}
+                  <div style={{ marginBottom: 4 }}>
+                    <div style={{ fontSize: 9, color: '#64748b', marginBottom: 1 }}>Context Window{newPresetCtx && <span style={{ color: '#3b82f6', marginLeft: 4 }}>{fmtCtx(newPresetCtx)}</span>}</div>
+                    <input class="input" type="text" placeholder="1000000" value={newPresetCtx} onInput={(e) => setNewPresetCtx((e.target as HTMLInputElement).value)} style={{ width: '100%', fontSize: 11 }} />
+                  </div>
+                  <div style={{ marginBottom: 4 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 1 }}>
+                      <span style={{ fontSize: 9, color: '#64748b' }}>Custom ENV Vars</span>
+                      <button type="button" style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', fontSize: 9, padding: 0 }} onClick={() => setNewPresetCustomEnv([...newPresetCustomEnv, { key: '', value: '' }])}>+ Add</button>
+                    </div>
+                    {newPresetCustomEnv.map((item, i) => (
+                      <div key={i} style={{ display: 'flex', gap: 3, marginBottom: 2 }}>
+                        <input class="input" placeholder="ENV_KEY" value={item.key} onInput={(e) => { const u = [...newPresetCustomEnv]; u[i] = { ...u[i], key: (e.target as HTMLInputElement).value }; setNewPresetCustomEnv(u); }} style={{ flex: 1, fontSize: 10, fontFamily: 'monospace' }} />
+                        <input class="input" placeholder="value" value={item.value} onInput={(e) => { const u = [...newPresetCustomEnv]; u[i] = { ...u[i], value: (e.target as HTMLInputElement).value }; setNewPresetCustomEnv(u); }} style={{ flex: 2, fontSize: 10 }} />
+                        <button type="button" style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: 11, padding: '0 3px' }} onClick={() => setNewPresetCustomEnv(newPresetCustomEnv.filter((_, j) => j !== i))}>×</button>
+                      </div>
+                    ))}
+                  </div>
                   <div style={{ marginBottom: 4 }}>
                     <div style={{ fontSize: 9, color: '#64748b', marginBottom: 1 }}>Init Message</div>
                     <textarea class="input" value={newPresetInit} rows={2} onInput={(e) => setNewPresetInit((e.target as HTMLTextAreaElement).value)} style={{ width: '100%', fontSize: 10, resize: 'vertical' }} />
@@ -333,13 +351,14 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                       const env: Record<string, string> = { ANTHROPIC_BASE_URL: newPresetBaseUrl.trim(), CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' };
                       if (newPresetToken.trim()) env['ANTHROPIC_AUTH_TOKEN'] = newPresetToken.trim();
                       if (newPresetModel.trim()) env['ANTHROPIC_MODEL'] = newPresetModel.trim();
+                      for (const { key, value } of newPresetCustomEnv) { if (key.trim()) env[key.trim()] = value; }
                       const preset: any = { name: newPresetName.trim(), env };
                       if (newPresetCtx) preset.contextWindow = parseInt(newPresetCtx, 10);
                       if (newPresetInit.trim()) preset.initMessage = newPresetInit.trim();
                       const updated = [...ccPresets.filter(p => p.name !== preset.name), preset];
                       setCcPresets(updated);
                       try { ws?.send({ type: 'cc.presets.save', presets: updated }); } catch {}
-                      setNewPresetName(''); setNewPresetBaseUrl(''); setNewPresetToken(''); setNewPresetModel(''); setNewPresetCtx(''); setNewPresetInit(DEFAULT_INIT_MSG);
+                      setNewPresetName(''); setNewPresetBaseUrl(''); setNewPresetToken(''); setNewPresetModel(''); setNewPresetCtx('1000000'); setNewPresetInit(DEFAULT_INIT_MSG); setNewPresetCustomEnv([]);
                       setCcPreset(preset.name); setPresetError('');
                     }}
                   >Save</button>
@@ -349,7 +368,12 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                         <div key={p.name} style={{ display: 'flex', justifyContent: 'space-between', padding: '2px 0', fontSize: 11 }}>
                           <span style={{ color: '#e2e8f0' }}>{p.name} <span style={{ color: '#475569' }}>{p.env['ANTHROPIC_MODEL'] ?? ''}</span></span>
                           <div style={{ display: 'flex', gap: 4 }}>
-                            <button type="button" style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', fontSize: 10 }} onClick={() => { setNewPresetName(p.name); setNewPresetBaseUrl(p.env['ANTHROPIC_BASE_URL'] ?? ''); setNewPresetToken(p.env['ANTHROPIC_AUTH_TOKEN'] ?? ''); setNewPresetModel(p.env['ANTHROPIC_MODEL'] ?? ''); setNewPresetCtx(p.contextWindow ? String(p.contextWindow) : ''); setNewPresetInit(p.initMessage ?? DEFAULT_INIT_MSG); }}>Edit</button>
+                            <button type="button" style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', fontSize: 10 }} onClick={() => {
+                              setNewPresetName(p.name); setNewPresetBaseUrl(p.env['ANTHROPIC_BASE_URL'] ?? ''); setNewPresetToken(p.env['ANTHROPIC_AUTH_TOKEN'] ?? ''); setNewPresetModel(p.env['ANTHROPIC_MODEL'] ?? '');
+                              setNewPresetCtx(p.contextWindow ? String(p.contextWindow) : '1000000'); setNewPresetInit(p.initMessage ?? DEFAULT_INIT_MSG);
+                              const knownKeys = new Set(['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC']);
+                              setNewPresetCustomEnv(Object.entries(p.env).filter(([k]) => !knownKeys.has(k)).map(([key, value]) => ({ key, value })));
+                            }}>Edit</button>
                             <button type="button" style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: 10 }} onClick={() => { const u = ccPresets.filter(x => x.name !== p.name); setCcPresets(u); try { ws?.send({ type: 'cc.presets.save', presets: u }); } catch {} if (ccPreset === p.name) setCcPreset(''); }}>Del</button>
                           </div>
                         </div>
