@@ -372,9 +372,74 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
         </div>
       )}
 
-      {/* Collapsed: compact buttons (all platforms) */}
+      {/* Collapsed: compact buttons (all platforms) — long-press to reorder */}
       {collapsed && subSessions.length > 0 && (
-        <div class="subsession-bar" style={{ borderTop: 'none' }}>
+        <div class="subsession-bar" style={{ borderTop: 'none' }} ref={(el) => {
+          // Touch-based reorder for collapsed bar (HTML5 drag doesn't work on mobile)
+          if (!el) return;
+          let longPressTimer: ReturnType<typeof setTimeout> | null = null;
+          let dragId: string | null = null;
+          let dragging = false;
+
+          const findBtnId = (target: EventTarget | null): string | null => {
+            let node = target as HTMLElement | null;
+            while (node && node !== el) {
+              if (node.dataset.subId) return node.dataset.subId;
+              node = node.parentElement;
+            }
+            return null;
+          };
+
+          el.ontouchstart = (e) => {
+            const id = findBtnId(e.target);
+            if (!id) return;
+            longPressTimer = setTimeout(() => {
+              dragId = id;
+              dragging = true;
+              if (!dragOrder) setDragOrder(orderedSessions.map((s) => s.id));
+              // Visual feedback
+              const btn = el.querySelector(`[data-sub-id="${id}"]`) as HTMLElement | null;
+              if (btn) btn.style.opacity = '0.5';
+              // Prevent scroll while dragging
+              el.style.overflowX = 'hidden';
+            }, 400);
+          };
+
+          el.ontouchmove = (e) => {
+            if (longPressTimer && !dragging) { clearTimeout(longPressTimer); longPressTimer = null; return; }
+            if (!dragging || !dragId) return;
+            e.preventDefault();
+            const touch = e.touches[0];
+            const targetEl = document.elementFromPoint(touch.clientX, touch.clientY);
+            const overId = findBtnId(targetEl);
+            if (overId && overId !== dragId) {
+              setDragOrder((prev) => {
+                const ids = prev ?? orderedSessions.map((s) => s.id);
+                const from = ids.indexOf(dragId!);
+                const to = ids.indexOf(overId);
+                if (from === -1 || to === -1) return prev;
+                const next = [...ids];
+                next.splice(from, 1);
+                next.splice(to, 0, dragId!);
+                return next;
+              });
+            }
+          };
+
+          const endDrag = () => {
+            if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+            if (dragging && dragId) {
+              const btn = el.querySelector(`[data-sub-id="${dragId}"]`) as HTMLElement | null;
+              if (btn) btn.style.opacity = '';
+              el.style.overflowX = '';
+              if (dragOrder) syncOrderToServer(dragOrder);
+            }
+            dragId = null;
+            dragging = false;
+          };
+          el.ontouchend = endDrag;
+          el.ontouchcancel = endDrag;
+        }}>
           {orderedSessions.map((sub) => {
             const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
             const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
@@ -391,6 +456,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
             return (
               <button
                 key={sub.id}
+                data-sub-id={sub.id}
                 class={`subsession-card${isOpen ? ' open' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
                 onClick={() => onOpen(sub.id)}
                 title={label + (model ? ` · ${model}` : '') + (ctxPct > 0 ? ` · ctx ${ctxPct.toFixed(0)}%` : '')}
