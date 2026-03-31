@@ -510,6 +510,10 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
   const envPrefix = Object.entries(mergedEnv).map(([k, v]) => `export ${k}=${sq(v)}`).join('; ');
   await respawnPane(record.name, `${envPrefix}; ${cmd}`);
 
+  // Immediately rebind pipe-pane stream (don't wait for old pipe close + 1s delay)
+  const { terminalStreamer } = await import('../daemon/terminal-streamer.js');
+  void terminalStreamer.rebindSession(record.name);
+
   const updated: SessionRecord = {
     ...record,
     restarts: record.restarts + 1,
