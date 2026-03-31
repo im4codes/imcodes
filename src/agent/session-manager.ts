@@ -520,9 +520,13 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     Object.assign(mergedEnv, presetEnv);
   }
 
-  // respawnPane doesn't support env — kill + newSession instead
-  await killSession(record.name).catch(() => {});
-  await newSession(record.name, cmd, { cwd: projectDir, env: mergedEnv });
+  // respawnPane doesn't support -e env — prepend exports to the command string
+  const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+  const envExports = Object.entries(mergedEnv)
+    .map(([k, v]) => `export ${k}=${sq(v)}`)
+    .join('; ');
+  const fullCmd = envExports ? `${envExports}; ${cmd}` : cmd;
+  await respawnPane(record.name, fullCmd);
 
   const updated: SessionRecord = {
     ...record,
