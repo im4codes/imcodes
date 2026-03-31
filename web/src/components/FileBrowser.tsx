@@ -733,6 +733,7 @@ export function FileBrowser({
               path={preview.path}
               content={preview.content}
               currentContent={editContent}
+              isDirty={editDirty}
               mtime={originalMtime}
               onClose={() => {
                 if (editDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
@@ -742,6 +743,7 @@ export function FileBrowser({
               }}
               onSaved={(newMtime) => {
                 setOriginalMtime(newMtime);
+                setEditDirty(false);
                 setPreview((prev) => prev.status === 'ok' && prev.path === preview.path
                   ? { ...prev, content: editContent, diff: undefined, diffHtml: undefined }
                   : prev);

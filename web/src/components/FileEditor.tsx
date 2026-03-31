@@ -43,6 +43,8 @@ export interface FileEditorProps {
   currentContent?: string;
   /** Live content updates from CodeMirror */
   onContentChange?: (content: string) => void;
+  /** Dirty state driven by parent (FileEditorContent via FileBrowser) */
+  isDirty?: boolean;
 }
 
 /** Detect CodeMirror language extension from file path */
@@ -71,10 +73,11 @@ function getLanguageExtension(path: string) {
   }
 }
 
-export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessage, onDirtyChange, currentContent }: FileEditorProps) {
+export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessage, currentContent, isDirty: isDirtyProp }: FileEditorProps) {
   const { t } = useTranslation();
   const [originalMtime, setOriginalMtime] = useState(mtime);
-  const [isDirty, setIsDirty] = useState(false);
+  // isDirty is driven by the parent (FileEditorContent reports dirty via onDirtyChange → FileBrowser → isDirty prop)
+  const isDirty = isDirtyProp ?? false;
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'success' | 'error' | 'timeout'>('idle');
   const [saveError, setSaveError] = useState<string | null>(null);
   const pendingWriteRef = useRef(new Map<string, string>());
@@ -88,7 +91,6 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
 
       if (msg.status === 'ok') {
         setOriginalMtime(msg.mtime);
-        setIsDirty(false);
         setSaveStatus('success');
         setSaveError(null);
         if (msg.mtime) onSaved(msg.mtime);
@@ -136,9 +138,6 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
   }, [isDirty, doSave]);
-
-  /** Expose dirty state to parent */
-  useEffect(() => { onDirtyChange?.(isDirty); }, [isDirty, onDirtyChange]);
 
   return (
     <>
