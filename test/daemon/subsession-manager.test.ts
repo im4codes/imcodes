@@ -177,6 +177,7 @@ describe('startSubSession — ccSessionId stored in session-store', () => {
     expect(startWatchingFile).toHaveBeenCalledWith(
       'deck_sub_sub456',
       expect.stringContaining('my-session-uuid.jsonl'),
+      'my-session-uuid',
     );
     expect(startWatching).not.toHaveBeenCalled();
   });
@@ -193,6 +194,7 @@ describe('startSubSession — ccSessionId stored in session-store', () => {
     expect(startWatchingFile).toHaveBeenCalledWith(
       'deck_sub_sub789',
       expect.stringContaining('.jsonl'),
+      expect.any(String),
     );
   });
 
