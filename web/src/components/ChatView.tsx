@@ -816,7 +816,7 @@ function ToolCallGroup({ events, onPathClick }: { events: TimelineEvent[]; onPat
 
 // ToolInputFold removed — replaced by unified ToolBlockFold (CSS max-height based)
 
-function AttachmentDownloadButton({ att, serverId }: { att: { id: string; originalName?: string; size?: number }; serverId: string }) {
+function AttachmentDownloadButton({ att, serverId, onPathClick }: { att: { id: string; originalName?: string; size?: number; daemonPath?: string }; serverId: string; onPathClick?: (p: string) => void }) {
   const { t } = useTranslation();
   const [error, setError] = useState<string | null>(null);
   const label = att.originalName || att.id;
@@ -837,6 +837,11 @@ function AttachmentDownloadButton({ att, serverId }: { att: { id: string; origin
         class="chat-attachment-dl"
         onClick={() => {
           setError(null);
+          // If file has a daemon path, open in file browser floating panel
+          if (att.daemonPath && onPathClick) {
+            onPathClick(att.daemonPath);
+            return;
+          }
           import('../api.js').then(({ previewAttachment }) => {
             previewAttachment(serverId, att.id).catch(handleError);
           });
@@ -875,7 +880,7 @@ const ChatEvent = memo(function ChatEvent({ event, nextTs, onPathClick, serverId
       return (
         <div class={`chat-event chat-user${event.payload.pending ? ' chat-pending' : ''}`}>
           {attachments && serverId && attachments.map((att) => (
-            <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} />
+            <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} onPathClick={onPathClick} />
           ))}
           {userText && <div class="chat-bubble-content">{splitPathsAndUrls(userText, onPathClick)}</div>}
           {!event.payload.pending && <ChatTime ts={event.ts} />}
