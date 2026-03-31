@@ -184,6 +184,17 @@ export function useSubSessions(
           parentSession: activeSession,
           ...extra,
         });
+      } else if (extra?.ccPreset || extra?.ccInitPrompt) {
+        // CC with preset — send as raw message to include extra fields
+        ws?.send({
+          type: 'subsession.start',
+          id: sub.id,
+          sessionType: type,
+          cwd,
+          ccSessionId,
+          parentSession: activeSession,
+          ...extra,
+        });
       } else {
         ws?.subSessionStart(sub.id, type, shellBin, cwd, ccSessionId, activeSession);
       }

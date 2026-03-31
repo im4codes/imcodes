@@ -49,6 +49,17 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const [description, setDescription] = useState('');
   const [ocSelectedSession, setOcSelectedSession] = useState('');
 
+  // CC env presets
+  const [ccPresets, setCcPresets] = useState<Array<{ name: string; env: Record<string, string>; contextWindow?: number; initMessage?: string }>>([]);
+  const [ccPreset, setCcPreset] = useState<string>('');
+  const [ccInitPrompt, setCcInitPrompt] = useState<string>('');
+  const [showPresetEditor, setShowPresetEditor] = useState(false);
+  const [newPresetName, setNewPresetName] = useState('');
+  const [newPresetEnv, setNewPresetEnv] = useState('');
+  const [newPresetCtx, setNewPresetCtx] = useState('');
+  const [newPresetInit, setNewPresetInit] = useState('');
+  const [presetError, setPresetError] = useState('');
+
   // Remote sessions come from the provider status hook (pushed on connect, cached in DB)
   const ocRemoteSessions = getRemoteSessions('openclaw');
 
@@ -72,10 +83,14 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
         setDetectingShells(false);
         setShellBin((prev) => (msg.shells.includes(prev) ? prev : (msg.shells[0] ?? prev)));
       }
+      if (msg.type === 'cc.presets.list_response') {
+        setCcPresets((msg as any).presets ?? []);
+      }
     });
 
     setDetectingShells(true);
     ws.subSessionDetectShells();
+    try { ws.send({ type: 'cc.presets.list' }); } catch {}
     return unsub;
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ws]);
@@ -109,7 +124,11 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     if (type === 'shell' && selectedShell) {
       void saveUserPref('default_shell', selectedShell).catch(() => {});
     }
-    onStart(type, selectedShell, cwd || undefined, label || undefined, desc ? { description: desc } : undefined);
+    const extra: Record<string, unknown> = {};
+    if (desc) extra.description = desc;
+    if (ccPreset && type === 'claude-code') extra.ccPreset = ccPreset;
+    if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
+    onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
 
   return (
@@ -263,6 +282,74 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                 </div>
               )}
 
+            </>
+          )}
+
+          {/* CC env preset selector + editor */}
+          {type === 'claude-code' && (
+            <>
+              <div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                  <span style={{ fontSize: 12, color: '#94a3b8' }}>API Provider</span>
+                  <button type="button" style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', fontSize: 11, padding: 0 }} onClick={() => setShowPresetEditor(!showPresetEditor)}>
+                    {showPresetEditor ? '▾ Close' : '+ Add / Edit'}
+                  </button>
+                </div>
+                {ccPresets.length > 0 ? (
+                  <select class="input" value={ccPreset} onChange={(e) => setCcPreset((e.target as HTMLSelectElement).value)} style={{ width: '100%' }}>
+                    <option value="">Default (Anthropic)</option>
+                    {ccPresets.map((p) => <option key={p.name} value={p.name}>{p.name}{p.env['ANTHROPIC_MODEL'] ? ` (${p.env['ANTHROPIC_MODEL']})` : ''}</option>)}
+                  </select>
+                ) : !showPresetEditor && (
+                  <div style={{ fontSize: 11, color: '#475569' }}>Default (Anthropic)</div>
+                )}
+              </div>
+
+              {showPresetEditor && (
+                <div style={{ background: '#0f172a', border: '1px solid #334155', borderRadius: 6, padding: 10, fontSize: 11 }}>
+                  <div style={{ color: '#64748b', marginBottom: 4, fontSize: 10 }}>Stored locally (~/.imcodes/cc-presets.json)</div>
+                  {presetError && <div style={{ color: '#ef4444', fontSize: 11, marginBottom: 4 }}>{presetError}</div>}
+                  <input class="input" placeholder="Name" value={newPresetName} onInput={(e) => setNewPresetName((e.target as HTMLInputElement).value)} style={{ width: '100%', marginBottom: 4, fontSize: 11 }} />
+                  <textarea class="input" placeholder='{"ANTHROPIC_BASE_URL":"...","ANTHROPIC_AUTH_TOKEN":"...","ANTHROPIC_MODEL":"..."}' value={newPresetEnv} rows={2} onInput={(e) => setNewPresetEnv((e.target as HTMLTextAreaElement).value)} style={{ width: '100%', marginBottom: 4, fontSize: 10, fontFamily: 'monospace', resize: 'vertical' }} />
+                  <input class="input" placeholder="Context window (e.g. 200000)" value={newPresetCtx} onInput={(e) => setNewPresetCtx((e.target as HTMLInputElement).value)} style={{ width: '100%', marginBottom: 4, fontSize: 11 }} />
+                  <textarea class="input" placeholder="Init message (default: DuckDuckGo search)" value={newPresetInit} rows={1} onInput={(e) => setNewPresetInit((e.target as HTMLTextAreaElement).value)} style={{ width: '100%', marginBottom: 6, fontSize: 11, resize: 'vertical' }} />
+                  <button type="button" class="btn btn-primary" style={{ fontSize: 11, padding: '3px 10px' }} disabled={!newPresetName.trim() || !newPresetEnv.trim()}
+                    onClick={() => {
+                      try {
+                        const env = JSON.parse(newPresetEnv);
+                        const preset: any = { name: newPresetName.trim(), env };
+                        if (newPresetCtx) preset.contextWindow = parseInt(newPresetCtx, 10);
+                        if (newPresetInit.trim()) preset.initMessage = newPresetInit.trim();
+                        const updated = [...ccPresets.filter(p => p.name !== preset.name), preset];
+                        setCcPresets(updated);
+                        try { ws?.send({ type: 'cc.presets.save', presets: updated }); } catch {}
+                        setNewPresetName(''); setNewPresetEnv(''); setNewPresetCtx(''); setNewPresetInit('');
+                        setCcPreset(preset.name); setPresetError('');
+                      } catch { setPresetError('Invalid JSON'); }
+                    }}
+                  >Save</button>
+                  {ccPresets.length > 0 && (
+                    <div style={{ marginTop: 8, borderTop: '1px solid #334155', paddingTop: 6 }}>
+                      {ccPresets.map((p) => (
+                        <div key={p.name} style={{ display: 'flex', justifyContent: 'space-between', padding: '2px 0', fontSize: 11 }}>
+                          <span style={{ color: '#e2e8f0' }}>{p.name} <span style={{ color: '#475569' }}>{p.env['ANTHROPIC_MODEL'] ?? ''}</span></span>
+                          <div style={{ display: 'flex', gap: 4 }}>
+                            <button type="button" style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', fontSize: 10 }} onClick={() => { setNewPresetName(p.name); setNewPresetEnv(JSON.stringify(p.env, null, 2)); setNewPresetCtx(p.contextWindow ? String(p.contextWindow) : ''); setNewPresetInit(p.initMessage ?? ''); }}>Edit</button>
+                            <button type="button" style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: 10 }} onClick={() => { const u = ccPresets.filter(x => x.name !== p.name); setCcPresets(u); try { ws?.send({ type: 'cc.presets.save', presets: u }); } catch {} if (ccPreset === p.name) setCcPreset(''); }}>Del</button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {ccPreset && (
+                <div>
+                  <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>Extra init prompt</div>
+                  <textarea class="input" placeholder="Additional instruction..." value={ccInitPrompt} rows={2} onInput={(e) => setCcInitPrompt((e.target as HTMLTextAreaElement).value)} style={{ width: '100%', resize: 'vertical' }} />
+                </div>
+              )}
             </>
           )}
 
