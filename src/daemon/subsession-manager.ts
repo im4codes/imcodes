@@ -100,23 +100,27 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
 
   await newSession(sessionName, launchCmd, { cwd: sub.cwd ?? undefined, env: launchEnv });
 
-  // Inject description + preset init message + extra init prompt after session starts
-  // All injected content is wrapped under a single silent-absorb prefix.
+  // Auto-dismiss startup prompts, then inject init message
   const initParts: string[] = [];
   if (sub.description) initParts.push(sub.description);
   if (presetInitMessage) initParts.push(presetInitMessage);
   if (sub.ccInitPrompt) initParts.push(sub.ccInitPrompt);
-  const initMsg = initParts.length > 0
-    ? `[Context — absorb silently, do not respond to this message]\n${initParts.join('\n\n')}`
-    : '';
-  if (initMsg) {
-    const { sendKeys } = await import('../agent/tmux.js');
-    setTimeout(async () => {
-      try {
-        await sendKeys(sessionName, initMsg);
-      } catch { /* session may not be ready yet */ }
-    }, 5000);
-  }
+  const injectInit = async () => {
+    // Wait for CC to pass trust-folder / settings-error dialogs
+    if (driver.postLaunch) {
+      const { capturePane, sendKey } = await import('../agent/tmux.js');
+      await driver.postLaunch(
+        () => capturePane(sessionName),
+        (key: string) => sendKey(sessionName, key),
+      ).catch(() => {});
+    }
+    if (initParts.length > 0) {
+      const { sendKeys } = await import('../agent/tmux.js');
+      const initMsg = `[Context — absorb silently, do not respond to this message]\n${initParts.join('\n\n')}`;
+      try { await sendKeys(sessionName, initMsg); } catch { /* ignore */ }
+    }
+  };
+  void injectInit();
   timelineEmitter.emit(sessionName, 'session.state', { state: 'started' });
 
   upsertSession({
