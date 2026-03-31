@@ -340,7 +340,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
                 </div>
                 <button type="button" disabled={!newPresetName.trim() || !newPresetBaseUrl.trim()} style={{ background: '#1d4ed8', border: 'none', color: '#fff', padding: '4px 12px', borderRadius: 4, cursor: 'pointer', fontSize: 12, opacity: !newPresetName.trim() || !newPresetBaseUrl.trim() ? 0.5 : 1 }}
                   onClick={() => {
-                    const env: Record<string, string> = { ANTHROPIC_BASE_URL: newPresetBaseUrl.trim(), CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' };
+                    const env: Record<string, string> = { ANTHROPIC_BASE_URL: newPresetBaseUrl.trim(), CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', CLAUDE_CODE_ATTRIBUTION_HEADER: '0' };
                     if (newPresetToken.trim()) env['ANTHROPIC_AUTH_TOKEN'] = newPresetToken.trim();
                     if (newPresetModel.trim()) env['ANTHROPIC_MODEL'] = newPresetModel.trim();
                     for (const { key, value } of newPresetCustomEnv) {
@@ -373,7 +373,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
                               setNewPresetModel(p.env['ANTHROPIC_MODEL'] ?? '');
                               setNewPresetCtx(p.contextWindow ? String(p.contextWindow) : '1000000');
                               setNewPresetInit(p.initMessage ?? DEFAULT_INIT_MSG);
-                              const knownKeys = new Set(['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC']);
+                              const knownKeys = new Set(['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'CLAUDE_CODE_ATTRIBUTION_HEADER']);
                               setNewPresetCustomEnv(Object.entries(p.env).filter(([k]) => !knownKeys.has(k)).map(([key, value]) => ({ key, value })));
                             }}
                           >Edit</button>

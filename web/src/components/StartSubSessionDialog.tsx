@@ -348,7 +348,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                   </div>
                   <button type="button" class="btn btn-primary" style={{ fontSize: 11, padding: '3px 10px' }} disabled={!newPresetName.trim() || !newPresetBaseUrl.trim()}
                     onClick={() => {
-                      const env: Record<string, string> = { ANTHROPIC_BASE_URL: newPresetBaseUrl.trim(), CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' };
+                      const env: Record<string, string> = { ANTHROPIC_BASE_URL: newPresetBaseUrl.trim(), CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', CLAUDE_CODE_ATTRIBUTION_HEADER: '0' };
                       if (newPresetToken.trim()) env['ANTHROPIC_AUTH_TOKEN'] = newPresetToken.trim();
                       if (newPresetModel.trim()) env['ANTHROPIC_MODEL'] = newPresetModel.trim();
                       for (const { key, value } of newPresetCustomEnv) { if (key.trim()) env[key.trim()] = value; }
@@ -371,7 +371,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                             <button type="button" style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', fontSize: 10 }} onClick={() => {
                               setNewPresetName(p.name); setNewPresetBaseUrl(p.env['ANTHROPIC_BASE_URL'] ?? ''); setNewPresetToken(p.env['ANTHROPIC_AUTH_TOKEN'] ?? ''); setNewPresetModel(p.env['ANTHROPIC_MODEL'] ?? '');
                               setNewPresetCtx(p.contextWindow ? String(p.contextWindow) : '1000000'); setNewPresetInit(p.initMessage ?? DEFAULT_INIT_MSG);
-                              const knownKeys = new Set(['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC']);
+                              const knownKeys = new Set(['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'CLAUDE_CODE_ATTRIBUTION_HEADER']);
                               setNewPresetCustomEnv(Object.entries(p.env).filter(([k]) => !knownKeys.has(k)).map(([key, value]) => ({ key, value })));
                             }}>Edit</button>
                             <button type="button" style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: 10 }} onClick={() => { const u = ccPresets.filter(x => x.name !== p.name); setCcPresets(u); try { ws?.send({ type: 'cc.presets.save', presets: u }); } catch {} if (ccPreset === p.name) setCcPreset(''); }}>Del</button>
