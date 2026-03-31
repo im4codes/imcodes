@@ -550,55 +550,43 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const handleMenuAction = (action: MenuAction) => {
     if (!ws || !activeSession) return;
     const isSub = !!onSubStop;
+    const isStop = action === 'stop';
 
-    if (isSub) {
-      // Sub-session: single click, no multi-step confirmation
-      if (action === 'stop') {
-        onSubStop();
-      } else if (action === 'restart') {
+    if (isSub && isStop) {
+      // Sub-session stop: no confirmation
+      onSubStop();
+      setMenuOpen(false); resetConfirm(); onAfterAction?.();
+      return;
+    }
+
+    if (isSub && !isStop) {
+      // Sub-session restart/new: 1-click confirmation
+      if (confirm !== action) { startConfirm(action, 1); return; }
+      if (action === 'restart') {
         onSubRestart ? onSubRestart() : ws.sendSessionCommand('restart', { project: activeSession.project });
       } else {
         onSubNew ? onSubNew() : ws.sendSessionCommand('restart', { project: activeSession.project, fresh: true });
       }
-      setMenuOpen(false);
-      resetConfirm();
-      onAfterAction?.();
+      setMenuOpen(false); resetConfirm(); onAfterAction?.();
       return;
     }
 
-    // Main session: 3-level confirmation (click → warn → danger → confirm dialog)
-    if (confirm !== action) {
-      startConfirm(action, 1);
-      return;
-    }
-    if (confirmLevel < 2) {
-      startConfirm(action, 2);
-      return;
-    }
-
-    // Level 3 — show window.confirm dialog with full details
-    const confirmMsg = action === 'stop'
-      ? t('session.confirm_stop_dialog')
-      : action === 'restart'
-        ? t('session.confirm_restart_dialog')
-        : t('session.confirm_new_dialog');
-    if (!window.confirm(confirmMsg)) {
-      resetConfirm();
-      return;
-    }
-    // Main session actions (sub already handled above)
-    if (action === 'restart') {
-      ws.sendSessionCommand('restart', { project: activeSession.project });
-    } else if (action === 'new') {
-      ws.sendSessionCommand('restart', { project: activeSession.project, fresh: true });
-    } else {
+    // Main session
+    if (isStop) {
+      // Main session stop: 3-level (warn → danger → dialog)
+      if (confirm !== action) { startConfirm(action, 1); return; }
+      if (confirmLevel < 2) { startConfirm(action, 2); return; }
+      if (!window.confirm(t('session.confirm_stop_dialog'))) { resetConfirm(); return; }
       onStopProject
         ? onStopProject(activeSession.project)
         : ws.sendSessionCommand('stop', { project: activeSession.project });
+    } else {
+      // Main session restart/new: 1-click confirmation
+      if (confirm !== action) { startConfirm(action, 1); return; }
+      if (!window.confirm(action === 'restart' ? t('session.confirm_restart_dialog') : t('session.confirm_new_dialog'))) { resetConfirm(); return; }
+      ws.sendSessionCommand('restart', { project: activeSession.project, ...(action === 'new' ? { fresh: true } : {}) });
     }
-    setMenuOpen(false);
-    resetConfirm();
-    onAfterAction?.();
+    setMenuOpen(false); resetConfirm(); onAfterAction?.();
   };
 
   const handleModelSelect = (m: ModelChoice) => {

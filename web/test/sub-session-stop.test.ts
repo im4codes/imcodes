@@ -87,46 +87,74 @@ describe('sub-session stop: single-click dispatch', () => {
   });
 });
 
-// ── main session: 3-level confirmation state machine ────────────────────────
+// ── confirmation levels per action type ──────────────────────────────────────
 
-describe('main session 3-level confirmation state machine', () => {
+describe('confirmation levels', () => {
   type MenuAction = 'stop' | 'restart' | 'new';
 
-  /**
-   * Mirrors the main-session branch of handleMenuAction in SessionControls.tsx.
-   * Main sessions: 3 steps (click → warn → danger → dialog).
-   */
-  function simulateMainConfirmStep(opts: {
+  /** Mirrors handleMenuAction confirmation logic. */
+  function simulateConfirmStep(opts: {
+    isSub: boolean;
     confirmAction: MenuAction | null;
     confirmLevel: number;
     action: MenuAction;
-  }): 'level1' | 'level2' | 'dialog' {
-    const { confirmAction, confirmLevel, action } = opts;
-    if (confirmAction !== action) return 'level1';
-    if (confirmLevel < 2) return 'level2';
-    return 'dialog';
+  }): 'immediate' | 'level1' | 'level2' | 'dialog' {
+    const { isSub, confirmAction, confirmLevel, action } = opts;
+    const isStop = action === 'stop';
+
+    // Sub-session stop: no confirmation
+    if (isSub && isStop) return 'immediate';
+
+    // Sub-session restart/new: 1-click confirm
+    if (isSub && !isStop) {
+      return confirmAction !== action ? 'level1' : 'dialog';
+    }
+
+    // Main session stop: 3-level (warn → danger → dialog)
+    if (!isSub && isStop) {
+      if (confirmAction !== action) return 'level1';
+      if (confirmLevel < 2) return 'level2';
+      return 'dialog';
+    }
+
+    // Main session restart/new: 1-click confirm
+    return confirmAction !== action ? 'level1' : 'dialog';
   }
 
-  it('step 1: first click shows warning', () => {
-    expect(simulateMainConfirmStep({ confirmAction: null, confirmLevel: 0, action: 'stop' })).toBe('level1');
+  // Sub-session stop: immediate
+  it('sub-session stop executes immediately', () => {
+    expect(simulateConfirmStep({ isSub: true, confirmAction: null, confirmLevel: 0, action: 'stop' })).toBe('immediate');
   });
 
-  it('step 2: second click escalates to danger', () => {
-    expect(simulateMainConfirmStep({ confirmAction: 'stop', confirmLevel: 1, action: 'stop' })).toBe('level2');
+  // Sub-session restart: 1-click
+  it('sub-session restart: first click warns', () => {
+    expect(simulateConfirmStep({ isSub: true, confirmAction: null, confirmLevel: 0, action: 'restart' })).toBe('level1');
+  });
+  it('sub-session restart: second click shows dialog', () => {
+    expect(simulateConfirmStep({ isSub: true, confirmAction: 'restart', confirmLevel: 1, action: 'restart' })).toBe('dialog');
   });
 
-  it('step 3: third click shows dialog', () => {
-    expect(simulateMainConfirmStep({ confirmAction: 'stop', confirmLevel: 2, action: 'stop' })).toBe('dialog');
+  // Main session stop: 3-level
+  it('main stop step 1: first click warns', () => {
+    expect(simulateConfirmStep({ isSub: false, confirmAction: null, confirmLevel: 0, action: 'stop' })).toBe('level1');
+  });
+  it('main stop step 2: second click escalates to danger', () => {
+    expect(simulateConfirmStep({ isSub: false, confirmAction: 'stop', confirmLevel: 1, action: 'stop' })).toBe('level2');
+  });
+  it('main stop step 3: third click shows dialog', () => {
+    expect(simulateConfirmStep({ isSub: false, confirmAction: 'stop', confirmLevel: 2, action: 'stop' })).toBe('dialog');
   });
 
-  it('restart also requires 3 steps', () => {
-    expect(simulateMainConfirmStep({ confirmAction: null, confirmLevel: 0, action: 'restart' })).toBe('level1');
-    expect(simulateMainConfirmStep({ confirmAction: 'restart', confirmLevel: 1, action: 'restart' })).toBe('level2');
-    expect(simulateMainConfirmStep({ confirmAction: 'restart', confirmLevel: 2, action: 'restart' })).toBe('dialog');
+  // Main session restart: 1-click
+  it('main restart: first click warns', () => {
+    expect(simulateConfirmStep({ isSub: false, confirmAction: null, confirmLevel: 0, action: 'restart' })).toBe('level1');
+  });
+  it('main restart: second click shows dialog', () => {
+    expect(simulateConfirmStep({ isSub: false, confirmAction: 'restart', confirmLevel: 1, action: 'restart' })).toBe('dialog');
   });
 
   it('clicking a different action resets to level1', () => {
-    expect(simulateMainConfirmStep({ confirmAction: 'stop', confirmLevel: 2, action: 'restart' })).toBe('level1');
+    expect(simulateConfirmStep({ isSub: false, confirmAction: 'stop', confirmLevel: 2, action: 'restart' })).toBe('level1');
   });
 });
 
