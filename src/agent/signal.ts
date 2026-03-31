@@ -12,6 +12,10 @@
  *
  * Hook format required by Claude Code:
  *   "Stop": [{ "matcher": "", "hooks": [{ "type": "command", "command": "..." }] }]
+ *
+ * Platform support:
+ *   Unix:    generates .sh scripts (bash + curl)
+ *   Windows: generates .mjs scripts (Node.js + fetch)
  */
 
 import { promises as fs } from 'fs';
@@ -21,6 +25,7 @@ import { activeHookPort } from '../daemon/hook-server.js';
 
 const IMCODES_DIR = path.join(os.homedir(), '.imcodes');
 const CC_SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json');
+const IS_WINDOWS = process.platform === 'win32';
 
 // ── Signal file API ────────────────────────────────────────────────────────────
 
@@ -54,6 +59,8 @@ export async function checkIdleSignal(session: string): Promise<IdleSignal | nul
   }
 }
 
+// ── Unix (bash) hook scripts ──────────────────────────────────────────────────
+
 // Common preamble for all hook scripts: get deck_ session name or exit.
 // Cross-platform: prefer $IMCODES_SESSION (injected by session-manager at launch),
 // fall back to tmux $TMUX_PANE for backward compatibility.
@@ -75,14 +82,6 @@ esac`;
 
 const CURL_BASE = (port: number) =>
   `curl -s -X POST "http://127.0.0.1:${port}/notify" \\\n  -H "Content-Type: application/json"`;
-
-/** Maps CC hook event name → script file name */
-const HOOK_SCRIPTS: Record<string, string> = {
-  Stop: 'cc_hook_stop.sh',
-  Notification: 'cc_hook_notify.sh',
-  PreToolUse: 'cc_hook_pretool.sh',
-  PostToolUse: 'cc_hook_posttool.sh',
-};
 
 function buildStopScript(port: number): string {
   return `#!/bin/bash
@@ -162,23 +161,123 @@ ${CURL_BASE(port)} \\
 `;
 }
 
+// ── Windows (Node.js) hook scripts ────────────────────────────────────────────
+
+// Common session detection for Windows .mjs scripts.
+// CC sets IMCODES_SESSION env var at launch. No tmux fallback needed on Windows.
+const WIN_SESSION_PREAMBLE = `const SESSION_NAME = process.env.IMCODES_SESSION || '';
+if (!SESSION_NAME || !SESSION_NAME.startsWith('deck_')) process.exit(0);`;
+
+const WIN_STDIN_READ = `const chunks = [];
+for await (const chunk of process.stdin) chunks.push(chunk);
+const INPUT = JSON.parse(Buffer.concat(chunks).toString() || '{}');`;
+
+const WIN_POST = (port: number) =>
+  `async function post(body) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), 2000);
+  try { await fetch('http://127.0.0.1:${port}/notify', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body), signal: ac.signal,
+  }); } catch {} finally { clearTimeout(t); }
+}`;
+
+function buildStopScriptWin(port: number): string {
+  return `#!/usr/bin/env node
+// IM.codes CC Stop Hook (Windows) — notifies daemon when Claude Code goes idle
+${WIN_SESSION_PREAMBLE}
+${WIN_POST(port)}
+(async () => {
+  ${WIN_STDIN_READ}
+  if (INPUT.stop_hook_active) process.exit(0);
+  await post({ event: 'idle', session: SESSION_NAME, agentType: 'claude-code' });
+})();
+`;
+}
+
+function buildNotifyScriptWin(port: number): string {
+  return `#!/usr/bin/env node
+// IM.codes CC Notification Hook (Windows) — forwards notifications to daemon
+${WIN_SESSION_PREAMBLE}
+${WIN_POST(port)}
+(async () => {
+  ${WIN_STDIN_READ}
+  const title = INPUT.title || '';
+  const message = INPUT.message || '';
+  if (!title && !message) process.exit(0);
+  await post({ event: 'notification', session: SESSION_NAME, title, message });
+})();
+`;
+}
+
+function buildPreToolScriptWin(port: number): string {
+  return `#!/usr/bin/env node
+// IM.codes CC PreToolUse Hook (Windows) — reports active tool to daemon
+${WIN_SESSION_PREAMBLE}
+${WIN_POST(port)}
+(async () => {
+  ${WIN_STDIN_READ}
+  await post({ event: 'tool_start', session: SESSION_NAME, tool: INPUT.tool_name || 'unknown', tool_input: INPUT.tool_input || {} });
+})();
+`;
+}
+
+function buildPostToolScriptWin(port: number): string {
+  return `#!/usr/bin/env node
+// IM.codes CC PostToolUse Hook (Windows) — reports tool completion to daemon
+${WIN_SESSION_PREAMBLE}
+${WIN_POST(port)}
+(async () => {
+  ${WIN_STDIN_READ}
+  await post({ event: 'tool_end', session: SESSION_NAME });
+})();
+`;
+}
+
+// ── Hook setup ────────────────────────────────────────────────────────────────
+
+/** Maps CC hook event name → script file name (platform-dependent extension) */
+function hookScripts(): Record<string, string> {
+  const ext = IS_WINDOWS ? '.mjs' : '.sh';
+  return {
+    Stop: `cc_hook_stop${ext}`,
+    Notification: `cc_hook_notify${ext}`,
+    PreToolUse: `cc_hook_pretool${ext}`,
+    PostToolUse: `cc_hook_posttool${ext}`,
+  };
+}
+
+/** Build all hook scripts for the current platform. */
+function buildScripts(port: number): Array<{ name: string; content: string }> {
+  const names = hookScripts();
+  if (IS_WINDOWS) {
+    return [
+      { name: names['Stop']!, content: buildStopScriptWin(port) },
+      { name: names['Notification']!, content: buildNotifyScriptWin(port) },
+      { name: names['PreToolUse']!, content: buildPreToolScriptWin(port) },
+      { name: names['PostToolUse']!, content: buildPostToolScriptWin(port) },
+    ];
+  }
+  return [
+    { name: names['Stop']!, content: buildStopScript(port) },
+    { name: names['Notification']!, content: buildNotifyScript(port) },
+    { name: names['PreToolUse']!, content: buildPreToolScript(port) },
+    { name: names['PostToolUse']!, content: buildPostToolScript(port) },
+  ];
+}
+
 /** Write all hook scripts to ~/.imcodes/ and register them in ~/.claude/settings.json. */
 export async function setupCCHooks(): Promise<void> {
   await fs.mkdir(IMCODES_DIR, { recursive: true });
   const port = activeHookPort;
+  const scripts = buildScripts(port);
+  const names = hookScripts();
 
   // ── 1. Write hook scripts ───────────────────────────────────────────────────
-  const scripts: Array<{ name: string; content: string }> = [
-    { name: HOOK_SCRIPTS['Stop']!, content: buildStopScript(port) },
-    { name: HOOK_SCRIPTS['Notification']!, content: buildNotifyScript(port) },
-    { name: HOOK_SCRIPTS['PreToolUse']!, content: buildPreToolScript(port) },
-    { name: HOOK_SCRIPTS['PostToolUse']!, content: buildPostToolScript(port) },
-  ];
-
   for (const { name, content } of scripts) {
     const scriptPath = path.join(IMCODES_DIR, name);
     await fs.writeFile(scriptPath, content);
-    await fs.chmod(scriptPath, 0o755);
+    await fs.chmod(scriptPath, 0o755).catch(() => {}); // chmod may fail on Windows, that's fine
   }
 
   // ── 2. Update ~/.claude/settings.json ──────────────────────────────────────
@@ -194,8 +293,10 @@ export async function setupCCHooks(): Promise<void> {
 
   type HookEntry = { matcher?: string; hooks?: Array<{ type: string; command: string }> };
 
-  for (const [eventName, scriptName] of Object.entries(HOOK_SCRIPTS)) {
+  for (const [eventName, scriptName] of Object.entries(names)) {
     const scriptPath = path.join(IMCODES_DIR, scriptName);
+    // On Windows, CC needs "node <path>" as the command since .mjs isn't directly executable
+    const command = IS_WINDOWS ? `node "${scriptPath}"` : scriptPath;
     const entries = ((hooks[eventName] as unknown[]) ?? []) as HookEntry[];
 
     // Remove any legacy flat entries pointing to any imcodes script (wrong format)
@@ -213,7 +314,7 @@ export async function setupCCHooks(): Promise<void> {
     // Register in correct format
     withoutOld.push({
       matcher: '',
-      hooks: [{ type: 'command', command: scriptPath }],
+      hooks: [{ type: 'command', command }],
     });
 
     hooks[eventName] = withoutOld;

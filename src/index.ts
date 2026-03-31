@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { startup, shutdown } from './daemon/lifecycle.js';
-import { startProject, stopProject, sessionName } from './agent/session-manager.js';
-import { loadStore, listSessions } from './store/session-store.js';
-import { sendKeys } from './agent/tmux.js';
+// These modules are imported lazily to avoid eager tmux backend detection on Windows.
+// Commands like `bind` don't need tmux/conpty and shouldn't crash when node-pty is missing.
+// Use dynamic import() at point of use instead of top-level imports.
 import { bindFlow } from './bind/bind-flow.js';
 import logger from './util/logger.js';
 import { execSync, spawn } from 'child_process';
@@ -89,6 +88,7 @@ program
     if (opts.foreground) {
       // Acquire single-instance lock before installing global error handlers
       // so duplicate-instance errors propagate cleanly instead of being swallowed.
+      const { startup } = await import('./daemon/lifecycle.js');
       try {
         await startup();
       } catch (err) {
@@ -136,7 +136,8 @@ program
       console.log('Daemon started via systemd.');
     } else {
       // Fallback: run inline
-      await startup();
+      const { startup: startupInline } = await import('./daemon/lifecycle.js');
+      await startupInline();
       logger.info('Daemon running. Press Ctrl+C to stop.');
       await new Promise(() => {});
     }
@@ -146,6 +147,7 @@ program
   .command('stop')
   .description('Stop the daemon gracefully')
   .action(async () => {
+    const { shutdown } = await import('./daemon/lifecycle.js');
     await shutdown(0);
   });
 
@@ -161,7 +163,9 @@ program
       .option('--workers <types>', 'Comma-separated worker types', 'claude-code')
       .action(async (name: string, dir: string, opts: { brain: string; workers: string }) => {
         const workerTypes = opts.workers.split(',').map((t) => t.trim()) as ('claude-code' | 'codex' | 'opencode')[];
+        const { loadStore } = await import('./store/session-store.js');
         await loadStore();
+        const { startProject } = await import('./agent/session-manager.js');
         await startProject({ name, dir, brainType: opts.brain as 'claude-code' | 'codex' | 'opencode', workerTypes });
         console.log(`Started project ${name}: brain + ${workerTypes.length} worker(s)`);
       }),
@@ -171,7 +175,9 @@ program
       .description('Stop all sessions for a project')
       .argument('<name>', 'Project name')
       .action(async (name: string) => {
+        const { loadStore } = await import('./store/session-store.js');
         await loadStore();
+        const { stopProject } = await import('./agent/session-manager.js');
         await stopProject(name);
         console.log(`Stopped project ${name}`);
       }),
@@ -186,6 +192,7 @@ program
     const { loadCredentials } = await import('./bind/bind-flow.js');
     const { listSessions: tmuxList } = await import('./agent/tmux.js');
     const { DAEMON_VERSION } = await import('./util/version.js');
+    const { loadStore, listSessions } = await import('./store/session-store.js');
 
     await loadStore();
     const sessions = listSessions(opts.project);
@@ -303,6 +310,7 @@ program
       }
 
       // Direct store fallback
+      const { loadStore, listSessions } = await import('./store/session-store.js');
       await loadStore();
       let from: string | undefined;
       try { from = await detectSenderSession(); } catch { /* unknown sender */ }
@@ -411,9 +419,11 @@ program
       process.exit(1);
     }
     // Support shorthand "project:role"
+    const { sessionName } = await import('./agent/session-manager.js');
     const name = resolvedTarget.includes(':')
       ? sessionName(resolvedTarget.split(':')[0], resolvedTarget.split(':')[1] as 'brain' | `w${number}`)
       : resolvedTarget;
+    const { sendKeys } = await import('./agent/tmux.js');
     await sendKeys(name, message);
     console.log(`Sent to ${name}`);
   });
