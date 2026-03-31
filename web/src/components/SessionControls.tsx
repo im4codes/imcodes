@@ -356,7 +356,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
     // Pass user locale for P2P language instruction
     if (extra.p2pAtTargets || extra.p2pMode) {
-      extra.p2pLocale = i18n.language;
+      extra.p2pLocale = i18n?.language ?? 'en';
     }
 
     // Prepend quotes
