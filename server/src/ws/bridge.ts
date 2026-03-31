@@ -978,6 +978,12 @@ export class WsBridge {
       return;
     }
 
+    // ── CC presets responses → broadcast to browsers ────────────
+    if (type === 'cc.presets.list_response' || type === 'cc.presets.save_response') {
+      this.broadcastToBrowsers(JSON.stringify(msg));
+      return;
+    }
+
     // ── P2P discussion list/read responses → broadcast to browsers ────────────
     if (type === 'p2p.list_discussions_response' || type === 'p2p.read_discussion_response') {
       this.broadcastToBrowsers(JSON.stringify(msg));
