@@ -312,16 +312,17 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
         )}
         {/* Mobile: compact stats in collapsed toolbar */}
         {collapsed && stats && (() => {
-          const memGb = stats.memUsed / (1024 ** 3);
-          const memStr = memGb >= 1 ? `${memGb.toFixed(1)}G` : `${(stats.memUsed / (1024 ** 2)).toFixed(0)}M`;
+          const fmt = (b: number) => { const g = b / (1024 ** 3); return g >= 1 ? `${g.toFixed(1)}G` : `${(b / (1024 ** 2)).toFixed(0)}M`; };
+          const memUsed = fmt(stats.memUsed);
+          const memTotal = fmt(stats.memTotal);
           return (
-            <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memStr} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`} style={{ whiteSpace: 'nowrap', fontSize: 10 }}>
-              {stats.daemonVersion && <><span style={{ color: '#94a3b8' }}>v{stats.daemonVersion}</span><span style={{ color: '#334155' }}>·</span></>}
-              <span style={{ color: stats.cpu > 80 ? '#f87171' : stats.cpu > 50 ? '#fbbf24' : '#4ade80' }}>{stats.cpu}%</span>
-              <span style={{ color: '#334155' }}>·</span>
-              <span style={{ color: '#60a5fa' }}>{memStr}</span>
-              <span style={{ color: '#334155' }}>·</span>
-              <span style={{ color: '#a78bfa' }}>{stats.load1}</span>
+            <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`} style={{ whiteSpace: 'nowrap', fontSize: 10 }}>
+              {stats.daemonVersion && <span style={{ color: '#94a3b8' }}>v{stats.daemonVersion} </span>}
+              <span style={{ color: stats.cpu > 80 ? '#f87171' : stats.cpu > 50 ? '#fbbf24' : '#4ade80' }}>⚡{stats.cpu}%</span>
+              {' '}
+              <span style={{ color: '#60a5fa' }}>💾{memUsed}/{memTotal}</span>
+              {' '}
+              <span style={{ color: '#a78bfa' }}>≡{stats.load1}</span>
             </span>
           );
         })()}
