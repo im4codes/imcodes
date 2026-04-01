@@ -305,7 +305,17 @@
     "all_rounds": "{{count}} 轮",
     "all_rounds_plural": "{{count}} 轮",
     "all_plus": "全部 + 自定义轮数",
-    "all_preview_empty": "未配置参与者"
+    "all_preview_empty": "未配置参与者",
+    "single_agent_prompt": {
+      "title": "再加几个 Agent？",
+      "body": "你现在只选择了 1 个 Agent。",
+      "tip_multi": "建议选择多个不同类型、不同厂家的 Agent，更容易突破定式思维，通常效果最好。",
+      "tip_rounds": "P2P 讨论通常 2 轮效果最佳。",
+      "dont_show_again": "此账号不再提示",
+      "more_agents": "@ 更多",
+      "send_anyway": "仍然发送",
+      "tip_history": "多 Agent 是共享文件、历史更完整的讨论；一对一则是一次性讨论。"
+    }
   },
   "upload": {
     "upload_file": "上传文件",

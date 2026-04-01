@@ -29,10 +29,12 @@ vi.mock('../../src/components/QuickInputPanel.js', () => ({
 }));
 
 const uploadFileMock = vi.fn();
+const getUserPrefMock = vi.fn().mockResolvedValue(null);
+const saveUserPrefMock = vi.fn().mockResolvedValue(undefined);
 vi.mock('../../src/api.js', () => ({
   uploadFile: (...args: unknown[]) => uploadFileMock(...args),
-  getUserPref: vi.fn().mockResolvedValue(null),
-  saveUserPref: vi.fn().mockResolvedValue(undefined),
+  getUserPref: (...args: unknown[]) => getUserPrefMock(...args),
+  saveUserPref: (...args: unknown[]) => saveUserPrefMock(...args),
 }));
 
 import { SessionControls } from '../../src/components/SessionControls.js';
@@ -92,6 +94,8 @@ describe('SessionControls', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    getUserPrefMock.mockResolvedValue(null);
+    saveUserPrefMock.mockResolvedValue(undefined);
   });
 
   it('renders input and send button', () => {
@@ -298,6 +302,9 @@ describe('SessionControls', () => {
     fireEvent.input(input);
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
 
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: /send_anyway/i }));
+
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       sessionName: 'deck_my-project_brain',
       text: 'please review',
@@ -413,7 +420,7 @@ describe('SessionControls', () => {
     getSelectionSpy.mockRestore();
   });
 
-  it('manual @@label(mode) text sends single-target p2p routing when exactly one target resolves', () => {
+  it('manual @@label(mode) text also triggers the single-agent reminder when exactly one target resolves', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -430,6 +437,9 @@ describe('SessionControls', () => {
     input.textContent = '@@plan(Audit) check this';
     fireEvent.input(input);
     fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: /send_anyway/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       sessionName: 'deck_my-project_brain',
@@ -645,6 +655,139 @@ describe('SessionControls', () => {
       // Send (with attachment only, no text)
       fireEvent.click(screen.getByRole('button', { name: /send/i }));
       expect(document.querySelector('.attachment-badge')).toBeNull();
+    });
+
+    it('shows a single-agent reminder before sending one @-picked target', () => {
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={mainSession}
+          quickData={makeQuickData() as any}
+          sessions={[mainSession]}
+          subSessions={[
+            { sessionName: 'deck_sub_w1', type: 'codex', label: 'w1', state: 'idle', parentSession: 'deck_my-project_brain' },
+          ]}
+        />,
+      );
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+      const getSelectionSpy = vi.spyOn(window, 'getSelection').mockImplementation(() => ({
+        anchorOffset: input.textContent?.length ?? 0,
+      }) as any);
+
+      input.textContent = '@';
+      fireEvent.input(input);
+      fireEvent.click(screen.getByText('agents'));
+      fireEvent.click(screen.getByText('w1'));
+      fireEvent.click(screen.getByText('audit'));
+      input.textContent = `${input.textContent}please review`;
+      fireEvent.input(input);
+      fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+      expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+      expect(screen.getByText('title')).toBeDefined();
+
+      fireEvent.click(screen.getByRole('button', { name: /send_anyway/i }));
+
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+        sessionName: 'deck_my-project_brain',
+        text: 'please review',
+        p2pAtTargets: [
+          { session: 'deck_sub_w1', mode: 'audit' },
+        ],
+      }));
+
+      getSelectionSpy.mockRestore();
+    });
+
+    it('can suppress the single-agent reminder for this account', () => {
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={mainSession}
+          quickData={makeQuickData() as any}
+          sessions={[mainSession]}
+          subSessions={[
+            { sessionName: 'deck_sub_w1', type: 'codex', label: 'w1', state: 'idle', parentSession: 'deck_my-project_brain' },
+          ]}
+        />,
+      );
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+      const getSelectionSpy = vi.spyOn(window, 'getSelection').mockImplementation(() => ({
+        anchorOffset: input.textContent?.length ?? 0,
+      }) as any);
+
+      input.textContent = '@';
+      fireEvent.input(input);
+      fireEvent.click(screen.getByText('agents'));
+      fireEvent.click(screen.getByText('w1'));
+      fireEvent.click(screen.getByText('audit'));
+      input.textContent = `${input.textContent}please review`;
+      fireEvent.input(input);
+      fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+      fireEvent.click(screen.getByRole('checkbox'));
+      fireEvent.click(screen.getByRole('button', { name: /send_anyway/i }));
+
+      expect(saveUserPrefMock).toHaveBeenCalledWith('atpicker_single_agent_prompt_dismissed', '1');
+
+      input.textContent = '@@w1(audit) again';
+      fireEvent.input(input);
+      fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+      expect(screen.queryByText('title')).toBeNull();
+      expect(ws.sendSessionCommand).toHaveBeenCalledTimes(2);
+
+      getSelectionSpy.mockRestore();
+    });
+
+    it('also warns for handwritten single-agent @@ targets', () => {
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={mainSession}
+          quickData={makeQuickData() as any}
+          sessions={[mainSession]}
+          subSessions={[
+            { sessionName: 'deck_sub_w1', type: 'codex', label: 'w1', state: 'idle', parentSession: 'deck_my-project_brain' },
+          ]}
+        />,
+      );
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+      input.textContent = '@@w1(audit) please review';
+      fireEvent.input(input);
+      fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+      expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+      expect(screen.getByText('title')).toBeDefined();
+    });
+
+    it('does not warn for @@all', () => {
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={mainSession}
+          quickData={makeQuickData() as any}
+          sessions={[mainSession]}
+          subSessions={[
+            { sessionName: 'deck_sub_w1', type: 'codex', label: 'w1', state: 'idle', parentSession: 'deck_my-project_brain' },
+            { sessionName: 'deck_sub_w2', type: 'gemini', label: 'w2', state: 'idle', parentSession: 'deck_my-project_brain' },
+          ]}
+        />,
+      );
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+      input.textContent = '@@all(audit) please review';
+      fireEvent.input(input);
+      fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+      expect(screen.queryByText('title')).toBeNull();
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+        sessionName: 'deck_my-project_brain',
+        text: 'please review',
+      }));
     });
   });
 });

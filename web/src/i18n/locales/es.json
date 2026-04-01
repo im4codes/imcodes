@@ -305,7 +305,17 @@
     "all_rounds": "{{count}} ronda",
     "all_rounds_plural": "{{count}} rondas",
     "all_plus": "Todos + rondas personalizadas",
-    "all_preview_empty": "Sin participantes configurados"
+    "all_preview_empty": "Sin participantes configurados",
+    "single_agent_prompt": {
+      "title": "¿Agregar más agentes?",
+      "body": "Has seleccionado solo un agente.",
+      "tip_multi": "Usar varios agentes de distintos tipos/proveedores ayuda a romper el pensamiento fijo y normalmente da el mejor resultado.",
+      "tip_rounds": "Para discusiones P2P, 2 rondas suelen dar el mejor resultado.",
+      "dont_show_again": "No volver a mostrar para esta cuenta",
+      "more_agents": "@ Más",
+      "send_anyway": "Enviar de todos modos",
+      "tip_history": "Las discusiones multiagente comparten archivos y conservan mejor historial. Las discusiones uno a uno se tratan como puntuales."
+    }
   },
   "upload": {
     "upload_file": "Subir archivo",

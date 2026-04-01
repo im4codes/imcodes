@@ -305,7 +305,17 @@
     "all_rounds": "{{count}} round",
     "all_rounds_plural": "{{count}} rounds",
     "all_plus": "All + custom rounds",
-    "all_preview_empty": "No sessions configured"
+    "all_preview_empty": "No sessions configured",
+    "single_agent_prompt": {
+      "title": "Add more agents?",
+      "body": "You selected only one agent.",
+      "tip_multi": "Using multiple agents from different types/providers helps break fixed thinking patterns and usually gives the best results.",
+      "tip_rounds": "For P2P discussions, 2 rounds usually work best.",
+      "dont_show_again": "Don't remind me again for this account",
+      "more_agents": "@ More",
+      "send_anyway": "Send Anyway",
+      "tip_history": "Multi-agent discussions share files and keep fuller history. One-to-one discussions are treated as one-off discussions."
+    }
   },
   "upload": {
     "upload_file": "Upload file",

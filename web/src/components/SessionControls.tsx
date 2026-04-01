@@ -73,6 +73,7 @@ type P2pMode = 'solo' | 'audit' | 'review' | 'brainstorm' | 'discuss' | typeof P
 
 const MODEL_STORAGE_KEY = 'imcodes-model';
 const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
+const SINGLE_AGENT_PROMPT_PREF_KEY = 'atpicker_single_agent_prompt_dismissed';
 const CODEX_MODELS: CodexModelChoice[] = ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.2'];
 const P2P_MODES: P2pMode[] = ['solo', 'audit', 'review', 'brainstorm', 'discuss', P2P_CONFIG_MODE];
 const P2P_MODE_I18N: Record<P2pMode, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
@@ -82,6 +83,12 @@ interface PendingAtTarget {
   session: string;
   mode: string;
   label: string;
+}
+
+interface PendingSendPayload {
+  text: string;
+  extra: Record<string, unknown>;
+  singleAgentTargetSelected: boolean;
 }
 
 type ManualP2pTargetCandidate = {
@@ -166,6 +173,10 @@ function extractManualP2pTargets(
     const mode = normalizeP2pMode(rawMode);
     if (!mode) return match;
     const alias = rawAlias.trim().toLowerCase();
+    if (alias === 'all') {
+      orderedTargets.push({ session: '__all__', mode });
+      return '';
+    }
     const session = aliasMap.get(alias);
     if (!session) return match;
     orderedTargets.push({ session, mode });
@@ -214,6 +225,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<Array<{ path: string; name: string }>>([]);
+  const [singleAgentPromptSuppressed, setSingleAgentPromptSuppressed] = useState(false);
+  const [singleAgentPromptOpen, setSingleAgentPromptOpen] = useState(false);
+  const [singleAgentPromptSkip, setSingleAgentPromptSkip] = useState(false);
+  const pendingSendRef = useRef<PendingSendPayload | null>(null);
 
   // Keep external inputRef in sync so parent can call .focus()
   useEffect(() => {
@@ -236,6 +251,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     } catch { /* ignore selection API failures */ }
     onPendingPrefillApplied?.();
   }, [pendingPrefillText, onPendingPrefillApplied]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void getUserPref(SINGLE_AGENT_PROMPT_PREF_KEY).then((raw) => {
+      if (cancelled) return;
+      setSingleAgentPromptSuppressed(raw === '1');
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
 
   // Persist input draft across unmount/remount (sub-session minimize/restore)
   const draftKey = activeSession ? `rcc_draft_${activeSession.name}` : null;
@@ -426,13 +450,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return { orderedTargets, cleanText };
   };
 
-  const handleSend = useCallback(() => {
+  const buildSendPayload = useCallback((): PendingSendPayload | null => {
     let text = getText();
-    if ((!text && attachments.length === 0) || !ws || !activeSession) return;
+    if ((!text && attachments.length === 0) || !ws || !activeSession) return null;
 
     // Build P2P routing as structured WS fields — keep text clean for display.
     const extra: Record<string, unknown> = {};
-    const pendingTargets = pendingAtTargetsRef.current.splice(0);
+    const pendingTargets = [...pendingAtTargetsRef.current];
+    let singleAgentTargetSelected = false;
 
     if (pendingTargets.length > 0) {
       // @ picker was used — derive routing from the visible textbox order, then strip matched labels.
@@ -452,7 +477,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           if (cfg.extraPrompt) extra.p2pExtraPrompt = cfg.extraPrompt;
         }
       }
-      pendingConfigOverrideRef.current = null;
     } else {
       const manual = extractManualP2pTargets(text, buildManualP2pCandidates(sessions, subSessions));
       if (manual.orderedTargets.length > 0) {
@@ -504,13 +528,22 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       const refs = attachments.map((a) => `@${a.path}`).join(' ');
       text = text ? `${refs} ${text}` : refs;
     }
-    quickData.recordHistory(text, activeSession.name);
+    const parsedTargets = Array.isArray(extra.p2pAtTargets) ? extra.p2pAtTargets as Array<{ session: string; mode: string }> : [];
+    singleAgentTargetSelected = parsedTargets.length === 1 && parsedTargets[0]?.session !== '__all__';
+    return { text, extra, singleAgentTargetSelected };
+  }, [attachments, activeSession, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, sessions, subSessions, ws]);
+
+  const finalizeSend = useCallback((payload: PendingSendPayload) => {
+    if (!ws || !activeSession) return;
+    quickData.recordHistory(payload.text, activeSession.name);
     try {
-      ws.sendSessionCommand('send', { sessionName: activeSession.name, text, ...extra });
+      ws.sendSessionCommand('send', { sessionName: activeSession.name, text: payload.text, ...payload.extra });
     } catch {
       return;
     }
-    onSend?.(activeSession.name, text);
+    pendingAtTargetsRef.current = [];
+    pendingConfigOverrideRef.current = null;
+    onSend?.(activeSession.name, payload.text);
     if (divRef.current) divRef.current.textContent = '';
     setHasText(false);
     setAttachments([]);
@@ -523,7 +556,25 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     histIdxRef.current = -1;
     draftRef.current = '';
     if (draftKey) sessionStorage.removeItem(draftKey);
-  }, [ws, activeSession, quickData, onSend, attachments, quotes, onRemoveQuote, p2pMode, p2pExcludeSameType, p2pSavedConfig]);
+  }, [activeSession, draftKey, onRemoveQuote, onSend, quickData, quotes, ws]);
+
+  const persistSingleAgentPromptPref = useCallback(() => {
+    if (!singleAgentPromptSkip) return;
+    setSingleAgentPromptSuppressed(true);
+    void saveUserPref(SINGLE_AGENT_PROMPT_PREF_KEY, '1').catch(() => {});
+  }, [singleAgentPromptSkip]);
+
+  const handleSend = useCallback(() => {
+    const payload = buildSendPayload();
+    if (!payload) return;
+    if (payload.singleAgentTargetSelected && !singleAgentPromptSuppressed) {
+      pendingSendRef.current = payload;
+      setSingleAgentPromptSkip(false);
+      setSingleAgentPromptOpen(true);
+      return;
+    }
+    finalizeSend(payload);
+  }, [buildSendPayload, finalizeSend, singleAgentPromptSuppressed]);
 
   // Voice overlay send handler — applies same P2P mode as text send
   const handleVoiceSend = useCallback((voiceText: string) => {
@@ -1275,6 +1326,66 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>}
       </div>
     </div>
+    {singleAgentPromptOpen && (
+      <div class="ask-dialog-overlay" onClick={() => { setSingleAgentPromptOpen(false); pendingSendRef.current = null; }}>
+        <div class="ask-dialog single-agent-dialog" onClick={(e) => e.stopPropagation()}>
+          <div class="single-agent-dialog-icon">🧠</div>
+          <div class="single-agent-dialog-title">{t('p2p.single_agent_prompt.title')}</div>
+          <div class="single-agent-dialog-body">
+            <div>{t('p2p.single_agent_prompt.body')}</div>
+            <div>{t('p2p.single_agent_prompt.tip_multi')}</div>
+            <div>{t('p2p.single_agent_prompt.tip_history')}</div>
+            <div>{t('p2p.single_agent_prompt.tip_rounds')}</div>
+          </div>
+          <label class="single-agent-dialog-checkbox">
+            <input
+              type="checkbox"
+              checked={singleAgentPromptSkip}
+              onChange={(e) => setSingleAgentPromptSkip((e.target as HTMLInputElement).checked)}
+            />
+            <span>{t('p2p.single_agent_prompt.dont_show_again')}</span>
+          </label>
+          <div class="ask-actions">
+            <button
+              class="ask-btn-cancel"
+              onClick={() => {
+                persistSingleAgentPromptPref();
+                setSingleAgentPromptOpen(false);
+                pendingSendRef.current = null;
+              }}
+            >
+              {t('common.cancel')}
+            </button>
+            <button
+              class="ask-btn-cancel"
+              onClick={() => {
+                persistSingleAgentPromptPref();
+                setSingleAgentPromptOpen(false);
+                pendingSendRef.current = null;
+                setAtQuery('');
+                setAtPickerStage('agents');
+                setAtPickerOpen(true);
+                divRef.current?.focus();
+              }}
+            >
+              {t('p2p.single_agent_prompt.more_agents')}
+            </button>
+            <button
+              class="ask-btn-submit"
+              onClick={() => {
+                const pending = pendingSendRef.current;
+                persistSingleAgentPromptPref();
+                setSingleAgentPromptOpen(false);
+                pendingSendRef.current = null;
+                if (pending) finalizeSend(pending);
+              }}
+            >
+              {t('p2p.single_agent_prompt.send_anyway')}
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
     <VoiceOverlay open={voiceOpen} onClose={() => setVoiceOpen(false)} onSend={handleVoiceSend} initialText={divRef.current?.textContent ?? ''} />
     {p2pConfigOpen && (
       <P2pConfigPanel

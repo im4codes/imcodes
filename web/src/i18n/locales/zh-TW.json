@@ -305,7 +305,17 @@
     "all_rounds": "{{count}} 輪",
     "all_rounds_plural": "{{count}} 輪",
     "all_plus": "全部 + 自訂輪數",
-    "all_preview_empty": "未配置參與者"
+    "all_preview_empty": "未配置參與者",
+    "single_agent_prompt": {
+      "title": "再加幾個 Agent？",
+      "body": "你現在只選了 1 個 Agent。",
+      "tip_multi": "建議選擇多個不同類型、不同廠家的 Agent，更容易突破定式思維，通常效果最好。",
+      "tip_rounds": "P2P 討論通常 2 輪效果最佳。",
+      "dont_show_again": "此帳號不再提示",
+      "more_agents": "@ 更多",
+      "send_anyway": "仍然傳送",
+      "tip_history": "多 Agent 是共享檔案、歷史更完整的討論；一對一則是一次性討論。"
+    }
   },
   "upload": {
     "upload_file": "上傳檔案",

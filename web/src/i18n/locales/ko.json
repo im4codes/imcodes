@@ -305,7 +305,17 @@
     "all_rounds": "{{count}}라운드",
     "all_rounds_plural": "{{count}}라운드",
     "all_plus": "전체 + 사용자 라운드",
-    "all_preview_empty": "참가자 미설정"
+    "all_preview_empty": "참가자 미설정",
+    "single_agent_prompt": {
+      "title": "에이전트를 더 추가할까요?",
+      "body": "현재 에이전트 1개만 선택했습니다.",
+      "tip_multi": "서로 다른 유형/제공사의 에이전트를 함께 쓰면 고정된 사고를 깨고 보통 가장 좋은 결과를 얻을 수 있습니다.",
+      "tip_rounds": "P2P 토론은 보통 2라운드가 가장 좋습니다.",
+      "dont_show_again": "이 계정에는 다시 표시하지 않기",
+      "more_agents": "@ 더 추가",
+      "send_anyway": "그대로 보내기",
+      "tip_history": "멀티 에이전트 토론은 파일을 공유하고 기록도 더 잘 남습니다. 1:1 토론은 일회성 토론으로 처리됩니다."
+    }
   },
   "upload": {
     "upload_file": "파일 업로드",

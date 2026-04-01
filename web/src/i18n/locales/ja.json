@@ -305,7 +305,17 @@
     "all_rounds": "{{count}}ラウンド",
     "all_rounds_plural": "{{count}}ラウンド",
     "all_plus": "全員 + カスタムラウンド",
-    "all_preview_empty": "参加者が未設定"
+    "all_preview_empty": "参加者が未設定",
+    "single_agent_prompt": {
+      "title": "Agent をもっと追加しますか？",
+      "body": "今は 1 つの Agent しか選択されていません。",
+      "tip_multi": "異なる種類・提供元の Agent を組み合わせると、発想の固定化を崩しやすく、通常は最も良い結果になります。",
+      "tip_rounds": "P2P ディスカッションは通常 2 ラウンドが最適です。",
+      "dont_show_again": "このアカウントでは今後表示しない",
+      "more_agents": "@ さらに追加",
+      "send_anyway": "そのまま送信",
+      "tip_history": "複数 Agent の議論はファイル共有があり、履歴もより完全に残ります。1 対 1 は単発の議論として扱われます。"
+    }
   },
   "upload": {
     "upload_file": "ファイルをアップロード",

@@ -771,6 +771,12 @@ body {
 .stop-session-dialog-body strong { color: #e2e8f0; }
 .stop-session-confirm-btn { background: #ef4444 !important; }
 .stop-session-confirm-btn:hover { background: #dc2626 !important; }
+.single-agent-dialog { max-width: 460px; }
+.single-agent-dialog-icon { font-size: 28px; line-height: 1; }
+.single-agent-dialog-title { font-size: 16px; font-weight: 700; color: #f1f5f9; }
+.single-agent-dialog-body { display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: #94a3b8; line-height: 1.6; }
+.single-agent-dialog-checkbox { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #cbd5e1; cursor: pointer; }
+.single-agent-dialog-checkbox input { margin: 0; }
 
 /* ── Sidebar redesign (tasks 1.2-1.4) ────────────────────────────────────── */
 
