@@ -25,6 +25,11 @@ describe('Repo message type contract', () => {
       REPO_MSG.PRS_RESPONSE,
       REPO_MSG.BRANCHES_RESPONSE,
       REPO_MSG.COMMITS_RESPONSE,
+      REPO_MSG.ACTIONS_RESPONSE,
+      REPO_MSG.ACTION_DETAIL_RESPONSE,
+      REPO_MSG.COMMIT_DETAIL_RESPONSE,
+      REPO_MSG.PR_DETAIL_RESPONSE,
+      REPO_MSG.ISSUE_DETAIL_RESPONSE,
       REPO_MSG.ERROR,
     ];
 
@@ -40,6 +45,11 @@ describe('Repo message type contract', () => {
       REPO_MSG.LIST_PRS,
       REPO_MSG.LIST_BRANCHES,
       REPO_MSG.LIST_COMMITS,
+      REPO_MSG.LIST_ACTIONS,
+      REPO_MSG.ACTION_DETAIL,
+      REPO_MSG.COMMIT_DETAIL,
+      REPO_MSG.PR_DETAIL,
+      REPO_MSG.ISSUE_DETAIL,
     ];
 
     for (const t of requestTypes) {
@@ -53,13 +63,19 @@ describe('Repo message type contract', () => {
     expect(REPO_MSG.PRS_RESPONSE).toBe('repo.prs_response');
     expect(REPO_MSG.BRANCHES_RESPONSE).toBe('repo.branches_response');
     expect(REPO_MSG.COMMITS_RESPONSE).toBe('repo.commits_response');
+    expect(REPO_MSG.ACTIONS_RESPONSE).toBe('repo.actions_response');
+    expect(REPO_MSG.ACTION_DETAIL_RESPONSE).toBe('repo.action_detail_response');
+    expect(REPO_MSG.COMMIT_DETAIL_RESPONSE).toBe('repo.commit_detail_response');
+    expect(REPO_MSG.PR_DETAIL_RESPONSE).toBe('repo.pr_detail_response');
+    expect(REPO_MSG.ISSUE_DETAIL_RESPONSE).toBe('repo.issue_detail_response');
 
     // Request types DO have list_ prefix
     expect(REPO_MSG.LIST_ISSUES).toBe('repo.list_issues');
     expect(REPO_MSG.LIST_PRS).toBe('repo.list_prs');
+    expect(REPO_MSG.LIST_ACTIONS).toBe('repo.list_actions');
   });
 
-  it('REPO_RELAY_TYPES has exactly 11 entries', () => {
-    expect(REPO_RELAY_TYPES.size).toBe(11);
+  it('REPO_RELAY_TYPES has exactly 12 entries', () => {
+    expect(REPO_RELAY_TYPES.size).toBe(12);
   });
 });
