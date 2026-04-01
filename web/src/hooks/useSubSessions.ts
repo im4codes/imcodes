@@ -35,8 +35,13 @@ export function useSubSessions(
   // Re-triggers when serverId changes or WS connection state changes (which
   // signals the API key / network may now be ready).
   const loadGenRef = useRef(0);
+  const loadedGenRef = useRef(0);
   useEffect(() => {
     if (!serverId) { setSubSessions([]); setLoadedServerId(null); return; }
+    if (!connected) {
+      rebuiltRef.current = false;
+      return;
+    }
     rebuiltRef.current = false;
     const gen = ++loadGenRef.current;
     let attempt = 0;
@@ -48,6 +53,7 @@ export function useSubSessions(
         .then((list) => {
           if (gen !== loadGenRef.current) return;
           console.warn(`[sub-sessions] loaded ${list.length} for server ${serverId}`);
+          loadedGenRef.current = gen;
           setSubSessions(list.map((s) => ({
             ...s,
             sessionName: toSessionName(s.id),
@@ -67,11 +73,13 @@ export function useSubSessions(
     load();
 
     return () => { if (timer) clearTimeout(timer); };
-  }, [serverId]);
+  }, [serverId, connected]);
 
   // Rebuild all when daemon connects (once per connection)
   useEffect(() => {
     if (!connected || !ws || subSessions.length === 0 || rebuiltRef.current) return;
+    if (loadedServerId !== serverId) return;
+    if (loadedGenRef.current !== loadGenRef.current) return;
     rebuiltRef.current = true;
     ws.subSessionRebuildAll(subSessions.map((s) => ({
       id: s.id,
