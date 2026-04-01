@@ -84,7 +84,12 @@
     "description": "Описание",
     "descriptionPlaceholder": "Роль или цель сессии (необязательно)",
     "sessionKey": "Ключ сессии",
-    "autoGenerate": "Автогенерация"
+    "autoGenerate": "Автогенерация",
+    "codex_ctx_short": "конт",
+    "codex_5h_short": "5ч",
+    "codex_wk_short": "нед",
+    "codex_ctx_title": "Контекст осталось {{percent}}%",
+    "codex_limit_title": "{{label}} осталось {{percent}}% · сброс {{reset}}"
   },
   "server": {
     "upgrade_daemon": "↑ Обновить Daemon",

@@ -18,6 +18,7 @@ import type { UseQuickDataResult } from './QuickInputPanel.js';
 import { formatLabel } from '../format-label.js';
 import type { WsClient } from '../ws-client.js';
 import type { SessionInfo, TerminalDiff } from '../types.js';
+import { extractLatestUsage } from '../usage-data.js';
 
 type ViewMode = 'terminal' | 'chat';
 
@@ -118,15 +119,7 @@ export function SessionPane({
   }, []);
 
   // ── Usage & thinking state ──────────────────────────────────────────────────
-  const lastUsage = useMemo(() => {
-    for (let i = timelineEvents.length - 1; i >= 0; i--) {
-      const e = timelineEvents[i];
-      if (e.type === 'usage.update' && e.payload.inputTokens) {
-        return e.payload as { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string };
-      }
-    }
-    return null;
-  }, [timelineEvents]);
+  const lastUsage = useMemo(() => extractLatestUsage(timelineEvents), [timelineEvents]);
 
   const lastCostEvent = useMemo(() => {
     for (let i = timelineEvents.length - 1; i >= 0; i--) {

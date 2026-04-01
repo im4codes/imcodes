@@ -6,6 +6,7 @@ import type { TerminalDiff } from './types.js';
 import { apiFetch, ApiError } from './api.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { REPO_MSG } from '@shared/repo-types.js';
+import { CODEX_STATUS_MSG } from '@shared/codex-status.js';
 import type {
   FsLsResponse,
   FsReadResponse,
@@ -403,6 +404,11 @@ export class WsClient {
     const requestId = crypto.randomUUID();
     this.send({ type: REPO_MSG.ACTION_DETAIL, projectDir, runId, requestId, ...opts });
     return requestId;
+  }
+
+  /** Ask the daemon to query Codex /status for an idle session. */
+  requestCodexStatus(sessionName: string): void {
+    this.send({ type: CODEX_STATUS_MSG.REQUEST, sessionName });
   }
 
   /** Get commit detail (diff stats, files). Returns requestId. */

@@ -472,6 +472,8 @@ export function App() {
   const [detectedModels, setDetectedModels] = useState<Map<string, string>>(new Map());
   const [subUsages, setSubUsages] = useState<Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string }>>(new Map());
   const quickData = useQuickData();
+  const lastImcodesActivityRef = useRef(Date.now());
+  const lastCodexStatusRequestRef = useRef(new Map<string, number>());
 
   // IDs of currently-open (non-minimized) sub-session windows
   const [openSubIds, setOpenSubIds] = useState<Set<string>>(new Set());
@@ -502,6 +504,23 @@ export function App() {
     }
     return maxId;
   }, [subZIndexes, openSubIds]);
+
+  useEffect(() => {
+    const markActive = () => { lastImcodesActivityRef.current = Date.now(); };
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') markActive();
+    };
+    document.addEventListener('pointerdown', markActive, true);
+    document.addEventListener('keydown', markActive, true);
+    document.addEventListener('focusin', markActive, true);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      document.removeEventListener('pointerdown', markActive, true);
+      document.removeEventListener('keydown', markActive, true);
+      document.removeEventListener('focusin', markActive, true);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, []);
 
   // ── Repo ────────────────────────────────────────────────────────────────────
   const [showRepoPage, setShowRepoPage] = useState(false);
@@ -1541,6 +1560,45 @@ export function App() {
   }
 
   const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
+  const focusedSubSession = useMemo(
+    () => focusedSubId ? subSessions.find((sub) => sub.id === focusedSubId) ?? null : null,
+    [focusedSubId, subSessions],
+  );
+
+  useEffect(() => {
+    const ws = wsRef.current;
+    if (!ws?.connected || !connected) return;
+
+    const check = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (Date.now() - lastImcodesActivityRef.current > 10 * 60_000) return;
+
+      const target = focusedSubSession
+        ? { sessionName: focusedSubSession.sessionName, agentType: focusedSubSession.type, state: focusedSubSession.state }
+        : activeSessionInfo
+          ? { sessionName: activeSessionInfo.name, agentType: activeSessionInfo.agentType, state: activeSessionInfo.state }
+          : null;
+      if (!target || target.agentType !== 'codex' || target.state !== 'idle') return;
+
+      const lastSentAt = lastCodexStatusRequestRef.current.get(target.sessionName) ?? 0;
+      if (lastSentAt !== 0 && Date.now() - lastSentAt < 5 * 60_000) return;
+
+      lastCodexStatusRequestRef.current.set(target.sessionName, Date.now());
+      try { ws.requestCodexStatus(target.sessionName); } catch { /* ignore */ }
+    };
+
+    check();
+    const timer = setInterval(check, 30_000);
+    return () => clearInterval(timer);
+  }, [
+    activeSessionInfo?.agentType,
+    activeSessionInfo?.name,
+    activeSessionInfo?.state,
+    connected,
+    focusedSubSession?.sessionName,
+    focusedSubSession?.state,
+    focusedSubSession?.type,
+  ]);
 
   useEffect(() => {
     if (!pendingRepoToastSession) return;

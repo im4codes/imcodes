@@ -7,13 +7,7 @@ import { useTranslation } from 'react-i18next';
 import { resolveContextWindow } from '../model-context.js';
 import { shortModelLabel } from '../model-label.js';
 import { getSessionCost, getWeeklyCost, getMonthlyCost, formatCost } from '../cost-tracker.js';
-
-interface UsageData {
-  inputTokens: number;
-  cacheTokens: number;
-  contextWindow: number;
-  model?: string;
-}
+import type { UsageData } from '../usage-data.js';
 
 interface Props {
   usage: UsageData;
@@ -37,24 +31,31 @@ export function UsageFooter({ usage, sessionName, showCost, activeThinkingTs, st
   const { t } = useTranslation();
 
   const { ctx, total, cachePct, newPct, pctStr, tip } = useMemo(() => {
-    const ctx = resolveContextWindow(usage.contextWindow, usage.model);
-    const total = usage.inputTokens + usage.cacheTokens;
+    const ctx = usage.codexStatus?.contextWindowTokens ?? resolveContextWindow(usage.contextWindow, usage.model);
+    const total = usage.codexStatus?.contextUsedTokens ?? (usage.inputTokens + usage.cacheTokens);
     const totalPct = Math.min(100, total / ctx * 100);
-    const cachePct = Math.min(totalPct, usage.cacheTokens / ctx * 100);
+    const cachePct = usage.codexStatus?.contextUsedTokens ? 0 : Math.min(totalPct, usage.cacheTokens / ctx * 100);
     const newPct = totalPct - cachePct;
-    const pctStr = totalPct < 1 ? totalPct.toFixed(1) : totalPct.toFixed(0);
+    const pctStr = usage.codexStatus?.contextLeftPercent !== undefined
+      ? String(usage.codexStatus.contextLeftPercent)
+      : totalPct < 1 ? totalPct.toFixed(1) : totalPct.toFixed(0);
     const tip = [
       usage.model ?? '',
       `Context: ${fmt(total)} / ${fmt(ctx)} (${pctStr}%)`,
       `  New: ${fmt(usage.inputTokens)}  Cache: ${fmt(usage.cacheTokens)}`,
+      usage.codexStatus?.fiveHourLeftPercent !== undefined ? `5h: ${usage.codexStatus.fiveHourLeftPercent}% (${usage.codexStatus.fiveHourResetAt ?? ''})` : '',
+      usage.codexStatus?.weeklyLeftPercent !== undefined ? `Weekly: ${usage.codexStatus.weeklyLeftPercent}% (${usage.codexStatus.weeklyResetAt ?? ''})` : '',
     ].filter(Boolean).join('\n');
     return { ctx, total, totalPct, cachePct, newPct, pctStr, tip };
-  }, [usage.inputTokens, usage.cacheTokens, usage.contextWindow, usage.model]);
+  }, [usage.inputTokens, usage.cacheTokens, usage.contextWindow, usage.model, usage.codexStatus]);
 
   const sessionCost = showCost ? getSessionCost(sessionName) : 0;
   const weeklyCost = sessionCost > 0 ? getWeeklyCost() : 0;
   const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const modelLabel = shortModelLabel(usage.model);
+  const hasCodexStatus = usage.codexStatus?.contextLeftPercent !== undefined
+    || usage.codexStatus?.fiveHourLeftPercent !== undefined
+    || usage.codexStatus?.weeklyLeftPercent !== undefined;
 
   return (
     <div class="session-usage-footer" title={tip}>
@@ -62,6 +63,39 @@ export function UsageFooter({ usage, sessionName, showCost, activeThinkingTs, st
         <div class="session-ctx-bar">
           <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
+        </div>
+      )}
+      {hasCodexStatus && (
+        <div class="session-usage-codex-row">
+          {usage.codexStatus?.contextLeftPercent !== undefined && (
+            <span class="session-usage-badge" title={t('session.codex_ctx_title', { percent: usage.codexStatus.contextLeftPercent })}>
+              {t('session.codex_ctx_short')} {usage.codexStatus.contextLeftPercent}%
+            </span>
+          )}
+          {usage.codexStatus?.fiveHourLeftPercent !== undefined && (
+            <span
+              class="session-usage-badge"
+              title={t('session.codex_limit_title', {
+                label: t('session.codex_5h_short'),
+                percent: usage.codexStatus.fiveHourLeftPercent,
+                reset: usage.codexStatus.fiveHourResetAt ?? '—',
+              })}
+            >
+              {t('session.codex_5h_short')} {usage.codexStatus.fiveHourLeftPercent}%
+            </span>
+          )}
+          {usage.codexStatus?.weeklyLeftPercent !== undefined && (
+            <span
+              class="session-usage-badge"
+              title={t('session.codex_limit_title', {
+                label: t('session.codex_wk_short'),
+                percent: usage.codexStatus.weeklyLeftPercent,
+                reset: usage.codexStatus.weeklyResetAt ?? '—',
+              })}
+            >
+              {t('session.codex_wk_short')} {usage.codexStatus.weeklyLeftPercent}%
+            </span>
+          )}
         </div>
       )}
       <div class="session-usage-stats">

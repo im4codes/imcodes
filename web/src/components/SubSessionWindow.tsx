@@ -17,6 +17,7 @@ import { useQuickData } from './QuickInputPanel.js';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff, SessionInfo } from '../types.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
+import { extractLatestUsage } from '../usage-data.js';
 
 interface WindowGeometry { x: number; y: number; w: number; h: number }
 
@@ -249,14 +250,7 @@ export function SubSessionWindow({
   }, [isPinnable, sub.id]);
 
   // Usage tracking
-  const lastUsage = useMemo(() => {
-    for (let i = events.length - 1; i >= 0; i--) {
-      if (events[i].type === 'usage.update' && events[i].payload.inputTokens) {
-        return events[i].payload as { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string };
-      }
-    }
-    return null;
-  }, [events]);
+  const lastUsage = useMemo(() => extractLatestUsage(events), [events]);
 
   // Model may appear in any usage.update event — not only ones with inputTokens
   const detectedModel = useMemo(() => {

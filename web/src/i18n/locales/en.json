@@ -84,7 +84,12 @@
     "description": "Description",
     "descriptionPlaceholder": "Session persona or purpose (optional)",
     "sessionKey": "Session Key",
-    "autoGenerate": "Auto-generate"
+    "autoGenerate": "Auto-generate",
+    "codex_ctx_short": "ctx",
+    "codex_5h_short": "5h",
+    "codex_wk_short": "wk",
+    "codex_ctx_title": "Context left {{percent}}%",
+    "codex_limit_title": "{{label}} left {{percent}}% · resets {{reset}}"
   },
   "server": {
     "upgrade_daemon": "↑ Upgrade Daemon",

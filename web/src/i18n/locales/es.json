@@ -84,7 +84,12 @@
     "description": "Descripción",
     "descriptionPlaceholder": "Persona o propósito de la sesión (opcional)",
     "sessionKey": "Clave de sesión",
-    "autoGenerate": "Generar automáticamente"
+    "autoGenerate": "Generar automáticamente",
+    "codex_ctx_short": "ctx",
+    "codex_5h_short": "5 h",
+    "codex_wk_short": "sem",
+    "codex_ctx_title": "Contexto restante {{percent}}%",
+    "codex_limit_title": "{{label}} restante {{percent}}% · se restablece {{reset}}"
   },
   "server": {
     "upgrade_daemon": "↑ Actualizar Daemon",

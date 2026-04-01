@@ -81,6 +81,10 @@ import { handleFileUpload, handleFileDownload, createProjectFileHandle, lookupAt
 import { REPO_MSG } from '../shared/repo-types.js';
 import { handlePreviewCommand } from './preview-relay.js';
 import { PREVIEW_MSG } from '../../shared/preview-types.js';
+import { CODEX_STATUS_MSG } from '../../shared/codex-status.js';
+import { detectStatusAsync } from '../agent/detect.js';
+import { capturePane } from '../agent/tmux.js';
+import { countCodexStatusMatches, normalizeCodexStatusPaneText, parseCodexStatusOutput } from './codex-status.js';
 
 // ── Common MIME map for file metadata ────────────────────────────────────────
 
@@ -484,6 +488,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case PREVIEW_MSG.WS_CLOSE:
       if (handlePreviewCommand(cmd, serverLink)) break;
       break;
+    case CODEX_STATUS_MSG.REQUEST:
+      void handleCodexStatusRequest(cmd);
+      break;
     case 'auth_ok':
     case 'heartbeat':
     case 'heartbeat_ack':
@@ -518,6 +525,50 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       if (typeof cmd.type === 'string') {
         logger.warn({ type: cmd.type }, 'Unknown web command type');
       }
+  }
+}
+
+const codexStatusInflight = new Set<string>();
+
+async function handleCodexStatusRequest(cmd: Record<string, unknown>): Promise<void> {
+  const sessionName = cmd.sessionName as string | undefined;
+  if (!sessionName || codexStatusInflight.has(sessionName)) return;
+
+  const record = getSession(sessionName);
+  if (!record || record.agentType !== 'codex' || record.state !== 'idle') return;
+
+  codexStatusInflight.add(sessionName);
+  const release = await getMutex(sessionName).acquire();
+  try {
+    const current = getSession(sessionName);
+    if (!current || current.agentType !== 'codex' || current.state !== 'idle') return;
+    const liveStatus = await detectStatusAsync(sessionName, 'codex').catch(() => 'unknown');
+    if (liveStatus !== 'idle') return;
+
+    const beforeText = normalizeCodexStatusPaneText((await capturePane(sessionName, 160)).join('\n'));
+    const beforeWeeklyMatches = countCodexStatusMatches(beforeText, /Weekly limit:/gi);
+
+    await sendRawInput(sessionName, '/status');
+    await sendKey(sessionName, 'Enter');
+
+    let snapshot = null;
+    for (let attempt = 0; attempt < 12; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const afterText = normalizeCodexStatusPaneText((await capturePane(sessionName, 160)).join('\n'));
+      const changed = afterText !== beforeText;
+      snapshot = parseCodexStatusOutput(afterText);
+      if (!snapshot) continue;
+      const weeklyMatches = countCodexStatusMatches(afterText, /Weekly limit:/gi);
+      if (weeklyMatches > beforeWeeklyMatches || changed || attempt === 11) break;
+    }
+
+    if (!snapshot) return;
+    timelineEmitter.emit(sessionName, 'usage.update', { codexStatus: snapshot }, { source: 'daemon', confidence: 'medium' });
+  } catch (err) {
+    logger.debug({ sessionName, err }, 'codex.status_request failed');
+  } finally {
+    release();
+    codexStatusInflight.delete(sessionName);
   }
 }
 

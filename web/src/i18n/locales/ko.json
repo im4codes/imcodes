@@ -84,7 +84,12 @@
     "description": "설명",
     "descriptionPlaceholder": "세션 페르소나 또는 목적 (선택 사항)",
     "sessionKey": "세션 키",
-    "autoGenerate": "자동 생성"
+    "autoGenerate": "자동 생성",
+    "codex_ctx_short": "컨텍스트",
+    "codex_5h_short": "5시간",
+    "codex_wk_short": "주간",
+    "codex_ctx_title": "컨텍스트 {{percent}}% 남음",
+    "codex_limit_title": "{{label}} {{percent}}% 남음 · {{reset}}에 재설정"
   },
   "server": {
     "upgrade_daemon": "↑ Daemon 업그레이드",

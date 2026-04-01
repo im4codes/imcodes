@@ -84,7 +84,12 @@
     "description": "描述",
     "descriptionPlaceholder": "会话角色或用途（可选）",
     "sessionKey": "会话密钥",
-    "autoGenerate": "自动生成"
+    "autoGenerate": "自动生成",
+    "codex_ctx_short": "上下文",
+    "codex_5h_short": "5小时",
+    "codex_wk_short": "周",
+    "codex_ctx_title": "上下文剩余 {{percent}}%",
+    "codex_limit_title": "{{label}} 剩余 {{percent}}% · 重置于 {{reset}}"
   },
   "server": {
     "upgrade_daemon": "↑ 升级 Daemon",
