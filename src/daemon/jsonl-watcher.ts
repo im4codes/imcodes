@@ -22,7 +22,6 @@ import { timelineEmitter } from './timeline-emitter.js';
 import logger from '../util/logger.js';
 import { resolveContextWindow } from '../util/model-context.js';
 import { getSessionContextWindow } from './cc-presets.js';
-import { readProjectMemory, appendAgentSendDocs } from './memory-inject.js';
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
@@ -73,21 +72,6 @@ export function scanForJsonlBySessionId(sessionId: string): string | null {
  */
 export function findJsonlPathBySessionId(workDir: string, sessionId: string): string {
   return scanForJsonlBySessionId(sessionId) ?? join(claudeProjectDir(workDir), `${sessionId}.jsonl`);
-}
-
-function buildSeedText(cwd: string, memory: string | null): string {
-  if (memory?.trim()) {
-    return [
-      `Restored/bootstrapped Claude Code session for project: ${cwd}`,
-      '',
-      memory.trim(),
-    ].join('\n');
-  }
-  return [
-    `Restored/bootstrapped Claude Code session for project: ${cwd}`,
-    '',
-    'This is an automatically created seed transcript so the session can resume deterministically.',
-  ].join('\n');
 }
 
 /**

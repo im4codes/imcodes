@@ -2,7 +2,7 @@
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import type { RepoContext, RepoInfo, RepoPlatform, RepoRemote, RepoStatus } from './types.js';
+import type { RepoContext, RepoPlatform, RepoStatus } from './types.js';
 
 const execFileAsync = promisify(execFile);
 

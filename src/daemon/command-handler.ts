@@ -32,7 +32,7 @@ import { CRON_MSG } from '../../shared/cron-types.js';
 import { executeCronJob } from './cron-executor.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { getProvider } from '../agent/provider-registry.js';
-import { copyFile, mkdir } from 'node:fs/promises';
+import { copyFile } from 'node:fs/promises';
 import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
 import { buildWindowsCleanupScript, buildWindowsUpgradeBatch } from '../util/windows-upgrade-script.js';
 
@@ -77,8 +77,7 @@ async function rewritePathsForSandbox(sessionName: string, text: string): Promis
   return result;
 }
 import { handleRepoCommand } from './repo-handler.js';
-import { handleFileUpload, handleFileDownload, initFileTransfer, startCleanupTimer, createProjectFileHandle, lookupAttachment } from './file-transfer-handler.js';
-import { FILE_TRANSFER_LIMITS } from '../shared/transport/file-transfer.js';
+import { handleFileUpload, handleFileDownload, createProjectFileHandle, lookupAttachment } from './file-transfer-handler.js';
 import { REPO_MSG } from '../shared/repo-types.js';
 import { handlePreviewCommand } from './preview-relay.js';
 import { PREVIEW_MSG } from '../../shared/preview-types.js';

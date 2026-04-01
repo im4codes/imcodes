@@ -115,7 +115,7 @@ export class YourProvider implements TransportProvider {
    * @param message     - The user's text content.
    * @param attachments - Only present when capabilities.attachments is true.
    */
-  async send(sessionId: string, message: string, _attachments?: unknown[]): Promise<void> {
+  async send(sessionId: string, _message: string, _attachments?: unknown[]): Promise<void> {
     if (!this.config) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Not connected', false);
     }

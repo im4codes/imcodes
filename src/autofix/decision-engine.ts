@@ -2,7 +2,7 @@
  * Structured JSON decision engine for brain auto-fix actions.
  * Fast-path rules for known states, JSON decisions for complex scenarios.
  */
-import type { AutoFixTask, AutoFixState } from './state-machine.js';
+import type { AutoFixTask } from './state-machine.js';
 import logger from '../util/logger.js';
 
 // ── Decision types ────────────────────────────────────────────────────────────

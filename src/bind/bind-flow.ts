@@ -1,9 +1,9 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
-import { existsSync as existsSyncFs, readFileSync } from 'fs';
+import { existsSync as existsSyncFs } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir, hostname } from 'os';
-import { execSync, spawn } from 'child_process';
+import { execSync } from 'child_process';
 import logger from '../util/logger.js';
 import { BACKEND } from '../agent/tmux.js';
 import { restartWindowsDaemon } from '../util/windows-daemon.js';

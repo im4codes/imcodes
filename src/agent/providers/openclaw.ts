@@ -291,7 +291,7 @@ export class OpenClawProvider implements TransportProvider {
         let frame: OcFrame;
         try {
           frame = JSON.parse(raw.toString()) as OcFrame;
-        } catch (e) {
+        } catch {
           logger.warn({ provider: this.id, raw: raw.toString() }, 'Unparseable frame from gateway');
           return;
         }

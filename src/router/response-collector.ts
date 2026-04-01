@@ -146,7 +146,6 @@ function diffScreens(previous: string, current: string): string {
  */
 function cleanOutput(raw: string): string {
   // Strip ANSI escape sequences
-  // eslint-disable-next-line no-control-regex
   const stripped = raw.replace(/\x1b\[[0-9;]*[mGKHFJABCDEFhlr]/g, '');
 
   const lines = stripped

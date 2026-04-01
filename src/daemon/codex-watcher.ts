@@ -3,7 +3,6 @@
  */
 
 import { watch, readdir, stat, open, mkdir, writeFile } from 'fs/promises';
-import type { FileChangeInfo } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
 import { exec } from 'node:child_process';
@@ -248,12 +247,7 @@ async function emitRecentHistory(sessionName: string, filePath: string, model?: 
     const lines = chunk.split('\n');
     const startIdx = size > readSize ? 1 : 0;
 
-    let bytePos = size - readSize;
-    for (let i = 0; i < startIdx; i++) bytePos += Buffer.byteLength(lines[i], 'utf8') + 1;
-
     for (let i = startIdx; i < lines.length; i++) {
-      const lineBytePos = bytePos;
-      bytePos += Buffer.byteLength(lines[i], 'utf8') + 1;
       const line = lines[i];
       if (!line.trim()) continue;
       parseLine(sessionName, line, model); // Simplified for this restoration fix

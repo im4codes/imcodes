@@ -5,7 +5,7 @@
 
 import { sessionExists, sendKeysDelayedEnter } from '../agent/tmux.js';
 import { startSubSession, stopSubSession } from './subsession-manager.js';
-import { writeFile, readFile, mkdir } from 'node:fs/promises';
+import { writeFile, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import logger from '../util/logger.js';
 import { ensureImcDir } from '../util/imc-dir.js';

@@ -1,4 +1,4 @@
-import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession } from '../store/session-store.js';
+import { loadStore, flushStore, listSessions, getSession, upsertSession } from '../store/session-store.js';
 import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes } from '../agent/session-manager.js';
 import { sessionExists, isPaneAlive, BACKEND } from '../agent/tmux.js';
 import { detectMemoryBackend } from '../memory/detector.js';
@@ -20,7 +20,6 @@ import { loadCredentials } from '../bind/bind-flow.js';
 import { sendKeys } from '../agent/tmux.js';
 import logger from '../util/logger.js';
 import type { MemoryBackend } from '../memory/interface.js';
-import type { RouterContext } from '../router/message-router.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -567,8 +566,7 @@ export async function shutdown(exitCode = 0): Promise<void> {
   // Kill all ConPTY sessions (they don't survive daemon exit like tmux)
   if ((BACKEND as string) === 'conpty') {
     try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const conpty: any = await import('../agent/conpty.js' as string);
+      const conpty = await import('../agent/conpty.js');
       const names: string[] = conpty.conptyListSessions();
       for (const name of names) {
         try {

@@ -22,11 +22,11 @@ export class OpenCodeDriver implements AgentDriver {
     return this.buildLaunchCommand(_sessionName, opts);
   }
 
-  detectStatus(lines: string[]): AgentStatus {
-    return detectStatus(lines, 'opencode');
+  detectStatus(_lines: string[]): AgentStatus {
+    return detectStatus(_lines, 'opencode');
   }
 
-  isOverlay(lines: string[]): boolean {
+  isOverlay(_lines: string[]): boolean {
     return false;
   }
 

@@ -5,8 +5,6 @@
 import type { AutoFixTask } from './state-machine.js';
 import { transition } from './state-machine.js';
 import { capturePane, sendKeys } from '../agent/tmux.js';
-import { ClaudeCodeDriver } from '../agent/drivers/claude-code.js';
-import { deleteBuffer, showBuffer } from '../agent/tmux.js';
 import logger from '../util/logger.js';
 
 export interface AuditResult {
@@ -20,8 +18,6 @@ export interface AuditEngineOptions {
 }
 
 export class AuditEngine {
-  private coderDriver = new ClaudeCodeDriver();
-
   constructor(private opts: AuditEngineOptions) {}
 
   /**

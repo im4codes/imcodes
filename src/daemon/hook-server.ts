@@ -20,8 +20,6 @@ import logger from '../util/logger.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { getSession, upsertSession, listSessions } from '../store/session-store.js';
 import type { SessionRecord } from '../store/session-store.js';
-import type { AgentType, AgentStatus } from '../agent/detect.js';
-import { detectStatus } from '../agent/detect.js';
 
 export const DEFAULT_HOOK_PORT = 51913;
 const PORT_FILE = path.join(os.homedir(), '.imcodes', 'hook-port');
@@ -29,8 +27,6 @@ const PORT_FILE = path.join(os.homedir(), '.imcodes', 'hook-port');
 /** Max body size: 1 MB */
 const MAX_BODY_SIZE = 1024 * 1024;
 
-/** Max queue depth per target session */
-const MAX_QUEUE_PER_TARGET = 10;
 /** Queue message expiry: 5 minutes */
 const QUEUE_EXPIRY_MS = 5 * 60 * 1000;
 /** Max send depth (circular send prevention) */
@@ -186,46 +182,6 @@ export function resolveTarget(from: string, to: string): ResolveResult {
   return { ok: false, error: `target "${to}" not found`, available: availableNames };
 }
 
-// ─── Status Detection ────────────────────────────────────────────────────────
-
-/**
- * Check if a target session is busy (running/thinking/streaming).
- * Process sessions: capturePane + detectStatus heuristics.
- * Transport sessions: runtime.getStatus().
- */
-async function isSessionBusy(record: SessionRecord): Promise<boolean> {
-  if (record.runtimeType === 'transport') {
-    try {
-      const { getTransportRuntime } = await import('../agent/session-manager.js');
-      const runtime = getTransportRuntime(record.name);
-      if (!runtime) return false;
-      const status = runtime.getStatus();
-      return status !== 'idle' && status !== 'error' && status !== 'unknown';
-    } catch {
-      return false;
-    }
-  }
-
-  // Process session: check session store state first (more reliable for codex/gemini
-  // which track state via watchers, not pane capture heuristics)
-  if (record.state === 'idle' || record.state === 'stopped' || record.state === 'error') {
-    return false;
-  }
-  if (record.state === 'running') {
-    return true;
-  }
-
-  // Fallback: capture pane and detect status for unknown/ambiguous states
-  try {
-    const { capturePane } = await import('../agent/tmux.js');
-    const lines = await capturePane(record.name);
-    const status = detectStatus(lines, record.agentType as AgentType);
-    return status !== 'idle' && status !== 'error' && status !== 'unknown';
-  } catch {
-    return false;
-  }
-}
-
 // ─── Message Dispatch ────────────────────────────────────────────────────────
 
 /**
@@ -261,16 +217,6 @@ function recordSend(from: string): void {
   const timestamps = rateLimiter.get(from) ?? [];
   timestamps.push(Date.now());
   rateLimiter.set(from, timestamps);
-}
-
-// ─── Queue Management ────────────────────────────────────────────────────────
-
-function enqueue(target: string, msg: QueuedMessage): boolean {
-  const queue = messageQueue.get(target) ?? [];
-  if (queue.length >= MAX_QUEUE_PER_TARGET) return false;
-  queue.push(msg);
-  messageQueue.set(target, queue);
-  return true;
 }
 
 /**

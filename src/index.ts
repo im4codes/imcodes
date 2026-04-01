@@ -5,7 +5,7 @@ import { Command } from 'commander';
 // Use dynamic import() at point of use instead of top-level imports.
 import { bindFlow } from './bind/bind-flow.js';
 import logger from './util/logger.js';
-import { execSync, spawn } from 'child_process';
+import { execSync } from 'child_process';
 import { homedir } from 'os';
 import { existsSync, realpathSync, readFileSync, writeFileSync } from 'fs';
 import { resolve, join, dirname } from 'path';
@@ -192,7 +192,6 @@ program
   .action(async (opts: { project?: string; json?: boolean }) => {
     const { loadCredentials } = await import('./bind/bind-flow.js');
     const { listSessions: tmuxList } = await import('./agent/tmux.js');
-    const { DAEMON_VERSION } = await import('./util/version.js');
     const { loadStore, listSessions } = await import('./store/session-store.js');
 
     await loadStore();
@@ -529,7 +528,6 @@ program
       .option('--no-build', 'Skip rebuild step')
       .action(async (opts: { build: boolean }) => {
         ensureServiceForeground();
-        const realScript = realpathSync(process.argv[1]);
         const projectRoot = PROJECT_ROOT;
 
         if (opts.build) {

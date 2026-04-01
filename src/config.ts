@@ -1,6 +1,6 @@
 import { readFile } from 'fs/promises';
 import { homedir } from 'os';
-import { join, resolve } from 'path';
+import { join } from 'path';
 import yaml from 'yaml';
 import { PROJECT_ROOT } from './util/project-root.js';
 

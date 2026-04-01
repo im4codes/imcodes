@@ -282,31 +282,6 @@ export async function sendKeys(session: string, keys: string, opts?: SendKeysOpt
   }, 3_000);
 }
 
-const CHUNK_SIZE = 800;
-/** Inter-chunk delay (ms). Agents without bracketed paste need time to consume each chunk. */
-const CHUNK_DELAY_MS = 50;
-/** Inter-line delay (ms). Enter key needs extra settle time for non-bracketed-paste agents. */
-const LINE_DELAY_MS = 120;
-
-/** Send large text in chunks via send-keys -l, splitting newlines into separate Enter keys. */
-async function sendKeysChunked(session: string, text: string): Promise<void> {
-  const lines = text.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    for (let offset = 0; offset < line.length; offset += CHUNK_SIZE) {
-      const chunk = line.slice(offset, offset + CHUNK_SIZE);
-      await rawSendText(session, chunk);
-      if (offset + CHUNK_SIZE < line.length) {
-        await new Promise<void>((r) => setTimeout(r, CHUNK_DELAY_MS));
-      }
-    }
-    if (i < lines.length - 1) {
-      await rawSendEnter(session);
-      await new Promise<void>((r) => setTimeout(r, LINE_DELAY_MS));
-    }
-  }
-}
-
 /** @deprecated Use sendKeys — kept as alias for backward compat. */
 export const sendKeysDelayedEnter = sendKeys;
 

@@ -6,14 +6,13 @@
  * Completion = file grew + agent idle.
  */
 
-import { stat, writeFile, readFile, mkdir, unlink, copyFile } from 'node:fs/promises';
+import { stat, writeFile, readFile, unlink, copyFile } from 'node:fs/promises';
 import { join, basename, dirname } from 'node:path';
-import { imcSubDir, ensureImcDir } from '../util/imc-dir.js';
+import { ensureImcDir } from '../util/imc-dir.js';
 import { randomUUID } from 'node:crypto';
 import { sendKeysDelayedEnter } from '../agent/tmux.js';
-import { detectStatus, detectStatusAsync } from '../agent/detect.js';
-import { capturePane } from '../agent/tmux.js';
-import { getSession, type SessionRecord } from '../store/session-store.js';
+import { detectStatusAsync } from '../agent/detect.js';
+import { getSession } from '../store/session-store.js';
 import { getP2pMode, roundPrompt, type P2pMode } from '../../shared/p2p-modes.js';
 import logger from '../util/logger.js';
 import type { ServerLink } from './server-link.js';
@@ -84,12 +83,6 @@ export function listP2pRuns(): P2pRun[] { return [...activeRuns.values()]; }
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
-/** Resolve the discussion file directory based on session projectDir (project-local). */
-function resolveP2pDir(session: string): string {
-  const record = getSession(session);
-  const cwd = record?.projectDir || process.cwd();
-  return imcSubDir(cwd, 'discussions');
-}
 let IDLE_POLL_MS = 3_000;
 let GRACE_PERIOD_DEFAULT_MS = 180_000; // 3 min — complex analysis (subagent research + write) takes time
 let MIN_PROCESSING_MS = 30_000; // Don't trust idle detection until 30s after dispatch

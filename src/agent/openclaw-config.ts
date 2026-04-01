@@ -1,7 +1,7 @@
 // Manages ~/.imcodes/openclaw.json for persistent connection config
 // AND auto-reads token from ~/.openclaw/openclaw.json (OC's own config)
 
-import { readFile, writeFile, unlink, chmod, mkdir } from 'fs/promises';
+import { readFile, writeFile, unlink, mkdir } from 'fs/promises';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';

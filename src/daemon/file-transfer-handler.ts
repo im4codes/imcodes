@@ -99,7 +99,7 @@ async function recoverRegistry(): Promise<void> {
 
 export async function handleFileUpload(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const msg = cmd as unknown as FileUploadRequest;
-  const { uploadId, filename, originalName, mime, size, content } = msg;
+  const { uploadId, filename, originalName, mime, content } = msg;
 
   try {
     await initFileTransfer();
