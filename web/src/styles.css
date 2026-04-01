@@ -677,9 +677,7 @@ body {
 .discussion-filepath { font-size: 11px; color: #64748b; margin-top: 4px; font-family: monospace; }
 
 /* ── Discussions Page ──────────────────────────────────────────────────── */
-.discussions-page { display: flex; flex-direction: column; height: 100%; background: #0a0e1a; color: #e2e8f0; }
-.discussions-header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid #1e293b; }
-.discussions-header h2 { margin: 0; font-size: 16px; flex: 1; }
+.discussions-page { display: flex; flex: 1; min-height: 0; flex-direction: column; height: 100%; background: #0a0e1a; color: #e2e8f0; }
 .discussions-layout { display: flex; flex: 1; overflow: hidden; }
 .discussions-list { width: 320px; min-width: 280px; border-right: 1px solid #1e293b; overflow-y: auto; }
 .discussions-list-item { padding: 12px 16px; border-bottom: 1px solid #1e293b10; cursor: pointer; transition: background 0.15s; }

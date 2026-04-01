@@ -146,10 +146,6 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
 
   return (
     <div class="discussions-page">
-      <div class="discussions-header">
-        <h2>P2P Discussions</h2>
-      </div>
-
       {/* Active P2P progress cards at top */}
       {activeLive.length > 0 && (
         <div class="discussions-progress-strip">
