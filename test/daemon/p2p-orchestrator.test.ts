@@ -640,6 +640,40 @@ describe('Group 11: Bookend Chain Flow', () => {
     expect(w1Prompt.prompt).toContain('hop 1/1');
   });
 
+  it('multi-target runs dispatch hops in target order with each target mode', async () => {
+    const capturedPrompts: Array<{ session: string; prompt: string }> = [];
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      capturedPrompts.push({ session, prompt });
+      const runs = listP2pRuns();
+      const run = runs[runs.length - 1];
+      if (run) {
+        const current = await readFile(run.contextFilePath, 'utf8');
+        await writeFile(run.contextFilePath, current + `\n## ${session}\n\nDone.`, 'utf8');
+      }
+    });
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [
+        { session: 'deck_proj_w2', mode: 'discuss' },
+        { session: 'deck_proj_w1', mode: 'audit' },
+      ],
+      'compare options',
+      [],
+      serverLinkMock as any,
+    );
+
+    await waitForStatus(run.id, 'completed', 15_000);
+
+    expect(capturedPrompts[0]?.session).toBe('deck_proj_brain');
+    expect(capturedPrompts[1]?.session).toBe('deck_proj_w2');
+    expect(capturedPrompts[1]?.prompt).toContain('Discuss');
+    expect(capturedPrompts[1]?.prompt).toContain('hop 1/2');
+    expect(capturedPrompts[2]?.session).toBe('deck_proj_w1');
+    expect(capturedPrompts[2]?.prompt).toContain('Audit');
+    expect(capturedPrompts[2]?.prompt).toContain('hop 2/2');
+  });
+
   it('final summary hop reads all prior sections', async () => {
     let capturedPrompts: Array<{ session: string; prompt: string }> = [];
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {

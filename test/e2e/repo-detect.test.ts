@@ -23,6 +23,7 @@ const PROJECT_DIR = new URL('../../', import.meta.url).pathname.replace(/\/$/, '
 describe.skipIf(SKIP)('Repo Detection E2E', () => {
   let remoteUrl: string;
   let remoteHost: string;
+  let currentBranch = '';
 
   beforeAll(() => {
     try {
@@ -37,6 +38,15 @@ describe.skipIf(SKIP)('Repo Detection E2E', () => {
     // Extract host from remote URL
     const parsed = parseRemoteUrl(remoteUrl);
     remoteHost = parsed?.host ?? '';
+
+    try {
+      currentBranch = execFileSync('git', ['branch', '--show-current'], {
+        cwd: PROJECT_DIR,
+        timeout: 5000,
+      }).toString().trim();
+    } catch {
+      currentBranch = '';
+    }
   });
 
   // ── parseRemoteUrl ──────────────────────────────────────────────────────
@@ -160,7 +170,7 @@ describe.skipIf(SKIP)('Repo Detection E2E', () => {
       const result = await detectRepo(PROJECT_DIR);
 
       if (result.status === 'ok') {
-        expect(result.info!.currentBranch).toBe('master');
+        expect(result.info!.currentBranch).toBe(currentBranch);
       }
     });
 

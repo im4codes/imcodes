@@ -78,6 +78,12 @@ const P2P_MODES: P2pMode[] = ['solo', 'audit', 'review', 'brainstorm', 'discuss'
 const P2P_MODE_I18N: Record<P2pMode, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
 const P2P_MODE_COLORS: Record<P2pMode, string> = { solo: '#6b7280', audit: '#f59e0b', review: '#3b82f6', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
 
+interface PendingAtTarget {
+  session: string;
+  mode: string;
+  label: string;
+}
+
 // Enter moved after ↓ arrow
 const SHORTCUTS: Array<{ label: string; title: string; data: string; wide?: boolean }> = [
   { label: 'Esc',  title: 'Escape',     data: '\x1b' },
@@ -313,25 +319,50 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [p2pConfigKey]);
 
   /** Build a short display label for the input box — prefer sub-session label over raw ID. */
-  const buildAgentLabel = (session: string, _mode: string) => {
-    if (session === '__all__') return '@@all';
+  const buildAgentLabel = (session: string, mode: string) => {
+    const modeLabel = mode === P2P_CONFIG_MODE
+      ? t('p2p.mode_config')
+      : t(`p2p.mode.${mode}`);
+    if (session === '__all__') return `@@all(${modeLabel})`;
     const sub = (subSessions ?? []).find(s => s.sessionName === session);
     const display = sub?.label || session.replace(/^deck_sub_/, '');
-    return `@@${display}`;
+    return `@@${display}(${modeLabel})`;
   };
 
   /** Pending @-selected P2P targets + their display labels for removal at send time. */
-  const pendingAtTargetsRef = useRef<Array<{ session: string; mode: string; label: string }>>([]);
+  const pendingAtTargetsRef = useRef<PendingAtTarget[]>([]);
   /** Custom config/rounds override from @@all+ picker (cleared on send). */
   const pendingConfigOverrideRef = useRef<{ config: P2pSavedConfig; rounds: number } | null>(null);
 
-  /** Strip only the exact @@labels we inserted (preserves single-@ file references). */
-  const stripAtLabels = (text: string, labels: string[]): string => {
-    let result = text;
-    for (const label of labels) {
-      result = result.replace(label, '');
+  const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  /**
+   * Extract @-picked agent targets in the order they appear in the textbox.
+   * This lets users reorder or delete @@agent(mode) labels manually before send.
+   */
+  const extractOrderedAtTargets = (text: string, pendingTargets: PendingAtTarget[]) => {
+    if (pendingTargets.length === 0) return { orderedTargets: [] as PendingAtTarget[], cleanText: text };
+
+    const labelQueues = new Map<string, PendingAtTarget[]>();
+    for (const target of pendingTargets) {
+      const queue = labelQueues.get(target.label);
+      if (queue) queue.push(target);
+      else labelQueues.set(target.label, [target]);
     }
-    return result.replace(/\s+/g, ' ').trim();
+
+    const labels = [...labelQueues.keys()].sort((a, b) => b.length - a.length);
+    if (labels.length === 0) return { orderedTargets: [] as PendingAtTarget[], cleanText: text };
+
+    const matcher = new RegExp(labels.map(escapeRegExp).join('|'), 'g');
+    const orderedTargets: PendingAtTarget[] = [];
+    const cleanText = text.replace(matcher, (match) => {
+      const queue = labelQueues.get(match);
+      const target = queue?.shift();
+      if (target) orderedTargets.push(target);
+      return '';
+    }).replace(/\s+/g, ' ').trim();
+
+    return { orderedTargets, cleanText };
   };
 
   const handleSend = useCallback(() => {
@@ -340,14 +371,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
     // Build P2P routing as structured WS fields — keep text clean for display.
     const extra: Record<string, unknown> = {};
-    const atTargets = pendingAtTargetsRef.current.splice(0);
+    const pendingTargets = pendingAtTargetsRef.current.splice(0);
 
-    if (atTargets.length > 0) {
-      // @ picker was used — send targets as structured field, strip @@labels from text
-      text = stripAtLabels(text, atTargets.map(t => t.label));
-      extra.p2pAtTargets = atTargets.map(({ session, mode }) => ({ session, mode }));
+    if (pendingTargets.length > 0) {
+      // @ picker was used — derive routing from the visible textbox order, then strip matched labels.
+      const { orderedTargets, cleanText } = extractOrderedAtTargets(text, pendingTargets);
+      text = cleanText;
+      if (orderedTargets.length > 0) {
+        extra.p2pAtTargets = orderedTargets.map(({ session, mode }) => ({ session, mode }));
+      }
       // Attach config data when any target uses config mode
-      const hasConfigTarget = atTargets.some(t => t.mode === 'config');
+      const hasConfigTarget = orderedTargets.some(t => t.mode === 'config');
       if (hasConfigTarget) {
         const override = pendingConfigOverrideRef.current;
         const cfg = override?.config ?? p2pSavedConfig;
@@ -356,8 +390,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           extra.p2pRounds = override?.rounds ?? cfg.rounds ?? 1;
           if (cfg.extraPrompt) extra.p2pExtraPrompt = cfg.extraPrompt;
         }
-        pendingConfigOverrideRef.current = null;
       }
+      pendingConfigOverrideRef.current = null;
     } else if (p2pMode !== 'solo' && !text.includes('@@')) {
       // Dropdown P2P mode — daemon handles expansion
       if (p2pMode === P2P_CONFIG_MODE) {

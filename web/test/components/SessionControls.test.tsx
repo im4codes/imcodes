@@ -289,6 +289,7 @@ describe('SessionControls', () => {
     fireEvent.click(screen.getByText('agents'));
     fireEvent.click(screen.getByText('w1'));
     fireEvent.click(screen.getByText('audit'));
+    expect(input.textContent).toBe('@@w1(audit) ');
 
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
@@ -330,8 +331,83 @@ describe('SessionControls', () => {
     fireEvent.click(screen.getByText('Worker Alpha'));
     fireEvent.click(screen.getByText('audit'));
 
-    // Input shows @@label when sub-session has a label (not the raw session ID)
-    expect(input.textContent).toBe('@@Worker Alpha ');
+    // Input shows @@label plus selected mode when sub-session has a label
+    expect(input.textContent).toBe('@@Worker Alpha(audit) ');
+    getSelectionSpy.mockRestore();
+  });
+
+  it('shows the selected mode in the inserted label for single-agent mentions', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={mainSession}
+        quickData={makeQuickData() as any}
+        sessions={[mainSession]}
+        subSessions={[
+          { sessionName: 'deck_sub_w1', type: 'codex', label: 'w1', state: 'idle', parentSession: 'deck_my-project_brain' },
+        ]}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    const getSelectionSpy = vi.spyOn(window, 'getSelection').mockImplementation(() => ({
+      anchorOffset: input.textContent?.length ?? 0,
+    }) as any);
+
+    input.textContent = '@';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByText('agents'));
+    fireEvent.click(screen.getByText('w1'));
+    fireEvent.click(screen.getByText('discuss'));
+
+    expect(input.textContent).toBe('@@w1(discuss) ');
+    getSelectionSpy.mockRestore();
+  });
+
+  it('sends p2pAtTargets in textbox order, not selection order', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={mainSession}
+        quickData={makeQuickData() as any}
+        sessions={[mainSession]}
+        subSessions={[
+          { sessionName: 'deck_sub_w1', type: 'codex', label: 'w1', state: 'idle', parentSession: 'deck_my-project_brain' },
+          { sessionName: 'deck_sub_w2', type: 'gemini', label: 'w2', state: 'idle', parentSession: 'deck_my-project_brain' },
+        ]}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    const getSelectionSpy = vi.spyOn(window, 'getSelection').mockImplementation(() => ({
+      anchorOffset: input.textContent?.length ?? 0,
+    }) as any);
+
+    input.textContent = '@';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByText('agents'));
+    fireEvent.click(screen.getByText('w1'));
+    fireEvent.click(screen.getByText('audit'));
+
+    input.textContent = `${input.textContent}@`;
+    fireEvent.input(input);
+    fireEvent.click(screen.getByText('agents'));
+    fireEvent.click(screen.getByText('w2'));
+    fireEvent.click(screen.getByText('discuss'));
+
+    input.textContent = '@@w2(discuss) @@w1(audit) please review';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      sessionName: 'deck_my-project_brain',
+      text: 'please review',
+      p2pAtTargets: [
+        { session: 'deck_sub_w2', mode: 'discuss' },
+        { session: 'deck_sub_w1', mode: 'audit' },
+      ],
+    }));
+
     getSelectionSpy.mockRestore();
   });
 
