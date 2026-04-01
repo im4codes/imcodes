@@ -171,6 +171,8 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
   const detectRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const tabRetryCountRef = useRef<Map<string, number>>(new Map());
   const tabRetryTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const detailRetryCountRef = useRef<Map<string, number>>(new Map());
+  const detailRetryTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const latestActionDetailRef = useRef<string | null>(null);
   const pendingCiFailureRef = useRef<Map<number, { id: number; name: string; status: string; conclusion?: string; url: string; updatedAt?: number }>>(new Map());
   const deliveredCiEventRef = useRef<Set<string>>(new Set());
@@ -298,6 +300,9 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
     deliveredCiEventRef.current.clear();
     actionJobRefs.current.clear();
     actionStepRefs.current.clear();
+    for (const timer of detailRetryTimersRef.current.values()) clearTimeout(timer);
+    detailRetryTimersRef.current.clear();
+    detailRetryCountRef.current.clear();
   }, [projectDir]);
 
   useEffect(() => {
@@ -307,6 +312,8 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
       if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
       for (const timer of tabRetryTimersRef.current.values()) clearTimeout(timer);
       tabRetryTimersRef.current.clear();
+      for (const timer of detailRetryTimersRef.current.values()) clearTimeout(timer);
+      detailRetryTimersRef.current.clear();
     };
   }, [doDetect]);
 
@@ -409,7 +416,39 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
         const detailKey = detailReqRef.current.get(msg.requestId);
         if (detailKey) {
           detailReqRef.current.delete(msg.requestId);
-          setDetailState(prev => new Map(prev).set(detailKey, 'error'));
+          const retryKey = detailKey;
+          const existingDetail = detailDataRef.current.get(detailKey);
+          const nextRetry = (detailRetryCountRef.current.get(retryKey) ?? 0) + 1;
+          const latestAction = tabs.actions.items[0] as any;
+          const isLatestActionDetail = detailKey === `actions:${latestAction?.id}`;
+          const latestActionStatus = latestAction?.status;
+          const runId = detailKey.startsWith('actions:') ? Number(detailKey.slice('actions:'.length)) : null;
+          const canSilentRetry = detailKey.startsWith('actions:')
+            && (isLatestActionDetail || !!existingDetail)
+            && nextRetry <= MAX_SILENT_RETRIES
+            && Number.isFinite(runId);
+
+          if (canSilentRetry && runId != null) {
+            detailRetryCountRef.current.set(retryKey, nextRetry);
+            const existingTimer = detailRetryTimersRef.current.get(retryKey);
+            if (existingTimer) clearTimeout(existingTimer);
+            detailRetryTimersRef.current.set(retryKey, setTimeout(() => {
+              detailRetryTimersRef.current.delete(retryKey);
+              fetchActionDetail(runId, { force: latestActionStatus === 'running' || latestActionStatus === 'queued' || latestActionStatus === 'failure' });
+            }, RETRY_DELAY_MS));
+            setDetailState(prev => {
+              const next = new Map(prev);
+              if (existingDetail) next.set(detailKey, 'loaded');
+              else next.set(detailKey, 'loading');
+              return next;
+            });
+          } else {
+            detailRetryCountRef.current.delete(retryKey);
+            const existingTimer = detailRetryTimersRef.current.get(retryKey);
+            if (existingTimer) clearTimeout(existingTimer);
+            detailRetryTimersRef.current.delete(retryKey);
+            setDetailState(prev => new Map(prev).set(detailKey, existingDetail ? 'loaded' : 'error'));
+          }
           return;
         }
         // Could be detect error or tab error
@@ -466,6 +505,10 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
           pendingRef.current.delete(m.requestId);
           detailReqRef.current.delete(m.requestId);
         }
+        detailRetryCountRef.current.delete(`actions:${m.detail.runId}`);
+        const retryTimer = detailRetryTimersRef.current.get(`actions:${m.detail.runId}`);
+        if (retryTimer) clearTimeout(retryTimer);
+        detailRetryTimersRef.current.delete(`actions:${m.detail.runId}`);
         detailDataRef.current = new Map(detailDataRef.current).set(`actions:${m.detail.runId}`, m.detail);
         setDetailData(prev => new Map(prev).set(`actions:${m.detail.runId}`, m.detail));
         setDetailState(prev => new Map(prev).set(`actions:${m.detail.runId}`, 'loaded'));
@@ -570,7 +613,7 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
         });
       }
     });
-  }, [ws, projectDir, doDetect, onCiEvent]);
+  }, [ws, projectDir, doDetect, onCiEvent, tabs.actions.items, fetchActionDetail]);
 
   useEffect(() => {
     if (!tabs.actions.fetched || tabs.actions.items.length === 0) return;

@@ -31,14 +31,12 @@ export function UsageFooter({ usage, sessionName, showCost, activeThinkingTs, st
   const { t } = useTranslation();
 
   const { ctx, total, cachePct, newPct, pctStr, tip } = useMemo(() => {
-    const ctx = usage.codexStatus?.contextWindowTokens ?? resolveContextWindow(usage.contextWindow, usage.model);
-    const total = usage.codexStatus?.contextUsedTokens ?? (usage.inputTokens + usage.cacheTokens);
+    const ctx = resolveContextWindow(usage.contextWindow, usage.model);
+    const total = usage.inputTokens + usage.cacheTokens;
     const totalPct = Math.min(100, total / ctx * 100);
-    const cachePct = usage.codexStatus?.contextUsedTokens ? 0 : Math.min(totalPct, usage.cacheTokens / ctx * 100);
+    const cachePct = Math.min(totalPct, usage.cacheTokens / ctx * 100);
     const newPct = totalPct - cachePct;
-    const pctStr = usage.codexStatus?.contextLeftPercent !== undefined
-      ? String(usage.codexStatus.contextLeftPercent)
-      : totalPct < 1 ? totalPct.toFixed(1) : totalPct.toFixed(0);
+    const pctStr = totalPct < 1 ? totalPct.toFixed(1) : totalPct.toFixed(0);
     const tip = [
       usage.model ?? '',
       `Context: ${fmt(total)} / ${fmt(ctx)} (${pctStr}%)`,
@@ -53,8 +51,7 @@ export function UsageFooter({ usage, sessionName, showCost, activeThinkingTs, st
   const weeklyCost = sessionCost > 0 ? getWeeklyCost() : 0;
   const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const modelLabel = shortModelLabel(usage.model);
-  const hasCodexStatus = usage.codexStatus?.contextLeftPercent !== undefined
-    || usage.codexStatus?.fiveHourLeftPercent !== undefined
+  const hasCodexStatus = usage.codexStatus?.fiveHourLeftPercent !== undefined
     || usage.codexStatus?.weeklyLeftPercent !== undefined;
 
   return (
@@ -67,11 +64,6 @@ export function UsageFooter({ usage, sessionName, showCost, activeThinkingTs, st
       )}
       {hasCodexStatus && (
         <div class="session-usage-codex-row">
-          {usage.codexStatus?.contextLeftPercent !== undefined && (
-            <span class="session-usage-badge" title={t('session.codex_ctx_title', { percent: usage.codexStatus.contextLeftPercent })}>
-              {t('session.codex_ctx_short')} {usage.codexStatus.contextLeftPercent}%
-            </span>
-          )}
           {usage.codexStatus?.fiveHourLeftPercent !== undefined && (
             <span
               class="session-usage-badge"

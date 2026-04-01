@@ -21,6 +21,11 @@ vi.mock('react-i18next', () => ({
 vi.mock('../../src/components/QuickInputPanel.js', () => ({
   QuickInputPanel: () => null,
   EMPTY_QUICK_DATA: { history: [], sessionHistory: {}, commands: [], phrases: [] },
+  getNavigableHistory: (data: { history: string[]; sessionHistory: Record<string, string[]> }, sessionName?: string) => {
+    if (!sessionName) return data.history;
+    const sessionHist = data.sessionHistory[sessionName] ?? [];
+    return sessionHist.length > 0 ? sessionHist : data.history;
+  },
 }));
 
 const uploadFileMock = vi.fn();
@@ -210,6 +215,36 @@ describe('SessionControls', () => {
     fireEvent.input(input);
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: true });
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it('ArrowUp/ArrowDown navigates the same history source and restores the draft', () => {
+    const ws = makeWs();
+    const quickData = makeQuickData();
+    quickData.data = {
+      history: ['global newest'],
+      sessionHistory: {
+        'my-session': ['session newest', 'session older'],
+      },
+      commands: [],
+      phrases: [],
+    };
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={quickData as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+
+    input.textContent = 'draft text';
+    fireEvent.input(input);
+
+    fireEvent.keyDown(input, { key: 'ArrowUp' });
+    expect(input.textContent).toBe('session newest');
+
+    fireEvent.keyDown(input, { key: 'ArrowUp' });
+    expect(input.textContent).toBe('session older');
+
+    fireEvent.keyDown(input, { key: 'ArrowDown' });
+    expect(input.textContent).toBe('session newest');
+
+    fireEvent.keyDown(input, { key: 'ArrowDown' });
+    expect(input.textContent).toBe('draft text');
   });
 
   it('closes @ picker if user keeps typing without making a selection', () => {

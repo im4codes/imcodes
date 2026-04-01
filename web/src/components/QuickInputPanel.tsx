@@ -48,6 +48,12 @@ export function recordHistoryEntry(data: QuickData, text: string, sessionName?: 
   return next;
 }
 
+export function getNavigableHistory(data: QuickData, sessionName?: string): string[] {
+  if (!sessionName) return data.history;
+  const sessionHist = data.sessionHistory[sessionName] ?? [];
+  return sessionHist.length > 0 ? sessionHist : data.history;
+}
+
 // ── Hook ──────────────────────────────────────────────────────────────────
 
 let _debounceTimer: ReturnType<typeof setTimeout> | null = null;

@@ -4,6 +4,7 @@ import type { RefObject } from 'preact';
 import type { WsClient } from '../ws-client.js';
 import type { SessionInfo } from '../types.js';
 import { QuickInputPanel } from './QuickInputPanel.js';
+import { getNavigableHistory } from './QuickInputPanel.js';
 import type { UseQuickDataResult } from './QuickInputPanel.js';
 import { FileBrowser } from './FileBrowser.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
@@ -235,6 +236,24 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const getText = () => (divRef.current?.textContent ?? '').trim();
 
+  const getCaretLineBoundary = (direction: 'up' | 'down') => {
+    const root = divRef.current;
+    const sel = window.getSelection();
+    if (!root || !sel || sel.rangeCount === 0 || !sel.isCollapsed) return true;
+    const range = sel.getRangeAt(0);
+    if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return true;
+
+    const probe = range.cloneRange();
+    probe.selectNodeContents(root);
+    if (direction === 'up') {
+      probe.setEnd(range.startContainer, range.startOffset);
+    } else {
+      probe.setStart(range.endContainer, range.endOffset);
+    }
+    const text = probe.toString();
+    return !text.includes('\n');
+  };
+
   const fillInput = (text: string) => {
     if (divRef.current) {
       divRef.current.textContent = text;
@@ -431,15 +450,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     }
 
     // Use session-scoped history, falling back to global history if session has no entries
-    const sessionHist = activeSession
-      ? (quickData.data.sessionHistory[activeSession.name] ?? [])
-      : [];
-    const history = sessionHist.length > 0 ? sessionHist : quickData.data.history;
+    const history = getNavigableHistory(quickData.data, activeSession?.name);
     if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && history.length > 0) {
-      // Only intercept when caret is on first/last line to avoid breaking multiline editing
-      const sel = window.getSelection();
-      const atTop = !sel || sel.anchorOffset === 0;
-      const atBottom = !sel || sel.anchorOffset === (divRef.current?.textContent?.length ?? 0);
+      // Only intercept when caret is on first/last visual line to avoid breaking multiline editing
+      const atTop = getCaretLineBoundary('up');
+      const atBottom = getCaretLineBoundary('down');
 
       if (e.key === 'ArrowUp' && atTop) {
         e.preventDefault();

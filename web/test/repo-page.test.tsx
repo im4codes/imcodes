@@ -40,10 +40,16 @@ vi.mock('react-i18next', () => ({
         'repo.tab_prs': 'PRs',
         'repo.tab_branches': 'Branches',
         'repo.tab_commits': 'Commits',
+        'repo.tab_actions': 'Actions',
+        'repo.tab_cicd': 'Actions',
         'repo.back': 'Back',
         'repo.refresh': 'Refresh',
         'repo.load_more': 'Load more',
         'repo.retry': 'Retry',
+        'repo.detail_loading': 'Loading details...',
+        'repo.detail_error': 'Failed to load details',
+        'repo.detail_retry': 'Retry details',
+        'repo.actions_view': 'View',
         'repo.cli_not_installed': 'CLI not installed',
         'repo.error_cli_missing_hint': 'Install the GitHub CLI',
         'repo.error_unauthorized_hint': 'Run gh auth login',
@@ -69,6 +75,7 @@ function makeWs() {
   // Track request IDs returned by each method
   let detectReqId = '';
   const lastTabReqIds: Partial<Record<'issues' | 'prs' | 'branches' | 'commits' | 'actions', string>> = {};
+  let lastActionDetailReqId = '';
 
   const repoDetect = vi.fn((projectDir: string) => {
     detectReqId = `detect-${Date.now()}-${Math.random()}`;
@@ -94,6 +101,10 @@ function makeWs() {
     lastTabReqIds.actions = `actions-${Date.now()}-${Math.random()}`;
     return lastTabReqIds.actions;
   });
+  const repoActionDetail = vi.fn((_dir: string, _runId: number, _opts?: any) => {
+    lastActionDetailReqId = `action-detail-${Date.now()}-${Math.random()}`;
+    return lastActionDetailReqId;
+  });
 
   const ws: WsClient = {
     connected: true,
@@ -107,6 +118,7 @@ function makeWs() {
     repoListBranches,
     repoListCommits,
     repoListActions,
+    repoActionDetail,
   } as unknown as WsClient;
 
   /** Send a message to the component's onMessage handler */
@@ -170,6 +182,23 @@ function makeWs() {
     } as ServerMessage);
   };
 
+  const respondActionDetail = (projectDir: string, detail: any) => {
+    emit({
+      type: 'repo.action_detail_response',
+      requestId: lastActionDetailReqId,
+      projectDir,
+      detail,
+    } as unknown as ServerMessage);
+  };
+
+  const respondActionDetailError = (error: string) => {
+    emit({
+      type: 'repo.error',
+      requestId: lastActionDetailReqId,
+      error,
+    } as ServerMessage);
+  };
+
   return {
     ws,
     emit,
@@ -179,11 +208,14 @@ function makeWs() {
     repoListBranches,
     repoListCommits,
     repoListActions,
+    repoActionDetail,
     respondDetect,
     respondDetectFlat,
     respondDetectError,
     respondTab,
     respondTabError,
+    respondActionDetail,
+    respondActionDetailError,
     getDetectReqId: () => detectReqId,
     getLastTabReqId: (tab: 'issues' | 'prs' | 'branches' | 'commits' | 'actions' = 'issues') => lastTabReqIds[tab] ?? '',
   };
@@ -284,6 +316,48 @@ describe('RepoPage', () => {
     expect(screen.getByText('rate limit exceeded (429)')).toBeDefined();
     // Rate-limited errors show a Retry button
     expect(screen.getByText('Retry')).toBeDefined();
+  });
+
+  it('silently retries latest action detail errors instead of showing a detail error immediately', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ws, respondDetect, respondTab, respondActionDetailError, repoActionDetail } = makeWs();
+      render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+      await act(async () => {
+        respondDetect({ provider: 'github', owner: 'acme', repo: 'widgets' });
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByText('Actions'));
+      });
+
+      await act(async () => {
+        respondTab('repo.actions_response', PROJECT_DIR, [
+          { id: 101, name: 'CI', status: 'failure', conclusion: 'failure', updatedAt: Date.now() },
+        ]);
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByText('CI'));
+      });
+
+      expect(repoActionDetail).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        respondActionDetailError('cli_error');
+      });
+
+      expect(screen.queryByText('Failed to load details')).toBeNull();
+
+      await act(async () => {
+        vi.advanceTimersByTime(1300);
+      });
+
+      expect(screen.queryByText('Failed to load details')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // 5. Empty state
