@@ -552,5 +552,58 @@
     "saveError": "Error al guardar",
     "fileTooLarge": "Archivo demasiado grande para guardar (> 1 MB)",
     "saveTimeout": "Tiempo de espera de guardado agotado — vuelva a cargar el archivo"
+  },
+  "onboarding": {
+    "prompt": {
+      "title": "¿Activar la guía para nuevos usuarios?",
+      "body_1": "Tu primera sesión principal ya está lista. Si eres nuevo, esta guía corta te mostrará los controles principales.",
+      "body_2": "Primero cubre los botones básicos y al final explica cómo sacar más provecho a las discusiones multiagente.",
+      "beginner": "Soy nuevo, iniciar guía",
+      "expert": "Tengo experiencia, no volver a mostrar",
+      "later": "Cerrar, recuérdamelo la próxima vez"
+    },
+    "step_counter": "Paso {{current}} / {{total}}",
+    "prev": "Atrás",
+    "next": "Siguiente",
+    "finish": "Finalizar",
+    "steps": {
+      "new_main": {
+        "title": "Crea aquí una sesión principal",
+        "body_1": "Usa este botón para crear una nueva sesión principal para un proyecto.",
+        "body_2": "La sesión principal es la entrada a terminal, chat, repo y discusiones."
+      },
+      "new_sub": {
+        "title": "Crea aquí una sub-sesión",
+        "body_1": "Usa este botón para añadir una sub-sesión worker/helper al proyecto actual.",
+        "body_2": "Las sub-sesiones sirven para tareas paralelas, revisiones y experimentos."
+      },
+      "discussions": {
+        "title": "Abre aquí el historial de discusiones",
+        "body_1": "Aquí puedes revisar discusiones anteriores y sus resultados."
+      },
+      "repo": {
+        "title": "Abre aquí el panel del repositorio",
+        "body_1": "Aquí puedes revisar estado del repo, ramas, commits, PR y CI."
+      },
+      "cron": {
+        "title": "Abre aquí las tareas programadas",
+        "body_1": "Aquí puedes crear y gestionar tareas programadas para el proyecto actual."
+      },
+      "view_toggle": {
+        "title": "Cambia aquí entre chat y terminal",
+        "body_1": "Usa este botón para alternar entre la vista de chat y la vista de terminal en vivo."
+      },
+      "p2p_defaults": {
+        "title": "Configura aquí los participantes por defecto",
+        "body_1": "Abre este menú y elige Config para definir qué sesiones se unen a @all por defecto.",
+        "body_2": "También puedes definir rápidamente las rondas por defecto."
+      },
+      "p2p_send": {
+        "title": "Inicia discusiones desde la caja de entrada",
+        "body_1": "Escribe @@all(discuss), @@all(review) u otro modo para iniciar una discusión compartida rápidamente.",
+        "body_2": "Las discusiones funcionan mejor con 2 o más agentes de distintos proveedores o tipos. Eso rompe el pensamiento fijo y suele dar mejores resultados.",
+        "body_3": "Las discusiones multiagente comparten archivos y conservan mejor historial. Uno a uno se parece más a una discusión puntual. En la práctica, 2 rondas son un buen valor por defecto."
+      }
+    }
   }
 }

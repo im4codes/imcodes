@@ -552,5 +552,58 @@
     "saveError": "儲存失敗",
     "fileTooLarge": "檔案過大，無法儲存（> 1 MB）",
     "saveTimeout": "儲存逾時 — 請重新載入檔案"
+  },
+  "onboarding": {
+    "prompt": {
+      "title": "開啟新手引導？",
+      "body_1": "你的第一個主 session 已經建立完成。如果你是新手，這個簡短引導會帶你認識核心操作。",
+      "body_2": "引導會先講基礎按鈕，最後再講多 Agent 討論如何得到更好的效果。",
+      "beginner": "我是新手，開啟引導",
+      "expert": "我是老手，不再提示",
+      "later": "關閉，下次再說"
+    },
+    "step_counter": "第 {{current}} / {{total}} 步",
+    "prev": "上一步",
+    "next": "下一步",
+    "finish": "完成",
+    "steps": {
+      "new_main": {
+        "title": "這裡新建主 Session",
+        "body_1": "用這個按鈕為專案建立新的主 session。",
+        "body_2": "主 session 是 terminal、chat、repo、discussion 等工作流的入口。"
+      },
+      "new_sub": {
+        "title": "這裡新建子 Session",
+        "body_1": "用這個按鈕在目前專案下新增 worker / helper 子 session。",
+        "body_2": "子 session 適合做旁線任務、review、實驗和並行工作。"
+      },
+      "discussions": {
+        "title": "這裡打開討論歷史",
+        "body_1": "這裡可以查看之前的討論記錄和結果。"
+      },
+      "repo": {
+        "title": "這裡打開 Repo 面板",
+        "body_1": "這裡可以查看倉庫狀態、分支、提交、PR 和 CI。"
+      },
+      "cron": {
+        "title": "這裡打開定時任務",
+        "body_1": "這裡可以為目前專案建立和管理定時任務。"
+      },
+      "view_toggle": {
+        "title": "這裡切換 Chat / Terminal",
+        "body_1": "用這個按鈕在目前 session 的聊天視圖和即時終端視圖之間切換。"
+      },
+      "p2p_defaults": {
+        "title": "這裡設定預設參與討論的 Session",
+        "body_1": "打開這裡並選擇 Config，可以設定哪些 session 會預設參與 @all 討論。",
+        "body_2": "這裡也能快速設定預設討論輪數。"
+      },
+      "p2p_send": {
+        "title": "從輸入框快速發起討論",
+        "body_1": "在輸入框輸入 @@all(discuss)、@@all(review) 或其它模式，就能快速發起共享討論。",
+        "body_2": "Agent 討論通常至少 2 個更好，尤其是不同廠商、不同類型的 Agent，一起更容易突破定式思維，效果通常更好。",
+        "body_3": "多 Agent 討論會共享檔案、保留更完整的歷史；一對一更像一次性討論。實戰裡 2 輪通常是很好的預設值。"
+      }
+    }
   }
 }

@@ -273,7 +273,7 @@ function SessionTreeInner({
           </button>
         )}
         {onNewSession && (
-          <button class="session-tree-add-btn" onClick={onNewSession} title={t('session.new_session', 'New session')}>+</button>
+          <button class="session-tree-add-btn" data-onboarding="new-main-session" onClick={onNewSession} title={t('session.new_session', 'New session')}>+</button>
         )}
       </div>
 

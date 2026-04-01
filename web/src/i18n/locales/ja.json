@@ -552,5 +552,58 @@
     "saveError": "保存に失敗しました",
     "fileTooLarge": "ファイルが大きすぎて保存できません（> 1 MB）",
     "saveTimeout": "保存がタイムアウトしました — ファイルを再読み込みしてください"
+  },
+  "onboarding": {
+    "prompt": {
+      "title": "新規ユーザー向けガイドを開始しますか？",
+      "body_1": "最初のメイン session の準備ができました。初めてなら、この短いガイドで主要な操作を確認できます。",
+      "body_2": "まず基本ボタンを説明し、最後にマルチ Agent 議論の使い方を案内します。",
+      "beginner": "初心者なのでガイドを開始",
+      "expert": "慣れているので今後は表示しない",
+      "later": "閉じる、次回また表示"
+    },
+    "step_counter": "ステップ {{current}} / {{total}}",
+    "prev": "戻る",
+    "next": "次へ",
+    "finish": "完了",
+    "steps": {
+      "new_main": {
+        "title": "ここでメイン Session を作成",
+        "body_1": "このボタンでプロジェクト用の新しいメイン session を作成します。",
+        "body_2": "メイン session は terminal、chat、repo、discussion の入口です。"
+      },
+      "new_sub": {
+        "title": "ここでサブ Session を作成",
+        "body_1": "このボタンで現在のプロジェクトに worker/helper のサブ session を追加します。",
+        "body_2": "サブ session は並列作業、レビュー、実験に向いています。"
+      },
+      "discussions": {
+        "title": "ここで議論履歴を開く",
+        "body_1": "過去の議論と結果をここで確認できます。"
+      },
+      "repo": {
+        "title": "ここで Repo パネルを開く",
+        "body_1": "リポジトリ状態、ブランチ、コミット、PR、CI をここで確認できます。"
+      },
+      "cron": {
+        "title": "ここで定期タスクを開く",
+        "body_1": "現在のプロジェクトの定期タスクをここで作成・管理できます。"
+      },
+      "view_toggle": {
+        "title": "ここで Chat / Terminal を切り替える",
+        "body_1": "このボタンで現在の session の chat 表示と live terminal 表示を切り替えます。"
+      },
+      "p2p_defaults": {
+        "title": "ここで既定の議論参加 Session を設定",
+        "body_1": "このメニューで Config を選ぶと、@all に既定で参加する session を設定できます。",
+        "body_2": "既定の議論ラウンド数もここで素早く設定できます。"
+      },
+      "p2p_send": {
+        "title": "入力欄から素早く議論を開始",
+        "body_1": "@@all(discuss) や @@all(review) などを入力すると、共有ディスカッションをすばやく開始できます。",
+        "body_2": "議論は異なる提供元や種類の Agent を 2 つ以上使うと効果的です。固定化した発想を崩しやすく、より良い結果になりやすいです。",
+        "body_3": "マルチ Agent 議論はファイル共有とより完全な履歴を持ちます。1 対 1 は単発の議論に近い扱いです。実運用では 2 ラウンドが強い既定値です。"
+      }
+    }
   }
 }

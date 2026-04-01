@@ -330,15 +330,16 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
             </span>
           );
         })()}
-        <button class="subcard-toolbar-add" onClick={onNew} title="New sub-session">+</button>
+        <button class="subcard-toolbar-add" data-onboarding="new-sub-session" onClick={onNew} title="New sub-session">+</button>
         {onViewDiscussions && (
-          <button class="subcard-toolbar-btn" onClick={onViewDiscussions} title="P2P discussions" style={{ marginLeft: 4, fontSize: 11 }}>
+          <button class="subcard-toolbar-btn" data-onboarding="discussion-history" onClick={onViewDiscussions} title="P2P discussions" style={{ marginLeft: 4, fontSize: 11 }}>
             📋
           </button>
         )}
         {onViewRepo && (
           <button
             class="subcard-toolbar-btn"
+            data-onboarding="repo-page"
             onClick={() => onViewRepo()}
             title="Repository"
             style={{
@@ -350,7 +351,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
           </button>
         )}
         {onViewCron && (
-          <button class="subcard-toolbar-btn" onClick={onViewCron} title="Scheduled Tasks" style={{ marginLeft: 4, fontSize: 11 }}>
+          <button class="subcard-toolbar-btn" data-onboarding="cron-manager" onClick={onViewCron} title="Scheduled Tasks" style={{ marginLeft: 4, fontSize: 11 }}>
             ⏰
           </button>
         )}

@@ -34,6 +34,7 @@ import { FloatingPanel } from './components/FloatingPanel.js';
 import { SettingsPage } from './pages/SettingsPage.js';
 import { AdminPage } from './pages/AdminPage.js';
 import { CronManager } from './pages/CronManager.js';
+import { NewUserGuide, type NewUserGuideStep } from './components/NewUserGuide.js';
 import { ServerIconBar } from './components/ServerIconBar.js';
 import { Sidebar, loadSidebarCollapsed, saveSidebarCollapsed } from './components/Sidebar.js';
 import { SessionTree } from './components/SessionTree.js';
@@ -47,6 +48,7 @@ import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
 import { useSubSessions } from './hooks/useSubSessions.js';
 import { useProviderStatus } from './hooks/useProviderStatus.js';
+import { DEFAULT_NEW_USER_GUIDE_PREF, shouldMarkNewUserGuidePending, shouldShowNewUserGuidePrompt, type NewUserGuidePref } from './onboarding.js';
 // useSwipeBack now handled inside FloatingPanel for discussion/repo pages
 import { WsClient } from './ws-client.js';
 import { configure as configureApi, apiFetch, onAuthExpired, getUserPref, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, normalizeLocalWebPreviewPath } from './api.js';
@@ -480,6 +482,11 @@ export function App() {
 
   // Panels pinned to the sidebar — synced to server, write-through cache
   const [pinnedPanels, setPinnedPanels] = useSyncedPreference<PinnedPanel[]>('sidebar_pinned_panels', [], 0);
+  const [newUserGuidePref, setNewUserGuidePref] = useSyncedPreference<NewUserGuidePref>('new_user_guide', DEFAULT_NEW_USER_GUIDE_PREF, 0);
+  const [showNewUserGuidePrompt, setShowNewUserGuidePrompt] = useState(false);
+  const [showNewUserGuide, setShowNewUserGuide] = useState(false);
+  const [guidePromptSnoozed, setGuidePromptSnoozed] = useState(false);
+  const sawLoadedEmptySessionsRef = useRef(false);
 
   // Per-panel heights (device-local, not synced)
   const [pinnedPanelHeights, setPinnedPanelHeights] = useState<Record<string, number>>(() => {
@@ -506,6 +513,30 @@ export function App() {
   }, [subZIndexes, openSubIds]);
   const focusedSubIdRef = useRef(focusedSubId);
   focusedSubIdRef.current = focusedSubId;
+
+  useEffect(() => {
+    if (sessionsLoaded && sessions.length === 0) {
+      sawLoadedEmptySessionsRef.current = true;
+    }
+  }, [sessionsLoaded, sessions.length]);
+
+  useEffect(() => {
+    if (!shouldMarkNewUserGuidePending(newUserGuidePref, sessionsLoaded, sessions.length, sawLoadedEmptySessionsRef.current)) return;
+    setNewUserGuidePref((prev) => ({ ...prev, pending: true }));
+    setGuidePromptSnoozed(false);
+    setShowNewUserGuidePrompt(true);
+  }, [newUserGuidePref, sessionsLoaded, sessions.length, setNewUserGuidePref]);
+
+  useEffect(() => {
+    if (shouldShowNewUserGuidePrompt(newUserGuidePref, sessionsLoaded, sessions.length) && !guidePromptSnoozed && !showNewUserGuide) {
+      setShowNewUserGuidePrompt(true);
+      return;
+    }
+    if (!newUserGuidePref.pending || newUserGuidePref.completed || newUserGuidePref.disabled) {
+      setShowNewUserGuidePrompt(false);
+      setShowNewUserGuide(false);
+    }
+  }, [guidePromptSnoozed, newUserGuidePref, sessionsLoaded, sessions.length, showNewUserGuide]);
 
   useEffect(() => {
     const markActive = () => { lastImcodesActivityRef.current = Date.now(); };
@@ -1577,6 +1608,69 @@ export function App() {
   }
 
   const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
+  const newUserGuideSteps = useMemo<NewUserGuideStep[]>(() => [
+    {
+      selector: '[data-onboarding="new-main-session"]',
+      titleKey: 'onboarding.steps.new_main.title',
+      bodyKeys: [
+        'onboarding.steps.new_main.body_1',
+        'onboarding.steps.new_main.body_2',
+      ],
+    },
+    {
+      selector: '[data-onboarding="new-sub-session"]',
+      titleKey: 'onboarding.steps.new_sub.title',
+      bodyKeys: [
+        'onboarding.steps.new_sub.body_1',
+        'onboarding.steps.new_sub.body_2',
+      ],
+    },
+    {
+      selector: '[data-onboarding="discussion-history"]',
+      titleKey: 'onboarding.steps.discussions.title',
+      bodyKeys: [
+        'onboarding.steps.discussions.body_1',
+      ],
+    },
+    {
+      selector: '[data-onboarding="repo-page"]',
+      titleKey: 'onboarding.steps.repo.title',
+      bodyKeys: [
+        'onboarding.steps.repo.body_1',
+      ],
+    },
+    {
+      selector: '[data-onboarding="cron-manager"]',
+      titleKey: 'onboarding.steps.cron.title',
+      bodyKeys: [
+        'onboarding.steps.cron.body_1',
+      ],
+    },
+    {
+      selector: '[data-onboarding="view-toggle"]',
+      titleKey: 'onboarding.steps.view_toggle.title',
+      bodyKeys: [
+        'onboarding.steps.view_toggle.body_1',
+      ],
+    },
+    {
+      selector: '[data-onboarding="p2p-mode"]',
+      titleKey: 'onboarding.steps.p2p_defaults.title',
+      bodyKeys: [
+        'onboarding.steps.p2p_defaults.body_1',
+        'onboarding.steps.p2p_defaults.body_2',
+      ],
+    },
+    {
+      selector: '[data-onboarding="chat-input"]',
+      titleKey: 'onboarding.steps.p2p_send.title',
+      bodyKeys: [
+        'onboarding.steps.p2p_send.body_1',
+        'onboarding.steps.p2p_send.body_2',
+        'onboarding.steps.p2p_send.body_3',
+      ],
+    },
+  ], []);
 
   function scheduleResubscribe(items: Array<{ name: string; mode?: ViewMode }>) {
     const ws = wsRef.current;
@@ -1994,7 +2088,7 @@ export function App() {
                   🌐
                 </button>
                 {!isTransportSession && (
-                  <button class="view-toggle" onClick={toggleViewMode}>
+                  <button class="view-toggle" data-onboarding="view-toggle" onClick={toggleViewMode}>
                     {viewMode === 'chat' ? '⌨' : '💬'}
                   </button>
                 )}
@@ -2057,7 +2151,7 @@ export function App() {
                   🌐
                 </button>
                 {!isTransportSession && (
-                  <button class="view-toggle" onClick={toggleViewMode}>
+                  <button class="view-toggle" data-onboarding="view-toggle" onClick={toggleViewMode}>
                     {viewMode === 'chat' ? '⌨ Terminal' : '💬 Chat'}
                   </button>
                 )}
@@ -2460,6 +2554,63 @@ export function App() {
           <AdminPage onBack={() => setShowAdminPage(false)} />
         </div>
       )}
+
+      {showNewUserGuidePrompt && (
+        <div class="ask-dialog-overlay" onClick={() => { setShowNewUserGuidePrompt(false); setGuidePromptSnoozed(true); }}>
+          <div class="ask-dialog onboarding-choice-dialog" onClick={(e) => e.stopPropagation()}>
+            <div class="onboarding-choice-title">{trans('onboarding.prompt.title')}</div>
+            <div class="onboarding-choice-body">
+              <div>{trans('onboarding.prompt.body_1')}</div>
+              <div>{trans('onboarding.prompt.body_2')}</div>
+            </div>
+            <div class="ask-actions onboarding-choice-actions">
+              <button
+                class="ask-btn-submit"
+                onClick={() => {
+                  setShowNewUserGuidePrompt(false);
+                  setGuidePromptSnoozed(false);
+                  setShowNewUserGuide(true);
+                }}
+              >
+                {trans('onboarding.prompt.beginner')}
+              </button>
+              <button
+                class="ask-btn-cancel"
+                onClick={() => {
+                  setNewUserGuidePref((prev) => ({ ...prev, pending: false, disabled: true }));
+                  setShowNewUserGuidePrompt(false);
+                  setGuidePromptSnoozed(true);
+                }}
+              >
+                {trans('onboarding.prompt.expert')}
+              </button>
+              <button
+                class="ask-btn-cancel"
+                onClick={() => {
+                  setShowNewUserGuidePrompt(false);
+                  setGuidePromptSnoozed(true);
+                }}
+              >
+                {trans('onboarding.prompt.later')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <NewUserGuide
+        open={showNewUserGuide}
+        steps={newUserGuideSteps}
+        onClose={() => {
+          setShowNewUserGuide(false);
+          setGuidePromptSnoozed(true);
+        }}
+        onComplete={() => {
+          setShowNewUserGuide(false);
+          setGuidePromptSnoozed(true);
+          setNewUserGuidePref((prev) => ({ ...prev, pending: false, completed: true }));
+        }}
+      />
 
       {showNewSession && (
         <NewSessionDialog

@@ -902,6 +902,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         {!isShellLike && <div class="shortcuts-model" ref={p2pRef}>
           <button
             class="shortcut-btn"
+            data-onboarding="p2p-mode"
             onClick={() => setP2pOpen((o) => !o)}
             disabled={disabled}
             title={p2pMode === 'solo' ? t('p2p.mode_solo') : `P2P: ${t(P2P_MODE_I18N[p2pMode])}`}
@@ -1157,6 +1158,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         <div
           ref={divRef}
           class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}`}
+          data-onboarding="chat-input"
           contenteditable={inputDisabled ? 'false' : 'true'}
           role="textbox"
           aria-multiline="true"

@@ -552,5 +552,58 @@
     "saveError": "저장 실패",
     "fileTooLarge": "파일이 너무 커서 저장할 수 없습니다 (> 1 MB)",
     "saveTimeout": "저장 시간 초과 — 파일을 다시 로드하세요"
+  },
+  "onboarding": {
+    "prompt": {
+      "title": "초보자 가이드를 시작할까요?",
+      "body_1": "첫 메인 session 이 준비되었습니다. 처음이라면 이 짧은 가이드로 핵심 조작을 익힐 수 있습니다.",
+      "body_2": "먼저 기본 버튼을 설명하고, 마지막에 멀티 에이전트 토론 활용법을 안내합니다.",
+      "beginner": "초보자입니다, 가이드 시작",
+      "expert": "익숙합니다, 다시 보지 않기",
+      "later": "닫기, 다음에 다시 보기"
+    },
+    "step_counter": "{{current}} / {{total}} 단계",
+    "prev": "이전",
+    "next": "다음",
+    "finish": "완료",
+    "steps": {
+      "new_main": {
+        "title": "여기서 메인 Session 생성",
+        "body_1": "이 버튼으로 프로젝트용 새 메인 session 을 만듭니다.",
+        "body_2": "메인 session 은 terminal, chat, repo, discussion 의 시작점입니다."
+      },
+      "new_sub": {
+        "title": "여기서 서브 Session 생성",
+        "body_1": "이 버튼으로 현재 프로젝트 아래 worker/helper 서브 session 을 추가합니다.",
+        "body_2": "서브 session 은 병렬 작업, 리뷰, 실험에 적합합니다."
+      },
+      "discussions": {
+        "title": "여기서 토론 기록 열기",
+        "body_1": "이전 토론과 결과를 여기서 확인할 수 있습니다."
+      },
+      "repo": {
+        "title": "여기서 Repo 패널 열기",
+        "body_1": "저장소 상태, 브랜치, 커밋, PR, CI 를 여기서 확인할 수 있습니다."
+      },
+      "cron": {
+        "title": "여기서 예약 작업 열기",
+        "body_1": "현재 프로젝트의 예약 작업을 여기서 만들고 관리할 수 있습니다."
+      },
+      "view_toggle": {
+        "title": "여기서 Chat / Terminal 전환",
+        "body_1": "이 버튼으로 현재 session 의 chat 보기와 live terminal 보기를 전환합니다."
+      },
+      "p2p_defaults": {
+        "title": "여기서 기본 토론 참가 Session 설정",
+        "body_1": "이 메뉴에서 Config 를 선택하면 @all 에 기본 참여할 session 을 정할 수 있습니다.",
+        "body_2": "기본 토론 라운드 수도 여기서 빠르게 설정할 수 있습니다."
+      },
+      "p2p_send": {
+        "title": "입력창에서 바로 토론 시작",
+        "body_1": "@@all(discuss), @@all(review) 같은 형식으로 공유 토론을 빠르게 시작할 수 있습니다.",
+        "body_2": "토론은 서로 다른 공급자/유형의 Agent 를 2개 이상 쓸 때 가장 좋습니다. 고정된 사고를 깨고 더 나은 결과를 얻기 쉽습니다.",
+        "body_3": "멀티 Agent 토론은 파일을 공유하고 더 완전한 기록을 남깁니다. 1:1 은 일회성 토론에 더 가깝습니다. 실전에서는 2라운드가 좋은 기본값입니다."
+      }
+    }
   }
 }

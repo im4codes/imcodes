@@ -552,5 +552,58 @@
     "saveError": "Save failed",
     "fileTooLarge": "File too large to save (> 1 MB)",
     "saveTimeout": "Save timed out — please reload file"
+  },
+  "onboarding": {
+    "prompt": {
+      "title": "Enable the new-user guide?",
+      "body_1": "Your first main session is ready. If you are new, this short guide will walk you through the core controls.",
+      "body_2": "It starts with the basic buttons, then ends with how multi-agent discussions work best.",
+      "beginner": "I'm new, start guide",
+      "expert": "I'm experienced, don't show again",
+      "later": "Close, remind me next time"
+    },
+    "step_counter": "Step {{current}} / {{total}}",
+    "prev": "Back",
+    "next": "Next",
+    "finish": "Finish",
+    "steps": {
+      "new_main": {
+        "title": "Create a main session here",
+        "body_1": "Use this button to create a new main session for a project.",
+        "body_2": "Main sessions are the entry point for terminal, chat, repo, and discussion workflows."
+      },
+      "new_sub": {
+        "title": "Create a sub-session here",
+        "body_1": "Use this button to add a worker or helper sub-session under the current project.",
+        "body_2": "Sub-sessions are useful for side tasks, reviews, experiments, and parallel work."
+      },
+      "discussions": {
+        "title": "Open discussion history here",
+        "body_1": "This opens your discussion history so you can review previous discussion runs and results."
+      },
+      "repo": {
+        "title": "Open the repository panel here",
+        "body_1": "Use this button to inspect repository status, branches, commits, PRs, and CI."
+      },
+      "cron": {
+        "title": "Open scheduled tasks here",
+        "body_1": "Use this button to create and manage scheduled tasks for the current project."
+      },
+      "view_toggle": {
+        "title": "Switch between chat and terminal here",
+        "body_1": "Use this toggle to switch between chat view and live terminal view for the current session."
+      },
+      "p2p_defaults": {
+        "title": "Configure default discussion participants here",
+        "body_1": "Open this menu and choose Config when you want to set which sessions join @all by default.",
+        "body_2": "That is also where you quickly choose default discussion rounds."
+      },
+      "p2p_send": {
+        "title": "Start discussions from the input box",
+        "body_1": "Type @@all(discuss), @@all(review), or another mode to start a shared discussion quickly.",
+        "body_2": "Agent discussions work best with 2 or more agents from different providers or types. That helps break fixed thinking patterns and usually gives better results.",
+        "body_3": "Multi-agent discussions share files and preserve fuller history. One-to-one discussions are treated more like one-off discussions. In practice, 2 rounds are a strong default."
+      }
+    }
   }
 }

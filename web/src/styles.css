@@ -777,6 +777,17 @@ body {
 .single-agent-dialog-body { display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: #94a3b8; line-height: 1.6; }
 .single-agent-dialog-checkbox { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #cbd5e1; cursor: pointer; }
 .single-agent-dialog-checkbox input { margin: 0; }
+.onboarding-choice-dialog { max-width: 520px; }
+.onboarding-choice-title { font-size: 18px; font-weight: 700; color: #f1f5f9; }
+.onboarding-choice-body { display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: #94a3b8; line-height: 1.6; }
+.onboarding-choice-actions { flex-wrap: wrap; }
+.onboarding-overlay { position: fixed; inset: 0; background: rgba(2, 6, 23, 0.72); z-index: 10000; }
+.onboarding-highlight { position: fixed; border: 2px solid #60a5fa; border-radius: 12px; box-shadow: 0 0 0 9999px rgba(2, 6, 23, 0.45), 0 0 0 6px rgba(96, 165, 250, 0.18); pointer-events: none; z-index: 10001; }
+.onboarding-card { position: fixed; inset: 50% auto auto 50%; transform: translate(-50%, -50%); width: min(420px, calc(100vw - 32px)); background: #1e293b; border: 1px solid #334155; border-radius: 14px; padding: 18px; display: flex; flex-direction: column; gap: 12px; z-index: 10002; box-shadow: 0 20px 50px rgba(0,0,0,0.45); }
+.onboarding-card-floating { transform: none; inset: auto; }
+.onboarding-step { font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: #60a5fa; }
+.onboarding-title { font-size: 17px; font-weight: 700; color: #f8fafc; }
+.onboarding-body { display: flex; flex-direction: column; gap: 8px; font-size: 13px; line-height: 1.6; color: #cbd5e1; }
 
 /* ── Sidebar redesign (tasks 1.2-1.4) ────────────────────────────────────── */
 
