@@ -432,7 +432,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
     // Build P2P routing as structured WS fields — keep text clean for display.
     const extra: Record<string, unknown> = {};
-    let directTargetSession: string | null = null;
     const pendingTargets = pendingAtTargetsRef.current.splice(0);
 
     if (pendingTargets.length > 0) {
@@ -440,13 +439,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       const { orderedTargets, cleanText } = extractOrderedAtTargets(text, pendingTargets);
       text = cleanText;
       if (orderedTargets.length === 1 && orderedTargets[0].session !== '__all__') {
-        directTargetSession = orderedTargets[0].session;
+        extra.directTargetSession = orderedTargets[0].session;
       } else if (orderedTargets.length > 1 || orderedTargets.some((t) => t.session === '__all__')) {
         extra.p2pAtTargets = orderedTargets.map(({ session, mode }) => ({ session, mode }));
       }
       // Attach config data when any target uses config mode
       const hasConfigTarget = orderedTargets.some(t => t.mode === 'config');
-      if (!directTargetSession && hasConfigTarget) {
+      if (!extra.directTargetSession && hasConfigTarget) {
         const override = pendingConfigOverrideRef.current;
         const cfg = override?.config ?? p2pSavedConfig;
         if (cfg) {
@@ -460,7 +459,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       const manual = extractManualP2pTargets(text, buildManualP2pCandidates(sessions, subSessions));
       if (manual.orderedTargets.length === 1 && manual.orderedTargets[0].session !== '__all__') {
         text = manual.cleanText;
-        directTargetSession = manual.orderedTargets[0].session;
+        extra.directTargetSession = manual.orderedTargets[0].session;
       } else if (manual.orderedTargets.length > 1 || manual.orderedTargets.some((t) => t.session === '__all__')) {
         text = manual.cleanText;
         extra.p2pAtTargets = manual.orderedTargets;
@@ -480,7 +479,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       }
     }
 
-    if (!directTargetSession && !extra.p2pAtTargets && p2pMode !== 'solo' && !text.includes('@@')) {
+    if (!extra.directTargetSession && !extra.p2pAtTargets && p2pMode !== 'solo' && !text.includes('@@')) {
       // Dropdown P2P mode — daemon handles expansion
       if (p2pMode === P2P_CONFIG_MODE) {
         extra.p2pMode = 'config';
@@ -512,11 +511,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     }
     quickData.recordHistory(text, activeSession.name);
     try {
-      ws.sendSessionCommand('send', { sessionName: directTargetSession ?? activeSession.name, text, ...extra });
+      ws.sendSessionCommand('send', { sessionName: activeSession.name, text, ...extra });
     } catch {
       return;
     }
-    if (!directTargetSession) onSend?.(activeSession.name, text);
+    onSend?.(activeSession.name, text);
     if (divRef.current) divRef.current.textContent = '';
     setHasText(false);
     setAttachments([]);

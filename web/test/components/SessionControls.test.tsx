@@ -299,8 +299,9 @@ describe('SessionControls', () => {
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
-      sessionName: 'deck_sub_w1',
+      sessionName: 'deck_my-project_brain',
       text: 'please review',
+      directTargetSession: 'deck_sub_w1',
     });
 
     getSelectionSpy.mockRestore();
@@ -429,8 +430,9 @@ describe('SessionControls', () => {
     fireEvent.click(screen.getByRole('button', { name: /send/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
-      sessionName: 'deck_sub_plan',
+      sessionName: 'deck_my-project_brain',
       text: 'check this',
+      directTargetSession: 'deck_sub_plan',
     });
   });
 

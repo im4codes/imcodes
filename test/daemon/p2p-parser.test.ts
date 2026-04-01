@@ -107,6 +107,7 @@ vi.mock('../../src/util/imc-dir.js', () => ({
 
 import { parseAtTokens, handleWebCommand } from '../../src/daemon/command-handler.js';
 import { startP2pRun, listP2pRuns } from '../../src/daemon/p2p-orchestrator.js';
+import { sendKeysDelayedEnter } from '../../src/agent/tmux.js';
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -333,6 +334,35 @@ describe('structured P2P routing via WS fields', () => {
 
     // Should NOT trigger P2P
     expect(startP2pRun).not.toHaveBeenCalled();
+  });
+
+  it('directTargetSession sends to the target and replies back to the sender once', async () => {
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'please check this',
+      commandId: 'cmd-direct-1',
+      directTargetSession: 'deck_proj_w1',
+    }, mockServerLink as any);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(startP2pRun).not.toHaveBeenCalled();
+    expect(sendKeysDelayedEnter).toHaveBeenCalledWith(
+      'deck_proj_w1',
+      expect.stringContaining('please check this'),
+      undefined,
+    );
+    expect(sendKeysDelayedEnter).toHaveBeenCalledWith(
+      'deck_proj_w1',
+      expect.stringContaining('imcodes send "deck_proj_brain" "<your response>"'),
+      undefined,
+    );
+    expect(mockServerLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'command.ack',
+      session: 'deck_proj_brain',
+      status: 'accepted',
+    }));
   });
 
   it('legacy @@all(audit) in text still works (backward compat)', async () => {

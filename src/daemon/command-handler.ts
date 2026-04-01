@@ -738,6 +738,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const sessionName = (cmd.sessionName ?? cmd.session) as string | undefined;
   const text = cmd.text as string | undefined;
   const commandId = cmd.commandId as string | undefined;
+  const directTargetSession = (cmd as any).directTargetSession as string | undefined;
 
   if (!sessionName || !text) {
     logger.warn('session.send: missing sessionName or text');
@@ -758,6 +759,44 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     return;
   }
   dedup.add(effectiveId);
+
+  if (directTargetSession) {
+    const targetRecord = getSession(directTargetSession);
+    if (!targetRecord) {
+      logger.warn({ sessionName, directTargetSession }, 'session.send: direct target not found');
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: 'Direct target not found' });
+      try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: 'direct_target_not_found' }); } catch {}
+      return;
+    }
+
+    const replyInstruction = `\n\nAfter completing the above task, send your response using: imcodes send "${sessionName}" "<your response>"`;
+    const directText = `${text}${replyInstruction}`;
+    const release = await getMutex(directTargetSession).acquire();
+    try {
+      const agentType = targetRecord.agentType ?? 'unknown';
+      let sendText = directText;
+      if (agentType === 'gemini' || agentType === 'codex') {
+        sendText = await rewritePathsForSandbox(directTargetSession, directText);
+      }
+      await sendShellAwareCommand(directTargetSession, sendText, agentType);
+      timelineEmitter.emit(directTargetSession, 'user.message', { text });
+      const status = isLegacy ? 'accepted_legacy' : 'accepted';
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
+      try {
+        serverLink.send({ type: 'command.ack', commandId: effectiveId, status, session: sessionName });
+      } catch { /* not connected */ }
+    } catch (err) {
+      logger.error({ sessionName, directTargetSession, err }, 'session.send direct target failed');
+      const errMsg = err instanceof Error ? err.message : String(err);
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
+      try {
+        serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg });
+      } catch { /* not connected */ }
+    } finally {
+      release();
+    }
+    return;
+  }
 
   // ── P2P routing: structured WS fields (new) or inline @@tokens (legacy) ──
   const p2pSessionConfig = (cmd as any).p2pSessionConfig as P2pSessionConfig | undefined;
