@@ -159,9 +159,28 @@ export async function startProject(config: ProjectConfig): Promise<void> {
 
 /** Stop all sessions for a project and remove them from the store. */
 export async function stopProject(projectName: string): Promise<void> {
-  const sessions = storeSessions(projectName);
+  const allSessions = storeSessions();
+  const toStop = new Map<string, SessionRecord>();
+
+  for (const session of allSessions) {
+    if (session.projectName === projectName) toStop.set(session.name, session);
+  }
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const session of allSessions) {
+      if (!session.name.startsWith('deck_sub_')) continue;
+      if (!session.parentSession) continue;
+      if (toStop.has(session.name)) continue;
+      if (!toStop.has(session.parentSession)) continue;
+      toStop.set(session.name, session);
+      changed = true;
+    }
+  }
+
   const invalidatedDirs = new Set<string>();
-  for (const s of sessions) {
+  for (const s of toStop.values()) {
     stopWatching(s.name);
     stopCodexWatching(s.name);
     stopGeminiWatching(s.name);

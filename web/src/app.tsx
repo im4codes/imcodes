@@ -1502,13 +1502,26 @@ export function App() {
 
   const handleStopProject = useCallback((project: string) => {
     if (!wsRef.current) return;
-    // Close all sub-sessions belonging to this project first
-    const mainSessionName = `deck_${project}_brain`;
-    for (const sub of subSessionsRef.current) {
-      if (sub.parentSession === mainSessionName) {
-        closeSubSession(sub.id);
+    const parentNames = new Set(sessionsRef.current.filter((s) => s.project === project).map((s) => s.name));
+    const descendants = new Set<string>();
+
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const sub of subSessionsRef.current) {
+        if (!sub.parentSession) continue;
+        if (descendants.has(sub.id)) continue;
+        if (!parentNames.has(sub.parentSession)) continue;
+        descendants.add(sub.id);
+        parentNames.add(sub.sessionName);
+        changed = true;
       }
     }
+
+    for (const subId of descendants) {
+      closeSubSession(subId);
+    }
+
     wsRef.current.sendSessionCommand('stop', { project });
     setSessions((prev) => prev.filter((s) => s.project !== project));
     if (sessions.some((s) => s.project === project && s.name === activeSession)) {

@@ -1,6 +1,6 @@
-import { loadStore, flushStore, listSessions, getSession, upsertSession } from '../store/session-store.js';
-import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes } from '../agent/session-manager.js';
-import { sessionExists, isPaneAlive, BACKEND } from '../agent/tmux.js';
+import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
+import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute } from '../agent/session-manager.js';
+import { sessionExists, isPaneAlive, BACKEND, killSession } from '../agent/tmux.js';
 import { detectMemoryBackend } from '../memory/detector.js';
 import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
@@ -96,18 +96,73 @@ async function deleteSessionFromWorker(workerUrl: string, serverId: string, toke
   }
 }
 
+async function dropLocalSession(session: SessionRecord): Promise<void> {
+  const [{ stopWatching }, codexWatcher, geminiWatcher] = await Promise.all([
+    import('./jsonl-watcher.js'),
+    import('./codex-watcher.js'),
+    import('./gemini-watcher.js'),
+  ]);
+  stopWatching(session.name);
+  codexWatcher.stopWatching(session.name);
+  geminiWatcher.stopWatching(session.name);
+
+  const transportRuntime = getTransportRuntime(session.name);
+  if (transportRuntime) {
+    if (transportRuntime.providerSessionId) unregisterProviderRoute(transportRuntime.providerSessionId);
+    await transportRuntime.kill().catch(() => {});
+  } else {
+    await killSession(session.name).catch(() => {});
+  }
+
+  removeSession(session.name);
+}
+
 /** On startup: pull sessions from D1 and populate the local store so restoreFromStore can rebuild tmux. */
 async function syncSessionsFromWorker(workerUrl: string, serverId: string, token: string): Promise<void> {
   try {
-    const res = await fetch(`${workerUrl}/api/server/${serverId}/sessions`, {
-      headers: { Authorization: `Bearer ${token}`, 'X-Server-Id': serverId },
-      signal: AbortSignal.timeout(5_000),
-    });
-    if (!res.ok) {
-      logger.warn({ status: res.status }, 'syncSessionsFromWorker: non-ok response');
+    const headers = { Authorization: `Bearer ${token}`, 'X-Server-Id': serverId };
+    const [sessionRes, subRes] = await Promise.all([
+      fetch(`${workerUrl}/api/server/${serverId}/sessions`, {
+        headers,
+        signal: AbortSignal.timeout(5_000),
+      }),
+      fetch(`${workerUrl}/api/server/${serverId}/sub-sessions`, {
+        headers,
+        signal: AbortSignal.timeout(5_000),
+      }),
+    ]);
+
+    if (!sessionRes.ok) {
+      logger.warn({ status: sessionRes.status }, 'syncSessionsFromWorker: non-ok response');
       return;
     }
-    const data = await res.json() as { sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; project_dir: string; state: string }> };
+    if (!subRes.ok) {
+      logger.warn({ status: subRes.status }, 'syncSessionsFromWorker: sub-session fetch failed');
+      return;
+    }
+
+    const data = await sessionRes.json() as { sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; project_dir: string; state: string }> };
+    const subData = await subRes.json() as { subSessions: Array<{ id: string }> };
+    const remoteSessionNames = new Set(
+      data.sessions
+        .filter((s) => s.state !== 'stopped')
+        .map((s) => s.name),
+    );
+    const remoteSubSessionNames = new Set(subData.subSessions.map((s) => `deck_sub_${s.id}`));
+
+    const localSessions = listSessions();
+    const staleLocal = localSessions.filter((session) => {
+      if (session.name.startsWith('deck_sub_')) return !remoteSubSessionNames.has(session.name);
+      return !remoteSessionNames.has(session.name);
+    });
+
+    for (const session of staleLocal) {
+      await dropLocalSession(session);
+    }
+    if (staleLocal.length > 0) {
+      logger.info({ count: staleLocal.length, sessions: staleLocal.map((s) => s.name) }, 'Pruned local sessions missing from server state');
+    }
+
     let count = 0;
     for (const s of data.sessions) {
       if (s.state === 'stopped') continue; // skip stopped sessions
