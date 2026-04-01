@@ -367,7 +367,7 @@ program
 
         // --reply: append callback instruction so the target knows to reply
         if (opts.reply) {
-          message += `\n\nAfter completing the above task, send your response using: imcodes send "${from}" "<your response>"`;
+          message += `\n\nAfter completing the above task, send your response using: imcodes send --no-reply "${from}" "<your response>"`;
         }
 
         if (opts.all) {

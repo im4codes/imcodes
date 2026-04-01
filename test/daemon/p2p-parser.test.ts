@@ -355,7 +355,7 @@ describe('structured P2P routing via WS fields', () => {
     );
     expect(sendKeysDelayedEnter).toHaveBeenCalledWith(
       'deck_proj_w1',
-      expect.stringContaining('imcodes send "deck_proj_brain" "<your response>"'),
+      expect.stringContaining('imcodes send --no-reply "deck_proj_brain" "<your response>"'),
       undefined,
     );
     expect(mockServerLink.send).toHaveBeenCalledWith(expect.objectContaining({

@@ -769,7 +769,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       return;
     }
 
-    const replyInstruction = `\n\nAfter completing the above task, send your response using: imcodes send "${sessionName}" "<your response>"`;
+    const replyInstruction = `\n\nAfter completing the above task, send your response using: imcodes send --no-reply "${sessionName}" "<your response>"`;
     const directText = `${text}${replyInstruction}`;
     const release = await getMutex(directTargetSession).acquire();
     try {
