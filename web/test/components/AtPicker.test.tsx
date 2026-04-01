@@ -187,4 +187,36 @@ describe('AtPicker', () => {
     expect(screen.getByText('no_agents_available')).toBeDefined();
     expect(screen.getByText(/← back/i)).toBeDefined();
   });
+
+  it('passes the selected mode for a single agent', () => {
+    const wsClient = {
+      connected: true,
+      send: vi.fn(),
+      onMessage: vi.fn(() => () => {}),
+    };
+    const onSelectAgent = vi.fn();
+
+    render(
+      <AtPicker
+        query=""
+        sessions={[
+          { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle', parentSession: null },
+          { name: 'deck_sub_worker1', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain' },
+        ]}
+        rootSession="deck_proj_brain"
+        wsClient={wsClient as any}
+        projectDir="/tmp/proj"
+        onSelectFile={vi.fn()}
+        onSelectAgent={onSelectAgent}
+        onClose={vi.fn()}
+        visible
+      />,
+    );
+
+    fireEvent.click(screen.getByText('agents'));
+    fireEvent.click(screen.getByText('worker1'));
+    fireEvent.click(screen.getByText('Discuss'));
+
+    expect(onSelectAgent).toHaveBeenCalledWith('deck_sub_worker1', 'discuss');
+  });
 });

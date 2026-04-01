@@ -1,5 +1,5 @@
 export const OPENAI_CONTEXT_WINDOWS = {
-  GPT_54: 1_050_000,
+  GPT_54: 1_000_000,
   GPT_5_FAMILY: 400_000,
   GPT_41_FAMILY: 1_000_000,
 } as const;

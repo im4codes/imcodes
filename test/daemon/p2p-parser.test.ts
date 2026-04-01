@@ -264,6 +264,45 @@ describe('structured P2P routing via WS fields', () => {
     expect(cleanText).toBe('check the tests');
   });
 
+  it('structured p2pAtTargets is authoritative; daemon does not interpret visible @@labels', async () => {
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: '@@w1(discuss) check the tests',
+      commandId: 'cmd-2b',
+      p2pAtTargets: [{ session: 'deck_proj_w1', mode: 'review' }],
+    }, mockServerLink as any);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(startP2pRun).toHaveBeenCalledOnce();
+    const [_initiator, targets] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(targets).toEqual([{ session: 'deck_proj_w1', mode: 'review' }]);
+  });
+
+  it('structured p2pAtTargets preserves the caller-provided agent order', async () => {
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'please review',
+      commandId: 'cmd-2c',
+      p2pAtTargets: [
+        { session: 'deck_proj_w2', mode: 'discuss' },
+        { session: 'deck_proj_w1', mode: 'audit' },
+      ],
+    }, mockServerLink as any);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(startP2pRun).toHaveBeenCalledOnce();
+    const [_initiator, targets, cleanText] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(targets).toEqual([
+      { session: 'deck_proj_w2', mode: 'discuss' },
+      { session: 'deck_proj_w1', mode: 'audit' },
+    ]);
+    expect(cleanText).toBe('please review');
+  });
+
   it('p2pMode field expands to all sessions with that mode', async () => {
     handleWebCommand({
       type: 'session.send',
