@@ -9,6 +9,7 @@ import { execSync, spawn } from 'child_process';
 import { homedir } from 'os';
 import { existsSync, realpathSync, readFileSync, writeFileSync } from 'fs';
 import { resolve, join, dirname } from 'path';
+import { restartWindowsDaemon } from './util/windows-daemon.js';
 
 import { PROJECT_ROOT } from './util/project-root.js';
 
@@ -682,29 +683,9 @@ program
         execSync('sudo systemctl restart imcodes', { stdio: 'inherit' });
       }
     } else if (platform === 'win32') {
-      // Kill daemon via PID file — the watchdog loop (created by `imcodes bind`)
-      // will automatically restart it in ~5 seconds.
-      const pidFile = resolve(homedir(), '.imcodes', 'daemon.pid');
-      try {
-        const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
-        if (pid && pid !== process.pid) {
-          try { execSync(`taskkill /f /pid ${pid}`, { stdio: 'ignore' }); } catch { /* not running */ }
-        }
-      } catch { /* no PID file */ }
-      // Ensure watchdog is running — it will restart the daemon in ~5s
-      const vbs = resolve(homedir(), '.imcodes', 'daemon-launcher.vbs');
-      let watchdogRunning = false;
-      try {
-        const taskInfo = execSync('schtasks /Query /TN imcodes-daemon /FO CSV /NH', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
-        watchdogRunning = taskInfo.includes('Running');
-      } catch { /* no scheduled task */ }
-      if (!watchdogRunning) {
-        if (existsSync(vbs)) {
-          spawn('wscript', [vbs], { detached: true, stdio: 'ignore' }).unref();
-        } else {
-          console.error('Watchdog not found. Run "imcodes bind" first.');
-          process.exit(1);
-        }
+      if (!restartWindowsDaemon(process.pid)) {
+        console.error('Watchdog not found. Run "imcodes bind" first.');
+        process.exit(1);
       }
       console.log('Daemon will restart in ~5 seconds (via watchdog).');
     } else {

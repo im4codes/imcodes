@@ -34,6 +34,7 @@ import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { getProvider } from '../agent/provider-registry.js';
 import { copyFile, mkdir } from 'node:fs/promises';
 import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
+import { buildWindowsCleanupScript, buildWindowsUpgradeBatch } from '../util/windows-upgrade-script.js';
 
 /**
  * For sandboxed agents (Gemini, Codex): copy files from ~/.imcodes/ to
@@ -1614,7 +1615,6 @@ async function handleDaemonUpgrade(targetVersion?: string): Promise<void> {
   const { join, dirname } = await import('path');
   const { tmpdir, homedir } = await import('os');
 
-  // Skip if we're already at the target version (prevents upgrade loops)
   const { DAEMON_VERSION } = await import('../util/version.js');
   if (targetVersion && DAEMON_VERSION === targetVersion) {
     logger.info({ daemonVersion: DAEMON_VERSION, targetVersion }, 'daemon.upgrade: already at target version, skipping');
@@ -1626,6 +1626,7 @@ async function handleDaemonUpgrade(targetVersion?: string): Promise<void> {
   const scriptDir = mkdtempSync(join(tmpdir(), 'imcodes-upgrade-'));
   const logFile = join(scriptDir, 'upgrade.log');
   const scriptPath = join(scriptDir, 'upgrade.sh');
+  const cliEntry = process.argv[1] || join(process.cwd(), 'dist', 'src', 'index.js');
 
   // Build the platform-specific restart command.
   // We always restart regardless of whether npm install succeeded, so the daemon
@@ -1654,43 +1655,26 @@ launchctl load -w "${plist}"`;
     const npmBin = join(dirname(process.execPath), 'npm.cmd');
     const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
     const pkgSpec = targetVersion ? `imcodes@${targetVersion}` : 'imcodes@latest';
-    const pidFile = join(homedir(), '.imcodes', 'daemon.pid');
-    const startupCmd = join(homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'imcodes-daemon.cmd');
-
     const batchPath = join(scriptDir, 'upgrade.cmd');
+    const cleanupPath = join(scriptDir, 'cleanup.cmd');
+    const restartCmd = `"${process.execPath}" "${cliEntry}" restart`;
+    const versionCmd = `"${process.execPath}" "${cliEntry}" --version`;
     const targetVer = targetVersion ?? 'latest';
-    const imcodesCmd = join(dirname(process.execPath), 'imcodes.cmd');
-    const verifyCmd = existsSync(imcodesCmd) ? `"${imcodesCmd}"` : 'imcodes';
-    // Windows: install first (while daemon is still running), then kill+restart.
-    // npm install -g overwrites .js files in node_modules (not locked by Node).
-    // The watchdog/startup script will relaunch with the new version.
-    const batch = `@echo off\r
-echo === imcodes upgrade started at %date% %time% === >> "${logFile}"\r
-timeout /t 2 /nobreak > nul\r
-\r
-echo Installing ${pkgSpec}... >> "${logFile}"\r
-"${npmCmd}" install -g ${pkgSpec} >> "${logFile}" 2>&1\r
-if %errorlevel% neq 0 (\r
-  echo Install FAILED — keeping current daemon running. >> "${logFile}"\r
-  goto :done\r
-)\r
-\r
-echo Install succeeded. Verifying version... >> "${logFile}"\r
-for /f "tokens=*" %%v in ('${verifyCmd} --version 2^>nul') do set INSTALLED_VER=%%v\r
-echo Installed version: %INSTALLED_VER%, target: ${targetVer} >> "${logFile}"\r
-if "${targetVer}"=="latest" goto :restart\r
-if "%INSTALLED_VER%"=="${targetVer}" goto :restart\r
-echo Version mismatch after install — keeping current daemon running. >> "${logFile}"\r
-goto :done\r
-\r
-:restart\r
-echo Restarting daemon... >> "${logFile}"\r
-for /f %%p in ('type "${pidFile}" 2^>nul') do taskkill /f /pid %%p >nul 2>&1\r
-timeout /t 2 /nobreak > nul\r
-if exist "${startupCmd}" start "" "${startupCmd}"\r
-:done\r
-echo === upgrade done at %date% %time% === >> "${logFile}"\r
-`;
+    const cleanupScript = buildWindowsCleanupScript(scriptDir);
+    writeFileSync(cleanupPath, cleanupScript);
+    // Windows: install first while the daemon is still running. On success,
+    // delegate restart to the CLI's shared watchdog logic (`imcodes restart`)
+    // instead of reimplementing restart behavior in batch.
+    const batch = buildWindowsUpgradeBatch({
+      logFile,
+      scriptDir,
+      cleanupPath,
+      npmCmd,
+      pkgSpec,
+      restartCmd,
+      versionCmd,
+      targetVer,
+    });
 
     writeFileSync(batchPath, batch);
 

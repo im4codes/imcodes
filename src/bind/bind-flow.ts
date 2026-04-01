@@ -6,6 +6,7 @@ import { homedir, hostname } from 'os';
 import { execSync, spawn } from 'child_process';
 import logger from '../util/logger.js';
 import { BACKEND } from '../agent/tmux.js';
+import { restartWindowsDaemon } from '../util/windows-daemon.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -130,22 +131,7 @@ function restartDaemon(): void {
         execSync('sudo systemctl restart imcodes', { stdio: 'ignore' });
       }
     } else if (process.platform === 'win32') {
-      // Kill existing daemon via PID file (safe — doesn't affect other Node processes)
-      const pidFile = join(homedir(), '.imcodes', 'daemon.pid');
-      try {
-        const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
-        if (pid) execSync(`taskkill /f /pid ${pid}`, { stdio: 'ignore' });
-      } catch { /* not running */ }
-      // Relaunch via Task Scheduler or watchdog
-      try {
-        execSync(`schtasks /Run /TN ${TASK_NAME}`, { stdio: 'ignore' });
-      } catch {
-        // Fallback: try VBS launcher (hidden window)
-        const vbs = join(homedir(), '.imcodes', 'daemon-launcher.vbs');
-        if (existsSyncFs(vbs)) {
-          spawn('wscript', [vbs], { detached: true, stdio: 'ignore' }).unref();
-        }
-      }
+      if (!restartWindowsDaemon()) throw new Error('watchdog not available');
     }
     console.log('Daemon restarted.');
   } catch {

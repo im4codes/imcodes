@@ -109,11 +109,10 @@ jobs:
           cache: 'npm'
       - run: npm ci
       - run: npm run build
-      - name: Run WezTerm backend unit tests
-        run: npx vitest run test/agent/wezterm.test.ts test/daemon/hook-send.test.ts test/daemon/env-injection.test.ts test/cli/send.test.ts
+      - name: Run Windows-specific unit tests
+        run: npx vitest run test/agent/wezterm.test.ts test/daemon/hook-send.test.ts test/daemon/env-injection.test.ts test/cli/send.test.ts test/util/windows-daemon.test.ts test/util/windows-upgrade-script.test.ts
         env:
           IMCODES_MUX: wezterm
-
   # ── Web frontend tests ────────────────────────────────────────────────────
 
   web-tests-unit:
