@@ -89,6 +89,14 @@ describe('WsBridge', () => {
   });
 
   describe('daemon auth', () => {
+    const originalAppVersion = process.env.APP_VERSION;
+
+    afterEach(() => {
+      if (originalAppVersion == null) delete process.env.APP_VERSION;
+      else process.env.APP_VERSION = originalAppVersion;
+      vi.useRealTimers();
+    });
+
     it('authenticates with valid token', async () => {
       const bridge = WsBridge.get(serverId);
       const ws = new MockWs();
@@ -120,6 +128,38 @@ describe('WsBridge', () => {
       ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'bad-token' }));
       await flushAsync();
       expect(ws.closed).toBe(true);
+    });
+
+    it('sends daemon.upgrade when daemon is older than server version', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.4.905-dev.877';
+
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash'), {} as never);
+
+      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.904-dev.100' }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushAsync();
+
+      expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905-dev.877'))).toBe(true);
+    });
+
+    it('does not send daemon.upgrade when daemon version is newer than server version', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.4.905-dev.877';
+
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash'), {} as never);
+
+      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.906-dev.1' }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushAsync();
+
+      expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"'))).toBe(false);
     });
   });
 

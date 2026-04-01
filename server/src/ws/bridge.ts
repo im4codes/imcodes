@@ -37,6 +37,7 @@ import {
 import { LocalWebPreviewRegistry } from '../preview/registry.js';
 import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions } from '../db/queries.js';
 import logger from '../util/logger.js';
+import { compareImcodesVersions, isLocalDevImcodesVersion } from '../../../shared/imcodes-version.js';
 
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
@@ -319,10 +320,20 @@ export class WsBridge {
         );
 
         // Auto-upgrade: on each reconnect, retry up to 3 times with 10-minute intervals.
-        // Skip dev versions (0.x.x) — those are local npm-linked development builds.
+        // Skip local source builds (0.x.x) — those are development checkouts, not published daemon packages.
         const serverVersion = process.env.APP_VERSION;
-        const isDev = this.daemonVersion?.startsWith('0.') ?? false;
-        if (serverVersion && serverVersion !== '0.0.0' && this.daemonVersion && this.daemonVersion !== serverVersion && !isDev) {
+        const daemonVersionCmp = serverVersion && this.daemonVersion
+          ? compareImcodesVersions(this.daemonVersion, serverVersion)
+          : null;
+        const isLocalDev = this.daemonVersion ? isLocalDevImcodesVersion(this.daemonVersion) : false;
+        const shouldUpgrade = Boolean(
+          serverVersion
+          && serverVersion !== '0.0.0'
+          && this.daemonVersion
+          && !isLocalDev
+          && (daemonVersionCmp != null ? daemonVersionCmp < 0 : this.daemonVersion !== serverVersion),
+        );
+        if (shouldUpgrade) {
           this.upgradeAttempts = (this.upgradeAttempts ?? 0) + 1;
           if (this.upgradeAttempts <= 3) {
             logger.info({ serverId: this.serverId, daemonVersion: this.daemonVersion, serverVersion, attempt: this.upgradeAttempts }, 'Version mismatch — sending daemon.upgrade');
@@ -335,7 +346,7 @@ export class WsBridge {
             logger.warn({ serverId: this.serverId, daemonVersion: this.daemonVersion, serverVersion, attempts: this.upgradeAttempts }, 'Version mismatch — max upgrade attempts reached, giving up');
           }
         } else {
-          // Version matches or not applicable — reset retry counter
+          // Version matches, daemon is newer, or auto-upgrade does not apply — reset retry counter
           this.upgradeAttempts = 0;
         }
 

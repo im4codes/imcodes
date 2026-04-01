@@ -403,7 +403,7 @@ jobs:
           build-args: |
             BUILD_TIME=${{ steps.ts.outputs.value }}
             OTA_VERSION=${{ steps.ota.outputs.version }}
-            APP_VERSION=${{ steps.ota.outputs.app_version }}
+            APP_VERSION=${{ steps.version_meta.outputs.npm_version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           push: true
