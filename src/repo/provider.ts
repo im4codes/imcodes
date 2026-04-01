@@ -8,6 +8,7 @@ import type {
   RepoBranch,
   RepoCommit,
   RepoWorkflowRun,
+  RepoActionDetail,
   RepoCommitDetail,
   RepoPRDetail,
   RepoIssueDetail,
@@ -43,6 +44,9 @@ export interface RepoProvider {
 
   /** List CI/CD workflow runs (Actions / Pipelines). Default page size: 20. */
   listActions(opts?: ListOptions): Promise<RepoListResult<RepoWorkflowRun>>;
+
+  /** Get detailed CI/CD run info including jobs and steps. */
+  getActionDetail(runId: number): Promise<RepoActionDetail>;
 
   /** Get detailed commit info including stats and file list. */
   getCommitDetail(sha: string): Promise<RepoCommitDetail>;

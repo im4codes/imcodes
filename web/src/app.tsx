@@ -468,7 +468,7 @@ export function App() {
   const stoppedNavTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [idleAlerts, setIdleAlerts] = useState<Set<string>>(new Set());
-  const [toasts, setToasts] = useState<Array<{ id: number; sessionName: string; project: string; kind: 'idle' | 'notification'; title?: string; message?: string }>>([]);
+  const [toasts, setToasts] = useState<Array<{ id: number; sessionName: string; project: string; kind: 'idle' | 'notification'; title?: string; message?: string; openRepoLatest?: boolean; failedJobName?: string; failedStepName?: string }>>([]);
   const [detectedModels, setDetectedModels] = useState<Map<string, string>>(new Map());
   const [subUsages, setSubUsages] = useState<Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string }>>(new Map());
   const quickData = useQuickData();
@@ -505,6 +505,8 @@ export function App() {
 
   // ── Repo ────────────────────────────────────────────────────────────────────
   const [showRepoPage, setShowRepoPage] = useState(false);
+  const [repoFocusLatestAction, setRepoFocusLatestAction] = useState<{ token: number; failedJobName?: string; failedStepName?: string } | null>(null);
+  const [pendingRepoToastSession, setPendingRepoToastSession] = useState<{ sessionName: string; focus: { token: number; failedJobName?: string; failedStepName?: string } } | null>(null);
   /** File path for the floating file preview window (opened from pinned file browser) */
   const [previewFilePath, setPreviewFilePath] = useState<string | null>(null);
   const [repoContexts, setRepoContexts] = useState<Map<string, any>>(new Map());
@@ -1540,6 +1542,14 @@ export function App() {
 
   const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
 
+  useEffect(() => {
+    if (!pendingRepoToastSession) return;
+    if (activeSession !== pendingRepoToastSession.sessionName) return;
+    setShowRepoPage(true);
+    setRepoFocusLatestAction(pendingRepoToastSession.focus);
+    setPendingRepoToastSession(null);
+  }, [activeSession, pendingRepoToastSession]);
+
   // Memoized sub-session mappings — avoids creating new arrays on every render,
   // which would defeat memo() on child components (SessionPane, SessionTree, pinned panels).
   const subSessionsSlim = useMemo(() =>
@@ -2302,9 +2312,21 @@ export function App() {
           <RepoPage ws={wsRef.current} projectDir={activeSessionInfo.projectDir} onBack={() => setShowRepoPage(false)} onCiEvent={(run) => {
             const id = Date.now();
             const icon = run.status === 'success' ? '✅' : '❌';
-            setToasts((prev) => [...prev, { id, sessionName: '', project: `${icon} ${run.name}`, kind: 'notification', title: run.status === 'success' ? 'CI Passed' : 'CI Failed', message: run.conclusion ?? run.status }]);
+            const failurePath = [run.failedJobName, run.failedStepName].filter(Boolean).join(' → ');
+            const message = failurePath || run.conclusion || run.status;
+            setToasts((prev) => [...prev, {
+              id,
+              sessionName: activeSession ?? '',
+              project: `${icon} ${run.name}`,
+              kind: 'notification',
+              title: run.status === 'success' ? 'CI Passed' : 'CI Failed',
+              message,
+              openRepoLatest: run.status === 'failure',
+              failedJobName: run.failedJobName,
+              failedStepName: run.failedStepName,
+            }]);
             setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 6000);
-          }} />
+          }} focusLatestAction={repoFocusLatestAction} />
         </FloatingPanel>
       )}
 
@@ -2530,6 +2552,20 @@ export function App() {
               key={t.id}
               class={`toast toast-${t.kind}`}
               onClick={() => {
+                if (t.openRepoLatest) {
+                  const focus = {
+                    token: Date.now(),
+                    failedJobName: t.failedJobName,
+                    failedStepName: t.failedStepName,
+                  };
+                  localStorage.setItem('repo-active-tab', 'actions');
+                  if (t.sessionName && t.sessionName !== activeSession) {
+                    setPendingRepoToastSession({ sessionName: t.sessionName, focus });
+                  } else {
+                    setShowRepoPage(true);
+                    setRepoFocusLatestAction(focus);
+                  }
+                }
                 if (t.sessionName) {
                   // Reuse push notification navigation — handles sub-sessions, parent activation, etc.
                   window.dispatchEvent(new CustomEvent('deck:navigate', {

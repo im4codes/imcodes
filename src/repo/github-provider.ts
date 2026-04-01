@@ -11,6 +11,7 @@ import type {
   RepoBranch,
   RepoCommit,
   RepoWorkflowRun,
+  RepoActionDetail,
   RepoError,
   RepoCommitDetail,
   RepoPRDetail,
@@ -213,6 +214,30 @@ export class GitHubProvider implements RepoProvider {
 
       const items: RepoWorkflowRun[] = JSON.parse(stdout || '[]');
       return { items, page, hasMore: items.length === perPage, projectDir: this.projectDir };
+    } catch (err) {
+      const code = translateError(err);
+      const stderr = (err as any)?.stderr ?? '';
+      const error = new Error(`gh error: ${code}${stderr ? ` — ${stderr.slice(0, 200)}` : ''}`);
+      (error as any).code = code;
+      throw error;
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*  getActionDetail                                                   */
+  /* ------------------------------------------------------------------ */
+
+  async getActionDetail(runId: number): Promise<RepoActionDetail> {
+    const jq = `{runId: ${runId}, jobs: [.jobs[] | {id, name, status: (if .status == "completed" then (if .conclusion == "success" then "success" elif .conclusion == "failure" then "failure" elif .conclusion == "cancelled" then "cancelled" else "failure" end) elif .status == "in_progress" then "running" else "queued" end), conclusion: (.conclusion // null), startedAt: (.started_at | if . then fromdateiso8601 * 1000 else null end), completedAt: (.completed_at | if . then fromdateiso8601 * 1000 else null end), url: .html_url, steps: [(.steps // [])[] | {number, name, status: (if .status == "completed" then (if .conclusion == "success" then "success" elif .conclusion == "failure" then "failure" elif .conclusion == "cancelled" then "cancelled" else "failure" end) elif .status == "in_progress" then "running" else "queued" end), conclusion: (.conclusion // null), startedAt: (.started_at | if . then fromdateiso8601 * 1000 else null end), completedAt: (.completed_at | if . then fromdateiso8601 * 1000 else null end)}]}]}`;
+
+    try {
+      const { stdout } = await execFileAsync('gh', [
+        'api',
+        `/repos/${this.owner}/${this.repo}/actions/runs/${runId}/jobs?per_page=100`,
+        '-q', jq,
+      ], { cwd: this.projectDir, timeout: 15000, maxBuffer: 10 * 1024 * 1024 });
+
+      return JSON.parse(stdout);
     } catch (err) {
       const code = translateError(err);
       const stderr = (err as any)?.stderr ?? '';

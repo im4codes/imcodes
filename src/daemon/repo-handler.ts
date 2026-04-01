@@ -113,6 +113,10 @@ function isValidNumber(v: unknown): v is number {
   return typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 999999;
 }
 
+function isValidRunId(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 1;
+}
+
 function validateProjectDir(projectDir: unknown): projectDir is string {
   if (typeof projectDir !== 'string' || !projectDir) return false;
   const knownDirs = new Set(listSessions().map((s) => s.projectDir));
@@ -299,6 +303,33 @@ async function handleListActions(
   }
 }
 
+async function handleActionDetail(
+  cmd: Record<string, unknown>,
+  serverLink: ServerLink,
+): Promise<void> {
+  const projectDir = cmd.projectDir as string;
+  const requestId = cmd.requestId as string | undefined;
+  const runId = cmd.runId as number;
+
+  const cacheKey = RepoCache.buildKey(projectDir, 'action_detail', { runId });
+  const cached = repoCache.get<unknown>(cacheKey);
+  if (cached) {
+    serverLink.send({ type: REPO_MSG.ACTION_DETAIL_RESPONSE, requestId, projectDir, detail: cached });
+    return;
+  }
+
+  const provider = await getProvider(projectDir, requestId, serverLink);
+  if (!provider) return;
+
+  try {
+    const result = await provider.getActionDetail(runId);
+    repoCache.set(cacheKey, result, projectDir);
+    serverLink.send({ type: REPO_MSG.ACTION_DETAIL_RESPONSE, requestId, projectDir, detail: result });
+  } catch (err) {
+    sendError(serverLink, requestId, projectDir, 'cli_error', err);
+  }
+}
+
 async function handleCommitDetail(
   cmd: Record<string, unknown>,
   serverLink: ServerLink,
@@ -469,6 +500,10 @@ export function handleRepoCommand(cmd: Record<string, unknown>, serverLink: Serv
     serverLink.send({ type: REPO_MSG.ERROR, requestId, projectDir, error: 'invalid_params' as RepoError });
     return;
   }
+  if (cmd.runId !== undefined && !isValidRunId(cmd.runId)) {
+    serverLink.send({ type: REPO_MSG.ERROR, requestId, projectDir, error: 'invalid_params' as RepoError });
+    return;
+  }
 
   // Strip any browser-sent provider field
   delete cmd.provider;
@@ -497,6 +532,9 @@ export function handleRepoCommand(cmd: Record<string, unknown>, serverLink: Serv
         break;
       case REPO_MSG.LIST_ACTIONS:
         await handleListActions(cmd, serverLink);
+        break;
+      case REPO_MSG.ACTION_DETAIL:
+        await handleActionDetail(cmd, serverLink);
         break;
       case REPO_MSG.COMMIT_DETAIL:
         await handleCommitDetail(cmd, serverLink);

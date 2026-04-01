@@ -71,8 +71,9 @@ interface Props {
   ws: WsClient;
   projectDir: string;
   onBack?: () => void;
+  focusLatestAction?: { token: number; failedJobName?: string; failedStepName?: string } | null;
   /** Called when a CI/CD run completes (success/failure). */
-  onCiEvent?: (run: { name: string; status: string; conclusion?: string; url: string }) => void;
+  onCiEvent?: (run: { name: string; status: string; conclusion?: string; url: string; failedJobName?: string; failedStepName?: string }) => void;
 }
 
 type TabKey = 'issues' | 'prs' | 'branches' | 'commits' | 'actions';
@@ -132,7 +133,7 @@ function classifyError(msg: string): ErrorKind {
 
 // ── Component ────────────────────────────────────────────────────────────────
 
-export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
+export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props) {
   const { t } = useTranslation();
 
   const [context, setContext] = useState<RepoContext | null>(null);
@@ -158,8 +159,17 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
 
   // Track pending requestIds to discard stale responses
   const pendingRef = useRef<Set<string>>(new Set());
+  const detailReqRef = useRef<Map<string, string>>(new Map());
+  const detailDataRef = useRef<Map<string, any>>(new Map());
   // Track detect requestId separately
   const detectReqRef = useRef<string | null>(null);
+  const latestActionDetailRef = useRef<string | null>(null);
+  const pendingCiFailureRef = useRef<Map<number, { id: number; name: string; status: string; conclusion?: string; url: string; updatedAt?: number }>>(new Map());
+  const deliveredCiEventRef = useRef<Set<string>>(new Set());
+  const lastFocusTokenRef = useRef<number | undefined>(undefined);
+  const actionJobRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const actionStepRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const [focusedActionTargetKey, setFocusedActionTargetKey] = useState<string | null>(null);
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -191,10 +201,24 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
         rid = ws.repoIssueDetail(projectDir, id as number);
       }
       pendingRef.current.add(rid);
+      detailReqRef.current.set(rid, key);
     } catch {
       setDetailState(prev => new Map(prev).set(key, 'error'));
     }
   }, [ws, projectDir, expandedKey, detailData]);
+
+  const fetchActionDetail = useCallback((runId: number, opts?: { force?: boolean }) => {
+    const key = `actions:${runId}`;
+    if (detailState.get(key) === 'loading') return;
+    setDetailState(prev => new Map(prev).set(key, 'loading'));
+    try {
+      const rid = ws.repoActionDetail(projectDir, runId, opts);
+      pendingRef.current.add(rid);
+      detailReqRef.current.set(rid, key);
+    } catch {
+      setDetailState(prev => new Map(prev).set(key, 'error'));
+    }
+  }, [ws, projectDir, detailState]);
 
   // ── Detect on mount ──────────────────────────────────────────────────────
 
@@ -226,6 +250,23 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
       }
     }, 10_000);
   }, [ws, projectDir]);
+
+  useEffect(() => {
+    for (const requestId of detailReqRef.current.keys()) {
+      pendingRef.current.delete(requestId);
+    }
+    setExpandedKey(null);
+    setDetailData(new Map());
+    setDetailState(new Map());
+    setFocusedActionTargetKey(null);
+    detailDataRef.current = new Map();
+    detailReqRef.current.clear();
+    latestActionDetailRef.current = null;
+    pendingCiFailureRef.current.clear();
+    deliveredCiEventRef.current.clear();
+    actionJobRefs.current.clear();
+    actionStepRefs.current.clear();
+  }, [projectDir]);
 
   useEffect(() => { doDetect(); return () => { if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current); }; }, [doDetect]);
 
@@ -269,6 +310,13 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
     fetchTab('actions');
   }, [context, tabs.actions.fetched, tabs.actions.loading, fetchTab]);
 
+  useEffect(() => {
+    if (!focusLatestAction?.token || lastFocusTokenRef.current === focusLatestAction.token) return;
+    lastFocusTokenRef.current = focusLatestAction.token;
+    setActiveTab('actions');
+    localStorage.setItem('repo-active-tab', 'actions');
+  }, [focusLatestAction]);
+
   // ── Message handler ──────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -276,7 +324,11 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
       // WS reconnected — clear stale pending requests, re-detect
       if (msg.type === 'daemon.reconnected' || (msg.type === 'session.event' && (msg as any).event === 'connected')) {
         pendingRef.current.clear();
+        detailReqRef.current.clear();
         detectReqRef.current = null;
+        latestActionDetailRef.current = null;
+        pendingCiFailureRef.current.clear();
+        deliveredCiEventRef.current.clear();
         doDetect();
         return;
       }
@@ -302,6 +354,12 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
       if (msg.type === REPO_MSG.ERROR) {
         if (!pendingRef.current.has(msg.requestId)) return;
         pendingRef.current.delete(msg.requestId);
+        const detailKey = detailReqRef.current.get(msg.requestId);
+        if (detailKey) {
+          detailReqRef.current.delete(msg.requestId);
+          setDetailState(prev => new Map(prev).set(detailKey, 'error'));
+          return;
+        }
         // Could be detect error or tab error
         if (msg.requestId === detectReqRef.current) {
           if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current);
@@ -324,20 +382,55 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
       }
 
       // Detail responses
+      if (msg.type === REPO_MSG.ACTION_DETAIL_RESPONSE) {
+        const m = msg as any;
+        if (m.projectDir !== projectDir) return;
+        if (m.requestId) {
+          pendingRef.current.delete(m.requestId);
+          detailReqRef.current.delete(m.requestId);
+        }
+        detailDataRef.current = new Map(detailDataRef.current).set(`actions:${m.detail.runId}`, m.detail);
+        setDetailData(prev => new Map(prev).set(`actions:${m.detail.runId}`, m.detail));
+        setDetailState(prev => new Map(prev).set(`actions:${m.detail.runId}`, 'loaded'));
+        const pendingRun = pendingCiFailureRef.current.get(m.detail.runId);
+        if (pendingRun) {
+          pendingCiFailureRef.current.delete(m.detail.runId);
+          emitCiEvent(pendingRun, m.detail);
+        }
+        return;
+      }
       if (msg.type === REPO_MSG.COMMIT_DETAIL_RESPONSE) {
         const m = msg as any;
+        if (m.projectDir !== projectDir) return;
+        if (m.requestId) {
+          pendingRef.current.delete(m.requestId);
+          detailReqRef.current.delete(m.requestId);
+        }
+        detailDataRef.current = new Map(detailDataRef.current).set(`commits:${m.detail.sha}`, m.detail);
         setDetailData(prev => new Map(prev).set(`commits:${m.detail.sha}`, m.detail));
         setDetailState(prev => new Map(prev).set(`commits:${m.detail.sha}`, 'loaded'));
         return;
       }
       if (msg.type === REPO_MSG.PR_DETAIL_RESPONSE) {
         const m = msg as any;
+        if (m.projectDir !== projectDir) return;
+        if (m.requestId) {
+          pendingRef.current.delete(m.requestId);
+          detailReqRef.current.delete(m.requestId);
+        }
+        detailDataRef.current = new Map(detailDataRef.current).set(`prs:${m.detail.number}`, m.detail);
         setDetailData(prev => new Map(prev).set(`prs:${m.detail.number}`, m.detail));
         setDetailState(prev => new Map(prev).set(`prs:${m.detail.number}`, 'loaded'));
         return;
       }
       if (msg.type === REPO_MSG.ISSUE_DETAIL_RESPONSE) {
         const m = msg as any;
+        if (m.projectDir !== projectDir) return;
+        if (m.requestId) {
+          pendingRef.current.delete(m.requestId);
+          detailReqRef.current.delete(m.requestId);
+        }
+        detailDataRef.current = new Map(detailDataRef.current).set(`issues:${m.detail.number}`, m.detail);
         setDetailData(prev => new Map(prev).set(`issues:${m.detail.number}`, m.detail));
         setDetailState(prev => new Map(prev).set(`issues:${m.detail.number}`, 'loaded'));
         return;
@@ -367,7 +460,16 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
             for (const run of m.items) {
               const prev = oldStatuses.get(run.id);
               if (prev && (prev === 'running' || prev === 'queued') && (run.status === 'success' || run.status === 'failure')) {
-                onCiEvent({ name: run.name, status: run.status, conclusion: run.conclusion, url: run.url });
+                if (run.status === 'failure') {
+                  const detail = detailDataRef.current.get(`actions:${run.id}`);
+                  if (detail) {
+                    emitCiEvent(run, detail);
+                  } else {
+                    pendingCiFailureRef.current.set(run.id, run);
+                  }
+                } else {
+                  emitCiEvent(run);
+                }
               }
             }
           }
@@ -386,7 +488,57 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
         });
       }
     });
-  }, [ws, projectDir]);
+  }, [ws, projectDir, doDetect, onCiEvent]);
+
+  useEffect(() => {
+    if (!tabs.actions.fetched || tabs.actions.items.length === 0) return;
+    const latest = tabs.actions.items[0] as any;
+    if (!latest?.id) return;
+    const fingerprint = `${latest.id}:${latest.status}:${latest.updatedAt ?? 0}`;
+    if (latestActionDetailRef.current === fingerprint) return;
+    latestActionDetailRef.current = fingerprint;
+    fetchActionDetail(latest.id, { force: latest.status === 'running' || latest.status === 'queued' });
+  }, [tabs.actions.fetched, tabs.actions.items, fetchActionDetail]);
+
+  useEffect(() => {
+    if (!focusLatestAction?.token || !tabs.actions.fetched || tabs.actions.items.length === 0) return;
+    const latest = tabs.actions.items[0] as any;
+    if (!latest?.id) return;
+    const actionKey = `actions:${latest.id}`;
+    setExpandedKey(actionKey);
+    const detail = detailData.get(actionKey);
+    const state = detailState.get(actionKey);
+    if (!detail && state !== 'loading') {
+      fetchActionDetail(latest.id, { force: true });
+    }
+  }, [focusLatestAction, tabs.actions.fetched, tabs.actions.items, detailData, detailState, fetchActionDetail]);
+
+  useEffect(() => {
+    if (!focusLatestAction?.token || !tabs.actions.fetched || tabs.actions.items.length === 0) return;
+    const latest = tabs.actions.items[0] as any;
+    if (!latest?.id) return;
+    const actionKey = `actions:${latest.id}`;
+    const detail = detailData.get(actionKey);
+    if (!detail) return;
+
+    const stepKey = focusLatestAction.failedJobName && focusLatestAction.failedStepName
+      ? `${latest.id}:${focusLatestAction.failedJobName}:${focusLatestAction.failedStepName}`
+      : null;
+    const jobKey = focusLatestAction.failedJobName ? `${latest.id}:${focusLatestAction.failedJobName}` : null;
+
+    const stepEl = stepKey ? actionStepRefs.current.get(stepKey) : null;
+    const jobEl = jobKey ? actionJobRefs.current.get(jobKey) : null;
+    const targetEl = stepEl ?? jobEl;
+    const targetKey = stepKey && stepEl ? stepKey : jobKey && jobEl ? jobKey : null;
+    if (!targetEl) return;
+
+    setFocusedActionTargetKey(targetKey);
+    window.setTimeout(() => {
+      targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 80);
+    const clearId = window.setTimeout(() => setFocusedActionTargetKey((current) => current === targetKey ? null : current), 4000);
+    return () => window.clearTimeout(clearId);
+  }, [focusLatestAction, tabs.actions.fetched, tabs.actions.items, detailData]);
 
   // ── Actions ──────────────────────────────────────────────────────────────
 
@@ -681,6 +833,37 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
     return `${days}d`;
   };
 
+  const isLikelyTestStep = (name: string | null | undefined): boolean => {
+    if (!name) return false;
+    return /\b(test|tests|spec|specs|e2e|integration|unit|jest|vitest|playwright|cypress|coverage)\b/i.test(name);
+  };
+
+  function extractFailedLocation(detail: any): { failedJobName?: string; failedStepName?: string } {
+    const jobs = Array.isArray(detail?.jobs) ? detail.jobs : [];
+    for (const job of jobs) {
+      const steps = Array.isArray(job?.steps) ? job.steps : [];
+      const failedStep = steps.find((step: any) => step?.status === 'failure' || step?.conclusion === 'failure');
+      if (failedStep) return { failedJobName: job?.name, failedStepName: failedStep?.name };
+      if (job?.status === 'failure' || job?.conclusion === 'failure') return { failedJobName: job?.name };
+    }
+    return {};
+  }
+
+  function emitCiEvent(run: { id: number; name: string; status: string; conclusion?: string; url: string; updatedAt?: number }, detail?: any): void {
+    if (!onCiEvent) return;
+    const key = `${run.id}:${run.status}:${run.updatedAt ?? 0}`;
+    if (deliveredCiEventRef.current.has(key)) return;
+    deliveredCiEventRef.current.add(key);
+    const failure = run.status === 'failure' ? extractFailedLocation(detail) : {};
+    onCiEvent({
+      name: run.name,
+      status: run.status,
+      conclusion: run.conclusion,
+      url: run.url,
+      ...failure,
+    });
+  }
+
   function renderCommitDetail(detail: any) {
     return (
       <div class="repo-detail-panel">
@@ -825,11 +1008,25 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
     const eventColor = item.event ? (EVENT_COLORS[item.event] ?? '#64748b') : undefined;
     const actionKey = `actions:${item.id}`;
     const isExpanded = expandedKey === actionKey;
+    const actionDetail = detailData.get(actionKey);
+    const actionDetailState = detailState.get(actionKey);
+    const isLatestAction = tabs.actions.items[0]?.id === item.id;
+    const visibleJobs = Array.isArray(actionDetail?.jobs) ? actionDetail.jobs.slice(0, 3) : [];
+    const extraJobs = Array.isArray(actionDetail?.jobs) ? Math.max(0, actionDetail.jobs.length - visibleJobs.length) : 0;
     return (
       <div key={item.id ?? item.runId}>
         <div
           style={{ ...listItemStyle, cursor: 'pointer' }}
-          onClick={() => setExpandedKey(isExpanded ? null : actionKey)}
+          onClick={() => {
+            if (isExpanded) {
+              setExpandedKey(null);
+              return;
+            }
+            setExpandedKey(actionKey);
+            if (!actionDetail && actionDetailState !== 'loading') {
+              fetchActionDetail(item.id, { force: item.status === 'running' || item.status === 'queued' });
+            }
+          }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span style={{
@@ -892,6 +1089,37 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
               {commitMsg}
             </div>
           )}
+          {!isExpanded && isLatestAction && visibleJobs.length > 0 && (
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
+              {visibleJobs.map((job: any) => {
+                const jobColor = actionStatusColor(job.status, job.conclusion);
+                return (
+                  <span
+                    key={job.id}
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      maxWidth: 220,
+                      padding: '2px 8px',
+                      borderRadius: 9999,
+                      border: `1px solid ${jobColor}55`,
+                      background: `${jobColor}14`,
+                      color: '#cbd5e1',
+                      fontSize: 10,
+                    }}
+                  >
+                    <span style={{ width: 6, height: 6, borderRadius: '50%', background: jobColor, flexShrink: 0, display: 'inline-block' }} />
+                    <span style={{ color: jobColor, fontWeight: 600, flexShrink: 0 }}>{actionStatusLabel(job.status, job.conclusion)}</span>
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{job.name}</span>
+                  </span>
+                );
+              })}
+              {extraJobs > 0 && (
+                <span style={{ fontSize: 10, color: '#64748b', alignSelf: 'center' }}>+{extraJobs}</span>
+              )}
+            </div>
+          )}
         </div>
         {isExpanded && (
           <div class="repo-detail-panel">
@@ -911,6 +1139,103 @@ export function RepoPage({ ws, projectDir, onCiEvent }: Props) {
               {item.createdAt && <span>Started: <strong>{formatTime(item.createdAt)}</strong></span>}
               {item.updatedAt && item.status !== 'queued' && <span>Updated: <strong>{formatTime(item.updatedAt)}</strong></span>}
             </div>
+            {actionDetailState === 'loading' && (
+              <div class="repo-detail-loading">{t('repo.detail_loading')}</div>
+            )}
+            {actionDetailState === 'error' && (
+              <div class="repo-detail-error">
+                {t('repo.detail_error')}
+                <button
+                  class="repo-detail-retry"
+                  onClick={(e: MouseEvent) => {
+                    e.stopPropagation();
+                    fetchActionDetail(item.id, { force: true });
+                  }}
+                >
+                  {t('repo.detail_retry')}
+                </button>
+              </div>
+            )}
+            {actionDetail?.jobs?.length > 0 && (
+              <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {actionDetail.jobs.map((job: any) => {
+                  const jobColor = actionStatusColor(job.status, job.conclusion);
+                  const steps = Array.isArray(job.steps) ? job.steps.filter((step: any) => step?.name) : [];
+                  const jobFocusKey = `${item.id}:${job.name}`;
+                  const isJobFocused = focusedActionTargetKey === jobFocusKey;
+                  return (
+                    <div
+                      key={job.id}
+                      ref={(el) => {
+                        if (el) actionJobRefs.current.set(jobFocusKey, el);
+                        else actionJobRefs.current.delete(jobFocusKey);
+                      }}
+                      style={{
+                        border: isJobFocused ? `1px solid ${jobColor}` : '1px solid rgba(148,163,184,0.18)',
+                        borderRadius: 8,
+                        padding: '8px 10px',
+                        background: isJobFocused ? 'rgba(59,130,246,0.10)' : 'rgba(15,23,42,0.45)',
+                        boxShadow: isJobFocused ? '0 0 0 1px rgba(59,130,246,0.30), 0 0 18px rgba(59,130,246,0.18)' : 'none',
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                        <span style={{ width: 8, height: 8, borderRadius: '50%', background: jobColor, flexShrink: 0, display: 'inline-block' }} />
+                        <span style={{ fontSize: 11, fontWeight: 600, color: jobColor }}>{actionStatusLabel(job.status, job.conclusion)}</span>
+                        <span style={{ color: '#cbd5e1', fontSize: 12, flex: 1 }}>{job.name}</span>
+                        {job.url && (
+                          <a
+                            href={job.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style={{ fontSize: 11, color: '#60a5fa', textDecoration: 'none' }}
+                            onClick={(e: MouseEvent) => e.stopPropagation()}
+                          >
+                            {t('repo.actions_view')}
+                          </a>
+                        )}
+                      </div>
+                      {steps.length > 0 && (
+                        <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                          {steps.map((step: any) => {
+                            const stepColor = actionStatusColor(step.status, step.conclusion);
+                            const isTestStep = isLikelyTestStep(step.name);
+                            const stepFocusKey = `${item.id}:${job.name}:${step.name}`;
+                            const isStepFocused = focusedActionTargetKey === stepFocusKey;
+                            return (
+                              <div
+                                key={`${job.id}:${step.number}`}
+                                ref={(el) => {
+                                  if (el) actionStepRefs.current.set(stepFocusKey, el);
+                                  else actionStepRefs.current.delete(stepFocusKey);
+                                }}
+                                style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: 8,
+                                  paddingLeft: 16,
+                                  paddingTop: 3,
+                                  paddingBottom: 3,
+                                  paddingRight: 8,
+                                  borderRadius: 6,
+                                  background: isStepFocused ? 'rgba(239,68,68,0.16)' : isTestStep ? 'rgba(59,130,246,0.10)' : 'transparent',
+                                  boxShadow: isStepFocused ? '0 0 0 1px rgba(239,68,68,0.35), 0 0 14px rgba(239,68,68,0.18)' : 'none',
+                                }}
+                              >
+                                <span style={{ width: 6, height: 6, borderRadius: '50%', background: stepColor, flexShrink: 0, display: 'inline-block' }} />
+                                <span style={{ fontSize: 10, fontWeight: 600, color: stepColor, flexShrink: 0 }}>{actionStatusLabel(step.status, step.conclusion)}</span>
+                                <span style={{ fontSize: 11, color: isTestStep ? '#bfdbfe' : '#94a3b8', fontWeight: isTestStep ? 600 : 400, flex: 1 }}>
+                                  {isTestStep ? `🧪 ${step.name}` : step.name}
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
             {item.url && (
               <a href={item.url} target="_blank" rel="noopener" class="repo-detail-link">{t('repo.view_on_platform')}</a>
             )}

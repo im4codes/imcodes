@@ -66,6 +66,7 @@ export type ServerMessage =
   | { type: 'repo.branches_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
   | { type: 'repo.commits_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
   | { type: 'repo.actions_response'; requestId?: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
+  | { type: 'repo.action_detail_response'; requestId?: string; projectDir: string; detail: any }
   | { type: 'repo.commit_detail_response'; requestId?: string; projectDir: string; detail: any }
   | { type: 'repo.pr_detail_response'; requestId?: string; projectDir: string; detail: any }
   | { type: 'repo.issue_detail_response'; requestId?: string; projectDir: string; detail: any }
@@ -394,6 +395,13 @@ export class WsClient {
   repoListActions(projectDir: string, opts?: { page?: number; force?: boolean }): string {
     const requestId = crypto.randomUUID();
     this.send({ type: REPO_MSG.LIST_ACTIONS, requestId, projectDir, ...opts });
+    return requestId;
+  }
+
+  /** Get workflow run jobs/steps for a project. Returns requestId. */
+  repoActionDetail(projectDir: string, runId: number, opts?: { force?: boolean }): string {
+    const requestId = crypto.randomUUID();
+    this.send({ type: REPO_MSG.ACTION_DETAIL, projectDir, runId, requestId, ...opts });
     return requestId;
   }
 

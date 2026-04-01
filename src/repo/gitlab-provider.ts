@@ -15,6 +15,7 @@ import type {
   RepoPR,
   RepoPRDetail,
   RepoListResult,
+  RepoActionDetail,
   RepoWorkflowRun,
 } from './types.js';
 import type {
@@ -196,6 +197,10 @@ export class GitLabProvider implements RepoProvider {
 
   async listActions(_opts?: ListOptions): Promise<RepoListResult<RepoWorkflowRun>> {
     return { items: [], page: 1, hasMore: false, projectDir: this.projectDir };
+  }
+
+  async getActionDetail(runId: number): Promise<RepoActionDetail> {
+    return { runId, jobs: [] };
   }
 
   /* ------------------------------------------------------------------ */

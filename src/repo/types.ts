@@ -111,6 +111,31 @@ export interface RepoWorkflowRun {
   headCommitMessage?: string; // full commit message (not just display_title)
 }
 
+export interface RepoActionStep {
+  number: number;
+  name: string;
+  status: 'queued' | 'running' | 'success' | 'failure' | 'cancelled';
+  conclusion?: string | null;
+  startedAt?: number;
+  completedAt?: number;
+}
+
+export interface RepoActionJob {
+  id: number;
+  name: string;
+  status: 'queued' | 'running' | 'success' | 'failure' | 'cancelled';
+  conclusion?: string | null;
+  startedAt?: number;
+  completedAt?: number;
+  url?: string;
+  steps: RepoActionStep[];
+}
+
+export interface RepoActionDetail {
+  runId: number;
+  jobs: RepoActionJob[];
+}
+
 export interface RepoCommitDetailFile {
   filename: string;
   status: string;
