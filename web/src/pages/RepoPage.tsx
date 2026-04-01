@@ -479,7 +479,7 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
                 tabRetryTimersRef.current.delete(retryKey);
                 fetchTab(meta.key, meta.page, meta.force, { preserveUi: hasExistingData });
               }, RETRY_DELAY_MS));
-              updateTab(meta.key, { loading: false, refreshing: false, error: null });
+              updateTab(meta.key, { loading: false, refreshing: false, error: msg.error });
             } else {
               tabRetryCountRef.current.delete(retryKey);
               const existingTimer = tabRetryTimersRef.current.get(retryKey);
@@ -707,6 +707,8 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
     commits: t('repo.tab_commits'),
     actions: t('repo.tab_cicd'),
   };
+
+  const shouldPreserveTabContent = (tab: TabState) => tab.items.length > 0;
 
   const renderError = (error: string, tabKey: TabKey) => {
     const kind = classifyError(error);
@@ -1415,10 +1417,11 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
   };
 
   const renderTabContent = (key: TabKey) => {
+    const tab = tabs[key];
     // Show spinner only on initial detect (no context yet)
-    if (detectLoading && !context) return renderSpinner();
+    if (detectLoading && !context && !shouldPreserveTabContent(tab)) return renderSpinner();
     // Detect failed AND we have no previous data — show retry prompt
-    if (detectError && !context) return (
+    if (detectError && !context && !shouldPreserveTabContent(tab)) return (
       <div style={{ padding: 24, textAlign: 'center', color: '#94a3b8', fontSize: 13 }}>
         <div style={{ marginBottom: 12, color: '#f87171' }}>{detectError}</div>
         <div style={{ marginBottom: 12, fontSize: 11, color: '#475569' }}>{t('repo.retry')}</div>
@@ -1426,9 +1429,8 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
       </div>
     );
     // If detect is re-running but we have cached data, show tabs normally
-    const tab = tabs[key];
     if (tab.loading && !tab.fetched) return renderSpinner();
-    if (tab.error) return renderError(tab.error, key);
+    if (tab.error && !shouldPreserveTabContent(tab)) return renderError(tab.error, key);
     if (tab.fetched && tab.items.length === 0) return renderEmpty(key);
     if (!tab.fetched && !tab.loading) return renderSpinner(); // waiting for lazy load
 
@@ -1521,9 +1523,13 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
         display: 'flex', borderBottom: '1px solid #1e293b', flexShrink: 0,
       }}>
         {(['issues', 'prs', 'branches', 'commits', 'actions'] as TabKey[]).map(key => (
+          (() => {
+            const tabError = tabs[key].error;
+            return (
           <button
             key={key}
             onClick={() => handleTabClick(key)}
+            title={tabError || undefined}
             style={{
               flex: 1, padding: '8px 0', fontSize: 13, fontWeight: 500,
               background: 'none', border: 'none', cursor: 'pointer',
@@ -1533,10 +1539,20 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
             }}
           >
             {TAB_LABELS[key]}
+            {tabError && (
+              <span
+                style={{ marginLeft: 6, fontSize: 11, color: '#ef4444', fontWeight: 700 }}
+                aria-label={`${TAB_LABELS[key]} error`}
+              >
+                !
+              </span>
+            )}
             {(tabs[key].loading || tabs[key].refreshing) && (
               <span style={{ marginLeft: 6, fontSize: 10, color: '#94a3b8', display: 'inline-block', animation: 'spin 1s linear infinite' }}>↻</span>
             )}
           </button>
+            );
+          })()
         ))}
       </div>
 

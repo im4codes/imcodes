@@ -318,6 +318,43 @@ describe('RepoPage', () => {
     expect(screen.getByText('Retry')).toBeDefined();
   });
 
+  it('keeps existing tab items visible and shows tab error marker when refresh fails', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ws, respondDetect, respondTab, respondTabError } = makeWs();
+      render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+      await act(async () => {
+        respondDetect({ provider: 'github', owner: 'acme', repo: 'widgets' });
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByText('Actions'));
+        respondTab('repo.actions_response', PROJECT_DIR, [
+          { id: 1, name: 'CI', status: 'success', conclusion: 'success', updatedAt: Date.now() },
+        ]);
+      });
+
+      expect(screen.getByText('CI')).toBeDefined();
+
+      await act(async () => {
+        vi.advanceTimersByTime(61_000);
+      });
+
+      await act(async () => {
+        respondTabError('cli_error', 'actions');
+      });
+
+      expect(screen.getByText('CI')).toBeDefined();
+      expect(screen.queryByText('cli_error')).toBeNull();
+      const actionsTab = screen.getByText('Actions').closest('button') as HTMLButtonElement;
+      expect(actionsTab.title).toBe('cli_error');
+      expect(screen.getByText('!')).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('silently retries latest action detail errors instead of showing a detail error immediately', async () => {
     vi.useFakeTimers();
     try {
