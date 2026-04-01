@@ -68,27 +68,31 @@ function makeWs() {
   let messageHandler: ((msg: ServerMessage) => void) | null = null;
   // Track request IDs returned by each method
   let detectReqId = '';
-  let lastTabReqId = '';
+  const lastTabReqIds: Partial<Record<'issues' | 'prs' | 'branches' | 'commits' | 'actions', string>> = {};
 
   const repoDetect = vi.fn((projectDir: string) => {
     detectReqId = `detect-${Date.now()}-${Math.random()}`;
     return detectReqId;
   });
   const repoListIssues = vi.fn((_dir: string, _opts?: any) => {
-    lastTabReqId = `issues-${Date.now()}-${Math.random()}`;
-    return lastTabReqId;
+    lastTabReqIds.issues = `issues-${Date.now()}-${Math.random()}`;
+    return lastTabReqIds.issues;
   });
   const repoListPRs = vi.fn((_dir: string, _opts?: any) => {
-    lastTabReqId = `prs-${Date.now()}-${Math.random()}`;
-    return lastTabReqId;
+    lastTabReqIds.prs = `prs-${Date.now()}-${Math.random()}`;
+    return lastTabReqIds.prs;
   });
   const repoListBranches = vi.fn((_dir: string) => {
-    lastTabReqId = `branches-${Date.now()}-${Math.random()}`;
-    return lastTabReqId;
+    lastTabReqIds.branches = `branches-${Date.now()}-${Math.random()}`;
+    return lastTabReqIds.branches;
   });
   const repoListCommits = vi.fn((_dir: string, _opts?: any) => {
-    lastTabReqId = `commits-${Date.now()}-${Math.random()}`;
-    return lastTabReqId;
+    lastTabReqIds.commits = `commits-${Date.now()}-${Math.random()}`;
+    return lastTabReqIds.commits;
+  });
+  const repoListActions = vi.fn((_dir: string, _opts?: any) => {
+    lastTabReqIds.actions = `actions-${Date.now()}-${Math.random()}`;
+    return lastTabReqIds.actions;
   });
 
   const ws: WsClient = {
@@ -102,6 +106,7 @@ function makeWs() {
     repoListPRs,
     repoListBranches,
     repoListCommits,
+    repoListActions,
   } as unknown as WsClient;
 
   /** Send a message to the component's onMessage handler */
@@ -137,9 +142,18 @@ function makeWs() {
 
   /** Respond to the last tab request with items */
   const respondTab = (type: string, projectDir: string, items: any[], page = 1, hasMore = false) => {
+    const requestId = type === 'repo.issues_response'
+      ? lastTabReqIds.issues
+      : type === 'repo.prs_response'
+        ? lastTabReqIds.prs
+        : type === 'repo.branches_response'
+          ? lastTabReqIds.branches
+          : type === 'repo.commits_response'
+            ? lastTabReqIds.commits
+            : lastTabReqIds.actions;
     emit({
       type,
-      requestId: lastTabReqId,
+      requestId,
       projectDir,
       items,
       page,
@@ -148,10 +162,10 @@ function makeWs() {
   };
 
   /** Respond to the last tab request with a repo.error */
-  const respondTabError = (error: string) => {
+  const respondTabError = (error: string, tab: 'issues' | 'prs' | 'branches' | 'commits' | 'actions' = 'issues') => {
     emit({
       type: 'repo.error',
-      requestId: lastTabReqId,
+      requestId: lastTabReqIds[tab],
       error,
     } as ServerMessage);
   };
@@ -164,13 +178,14 @@ function makeWs() {
     repoListPRs,
     repoListBranches,
     repoListCommits,
+    repoListActions,
     respondDetect,
     respondDetectFlat,
     respondDetectError,
     respondTab,
     respondTabError,
     getDetectReqId: () => detectReqId,
-    getLastTabReqId: () => lastTabReqId,
+    getLastTabReqId: (tab: 'issues' | 'prs' | 'branches' | 'commits' | 'actions' = 'issues') => lastTabReqIds[tab] ?? '',
   };
 }
 

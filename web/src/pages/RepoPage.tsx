@@ -119,6 +119,9 @@ function emptyTab<T = any>(): TabState<T> {
   return { items: [], page: 1, hasMore: false, loading: false, refreshing: false, error: null, fetched: false };
 }
 
+const MAX_SILENT_RETRIES = 3;
+const RETRY_DELAY_MS = 1200;
+
 // ── Error classification ─────────────────────────────────────────────────────
 
 type ErrorKind = 'cli_missing' | 'unauthorized' | 'rate_limited' | 'generic';
@@ -160,9 +163,14 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
   // Track pending requestIds to discard stale responses
   const pendingRef = useRef<Set<string>>(new Set());
   const detailReqRef = useRef<Map<string, string>>(new Map());
+  const tabReqRef = useRef<Map<string, { key: TabKey; page: number; force: boolean }>>(new Map());
   const detailDataRef = useRef<Map<string, any>>(new Map());
   // Track detect requestId separately
   const detectReqRef = useRef<string | null>(null);
+  const detectRetryCountRef = useRef(0);
+  const detectRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const tabRetryCountRef = useRef<Map<string, number>>(new Map());
+  const tabRetryTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const latestActionDetailRef = useRef<string | null>(null);
   const pendingCiFailureRef = useRef<Map<number, { id: number; name: string; status: string; conclusion?: string; url: string; updatedAt?: number }>>(new Map());
   const deliveredCiEventRef = useRef<Set<string>>(new Set());
@@ -224,16 +232,24 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
 
   const detectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const doDetect = useCallback(() => {
-    setDetectLoading(true);
-    setDetectError(null);
+  const doDetect = useCallback((opts?: { preserveUi?: boolean }) => {
+    const preserveUi = opts?.preserveUi === true;
+    if (!preserveUi || !context) {
+      setDetectLoading(true);
+    }
+    if (!preserveUi) {
+      setDetectError(null);
+      detectRetryCountRef.current = 0;
+    }
 
     let rid: string;
     try {
       rid = ws.repoDetect(projectDir);
     } catch (err) {
-      setDetectError(`Send failed: ${err instanceof Error ? err.message : String(err)}`);
-      setDetectLoading(false);
+      if (!context) {
+        setDetectError(`Send failed: ${err instanceof Error ? err.message : String(err)}`);
+        setDetectLoading(false);
+      }
       return;
     }
 
@@ -245,11 +261,20 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
     detectTimeoutRef.current = setTimeout(() => {
       if (detectReqRef.current === rid && pendingRef.current.has(rid)) {
         pendingRef.current.delete(rid);
-        setDetectError(`Detect timeout — no response after 10s (requestId: ${rid.slice(0, 8)})`);
-        setDetectLoading(false);
+        const nextRetry = detectRetryCountRef.current + 1;
+        detectRetryCountRef.current = nextRetry;
+        if (context && nextRetry <= MAX_SILENT_RETRIES) {
+          if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
+          detectRetryTimerRef.current = setTimeout(() => doDetect({ preserveUi: true }), RETRY_DELAY_MS);
+          return;
+        }
+        if (!context) {
+          setDetectError(`Detect timeout — no response after 10s (requestId: ${rid.slice(0, 8)})`);
+          setDetectLoading(false);
+        }
       }
     }, 10_000);
-  }, [ws, projectDir]);
+  }, [ws, projectDir, context]);
 
   useEffect(() => {
     for (const requestId of detailReqRef.current.keys()) {
@@ -261,19 +286,40 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
     setFocusedActionTargetKey(null);
     detailDataRef.current = new Map();
     detailReqRef.current.clear();
+    tabReqRef.current.clear();
     latestActionDetailRef.current = null;
+    detectRetryCountRef.current = 0;
+    if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
+    detectRetryTimerRef.current = null;
+    for (const timer of tabRetryTimersRef.current.values()) clearTimeout(timer);
+    tabRetryTimersRef.current.clear();
+    tabRetryCountRef.current.clear();
     pendingCiFailureRef.current.clear();
     deliveredCiEventRef.current.clear();
     actionJobRefs.current.clear();
     actionStepRefs.current.clear();
   }, [projectDir]);
 
-  useEffect(() => { doDetect(); return () => { if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current); }; }, [doDetect]);
+  useEffect(() => {
+    doDetect();
+    return () => {
+      if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current);
+      if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
+      for (const timer of tabRetryTimersRef.current.values()) clearTimeout(timer);
+      tabRetryTimersRef.current.clear();
+    };
+  }, [doDetect]);
 
   // ── Tab data fetching ────────────────────────────────────────────────────
 
-  const fetchTab = useCallback((key: TabKey, page = 1, force = false) => {
-    updateTab(key, { loading: true, error: null });
+  const fetchTab = useCallback((key: TabKey, page = 1, force = false, opts?: { preserveUi?: boolean }) => {
+    const preserveUi = opts?.preserveUi === true;
+    if (!preserveUi) {
+      updateTab(key, { loading: true, error: null });
+      if (page === 1) tabRetryCountRef.current.delete(key);
+    } else {
+      updateTab(key, { loading: true });
+    }
     let rid: string;
     switch (key) {
       case 'issues':
@@ -293,6 +339,7 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
         break;
     }
     pendingRef.current.add(rid);
+    tabReqRef.current.set(rid, { key, page, force });
   }, [ws, projectDir, updateTab]);
 
   // Lazy-load: fetch tab data on first activation
@@ -325,11 +372,12 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
       if (msg.type === 'daemon.reconnected' || (msg.type === 'session.event' && (msg as any).event === 'connected')) {
         pendingRef.current.clear();
         detailReqRef.current.clear();
+        tabReqRef.current.clear();
         detectReqRef.current = null;
         latestActionDetailRef.current = null;
         pendingCiFailureRef.current.clear();
         deliveredCiEventRef.current.clear();
-        doDetect();
+        doDetect({ preserveUi: true });
         return;
       }
 
@@ -338,8 +386,12 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
         if (msg.requestId !== detectReqRef.current) return;
         pendingRef.current.delete(msg.requestId);
         if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current);
+        if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
+        detectRetryTimerRef.current = null;
+        detectRetryCountRef.current = 0;
         setContext(mapDetectToContext((msg as any).context ?? msg));
         setDetectLoading(false);
+        setDetectError(null);
         return;
       }
 
@@ -363,20 +415,45 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
         // Could be detect error or tab error
         if (msg.requestId === detectReqRef.current) {
           if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current);
-          setDetectError(msg.error);
-          setDetectLoading(false);
+          const nextRetry = detectRetryCountRef.current + 1;
+          detectRetryCountRef.current = nextRetry;
+          if (context && nextRetry <= MAX_SILENT_RETRIES) {
+            if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
+            detectRetryTimerRef.current = setTimeout(() => doDetect({ preserveUi: true }), RETRY_DELAY_MS);
+          } else if (!context) {
+            setDetectError(msg.error);
+            setDetectLoading(false);
+          }
         } else {
-          // Find which tab had this request — set error on all loading tabs
-          // (we track per-request, but simplify by checking which tab is loading)
-          setTabs(prev => {
-            const next = { ...prev };
-            for (const key of Object.keys(next) as TabKey[]) {
-              if (next[key].loading) {
-                next[key] = { ...next[key], loading: false, refreshing: false, error: msg.error, fetched: true };
-              }
+          const meta = tabReqRef.current.get(msg.requestId);
+          if (meta) {
+            tabReqRef.current.delete(msg.requestId);
+            const retryKey = meta.key;
+            const nextRetry = (tabRetryCountRef.current.get(retryKey) ?? 0) + 1;
+            const existingTab = tabs[meta.key];
+            const hasExistingData = existingTab.fetched;
+            if (hasExistingData && nextRetry <= MAX_SILENT_RETRIES) {
+              tabRetryCountRef.current.set(retryKey, nextRetry);
+              const existingTimer = tabRetryTimersRef.current.get(retryKey);
+              if (existingTimer) clearTimeout(existingTimer);
+              tabRetryTimersRef.current.set(retryKey, setTimeout(() => {
+                tabRetryTimersRef.current.delete(retryKey);
+                fetchTab(meta.key, meta.page, meta.force, { preserveUi: hasExistingData });
+              }, RETRY_DELAY_MS));
+              updateTab(meta.key, { loading: false, refreshing: false, error: null });
+            } else {
+              tabRetryCountRef.current.delete(retryKey);
+              const existingTimer = tabRetryTimersRef.current.get(retryKey);
+              if (existingTimer) clearTimeout(existingTimer);
+              tabRetryTimersRef.current.delete(retryKey);
+              updateTab(meta.key, {
+                loading: false,
+                refreshing: false,
+                error: hasExistingData ? null : msg.error,
+                fetched: existingTab.fetched || !hasExistingData,
+              });
             }
-            return next;
-          });
+          }
         }
         return;
       }
@@ -449,6 +526,11 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
         const m = msg as any;
         if (!pendingRef.current.has(m.requestId)) return;
         pendingRef.current.delete(m.requestId);
+        tabReqRef.current.delete(m.requestId);
+        tabRetryCountRef.current.delete(tabKey);
+        const retryTimer = tabRetryTimersRef.current.get(tabKey);
+        if (retryTimer) clearTimeout(retryTimer);
+        tabRetryTimersRef.current.delete(tabKey);
         // Stale response check — projectDir must match
         if (m.projectDir !== projectDir) return;
         setTabs(prev => {
@@ -1297,7 +1379,7 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
       <div style={{ padding: 24, textAlign: 'center', color: '#94a3b8', fontSize: 13 }}>
         <div style={{ marginBottom: 12, color: '#f87171' }}>{detectError}</div>
         <div style={{ marginBottom: 12, fontSize: 11, color: '#475569' }}>{t('repo.retry')}</div>
-        <button class="btn btn-sm" onClick={doDetect}>{t('repo.retry')}</button>
+        <button class="btn btn-sm" onClick={() => doDetect()}>{t('repo.retry')}</button>
       </div>
     );
     // If detect is re-running but we have cached data, show tabs normally
