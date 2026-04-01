@@ -494,10 +494,11 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
     if (!tabs.actions.fetched || tabs.actions.items.length === 0) return;
     const latest = tabs.actions.items[0] as any;
     if (!latest?.id) return;
+    if (latest.status !== 'running' && latest.status !== 'failure') return;
     const fingerprint = `${latest.id}:${latest.status}:${latest.updatedAt ?? 0}`;
     if (latestActionDetailRef.current === fingerprint) return;
     latestActionDetailRef.current = fingerprint;
-    fetchActionDetail(latest.id, { force: latest.status === 'running' || latest.status === 'queued' });
+    fetchActionDetail(latest.id, { force: latest.status === 'running' });
   }, [tabs.actions.fetched, tabs.actions.items, fetchActionDetail]);
 
   useEffect(() => {
@@ -989,6 +990,44 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
     return status?.toUpperCase() ?? '';
   };
 
+  const renderJobStatusIcon = (status: string, conclusion: string | null | undefined) => {
+    const color = actionStatusColor(status, conclusion);
+    const label = actionStatusLabel(status, conclusion);
+    if (status === 'running' || status === 'in_progress') {
+      return (
+        <span
+          aria-label={label}
+          title={label}
+          style={{
+            width: 10,
+            height: 10,
+            borderRadius: '50%',
+            border: `2px solid ${color}33`,
+            borderTopColor: color,
+            display: 'inline-block',
+            flexShrink: 0,
+            animation: 'repo-spin 0.8s linear infinite',
+          }}
+        />
+      );
+    }
+
+    return (
+      <span
+        aria-label={label}
+        title={label}
+        style={{
+          width: 8,
+          height: 8,
+          borderRadius: '50%',
+          background: color,
+          display: 'inline-block',
+          flexShrink: 0,
+        }}
+      />
+    );
+  };
+
   const EVENT_COLORS: Record<string, string> = {
     push: '#3b82f6',
     pull_request: '#a78bfa',
@@ -1011,8 +1050,8 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
     const actionDetail = detailData.get(actionKey);
     const actionDetailState = detailState.get(actionKey);
     const isLatestAction = tabs.actions.items[0]?.id === item.id;
-    const visibleJobs = Array.isArray(actionDetail?.jobs) ? actionDetail.jobs.slice(0, 3) : [];
-    const extraJobs = Array.isArray(actionDetail?.jobs) ? Math.max(0, actionDetail.jobs.length - visibleJobs.length) : 0;
+    const showCollapsedJobSummary = isLatestAction && (item.status === 'running' || item.status === 'failure');
+    const visibleJobs = showCollapsedJobSummary && Array.isArray(actionDetail?.jobs) ? actionDetail.jobs : [];
     return (
       <div key={item.id ?? item.runId}>
         <div
@@ -1089,13 +1128,14 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
               {commitMsg}
             </div>
           )}
-          {!isExpanded && isLatestAction && visibleJobs.length > 0 && (
+          {!isExpanded && visibleJobs.length > 0 && (
             <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
               {visibleJobs.map((job: any) => {
                 const jobColor = actionStatusColor(job.status, job.conclusion);
                 return (
                   <span
                     key={job.id}
+                    title={`${job.name} · ${actionStatusLabel(job.status, job.conclusion)}`}
                     style={{
                       display: 'inline-flex',
                       alignItems: 'center',
@@ -1103,21 +1143,17 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
                       maxWidth: 220,
                       padding: '2px 8px',
                       borderRadius: 9999,
-                      border: `1px solid ${jobColor}55`,
-                      background: `${jobColor}14`,
+                      border: `1px solid ${jobColor}40`,
+                      background: 'rgba(15,23,42,0.45)',
                       color: '#cbd5e1',
                       fontSize: 10,
                     }}
                   >
-                    <span style={{ width: 6, height: 6, borderRadius: '50%', background: jobColor, flexShrink: 0, display: 'inline-block' }} />
-                    <span style={{ color: jobColor, fontWeight: 600, flexShrink: 0 }}>{actionStatusLabel(job.status, job.conclusion)}</span>
+                    {renderJobStatusIcon(job.status, job.conclusion)}
                     <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{job.name}</span>
                   </span>
                 );
               })}
-              {extraJobs > 0 && (
-                <span style={{ fontSize: 10, color: '#64748b', alignSelf: 'center' }}>+{extraJobs}</span>
-              )}
             </div>
           )}
         </div>
@@ -1305,6 +1341,7 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
 
   return (
     <div class="repo-page">
+      <style>{'@keyframes repo-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }'}</style>
       {/* Header bar */}
       <div style={{
         display: 'flex', alignItems: 'center', gap: 12,
