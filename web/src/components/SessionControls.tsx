@@ -84,6 +84,16 @@ interface PendingAtTarget {
   label: string;
 }
 
+type ManualP2pTargetCandidate = {
+  session: string;
+  aliases: string[];
+};
+
+type ManualP2pResolveResult = {
+  orderedTargets: Array<{ session: string; mode: string }>;
+  cleanText: string;
+};
+
 // Enter moved after ↓ arrow
 const SHORTCUTS: Array<{ label: string; title: string; data: string; wide?: boolean }> = [
   { label: 'Esc',  title: 'Escape',     data: '\x1b' },
@@ -112,6 +122,57 @@ function loadCodexModel(): CodexModelChoice | null {
     if (CODEX_MODELS.includes(v as CodexModelChoice)) return v as CodexModelChoice;
   } catch { /* ignore */ }
   return null;
+}
+
+function normalizeP2pMode(mode: string): string | null {
+  const normalized = mode.trim().toLowerCase();
+  return P2P_MODES.includes(normalized as P2pMode) ? normalized : null;
+}
+
+function buildManualP2pCandidates(
+  sessions: SessionInfo[] | undefined,
+  subSessions: Props['subSessions'],
+): ManualP2pTargetCandidate[] {
+  const main = (sessions ?? []).map((s) => ({
+    session: s.name,
+    aliases: [s.label, s.name].filter((v): v is string => !!v && v.trim().length > 0),
+  }));
+  const subs = (subSessions ?? []).map((s) => ({
+    session: s.sessionName,
+    aliases: [s.label, s.sessionName, s.sessionName.replace(/^deck_sub_/, '')].filter((v): v is string => !!v && v.trim().length > 0),
+  }));
+  return [...main, ...subs];
+}
+
+function extractManualP2pTargets(
+  text: string,
+  candidates: ManualP2pTargetCandidate[],
+): ManualP2pResolveResult {
+  if (!text.includes('@@')) return { orderedTargets: [], cleanText: text };
+
+  const aliasMap = new Map<string, string | null>();
+  for (const candidate of candidates) {
+    for (const alias of candidate.aliases) {
+      const key = alias.trim().toLowerCase();
+      if (!key || key === 'all' || key === 'discuss' || key === 'p2p-config') continue;
+      const existing = aliasMap.get(key);
+      if (existing === undefined) aliasMap.set(key, candidate.session);
+      else if (existing !== candidate.session) aliasMap.set(key, null);
+    }
+  }
+
+  const orderedTargets: Array<{ session: string; mode: string }> = [];
+  const cleanText = text.replace(/@@([^()\n]+?)\(([^()\n]+)\)/g, (match, rawAlias: string, rawMode: string) => {
+    const mode = normalizeP2pMode(rawMode);
+    if (!mode) return match;
+    const alias = rawAlias.trim().toLowerCase();
+    const session = aliasMap.get(alias);
+    if (!session) return match;
+    orderedTargets.push({ session, mode });
+    return '';
+  }).replace(/\s+/g, ' ').trim();
+
+  return { orderedTargets, cleanText };
 }
 
 export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact }: Props) {
@@ -371,18 +432,21 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
     // Build P2P routing as structured WS fields — keep text clean for display.
     const extra: Record<string, unknown> = {};
+    let directTargetSession: string | null = null;
     const pendingTargets = pendingAtTargetsRef.current.splice(0);
 
     if (pendingTargets.length > 0) {
       // @ picker was used — derive routing from the visible textbox order, then strip matched labels.
       const { orderedTargets, cleanText } = extractOrderedAtTargets(text, pendingTargets);
       text = cleanText;
-      if (orderedTargets.length > 0) {
+      if (orderedTargets.length === 1 && orderedTargets[0].session !== '__all__') {
+        directTargetSession = orderedTargets[0].session;
+      } else if (orderedTargets.length > 1 || orderedTargets.some((t) => t.session === '__all__')) {
         extra.p2pAtTargets = orderedTargets.map(({ session, mode }) => ({ session, mode }));
       }
       // Attach config data when any target uses config mode
       const hasConfigTarget = orderedTargets.some(t => t.mode === 'config');
-      if (hasConfigTarget) {
+      if (!directTargetSession && hasConfigTarget) {
         const override = pendingConfigOverrideRef.current;
         const cfg = override?.config ?? p2pSavedConfig;
         if (cfg) {
@@ -392,7 +456,31 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         }
       }
       pendingConfigOverrideRef.current = null;
-    } else if (p2pMode !== 'solo' && !text.includes('@@')) {
+    } else {
+      const manual = extractManualP2pTargets(text, buildManualP2pCandidates(sessions, subSessions));
+      if (manual.orderedTargets.length === 1 && manual.orderedTargets[0].session !== '__all__') {
+        text = manual.cleanText;
+        directTargetSession = manual.orderedTargets[0].session;
+      } else if (manual.orderedTargets.length > 1 || manual.orderedTargets.some((t) => t.session === '__all__')) {
+        text = manual.cleanText;
+        extra.p2pAtTargets = manual.orderedTargets;
+      } else if (p2pMode !== 'solo' && !text.includes('@@')) {
+        // Dropdown P2P mode — daemon handles expansion
+        if (p2pMode === P2P_CONFIG_MODE) {
+          extra.p2pMode = 'config';
+        } else {
+          extra.p2pMode = p2pMode;
+          if (p2pExcludeSameType) extra.p2pExcludeSameType = true;
+        }
+        if (p2pMode === P2P_CONFIG_MODE && p2pSavedConfig) {
+          extra.p2pSessionConfig = p2pSavedConfig.sessions;
+          extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
+          if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
+        }
+      }
+    }
+
+    if (!directTargetSession && !extra.p2pAtTargets && p2pMode !== 'solo' && !text.includes('@@')) {
       // Dropdown P2P mode — daemon handles expansion
       if (p2pMode === P2P_CONFIG_MODE) {
         extra.p2pMode = 'config';
@@ -424,11 +512,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     }
     quickData.recordHistory(text, activeSession.name);
     try {
-      ws.sendSessionCommand('send', { sessionName: activeSession.name, text, ...extra });
+      ws.sendSessionCommand('send', { sessionName: directTargetSession ?? activeSession.name, text, ...extra });
     } catch {
       return;
     }
-    onSend?.(activeSession.name, text);
+    if (!directTargetSession) onSend?.(activeSession.name, text);
     if (divRef.current) divRef.current.textContent = '';
     setHasText(false);
     setAttachments([]);

@@ -266,7 +266,7 @@ describe('SessionControls', () => {
     getSelectionSpy.mockRestore();
   });
 
-  it('does not send immediately after selecting agent and mode; sends after further editing', () => {
+  it('does not send immediately after selecting agent and mode; sends a direct message after further editing when only one target is present', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -298,11 +298,10 @@ describe('SessionControls', () => {
     fireEvent.input(input);
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
 
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
-      sessionName: 'deck_my-project_brain',
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      sessionName: 'deck_sub_w1',
       text: 'please review',
-      p2pAtTargets: [{ session: 'deck_sub_w1', mode: 'audit' }],
-    }));
+    });
 
     getSelectionSpy.mockRestore();
   });
@@ -409,6 +408,59 @@ describe('SessionControls', () => {
     }));
 
     getSelectionSpy.mockRestore();
+  });
+
+  it('manual @@label(mode) text sends direct when exactly one target resolves', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={mainSession}
+        quickData={makeQuickData() as any}
+        sessions={[mainSession]}
+        subSessions={[
+          { sessionName: 'deck_sub_plan', type: 'codex', label: 'plan', state: 'idle', parentSession: 'deck_my-project_brain' },
+        ]}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = '@@plan(Audit) check this';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      sessionName: 'deck_sub_plan',
+      text: 'check this',
+    });
+  });
+
+  it('manual @@label(mode) text sends p2pAtTargets when multiple targets resolve', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={mainSession}
+        quickData={makeQuickData() as any}
+        sessions={[mainSession]}
+        subSessions={[
+          { sessionName: 'deck_sub_plan', type: 'codex', label: 'plan', state: 'idle', parentSession: 'deck_my-project_brain' },
+          { sessionName: 'deck_sub_planx', type: 'codex', label: 'planx', state: 'idle', parentSession: 'deck_my-project_brain' },
+        ]}
+      />,
+    );
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = '@@plan(Audit) @@planx(Audit) compare';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+      sessionName: 'deck_my-project_brain',
+      text: 'compare',
+      p2pAtTargets: [
+        { session: 'deck_sub_plan', mode: 'audit' },
+        { session: 'deck_sub_planx', mode: 'audit' },
+      ],
+    }));
   });
 
   it('when active session is a sub-session, agent picker still shows same-root peers', () => {
