@@ -11,10 +11,10 @@ function usageSummary(inputTokens: number, cacheTokens: number, contextWindow: n
 }
 
 describe('usage display behavior', () => {
-  it('uses 1.05M context for gpt-5.4 even when explicit context is stale', () => {
+  it('uses 1M context for gpt-5.4 even when explicit context is stale', () => {
     const view = usageSummary(210_000, 105_000, 400_000, 'gpt-5.4');
-    expect(view.ctx).toBe(1_050_000);
-    expect(view.pctStr).toBe('30');
+    expect(view.ctx).toBe(1_000_000);
+    expect(view.pctStr).toBe('32');
   });
 
   it('uses 400k context for gpt-5.2-codex', () => {

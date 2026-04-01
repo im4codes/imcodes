@@ -2,10 +2,10 @@ import { describe, it, expect } from 'vitest';
 import { inferContextWindow, resolveContextWindow } from '../../src/util/model-context.js';
 
 describe('model context inference', () => {
-  it('maps GPT-5.4 family to ~1M context', () => {
-    expect(inferContextWindow('gpt-5.4')).toBe(1_050_000);
-    expect(inferContextWindow('gpt-5.4-pro')).toBe(1_050_000);
-    expect(inferContextWindow('gpt-5.4-2026-03-01')).toBe(1_050_000);
+  it('maps GPT-5.4 family to 1M context', () => {
+    expect(inferContextWindow('gpt-5.4')).toBe(1_000_000);
+    expect(inferContextWindow('gpt-5.4-pro')).toBe(1_000_000);
+    expect(inferContextWindow('gpt-5.4-2026-03-01')).toBe(1_000_000);
   });
 
   it('maps older GPT-5 families to 400k context', () => {
@@ -22,6 +22,6 @@ describe('model context inference', () => {
   });
 
   it('prefers model mapping over stale explicit fallback values', () => {
-    expect(resolveContextWindow(400_000, 'gpt-5.4')).toBe(1_050_000);
+    expect(resolveContextWindow(400_000, 'gpt-5.4')).toBe(1_000_000);
   });
 });
