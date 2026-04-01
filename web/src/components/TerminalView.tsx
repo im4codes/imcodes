@@ -9,6 +9,8 @@ interface Props {
   sessionName: string;
   ws: WsClient | null;
   connected?: boolean;
+  /** When false, keep the terminal mounted but pause expensive live work. */
+  active?: boolean;
   onDiff?: (applyDiff: (diff: TerminalDiff) => void) => void;
   onHistory?: (applyHistory: (content: string) => void) => void;
   /** Receives a function that focuses the xterm terminal — call it to restore keyboard to xterm. */
@@ -21,13 +23,15 @@ interface Props {
   mobileInput?: boolean;
 }
 
-export function TerminalView({ sessionName, ws, connected, onDiff, onHistory, onFocusFn, onFitFn, onScrollBottomFn, mobileInput }: Props) {
+export function TerminalView({ sessionName, ws, connected, active = true, onDiff, onHistory, onFocusFn, onFitFn, onScrollBottomFn, mobileInput }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const linesRef = useRef<string[]>([]);
   const wsRef = useRef(ws);
   wsRef.current = ws;
+  const activeRef = useRef(active);
+  activeRef.current = active;
 
   // Touch scroll tracking: suppress auto-scroll for 1s after user releases touch
   const lastTouchEndRef = useRef<number>(0);
@@ -93,6 +97,7 @@ export function TerminalView({ sessionName, ws, connected, onDiff, onHistory, on
       // Defer fit until container has non-zero dimensions (mobile needs a frame to lay out)
       let fitDone = false;
       const doFit = () => {
+        if (!activeRef.current) return;
         const el = containerRef.current;
         if (el && el.clientWidth > 0 && el.clientHeight > 0) {
           fittingRef.current = true;
@@ -107,6 +112,7 @@ export function TerminalView({ sessionName, ws, connected, onDiff, onHistory, on
       });
       // Fallback: force a fit after 400ms for slow mobile renders
       fitTimer = setTimeout(() => {
+        if (!activeRef.current) return;
         if (!fitDone) {
           fittingRef.current = true;
           fitAddon.fit();
@@ -176,6 +182,7 @@ export function TerminalView({ sessionName, ws, connected, onDiff, onHistory, on
 
     // Expose fit function so parent can trigger resize on send / focus
     const doFitAndSnap = () => {
+      if (!activeRef.current) return;
       fittingRef.current = true;
       fitAddon.fit();
       // Use rAF so the reflow onScroll events fire before we clear fittingRef
@@ -190,12 +197,13 @@ export function TerminalView({ sessionName, ws, connected, onDiff, onHistory, on
     // Re-fit when window regains focus or tab becomes visible.
     const onWindowFocus = () => { doFitAndSnap(); };
     const onVisibilityChange = () => {
-      if (document.visibilityState === 'visible') { doFitAndSnap(); }
+      if (activeRef.current && document.visibilityState === 'visible') { doFitAndSnap(); }
     };
     window.addEventListener('focus', onWindowFocus);
     document.addEventListener('visibilitychange', onVisibilityChange);
 
     const handleResize = (rect?: DOMRectReadOnly) => {
+      if (!activeRef.current) return;
       // Skip when container is hidden (display:none → dimensions are 0)
       if (!rect || rect.width === 0 || rect.height === 0) return;
       fittingRef.current = true;
@@ -235,7 +243,7 @@ export function TerminalView({ sessionName, ws, connected, onDiff, onHistory, on
   // always matches xterm — prevents garbled/corrupted display (花屏).
   // Skip when hidden (chat mode) — parent handles that with 200x50.
   useEffect(() => {
-    if (!connected) return;
+    if (!connected || !active) return;
     const el = containerRef.current;
     if (!el || el.clientWidth === 0 || el.clientHeight === 0) return; // hidden (chat mode)
     const term = termRef.current;
@@ -243,13 +251,13 @@ export function TerminalView({ sessionName, ws, connected, onDiff, onHistory, on
     if (term && ws) {
       ws.sendResize(sessionName, term.cols, term.rows);
     }
-  }, [connected, sessionName]);
+  }, [active, connected, sessionName]);
 
   // Raw PTY bytes: feed directly into xterm.js.
   // Use useEffect so cleanup properly unsubscribes this specific handler instance,
   // allowing multiple TerminalViews for the same session (e.g. preview card + window).
   useEffect(() => {
-    if (!ws) return;
+    if (!ws || !active) return;
     return ws.onTerminalRaw(sessionName, (data: Uint8Array) => {
       const term = termRef.current;
       if (!term) return;
@@ -262,11 +270,11 @@ export function TerminalView({ sessionName, ws, connected, onDiff, onHistory, on
         term.scrollToBottom();
       });
     });
-  }, [ws, sessionName]);
+  }, [active, ws, sessionName]);
 
   // Handle terminal.stream_reset — reset xterm state so stale ANSI doesn't corrupt (Task 5.4)
   useEffect(() => {
-    if (!ws) return;
+    if (!ws || !active) return;
     const unsub = ws.onMessage((msg) => {
       if (msg.type === 'terminal.stream_reset' && msg.session === sessionName) {
         termRef.current?.reset();
@@ -274,9 +282,10 @@ export function TerminalView({ sessionName, ws, connected, onDiff, onHistory, on
       }
     });
     return unsub;
-  }, [ws, sessionName]);
+  }, [active, ws, sessionName]);
 
   const applyDiff = useCallback((diff: TerminalDiff) => {
+    if (!activeRef.current) return;
     const term = termRef.current;
     if (!term) return;
 
@@ -319,6 +328,7 @@ export function TerminalView({ sessionName, ws, connected, onDiff, onHistory, on
   }, []);
 
   const applyHistory = useCallback((content: string) => {
+    if (!activeRef.current) return;
     const term = termRef.current;
     if (!term || !content) return;
     // Write history into scrollback as a single batched write to reduce main-thread churn.
@@ -335,6 +345,17 @@ export function TerminalView({ sessionName, ws, connected, onDiff, onHistory, on
   useEffect(() => {
     onHistory?.(applyHistory);
   }, [applyHistory, onHistory]);
+
+  useEffect(() => {
+    if (active) return;
+    if (scrollHideTimerRef.current) {
+      clearTimeout(scrollHideTimerRef.current);
+      scrollHideTimerRef.current = null;
+    }
+    setShowScrollbar(false);
+    setScrolledUp(false);
+    setScrollProgress(1);
+  }, [active]);
 
   const scrollToBottom = () => {
     // Re-enter auto-follow mode (State 2) before scrolling

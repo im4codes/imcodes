@@ -18,8 +18,11 @@ sharedDb.open().catch(() => {});
 // session (e.g. SubSessionWindow opening while SubSessionCard is running) can
 // render immediately from in-memory state without waiting for IDB or network.
 const eventsCache = new Map<string, TimelineEvent[]>();
+const eventsCacheAccess = new Map<string, number>();
 
 const MAX_MEMORY_EVENTS = 2000;
+const MAX_CACHED_SESSIONS = 12;
+const MAX_TOTAL_CACHED_EVENTS = 12_000;
 const ECHO_WINDOW_MS = 500;
 // Dedup window for user.message from JSONL vs web-UI-sent: JSONL watcher polls every 2s,
 // so the same message can arrive twice (once from command-handler, once from JSONL).
@@ -32,6 +35,53 @@ function normalizeForEcho(text: string): string {
     .trim()
     .replace(/^[❯>λ›$%#]\s*/, '')
     .replace(/\s+/g, ' ');
+}
+
+function markCacheAccess(cacheKey: string): void {
+  eventsCacheAccess.set(cacheKey, Date.now());
+}
+
+function getCachedEvents(cacheKey: string): TimelineEvent[] | undefined {
+  const cached = eventsCache.get(cacheKey);
+  if (cached) markCacheAccess(cacheKey);
+  return cached;
+}
+
+function setCachedEvents(cacheKey: string, events: TimelineEvent[]): void {
+  eventsCache.set(cacheKey, events);
+  markCacheAccess(cacheKey);
+  pruneTimelineCache();
+}
+
+function pruneTimelineCache(): void {
+  let totalEvents = 0;
+  for (const events of eventsCache.values()) totalEvents += events.length;
+  if (eventsCache.size <= MAX_CACHED_SESSIONS && totalEvents <= MAX_TOTAL_CACHED_EVENTS) return;
+
+  const evictionOrder = [...eventsCache.keys()]
+    .map((key) => ({ key, at: eventsCacheAccess.get(key) ?? 0, size: eventsCache.get(key)?.length ?? 0 }))
+    .sort((a, b) => a.at - b.at);
+
+  for (const entry of evictionOrder) {
+    if (eventsCache.size <= MAX_CACHED_SESSIONS && totalEvents <= MAX_TOTAL_CACHED_EVENTS) break;
+    if (eventsCache.delete(entry.key)) {
+      eventsCacheAccess.delete(entry.key);
+      totalEvents -= entry.size;
+    }
+  }
+}
+
+export function __resetTimelineCacheForTests(): void {
+  eventsCache.clear();
+  eventsCacheAccess.clear();
+}
+
+export function __getTimelineCacheKeysForTests(): string[] {
+  return [...eventsCache.keys()];
+}
+
+export function __setTimelineCacheForTests(cacheKey: string, events: TimelineEvent[]): void {
+  setCachedEvents(cacheKey, events);
 }
 
 export interface UseTimelineResult {
@@ -85,7 +135,7 @@ export function useTimeline(
     let cancelled = false;
 
     // 1. Module-level memory cache — instant restore (e.g. window reopen)
-    const memCached = eventsCache.get(cacheKey!);
+    const memCached = getCachedEvents(cacheKey!);
     if (memCached && memCached.length > 0) {
       setEvents(memCached);
       setLoading(false);
@@ -122,7 +172,7 @@ export function useTimeline(
         seqRef.current = last.seq;
         const stored = await db.getRecentEvents(cacheKey!, { limit: MAX_MEMORY_EVENTS });
         if (cancelled) return;
-        eventsCache.set(cacheKey!, stored);
+        setCachedEvents(cacheKey!, stored);
         setEvents(stored);
         setLoading(false);
         historyLoadedRef.current = cacheKey;
@@ -164,7 +214,7 @@ export function useTimeline(
     };
     setEvents((prev) => {
       const result = [...prev, event];
-      if (cacheKey) eventsCache.set(cacheKey, result);
+      if (cacheKey) setCachedEvents(cacheKey, result);
       return result;
     });
   }, [sessionId, cacheKey]);
@@ -180,7 +230,7 @@ export function useTimeline(
   // Load older events (backward pagination)
   const loadOlderEvents = useCallback(() => {
     if (!ws?.connected || !sessionId || loadingOlderRef.current) return;
-    const cached = cacheKey ? eventsCache.get(cacheKey) : undefined;
+    const cached = cacheKey ? getCachedEvents(cacheKey) : undefined;
     if (!cached || cached.length === 0) return;
     const oldestTs = Math.min(...cached.map((e) => e.ts));
     loadingOlderRef.current = true;
@@ -202,7 +252,7 @@ export function useTimeline(
           // Replace in place — enables typewriter effect for streaming events
           const updated = [...prev];
           updated[i] = event;
-          if (cacheKey) eventsCache.set(cacheKey, updated);
+          if (cacheKey) setCachedEvents(cacheKey, updated);
           return updated;
         }
       }
@@ -210,7 +260,7 @@ export function useTimeline(
       const result = next.length > MAX_MEMORY_EVENTS
         ? next.slice(next.length - MAX_MEMORY_EVENTS)
         : next;
-      if (cacheKey) eventsCache.set(cacheKey, result);
+      if (cacheKey) setCachedEvents(cacheKey, result);
       return result;
     });
   }, [cacheKey]);
@@ -240,7 +290,7 @@ export function useTimeline(
       const result = merged.length > MAX_MEMORY_EVENTS
         ? merged.slice(merged.length - MAX_MEMORY_EVENTS)
         : merged;
-      if (cacheKey) eventsCache.set(cacheKey, result);
+      if (cacheKey) setCachedEvents(cacheKey, result);
       return result;
     });
   }, []);
@@ -289,7 +339,7 @@ export function useTimeline(
               (e) => !(e.type === 'user.message' && e.payload.pending && String(e.payload.text ?? '').trim() === text),
             );
             if (withoutPending.length < prev.length) {
-              if (cacheKey) eventsCache.set(cacheKey, withoutPending);
+              if (cacheKey) setCachedEvents(cacheKey, withoutPending);
               return withoutPending;
             }
             // No pending event — check for confirmed dedup (JSONL re-emit)
@@ -375,12 +425,12 @@ export function useTimeline(
         // will bring back any messages that were actually processed.
         setEvents((prev) => {
           const cleaned = prev.filter((e) => !(e.type === 'user.message' && e.payload.pending));
-          if (cleaned.length !== prev.length && cacheKey) eventsCache.set(cacheKey, cleaned);
+          if (cleaned.length !== prev.length && cacheKey) setCachedEvents(cacheKey, cleaned);
           return cleaned;
         });
         if (ws && sessionId) {
           setRefreshing(true);
-          const cached = cacheKey ? eventsCache.get(cacheKey) : undefined;
+          const cached = cacheKey ? getCachedEvents(cacheKey) : undefined;
           const afterTs = cached && cached.length > 0 ? Math.max(...cached.map((e) => e.ts)) : undefined;
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500, afterTs);
         }
@@ -394,7 +444,7 @@ export function useTimeline(
       // epoch mismatch and seq desync issues on mobile (app killed/backgrounded).
       if (msg.type === 'session.event' && (msg as { event: string }).event === 'connected') {
         if (ws && sessionId) {
-          const cached = cacheKey ? eventsCache.get(cacheKey) : undefined;
+          const cached = cacheKey ? getCachedEvents(cacheKey) : undefined;
           const afterTs = cached && cached.length > 0 ? Math.max(...cached.map((e) => e.ts)) : undefined;
           historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500, afterTs);
         }

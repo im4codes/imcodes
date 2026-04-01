@@ -152,4 +152,52 @@ describe('TerminalView', () => {
     unmount();
     expect(mockDispose).toHaveBeenCalledOnce();
   });
+
+  it('does not subscribe to raw terminal bytes while inactive', async () => {
+    const onTerminalRaw = vi.fn();
+    render(
+      <TerminalView sessionName="inactive-session" ws={{ onTerminalRaw } as any} active={false} />,
+    );
+    expect(onTerminalRaw).not.toHaveBeenCalled();
+  });
+
+  it('does not apply diffs while inactive', async () => {
+    const { Terminal } = await import('xterm');
+    const mockWrite = vi.fn();
+    (Terminal as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      open: vi.fn(),
+      write: mockWrite,
+      reset: vi.fn(),
+      loadAddon: vi.fn(),
+      dispose: vi.fn(),
+      options: {},
+      attachCustomKeyEventHandler: vi.fn(),
+      hasSelection: vi.fn().mockReturnValue(false),
+      getSelection: vi.fn().mockReturnValue(''),
+      onData: vi.fn(),
+      onResize: vi.fn(),
+      onScroll: vi.fn(),
+      focus: vi.fn(),
+      scrollToBottom: vi.fn(),
+      buffer: { active: { baseY: 0, viewportY: 0 } },
+      cols: 80,
+      rows: 24,
+    }));
+
+    let capturedApplyDiff: ((diff: TerminalDiff) => void) | undefined;
+    render(
+      <TerminalView
+        sessionName="inactive-diff"
+        active={false}
+        onDiff={(fn) => { capturedApplyDiff = fn; }}
+      />,
+    );
+
+    capturedApplyDiff?.({
+      rows: 1,
+      lines: [[0, 'hidden update']],
+    });
+
+    expect(mockWrite).not.toHaveBeenCalled();
+  });
 });

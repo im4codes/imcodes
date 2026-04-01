@@ -195,6 +195,11 @@ export function SessionPane({
   const chatVisible = isActive && effectiveViewMode === 'chat';
   const isShellTerminal = terminalVisible && (session.agentType === 'shell' || session.agentType === 'script');
 
+  useEffect(() => {
+    if (!terminalVisible || !connected || !ws) return;
+    try { ws.sendSnapshotRequest(sessionName); } catch { /* ignore */ }
+  }, [terminalVisible, connected, ws, sessionName]);
+
   return (
     <div class={isShellTerminal ? 'shell-terminal-pane' : undefined} style={{ display: 'contents' }}>
       {/* Terminal view: kept alive, shown/hidden via CSS display */}
@@ -206,6 +211,7 @@ export function SessionPane({
           sessionName={sessionName}
           ws={ws}
           connected={connected}
+          active={terminalVisible}
           onDiff={onDiff ? (apply) => onDiff(apply) : undefined}
           onHistory={onHistory ? (apply) => onHistory(apply) : undefined}
           onFocusFn={onFocusFn}

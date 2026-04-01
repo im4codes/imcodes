@@ -473,7 +473,7 @@ export function App() {
   const [subUsages, setSubUsages] = useState<Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string }>>(new Map());
   const quickData = useQuickData();
   const lastImcodesActivityRef = useRef(Date.now());
-  const lastCodexStatusRequestRef = useRef(new Map<string, number>());
+  const resubscribeTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
 
   // IDs of currently-open (non-minimized) sub-session windows
   const [openSubIds, setOpenSubIds] = useState<Set<string>>(new Set());
@@ -504,6 +504,8 @@ export function App() {
     }
     return maxId;
   }, [subZIndexes, openSubIds]);
+  const focusedSubIdRef = useRef(focusedSubId);
+  focusedSubIdRef.current = focusedSubId;
 
   useEffect(() => {
     const markActive = () => { lastImcodesActivityRef.current = Date.now(); };
@@ -1120,18 +1122,18 @@ export function App() {
       if (msg.type === 'daemon.reconnected') {
         setDaemonOnline(true);
         // Daemon process (re)started — all its subscriptions are gone.
-        // Re-subscribe all sessions immediately so terminals resume without a page refresh.
-        for (const s of sessionsRef.current) {
-          ws.subscribeTerminal(s.name);
-          const mode = viewModesRef.current[s.name] ?? defaultViewMode;
-          if (mode === 'chat') {
-            ws.sendResize(s.name, 200, 50);
-          }
-        }
-        // Re-subscribe all sub-session terminals
-        for (const sub of subSessionsRef.current) {
-          ws.subscribeTerminal(sub.sessionName);
-        }
+        // Re-subscribe active targets first, then stagger the rest to avoid a herd.
+        const activeName = activeSessionRef.current;
+        const activeMode = activeName ? (viewModesRef.current[activeName] ?? defaultViewMode) as ViewMode : undefined;
+        const focusedSub = focusedSubIdRef.current
+          ? subSessionsRef.current.find((sub) => sub.id === focusedSubIdRef.current)
+          : null;
+        scheduleResubscribe([
+          ...(activeName ? [{ name: activeName, mode: activeMode }] : []),
+          ...(focusedSub ? [{ name: focusedSub.sessionName, mode: 'chat' as ViewMode }] : []),
+          ...sessionsRef.current.map((s) => ({ name: s.name, mode: (viewModesRef.current[s.name] ?? defaultViewMode) as ViewMode })),
+          ...subSessionsRef.current.map((sub) => ({ name: sub.sessionName, mode: 'chat' as ViewMode })),
+        ]);
         // Refresh discussion list
         ws.discussionList();
       }
@@ -1165,6 +1167,8 @@ export function App() {
       setLatencyMs(null);
       setDaemonStats(null);
       if (sessionListRetryRef.current) { clearTimeout(sessionListRetryRef.current); sessionListRetryRef.current = null; }
+      for (const timer of resubscribeTimersRef.current) clearTimeout(timer);
+      resubscribeTimersRef.current.clear();
     };
   }, [auth, selectedServerId]);
 
@@ -1560,45 +1564,31 @@ export function App() {
   }
 
   const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
-  const focusedSubSession = useMemo(
-    () => focusedSubId ? subSessions.find((sub) => sub.id === focusedSubId) ?? null : null,
-    [focusedSubId, subSessions],
-  );
 
-  useEffect(() => {
+  function scheduleResubscribe(items: Array<{ name: string; mode?: ViewMode }>) {
     const ws = wsRef.current;
-    if (!ws?.connected || !connected) return;
+    if (!ws?.connected || items.length === 0) return;
 
-    const check = () => {
-      if (document.visibilityState !== 'visible') return;
-      if (Date.now() - lastImcodesActivityRef.current > 10 * 60_000) return;
+    const unique = new Map<string, { name: string; mode?: ViewMode }>();
+    for (const item of items) {
+      if (!unique.has(item.name)) unique.set(item.name, item);
+    }
 
-      const target = focusedSubSession
-        ? { sessionName: focusedSubSession.sessionName, agentType: focusedSubSession.type, state: focusedSubSession.state }
-        : activeSessionInfo
-          ? { sessionName: activeSessionInfo.name, agentType: activeSessionInfo.agentType, state: activeSessionInfo.state }
-          : null;
-      if (!target || target.agentType !== 'codex' || target.state !== 'idle') return;
-
-      const lastSentAt = lastCodexStatusRequestRef.current.get(target.sessionName) ?? 0;
-      if (lastSentAt !== 0 && Date.now() - lastSentAt < 5 * 60_000) return;
-
-      lastCodexStatusRequestRef.current.set(target.sessionName, Date.now());
-      try { ws.requestCodexStatus(target.sessionName); } catch { /* ignore */ }
-    };
-
-    check();
-    const timer = setInterval(check, 30_000);
-    return () => clearInterval(timer);
-  }, [
-    activeSessionInfo?.agentType,
-    activeSessionInfo?.name,
-    activeSessionInfo?.state,
-    connected,
-    focusedSubSession?.sessionName,
-    focusedSubSession?.state,
-    focusedSubSession?.type,
-  ]);
+    let index = 0;
+    for (const item of unique.values()) {
+      const timer = setTimeout(() => {
+        resubscribeTimersRef.current.delete(timer);
+        const liveWs = wsRef.current;
+        if (!liveWs?.connected) return;
+        try { liveWs.subscribeTerminal(item.name); } catch { return; }
+        if (item.mode === 'chat') {
+          try { liveWs.sendResize(item.name, 200, 50); } catch { /* ignore */ }
+        }
+      }, index * 120);
+      resubscribeTimersRef.current.add(timer);
+      index++;
+    }
+  }
 
   useEffect(() => {
     if (!pendingRepoToastSession) return;

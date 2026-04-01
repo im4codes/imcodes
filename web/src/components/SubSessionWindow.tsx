@@ -150,12 +150,12 @@ export function SubSessionWindow({
     } else if (viewMode === 'terminal') {
       requestAnimationFrame(() => {
         termFitFnRef.current?.();
-        if (ws && connected) {
+        if (ws && connected && active) {
           try { ws.sendSnapshotRequest(sub.sessionName); } catch { /* ignore */ }
         }
       });
     }
-  }, [viewMode, ws, connected, sub.sessionName]);
+  }, [viewMode, ws, connected, active, sub.sessionName]);
 
   // Re-subscribe terminal on mount so the server sends a fresh snapshot.
   // SubSessionWindow unmounts on minimize, so without this the remounted
@@ -336,6 +336,7 @@ export function SubSessionWindow({
             sessionName={sub.sessionName}
             ws={ws}
             connected={connected}
+            active={active && viewMode === 'terminal'}
             onDiff={(apply) => onDiff(sub.sessionName, apply)}
             onHistory={(apply) => onHistory(sub.sessionName, apply)}
             onFitFn={(fn) => { termFitFnRef.current = fn; }}
