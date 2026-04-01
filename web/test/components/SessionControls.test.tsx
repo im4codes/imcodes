@@ -298,11 +298,13 @@ describe('SessionControls', () => {
     fireEvent.input(input);
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
 
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       sessionName: 'deck_my-project_brain',
       text: 'please review',
-      directTargetSession: 'deck_sub_w1',
-    });
+      p2pAtTargets: [
+        { session: 'deck_sub_w1', mode: 'audit' },
+      ],
+    }));
 
     getSelectionSpy.mockRestore();
   });
@@ -411,7 +413,7 @@ describe('SessionControls', () => {
     getSelectionSpy.mockRestore();
   });
 
-  it('manual @@label(mode) text sends direct when exactly one target resolves', () => {
+  it('manual @@label(mode) text sends single-target p2p routing when exactly one target resolves', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -429,11 +431,13 @@ describe('SessionControls', () => {
     fireEvent.input(input);
     fireEvent.click(screen.getByRole('button', { name: /send/i }));
 
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       sessionName: 'deck_my-project_brain',
       text: 'check this',
-      directTargetSession: 'deck_sub_plan',
-    });
+      p2pAtTargets: [
+        { session: 'deck_sub_plan', mode: 'audit' },
+      ],
+    }));
   });
 
   it('manual @@label(mode) text sends p2pAtTargets when multiple targets resolve', () => {

@@ -438,14 +438,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       // @ picker was used — derive routing from the visible textbox order, then strip matched labels.
       const { orderedTargets, cleanText } = extractOrderedAtTargets(text, pendingTargets);
       text = cleanText;
-      if (orderedTargets.length === 1 && orderedTargets[0].session !== '__all__') {
-        extra.directTargetSession = orderedTargets[0].session;
-      } else if (orderedTargets.length > 1 || orderedTargets.some((t) => t.session === '__all__')) {
+      if (orderedTargets.length > 0) {
         extra.p2pAtTargets = orderedTargets.map(({ session, mode }) => ({ session, mode }));
       }
       // Attach config data when any target uses config mode
       const hasConfigTarget = orderedTargets.some(t => t.mode === 'config');
-      if (!extra.directTargetSession && hasConfigTarget) {
+      if (extra.p2pAtTargets && hasConfigTarget) {
         const override = pendingConfigOverrideRef.current;
         const cfg = override?.config ?? p2pSavedConfig;
         if (cfg) {
@@ -457,10 +455,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       pendingConfigOverrideRef.current = null;
     } else {
       const manual = extractManualP2pTargets(text, buildManualP2pCandidates(sessions, subSessions));
-      if (manual.orderedTargets.length === 1 && manual.orderedTargets[0].session !== '__all__') {
-        text = manual.cleanText;
-        extra.directTargetSession = manual.orderedTargets[0].session;
-      } else if (manual.orderedTargets.length > 1 || manual.orderedTargets.some((t) => t.session === '__all__')) {
+      if (manual.orderedTargets.length > 0) {
         text = manual.cleanText;
         extra.p2pAtTargets = manual.orderedTargets;
       } else if (p2pMode !== 'solo' && !text.includes('@@')) {
@@ -479,7 +474,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       }
     }
 
-    if (!extra.directTargetSession && !extra.p2pAtTargets && p2pMode !== 'solo' && !text.includes('@@')) {
+    if (!extra.p2pAtTargets && p2pMode !== 'solo' && !text.includes('@@')) {
       // Dropdown P2P mode — daemon handles expansion
       if (p2pMode === P2P_CONFIG_MODE) {
         extra.p2pMode = 'config';

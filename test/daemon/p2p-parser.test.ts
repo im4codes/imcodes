@@ -248,7 +248,7 @@ describe('structured P2P routing via WS fields', () => {
     expect(cleanText).not.toContain('@@');
   });
 
-  it('p2pAtTargets with specific session sends to that session', async () => {
+  it('single-target p2pAtTargets routes through the initiator with a peer consultation prompt', async () => {
     handleWebCommand({
       type: 'session.send',
       sessionName: 'deck_proj_brain',
@@ -259,13 +259,30 @@ describe('structured P2P routing via WS fields', () => {
 
     await new Promise((r) => setTimeout(r, 100));
 
-    expect(startP2pRun).toHaveBeenCalledOnce();
-    const [_initiator, targets, cleanText] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(targets).toEqual([{ session: 'deck_proj_w1', mode: 'review' }]);
-    expect(cleanText).toBe('check the tests');
+    expect(startP2pRun).not.toHaveBeenCalled();
+    expect(sendKeysDelayedEnter).toHaveBeenCalledWith(
+      'deck_proj_brain',
+      expect.stringContaining('[Peer Consultation Task]'),
+      undefined,
+    );
+    expect(sendKeysDelayedEnter).toHaveBeenCalledWith(
+      'deck_proj_brain',
+      expect.stringContaining('User request: "check the tests"'),
+      undefined,
+    );
+    expect(sendKeysDelayedEnter).toHaveBeenCalledWith(
+      'deck_proj_brain',
+      expect.stringContaining('imcodes send --reply "deck_proj_w1"'),
+      undefined,
+    );
+    expect(sendKeysDelayedEnter).toHaveBeenCalledWith(
+      'deck_proj_brain',
+      expect.stringContaining('Consultation mode for deck_proj_w1: review'),
+      undefined,
+    );
   });
 
-  it('structured p2pAtTargets is authoritative; daemon does not interpret visible @@labels', async () => {
+  it('structured p2pAtTargets is authoritative for single-target consult routing', async () => {
     handleWebCommand({
       type: 'session.send',
       sessionName: 'deck_proj_brain',
@@ -276,9 +293,12 @@ describe('structured P2P routing via WS fields', () => {
 
     await new Promise((r) => setTimeout(r, 100));
 
-    expect(startP2pRun).toHaveBeenCalledOnce();
-    const [_initiator, targets] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(targets).toEqual([{ session: 'deck_proj_w1', mode: 'review' }]);
+    expect(startP2pRun).not.toHaveBeenCalled();
+    expect(sendKeysDelayedEnter).toHaveBeenCalledWith(
+      'deck_proj_brain',
+      expect.stringContaining('Consultation mode for deck_proj_w1: review'),
+      undefined,
+    );
   });
 
   it('structured p2pAtTargets preserves the caller-provided agent order', async () => {
@@ -336,26 +356,32 @@ describe('structured P2P routing via WS fields', () => {
     expect(startP2pRun).not.toHaveBeenCalled();
   });
 
-  it('directTargetSession sends to the target and replies back to the sender once', async () => {
+  it('legacy directTargetSession also routes through the initiator prompt', async () => {
     handleWebCommand({
       type: 'session.send',
       sessionName: 'deck_proj_brain',
       text: 'please check this',
       commandId: 'cmd-direct-1',
       directTargetSession: 'deck_proj_w1',
+      directTargetMode: 'audit',
     }, mockServerLink as any);
 
     await new Promise((r) => setTimeout(r, 100));
 
     expect(startP2pRun).not.toHaveBeenCalled();
     expect(sendKeysDelayedEnter).toHaveBeenCalledWith(
-      'deck_proj_w1',
+      'deck_proj_brain',
       expect.stringContaining('please check this'),
       undefined,
     );
     expect(sendKeysDelayedEnter).toHaveBeenCalledWith(
-      'deck_proj_w1',
-      expect.stringContaining('imcodes send --no-reply "deck_proj_brain" "<your response>"'),
+      'deck_proj_brain',
+      expect.stringContaining('imcodes send --reply "deck_proj_w1"'),
+      undefined,
+    );
+    expect(sendKeysDelayedEnter).toHaveBeenCalledWith(
+      'deck_proj_brain',
+      expect.stringContaining('Consultation mode for deck_proj_w1: audit'),
       undefined,
     );
     expect(mockServerLink.send).toHaveBeenCalledWith(expect.objectContaining({
