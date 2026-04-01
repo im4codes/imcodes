@@ -56,3 +56,5 @@ openspec/
 .imcodes-prompt-*.md
 tmp/
 .imc/
+
+docs/
