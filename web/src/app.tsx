@@ -2023,14 +2023,6 @@ export function App() {
           </div>
           <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
             <LanguageSwitcher />
-            <button
-              class="btn btn-secondary"
-              style={{ fontSize: 11, flex: 1 }}
-              onClick={() => setSelectedServerId(null)}
-              title="API Keys & Settings"
-            >
-              ⚙
-            </button>
           </div>
           <button class="btn btn-secondary" style={{ width: '100%', fontSize: 11 }} onClick={handleLogout}>
             Log Out
@@ -2328,6 +2320,16 @@ export function App() {
             <div class="mobile-sidebar-header">
               <span style={{ fontWeight: 700, fontSize: 14, color: '#e2e8f0' }}>IM.codes</span>
               <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                <button
+                  class="mobile-sidebar-hdr-btn"
+                  onClick={() => { setSelectedServerId(null); closeSidebar(); }}
+                  title="Home"
+                >🏠</button>
+                <button
+                  class="mobile-sidebar-hdr-btn"
+                  onClick={() => { setShowSettingsPage(true); closeSidebar(); }}
+                  title="Settings"
+                >⚙</button>
                 <button
                   class={`mobile-sidebar-hdr-btn${mobileHideServerBar ? '' : ' active'}`}
                   onClick={() => setMobileHideServerBar((p) => { const v = !p; localStorage.setItem('mobile_hide_server_bar', v ? '1' : ''); return v; })}
