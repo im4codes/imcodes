@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+const normalizeSlashes = (value: string) => value.replace(/\\/g, '/');
+
 // ── Mock node-pty ──────────────────────────────────────────────────────────────
 
 interface MockPty {
@@ -471,8 +473,7 @@ describe('conpty backend', () => {
   describe('conptyGetPaneCwd', () => {
     it('returns cached spawn CWD', async () => {
       await conpty.conptyNewSession('cwd-test', 'cmd', { cwd: '/home/user/project' });
-      const expected = process.platform === 'win32' ? '\\home\\user\\project' : '/home/user/project';
-      expect(conpty.conptyGetPaneCwd('cwd-test')).toBe(expected);
+      expect(normalizeSlashes(conpty.conptyGetPaneCwd('cwd-test'))).toBe('/home/user/project');
     });
 
     it('returns empty string for non-existent session', () => {
@@ -505,10 +506,10 @@ describe('conpty backend', () => {
 
       expect(conpty.conptySessionExists('respawn-test')).toBe(true);
       // Should have spawned with new command but preserved CWD
-      const expectedCwd = process.platform === 'win32' ? '\\old\\path' : '/old/path';
-      expect(spawnMock).toHaveBeenLastCalledWith('new-cmd', [], expect.objectContaining({
-        cwd: expectedCwd,
-      }));
+      const lastCall = spawnMock.mock.calls.at(-1) as [string, string[], { cwd?: string }] | undefined;
+      expect(lastCall?.[0]).toBe('new-cmd');
+      expect(lastCall?.[1]).toEqual([]);
+      expect(normalizeSlashes(lastCall?.[2]?.cwd ?? '')).toBe('/old/path');
     });
 
     it('old PTY is killed before new one is spawned', async () => {
