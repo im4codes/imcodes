@@ -659,6 +659,35 @@ body {
 .discussion-participant-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 6px 8px; background: #0f172a; border: 1px solid #1e293b; border-radius: 6px; }
 .discussion-verdict-badge { font-size: 14px; margin-left: 2px; flex-shrink: 0; }
 .discussion-panel { display: flex; flex-direction: column; gap: 8px; padding: 8px; }
+.discussion-panel .discussions-progress-card {
+  border-radius: 10px;
+}
+.discussion-panel .discussions-progress-card-compact {
+  padding: 8px 10px 10px;
+}
+.discussion-panel .discussions-progress-card-compact .discussions-progress-head {
+  margin-bottom: 6px;
+}
+.discussion-panel .discussions-progress-card-compact .discussions-progress-title {
+  font-size: 12px;
+}
+.discussion-panel .discussions-progress-card-compact .discussions-progress-meta {
+  margin-bottom: 6px;
+}
+.discussion-panel .discussions-progress-card-compact .discussions-progress-lines {
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.discussion-panel .discussions-progress-card-compact .discussions-progress-segments-round {
+  height: 16px;
+}
+.discussion-panel .discussions-progress-card-compact .discussions-progress-segments-hop {
+  height: 12px;
+}
+.discussion-panel .discussions-progress-card-compact .discussions-progress-node {
+  padding: 4px 7px;
+  font-size: 10px;
+}
 .discussion-card { background: #0f172a; border: 1px solid #1e293b; border-radius: 6px; padding: 10px; }
 .discussion-card.running { border-color: #22c55e40; }
 .discussion-card.verdict { border-color: #f59e0b40; }

@@ -12,6 +12,8 @@ import { reorderSubSessions } from '../api.js';
 import { formatLabel } from '../format-label.js';
 import { resolveContextWindow } from '../model-context.js';
 import { shortModelLabel } from '../model-label.js';
+import { P2pProgressCard } from './P2pProgressCard.js';
+import type { P2pProgressDiscussion } from './P2pProgressCard.js';
 
 interface DaemonStats {
   daemonVersion?: string | null;
@@ -24,25 +26,11 @@ interface DaemonStats {
   uptime: number;
 }
 
-interface P2pNode {
-  label: string;
-  agentType: string;
-  status: 'done' | 'active' | 'pending' | 'skipped';
-}
-
-interface DiscussionSummary {
-  id: string;
-  topic: string;
-  state: string;
-  currentRound: number;
-  maxRounds: number;
+type DiscussionSummary = P2pProgressDiscussion & {
   currentSpeaker?: string;
-  conclusion?: string;
-  error?: string;
   filePath?: string;
   fileId?: string;
-  nodes?: P2pNode[];
-}
+};
 
 interface Props {
   subSessions: SubSession[];
@@ -398,78 +386,15 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
       {/* Discussions panel — above sub-session buttons */}
       {discussions.length > 0 && (
         <div class="discussion-panel">
-          {discussions.map((d) => {
-            const isActive = d.state !== 'done' && d.state !== 'failed';
-            const nodes = d.nodes ?? [];
-            const doneCount = nodes.filter(n => n.status === 'done').length;
-            const totalNodes = nodes.length || d.maxRounds;
-            const progressPct = totalNodes > 0 ? Math.round((doneCount / totalNodes) * 100) : 0;
-
-            return (
-              <div key={d.id} class={`discussion-card ${d.state}`} style={{ cursor: d.fileId ? 'pointer' : undefined }} onClick={() => { if (d.fileId && onViewDiscussion) onViewDiscussion(d.fileId); }}>
-                {/* Segmented progress bar on TOP of card */}
-                {nodes.length > 0 && (
-                  <div style={{ display: 'flex', gap: 1, height: 3, borderRadius: 2, overflow: 'hidden' }}>
-                    {nodes.map((n, i) => (
-                      <div key={i} style={{
-                        flex: 1,
-                        background: n.status === 'done' ? '#22c55e' : n.status === 'active' ? '#3b82f6' : n.status === 'skipped' ? '#ef4444' : '#334155',
-                        transition: 'background 0.3s',
-                      }} title={`${n.label} (${n.agentType}) — ${n.status}`} />
-                    ))}
-                  </div>
-                )}
-                {nodes.length === 0 && isActive && (
-                  <div class="discussion-progress-bar" style={{ height: 3, borderRadius: 2 }}>
-                    <div class="discussion-progress-fill" style={{ width: `${progressPct}%` }} />
-                  </div>
-                )}
-
-                <div class="discussion-card-header" style={{ padding: '6px 10px' }}>
-                  <div class="discussion-card-title" style={{ fontSize: 12 }}>⚖️ {d.topic || 'Discussion'}</div>
-                  <div class="discussion-card-actions">
-                    {isActive && onStopDiscussion && (
-                      <button class="btn btn-sm btn-danger" style={{ fontSize: 10, padding: '1px 6px' }} onClick={(e: Event) => { e.stopPropagation(); onStopDiscussion(d.id); }}>Stop</button>
-                    )}
-                  </div>
-                </div>
-
-                {/* Node list — shows each participant with type and status */}
-                {nodes.length > 0 && isActive && (
-                  <div style={{ padding: '2px 10px 6px', display: 'flex', flexWrap: 'wrap', gap: '3px 8px', fontSize: 10, color: '#94a3b8' }}>
-                    {nodes.map((n, i) => (
-                      <span key={i} style={{
-                        color: n.status === 'done' ? '#22c55e' : n.status === 'active' ? '#60a5fa' : n.status === 'skipped' ? '#f87171' : '#475569',
-                        fontWeight: n.status === 'active' ? 600 : 400,
-                      }}>
-                        {n.status === 'done' ? '✓' : n.status === 'active' ? '▸' : n.status === 'skipped' ? '✕' : '○'}{' '}
-                        {n.label} <span style={{ opacity: 0.6 }}>({n.agentType})</span>
-                      </span>
-                    ))}
-                  </div>
-                )}
-
-                <div class="discussion-card-body" style={{ padding: nodes.length > 0 ? '0 10px 6px' : undefined }}>
-                  {d.state === 'done' && (
-                    <>
-                      <div class="discussion-status done">✓ Complete</div>
-                      {d.conclusion && (
-                        <div class="discussion-conclusion">{d.conclusion}</div>
-                      )}
-                    </>
-                  )}
-                  {d.state === 'failed' && (
-                    <>
-                      <div class="discussion-status failed">✕ Failed</div>
-                      {d.error && (
-                        <div class="discussion-conclusion" style={{ color: '#f87171' }}>{d.error}</div>
-                      )}
-                    </>
-                  )}
-                </div>
-              </div>
-            );
-          })}
+          {discussions.map((d) => (
+            <P2pProgressCard
+              key={d.id}
+              discussion={d}
+              compact
+              onStopDiscussion={onStopDiscussion}
+              onClick={d.fileId && onViewDiscussion ? () => onViewDiscussion(d.fileId!) : undefined}
+            />
+          ))}
         </div>
       )}
 

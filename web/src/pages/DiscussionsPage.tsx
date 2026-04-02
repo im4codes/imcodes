@@ -3,31 +3,8 @@ import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 import { useTranslation } from 'react-i18next';
 import type { WsClient, ServerMessage } from '../ws-client.js';
-
-interface P2pNode {
-  label: string;
-  displayLabel?: string;
-  agentType: string;
-  ccPreset?: string | null;
-  mode?: string;
-  phase?: 'initial' | 'hop' | 'summary';
-  status: 'done' | 'active' | 'pending' | 'skipped';
-}
-
-interface LiveDiscussion {
-  id: string;
-  topic: string;
-  state: string;
-  modeKey?: string;
-  currentRound: number;
-  maxRounds: number;
-  completedHops?: number;
-  totalHops?: number;
-  activeHop?: number | null;
-  activePhase?: 'queued' | 'initial' | 'hop' | 'summary';
-  initiatorLabel?: string;
-  nodes?: P2pNode[];
-}
+import { P2pProgressCard } from '../components/P2pProgressCard.js';
+import type { P2pProgressDiscussion } from '../components/P2pProgressCard.js';
 
 interface P2pDiscussion {
   id: string;
@@ -41,7 +18,7 @@ interface Props {
   onBack?: () => void;
   initialSelectedId?: string | null;
   /** Live discussion state from app (progress, nodes). */
-  liveDiscussions?: LiveDiscussion[];
+  liveDiscussions?: P2pProgressDiscussion[];
   onStopDiscussion?: (id: string) => void;
 }
 
@@ -146,21 +123,6 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
   // Find matching live discussion for progress display
   const activeLive = liveDiscussions.filter((d) => d.state !== 'done' && d.state !== 'failed');
 
-  const phaseLabel = useCallback((phase?: string) => {
-    if (!phase) return null;
-    return t(`p2p.discussions.phase_${phase}`);
-  }, [t]);
-
-  const statusClassName = useCallback((status: P2pNode['status']) => (
-    status === 'done'
-      ? 'is-done'
-      : status === 'active'
-        ? 'is-active'
-        : status === 'skipped'
-          ? 'is-skipped'
-          : 'is-pending'
-  ), []);
-
   // Render markdown content safely
   const renderMarkdown = (md: string): string => {
     try {
@@ -189,109 +151,13 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
               {progressHidden ? t('p2p.discussions.show') : t('p2p.discussions.hide')}
             </button>
           </div>
-          {!progressHidden && activeLive.map((d) => {
-            const nodes = d.nodes ?? [];
-            const hopText = d.totalHops != null && d.totalHops > 0
-              ? `H${d.activeHop ?? d.completedHops ?? 0}/${d.totalHops}`
-              : null;
-            const roundText = `R${d.currentRound}/${d.maxRounds}`;
-            const roundSegments = Array.from({ length: Math.max(0, d.maxRounds) }, (_, idx) => {
-              const roundNum = idx + 1;
-              const status = d.state === 'done'
-                ? 'done'
-                : roundNum < d.currentRound
-                  ? 'done'
-                  : roundNum === d.currentRound
-                    ? 'active'
-                    : 'pending';
-              return { roundNum, status };
-            });
-            const hopSegments = Array.from({ length: Math.max(0, d.totalHops ?? 0) }, (_, idx) => {
-              const hopNum = idx + 1;
-              const activeHopNum = d.activeHop ?? d.completedHops ?? 0;
-              const status = d.state === 'done'
-                ? 'done'
-                : hopNum < activeHopNum
-                  ? 'done'
-                  : hopNum === activeHopNum && d.activePhase === 'hop'
-                    ? 'active'
-                    : 'pending';
-              return { hopNum, status };
-            });
-            return (
-              <div key={d.id} class="discussions-progress-card">
-                <div class="discussions-progress-head">
-                  <div class="discussions-progress-titlewrap">
-                    <div class="discussions-progress-kicker">P2P</div>
-                    <div class="discussions-progress-title">{d.topic || t('p2p.discussions.untitled')}</div>
-                  </div>
-                  {onStopDiscussion && (
-                    <button class="discussions-progress-stop" onClick={() => onStopDiscussion(d.id)}>
-                      {t('common.cancel')}
-                    </button>
-                  )}
-                </div>
-                <div class="discussions-progress-meta">
-                  {d.modeKey && <span class="discussions-progress-badge discussions-progress-badge-mode">{t(`p2p.mode.${d.modeKey}`, d.modeKey)}</span>}
-                  <span class="discussions-progress-badge">{roundText}</span>
-                  {hopText && <span class="discussions-progress-badge">{hopText}</span>}
-                  {d.activePhase && phaseLabel(d.activePhase) && (
-                    <span class="discussions-progress-badge discussions-progress-badge-phase">{phaseLabel(d.activePhase)}</span>
-                  )}
-                </div>
-                <div class="discussions-progress-lines">
-                  <div class="discussions-progress-line">
-                    <div class="discussions-progress-line-head">
-                      <span class="discussions-progress-line-label">{t('p2p.discussions.round_label')}</span>
-                      <span class="discussions-progress-line-value">{roundText}</span>
-                    </div>
-                    <div class="discussions-progress-segments discussions-progress-segments-round">
-                      {roundSegments.map((seg) => (
-                        <div
-                          key={seg.roundNum}
-                          class={`discussions-progress-segment ${statusClassName(seg.status as P2pNode['status'])}`}
-                          title={`${t('p2p.discussions.round_label')} ${seg.roundNum}/${d.maxRounds}`}
-                        >
-                          <span class="discussions-progress-segment-index">{seg.roundNum}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                  {hopSegments.length > 0 && (
-                    <div class="discussions-progress-line">
-                      <div class="discussions-progress-line-head">
-                        <span class="discussions-progress-line-label">{t('p2p.discussions.hop_label')}</span>
-                        <span class="discussions-progress-line-value">{hopText}</span>
-                      </div>
-                      <div class="discussions-progress-segments discussions-progress-segments-hop">
-                        {hopSegments.map((seg) => (
-                          <div
-                            key={seg.hopNum}
-                            class={`discussions-progress-segment ${statusClassName(seg.status as P2pNode['status'])}`}
-                            title={`${t('p2p.discussions.hop_label')} ${seg.hopNum}/${d.totalHops}`}
-                          >
-                            <span class="discussions-progress-segment-index">{seg.hopNum}</span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-                {nodes.length > 0 && (
-                  <div class="discussions-progress-nodes">
-                    {nodes.map((n, i) => (
-                      <div key={i} class={`discussions-progress-node ${statusClassName(n.status)}`}>
-                        <span class="discussions-progress-node-dot" />
-                        <span class="discussions-progress-node-label">{n.displayLabel ?? n.label}</span>
-                        {n.mode && <span class="discussions-progress-node-mode">{t(`p2p.mode.${n.mode}`, n.mode)}</span>}
-                        {n.phase && <span class="discussions-progress-node-phase">{phaseLabel(n.phase)}</span>}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            );
-          })}
+          {!progressHidden && activeLive.map((d) => (
+            <P2pProgressCard
+              key={d.id}
+              discussion={d}
+              onStopDiscussion={onStopDiscussion}
+            />
+          ))}
         </div>
       )}
 

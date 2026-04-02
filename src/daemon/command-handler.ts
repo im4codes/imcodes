@@ -26,7 +26,7 @@ import * as nodePath from 'node:path';
 import { exec as execCb } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
-import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, type P2pTarget } from './p2p-orchestrator.js';
+import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget } from './p2p-orchestrator.js';
 import { getP2pMode, P2P_CONFIG_MODE, type P2pSessionConfig } from '../../shared/p2p-modes.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
 import { executeCronJob } from './cron-executor.js';
@@ -1940,10 +1940,10 @@ async function handleP2pStatus(cmd: Record<string, unknown>, serverLink: ServerL
   const runId = cmd.runId as string | undefined;
   if (runId) {
     const run = getP2pRun(runId);
-    try { serverLink.send({ type: 'p2p.status_response', runId, run: run ?? null }); } catch { /* ignore */ }
+    try { serverLink.send({ type: 'p2p.status_response', runId, run: run ? serializeP2pRun(run) : null }); } catch { /* ignore */ }
   } else {
     const runs = listP2pRuns();
-    try { serverLink.send({ type: 'p2p.status_response', runs }); } catch { /* ignore */ }
+    try { serverLink.send({ type: 'p2p.status_response', runs: runs.map((run) => serializeP2pRun(run)) }); } catch { /* ignore */ }
   }
 }
 

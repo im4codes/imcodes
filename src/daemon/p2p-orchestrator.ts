@@ -82,6 +82,135 @@ const activeRuns = new Map<string, P2pRun>();
 export function getP2pRun(id: string): P2pRun | undefined { return activeRuns.get(id); }
 export function listP2pRuns(): P2pRun[] { return [...activeRuns.values()]; }
 
+export function serializeP2pRun(run: P2pRun): Record<string, unknown> {
+  return {
+    id: run.id,
+    discussion_id: run.discussionId,
+    server_id: '', // filled by bridge from auth context
+    main_session: run.mainSession,
+    initiator_session: run.initiatorSession,
+    current_target_session: run.currentTargetSession,
+    final_return_session: run.finalReturnSession,
+    remaining_targets: JSON.stringify(run.remainingTargets),
+    mode_key: run.mode,
+    status: run.status,
+    request_message_id: null,
+    callback_message_id: null,
+    context_ref: JSON.stringify({ type: 'file', path: run.contextFilePath }),
+    timeout_ms: run.timeoutMs,
+    result_summary: run.resultSummary,
+    error: run.error,
+    created_at: run.createdAt,
+    updated_at: run.updatedAt,
+    completed_at: run.completedAt,
+    // UI-ready progress fields (avoids client-side JSON parsing)
+    total_count: run.totalTargets + 2, // +2 for Phase 1 (initial) + Phase 3 (summary)
+    total_hops: run.totalTargets,
+    remaining_count: run.remainingTargets.length,
+    completed_hops_count: run.completedHops.length,
+    completed_round_hops_count: Math.max(0, run.completedHops.length - ((run.currentRound - 1) * run.totalTargets)),
+    current_round: run.currentRound,
+    total_rounds: run.rounds,
+    skipped_hops: run.skippedHops,
+    active_phase: (() => {
+      if (run.currentTargetSession === run.initiatorSession) {
+        return run.remainingTargets.length === 0 ? 'summary' : 'initial';
+      }
+      if (run.currentTargetSession) return 'hop';
+      if (run.status === 'completed') return 'summary';
+      return 'queued';
+    })(),
+    active_hop_number: run.currentTargetSession && run.currentTargetSession !== run.initiatorSession
+      ? run.completedHops.length + 1
+      : null,
+    active_round_hop_number: run.currentTargetSession && run.currentTargetSession !== run.initiatorSession && run.totalTargets > 0
+      ? ((run.completedHops.length % run.totalTargets) + 1)
+      : null,
+    // Agent metadata for display
+    current_target_label: (() => {
+      if (!run.currentTargetSession) return null;
+      const rec = getSession(run.currentTargetSession);
+      return formatP2pParticipantIdentity({
+        session: run.currentTargetSession,
+        label: rec?.label,
+        agentType: rec?.agentType,
+        ccPreset: rec?.ccPreset,
+      });
+    })(),
+    initiator_label: (() => {
+      const rec = getSession(run.initiatorSession);
+      return formatP2pParticipantIdentity({
+        session: run.initiatorSession,
+        label: rec?.label,
+        agentType: rec?.agentType,
+        ccPreset: rec?.ccPreset,
+      });
+    })(),
+    // Full node list for segmented progress display — includes completed, active, pending, skipped
+    all_nodes: (() => {
+      type NodeInfo = {
+        session: string;
+        label: string;
+        displayLabel: string;
+        agentType: string;
+        ccPreset: string | null;
+        mode: string;
+        phase: 'initial' | 'hop' | 'summary';
+        status: 'done' | 'active' | 'pending' | 'skipped';
+      };
+      const nodes: NodeInfo[] = [];
+      const skippedSet = new Set(run.skippedHops);
+      const getInfo = (s: string, mode: string, phase: 'initial' | 'hop' | 'summary') => {
+        const r = getSession(s);
+        const label = r?.label || shortName(s);
+        const agentType = r?.agentType ?? 'unknown';
+        const ccPreset = r?.ccPreset ?? null;
+        return {
+          label,
+          displayLabel: formatP2pParticipantIdentity({
+            session: s,
+            label: r?.label,
+            agentType: r?.agentType,
+            ccPreset: r?.ccPreset,
+          }),
+          agentType,
+          ccPreset,
+          mode,
+          phase,
+        };
+      };
+
+      const init = getInfo(run.initiatorSession, run.mode, 'initial');
+      const phase1Done = run.completedHops.length > 0 || run.remainingTargets.length < run.totalTargets || run.status === 'completed';
+      const phase1Active = !phase1Done && run.currentTargetSession === run.initiatorSession;
+      nodes.push({ session: run.initiatorSession, ...init, status: phase1Done ? 'done' : phase1Active ? 'active' : 'pending' });
+
+      for (const t of run.completedHops) {
+        const info = getInfo(t.session, t.mode, 'hop');
+        nodes.push({ session: t.session, ...info, status: skippedSet.has(t.session) ? 'skipped' : 'done' });
+      }
+      if (run.currentTargetSession && run.currentTargetSession !== run.initiatorSession) {
+        const activeTarget = run.allTargets.find((t) => t.session === run.currentTargetSession)
+          ?? run.remainingTargets.find((t) => t.session === run.currentTargetSession)
+          ?? { session: run.currentTargetSession, mode: run.mode };
+        const info = getInfo(run.currentTargetSession, activeTarget.mode, 'hop');
+        nodes.push({ session: run.currentTargetSession, ...info, status: 'active' });
+      }
+      for (const t of run.remainingTargets) {
+        if (t.session === run.currentTargetSession) continue;
+        const info = getInfo(t.session, t.mode, 'hop');
+        nodes.push({ session: t.session, ...info, status: 'pending' });
+      }
+
+      const summaryDone = run.status === 'completed';
+      const summaryActive = run.remainingTargets.length === 0 && !summaryDone && run.currentTargetSession === run.initiatorSession;
+      const summary = getInfo(run.initiatorSession, run.mode, 'summary');
+      nodes.push({ session: run.initiatorSession, ...summary, status: summaryDone ? 'done' : summaryActive ? 'active' : 'pending' });
+      return nodes;
+    })(),
+  };
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────
 
 let IDLE_POLL_MS = 3_000;
@@ -742,137 +871,7 @@ function pushState(run: P2pRun, serverLink: ServerLink | null): void {
     : (s === 'failed' || s === 'timed_out' || s === 'cancelled') ? 'p2p.run_error'
       : 'p2p.run_save';
   try {
-    serverLink.send({
-      type,
-      run: {
-        id: run.id,
-        discussion_id: run.discussionId,
-        server_id: '', // filled by bridge from auth context
-        main_session: run.mainSession,
-        initiator_session: run.initiatorSession,
-        current_target_session: run.currentTargetSession,
-        final_return_session: run.finalReturnSession,
-        remaining_targets: JSON.stringify(run.remainingTargets),
-        mode_key: run.mode,
-        status: run.status,
-        request_message_id: null,
-        callback_message_id: null,
-        context_ref: JSON.stringify({ type: 'file', path: run.contextFilePath }),
-        timeout_ms: run.timeoutMs,
-        result_summary: run.resultSummary,
-        error: run.error,
-        created_at: run.createdAt,
-        updated_at: run.updatedAt,
-        completed_at: run.completedAt,
-        // UI-ready progress fields (avoids client-side JSON parsing)
-        total_count: run.totalTargets + 2, // +2 for Phase 1 (initial) + Phase 3 (summary)
-        total_hops: run.totalTargets,
-        remaining_count: run.remainingTargets.length,
-        completed_hops_count: run.completedHops.length,
-        current_round: run.currentRound,
-        total_rounds: run.rounds,
-        skipped_hops: run.skippedHops,
-        active_phase: (() => {
-          if (run.currentTargetSession === run.initiatorSession) {
-            return run.remainingTargets.length === 0 ? 'summary' : 'initial';
-          }
-          if (run.currentTargetSession) return 'hop';
-          if (run.status === 'completed') return 'summary';
-          return 'queued';
-        })(),
-        active_hop_number: run.currentTargetSession && run.currentTargetSession !== run.initiatorSession
-          ? run.completedHops.length + 1
-          : null,
-        // Agent metadata for display
-        current_target_label: (() => {
-          if (!run.currentTargetSession) return null;
-          const rec = getSession(run.currentTargetSession);
-          return formatP2pParticipantIdentity({
-            session: run.currentTargetSession,
-            label: rec?.label,
-            agentType: rec?.agentType,
-            ccPreset: rec?.ccPreset,
-          });
-        })(),
-        initiator_label: (() => {
-          const rec = getSession(run.initiatorSession);
-          return formatP2pParticipantIdentity({
-            session: run.initiatorSession,
-            label: rec?.label,
-            agentType: rec?.agentType,
-            ccPreset: rec?.ccPreset,
-          });
-        })(),
-        // Full node list for segmented progress display — includes completed, active, pending, skipped
-        all_nodes: (() => {
-          type NodeInfo = {
-            session: string;
-            label: string;
-            displayLabel: string;
-            agentType: string;
-            ccPreset: string | null;
-            mode: string;
-            phase: 'initial' | 'hop' | 'summary';
-            status: 'done' | 'active' | 'pending' | 'skipped';
-          };
-          const nodes: NodeInfo[] = [];
-          const skippedSet = new Set(run.skippedHops);
-          const getInfo = (s: string, mode: string, phase: 'initial' | 'hop' | 'summary') => {
-            const r = getSession(s);
-            const label = r?.label || shortName(s);
-            const agentType = r?.agentType ?? 'unknown';
-            const ccPreset = r?.ccPreset ?? null;
-            return {
-              label,
-              displayLabel: formatP2pParticipantIdentity({
-                session: s,
-                label: r?.label,
-                agentType: r?.agentType,
-                ccPreset: r?.ccPreset,
-              }),
-              agentType,
-              ccPreset,
-              mode,
-              phase,
-            };
-          };
-
-          // Phase 1: initiator initial analysis
-          const init = getInfo(run.initiatorSession, run.mode, 'initial');
-          const phase1Done = run.completedHops.length > 0 || run.remainingTargets.length < run.totalTargets || run.status === 'completed';
-          const phase1Active = !phase1Done && run.currentTargetSession === run.initiatorSession;
-          nodes.push({ session: run.initiatorSession, ...init, status: phase1Done ? 'done' : phase1Active ? 'active' : 'pending' });
-
-          // Phase 2: completed hops (in order)
-          for (const t of run.completedHops) {
-            const info = getInfo(t.session, t.mode, 'hop');
-            nodes.push({ session: t.session, ...info, status: skippedSet.has(t.session) ? 'skipped' : 'done' });
-          }
-          // Phase 2: current active hop
-          if (run.currentTargetSession && run.currentTargetSession !== run.initiatorSession) {
-            const activeTarget = run.allTargets.find((t) => t.session === run.currentTargetSession)
-              ?? run.remainingTargets.find((t) => t.session === run.currentTargetSession)
-              ?? { session: run.currentTargetSession, mode: run.mode };
-            const info = getInfo(run.currentTargetSession, activeTarget.mode, 'hop');
-            nodes.push({ session: run.currentTargetSession, ...info, status: 'active' });
-          }
-          // Phase 2: remaining pending hops
-          for (const t of run.remainingTargets) {
-            if (t.session === run.currentTargetSession) continue;
-            const info = getInfo(t.session, t.mode, 'hop');
-            nodes.push({ session: t.session, ...info, status: 'pending' });
-          }
-
-          // Phase 3: summary
-          const summaryDone = run.status === 'completed';
-          const summaryActive = run.remainingTargets.length === 0 && !summaryDone && run.currentTargetSession === run.initiatorSession;
-          const summary = getInfo(run.initiatorSession, run.mode, 'summary');
-          nodes.push({ session: run.initiatorSession, ...summary, status: summaryDone ? 'done' : summaryActive ? 'active' : 'pending' });
-
-          return nodes;
-        })(),
-      },
-    });
+    serverLink.send({ type, run: serializeP2pRun(run) });
   } catch { /* not connected */ }
 }
 
