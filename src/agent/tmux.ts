@@ -241,10 +241,9 @@ export async function sendKeys(session: string, keys: string, opts?: SendKeysOpt
     const c = await conpty();
     const isLong = keys.length > 200 || keys.includes('\n');
     await c.conptySendText(session, keys);
-    // Delay before Enter — ConPTY on Windows can deliver Enter before the foreground
-    // app has fully consumed the preceding text, especially for npm shim commands.
-    // Be more conservative than tmux/wezterm here.
-    const delay = isLong ? 800 : Math.max(300, Math.min(120 + Math.floor(keys.length / 8) * 8, 1200));
+    // Delay before Enter — keep a minimum floor so the foreground app has time
+    // to consume the preceding text before Enter lands.
+    const delay = isLong ? 500 : Math.max(180, Math.min(80 + Math.floor(keys.length / 10) * 5, 1000));
     await new Promise<void>((r) => setTimeout(r, delay));
     await c.conptySendEnter(session);
     // Safety net: 3s delayed Enter for long text (empty-line Enter is a no-op)
@@ -273,8 +272,9 @@ export async function sendKeys(session: string, keys: string, opts?: SendKeysOpt
     await rawSendText(session, keys);
   }
 
-  // Delay before Enter — CC needs time to process @file references etc.
-  const delay = isLong ? 500 : Math.max(200, Math.min(80 + Math.floor(keys.length / 10) * 5, 1000));
+  // Delay before Enter — keep a minimum floor so the foreground app has time
+  // to consume the preceding text before Enter lands.
+  const delay = isLong ? 500 : Math.max(180, Math.min(80 + Math.floor(keys.length / 10) * 5, 1000));
   await new Promise<void>((r) => setTimeout(r, delay));
   await rawSendEnter(session);
 
