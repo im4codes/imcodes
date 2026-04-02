@@ -1198,6 +1198,9 @@ function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): 
   const session = cmd.session as string | undefined;
   if (!session) return;
 
+  // The bridge may include a `raw` flag on terminal.subscribe for its own forwarding-mode
+  // bookkeeping, but daemon-side terminal streaming remains transport-stable in this phase:
+  // once subscribed for a session, we continue emitting both text diffs and raw PTY bytes.
   // Per-session raw PTY batching: accumulate small chunks and flush on timer or size threshold.
   let rawBatch: Buffer[] = [];
   let rawBatchBytes = 0;

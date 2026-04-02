@@ -191,9 +191,9 @@ export class WsClient {
     return () => this.handlers.delete(handler);
   }
 
-  subscribeTerminal(sessionName: string): void {
+  subscribeTerminal(sessionName: string, raw: boolean): void {
     if (!this._connected) return;
-    this.send({ type: 'terminal.subscribe', session: sessionName });
+    this.send({ type: 'terminal.subscribe', session: sessionName, raw });
   }
 
   unsubscribeTerminal(sessionName: string): void {
@@ -603,7 +603,7 @@ export class WsClient {
       // retryCount is NOT reset here — only reset when data actually flows
       // (confirmStreamRecovery called from handleRawFrame on first received frame)
       if (!this._destroyed && this._connected) {
-        this.subscribeTerminal(session);
+        this.subscribeTerminal(session, true);
       }
     }, delay);
   }

@@ -36,9 +36,18 @@ class MockWebSocket {
 /** Flush the microtask queue so the async openSocket() completes after the mocked fetch. */
 const flushAsync = () => new Promise<void>((r) => setTimeout(r, 0));
 
+let lastWs: MockWebSocket | null;
+
+async function connectClient(): Promise<WsClient> {
+  const client = new WsClient('http://localhost:8787', 'srv-1');
+  client.connect();
+  await flushAsync();
+  lastWs!.emit('open');
+  return client;
+}
+
 describe('WsClient', () => {
   let MockWS: typeof MockWebSocket;
-  let lastWs: MockWebSocket | null;
 
   beforeEach(() => {
     lastWs = null;
@@ -62,6 +71,7 @@ describe('WsClient', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.clearAllTimers();
   });
@@ -180,6 +190,56 @@ describe('WsClient', () => {
   it('send() throws when not connected', () => {
     const client = new WsClient('http://localhost:8787', 'srv-1');
     expect(() => client.send({ type: 'ping' })).toThrow('WebSocket not connected');
+  });
+
+  describe('terminal subscription modes', () => {
+    it('subscribeTerminal sends an explicit raw flag', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+
+      client.subscribeTerminal('chat-session', false);
+      client.subscribeTerminal('terminal-session', true);
+
+      expect(lastWs!.send).toHaveBeenCalledTimes(2);
+      expect(JSON.parse(lastWs!.send.mock.calls[0][0] as string)).toEqual({
+        type: 'terminal.subscribe',
+        session: 'chat-session',
+        raw: false,
+      });
+      expect(JSON.parse(lastWs!.send.mock.calls[1][0] as string)).toEqual({
+        type: 'terminal.subscribe',
+        session: 'terminal-session',
+        raw: true,
+      });
+      client.disconnect();
+    });
+
+    it('retries terminal.stream_reset with raw=true', async () => {
+      const client = await connectClient();
+      vi.useFakeTimers();
+      lastWs!.send.mockClear();
+
+      try {
+        lastWs!.emit('message', {
+          data: JSON.stringify({
+            type: 'terminal.stream_reset',
+            session: 'stream-session',
+            reason: 'reset',
+          }),
+        });
+
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(lastWs!.send).toHaveBeenCalled();
+        expect(JSON.parse(lastWs!.send.mock.calls.at(-1)[0] as string)).toEqual({
+          type: 'terminal.subscribe',
+          session: 'stream-session',
+          raw: true,
+        });
+      } finally {
+        client.disconnect();
+        vi.useRealTimers();
+      }
+    });
   });
 
   // ── daemon.disconnected / daemon.reconnected dispatch ──────────────────

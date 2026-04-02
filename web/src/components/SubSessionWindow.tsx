@@ -161,8 +161,15 @@ export function SubSessionWindow({
   // SubSessionWindow unmounts on minimize, so without this the remounted
   // TerminalView would start empty (no snapshot, only incremental data).
   useEffect(() => {
-    if (!ws || !connected || !active) return;
-    try { ws.subscribeTerminal(sub.sessionName); } catch { /* ignore */ }
+    if (!ws || !connected) return;
+    const raw = active;
+    try { ws.subscribeTerminal(sub.sessionName, raw); } catch { /* ignore */ }
+    if (!raw) {
+      return;
+    }
+    return () => {
+      try { ws.subscribeTerminal(sub.sessionName, false); } catch { /* ignore */ }
+    };
   }, [ws, connected, sub.sessionName, active]);
 
   const scrollToBottom = useCallback(() => {

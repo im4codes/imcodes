@@ -3,8 +3,9 @@
  * Replaces the CF DaemonBridge Durable Object.
  *
  * Binary routing: daemon binary raw frames are routed only to browsers
- * subscribed to the target session (not broadcast). Subscription state is
- * tracked by intercepting terminal.subscribe/unsubscribe browser messages.
+ * subscribed to the target session in raw mode (not broadcast). Subscription
+ * state is tracked by intercepting terminal.subscribe/unsubscribe browser
+ * messages.
  *
  * Per-(session,browser) forwarding queue: text snapshot frames and binary raw
  * frames share a single queue for ordered delivery. Overflow (512KB) triggers
@@ -167,8 +168,8 @@ export class WsBridge {
   private authTimer: ReturnType<typeof setTimeout> | null = null;
   private browserRateLimiter = new MemoryRateLimiter();
 
-  /** browser socket → set of subscribed session names */
-  private browserSubscriptions = new Map<WebSocket, Set<string>>();
+  /** browser socket → session name → raw-enabled flag */
+  private browserSubscriptions = new Map<WebSocket, Map<string, boolean>>();
 
   /** browser socket → set of subscribed transport session IDs */
   private transportSubscriptions = new Map<WebSocket, Set<string>>();
@@ -222,11 +223,16 @@ export class WsBridge {
   private previewWsTunnels = new Map<string, WsTunnelState>();
 
   /**
-   * Per-session daemon subscription reference count.
-   * Forward terminal.subscribe to daemon only on 0→1.
-   * Forward terminal.unsubscribe to daemon only on 1→0 (including on browser disconnect).
+   * Per-session subscription reference counts derived from browser sockets.
+   * totalRefs tracks active browser subscribers; rawRefs tracks raw-enabled subscribers.
    */
-  private daemonSessionRefs = new Map<string, number>();
+  private daemonSessionRefs = new Map<string, { totalRefs: number; rawRefs: number }>();
+
+  /**
+   * browser socket → session name → monotonically increasing intent revision.
+   * Used to ignore stale async subscribe callbacks when a later subscribe/unsubscribe wins.
+   */
+  private terminalSubscriptionRevisions = new Map<WebSocket, Map<string, number>>();
 
   /**
    * Per-(session, browser) forwarding queues.
@@ -350,11 +356,11 @@ export class WsBridge {
           this.upgradeAttempts = 0;
         }
 
-        // Replay queued messages, skipping terminal.subscribe — refs replay below is authoritative
+        // Replay queued messages, skipping terminal.subscribe/unsubscribe — refs replay below is authoritative
         for (const queued of this.queue) {
           try {
             const parsed = JSON.parse(queued) as { type?: string };
-            if (parsed.type === 'terminal.subscribe') continue;
+            if (parsed.type === 'terminal.subscribe' || parsed.type === 'terminal.unsubscribe') continue;
             ws.send(queued);
           } catch { /* ignore */ }
         }
@@ -364,8 +370,14 @@ export class WsBridge {
 
         // Re-subscribe daemon to all sessions that still have active browser subscribers
         for (const [sessionName, refs] of this.daemonSessionRefs) {
-          if (refs > 0) {
-            try { ws.send(JSON.stringify({ type: 'terminal.subscribe', session: sessionName })); } catch { /* ignore */ }
+          if (refs.totalRefs > 0) {
+            try {
+              ws.send(JSON.stringify({
+                type: 'terminal.subscribe',
+                session: sessionName,
+                raw: refs.rawRefs > 0,
+              }));
+            } catch { /* ignore */ }
           }
         }
 
@@ -447,7 +459,7 @@ export class WsBridge {
     this.db = db;
     this.browserSockets.add(ws);
     if (isMobile) this.mobileSockets.add(ws);
-    this.browserSubscriptions.set(ws, new Set());
+    this.browserSubscriptions.set(ws, new Map());
     this.transportSubscriptions.set(ws, new Set());
     this.browserUserIds.set(ws, userId);
 
@@ -539,12 +551,15 @@ export class WsBridge {
       // Track terminal subscriptions for binary routing + ref-counted daemon forwarding
       if (msg.type === 'terminal.subscribe' && typeof msg.session === 'string') {
         const sessionName = msg.session;
+        const rawMode = typeof msg.raw === 'boolean' ? msg.raw : true;
+        const revision = this.bumpTerminalSubscriptionRevision(ws, sessionName);
         void this.verifySessionOwnership(sessionName).then((allowed) => {
           if (!allowed) {
             logger.warn({ serverId: this.serverId, sessionName }, 'terminal.subscribe: session not owned by this server — rejected');
             return;
           }
-          this.addBrowserSessionSubscription(ws, sessionName, raw);
+          if (!this.isCurrentTerminalSubscriptionRevision(ws, sessionName, revision)) return;
+          this.addBrowserSessionSubscription(ws, sessionName, rawMode, raw, revision);
         });
         return;
       } else if (msg.type === 'terminal.unsubscribe' && typeof msg.session === 'string') {
@@ -1082,12 +1097,20 @@ export class WsBridge {
       logger.warn({ serverId: this.serverId }, 'Binary frame: invalid v1 header');
       return;
     }
-    this.sendToSessionSubscribers(sessionName, data);
+    this.sendToRawSessionSubscribers(sessionName, data);
   }
 
   private sendToSessionSubscribers(sessionName: string, data: string | Buffer): void {
     for (const [ws, sessions] of this.browserSubscriptions) {
       if (!sessions.has(sessionName)) continue;
+      const queue = this.getOrCreateQueue(sessionName, ws);
+      queue.send(ws, data, () => this.handleQueueOverflow(sessionName, ws));
+    }
+  }
+
+  private sendToRawSessionSubscribers(sessionName: string, data: string | Buffer): void {
+    for (const [ws, sessions] of this.browserSubscriptions) {
+      if (sessions.get(sessionName) !== true) continue;
       const queue = this.getOrCreateQueue(sessionName, ws);
       queue.send(ws, data, () => this.handleQueueOverflow(sessionName, ws));
     }
@@ -1137,22 +1160,46 @@ export class WsBridge {
   }
 
   /**
-   * Add a browser subscription for sessionName.
-   * Forwards terminal.subscribe to daemon only on 0→1 transition.
-   * rawMsg is the original JSON string to forward on 0→1.
+   * Add or update a browser subscription for sessionName.
+   * totalRefs/rawRefs are derived from live browser sockets.
+   * rawMsg is the original JSON string to forward on the first 0→1 transition.
    */
-  private addBrowserSessionSubscription(ws: WebSocket, sessionName: string, rawMsg: string): void {
+  private addBrowserSessionSubscription(ws: WebSocket, sessionName: string, raw: boolean, rawMsg: string, revision: number): void {
+    if (!this.isCurrentTerminalSubscriptionRevision(ws, sessionName, revision)) return;
+
     const subs = this.browserSubscriptions.get(ws);
-    if (!subs || subs.has(sessionName)) return; // already subscribed
-    subs.add(sessionName);
+    if (!subs) return;
 
-    const prev = this.daemonSessionRefs.get(sessionName) ?? 0;
-    this.daemonSessionRefs.set(sessionName, prev + 1);
+    const existing = subs.get(sessionName);
+    if (existing === raw) return;
 
-    if (prev === 0) {
-      // First browser subscriber — tell daemon to start streaming
-      this.sendToDaemon(rawMsg);
+    const refs = this.getOrCreateSessionRefs(sessionName);
+
+    if (existing === undefined) {
+      subs.set(sessionName, raw);
+      refs.totalRefs += 1;
+      if (raw) refs.rawRefs += 1;
+      this.daemonSessionRefs.set(sessionName, refs);
+
+      if (refs.totalRefs === 1) {
+        // First browser subscriber — tell daemon to start streaming
+        this.sendToDaemon(rawMsg);
+      }
+      return;
     }
+
+    subs.set(sessionName, raw);
+    if (existing) refs.rawRefs = Math.max(0, refs.rawRefs - 1);
+    if (raw) refs.rawRefs += 1;
+    this.daemonSessionRefs.set(sessionName, refs);
+  }
+
+  private getOrCreateSessionRefs(sessionName: string): { totalRefs: number; rawRefs: number } {
+    const existing = this.daemonSessionRefs.get(sessionName);
+    if (existing) return existing;
+    const refs = { totalRefs: 0, rawRefs: 0 };
+    this.daemonSessionRefs.set(sessionName, refs);
+    return refs;
   }
 
   /**
@@ -1160,8 +1207,11 @@ export class WsBridge {
    * Forwards terminal.unsubscribe to daemon only on 1→0 transition.
    */
   private removeBrowserSessionSubscription(ws: WebSocket, sessionName: string): void {
+    this.bumpTerminalSubscriptionRevision(ws, sessionName);
+
     const subs = this.browserSubscriptions.get(ws);
     if (!subs?.has(sessionName)) return; // not subscribed
+    const wasRaw = subs.get(sessionName) === true;
     subs.delete(sessionName);
 
     this.terminalQueues.get(sessionName)?.delete(ws);
@@ -1169,15 +1219,34 @@ export class WsBridge {
       this.terminalQueues.delete(sessionName);
     }
 
-    const prev = this.daemonSessionRefs.get(sessionName) ?? 0;
-    const next = Math.max(0, prev - 1);
-    if (next === 0) {
+    const refs = this.daemonSessionRefs.get(sessionName);
+    if (!refs) return;
+
+    refs.totalRefs = Math.max(0, refs.totalRefs - 1);
+    if (wasRaw) refs.rawRefs = Math.max(0, refs.rawRefs - 1);
+
+    if (refs.totalRefs === 0) {
       this.daemonSessionRefs.delete(sessionName);
       // Last browser unsubscribed — tell daemon to stop streaming
       this.sendToDaemon(JSON.stringify({ type: 'terminal.unsubscribe', session: sessionName }));
     } else {
-      this.daemonSessionRefs.set(sessionName, next);
+      this.daemonSessionRefs.set(sessionName, refs);
     }
+  }
+
+  private bumpTerminalSubscriptionRevision(ws: WebSocket, sessionName: string): number {
+    let sessions = this.terminalSubscriptionRevisions.get(ws);
+    if (!sessions) {
+      sessions = new Map();
+      this.terminalSubscriptionRevisions.set(ws, sessions);
+    }
+    const next = (sessions.get(sessionName) ?? 0) + 1;
+    sessions.set(sessionName, next);
+    return next;
+  }
+
+  private isCurrentTerminalSubscriptionRevision(ws: WebSocket, sessionName: string, revision: number): boolean {
+    return this.terminalSubscriptionRevisions.get(ws)?.get(sessionName) === revision;
   }
 
   private cleanupBrowserSocket(ws: WebSocket): void {
@@ -1186,12 +1255,13 @@ export class WsBridge {
     this.browserUserIds.delete(ws);
     const sessions = this.browserSubscriptions.get(ws);
     if (sessions) {
-      for (const sessionName of [...sessions]) {
+      for (const sessionName of [...sessions.keys()]) {
         // Use removeBrowserSessionSubscription to correctly handle ref counting + daemon notify
         this.removeBrowserSessionSubscription(ws, sessionName);
       }
     }
     this.browserSubscriptions.delete(ws);
+    this.terminalSubscriptionRevisions.delete(ws);
     this.transportSubscriptions.delete(ws);
   }
 

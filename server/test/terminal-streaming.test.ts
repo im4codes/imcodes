@@ -148,6 +148,33 @@ describe('Terminal streaming integration', () => {
     expect(daemonWs.sent.some((s) => s.includes('terminal.subscribe'))).toBe(true);
   });
 
+  it('raw:false subscribe is forwarded upstream and still preserves non-binary terminal delivery', async () => {
+    const { daemonWs, browserWs } = await setupStreamingBridge();
+
+    browserWs.emit('message', JSON.stringify({
+      type: 'terminal.subscribe',
+      session: 'deck_myapp_brain',
+      raw: false,
+    }));
+    await flush();
+
+    const forwarded = daemonWs.sent.find((s) => s.includes('terminal.subscribe') && s.includes('deck_myapp_brain'));
+    expect(forwarded).toBeTruthy();
+    expect(forwarded).toContain('"raw":false');
+
+    browserWs.sent.length = 0;
+    daemonWs.emit('message', JSON.stringify({
+      type: 'terminal_update',
+      diff: { sessionName: 'deck_myapp_brain', rows: ['chat-safe-line'] },
+    }));
+    await flush();
+
+    expect(browserWs.sent).toHaveLength(1);
+    const msg = JSON.parse(browserWs.sent[0]) as { type: string; diff: unknown };
+    expect(msg.type).toBe('terminal.diff');
+    expect(msg.diff).toBeTruthy();
+  });
+
   it('daemon reconnect drains queued browser messages', async () => {
     const serverId = `drain-${Math.random().toString(36).slice(2)}`;
     const bridge = WsBridge.get(serverId);

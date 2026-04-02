@@ -104,13 +104,14 @@ import { ServerSetupPage } from './pages/ServerSetupPage.js';
 import { NativeAuthBridge } from './pages/NativeAuthBridge.js';
 import type { SessionInfo, TerminalDiff } from './types.js';
 import { REPO_MSG } from '@shared/repo-types.js';
+import { shouldSubscribeTerminalRaw, type TerminalSubscribeViewMode } from './terminal-subscribe-mode.js';
 
 // On web: if opened by the native app for passkey auth, render the bridge page.
 const nativeCallback = typeof window !== 'undefined'
   ? new URLSearchParams(window.location.search).get('native_callback')
   : null;
 
-type ViewMode = 'terminal' | 'chat';
+type ViewMode = TerminalSubscribeViewMode;
 
 /** A panel pinned to the sidebar. Uses sessionName as stable identity. */
 export interface PinnedPanel {
@@ -1232,7 +1233,9 @@ export function App() {
         scheduleResubscribe([
           ...(activeName ? [{ name: activeName, mode: activeMode }] : []),
           ...(focusedSub ? [{ name: focusedSub.sessionName, mode: 'chat' as ViewMode }] : []),
-          ...sessionsRef.current.map((s) => ({ name: s.name, mode: (viewModesRef.current[s.name] ?? defaultViewMode) as ViewMode })),
+          ...sessionsRef.current
+            .filter((s) => s.name !== activeName)
+            .map((s) => ({ name: s.name, mode: 'chat' as ViewMode })),
           ...subSessionsRef.current.map((sub) => ({ name: sub.sessionName, mode: 'chat' as ViewMode })),
         ]);
         // Refresh discussion list
@@ -1274,16 +1277,15 @@ export function App() {
   }, [auth, selectedServerId]);
 
   // Subscribe to terminal for ALL sessions when connected.
-  // The server bridge uses terminal subscriptions to route session-scoped messages
-  // (timeline events, command.ack, etc.) to browsers — without subscription,
-  // chat mode wouldn't receive any events. Binary traffic is batched at ~24fps daemon-side.
+  // Passive/background subscriptions stay raw:false so chat/timeline traffic still flows
+  // without pulling raw PTY bytes into browsers that are not actively rendering terminal output.
   const sessionNamesKey = sessions.map((s) => s.name).sort().join(',');
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws?.connected || sessions.length === 0) return;
     const names = sessions.map((s) => s.name);
     for (const name of names) {
-      ws.subscribeTerminal(name);
+      ws.subscribeTerminal(name, false);
       const mode = viewModesRef.current[name] ?? defaultViewMode;
       if (mode === 'chat') {
         ws.sendResize(name, 200, 50);
@@ -1297,14 +1299,15 @@ export function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected, sessionNamesKey]);
 
-  // Subscribe terminal for ALL sub-sessions (needed for timeline events + open windows)
+  // Subscribe terminal for ALL sub-sessions in passive mode.
+  // Active sub-session windows upgrade themselves to raw:true while visible.
   const subSessionNamesKey = subSessions.map((s) => s.sessionName).sort().join(',');
   useEffect(() => {
     const ws = wsRef.current;
     if (!ws?.connected || subSessions.length === 0) return;
     const names = subSessions.map((s) => s.sessionName);
     for (const name of names) {
-      try { ws.subscribeTerminal(name); } catch { /* ignore */ }
+      try { ws.subscribeTerminal(name, false); } catch { /* ignore */ }
     }
     return () => {
       for (const name of names) {
@@ -1332,13 +1335,29 @@ export function App() {
   // Re-subscribe when tab/window becomes visible (handles sleep/wake, background tabs)
   const viewModesRef = useRef(viewModes);
   viewModesRef.current = viewModes;
+
+  // Keep the active session in raw mode only while it is actively rendering terminal output.
+  useEffect(() => {
+    const ws = wsRef.current;
+    if (!ws?.connected || !activeSession) return;
+    const raw = shouldSubscribeTerminalRaw(true, viewMode);
+    ws.subscribeTerminal(activeSession, raw);
+    if (!raw) {
+      ws.sendResize(activeSession, 200, 50);
+    }
+    return () => {
+      try { ws.subscribeTerminal(activeSession, false); } catch { /* ignore */ }
+    };
+  }, [connected, activeSession, viewMode]);
+
   useEffect(() => {
     const handler = () => {
       if (document.visibilityState !== 'visible') return;
       const ws = wsRef.current;
       const session = activeSessionRef.current;
       if (!ws?.connected || !session) return;
-      ws.subscribeTerminal(session);
+      const raw = shouldSubscribeTerminalRaw(true, (viewModesRef.current[session] ?? defaultViewMode) as ViewMode);
+      ws.subscribeTerminal(session, raw);
       const mode = viewModesRef.current[session] ?? defaultViewMode;
       if (mode === 'chat') {
         ws.sendResize(session, 200, 50);
@@ -1757,7 +1776,7 @@ export function App() {
         resubscribeTimersRef.current.delete(timer);
         const liveWs = wsRef.current;
         if (!liveWs?.connected) return;
-        try { liveWs.subscribeTerminal(item.name); } catch { return; }
+        try { liveWs.subscribeTerminal(item.name, item.mode === 'terminal'); } catch { return; }
         if (item.mode === 'chat') {
           try { liveWs.sendResize(item.name, 200, 50); } catch { /* ignore */ }
         }

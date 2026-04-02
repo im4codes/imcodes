@@ -361,6 +361,147 @@ describe('WsBridge', () => {
 
       expect(daemonWs.sentStrings.filter((s) => s.includes('terminal.unsubscribe')).length).toBe(unsubBefore + 1);
     });
+
+    it('keeps same-mode resubscribe idempotent and upgrades raw mode without extra daemon subscribe', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sess-mode', raw: false }));
+      await flushAsync();
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sess-mode', raw: false }));
+      await flushAsync();
+
+      const initialSubscribes = daemonWs.sentStrings.filter((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === 'terminal.subscribe'; } catch { return false; }
+      });
+      expect(initialSubscribes).toHaveLength(1);
+
+      browserWs.sent.length = 0;
+      daemonWs.emit('message', JSON.stringify({
+        type: 'terminal_update',
+        diff: { sessionName: 'sess-mode', rows: ['line-1'] },
+      }));
+      await flushAsync();
+      expect(browserWs.sentStrings.some((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === 'terminal.diff'; } catch { return false; }
+      })).toBe(true);
+
+      browserWs.sent.length = 0;
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sess-mode', raw: true }));
+      await flushAsync();
+
+      const subscribesAfterUpgrade = daemonWs.sentStrings.filter((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === 'terminal.subscribe'; } catch { return false; }
+      });
+      expect(subscribesAfterUpgrade).toHaveLength(1);
+
+      browserWs.sent.length = 0;
+      daemonWs.emit('message', packFrame('sess-mode', Buffer.from('abc')), true);
+      await flushAsync();
+      expect(browserWs.sent.some((s) => Buffer.isBuffer(s))).toBe(true);
+    });
+
+    it('forwards binary only to raw-enabled subscribers while text reaches all subscribers', async () => {
+      const { daemonWs, bridge } = await setupAuth();
+
+      const passive = new MockWs();
+      const active = new MockWs();
+      bridge.handleBrowserConnection(passive as never, 'passive-user', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(active as never, 'active-user', makeDb('valid-hash'));
+
+      passive.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sess-bin', raw: false }));
+      active.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sess-bin', raw: true }));
+      await flushAsync();
+
+      passive.sent.length = 0;
+      active.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'terminal_update',
+        diff: { sessionName: 'sess-bin', rows: ['text-line'] },
+      }));
+      await flushAsync();
+
+      expect(passive.sentStrings.some((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === 'terminal.diff'; } catch { return false; }
+      })).toBe(true);
+      expect(active.sentStrings.some((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === 'terminal.diff'; } catch { return false; }
+      })).toBe(true);
+
+      passive.sent.length = 0;
+      active.sent.length = 0;
+
+      daemonWs.emit('message', packFrame('sess-bin', Buffer.from('raw-bytes')), true);
+      await flushAsync();
+
+      expect(passive.sent.some((s) => Buffer.isBuffer(s))).toBe(false);
+      expect(active.sent.some((s) => Buffer.isBuffer(s))).toBe(true);
+    });
+
+    it('treats missing raw as raw-enabled for backward compatibility', async () => {
+      const { daemonWs, bridge } = await setupAuth();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'legacy-user', makeDb('valid-hash'));
+
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sess-legacy' }));
+      await flushAsync();
+
+      browserWs.sent.length = 0;
+      daemonWs.emit('message', packFrame('sess-legacy', Buffer.from('legacy-raw')), true);
+      await flushAsync();
+
+      expect(browserWs.sent.some((s) => Buffer.isBuffer(s))).toBe(true);
+    });
+
+    it('ignores stale async subscribe results after a later unsubscribe wins', async () => {
+      let resolveOwnership: ((value: Record<string, unknown> | null) => void) | null = null;
+      const ownershipPending = new Promise<Record<string, unknown> | null>((resolve) => {
+        resolveOwnership = resolve;
+      });
+      const delayedDb = {
+        queryOne: async (sql: string) => {
+          if (sql.includes('FROM servers')) return { token_hash: 'valid-hash' };
+          if (sql.includes('FROM sessions')) return ownershipPending;
+          return null;
+        },
+        query: async () => [],
+        execute: async () => ({ changes: 1 }),
+        exec: async () => {},
+        close: () => {},
+      } as unknown as import('../src/db/client.js').Database;
+
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, delayedDb, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', delayedDb);
+
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sess-late', raw: true }));
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.unsubscribe', session: 'sess-late' }));
+      resolveOwnership?.({ name: 'owned' });
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((s) => {
+        try { return (JSON.parse(s) as { type: string; session?: string }).type === 'terminal.subscribe' && (JSON.parse(s) as { type: string; session?: string }).session === 'sess-late'; } catch { return false; }
+      })).toBe(false);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'terminal_update',
+        diff: { sessionName: 'sess-late', rows: ['late-line'] },
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings.some((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === 'terminal.diff'; } catch { return false; }
+      })).toBe(false);
+    });
   });
 
   // ── bufferedBytes balance ──────────────────────────────────────────────────
@@ -425,6 +566,62 @@ describe('WsBridge', () => {
       expect(daemonWs2.sentStrings.some((s) => {
         try { return (JSON.parse(s) as { type: string; session: string }).session === 'sessR'; } catch { return false; }
       })).toBe(true);
+    });
+
+    it('replays explicit raw=false for passive subscribers after reconnect', async () => {
+      const bridge = WsBridge.get(serverId);
+
+      const daemonWs1 = new MockWs();
+      bridge.handleDaemonConnection(daemonWs1 as never, makeDb('valid-hash'), {} as never);
+      daemonWs1.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sessPassive', raw: false }));
+      await flushAsync();
+
+      daemonWs1.emit('close');
+      await flushAsync();
+
+      const daemonWs2 = new MockWs();
+      bridge.handleDaemonConnection(daemonWs2 as never, makeDb('valid-hash'), {} as never);
+      daemonWs2.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const replay = daemonWs2.sentStrings.map((s) => {
+        try { return JSON.parse(s) as { type?: string; session?: string; raw?: boolean }; } catch { return null; }
+      }).find((msg) => msg?.type === 'terminal.subscribe' && msg.session === 'sessPassive');
+
+      expect(replay?.raw).toBe(false);
+    });
+
+    it('replays explicit raw mode after reconnect and ignores stale queued terminal unsubscribe', async () => {
+      const bridge = WsBridge.get(serverId);
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sessRaw', raw: false }));
+      await flushAsync();
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.unsubscribe', session: 'sessRaw' }));
+      await flushAsync();
+
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const terminalMessages = daemonWs.sentStrings.flatMap((s) => {
+        try {
+          const parsed = JSON.parse(s) as { type?: string };
+          return parsed.type === 'terminal.subscribe' || parsed.type === 'terminal.unsubscribe' ? [parsed] : [];
+        } catch {
+          return [];
+        }
+      });
+
+      expect(terminalMessages).toHaveLength(0);
     });
 
     it('does not replay terminal.subscribe from offline queue (prevents duplicates)', async () => {
