@@ -308,6 +308,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
           registry-url: 'https://registry.npmjs.org'
+      - run: npm install -g npm@latest
       - run: npm ci
       - name: Install web deps
         run: npm ci
