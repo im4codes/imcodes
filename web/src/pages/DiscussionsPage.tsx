@@ -142,7 +142,6 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
               <div class="discussions-progress-strip-title">
                 {t('p2p.discussions.live_progress')} · {activeLive.length}
               </div>
-              <div class="discussions-progress-strip-slogan">{t('p2p.discussions.slogan')}</div>
             </div>
             <button
               class="discussions-progress-strip-toggle"
@@ -151,13 +150,17 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
               {progressHidden ? t('p2p.discussions.show') : t('p2p.discussions.hide')}
             </button>
           </div>
-          {!progressHidden && activeLive.map((d) => (
-            <P2pProgressCard
-              key={d.id}
-              discussion={d}
-              onStopDiscussion={onStopDiscussion}
-            />
-          ))}
+          {!progressHidden && (
+            <div class="discussions-progress-strip-scroll">
+              {activeLive.map((d) => (
+                <P2pProgressCard
+                  key={d.id}
+                  discussion={d}
+                  onStopDiscussion={onStopDiscussion}
+                />
+              ))}
+            </div>
+          )}
         </div>
       )}
 

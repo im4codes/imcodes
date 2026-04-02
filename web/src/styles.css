@@ -723,8 +723,8 @@ body {
 .discussions-empty { padding: 40px 20px; text-align: center; color: #64748b; font-size: 14px; }
 .discussions-progress-strip {
   padding: 12px;
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  display: flex;
+  flex-direction: column;
   gap: 10px;
   border-bottom: 1px solid #1e293b;
   background:
@@ -732,7 +732,6 @@ body {
     linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(10, 14, 26, 0.96));
 }
 .discussions-progress-strip-header {
-  grid-column: 1 / -1;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -751,13 +750,25 @@ body {
   text-transform: uppercase;
   color: #93c5fd;
 }
-.discussions-progress-strip-slogan {
-  font-size: 11px;
-  color: #64748b;
-  letter-spacing: 0.04em;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+.discussions-progress-strip-scroll {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 4px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(96, 165, 250, 0.45) rgba(15, 23, 42, 0.65);
+}
+.discussions-progress-strip-scroll::-webkit-scrollbar {
+  height: 8px;
+}
+.discussions-progress-strip-scroll::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.65);
+  border-radius: 999px;
+}
+.discussions-progress-strip-scroll::-webkit-scrollbar-thumb {
+  background: linear-gradient(90deg, rgba(37, 99, 235, 0.9), rgba(56, 189, 248, 0.9));
+  border-radius: 999px;
 }
 .discussions-progress-strip-toggle {
   border: 1px solid rgba(71, 85, 105, 0.9);
@@ -776,6 +787,9 @@ body {
 .discussions-progress-card {
   position: relative;
   overflow: hidden;
+  flex: 0 0 min(440px, calc(100vw - 48px));
+  min-width: 340px;
+  max-width: 440px;
   background:
     linear-gradient(180deg, rgba(15, 23, 42, 0.92), rgba(2, 6, 23, 0.96)),
     linear-gradient(135deg, rgba(59, 130, 246, 0.10), rgba(34, 197, 94, 0.06));
@@ -794,7 +808,7 @@ body {
   pointer-events: none;
 }
 .discussions-progress-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
-.discussions-progress-titlewrap { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.discussions-progress-titlewrap { min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column; gap: 2px; }
 .discussions-progress-kicker {
   font-size: 10px;
   font-weight: 700;
@@ -806,11 +820,16 @@ body {
   font-size: 13px;
   font-weight: 600;
   color: #e2e8f0;
-  white-space: nowrap;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
+  line-height: 1.35;
+  max-height: calc(1.35em * 2);
+  word-break: break-word;
 }
 .discussions-progress-stop {
+  flex: 0 0 auto;
   border: 1px solid rgba(248, 113, 113, 0.4);
   background: rgba(127, 29, 29, 0.18);
   color: #fca5a5;
@@ -850,6 +869,19 @@ body {
   font-size: 11px;
   font-weight: 700;
   color: #e2e8f0;
+}
+.discussions-progress-slogan {
+  align-self: center;
+  max-width: 100%;
+  padding: 0 10px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: #64748b;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .discussions-progress-badge {
   padding: 2px 8px;

@@ -158,23 +158,26 @@ export function P2pProgressCard({ discussion, compact = false, onClick, onStopDi
         </div>
 
         {hopSegments.length > 0 && (
-          <div class="discussions-progress-line">
-            <div class="discussions-progress-line-head">
-              <span class="discussions-progress-line-label">{t('p2p.discussions.hop_label')}</span>
-              <span class="discussions-progress-line-value">{hopText}</span>
+          <>
+            <div class="discussions-progress-slogan">{t('p2p.discussions.slogan')}</div>
+            <div class="discussions-progress-line">
+              <div class="discussions-progress-line-head">
+                <span class="discussions-progress-line-label">{t('p2p.discussions.hop_label')}</span>
+                <span class="discussions-progress-line-value">{hopText}</span>
+              </div>
+              <div class="discussions-progress-segments discussions-progress-segments-hop">
+                {hopSegments.map((seg) => (
+                  <div
+                    key={seg.hopNum}
+                    class={`discussions-progress-segment ${statusClassName(seg.status as P2pProgressNode['status'])}`}
+                    title={`${t('p2p.discussions.hop_label')} ${seg.hopNum}/${discussion.totalHops}`}
+                  >
+                    <span class="discussions-progress-segment-index">{seg.hopNum}</span>
+                  </div>
+                ))}
+              </div>
             </div>
-            <div class="discussions-progress-segments discussions-progress-segments-hop">
-              {hopSegments.map((seg) => (
-                <div
-                  key={seg.hopNum}
-                  class={`discussions-progress-segment ${statusClassName(seg.status as P2pProgressNode['status'])}`}
-                  title={`${t('p2p.discussions.hop_label')} ${seg.hopNum}/${discussion.totalHops}`}
-                >
-                  <span class="discussions-progress-segment-index">{seg.hopNum}</span>
-                </div>
-              ))}
-            </div>
-          </div>
+          </>
         )}
       </div>
 
