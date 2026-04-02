@@ -8,6 +8,7 @@ import type {
   ProviderConfig,
   ProviderError,
   SessionConfig,
+  ToolCallEvent,
 } from '../transport-provider.js';
 import {
   CONNECTION_MODES,
@@ -27,11 +28,20 @@ interface QwenSessionState {
   child: ChildProcess | null;
   currentMessageId: string | null;
   currentText: string;
+  toolUseByIndex: Map<number, { id: string; name: string; input?: unknown; partialJson: string }>;
+  toolUseById: Map<string, { id: string; name: string; input?: unknown; partialJson: string }>;
+  emittedToolSignatures: Map<string, string>;
 }
 
 interface QwenStreamEvent {
   type: string;
   index?: number;
+  content_block?: {
+    type?: string;
+    id?: string;
+    name?: string;
+    input?: unknown;
+  };
   delta?: {
     type?: string;
     text?: string;
@@ -75,13 +85,22 @@ function collectAssistantText(content?: QwenAssistantContentBlock[]): string {
   return parts.join('');
 }
 
+function stringifyToolResultContent(content: unknown): string | undefined {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return undefined;
+  const parts = content
+    .map((item) => (item && typeof item === 'object' && typeof item.text === 'string' ? item.text : ''))
+    .filter(Boolean);
+  return parts.length > 0 ? parts.join('\n') : undefined;
+}
+
 export class QwenProvider implements TransportProvider {
   readonly id = 'qwen';
   readonly connectionMode = CONNECTION_MODES.LOCAL_SDK;
   readonly sessionOwnership = SESSION_OWNERSHIP.SHARED;
   readonly capabilities: ProviderCapabilities = {
     streaming: true,
-    toolCalling: false,
+    toolCalling: true,
     approval: false,
     sessionRestore: true,
     multiTurn: true,
@@ -93,6 +112,7 @@ export class QwenProvider implements TransportProvider {
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
+  private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
 
   async connect(config: ProviderConfig): Promise<void> {
     await execFileAsync(QWEN_BIN, ['--version']);
@@ -121,6 +141,9 @@ export class QwenProvider implements TransportProvider {
       child: existing?.child ?? null,
       currentMessageId: existing?.currentMessageId ?? null,
       currentText: existing?.currentText ?? '',
+      toolUseByIndex: existing?.toolUseByIndex ?? new Map(),
+      toolUseById: existing?.toolUseById ?? new Map(),
+      emittedToolSignatures: existing?.emittedToolSignatures ?? new Map(),
     });
     return sessionId;
   }
@@ -157,6 +180,10 @@ export class QwenProvider implements TransportProvider {
     };
   }
 
+  onToolCall(cb: (sessionId: string, tool: ToolCallEvent) => void): void {
+    this.toolCallCallbacks.push(cb);
+  }
+
   async send(sessionId: string, message: string, _attachments?: unknown[], extraSystemPrompt?: string): Promise<void> {
     if (!this.config) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Qwen provider not connected', false);
@@ -169,6 +196,9 @@ export class QwenProvider implements TransportProvider {
       child: null,
       currentMessageId: null,
       currentText: '',
+      toolUseByIndex: new Map(),
+      toolUseById: new Map(),
+      emittedToolSignatures: new Map(),
     };
     if (state.child && !state.child.killed) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Qwen session is already busy', true);
@@ -176,6 +206,9 @@ export class QwenProvider implements TransportProvider {
 
     state.currentMessageId = null;
     state.currentText = '';
+    state.toolUseByIndex.clear();
+    state.toolUseById.clear();
+    state.emittedToolSignatures.clear();
 
     const args = [
       '-p', message,
@@ -234,6 +267,18 @@ export class QwenProvider implements TransportProvider {
       this.completeCallbacks.forEach((cb) => cb(sessionId, msg));
     };
 
+    const emitTool = (tool: ToolCallEvent): void => {
+      const signature = JSON.stringify({
+        status: tool.status,
+        name: tool.name,
+        input: tool.input ?? null,
+        output: tool.output ?? null,
+      });
+      if (state.emittedToolSignatures.get(tool.id) === signature) return;
+      state.emittedToolSignatures.set(tool.id, signature);
+      this.toolCallCallbacks.forEach((cb) => cb(sessionId, tool));
+    };
+
     const rl = readline.createInterface({ input: child.stdout! });
     rl.on('line', (line) => {
       const trimmed = line.trim();
@@ -258,6 +303,32 @@ export class QwenProvider implements TransportProvider {
           state.currentText = '';
           return;
         }
+        if (event.type === 'content_block_start' && event.content_block?.type === 'tool_use') {
+          const toolId = event.content_block.id ?? randomUUID();
+          const toolName = event.content_block.name ?? 'tool';
+          const toolInput = event.content_block.input;
+          if (typeof event.index === 'number') {
+            state.toolUseByIndex.set(event.index, {
+              id: toolId,
+              name: toolName,
+              input: toolInput,
+              partialJson: '',
+            });
+          }
+          state.toolUseById.set(toolId, {
+            id: toolId,
+            name: toolName,
+            input: toolInput,
+            partialJson: '',
+          });
+          emitTool({
+            id: toolId,
+            name: toolName,
+            status: 'running',
+            ...(toolInput !== undefined ? { input: toolInput } : {}),
+          });
+          return;
+        }
         if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta' && typeof event.delta.text === 'string') {
           state.currentMessageId ??= randomUUID();
           state.currentText += event.delta.text;
@@ -267,17 +338,60 @@ export class QwenProvider implements TransportProvider {
             delta: state.currentText,
             role: 'assistant',
           }));
+          return;
+        }
+        if (event.type === 'content_block_delta' && event.delta?.type === 'input_json_delta' && typeof event.index === 'number') {
+          const tool = state.toolUseByIndex.get(event.index);
+          if (!tool) return;
+          tool.partialJson += event.delta.partial_json ?? '';
+          try {
+            tool.input = JSON.parse(tool.partialJson);
+          } catch {
+            // Partial JSON may be incomplete mid-stream.
+          }
+          state.toolUseById.set(tool.id, tool);
+          emitTool({
+            id: tool.id,
+            name: tool.name,
+            status: 'running',
+            ...(tool.input !== undefined ? { input: tool.input } : {}),
+          });
         }
         return;
       }
 
       if (payload.type === 'assistant') {
+        for (const block of payload.message?.content ?? []) {
+          if (block?.type === 'tool_use' && block.id) {
+            emitTool({
+              id: block.id,
+              name: block.name ?? 'tool',
+              status: 'running',
+              ...(block.input !== undefined ? { input: block.input } : {}),
+            });
+          }
+        }
         const finalText = collectAssistantText(payload.message?.content);
         if (finalText) {
           // Qwen may emit a different final assistant message.id than the prior
           // stream_event message_start id. For IM.codes we must preserve the
           // streaming message id so timeline replacement stays in-place.
           emitComplete(finalText, state.currentMessageId ?? payload.message?.id ?? undefined);
+        }
+        return;
+      }
+
+      if (payload.type === 'user') {
+        for (const block of payload.message?.content ?? []) {
+          if (block?.type !== 'tool_result' || !block.tool_use_id) continue;
+          const output = stringifyToolResultContent(block.content);
+          const tool = state.toolUseById.get(block.tool_use_id);
+          emitTool({
+            id: block.tool_use_id,
+            name: tool?.name ?? 'tool',
+            status: block.is_error ? 'error' : 'complete',
+            ...(output ? { output } : {}),
+          });
         }
         return;
       }

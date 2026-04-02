@@ -39,7 +39,7 @@ import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { appendTransportEvent } from '../../src/daemon/transport-history.js';
 
 import type { TransportProvider } from '../../src/agent/transport-provider.js';
-import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
+import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 
 // ── Mock provider factory ────────────────────────────────────────────────────
@@ -47,21 +47,25 @@ import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 type DeltaCb = (sessionId: string, delta: MessageDelta) => void;
 type CompleteCb = (sessionId: string, message: AgentMessage) => void;
 type ErrorCb = (sessionId: string, error: { code: string; message: string; recoverable: boolean }) => void;
+type ToolCb = (sessionId: string, tool: ToolCallEvent) => void;
 
 function makeMockProvider() {
   let deltaCb: DeltaCb | undefined;
   let completeCb: CompleteCb | undefined;
   let errorCb: ErrorCb | undefined;
+  let toolCb: ToolCb | undefined;
 
   return {
     provider: {
       onDelta: (cb: DeltaCb) => { deltaCb = cb; return () => { deltaCb = undefined; }; },
       onComplete: (cb: CompleteCb) => { completeCb = cb; return () => { completeCb = undefined; }; },
       onError: (cb: ErrorCb) => { errorCb = cb; return () => { errorCb = undefined; }; },
+      onToolCall: (cb: ToolCb) => { toolCb = cb; },
     } as unknown as TransportProvider,
     fireDelta: (sid: string, delta: MessageDelta) => deltaCb?.(sid, delta),
     fireComplete: (sid: string, msg: AgentMessage) => completeCb?.(sid, msg),
     fireError: (sid: string, err: { code: string; message: string; recoverable: boolean }) => errorCb?.(sid, err),
+    fireTool: (sid: string, tool: ToolCallEvent) => toolCb?.(sid, tool),
   };
 }
 
@@ -447,6 +451,44 @@ describe('transport-relay (timeline-emitter based)', () => {
       broadcastProviderStatus('openclaw', true);
 
       expect(emitMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('onToolCall', () => {
+    it('emits tool.call for running tools with stable eventId', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-tool', {
+        id: 'tool-1',
+        name: 'list_directory',
+        status: 'running',
+        input: { path: '/tmp' },
+      });
+
+      const call = emitMock.mock.calls.find((c) => c[1] === 'tool.call');
+      expect(call).toBeDefined();
+      expect(call![0]).toBe('sess-tool');
+      expect(call![2]).toEqual({ tool: 'list_directory', input: { path: '/tmp' } });
+      expect(call![3].eventId).toBe('transport-tool:sess-tool:tool-1:call');
+    });
+
+    it('emits tool.result for completed tools with stable eventId', () => {
+      const { provider, fireTool } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireTool('sess-tool', {
+        id: 'tool-1',
+        name: 'list_directory',
+        status: 'complete',
+        output: 'done',
+      });
+
+      const call = emitMock.mock.calls.find((c) => c[1] === 'tool.result');
+      expect(call).toBeDefined();
+      expect(call![0]).toBe('sess-tool');
+      expect(call![2]).toEqual({ output: 'done' });
+      expect(call![3].eventId).toBe('transport-tool:sess-tool:tool-1:result');
     });
   });
 });

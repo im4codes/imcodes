@@ -6,7 +6,7 @@
  * Also cached to local JSONL for replay on reconnect/restart.
  */
 import type { TransportProvider, ProviderError } from '../agent/transport-provider.js';
-import type { MessageDelta, AgentMessage } from '../../shared/agent-message.js';
+import type { MessageDelta, AgentMessage, ToolCallEvent } from '../../shared/agent-message.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { resolveSessionName } from '../agent/session-manager.js';
 import { timelineEmitter } from './timeline-emitter.js';
@@ -101,6 +101,50 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       sessionId: sessionName,
       error: error.message,
       code: error.code,
+    });
+  });
+
+  provider.onToolCall?.((providerSid: string, tool: ToolCallEvent) => {
+    const sessionName = resolveSessionName(providerSid);
+    if (!sessionName) return;
+
+    if (tool.status === 'running') {
+      timelineEmitter.emit(sessionName, 'tool.call', {
+        tool: tool.name,
+        ...(tool.input !== undefined ? { input: tool.input } : {}),
+      }, {
+        source: 'daemon',
+        confidence: 'high',
+        eventId: `transport-tool:${sessionName}:${tool.id}:call`,
+      });
+      void appendTransportEvent(sessionName, {
+        type: 'tool.call',
+        sessionId: sessionName,
+        tool: tool.name,
+        ...(tool.input !== undefined ? { input: tool.input } : {}),
+      });
+      return;
+    }
+
+    timelineEmitter.emit(sessionName, 'tool.result', {
+      ...(tool.status === 'error'
+        ? { error: tool.output ?? 'error' }
+        : tool.output !== undefined
+          ? { output: tool.output }
+          : {}),
+    }, {
+      source: 'daemon',
+      confidence: 'high',
+      eventId: `transport-tool:${sessionName}:${tool.id}:result`,
+    });
+    void appendTransportEvent(sessionName, {
+      type: 'tool.result',
+      sessionId: sessionName,
+      ...(tool.status === 'error'
+        ? { error: tool.output ?? 'error' }
+        : tool.output !== undefined
+          ? { output: tool.output }
+          : {}),
     });
   });
 }

@@ -57,6 +57,7 @@ vi.mock('../../src/util/logger.js', () => ({
 }));
 
 import { QwenProvider } from '../../src/agent/providers/qwen.js';
+import type { ToolCallEvent } from '../../src/agent/transport-provider.js';
 
 function lastSpawn() {
   const entry = childProcessMock.spawned.at(-1);
@@ -156,5 +157,42 @@ describe('QwenProvider', () => {
     await flushIO();
 
     expect(errors).toEqual(['bad request']);
+  });
+
+  it('emits tool.call and tool.result events for qwen tool blocks', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-tool', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall?.((_sid, tool) => tools.push(tool));
+
+    await provider.send('sess-tool', 'use a tool');
+    const run = lastSpawn();
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'tool-1', name: 'list_directory' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{\"path\":\"/tmp/project\"}' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'ok', is_error: false }] } })}\n`);
+    run.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(tools).toEqual([
+      {
+        id: 'tool-1',
+        name: 'list_directory',
+        status: 'running',
+      },
+      {
+        id: 'tool-1',
+        name: 'list_directory',
+        status: 'running',
+        input: { path: '/tmp/project' },
+      },
+      {
+        id: 'tool-1',
+        name: 'list_directory',
+        status: 'complete',
+        output: 'ok',
+      },
+    ]);
   });
 });
