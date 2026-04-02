@@ -53,13 +53,14 @@ describe('NewSessionDialog', () => {
     expect(select).toBeDefined();
   });
 
-  it('agent type selector has claude-code, codex, opencode options', () => {
+  it('agent type selector has claude-code, codex, opencode, qwen options', () => {
     render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     const select = screen.getByRole('combobox') as HTMLSelectElement;
     const options = Array.from(select.options).map((o) => o.value);
     expect(options).toContain('claude-code');
     expect(options).toContain('codex');
     expect(options).toContain('opencode');
+    expect(options).toContain('qwen');
   });
 
   it('defaults agent type to claude-code', () => {

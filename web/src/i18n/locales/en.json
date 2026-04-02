@@ -71,7 +71,8 @@
     "actions": "Session actions",
     "new_btn": "New session",
     "agentType": {
-      "openclaw": "OpenClaw"
+      "openclaw": "OpenClaw",
+      "qwen": "Qwen Code"
     },
     "openclaw_not_connected": "not connected",
     "openclaw_connect_hint": "OpenClaw gateway is not connected. Run the following command on your daemon machine to connect:",

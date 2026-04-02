@@ -50,7 +50,7 @@ export type ServerMessage =
   | { type: 'file.search_response'; requestId: string; results: string[]; error?: string }
   | { type: 'p2p.run_update'; run: any }
   | { type: 'p2p.conflict'; existingRunId: string; initiatorSession: string; commandId: string }
-  | { type: 'subsession.created'; id: string; sessionName: string; sessionType: string; cwd?: string; label?: string; parentSession?: string; state?: string }
+  | { type: 'subsession.created'; id: string; sessionName: string; sessionType: string; cwd?: string; label?: string; parentSession?: string; state?: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null }
   | { type: 'subsession.removed'; id: string; sessionName: string }
   | { type: 'p2p.run_started'; runId: string; session: string }
   | { type: 'p2p.cancel_response'; runId: string; ok: boolean }
@@ -244,7 +244,7 @@ export class WsClient {
     this.send({ type: 'subsession.restart', sessionName });
   }
 
-  subSessionRebuildAll(subSessions: Array<{ id: string; type: string; shellBin?: string | null; cwd?: string | null; ccSessionId?: string | null; geminiSessionId?: string | null; parentSession?: string | null; label?: string | null; ccPresetId?: string | null }>): void {
+  subSessionRebuildAll(subSessions: Array<{ id: string; type: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; shellBin?: string | null; cwd?: string | null; ccSessionId?: string | null; geminiSessionId?: string | null; parentSession?: string | null; label?: string | null; ccPresetId?: string | null }>): void {
     this.send({ type: 'subsession.rebuild_all', subSessions });
   }
 

@@ -31,6 +31,7 @@ const AGENT_BADGE: Record<string, { label: string; color: string }> = {
   'codex':       { label: 'cx', color: '#d97706' },
   'opencode':    { label: 'oc', color: '#059669' },
   'openclaw':    { label: 'oc', color: '#f97316' },
+  'qwen':        { label: 'qw', color: '#0f766e' },
 };
 
 /** Legacy localStorage keys — read once on first load for migration. */

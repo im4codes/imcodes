@@ -99,8 +99,8 @@ export function SubSessionWindow({
     return () => clearInterval(id);
   }, [!!activeThinkingTs, active]); // eslint-disable-line react-hooks/exhaustive-deps
   const isShell = sub.type === 'shell' || sub.type === 'script';
-  /** Transport-backed sessions (e.g. openclaw) have no tmux terminal — chat only */
-  const isTransport = sub.type === 'openclaw';
+  /** Transport-backed sessions have no tmux terminal — chat only */
+  const isTransport = sub.runtimeType === 'transport';
   const initial = loadLocal(sub.id);
   const [geom, setGeom] = useState<WindowGeometry>(initial.geom);
   const [viewMode, setViewMode] = useState<ViewMode>(isShell ? 'terminal' : isTransport ? 'chat' : initial.viewMode);

@@ -71,7 +71,8 @@
     "actions": "세션 작업",
     "new_btn": "새 세션",
     "agentType": {
-      "openclaw": "OpenClaw"
+      "openclaw": "OpenClaw",
+      "qwen": "Qwen Code"
     },
     "openclaw_not_connected": "미연결",
     "openclaw_connect_hint": "OpenClaw 게이트웨이가 연결되지 않았습니다. 데몬 머신에서 다음 명령을 실행하세요:",

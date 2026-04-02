@@ -84,6 +84,9 @@ export function useSubSessions(
     ws.subSessionRebuildAll(subSessions.map((s) => ({
       id: s.id,
       type: s.type,
+      runtimeType: s.runtimeType,
+      providerId: s.providerId,
+      providerSessionId: s.providerSessionId,
       shellBin: s.shellBin,
       cwd: s.cwd,
       ccSessionId: s.ccSessionId,
@@ -119,6 +122,9 @@ export function useSubSessions(
               serverId: '',
               type: m.sessionType || 'shell',
               sessionName: m.sessionName || `deck_sub_${m.id}`,
+              runtimeType: m.runtimeType ?? null,
+              providerId: m.providerId ?? null,
+              providerSessionId: m.providerSessionId ?? null,
               cwd: m.cwd || null,
               label: m.label || null,
               parentSession: m.parentSession || null,
@@ -181,11 +187,13 @@ export function useSubSessions(
       const sub: SubSession = {
         ...res.subSession,
         sessionName: res.sessionName,
+        runtimeType: res.subSession.runtimeType ?? (type === 'openclaw' || type === 'qwen' ? 'transport' : 'process'),
+        providerId: res.subSession.providerId ?? (type === 'openclaw' || type === 'qwen' ? type : null),
         state: 'starting',
       };
       setSubSessions((prev) => [...prev, sub]);
-      // Ask daemon to start it — for openclaw pass extra fields
-      if (type === 'openclaw' && extra) {
+      // Ask daemon to start it — transport providers may need extra fields
+      if ((type === 'openclaw' || type === 'qwen') && extra) {
         ws?.send({
           type: 'subsession.start',
           id: sub.id,

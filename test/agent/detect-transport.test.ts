@@ -15,6 +15,10 @@ describe('isTransportAgent()', () => {
     expect(isTransportAgent('openclaw')).toBe(true);
   });
 
+  it('returns true for qwen', () => {
+    expect(isTransportAgent('qwen')).toBe(true);
+  });
+
   it('returns false for claude-code', () => {
     expect(isTransportAgent('claude-code')).toBe(false);
   });
@@ -57,6 +61,10 @@ describe('isProcessAgent()', () => {
     expect(isProcessAgent('openclaw')).toBe(false);
   });
 
+  it('returns false for qwen', () => {
+    expect(isProcessAgent('qwen')).toBe(false);
+  });
+
   it('returns true for unknown strings (non-transport fallthrough)', () => {
     // isProcessAgent is defined as !isTransportAgent, so any non-transport string is "process"
     expect(isProcessAgent('unknown-agent')).toBe(true);
@@ -75,6 +83,10 @@ describe('isProcessAgent()', () => {
 describe('TRANSPORT_AGENTS set', () => {
   it('contains openclaw', () => {
     expect(TRANSPORT_AGENTS.has('openclaw')).toBe(true);
+  });
+
+  it('contains qwen', () => {
+    expect(TRANSPORT_AGENTS.has('qwen')).toBe(true);
   });
 
   it('has at least 1 entry', () => {
@@ -129,9 +141,8 @@ describe('TRANSPORT_AGENTS and PROCESS_AGENTS', () => {
 
 // ── detectStatus() with transport agent (graceful fallthrough) ─────────────────
 
-describe('detectStatus() with openclaw agentType', () => {
+describe('detectStatus() with transport agentType', () => {
   it('returns idle for empty lines (default fallthrough)', () => {
-    // openclaw has no case in the switch — falls through to default return 'idle'
     const status = detectStatus([], 'openclaw' as AgentType);
     expect(status).toBe('idle');
   });
@@ -146,5 +157,10 @@ describe('detectStatus() with openclaw agentType', () => {
     expect(() => detectStatus(['❯'], 'openclaw' as AgentType)).not.toThrow();
     expect(() => detectStatus(['⠋ Thinking'], 'openclaw' as AgentType)).not.toThrow();
     expect(() => detectStatus(['Running Bash('], 'openclaw' as AgentType)).not.toThrow();
+  });
+
+  it('does not throw for any qwen input', () => {
+    expect(() => detectStatus(['partial json'], 'qwen' as AgentType)).not.toThrow();
+    expect(() => detectStatus(['{"type":"assistant"}'], 'qwen' as AgentType)).not.toThrow();
   });
 });

@@ -579,8 +579,19 @@ export async function startup(): Promise<DaemonContext> {
 async function autoReconnectProviders(): Promise<void> {
   try {
     // Dynamic import to avoid loading WS deps when not needed
+    const { listSessions } = await import('../store/session-store.js');
     const { loadConfig: loadOcConfig } = await import('../agent/openclaw-config.js');
-    const { connectProvider } = await import('../agent/provider-registry.js');
+    const { connectProvider, ensureProviderConnected } = await import('../agent/provider-registry.js');
+    const { restoreTransportSessions } = await import('../agent/session-manager.js');
+
+    if (listSessions().some((s) => s.runtimeType === 'transport' && s.providerId === 'qwen')) {
+      try {
+        await ensureProviderConnected('qwen', {});
+        await restoreTransportSessions('qwen');
+      } catch (err) {
+        logger.warn({ err }, 'Qwen local provider auto-connect failed');
+      }
+    }
 
     const ocConfig = await loadOcConfig();
     if (ocConfig) {
@@ -597,10 +608,7 @@ async function autoReconnectProviders(): Promise<void> {
             agentId: ocConfig.agentId,
           });
           logger.info('OpenClaw gateway reconnected');
-          // Rebuild transport session runtimes that restoreFromStore couldn't
-          // (provider wasn't connected yet at that point).
           try {
-            const { restoreTransportSessions } = await import('../agent/session-manager.js');
             await restoreTransportSessions('openclaw');
           } catch (e) {
             logger.warn({ err: e }, 'Failed to restore transport sessions after provider connect');

@@ -6,8 +6,9 @@ import { newSession, killSession, sessionExists, getPanePids } from '../agent/tm
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
-import { getDriver } from '../agent/session-manager.js';
+import { getDriver, getTransportRuntime, launchTransportSession } from '../agent/session-manager.js';
 import type { AgentType } from '../agent/detect.js';
+import { isTransportAgent } from '../agent/detect.js';
 import { timelineStore } from './timeline-store.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { upsertSession, getSession, removeSession } from '../store/session-store.js';
@@ -28,6 +29,9 @@ export interface SubSessionRecord {
   codexModel?: string | null;
   geminiSessionId?: string | null;
   opencodeSessionId?: string | null;
+  runtimeType?: 'process' | 'transport' | null;
+  providerId?: string | null;
+  providerSessionId?: string | null;
   parentSession?: string | null;
   /** CC env preset name (e.g. "MiniMax", "DeepSeek"). Resolves to env vars at launch. */
   ccPreset?: string | null;
@@ -249,6 +253,24 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
 
   for (const sub of subSessions) {
     const sessionName = subSessionName(sub.id);
+    if (isTransportAgent(sub.type)) {
+      const existingRuntime = getTransportRuntime(sessionName);
+      if (!existingRuntime) {
+        await launchTransportSession({
+          name: sessionName,
+          projectName: sessionName,
+          role: 'w1',
+          agentType: sub.type,
+          projectDir: sub.cwd ?? process.cwd(),
+          description: sub.description ?? undefined,
+          label: sub.label ?? undefined,
+          bindExistingKey: sub.providerSessionId ?? undefined,
+          skipCreate: !!sub.providerSessionId,
+          parentSession: sub.parentSession ?? undefined,
+        }).catch((e) => logger.warn({ err: e, sessionName }, 'Failed to rebuild transport sub-session'));
+      }
+      continue;
+    }
     const exists = await sessionExists(sessionName);
     if (!exists) {
       await startSubSession(sub).catch(() => {});

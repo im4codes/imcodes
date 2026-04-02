@@ -1,5 +1,5 @@
 /**
- * StartSubSessionDialog — choose type (cc/codex/opencode/shell/openclaw) and launch a sub-session.
+ * StartSubSessionDialog — choose type (cc/codex/opencode/gemini/qwen/shell/openclaw) and launch a sub-session.
  */
 import { useState, useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
@@ -23,6 +23,7 @@ const BASE_AGENT_TYPES = [
   { id: 'codex', label: 'Codex', icon: '📦' },
   { id: 'opencode', label: 'OpenCode', icon: '🔆' },
   { id: 'gemini', label: 'Gemini CLI', icon: '♊' },
+  { id: 'qwen', label: 'Qwen Code', icon: '千' },
   { id: 'shell', label: 'Shell', icon: '🐚' },
   { id: 'script', label: 'Script', icon: '🔄' },
 ];
@@ -155,7 +156,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                   class={`subsession-type-btn${type === at.id ? ' active' : ''}`}
                   onClick={() => setType(at.id)}
                 >
-                  <span>{at.icon}</span> {at.id === 'openclaw' ? t('session.agentType.openclaw') : at.label}
+                  <span>{at.icon}</span> {at.id === 'openclaw' || at.id === 'qwen' ? t(`session.agentType.${at.id}`) : at.label}
                 </button>
               ))}
             </div>

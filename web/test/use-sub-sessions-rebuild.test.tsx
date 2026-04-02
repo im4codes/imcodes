@@ -52,4 +52,40 @@ describe('useSubSessions rebuild gating', () => {
     await new Promise((r) => setTimeout(r, 0));
     expect(ws.subSessionRebuildAll).toHaveBeenCalledTimes(1);
   });
+
+  it('preserves transport runtime metadata in rebuild payloads', async () => {
+    const ws = { subSessionRebuildAll: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    listSubSessions.mockResolvedValueOnce([{
+      id: 'q1',
+      serverId: 'srv1',
+      type: 'qwen',
+      runtimeType: 'transport',
+      providerId: 'qwen',
+      providerSessionId: 'qwen-session-1',
+      shellBin: null,
+      cwd: '/tmp/project',
+      label: 'qwen worker',
+      parentSession: 'deck_proj_brain',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }]);
+
+    function Harness() {
+      useSubSessions('srv1', ws, true, 'deck_proj_brain');
+      return null;
+    }
+
+    render(<Harness />);
+
+    await waitFor(() => expect(ws.subSessionRebuildAll).toHaveBeenCalledTimes(1));
+    expect(ws.subSessionRebuildAll).toHaveBeenCalledWith([
+      expect.objectContaining({
+        id: 'q1',
+        type: 'qwen',
+        runtimeType: 'transport',
+        providerId: 'qwen',
+        providerSessionId: 'qwen-session-1',
+      }),
+    ]);
+  });
 });

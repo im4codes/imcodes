@@ -119,7 +119,7 @@ function sessionDisplayLabel(s: SessionInfo): string {
 
 /** Short agent type badge. */
 const AGENT_ABBR: Record<string, string> = {
-  'claude-code': 'cc', codex: 'cx', opencode: 'oc', gemini: 'gm', shell: 'sh',
+  'claude-code': 'cc', codex: 'cx', opencode: 'oc', gemini: 'gm', qwen: 'qw', shell: 'sh',
 };
 function agentBadge(agentType: string): string {
   return AGENT_ABBR[agentType] ?? agentType.slice(0, 3);

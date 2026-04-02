@@ -71,7 +71,8 @@
     "actions": "セッション操作",
     "new_btn": "新規セッション",
     "agentType": {
-      "openclaw": "OpenClaw"
+      "openclaw": "OpenClaw",
+      "qwen": "Qwen Code"
     },
     "openclaw_not_connected": "未接続",
     "openclaw_connect_hint": "OpenClaw ゲートウェイに接続されていません。デーモンマシンで以下のコマンドを実行してください：",

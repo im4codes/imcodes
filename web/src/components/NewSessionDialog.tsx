@@ -13,7 +13,7 @@ interface Props {
   isProviderConnected: (id: string) => boolean;
 }
 
-type AgentType = 'claude-code' | 'codex' | 'opencode' | 'gemini' | 'openclaw';
+type AgentType = 'claude-code' | 'codex' | 'opencode' | 'gemini' | 'openclaw' | 'qwen';
 type OpenClawMode = 'new' | 'bind';
 
 interface RemoteSession {
@@ -249,6 +249,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
             <option value="codex">Codex CLI</option>
             <option value="opencode">OpenCode</option>
             <option value="gemini">Gemini CLI</option>
+            <option value="qwen">{t('session.agentType.qwen')}</option>
             <option value="openclaw">{t('session.agentType.openclaw')}</option>
           </select>
         </div>

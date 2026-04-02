@@ -94,6 +94,8 @@ export interface ProviderConfig {
 export interface SessionConfig {
   /** Local session key used by the daemon to identify this session. */
   sessionKey: string;
+  /** Working directory for providers that need local project context. */
+  cwd?: string;
   /** Provider-side agent/model identifier (overrides ProviderConfig.agentId). */
   agentId?: string;
   /** Human-readable label for this session. */

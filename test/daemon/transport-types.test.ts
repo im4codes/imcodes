@@ -177,6 +177,10 @@ describe('src/agent/detect — transport/process classification', () => {
     expect(isTransportAgent('openclaw')).toBe(true);
   });
 
+  it('isTransportAgent returns true for qwen', () => {
+    expect(isTransportAgent('qwen')).toBe(true);
+  });
+
   it('isTransportAgent returns false for claude-code', () => {
     expect(isTransportAgent('claude-code')).toBe(false);
   });
@@ -189,8 +193,16 @@ describe('src/agent/detect — transport/process classification', () => {
     expect(isProcessAgent('openclaw')).toBe(false);
   });
 
+  it('isProcessAgent returns false for qwen', () => {
+    expect(isProcessAgent('qwen')).toBe(false);
+  });
+
   it('TRANSPORT_AGENTS contains openclaw', () => {
     expect(TRANSPORT_AGENTS.has('openclaw')).toBe(true);
+  });
+
+  it('TRANSPORT_AGENTS contains qwen', () => {
+    expect(TRANSPORT_AGENTS.has('qwen')).toBe(true);
   });
 
   it('PROCESS_AGENTS contains all process agent types', () => {

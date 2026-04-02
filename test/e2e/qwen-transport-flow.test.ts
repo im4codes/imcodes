@@ -1,0 +1,199 @@
+/**
+ * E2E for Qwen transport-backed sessions.
+ *
+ * Uses:
+ * - real session-manager transport launch flow
+ * - real provider-registry wiring into transport-relay
+ * - real command-handler session.send path
+ * - mocked Qwen provider (no external CLI required)
+ *
+ * Verifies:
+ * - main qwen sessions launch as transport sessions
+ * - providerSessionId is persisted
+ * - session.send produces streaming + final assistant timeline events
+ * - streaming and final events reuse the same stable eventId (typewriter path)
+ */
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+const SESSION = `deck_qwene2e_${Math.random().toString(36).slice(2, 8)}_brain`;
+
+const flushAsync = async () => {
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => process.nextTick(resolve));
+};
+
+const mocks = vi.hoisted(() => {
+  const store = new Map<string, Record<string, unknown>>();
+  const emitted: Array<{ session: string; type: string; payload: Record<string, unknown>; opts?: Record<string, unknown> }> = [];
+
+  class MockQwenProvider {
+    readonly id = 'qwen';
+    readonly connectionMode = 'local-sdk';
+    readonly sessionOwnership = 'shared';
+    readonly capabilities = {
+      streaming: true,
+      toolCalling: false,
+      approval: false,
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: false,
+    };
+
+    deltaCallbacks: Array<(sid: string, delta: any) => void> = [];
+    completeCallbacks: Array<(sid: string, msg: any) => void> = [];
+    errorCallbacks: Array<(sid: string, err: any) => void> = [];
+    created: Array<Record<string, unknown>> = [];
+
+    async connect() {}
+    async disconnect() {}
+    async createSession(config: Record<string, unknown>) {
+      this.created.push(config);
+      return String(config.bindExistingKey ?? config.sessionKey);
+    }
+    async endSession() {}
+    onDelta(cb: (sid: string, delta: any) => void) { this.deltaCallbacks.push(cb); return () => {}; }
+    onComplete(cb: (sid: string, msg: any) => void) { this.completeCallbacks.push(cb); return () => {}; }
+    onError(cb: (sid: string, err: any) => void) { this.errorCallbacks.push(cb); return () => {}; }
+    async send(sessionId: string, message: string) {
+      this.deltaCallbacks.forEach((cb) => cb(sessionId, {
+        messageId: 'msg-qwen-e2e',
+        type: 'text',
+        delta: 'Qwen',
+        role: 'assistant',
+      }));
+      this.deltaCallbacks.forEach((cb) => cb(sessionId, {
+        messageId: 'msg-qwen-e2e',
+        type: 'text',
+        delta: `Qwen: ${message}`,
+        role: 'assistant',
+      }));
+      this.completeCallbacks.forEach((cb) => cb(sessionId, {
+        id: 'msg-qwen-e2e',
+        sessionId,
+        kind: 'text',
+        role: 'assistant',
+        content: `Qwen: ${message}`,
+        timestamp: Date.now(),
+        status: 'complete',
+      }));
+    }
+  }
+
+  return {
+    store,
+    emitted,
+    MockQwenProvider,
+    nextUuid: vi.fn(() => '11111111-1111-4111-8111-111111111111'),
+  };
+});
+
+vi.mock('node:crypto', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:crypto')>();
+  return {
+    ...actual,
+    randomUUID: mocks.nextUuid,
+  };
+});
+
+vi.mock('../../src/agent/providers/qwen.js', () => ({
+  QwenProvider: mocks.MockQwenProvider,
+}));
+
+vi.mock('../../src/store/session-store.js', () => ({
+  listSessions: vi.fn(() => [...mocks.store.values()]),
+  getSession: vi.fn((name: string) => mocks.store.get(name) ?? null),
+  upsertSession: vi.fn((record: Record<string, unknown>) => {
+    if (typeof record.name === 'string') mocks.store.set(record.name, record);
+  }),
+  removeSession: vi.fn((name: string) => { mocks.store.delete(name); }),
+  updateSessionState: vi.fn((name: string, state: string) => {
+    const existing = mocks.store.get(name);
+    if (existing) mocks.store.set(name, { ...existing, state });
+  }),
+}));
+
+vi.mock('../../src/daemon/timeline-emitter.js', () => ({
+  timelineEmitter: {
+    emit: vi.fn((session: string, type: string, payload: Record<string, unknown>, opts?: Record<string, unknown>) => {
+      mocks.emitted.push({ session, type, payload, opts });
+    }),
+    on: vi.fn(() => () => {}),
+    epoch: 0,
+    replay: vi.fn(() => ({ events: [], truncated: false })),
+  },
+}));
+
+vi.mock('../../src/daemon/transport-history.js', () => ({
+  appendTransportEvent: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../../src/agent/agent-version.js', () => ({
+  getAgentVersion: vi.fn().mockResolvedValue('test-version'),
+}));
+
+vi.mock('../../src/repo/cache.js', () => ({
+  repoCache: { invalidate: vi.fn() },
+}));
+
+vi.mock('../../src/agent/signal.js', () => ({
+  setupCCStopHook: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../../src/agent/notify-setup.js', () => ({
+  setupCodexNotify: vi.fn().mockResolvedValue(undefined),
+  setupOpenCodePlugin: vi.fn().mockResolvedValue(undefined),
+}));
+
+import { launchSession } from '../../src/agent/session-manager.js';
+import { disconnectAll } from '../../src/agent/provider-registry.js';
+import { handleWebCommand } from '../../src/daemon/command-handler.js';
+
+describe('qwen transport flow e2e', () => {
+  afterEach(async () => {
+    await disconnectAll();
+    mocks.store.clear();
+    mocks.emitted.length = 0;
+    vi.clearAllMocks();
+  });
+
+  it('launches qwen main session and emits typewriter-friendly timeline events on send', async () => {
+    await launchSession({
+      name: SESSION,
+      projectName: 'qwene2e',
+      role: 'brain',
+      agentType: 'qwen',
+      projectDir: '/tmp/qwen-e2e',
+    });
+
+    const record = mocks.store.get(SESSION);
+    expect(record).toBeDefined();
+    expect(record?.runtimeType).toBe('transport');
+    expect(record?.providerId).toBe('qwen');
+    expect(record?.providerSessionId).toBe('11111111-1111-4111-8111-111111111111');
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({
+      type: 'session.send',
+      session: SESSION,
+      text: 'hello',
+      commandId: 'cmd-qwen-e2e',
+    }, serverLink);
+    await flushAsync();
+    const streaming = mocks.emitted.filter((e) => e.session === SESSION && e.type === 'assistant.text' && e.payload.streaming === true);
+    const final = mocks.emitted.find((e) => e.session === SESSION && e.type === 'assistant.text' && e.payload.streaming === false);
+    const ack = mocks.emitted.find((e) => e.session === SESSION && e.type === 'command.ack');
+    const stableEventId = `transport:${SESSION}:msg-qwen-e2e`;
+
+    expect(streaming.map((e) => e.payload.text)).toEqual(['Qwen', 'Qwen: hello']);
+    expect(streaming[0]?.opts?.eventId).toBe(stableEventId);
+    expect(streaming[1]?.opts?.eventId).toBe(stableEventId);
+    expect(final?.payload.text).toBe('Qwen: hello');
+    expect(final?.opts?.eventId).toBe(stableEventId);
+    expect(ack?.payload.status).toBe('accepted');
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'command.ack',
+      commandId: 'cmd-qwen-e2e',
+      status: 'accepted',
+      session: SESSION,
+    });
+  });
+});

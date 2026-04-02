@@ -1,4 +1,5 @@
 import { newSession, killSession, sessionExists, isPaneAlive, respawnPane, listSessions as tmuxListSessions, sendKeys, sendKey, capturePane, showBuffer, getPaneId, getPaneCwd, getPaneStartCommand, cleanupOrphanFifos } from './tmux.js';
+import { randomUUID } from 'node:crypto';
 import { ClaudeCodeDriver } from './drivers/claude-code.js';
 import { CodexDriver } from './drivers/codex.js';
 import { OpenCodeDriver } from './drivers/opencode.js';
@@ -9,7 +10,7 @@ import type { AgentType } from './detect.js';
 import { isTransportAgent } from './detect.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import { TransportSessionRuntime } from './transport-session-runtime.js';
-import { getProvider } from './provider-registry.js';
+import { ensureProviderConnected, getProvider } from './provider-registry.js';
 import { setupCCStopHook } from './signal.js';
 import { setupCodexNotify, setupOpenCodePlugin } from './notify-setup.js';
 import {
@@ -695,7 +696,7 @@ export function getTransportRuntime(name: string): TransportSessionRuntime | und
  * Called after provider auto-reconnect succeeds (restoreFromStore runs before provider connects).
  * Skips sessions that already have a runtime (rebuilt by oc-session-sync).
  */
-export function restoreTransportSessions(providerId: string): void {
+export async function restoreTransportSessions(providerId: string): Promise<void> {
   const all = storeSessions();
   for (const s of all) {
     if (s.runtimeType !== RUNTIME_TYPES.TRANSPORT) continue;
@@ -706,7 +707,14 @@ export function restoreTransportSessions(providerId: string): void {
       const provider = getProvider(s.providerId);
       if (!provider) continue;
       const runtime = new TransportSessionRuntime(provider, s.name);
-      runtime.setProviderSessionId(s.providerSessionId);
+      await runtime.initialize({
+        sessionKey: s.providerSessionId,
+        bindExistingKey: s.providerSessionId,
+        skipCreate: true,
+        cwd: s.projectDir,
+        label: s.label ?? s.name,
+        description: s.description,
+      });
       if (s.description) runtime.setDescription(s.description);
       transportRuntimes.set(s.name, runtime);
       registerProviderRoute(s.providerSessionId, s.name);
@@ -721,20 +729,33 @@ export function restoreTransportSessions(providerId: string): void {
 export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate, parentSession } = opts;
 
-  const provider = getProvider(agentType);
-  if (!provider) {
-    throw new Error(`No connected provider for agent type '${agentType}'`);
-  }
+  const provider = await ensureProviderConnected(agentType, {});
 
   const runtime = new TransportSessionRuntime(provider, name);
+  let effectiveSessionKey = name;
+  let effectiveBindExistingKey = bindExistingKey;
+  let effectiveSkipCreate = skipCreate;
+  if (agentType === 'qwen') {
+    const stored = !opts.fresh ? getSession(name)?.providerSessionId : undefined;
+    const qwenSessionId = effectiveBindExistingKey ?? stored ?? randomUUID();
+    effectiveSessionKey = qwenSessionId;
+    if (!opts.fresh && (effectiveBindExistingKey || stored)) {
+      effectiveBindExistingKey = qwenSessionId;
+      effectiveSkipCreate = true;
+    } else {
+      effectiveBindExistingKey = undefined;
+      effectiveSkipCreate = false;
+    }
+  }
 
   // Create session on provider
   await runtime.initialize({
-    sessionKey: name,
+    sessionKey: effectiveSessionKey,
+    cwd: projectDir,
     label: label || name,
     description,
-    bindExistingKey,
-    skipCreate,
+    bindExistingKey: effectiveBindExistingKey,
+    skipCreate: effectiveSkipCreate,
   });
 
   // Atomic: store runtime + register provider route + persist — rollback all on failure

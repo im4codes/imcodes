@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── Hoisted mocks ─────────────────────────────────────────────────────────────
 
-const { mockConnect, mockDisconnect, MockOpenClawProvider } = vi.hoisted(() => {
+const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider } = vi.hoisted(() => {
   const mockConnect = vi.fn().mockResolvedValue(undefined);
   const mockDisconnect = vi.fn().mockResolvedValue(undefined);
   const MockOpenClawProvider = vi.fn().mockImplementation(() => ({
@@ -26,11 +26,36 @@ const { mockConnect, mockDisconnect, MockOpenClawProvider } = vi.hoisted(() => {
     createSession: vi.fn().mockResolvedValue('session-1'),
     endSession: vi.fn().mockResolvedValue(undefined),
   }));
-  return { mockConnect, mockDisconnect, MockOpenClawProvider };
+  const MockQwenProvider = vi.fn().mockImplementation(() => ({
+    id: 'qwen',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'shared',
+    capabilities: {
+      streaming: true,
+      toolCalling: false,
+      approval: false,
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: false,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('session-1'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
+  return { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider };
 });
 
 vi.mock('../../src/agent/providers/openclaw.js', () => ({
   OpenClawProvider: MockOpenClawProvider,
+}));
+
+vi.mock('../../src/agent/providers/qwen.js', () => ({
+  QwenProvider: MockQwenProvider,
 }));
 
 vi.mock('../../src/util/logger.js', () => ({
@@ -76,6 +101,13 @@ describe('getProvider', () => {
     expect(provider!.id).toBe('openclaw');
   });
 
+  it('returns qwen after connectProvider()', async () => {
+    await connectProvider('qwen', CONFIG);
+    const provider = getProvider('qwen');
+    expect(provider).toBeDefined();
+    expect(provider!.id).toBe('qwen');
+  });
+
   it('returns undefined for an unknown id', () => {
     expect(getProvider('minimax')).toBeUndefined();
   });
@@ -86,6 +118,12 @@ describe('connectProvider', () => {
     await connectProvider('openclaw', CONFIG);
     expect(MockOpenClawProvider).toHaveBeenCalledOnce();
     expect(mockConnect).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
+  it('instantiates QwenProvider and calls connect()', async () => {
+    await connectProvider('qwen', CONFIG);
+    expect(MockQwenProvider).toHaveBeenCalledOnce();
     expect(mockConnect).toHaveBeenCalledWith(CONFIG);
   });
 

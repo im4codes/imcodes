@@ -22,6 +22,7 @@ const TYPE_ICON: Record<string, string> = {
   'codex': '📦',
   'opencode': '🔆',
   'openclaw': '☁️',
+  'qwen': '千',
   'gemini': '♊',
   'shell': '🐚',
   'script': '🔄',

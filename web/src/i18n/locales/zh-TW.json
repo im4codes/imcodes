@@ -71,7 +71,8 @@
     "actions": "Session 操作",
     "new_btn": "新建 Session",
     "agentType": {
-      "openclaw": "OpenClaw"
+      "openclaw": "OpenClaw",
+      "qwen": "Qwen Code"
     },
     "openclaw_not_connected": "未連接",
     "openclaw_connect_hint": "OpenClaw 閘道未連接。請在 daemon 機器上執行以下命令連接：",

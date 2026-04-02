@@ -18,14 +18,14 @@ export type AgentStatus =
 export type ProcessAgent = 'claude-code' | 'codex' | 'opencode' | 'shell' | 'script' | 'gemini';
 
 /** Transport-backed agents — controlled via network protocols */
-export type TransportAgent = 'openclaw';
+export type TransportAgent = 'openclaw' | 'qwen';
 // Future: | 'claude-code-sdk' | 'codex-sdk' | 'minimax' | 'deepseek'
 
 /** All agent types */
 export type AgentType = ProcessAgent | TransportAgent;
 
 /** Set of all transport agent type strings */
-export const TRANSPORT_AGENTS = new Set<TransportAgent>(['openclaw']);
+export const TRANSPORT_AGENTS = new Set<TransportAgent>(['openclaw', 'qwen']);
 
 /** Set of all process agent type strings */
 export const PROCESS_AGENTS = new Set<ProcessAgent>(['claude-code', 'codex', 'opencode', 'shell', 'script', 'gemini']);

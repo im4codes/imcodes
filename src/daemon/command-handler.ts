@@ -3,6 +3,7 @@
  * Commands arrive as JSON objects with a `type` field.
  */
 import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, type ProjectConfig } from '../agent/session-manager.js';
+import { isTransportAgent } from '../agent/detect.js';
 import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey } from '../agent/tmux.js';
 import { listSessions, getSession, upsertSession } from '../store/session-store.js';
 import { routeMessage, type InboundMessage, type RouterContext } from '../router/message-router.js';
@@ -1409,13 +1410,14 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
   const ccSessionId = cmd.ccSessionId as string | null | undefined;
   const parentSession = cmd.parentSession as string | null | undefined;
 
-  // OpenClaw: launch transport session instead of tmux
-  if (type === 'openclaw') {
+  // Transport-backed providers: launch without tmux.
+  if (isTransportAgent(type)) {
     const sessionName = subSessionName(id);
     const ocMode = cmd.ocMode as string | undefined;
-    const description = (cmd.ocDescription as string) || undefined;
-    const bindExistingKey = ocMode === 'bind' ? (cmd.ocSessionId as string) || undefined : undefined;
-    // Uniqueness check: prevent duplicate binding to same OC session
+    const bindExistingKey = type === 'openclaw'
+      ? (ocMode === 'bind' ? (cmd.ocSessionId as string) || undefined : undefined)
+      : ((cmd.providerSessionId as string | undefined) || undefined);
+    const description = ((cmd.ocDescription as string) || (cmd.description as string) || '').trim() || undefined;
     if (bindExistingKey && isProviderSessionBound(bindExistingKey)) {
       logger.warn({ id, bindExistingKey }, 'subsession.start: providerSessionId already bound — skipped');
       return;
@@ -1425,7 +1427,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
         name: sessionName,
         projectName: sessionName,
         role: 'w1',
-        agentType: 'openclaw',
+        agentType: type as any,
         projectDir: (cwd as string) || process.cwd(),
         description,
         bindExistingKey,
@@ -1434,6 +1436,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
       });
       // Sync to server DB
       try {
+        const record = getSession(sessionName);
         serverLink.send({
           type: 'subsession.sync',
           id,
@@ -1441,11 +1444,15 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
           cwd: cwd ?? null,
           shellBin: null,
           ccSessionId: null,
+          runtimeType: record?.runtimeType ?? null,
+          providerId: record?.providerId ?? null,
+          providerSessionId: record?.providerSessionId ?? null,
           parentSession: parentSession ?? null,
+          description: description ?? null,
         });
       } catch { /* not connected */ }
     } catch (e: unknown) {
-      logger.error({ err: e, id }, 'subsession.start failed (openclaw transport)');
+      logger.error({ err: e, id, type }, 'subsession.start failed (transport)');
     }
     return;
   }
@@ -1516,6 +1523,38 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
   try {
     // Stop without notifying server (preserve PG record)
     await stopSubSession(sName, null);
+    if (record.runtimeType === 'transport') {
+      await launchTransportSession({
+        name: sName,
+        projectName: sName,
+        role: 'w1',
+        agentType: record.agentType as any,
+        projectDir: record.projectDir || process.cwd(),
+        description: record.description ?? undefined,
+        label: record.label ?? undefined,
+        bindExistingKey: record.providerSessionId ?? undefined,
+        skipCreate: !!record.providerSessionId,
+        parentSession: record.parentSession ?? undefined,
+        userCreated: record.userCreated,
+      });
+      try {
+        const next = getSession(sName);
+        serverLink.send({
+          type: 'subsession.sync',
+          id,
+          sessionType: record.agentType,
+          cwd: record.projectDir ?? null,
+          shellBin: null,
+          ccSessionId: null,
+          runtimeType: next?.runtimeType ?? null,
+          providerId: next?.providerId ?? null,
+          providerSessionId: next?.providerSessionId ?? null,
+          parentSession: record.parentSession ?? null,
+          description: record.description ?? null,
+        });
+      } catch { /* not connected */ }
+      return;
+    }
     // Recreate with same ID — pass existing session IDs so agents resume
     // their conversation and ensureSessionFile skips if file already exists
     await startSubSession({

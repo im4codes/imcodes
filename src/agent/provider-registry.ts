@@ -19,6 +19,15 @@ export function getAllProviders(): TransportProvider[] {
   return [...providers.values()];
 }
 
+export async function ensureProviderConnected(id: string, config: ProviderConfig = {}): Promise<TransportProvider> {
+  const existing = providers.get(id);
+  if (existing) return existing;
+  await connectProvider(id, config);
+  const connected = providers.get(id);
+  if (!connected) throw new Error(`Provider failed to connect: ${id}`);
+  return connected;
+}
+
 export async function connectProvider(id: string, config: ProviderConfig): Promise<void> {
   // If already connected, disconnect first
   if (providers.has(id)) {
@@ -74,6 +83,10 @@ async function createProvider(id: string): Promise<TransportProvider> {
     case 'openclaw': {
       const { OpenClawProvider } = await import('./providers/openclaw.js');
       return new OpenClawProvider();
+    }
+    case 'qwen': {
+      const { QwenProvider } = await import('./providers/qwen.js');
+      return new QwenProvider();
     }
     default:
       throw new Error(`Unknown provider: ${id}`);

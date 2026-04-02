@@ -71,7 +71,8 @@
     "actions": "会话操作",
     "new_btn": "新建会话",
     "agentType": {
-      "openclaw": "OpenClaw"
+      "openclaw": "OpenClaw",
+      "qwen": "Qwen Code"
     },
     "openclaw_not_connected": "未连接",
     "openclaw_connect_hint": "OpenClaw 网关未连接。请在 daemon 机器上运行以下命令连接：",

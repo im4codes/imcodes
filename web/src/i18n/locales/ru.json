@@ -71,7 +71,8 @@
     "actions": "Действия с сессией",
     "new_btn": "Новая сессия",
     "agentType": {
-      "openclaw": "OpenClaw"
+      "openclaw": "OpenClaw",
+      "qwen": "Qwen Code"
     },
     "openclaw_not_connected": "не подключено",
     "openclaw_connect_hint": "Шлюз OpenClaw не подключён. Запустите следующую команду на машине с демоном:",

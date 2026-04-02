@@ -70,6 +70,7 @@ const TYPE_ABBR: Record<string, string> = {
   'codex': 'cx',
   'opencode': 'oc',
   'openclaw': 'oc',
+  'qwen': 'qw',
   'gemini': 'gm',
   'shell': 'sh',
   'script': 'sc',
