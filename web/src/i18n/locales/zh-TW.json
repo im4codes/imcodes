@@ -562,7 +562,9 @@
     "confirm_trigger": "立即執行此任務？",
     "status_manual_trigger": "手動觸發",
     "go_to_session": "跳轉到會話",
-    "go_and_quote": "跳轉並引用結果"
+    "go_and_quote": "跳轉並引用結果",
+    "read_only": "唯讀",
+    "read_only_scope": "這個 cron 任務屬於其他 server 或 tab，這裡暫時唯讀。"
   },
   "fileBrowser": {
     "edit": "編輯",

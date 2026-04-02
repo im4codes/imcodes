@@ -16,22 +16,24 @@ export async function dispatchJobNow(env: Env, job: DbCronJob): Promise<void> {
   try {
     action = JSON.parse(job.action);
   } catch {
-    await logExecution(env, job.id, 'error', 'Invalid action JSON');
+    await logExecution(env, randomHex(12), job.id, 'error', 'Invalid action JSON');
     throw new Error('invalid_action');
   }
 
   const bridge = WsBridge.get(job.server_id);
   if (!bridge.isDaemonConnected()) {
-    await logExecution(env, job.id, 'skipped_offline');
+    await logExecution(env, randomHex(12), job.id, 'skipped_offline');
     throw new Error('daemon_offline');
   }
 
   if (!job.target_role) {
     logger.warn({ jobId: job.id }, 'Cron manual trigger: target_role is NULL, defaulting to brain');
   }
+  const executionId = randomHex(12);
   const msg: CronDispatchMessage = {
     type: CRON_MSG.DISPATCH,
     jobId: job.id,
+    executionId,
     jobName: job.name,
     serverId: job.server_id,
     projectName: job.project_name ?? '',
@@ -41,7 +43,7 @@ export async function dispatchJobNow(env: Env, job: DbCronJob): Promise<void> {
   };
   bridge.sendToDaemon(JSON.stringify(msg));
 
-  await logExecution(env, job.id, 'manual_trigger');
+  await logExecution(env, executionId, job.id, 'manual_trigger');
   logger.info({ jobId: job.id, jobName: job.name }, 'Cron job manually triggered');
 }
 
@@ -79,7 +81,7 @@ export async function jobDispatchCron(env: Env): Promise<void> {
       } catch {
         logger.error({ jobId: job.id }, 'Cron job has invalid action JSON, marking as error');
         await env.DB.execute('UPDATE cron_jobs SET status = $1 WHERE id = $2', [CRON_STATUS.ERROR, job.id]);
-        await logExecution(env, job.id, 'error', 'Invalid action JSON');
+        await logExecution(env, randomHex(12), job.id, 'error', 'Invalid action JSON');
         continue;
       }
 
@@ -89,7 +91,7 @@ export async function jobDispatchCron(env: Env): Promise<void> {
         logger.debug({ jobId: job.id }, 'Cron skipped: daemon offline');
         const nextRun = calculateNextRun(job.cron_expr, now, job.timezone);
         await env.DB.execute('UPDATE cron_jobs SET next_run_at = $1 WHERE id = $2', [nextRun, job.id]);
-        await logExecution(env, job.id, 'skipped_offline');
+        await logExecution(env, randomHex(12), job.id, 'skipped_offline');
         continue;
       }
 
@@ -100,6 +102,7 @@ export async function jobDispatchCron(env: Env): Promise<void> {
       const msg: CronDispatchMessage = {
         type: CRON_MSG.DISPATCH,
         jobId: job.id,
+        executionId: randomHex(12),
         jobName: job.name,
         serverId: job.server_id,
         projectName: job.project_name ?? '',
@@ -118,7 +121,7 @@ export async function jobDispatchCron(env: Env): Promise<void> {
         await env.DB.execute('UPDATE cron_jobs SET status = $1 WHERE id = $2', [CRON_STATUS.EXPIRED, job.id]);
       }
 
-      await logExecution(env, job.id, 'dispatched');
+      await logExecution(env, msg.executionId!, job.id, 'dispatched');
 
       await logAudit(
         { userId: job.user_id, serverId: job.server_id, action: 'cron.job.dispatched', details: { jobId: job.id, jobName: job.name } },
@@ -134,10 +137,10 @@ export async function jobDispatchCron(env: Env): Promise<void> {
   }
 }
 
-async function logExecution(env: Env, jobId: string, status: string, detail?: string): Promise<void> {
+async function logExecution(env: Env, executionId: string, jobId: string, status: string, detail?: string): Promise<void> {
   await env.DB.execute(
     'INSERT INTO cron_executions (id, job_id, status, detail, created_at) VALUES ($1, $2, $3, $4, $5)',
-    [randomHex(12), jobId, status, detail ?? null, Date.now()],
+    [executionId, jobId, status, detail ?? null, Date.now()],
   ).catch((err) => logger.error({ jobId, err }, 'Failed to log cron execution'));
 }
 

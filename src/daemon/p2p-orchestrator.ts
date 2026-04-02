@@ -692,6 +692,7 @@ export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: Hop
   } else {
     parts.push(`This is a dedicated discussion file for multi-agent analysis: ${filePath}`);
     parts.push(`All output MUST go into this file. Do NOT modify any other files or run any commands.`);
+    parts.push(`Your identity for this discussion run is "${shortName(opts.session)}". When later rounds refer to this code name, they mean you.`);
     parts.push(``);
     parts.push(`Steps:`);
     parts.push(`1. Read the discussion file`);

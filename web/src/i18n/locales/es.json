@@ -562,7 +562,9 @@
     "confirm_trigger": "¿Ejecutar esta tarea ahora?",
     "status_manual_trigger": "Manual",
     "go_to_session": "Ir a sesión",
-    "go_and_quote": "Ir y citar resultado"
+    "go_and_quote": "Ir y citar resultado",
+    "read_only": "Solo lectura",
+    "read_only_scope": "Esta tarea cron pertenece a otro servidor o pestaña y aquí es temporalmente de solo lectura."
   },
   "fileBrowser": {
     "edit": "Editar",

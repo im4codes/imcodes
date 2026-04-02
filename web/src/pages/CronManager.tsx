@@ -138,6 +138,10 @@ function resolveExecSession(exec: CrossJobExecution): string {
   return `deck_${exec.project_name}_${exec.target_role}`;
 }
 
+function isCurrentContextJob(job: Pick<CronJob, 'server_id' | 'project_name'>, serverId: string, projectName: string): boolean {
+  return job.server_id === serverId && job.project_name === projectName;
+}
+
 // ── Component ────────────────────────────────────────────────────────────
 
 export function CronManager({ serverId, projectName, sessions, subSessions = [], activeSession: _activeSession, onBack: _onBack, onViewDiscussion, onNavigateSession, servers = [] }: Props) {
@@ -337,11 +341,17 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
 
       {tab === 'tasks' && jobs.map(job => {
         const action = parseAction(job.action);
+        const isReadOnly = !isCurrentContextJob(job, serverId, projectName);
         return (
           <div key={job.id} style={{ ...cardStyle, padding: '12px 16px', marginBottom: '10px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
               <span style={{ color: '#e2e8f0', fontWeight: 600, fontSize: '14px', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{job.name}</span>
               {showAllServers && <span style={{ color: '#64748b', fontSize: '11px', flexShrink: 0 }}>{serverNameMap.get(job.server_id) ?? job.server_id.slice(0, 6)} / {job.project_name}</span>}
+              {isReadOnly && (
+                <span title={t('cron.read_only_scope')} style={{ color: '#fbbf24', fontSize: '11px', fontWeight: 600, flexShrink: 0 }}>
+                  {t('cron.read_only')}
+                </span>
+              )}
               <span style={{ color: statusColors[job.status] ?? '#94a3b8', fontSize: '11px', fontWeight: 600, textTransform: 'uppercase', flexShrink: 0 }}>
                 {t(`cron.${job.status}`)}
               </span>
@@ -354,15 +364,21 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
               {action?.type === 'command' && <span style={{ opacity: 0.6, maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{action.command}</span>}
             </div>
 
+            {isReadOnly && (
+              <div style={{ color: '#fbbf24', fontSize: '11px', marginBottom: '8px' }}>
+                {t('cron.read_only_scope')}
+              </div>
+            )}
+
             <div style={{ display: 'flex', gap: '6px', fontSize: '12px' }}>
               {(job.status === CRON_STATUS.ACTIVE || job.status === CRON_STATUS.PAUSED) && (
-                <button onClick={() => handlePauseResume(job)} style={{ ...btnSecondary, padding: '3px 8px', fontSize: '12px' }}>
+                <button disabled={isReadOnly} onClick={() => handlePauseResume(job)} style={{ ...btnSecondary, padding: '3px 8px', fontSize: '12px', opacity: isReadOnly ? '0.5' : '1', cursor: isReadOnly ? 'not-allowed' : 'pointer' }}>
                   {job.status === CRON_STATUS.ACTIVE ? t('cron.pause') : t('cron.resume')}
                 </button>
               )}
-              <button onClick={() => handleTriggerNow(job)} style={{ ...btnSecondary, padding: '3px 8px', fontSize: '12px' }}>▶</button>
-              <button onClick={() => handleEdit(job)} style={{ ...btnSecondary, padding: '3px 8px', fontSize: '12px' }}>✎</button>
-              <button onClick={() => handleDelete(job)} style={{ ...btnDanger, padding: '3px 8px', fontSize: '12px' }}>✕</button>
+              <button disabled={isReadOnly} onClick={() => handleTriggerNow(job)} style={{ ...btnSecondary, padding: '3px 8px', fontSize: '12px', opacity: isReadOnly ? '0.5' : '1', cursor: isReadOnly ? 'not-allowed' : 'pointer' }}>▶</button>
+              <button disabled={isReadOnly} onClick={() => handleEdit(job)} style={{ ...btnSecondary, padding: '3px 8px', fontSize: '12px', opacity: isReadOnly ? '0.5' : '1', cursor: isReadOnly ? 'not-allowed' : 'pointer' }}>✎</button>
+              <button disabled={isReadOnly} onClick={() => handleDelete(job)} style={{ ...btnDanger, padding: '3px 8px', fontSize: '12px', opacity: isReadOnly ? '0.5' : '1', cursor: isReadOnly ? 'not-allowed' : 'pointer' }}>✕</button>
               <button onClick={() => openHistory(job.id)} style={{ ...btnSecondary, padding: '3px 8px', fontSize: '12px', marginLeft: 'auto' }}>
                 {t('cron.history')}
               </button>
@@ -381,8 +397,8 @@ export function CronManager({ serverId, projectName, sessions, subSessions = [],
         >
           <div style={{ padding: '16px', overflow: 'auto', height: '100%' }}>
             <CronForm
-              serverId={serverId}
-              projectName={projectName}
+              serverId={editingJob?.server_id ?? serverId}
+              projectName={editingJob?.project_name ?? projectName}
               sessions={eligible}
               subSessions={scopedSubs}
               job={editingJob}

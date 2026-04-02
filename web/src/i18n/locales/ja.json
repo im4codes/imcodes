@@ -562,7 +562,9 @@
     "confirm_trigger": "このタスクを今すぐ実行しますか？",
     "status_manual_trigger": "手動実行",
     "go_to_session": "セッションへ移動",
-    "go_and_quote": "移動して結果を引用"
+    "go_and_quote": "移動して結果を引用",
+    "read_only": "読み取り専用",
+    "read_only_scope": "この cron ジョブは別の server または tab に属しているため、ここでは一時的に読み取り専用です。"
   },
   "fileBrowser": {
     "edit": "編集",

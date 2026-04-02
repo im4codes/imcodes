@@ -1662,4 +1662,37 @@ describe('WsBridge', () => {
       expect(browserWs.sentStrings.filter(s => s.includes('fs.write_response'))).toHaveLength(0);
     });
   });
+
+  describe('cron command result persistence', () => {
+    it('updates the exact execution row when executionId is provided', async () => {
+      const execSpy = vi.fn(async () => ({ changes: 1 }));
+      const db = {
+        queryOne: async () => ({ token_hash: 'valid-hash' }),
+        query: async () => [],
+        execute: execSpy,
+        exec: async () => {},
+        close: () => {},
+      } as unknown as import('../src/db/client.js').Database;
+
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'cron.command_result',
+        jobId: 'job-1',
+        executionId: 'exec-1',
+        status: 'skipped_busy',
+        detail: 'busy',
+      }));
+      await flushAsync();
+
+      expect(execSpy).toHaveBeenCalledWith(
+        'UPDATE cron_executions SET detail = $1, status = $2 WHERE id = $3',
+        ['busy', 'skipped_busy', 'exec-1'],
+      );
+    });
+  });
 });

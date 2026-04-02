@@ -2,7 +2,7 @@
  * Daemon-side cron job executor.
  * Receives dispatched cron jobs and sends commands to target sessions.
  */
-import type { CronDispatchMessage, CronParticipant } from '../../shared/cron-types.js';
+import type { CronCommandResultMessage, CronDispatchMessage, CronParticipant } from '../../shared/cron-types.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
 import { sendKeys } from '../agent/tmux.js';
 import { getSession } from '../store/session-store.js';
@@ -17,7 +17,7 @@ import logger from '../util/logger.js';
 const BUSY_STATES = new Set(['streaming', 'thinking', 'tool_running', 'permission']);
 
 export async function executeCronJob(msg: CronDispatchMessage, serverLink: ServerLink): Promise<void> {
-  const { jobId, jobName, projectName, targetRole, targetSessionName, action } = msg;
+  const { jobId, executionId, jobName, projectName, targetRole, targetSessionName, action } = msg;
 
   // Resolve target session: prefer direct session name, fall back to role-based construction
   let name: string;
@@ -26,6 +26,13 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
   } else {
     if (!/^(brain|w\d+)$/.test(targetRole)) {
       logger.warn({ jobId, targetRole }, 'Cron: invalid target role');
+      sendCommandResult(serverLink, {
+        type: CRON_MSG.COMMAND_RESULT,
+        jobId,
+        executionId,
+        status: 'error',
+        detail: `Cron target role is invalid: ${targetRole}`,
+      });
       return;
     }
     name = sessionName(projectName, targetRole as 'brain' | `w${number}`);
@@ -34,6 +41,13 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
   const session = getSession(name);
   if (!session) {
     logger.warn({ jobId, sessionName: name }, 'Cron: target session not found, skipping');
+    sendCommandResult(serverLink, {
+      type: CRON_MSG.COMMAND_RESULT,
+      jobId,
+      executionId,
+      status: 'error',
+      detail: `Cron target session not found: ${name}`,
+    });
     return;
   }
 
@@ -42,6 +56,13 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
     const expectedPrefix = `deck_${projectName}_`;
     if (!session.parentSession.startsWith(expectedPrefix)) {
       logger.warn({ jobId, targetSessionName, projectName, parentSession: session.parentSession }, 'Cron: cross-project sub-session targeting blocked');
+      sendCommandResult(serverLink, {
+        type: CRON_MSG.COMMAND_RESULT,
+        jobId,
+        executionId,
+        status: 'error',
+        detail: `Cron target session ${targetSessionName} does not belong to project ${projectName}`,
+      });
       return;
     }
   }
@@ -54,6 +75,13 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
       const status = await detectStatusAsync(name, session.agentType as AgentType);
       if (BUSY_STATES.has(status)) {
         logger.info({ jobId, sessionName: name, status }, 'Cron: session busy, skipping');
+        sendCommandResult(serverLink, {
+          type: CRON_MSG.COMMAND_RESULT,
+          jobId,
+          executionId,
+          status: 'skipped_busy',
+          detail: `Cron target session is busy: ${name} (${status})`,
+        });
         return;
       }
     } catch (err) {
@@ -71,16 +99,30 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
           await runtime.send(action.command);
         } catch (err) {
           logger.error({ jobId, sessionName: name, err }, 'Cron: transport send failed');
+          sendCommandResult(serverLink, {
+            type: CRON_MSG.COMMAND_RESULT,
+            jobId,
+            executionId,
+            status: 'error',
+            detail: `Cron transport send failed for ${name}: ${formatErr(err)}`,
+          });
         }
       } else {
         logger.warn({ jobId, sessionName: name }, 'Cron: transport provider not connected');
+        sendCommandResult(serverLink, {
+          type: CRON_MSG.COMMAND_RESULT,
+          jobId,
+          executionId,
+          status: 'error',
+          detail: `Cron transport provider not connected for ${name}`,
+        });
       }
     } else {
       await sendKeys(name, action.command, { cwd: session.projectDir });
     }
 
     // Capture agent response: collect assistant.text events until session goes idle
-    collectCommandResult(name, jobId, serverLink);
+    collectCommandResult(name, jobId, executionId, serverLink);
     return;
   }
 
@@ -109,6 +151,13 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
 
     if (targets.length === 0) {
       logger.warn({ jobId, jobName }, 'Cron: no valid P2P participants, skipping');
+      sendCommandResult(serverLink, {
+        type: CRON_MSG.COMMAND_RESULT,
+        jobId,
+        executionId,
+        status: 'error',
+        detail: 'Cron P2P job has no valid participants',
+      });
       return;
     }
 
@@ -122,10 +171,17 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
   }
 
   logger.warn({ jobId, actionType: (action as Record<string, unknown>).type }, 'Cron: unknown action type');
+  sendCommandResult(serverLink, {
+    type: CRON_MSG.COMMAND_RESULT,
+    jobId,
+    executionId,
+    status: 'error',
+    detail: `Cron action type is unknown: ${String((action as Record<string, unknown>).type ?? 'unknown')}`,
+  });
 }
 
 /** Collect assistant output after a cron command until session goes idle, then send result to server. */
-function collectCommandResult(sessionId: string, jobId: string, serverLink: ServerLink): void {
+function collectCommandResult(sessionId: string, jobId: string, executionId: string | undefined, serverLink: ServerLink): void {
   const MAX_WAIT_MS = 10 * 60 * 1000; // 10 min max
   const MAX_DETAIL_LEN = 4000;
   const collected: string[] = [];
@@ -133,7 +189,18 @@ function collectCommandResult(sessionId: string, jobId: string, serverLink: Serv
 
   const handler = (e: TimelineEvent) => {
     if (e.sessionId !== sessionId) return;
-    if (Date.now() - startTs > MAX_WAIT_MS) { cleanup(); return; }
+    if (Date.now() - startTs > MAX_WAIT_MS) {
+      logger.warn({ jobId, executionId, sessionId }, 'Cron: command result timed out');
+      sendCommandResult(serverLink, {
+        type: CRON_MSG.COMMAND_RESULT,
+        jobId,
+        executionId,
+        status: 'error',
+        detail: `Cron command timed out waiting for response from ${sessionId}`,
+      });
+      cleanup();
+      return;
+    }
 
     if (e.type === 'assistant.text' && typeof e.payload.text === 'string') {
       collected.push(e.payload.text);
@@ -141,9 +208,8 @@ function collectCommandResult(sessionId: string, jobId: string, serverLink: Serv
 
     if (e.type === 'session.state' && e.payload.state === 'idle' && collected.length > 0) {
       const detail = collected.join('\n').slice(0, MAX_DETAIL_LEN);
-      try {
-        serverLink.send({ type: CRON_MSG.COMMAND_RESULT, jobId, detail });
-      } catch { /* not critical */ }
+      logger.info({ jobId, executionId, sessionId, detailLength: detail.length }, 'Cron: command result captured');
+      sendCommandResult(serverLink, { type: CRON_MSG.COMMAND_RESULT, jobId, executionId, detail });
       cleanup();
     }
   };
@@ -155,4 +221,22 @@ function collectCommandResult(sessionId: string, jobId: string, serverLink: Serv
     clearTimeout(timer);
     unsub();
   }
+}
+
+function sendCommandResult(serverLink: ServerLink, msg: CronCommandResultMessage, attempt = 1): void {
+  try {
+    serverLink.send(msg);
+    logger.info({ jobId: msg.jobId, executionId: msg.executionId, attempt, status: msg.status }, 'Cron: command result sent');
+  } catch (err) {
+    const maxAttempts = 12;
+    logger.warn({ jobId: msg.jobId, executionId: msg.executionId, attempt, err }, 'Cron: command result send failed');
+    if (attempt >= maxAttempts) return;
+    const delayMs = Math.min(30_000, 1000 * attempt);
+    setTimeout(() => sendCommandResult(serverLink, msg, attempt + 1), delayMs);
+  }
+}
+
+function formatErr(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message;
+  return String(err);
 }

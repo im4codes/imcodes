@@ -66,6 +66,7 @@ describe('jobDispatchCron', () => {
     const sent = JSON.parse(mockSendToDaemon.mock.calls[0][0]) as CronDispatchMessage;
     expect(sent.type).toBe(CRON_MSG.DISPATCH);
     expect(sent.jobId).toBe('j1');
+    expect(sent.executionId).toBe('a'.repeat(24));
     expect(sent.projectName).toBe('myapp');
     expect(sent.targetRole).toBe('brain');
     expect(sent.action).toEqual({ type: 'command', command: 'hello' });

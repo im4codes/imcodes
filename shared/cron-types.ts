@@ -35,6 +35,7 @@ export const CRON_MSG = {
 export interface CronDispatchMessage {
   type: typeof CRON_MSG.DISPATCH;
   jobId: string;
+  executionId?: string;
   jobName: string;
   serverId: string;
   projectName: string;
@@ -42,6 +43,14 @@ export interface CronDispatchMessage {
   /** Direct session name for sub-session targeting (e.g. deck_sub_xxx). When set, overrides targetRole. */
   targetSessionName?: string;
   action: CronAction;
+}
+
+export interface CronCommandResultMessage {
+  type: typeof CRON_MSG.COMMAND_RESULT;
+  jobId: string;
+  executionId?: string;
+  detail: string;
+  status?: 'manual_trigger' | 'dispatched' | 'skipped_busy' | 'error';
 }
 
 // ── Job status ───────────────────────────────────────────────────────────

@@ -23,6 +23,15 @@ vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
   startP2pRun: vi.fn(),
 }));
 
+const { timelineOn } = vi.hoisted(() => ({
+  timelineOn: vi.fn(),
+}));
+vi.mock('../../src/daemon/timeline-emitter.js', () => ({
+  timelineEmitter: {
+    on: timelineOn,
+  },
+}));
+
 vi.mock('../../src/util/logger.js', () => ({
   default: {
     info: vi.fn(),
@@ -83,6 +92,7 @@ describe('executeCronJob', () => {
     (sessionName as ReturnType<typeof vi.fn>).mockImplementation(
       (project: string, role: string) => `deck_${project}_${role}`,
     );
+    timelineOn.mockReturnValue(() => {});
   });
 
   // 1. Command to idle process session
@@ -451,5 +461,72 @@ describe('executeCronJob', () => {
       mockServerLink,
       1,
     );
+  });
+
+  it('sends command result with executionId when assistant output completes', async () => {
+    let handler: ((event: any) => void) | undefined;
+    timelineOn.mockImplementation((fn: (event: any) => void) => {
+      handler = fn;
+      return () => {};
+    });
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(makeSession());
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
+
+    await executeCronJob(makeMsg({ executionId: 'exec-1' }), mockServerLink);
+
+    handler?.({ sessionId: 'deck_myapp_brain', type: 'assistant.text', payload: { text: 'done' } });
+    handler?.({ sessionId: 'deck_myapp_brain', type: 'session.state', payload: { state: 'idle' } });
+
+    expect(mockServerLink.send).toHaveBeenCalledWith({
+      type: CRON_MSG.COMMAND_RESULT,
+      jobId: 'job-1',
+      executionId: 'exec-1',
+      detail: 'done',
+    });
+  });
+
+  it('retries command result send after a transient link failure', async () => {
+    vi.useFakeTimers();
+    let handler: ((event: any) => void) | undefined;
+    timelineOn.mockImplementation((fn: (event: any) => void) => {
+      handler = fn;
+      return () => {};
+    });
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(makeSession());
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
+    mockServerLink.send
+      .mockImplementationOnce(() => { throw new Error('not connected'); })
+      .mockImplementationOnce(() => undefined);
+
+    await executeCronJob(makeMsg({ executionId: 'exec-2' }), mockServerLink);
+
+    handler?.({ sessionId: 'deck_myapp_brain', type: 'assistant.text', payload: { text: 'retry me' } });
+    handler?.({ sessionId: 'deck_myapp_brain', type: 'session.state', payload: { state: 'idle' } });
+
+    expect(mockServerLink.send).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(mockServerLink.send).toHaveBeenCalledTimes(2);
+    expect(mockServerLink.send).toHaveBeenLastCalledWith({
+      type: CRON_MSG.COMMAND_RESULT,
+      jobId: 'job-1',
+      executionId: 'exec-2',
+      detail: 'retry me',
+    });
+    vi.useRealTimers();
+  });
+
+  it('reports skipped_busy back to the server', async () => {
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(makeSession());
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('thinking');
+
+    await executeCronJob(makeMsg({ executionId: 'exec-3' }), mockServerLink);
+
+    expect(mockServerLink.send).toHaveBeenCalledWith({
+      type: CRON_MSG.COMMAND_RESULT,
+      jobId: 'job-1',
+      executionId: 'exec-3',
+      status: 'skipped_busy',
+      detail: 'Cron target session is busy: deck_myapp_brain (thinking)',
+    });
   });
 });

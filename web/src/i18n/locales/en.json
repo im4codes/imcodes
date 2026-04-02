@@ -562,7 +562,9 @@
     "confirm_trigger": "Run this task now?",
     "status_manual_trigger": "Manual",
     "go_to_session": "Go to session",
-    "go_and_quote": "Go & quote result"
+    "go_and_quote": "Go & quote result",
+    "read_only": "Read-only",
+    "read_only_scope": "This cron job belongs to another server or tab and is temporarily read-only here."
   },
   "fileBrowser": {
     "edit": "Edit",

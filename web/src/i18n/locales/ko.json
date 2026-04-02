@@ -562,7 +562,9 @@
     "confirm_trigger": "이 작업을 지금 실행하시겠습니까?",
     "status_manual_trigger": "수동 실행",
     "go_to_session": "세션으로 이동",
-    "go_and_quote": "이동 후 결과 인용"
+    "go_and_quote": "이동 후 결과 인용",
+    "read_only": "읽기 전용",
+    "read_only_scope": "이 cron 작업은 다른 server 또는 tab 소속이라 여기서는 임시로 읽기 전용입니다."
   },
   "fileBrowser": {
     "edit": "편집",

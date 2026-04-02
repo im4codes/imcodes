@@ -940,14 +940,30 @@ export class WsBridge {
 
     // ── Cron command result: update execution detail with agent response ──
     if (type === 'cron.command_result' && this.db) {
-      const { jobId, detail } = msg as { jobId: string; detail: string };
+      const { jobId, executionId, detail, status } = msg as { jobId: string; executionId?: string; detail: string; status?: string };
       if (jobId && detail) {
-        void this.db.execute(
-          `UPDATE cron_executions SET detail = $1 WHERE id = (
+        const params: unknown[] = [detail.slice(0, 4000)];
+        let sql = '';
+        if (executionId) {
+          if (status) {
+            sql = 'UPDATE cron_executions SET detail = $1, status = $2 WHERE id = $3';
+            params.push(status, executionId);
+          } else {
+            sql = 'UPDATE cron_executions SET detail = $1 WHERE id = $2';
+            params.push(executionId);
+          }
+        } else if (status) {
+          sql = `UPDATE cron_executions SET detail = $1, status = $2 WHERE id = (
+             SELECT id FROM cron_executions WHERE job_id = $3 ORDER BY created_at DESC LIMIT 1
+           )`;
+          params.push(status, jobId);
+        } else {
+          sql = `UPDATE cron_executions SET detail = $1 WHERE id = (
              SELECT id FROM cron_executions WHERE job_id = $2 ORDER BY created_at DESC LIMIT 1
-           )`,
-          [detail.slice(0, 4000), jobId],
-        ).catch(() => {});
+           )`;
+          params.push(jobId);
+        }
+        void this.db.execute(sql, params).catch(() => {});
       }
       return;
     }
