@@ -313,7 +313,7 @@ jobs:
           if [ -n "${NPM_CONFIG_USERCONFIG:-}" ] && [ -f "$NPM_CONFIG_USERCONFIG" ]; then
             sed -i '/^always-auth=/d' "$NPM_CONFIG_USERCONFIG"
           fi
-      - run: npm install -g npm@latest
+      - run: npm install -g npm@11.11.1
       - run: npm ci
       - name: Install web deps
         run: npm ci
