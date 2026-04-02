@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const normalizeSlashes = (value: string) => value.replace(/\\/g, '/');
+const isNativeWindows = process.platform === 'win32';
 
 // ── Mock node-pty ──────────────────────────────────────────────────────────────
 
@@ -97,8 +98,13 @@ describe('conpty backend', () => {
 
       expect(spawnMock).toHaveBeenCalledTimes(1);
       const [command, args, options] = spawnMock.mock.calls[0] as [string, string[], { cwd: string; env: Record<string, string>; cols: number; rows: number; useConpty: boolean }];
-      expect(command).toBe('echo');
-      expect(args).toEqual(['hello']);
+      if (isNativeWindows) {
+        expect(command).toBe('C:\\Windows\\system32\\cmd.exe');
+        expect(args).toEqual(['/d', '/c', 'echo hello']);
+      } else {
+        expect(command).toBe('echo');
+        expect(args).toEqual(['hello']);
+      }
       expect(normalizeSlashes(options.cwd)).toBe('/tmp');
       expect(options.env).toEqual(expect.objectContaining({ FOO: 'bar' }));
       expect(options.cols).toBe(120);
@@ -112,9 +118,15 @@ describe('conpty backend', () => {
         cwd: 'C:\\Users\\admin',
       });
 
-      expect(spawnMock).toHaveBeenCalledWith('claude', ['--resume', 'abc'], expect.objectContaining({
-        cwd: expect.any(String),
-      }));
+      if (isNativeWindows) {
+        expect(spawnMock).toHaveBeenCalledWith('C:\\Windows\\system32\\cmd.exe', ['/d', '/c', 'claude --resume abc'], expect.objectContaining({
+          cwd: expect.any(String),
+        }));
+      } else {
+        expect(spawnMock).toHaveBeenCalledWith('claude', ['--resume', 'abc'], expect.objectContaining({
+          cwd: expect.any(String),
+        }));
+      }
     });
 
     it('strips cd prefix without /d flag', async () => {
@@ -122,18 +134,31 @@ describe('conpty backend', () => {
         cwd: 'C:\\path',
       });
 
-      expect(spawnMock).toHaveBeenCalledWith('some-cmd', [], expect.objectContaining({
-        cwd: expect.any(String),
-      }));
+      if (isNativeWindows) {
+        expect(spawnMock).toHaveBeenCalledWith('C:\\Windows\\system32\\cmd.exe', ['/d', '/c', 'some-cmd'], expect.objectContaining({
+          cwd: expect.any(String),
+        }));
+      } else {
+        expect(spawnMock).toHaveBeenCalledWith('some-cmd', [], expect.objectContaining({
+          cwd: expect.any(String),
+        }));
+      }
     });
 
     it('uses default cols=200, rows=50 when not specified', async () => {
       await conpty.conptyNewSession('test-defaults', 'cmd');
 
-      expect(spawnMock).toHaveBeenCalledWith('cmd', [], expect.objectContaining({
-        cols: 200,
-        rows: 50,
-      }));
+      if (isNativeWindows) {
+        expect(spawnMock).toHaveBeenCalledWith('C:\\Windows\\system32\\cmd.exe', ['/d', '/c', 'cmd'], expect.objectContaining({
+          cols: 200,
+          rows: 50,
+        }));
+      } else {
+        expect(spawnMock).toHaveBeenCalledWith('cmd', [], expect.objectContaining({
+          cols: 200,
+          rows: 50,
+        }));
+      }
     });
 
     it('merges opts.env with process.env', async () => {
@@ -553,8 +578,13 @@ describe('conpty backend', () => {
       expect(conpty.conptySessionExists('respawn-test')).toBe(true);
       // Should have spawned with new command but preserved CWD
       const lastCall = spawnMock.mock.calls.at(-1) as [string, string[], { cwd?: string }] | undefined;
-      expect(lastCall?.[0]).toBe('new-cmd');
-      expect(lastCall?.[1]).toEqual([]);
+      if (isNativeWindows) {
+        expect(lastCall?.[0]).toBe('C:\\Windows\\system32\\cmd.exe');
+        expect(lastCall?.[1]).toEqual(['/d', '/c', 'new-cmd']);
+      } else {
+        expect(lastCall?.[0]).toBe('new-cmd');
+        expect(lastCall?.[1]).toEqual([]);
+      }
       expect(normalizeSlashes(lastCall?.[2]?.cwd ?? '')).toBe('/old/path');
     });
 
