@@ -77,6 +77,8 @@ const program = new Command()
   .description('Remote AI coding agent controller')
   .version(version);
 
+program.exitOverride();
+
 program
   .command('start')
   .description('Start the daemon via system service (launchd/systemd)')
@@ -789,7 +791,19 @@ program
     console.log(`Disconnected from ${provider}.`);
   });
 
-program.parseAsync(process.argv).catch((err) => {
+program.parseAsync(process.argv).catch((err: unknown) => {
+  const exitCode = typeof err === 'object' && err && 'exitCode' in err
+    ? Number((err as { exitCode?: unknown }).exitCode)
+    : null;
+  const code = typeof err === 'object' && err && 'code' in err
+    ? String((err as { code?: unknown }).code ?? '')
+    : '';
+
+  if (exitCode === 0 || code === 'commander.help' || code === 'commander.version') {
+    process.exitCode = 0;
+    return;
+  }
+
   logger.error({ err }, 'Fatal error');
-  process.exit(1);
+  process.exit(exitCode && exitCode > 0 ? exitCode : 1);
 });
