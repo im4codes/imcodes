@@ -91,7 +91,7 @@ vi.mock('../../src/daemon/timeline-store.js', () => ({
   timelineStore: { read: timelineReadMock, append: vi.fn() },
 }));
 
-import { subSessionName, detectShells, startSubSession, rebuildSubSessions, readSubSessionResponse } from '../../src/daemon/subsession-manager.js';
+import { subSessionName, detectShells, startSubSession, rebuildSubSessions, readSubSessionResponse, normalizeShellBinForHost } from '../../src/daemon/subsession-manager.js';
 import { upsertSession } from '../../src/store/session-store.js';
 import { startWatchingFile, startWatching } from '../../src/daemon/jsonl-watcher.js';
 
@@ -142,6 +142,22 @@ describe('detectShells()', () => {
     for (const s of shells) {
       expect(s.startsWith('/')).toBe(true);
     }
+  });
+});
+
+describe('normalizeShellBinForHost()', () => {
+  it('rejects Windows shell paths on unix hosts', () => {
+    expect(normalizeShellBinForHost('C:\\Windows\\system32\\cmd.exe')).toBeUndefined();
+    expect(normalizeShellBinForHost('C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')).toBeUndefined();
+  });
+
+  it('accepts unix shell paths when they exist', () => {
+    expect(normalizeShellBinForHost('/bin/sh')).toBe('/bin/sh');
+  });
+
+  it('accepts bare unix shell commands', () => {
+    expect(normalizeShellBinForHost('fish')).toBe('fish');
+    expect(normalizeShellBinForHost('pwsh')).toBe('pwsh');
   });
 });
 
@@ -223,6 +239,38 @@ describe('startSubSession — ccSessionId stored in session-store', () => {
     // Should be a valid UUID string, not undefined or null
     expect(typeof call.ccSessionId).toBe('string');
     expect(call.ccSessionId).toMatch(/^[0-9a-f-]{36}$/);
+  });
+});
+
+describe('startSubSession — shellBin host normalization', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionExistsMock.mockResolvedValue(false);
+    newSessionMock.mockResolvedValue(undefined);
+    getDriverMock.mockReturnValue({
+      buildLaunchCommand: vi.fn(() => '/bin/sh'),
+      buildResumeCommand: vi.fn(() => '/bin/sh'),
+      postLaunch: undefined,
+    });
+  });
+
+  it('drops incompatible Windows shellBin on unix hosts before launch', async () => {
+    await startSubSession({
+      id: 'shell-win-path',
+      type: 'shell',
+      cwd: '/proj',
+      shellBin: 'C:\\Windows\\system32\\cmd.exe',
+    });
+
+    const buildLaunchCommand = getDriverMock.mock.results[0]?.value.buildLaunchCommand as ReturnType<typeof vi.fn>;
+    expect(buildLaunchCommand).toHaveBeenCalledWith(
+      'deck_sub_shell-win-path',
+      expect.not.objectContaining({ shellBin: 'C:\\Windows\\system32\\cmd.exe' }),
+    );
+
+    expect(upsertSession).toHaveBeenCalledWith(
+      expect.not.objectContaining({ shellBin: 'C:\\Windows\\system32\\cmd.exe' }),
+    );
   });
 });
 

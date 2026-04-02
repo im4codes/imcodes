@@ -41,9 +41,39 @@ export interface SubSessionRecord {
 
 export function subSessionName(id: string): string { return `deck_sub_${id}`; }
 
+export function normalizeShellBinForHost(shellBin?: string | null): string | undefined {
+  if (!shellBin) return undefined;
+
+  if (process.platform === 'win32') {
+    // On Windows accept bare commands (pwsh.exe, cmd.exe) and existing paths.
+    if (!/[\\/]/.test(shellBin)) return shellBin;
+    return existsSync(shellBin) ? shellBin : undefined;
+  }
+
+  // Unix/macOS: never try to execute Windows-style paths or .exe binaries.
+  if (/^[a-zA-Z]:[\\/]/.test(shellBin)) return undefined;
+  if (shellBin.includes('\\')) return undefined;
+  if (/\.exe$/i.test(shellBin)) return undefined;
+
+  // Absolute/relative unix path: keep only if it exists locally.
+  if (shellBin.includes('/')) {
+    return existsSync(shellBin) ? shellBin : undefined;
+  }
+
+  // Bare command name (fish, zsh, bash, pwsh, etc.) is allowed.
+  return shellBin;
+}
+
 export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   const sessionName = subSessionName(sub.id);
   const agentType = sub.type as AgentType;
+  if (agentType === 'shell' || agentType === 'script') {
+    const normalizedShellBin = normalizeShellBinForHost(sub.shellBin);
+    if (sub.shellBin && !normalizedShellBin) {
+      logger.warn({ sessionName, shellBin: sub.shellBin, platform: process.platform }, 'Ignoring incompatible shellBin for current host');
+    }
+    sub.shellBin = normalizedShellBin ?? undefined;
+  }
   const driver = getDriver(agentType);
   const agentVersion = await getAgentVersion(agentType, sub.shellBin ?? undefined);
 
