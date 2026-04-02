@@ -35,11 +35,13 @@ import { getProvider } from '../agent/provider-registry.js';
 import { copyFile } from 'node:fs/promises';
 import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
 import { buildWindowsCleanupScript, buildWindowsUpgradeBatch } from '../util/windows-upgrade-script.js';
+import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 
 /**
  * For sandboxed agents (Gemini, Codex): copy files from ~/.imcodes/ to
  * the session's project .imc/refs/ so the agent can access them.
- * Rewrites @paths in the message text. Auto-deletes copies after 5 min.
+ * Rewrites @paths in the message text. Auto-deletes copies after 30 min and
+ * persists cleanup metadata in ~/.imcodes/temp-files.json.
  */
 async function rewritePathsForSandbox(sessionName: string, text: string): Promise<string> {
   const record = getSession(sessionName);
@@ -64,11 +66,19 @@ async function rewritePathsForSandbox(sessionName: string, text: string): Promis
     const destPath = nodePath.join(refsDir, uniqueName);
     try {
       await copyFile(srcPath, destPath);
+      const now = Date.now();
+      await registerTempFile({
+        path: destPath,
+        createdAt: now,
+        expiresAt: now + (30 * 60_000),
+        reason: 'sandbox-ref-copy',
+      });
       result = result.replace(`@${srcPath}`, `@${destPath}`);
-      // Auto-delete after 5 minutes
+      // Auto-delete after 30 minutes
       setTimeout(async () => {
         try { const { unlink } = await import('node:fs/promises'); await unlink(destPath); } catch { /* already deleted */ }
-      }, 5 * 60_000);
+        try { await removeTrackedTempFile(destPath); } catch { /* ignore */ }
+      }, 30 * 60_000);
     } catch (err) {
       logger.warn({ src: srcPath, dest: destPath, err }, 'Failed to copy file for sandboxed agent');
     }

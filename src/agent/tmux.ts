@@ -29,6 +29,7 @@ import {
   startWeztermPollingStream,
   registerPane,
 } from './wezterm.js';
+import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 
 const execFile = promisify(execFileCb);
 
@@ -232,7 +233,7 @@ export interface SendKeysOptions {
  *
  * **With cwd** — for sandboxed agents (Gemini) that can't handle paste-buffer or /tmp:
  * - Write to temp file in project dir, send "read <path>" instruction
- * - 60s auto-cleanup
+ * - 30m auto-cleanup persisted in ~/.imcodes/temp-files.json
  *
  * Always sends Enter after text. Long text gets a 3s safety-net Enter.
  */
@@ -264,9 +265,19 @@ export async function sendKeys(session: string, keys: string, opts?: SendKeysOpt
     const fileName = `.imcodes-prompt-${hash}.md`;
     const filePath = opts?.cwd ? path.join(opts.cwd, fileName) : path.join(os.tmpdir(), fileName);
     await fsp.writeFile(filePath, keys, { encoding: 'utf-8', mode: 0o600 });
+    const now = Date.now();
+    await registerTempFile({
+      path: filePath,
+      createdAt: now,
+      expiresAt: now + (30 * 60_000),
+      reason: 'sendKeys',
+    });
     const instruction = `Read and execute all instructions in @${filePath}`;
     await rawSendText(session, instruction);
-    setTimeout(() => fsp.unlink(filePath).catch(() => {}), 120_000);
+    setTimeout(async () => {
+      try { await fsp.unlink(filePath); } catch { /* already deleted */ }
+      try { await removeTrackedTempFile(filePath); } catch { /* ignore */ }
+    }, 30 * 60_000);
   } else {
     // Short text: simple send (no shell quoting needed with execFile)
     await rawSendText(session, keys);

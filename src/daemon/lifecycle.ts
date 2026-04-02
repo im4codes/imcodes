@@ -12,6 +12,7 @@ import { handlePreviewBinaryFrame } from './preview-relay.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { timelineStore } from './timeline-store.js';
 import { startHookServer, drainQueue } from './hook-server.js';
+import { initTempFileStore } from '../store/temp-file-store.js';
 import { setupCCHooks } from '../agent/signal.js';
 import type http from 'http';
 import net from 'node:net';
@@ -262,6 +263,9 @@ export async function startup(): Promise<DaemonContext> {
 
   await loadStore();
   logger.info('Session store loaded');
+
+  await initTempFileStore();
+  logger.info('Temp file store initialized');
 
   // Rebuild provider routing from persisted transport sessions BEFORE any connectProvider()
   rebuildProviderRoutes();
