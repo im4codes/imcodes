@@ -56,6 +56,7 @@ vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
 }));
 
 vi.mock('../../src/daemon/codex-watcher.js', () => ({
+  ensureSessionFile: vi.fn().mockResolvedValue('/mock/codex-rollout.jsonl'),
   startWatching: mocks.codexStartWatching,
   startWatchingSpecificFile: mocks.codexStartWatchingSpecificFile,
   startWatchingById: vi.fn().mockResolvedValue(undefined),

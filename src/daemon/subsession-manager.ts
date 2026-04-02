@@ -12,10 +12,10 @@ import { timelineStore } from './timeline-store.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { upsertSession, getSession, removeSession } from '../store/session-store.js';
 import { existsSync } from 'node:fs';
+import { resolveStructuredSessionBootstrap } from '../agent/structured-session-bootstrap.js';
 
 import logger from '../util/logger.js';
 import { getAgentVersion } from '../agent/agent-version.js';
-import { randomUUID } from 'node:crypto';
 
 export interface SubSessionRecord {
   id: string;
@@ -49,18 +49,17 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
 
   if (await sessionExists(sessionName)) return;
 
-  if (agentType === 'claude-code') {
-    sub.ccSessionId = sub.ccSessionId ?? randomUUID();
-  }
-
-  // For Codex: generate explicit UUID before launch, then pre-create the session
-  // file so `codex resume <uuid>` finds it immediately and the watcher starts fast.
-  if (agentType === 'codex') {
-    const { randomUUID } = await import('node:crypto');
-    sub.codexSessionId = sub.codexSessionId ?? randomUUID();
-    const { ensureSessionFile } = await import('./codex-watcher.js');
-    await ensureSessionFile(sub.codexSessionId, sub.cwd ?? process.cwd()).catch(() => {});
-  }
+  const resolved = await resolveStructuredSessionBootstrap({
+    agentType,
+    projectDir: sub.cwd ?? process.cwd(),
+    isNewSession: true,
+    ccSessionId: sub.ccSessionId,
+    codexSessionId: sub.codexSessionId,
+    geminiSessionId: sub.geminiSessionId,
+  });
+  sub.ccSessionId = resolved.ccSessionId ?? sub.ccSessionId ?? undefined;
+  sub.codexSessionId = resolved.codexSessionId ?? sub.codexSessionId ?? undefined;
+  sub.geminiSessionId = resolved.geminiSessionId ?? sub.geminiSessionId ?? undefined;
 
   // CC: if JSONL exists (restart), use --resume to continue the conversation.
   // If no JSONL (new session), use --session-id. Never delete the JSONL.

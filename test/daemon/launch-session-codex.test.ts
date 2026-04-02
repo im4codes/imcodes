@@ -3,10 +3,18 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // ── Mocks ─────────────────────────────────────────────────────────────────────
 
 const mocks = vi.hoisted(() => ({
-  extractNewRolloutUuid: vi.fn(),
+  ensureSessionFile: vi.fn().mockResolvedValue('/proj/rollout-seeded.jsonl'),
   upsertSession: vi.fn(),
   newSession: vi.fn().mockResolvedValue(undefined),
 }));
+
+vi.mock('node:crypto', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:crypto')>();
+  return {
+    ...actual,
+    randomUUID: vi.fn(() => 'new-codex-uuid'),
+  };
+});
 
 vi.mock('../../src/store/session-store.js', () => ({
   listSessions: vi.fn(() => []),
@@ -28,8 +36,9 @@ vi.mock('../../src/daemon/codex-watcher.js', () => ({
   startWatchingSpecificFile: vi.fn().mockResolvedValue(undefined),
   stopWatching: vi.fn(),
   isWatching: vi.fn().mockReturnValue(false),
-  extractNewRolloutUuid: mocks.extractNewRolloutUuid,
-  findRolloutPathByUuid: vi.fn().mockResolvedValue('/proj/rollout.jsonl'),
+  extractNewRolloutUuid: vi.fn(),
+  ensureSessionFile: mocks.ensureSessionFile,
+  findRolloutPathByUuid: vi.fn().mockResolvedValue(null),
   preClaimFile: vi.fn(),
 }));
 
@@ -63,13 +72,7 @@ describe('launchSession — Codex ID handling', () => {
     vi.clearAllMocks();
   });
 
-  it('awaits extractNewRolloutUuid and saves it to store before finishing', async () => {
-    // Simulate extractNewRolloutUuid taking some time
-    mocks.extractNewRolloutUuid.mockImplementation(async () => {
-      await new Promise(r => setTimeout(r, 100));
-      return 'new-codex-uuid';
-    });
-
+  it('assigns an explicit codexSessionId before first launch and persists it', async () => {
     await launchSession({
       name: 'deck_codex_brain',
       projectName: 'test',
@@ -78,12 +81,12 @@ describe('launchSession — Codex ID handling', () => {
       projectDir: '/proj',
     });
 
-    // Verify extractNewRolloutUuid was called
-    expect(mocks.extractNewRolloutUuid).toHaveBeenCalled();
+    expect(mocks.ensureSessionFile).toHaveBeenCalledWith('new-codex-uuid', '/proj');
 
-    // Verify upsertSession was called WITH the new UUID
-    // launchSession calls upsertSession multiple times (paneId update, record creation, UUID update)
-    // The LAST call should have the UUID.
+    const launchCmd = mocks.newSession.mock.calls[0]?.[1];
+    expect(launchCmd).toContain('resume new-codex-uuid');
+    expect(launchCmd).not.toContain('resume --last');
+
     const upsertCalls = mocks.upsertSession.mock.calls;
     const lastRecord = upsertCalls[upsertCalls.length - 1][0];
     expect(lastRecord.codexSessionId).toBe('new-codex-uuid');

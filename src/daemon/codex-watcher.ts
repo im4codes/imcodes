@@ -114,7 +114,12 @@ async function findLatestRollout(dir: string, workDir: string, excludeClaimed = 
   return null;
 }
 
-function normalizePath(p: string): string { return p.replace(/\/+$/, ''); }
+function normalizePath(p: string): string {
+  const normalized = p
+    .replace(/\\/g, '/')
+    .replace(/\/+$/, '');
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
 
 // ── JSONL parsing ──────────────────────────────────────────────────────────────
 

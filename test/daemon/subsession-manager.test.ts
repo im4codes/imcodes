@@ -8,7 +8,7 @@ const {
   capturePaneMock, timelineReadMock,
   geminiStartWatchingMock, geminiIsWatchingMock,
   codexStartWatchingByIdMock, codexIsWatchingMock, codexIsFileClaimedMock,
-  removeSessionMock,
+  removeSessionMock, resolveGeminiSessionIdMock, injectGeminiMemoryMock,
 } = vi.hoisted(() => ({
   upsertSessionMock: vi.fn(),
   startWatchingMock: vi.fn().mockResolvedValue(undefined),
@@ -26,6 +26,8 @@ const {
   codexIsWatchingMock: vi.fn().mockReturnValue(false),
   codexIsFileClaimedMock: vi.fn().mockReturnValue(false),
   removeSessionMock: vi.fn(),
+  resolveGeminiSessionIdMock: vi.fn().mockResolvedValue('resolved-gemini-uuid'),
+  injectGeminiMemoryMock: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -46,6 +48,7 @@ vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
 }));
 
 vi.mock('../../src/daemon/codex-watcher.js', () => ({
+  ensureSessionFile: vi.fn().mockResolvedValue('/mock/codex-rollout.jsonl'),
   startWatching: vi.fn().mockResolvedValue(undefined),
   startWatchingSpecificFile: vi.fn().mockResolvedValue(undefined),
   startWatchingById: codexStartWatchingByIdMock,
@@ -72,6 +75,16 @@ vi.mock('../../src/agent/tmux.js', () => ({
 
 vi.mock('../../src/agent/session-manager.js', () => ({
   getDriver: getDriverMock,
+}));
+
+vi.mock('../../src/agent/drivers/gemini.js', () => ({
+  GeminiDriver: vi.fn().mockImplementation(() => ({
+    resolveSessionId: resolveGeminiSessionIdMock,
+  })),
+}));
+
+vi.mock('../../src/daemon/memory-inject.js', () => ({
+  injectGeminiMemory: injectGeminiMemoryMock,
 }));
 
 vi.mock('../../src/daemon/timeline-store.js', () => ({
@@ -239,6 +252,8 @@ describe('startSubSession — geminiSessionId stored in session-store', () => {
   });
 
   it('persists undefined geminiSessionId as undefined (not lost)', async () => {
+    resolveGeminiSessionIdMock.mockResolvedValue('resolved-gemini-uuid');
+
     await startSubSession({
       id: 'gem-sub2',
       type: 'gemini',
@@ -248,8 +263,8 @@ describe('startSubSession — geminiSessionId stored in session-store', () => {
     });
 
     const call = vi.mocked(upsertSession).mock.calls[0]?.[0] as Record<string, unknown>;
-    // Should not have geminiSessionId set to something truthy when null was passed
-    expect(call.geminiSessionId).toBeUndefined();
+    expect(call.geminiSessionId).toBe('resolved-gemini-uuid');
+    expect(injectGeminiMemoryMock).toHaveBeenCalledWith('resolved-gemini-uuid', '/proj');
   });
 });
 
