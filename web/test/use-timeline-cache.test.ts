@@ -2,11 +2,14 @@
  * @vitest-environment jsdom
  */
 import { beforeEach, describe, expect, it } from 'vitest';
+import { render, screen, cleanup, act } from '@testing-library/preact';
+import { h } from 'preact';
 import type { TimelineEvent } from '../src/ws-client.js';
 import {
   __getTimelineCacheKeysForTests,
   __resetTimelineCacheForTests,
   __setTimelineCacheForTests,
+  useTimeline,
 } from '../src/hooks/useTimeline.js';
 
 function makeEvents(sessionId: string, count: number): TimelineEvent[] {
@@ -26,6 +29,7 @@ function makeEvents(sessionId: string, count: number): TimelineEvent[] {
 describe('useTimeline global cache bounds', () => {
   beforeEach(() => {
     __resetTimelineCacheForTests();
+    cleanup();
   });
 
   it('evicts least recently used sessions when session-count cap is exceeded', () => {
@@ -51,5 +55,29 @@ describe('useTimeline global cache bounds', () => {
     expect(keys).toContain('server:b');
     expect(keys).toContain('server:c');
     expect(keys).toContain('server:d');
+  });
+
+  it('pushes cache updates to already-mounted hooks for the same session', async () => {
+    function Probe({ name }: { name: string }) {
+      const { events } = useTimeline('deck_sub_codex', null, 'srv');
+      return h('div', { 'data-testid': name }, String(events.length));
+    }
+
+    render(
+      h('div', null,
+        h(Probe, { name: 'card' }),
+        h(Probe, { name: 'window' }),
+      ),
+    );
+
+    expect(screen.getByTestId('card').textContent).toBe('0');
+    expect(screen.getByTestId('window').textContent).toBe('0');
+
+    await act(async () => {
+      __setTimelineCacheForTests('srv:deck_sub_codex', makeEvents('deck_sub_codex', 3));
+    });
+
+    expect(screen.getByTestId('card').textContent).toBe('3');
+    expect(screen.getByTestId('window').textContent).toBe('3');
   });
 });

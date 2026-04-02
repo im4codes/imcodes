@@ -19,6 +19,7 @@ sharedDb.open().catch(() => {});
 // render immediately from in-memory state without waiting for IDB or network.
 const eventsCache = new Map<string, TimelineEvent[]>();
 const eventsCacheAccess = new Map<string, number>();
+const cacheListeners = new Map<string, Set<(events: TimelineEvent[]) => void>>();
 
 const MAX_MEMORY_EVENTS = 2000;
 const MAX_CACHED_SESSIONS = 12;
@@ -50,7 +51,26 @@ function getCachedEvents(cacheKey: string): TimelineEvent[] | undefined {
 function setCachedEvents(cacheKey: string, events: TimelineEvent[]): void {
   eventsCache.set(cacheKey, events);
   markCacheAccess(cacheKey);
+  const listeners = cacheListeners.get(cacheKey);
+  if (listeners) {
+    for (const listener of listeners) listener(events);
+  }
   pruneTimelineCache();
+}
+
+function subscribeCache(cacheKey: string, listener: (events: TimelineEvent[]) => void): () => void {
+  let listeners = cacheListeners.get(cacheKey);
+  if (!listeners) {
+    listeners = new Set();
+    cacheListeners.set(cacheKey, listeners);
+  }
+  listeners.add(listener);
+  return () => {
+    const set = cacheListeners.get(cacheKey);
+    if (!set) return;
+    set.delete(listener);
+    if (set.size === 0) cacheListeners.delete(cacheKey);
+  };
 }
 
 function pruneTimelineCache(): void {
@@ -74,6 +94,7 @@ function pruneTimelineCache(): void {
 export function __resetTimelineCacheForTests(): void {
   eventsCache.clear();
   eventsCacheAccess.clear();
+  cacheListeners.clear();
 }
 
 export function __getTimelineCacheKeysForTests(): string[] {
@@ -118,6 +139,13 @@ export function useTimeline(
   const historyRequestIdRef = useRef<string | null>(null);
   const olderRequestIdRef = useRef<string | null>(null);
   const historyLoadedRef = useRef<string | null>(null); // tracks which session has been loaded
+
+  useEffect(() => {
+    if (!cacheKey) return;
+    return subscribeCache(cacheKey, (nextEvents) => {
+      setEvents((prev) => (prev === nextEvents ? prev : nextEvents));
+    });
+  }, [cacheKey]);
 
   // Reset on session change — but DON'T clear events when sessionId becomes null
   // (window minimized). The memory cache (eventsCache) preserves them for instant
