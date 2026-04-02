@@ -1,8 +1,9 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
-    branches: [main, master, dev]
+    branches: [main, master, dev, 'repro/**']
     tags: ['v*']
   pull_request:
     branches: [main, master]
