@@ -175,8 +175,8 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
           await Preferences.get({ key: 'deck_api_key_id' });
           // Re-resolve userId from /me endpoint
           const { apiFetch } = await import('../api.js');
-          const me = await apiFetch<{ userId: string }>('/api/auth/user/me');
-          onLoginSuccess?.(me.userId, serverUrl);
+          const me = await apiFetch<{ id: string }>('/api/auth/user/me');
+          onLoginSuccess?.(me.id, serverUrl);
           return;
         }
       }

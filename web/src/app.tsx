@@ -571,13 +571,23 @@ export function App() {
   const [showAdminPage, setShowAdminPage] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
   const [userDisplayName, setUserDisplayName] = useState<string | null>(null);
+  const [username, setUsername] = useState<string | null>(null);
+  const [userHasPassword, setUserHasPassword] = useState(false);
 
   // Fetch current user info on auth
   useEffect(() => {
-    if (!auth) { setIsAdmin(false); setUserDisplayName(null); return; }
+    if (!auth) {
+      setIsAdmin(false);
+      setUserDisplayName(null);
+      setUsername(null);
+      setUserHasPassword(false);
+      return;
+    }
     fetchMe().then((me) => {
       setIsAdmin(me.is_admin);
       setUserDisplayName(me.display_name);
+      setUsername(me.username);
+      setUserHasPassword(me.has_password);
     }).catch(() => {});
   }, [auth]);
 
@@ -2513,8 +2523,15 @@ export function App() {
         <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)' }}>
           <SettingsPage
             displayName={userDisplayName}
+            username={username}
+            hasPassword={userHasPassword}
+            serverUrl={auth?.baseUrl ?? nativeServerUrl}
             onBack={() => setShowSettingsPage(false)}
             onDisplayNameChanged={(name) => setUserDisplayName(name)}
+            onUserAuthUpdated={(next) => {
+              setUsername(next.username);
+              setUserHasPassword(next.hasPassword);
+            }}
           />
         </div>
       )}

@@ -24,6 +24,16 @@ export function configureApiKey(key: string): void {
   _apiKey = key;
   try { localStorage.setItem('rcc_api_key', key); } catch { /* ignore */ }
 }
+/** Temporarily use a Bearer API key without persisting it to storage. */
+export async function withTemporaryApiKey<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const previous = _apiKey;
+  _apiKey = key;
+  try {
+    return await fn();
+  } finally {
+    _apiKey = previous;
+  }
+}
 /** Clear the Bearer API key (reverts to cookie auth). */
 export function clearApiKey(): void {
   _apiKey = null;
@@ -371,9 +381,22 @@ export async function apiFetch<T = unknown>(
 }
 
 export class ApiError extends Error {
+  public code: string | null;
+
   constructor(public status: number, public body: string) {
-    super(`API ${status}: ${body}`);
+    const code = parseApiErrorCode(body);
+    super(`API ${status}: ${code ?? body}`);
     this.name = 'ApiError';
+    this.code = code;
+  }
+}
+
+function parseApiErrorCode(body: string): string | null {
+  try {
+    const parsed = JSON.parse(body) as { error?: unknown };
+    return typeof parsed.error === 'string' ? parsed.error : null;
+  } catch {
+    return null;
   }
 }
 
@@ -508,6 +531,7 @@ export interface MeResponse {
   display_name: string | null;
   is_admin: boolean;
   status: string;
+  has_password: boolean;
 }
 
 export async function fetchMe(): Promise<MeResponse> {
@@ -610,6 +634,10 @@ export async function passkeyLoginBegin(): Promise<Record<string, unknown> & { c
   return apiFetch('/api/auth/passkey/login/begin', { method: 'POST', body: '{}' });
 }
 
+export async function passkeyVerifyBegin(): Promise<Record<string, unknown> & { challengeId: string }> {
+  return apiFetch('/api/auth/passkey/verify/begin', { method: 'POST', body: '{}' });
+}
+
 export async function passkeyLoginComplete(challengeId: string, response: unknown): Promise<void> {
   await apiFetch('/api/auth/passkey/login/complete', {
     method: 'POST',
@@ -639,6 +667,18 @@ export async function passwordChange(oldPassword: string, newPassword: string): 
   await apiFetch('/api/auth/password/change', {
     method: 'POST',
     body: JSON.stringify({ oldPassword, newPassword }),
+  });
+}
+
+export async function passwordSetupWithPasskey(
+  username: string,
+  newPassword: string,
+  challengeId: string,
+  response: unknown,
+): Promise<{ ok: boolean; user: MeResponse }> {
+  return apiFetch('/api/auth/passkey/password/setup', {
+    method: 'POST',
+    body: JSON.stringify({ username, newPassword, challengeId, response }),
   });
 }
 

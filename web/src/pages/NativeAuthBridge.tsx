@@ -9,10 +9,25 @@
 import { useState, useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { startAuthentication, startRegistration } from '@simplewebauthn/browser';
-import { passkeyLoginBegin, passkeyLoginCompleteNative, passkeyRegisterBegin, passkeyRegisterComplete } from '../api.js';
+import {
+  passkeyLoginBegin,
+  passkeyLoginCompleteNative,
+  passkeyRegisterBegin,
+  passkeyRegisterComplete,
+  passkeyVerifyBegin,
+  passwordSetupWithPasskey,
+  withTemporaryApiKey,
+  ApiError,
+} from '../api.js';
 
 interface Props {
   callbackUrl: string;
+}
+
+interface NativePasswordSetupState {
+  apiKey: string;
+  username: string;
+  newPassword: string;
 }
 
 /**
@@ -47,29 +62,55 @@ export function NativeAuthBridge({ callbackUrl }: Props) {
   const [autoTriggered, setAutoTriggered] = useState(false);
   const [callbackLink, setCallbackLink] = useState<string | null>(null);
 
-  const buildCallbackUrl = (apiKey: string, userId: string, keyId: string): string => {
+  const buildActionCallbackUrl = (params: Record<string, string>): string => {
     const url = new URL(callbackUrl);
-    url.searchParams.set('key', apiKey);
-    url.searchParams.set('userId', userId);
-    url.searchParams.set('keyId', keyId);
+    for (const [key, value] of Object.entries(params)) {
+      url.searchParams.set(key, value);
+    }
     return url.toString();
+  };
+
+  const decodePasswordSetupState = (): NativePasswordSetupState | null => {
+    const hash = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : window.location.hash;
+    const params = new URLSearchParams(hash);
+    const encoded = params.get('state');
+    if (!encoded) return null;
+    try {
+      const padded = encoded.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(encoded.length / 4) * 4, '=');
+      const binary = atob(padded);
+      const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
+      const json = new TextDecoder().decode(bytes);
+      const parsed = JSON.parse(json) as Partial<NativePasswordSetupState>;
+      if (!parsed.apiKey || !parsed.username || !parsed.newPassword) return null;
+      return {
+        apiKey: parsed.apiKey,
+        username: parsed.username,
+        newPassword: parsed.newPassword,
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  const finishWithResult = (params: Record<string, string>) => {
+    const url = buildActionCallbackUrl(params);
+    setCallbackLink(url);
+    navigateToCallback(url);
   };
 
   const doLogin = async (source: string) => {
     setLoading(true);
     setError(null);
-    setStatus('Getting challenge...');
+    setStatus(t('login.native_status_getting_challenge'));
     try {
       const beginRes = await passkeyLoginBegin();
       const { challengeId, ...options } = beginRes;
-      setStatus('Authenticating...');
+      setStatus(t('login.native_status_authenticating'));
       const authResponse = await startAuthentication(options as never);
-      setStatus('Getting API key...');
+      setStatus(t('login.native_status_getting_api_key'));
       const res = await passkeyLoginCompleteNative(challengeId, authResponse);
-      setStatus('Redirecting...');
-      const url = buildCallbackUrl(res.apiKey, res.userId, res.keyId);
-      setCallbackLink(url);
-      navigateToCallback(url);
+      setStatus(t('login.native_status_redirecting'));
+      finishWithResult({ key: res.apiKey, userId: res.userId, keyId: res.keyId });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('NotAllowedError') || msg.toLowerCase().includes('not allowed')) {
@@ -79,8 +120,36 @@ export function NativeAuthBridge({ callbackUrl }: Props) {
           setError(t('login.passkey_not_found'));
         }
       } else if (!msg.toLowerCase().includes('cancel')) {
-        setError(`[DEBUG ${source}] ${msg}`);
+        setError(t('login.passkey_error'));
       }
+      setLoading(false);
+    }
+  };
+
+  const handlePasswordSetup = async () => {
+    const state = decodePasswordSetupState();
+    if (!state) {
+      finishWithResult({ error: 'password_setup_error' });
+      setError(t('settings.password_setup_error'));
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    setStatus(t('settings.native_status_verifying_passkey'));
+    try {
+      await withTemporaryApiKey(state.apiKey, async () => {
+        const beginRes = await passkeyVerifyBegin();
+        const { challengeId, ...options } = beginRes;
+        const authResponse = await startAuthentication(options as never);
+        setStatus(t('settings.native_status_saving_password'));
+        const result = await passwordSetupWithPasskey(state.username, state.newPassword, challengeId, authResponse);
+        finishWithResult({ ok: '1', username: result.user.username ?? state.username });
+      });
+    } catch (err: unknown) {
+      const errorCode = err instanceof ApiError ? err.code : null;
+      finishWithResult({ error: errorCode ?? 'password_setup_error' });
+      if (!errorCode) setError(t('settings.password_setup_error'));
+    } finally {
       setLoading(false);
     }
   };
@@ -89,11 +158,15 @@ export function NativeAuthBridge({ callbackUrl }: Props) {
     if (autoTriggered) return;
     setAutoTriggered(true);
     const params = new URLSearchParams(window.location.search);
+    if (params.get('action') === 'password_setup') {
+      void handlePasswordSetup();
+      return;
+    }
     if (params.get('action') === 'register') {
       setMode('register');
       return;
     }
-    doLogin('auto');
+    void doLogin('auto');
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -101,30 +174,28 @@ export function NativeAuthBridge({ callbackUrl }: Props) {
     if (!displayName.trim()) return;
     setLoading(true);
     setError(null);
-    setStatus('Creating passkey...');
+    setStatus(t('login.native_status_creating_passkey'));
     try {
       const beginRes = await passkeyRegisterBegin(displayName.trim());
       const { challengeId, ...options } = beginRes;
-      setStatus('Registering...');
+      setStatus(t('login.native_status_registering'));
       const regResponse = await startRegistration(options as never);
-      setStatus('Saving...');
+      setStatus(t('login.native_status_saving'));
       await passkeyRegisterComplete(challengeId, regResponse, deviceName.trim() || undefined);
       // After registration, login to get API key
-      setStatus('Logging in...');
+      setStatus(t('login.native_status_logging_in'));
       const beginRes2 = await passkeyLoginBegin();
       const { challengeId: cid2, ...opts2 } = beginRes2;
-      setStatus('Authenticating...');
+      setStatus(t('login.native_status_authenticating'));
       const authResponse = await startAuthentication(opts2 as never);
-      setStatus('Getting API key...');
+      setStatus(t('login.native_status_getting_api_key'));
       const res = await passkeyLoginCompleteNative(cid2, authResponse);
-      setStatus('Redirecting...');
-      const url = buildCallbackUrl(res.apiKey, res.userId, res.keyId);
-      setCallbackLink(url);
-      navigateToCallback(url);
+      setStatus(t('login.native_status_redirecting'));
+      finishWithResult({ key: res.apiKey, userId: res.userId, keyId: res.keyId });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (!msg.toLowerCase().includes('cancel')) {
-        setError(`[DEBUG reg] ${msg}`);
+        setError(t('login.passkey_error'));
       }
       setLoading(false);
     }
@@ -157,7 +228,7 @@ export function NativeAuthBridge({ callbackUrl }: Props) {
               href={callbackLink}
               style={{ color: '#60a5fa', fontSize: 14, textDecoration: 'underline' }}
             >
-              Tap here if not redirected automatically
+              {t('login.native_callback_fallback')}
             </a>
           </div>
         )}

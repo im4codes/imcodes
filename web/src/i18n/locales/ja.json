@@ -210,7 +210,16 @@
     "confirm_password_placeholder": "新しいパスワードを確認",
     "change_password_btn": "パスワードを変更",
     "passwords_mismatch": "パスワードが一致しません",
-    "password_too_short": "パスワードは8文字以上で入力してください"
+    "password_too_short": "パスワードは8文字以上で入力してください",
+    "native_callback_fallback": "自動で戻らない場合はここをタップしてください",
+    "native_status_getting_challenge": "チャレンジを取得中…",
+    "native_status_authenticating": "認証中…",
+    "native_status_getting_api_key": "APIキーを取得中…",
+    "native_status_redirecting": "リダイレクト中…",
+    "native_status_creating_passkey": "パスキーを作成中…",
+    "native_status_registering": "登録中…",
+    "native_status_saving": "保存中…",
+    "native_status_logging_in": "ログイン中…"
   },
   "serverSetup": {
     "title": "サーバーを選択",
@@ -348,7 +357,24 @@
     "passwords_mismatch": "パスワードが一致しません",
     "password_too_short": "パスワードは8文字以上で入力してください",
     "privacy_policy": "プライバシーポリシー",
-    "terms_of_service": "利用規約"
+    "terms_of_service": "利用規約",
+    "account_identity": "アカウント情報",
+    "username": "ユーザー名",
+    "no_username": "未設定",
+    "username_placeholder": "ユーザー名を設定",
+    "username_required": "ユーザー名を入力してください",
+    "username_invalid": "ユーザー名は3〜32文字で、小文字・数字・ドット・アンダースコア・ハイフンのみ使用できます",
+    "username_taken": "そのユーザー名は既に使われています",
+    "set_password_login": "パスワードログインを設定",
+    "set_password_hint": "パスキーアカウントには通常ユーザー名とパスワードがありません。まずパスキーを一度確認し、その後ユーザー名とパスワードを設定すると、パスワードでもログインできるようになります。",
+    "set_password_btn": "パスキーを確認してパスワードを設定",
+    "password_setup_success": "パスワードログインを有効にしました",
+    "password_setup_error": "パスワードログインの設定に失敗しました。パスキーを確認して再試行してください。",
+    "passkey_verify_browser_only": "パスワード設定のためのパスキー確認は現在ブラウザ版でのみ利用できます。",
+    "passkey_verify_wrong_account": "そのパスキーは別のアカウントに紐づいています。このアカウントに登録されたパスキーを使ってください。",
+    "passkey_verify_no_passkeys": "このアカウントにはパスキーが登録されていません。",
+    "native_status_verifying_passkey": "パスキーを確認中…",
+    "native_status_saving_password": "パスワードログインを保存中…"
   },
   "admin": {
     "title": "管理パネル",

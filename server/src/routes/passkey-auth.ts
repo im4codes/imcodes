@@ -8,8 +8,8 @@ import {
   verifyAuthenticationResponse,
 } from '@simplewebauthn/server';
 import type { Env } from '../env.js';
-import { createUser, getUserById } from '../db/queries.js';
-import { randomHex, sha256Hex, signJwt, verifyJwt } from '../security/crypto.js';
+import { createUser, getUserById, getUserByUsername } from '../db/queries.js';
+import { randomHex, sha256Hex, signJwt, verifyJwt, hashPassword } from '../security/crypto.js';
 import { COOKIE_SESSION } from '../../../shared/cookie-names.js';
 import { logAudit } from '../security/audit.js';
 import { z } from 'zod';
@@ -130,6 +130,14 @@ interface PendingChallenge {
   displayName: string;
 }
 
+interface StoredPasskeyCredential {
+  id: string;
+  user_id: string;
+  public_key: string;
+  counter: number;
+  transports: string | null;
+}
+
 async function saveChallenge(
   db: Env['DB'],
   id: string,
@@ -146,14 +154,38 @@ async function saveChallenge(
   await db.execute('DELETE FROM passkey_challenges WHERE expires_at < $1', [now]);
 }
 
-async function consumeChallenge(db: Env['DB'], id: string): Promise<PendingChallenge | null> {
+async function getChallenge(db: Env['DB'], id: string): Promise<PendingChallenge | null> {
   const row = await db.queryOne<{ challenge: string; user_id: string | null; display_name: string }>(
     'SELECT challenge, user_id, display_name FROM passkey_challenges WHERE id = $1 AND expires_at > $2',
     [id, Date.now()],
   );
   if (!row) return null;
-  await db.execute('DELETE FROM passkey_challenges WHERE id = $1', [id]);
   return { challenge: row.challenge, userId: row.user_id, displayName: row.display_name };
+}
+
+async function consumeChallenge(db: Env['DB'], id: string): Promise<PendingChallenge | null> {
+  const row = await getChallenge(db, id);
+  if (!row) return null;
+  await db.execute('DELETE FROM passkey_challenges WHERE id = $1', [id]);
+  return row;
+}
+
+async function listUserCredentialIds(db: Env['DB'], userId: string): Promise<Array<{ id: string; type: 'public-key' }>> {
+  const rows = await db.query<{ id: string }>(
+    'SELECT id FROM passkey_credentials WHERE user_id = $1', [userId],
+  );
+  return rows.map((r) => ({ id: r.id, type: 'public-key' as const }));
+}
+
+async function getStoredPasskeyCredential(db: Env['DB'], credentialId: string): Promise<StoredPasskeyCredential | null> {
+  return db.queryOne<StoredPasskeyCredential>(
+    'SELECT id, user_id, public_key, counter, transports FROM passkey_credentials WHERE id = $1',
+    [credentialId],
+  );
+}
+
+function isUniqueViolation(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && 'code' in err && (err as { code?: unknown }).code === '23505';
 }
 
 // ── POST /api/auth/passkey/register/begin ─────────────────────────────────
@@ -175,24 +207,28 @@ passkeyRoutes.post('/register/begin', async (c) => {
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
   const parsed = registerBeginSchema.safeParse(body);
   let displayName = parsed.data?.displayName;
+  let existingUser = null as Awaited<ReturnType<typeof getUserById>> | null;
+
+  if (existingUserId) {
+    existingUser = await getUserById(c.env.DB, existingUserId);
+    if (!existingUser) return c.json({ error: 'user_not_found' }, 404);
+    if (existingUser.status !== 'active') {
+      return c.json({ error: existingUser.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+    }
+  }
 
   // For existing users adding a new passkey, look up their display_name from DB
-  if (!displayName && existingUserId) {
-    const user = await getUserById(c.env.DB, existingUserId);
-    displayName = user?.display_name || undefined;
+  if (!displayName && existingUser) {
+    displayName = existingUser.display_name || undefined;
   }
   displayName = displayName || 'IM.codes User';
 
   const { rpId } = getRpInfo(c);
 
   // Exclude already-registered credentials for this user
-  let excludeCredentials: { id: string; type: 'public-key' }[] = [];
-  if (existingUserId) {
-    const rows = await c.env.DB.query<{ id: string }>(
-      'SELECT id FROM passkey_credentials WHERE user_id = $1', [existingUserId],
-    );
-    excludeCredentials = rows.map((r) => ({ id: r.id, type: 'public-key' as const }));
-  }
+  const excludeCredentials = existingUserId
+    ? await listUserCredentialIds(c.env.DB, existingUserId)
+    : [];
 
   const userIdBytes = existingUserId
     ? Buffer.from(existingUserId, 'hex')
@@ -215,6 +251,31 @@ passkeyRoutes.post('/register/begin', async (c) => {
   const challengeId = randomHex(16);
   await saveChallenge(c.env.DB, challengeId, options.challenge, existingUserId, displayName);
 
+  return c.json({ ...options, challengeId });
+});
+
+// ── POST /api/auth/passkey/verify/begin ───────────────────────────────────
+passkeyRoutes.post('/verify/begin', async (c) => {
+  const userId = await resolveAuthedUserId(c);
+  if (!userId) return c.json({ error: 'unauthorized' }, 401);
+  const user = await getUserById(c.env.DB, userId);
+  if (!user) return c.json({ error: 'user_not_found' }, 404);
+  if (user.status !== 'active') {
+    return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+  }
+
+  const allowCredentials = await listUserCredentialIds(c.env.DB, userId);
+  if (allowCredentials.length === 0) return c.json({ error: 'no_passkeys' }, 400);
+
+  const { rpId } = getRpInfo(c);
+  const options = await generateAuthenticationOptions({
+    rpID: rpId,
+    userVerification: 'preferred',
+    allowCredentials,
+  });
+
+  const challengeId = randomHex(16);
+  await saveChallenge(c.env.DB, challengeId, options.challenge, userId, '');
   return c.json({ ...options, challengeId });
 });
 
@@ -246,15 +307,12 @@ passkeyRoutes.post('/register/complete', async (c) => {
       expectedRPID: rpId,
     });
   } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err);
     logger.warn({ err, rpId, origin }, '[passkey] registration verification failed');
-    // TODO: remove debug detail after fixing native passkey
-    return c.json({ error: 'verification_failed', debug: { rpId, origin, err: errMsg } }, 400);
+    return c.json({ error: 'verification_failed' }, 400);
   }
 
   if (!verification.verified || !verification.registrationInfo) {
-    // TODO: remove debug detail after fixing native passkey
-    return c.json({ error: 'verification_failed', debug: { rpId, origin, note: 'verified=false' } }, 400);
+    return c.json({ error: 'verification_failed' }, 400);
   }
 
   const { credentialID, credentialPublicKey, counter } = verification.registrationInfo;
@@ -277,6 +335,12 @@ passkeyRoutes.post('/register/complete', async (c) => {
     const requireApproval = await getSetting(c.env.DB, 'require_approval');
     if (requireApproval === 'true') {
       await updateUserStatus(c.env.DB, userId, 'pending');
+    }
+  } else {
+    const user = await getUserById(c.env.DB, userId);
+    if (!user) return c.json({ error: 'user_not_found' }, 404);
+    if (user.status !== 'active') {
+      return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
     }
   }
 
@@ -349,11 +413,9 @@ passkeyRoutes.post('/login/complete', async (c) => {
   logger.info({ rpId, origin }, '[passkey] login/complete verification');
 
   const credentialId = response.id as string;
-  const storedCred = await c.env.DB.queryOne<{ id: string; user_id: string; public_key: string; counter: number; transports: string | null }>(
-    'SELECT id, user_id, public_key, counter, transports FROM passkey_credentials WHERE id = $1', [credentialId],
-  );
+  const storedCred = await getStoredPasskeyCredential(c.env.DB, credentialId);
 
-  if (!storedCred) return c.json({ error: 'credential_not_found' }, 400);
+  if (!storedCred) return c.json({ error: 'wrong_passkey' }, 403);
 
   let verification;
   try {
@@ -370,22 +432,13 @@ passkeyRoutes.post('/login/complete', async (c) => {
       },
     });
   } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err);
     logger.warn({ err, rpId, origin }, '[passkey] authentication verification failed');
-    // TODO: remove debug detail after fixing native passkey
-    return c.json({ error: 'verification_failed', debug: { rpId, origin, err: errMsg } }, 400);
+    return c.json({ error: 'verification_failed' }, 400);
   }
 
   if (!verification.verified) {
-    // TODO: remove debug detail after fixing native passkey
-    return c.json({ error: 'verification_failed', debug: { rpId, origin, note: 'verified=false' } }, 400);
+    return c.json({ error: 'verification_failed' }, 400);
   }
-
-  const now = Date.now();
-  await c.env.DB.execute(
-    'UPDATE passkey_credentials SET counter = $1, last_used_at = $2 WHERE id = $3',
-    [verification.authenticationInfo.newCounter, now, storedCred.id],
-  );
 
   const user = await getUserById(c.env.DB, storedCred.user_id);
   if (!user) return c.json({ error: 'user_not_found' }, 400);
@@ -394,6 +447,12 @@ passkeyRoutes.post('/login/complete', async (c) => {
   if (user.status !== 'active') {
     return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
   }
+
+  const now = Date.now();
+  await c.env.DB.execute(
+    'UPDATE passkey_credentials SET counter = $1, last_used_at = $2 WHERE id = $3',
+    [verification.authenticationInfo.newCounter, now, storedCred.id],
+  );
 
   const ip = (c.get('clientIp' as never) as string | undefined) ?? 'unknown';
   await logAudit({ userId: user.id, action: 'auth.passkey.login', ip, details: { credentialId: storedCred.id } }, c.env.DB);
@@ -434,10 +493,127 @@ passkeyRoutes.post('/login/complete', async (c) => {
   return c.json({ ok: true });
 });
 
+// ── POST /api/auth/password/setup ─────────────────────────────────────────
+const passwordSetupSchema = z.object({
+  username: z.string().min(3).max(32),
+  newPassword: z.string().min(8),
+  challengeId: z.string(),
+  response: z.any(),
+});
+
+passkeyRoutes.post('/password/setup', async (c) => {
+  const userId = await resolveAuthedUserId(c);
+  if (!userId) return c.json({ error: 'unauthorized' }, 401);
+
+  const body = await parseBody(c);
+  const parsed = passwordSetupSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+
+  const { username, newPassword, challengeId, response } = parsed.data;
+  const user = await getUserById(c.env.DB, userId);
+  if (!user) return c.json({ error: 'user_not_found' }, 404);
+  if (user.status !== 'active') {
+    return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+  }
+  if (user.password_hash) return c.json({ error: 'password_already_set' }, 400);
+
+  const normalizedUsername = username.trim().toLowerCase();
+  if (!/^[a-z0-9](?:[a-z0-9._-]{1,30}[a-z0-9])?$/.test(normalizedUsername)) {
+    return c.json({ error: 'invalid_username_format' }, 400);
+  }
+
+  const existingUser = await getUserByUsername(c.env.DB, normalizedUsername);
+  if (existingUser && existingUser.id !== userId) {
+    return c.json({ error: 'username_taken' }, 409);
+  }
+
+  const pending = await getChallenge(c.env.DB, challengeId);
+  if (!pending) return c.json({ error: 'challenge_expired' }, 400);
+  if (pending.userId !== userId) return c.json({ error: 'challenge_user_mismatch' }, 403);
+
+  const credentialId = response.id as string;
+  const storedCred = await getStoredPasskeyCredential(c.env.DB, credentialId);
+  if (!storedCred) return c.json({ error: 'wrong_passkey' }, 403);
+  if (storedCred.user_id !== userId) return c.json({ error: 'wrong_passkey' }, 403);
+
+  const { rpId, origin } = getRpInfo(c);
+
+  let verification;
+  try {
+    verification = await verifyAuthenticationResponse({
+      response,
+      expectedChallenge: pending.challenge,
+      expectedOrigin: origin,
+      expectedRPID: rpId,
+      authenticator: {
+        credentialID: storedCred.id,
+        credentialPublicKey: Uint8Array.from(Buffer.from(storedCred.public_key, 'base64')),
+        counter: storedCred.counter,
+        transports: storedCred.transports ? JSON.parse(storedCred.transports) : undefined,
+      },
+    });
+  } catch (err) {
+    logger.warn({ err, rpId, origin }, '[passkey] password setup verification failed');
+    return c.json({ error: 'verification_failed' }, 400);
+  }
+
+  if (!verification.verified) {
+    return c.json({ error: 'verification_failed' }, 400);
+  }
+
+  const newHash = await hashPassword(newPassword);
+  const now = Date.now();
+  try {
+    await c.env.DB.transaction(async (tx) => {
+      const deleted = await tx.execute(
+        'DELETE FROM passkey_challenges WHERE id = $1 AND expires_at > $2 AND user_id = $3',
+        [challengeId, Date.now(), userId],
+      );
+      if (deleted.changes === 0) throw new Error('challenge_expired');
+      await tx.execute(
+        'UPDATE passkey_credentials SET counter = $1, last_used_at = $2 WHERE id = $3',
+        [verification.authenticationInfo.newCounter, now, storedCred.id],
+      );
+      await tx.execute(
+        'UPDATE users SET username = $1, password_hash = $2, password_must_change = false WHERE id = $3',
+        [normalizedUsername, newHash, userId],
+      );
+    });
+  } catch (err) {
+    if (err instanceof Error && err.message === 'challenge_expired') {
+      return c.json({ error: 'challenge_expired' }, 400);
+    }
+    if (isUniqueViolation(err)) {
+      return c.json({ error: 'username_taken' }, 409);
+    }
+    throw err;
+  }
+
+  const ip = (c.get('clientIp' as never) as string | undefined) ?? 'unknown';
+  await logAudit({ userId, action: 'auth.password_setup_with_passkey', ip, details: { credentialId: storedCred.id } }, c.env.DB);
+
+  return c.json({
+    ok: true,
+    user: {
+      id: user.id,
+      username: normalizedUsername,
+      display_name: user.display_name,
+      is_admin: user.is_admin,
+      status: user.status,
+      has_password: true,
+    },
+  });
+});
+
 // ── GET /api/auth/passkey/credentials ─────────────────────────────────────
 passkeyRoutes.get('/credentials', async (c) => {
   const userId = await resolveAuthedUserId(c);
   if (!userId) return c.json({ error: 'unauthorized' }, 401);
+  const user = await getUserById(c.env.DB, userId);
+  if (!user) return c.json({ error: 'user_not_found' }, 404);
+  if (user.status !== 'active') {
+    return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+  }
 
   const rows = await c.env.DB.query<{ id: string; device_name: string | null; created_at: number; last_used_at: number | null }>(
     'SELECT id, device_name, created_at, last_used_at FROM passkey_credentials WHERE user_id = $1 ORDER BY created_at DESC',
@@ -539,6 +715,11 @@ run();
 passkeyRoutes.delete('/credentials/:credId', async (c) => {
   const userId = await resolveAuthedUserId(c);
   if (!userId) return c.json({ error: 'unauthorized' }, 401);
+  const user = await getUserById(c.env.DB, userId);
+  if (!user) return c.json({ error: 'user_not_found' }, 404);
+  if (user.status !== 'active') {
+    return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+  }
 
   const credId = c.req.param('credId');
   const result = await c.env.DB.execute(

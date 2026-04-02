@@ -210,7 +210,16 @@
     "confirm_password_placeholder": "Подтвердите новый пароль",
     "change_password_btn": "Сменить пароль",
     "passwords_mismatch": "Пароли не совпадают",
-    "password_too_short": "Пароль должен содержать не менее 8 символов"
+    "password_too_short": "Пароль должен содержать не менее 8 символов",
+    "native_callback_fallback": "Нажмите здесь, если перенаправление не произошло автоматически",
+    "native_status_getting_challenge": "Получение challenge…",
+    "native_status_authenticating": "Аутентификация…",
+    "native_status_getting_api_key": "Получение API-ключа…",
+    "native_status_redirecting": "Перенаправление…",
+    "native_status_creating_passkey": "Создание passkey…",
+    "native_status_registering": "Регистрация…",
+    "native_status_saving": "Сохранение…",
+    "native_status_logging_in": "Вход…"
   },
   "serverSetup": {
     "title": "Выбор сервера",
@@ -348,7 +357,24 @@
     "passwords_mismatch": "Пароли не совпадают",
     "password_too_short": "Пароль должен содержать не менее 8 символов",
     "privacy_policy": "Политика конфиденциальности",
-    "terms_of_service": "Условия использования"
+    "terms_of_service": "Условия использования",
+    "account_identity": "Данные аккаунта",
+    "username": "Имя пользователя",
+    "no_username": "Не задано",
+    "username_placeholder": "Выберите имя пользователя",
+    "username_required": "Имя пользователя обязательно",
+    "username_invalid": "Используйте 3-32 символа: строчные буквы, цифры, точку, подчёркивание или дефис",
+    "username_taken": "Это имя пользователя уже занято",
+    "set_password_login": "Настроить вход по паролю",
+    "set_password_hint": "У аккаунтов с passkey по умолчанию нет имени пользователя и пароля. Подтвердите passkey один раз, затем задайте оба значения, чтобы можно было входить и по паролю.",
+    "set_password_btn": "Подтвердить passkey и задать пароль",
+    "password_setup_success": "Вход по паролю настроен",
+    "password_setup_error": "Не удалось настроить вход по паролю. Подтвердите passkey и попробуйте снова.",
+    "passkey_verify_browser_only": "Проверка passkey для настройки пароля сейчас доступна только в веб-браузере.",
+    "passkey_verify_wrong_account": "Этот passkey принадлежит другому аккаунту. Подтвердите passkey, зарегистрированный для текущего аккаунта.",
+    "passkey_verify_no_passkeys": "Для этого аккаунта не зарегистрировано ни одного passkey.",
+    "native_status_verifying_passkey": "Подтверждение passkey…",
+    "native_status_saving_password": "Сохранение входа по паролю…"
   },
   "admin": {
     "title": "Панель администратора",

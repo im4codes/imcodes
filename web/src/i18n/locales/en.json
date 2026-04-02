@@ -210,7 +210,16 @@
     "confirm_password_placeholder": "Confirm new password",
     "change_password_btn": "Change Password",
     "passwords_mismatch": "Passwords do not match",
-    "password_too_short": "Password must be at least 8 characters"
+    "password_too_short": "Password must be at least 8 characters",
+    "native_callback_fallback": "Tap here if not redirected automatically",
+    "native_status_getting_challenge": "Getting challenge…",
+    "native_status_authenticating": "Authenticating…",
+    "native_status_getting_api_key": "Getting API key…",
+    "native_status_redirecting": "Redirecting…",
+    "native_status_creating_passkey": "Creating passkey…",
+    "native_status_registering": "Registering…",
+    "native_status_saving": "Saving…",
+    "native_status_logging_in": "Logging in…"
   },
   "serverSetup": {
     "title": "Choose a Server",
@@ -348,7 +357,24 @@
     "passwords_mismatch": "Passwords do not match",
     "password_too_short": "Password must be at least 8 characters",
     "privacy_policy": "Privacy Policy",
-    "terms_of_service": "Terms of Service"
+    "terms_of_service": "Terms of Service",
+    "account_identity": "Account Identity",
+    "username": "Username",
+    "no_username": "Not set",
+    "username_placeholder": "Choose a username",
+    "username_required": "Username is required",
+    "username_invalid": "Use 3-32 chars: lowercase letters, numbers, dot, underscore, hyphen",
+    "username_taken": "That username is already taken",
+    "set_password_login": "Set Password Login",
+    "set_password_hint": "Passkey accounts do not have a username or password by default. Verify your passkey once, then set both so you can also sign in with a password.",
+    "set_password_btn": "Verify Passkey and Set Password",
+    "password_setup_success": "Password login is ready",
+    "password_setup_error": "Failed to set password login. Verify your passkey and try again.",
+    "passkey_verify_browser_only": "Passkey verification for password setup is currently only available in the web browser.",
+    "passkey_verify_wrong_account": "That passkey belongs to a different account. Verify with the passkey registered to this account.",
+    "passkey_verify_no_passkeys": "No passkeys are registered for this account.",
+    "native_status_verifying_passkey": "Verifying passkey…",
+    "native_status_saving_password": "Saving password login…"
   },
   "admin": {
     "title": "Admin Panel",

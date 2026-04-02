@@ -1,28 +1,99 @@
 import { useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { passwordChange, updateDisplayName } from '../api.js';
+import { startAuthentication } from '@simplewebauthn/browser';
+import { ApiError, passwordChange, passkeyVerifyBegin, passwordSetupWithPasskey, updateDisplayName } from '../api.js';
+import { isNative } from '../native.js';
 
 interface Props {
   displayName: string | null;
+  username: string | null;
+  hasPassword: boolean;
+  serverUrl?: string | null;
   onBack: () => void;
   onDisplayNameChanged: (name: string) => void;
+  onUserAuthUpdated: (next: { username: string | null; hasPassword: boolean }) => void;
 }
 
-export function SettingsPage({ displayName, onBack, onDisplayNameChanged }: Props) {
+export function SettingsPage({ displayName, username, hasPassword, serverUrl, onBack, onDisplayNameChanged, onUserAuthUpdated }: Props) {
   const { t } = useTranslation();
 
-  // Display name editing
   const [editingName, setEditingName] = useState(false);
   const [nameValue, setNameValue] = useState(displayName ?? '');
   const [nameSaving, setNameSaving] = useState(false);
   const [nameMsg, setNameMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
-  // Password change
+  const [setupUsername, setSetupUsername] = useState(username ?? '');
+  const [setupPassword, setSetupPassword] = useState('');
+  const [setupConfirmPassword, setSetupConfirmPassword] = useState('');
+  const [setupSaving, setSetupSaving] = useState(false);
+  const [setupMsg, setSetupMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
   const [oldPw, setOldPw] = useState('');
   const [newPw, setNewPw] = useState('');
   const [confirmPw, setConfirmPw] = useState('');
   const [pwSaving, setPwSaving] = useState(false);
   const [pwMsg, setPwMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
+  const applySetupErrorCode = (errorCode: string | null) => {
+    if (errorCode === 'username_taken') {
+      setSetupMsg({ type: 'err', text: t('settings.username_taken') });
+    } else if (errorCode === 'invalid_username_format') {
+      setSetupMsg({ type: 'err', text: t('settings.username_invalid') });
+    } else if (errorCode === 'wrong_passkey') {
+      setSetupMsg({ type: 'err', text: t('settings.passkey_verify_wrong_account') });
+    } else if (errorCode === 'no_passkeys') {
+      setSetupMsg({ type: 'err', text: t('settings.passkey_verify_no_passkeys') });
+    } else {
+      setSetupMsg({ type: 'err', text: t('settings.password_setup_error') });
+    }
+  };
+
+  const encodeNativePasswordSetupState = (payload: { apiKey: string; username: string; newPassword: string }): string => {
+    const json = JSON.stringify(payload);
+    const utf8 = new TextEncoder().encode(json);
+    let binary = '';
+    for (const byte of utf8) binary += String.fromCharCode(byte);
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  };
+
+  const handleNativeSetupPassword = async (normalizedUsername: string) => {
+    if (!serverUrl) {
+      setSetupMsg({ type: 'err', text: t('settings.password_setup_error') });
+      return;
+    }
+    const [{ getAuthKey }, { default: AuthSession }] = await Promise.all([
+      import('../biometric-auth.js'),
+      import('../plugins/auth-session.js'),
+    ]);
+    const key = await getAuthKey();
+    if (!key) {
+      setSetupMsg({ type: 'err', text: t('settings.password_setup_error') });
+      return;
+    }
+    const url = new URL('/', serverUrl);
+    url.searchParams.set('native_callback', 'imcodes://password-setup');
+    url.searchParams.set('action', 'password_setup');
+    url.searchParams.set('_t', String(Date.now()));
+    url.hash = `state=${encodeURIComponent(encodeNativePasswordSetupState({
+      apiKey: key,
+      username: normalizedUsername,
+      newPassword: setupPassword,
+    }))}`;
+
+    const result = await AuthSession.start({ url: url.toString(), callbackScheme: 'imcodes' });
+    const callback = new URL(result.url);
+    const ok = callback.searchParams.get('ok');
+    if (ok === '1') {
+      const nextUsername = callback.searchParams.get('username') ?? normalizedUsername;
+      onUserAuthUpdated({ username: nextUsername, hasPassword: true });
+      setSetupUsername(nextUsername);
+      setSetupPassword('');
+      setSetupConfirmPassword('');
+      setSetupMsg({ type: 'ok', text: t('settings.password_setup_success') });
+      return;
+    }
+    applySetupErrorCode(callback.searchParams.get('error'));
+  };
 
   const handleSaveName = async () => {
     if (!nameValue.trim()) return;
@@ -37,6 +108,48 @@ export function SettingsPage({ displayName, onBack, onDisplayNameChanged }: Prop
       setNameMsg({ type: 'err', text: t('settings.name_error') });
     } finally {
       setNameSaving(false);
+    }
+  };
+
+  const handleSetupPassword = async () => {
+    setSetupMsg(null);
+    const normalizedUsername = setupUsername.trim().toLowerCase();
+    if (!normalizedUsername) {
+      setSetupMsg({ type: 'err', text: t('settings.username_required') });
+      return;
+    }
+    if (!/^[a-z0-9](?:[a-z0-9._-]{1,30}[a-z0-9])?$/.test(normalizedUsername)) {
+      setSetupMsg({ type: 'err', text: t('settings.username_invalid') });
+      return;
+    }
+    if (setupPassword !== setupConfirmPassword) {
+      setSetupMsg({ type: 'err', text: t('settings.passwords_mismatch') });
+      return;
+    }
+    if (setupPassword.length < 8) {
+      setSetupMsg({ type: 'err', text: t('settings.password_too_short') });
+      return;
+    }
+    setSetupSaving(true);
+    try {
+      if (isNative()) {
+        await handleNativeSetupPassword(normalizedUsername);
+      } else {
+        const beginRes = await passkeyVerifyBegin();
+        const { challengeId, ...options } = beginRes;
+        const authResponse = await startAuthentication(options as never);
+        const result = await passwordSetupWithPasskey(normalizedUsername, setupPassword, challengeId, authResponse);
+        onUserAuthUpdated({ username: result.user.username, hasPassword: result.user.has_password });
+        setSetupUsername(result.user.username ?? normalizedUsername);
+        setSetupPassword('');
+        setSetupConfirmPassword('');
+        setSetupMsg({ type: 'ok', text: t('settings.password_setup_success') });
+      }
+    } catch (err) {
+      const errorCode = err instanceof ApiError ? err.code : null;
+      applySetupErrorCode(errorCode);
+    } finally {
+      setSetupSaving(false);
     }
   };
 
@@ -104,6 +217,16 @@ export function SettingsPage({ displayName, onBack, onDisplayNameChanged }: Prop
     fontSize: '14px',
   };
 
+  const inlineLabelStyle: Record<string, string> = {
+    fontSize: '12px',
+    color: '#94a3b8',
+    textTransform: 'uppercase',
+    letterSpacing: '0.04em',
+    marginBottom: '6px',
+  };
+
+  const messageColor = (type: 'ok' | 'err'): string => (type === 'ok' ? '#4ade80' : '#f87171');
+
   return (
     <div style={{ background: '#0a0e1a', color: '#e2e8f0', minHeight: '100%', padding: '20px', overflowY: 'auto' }}>
       <div style={{ maxWidth: '520px', margin: '0 auto' }}>
@@ -112,11 +235,13 @@ export function SettingsPage({ displayName, onBack, onDisplayNameChanged }: Prop
         </button>
         <h1 style={{ fontSize: '24px', fontWeight: '700', marginBottom: '24px' }}>{t('settings.title')}</h1>
 
-        {/* Display Name */}
         <div style={cardStyle}>
           <h2 style={{ fontSize: '16px', fontWeight: '600', marginBottom: '12px', color: '#94a3b8' }}>
-            {t('settings.display_name')}
+            {t('settings.account_identity')}
           </h2>
+          <div style={inlineLabelStyle}>{t('settings.username')}</div>
+          <div style={{ fontSize: '16px', marginBottom: '14px' }}>{username ?? t('settings.no_username')}</div>
+          <div style={inlineLabelStyle}>{t('settings.display_name')}</div>
           {!editingName ? (
             <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
               <span style={{ fontSize: '16px' }}>{displayName || t('settings.no_name')}</span>
@@ -144,53 +269,98 @@ export function SettingsPage({ displayName, onBack, onDisplayNameChanged }: Prop
             </div>
           )}
           {nameMsg && (
-            <div style={{ marginTop: '8px', fontSize: '13px', color: nameMsg.type === 'ok' ? '#4ade80' : '#f87171' }}>
+            <div style={{ marginTop: '8px', fontSize: '13px', color: messageColor(nameMsg.type) }}>
               {nameMsg.text}
             </div>
           )}
         </div>
 
-        {/* Change Password */}
-        <div style={cardStyle}>
-          <h2 style={{ fontSize: '16px', fontWeight: '600', marginBottom: '12px', color: '#94a3b8' }}>
-            {t('settings.change_password')}
-          </h2>
-          <input
-            type="password"
-            placeholder={t('settings.old_password')}
-            value={oldPw}
-            onInput={(e) => setOldPw((e.target as HTMLInputElement).value)}
-            style={inputStyle}
-          />
-          <input
-            type="password"
-            placeholder={t('settings.new_password')}
-            value={newPw}
-            onInput={(e) => setNewPw((e.target as HTMLInputElement).value)}
-            style={inputStyle}
-          />
-          <input
-            type="password"
-            placeholder={t('settings.confirm_password')}
-            value={confirmPw}
-            onInput={(e) => setConfirmPw((e.target as HTMLInputElement).value)}
-            style={inputStyle}
-          />
-          <button
-            onClick={handleChangePw}
-            disabled={pwSaving || !oldPw || !newPw || !confirmPw}
-            style={{ ...btnPrimary, opacity: (!oldPw || !newPw || !confirmPw) ? '0.5' : '1' }}
-          >
-            {pwSaving ? t('common.loading') : t('settings.change_password_btn')}
-          </button>
-          {pwMsg && (
-            <div style={{ marginTop: '8px', fontSize: '13px', color: pwMsg.type === 'ok' ? '#4ade80' : '#f87171' }}>
-              {pwMsg.text}
-            </div>
-          )}
-        </div>
+        {!hasPassword ? (
+          <div style={cardStyle}>
+            <h2 style={{ fontSize: '16px', fontWeight: '600', marginBottom: '12px', color: '#94a3b8' }}>
+              {t('settings.set_password_login')}
+            </h2>
+            <p style={{ color: '#94a3b8', fontSize: '14px', lineHeight: 1.6, marginTop: 0, marginBottom: '14px' }}>
+              {t('settings.set_password_hint')}
+            </p>
+            <input
+              type="text"
+              placeholder={t('settings.username_placeholder')}
+              value={setupUsername}
+              onInput={(e) => setSetupUsername((e.target as HTMLInputElement).value)}
+              style={inputStyle}
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellcheck={false}
+            />
+            <input
+              type="password"
+              placeholder={t('settings.new_password')}
+              value={setupPassword}
+              onInput={(e) => setSetupPassword((e.target as HTMLInputElement).value)}
+              style={inputStyle}
+            />
+            <input
+              type="password"
+              placeholder={t('settings.confirm_password')}
+              value={setupConfirmPassword}
+              onInput={(e) => setSetupConfirmPassword((e.target as HTMLInputElement).value)}
+              style={inputStyle}
+            />
+            <button
+              onClick={handleSetupPassword}
+              disabled={setupSaving || !setupUsername || !setupPassword || !setupConfirmPassword}
+              style={{ ...btnPrimary, opacity: (!setupUsername || !setupPassword || !setupConfirmPassword) ? '0.5' : '1' }}
+            >
+              {setupSaving ? t('common.loading') : t('settings.set_password_btn')}
+            </button>
+            {setupMsg && (
+              <div style={{ marginTop: '8px', fontSize: '13px', color: messageColor(setupMsg.type) }}>
+                {setupMsg.text}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div style={cardStyle}>
+            <h2 style={{ fontSize: '16px', fontWeight: '600', marginBottom: '12px', color: '#94a3b8' }}>
+              {t('settings.change_password')}
+            </h2>
+            <input
+              type="password"
+              placeholder={t('settings.old_password')}
+              value={oldPw}
+              onInput={(e) => setOldPw((e.target as HTMLInputElement).value)}
+              style={inputStyle}
+            />
+            <input
+              type="password"
+              placeholder={t('settings.new_password')}
+              value={newPw}
+              onInput={(e) => setNewPw((e.target as HTMLInputElement).value)}
+              style={inputStyle}
+            />
+            <input
+              type="password"
+              placeholder={t('settings.confirm_password')}
+              value={confirmPw}
+              onInput={(e) => setConfirmPw((e.target as HTMLInputElement).value)}
+              style={inputStyle}
+            />
+            <button
+              onClick={handleChangePw}
+              disabled={pwSaving || !oldPw || !newPw || !confirmPw}
+              style={{ ...btnPrimary, opacity: (!oldPw || !newPw || !confirmPw) ? '0.5' : '1' }}
+            >
+              {pwSaving ? t('common.loading') : t('settings.change_password_btn')}
+            </button>
+            {pwMsg && (
+              <div style={{ marginTop: '8px', fontSize: '13px', color: messageColor(pwMsg.type) }}>
+                {pwMsg.text}
+              </div>
+            )}
+          </div>
+        )}
 
-        {/* Legal links */}
         <div style={{ textAlign: 'center', marginTop: '24px', marginBottom: '12px' }}>
           <a
             href="https://im.codes/privacy.html"

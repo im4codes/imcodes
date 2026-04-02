@@ -210,7 +210,16 @@
     "confirm_password_placeholder": "确认新密码",
     "change_password_btn": "修改密码",
     "passwords_mismatch": "两次输入的密码不一致",
-    "password_too_short": "密码至少需要 8 个字符"
+    "password_too_short": "密码至少需要 8 个字符",
+    "native_callback_fallback": "如果没有自动跳转，请点这里",
+    "native_status_getting_challenge": "正在获取挑战…",
+    "native_status_authenticating": "正在验证…",
+    "native_status_getting_api_key": "正在获取 API Key…",
+    "native_status_redirecting": "正在跳转…",
+    "native_status_creating_passkey": "正在创建 Passkey…",
+    "native_status_registering": "正在注册…",
+    "native_status_saving": "正在保存…",
+    "native_status_logging_in": "正在登录…"
   },
   "serverSetup": {
     "title": "选择服务器",
@@ -348,7 +357,24 @@
     "passwords_mismatch": "两次输入的密码不一致",
     "password_too_short": "密码至少需要 8 个字符",
     "privacy_policy": "隐私政策",
-    "terms_of_service": "服务条款"
+    "terms_of_service": "服务条款",
+    "account_identity": "账号信息",
+    "username": "用户名",
+    "no_username": "未设置",
+    "username_placeholder": "设置用户名",
+    "username_required": "请输入用户名",
+    "username_invalid": "用户名需为 3-32 位，只能包含小写字母、数字、点、下划线、连字符",
+    "username_taken": "该用户名已被占用",
+    "set_password_login": "设置密码登录",
+    "set_password_hint": "Passkey 账号默认没有用户名和密码。先验证一次 Passkey，再设置用户名和密码，之后即可同时支持密码登录。",
+    "set_password_btn": "验证 Passkey 并设置密码",
+    "password_setup_success": "已启用密码登录",
+    "password_setup_error": "设置密码登录失败，请验证 Passkey 后重试。",
+    "passkey_verify_browser_only": "当前仅支持在网页端验证 Passkey 后设置密码登录。",
+    "passkey_verify_wrong_account": "你验证的是另一个账号的 Passkey，请使用当前账号绑定的 Passkey。",
+    "passkey_verify_no_passkeys": "当前账号还没有绑定 Passkey。",
+    "native_status_verifying_passkey": "正在验证 Passkey…",
+    "native_status_saving_password": "正在保存密码登录…"
   },
   "admin": {
     "title": "管理面板",

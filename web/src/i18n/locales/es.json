@@ -210,7 +210,16 @@
     "confirm_password_placeholder": "Confirmar nueva contraseña",
     "change_password_btn": "Cambiar contraseña",
     "passwords_mismatch": "Las contraseñas no coinciden",
-    "password_too_short": "La contraseña debe tener al menos 8 caracteres"
+    "password_too_short": "La contraseña debe tener al menos 8 caracteres",
+    "native_callback_fallback": "Toca aquí si no se redirige automáticamente",
+    "native_status_getting_challenge": "Obteniendo desafío…",
+    "native_status_authenticating": "Autenticando…",
+    "native_status_getting_api_key": "Obteniendo clave API…",
+    "native_status_redirecting": "Redirigiendo…",
+    "native_status_creating_passkey": "Creando passkey…",
+    "native_status_registering": "Registrando…",
+    "native_status_saving": "Guardando…",
+    "native_status_logging_in": "Iniciando sesión…"
   },
   "serverSetup": {
     "title": "Elegir servidor",
@@ -348,7 +357,24 @@
     "passwords_mismatch": "Las contraseñas no coinciden",
     "password_too_short": "La contraseña debe tener al menos 8 caracteres",
     "privacy_policy": "Política de privacidad",
-    "terms_of_service": "Términos de servicio"
+    "terms_of_service": "Términos de servicio",
+    "account_identity": "Identidad de la cuenta",
+    "username": "Nombre de usuario",
+    "no_username": "Sin configurar",
+    "username_placeholder": "Elige un nombre de usuario",
+    "username_required": "El nombre de usuario es obligatorio",
+    "username_invalid": "Usa 3-32 caracteres: letras minúsculas, números, punto, guion bajo o guion",
+    "username_taken": "Ese nombre de usuario ya está en uso",
+    "set_password_login": "Configurar inicio con contraseña",
+    "set_password_hint": "Las cuentas con passkey no tienen nombre de usuario ni contraseña por defecto. Verifica tu passkey una vez y luego configura ambos para poder iniciar sesión también con contraseña.",
+    "set_password_btn": "Verificar passkey y configurar contraseña",
+    "password_setup_success": "El acceso con contraseña ya está listo",
+    "password_setup_error": "No se pudo configurar el acceso con contraseña. Verifica tu passkey y vuelve a intentarlo.",
+    "passkey_verify_browser_only": "La verificación de passkey para configurar contraseña solo está disponible en el navegador web.",
+    "passkey_verify_wrong_account": "Esa passkey pertenece a otra cuenta. Verifica con la passkey registrada en esta cuenta.",
+    "passkey_verify_no_passkeys": "No hay passkeys registradas para esta cuenta.",
+    "native_status_verifying_passkey": "Verificando passkey…",
+    "native_status_saving_password": "Guardando acceso con contraseña…"
   },
   "admin": {
     "title": "Panel de administración",

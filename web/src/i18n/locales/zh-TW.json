@@ -210,7 +210,16 @@
     "confirm_password_placeholder": "確認新密碼",
     "change_password_btn": "變更密碼",
     "passwords_mismatch": "兩次輸入的密碼不一致",
-    "password_too_short": "密碼至少需要 8 個字元"
+    "password_too_short": "密碼至少需要 8 個字元",
+    "native_callback_fallback": "如果沒有自動跳轉，請點這裡",
+    "native_status_getting_challenge": "正在取得挑戰…",
+    "native_status_authenticating": "正在驗證…",
+    "native_status_getting_api_key": "正在取得 API Key…",
+    "native_status_redirecting": "正在跳轉…",
+    "native_status_creating_passkey": "正在建立 Passkey…",
+    "native_status_registering": "正在註冊…",
+    "native_status_saving": "正在儲存…",
+    "native_status_logging_in": "正在登入…"
   },
   "serverSetup": {
     "title": "選擇伺服器",
@@ -348,7 +357,24 @@
     "passwords_mismatch": "兩次輸入的密碼不一致",
     "password_too_short": "密碼至少需要 8 個字元",
     "privacy_policy": "隱私權政策",
-    "terms_of_service": "服務條款"
+    "terms_of_service": "服務條款",
+    "account_identity": "帳號資訊",
+    "username": "使用者名稱",
+    "no_username": "未設定",
+    "username_placeholder": "設定使用者名稱",
+    "username_required": "請輸入使用者名稱",
+    "username_invalid": "使用者名稱需為 3-32 位，只能包含小寫字母、數字、點、底線、連字號",
+    "username_taken": "此使用者名稱已被使用",
+    "set_password_login": "設定密碼登入",
+    "set_password_hint": "Passkey 帳號預設沒有使用者名稱與密碼。先驗證一次 Passkey，再設定使用者名稱與密碼，之後即可同時支援密碼登入。",
+    "set_password_btn": "驗證 Passkey 並設定密碼",
+    "password_setup_success": "已啟用密碼登入",
+    "password_setup_error": "設定密碼登入失敗，請驗證 Passkey 後再試。",
+    "passkey_verify_browser_only": "目前僅支援在網頁端驗證 Passkey 後設定密碼登入。",
+    "passkey_verify_wrong_account": "你驗證的是另一個帳號的 Passkey，請使用目前帳號綁定的 Passkey。",
+    "passkey_verify_no_passkeys": "目前帳號尚未綁定 Passkey。",
+    "native_status_verifying_passkey": "正在驗證 Passkey…",
+    "native_status_saving_password": "正在儲存密碼登入…"
   },
   "admin": {
     "title": "管理面板",

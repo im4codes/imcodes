@@ -64,6 +64,18 @@ async function resolveUserId(c: AnyAuthContext): Promise<string | null> {
   return null;
 }
 
+function toClientUser(user: Awaited<ReturnType<typeof getUserById>>) {
+  if (!user) return null;
+  return {
+    id: user.id,
+    username: user.username,
+    display_name: user.display_name,
+    is_admin: user.is_admin,
+    status: user.status,
+    has_password: !!user.password_hash,
+  };
+}
+
 // POST /api/auth/register — create a new user and issue initial API key
 authRoutes.post('/register', async (c) => {
   // Check if registration is enabled
@@ -116,7 +128,7 @@ authRoutes.get('/user/me', async (c) => {
   if (!userId) return c.json({ error: 'unauthorized' }, 401);
   const user = await getUserById(c.env.DB, userId);
   if (!user) return c.json({ error: 'not_found' }, 404);
-  return c.json(user);
+  return c.json(toClientUser(user));
 });
 
 // GET /api/auth/user/:id — requires auth, only accessible for own user ID
@@ -129,7 +141,7 @@ authRoutes.get('/user/:id', async (c) => {
 
   const user = await getUserById(c.env.DB, requestedId);
   if (!user) return c.json({ error: 'not_found' }, 404);
-  return c.json(user);
+  return c.json(toClientUser(user));
 });
 
 // POST /api/user/:id/rotate-key — generate new API key, 24-hour grace for old key
@@ -582,7 +594,7 @@ authRoutes.patch('/user/me', async (c) => {
   }
 
   const user = await getUserById(c.env.DB, userId);
-  return c.json(user);
+  return c.json(toClientUser(user));
 });
 
 // POST /api/auth/password/change — change password (requires auth)

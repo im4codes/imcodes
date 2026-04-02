@@ -210,7 +210,16 @@
     "confirm_password_placeholder": "새 비밀번호 확인",
     "change_password_btn": "비밀번호 변경",
     "passwords_mismatch": "비밀번호가 일치하지 않습니다",
-    "password_too_short": "비밀번호는 최소 8자 이상이어야 합니다"
+    "password_too_short": "비밀번호는 최소 8자 이상이어야 합니다",
+    "native_callback_fallback": "자동으로 돌아가지 않으면 여기를 누르세요",
+    "native_status_getting_challenge": "챌린지를 가져오는 중…",
+    "native_status_authenticating": "인증 중…",
+    "native_status_getting_api_key": "API 키를 가져오는 중…",
+    "native_status_redirecting": "이동 중…",
+    "native_status_creating_passkey": "패스키 생성 중…",
+    "native_status_registering": "등록 중…",
+    "native_status_saving": "저장 중…",
+    "native_status_logging_in": "로그인 중…"
   },
   "serverSetup": {
     "title": "서버 선택",
@@ -348,7 +357,24 @@
     "passwords_mismatch": "비밀번호가 일치하지 않습니다",
     "password_too_short": "비밀번호는 최소 8자 이상이어야 합니다",
     "privacy_policy": "개인정보 처리방침",
-    "terms_of_service": "이용약관"
+    "terms_of_service": "이용약관",
+    "account_identity": "계정 정보",
+    "username": "사용자 이름",
+    "no_username": "설정되지 않음",
+    "username_placeholder": "사용자 이름 설정",
+    "username_required": "사용자 이름이 필요합니다",
+    "username_invalid": "사용자 이름은 3-32자이며 소문자, 숫자, 점, 밑줄, 하이픈만 사용할 수 있습니다",
+    "username_taken": "이미 사용 중인 사용자 이름입니다",
+    "set_password_login": "비밀번호 로그인 설정",
+    "set_password_hint": "패스키 계정에는 기본적으로 사용자 이름과 비밀번호가 없습니다. 패스키를 한 번 확인한 뒤 둘 다 설정하면 비밀번호로도 로그인할 수 있습니다.",
+    "set_password_btn": "패스키 확인 후 비밀번호 설정",
+    "password_setup_success": "비밀번호 로그인이 준비되었습니다",
+    "password_setup_error": "비밀번호 로그인 설정에 실패했습니다. 패스키를 확인한 뒤 다시 시도하세요.",
+    "passkey_verify_browser_only": "비밀번호 설정을 위한 패스키 확인은 현재 웹 브라우저에서만 지원됩니다.",
+    "passkey_verify_wrong_account": "이 패스키는 다른 계정에 속합니다. 현재 계정에 등록된 패스키로 확인하세요.",
+    "passkey_verify_no_passkeys": "이 계정에는 등록된 패스키가 없습니다.",
+    "native_status_verifying_passkey": "패스키 확인 중…",
+    "native_status_saving_password": "비밀번호 로그인 저장 중…"
   },
   "admin": {
     "title": "관리자 패널",
