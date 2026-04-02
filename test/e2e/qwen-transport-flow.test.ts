@@ -10,7 +10,7 @@
  * Verifies:
  * - main qwen sessions launch as transport sessions
  * - providerSessionId is persisted
- * - session.send produces streaming + final assistant timeline events
+ * - session.send produces immediate thinking state, then streaming + final assistant timeline events
  * - streaming and final events reuse the same stable eventId (typewriter path)
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -178,11 +178,17 @@ describe('qwen transport flow e2e', () => {
       commandId: 'cmd-qwen-e2e',
     }, serverLink);
     await flushAsync();
+    const running = mocks.emitted.find((e) => e.session === SESSION && e.type === 'session.state' && e.payload.state === 'running');
+    const thinking = mocks.emitted.find((e) => e.session === SESSION && e.type === 'assistant.thinking');
+    const user = mocks.emitted.find((e) => e.session === SESSION && e.type === 'user.message');
     const streaming = mocks.emitted.filter((e) => e.session === SESSION && e.type === 'assistant.text' && e.payload.streaming === true);
     const final = mocks.emitted.find((e) => e.session === SESSION && e.type === 'assistant.text' && e.payload.streaming === false);
     const ack = mocks.emitted.find((e) => e.session === SESSION && e.type === 'command.ack');
     const stableEventId = `transport:${SESSION}:msg-qwen-e2e`;
 
+    expect(user?.payload.text).toBe('hello');
+    expect(running).toBeDefined();
+    expect(thinking?.payload.text).toBe('');
     expect(streaming.map((e) => e.payload.text)).toEqual(['Qwen', 'Qwen: hello']);
     expect(streaming[0]?.opts?.eventId).toBe(stableEventId);
     expect(streaming[1]?.opts?.eventId).toBe(stableEventId);

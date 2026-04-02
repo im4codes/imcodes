@@ -405,6 +405,33 @@ describe('OpenClawProvider', () => {
       expect(deltas[0].sessionId).toBe('sess-2');
       expect(deltas[0].delta.delta).toBe('Hi');
     });
+
+    it('does not replace messageId if lifecycle.start arrives after assistant output', async () => {
+      await connectProvider(provider);
+
+      const deltas: Array<{ sessionId: string; delta: MessageDelta }> = [];
+      const completes: Array<{ sessionId: string; message: AgentMessage }> = [];
+      provider.onDelta((sessionId, delta) => deltas.push({ sessionId, delta }));
+      provider.onComplete((sessionId, message) => completes.push({ sessionId, message }));
+
+      const runId = 'run-late-start';
+
+      emitAgentEvent({ runId, stream: 'assistant', data: { delta: 'Hello' }, key: 'sess-late' });
+      const firstMessageId = deltas[0]?.delta.messageId;
+      expect(firstMessageId).toBeTruthy();
+
+      emitAgentEvent({ runId, stream: 'lifecycle', data: { phase: 'start' }, key: 'sess-late' });
+      emitAgentEvent({ runId, stream: 'assistant', data: { delta: ' World' }, key: 'sess-late' });
+      emitAgentEvent({ runId, stream: 'lifecycle', data: { phase: 'end' }, key: 'sess-late' });
+
+      expect(deltas).toHaveLength(2);
+      expect(deltas[0].delta.messageId).toBe(firstMessageId);
+      expect(deltas[1].delta.messageId).toBe(firstMessageId);
+      expect(deltas[1].delta.delta).toBe('Hello World');
+      expect(completes).toHaveLength(1);
+      expect(completes[0].message.id).toBe(firstMessageId);
+      expect(completes[0].message.content).toBe('Hello World');
+    });
   });
 
   // 6. lifecycle start + deltas + lifecycle end -> fires onComplete

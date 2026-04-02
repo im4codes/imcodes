@@ -1050,8 +1050,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   if (transportRuntime) {
     const release = await getMutex(sessionName).acquire();
     try {
-      await transportRuntime.send(text);
       timelineEmitter.emit(sessionName, 'user.message', { text });
+      timelineEmitter.emit(sessionName, 'session.state', { state: 'running' }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'medium' });
+      await transportRuntime.send(text);
       const status = isLegacy ? 'accepted_legacy' : 'accepted';
       timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
       try {
@@ -1061,7 +1063,6 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       // Send failed — show error in chat
       const errMsg = err instanceof Error ? err.message : String(err);
       logger.error({ sessionName, err }, 'session.send (transport) failed');
-      timelineEmitter.emit(sessionName, 'user.message', { text });
       timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Send failed: ${errMsg}`, streaming: false }, { source: 'daemon', confidence: 'high' });
       timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
       try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch { /* */ }

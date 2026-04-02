@@ -427,6 +427,11 @@ export class OpenClawProvider implements TransportProvider {
       const phase = (data as { phase?: string })?.phase;
 
       if (phase === 'start') {
+        const existing = this.runAccumulator.get(runId);
+        if (existing) {
+          logger.debug({ provider: this.id, runId, sessionId: existing.sessionId }, 'Agent run start ignored — accumulator already exists');
+          return;
+        }
         // Initialise accumulator for this run.
         // We need sessionId; OpenClaw includes it in the payload as `key` or `sessionKey`.
         // Sanitize `:` → `___` so internal code never sees colons.

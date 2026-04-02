@@ -274,7 +274,10 @@ export class QwenProvider implements TransportProvider {
       if (payload.type === 'assistant') {
         const finalText = collectAssistantText(payload.message?.content);
         if (finalText) {
-          emitComplete(finalText, payload.message?.id ?? state.currentMessageId ?? undefined);
+          // Qwen may emit a different final assistant message.id than the prior
+          // stream_event message_start id. For IM.codes we must preserve the
+          // streaming message id so timeline replacement stays in-place.
+          emitComplete(finalText, state.currentMessageId ?? payload.message?.id ?? undefined);
         }
         return;
       }

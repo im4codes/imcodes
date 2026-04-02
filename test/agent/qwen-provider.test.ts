@@ -123,6 +123,25 @@ describe('QwenProvider', () => {
     expect(second.args).not.toContain('--session-id');
   });
 
+  it('keeps the streaming message id for final completion when qwen emits a different assistant id', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-2', cwd: '/tmp/project' });
+
+    const completeIds: string[] = [];
+    provider.onComplete((_sid, msg) => completeIds.push(msg.id));
+
+    await provider.send('sess-2', 'hello');
+    const run = lastSpawn();
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'stream-msg-1' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Hello' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'assistant-msg-2', content: [{ type: 'text', text: 'Hello' }] } })}\n`);
+    run.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(completeIds).toEqual(['stream-msg-1']);
+  });
+
   it('emits provider error on result is_error payload', async () => {
     const provider = new QwenProvider();
     await provider.connect({});
