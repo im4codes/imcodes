@@ -240,6 +240,16 @@ async function extractSessionUuidFromPane(sessionName: string): Promise<string |
 const extractCcSessionIdFromPane = extractSessionUuidFromPane;
 /** Extract geminiSessionId from tmux pane start command (gemini --resume <uuid>). */
 const extractGeminiSessionIdFromPane = extractSessionUuidFromPane;
+/** Extract OpenCode session ID from tmux pane start command (`opencode -s <id>`). */
+async function extractOpenCodeSessionIdFromPane(sessionName: string): Promise<string | undefined> {
+  try {
+    const cmd = await getPaneStartCommand(sessionName);
+    const match = cmd.match(/\bopencode\b[\s\S]*?(?:--session|-s)\s+(?:"([^"]+)"|'([^']+)'|([^\s"'`;|&]+))/);
+    return match?.[1] ?? match?.[2] ?? match?.[3];
+  } catch {
+    return undefined;
+  }
+}
 
 /** Infer agent type from tmux pane start command. */
 async function inferAgentTypeFromPane(sessionName: string): Promise<AgentType> {
@@ -304,6 +314,14 @@ export async function restoreFromStore(): Promise<void> {
         if (gemId) {
           startGeminiWatching(s.name, gemId);
         }
+      } else if (s.agentType === 'opencode' && !s.opencodeSessionId) {
+        const opencodeId = await extractOpenCodeSessionIdFromPane(s.name);
+        if (opencodeId) {
+          const next = { ...s, opencodeSessionId: opencodeId };
+          upsertSession(next);
+          emitSessionPersist(next, s.name);
+          logger.info({ session: s.name, opencodeSessionId: opencodeId }, 'Backfilled missing opencodeSessionId from tmux');
+        }
       }
       continue;
     }
@@ -319,6 +337,14 @@ export async function restoreFromStore(): Promise<void> {
         upsertSession(hydrated);
         emitSessionPersist(hydrated, s.name);
         logger.info({ session: s.name, ccSessionId: ccId }, 'Backfilled missing ccSessionId from tmux');
+      }
+    } else if (s.agentType === 'opencode' && !s.opencodeSessionId) {
+      const opencodeId = await extractOpenCodeSessionIdFromPane(s.name);
+      if (opencodeId) {
+        hydrated = { ...s, opencodeSessionId: opencodeId };
+        upsertSession(hydrated);
+        emitSessionPersist(hydrated, s.name);
+        logger.info({ session: s.name, opencodeSessionId: opencodeId }, 'Backfilled missing opencodeSessionId from tmux');
       }
     }
 

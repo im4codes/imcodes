@@ -13,7 +13,7 @@ import { describe, it, expect, vi } from 'vitest';
 
 const {
   storeMock, tmuxListMock, startWatchingMock, startWatchingFileMock,
-  isWatchingMock, restartSessionMock,
+  isWatchingMock, restartSessionMock, getPaneStartCommandMock, upsertSessionMock,
 } = vi.hoisted(() => ({
   storeMock: vi.fn(),
   tmuxListMock: vi.fn().mockResolvedValue(['deck_Cd_brain', 'deck_sub_5907196l']),
@@ -21,11 +21,13 @@ const {
   startWatchingFileMock: vi.fn().mockResolvedValue(undefined),
   isWatchingMock: vi.fn().mockReturnValue(false),
   restartSessionMock: vi.fn().mockResolvedValue(undefined),
+  getPaneStartCommandMock: vi.fn().mockResolvedValue('claude --dangerously-skip-permissions'),
+  upsertSessionMock: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
   listSessions: storeMock,   // session-manager imports `listSessions as storeSessions`
-  upsertSession: vi.fn(),
+  upsertSession: upsertSessionMock,
   getSession: vi.fn(() => null),
 }));
 
@@ -44,7 +46,7 @@ vi.mock('../../src/agent/tmux.js', () => ({
   resizeSession: vi.fn(),
   getPaneCwd: vi.fn().mockResolvedValue('/proj'),
   getPaneId: vi.fn().mockResolvedValue('%1'),
-  getPaneStartCommand: vi.fn().mockResolvedValue('claude --dangerously-skip-permissions'),
+  getPaneStartCommand: getPaneStartCommandMock,
   showBuffer: vi.fn().mockResolvedValue(''),
   cleanupOrphanFifos: vi.fn().mockResolvedValue(undefined),
 }));
@@ -136,5 +138,23 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
     const mainCalls = fileWatchCalls.filter(([session]) => session === 'deck_Cd_brain');
     expect(mainCalls.length).toBeGreaterThan(0);
     expect(mainCalls[0][1]).toContain('main-uuid.jsonl');
+  });
+
+  it('backfills opencodeSessionId for live sub-sessions from tmux command', async () => {
+    getPaneStartCommandMock.mockResolvedValueOnce('opencode -s oc-sub-restore-456');
+    storeMock.mockReturnValue([
+      {
+        name: 'deck_sub_5907196l', agentType: 'opencode',
+        projectDir: '/proj', opencodeSessionId: undefined, state: 'running',
+      },
+    ]);
+    tmuxListMock.mockResolvedValue(['deck_sub_5907196l']);
+
+    await restoreFromStore();
+
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_sub_5907196l',
+      opencodeSessionId: 'oc-sub-restore-456',
+    }));
   });
 });

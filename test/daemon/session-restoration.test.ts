@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   storeListSessions: vi.fn(),
   storeUpsertSession: vi.fn(),
   tmuxListSessions: vi.fn(),
+  getPaneStartCommand: vi.fn().mockResolvedValue('claude --dangerously-skip-permissions'),
   jsonlStartWatching: vi.fn().mockResolvedValue(undefined),
   jsonlStartWatchingFile: vi.fn().mockResolvedValue(undefined),
   jsonlIsWatching: vi.fn().mockReturnValue(false),
@@ -38,7 +39,7 @@ vi.mock('../../src/agent/tmux.js', () => ({
   respawnPane: mocks.respawnPane,
   getPaneCwd: vi.fn().mockResolvedValue('/proj'),
   getPaneId: vi.fn().mockResolvedValue('%1'),
-  getPaneStartCommand: vi.fn().mockResolvedValue('claude --dangerously-skip-permissions'),
+  getPaneStartCommand: mocks.getPaneStartCommand,
   cleanupOrphanFifos: vi.fn(),
   newSession: mocks.newSession,
   capturePane: vi.fn().mockResolvedValue([]),
@@ -201,5 +202,26 @@ describe('Session Restoration (all agents)', () => {
     // Should NOT respawn — session is alive, just missing ccSessionId
     expect(mocks.respawnPane).not.toHaveBeenCalled();
     expect(mocks.jsonlStartWatching).not.toHaveBeenCalled();
+  });
+
+  it('backfills opencodeSessionId for live main OpenCode sessions from tmux command', async () => {
+    mocks.getPaneStartCommand.mockResolvedValueOnce('opencode -s "oc-main-restore-123"');
+    mocks.storeListSessions.mockReturnValue([
+      {
+        name: 'deck_proj_brain',
+        agentType: 'opencode',
+        projectDir: '/proj',
+        state: 'running',
+        restartTimestamps: [],
+      },
+    ]);
+    mocks.tmuxListSessions.mockResolvedValue(['deck_proj_brain']);
+
+    await restoreFromStore();
+
+    expect(mocks.storeUpsertSession).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_proj_brain',
+      opencodeSessionId: 'oc-main-restore-123',
+    }));
   });
 });
