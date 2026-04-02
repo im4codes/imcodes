@@ -17,23 +17,25 @@ describe('buildWindowsUpgradeBatch', () => {
     cleanupPath: 'C:\\Temp\\imcodes-upgrade-123\\cleanup.cmd',
     npmCmd: 'C:\\Program Files\\nodejs\\npm.cmd',
     pkgSpec: 'imcodes@1.2.3',
-    restartCmd: '"C:\\Program Files\\nodejs\\node.exe" "C:\\imcodes\\dist\\src\\index.js" restart',
-    versionCmd: '"C:\\Program Files\\nodejs\\node.exe" "C:\\imcodes\\dist\\src\\index.js" --version',
     targetVer: '1.2.3',
   });
 
   it('installs the requested package with a quoted npm path', () => {
-    expect(batch).toContain('"C:\\Program Files\\nodejs\\npm.cmd" install -g imcodes@1.2.3');
+    expect(batch).toContain('call "C:\\Program Files\\nodejs\\npm.cmd" install -g imcodes@1.2.3');
   });
 
-  it('verifies installed version before restart', () => {
+  it('verifies the installed CLI shim and version before restart', () => {
+    expect(batch).toContain('set "NPM_PREFIX="');
+    expect(batch).toContain('prefix -g');
+    expect(batch).toContain('set "CLI_SHIM=%NPM_PREFIX%\\imcodes.cmd"');
+    expect(batch).toContain('if not exist "%CLI_SHIM%"');
     expect(batch).toContain('set "INSTALLED_VER="');
-    expect(batch).toContain('for /f "usebackq delims=" %%v');
+    expect(batch).toContain('call "%CLI_SHIM%" --version');
     expect(batch).toContain('if /I not "%INSTALLED_VER%"=="1.2.3"');
   });
 
-  it('uses the shared CLI restart path instead of startup cmd shortcuts', () => {
-    expect(batch).toContain('"C:\\Program Files\\nodejs\\node.exe" "C:\\imcodes\\dist\\src\\index.js" restart');
+  it('uses the shared CLI restart path through the global shim instead of startup cmd shortcuts', () => {
+    expect(batch).toContain('call "%CLI_SHIM%" restart');
     expect(batch).not.toContain('imcodes-daemon.cmd');
     expect(batch).not.toContain('taskkill /f /pid');
   });
@@ -43,4 +45,3 @@ describe('buildWindowsUpgradeBatch', () => {
     expect(batch).not.toContain('rmdir /s /q ""');
   });
 });
-

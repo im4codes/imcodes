@@ -1820,8 +1820,6 @@ launchctl load -w "${plist}"`;
     const pkgSpec = targetVersion ? `imcodes@${targetVersion}` : 'imcodes@latest';
     const batchPath = join(scriptDir, 'upgrade.cmd');
     const cleanupPath = join(scriptDir, 'cleanup.cmd');
-    const restartCmd = `"${process.execPath}" "${cliEntry}" restart`;
-    const versionCmd = `"${process.execPath}" "${cliEntry}" --version`;
     const targetVer = targetVersion ?? 'latest';
     const cleanupScript = buildWindowsCleanupScript(scriptDir);
     writeFileSync(cleanupPath, cleanupScript);
@@ -1834,8 +1832,6 @@ launchctl load -w "${plist}"`;
       cleanupPath,
       npmCmd,
       pkgSpec,
-      restartCmd,
-      versionCmd,
       targetVer,
     });
 
