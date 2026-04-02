@@ -21,6 +21,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "postbuild": "node scripts/mark-bin-executable.mjs",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.ts",
     "test": "vitest run",
