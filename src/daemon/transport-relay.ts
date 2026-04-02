@@ -12,6 +12,7 @@ import { resolveSessionName } from '../agent/session-manager.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { appendTransportEvent } from './transport-history.js';
 import logger from '../util/logger.js';
+import { resolveContextWindow } from '../util/model-context.js';
 
 let sendToServer: ((msg: Record<string, unknown>) => void) | null = null;
 
@@ -64,6 +65,21 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       text: finalText,
       streaming: false,
     }, { source: 'daemon', confidence: 'high', eventId: stableEventId });
+
+    const usage = message.metadata?.usage as {
+      input_tokens?: number;
+      output_tokens?: number;
+      cache_read_input_tokens?: number;
+    } | undefined;
+    const model = typeof message.metadata?.model === 'string' ? message.metadata.model : undefined;
+    if (usage || model) {
+      timelineEmitter.emit(sessionName, 'usage.update', {
+        ...(typeof usage?.input_tokens === 'number' ? { inputTokens: usage.input_tokens } : {}),
+        ...(typeof usage?.cache_read_input_tokens === 'number' ? { cacheTokens: usage.cache_read_input_tokens } : {}),
+        ...(model ? { model } : {}),
+        contextWindow: resolveContextWindow(undefined, model),
+      }, { source: 'daemon', confidence: 'high' });
+    }
 
     // Emit idle state
     timelineEmitter.emit(sessionName, 'session.state', {

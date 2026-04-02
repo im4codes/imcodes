@@ -89,6 +89,7 @@ describe('QwenProvider', () => {
       sessionKey: 'sess-1',
       cwd: '/tmp/project',
       description: 'Be concise',
+      agentId: 'qwen3-coder-plus',
     });
 
     const deltas: string[] = [];
@@ -105,6 +106,8 @@ describe('QwenProvider', () => {
     expect(first.args).not.toContain('--resume');
     expect(first.args).toContain('--append-system-prompt');
     expect(first.args).toContain('Be concise');
+    expect(first.args).toContain('--model');
+    expect(first.args).toContain('qwen3-coder-plus');
 
     first.child.stdout.write(`${JSON.stringify({ type: 'system', subtype: 'session_start', session_id: 'sess-1' })}\n`);
     first.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-1' } } })}\n`);
@@ -130,17 +133,22 @@ describe('QwenProvider', () => {
     await provider.createSession({ sessionKey: 'sess-2', cwd: '/tmp/project' });
 
     const completeIds: string[] = [];
-    provider.onComplete((_sid, msg) => completeIds.push(msg.id));
+    const metadata: Array<Record<string, unknown> | undefined> = [];
+    provider.onComplete((_sid, msg) => { completeIds.push(msg.id); metadata.push(msg.metadata); });
 
     await provider.send('sess-2', 'hello');
     const run = lastSpawn();
     run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'stream-msg-1' } } })}\n`);
     run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Hello' } } })}\n`);
-    run.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'assistant-msg-2', content: [{ type: 'text', text: 'Hello' }] } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'assistant-msg-2', model: 'qwen3.5-plus', usage: { input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 2 }, content: [{ type: 'text', text: 'Hello' }] } })}\n`);
     run.child.emit('close', 0, null);
     await flushIO();
 
     expect(completeIds).toEqual(['stream-msg-1']);
+    expect(metadata[0]).toEqual({
+      model: 'qwen3.5-plus',
+      usage: { input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 2 },
+    });
   });
 
   it('emits provider error on result is_error payload', async () => {

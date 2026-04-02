@@ -263,6 +263,12 @@ export interface TransportProvider {
   restoreSession?(sessionId: string): Promise<boolean>;
 
   /**
+   * Update provider-side model/agent selection for an existing session record.
+   * Used by local-sdk providers that apply model choice on each send.
+   */
+  setSessionAgentId?(sessionId: string, agentId: string): void;
+
+  /**
    * Enumerate all remote sessions visible to this provider.
    * Useful for session-picker UIs and resuming orphaned sessions.
    * Only call when capabilities.sessionRestore is true.

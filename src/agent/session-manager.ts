@@ -631,6 +631,8 @@ export interface LaunchOpts {
   geminiSessionId?: string;
   /** OpenCode session ID for `opencode -s <ID>`. */
   opencodeSessionId?: string;
+  /** Qwen model ID for `qwen --model <ID>`. */
+  qwenModel?: string;
   /** Human-readable label for UI display. */
   label?: string;
   /** Session description for transport sessions (persona/system prompt injection). */
@@ -714,8 +716,10 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         cwd: s.projectDir,
         label: s.label ?? s.name,
         description: s.description,
+        agentId: s.qwenModel,
       });
       if (s.description) runtime.setDescription(s.description);
+      if (s.qwenModel) runtime.setAgentId(s.qwenModel);
       transportRuntimes.set(s.name, runtime);
       registerProviderRoute(s.providerSessionId, s.name);
       upsertSession({ ...s, state: 'running', updatedAt: Date.now() });
@@ -735,6 +739,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   let effectiveSessionKey = name;
   let effectiveBindExistingKey = bindExistingKey;
   let effectiveSkipCreate = skipCreate;
+  const effectiveQwenModel = agentType === 'qwen' ? (opts.qwenModel ?? getSession(name)?.qwenModel) : undefined;
   if (agentType === 'qwen') {
     const stored = !opts.fresh ? getSession(name)?.providerSessionId : undefined;
     const qwenSessionId = effectiveBindExistingKey ?? stored ?? randomUUID();
@@ -754,6 +759,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     cwd: projectDir,
     label: label || name,
     description,
+    agentId: effectiveQwenModel,
     bindExistingKey: effectiveBindExistingKey,
     skipCreate: effectiveSkipCreate,
   });
@@ -779,6 +785,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         runtimeType: RUNTIME_TYPES.TRANSPORT,
         providerId: provider.id,
         providerSessionId: runtime.providerSessionId ?? undefined,
+        ...(effectiveQwenModel ? { qwenModel: effectiveQwenModel } : {}),
         description,
         label,
         parentSession,
@@ -921,6 +928,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
         ...(codexSessionId ? { codexSessionId } : {}),
         ...(geminiSessionId ? { geminiSessionId } : {}),
         ...(opencodeSessionId ? { opencodeSessionId } : {}),
+        ...(opts.qwenModel ? { qwenModel: opts.qwenModel } : {}),
         updatedAt: Date.now(),
       };
       upsertSession(merged);

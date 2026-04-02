@@ -96,6 +96,8 @@ import { CODEX_STATUS_MSG } from '../../shared/codex-status.js';
 import { detectStatusAsync } from '../agent/detect.js';
 import { capturePane } from '../agent/tmux.js';
 import { countCodexStatusMatches, normalizeCodexStatusPaneText, parseCodexStatusOutput } from './codex-status.js';
+import { resolveContextWindow } from '../util/model-context.js';
+import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
 
 // ── Common MIME map for file metadata ────────────────────────────────────────
 
@@ -1050,6 +1052,36 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   if (transportRuntime) {
     const release = await getMutex(sessionName).acquire();
     try {
+      if (record?.agentType === 'qwen') {
+        const modelMatch = text.trim().match(/^\/model\s+(\S+)\s*$/);
+        if (modelMatch) {
+          const nextModel = modelMatch[1];
+          if (!QWEN_MODEL_IDS.includes(nextModel)) {
+            timelineEmitter.emit(sessionName, 'user.message', { text });
+            timelineEmitter.emit(sessionName, 'assistant.text', {
+              text: `⚠️ Unknown Qwen model: ${nextModel}`,
+              streaming: false,
+            }, { source: 'daemon', confidence: 'high' });
+            timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Qwen model: ${nextModel}` });
+            try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unknown Qwen model: ${nextModel}` }); } catch { /* */ }
+            return;
+          }
+          transportRuntime.setAgentId(nextModel);
+          upsertSession({ ...record, qwenModel: nextModel, updatedAt: Date.now() });
+          timelineEmitter.emit(sessionName, 'user.message', { text });
+          timelineEmitter.emit(sessionName, 'usage.update', {
+            model: nextModel,
+            contextWindow: resolveContextWindow(undefined, nextModel),
+          }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'assistant.text', {
+            text: `Switched model to ${nextModel}`,
+            streaming: false,
+          }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
+          try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch { /* */ }
+          return;
+        }
+      }
       timelineEmitter.emit(sessionName, 'user.message', { text });
       timelineEmitter.emit(sessionName, 'session.state', { state: 'running' }, { source: 'daemon', confidence: 'high' });
       timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'medium' });

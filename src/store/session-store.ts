@@ -34,6 +34,8 @@ export interface SessionRecord {
   geminiSessionId?: string;
   /** OpenCode session ID used for `opencode -s <ID>` deterministic resume/history lookup. */
   opencodeSessionId?: string;
+  /** Qwen model ID used for transport sends (`qwen --model <ID>`). */
+  qwenModel?: string;
   /** Parent main session name (e.g. `deck_proj_brain`) — links sub-sessions to their parent. */
   parentSession?: string;
   /** Runtime type — 'process' for tmux, 'transport' for network-backed. Defaults to 'process' for backward compat. */

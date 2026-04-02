@@ -223,6 +223,27 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(textCall![2].text).toBe('part1 part2');
     });
 
+    it('emits usage.update when completion metadata includes model and usage', () => {
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireComplete('sess-1', makeMessage({
+        id: 'msg-usage',
+        metadata: {
+          model: 'qwen3-coder-plus',
+          usage: { input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 5 },
+        },
+      }));
+
+      const usageCall = emitMock.mock.calls.find(c => c[1] === 'usage.update');
+      expect(usageCall).toBeDefined();
+      expect(usageCall![2]).toMatchObject({
+        inputTokens: 100,
+        cacheTokens: 5,
+        model: 'qwen3-coder-plus',
+      });
+    });
+
     it('falls back to message.content when no accumulator exists', () => {
       const { provider, fireComplete } = makeMockProvider();
       wireProviderToRelay(provider);

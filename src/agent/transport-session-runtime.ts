@@ -15,6 +15,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _sending = false;
   /** Session description — passed as extraSystemPrompt on each send. */
   private _description: string | undefined;
+  /** Provider-side model/agent selection — passed via SessionConfig.agentId. */
+  private _agentId: string | undefined;
   /** Unsubscribe functions for provider callbacks — called in kill(). */
   private _unsubscribes: Array<() => void> = [];
 
@@ -46,6 +48,12 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   /** Set description (used when restoring from store — passed as extraSystemPrompt on send). */
   setDescription(desc: string): void { this._description = desc; }
+  setAgentId(agentId: string): void {
+    this._agentId = agentId;
+    if (this._providerSessionId) {
+      this.provider.setSessionAgentId?.(this._providerSessionId, agentId);
+    }
+  }
 
   get providerSessionId(): string | null {
     return this._providerSessionId;
@@ -60,6 +68,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   async initialize(config: SessionConfig): Promise<void> {
     this._providerSessionId = await this.provider.createSession(config);
     this._description = config.description;
+    this._agentId = config.agentId;
   }
 
   async send(message: string): Promise<void> {

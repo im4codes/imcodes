@@ -16,6 +16,7 @@ import { uploadFile, getUserPref, saveUserPref } from '../api.js';
 import { isVisuallyBusy } from '../thinking-utils.js';
 import { P2P_CONFIG_MODE } from '@shared/p2p-modes.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
+import { QWEN_MODEL_OPTIONS } from '@shared/qwen-models.js';
 
 interface Props {
   ws: WsClient | null;
@@ -69,12 +70,15 @@ interface Props {
 type MenuAction = 'restart' | 'new' | 'stop';
 type ModelChoice = 'opus' | 'sonnet' | 'haiku';
 type CodexModelChoice = 'gpt-5.4' | 'gpt-5.4-mini' | 'gpt-5.2';
+type QwenModelChoice = typeof QWEN_MODEL_OPTIONS[number]['id'];
 type P2pMode = 'solo' | 'audit' | 'review' | 'brainstorm' | 'discuss' | typeof P2P_CONFIG_MODE;
 
 const MODEL_STORAGE_KEY = 'imcodes-model';
 const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
+const QWEN_MODEL_STORAGE_KEY = 'imcodes-qwen-model';
 const SINGLE_AGENT_PROMPT_PREF_KEY = 'atpicker_single_agent_prompt_dismissed';
 const CODEX_MODELS: CodexModelChoice[] = ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.2'];
+const QWEN_MODELS: QwenModelChoice[] = QWEN_MODEL_OPTIONS.map((model) => model.id as QwenModelChoice);
 const P2P_MODES: P2pMode[] = ['solo', 'audit', 'review', 'brainstorm', 'discuss', P2P_CONFIG_MODE];
 const P2P_MODE_I18N: Record<P2pMode, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
 const P2P_MODE_COLORS: Record<P2pMode, string> = { solo: '#6b7280', audit: '#f59e0b', review: '#3b82f6', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
@@ -127,6 +131,14 @@ function loadCodexModel(): CodexModelChoice | null {
   try {
     const v = localStorage.getItem(CODEX_MODEL_STORAGE_KEY);
     if (CODEX_MODELS.includes(v as CodexModelChoice)) return v as CodexModelChoice;
+  } catch { /* ignore */ }
+  return null;
+}
+
+function loadQwenModel(): QwenModelChoice | null {
+  try {
+    const v = localStorage.getItem(QWEN_MODEL_STORAGE_KEY);
+    if (QWEN_MODELS.includes(v as QwenModelChoice)) return v as QwenModelChoice;
   } catch { /* ignore */ }
   return null;
 }
@@ -207,6 +219,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [p2pSavedConfig, setP2pSavedConfig] = useState<P2pSavedConfig | null>(null);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
+  const [qwenModel, setQwenModel] = useState<QwenModelChoice | null>(loadQwenModel);
   const [confirm, setConfirm] = useState<MenuAction | null>(null);
   const [confirmLevel, setConfirmLevel] = useState(0); // 0=none, 1=first warning, 2=second warning (sub-session only)
   const menuRef = useRef<HTMLDivElement>(null);
@@ -288,7 +301,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (detectedModel.startsWith('gpt-') && CODEX_MODELS.includes(detectedModel as CodexModelChoice)) {
       if (codexModel !== detectedModel) setCodexModel(detectedModel as CodexModelChoice);
     }
-  }, [detectedModel]);
+    if (QWEN_MODELS.includes(detectedModel as QwenModelChoice)) {
+      if (qwenModel !== detectedModel) setQwenModel(detectedModel as QwenModelChoice);
+    }
+  }, [detectedModel, qwenModel, codexModel, model]);
 
   const connected = !!ws?.connected;
   const hasSession = !!activeSession;
@@ -299,6 +315,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const isClaudeCode = activeSession?.agentType === 'claude-code';
   const isShellLike = activeSession?.agentType === 'shell' || activeSession?.agentType === 'script';
   const isCodex = activeSession?.agentType === 'codex';
+  const isQwen = activeSession?.agentType === 'qwen';
 
   // P2P config loading moved after rootSession declaration below
 
@@ -791,6 +808,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     onAfterAction?.();
   };
 
+  const handleQwenModelSelect = (m: QwenModelChoice) => {
+    if (!ws || !activeSession) return;
+    setQwenModel(m);
+    try { localStorage.setItem(QWEN_MODEL_STORAGE_KEY, m); } catch { /* ignore */ }
+    ws.sendSessionCommand('send', { sessionName: activeSession.name, text: `/model ${m}` });
+    setModelOpen(false);
+    onAfterAction?.();
+  };
+
   const placeholder = !hasSession ? t('session.no_session') : !connected ? t('session.send_queued') : t('session.send_placeholder', { name: sessionDisplayName ?? activeSession?.label ?? activeSession?.project ?? 'session' });
 
   return (
@@ -892,6 +918,33 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     onClick={() => handleCodexModelSelect(m)}
                   >
                     {codexModel === m ? '● ' : '○ '}{m}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+        {isQwen && (
+          <div class="shortcuts-model" ref={modelRef}>
+            <button
+              class="shortcut-btn"
+              onClick={() => setModelOpen((o) => !o)}
+              disabled={disabled}
+              title={qwenModel ? `Model: ${qwenModel}` : 'Model: qwen default — tap to select'}
+              style={{ color: qwenModel ? '#f59e0b' : '#6b7280', fontSize: 10 }}
+            >
+              {qwenModel ?? 'qwen'}
+            </button>
+            {modelOpen && (
+              <div class="menu-dropdown">
+                {QWEN_MODEL_OPTIONS.map((m) => (
+                  <button
+                    key={m.id}
+                    class={`menu-item ${qwenModel === m.id ? 'menu-item-active' : ''}`}
+                    onClick={() => handleQwenModelSelect(m.id as QwenModelChoice)}
+                    title={m.description}
+                  >
+                    {qwenModel === m.id ? '● ' : '○ '}{m.id}
                   </button>
                 ))}
               </div>

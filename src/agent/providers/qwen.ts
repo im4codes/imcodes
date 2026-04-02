@@ -25,6 +25,7 @@ interface QwenSessionState {
   cwd: string;
   started: boolean;
   description?: string;
+  model?: string;
   child: ChildProcess | null;
   currentMessageId: string | null;
   currentText: string;
@@ -63,12 +64,26 @@ interface QwenStreamMessage {
   type: string;
   session_id?: string;
   subtype?: string;
+  model?: string;
   is_error?: boolean;
   error?: { message?: string };
   result?: string;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_input_tokens?: number;
+    total_tokens?: number;
+  };
   event?: QwenStreamEvent;
   message?: {
     id?: string;
+    model?: string;
+    usage?: {
+      input_tokens?: number;
+      output_tokens?: number;
+      cache_read_input_tokens?: number;
+      total_tokens?: number;
+    };
     content?: QwenAssistantContentBlock[];
   };
 }
@@ -138,6 +153,7 @@ export class QwenProvider implements TransportProvider {
       cwd: config.cwd ?? existing?.cwd ?? process.cwd(),
       started: !!(config.bindExistingKey || config.skipCreate || existing?.started),
       description: config.description ?? existing?.description,
+      model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
       child: existing?.child ?? null,
       currentMessageId: existing?.currentMessageId ?? null,
       currentText: existing?.currentText ?? '',
@@ -184,6 +200,13 @@ export class QwenProvider implements TransportProvider {
     this.toolCallCallbacks.push(cb);
   }
 
+  setSessionAgentId(sessionId: string, agentId: string): void {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    state.model = agentId;
+    this.sessions.set(sessionId, state);
+  }
+
   async send(sessionId: string, message: string, _attachments?: unknown[], extraSystemPrompt?: string): Promise<void> {
     if (!this.config) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Qwen provider not connected', false);
@@ -193,6 +216,7 @@ export class QwenProvider implements TransportProvider {
       cwd: process.cwd(),
       started: true,
       description: undefined,
+      model: undefined,
       child: null,
       currentMessageId: null,
       currentText: '',
@@ -219,6 +243,9 @@ export class QwenProvider implements TransportProvider {
     const effectivePrompt = extraSystemPrompt?.trim() || state.description?.trim();
     if (effectivePrompt) {
       args.push('--append-system-prompt', effectivePrompt);
+    }
+    if (state.model) {
+      args.push('--model', state.model);
     }
     if (state.started) {
       args.push('--resume', sessionId);
@@ -248,7 +275,7 @@ export class QwenProvider implements TransportProvider {
       this.errorCallbacks.forEach((cb) => cb(sessionId, this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, messageText, false, details)));
     };
 
-    const emitComplete = (text: string, messageId?: string): void => {
+    const emitComplete = (text: string, messageId?: string, metadata?: Record<string, unknown>): void => {
       if (completed || sawError) return;
       completed = true;
       state.started = true;
@@ -263,6 +290,7 @@ export class QwenProvider implements TransportProvider {
         content: text,
         timestamp: Date.now(),
         status: 'complete',
+        ...(metadata ? { metadata } : {}),
       };
       this.completeCallbacks.forEach((cb) => cb(sessionId, msg));
     };
@@ -292,6 +320,8 @@ export class QwenProvider implements TransportProvider {
 
       if (payload.type === 'system' && payload.subtype === 'session_start') {
         state.started = true;
+        if (payload.model) state.model = payload.model;
+        if (payload.message?.model) state.model = payload.message.model;
         return;
       }
 
@@ -376,7 +406,10 @@ export class QwenProvider implements TransportProvider {
           // Qwen may emit a different final assistant message.id than the prior
           // stream_event message_start id. For IM.codes we must preserve the
           // streaming message id so timeline replacement stays in-place.
-          emitComplete(finalText, state.currentMessageId ?? payload.message?.id ?? undefined);
+          emitComplete(finalText, state.currentMessageId ?? payload.message?.id ?? undefined, {
+            ...(payload.message?.model || state.model ? { model: payload.message?.model ?? state.model } : {}),
+            ...(payload.message?.usage ? { usage: payload.message.usage } : {}),
+          });
         }
         return;
       }
@@ -402,7 +435,10 @@ export class QwenProvider implements TransportProvider {
           return;
         }
         if (!completed && typeof payload.result === 'string' && payload.result.trim()) {
-          emitComplete(payload.result, state.currentMessageId ?? undefined);
+          emitComplete(payload.result, state.currentMessageId ?? undefined, {
+            ...(state.model ? { model: state.model } : {}),
+            ...(payload.usage ? { usage: payload.usage } : {}),
+          });
         }
       }
     });

@@ -42,17 +42,21 @@ const mocks = vi.hoisted(() => {
     completeCallbacks: Array<(sid: string, msg: any) => void> = [];
     errorCallbacks: Array<(sid: string, err: any) => void> = [];
     created: Array<Record<string, unknown>> = [];
+    modelBySession = new Map<string, string | undefined>();
 
     async connect() {}
     async disconnect() {}
     async createSession(config: Record<string, unknown>) {
       this.created.push(config);
-      return String(config.bindExistingKey ?? config.sessionKey);
+      const id = String(config.bindExistingKey ?? config.sessionKey);
+      this.modelBySession.set(id, typeof config.agentId === 'string' ? config.agentId : undefined);
+      return id;
     }
     async endSession() {}
     onDelta(cb: (sid: string, delta: any) => void) { this.deltaCallbacks.push(cb); return () => {}; }
     onComplete(cb: (sid: string, msg: any) => void) { this.completeCallbacks.push(cb); return () => {}; }
     onError(cb: (sid: string, err: any) => void) { this.errorCallbacks.push(cb); return () => {}; }
+    setSessionAgentId(sessionId: string, agentId: string) { this.modelBySession.set(sessionId, agentId); }
     async send(sessionId: string, message: string) {
       this.deltaCallbacks.forEach((cb) => cb(sessionId, {
         messageId: 'msg-qwen-e2e',
@@ -74,6 +78,7 @@ const mocks = vi.hoisted(() => {
         content: `Qwen: ${message}`,
         timestamp: Date.now(),
         status: 'complete',
+        metadata: { model: this.modelBySession.get(sessionId), usage: { input_tokens: 10, output_tokens: 3, cache_read_input_tokens: 1 } },
       }));
     }
   }
@@ -194,6 +199,9 @@ describe('qwen transport flow e2e', () => {
     expect(streaming[1]?.opts?.eventId).toBe(stableEventId);
     expect(final?.payload.text).toBe('Qwen: hello');
     expect(final?.opts?.eventId).toBe(stableEventId);
+    const usage = mocks.emitted.find((e) => e.session === SESSION && e.type === 'usage.update');
+    expect(usage?.payload.model).toBeUndefined();
+    expect(usage?.payload.inputTokens).toBe(10);
     expect(ack?.payload.status).toBe('accepted');
     expect(serverLink.send).toHaveBeenCalledWith({
       type: 'command.ack',
@@ -201,5 +209,41 @@ describe('qwen transport flow e2e', () => {
       status: 'accepted',
       session: SESSION,
     });
+  });
+
+  it('switches qwen model via /model and applies it to later sends', async () => {
+    await launchSession({
+      name: SESSION,
+      projectName: 'qwene2e',
+      role: 'brain',
+      agentType: 'qwen',
+      projectDir: '/tmp/qwen-e2e',
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({
+      type: 'session.send',
+      session: SESSION,
+      text: '/model qwen3-coder-plus',
+      commandId: 'cmd-qwen-model',
+    }, serverLink);
+    await flushAsync();
+
+    const usage = mocks.emitted.find((e) => e.session === SESSION && e.type === 'usage.update' && e.payload.model === 'qwen3-coder-plus');
+    const switched = mocks.emitted.find((e) => e.session === SESSION && e.type === 'assistant.text' && String(e.payload.text).includes('Switched model'));
+    expect(usage).toBeDefined();
+    expect(switched).toBeDefined();
+
+    mocks.emitted.length = 0;
+    handleWebCommand({
+      type: 'session.send',
+      session: SESSION,
+      text: 'hello after switch',
+      commandId: 'cmd-qwen-after-switch',
+    }, serverLink);
+    await flushAsync();
+
+    const laterUsage = mocks.emitted.find((e) => e.session === SESSION && e.type === 'usage.update');
+    expect(laterUsage?.payload.model).toBe('qwen3-coder-plus');
   });
 });
