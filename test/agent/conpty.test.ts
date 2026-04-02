@@ -471,7 +471,8 @@ describe('conpty backend', () => {
   describe('conptyGetPaneCwd', () => {
     it('returns cached spawn CWD', async () => {
       await conpty.conptyNewSession('cwd-test', 'cmd', { cwd: '/home/user/project' });
-      expect(conpty.conptyGetPaneCwd('cwd-test')).toBe('/home/user/project');
+      const expected = process.platform === 'win32' ? '\\home\\user\\project' : '/home/user/project';
+      expect(conpty.conptyGetPaneCwd('cwd-test')).toBe(expected);
     });
 
     it('returns empty string for non-existent session', () => {
@@ -504,8 +505,9 @@ describe('conpty backend', () => {
 
       expect(conpty.conptySessionExists('respawn-test')).toBe(true);
       // Should have spawned with new command but preserved CWD
+      const expectedCwd = process.platform === 'win32' ? '\\old\\path' : '/old/path';
       expect(spawnMock).toHaveBeenLastCalledWith('new-cmd', [], expect.objectContaining({
-        cwd: '/old/path',
+        cwd: expectedCwd,
       }));
     });
 
