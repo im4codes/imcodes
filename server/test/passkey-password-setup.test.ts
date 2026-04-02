@@ -348,6 +348,25 @@ describe('passkey password setup', () => {
     expect(rows.map((row) => row.id).sort()).toEqual(['cred-user-passkey', 'new-cred']);
   });
 
+  it('uses residentKey preferred for registration options', async () => {
+    const res = await app.request('/api/auth/passkey/register/begin', {
+      method: 'POST',
+      headers: { ...authHeader, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ displayName: 'Alice' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(generateRegistrationOptionsMock).toHaveBeenCalledWith(expect.objectContaining({
+      authenticatorSelection: expect.objectContaining({
+        residentKey: 'preferred',
+        userVerification: 'preferred',
+      }),
+    }));
+    const call = generateRegistrationOptionsMock.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    const selection = call.authenticatorSelection as Record<string, unknown>;
+    expect(selection.requireResidentKey).toBeUndefined();
+  });
+
   it('sets username and password after passkey verification, then allows password login', async () => {
     const beginRes = await app.request('/api/auth/passkey/verify/begin', { method: 'POST', headers: authHeader, body: '{}' });
     const { challengeId } = await beginRes.json() as { challengeId: string };

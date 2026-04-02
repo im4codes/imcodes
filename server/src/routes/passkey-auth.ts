@@ -243,7 +243,7 @@ passkeyRoutes.post('/register/begin', async (c) => {
     attestationType: 'none',
     excludeCredentials,
     authenticatorSelection: {
-      residentKey: 'required',
+      residentKey: 'preferred',
       userVerification: 'preferred',
     },
   });
