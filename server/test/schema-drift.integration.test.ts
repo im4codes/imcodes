@@ -95,7 +95,7 @@ const SCHEMA_MAP: Array<[string, string[]]> = [
     'id', 'discussion_id', 'server_id', 'main_session', 'initiator_session',
     'current_target_session', 'final_return_session', 'remaining_targets',
     'mode_key', 'status', 'request_message_id', 'callback_message_id',
-    'context_ref', 'timeout_ms', 'result_summary', 'error',
+    'context_ref', 'timeout_ms', 'result_summary', 'error', 'progress_snapshot',
     'created_at', 'updated_at', 'completed_at',
   ]],
 ];

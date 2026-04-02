@@ -640,7 +640,7 @@ describe('getRecentOrchestrationRuns', () => {
       remaining_targets: '[]', mode_key: 'round-robin',
       status: 'completed', request_message_id: null,
       callback_message_id: null, context_ref: '{}',
-      timeout_ms: 300000, result_summary: 'done', error: null,
+      timeout_ms: 300000, result_summary: 'done', error: null, progress_snapshot: '{}',
       created_at: now, updated_at: now, completed_at: now,
     };
     await upsertOrchestrationRun(db, base);
@@ -795,7 +795,7 @@ describe('composite PK multi-server isolation', () => {
         remaining_targets: '[]', mode_key: 'round-robin',
         status: 'running', request_message_id: null,
         callback_message_id: null, context_ref: '{}',
-        timeout_ms: 300000, result_summary: null, error: null,
+        timeout_ms: 300000, result_summary: null, error: null, progress_snapshot: '{}',
         created_at: now, updated_at: now, completed_at: null,
       };
       await upsertOrchestrationRun(db, base);
@@ -827,6 +827,49 @@ describe('composite PK multi-server isolation', () => {
       expect(runsB[0].status).toBe('completed');
       // Wrong server returns empty
       expect(await getOrchestrationRunsByDiscussion(db, discId, 'nonexistent-srv')).toHaveLength(0);
+    });
+
+    it('persists progress_snapshot for UI restore', async () => {
+      const now = new Date().toISOString();
+      const snapshotRunId = 'snapshot-run-id';
+      const snapshot = {
+        id: snapshotRunId,
+        discussion_id: discId,
+        status: 'running',
+        current_round: 2,
+        total_rounds: 3,
+        total_hops: 2,
+        completed_hops_count: 3,
+        active_hop_number: 4,
+        active_round_hop_number: 2,
+        active_phase: 'hop',
+        all_nodes: [
+          { label: 'brain', status: 'done' },
+          { label: 'w1', status: 'done' },
+          { label: 'w2', status: 'active' },
+        ],
+      };
+
+      await upsertOrchestrationRun(db, {
+        id: snapshotRunId, discussion_id: discId, server_id: serverA,
+        main_session: 'brain', initiator_session: 'brain',
+        current_target_session: 'w2', final_return_session: 'brain',
+        remaining_targets: '[]', mode_key: 'audit',
+        status: 'running', request_message_id: null,
+        callback_message_id: null, context_ref: '{}',
+        timeout_ms: 300000, result_summary: null, error: null,
+        progress_snapshot: JSON.stringify(snapshot),
+        created_at: now, updated_at: now, completed_at: null,
+      });
+
+      const run = await getOrchestrationRunById(db, snapshotRunId, serverA);
+      expect(run?.progress_snapshot).toBeTruthy();
+      const parsed = typeof run?.progress_snapshot === 'string'
+        ? JSON.parse(run.progress_snapshot)
+        : run?.progress_snapshot;
+      expect(parsed?.active_round_hop_number).toBe(2);
+      expect(parsed?.current_round).toBe(2);
+      expect(parsed?.all_nodes?.[2]?.status).toBe('active');
     });
   });
 

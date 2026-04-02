@@ -12,6 +12,7 @@ export interface P2pRingProgressProps {
   completedHops?: number;
   totalHops?: number;
   activeHop?: number | null;
+  activeRoundHop?: number | null;
   status: string;
   modeKey?: string;
   onClick?: () => void;
@@ -34,17 +35,25 @@ export function P2pRingProgress({
   completedHops = 0,
   totalHops = 0,
   activeHop = null,
+  activeRoundHop = null,
   status,
   modeKey,
   onClick,
 }: P2pRingProgressProps) {
   const { t } = useTranslation();
+  const visibleRoundHop = useMemo(() => {
+    if (totalHops <= 0) return 0;
+    if (typeof activeRoundHop === 'number') return activeRoundHop;
+    const visibleGlobalHop = ACTIVE_STATUSES.has(status) ? (activeHop ?? completedHops) : completedHops;
+    return visibleGlobalHop > 0 ? ((visibleGlobalHop - 1) % totalHops) + 1 : 0;
+  }, [activeHop, activeRoundHop, completedHops, status, totalHops]);
 
   // Use hop-level progress if available, fall back to round-level
   const fraction = useMemo(() => {
     if (totalHops > 0) {
       const visibleHop = ACTIVE_STATUSES.has(status) ? (activeHop ?? completedHops) : completedHops;
-      return Math.min(1, Math.max(0, visibleHop / totalHops));
+      const totalOverallHops = totalRounds > 1 ? totalRounds * totalHops : totalHops;
+      return Math.min(1, Math.max(0, visibleHop / totalOverallHops));
     }
     if (totalRounds <= 0) return 0;
     return Math.min(1, Math.max(0, completedRounds / totalRounds));
@@ -57,12 +66,11 @@ export function P2pRingProgress({
 
   const centerText = useMemo(() => {
     if (ACTIVE_STATUSES.has(status)) {
-      const visibleHop = activeHop ?? completedHops;
       if (totalHops > 0) {
         return t('p2p.ring.active_hops', {
           round: completedRounds + 1,
           totalRounds,
-          hop: visibleHop,
+          hop: visibleRoundHop,
           totalHops,
           defaultValue: `R{{round}}/{{totalRounds}} H{{hop}}/{{totalHops}}`,
         });
@@ -74,7 +82,7 @@ export function P2pRingProgress({
       });
     }
     return status;
-  }, [status, completedRounds, totalRounds, completedHops, totalHops, activeHop, t]);
+  }, [status, completedRounds, totalRounds, totalHops, visibleRoundHop, t]);
 
   const statusLabel = useMemo(() => {
     if (ACTIVE_STATUSES.has(status)) {

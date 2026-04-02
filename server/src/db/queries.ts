@@ -728,6 +728,7 @@ export interface DbOrchestrationRun {
   timeout_ms: number;
   result_summary: string | null;
   error: string | null;
+  progress_snapshot: string;
   created_at: string;
   updated_at: string;
   completed_at: string | null;
@@ -738,8 +739,8 @@ export async function upsertOrchestrationRun(db: Database, r: DbOrchestrationRun
     INSERT INTO discussion_orchestration_runs
       (id, discussion_id, server_id, main_session, initiator_session, current_target_session, final_return_session,
        remaining_targets, mode_key, status, request_message_id, callback_message_id, context_ref, timeout_ms,
-       result_summary, error, created_at, updated_at, completed_at)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13::jsonb, $14, $15, $16, $17, $18, $19)
+       result_summary, error, progress_snapshot, created_at, updated_at, completed_at)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13::jsonb, $14, $15, $16, $17::jsonb, $18, $19, $20)
     ON CONFLICT (id, server_id) DO UPDATE SET
       current_target_session = EXCLUDED.current_target_session,
       remaining_targets = EXCLUDED.remaining_targets,
@@ -747,12 +748,13 @@ export async function upsertOrchestrationRun(db: Database, r: DbOrchestrationRun
       callback_message_id = EXCLUDED.callback_message_id,
       result_summary = EXCLUDED.result_summary,
       error = EXCLUDED.error,
+      progress_snapshot = EXCLUDED.progress_snapshot,
       updated_at = EXCLUDED.updated_at,
       completed_at = EXCLUDED.completed_at
   `, [
     r.id, r.discussion_id, r.server_id, r.main_session, r.initiator_session, r.current_target_session, r.final_return_session,
     r.remaining_targets, r.mode_key, r.status, r.request_message_id, r.callback_message_id, r.context_ref, r.timeout_ms,
-    r.result_summary, r.error, r.created_at, r.updated_at, r.completed_at,
+    r.result_summary, r.error, r.progress_snapshot, r.created_at, r.updated_at, r.completed_at,
   ]);
 }
 

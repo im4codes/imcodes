@@ -11,6 +11,51 @@ function mapP2pState(status: string): 'done' | 'failed' | 'running' | 'setup' {
   if (P2P_RUNNING.has(status)) return 'running';
   return 'setup';
 }
+
+function mapP2pRunToDiscussion(r: Record<string, any>) {
+  const rawSnapshot = r.progress_snapshot;
+  const snapshot = typeof rawSnapshot === 'string'
+    ? (() => { try { return JSON.parse(rawSnapshot) as Record<string, any>; } catch { return {}; } })()
+    : (rawSnapshot ?? {});
+  const source = { ...r, ...snapshot } as Record<string, any>;
+  const id = `p2p_${source.id}`;
+  const status = String(source.status ?? '');
+  const state = mapP2pState(status);
+  const mode = source.mode_key ?? 'discuss';
+  const initiatorLabel = source.initiator_label ?? 'brain';
+  const currentTarget = source.current_target_label ?? (source.current_target_session ? String(source.current_target_session).split('_').pop() : undefined);
+  const totalCount = source.total_count ?? 3;
+  const totalHops = source.total_hops ?? Math.max(0, totalCount - 2);
+  const nodes = Array.isArray(source.all_nodes) ? source.all_nodes.map((n: any) => ({
+    label: String(n.label ?? ''),
+    displayLabel: String(n.displayLabel ?? n.display_label ?? n.label ?? ''),
+    agentType: String(n.agentType ?? ''),
+    ccPreset: n.ccPreset ?? n.cc_preset ?? null,
+    mode: typeof n.mode === 'string' ? n.mode : undefined,
+    phase: typeof n.phase === 'string' ? n.phase as 'initial' | 'hop' | 'summary' : undefined,
+    status: String(n.status ?? 'pending') as 'done' | 'active' | 'pending' | 'skipped',
+  })) : undefined;
+  return {
+    id,
+    topic: `P2P ${mode} · ${initiatorLabel}`,
+    state,
+    modeKey: mode,
+    currentRound: source.current_round ?? 1,
+    maxRounds: source.total_rounds ?? 1,
+    completedHops: source.completed_hops_count ?? 0,
+    totalHops,
+    activeHop: source.active_hop_number ?? null,
+    activeRoundHop: source.active_round_hop_number ?? null,
+    activePhase: (typeof source.active_phase === 'string' ? source.active_phase : 'queued') as 'queued' | 'initial' | 'hop' | 'summary',
+    initiatorLabel,
+    currentSpeaker: currentTarget,
+    conclusion: state === 'done' ? (source.result_summary ?? undefined) : undefined,
+    error: state === 'failed' ? (source.error ?? undefined) : undefined,
+    filePath: undefined,
+    fileId: source.discussion_id ? String(source.discussion_id) : source.id,
+    nodes,
+  };
+}
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
 import { LanguageSwitcher } from './components/LanguageSwitcher.js';
@@ -51,7 +96,7 @@ import { useProviderStatus } from './hooks/useProviderStatus.js';
 import { DEFAULT_NEW_USER_GUIDE_PREF, shouldMarkNewUserGuidePending, shouldShowNewUserGuidePrompt, type NewUserGuidePref } from './onboarding.js';
 // useSwipeBack now handled inside FloatingPanel for discussion/repo pages
 import { WsClient } from './ws-client.js';
-import { configure as configureApi, apiFetch, onAuthExpired, getUserPref, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, normalizeLocalWebPreviewPath } from './api.js';
+import { configure as configureApi, apiFetch, onAuthExpired, getUserPref, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, normalizeLocalWebPreviewPath, listP2pRuns } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { getAuthKey, clearAuthKey } from './biometric-auth.js';
 import { initPushNotifications } from './push-notifications.js';
@@ -609,6 +654,7 @@ export function App() {
     completedHops: number;
     totalHops: number;
     activeHop?: number | null;
+    activeRoundHop?: number | null;
     activePhase?: 'queued' | 'initial' | 'hop' | 'summary';
     initiatorLabel?: string;
     currentSpeaker?: string;
@@ -669,6 +715,24 @@ export function App() {
 
   const wsRef = useRef<WsClient | null>(null);
   const [daemonStats, setDaemonStats] = useState<{ daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number } | null>(null);
+
+  useEffect(() => {
+    if (!auth || !selectedServerId) return;
+    let cancelled = false;
+    void listP2pRuns(selectedServerId)
+      .then((runs) => {
+        if (cancelled) return;
+        const mapped = runs
+          .map((run) => mapP2pRunToDiscussion(run as Record<string, any>))
+          .filter((d) => d.state === 'running' || d.state === 'setup');
+        setDiscussions((prev) => {
+          const nonP2p = prev.filter((d) => !d.id.startsWith('p2p_'));
+          return [...nonP2p, ...mapped];
+        });
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [auth, selectedServerId]);
 
   // ── Sub-sessions ───────────────────────────────────────────────────────────
   const { subSessions, visibleSubSessions, loadedServerId, create: createSubSession, close: closeSubSession, restart: restartSubSession, rename: renameSubSession, updateLocal: updateSubLocal } = useSubSessions(
@@ -822,6 +886,7 @@ export function App() {
           setConnecting(false);
           ws.requestSessionList();
           ws.discussionList();
+          ws.p2pStatus();
           // Timeout: if session_list never arrives, stop blocking the UI
           if (sessionListRetryRef.current) clearTimeout(sessionListRetryRef.current);
           sessionListRetryRef.current = setTimeout(() => {
@@ -1078,70 +1143,43 @@ export function App() {
         }
       }
       if (msg.type === 'p2p.run_update' && msg.run) {
-        const r = msg.run as Record<string, any>;
-        const id = `p2p_${r.id}`;
-        const totalCount = r.total_count ?? 3;
-        const totalHops = r.total_hops ?? Math.max(0, totalCount - 2);
-        const completedHopsCount = r.completed_hops_count ?? 0;
-        const currentRoundFromDaemon = r.current_round ?? 1;
-        const totalRoundsFromDaemon = r.total_rounds ?? 1;
-        const status = String(r.status ?? '');
-        const currentTarget = r.current_target_label ?? (r.current_target_session ? String(r.current_target_session).split('_').pop() : undefined);
-        const initiatorLabel = r.initiator_label ?? 'brain';
-        const mode = r.mode_key ?? 'discuss';
-
-        // Map P2P status to discussion state
-        const state = mapP2pState(status);
-
-        const currentRound = currentRoundFromDaemon;
-
+        const entry = mapP2pRunToDiscussion(msg.run as Record<string, any>);
         setDiscussions((prev) => {
-          const existing = prev.find((d) => d.id === id);
-          // discussion_id is the file-level ID (maps to ~/.imcodes/discussions/${discussion_id}.md)
-          // run.id is the execution-level ID — use discussion_id for navigation
-          const fileId = r.discussion_id ? String(r.discussion_id) : r.id;
-          // Parse node list for segmented progress display
-          const nodes = Array.isArray(r.all_nodes) ? r.all_nodes.map((n: any) => ({
-            label: String(n.label ?? ''),
-            displayLabel: String(n.displayLabel ?? n.display_label ?? n.label ?? ''),
-            agentType: String(n.agentType ?? ''),
-            ccPreset: n.ccPreset ?? n.cc_preset ?? null,
-            mode: typeof n.mode === 'string' ? n.mode : undefined,
-            phase: typeof n.phase === 'string' ? n.phase as 'initial' | 'hop' | 'summary' : undefined,
-            status: String(n.status ?? 'pending') as 'done' | 'active' | 'pending' | 'skipped',
-          })) : undefined;
-
-          const entry = {
-            id,
-            topic: `P2P ${mode} · ${initiatorLabel}`,
-            state,
-            modeKey: mode,
-            currentRound,
-            maxRounds: totalRoundsFromDaemon,
-            completedHops: completedHopsCount,
-            totalHops,
-            activeHop: r.active_hop_number ?? null,
-            activePhase: (typeof r.active_phase === 'string' ? r.active_phase : 'queued') as 'queued' | 'initial' | 'hop' | 'summary',
-            initiatorLabel,
-            currentSpeaker: currentTarget,
-            conclusion: state === 'done' ? (r.result_summary ?? undefined) : undefined,
-            error: state === 'failed' ? (r.error ?? undefined) : undefined,
-            filePath: undefined,
-            fileId,
-            nodes,
-          };
-          if (existing) {
-            return prev.map((d) => d.id === id ? { ...d, ...entry } : d);
-          }
-          return [...prev, entry];
+          const existing = prev.find((d) => d.id === entry.id);
+          return existing
+            ? prev.map((d) => d.id === entry.id ? { ...d, ...entry } : d)
+            : [...prev, entry];
         });
 
         // Auto-cleanup completed/failed P2P entries after 30s
-        if (state === 'done' || state === 'failed') {
+        if (entry.state === 'done' || entry.state === 'failed') {
           setTimeout(() => {
-            setDiscussions((prev) => prev.filter((d) => d.id !== id));
+            setDiscussions((prev) => prev.filter((d) => d.id !== entry.id));
           }, 120_000);
         }
+      }
+      if (msg.type === 'p2p.status_response') {
+        const runs = Array.isArray(msg.runs)
+          ? msg.runs
+          : msg.run
+            ? [msg.run]
+            : [];
+        const mapped = runs.map((run) => mapP2pRunToDiscussion(run as Record<string, any>));
+        const activeIds = new Set(mapped.map((d) => d.id));
+        setDiscussions((prev) => {
+          const retained = prev.filter((d) => {
+            if (!d.id.startsWith('p2p_')) return true;
+            if (d.state === 'done' || d.state === 'failed') return true;
+            return activeIds.has(d.id);
+          });
+          const merged = [...retained];
+          for (const entry of mapped) {
+            const idx = merged.findIndex((d) => d.id === entry.id);
+            if (idx >= 0) merged[idx] = { ...merged[idx], ...entry };
+            else merged.push(entry);
+          }
+          return merged;
+        });
       }
       if (msg.type === REPO_MSG.DETECTED || msg.type === REPO_MSG.DETECT_RESPONSE) {
         const dir = msg.projectDir as string;
@@ -1928,6 +1966,7 @@ export function App() {
                 completedHops={d.completedHops}
                 totalHops={d.totalHops}
                 activeHop={d.activeHop}
+                activeRoundHop={d.activeRoundHop}
                 status={d.state}
                 modeKey={d.modeKey}
                 onClick={() => { setDiscussionInitialId(d.fileId ?? null); setShowDiscussionsPage(true); }}
@@ -2419,6 +2458,7 @@ export function App() {
                   completedHops={d.completedHops}
                   totalHops={d.totalHops}
                   activeHop={d.activeHop}
+                  activeRoundHop={d.activeRoundHop}
                   status={d.state}
                   modeKey={d.modeKey}
                   onClick={() => { setDiscussionInitialId(d.fileId ?? null); setShowDiscussionsPage(true); closeSidebar(); }}

@@ -970,7 +970,8 @@ export class WsBridge {
 
     // ── P2P orchestration run persistence + broadcast ────────────────────────
     if (type === 'p2p.run_save' && this.db) {
-      void upsertOrchestrationRun(this.db, msg.run as any).catch(() => {});
+      const run = { ...(msg.run as Record<string, unknown>), progress_snapshot: JSON.stringify(msg.run) };
+      void upsertOrchestrationRun(this.db, run as any).catch(() => {});
       this.broadcastToBrowsers(JSON.stringify({ type: 'p2p.run_update', run: msg.run }));
       return;
     }
@@ -978,6 +979,7 @@ export class WsBridge {
       const run = msg.run as any;
       run.status = 'completed';
       run.completed_at = new Date().toISOString();
+      run.progress_snapshot = JSON.stringify(run);
       void upsertOrchestrationRun(this.db, run).catch(() => {});
       this.broadcastToBrowsers(JSON.stringify({ type: 'p2p.run_update', run }));
       return;
@@ -985,6 +987,7 @@ export class WsBridge {
     if (type === 'p2p.run_error' && this.db) {
       const run = msg.run as any;
       run.updated_at = new Date().toISOString();
+      run.progress_snapshot = JSON.stringify(run);
       void upsertOrchestrationRun(this.db, run).catch(() => {});
       this.broadcastToBrowsers(JSON.stringify({ type: 'p2p.run_update', run }));
       return;

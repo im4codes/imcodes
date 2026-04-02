@@ -187,6 +187,7 @@ export function AtPicker({
   const [configRoundsPicker, setConfigRoundsPicker] = useState(false);
   const [configRoundsHighlight, setConfigRoundsHighlight] = useState(0);
   const [configModeOverride, setConfigModeOverride] = useState<string>('config');
+  const [configPickerFocus, setConfigPickerFocus] = useState<'rounds' | 'mode'>('rounds');
   const CONFIG_ROUNDS_OPTIONS = [1, 2, 3, 5] as const;
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const requestIdRef = useRef<string | null>(null);
@@ -300,6 +301,7 @@ export function AtPicker({
       setModeAgent(null);
       setConfigRoundsPicker(false);
       setConfigModeOverride('config');
+      setConfigPickerFocus('rounds');
     }
   }, [visible]);
 
@@ -319,15 +321,41 @@ export function AtPicker({
 
       // Config rounds sub-picker
       if (configRoundsPicker) {
-        if (e.key === 'Escape') { e.preventDefault(); setConfigRoundsPicker(false); return; }
-        if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); setConfigRoundsHighlight((h) => (h - 1 + CONFIG_ROUNDS_OPTIONS.length) % CONFIG_ROUNDS_OPTIONS.length); return; }
-        if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); setConfigRoundsHighlight((h) => (h + 1) % CONFIG_ROUNDS_OPTIONS.length); return; }
+        const ALL_MODES = ['config', 'audit', 'review', 'brainstorm', 'discuss'] as const;
+        const currentModeIdx = Math.max(0, ALL_MODES.indexOf(configModeOverride as typeof ALL_MODES[number]));
+        if (e.key === 'Escape') { e.preventDefault(); setConfigRoundsPicker(false); setConfigPickerFocus('rounds'); return; }
+        if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+          e.preventDefault();
+          setConfigPickerFocus((f) => (f === 'rounds' ? 'mode' : 'rounds'));
+          return;
+        }
+        if (e.key === 'ArrowLeft') {
+          e.preventDefault();
+          if (configPickerFocus === 'rounds') {
+            setConfigRoundsHighlight((h) => (h - 1 + CONFIG_ROUNDS_OPTIONS.length) % CONFIG_ROUNDS_OPTIONS.length);
+          } else {
+            const next = (currentModeIdx - 1 + ALL_MODES.length) % ALL_MODES.length;
+            setConfigModeOverride(ALL_MODES[next]);
+          }
+          return;
+        }
+        if (e.key === 'ArrowRight') {
+          e.preventDefault();
+          if (configPickerFocus === 'rounds') {
+            setConfigRoundsHighlight((h) => (h + 1) % CONFIG_ROUNDS_OPTIONS.length);
+          } else {
+            const next = (currentModeIdx + 1) % ALL_MODES.length;
+            setConfigModeOverride(ALL_MODES[next]);
+          }
+          return;
+        }
         if (e.key === 'Enter' && p2pConfig) {
           e.preventDefault(); e.stopPropagation();
           const rounds = CONFIG_ROUNDS_OPTIONS[configRoundsHighlight];
           const effectiveConfig = buildEffectiveConfig(p2pConfig, configModeOverride);
           onSelectAllConfig?.(effectiveConfig, rounds, configModeOverride);
           setConfigRoundsPicker(false);
+          setConfigPickerFocus('rounds');
           return;
         }
         return;
@@ -393,7 +421,7 @@ export function AtPicker({
           onSelectAllConfig?.(p2pConfig!, rounds, 'config');
         } else if (cfgRowCount > 0 && highlightIdx === 1) {
           // @all+ — open rounds picker
-          setConfigRoundsPicker(true); setConfigRoundsHighlight(0); setConfigModeOverride('config');
+          setConfigRoundsPicker(true); setConfigRoundsHighlight(0); setConfigModeOverride('config'); setConfigPickerFocus('rounds');
         } else if (hasAllRow && highlightIdx === regAllOffset) {
           setModeAgent('__all__'); setModeHighlight(0);
         } else {
@@ -403,7 +431,7 @@ export function AtPicker({
         }
       }
     },
-    [visible, category, highlightIdx, fileResults, agents, modeAgent, modeHighlight, configRoundsPicker, configRoundsHighlight, configModeOverride, p2pConfig, onClose, onSelectFile, onSelectAgent, onSelectAllConfig],
+    [visible, category, highlightIdx, fileResults, agents, modeAgent, modeHighlight, configRoundsPicker, configRoundsHighlight, configModeOverride, configPickerFocus, p2pConfig, onClose, onSelectFile, onSelectAgent, onSelectAllConfig],
   );
 
   useEffect(() => {
@@ -429,8 +457,11 @@ export function AtPicker({
       .filter(([, e]) => e.enabled && e.mode !== 'skip');
     return (
       <div ref={containerRef} style={containerStyle}>
-        <div style={backBtnStyle} onClick={() => { setConfigRoundsPicker(false); setConfigModeOverride('config'); }}>← {t('p2p.picker.back')}</div>
-        <div style={groupLabelStyle}>{t('p2p.settings_mode', 'Mode')}</div>
+        <div style={backBtnStyle} onClick={() => { setConfigRoundsPicker(false); setConfigModeOverride('config'); setConfigPickerFocus('rounds'); }}>← {t('p2p.picker.back')}</div>
+        <div style={{
+          ...groupLabelStyle,
+          color: configPickerFocus === 'mode' ? '#93c5fd' : groupLabelStyle.color,
+        }}>{t('p2p.settings_mode', 'Mode')}</div>
         <div style={modeContainerStyle}>
           {ALL_MODES.map((m) => (
             <button
@@ -448,7 +479,7 @@ export function AtPicker({
                 fontSize: 11,
                 padding: '2px 8px',
               }}
-              onClick={() => setConfigModeOverride(m)}
+              onClick={() => { setConfigModeOverride(m); setConfigPickerFocus('mode'); }}
             >
               {configModeOverride === m ? '● ' : ''}{t(`p2p.mode_${m}`)}
             </button>
@@ -457,19 +488,28 @@ export function AtPicker({
         <div style={{ ...dimStyle, padding: '2px 12px 8px', color: MODE_COLORS[configModeOverride] ?? dimStyle.color }}>
           {t('p2p.settings_mode')}: {t(`p2p.mode_${configModeOverride}`)}
         </div>
-        <div style={groupLabelStyle}>{t('p2p.settings_rounds')}</div>
+        <div style={{
+          ...groupLabelStyle,
+          color: configPickerFocus === 'rounds' ? '#93c5fd' : groupLabelStyle.color,
+        }}>{t('p2p.settings_rounds')}</div>
         <div style={modeContainerStyle}>
           {CONFIG_ROUNDS_OPTIONS.map((r, idx) => (
             <button
               key={r}
               type="button"
-              style={idx === configRoundsHighlight ? modeBtnHoverStyle : modeBtnStyle}
+              style={idx === configRoundsHighlight ? {
+                ...modeBtnHoverStyle,
+                boxShadow: configPickerFocus === 'rounds'
+                  ? '0 0 0 1px rgba(147, 197, 253, 0.7), 0 0 18px rgba(96, 165, 250, 0.22)'
+                  : modeBtnHoverStyle.boxShadow,
+              } : modeBtnStyle}
               onClick={() => {
                 const cfg = buildEffectiveConfig(p2pConfig, configModeOverride);
                 onSelectAllConfig?.(cfg, r, configModeOverride);
                 setConfigRoundsPicker(false);
+                setConfigPickerFocus('rounds');
               }}
-              onMouseEnter={() => setConfigRoundsHighlight(idx)}
+              onMouseEnter={() => { setConfigRoundsHighlight(idx); setConfigPickerFocus('rounds'); }}
             >
               {r}
             </button>
@@ -653,14 +693,18 @@ export function AtPicker({
             <div
               data-hl={hlAllPlus ? 'true' : undefined}
               style={hlAllPlus ? itemHighlightStyle : itemStyle}
-              onClick={() => { setConfigRoundsPicker(true); setConfigRoundsHighlight(0); setConfigModeOverride('config'); }}
+              onClick={() => { setConfigRoundsPicker(true); setConfigRoundsHighlight(0); setConfigModeOverride('config'); setConfigPickerFocus('rounds'); }}
               onMouseEnter={() => setHighlightIdx(1)}
             >
               <span style={{ fontWeight: 600, color: '#94a3b8' }}>⚙ {t('p2p.all_plus')}</span>
+              <span style={{ ...dimStyle, color: '#94a3b8' }}>{t('p2p.settings_mode')}: {t('p2p.mode_config')}</span>
             </div>
             {/* Participant preview under @all+ */}
             {hlAllPlus && (
               <div style={{ paddingLeft: 20, paddingBottom: 4 }}>
+                <div style={{ fontSize: 11, color: '#64748b', lineHeight: '1.6' }}>
+                  {t('p2p.settings_mode')}: {t('p2p.mode_config')} · {t('p2p.settings_rounds')}
+                </div>
                 {configParticipants.map(([session, entry]) => {
                   const shortName = resolveDisplayName(session);
                   const aType = resolveAgentType(session);

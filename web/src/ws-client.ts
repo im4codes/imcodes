@@ -301,6 +301,10 @@ export class WsClient {
     this.send({ type: 'discussion.list' });
   }
 
+  p2pStatus(runId?: string): void {
+    this.send(runId ? { type: 'p2p.status', runId } : { type: 'p2p.status' });
+  }
+
   /** Request timeline event replay from the daemon for reconnection gap-fill. */
   sendTimelineReplayRequest(sessionName: string, afterSeq: number, epoch: number): string {
     const requestId = crypto.randomUUID();

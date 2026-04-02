@@ -511,6 +511,7 @@ export interface P2pRunData {
   remaining_count?: number;
   current_target_label?: string | null;
   initiator_label?: string | null;
+  progress_snapshot?: Record<string, unknown> | string | null;
   result_summary: string | null;
   error: string | null;
   created_at: string;
