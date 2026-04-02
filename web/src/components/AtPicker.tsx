@@ -439,18 +439,23 @@ export function AtPicker({
               style={{
                 ...modeBtnStyle,
                 ...(configModeOverride === m ? {
-                  background: '#334155',
+                  background: '#1e293b',
                   borderColor: MODE_COLORS[m] ?? '#60a5fa',
                   color: MODE_COLORS[m] ?? '#93c5fd',
+                  boxShadow: `0 0 0 1px ${(MODE_COLORS[m] ?? '#60a5fa')}55, 0 0 18px ${(MODE_COLORS[m] ?? '#60a5fa')}22`,
+                  fontWeight: 700,
                 } : {}),
                 fontSize: 11,
                 padding: '2px 8px',
               }}
               onClick={() => setConfigModeOverride(m)}
             >
-              {t(`p2p.mode_${m}`)}
+              {configModeOverride === m ? '● ' : ''}{t(`p2p.mode_${m}`)}
             </button>
           ))}
+        </div>
+        <div style={{ ...dimStyle, padding: '2px 12px 8px', color: MODE_COLORS[configModeOverride] ?? dimStyle.color }}>
+          {t('p2p.settings_mode')}: {t(`p2p.mode_${configModeOverride}`)}
         </div>
         <div style={groupLabelStyle}>{t('p2p.settings_rounds')}</div>
         <div style={modeContainerStyle}>

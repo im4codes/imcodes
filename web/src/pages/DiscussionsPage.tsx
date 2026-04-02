@@ -49,6 +49,7 @@ interface Props {
 
 export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], onStopDiscussion }: Props) {
   const { t } = useTranslation();
+  const [progressHidden, setProgressHidden] = useState(false);
   const [discussions, setDiscussions] = useState<P2pDiscussion[]>([]);
   const [selected, setSelected] = useState<string | null>(initialSelectedId ?? null);
   const [content, setContent] = useState<string | null>(null);
@@ -174,30 +175,51 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
       {/* Active P2P progress cards at top */}
       {activeLive.length > 0 && (
         <div class="discussions-progress-strip">
-          {activeLive.map((d) => {
+          <div class="discussions-progress-strip-header">
+            <div class="discussions-progress-strip-headcopy">
+              <div class="discussions-progress-strip-title">
+                {t('p2p.discussions.live_progress')} · {activeLive.length}
+              </div>
+              <div class="discussions-progress-strip-slogan">{t('p2p.discussions.slogan')}</div>
+            </div>
+            <button
+              class="discussions-progress-strip-toggle"
+              onClick={() => setProgressHidden((v) => !v)}
+            >
+              {progressHidden ? t('p2p.discussions.show') : t('p2p.discussions.hide')}
+            </button>
+          </div>
+          {!progressHidden && activeLive.map((d) => {
             const nodes = d.nodes ?? [];
             const hopText = d.totalHops != null && d.totalHops > 0
               ? `H${d.activeHop ?? d.completedHops ?? 0}/${d.totalHops}`
               : null;
             const roundText = `R${d.currentRound}/${d.maxRounds}`;
+            const roundSegments = Array.from({ length: Math.max(0, d.maxRounds) }, (_, idx) => {
+              const roundNum = idx + 1;
+              const status = d.state === 'done'
+                ? 'done'
+                : roundNum < d.currentRound
+                  ? 'done'
+                  : roundNum === d.currentRound
+                    ? 'active'
+                    : 'pending';
+              return { roundNum, status };
+            });
+            const hopSegments = Array.from({ length: Math.max(0, d.totalHops ?? 0) }, (_, idx) => {
+              const hopNum = idx + 1;
+              const activeHopNum = d.activeHop ?? d.completedHops ?? 0;
+              const status = d.state === 'done'
+                ? 'done'
+                : hopNum < activeHopNum
+                  ? 'done'
+                  : hopNum === activeHopNum && d.activePhase === 'hop'
+                    ? 'active'
+                    : 'pending';
+              return { hopNum, status };
+            });
             return (
               <div key={d.id} class="discussions-progress-card">
-                {nodes.length > 0 && (
-                  <div class="discussions-progress-segments">
-                    {nodes.map((n, i) => (
-                      <div
-                        key={i}
-                        class={`discussions-progress-segment ${statusClassName(n.status)}`}
-                        title={[
-                          n.displayLabel ?? n.label,
-                          n.mode ? t(`p2p.mode.${n.mode}`, n.mode) : null,
-                          phaseLabel(n.phase),
-                          t(`p2p.status.${n.status}`, n.status),
-                        ].filter(Boolean).join(' · ')}
-                      />
-                    ))}
-                  </div>
-                )}
                 <div class="discussions-progress-head">
                   <div class="discussions-progress-titlewrap">
                     <div class="discussions-progress-kicker">P2P</div>
@@ -215,6 +237,44 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
                   {hopText && <span class="discussions-progress-badge">{hopText}</span>}
                   {d.activePhase && phaseLabel(d.activePhase) && (
                     <span class="discussions-progress-badge discussions-progress-badge-phase">{phaseLabel(d.activePhase)}</span>
+                  )}
+                </div>
+                <div class="discussions-progress-lines">
+                  <div class="discussions-progress-line">
+                    <div class="discussions-progress-line-head">
+                      <span class="discussions-progress-line-label">{t('p2p.discussions.round_label')}</span>
+                      <span class="discussions-progress-line-value">{roundText}</span>
+                    </div>
+                    <div class="discussions-progress-segments discussions-progress-segments-round">
+                      {roundSegments.map((seg) => (
+                        <div
+                          key={seg.roundNum}
+                          class={`discussions-progress-segment ${statusClassName(seg.status as P2pNode['status'])}`}
+                          title={`${t('p2p.discussions.round_label')} ${seg.roundNum}/${d.maxRounds}`}
+                        >
+                          <span class="discussions-progress-segment-index">{seg.roundNum}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  {hopSegments.length > 0 && (
+                    <div class="discussions-progress-line">
+                      <div class="discussions-progress-line-head">
+                        <span class="discussions-progress-line-label">{t('p2p.discussions.hop_label')}</span>
+                        <span class="discussions-progress-line-value">{hopText}</span>
+                      </div>
+                      <div class="discussions-progress-segments discussions-progress-segments-hop">
+                        {hopSegments.map((seg) => (
+                          <div
+                            key={seg.hopNum}
+                            class={`discussions-progress-segment ${statusClassName(seg.status as P2pNode['status'])}`}
+                            title={`${t('p2p.discussions.hop_label')} ${seg.hopNum}/${d.totalHops}`}
+                          >
+                            <span class="discussions-progress-segment-index">{seg.hopNum}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
                   )}
                 </div>
                 {nodes.length > 0 && (

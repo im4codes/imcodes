@@ -286,6 +286,10 @@
     },
     "discussions": {
       "title": "토론",
+      "live_progress": "실시간 진행",
+      "slogan": "IM.codes - the IM for agents",
+      "hide": "숨기기",
+      "show": "표시",
       "untitled": "토론",
       "empty": "아직 P2P 토론이 없습니다. @@all(discuss) 또는 @agent로 시작하세요.",
       "select": "볼 토론을 선택하세요",
@@ -293,7 +297,9 @@
       "phase_initial": "초기",
       "phase_hop": "홉",
       "phase_summary": "요약",
-      "phase_queued": "대기열"
+      "phase_queued": "대기열",
+      "round_label": "라운드",
+      "hop_label": "홉"
     },
     "mode_solo": "Solo",
     "mode_audit": "감사",

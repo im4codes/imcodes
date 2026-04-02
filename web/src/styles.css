@@ -702,6 +702,48 @@ body {
     radial-gradient(circle at top right, rgba(59, 130, 246, 0.12), transparent 32%),
     linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(10, 14, 26, 0.96));
 }
+.discussions-progress-strip-header {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.discussions-progress-strip-headcopy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.discussions-progress-strip-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #93c5fd;
+}
+.discussions-progress-strip-slogan {
+  font-size: 11px;
+  color: #64748b;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.discussions-progress-strip-toggle {
+  border: 1px solid rgba(71, 85, 105, 0.9);
+  background: rgba(15, 23, 42, 0.76);
+  color: #cbd5e1;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.discussions-progress-strip-toggle:hover {
+  border-color: rgba(96, 165, 250, 0.65);
+  color: #e2e8f0;
+}
 .discussions-progress-card {
   position: relative;
   overflow: hidden;
@@ -751,6 +793,35 @@ body {
 }
 .discussions-progress-stop:hover { background: rgba(127, 29, 29, 0.28); }
 .discussions-progress-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.discussions-progress-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.discussions-progress-line {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.discussions-progress-line-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.discussions-progress-line-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #64748b;
+}
+.discussions-progress-line-value {
+  font-size: 11px;
+  font-weight: 700;
+  color: #e2e8f0;
+}
 .discussions-progress-badge {
   padding: 2px 8px;
   border-radius: 999px;
@@ -773,21 +844,43 @@ body {
 .discussions-progress-segments {
   display: flex;
   gap: 3px;
-  height: 6px;
+  height: 16px;
   border-radius: 999px;
   overflow: hidden;
-  margin-bottom: 10px;
 }
+.discussions-progress-segments-round { height: 18px; }
+.discussions-progress-segments-hop { height: 14px; }
 .discussions-progress-segment {
   flex: 1;
   border-radius: 999px;
   background: #334155;
-  transition: transform 0.2s ease, background 0.25s ease, box-shadow 0.25s ease;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.2s ease, background 0.25s ease, box-shadow 0.25s ease, opacity 0.25s ease;
+  opacity: 0.95;
 }
 .discussions-progress-segment.is-done { background: linear-gradient(90deg, #16a34a, #4ade80); box-shadow: 0 0 10px rgba(74, 222, 128, 0.35); }
-.discussions-progress-segment.is-active { background: linear-gradient(90deg, #2563eb, #38bdf8); box-shadow: 0 0 12px rgba(56, 189, 248, 0.45); }
+.discussions-progress-segment.is-active {
+  background: linear-gradient(90deg, #2563eb, #38bdf8);
+  box-shadow: 0 0 12px rgba(56, 189, 248, 0.45);
+  animation: discussions-active-pulse 1.1s ease-in-out infinite;
+  outline: 1px solid rgba(125, 211, 252, 0.75);
+  z-index: 1;
+}
 .discussions-progress-segment.is-skipped { background: linear-gradient(90deg, #dc2626, #f87171); box-shadow: 0 0 10px rgba(248, 113, 113, 0.35); }
 .discussions-progress-segment.is-pending { background: linear-gradient(90deg, #1e293b, #475569); }
+.discussions-progress-segment-index {
+  font-size: 9px;
+  font-weight: 700;
+  color: rgba(226, 232, 240, 0.92);
+  text-shadow: 0 1px 2px rgba(2, 6, 23, 0.6);
+  pointer-events: none;
+}
+.discussions-progress-segment.is-pending .discussions-progress-segment-index {
+  color: rgba(148, 163, 184, 0.75);
+}
 .discussions-progress-nodes { display: flex; flex-wrap: wrap; gap: 6px; }
 .discussions-progress-node {
   display: inline-flex;
@@ -822,7 +915,16 @@ body {
   color: #64748b;
 }
 .discussions-progress-node.is-done { color: #4ade80; border-color: rgba(34, 197, 94, 0.25); }
-.discussions-progress-node.is-active { color: #60a5fa; border-color: rgba(59, 130, 246, 0.4); box-shadow: 0 0 16px rgba(37, 99, 235, 0.14); }
+.discussions-progress-node.is-active {
+  color: #60a5fa;
+  border-color: rgba(59, 130, 246, 0.4);
+  box-shadow: 0 0 16px rgba(37, 99, 235, 0.14);
+  animation: discussions-active-chip 1.1s ease-in-out infinite;
+}
+.discussions-progress-node.is-active .discussions-progress-node-label,
+.discussions-progress-node.is-active .discussions-progress-node-dot {
+  animation: discussions-active-text 1.1s ease-in-out infinite;
+}
 .discussions-progress-node.is-skipped { color: #f87171; border-color: rgba(248, 113, 113, 0.3); }
 .discussions-progress-node.is-pending { color: #64748b; }
 .discussions-markdown { padding: 16px 20px; font-size: 14px; line-height: 1.7; color: #cbd5e1; overflow-y: auto; }
@@ -1373,4 +1475,38 @@ body {
 @keyframes discussions-scan {
   0% { transform: translateX(-100%); }
   100% { transform: translateX(100%); }
+}
+@keyframes discussions-active-pulse {
+  0%, 100% {
+    transform: scaleY(1);
+    opacity: 1;
+    box-shadow: 0 0 12px rgba(56, 189, 248, 0.35);
+  }
+  50% {
+    transform: scaleY(1.18);
+    opacity: 0.68;
+    box-shadow: 0 0 18px rgba(56, 189, 248, 0.75);
+  }
+}
+@keyframes discussions-active-chip {
+  0%, 100% {
+    border-color: rgba(59, 130, 246, 0.4);
+    box-shadow: 0 0 16px rgba(37, 99, 235, 0.14);
+    background: rgba(15, 23, 42, 0.82);
+  }
+  50% {
+    border-color: rgba(56, 189, 248, 0.85);
+    box-shadow: 0 0 22px rgba(56, 189, 248, 0.28);
+    background: rgba(10, 25, 47, 0.95);
+  }
+}
+@keyframes discussions-active-text {
+  0%, 100% {
+    opacity: 1;
+    filter: drop-shadow(0 0 0 rgba(125, 211, 252, 0));
+  }
+  50% {
+    opacity: 0.58;
+    filter: drop-shadow(0 0 8px rgba(125, 211, 252, 0.9));
+  }
 }

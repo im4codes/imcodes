@@ -286,6 +286,10 @@
     },
     "discussions": {
       "title": "Обсуждения",
+      "live_progress": "Живой прогресс",
+      "slogan": "IM.codes - the IM for agents",
+      "hide": "Скрыть",
+      "show": "Показать",
       "untitled": "Обсуждение",
       "empty": "Пока нет P2P-обсуждений. Используйте @@all(discuss) или @agent, чтобы начать.",
       "select": "Выберите обсуждение для просмотра",
@@ -293,7 +297,9 @@
       "phase_initial": "Начало",
       "phase_hop": "Шаг",
       "phase_summary": "Сводка",
-      "phase_queued": "В очереди"
+      "phase_queued": "В очереди",
+      "round_label": "Раунд",
+      "hop_label": "Шаг"
     },
     "mode_solo": "Solo",
     "mode_audit": "Аудит",

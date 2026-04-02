@@ -286,6 +286,10 @@
     },
     "discussions": {
       "title": "討論",
+      "live_progress": "即時進度",
+      "slogan": "IM.codes - the IM for agents",
+      "hide": "隱藏",
+      "show": "顯示",
       "untitled": "討論",
       "empty": "還沒有 P2P 討論。使用 @@all(discuss) 或 @agent 發起一個。",
       "select": "選擇一個討論查看",
@@ -293,7 +297,9 @@
       "phase_initial": "初始",
       "phase_hop": "傳遞",
       "phase_summary": "總結",
-      "phase_queued": "排隊中"
+      "phase_queued": "排隊中",
+      "round_label": "輪次",
+      "hop_label": "跳轉"
     },
     "mode_solo": "Solo",
     "mode_audit": "審查",

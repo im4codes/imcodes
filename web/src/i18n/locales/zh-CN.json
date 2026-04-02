@@ -286,6 +286,10 @@
     },
     "discussions": {
       "title": "讨论",
+      "live_progress": "实时进度",
+      "slogan": "IM.codes - the IM for agents",
+      "hide": "隐藏",
+      "show": "显示",
       "untitled": "讨论",
       "empty": "还没有 P2P 讨论。使用 @@all(discuss) 或 @agent 发起一个。",
       "select": "选择一个讨论查看",
@@ -293,7 +297,9 @@
       "phase_initial": "初始",
       "phase_hop": "传递",
       "phase_summary": "总结",
-      "phase_queued": "排队中"
+      "phase_queued": "排队中",
+      "round_label": "轮次",
+      "hop_label": "跳转"
     },
     "mode_solo": "Solo",
     "mode_audit": "审查",

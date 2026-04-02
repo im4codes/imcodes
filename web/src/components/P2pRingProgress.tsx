@@ -42,18 +42,18 @@ export function P2pRingProgress({
 
   // Use hop-level progress if available, fall back to round-level
   const fraction = useMemo(() => {
-    if (totalHops > 0) return Math.min(1, Math.max(0, completedHops / totalHops));
+    if (totalHops > 0) {
+      const visibleHop = ACTIVE_STATUSES.has(status) ? (activeHop ?? completedHops) : completedHops;
+      return Math.min(1, Math.max(0, visibleHop / totalHops));
+    }
     if (totalRounds <= 0) return 0;
     return Math.min(1, Math.max(0, completedRounds / totalRounds));
-  }, [completedHops, totalHops, completedRounds, totalRounds]);
+  }, [completedHops, totalHops, completedRounds, totalRounds, activeHop, status]);
 
   const dashArray = useMemo(() => {
     const filled = fraction * CIRCUMFERENCE;
     return `${filled} ${CIRCUMFERENCE - filled}`;
   }, [fraction]);
-
-  // Rotate so progress starts at the top (12 o'clock position)
-  const dashOffset = CIRCUMFERENCE / 4;
 
   const centerText = useMemo(() => {
     if (ACTIVE_STATUSES.has(status)) {
@@ -115,7 +115,7 @@ export function P2pRingProgress({
             cy={CENTER}
             r={RING_RADIUS}
             fill="none"
-            stroke-width={STROKE_WIDTH}
+            strokeWidth={STROKE_WIDTH}
           />
           {/* Progress arc */}
           <circle
@@ -124,10 +124,10 @@ export function P2pRingProgress({
             cy={CENTER}
             r={RING_RADIUS}
             fill="none"
-            stroke-width={STROKE_WIDTH}
-            stroke-dasharray={dashArray}
-            stroke-dashoffset={-dashOffset}
-            stroke-linecap="round"
+            strokeWidth={STROKE_WIDTH}
+            strokeDasharray={dashArray}
+            strokeLinecap="round"
+            transform={`rotate(-90 ${CENTER} ${CENTER})`}
           />
         </svg>
         {/* Center text absolutely positioned over SVG */}

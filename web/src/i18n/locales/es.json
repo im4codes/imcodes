@@ -286,6 +286,10 @@
     },
     "discussions": {
       "title": "Discusiones",
+      "live_progress": "Progreso en vivo",
+      "slogan": "IM.codes - the IM for agents",
+      "hide": "Ocultar",
+      "show": "Mostrar",
       "untitled": "Discusión",
       "empty": "Aún no hay discusiones P2P. Usa @@all(discuss) o @agent para iniciar una.",
       "select": "Selecciona una discusión para verla",
@@ -293,7 +297,9 @@
       "phase_initial": "Inicial",
       "phase_hop": "Salto",
       "phase_summary": "Resumen",
-      "phase_queued": "En cola"
+      "phase_queued": "En cola",
+      "round_label": "Ronda",
+      "hop_label": "Salto"
     },
     "mode_solo": "Solo",
     "mode_audit": "Auditoría",

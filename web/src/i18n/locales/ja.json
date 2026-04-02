@@ -286,6 +286,10 @@
     },
     "discussions": {
       "title": "ディスカッション",
+      "live_progress": "進行状況",
+      "slogan": "IM.codes - the IM for agents",
+      "hide": "隠す",
+      "show": "表示",
       "untitled": "ディスカッション",
       "empty": "まだ P2P ディスカッションはありません。@@all(discuss) または @agent で開始してください。",
       "select": "表示するディスカッションを選択",
@@ -293,7 +297,9 @@
       "phase_initial": "初期",
       "phase_hop": "ホップ",
       "phase_summary": "要約",
-      "phase_queued": "待機中"
+      "phase_queued": "待機中",
+      "round_label": "ラウンド",
+      "hop_label": "ホップ"
     },
     "mode_solo": "Solo",
     "mode_audit": "監査",
