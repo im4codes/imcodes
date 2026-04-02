@@ -95,13 +95,15 @@ describe('conpty backend', () => {
         rows: 40,
       });
 
-      expect(spawnMock).toHaveBeenCalledWith('echo', ['hello'], {
-        cwd: '/tmp',
-        env: expect.objectContaining({ FOO: 'bar' }),
-        cols: 120,
-        rows: 40,
-        useConpty: true,
-      });
+      expect(spawnMock).toHaveBeenCalledTimes(1);
+      const [command, args, options] = spawnMock.mock.calls[0] as [string, string[], { cwd: string; env: Record<string, string>; cols: number; rows: number; useConpty: boolean }];
+      expect(command).toBe('echo');
+      expect(args).toEqual(['hello']);
+      expect(normalizeSlashes(options.cwd)).toBe('/tmp');
+      expect(options.env).toEqual(expect.objectContaining({ FOO: 'bar' }));
+      expect(options.cols).toBe(120);
+      expect(options.rows).toBe(40);
+      expect(options.useConpty).toBe(true);
       expect(conpty.conptySessionExists('test-session')).toBe(true);
     });
 
