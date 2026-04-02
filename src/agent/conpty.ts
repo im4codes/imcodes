@@ -127,6 +127,25 @@ function needsWindowsShell(cmd: string): boolean {
   return /(?:\|\||&&|[<>|])/.test(cmd);
 }
 
+function shouldUseWindowsShell(file: string, cmd: string): boolean {
+  if (needsWindowsShell(cmd)) return true;
+
+  const normalized = file.trim().replace(/^"|"$/g, '');
+  if (!normalized) return true;
+
+  const lower = normalized.toLowerCase();
+  if (lower.endsWith('.cmd') || lower.endsWith('.bat')) return true;
+
+  const hasPathSeparator = /[\\/]/.test(normalized);
+  const hasKnownExecutableExtension = /\.(?:exe|com)$/i.test(normalized);
+
+  if (!hasPathSeparator && !hasKnownExecutableExtension) {
+    return true;
+  }
+
+  return false;
+}
+
 function buildWindowsEnv(extraEnv?: Record<string, string>): Record<string, string> {
   const env = { ...process.env, ...extraEnv } as Record<string, string>;
   const pathKey = Object.keys(env).find((k) => k.toUpperCase() === 'PATH') ?? 'PATH';
@@ -151,8 +170,9 @@ function buildWindowsEnv(extraEnv?: Record<string, string>): Record<string, stri
 
 /**
  * Spawn a new ConPTY session via node-pty.
- * Spawns the command directly (no cmd.exe /c wrapper) to avoid double echo
- * caused by cmd.exe's ENABLE_ECHO_INPUT overlapping with the child's own echo.
+ * On Windows, bare commands and shell-builtins are wrapped with cmd.exe /d /c so
+ * npm-installed .cmd shims (for example codex/claude) resolve correctly. Explicit
+ * executable paths still spawn directly to avoid unnecessary shell layering.
  */
 export async function conptyNewSession(
   name: string,
@@ -178,11 +198,10 @@ export async function conptyNewSession(
 
   let file: string;
   let args: string[];
-  if (process.platform === 'win32' && needsWindowsShell(cleanCmd)) {
+  ({ file, args } = splitCommand(cleanCmd));
+  if (process.platform === 'win32' && shouldUseWindowsShell(file, cleanCmd)) {
     file = process.env.COMSPEC ?? 'cmd.exe';
     args = ['/d', '/c', cleanCmd];
-  } else {
-    ({ file, args } = splitCommand(cleanCmd));
   }
   const pty = spawn(file, args, {
     cwd,
