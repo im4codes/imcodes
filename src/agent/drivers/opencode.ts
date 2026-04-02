@@ -14,11 +14,7 @@ export class OpenCodeDriver implements AgentDriver {
     if (opts?.opencodeSessionId && !opts?.fresh) {
       return `${cwd}opencode -s ${JSON.stringify(opts.opencodeSessionId)}`;
     }
-    if (opts?.fresh) {
-      return `${cwd}opencode`;
-    }
-    // Default: resume last conversation; fall back to fresh if no history
-    return `${cwd}opencode -c || opencode`;
+    return `${cwd}opencode`;
   }
 
   buildResumeCommand(_sessionName: string, opts?: LaunchOptions): string {
@@ -26,7 +22,8 @@ export class OpenCodeDriver implements AgentDriver {
     if (opts?.opencodeSessionId) {
       return `${cwd}opencode -s ${JSON.stringify(opts.opencodeSessionId)}`;
     }
-    return this.buildLaunchCommand(_sessionName, opts);
+    // Legacy fallback for pre-opencodeSessionId sessions.
+    return `${cwd}opencode -c || opencode`;
   }
 
   detectStatus(_lines: string[]): AgentStatus {

@@ -84,6 +84,7 @@ describe('launchSession — OpenCode ID handling', () => {
     const launchCmd = mocks.newSession.mock.calls[0]?.[1];
     expect(launchCmd).toContain('opencode');
     expect(launchCmd).not.toContain(' -s ');
+    expect(launchCmd).not.toContain(' -c ');
 
     const upsertCalls = mocks.upsertSession.mock.calls;
     const lastRecord = upsertCalls[upsertCalls.length - 1][0];

@@ -106,11 +106,13 @@ describe('OpenCodeDriver', () => {
   it('buildLaunchCommand includes opencode', () => {
     const cmd = driver.buildLaunchCommand('deck_proj_w1');
     expect(cmd).toContain('opencode');
+    expect(cmd).not.toContain(' -c ');
   });
 
   it('buildResumeCommand returns a resume command', () => {
     const cmd = driver.buildResumeCommand('deck_proj_w1');
     expect(cmd).toBeTruthy();
+    expect(cmd).toContain('opencode -c || opencode');
   });
 
   it('prefers explicit opencodeSessionId when provided', () => {

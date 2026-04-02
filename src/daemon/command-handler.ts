@@ -1315,6 +1315,17 @@ function handleTimelineReplay(cmd: Record<string, unknown>, serverLink: ServerLi
 }
 
 /** Handle timeline.history_request — browser requesting full session history on open. */
+export function hasSubstantiveTimelineHistory(events: Array<{ type: string }>): boolean {
+  return events.some((event) => (
+    event.type === 'user.message'
+    || event.type === 'assistant.text'
+    || event.type === 'assistant.thinking'
+    || event.type === 'tool.call'
+    || event.type === 'tool.result'
+    || event.type === 'ask.question'
+  ));
+}
+
 async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = cmd.sessionName as string | undefined;
   const requestId = cmd.requestId as string | undefined;
@@ -1350,7 +1361,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
   // Trim to requested limit after dedup
   let trimmed = deduped.length > limit ? deduped.slice(deduped.length - limit) : deduped;
 
-  if (trimmed.length === 0) {
+  if (!hasSubstantiveTimelineHistory(trimmed)) {
     const record = getSession(sessionName);
     if (record?.agentType === 'opencode' && record.projectDir && record.opencodeSessionId) {
       try {
