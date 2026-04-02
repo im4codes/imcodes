@@ -486,6 +486,7 @@ export async function restartSession(record: SessionRecord): Promise<boolean> {
     ccSessionId: record.ccSessionId,
     codexSessionId: record.codexSessionId,
     geminiSessionId: record.geminiSessionId,
+    opencodeSessionId: record.opencodeSessionId,
   });
 
   return true;
@@ -516,8 +517,19 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
   const driver = getDriver(record.agentType as AgentType);
   const ccSessionId = record.ccSessionId;
   const projectDir = record.projectDir;
-  const cmd = driver.buildResumeCommand(record.name, { cwd: projectDir, ccSessionId, codexSessionId: record.codexSessionId, geminiSessionId: record.geminiSessionId })
-    ?? driver.buildLaunchCommand(record.name, { cwd: projectDir, ccSessionId, codexSessionId: record.codexSessionId, geminiSessionId: record.geminiSessionId });
+  const cmd = driver.buildResumeCommand(record.name, {
+    cwd: projectDir,
+    ccSessionId,
+    codexSessionId: record.codexSessionId,
+    geminiSessionId: record.geminiSessionId,
+    opencodeSessionId: record.opencodeSessionId,
+  }) ?? driver.buildLaunchCommand(record.name, {
+    cwd: projectDir,
+    ccSessionId,
+    codexSessionId: record.codexSessionId,
+    geminiSessionId: record.geminiSessionId,
+    opencodeSessionId: record.opencodeSessionId,
+  });
 
   // Env injection: respawnPane doesn't support -e, prepend exports to the command
   const mergedEnv: Record<string, string> = { IMCODES_SESSION: record.name };
@@ -590,6 +602,8 @@ export interface LaunchOpts {
   codexSessionId?: string;
   /** Gemini session UUID for `gemini --resume <UUID>`. */
   geminiSessionId?: string;
+  /** OpenCode session ID for `opencode -s <ID>`. */
+  opencodeSessionId?: string;
   /** Human-readable label for UI display. */
   label?: string;
   /** Session description for transport sessions (persona/system prompt injection). */
@@ -784,6 +798,8 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   if (agentType === 'codex' && !codexSessionId) codexSessionId = getSession(name)?.codexSessionId;
   let geminiSessionId = opts.geminiSessionId;
   if (agentType === 'gemini' && !geminiSessionId) geminiSessionId = getSession(name)?.geminiSessionId;
+  let opencodeSessionId = opts.opencodeSessionId;
+  if (agentType === 'opencode' && !opencodeSessionId) opencodeSessionId = getSession(name)?.opencodeSessionId;
   ({ ccSessionId, codexSessionId, geminiSessionId } = await resolveStructuredSessionBootstrap({
     agentType,
     projectDir,
@@ -797,9 +813,23 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     // CC: if JSONL already exists (restart via killSession+newSession), use --resume to
     // launchSession is only for NEW tmux sessions (--session-id for CC).
     // Restarts go through respawnSession which uses respawnPane + --resume.
-    const launchCmd = driver.buildLaunchCommand(name, { cwd: projectDir, fresh, ccSessionId, codexSessionId, geminiSessionId });
+    let knownOpenCodeSessionIds: string[] | undefined;
+    if (agentType === 'opencode' && !opencodeSessionId) {
+      const { listOpenCodeSessions } = await import('../daemon/opencode-history.js');
+      knownOpenCodeSessionIds = (await listOpenCodeSessions(projectDir, 50)).map((session) => session.id);
+    }
+    const launchStart = Date.now();
+    const launchCmd = driver.buildLaunchCommand(name, { cwd: projectDir, fresh, ccSessionId, codexSessionId, geminiSessionId, opencodeSessionId });
     await newSession(name, launchCmd, { cwd: projectDir, env: mergedEnv });
-    logger.info({ session: name, agentType, ccSessionId, codexSessionId, geminiSessionId }, 'Launched session');
+    if (agentType === 'opencode' && !opencodeSessionId) {
+      const { waitForOpenCodeSessionId } = await import('../daemon/opencode-history.js');
+      opencodeSessionId = await waitForOpenCodeSessionId(projectDir, {
+        updatedAfter: launchStart,
+        exactDirectory: projectDir,
+        knownSessionIds: knownOpenCodeSessionIds,
+      });
+    }
+    logger.info({ session: name, agentType, ccSessionId, codexSessionId, geminiSessionId, opencodeSessionId }, 'Launched session');
   }
 
   // Always record paneId — it changes on each session creation/restart
@@ -829,6 +859,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ...(ccSessionId ? { ccSessionId } : {}),
       ...(codexSessionId ? { codexSessionId } : {}),
       ...(geminiSessionId ? { geminiSessionId } : {}),
+      ...(opencodeSessionId ? { opencodeSessionId } : {}),
       ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),
     };
     upsertSession(record);
@@ -842,6 +873,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
         ...(ccSessionId ? { ccSessionId } : {}),
         ...(codexSessionId ? { codexSessionId } : {}),
         ...(geminiSessionId ? { geminiSessionId } : {}),
+        ...(opencodeSessionId ? { opencodeSessionId } : {}),
         updatedAt: Date.now(),
       };
       upsertSession(merged);

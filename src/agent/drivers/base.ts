@@ -14,6 +14,8 @@ export interface LaunchOptions {
   codexModel?: string;
   /** Gemini session UUID for `gemini --resume <UUID>`. */
   geminiSessionId?: string;
+  /** OpenCode session ID for `opencode -s <ID>`. */
+  opencodeSessionId?: string;
 }
 
 /** Build a cd prefix for shell commands. Uses Windows syntax on win32. */

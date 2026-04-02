@@ -11,6 +11,9 @@ export class OpenCodeDriver implements AgentDriver {
 
   buildLaunchCommand(_sessionName: string, opts?: LaunchOptions): string {
     const cwd = cwdPrefix(opts?.cwd);
+    if (opts?.opencodeSessionId && !opts?.fresh) {
+      return `${cwd}opencode -s ${JSON.stringify(opts.opencodeSessionId)}`;
+    }
     if (opts?.fresh) {
       return `${cwd}opencode`;
     }
@@ -19,6 +22,10 @@ export class OpenCodeDriver implements AgentDriver {
   }
 
   buildResumeCommand(_sessionName: string, opts?: LaunchOptions): string {
+    const cwd = cwdPrefix(opts?.cwd);
+    if (opts?.opencodeSessionId) {
+      return `${cwd}opencode -s ${JSON.stringify(opts.opencodeSessionId)}`;
+    }
     return this.buildLaunchCommand(_sessionName, opts);
   }
 

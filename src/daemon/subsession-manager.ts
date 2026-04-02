@@ -27,6 +27,7 @@ export interface SubSessionRecord {
   codexSessionId?: string | null;
   codexModel?: string | null;
   geminiSessionId?: string | null;
+  opencodeSessionId?: string | null;
   parentSession?: string | null;
   /** CC env preset name (e.g. "MiniMax", "DeepSeek"). Resolves to env vars at launch. */
   ccPreset?: string | null;
@@ -109,8 +110,15 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     ...(sub.codexModel ? { codexModel: sub.codexModel } : {}),
     ...(sub.codexSessionId ? { codexSessionId: sub.codexSessionId ?? undefined } : {}),
     ...(sub.geminiSessionId ? { geminiSessionId: sub.geminiSessionId } : {}),
+    ...(sub.opencodeSessionId ? { opencodeSessionId: sub.opencodeSessionId } : {}),
     ...(sub.fresh ? { fresh: true } : {}),
   } as any;
+  let knownOpenCodeSessionIds: string[] | undefined;
+  if (agentType === 'opencode' && !sub.opencodeSessionId && sub.cwd) {
+    const { listOpenCodeSessions } = await import('./opencode-history.js');
+    knownOpenCodeSessionIds = (await listOpenCodeSessions(sub.cwd, 50)).map((session) => session.id);
+  }
+  const launchStart = Date.now();
   const launchCmd = useResume
     ? (driver.buildResumeCommand(sessionName, launchOpts) ?? driver.buildLaunchCommand(sessionName, launchOpts))
     : driver.buildLaunchCommand(sessionName, launchOpts);
@@ -127,6 +135,15 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   }
 
   await newSession(sessionName, launchCmd, { cwd: sub.cwd ?? undefined, env: launchEnv });
+
+  if (agentType === 'opencode' && !sub.opencodeSessionId && sub.cwd) {
+    const { waitForOpenCodeSessionId } = await import('./opencode-history.js');
+    sub.opencodeSessionId = await waitForOpenCodeSessionId(sub.cwd, {
+      updatedAfter: launchStart,
+      exactDirectory: sub.cwd,
+      knownSessionIds: knownOpenCodeSessionIds,
+    });
+  }
 
   // Rebind pipe-pane stream — on restart (stopSubSession killed the old tmux session),
   // the streamer's pipe broke and scheduleRebind may have a pending timer that will fail.
@@ -163,6 +180,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     ccSessionId: sub.ccSessionId ?? undefined,
     codexSessionId: sub.codexSessionId ?? undefined,
     geminiSessionId: sub.geminiSessionId ?? undefined,
+    opencodeSessionId: sub.opencodeSessionId ?? undefined,
     parentSession: sub.parentSession ?? undefined,
     ccPreset: sub.ccPreset ?? undefined,
     description: sub.description ?? undefined,
@@ -260,12 +278,14 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
       // Merge all session IDs: prefer server-provided, fall back to local store
       const effectiveCodexSessionId = sub.codexSessionId ?? stored?.codexSessionId;
       const effectiveGeminiSessionId = sub.geminiSessionId ?? stored?.geminiSessionId;
+      const effectiveOpenCodeSessionId = sub.opencodeSessionId ?? stored?.opencodeSessionId;
       upsertSession({
         name: sessionName, projectName: sessionName, agentType: sub.type, agentVersion: stored?.agentVersion ?? await getAgentVersion(sub.type as AgentType, sub.shellBin ?? undefined), role: 'w1', state: 'running',
         projectDir: sub.cwd ?? '', label: sub.label ?? stored?.label ?? undefined,
         ccSessionId: effectiveCcSessionId ?? undefined,
         codexSessionId: effectiveCodexSessionId ?? undefined,
         geminiSessionId: effectiveGeminiSessionId ?? undefined,
+        opencodeSessionId: effectiveOpenCodeSessionId ?? undefined,
         parentSession: sub.parentSession ?? stored?.parentSession,
         // Preserve existing diagnostic fields instead of resetting
         restarts: stored?.restarts ?? 0,

@@ -32,6 +32,8 @@ export interface SessionRecord {
   codexSessionId?: string;
   /** Gemini session UUID obtained from stream-json init event, used for `gemini --resume <UUID>`. */
   geminiSessionId?: string;
+  /** OpenCode session ID used for `opencode -s <ID>` deterministic resume/history lookup. */
+  opencodeSessionId?: string;
   /** Parent main session name (e.g. `deck_proj_brain`) — links sub-sessions to their parent. */
   parentSession?: string;
   /** Runtime type — 'process' for tmux, 'transport' for network-backed. Defaults to 'process' for backward compat. */

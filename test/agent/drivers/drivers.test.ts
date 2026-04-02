@@ -112,6 +112,12 @@ describe('OpenCodeDriver', () => {
     const cmd = driver.buildResumeCommand('deck_proj_w1');
     expect(cmd).toBeTruthy();
   });
+
+  it('prefers explicit opencodeSessionId when provided', () => {
+    const cmd = driver.buildResumeCommand('deck_proj_w1', { opencodeSessionId: 'oc-session-123', cwd: '/tmp/proj' });
+    expect(cmd).toContain('opencode -s');
+    expect(cmd).toContain('oc-session-123');
+  });
 });
 
 // ── Shell ─────────────────────────────────────────────────────────────────────

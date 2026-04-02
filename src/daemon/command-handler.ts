@@ -380,7 +380,7 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       handleTimelineReplay(cmd, serverLink);
       break;
     case 'timeline.history_request':
-      handleTimelineHistory(cmd, serverLink);
+      void handleTimelineHistory(cmd, serverLink);
       break;
     case 'chat.subscribe':
       void handleChatSubscribeReplay(cmd, serverLink);
@@ -1313,7 +1313,7 @@ function handleTimelineReplay(cmd: Record<string, unknown>, serverLink: ServerLi
 }
 
 /** Handle timeline.history_request — browser requesting full session history on open. */
-function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: ServerLink): void {
+async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = cmd.sessionName as string | undefined;
   const requestId = cmd.requestId as string | undefined;
   const rawLimit = cmd.limit;
@@ -1346,7 +1346,23 @@ function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: ServerL
     deduped.push(ev);
   }
   // Trim to requested limit after dedup
-  const trimmed = deduped.length > limit ? deduped.slice(deduped.length - limit) : deduped;
+  let trimmed = deduped.length > limit ? deduped.slice(deduped.length - limit) : deduped;
+
+  if (trimmed.length === 0) {
+    const record = getSession(sessionName);
+    if (record?.agentType === 'opencode' && record.projectDir && record.opencodeSessionId) {
+      try {
+        const { exportOpenCodeSession, buildTimelineEventsFromOpenCodeExport } = await import('./opencode-history.js');
+        const exportData = await exportOpenCodeSession(record.projectDir, record.opencodeSessionId);
+        const synthesized = buildTimelineEventsFromOpenCodeExport(sessionName, exportData, timelineEmitter.epoch)
+          .filter((event) => afterTs === undefined || event.ts > afterTs)
+          .filter((event) => beforeTs === undefined || event.ts < beforeTs);
+        trimmed = synthesized.length > limit ? synthesized.slice(synthesized.length - limit) : synthesized;
+      } catch (err) {
+        logger.debug({ err, sessionName, opencodeSessionId: record.opencodeSessionId }, 'Failed to synthesize OpenCode timeline history');
+      }
+    }
+  }
 
   try {
     serverLink.send({
@@ -1510,6 +1526,7 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
       ccSessionId: record.ccSessionId ?? null,
       codexSessionId: record.codexSessionId ?? null,
       geminiSessionId: record.geminiSessionId ?? null,
+      opencodeSessionId: record.opencodeSessionId ?? null,
       ccPreset: record.ccPreset ?? null,
       description: record.description ?? null,
     });
