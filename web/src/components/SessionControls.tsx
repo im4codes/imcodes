@@ -417,7 +417,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   /** Pending @-selected P2P targets + their display labels for removal at send time. */
   const pendingAtTargetsRef = useRef<PendingAtTarget[]>([]);
   /** Custom config/rounds override from @@all+ picker (cleared on send). */
-  const pendingConfigOverrideRef = useRef<{ config: P2pSavedConfig; rounds: number } | null>(null);
+  const pendingConfigOverrideRef = useRef<{ config: P2pSavedConfig; rounds: number; modeOverride: string } | null>(null);
 
   const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -1119,15 +1119,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 sel?.addRange(range);
               } catch { /* jsdom lacks Selection API */ }
             }}
-            onSelectAllConfig={(config, rounds) => {
+            onSelectAllConfig={(config, rounds, modeOverride) => {
               // Show @@all(config) — daemon expands per config. Store custom rounds + config override.
               const text = divRef.current?.textContent ?? '';
               const before = text.replace(/@[^\s@]*$/, '');
-              const label = rounds > 1 ? `@@all(config ×${rounds})` : '@@all(config)';
+              const labelMode = modeOverride === 'config' ? 'config' : modeOverride;
+              const label = rounds > 1 ? `@@all(${labelMode} ×${rounds})` : `@@all(${labelMode})`;
               divRef.current!.textContent = `${before}${label} `;
               pendingAtTargetsRef.current.push({ session: '__all__', mode: 'config', label });
               // Store custom config + rounds for handleSend
-              pendingConfigOverrideRef.current = { config, rounds };
+              pendingConfigOverrideRef.current = { config, rounds, modeOverride };
               atSelectionSnapshotRef.current = divRef.current!.textContent;
               atSelectionLockRef.current = true;
               setAtPickerOpen(false);

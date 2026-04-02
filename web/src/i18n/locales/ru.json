@@ -269,6 +269,31 @@
       "label_active": "Round {{round}}/{{totalRounds}}",
       "active_hops": "R{{round}}/{{totalRounds}} H{{hop}}/{{totalHops}}"
     },
+    "status": {
+      "done": "Готово",
+      "active": "Активно",
+      "pending": "Ожидает",
+      "skipped": "Пропущено",
+      "queued": "В очереди",
+      "dispatched": "Отправляется",
+      "running": "Выполняется",
+      "awaiting_next_hop": "Ожидание следующего шага",
+      "completed": "Завершено",
+      "failed": "Ошибка",
+      "timed_out": "Тайм-аут",
+      "cancelled": "Отменено",
+      "setup": "Подготовка"
+    },
+    "discussions": {
+      "untitled": "Обсуждение",
+      "empty": "Пока нет P2P-обсуждений. Используйте @@all(discuss) или @agent, чтобы начать.",
+      "select": "Выберите обсуждение для просмотра",
+      "load_failed": "(Не удалось загрузить)",
+      "phase_initial": "Начало",
+      "phase_hop": "Шаг",
+      "phase_summary": "Сводка",
+      "phase_queued": "В очереди"
+    },
     "mode_solo": "Solo",
     "mode_audit": "Аудит",
     "mode_review": "Обзор",

@@ -24,7 +24,7 @@ interface AtPickerProps {
   projectDir?: string;
   onSelectFile: (path: string) => void;
   onSelectAgent: (session: string, mode: string) => void;
-  onSelectAllConfig?: (config: P2pSavedConfig, rounds: number) => void;
+  onSelectAllConfig?: (config: P2pSavedConfig, rounds: number, modeOverride: string) => void;
   p2pConfig?: P2pSavedConfig | null;
   onClose: () => void;
   onStageChange?: (stage: 'choose' | 'files' | 'agents' | 'mode') => void;
@@ -326,7 +326,7 @@ export function AtPicker({
           e.preventDefault(); e.stopPropagation();
           const rounds = CONFIG_ROUNDS_OPTIONS[configRoundsHighlight];
           const effectiveConfig = buildEffectiveConfig(p2pConfig, configModeOverride);
-          onSelectAllConfig?.(effectiveConfig, rounds);
+          onSelectAllConfig?.(effectiveConfig, rounds, configModeOverride);
           setConfigRoundsPicker(false);
           return;
         }
@@ -390,7 +390,7 @@ export function AtPicker({
         } else if (cfgRowCount > 0 && highlightIdx === 0) {
           // @all with saved rounds
           const rounds = p2pConfig!.rounds ?? 1;
-          onSelectAllConfig?.(p2pConfig!, rounds);
+          onSelectAllConfig?.(p2pConfig!, rounds, 'config');
         } else if (cfgRowCount > 0 && highlightIdx === 1) {
           // @all+ — open rounds picker
           setConfigRoundsPicker(true); setConfigRoundsHighlight(0); setConfigModeOverride('config');
@@ -461,7 +461,7 @@ export function AtPicker({
               style={idx === configRoundsHighlight ? modeBtnHoverStyle : modeBtnStyle}
               onClick={() => {
                 const cfg = buildEffectiveConfig(p2pConfig, configModeOverride);
-                onSelectAllConfig?.(cfg, r);
+                onSelectAllConfig?.(cfg, r, configModeOverride);
                 setConfigRoundsPicker(false);
               }}
               onMouseEnter={() => setConfigRoundsHighlight(idx)}
@@ -624,7 +624,7 @@ export function AtPicker({
             <div
               data-hl={hlAll ? 'true' : undefined}
               style={hlAll ? itemHighlightStyle : itemStyle}
-              onClick={() => { onSelectAllConfig?.(p2pConfig!, rounds); }}
+              onClick={() => { onSelectAllConfig?.(p2pConfig!, rounds, 'config'); }}
               onMouseEnter={() => setHighlightIdx(0)}
             >
               <span style={{ fontWeight: 600, color: '#94a3b8' }}>⚙ {t('p2p.all_label')}</span>

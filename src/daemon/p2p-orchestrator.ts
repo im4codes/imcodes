@@ -13,7 +13,8 @@ import { randomUUID } from 'node:crypto';
 import { sendKeysDelayedEnter } from '../agent/tmux.js';
 import { detectStatusAsync } from '../agent/detect.js';
 import { getSession } from '../store/session-store.js';
-import { getP2pMode, roundPrompt, type P2pMode } from '../../shared/p2p-modes.js';
+import { P2P_BASELINE_PROMPT, getP2pMode, roundPrompt, type P2pMode } from '../../shared/p2p-modes.js';
+import { formatP2pParticipantIdentity, shortP2pSessionName } from '../../shared/p2p-participant.js';
 import logger from '../util/logger.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
@@ -311,7 +312,7 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
     // ── Phase 1: Initiator initial analysis (first round only) ──
     if (run.currentRound === 1) {
       if (run._cancelled) return;
-      const initialHeader = `${shortName(run.initiatorSession)} — Initial Analysis${roundLabel}`;
+      const initialHeader = `${discussionParticipantNameWithMode(run.initiatorSession, run.mode)} — Initial Analysis${roundLabel}`;
       const initialPrompt = buildHopPrompt(run, modeConfig, {
         session: run.initiatorSession,
         sectionHeader: initialHeader,
@@ -326,7 +327,7 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
     for (let i = 0; i < targets.length; i++) {
       if (run._cancelled) return;
       const target = targets[i];
-      const hopLabel = `${shortName(target.session)} — ${capitalize(target.mode)} (hop ${i + 1}/${totalHops}${roundLabel})`;
+      const hopLabel = `${discussionParticipantName(target.session)} — ${capitalize(target.mode)} (hop ${i + 1}/${totalHops}${roundLabel})`;
       const hopModeConfig = getP2pMode(target.mode) ?? modeConfig;
 
       const hopPrompt = buildHopPrompt(run, hopModeConfig, {
@@ -347,8 +348,8 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
     if (run._cancelled) return;
     const isLastRound = run.currentRound === run.rounds;
     const roundSummaryHeader = isLastRound
-      ? `${shortName(run.initiatorSession)} — Final Summary`
-      : `${shortName(run.initiatorSession)} — Round ${run.currentRound}/${run.rounds} Summary`;
+      ? `${discussionParticipantNameWithMode(run.initiatorSession, run.mode)} — Final Summary`
+      : `${discussionParticipantNameWithMode(run.initiatorSession, run.mode)} — Round ${run.currentRound}/${run.rounds} Summary`;
     const roundSummaryInstruction = isLastRound
       ? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.'
       : `Synthesize the key points, areas of agreement, and open questions from this round. Then assign specific focus areas or questions for each participant in the next round (round ${run.currentRound + 1}). Append to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`;
@@ -665,6 +666,9 @@ export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: Hop
     parts.push(roundPrefix);
   }
 
+  // Shared discussion-quality prompt
+  parts.push(P2P_BASELINE_PROMPT);
+
   // Mode role prompt
   if (mode?.prompt) {
     parts.push(mode.prompt);
@@ -692,7 +696,7 @@ export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: Hop
   } else {
     parts.push(`This is a dedicated discussion file for multi-agent analysis: ${filePath}`);
     parts.push(`All output MUST go into this file. Do NOT modify any other files or run any commands.`);
-    parts.push(`Your identity for this discussion run is "${shortName(opts.session)}". When later rounds refer to this code name, they mean you.`);
+    parts.push(`Your identity for this discussion run is "${discussionParticipantName(opts.session)}". When later rounds refer to this code name, they mean you.`);
     parts.push(``);
     parts.push(`Steps:`);
     parts.push(`1. Read the discussion file`);
@@ -762,59 +766,108 @@ function pushState(run: P2pRun, serverLink: ServerLink | null): void {
         completed_at: run.completedAt,
         // UI-ready progress fields (avoids client-side JSON parsing)
         total_count: run.totalTargets + 2, // +2 for Phase 1 (initial) + Phase 3 (summary)
+        total_hops: run.totalTargets,
         remaining_count: run.remainingTargets.length,
         completed_hops_count: run.completedHops.length,
         current_round: run.currentRound,
         total_rounds: run.rounds,
         skipped_hops: run.skippedHops,
+        active_phase: (() => {
+          if (run.currentTargetSession === run.initiatorSession) {
+            return run.remainingTargets.length === 0 ? 'summary' : 'initial';
+          }
+          if (run.currentTargetSession) return 'hop';
+          if (run.status === 'completed') return 'summary';
+          return 'queued';
+        })(),
+        active_hop_number: run.currentTargetSession && run.currentTargetSession !== run.initiatorSession
+          ? run.completedHops.length + 1
+          : null,
         // Agent metadata for display
         current_target_label: (() => {
           if (!run.currentTargetSession) return null;
           const rec = getSession(run.currentTargetSession);
-          const label = rec?.label || shortName(run.currentTargetSession);
-          const agentType = rec?.agentType ?? '';
-          return agentType ? `${label} (${agentType})` : label;
+          return formatP2pParticipantIdentity({
+            session: run.currentTargetSession,
+            label: rec?.label,
+            agentType: rec?.agentType,
+            ccPreset: rec?.ccPreset,
+          });
         })(),
         initiator_label: (() => {
           const rec = getSession(run.initiatorSession);
-          const label = rec?.label || shortName(run.initiatorSession);
-          const agentType = rec?.agentType ?? '';
-          return agentType ? `${label} (${agentType})` : label;
+          return formatP2pParticipantIdentity({
+            session: run.initiatorSession,
+            label: rec?.label,
+            agentType: rec?.agentType,
+            ccPreset: rec?.ccPreset,
+          });
         })(),
         // Full node list for segmented progress display — includes completed, active, pending, skipped
         all_nodes: (() => {
-          type NodeInfo = { session: string; label: string; agentType: string; status: 'done' | 'active' | 'pending' | 'skipped' };
+          type NodeInfo = {
+            session: string;
+            label: string;
+            displayLabel: string;
+            agentType: string;
+            ccPreset: string | null;
+            mode: string;
+            phase: 'initial' | 'hop' | 'summary';
+            status: 'done' | 'active' | 'pending' | 'skipped';
+          };
           const nodes: NodeInfo[] = [];
           const skippedSet = new Set(run.skippedHops);
-          const getInfo = (s: string) => { const r = getSession(s); return { label: r?.label || shortName(s), agentType: r?.agentType ?? 'unknown' }; };
+          const getInfo = (s: string, mode: string, phase: 'initial' | 'hop' | 'summary') => {
+            const r = getSession(s);
+            const label = r?.label || shortName(s);
+            const agentType = r?.agentType ?? 'unknown';
+            const ccPreset = r?.ccPreset ?? null;
+            return {
+              label,
+              displayLabel: formatP2pParticipantIdentity({
+                session: s,
+                label: r?.label,
+                agentType: r?.agentType,
+                ccPreset: r?.ccPreset,
+              }),
+              agentType,
+              ccPreset,
+              mode,
+              phase,
+            };
+          };
 
           // Phase 1: initiator initial analysis
-          const init = getInfo(run.initiatorSession);
+          const init = getInfo(run.initiatorSession, run.mode, 'initial');
           const phase1Done = run.completedHops.length > 0 || run.remainingTargets.length < run.totalTargets || run.status === 'completed';
           const phase1Active = !phase1Done && run.currentTargetSession === run.initiatorSession;
           nodes.push({ session: run.initiatorSession, ...init, status: phase1Done ? 'done' : phase1Active ? 'active' : 'pending' });
 
           // Phase 2: completed hops (in order)
           for (const t of run.completedHops) {
-            const info = getInfo(t.session);
+            const info = getInfo(t.session, t.mode, 'hop');
             nodes.push({ session: t.session, ...info, status: skippedSet.has(t.session) ? 'skipped' : 'done' });
           }
           // Phase 2: current active hop
           if (run.currentTargetSession && run.currentTargetSession !== run.initiatorSession) {
-            const info = getInfo(run.currentTargetSession);
+            const activeTarget = run.allTargets.find((t) => t.session === run.currentTargetSession)
+              ?? run.remainingTargets.find((t) => t.session === run.currentTargetSession)
+              ?? { session: run.currentTargetSession, mode: run.mode };
+            const info = getInfo(run.currentTargetSession, activeTarget.mode, 'hop');
             nodes.push({ session: run.currentTargetSession, ...info, status: 'active' });
           }
           // Phase 2: remaining pending hops
           for (const t of run.remainingTargets) {
             if (t.session === run.currentTargetSession) continue;
-            const info = getInfo(t.session);
+            const info = getInfo(t.session, t.mode, 'hop');
             nodes.push({ session: t.session, ...info, status: 'pending' });
           }
 
           // Phase 3: summary
           const summaryDone = run.status === 'completed';
           const summaryActive = run.remainingTargets.length === 0 && !summaryDone && run.currentTargetSession === run.initiatorSession;
-          nodes.push({ session: run.initiatorSession, label: `${init.label} · summary`, agentType: init.agentType, status: summaryDone ? 'done' : summaryActive ? 'active' : 'pending' });
+          const summary = getInfo(run.initiatorSession, run.mode, 'summary');
+          nodes.push({ session: run.initiatorSession, ...summary, status: summaryDone ? 'done' : summaryActive ? 'active' : 'pending' });
 
           return nodes;
         })(),
@@ -844,8 +897,21 @@ function extractMainSession(sessionName: string): string {
 }
 
 function shortName(session: string): string {
-  const parts = session.split('_');
-  return parts[parts.length - 1] ?? session;
+  return shortP2pSessionName(session);
+}
+
+function discussionParticipantName(session: string): string {
+  const record = getSession(session);
+  return formatP2pParticipantIdentity({
+    session,
+    label: record?.label,
+    agentType: record?.agentType,
+    ccPreset: record?.ccPreset,
+  });
+}
+
+function discussionParticipantNameWithMode(session: string, mode: string): string {
+  return `${discussionParticipantName(session)}:${mode}`;
 }
 
 function capitalize(s: string): string {

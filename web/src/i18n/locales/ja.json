@@ -269,6 +269,31 @@
       "label_active": "Round {{round}}/{{totalRounds}}",
       "active_hops": "R{{round}}/{{totalRounds}} H{{hop}}/{{totalHops}}"
     },
+    "status": {
+      "done": "完了",
+      "active": "進行中",
+      "pending": "待機中",
+      "skipped": "スキップ",
+      "queued": "待機列",
+      "dispatched": "送信中",
+      "running": "実行中",
+      "awaiting_next_hop": "次のホップ待ち",
+      "completed": "完了",
+      "failed": "失敗",
+      "timed_out": "タイムアウト",
+      "cancelled": "キャンセル済み",
+      "setup": "準備中"
+    },
+    "discussions": {
+      "untitled": "ディスカッション",
+      "empty": "まだ P2P ディスカッションはありません。@@all(discuss) または @agent で開始してください。",
+      "select": "表示するディスカッションを選択",
+      "load_failed": "（読み込み失敗）",
+      "phase_initial": "初期",
+      "phase_hop": "ホップ",
+      "phase_summary": "要約",
+      "phase_queued": "待機中"
+    },
     "mode_solo": "Solo",
     "mode_audit": "監査",
     "mode_review": "レビュー",

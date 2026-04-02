@@ -269,6 +269,31 @@
       "label_active": "Round {{round}}/{{totalRounds}}",
       "active_hops": "R{{round}}/{{totalRounds}} H{{hop}}/{{totalHops}}"
     },
+    "status": {
+      "done": "Done",
+      "active": "Active",
+      "pending": "Pending",
+      "skipped": "Skipped",
+      "queued": "Queued",
+      "dispatched": "Dispatching",
+      "running": "Running",
+      "awaiting_next_hop": "Awaiting next hop",
+      "completed": "Completed",
+      "failed": "Failed",
+      "timed_out": "Timed out",
+      "cancelled": "Cancelled",
+      "setup": "Setup"
+    },
+    "discussions": {
+      "untitled": "Discussion",
+      "empty": "No P2P discussions yet. Use @@all(discuss) or @agent to start one.",
+      "select": "Select a discussion to view",
+      "load_failed": "(Failed to load)",
+      "phase_initial": "Initial",
+      "phase_hop": "Hop",
+      "phase_summary": "Summary",
+      "phase_queued": "Queued"
+    },
     "mode_solo": "Solo",
     "mode_audit": "Audit",
     "mode_review": "Review",

@@ -51,6 +51,8 @@ describe('buildHopPrompt — production function', () => {
     const run = makeRun();
     const mode = getP2pMode('audit');
     const prompt = buildHopPrompt(run, mode, defaultOpts);
+    expect(prompt).toContain('staff-level engineer');
+    expect(prompt).toContain('Prioritize correctness over speed or politeness');
     expect(prompt).toContain('code auditor');
     expect(prompt).toContain('P2P Discussion Task');
   });

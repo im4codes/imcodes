@@ -611,6 +611,41 @@ describe('Group 11: Bookend Chain Flow', () => {
     expect(initialPrompt.prompt).toContain('brain');
   });
 
+  it('section headers include label, agent type, and Claude Code preset when available', async () => {
+    getSessionMock.mockImplementation((session: string) => {
+      if (session === 'deck_proj_brain') return { agentType: 'claude-code', projectDir: '/tmp/proj', label: 'lead', ccPreset: 'Sonnet-4' };
+      if (session === 'deck_proj_w1') return { agentType: 'claude-code', projectDir: '/tmp/proj', label: 'reviewer', ccPreset: 'Haiku-3.5' };
+      return { agentType: 'claude-code', projectDir: '/tmp/proj' };
+    });
+
+    const capturedPrompts: Array<{ session: string; prompt: string }> = [];
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      capturedPrompts.push({ session, prompt });
+      const runs = listP2pRuns();
+      const run = runs[runs.length - 1];
+      if (run) {
+        const current = await readFile(run.contextFilePath, 'utf8');
+        await writeFile(run.contextFilePath, current + `\n## ${session}\n\nDone.`, 'utf8');
+      }
+    });
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'audit code',
+      [],
+      serverLinkMock as any,
+    );
+
+    await waitForStatus(run.id, 'completed', 15_000);
+
+    expect(capturedPrompts[0]?.prompt).toContain('lead:claude-code:(Sonnet-4):audit — Initial Analysis');
+    expect(capturedPrompts[0]?.prompt).toContain('Your identity for this discussion run is "lead:claude-code:(Sonnet-4)"');
+    expect(capturedPrompts[1]?.prompt).toContain('reviewer:claude-code:(Haiku-3.5) — Audit (hop 1/1)');
+    expect(capturedPrompts[1]?.prompt).toContain('Your identity for this discussion run is "reviewer:claude-code:(Haiku-3.5)"');
+    expect(capturedPrompts[2]?.prompt).toContain('lead:claude-code:(Sonnet-4):audit — Final Summary');
+  });
+
   it('sub-session hop appends correct section header', async () => {
     let capturedPrompts: Array<{ session: string; prompt: string }> = [];
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {

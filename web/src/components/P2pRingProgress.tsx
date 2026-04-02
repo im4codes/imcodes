@@ -11,7 +11,9 @@ export interface P2pRingProgressProps {
   totalRounds: number;
   completedHops?: number;
   totalHops?: number;
+  activeHop?: number | null;
   status: string;
+  modeKey?: string;
   onClick?: () => void;
 }
 
@@ -31,7 +33,9 @@ export function P2pRingProgress({
   totalRounds,
   completedHops = 0,
   totalHops = 0,
+  activeHop = null,
   status,
+  modeKey,
   onClick,
 }: P2pRingProgressProps) {
   const { t } = useTranslation();
@@ -53,11 +57,12 @@ export function P2pRingProgress({
 
   const centerText = useMemo(() => {
     if (ACTIVE_STATUSES.has(status)) {
+      const visibleHop = activeHop ?? completedHops;
       if (totalHops > 0) {
         return t('p2p.ring.active_hops', {
           round: completedRounds + 1,
           totalRounds,
-          hop: completedHops,
+          hop: visibleHop,
           totalHops,
           defaultValue: `R{{round}}/{{totalRounds}} H{{hop}}/{{totalHops}}`,
         });
@@ -69,9 +74,9 @@ export function P2pRingProgress({
       });
     }
     return status;
-  }, [status, completedRounds, totalRounds, completedHops, totalHops, t]);
+  }, [status, completedRounds, totalRounds, completedHops, totalHops, activeHop, t]);
 
-  const label = useMemo(() => {
+  const statusLabel = useMemo(() => {
     if (ACTIVE_STATUSES.has(status)) {
       return t('p2p.ring.label_active', {
         round: completedRounds + 1,
@@ -82,16 +87,21 @@ export function P2pRingProgress({
     return t(`p2p.status.${status}`, status);
   }, [status, completedRounds, totalRounds, t]);
 
+  const modeLabel = useMemo(() => (
+    modeKey ? t(`p2p.mode.${modeKey}`, modeKey) : null
+  ), [modeKey, t]);
+
   return (
     <div
-      class={`p2p-ring${onClick ? ' p2p-ring-clickable' : ''}`}
+      class={`p2p-ring p2p-ring-status-${status}${onClick ? ' p2p-ring-clickable' : ''}`}
       onClick={onClick}
       role={onClick ? 'button' : undefined}
       tabIndex={onClick ? 0 : undefined}
       onKeyDown={onClick ? (e) => { if (e.key === 'Enter' || e.key === ' ') onClick(); } : undefined}
-      title={label}
+      title={[modeLabel, statusLabel].filter(Boolean).join(' · ')}
     >
       <div class="p2p-ring-inner">
+        {modeLabel && <div class="p2p-ring-mode">{modeLabel}</div>}
         <svg
           width={VIEW_SIZE}
           height={VIEW_SIZE}
@@ -126,7 +136,8 @@ export function P2pRingProgress({
         </div>
       </div>
       {/* Label below ring */}
-      <div class="p2p-ring-label">{label}</div>
+      <div class="p2p-ring-label">{modeLabel || statusLabel}</div>
+      {modeLabel && <div class="p2p-ring-sub">{statusLabel}</div>}
     </div>
   );
 }

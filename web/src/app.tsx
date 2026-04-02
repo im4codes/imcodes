@@ -603,13 +603,26 @@ export function App() {
     id: string;
     topic: string;
     state: string;
+    modeKey?: string;
     currentRound: number;
     maxRounds: number;
     completedHops: number;
     totalHops: number;
+    activeHop?: number | null;
+    activePhase?: 'queued' | 'initial' | 'hop' | 'summary';
+    initiatorLabel?: string;
     currentSpeaker?: string;
     conclusion?: string;
     filePath?: string;
+    nodes?: Array<{
+      label: string;
+      displayLabel?: string;
+      agentType: string;
+      ccPreset?: string | null;
+      mode?: string;
+      phase?: 'initial' | 'hop' | 'summary';
+      status: 'done' | 'active' | 'pending' | 'skipped';
+    }>;
     /** Discussion file ID for navigation (P2P runs use discussion_id, not run id) */
     fileId?: string;
   }>>([]);
@@ -1068,6 +1081,7 @@ export function App() {
         const r = msg.run as Record<string, any>;
         const id = `p2p_${r.id}`;
         const totalCount = r.total_count ?? 3;
+        const totalHops = r.total_hops ?? Math.max(0, totalCount - 2);
         const completedHopsCount = r.completed_hops_count ?? 0;
         const currentRoundFromDaemon = r.current_round ?? 1;
         const totalRoundsFromDaemon = r.total_rounds ?? 1;
@@ -1089,7 +1103,11 @@ export function App() {
           // Parse node list for segmented progress display
           const nodes = Array.isArray(r.all_nodes) ? r.all_nodes.map((n: any) => ({
             label: String(n.label ?? ''),
+            displayLabel: String(n.displayLabel ?? n.display_label ?? n.label ?? ''),
             agentType: String(n.agentType ?? ''),
+            ccPreset: n.ccPreset ?? n.cc_preset ?? null,
+            mode: typeof n.mode === 'string' ? n.mode : undefined,
+            phase: typeof n.phase === 'string' ? n.phase as 'initial' | 'hop' | 'summary' : undefined,
             status: String(n.status ?? 'pending') as 'done' | 'active' | 'pending' | 'skipped',
           })) : undefined;
 
@@ -1097,10 +1115,14 @@ export function App() {
             id,
             topic: `P2P ${mode} · ${initiatorLabel}`,
             state,
+            modeKey: mode,
             currentRound,
             maxRounds: totalRoundsFromDaemon,
             completedHops: completedHopsCount,
-            totalHops: totalCount - 2, // total_count includes Phase 1 + Phase 3; hops = targets only
+            totalHops,
+            activeHop: r.active_hop_number ?? null,
+            activePhase: (typeof r.active_phase === 'string' ? r.active_phase : 'queued') as 'queued' | 'initial' | 'hop' | 'summary',
+            initiatorLabel,
             currentSpeaker: currentTarget,
             conclusion: state === 'done' ? (r.result_summary ?? undefined) : undefined,
             error: state === 'failed' ? (r.error ?? undefined) : undefined,
@@ -1905,7 +1927,9 @@ export function App() {
                 totalRounds={d.maxRounds}
                 completedHops={d.completedHops}
                 totalHops={d.totalHops}
+                activeHop={d.activeHop}
                 status={d.state}
+                modeKey={d.modeKey}
                 onClick={() => { setDiscussionInitialId(d.fileId ?? null); setShowDiscussionsPage(true); }}
               />
             ))}
@@ -2394,7 +2418,9 @@ export function App() {
                   totalRounds={d.maxRounds}
                   completedHops={d.completedHops}
                   totalHops={d.totalHops}
+                  activeHop={d.activeHop}
                   status={d.state}
+                  modeKey={d.modeKey}
                   onClick={() => { setDiscussionInitialId(d.fileId ?? null); setShowDiscussionsPage(true); closeSidebar(); }}
                 />
               ))}

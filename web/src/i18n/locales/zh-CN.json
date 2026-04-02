@@ -269,6 +269,31 @@
       "label_active": "Round {{round}}/{{totalRounds}}",
       "active_hops": "R{{round}}/{{totalRounds}} H{{hop}}/{{totalHops}}"
     },
+    "status": {
+      "done": "完成",
+      "active": "进行中",
+      "pending": "等待中",
+      "skipped": "已跳过",
+      "queued": "排队中",
+      "dispatched": "已派发",
+      "running": "运行中",
+      "awaiting_next_hop": "等待下一跳",
+      "completed": "已完成",
+      "failed": "失败",
+      "timed_out": "超时",
+      "cancelled": "已取消",
+      "setup": "准备中"
+    },
+    "discussions": {
+      "untitled": "讨论",
+      "empty": "还没有 P2P 讨论。使用 @@all(discuss) 或 @agent 发起一个。",
+      "select": "选择一个讨论查看",
+      "load_failed": "（加载失败）",
+      "phase_initial": "初始",
+      "phase_hop": "传递",
+      "phase_summary": "总结",
+      "phase_queued": "排队中"
+    },
     "mode_solo": "Solo",
     "mode_audit": "审查",
     "mode_review": "评审",
