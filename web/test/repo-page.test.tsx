@@ -245,6 +245,19 @@ describe('RepoPage', () => {
     expect(screen.getByText('main')).toBeDefined();
   });
 
+  it('does not re-trigger repo detect after receiving detect response', async () => {
+    const { ws, respondDetect, repoDetect } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    expect(repoDetect).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      respondDetect({ provider: 'github', owner: 'acme', repo: 'widgets' });
+    });
+
+    expect(repoDetect).toHaveBeenCalledTimes(1);
+  });
+
   // 2. Tab switching preserves state (no re-fetch)
   it('does not re-fetch issues tab when switching away and back', async () => {
     const { ws, respondDetect, respondTab, repoListIssues, repoListPRs } = makeWs();

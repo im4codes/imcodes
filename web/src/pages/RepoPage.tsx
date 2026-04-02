@@ -180,6 +180,11 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
   const actionJobRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const actionStepRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const [focusedActionTargetKey, setFocusedActionTargetKey] = useState<string | null>(null);
+  const contextRef = useRef<RepoContext | null>(null);
+
+  useEffect(() => {
+    contextRef.current = context;
+  }, [context]);
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -236,7 +241,8 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
 
   const doDetect = useCallback((opts?: { preserveUi?: boolean }) => {
     const preserveUi = opts?.preserveUi === true;
-    if (!preserveUi || !context) {
+    const currentContext = contextRef.current;
+    if (!preserveUi || !currentContext) {
       setDetectLoading(true);
     }
     if (!preserveUi) {
@@ -248,7 +254,7 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
     try {
       rid = ws.repoDetect(projectDir);
     } catch (err) {
-      if (!context) {
+      if (!currentContext) {
         setDetectError(`Send failed: ${err instanceof Error ? err.message : String(err)}`);
         setDetectLoading(false);
       }
@@ -265,20 +271,24 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
         pendingRef.current.delete(rid);
         const nextRetry = detectRetryCountRef.current + 1;
         detectRetryCountRef.current = nextRetry;
-        if (context && nextRetry <= MAX_SILENT_RETRIES) {
+        if (currentContext && nextRetry <= MAX_SILENT_RETRIES) {
           if (detectRetryTimerRef.current) clearTimeout(detectRetryTimerRef.current);
           detectRetryTimerRef.current = setTimeout(() => doDetect({ preserveUi: true }), RETRY_DELAY_MS);
           return;
         }
-        if (!context) {
+        if (!currentContext) {
           setDetectError(`Detect timeout — no response after 10s (requestId: ${rid.slice(0, 8)})`);
           setDetectLoading(false);
         }
       }
     }, 10_000);
-  }, [ws, projectDir, context]);
+  }, [ws, projectDir]);
 
   useEffect(() => {
+    contextRef.current = null;
+    setContext(null);
+    setDetectLoading(true);
+    setDetectError(null);
     for (const requestId of detailReqRef.current.keys()) {
       pendingRef.current.delete(requestId);
     }
