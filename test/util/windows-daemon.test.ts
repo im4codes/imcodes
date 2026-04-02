@@ -6,6 +6,7 @@ const state = vi.hoisted(() => ({
   taskQueryOutput: '',
   scheduledTaskRunOk: false,
   vbsExists: false,
+  startupCmdExists: false,
   alivePids: new Set<number>(),
   execCalls: [] as string[],
   spawnCalls: [] as Array<{ cmd: string; args: string[] }>,
@@ -24,7 +25,11 @@ vi.mock('node:path', async () => {
 });
 
 vi.mock('node:fs', () => ({
-  existsSync: vi.fn((path: string) => path.endsWith('daemon-launcher.vbs') ? state.vbsExists : false),
+  existsSync: vi.fn((path: string) => {
+    if (path.endsWith('daemon-launcher.vbs')) return state.vbsExists;
+    if (path.endsWith('Start Menu\\Programs\\Startup\\imcodes-daemon.cmd')) return state.startupCmdExists;
+    return false;
+  }),
   readFileSync: vi.fn(() => {
     const idx = Math.min(state.pidIndex, state.pidContents.length - 1);
     const value = state.pidContents[idx] ?? '';
@@ -61,6 +66,7 @@ describe('restartWindowsDaemon', () => {
     state.taskQueryOutput = '';
     state.scheduledTaskRunOk = false;
     state.vbsExists = false;
+    state.startupCmdExists = false;
     state.alivePids = new Set<number>();
     state.execCalls = [];
     state.spawnCalls = [];
@@ -110,5 +116,19 @@ describe('restartWindowsDaemon', () => {
       { cmd: 'wscript', args: ['C:\\Users\\tester\\.imcodes\\daemon-launcher.vbs'] },
     ]);
   });
-});
 
+  it('falls back to startup shortcut when no scheduled task or VBS launcher is available', async () => {
+    state.pidContents = ['', '901'];
+    state.alivePids = new Set([901]);
+    state.startupCmdExists = true;
+
+    const { restartWindowsDaemon } = await import('../../src/util/windows-daemon.js');
+    expect(restartWindowsDaemon()).toBe(true);
+    expect(state.spawnCalls).toEqual([
+      {
+        cmd: 'cmd',
+        args: ['/c', 'C:\\Users\\tester\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\imcodes-daemon.cmd'],
+      },
+    ]);
+  });
+});

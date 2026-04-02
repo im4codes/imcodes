@@ -12,7 +12,8 @@ export class ShellDriver implements AgentDriver {
       ?? process.env.SHELL
       ?? (process.platform === 'win32' ? (process.env.COMSPEC ?? 'powershell.exe') : '/bin/bash');
     const cwd = cwdPrefix(opts?.cwd);
-    return `${cwd}${bin}`;
+    const quotedBin = process.platform === 'win32' && /\s/.test(bin) ? `"${bin}"` : bin;
+    return `${cwd}${quotedBin}`;
   }
 
   buildResumeCommand(sessionName: string, opts?: LaunchOptions): string {

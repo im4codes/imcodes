@@ -124,4 +124,37 @@ describe('SessionTabs', () => {
     );
     expect(screen.getByRole('tablist')).toBeDefined();
   });
+
+  it('requires three confirmations before stopping from the tab context dialog', () => {
+    const onStopProject = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1', project: 'proj-1' }]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+        onStopProject={onStopProject}
+      />,
+    );
+
+    const tab = screen.getByRole('tab');
+    fireEvent.contextMenu(tab);
+    fireEvent.click(screen.getByText('✕ Stop'));
+
+    const stopBtn = () => screen.getByRole('button', { name: /stop session|confirm stop|really stop/i });
+
+    fireEvent.click(stopBtn());
+    expect(onStopProject).not.toHaveBeenCalled();
+    expect(screen.getByText('Confirm stop?')).toBeDefined();
+
+    fireEvent.click(stopBtn());
+    expect(onStopProject).not.toHaveBeenCalled();
+    expect(screen.getByText('⚠ REALLY stop proj-1?')).toBeDefined();
+
+    fireEvent.click(stopBtn());
+    expect(onStopProject).toHaveBeenCalledOnce();
+    expect(onStopProject).toHaveBeenCalledWith('proj-1');
+  });
 });

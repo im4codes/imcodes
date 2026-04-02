@@ -10,6 +10,7 @@
  */
 
 import { execSync } from 'child_process';
+import { dirname, join } from 'path';
 
 import logger from '../util/logger.js';
 import { TMUX_KEY_TO_ESCAPE } from './key-map.js';
@@ -122,6 +123,32 @@ function splitCommand(cmd: string): { file: string; args: string[] } {
   return { file: tokens[0] ?? cmd, args: tokens.slice(1) };
 }
 
+function needsWindowsShell(cmd: string): boolean {
+  return /(?:\|\||&&|[<>|])/.test(cmd);
+}
+
+function buildWindowsEnv(extraEnv?: Record<string, string>): Record<string, string> {
+  const env = { ...process.env, ...extraEnv } as Record<string, string>;
+  const pathKey = Object.keys(env).find((k) => k.toUpperCase() === 'PATH') ?? 'PATH';
+  const current = env[pathKey] ?? '';
+  const entries = current.split(';').filter(Boolean);
+  const prepend: string[] = [];
+
+  const nodeDir = dirname(process.execPath);
+  if (nodeDir) prepend.push(nodeDir);
+
+  const appData = env.APPDATA ?? process.env.APPDATA;
+  if (appData) prepend.push(join(appData, 'npm'));
+
+  for (const dir of prepend.reverse()) {
+    if (!entries.some((entry) => entry.toLowerCase() === dir.toLowerCase())) {
+      entries.unshift(dir);
+    }
+  }
+  env[pathKey] = entries.join(';');
+  return env;
+}
+
 /**
  * Spawn a new ConPTY session via node-pty.
  * Spawns the command directly (no cmd.exe /c wrapper) to avoid double echo
@@ -149,11 +176,19 @@ export async function conptyNewSession(
     cleanCmd = cleanCmd.slice(cdMatch[0].length);
   }
 
-  // Spawn directly — no cmd.exe /c wrapper (causes double echo).
-  const { file, args } = splitCommand(cleanCmd);
+  let file: string;
+  let args: string[];
+  if (process.platform === 'win32' && needsWindowsShell(cleanCmd)) {
+    file = process.env.COMSPEC ?? 'cmd.exe';
+    args = ['/d', '/c', cleanCmd];
+  } else {
+    ({ file, args } = splitCommand(cleanCmd));
+  }
   const pty = spawn(file, args, {
     cwd,
-    env: { ...process.env, ...opts?.env } as Record<string, string>,
+    env: process.platform === 'win32'
+      ? buildWindowsEnv(opts?.env)
+      : ({ ...process.env, ...opts?.env } as Record<string, string>),
     cols,
     rows,
     useConpty: true,

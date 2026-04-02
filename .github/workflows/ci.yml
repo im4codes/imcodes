@@ -113,6 +113,20 @@ jobs:
         run: npx vitest run test/agent/wezterm.test.ts test/daemon/hook-send.test.ts test/daemon/env-injection.test.ts test/cli/send.test.ts test/util/windows-daemon.test.ts test/util/windows-upgrade-script.test.ts
         env:
           IMCODES_MUX: wezterm
+
+  windows-conpty-tests:
+    name: Unit Tests (Windows ConPTY)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build
+      - name: Run Windows ConPTY / startup regression tests
+        run: npx vitest run test/agent/conpty.test.ts test/agent/drivers/drivers.test.ts test/util/windows-daemon.test.ts test/util/windows-upgrade-script.test.ts
   # ── Web frontend tests ────────────────────────────────────────────────────
 
   web-tests-unit:

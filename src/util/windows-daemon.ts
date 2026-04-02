@@ -57,6 +57,23 @@ function tryStartVbsLauncher(): boolean {
   return true;
 }
 
+function tryStartStartupShortcut(): boolean {
+  const startupCmd = resolve(
+    homedir(),
+    'AppData',
+    'Roaming',
+    'Microsoft',
+    'Windows',
+    'Start Menu',
+    'Programs',
+    'Startup',
+    'imcodes-daemon.cmd',
+  );
+  if (!existsSync(startupCmd)) return false;
+  spawn('cmd', ['/c', startupCmd], { detached: true, stdio: 'ignore' }).unref();
+  return true;
+}
+
 /** Restart the Windows daemon by killing the current process and ensuring the
  * watchdog/launcher path is active. Returns true only after a live daemon PID
  * is observed (or immediately if we can prove one is already running). */
@@ -74,6 +91,8 @@ export function restartWindowsDaemon(currentPid?: number): boolean {
     // and will relaunch the daemon shortly.
     triggered = true;
   } else if (tryStartVbsLauncher()) {
+    triggered = true;
+  } else if (tryStartStartupShortcut()) {
     triggered = true;
   }
   if (!triggered) return false;

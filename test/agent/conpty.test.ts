@@ -150,6 +150,32 @@ describe('conpty backend', () => {
       expect(mockPty.onData).toHaveBeenCalledTimes(1);
       expect(mockPty.onExit).toHaveBeenCalledTimes(1);
     });
+
+    it('uses cmd.exe for compound Windows commands', async () => {
+      const origPlatform = process.platform;
+      const origComspec = process.env.COMSPEC;
+      const origAppData = process.env.APPDATA;
+      try {
+        Object.defineProperty(process, 'platform', { value: 'win32' });
+        process.env.COMSPEC = 'C:\\Windows\\System32\\cmd.exe';
+        process.env.APPDATA = 'C:\\Users\\tester\\AppData\\Roaming';
+
+        await conpty.conptyNewSession('win-shell', 'cd /d "C:\\repo" && claude --dangerously-skip-permissions -c || claude --dangerously-skip-permissions', {
+          cwd: 'C:\\repo',
+        });
+
+        expect(spawnMock).toHaveBeenCalledTimes(1);
+        const [file, args, options] = spawnMock.mock.calls[0] as [string, string[], { cwd: string; env: Record<string, string> }];
+        expect(file).toBe('C:\\Windows\\System32\\cmd.exe');
+        expect(args).toEqual(['/d', '/c', 'claude --dangerously-skip-permissions -c || claude --dangerously-skip-permissions']);
+        expect(options.cwd).toBe('C:\\repo');
+        expect(options.env.PATH).toMatch(/C:\\Users\\tester\\AppData\\Roaming[\\/]npm/);
+      } finally {
+        if (origComspec === undefined) delete process.env.COMSPEC; else process.env.COMSPEC = origComspec;
+        if (origAppData === undefined) delete process.env.APPDATA; else process.env.APPDATA = origAppData;
+        Object.defineProperty(process, 'platform', { value: origPlatform });
+      }
+    });
   });
 
   describe('conptySessionExists / conptyListSessions', () => {

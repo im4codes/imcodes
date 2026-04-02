@@ -143,6 +143,17 @@ describe('ShellDriver', () => {
     expect(cmd).toContain('/bin/bash');
   });
 
+  it('quotes Windows shellBin paths with spaces', () => {
+    const origPlatform = process.platform;
+    try {
+      Object.defineProperty(process, 'platform', { value: 'win32' });
+      const cmd = driver.buildLaunchCommand('deck_sub_abc', { shellBin: 'C:\\Program Files\\Git\\bin\\bash.exe' } as never);
+      expect(cmd).toContain('"C:\\Program Files\\Git\\bin\\bash.exe"');
+    } finally {
+      Object.defineProperty(process, 'platform', { value: origPlatform });
+    }
+  });
+
   it('buildResumeCommand returns same as buildLaunchCommand', () => {
     expect(driver.buildResumeCommand('x')).toBe(driver.buildLaunchCommand('x'));
   });

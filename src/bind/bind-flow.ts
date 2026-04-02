@@ -141,9 +141,24 @@ function restartDaemon(): void {
 
 const TASK_NAME = 'imcodes-daemon';
 
+async function writeWindowsWatchdogFiles(imcodesScript: string, nodeExe: string): Promise<void> {
+  const batDir = join(homedir(), '.imcodes');
+  await mkdir(batDir, { recursive: true });
+
+  const watchdogPath = join(batDir, 'daemon-watchdog.cmd');
+  const vbsPath = join(batDir, 'daemon-launcher.vbs');
+
+  const watchdog = `@echo off\r\nchcp 65001 >nul 2>&1\r\n:loop\r\n"${nodeExe}" "${imcodesScript}" start --foreground >nul 2>&1\r\ntimeout /t 5 /nobreak >nul\r\ngoto loop\r\n`;
+  await writeFile(watchdogPath, watchdog, 'utf8');
+
+  const vbs = `Set WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${watchdogPath}""", 0, False\r\n`;
+  await writeFile(vbsPath, vbs, 'utf8');
+}
+
 async function installWindowsStartup(): Promise<void> {
   const nodeExe = process.execPath;
   const imcodesScript = join(__dirname, '..', 'index.js');
+  await writeWindowsWatchdogFiles(imcodesScript, nodeExe);
 
   // Remove legacy Startup folder CMD/VBS if present
   const startupDir = join(homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup');
@@ -167,28 +182,15 @@ async function installWindowsStartup(): Promise<void> {
     console.warn('Task Scheduler registration failed (may need admin). Falling back to Startup folder.');
     await mkdir(startupDir, { recursive: true });
     const cmdPath = join(startupDir, 'imcodes-daemon.cmd');
-    const cmd = `@echo off\r\nchcp 65001 >nul 2>&1\r\nstart /min "" "${nodeExe}" "${imcodesScript}" start --foreground\r\n`;
+    const vbsPath = join(homedir(), '.imcodes', 'daemon-launcher.vbs');
+    const cmd = `@echo off\r\nchcp 65001 >nul 2>&1\r\nstart "" /min wscript "${vbsPath}"\r\n`;
     await writeFile(cmdPath, cmd, 'utf8');
     return;
   }
 
-  // Configure restart on failure via XML task update
-  // schtasks /Create doesn't support restart-on-failure directly,
-  // but the task will re-run on next logon. For immediate restart,
-  // we add a watchdog wrapper.
-  const batDir = join(homedir(), '.imcodes');
-  await mkdir(batDir, { recursive: true });
-  const watchdogPath = join(batDir, 'daemon-watchdog.cmd');
-  // VBS launcher to run watchdog CMD hidden (no visible window)
-  const vbsPath = join(batDir, 'daemon-launcher.vbs');
-  const vbs = `Set WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${watchdogPath}""", 0, False\r\n`;
-  await writeFile(vbsPath, vbs, 'utf8');
-
-  const watchdog = `@echo off\r\nchcp 65001 >nul 2>&1\r\n:loop\r\n"${nodeExe}" "${imcodesScript}" start --foreground >nul 2>&1\r\ntimeout /t 5 /nobreak >nul\r\ngoto loop\r\n`;
-  await writeFile(watchdogPath, watchdog, 'utf8');
-
   // Update task to use VBS launcher (runs watchdog CMD hidden — no visible window)
   try {
+    const vbsPath = join(homedir(), '.imcodes', 'daemon-launcher.vbs');
     execSync([
       'schtasks', '/Change',
       '/TN', TASK_NAME,

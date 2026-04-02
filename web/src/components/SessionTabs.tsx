@@ -47,6 +47,7 @@ function readLegacyPinned(): string[] {
 export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, onAlertDismiss, onSelect, onNewSession, onStopProject, onRestartProject, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded }: Props) {
   const [ctx, setCtx] = useState<CtxMenu | null>(null);
   const [stopConfirmProject, setStopConfirmProject] = useState<string | null>(null);
+  const [stopConfirmLevel, setStopConfirmLevel] = useState(0);
   const [renaming, setRenaming] = useState<string | null>(null);
   const [renameVal, setRenameVal] = useState('');
   const menuRef = useRef<HTMLDivElement>(null);
@@ -292,11 +293,11 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
           <button class="menu-item" onClick={() => { onRestartProject(ctx.session.project, true); setCtx(null); }}>＋ New</button>
           <button class="menu-item" onClick={() => startRename(ctx.session)}>✎ Rename</button>
           <div class="menu-divider" />
-          <button class="menu-item menu-item-danger" onClick={() => { setStopConfirmProject(ctx.session.project); setCtx(null); }}>✕ Stop</button>
+          <button class="menu-item menu-item-danger" onClick={() => { setStopConfirmProject(ctx.session.project); setStopConfirmLevel(0); setCtx(null); }}>✕ Stop</button>
         </div>
       )}
       {stopConfirmProject && (
-        <div class="ask-dialog-overlay" onClick={() => setStopConfirmProject(null)}>
+        <div class="ask-dialog-overlay" onClick={() => { setStopConfirmProject(null); setStopConfirmLevel(0); }}>
           <div class="ask-dialog stop-session-dialog" onClick={(e) => e.stopPropagation()}>
             <div class="stop-session-dialog-icon">⚠</div>
             <div class="stop-session-dialog-title">Stop main session?</div>
@@ -304,8 +305,23 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
               <strong>{stopConfirmProject}</strong> is a main session. Stopping it will terminate all its tmux processes. This cannot be undone.
             </div>
             <div class="ask-actions">
-              <button class="ask-btn-cancel" onClick={() => setStopConfirmProject(null)}>Cancel</button>
-              <button class="ask-btn-submit stop-session-confirm-btn" onClick={() => { onStopProject(stopConfirmProject); setStopConfirmProject(null); }}>Stop session</button>
+              <button class="ask-btn-cancel" onClick={() => { setStopConfirmProject(null); setStopConfirmLevel(0); }}>Cancel</button>
+              <button
+                class={`ask-btn-submit stop-session-confirm-btn${stopConfirmLevel >= 1 ? ' menu-item-danger' : ''}`}
+                onClick={() => {
+                  if (stopConfirmLevel < 2) {
+                    setStopConfirmLevel((n) => n + 1);
+                    return;
+                  }
+                  onStopProject(stopConfirmProject);
+                  setStopConfirmProject(null);
+                  setStopConfirmLevel(0);
+                }}
+              >
+                {stopConfirmLevel >= 2 ? `⚠ REALLY stop ${stopConfirmProject}?`
+                  : stopConfirmLevel === 1 ? 'Confirm stop?'
+                  : 'Stop session'}
+              </button>
             </div>
           </div>
         </div>
