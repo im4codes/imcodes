@@ -2482,7 +2482,7 @@ export function App() {
       )}
 
       {showDiscussionsPage && selectedServerId && (
-        <FloatingPanel id="discussions" title="Discussions" onClose={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }} defaultW={800} defaultH={600}>
+        <FloatingPanel id="discussions" title={trans('p2p.discussions.title')} onClose={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }} defaultW={800} defaultH={600}>
           <DiscussionsPage
             ws={wsRef.current}
             onBack={() => { setShowDiscussionsPage(false); setDiscussionInitialId(null); }}

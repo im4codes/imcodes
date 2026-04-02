@@ -285,6 +285,7 @@
       "setup": "準備中"
     },
     "discussions": {
+      "title": "討論",
       "untitled": "討論",
       "empty": "還沒有 P2P 討論。使用 @@all(discuss) 或 @agent 發起一個。",
       "select": "選擇一個討論查看",

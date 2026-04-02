@@ -285,6 +285,7 @@
       "setup": "Setup"
     },
     "discussions": {
+      "title": "Discussions",
       "untitled": "Discussion",
       "empty": "No P2P discussions yet. Use @@all(discuss) or @agent to start one.",
       "select": "Select a discussion to view",

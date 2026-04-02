@@ -285,6 +285,7 @@
       "setup": "준비 중"
     },
     "discussions": {
+      "title": "토론",
       "untitled": "토론",
       "empty": "아직 P2P 토론이 없습니다. @@all(discuss) 또는 @agent로 시작하세요.",
       "select": "볼 토론을 선택하세요",

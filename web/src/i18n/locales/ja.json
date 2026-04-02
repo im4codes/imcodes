@@ -285,6 +285,7 @@
       "setup": "準備中"
     },
     "discussions": {
+      "title": "ディスカッション",
       "untitled": "ディスカッション",
       "empty": "まだ P2P ディスカッションはありません。@@all(discuss) または @agent で開始してください。",
       "select": "表示するディスカッションを選択",

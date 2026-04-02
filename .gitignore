@@ -44,6 +44,7 @@ docs/*.local.md
 # Agent memory and skills (private)
 .claude/
 .codex/
+.gemini/
 
 # System
 .DS_Store
