@@ -418,8 +418,16 @@ export function useTimeline(
           return;
         }
 
-        if (msg.requestId && msg.requestId !== historyRequestIdRef.current) return;
-        historyRequestIdRef.current = null;
+        // Accept any same-session history batch for forward sync. Mobile
+        // reconnect/background churn can legitimately create overlapping history
+        // requests; dropping the earlier response can leave the UI stuck on old
+        // cache if the newest request never completes. Since history merges by
+        // eventId and ts, older batches cannot delete newer events.
+        if (!olderRequestIdRef.current || msg.requestId !== olderRequestIdRef.current) {
+          if (!historyRequestIdRef.current || msg.requestId === historyRequestIdRef.current) {
+            historyRequestIdRef.current = null;
+          }
+        }
         historyLoadedRef.current = cacheKey;
 
         epochRef.current = msg.epoch;
