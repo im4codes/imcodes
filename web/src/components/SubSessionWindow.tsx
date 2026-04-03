@@ -43,6 +43,8 @@ interface Props {
   serverId?: string;
   pendingPrefillText?: string | null;
   onPendingPrefillApplied?: () => void;
+  /** Whether this sub-session is participating in an active P2P discussion. */
+  inP2p?: boolean;
 }
 
 type ViewMode = 'terminal' | 'chat';
@@ -70,7 +72,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, zIndex, onFocus, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied,
+  sub, ws, connected, active, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, zIndex, onFocus, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, inP2p,
 }: Props) {
   const { t } = useTranslation();
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -336,6 +338,7 @@ export function SubSessionWindow({
       >
         <span class="subsession-drag-icon">⠿</span>
         <span class="subsession-title">{typeLabel}</span>
+        {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
         {sub.ccPresetId && <span style={{ fontSize: 11, color: '#f59e0b' }} title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
           {!isShell && !isTransport && <button class="subsession-mode-btn" onClick={() => { const next = viewMode === 'chat' ? 'terminal' : 'chat'; setViewMode(next); if (next === 'chat') requestAnimationFrame(() => chatScrollRef.current?.()); }} title={viewMode === 'chat' ? 'Switch to terminal' : 'Switch to chat'}>{viewMode === 'chat' ? '⌨' : '💬'}</button>}

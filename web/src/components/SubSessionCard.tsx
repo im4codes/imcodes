@@ -53,6 +53,8 @@ interface Props {
   sessions?: import('../types.js').SessionInfo[];
   subSessions?: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
   serverId?: string;
+  /** Whether this sub-session is participating in an active P2P discussion. */
+  inP2p?: boolean;
 }
 
 function loadCardW(id: string, fallback: number): number {
@@ -63,7 +65,7 @@ function loadCardW(id: string, fallback: number): number {
   return fallback;
 }
 
-export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId }: Props) {
+export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, inP2p }: Props) {
   const { t } = useTranslation();
   const isShell = sub.type === 'shell' || sub.type === 'script';
   const { events, refreshing } = isShell ? { events: [], refreshing: false } : useTimeline(sub.sessionName, ws, serverId);
@@ -181,6 +183,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
       <div class="subcard-header">
         <span class="subcard-icon">{icon}</span>
         <span class="subcard-label">{label}</span>
+        {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
         {badge && <span class="subcard-badge">{badge}</span>}
         {busy && <span class="subcard-running">●</span>}
         {modelLabel && <span class="subcard-model">{modelLabel}</span>}

@@ -53,6 +53,8 @@ interface Props {
   activeSession: string | null;
   /** Map<sessionName, unreadCount> — supplied by useUnreadCounts */
   unreadCounts: Map<string, number>;
+  /** Set of sub-session labels participating in active P2P discussions. */
+  p2pSessionLabels?: Set<string>;
   onSelectSession: (sessionName: string) => void;
   onSelectSubSession: (sub: SubSession) => void;
   /** Open new session dialog. */
@@ -103,12 +105,14 @@ interface NodeProps {
   isSub?: boolean;
   unread: number;
   idleFlash: boolean;
+  inP2p?: boolean;
   onClick: () => void;
 }
 
 function SessionNode({
-  label, agentType, state, isActive, isTransport, isSub, unread, idleFlash, onClick,
+  label, agentType, state, isActive, isTransport, isSub, unread, idleFlash, inP2p, onClick,
 }: NodeProps) {
+  const { t } = useTranslation();
   const badge = isSub
     ? (SUB_TYPE_BADGE[agentType] ?? null)
     : (AGENT_BADGE[agentType] ?? null);
@@ -141,6 +145,9 @@ function SessionNode({
 
       {/* Label */}
       <span class="session-tree-label">{label}</span>
+
+      {/* P2P badge */}
+      {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
 
       {/* Spacer */}
       <span class="session-tree-spacer" />
@@ -209,6 +216,7 @@ function SessionTreeInner({
   subSessions,
   activeSession,
   unreadCounts,
+  p2pSessionLabels,
   onSelectSession,
   onSelectSubSession,
   onNewSession,
@@ -314,6 +322,7 @@ function SessionTreeInner({
                 isSub={false}
                 unread={unread}
                 idleFlash={idleFlash}
+                inP2p={!!(session.label && p2pSessionLabels?.has(session.label))}
                 onClick={() => onSelectSession(session.name)}
               />
               {onNewSubSession && (
@@ -341,6 +350,7 @@ function SessionTreeInner({
                   isSub={true}
                   unread={subUnread}
                   idleFlash={subIdleFlash}
+                  inP2p={!!(sub.label && p2pSessionLabels?.has(sub.label))}
                   onClick={() => onSelectSubSession(sub)}
                 />
               );
