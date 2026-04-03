@@ -1,8 +1,28 @@
 apply plugin: 'com.android.application'
 
+def keystoreFilePath = System.getenv('KEYSTORE_FILE')
+def keystorePassword = System.getenv('KEYSTORE_PASSWORD')
+def keyAlias = System.getenv('KEY_ALIAS')
+def keyPassword = System.getenv('KEY_PASSWORD')
+def releaseSigningAvailable = keystoreFilePath && keystorePassword && keyAlias && keyPassword && file(keystoreFilePath).exists()
+
+if (!releaseSigningAvailable) {
+    logger.lifecycle("Release signing configuration not found. assembleRelease will build without a production signing key until KEYSTORE_FILE, KEYSTORE_PASSWORD, KEY_ALIAS, and KEY_PASSWORD are provided.")
+}
+
 android {
     namespace = "com.im.codes"
     compileSdk = rootProject.ext.compileSdkVersion
+    signingConfigs {
+        if (releaseSigningAvailable) {
+            release {
+                storeFile file(keystoreFilePath)
+                storePassword keystorePassword
+                this.keyAlias = keyAlias
+                keyPassword keyPassword
+            }
+        }
+    }
     defaultConfig {
         applicationId "com.im.codes"
         minSdkVersion rootProject.ext.minSdkVersion
@@ -18,8 +38,12 @@ android {
     }
     buildTypes {
         release {
-            minifyEnabled false
+            minifyEnabled true
+            shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            if (releaseSigningAvailable) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 }

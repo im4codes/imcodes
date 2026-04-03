@@ -1,0 +1,84 @@
+name: Android CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev]
+
+env:
+  NODE_VERSION_PRIMARY: '22'
+  KEYSTORE_FILE: ${{ github.workspace }}/web/android/app/release.keystore
+  KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+  KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+  KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+  GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
+  ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+
+jobs:
+  android-release:
+    name: Android Release Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+
+      - run: npm ci
+
+      - run: npm ci
+        working-directory: web
+
+      - name: Restore optional Android secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${GOOGLE_SERVICES_JSON_BASE64:-}" ]; then
+            printf '%s' "$GOOGLE_SERVICES_JSON_BASE64" | base64 --decode > web/android/app/google-services.json
+            echo "Decoded google-services.json from secret."
+          else
+            echo "GOOGLE_SERVICES_JSON_BASE64 not set; Firebase push notifications will remain disabled in this build."
+          fi
+
+          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > web/android/app/release.keystore
+            echo "Decoded Android keystore from secret."
+          else
+            echo "ANDROID_KEYSTORE_BASE64 not set; assembleRelease will build without production signing."
+          fi
+
+      - name: Build web assets
+        working-directory: web
+        run: npm run build
+
+      - name: Sync Capacitor Android project
+        working-directory: web
+        run: npx cap sync android
+
+      - name: Build Android release APK
+        working-directory: web/android
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Upload release APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: imcodes-android-release-apk
+          path: web/android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
