@@ -511,7 +511,9 @@ passkeyRoutes.post('/login/complete', async (c) => {
     );
 
     const nonce = await issueAuthNonce(c.env.DB, { apiKey: rawKey, userId: user.id, keyId });
-    return c.json({ ok: true, userId: user.id, nonce });
+    // Include legacy apiKey/keyId for backward compatibility with older iOS app versions
+    // that don't support nonce exchange. New clients should prefer the nonce path.
+    return c.json({ ok: true, userId: user.id, nonce, apiKey: rawKey, keyId });
   }
 
   const accessToken = signJwt({ sub: user.id }, c.env.JWT_SIGNING_KEY, 4 * 3600);
