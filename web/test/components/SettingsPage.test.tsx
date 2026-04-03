@@ -89,15 +89,15 @@ describe('SettingsPage', () => {
     expect(screen.getByText('settings.set_password_login')).toBeDefined();
 
     fireEvent.input(screen.getByPlaceholderText('settings.username_placeholder'), { target: { value: 'Alice.Name' } });
-    fireEvent.input(screen.getByPlaceholderText('settings.new_password'), { target: { value: 'strong-password-123' } });
-    fireEvent.input(screen.getByPlaceholderText('settings.confirm_password'), { target: { value: 'strong-password-123' } });
+    fireEvent.input(screen.getByPlaceholderText('settings.new_password'), { target: { value: 'Strong-Pass-123' } });
+    fireEvent.input(screen.getByPlaceholderText('settings.confirm_password'), { target: { value: 'Strong-Pass-123' } });
 
     fireEvent.click(screen.getByRole('button', { name: 'settings.set_password_btn' }));
 
     await waitFor(() => {
       expect(passkeyVerifyBeginMock).toHaveBeenCalledOnce();
       expect(startAuthenticationMock).toHaveBeenCalledOnce();
-      expect(passwordSetupWithPasskeyMock).toHaveBeenCalledWith('alice.name', 'strong-password-123', 'cid-1', { id: 'cred-1' });
+      expect(passwordSetupWithPasskeyMock).toHaveBeenCalledWith('alice.name', 'Strong-Pass-123', 'cid-1', { id: 'cred-1' });
       expect(onUserAuthUpdated).toHaveBeenCalledWith({ username: 'alice', hasPassword: true });
     });
   });
@@ -138,8 +138,8 @@ describe('SettingsPage', () => {
     );
 
     fireEvent.input(screen.getByPlaceholderText('settings.username_placeholder'), { target: { value: 'Alice.Name' } });
-    fireEvent.input(screen.getByPlaceholderText('settings.new_password'), { target: { value: 'strong-password-123' } });
-    fireEvent.input(screen.getByPlaceholderText('settings.confirm_password'), { target: { value: 'strong-password-123' } });
+    fireEvent.input(screen.getByPlaceholderText('settings.new_password'), { target: { value: 'Strong-Pass-123' } });
+    fireEvent.input(screen.getByPlaceholderText('settings.confirm_password'), { target: { value: 'Strong-Pass-123' } });
     fireEvent.click(screen.getByRole('button', { name: 'settings.set_password_btn' }));
 
     expect(await screen.findByText('settings.username_taken')).toBeDefined();
@@ -162,8 +162,8 @@ describe('SettingsPage', () => {
     );
 
     fireEvent.input(screen.getByPlaceholderText('settings.username_placeholder'), { target: { value: 'Alice.Name' } });
-    fireEvent.input(screen.getByPlaceholderText('settings.new_password'), { target: { value: 'strong-password-123' } });
-    fireEvent.input(screen.getByPlaceholderText('settings.confirm_password'), { target: { value: 'strong-password-123' } });
+    fireEvent.input(screen.getByPlaceholderText('settings.new_password'), { target: { value: 'Strong-Pass-123' } });
+    fireEvent.input(screen.getByPlaceholderText('settings.confirm_password'), { target: { value: 'Strong-Pass-123' } });
     fireEvent.click(screen.getByRole('button', { name: 'settings.set_password_btn' }));
 
     expect(await screen.findByText('settings.password_setup_error')).toBeDefined();
@@ -188,8 +188,8 @@ describe('SettingsPage', () => {
     );
 
     fireEvent.input(screen.getByPlaceholderText('settings.username_placeholder'), { target: { value: 'Alice.Name' } });
-    fireEvent.input(screen.getByPlaceholderText('settings.new_password'), { target: { value: 'strong-password-123' } });
-    fireEvent.input(screen.getByPlaceholderText('settings.confirm_password'), { target: { value: 'strong-password-123' } });
+    fireEvent.input(screen.getByPlaceholderText('settings.new_password'), { target: { value: 'Strong-Pass-123' } });
+    fireEvent.input(screen.getByPlaceholderText('settings.confirm_password'), { target: { value: 'Strong-Pass-123' } });
     fireEvent.click(screen.getByRole('button', { name: 'settings.set_password_btn' }));
 
     await waitFor(() => {
