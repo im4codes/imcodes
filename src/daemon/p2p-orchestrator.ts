@@ -367,7 +367,7 @@ export async function startP2pRun(
     status: 'queued',
     contextFilePath,
     userText,
-    timeoutMs: hopTimeoutMs ?? modeConfig?.defaultTimeoutMs ?? 300_000,
+    timeoutMs: Math.min(hopTimeoutMs ?? modeConfig?.defaultTimeoutMs ?? 300_000, 600_000),
     resultSummary: null,
     completedHops: [],
     skippedHops: [],

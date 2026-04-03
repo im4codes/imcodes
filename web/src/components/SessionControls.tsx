@@ -559,7 +559,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           extra.p2pSessionConfig = cfg.sessions;
           extra.p2pRounds = override?.rounds ?? cfg.rounds ?? 1;
           if (cfg.extraPrompt) extra.p2pExtraPrompt = cfg.extraPrompt;
-          if (cfg.hopTimeoutMinutes) extra.p2pHopTimeoutMs = cfg.hopTimeoutMinutes * 60_000;
+          if (cfg.hopTimeoutMinutes) extra.p2pHopTimeoutMs = Math.min(cfg.hopTimeoutMinutes * 60_000, 600_000);
         }
         // For non-config mode overrides (single or combo), send as p2pMode so the daemon uses it
         if (override?.modeOverride && override.modeOverride !== 'config') {
@@ -583,7 +583,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           extra.p2pSessionConfig = p2pSavedConfig.sessions;
           extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
           if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
-          if (p2pSavedConfig.hopTimeoutMinutes) extra.p2pHopTimeoutMs = p2pSavedConfig.hopTimeoutMinutes * 60_000;
+          if (p2pSavedConfig.hopTimeoutMinutes) extra.p2pHopTimeoutMs = Math.min(p2pSavedConfig.hopTimeoutMinutes * 60_000, 600_000);
         }
       }
     }
