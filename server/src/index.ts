@@ -134,7 +134,7 @@ export function buildApp(env: Env) {
       // Non-whitelisted origins get no Access-Control-Allow-Origin header
       return all.includes(origin) ? origin : '';
     },
-    allowHeaders: ['Authorization', 'Content-Type', 'X-CSRF-Token'],
+    allowHeaders: ['Authorization', 'Content-Type', 'X-CSRF-Token', 'X-Platform', 'X-App-Version', 'X-Bundle-Version'],
     allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     credentials: true,
   });
