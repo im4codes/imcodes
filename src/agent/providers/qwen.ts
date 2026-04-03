@@ -298,11 +298,6 @@ export class QwenProvider implements TransportProvider {
     if (state.model) {
       args.push('--model', state.model);
     }
-    // After cancel, qwenConversationId is regenerated so we start a fresh conversation
-    // instead of resuming the one stuck in a tool-call loop.
-    if (!state.started) {
-      state.qwenConversationId = randomUUID();
-    }
     if (state.started) {
       args.push('--resume', state.qwenConversationId);
     } else {
@@ -552,18 +547,20 @@ export class QwenProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state?.child || state.child.killed) return;
     state.cancelled = true;
-    state.child.kill('SIGTERM');
+    const child = state.child;
+    child.kill('SIGTERM');
     // SIGKILL escalation — Qwen CLI may have child processes (web_search, etc.) that ignore SIGTERM
     const killTimer = setTimeout(() => {
-      if (state.child && !state.child.killed) {
+      if (!child.killed) {
         logger.warn({ provider: this.id, sessionId }, 'Qwen process did not exit after SIGTERM — sending SIGKILL');
-        state.child.kill('SIGKILL');
+        child.kill('SIGKILL');
       }
     }, 2000);
-    state.child.once('close', () => clearTimeout(killTimer));
-    // Reset conversation — next send() will generate a fresh qwenConversationId
-    // so we don't --resume the conversation stuck in a tool-call loop.
+    child.once('close', () => clearTimeout(killTimer));
+    // Reset conversation so next send uses --session-id with a fresh ID
+    // instead of --resume on the conversation stuck in a tool-call loop.
     state.started = false;
+    state.qwenConversationId = randomUUID();
   }
 
   private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {

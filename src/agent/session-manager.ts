@@ -790,9 +790,10 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         : s.qwenModel;
       const runtime = new TransportSessionRuntime(provider, s.name);
       // After cancel, qwenFreshOnResume is set — don't resume the stuck conversation.
-      const freshAfterCancel = s.qwenFreshOnResume && s.providerId === 'qwen';
+      const freshAfterCancel = !!(s.qwenFreshOnResume && s.providerId === 'qwen');
+      const effectiveSessionKey = freshAfterCancel ? randomUUID() : s.providerSessionId;
       await runtime.initialize({
-        sessionKey: freshAfterCancel ? s.providerSessionId : s.providerSessionId,
+        sessionKey: effectiveSessionKey,
         bindExistingKey: freshAfterCancel ? undefined : s.providerSessionId,
         skipCreate: !freshAfterCancel,
         cwd: s.projectDir,
@@ -803,12 +804,13 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       if (s.description) runtime.setDescription(s.description);
       if (effectiveQwenModel) runtime.setAgentId(effectiveQwenModel);
       transportRuntimes.set(s.name, runtime);
-      registerProviderRoute(s.providerSessionId, s.name);
+      const actualProviderSid = runtime.providerSessionId ?? effectiveSessionKey;
+      registerProviderRoute(actualProviderSid, s.name);
       upsertSession({
         ...s,
         state: 'running',
         updatedAt: Date.now(),
-        ...(freshAfterCancel ? { qwenFreshOnResume: undefined } : {}),
+        ...(freshAfterCancel ? { providerSessionId: actualProviderSid, qwenFreshOnResume: undefined } : {}),
         ...(effectiveQwenModel ? { qwenModel: effectiveQwenModel } : {}),
         ...(qwenRuntime?.authType ? { qwenAuthType: qwenRuntime.authType } : {}),
         ...(qwenRuntime?.authLimit ? { qwenAuthLimit: qwenRuntime.authLimit } : {}),
