@@ -152,13 +152,15 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
           </div>
           {!progressHidden && (
             <div class="discussions-progress-strip-scroll">
-              {activeLive.map((d) => (
-                <P2pProgressCard
-                  key={d.id}
-                  discussion={d}
-                  onStopDiscussion={onStopDiscussion}
-                />
-              ))}
+              <div class="discussions-progress-strip-inner">
+                {activeLive.map((d) => (
+                  <P2pProgressCard
+                    key={d.id}
+                    discussion={d}
+                    onStopDiscussion={onStopDiscussion}
+                  />
+                ))}
+              </div>
             </div>
           )}
         </div>

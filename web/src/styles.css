@@ -837,8 +837,13 @@ body {
   box-shadow: inset 0 1px 0 rgba(148, 163, 184, 0.06), 0 10px 24px rgba(2, 6, 23, 0.28);
 }
 /* In the horizontal strip: stretch to fill, max 3 visible, scroll beyond */
-.discussions-progress-strip-scroll .discussions-progress-card {
-  flex: 1 1 0;
+.discussions-progress-strip-inner {
+  display: flex;
+  gap: 10px;
+  min-width: 100%;
+}
+.discussions-progress-strip-inner .discussions-progress-card {
+  flex: 1 1 calc(33.333% - 7px);
   min-width: calc(33.333% - 7px);
 }
 .discussions-progress-card::before {
