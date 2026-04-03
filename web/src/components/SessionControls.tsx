@@ -239,6 +239,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [p2pMode, setP2pMode] = useState<P2pMode>('solo');
   const [p2pExcludeSameType, setP2pExcludeSameType] = useState(true);
   const [p2pOpen, setP2pOpen] = useState(false);
+  const [customCombos, setCustomCombos] = useState<string[]>([]);
   const [p2pConfigOpen, setP2pConfigOpen] = useState(false);
   const [p2pSavedConfig, setP2pSavedConfig] = useState<P2pSavedConfig | null>(null);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
@@ -375,6 +376,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [activeSession?.qwenAuthType, activeSession?.qwenAvailableModels, detectedModel, qwenModel, qwenTier]);
 
   // P2P config loading moved after rootSession declaration below
+
+  // Load custom combos from server
+  useEffect(() => {
+    void getUserPref('p2p_custom_combos').then((raw) => {
+      if (raw && typeof raw === 'string') {
+        try { setCustomCombos(JSON.parse(raw)); } catch { /* ignore */ }
+      }
+    });
+  }, []);
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
@@ -1084,6 +1094,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   style={{ color: getP2pModeColor(c.key), fontSize: 12 }}
                 >
                   {p2pMode === c.key ? '● ' : '○ '}{getP2pModeLabel(c.key, t)}
+                </button>
+              ))}
+              {customCombos.filter((k) => !COMBO_PRESETS.some((p) => p.key === k)).map((key) => (
+                <button
+                  key={key}
+                  class={`menu-item ${p2pMode === key ? 'menu-item-active' : ''}`}
+                  onClick={() => { setP2pMode(key); setP2pOpen(false); }}
+                  style={{ color: getP2pModeColor(key), fontSize: 12 }}
+                >
+                  {p2pMode === key ? '● ' : '○ '}{getP2pModeLabel(key, t)}
                 </button>
               ))}
               {/* Config mode */}
