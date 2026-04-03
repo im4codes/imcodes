@@ -216,6 +216,8 @@
     "password_placeholder": "Contraseña",
     "signin": "Iniciar sesión",
     "invalid_credentials": "Nombre de usuario o contraseña incorrectos",
+    "account_pending": "Tu cuenta está pendiente de aprobación del administrador. Por favor, contacta al administrador.",
+    "account_disabled": "Tu cuenta ha sido deshabilitada. Por favor, contacta al administrador.",
     "must_change_password": "Debes cambiar tu contraseña antes de continuar",
     "new_password_placeholder": "Nueva contraseña",
     "confirm_password_placeholder": "Confirmar nueva contraseña",

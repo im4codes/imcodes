@@ -216,6 +216,8 @@
     "password_placeholder": "密碼",
     "signin": "登入",
     "invalid_credentials": "使用者名稱或密碼錯誤",
+    "account_pending": "您的帳號正在等待管理員審核，請聯繫管理員。",
+    "account_disabled": "您的帳號已被停用，請聯繫管理員。",
     "must_change_password": "請先變更密碼才能繼續",
     "new_password_placeholder": "新密碼",
     "confirm_password_placeholder": "確認新密碼",
