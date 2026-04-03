@@ -257,7 +257,7 @@ export function P2pChainStatus({ run, onCancel }: P2pChainStatusProps) {
               style={{ ...cancelBtnStyle, background: 'rgba(239, 68, 68, 0.3)', borderColor: '#ef4444' }}
               onClick={() => { onCancel(run.id); setConfirming(false); }}
             >
-              {t('common.confirm', 'Confirm')}
+              {t('p2p.confirm_cancel')}
             </button>
           ) : (
             <button

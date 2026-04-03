@@ -364,6 +364,7 @@
     "cross_session": "包含其他项目的会话",
     "settings_save": "保存",
     "settings_close": "关闭",
+    "confirm_cancel": "确定取消?",
     "settings_enabled": "参与",
     "settings_mode": "模式",
     "settings_skip": "跳过",
