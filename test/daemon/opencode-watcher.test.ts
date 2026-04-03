@@ -58,7 +58,7 @@ describe('opencode-watcher', () => {
     expect(mocks.emit).not.toHaveBeenCalled();
 
     mocks.readOpenCodeSessionMessagesSince.mockResolvedValueOnce([
-      { info: { id: 'm2', role: 'assistant', time: { created: 200 } }, parts: [{ id: 'p1', type: 'text', text: 'hi' }] },
+      { info: { id: 'm2', role: 'assistant', time: { created: 200 } }, parts: [{ id: 'p1', type: 'text', text: 'hi' }, { id: 'p2', type: 'step-finish' }] },
     ]);
     mocks.buildTimelineEventsFromOpenCodeExport.mockReturnValueOnce([
       { type: 'assistant.text', payload: { text: 'hi', streaming: false }, source: 'daemon', confidence: 'high', eventId: 'evt-1', ts: 200 },
@@ -79,7 +79,7 @@ describe('opencode-watcher', () => {
   it('bootstraps missing assistant history from session creation time and skips duplicate user message', async () => {
     mocks.getSession.mockReturnValue({ name: 'deck_sub_oc', projectDir: '/proj', opencodeSessionId: 'sid-1', createdAt: 500 });
     mocks.readOpenCodeSessionMessagesSince.mockResolvedValueOnce([
-      { info: { id: 'm2', role: 'assistant', time: { created: 700 } }, parts: [{ id: 'p1', type: 'text', text: '你好！' }] },
+      { info: { id: 'm2', role: 'assistant', time: { created: 700 } }, parts: [{ id: 'p1', type: 'text', text: '你好！' }, { id: 'p2', type: 'step-finish' }] },
     ]);
     mocks.buildTimelineEventsFromOpenCodeExport.mockReturnValueOnce([
       { type: 'user.message', payload: { text: '你好' }, source: 'daemon', confidence: 'high', eventId: 'evt-u', ts: 600 },
@@ -106,7 +106,7 @@ describe('opencode-watcher', () => {
       { type: 'session.state', ts: 950 },
     ]);
     mocks.readOpenCodeSessionMessagesSince.mockResolvedValueOnce([
-      { info: { id: 'm2', role: 'assistant', time: { created: 700 } }, parts: [{ id: 'p1', type: 'text', text: '你好！' }] },
+      { info: { id: 'm2', role: 'assistant', time: { created: 700 } }, parts: [{ id: 'p1', type: 'text', text: '你好！' }, { id: 'p2', type: 'step-finish' }] },
     ]);
     mocks.buildTimelineEventsFromOpenCodeExport.mockReturnValueOnce([
       { type: 'user.message', payload: { text: '你好' }, source: 'daemon', confidence: 'high', eventId: 'evt-u', ts: 600 },
@@ -133,7 +133,7 @@ describe('opencode-watcher', () => {
     ]);
     mocks.discoverLatestOpenCodeSessionId.mockResolvedValueOnce('sid-new');
     mocks.readOpenCodeSessionMessagesSince.mockResolvedValueOnce([
-      { info: { id: 'm2', role: 'assistant', time: { created: 1100 } }, parts: [{ id: 'p1', type: 'text', text: 'hi' }] },
+      { info: { id: 'm2', role: 'assistant', time: { created: 1100 } }, parts: [{ id: 'p1', type: 'text', text: 'hi' }, { id: 'p2', type: 'step-finish' }] },
     ]);
     mocks.buildTimelineEventsFromOpenCodeExport.mockReturnValueOnce([
       { type: 'user.message', payload: { text: 'hello' }, source: 'daemon', confidence: 'high', eventId: 'evt-u', ts: 1000 },
@@ -166,7 +166,7 @@ describe('opencode-watcher', () => {
     ]);
     mocks.readOpenCodeSessionMessagesSince.mockResolvedValueOnce([
       { info: { id: 'm3', role: 'user', time: { created: 1010 } }, parts: [] },
-      { info: { id: 'm4', role: 'assistant', time: { created: 1020 } }, parts: [{ id: 'p1', type: 'text', text: 'reply' }] },
+      { info: { id: 'm4', role: 'assistant', time: { created: 1020 } }, parts: [{ id: 'p1', type: 'text', text: 'reply' }, { id: 'p2', type: 'step-finish' }] },
     ]);
     mocks.buildTimelineEventsFromOpenCodeExport.mockReturnValueOnce([
       { type: 'user.message', payload: { text: 'hi' }, source: 'daemon', confidence: 'high', eventId: 'evt-u', ts: 1010 },
@@ -223,9 +223,9 @@ describe('opencode-watcher', () => {
   it('only commits trailing assistant rows once they have materialized parts', () => {
     const { committed, pendingTail } = __testOnly.splitCommittedMessages([
       { info: { id: 'u1', role: 'user' }, parts: [] },
-      { info: { id: 'a1', role: 'assistant' }, parts: [{ type: 'reasoning', text: 'thinking' }] },
+      { info: { id: 'a1', role: 'assistant' }, parts: [{ type: 'reasoning', text: 'thinking' }, { type: 'step-finish' }] },
       { info: { id: 'a2', role: 'assistant' }, parts: [] },
-      { info: { id: 'a3', role: 'assistant' }, parts: [{ type: 'step-start' }] },
+      { info: { id: 'a3', role: 'assistant' }, parts: [{ type: 'reasoning', text: 'thinking more' }] },
     ]);
 
     expect(committed.map((m) => String(m.info?.id))).toEqual(['u1', 'a1']);

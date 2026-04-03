@@ -81,6 +81,10 @@ function hasProcessableAssistantParts(message: { parts?: Array<Record<string, un
   ));
 }
 
+function hasCompletionMarker(message: { parts?: Array<Record<string, unknown>> }): boolean {
+  return (message.parts ?? []).some((part) => part.type === 'step-finish');
+}
+
 function splitCommittedMessages<T extends { info?: Record<string, unknown>; parts?: Array<Record<string, unknown>> }>(
   messages: T[],
 ): { committed: T[]; pendingTail: T[] } {
@@ -89,7 +93,8 @@ function splitCommittedMessages<T extends { info?: Record<string, unknown>; part
   let cut = messages.length;
   while (cut > 0) {
     const candidate = messages[cut - 1];
-    if (isUserRole(candidate) || hasProcessableAssistantParts(candidate)) break;
+    if (isUserRole(candidate)) break;
+    if (hasProcessableAssistantParts(candidate) && hasCompletionMarker(candidate)) break;
     cut -= 1;
   }
 
