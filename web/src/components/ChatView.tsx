@@ -770,6 +770,7 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
             </div>
             <FileBrowser
               ws={ws}
+              serverId={serverId}
               mode="file-single"
               layout="panel"
               initialPath={workdir ?? '~'}
@@ -804,6 +805,7 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
         <FloatingPanel id="chat-file-preview" title={`📄 ${fileBrowserPath.split(/[/\\]/).pop() ?? 'File'}`} onClose={() => setFileBrowserPath(null)} defaultW={600} defaultH={500}>
           <FileBrowser
             ws={ws}
+            serverId={serverId}
             mode="file-single"
             layout="panel"
             initialPath={(() => {

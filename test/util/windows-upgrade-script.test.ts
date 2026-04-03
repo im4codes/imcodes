@@ -5,7 +5,7 @@ describe('buildWindowsCleanupScript', () => {
   it('generates a standalone cleanup cmd script', () => {
     const script = buildWindowsCleanupScript('C:\\Temp\\imcodes-upgrade-123');
     expect(script).toContain('@echo off');
-    expect(script).toContain('timeout /t 60 /nobreak >nul');
+    expect(script).toContain('timeout /t 120 /nobreak >nul');
     expect(script).toContain('rmdir /s /q "C:\\Temp\\imcodes-upgrade-123"');
   });
 });

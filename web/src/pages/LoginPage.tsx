@@ -62,18 +62,24 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
       const key = parsed.searchParams.get('key');
       const userId = parsed.searchParams.get('userId');
       const keyId = parsed.searchParams.get('keyId');
+      // Try nonce exchange first (secure path), fall back to legacy direct key
+      let resolved = false;
       if (nonce) {
-        const exchanged = await exchangeNonceWithRetry(serverUrl, nonce);
-        const { configureApiKey } = await import('../api.js');
-        const { storeAuthKey } = await import('../biometric-auth.js');
-        const { Preferences } = await import('@capacitor/preferences');
-        await storeAuthKey(exchanged.apiKey);
-        configureApiKey(exchanged.apiKey);
-        await Preferences.set({ key: 'deck_api_key_id', value: exchanged.keyId });
-        onLoginSuccess?.(exchanged.userId, serverUrl);
-        return;
+        try {
+          const exchanged = await exchangeNonceWithRetry(serverUrl, nonce);
+          const { configureApiKey } = await import('../api.js');
+          const { storeAuthKey } = await import('../biometric-auth.js');
+          const { Preferences } = await import('@capacitor/preferences');
+          await storeAuthKey(exchanged.apiKey);
+          configureApiKey(exchanged.apiKey);
+          await Preferences.set({ key: 'deck_api_key_id', value: exchanged.keyId });
+          onLoginSuccess?.(exchanged.userId, serverUrl);
+          resolved = true;
+        } catch {
+          // Nonce exchange failed — fall through to legacy key path
+        }
       }
-      if (key && userId && keyId) {
+      if (!resolved && key && userId && keyId) {
         const { configureApiKey } = await import('../api.js');
         const { storeAuthKey } = await import('../biometric-auth.js');
         const { Preferences } = await import('@capacitor/preferences');
@@ -81,9 +87,9 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
         configureApiKey(key);
         await Preferences.set({ key: 'deck_api_key_id', value: keyId });
         onLoginSuccess?.(userId, serverUrl);
-        return;
+        resolved = true;
       }
-      setError(t('login.nonce_exchange_failed'));
+      if (!resolved) setError(t('login.nonce_exchange_failed'));
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (!msg.toLowerCase().includes('cancel')) {

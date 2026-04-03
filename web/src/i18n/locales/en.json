@@ -149,6 +149,7 @@
     "show_hidden": "Hidden",
     "selected_count": "{{count}} selected",
     "timeout": "Request timed out",
+    "timeout_detail": "Could not read directory. This may be caused by slow or unavailable network drives.",
     "preview_loading": "Loading…",
     "preview_too_large": "File too large to preview (> 512 KB)",
     "preview_error": "Preview unavailable",

@@ -791,6 +791,19 @@ program
     console.log(`Disconnected from ${provider}.`);
   });
 
+program
+  .command('repair-watchdog')
+  .description('Regenerate Windows daemon watchdog files with current paths')
+  .action(async () => {
+    if (process.platform !== 'win32') {
+      console.log('This command is only needed on Windows.');
+      return;
+    }
+    const { regenerateAllArtifacts } = await import('./util/windows-launch-artifacts.js');
+    await regenerateAllArtifacts();
+    console.log('Watchdog files regenerated with current Node.js and imcodes paths.');
+  });
+
 program.parseAsync(process.argv).catch((err: unknown) => {
   const exitCode = typeof err === 'object' && err && 'exitCode' in err
     ? Number((err as { exitCode?: unknown }).exitCode)

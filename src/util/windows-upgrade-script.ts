@@ -9,7 +9,7 @@ export interface WindowsUpgradeScriptInput {
 
 export function buildWindowsCleanupScript(scriptDir: string): string {
   return `@echo off\r
-timeout /t 60 /nobreak >nul\r
+timeout /t 120 /nobreak >nul\r
 rmdir /s /q "${scriptDir}"\r
 `;
 }
@@ -17,6 +17,7 @@ rmdir /s /q "${scriptDir}"\r
 export function buildWindowsUpgradeBatch(input: WindowsUpgradeScriptInput): string {
   const { logFile, cleanupPath, npmCmd, pkgSpec, targetVer } = input;
   return `@echo off\r
+setlocal EnableDelayedExpansion\r
 echo === imcodes upgrade started at %date% %time% === >> "${logFile}"\r
 timeout /t 2 /nobreak > nul\r
 \r
@@ -55,9 +56,32 @@ if not "${targetVer}"=="latest" if /I not "%INSTALLED_VER%"=="${targetVer}" (\r
   start "" cmd /c "${cleanupPath}" >nul 2>&1\r
   goto :done\r
 )\r
+where imcodes >nul 2>&1\r
+if %errorlevel% neq 0 (\r
+  echo WARNING: imcodes not found on PATH >> "${logFile}"\r
+  echo To fix: setx PATH "%NPM_PREFIX%;%%PATH%%" >> "${logFile}"\r
+)\r
+echo Regenerating daemon launch chain... >> "${logFile}"\r
+call "%CLI_SHIM%" repair-watchdog >> "${logFile}" 2>&1\r
+if %errorlevel% neq 0 (\r
+  echo WARNING: Launch chain regeneration failed >> "${logFile}"\r
+)\r
 echo Restarting daemon via CLI watchdog path... >> "${logFile}"\r
 call "%CLI_SHIM%" restart >> "${logFile}" 2>&1\r
 if %errorlevel% neq 0 echo Restart command failed (exit %errorlevel%). >> "${logFile}"\r
+timeout /t 8 /nobreak >nul\r
+set "PIDFILE=%USERPROFILE%\\.imcodes\\daemon.pid"\r
+if exist "%PIDFILE%" (\r
+  set /p DAEMON_PID=<"%PIDFILE%"\r
+  tasklist /fi "PID eq !DAEMON_PID!" /nh 2^>nul | find "!DAEMON_PID!" >nul\r
+  if !errorlevel! equ 0 (\r
+    echo Health check PASSED: daemon PID !DAEMON_PID! alive >> "${logFile}"\r
+  ) else (\r
+    echo Health check FAILED: PID !DAEMON_PID! not running >> "${logFile}"\r
+  )\r
+) else (\r
+  echo Health check FAILED: daemon.pid not found >> "${logFile}"\r
+)\r
 start "" cmd /c "${cleanupPath}" >nul 2>&1\r
 :done\r
 echo === upgrade done at %date% %time% === >> "${logFile}"\r

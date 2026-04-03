@@ -150,7 +150,7 @@ type PreviewState =
   | { status: 'image'; path: string; dataUrl: string; downloadId?: string }
   | { status: 'error'; path: string; error: string; downloadId?: string };
 
-const REQUEST_TIMEOUT_MS = 5_000;
+const REQUEST_TIMEOUT_MS = 15_000;
 
 function updateNode(nodes: FsNode[], targetId: string, patch: Partial<FsNode>): FsNode[] {
   return nodes.map((n) => {
@@ -470,7 +470,7 @@ export function FileBrowser({
         pendingRef.current.delete(requestId);
         timersRef.current.delete(requestId);
         setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
-        setError(t('file_browser.timeout'));
+        setError(t('file_browser.timeout_detail', { defaultValue: t('file_browser.timeout') }));
       }
     }, REQUEST_TIMEOUT_MS);
     timersRef.current.set(requestId, timer);
