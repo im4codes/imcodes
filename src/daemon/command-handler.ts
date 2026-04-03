@@ -2174,13 +2174,18 @@ sleep 60 && rm -rf "${scriptDir}" &
 const UPLOAD_DIR = nodePath.join(homedir(), '.imcodes', 'uploads');
 // On Windows, don't restrict paths — projects commonly live on any drive (D:\code, etc.)
 // The daemon runs as the user, so OS-level permissions are the real security boundary.
-const FS_ALLOWED_ROOTS: string[] | null = process.platform === 'win32'
-  ? null
-  : [homedir(), UPLOAD_DIR, '/tmp', '/private/tmp'];
+// Deny-list: block access to sensitive directories regardless of platform.
+// Everything else is allowed — the daemon runs as the user and inherits their permissions.
+const FS_DENIED_DIRS = ['.ssh', '.gnupg', '.pki'];
 
 function isPathAllowed(realPath: string): boolean {
-  if (!FS_ALLOWED_ROOTS) return true; // no restriction (Windows)
-  return FS_ALLOWED_ROOTS.some((root) => realPath === root || realPath.startsWith(root + nodePath.sep));
+  // Block sensitive directories (e.g. ~/.ssh, ~/.gnupg)
+  const home = homedir();
+  for (const dir of FS_DENIED_DIRS) {
+    const denied = nodePath.join(home, dir);
+    if (realPath === denied || realPath.startsWith(denied + nodePath.sep)) return false;
+  }
+  return true;
 }
 
 // ── P2P cancel/status handlers ────────────────────────────────────────────

@@ -46,12 +46,12 @@ describe('fs.write handler', () => {
     vi.restoreAllMocks();
   });
 
-  it('returns forbidden_path when path is outside allowed roots', async () => {
-    const forbiddenPath = '/root/secret.txt';
+  it('returns forbidden_path when path is in a denied directory like ~/.ssh', async () => {
+    const forbiddenPath = path.join(homedir(), '.ssh', 'secret.txt');
     // File doesn't exist → goes to parent check
     mockStat.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
-    // Parent realpath resolves to forbidden location
-    mockRealpath.mockResolvedValue('/root' as unknown as string);
+    // Parent realpath resolves to denied directory
+    mockRealpath.mockResolvedValue(path.join(homedir(), '.ssh') as unknown as string);
 
     handleWebCommand({ type: 'fs.write', path: forbiddenPath, content: 'hello', requestId: 'req-forbidden' }, mockServerLink as any);
     await flushAsync();
@@ -64,12 +64,12 @@ describe('fs.write handler', () => {
     });
   });
 
-  it('returns forbidden_path when existing file realpath is outside allowed roots', async () => {
-    const forbiddenPath = '/root/existing.txt';
+  it('returns forbidden_path when existing file realpath is in denied directory', async () => {
+    const forbiddenPath = path.join(homedir(), '.ssh', 'authorized_keys');
     // File exists
     mockStat.mockResolvedValue({ mtimeMs: 1000 } as fsp.Stats);
-    // Realpath resolves to forbidden location
-    mockRealpath.mockResolvedValue('/root/existing.txt' as unknown as string);
+    // Realpath resolves to denied directory
+    mockRealpath.mockResolvedValue(path.join(homedir(), '.ssh', 'authorized_keys') as unknown as string);
 
     handleWebCommand({ type: 'fs.write', path: forbiddenPath, content: 'hello', requestId: 'req-forbidden-existing' }, mockServerLink as any);
     await flushAsync();
@@ -157,12 +157,12 @@ describe('fs.write handler', () => {
     });
   });
 
-  it('symlink escape — realpath of existing file outside allowed roots is rejected', async () => {
-    // A path that looks allowed but resolves to outside roots via symlink
+  it('symlink escape — realpath of file resolving into ~/.ssh is rejected', async () => {
+    // A path that looks allowed but resolves to denied dir via symlink
     const symlinkPath = path.join(homedir(), 'link-to-secret.txt');
     mockStat.mockResolvedValue({ mtimeMs: 1000 } as fsp.Stats);
-    // Symlink resolves to outside home
-    mockRealpath.mockResolvedValue('/etc/passwd' as unknown as string);
+    // Symlink resolves into .ssh
+    mockRealpath.mockResolvedValue(path.join(homedir(), '.ssh', 'id_rsa') as unknown as string);
 
     handleWebCommand({ type: 'fs.write', path: symlinkPath, content: 'evil', requestId: 'req-symlink' }, mockServerLink as any);
     await flushAsync();
