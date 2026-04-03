@@ -4,6 +4,11 @@ import {
   roundPrompt,
   BUILT_IN_MODES,
   getP2pMode,
+  parseModePipeline,
+  isComboMode,
+  getModeForRound,
+  getComboRoundCount,
+  COMBO_PRESETS,
 } from '../../shared/p2p-modes.js';
 import type { P2pSavedConfig, P2pSessionConfig, P2pSessionEntry } from '../../shared/p2p-modes.js';
 
@@ -201,5 +206,141 @@ describe('extraPrompt in P2pSavedConfig', () => {
     const combined = rp + extra;
     expect(combined).toContain('Round 2/3');
     expect(combined).toContain('Reply in Chinese');
+  });
+});
+
+// ── Combo pipeline tests ────────────────────────────────────────────────────
+
+describe('parseModePipeline', () => {
+  it('parses combo string into pipeline array', () => {
+    expect(parseModePipeline('brainstorm>discuss>plan')).toEqual(['brainstorm', 'discuss', 'plan']);
+  });
+
+  it('parses 4-step combo', () => {
+    expect(parseModePipeline('brainstorm>discuss>discuss>plan')).toEqual(['brainstorm', 'discuss', 'discuss', 'plan']);
+  });
+
+  it('returns single-element array for non-combo mode', () => {
+    expect(parseModePipeline('brainstorm')).toEqual(['brainstorm']);
+  });
+
+  it('handles whitespace around separator', () => {
+    expect(parseModePipeline('brainstorm > discuss > plan')).toEqual(['brainstorm', 'discuss', 'plan']);
+  });
+
+  it('filters empty segments', () => {
+    expect(parseModePipeline('brainstorm>>plan')).toEqual(['brainstorm', 'plan']);
+  });
+});
+
+describe('isComboMode', () => {
+  it('returns true for combo string with separator', () => {
+    expect(isComboMode('brainstorm>discuss>plan')).toBe(true);
+  });
+
+  it('returns false for single mode', () => {
+    expect(isComboMode('brainstorm')).toBe(false);
+  });
+
+  it('returns false for "config"', () => {
+    expect(isComboMode('config')).toBe(false);
+  });
+
+  it('returns false for empty string', () => {
+    expect(isComboMode('')).toBe(false);
+  });
+});
+
+describe('getModeForRound', () => {
+  it('returns first mode for round 1 of combo', () => {
+    const mode = getModeForRound('brainstorm>discuss>plan', 1);
+    expect(mode?.key).toBe('brainstorm');
+  });
+
+  it('returns second mode for round 2 of combo', () => {
+    const mode = getModeForRound('brainstorm>discuss>plan', 2);
+    expect(mode?.key).toBe('discuss');
+  });
+
+  it('returns third mode for round 3 of 3-step combo', () => {
+    const mode = getModeForRound('brainstorm>discuss>plan', 3);
+    expect(mode?.key).toBe('plan');
+  });
+
+  it('clamps to last mode when round exceeds pipeline length', () => {
+    const mode = getModeForRound('brainstorm>discuss>plan', 5);
+    expect(mode?.key).toBe('plan');
+  });
+
+  it('returns correct mode for each round of 4-step combo', () => {
+    const combo = 'brainstorm>discuss>discuss>plan';
+    expect(getModeForRound(combo, 1)?.key).toBe('brainstorm');
+    expect(getModeForRound(combo, 2)?.key).toBe('discuss');
+    expect(getModeForRound(combo, 3)?.key).toBe('discuss');
+    expect(getModeForRound(combo, 4)?.key).toBe('plan');
+  });
+
+  it('returns the single mode for non-combo string', () => {
+    const mode = getModeForRound('audit', 1);
+    expect(mode?.key).toBe('audit');
+  });
+});
+
+describe('getComboRoundCount', () => {
+  it('returns pipeline length for combo', () => {
+    expect(getComboRoundCount('brainstorm>discuss>plan')).toBe(3);
+  });
+
+  it('returns 4 for 4-step combo', () => {
+    expect(getComboRoundCount('brainstorm>discuss>discuss>plan')).toBe(4);
+  });
+
+  it('returns undefined for single mode', () => {
+    expect(getComboRoundCount('brainstorm')).toBeUndefined();
+  });
+});
+
+describe('COMBO_PRESETS', () => {
+  it('all presets have valid mode keys in their pipeline', () => {
+    for (const preset of COMBO_PRESETS) {
+      for (const modeKey of preset.pipeline) {
+        expect(getP2pMode(modeKey)).toBeDefined();
+      }
+    }
+  });
+
+  it('preset keys match their pipeline joined by separator', () => {
+    for (const preset of COMBO_PRESETS) {
+      expect(preset.key).toBe(preset.pipeline.join('>'));
+    }
+  });
+
+  it('all presets are recognized as combo mode', () => {
+    for (const preset of COMBO_PRESETS) {
+      expect(isComboMode(preset.key)).toBe(true);
+    }
+  });
+});
+
+describe('roundPrompt with combo mode key', () => {
+  it('includes phase label when modeKey is provided', () => {
+    const prompt = roundPrompt(1, 3, 'brainstorm');
+    expect(prompt).toContain('Brainstorm Phase');
+  });
+
+  it('includes correct phase label per round in a combo', () => {
+    const combo = 'brainstorm>discuss>plan';
+    const pipeline = parseModePipeline(combo);
+    const r1 = roundPrompt(1, 3, pipeline[0]);
+    expect(r1).toContain('Brainstorm Phase');
+    const r2 = roundPrompt(2, 3, pipeline[1]);
+    expect(r2).toContain('Discuss Phase');
+    const r3 = roundPrompt(3, 3, pipeline[2]);
+    expect(r3).toContain('Plan Phase');
+  });
+
+  it('does NOT include phase label when modeKey is omitted', () => {
+    const prompt = roundPrompt(1, 3);
+    expect(prompt).not.toContain('Phase');
   });
 });
