@@ -12,6 +12,9 @@ import type { UsageData } from '../usage-data.js';
 interface Props {
   usage: UsageData;
   sessionName: string;
+  modelOverride?: string | null;
+  planLabel?: string | null;
+  quotaLabel?: string | null;
   /** Show cost tracking (requires costUsd events to have been recorded). */
   showCost?: boolean;
   /** Active thinking timestamp — shows elapsed time spinner. */
@@ -27,30 +30,42 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, showCost, activeThinkingTs, statusText, now }: Props) {
+export function UsageFooter({ usage, sessionName, modelOverride, planLabel, quotaLabel, showCost, activeThinkingTs, statusText, now }: Props) {
   const { t } = useTranslation();
 
+  const displayModel = modelOverride ?? usage.model;
+  const displayPlanLabel = useMemo(() => {
+    const normalized = planLabel?.trim().toLowerCase();
+    if (!normalized) return null;
+    if (normalized === 'free') return t('session.provider_plan_free');
+    if (normalized === 'paid') return t('session.provider_plan_paid');
+    if (normalized === 'byo') return t('session.provider_plan_byo');
+    return planLabel;
+  }, [planLabel, t]);
+
   const { ctx, total, cachePct, newPct, pctStr, tip } = useMemo(() => {
-    const ctx = resolveContextWindow(usage.contextWindow, usage.model);
+    const ctx = resolveContextWindow(usage.contextWindow, displayModel);
     const total = usage.inputTokens + usage.cacheTokens;
     const totalPct = Math.min(100, total / ctx * 100);
     const cachePct = Math.min(totalPct, usage.cacheTokens / ctx * 100);
     const newPct = totalPct - cachePct;
     const pctStr = totalPct < 1 ? totalPct.toFixed(1) : totalPct.toFixed(0);
     const tip = [
-      usage.model ?? '',
+      displayModel ?? '',
       `Context: ${fmt(total)} / ${fmt(ctx)} (${pctStr}%)`,
       `  New: ${fmt(usage.inputTokens)}  Cache: ${fmt(usage.cacheTokens)}`,
+      displayPlanLabel ? t('session.provider_plan_title', { value: displayPlanLabel }) : '',
+      quotaLabel ? t('session.provider_quota_title', { value: quotaLabel }) : '',
       usage.codexStatus?.fiveHourLeftPercent !== undefined ? `5h: ${usage.codexStatus.fiveHourLeftPercent}% (${usage.codexStatus.fiveHourResetAt ?? ''})` : '',
       usage.codexStatus?.weeklyLeftPercent !== undefined ? `Weekly: ${usage.codexStatus.weeklyLeftPercent}% (${usage.codexStatus.weeklyResetAt ?? ''})` : '',
     ].filter(Boolean).join('\n');
     return { ctx, total, totalPct, cachePct, newPct, pctStr, tip };
-  }, [usage.inputTokens, usage.cacheTokens, usage.contextWindow, usage.model, usage.codexStatus]);
+  }, [usage.inputTokens, usage.cacheTokens, usage.contextWindow, displayModel, usage.codexStatus, displayPlanLabel, quotaLabel, t]);
 
   const sessionCost = showCost ? getSessionCost(sessionName) : 0;
   const weeklyCost = sessionCost > 0 ? getWeeklyCost() : 0;
   const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
-  const modelLabel = shortModelLabel(usage.model);
+  const modelLabel = shortModelLabel(displayModel);
   const hasCodexStatus = usage.codexStatus?.fiveHourLeftPercent !== undefined
     || usage.codexStatus?.weeklyLeftPercent !== undefined;
 
@@ -60,6 +75,20 @@ export function UsageFooter({ usage, sessionName, showCost, activeThinkingTs, st
         <div class="session-ctx-bar">
           <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
+        </div>
+      )}
+      {(displayPlanLabel || quotaLabel) && (
+        <div class="session-usage-codex-row">
+          {displayPlanLabel && (
+            <span class="session-usage-badge" title={displayPlanLabel}>
+              {displayPlanLabel}
+            </span>
+          )}
+          {quotaLabel && (
+            <span class="session-usage-badge" title={quotaLabel}>
+              {quotaLabel}
+            </span>
+          )}
         </div>
       )}
       {hasCodexStatus && (

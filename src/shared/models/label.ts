@@ -27,6 +27,16 @@ export function shortModelLabel(model?: string | null): string | null {
   const gem = lower.match(/\b(gemini[- ]\d[\w.-]*)\b/);
   if (gem) return gem[1];
 
+  if (lower === 'coder-model') return 'coder-model';
+  const qwen = m.match(/\b(qwen[\w.-]*)\b/i);
+  if (qwen) return qwen[1];
+  const glm = m.match(/\b(glm[\w.-]*)\b/i);
+  if (glm) return glm[1];
+  const kimi = m.match(/\b(kimi[\w.-]*)\b/i);
+  if (kimi) return kimi[1];
+  const minimax = m.match(/\b(minimax[\w.-]*)\b/i);
+  if (minimax) return minimax[1];
+
   const parts = m.split('-');
   return parts[parts.length - 1] ?? m;
 }

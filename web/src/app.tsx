@@ -489,7 +489,11 @@ export function App() {
         description: s.description ?? null,
         qwenModel: undefined,
         qwenAuthType: undefined,
+        qwenAuthLimit: undefined,
         qwenAvailableModels: undefined,
+        modelDisplay: undefined,
+        planLabel: undefined,
+        quotaLabel: undefined,
       }));
       setSessions(mapped);
       // Only mark loaded if we got data — empty means daemon hasn't synced yet,
@@ -967,7 +971,11 @@ export function App() {
             description: s.description ?? existing?.description,
             qwenModel: s.qwenModel ?? existing?.qwenModel,
             qwenAuthType: s.qwenAuthType ?? existing?.qwenAuthType,
+            qwenAuthLimit: s.qwenAuthLimit ?? existing?.qwenAuthLimit,
             qwenAvailableModels: s.qwenAvailableModels ?? existing?.qwenAvailableModels,
+            modelDisplay: s.modelDisplay ?? existing?.modelDisplay,
+            planLabel: s.planLabel ?? existing?.planLabel,
+            quotaLabel: s.quotaLabel ?? existing?.quotaLabel,
           };
         }));
         setSessionsLoaded(true);

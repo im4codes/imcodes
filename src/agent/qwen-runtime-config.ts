@@ -15,6 +15,7 @@ const CACHE_TTL_MS = 30_000;
 interface QwenRuntimeConfig {
   authType: QwenAuthType;
   availableModels: string[];
+  authLimit?: string;
 }
 
 let cached: { expiresAt: number; value: QwenRuntimeConfig } | null = null;
@@ -61,16 +62,29 @@ async function execFileStdout(file: string, args: string[]): Promise<string> {
   });
 }
 
-async function detectAuthTypeFromStatus(): Promise<QwenAuthType | null> {
+function parseAuthTypeFromStatusOutput(stdout: string): QwenAuthType | null {
+  if (/Qwen OAuth/i.test(stdout)) return QWEN_AUTH_TYPES.OAUTH;
+  if (/Coding Plan/i.test(stdout)) return QWEN_AUTH_TYPES.CODING_PLAN;
+  if (/API[- ]?KEY/i.test(stdout) || /API Key/i.test(stdout)) return QWEN_AUTH_TYPES.API_KEY;
+  return null;
+}
+
+function parseAuthLimitFromStatusOutput(stdout: string): string | undefined {
+  const match = stdout.match(/^\s*Limit:\s*(.+)$/mi);
+  return match?.[1]?.trim() || undefined;
+}
+
+async function readAuthStatus(): Promise<{ authType: QwenAuthType | null; authLimit?: string } | null> {
   try {
     const stdout = await execFileStdout('qwen', ['auth', 'status']);
-    if (/Qwen OAuth/i.test(stdout)) return QWEN_AUTH_TYPES.OAUTH;
-    if (/Coding Plan/i.test(stdout)) return QWEN_AUTH_TYPES.CODING_PLAN;
-    if (/API[- ]?KEY/i.test(stdout) || /API Key/i.test(stdout)) return QWEN_AUTH_TYPES.API_KEY;
+    return {
+      authType: parseAuthTypeFromStatusOutput(stdout),
+      authLimit: parseAuthLimitFromStatusOutput(stdout),
+    };
   } catch (err) {
     logger.debug({ err }, 'Failed to detect qwen auth status from CLI');
+    return null;
   }
-  return null;
 }
 
 function detectAuthTypeFromSettings(settings: QwenSettings | null): QwenAuthType {
@@ -109,13 +123,14 @@ export async function getQwenRuntimeConfig(force = false): Promise<QwenRuntimeCo
   }
 
   const settings = await readSettings();
-  const authFromStatus = await detectAuthTypeFromStatus();
-  const authType = authFromStatus ?? detectAuthTypeFromSettings(settings);
+  const status = await readAuthStatus();
+  const authType = status?.authType ?? detectAuthTypeFromSettings(settings);
   const availableModels = getAvailableModelsFromSettings(settings, authType);
 
   const value = {
     authType,
     availableModels,
+    authLimit: status?.authLimit,
   };
   cached = { value, expiresAt: Date.now() + CACHE_TTL_MS };
   return value;

@@ -28,7 +28,7 @@ export type ServerMessage =
   | { type: 'session.tool'; session: string; tool: string | null }
   | { type: 'daemon.reconnected' }
   | { type: 'daemon.disconnected' }
-  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; qwenModel?: string; qwenAuthType?: string; qwenAvailableModels?: string[] }> }
+  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; qwenModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; quotaLabel?: string }> }
   | { type: 'outbound'; platform: string; channelId: string; content: string }
   | { type: 'timeline.event'; event: TimelineEvent }
   | { type: 'timeline.replay'; sessionName: string; requestId?: string; events: TimelineEvent[]; truncated: boolean; epoch: number }

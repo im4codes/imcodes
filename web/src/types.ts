@@ -42,7 +42,11 @@ export interface SessionInfo {
   runtimeType?: 'process' | 'transport';
   qwenModel?: string;
   qwenAuthType?: string;
+  qwenAuthLimit?: string;
   qwenAvailableModels?: string[];
+  modelDisplay?: string;
+  planLabel?: string;
+  quotaLabel?: string;
 }
 
 export interface ServerInfo {

@@ -29,6 +29,7 @@ import { startWatching as startGeminiWatching, startWatchingLatest as startGemin
 import { startWatching as startOpenCodeWatching, stopWatching as stopOpenCodeWatching, isWatching as isOpenCodeWatching } from '../daemon/opencode-watcher.js';
 import { resolveStructuredSessionBootstrap } from './structured-session-bootstrap.js';
 import { getQwenRuntimeConfig } from './qwen-runtime-config.js';
+import { getQwenDisplayMetadata } from './provider-display.js';
 
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
@@ -808,6 +809,11 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         ...(qwenRuntime?.authType ? { qwenAuthType: qwenRuntime.authType } : {}),
         ...(qwenRuntime?.authLimit ? { qwenAuthLimit: qwenRuntime.authLimit } : {}),
         ...(availableQwenModels.length > 0 ? { qwenAvailableModels: availableQwenModels } : {}),
+        ...getQwenDisplayMetadata({
+          model: effectiveQwenModel,
+          authType: qwenRuntime?.authType ?? s.qwenAuthType,
+          authLimit: qwenRuntime?.authLimit ?? s.qwenAuthLimit,
+        }),
       });
       logger.info({ session: s.name, providerId: s.providerId, providerSid: s.providerSessionId }, 'Restored transport session runtime');
     } catch (err) {
@@ -885,6 +891,11 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         ...(qwenAuthType ? { qwenAuthType } : {}),
         ...(qwenAuthLimit ? { qwenAuthLimit } : {}),
         ...(availableQwenModels?.length ? { qwenAvailableModels: availableQwenModels } : {}),
+        ...getQwenDisplayMetadata({
+          model: effectiveQwenModel,
+          authType: qwenAuthType,
+          authLimit: qwenAuthLimit,
+        }),
         description,
         label,
         parentSession,

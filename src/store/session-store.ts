@@ -39,8 +39,16 @@ export interface SessionRecord {
   qwenModel?: string;
   /** Qwen auth source detected from local CLI config/status. */
   qwenAuthType?: QwenAuthType;
+  /** Human-readable auth limit from `qwen auth status` (e.g. Up to 1,000 requests/day). */
+  qwenAuthLimit?: string;
   /** Qwen models available for the current auth source. */
   qwenAvailableModels?: string[];
+  /** Generic display model override for UI footer/header. */
+  modelDisplay?: string;
+  /** Generic commercial/plan badge label (e.g. Free, Paid, BYO). */
+  planLabel?: string;
+  /** Generic quota/limit badge label (e.g. 1000/day, 60/min). */
+  quotaLabel?: string;
   /** Parent main session name (e.g. `deck_proj_brain`) — links sub-sessions to their parent. */
   parentSession?: string;
   /** Runtime type — 'process' for tmux, 'transport' for network-backed. Defaults to 'process' for backward compat. */

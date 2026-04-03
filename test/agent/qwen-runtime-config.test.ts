@@ -90,4 +90,23 @@ describe('getQwenRuntimeConfig', () => {
     expect(config.authType).toBe(QWEN_AUTH_TYPES.API_KEY);
     expect(config.availableModels).toEqual(['gpt-4.1', 'qwen3-coder-plus']);
   });
+
+  it('reads auth limit from qwen auth status output', async () => {
+    childProcessMock.execFile.mockImplementation((...args: any[]) => {
+      const cb = args.at(-1);
+      cb?.(null, [
+        'Authentication Method: Qwen OAuth',
+        'Type: Free tier',
+        'Limit: Up to 1,000 requests/day',
+      ].join('\n'), '');
+      return {} as never;
+    });
+    fsMock.readFile.mockResolvedValue(JSON.stringify({
+      security: { auth: { selectedType: 'qwen-oauth' } },
+    }));
+
+    const config = await getQwenRuntimeConfig(true);
+    expect(config.authType).toBe(QWEN_AUTH_TYPES.OAUTH);
+    expect(config.authLimit).toBe('Up to 1,000 requests/day');
+  });
 });

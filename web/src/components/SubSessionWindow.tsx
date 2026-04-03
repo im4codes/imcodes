@@ -129,6 +129,7 @@ export function SubSessionWindow({
   const onChatScrollBottomFn = useCallback((fn: () => void) => { chatScrollRef.current = fn; }, []);
 
   // SessionInfo shape for SessionControls
+  const matchedSession = sessions?.find((s) => s.name === sub.sessionName);
   const sessionInfo: SessionInfo = {
     name: sub.sessionName,
     project: sub.label ?? sub.type,
@@ -136,6 +137,13 @@ export function SubSessionWindow({
     agentType: sub.type,
     state: sub.state === 'running' ? 'running' : sub.state === 'stopped' ? 'stopped' : 'idle',
     projectDir: sub.cwd ?? undefined,
+    qwenModel: matchedSession?.qwenModel,
+    qwenAuthType: matchedSession?.qwenAuthType,
+    qwenAuthLimit: matchedSession?.qwenAuthLimit,
+    qwenAvailableModels: matchedSession?.qwenAvailableModels,
+    modelDisplay: matchedSession?.modelDisplay,
+    planLabel: matchedSession?.planLabel,
+    quotaLabel: matchedSession?.quotaLabel,
   };
 
   useEffect(() => {
@@ -371,6 +379,9 @@ export function SubSessionWindow({
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sub.sessionName}
+          modelOverride={sessionInfo?.modelDisplay ?? (sessionInfo?.agentType === 'qwen' ? sessionInfo?.qwenModel : undefined)}
+          planLabel={sessionInfo?.planLabel}
+          quotaLabel={sessionInfo?.quotaLabel}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}

@@ -99,6 +99,7 @@ import { countCodexStatusMatches, normalizeCodexStatusPaneText, parseCodexStatus
 import { resolveContextWindow } from '../util/model-context.js';
 import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
 import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
+import { getQwenDisplayMetadata } from '../agent/provider-display.js';
 
 // ── Common MIME map for file metadata ────────────────────────────────────────
 
@@ -1078,12 +1079,18 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             return;
           }
           transportRuntime.setAgentId(nextModel);
+          const qwenAuthType = runtimeConfig?.authType ?? record.qwenAuthType;
           upsertSession({
             ...record,
             qwenModel: nextModel,
-            ...(runtimeConfig?.authType ? { qwenAuthType: runtimeConfig.authType } : {}),
+            ...(qwenAuthType ? { qwenAuthType } : {}),
             ...(runtimeConfig?.authLimit ? { qwenAuthLimit: runtimeConfig.authLimit } : {}),
             ...(runtimeConfig?.availableModels?.length ? { qwenAvailableModels: runtimeConfig.availableModels } : {}),
+            ...getQwenDisplayMetadata({
+              model: nextModel,
+              authType: qwenAuthType,
+              authLimit: runtimeConfig?.authLimit ?? record.qwenAuthLimit,
+            }),
             updatedAt: Date.now(),
           });
           handleGetSessions(serverLink);
@@ -1242,6 +1249,9 @@ function handleGetSessions(serverLink: ServerLink): void {
       qwenAuthType: s.qwenAuthType,
       qwenAuthLimit: s.qwenAuthLimit,
       qwenAvailableModels: s.qwenAvailableModels,
+      modelDisplay: s.modelDisplay,
+      planLabel: s.planLabel,
+      quotaLabel: s.quotaLabel,
       description: s.description,
       label: s.label,
     }));

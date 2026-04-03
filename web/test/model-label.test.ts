@@ -19,4 +19,11 @@ describe('shortModelLabel', () => {
     expect(shortModelLabel('claude-opus-4-1')).toBe('opus');
     expect(shortModelLabel('gemini-3-flash-preview')).toBe('flash');
   });
+
+  it('preserves Qwen and compatible provider model labels', () => {
+    expect(shortModelLabel('coder-model')).toBe('coder-model');
+    expect(shortModelLabel('qwen3-coder-next')).toBe('qwen3-coder-next');
+    expect(shortModelLabel('glm-4.7')).toBe('glm-4.7');
+    expect(shortModelLabel('kimi-k2.5')).toBe('kimi-k2.5');
+  });
 });
