@@ -100,6 +100,7 @@ import { resolveContextWindow } from '../util/model-context.js';
 import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
 import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from '../agent/provider-display.js';
+import { buildSessionList } from './session-list.js';
 import { getQwenOAuthQuotaUsageLabel, recordQwenOAuthRequest } from '../agent/provider-quota.js';
 
 function describeTransportSendError(err: unknown): string {
@@ -120,7 +121,7 @@ function refreshQwenQuotaUsageLabels(serverLink?: ServerLink): void {
       updatedAt: Date.now(),
     });
   }
-  if (serverLink) handleGetSessions(serverLink);
+  if (serverLink) void handleGetSessions(serverLink);
 }
 
 // ── Common MIME map for file metadata ────────────────────────────────────────
@@ -1134,7 +1135,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             }),
             updatedAt: Date.now(),
           });
-          handleGetSessions(serverLink);
+          await handleGetSessions(serverLink);
           timelineEmitter.emit(sessionName, 'user.message', { text });
           timelineEmitter.emit(sessionName, 'usage.update', {
             model: nextModel,
@@ -1276,31 +1277,8 @@ async function handleResize(cmd: Record<string, unknown>): Promise<void> {
   }
 }
 
-function handleGetSessions(serverLink: ServerLink): void {
-  const sessions = listSessions()
-    .filter((s) => !s.name.startsWith('deck_sub_'))
-    .map((s) => ({
-      name: s.name,
-      project: s.projectName,
-      role: s.role,
-      agentType: s.agentType,
-      agentVersion: s.agentVersion,
-      state: s.state,
-      projectDir: s.projectDir,
-      runtimeType: s.runtimeType,
-      providerId: s.providerId,
-      providerSessionId: s.providerSessionId,
-      qwenModel: s.qwenModel,
-      qwenAuthType: s.qwenAuthType,
-      qwenAuthLimit: s.qwenAuthLimit,
-      qwenAvailableModels: s.qwenAvailableModels,
-      modelDisplay: s.modelDisplay,
-      planLabel: s.planLabel,
-      quotaLabel: s.quotaLabel,
-      quotaUsageLabel: s.quotaUsageLabel,
-      description: s.description,
-      label: s.label,
-    }));
+async function handleGetSessions(serverLink: ServerLink): Promise<void> {
+  const sessions = await buildSessionList();
   try {
     serverLink.send({ type: 'session_list', daemonVersion: serverLink.daemonVersion, sessions });
   } catch {
