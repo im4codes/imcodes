@@ -47,10 +47,13 @@ export function clearApiKey(): void {
   try { localStorage.removeItem('rcc_api_key'); } catch { /* ignore */ }
 }
 
+const TELEMETRY_FALLBACK: AuthTelemetryHeaders = { 'X-Platform': 'unknown', 'X-App-Version': 'unknown', 'X-Bundle-Version': 'none' };
+
 async function getAuthTelemetryHeaders(): Promise<AuthTelemetryHeaders> {
   if (_authTelemetryHeadersCache) return _authTelemetryHeadersCache;
   if (!_authTelemetryHeadersPromise) {
-    _authTelemetryHeadersPromise = (async () => {
+    // Race against a 2s timeout — telemetry must never block auth requests
+    const collect = (async () => {
       const platform = typeof (globalThis as { Capacitor?: { getPlatform?: () => string } }).Capacitor?.getPlatform === 'function'
         ? (globalThis as { Capacitor?: { getPlatform?: () => string } }).Capacitor!.getPlatform!()
         : 'web';
@@ -76,14 +79,12 @@ async function getAuthTelemetryHeaders(): Promise<AuthTelemetryHeaders> {
         bundleVersion = 'none';
       }
 
-      const headers: AuthTelemetryHeaders = {
-        'X-Platform': platform,
-        'X-App-Version': appVersion,
-        'X-Bundle-Version': bundleVersion,
-      };
+      const headers: AuthTelemetryHeaders = { 'X-Platform': platform, 'X-App-Version': appVersion, 'X-Bundle-Version': bundleVersion };
       _authTelemetryHeadersCache = headers;
       return headers;
-    })().finally(() => {
+    })();
+    const timeout = new Promise<AuthTelemetryHeaders>((resolve) => setTimeout(() => resolve(TELEMETRY_FALLBACK), 2000));
+    _authTelemetryHeadersPromise = Promise.race([collect, timeout]).finally(() => {
       _authTelemetryHeadersPromise = null;
     });
   }
