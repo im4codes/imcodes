@@ -363,6 +363,31 @@ export async function startup(): Promise<DaemonContext> {
   setSessionEventCallback((event, session, state) => {
     if (!serverLink) return;
     try { serverLink.send({ type: 'session_event', event, session, state }); } catch { /* not connected */ }
+    try {
+      serverLink.send({
+        type: 'session_list',
+        daemonVersion: serverLink.daemonVersion,
+        sessions: listSessions()
+          .filter((s) => !s.name.startsWith('deck_sub_'))
+          .map((s) => ({
+            name: s.name,
+            project: s.projectName,
+            role: s.role,
+            agentType: s.agentType,
+            agentVersion: s.agentVersion,
+            state: s.state,
+            projectDir: s.projectDir,
+            runtimeType: s.runtimeType,
+            providerId: s.providerId,
+            providerSessionId: s.providerSessionId,
+            qwenModel: s.qwenModel,
+            qwenAuthType: s.qwenAuthType,
+            qwenAvailableModels: s.qwenAvailableModels,
+            description: s.description,
+            label: s.label,
+          })),
+      });
+    } catch { /* not connected */ }
 
     // Background repo detection on session start
     if (event === 'started') {

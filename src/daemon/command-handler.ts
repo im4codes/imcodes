@@ -828,6 +828,10 @@ async function handleSingleTargetConsult(
     try {
       serverLink.send({ type: 'command.ack', commandId: effectiveId, status, session: sessionName });
     } catch { /* not connected */ }
+    if (agentType === 'opencode') {
+      const { scheduleCatchup } = await import('./opencode-watcher.js');
+      scheduleCatchup(sessionName);
+    }
   } catch (err) {
     logger.error({ sessionName, targetSession, err }, 'session.send single target consult failed');
     const errMsg = err instanceof Error ? err.message : String(err);
@@ -1081,6 +1085,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             ...(runtimeConfig?.availableModels?.length ? { qwenAvailableModels: runtimeConfig.availableModels } : {}),
             updatedAt: Date.now(),
           });
+          handleGetSessions(serverLink);
           timelineEmitter.emit(sessionName, 'user.message', { text });
           timelineEmitter.emit(sessionName, 'usage.update', {
             model: nextModel,
@@ -1162,6 +1167,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     try {
       serverLink.send({ type: 'command.ack', commandId: effectiveId, status, session: sessionName });
     } catch { /* not connected */ }
+    if (agentType === 'opencode') {
+      const { scheduleCatchup } = await import('./opencode-watcher.js');
+      scheduleCatchup(sessionName);
+    }
   } catch (err) {
     logger.error({ sessionName, err }, 'session.send failed');
   } finally {
@@ -1362,6 +1371,12 @@ function handleTimelineReplay(cmd: Record<string, unknown>, serverLink: ServerLi
   } catch { /* not connected */ }
 }
 
+const OPENCODE_SYNTH_HISTORY_OVERLAP_MS = 60_000;
+
+export function getOpenCodeSynthesizedAfterTs(afterTs: number | undefined): number | undefined {
+  return afterTs === undefined ? undefined : Math.max(0, afterTs - OPENCODE_SYNTH_HISTORY_OVERLAP_MS);
+}
+
 /** Handle timeline.history_request — browser requesting full session history on open. */
 export function hasSubstantiveTimelineHistory(events: Array<{ type: string }>): boolean {
   return events.some((event) => (
@@ -1455,8 +1470,9 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
     try {
       const { exportOpenCodeSession, buildTimelineEventsFromOpenCodeExport } = await import('./opencode-history.js');
       const exportData = await exportOpenCodeSession(record.projectDir, record.opencodeSessionId);
+      const synthesizedAfterTs = getOpenCodeSynthesizedAfterTs(afterTs);
       const synthesized = buildTimelineEventsFromOpenCodeExport(sessionName, exportData, timelineEmitter.epoch)
-        .filter((event) => afterTs === undefined || event.ts > afterTs)
+        .filter((event) => synthesizedAfterTs === undefined || event.ts > synthesizedAfterTs)
         .filter((event) => beforeTs === undefined || event.ts < beforeTs);
       const synthesizedTrimmed = synthesized.length > limit ? synthesized.slice(synthesized.length - limit) : synthesized;
       if (
