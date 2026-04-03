@@ -13,6 +13,7 @@ import { randomUUID } from 'node:crypto';
 import { sendKeysDelayedEnter } from '../agent/tmux.js';
 import { detectStatusAsync } from '../agent/detect.js';
 import { getSession } from '../store/session-store.js';
+import { getTransportRuntime } from '../agent/session-manager.js';
 import { P2P_BASELINE_PROMPT, getP2pMode, roundPrompt, type P2pMode } from '../../shared/p2p-modes.js';
 import { formatP2pParticipantIdentity, shortP2pSessionName } from '../../shared/p2p-participant.js';
 import logger from '../util/logger.js';
@@ -589,12 +590,19 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
     let sizeBefore = 0;
     try { sizeBefore = (await stat(watchPath)).size; } catch { /* file should exist */ }
 
-    // Send the prompt (sendKeys auto-handles long text; pass cwd for sandboxed agents)
+    // Send the prompt — transport agents use provider runtime, tmux agents use sendKeys
     try {
-      await sendKeysDelayedEnter(session, prompt);
+      const transportRuntime = getTransportRuntime(session);
+      if (transportRuntime) {
+        timelineEmitter.emit(session, 'user.message', { text: prompt });
+        timelineEmitter.emit(session, 'session.state', { state: 'running' }, { source: 'daemon', confidence: 'high' });
+        await transportRuntime.send(prompt);
+      } else {
+        await sendKeysDelayedEnter(session, prompt);
+      }
     } catch (err) {
       if (attempt < MAX_RETRIES) {
-        logger.warn({ runId: run.id, session, attempt }, 'P2P: sendKeys failed, will retry');
+        logger.warn({ runId: run.id, session, attempt }, 'P2P: dispatch failed, will retry');
         await sleep(2_000);
         continue;
       }
