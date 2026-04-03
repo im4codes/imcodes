@@ -252,7 +252,7 @@ describe('AtPicker', () => {
 
     fireEvent.click(screen.getByText('agents'));
     fireEvent.click(screen.getByText((_, el) => el?.tagName === 'SPAN' && (el.textContent?.includes('all_plus') ?? false)));
-    fireEvent.click(screen.getByText((_, el) => el?.tagName === 'BUTTON' && (el.textContent?.toLowerCase().includes('audit') ?? false)));
+    fireEvent.click(screen.getByText((_, el) => el?.tagName === 'BUTTON' && el?.textContent === 'mode_audit'));
     fireEvent.click(screen.getByText('3'));
 
     expect(onSelectAllConfig).toHaveBeenCalledTimes(1);
@@ -294,7 +294,7 @@ describe('AtPicker', () => {
 
     fireEvent.click(screen.getByText('agents'));
     fireEvent.click(screen.getByText((_, el) => el?.tagName === 'SPAN' && (el.textContent?.includes('all_plus') ?? false)));
-    fireEvent.click(screen.getByText((_, el) => el?.tagName === 'BUTTON' && (el.textContent?.toLowerCase().includes('audit') ?? false)));
+    fireEvent.click(screen.getByText((_, el) => el?.tagName === 'BUTTON' && el?.textContent === 'mode_audit'));
 
     expect(screen.getByText((_, el) => el?.textContent === 'Cron')).toBeDefined();
     expect(screen.getByText((_, el) => el?.textContent === 'mm0')).toBeDefined();
