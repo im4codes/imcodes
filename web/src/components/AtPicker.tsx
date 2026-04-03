@@ -6,6 +6,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'preact/hooks'
 import { useTranslation } from 'react-i18next';
 import type { ServerMessage } from '../ws-client.js';
 import { COMBO_PRESETS, COMBO_SEPARATOR, type P2pSavedConfig } from '@shared/p2p-modes.js';
+import { getUserPref, saveUserPref } from '../api.js';
 
 interface SessionEntry {
   name: string;
@@ -199,7 +200,31 @@ export function AtPicker({
   const [configModeOverride, setConfigModeOverride] = useState<string>('config');
   const [configPickerFocus, setConfigPickerFocus] = useState<'mode' | 'rounds' | 'combo'>('rounds');
   const [comboHighlight, setComboHighlight] = useState(0);
+  const [customCombos, setCustomCombos] = useState<string[]>([]);
+  const [buildingCombo, setBuildingCombo] = useState<string[]>([]);
+  const CUSTOM_COMBOS_PREF_KEY = 'p2p_custom_combos';
+  const BUILDER_MODES = ['audit', 'review', 'plan', 'brainstorm', 'discuss'] as const;
   const CONFIG_ROUNDS_OPTIONS = [1, 2, 3, 5] as const;
+
+  // Load custom combos from server on mount
+  useEffect(() => {
+    void getUserPref(CUSTOM_COMBOS_PREF_KEY).then((raw) => {
+      if (raw && typeof raw === 'string') {
+        try { setCustomCombos(JSON.parse(raw)); } catch { /* ignore */ }
+      }
+    });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const saveCustomCombos = useCallback((combos: string[]) => {
+    setCustomCombos(combos);
+    void saveUserPref(CUSTOM_COMBOS_PREF_KEY, JSON.stringify(combos)).catch(() => {});
+  }, []);
+
+  const allCombos = useMemo(() => {
+    const presetKeys = new Set(COMBO_PRESETS.map((c) => c.key));
+    const custom = customCombos.filter((k) => !presetKeys.has(k));
+    return { presets: COMBO_PRESETS, custom };
+  }, [customCombos]);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const requestIdRef = useRef<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -352,7 +377,8 @@ export function AtPicker({
           if (configPickerFocus === 'rounds') {
             setConfigRoundsHighlight((h) => (h - 1 + CONFIG_ROUNDS_OPTIONS.length) % CONFIG_ROUNDS_OPTIONS.length);
           } else if (configPickerFocus === 'combo') {
-            setComboHighlight((h) => (h - 1 + COMBO_PRESETS.length) % COMBO_PRESETS.length);
+            const total = COMBO_PRESETS.length + allCombos.custom.length;
+            setComboHighlight((h) => (h - 1 + total) % total);
           } else {
             const next = (currentModeIdx - 1 + ALL_MODES.length) % ALL_MODES.length;
             setConfigModeOverride(ALL_MODES[next]);
@@ -364,7 +390,8 @@ export function AtPicker({
           if (configPickerFocus === 'rounds') {
             setConfigRoundsHighlight((h) => (h + 1) % CONFIG_ROUNDS_OPTIONS.length);
           } else if (configPickerFocus === 'combo') {
-            setComboHighlight((h) => (h + 1) % COMBO_PRESETS.length);
+            const total = COMBO_PRESETS.length + allCombos.custom.length;
+            setComboHighlight((h) => (h + 1) % total);
           } else {
             const next = (currentModeIdx + 1) % ALL_MODES.length;
             setConfigModeOverride(ALL_MODES[next]);
@@ -374,9 +401,11 @@ export function AtPicker({
         if (e.key === 'Enter' && p2pConfig) {
           e.preventDefault(); e.stopPropagation();
           if (configPickerFocus === 'combo') {
-            const c = COMBO_PRESETS[comboHighlight];
-            const cfg = buildEffectiveConfig(p2pConfig, c.pipeline[0]);
-            onSelectAllConfig?.(cfg, c.pipeline.length, c.key);
+            const allKeys = [...COMBO_PRESETS.map((c) => c.key), ...allCombos.custom];
+            const key = allKeys[comboHighlight] ?? allKeys[0];
+            const pipeline = key.split(COMBO_SEPARATOR);
+            const cfg = buildEffectiveConfig(p2pConfig, pipeline[0]);
+            onSelectAllConfig?.(cfg, pipeline.length, key);
           } else {
             const rounds = CONFIG_ROUNDS_OPTIONS[configRoundsHighlight];
             const effectiveConfig = buildEffectiveConfig(p2pConfig, configModeOverride);
@@ -560,13 +589,14 @@ export function AtPicker({
             })}
           </>
         )}
-        {/* Combo presets — below rounds and agents */}
+        {/* Combo presets + custom combos */}
         <div style={{
           ...groupLabelStyle,
           marginTop: 6,
           color: configPickerFocus === 'combo' ? '#93c5fd' : groupLabelStyle.color,
         }}>{t('p2p.combo_label')}</div>
         <div style={{ ...modeContainerStyle, flexWrap: 'wrap' }}>
+          {/* Built-in presets */}
           {COMBO_PRESETS.map((c, idx) => {
             const color = comboModeColor(c.key);
             const isHl = configPickerFocus === 'combo' && comboHighlight === idx;
@@ -583,8 +613,9 @@ export function AtPicker({
                   boxShadow: `0 0 0 1px ${color}55, 0 0 18px ${color}22`,
                 } : { ...modeBtnStyle, fontSize: 10, padding: '2px 6px' }}
                 onClick={() => {
-                  const cfg = buildEffectiveConfig(p2pConfig, c.pipeline[0]);
-                  onSelectAllConfig?.(cfg, c.pipeline.length, c.key);
+                  const pipeline = c.key.split(COMBO_SEPARATOR);
+                  const cfg = buildEffectiveConfig(p2pConfig, pipeline[0]);
+                  onSelectAllConfig?.(cfg, pipeline.length, c.key);
                   setConfigRoundsPicker(false);
                   setConfigPickerFocus('rounds');
                 }}
@@ -594,7 +625,86 @@ export function AtPicker({
               </button>
             );
           })}
+          {/* User custom combos */}
+          {allCombos.custom.map((key) => {
+            const color = comboModeColor(key);
+            const pipeline = key.split(COMBO_SEPARATOR);
+            return (
+              <span key={key} style={{ display: 'inline-flex', alignItems: 'center', gap: 0 }}>
+                <button
+                  type="button"
+                  style={{ ...modeBtnStyle, fontSize: 10, padding: '2px 6px', borderRadius: '6px 0 0 6px' }}
+                  onClick={() => {
+                    const cfg = buildEffectiveConfig(p2pConfig, pipeline[0]);
+                    onSelectAllConfig?.(cfg, pipeline.length, key);
+                    setConfigRoundsPicker(false);
+                    setConfigPickerFocus('rounds');
+                  }}
+                  onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.borderColor = color; (e.currentTarget as HTMLElement).style.color = color; }}
+                  onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.borderColor = modeBtnStyle.borderColor as string; (e.currentTarget as HTMLElement).style.color = modeBtnStyle.color as string; }}
+                >
+                  {comboModeLabel(key, t)}
+                </button>
+                <button
+                  type="button"
+                  style={{ ...modeBtnStyle, fontSize: 10, padding: '2px 4px', borderRadius: '0 6px 6px 0', borderLeft: 'none', color: '#64748b' }}
+                  title={t('common.delete')}
+                  onClick={() => saveCustomCombos(customCombos.filter((c) => c !== key))}
+                >
+                  ×
+                </button>
+              </span>
+            );
+          })}
         </div>
+        {/* Custom combo builder — hidden when at 5 custom limit */}
+        {(customCombos.length < 5 || buildingCombo.length > 0) && (
+          <>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '4px 12px', flexWrap: 'wrap' }}>
+              {buildingCombo.length > 0 && (
+                <span style={{ fontSize: 10, color: comboModeColor(buildingCombo.join(COMBO_SEPARATOR)), fontWeight: 600 }}>
+                  {buildingCombo.map((m) => t(`p2p.mode_${m}`)).join('→')}
+                </span>
+              )}
+              {buildingCombo.length > 0 && (
+                <button
+                  type="button"
+                  style={{ ...modeBtnStyle, fontSize: 9, padding: '1px 4px', color: '#64748b' }}
+                  onClick={() => setBuildingCombo((p) => p.slice(0, -1))}
+                >
+                  ←
+                </button>
+              )}
+              {buildingCombo.length >= 2 && (
+                <button
+                  type="button"
+                  style={{ ...modeBtnStyle, fontSize: 9, padding: '1px 6px', borderColor: '#22c55e', color: '#22c55e' }}
+                  onClick={() => {
+                    const key = buildingCombo.join(COMBO_SEPARATOR);
+                    if (!customCombos.includes(key) && !COMBO_PRESETS.some((p) => p.key === key) && customCombos.length < 5) {
+                      saveCustomCombos([...customCombos, key]);
+                    }
+                    setBuildingCombo([]);
+                  }}
+                >
+                  ✓
+                </button>
+              )}
+            </div>
+            <div style={{ ...modeContainerStyle, padding: '0 12px 8px' }}>
+              {BUILDER_MODES.map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  style={{ ...modeBtnStyle, fontSize: 9, padding: '1px 6px' }}
+                  onClick={() => setBuildingCombo((p) => [...p, m])}
+                >
+                  +{t(`p2p.mode_${m}`)}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
       </div>
     );
   }
