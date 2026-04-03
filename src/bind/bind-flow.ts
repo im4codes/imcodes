@@ -141,24 +141,19 @@ function restartDaemon(): void {
 
 const TASK_NAME = 'imcodes-daemon';
 
-async function writeWindowsWatchdogFiles(imcodesScript: string, nodeExe: string): Promise<void> {
-  const batDir = join(homedir(), '.imcodes');
-  await mkdir(batDir, { recursive: true });
-
-  const watchdogPath = join(batDir, 'daemon-watchdog.cmd');
-  const vbsPath = join(batDir, 'daemon-launcher.vbs');
-
-  const watchdog = `@echo off\r\nchcp 65001 >nul 2>&1\r\n:loop\r\n"${nodeExe}" "${imcodesScript}" start --foreground >nul 2>&1\r\ntimeout /t 5 /nobreak >nul\r\ngoto loop\r\n`;
-  await writeFile(watchdogPath, watchdog, 'utf8');
-
-  const vbs = `Set WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${watchdogPath}""", 0, False\r\n`;
-  await writeFile(vbsPath, vbs, 'utf8');
+// writeWindowsWatchdogFiles now delegates to the centralized launch-artifacts module.
+async function writeWindowsWatchdogFiles(): Promise<void> {
+  const { resolveLaunchPaths, writeWatchdogCmd, writeVbsLauncher, rotateWatchdogLog } = await import('../util/windows-launch-artifacts.js');
+  const paths = resolveLaunchPaths();
+  await writeWatchdogCmd(paths);
+  await writeVbsLauncher(paths);
+  await rotateWatchdogLog(paths);
 }
 
 async function installWindowsStartup(): Promise<void> {
   const nodeExe = process.execPath;
   const imcodesScript = join(__dirname, '..', 'index.js');
-  await writeWindowsWatchdogFiles(imcodesScript, nodeExe);
+  await writeWindowsWatchdogFiles();
 
   // Remove legacy Startup folder CMD/VBS if present
   const startupDir = join(homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup');
