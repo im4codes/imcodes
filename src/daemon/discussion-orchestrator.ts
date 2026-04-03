@@ -17,6 +17,7 @@ const IDLE_POLL_INTERVAL = 3_000;
 
 // Model strength ranking (for auto-selecting the verdict participant)
 const MODEL_STRENGTH: Record<string, number> = {
+  'opus[1M]': 100,
   opus: 100,
   sonnet: 80,
   codex: 50,

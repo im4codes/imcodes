@@ -69,7 +69,7 @@ interface Props {
 }
 
 type MenuAction = 'restart' | 'new' | 'stop';
-type ModelChoice = 'opus' | 'sonnet' | 'haiku';
+type ModelChoice = 'opus[1M]' | 'sonnet' | 'haiku';
 type CodexModelChoice = 'gpt-5.4' | 'gpt-5.4-mini' | 'gpt-5.2';
 type QwenModelChoice = string;
 type P2pMode = 'solo' | 'audit' | 'review' | 'plan' | 'brainstorm' | 'discuss' | typeof P2P_CONFIG_MODE;
@@ -122,7 +122,8 @@ const SHORTCUTS: Array<{ label: string; title: string; data: string; wide?: bool
 function loadModel(): ModelChoice | null {
   try {
     const v = localStorage.getItem(MODEL_STORAGE_KEY);
-    if (v === 'opus' || v === 'sonnet' || v === 'haiku') return v;
+    if (v === 'opus[1M]' || v === 'sonnet' || v === 'haiku') return v;
+    if (v === 'opus') return 'opus[1M]';
   } catch { /* ignore */ }
   return null;
 }
@@ -294,7 +295,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   useEffect(() => {
     if (!detectedModel) return;
     // CC models
-    if (detectedModel === 'opus' || detectedModel === 'sonnet' || detectedModel === 'haiku') {
+    if (detectedModel === 'opus[1M]' || detectedModel === 'sonnet' || detectedModel === 'haiku') {
       if (model !== detectedModel) setModel(detectedModel);
     }
     // Codex models
@@ -917,7 +918,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             </button>
             {modelOpen && (
               <div class="menu-dropdown">
-                {(['opus', 'sonnet', 'haiku'] as const).map((m) => (
+                {(['opus[1M]', 'sonnet', 'haiku'] as const).map((m) => (
                   <button
                     key={m}
                     class={`menu-item ${model === m ? 'menu-item-active' : ''}`}
