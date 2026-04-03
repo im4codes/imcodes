@@ -9,6 +9,7 @@ import { handleWebCommand, setRouterContext } from './command-handler.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
 import { notifySessionIdle, listP2pRuns } from './p2p-orchestrator.js';
 import { handlePreviewBinaryFrame } from './preview-relay.js';
+import { buildSessionList } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { timelineStore } from './timeline-store.js';
 import { startHookServer, drainQueue } from './hook-server.js';
@@ -363,36 +364,15 @@ export async function startup(): Promise<DaemonContext> {
   setSessionEventCallback((event, session, state) => {
     if (!serverLink) return;
     try { serverLink.send({ type: 'session_event', event, session, state }); } catch { /* not connected */ }
-    try {
-      serverLink.send({
-        type: 'session_list',
-        daemonVersion: serverLink.daemonVersion,
-        sessions: listSessions()
-          .filter((s) => !s.name.startsWith('deck_sub_'))
-          .map((s) => ({
-            name: s.name,
-            project: s.projectName,
-            role: s.role,
-            agentType: s.agentType,
-            agentVersion: s.agentVersion,
-            state: s.state,
-            projectDir: s.projectDir,
-            runtimeType: s.runtimeType,
-            providerId: s.providerId,
-            providerSessionId: s.providerSessionId,
-            qwenModel: s.qwenModel,
-            qwenAuthType: s.qwenAuthType,
-            qwenAuthLimit: s.qwenAuthLimit,
-            qwenAvailableModels: s.qwenAvailableModels,
-            modelDisplay: s.modelDisplay,
-            planLabel: s.planLabel,
-            quotaLabel: s.quotaLabel,
-            quotaUsageLabel: s.quotaUsageLabel,
-            description: s.description,
-            label: s.label,
-          })),
-      });
-    } catch { /* not connected */ }
+    void buildSessionList().then((sessions) => {
+      try {
+        serverLink.send({
+          type: 'session_list',
+          daemonVersion: serverLink.daemonVersion,
+          sessions,
+        });
+      } catch { /* not connected */ }
+    });
 
     // Background repo detection on session start
     if (event === 'started') {
