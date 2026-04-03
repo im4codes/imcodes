@@ -3,6 +3,7 @@
  * Cards show live chat/terminal previews. Single or double row layout.
  */
 import { useState, useEffect, useMemo, useRef } from 'preact/hooks';
+import { useTranslation } from 'react-i18next';
 import { SubSessionCard } from './SubSessionCard.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import type { WsClient } from '../ws-client.js';
@@ -61,6 +62,8 @@ interface Props {
   sessions?: import('../types.js').SessionInfo[];
   /** All sub-sessions slim — for @ picker. */
   allSubSessions?: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
+  /** Set of sub-session labels participating in active P2P discussions. */
+  p2pSessionLabels?: Set<string>;
 }
 
 const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -100,7 +103,8 @@ function formatUptime(seconds: number): string {
   return d > 0 ? `${d}d ${h}h` : `${h}h`;
 }
 
-export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId, quickData, sessions, allSubSessions }: Props) {
+export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId, quickData, sessions, allSubSessions, p2pSessionLabels }: Props) {
+  const { t } = useTranslation();
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
   const [collapsed, setCollapsed] = useState(isMobile);
   const [p2pHidden, setP2pHidden] = useState(false);
@@ -429,6 +433,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
               >
                 <span class="subsession-card-icon">{abbr}</span>
                 <span class="subsession-card-label">{sub.label ? formatLabel(sub.label).slice(0, 12) : agentTag.slice(0, 6)}</span>
+                {sub.label && p2pSessionLabels?.has(sub.label) && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
                 {model && <span class="subsession-card-model">{model}</span>}
                 {sub.ccPresetId && <span class="subsession-card-custom-api" title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
                 {sub.state === 'starting' && <span class="subsession-card-badge">…</span>}
@@ -499,6 +504,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
                 sessions={sessions}
                 subSessions={allSubSessions}
                 serverId={serverId}
+                inP2p={!!(sub.label && p2pSessionLabels?.has(sub.label))}
               />
             </div>
           ))}

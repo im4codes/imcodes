@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from 'preact/hooks';
+import { useTranslation } from 'react-i18next';
 import type { SessionInfo } from '../types.js';
 import { useSyncedPreference } from '../hooks/useSyncedPreference.js';
 import { formatLabel } from '../format-label.js';
@@ -10,6 +11,8 @@ interface Props {
   latencyMs?: number | null;
   /** Set of session names that just went idle — shows pulse alert on that tab */
   idleAlerts?: Set<string>;
+  /** Set of sub-session labels participating in active P2P discussions. */
+  p2pSessionLabels?: Set<string>;
   onAlertDismiss?: (sessionName: string) => void;
   onSelect: (name: string) => void;
   onNewSession: () => void;
@@ -45,7 +48,8 @@ function readLegacyPinned(): string[] {
   try { return JSON.parse(localStorage.getItem(LEGACY_LS_PINNED) ?? '[]'); } catch { return []; }
 }
 
-export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, onAlertDismiss, onSelect, onNewSession, onStopProject, onRestartProject, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded }: Props) {
+export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, onRestartProject, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded }: Props) {
+  const { t } = useTranslation();
   const [ctx, setCtx] = useState<CtxMenu | null>(null);
   const [stopConfirmProject, setStopConfirmProject] = useState<string | null>(null);
   const [stopConfirmLevel, setStopConfirmLevel] = useState(0);
@@ -270,6 +274,7 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
                 {isPinned && <span class="tab-pin">📌</span>}
                 {agentBadge(s.agentType)}
                 {getLabel(s)}
+                {s.label && p2pSessionLabels?.has(s.label) && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
                 {/* tool call indicator removed — too flashy */}
                 {isActive && (
                   <span class="tab-ws-dot" style={{ color: connected ? latencyColor : '#ef4444' }} title={connected ? (latencyMs != null ? `${latencyMs}ms` : 'Connected') : 'Disconnected'}>

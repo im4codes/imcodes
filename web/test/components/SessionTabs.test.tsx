@@ -4,6 +4,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, cleanup } from '@testing-library/preact';
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string, fallback?: string) => fallback ?? key.split('.').pop() ?? key,
+  }),
+}));
+
 import { SessionTabs } from '../../src/components/SessionTabs.js';
 import type { SessionInfo } from '../../src/types.js';
 
