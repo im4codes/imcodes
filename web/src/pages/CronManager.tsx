@@ -956,6 +956,9 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
         {actionType === 'command' && (
           <>
             <label style={labelStyle}>{t('cron.command')}</label>
+            <div style={{ fontSize: 11, color: '#64748b', marginBottom: 6, lineHeight: 1.5 }}>
+              {t('cron.shell_hint')}
+            </div>
             <textarea
               style={{ ...inputStyle, minHeight: '80px', resize: 'vertical', fontFamily: 'inherit' }}
               value={command}

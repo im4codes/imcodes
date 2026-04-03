@@ -593,6 +593,7 @@
     "action_p2p": "P2P 討論",
     "command": "指令",
     "command_placeholder": "輸入發送給代理的指令...",
+    "shell_hint": "提示：Shell 視窗可直接執行腳本，只需填寫腳本路徑即可（如 /path/to/script.sh）",
     "p2p_topic": "討論主題",
     "p2p_topic_placeholder": "輸入討論主題...",
     "p2p_mode": "討論模式",
