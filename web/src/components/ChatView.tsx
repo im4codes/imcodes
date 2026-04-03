@@ -448,6 +448,9 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
     });
   }, [lastVisibleTs, preview]);
 
+  const lastScrollActivityRef = useRef(Date.now());
+  const SCROLL_IDLE_RESUME_MS = 60_000;
+
   const handleScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
@@ -455,7 +458,21 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 150;
     autoScrollRef.current = atBottom;
     setShowScrollBtn(!atBottom);
+    if (!atBottom) lastScrollActivityRef.current = Date.now();
   };
+
+  // Resume auto-scroll after 1 min of scroll inactivity
+  useEffect(() => {
+    if (!showScrollBtn || preview) return;
+    const timer = setInterval(() => {
+      if (!autoScrollRef.current && Date.now() - lastScrollActivityRef.current >= SCROLL_IDLE_RESUME_MS) {
+        autoScrollRef.current = true;
+        setShowScrollBtn(false);
+        scrollToBottom();
+      }
+    }, 10_000);
+    return () => clearInterval(timer);
+  }, [showScrollBtn, preview]);
 
   // Keep the active chat pinned to bottom when layout changes reduce available height
   // (for example, when the sub-session bar appears after tab switch).
