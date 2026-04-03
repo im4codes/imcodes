@@ -4,7 +4,7 @@ import type { WsClient } from '../ws-client.js';
 import { saveUserPref } from '../api.js';
 
 const AGENTS = [
-  { id: 'claude-code', label: 'Claude Code', models: ['opus', 'sonnet'] },
+  { id: 'claude-code', label: 'Claude Code', models: ['opus[1M]', 'sonnet'] },
   { id: 'codex', label: 'Codex', models: [] },
   { id: 'gemini', label: 'Gemini', models: [] },
 ];
@@ -52,7 +52,7 @@ export function StartDiscussionDialog({ ws, defaultCwd, existingSessions, savedP
   const [cwd, setCwd] = useState(defaultCwd ?? '');
   const [participants, setParticipants] = useState<Participant[]>(
     savedPrefs?.participants ?? [
-      { roleId: 'critic', agentType: 'claude-code', model: 'opus' },
+      { roleId: 'critic', agentType: 'claude-code', model: 'opus[1M]' },
       { roleId: 'pragmatist', agentType: 'claude-code', model: 'sonnet' },
     ],
   );
@@ -246,7 +246,7 @@ export function StartDiscussionDialog({ ws, defaultCwd, existingSessions, savedP
                           value={p.model ?? 'sonnet'}
                           onChange={(e) => updateParticipant(idx, { model: (e.target as HTMLSelectElement).value })}
                         >
-                          <option value="opus">Opus</option>
+                          <option value="opus[1M]">Opus [1M]</option>
                           <option value="sonnet">Sonnet</option>
                         </select>
                       )}

@@ -992,7 +992,7 @@ export function App() {
         const stripped = msg.diff.lines.map(([, l]: [unknown, string]) => l.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')).join(' ').toLowerCase();
         // Detect models from terminal output
         const claudeModel: string | null =
-          stripped.includes('opus') ? 'opus' :
+          stripped.includes('opus') ? 'opus[1M]' :
           stripped.includes('sonnet') ? 'sonnet' :
           stripped.includes('haiku') ? 'haiku' : null;
         const gptMatch = stripped.match(/\b(gpt-5(?:\.\d+)?(?:-\w+)?)\b/);
@@ -1031,7 +1031,7 @@ export function App() {
           if (event.payload.model) {
             const modelStr = String(event.payload.model).toLowerCase();
             const claudeM: string | null =
-              modelStr.includes('opus') ? 'opus' :
+              modelStr.includes('opus') ? 'opus[1M]' :
               modelStr.includes('sonnet') ? 'sonnet' :
               modelStr.includes('haiku') ? 'haiku' : null;
             const gptM = modelStr.match(/\b(gpt-5(?:\.\d+)?(?:-\w+)?)\b/);
