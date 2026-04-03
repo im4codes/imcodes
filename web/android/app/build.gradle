@@ -1,10 +1,10 @@
 apply plugin: 'com.android.application'
 
 def keystoreFilePath = System.getenv('KEYSTORE_FILE')
-def keystorePassword = System.getenv('KEYSTORE_PASSWORD')
-def keyAlias = System.getenv('KEY_ALIAS')
-def keyPassword = System.getenv('KEY_PASSWORD')
-def releaseSigningAvailable = keystoreFilePath && keystorePassword && keyAlias && keyPassword && file(keystoreFilePath).exists()
+def keystorePass = System.getenv('KEYSTORE_PASSWORD')
+def releaseKeyAlias = System.getenv('KEY_ALIAS')
+def releaseKeyPassword = System.getenv('KEY_PASSWORD')
+def releaseSigningAvailable = keystoreFilePath && keystorePass && releaseKeyAlias && releaseKeyPassword && file(keystoreFilePath).exists()
 
 if (!releaseSigningAvailable) {
     logger.lifecycle("Release signing configuration not found. assembleRelease will build without a production signing key until KEYSTORE_FILE, KEYSTORE_PASSWORD, KEY_ALIAS, and KEY_PASSWORD are provided.")
@@ -17,9 +17,9 @@ android {
         if (releaseSigningAvailable) {
             release {
                 storeFile file(keystoreFilePath)
-                storePassword keystorePassword
-                this.keyAlias = keyAlias
-                keyPassword keyPassword
+                storePassword keystorePass
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
             }
         }
     }
