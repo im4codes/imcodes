@@ -353,8 +353,13 @@ export function buildTimelineEventsFromOpenCodeExport(
           ...(state.input ? { input: state.input } : {}),
         }, startTs, `${messageId}:${partId}:tool.call`);
         if (state.status === 'completed' || state.status === 'error') {
+          const rawOut = typeof state.output === 'string' ? state.output.trim() : '';
+          const truncOut = state.status !== 'error' && rawOut
+            ? (rawOut.length > 200 ? rawOut.slice(0, 197) + '...' : rawOut)
+            : undefined;
           push('tool.result', {
             ...(state.status === 'error' && state.error ? { error: state.error } : {}),
+            ...(truncOut ? { output: truncOut } : {}),
           }, endTs, `${messageId}:${partId}:tool.result`);
         }
       }

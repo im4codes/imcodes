@@ -171,7 +171,10 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
       timelineEmitter.emit(sessionName, 'tool.call', { tool: name, ...(input ? { input } : {}) }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
     } else if (pl.type === 'function_call_output') {
       const errMsg = pl.error;
-      timelineEmitter.emit(sessionName, 'tool.result', { ...(errMsg ? { error: errMsg } : {}) }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
+      const output = !errMsg && typeof pl.output === 'string' && pl.output.trim()
+        ? (pl.output.length > 200 ? pl.output.slice(0, 197) + '...' : pl.output)
+        : undefined;
+      timelineEmitter.emit(sessionName, 'tool.result', { ...(errMsg ? { error: errMsg } : {}), ...(output ? { output } : {}) }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
     } else if (pl.type === 'reasoning') {
       emitSessionState(sessionName, 'running');
       // Codex reasoning — content is encrypted, emit empty thinking event to show activity
@@ -183,11 +186,15 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
       timelineEmitter.emit(sessionName, 'tool.call', { tool: name, ...(input ? { input } : {}) }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
     } else if (pl.type === 'custom_tool_call_output') {
       let error: string | undefined;
+      let output: string | undefined;
       try {
         const out = JSON.parse(pl.output ?? '{}');
         if (out.metadata?.exit_code && out.metadata.exit_code !== 0) error = `exit ${out.metadata.exit_code}`;
+        // Extract truncated output text for display
+        const text = typeof out.output === 'string' ? out.output.trim() : '';
+        if (!error && text) output = text.length > 200 ? text.slice(0, 197) + '...' : text;
       } catch {}
-      timelineEmitter.emit(sessionName, 'tool.result', { ...(error ? { error } : {}) }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
+      timelineEmitter.emit(sessionName, 'tool.result', { ...(error ? { error } : {}), ...(output ? { output } : {}) }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
     } else if (pl.type === 'web_search_call') {
       emitSessionState(sessionName, 'running');
       const action = pl.action;

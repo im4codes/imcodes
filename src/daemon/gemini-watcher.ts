@@ -87,8 +87,12 @@ function parseMessage(sessionName: string, msg: any, hist?: any, streaming = fal
         if (!tc.name) continue;
         const input = extractToolInput(tc.name, tc.args);
         timelineEmitter.emit(sessionName, 'tool.call', { tool: tc.name, ...(input ? { input } : {}) }, { source: 'daemon', confidence: 'high', eventId: stableId('tc'), ts: stableTs });
-        const output = tc.result?.[0]?.functionResponse?.response?.output;
-        timelineEmitter.emit(sessionName, 'tool.result', { ...(tc.status === 'error' ? { error: output ?? 'error' } : {}) }, { source: 'daemon', confidence: 'high', eventId: stableId('tr'), ts: stableTs });
+        const rawOutput = tc.result?.[0]?.functionResponse?.response?.output;
+        const isErr = tc.status === 'error';
+        const truncOutput = !isErr && typeof rawOutput === 'string' && rawOutput.trim()
+          ? (rawOutput.length > 200 ? rawOutput.slice(0, 197) + '...' : rawOutput)
+          : undefined;
+        timelineEmitter.emit(sessionName, 'tool.result', { ...(isErr ? { error: rawOutput ?? 'error' } : {}), ...(truncOutput ? { output: truncOutput } : {}) }, { source: 'daemon', confidence: 'high', eventId: stableId('tr'), ts: stableTs });
       }
     }
     if (typeof msg.content === 'string' && msg.content.trim()) {
