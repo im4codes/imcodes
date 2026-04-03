@@ -322,7 +322,7 @@ function SessionTreeInner({
                 isSub={false}
                 unread={unread}
                 idleFlash={idleFlash}
-                inP2p={!!(session.label && p2pSessionLabels?.has(session.label))}
+                inP2p={!!p2pSessionLabels?.has(session.name)}
                 onClick={() => onSelectSession(session.name)}
               />
               {onNewSubSession && (
@@ -350,7 +350,7 @@ function SessionTreeInner({
                   isSub={true}
                   unread={subUnread}
                   idleFlash={subIdleFlash}
-                  inP2p={!!(sub.label && p2pSessionLabels?.has(sub.label))}
+                  inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
                   onClick={() => onSelectSubSession(sub)}
                 />
               );

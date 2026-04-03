@@ -433,7 +433,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
               >
                 <span class="subsession-card-icon">{abbr}</span>
                 <span class="subsession-card-label">{sub.label ? formatLabel(sub.label).slice(0, 12) : agentTag.slice(0, 6)}</span>
-                {sub.label && p2pSessionLabels?.has(sub.label) && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
+                {p2pSessionLabels?.has(sub.sessionName) && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
                 {model && <span class="subsession-card-model">{model}</span>}
                 {sub.ccPresetId && <span class="subsession-card-custom-api" title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
                 {sub.state === 'starting' && <span class="subsession-card-badge">…</span>}
@@ -504,7 +504,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
                 sessions={sessions}
                 subSessions={allSubSessions}
                 serverId={serverId}
-                inP2p={!!(sub.label && p2pSessionLabels?.has(sub.label))}
+                inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
               />
             </div>
           ))}
