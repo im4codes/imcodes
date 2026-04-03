@@ -84,6 +84,7 @@ The web project uses `i18next` with `react-i18next` for internationalization.
 
 ## Key Conventions
 
+- **FORBIDDEN — Never `git add` these directories:** `openspec/` and `docs/` are local-only planning/documentation directories. NEVER stage, commit, or push any file under `openspec/` or `docs/` to git. They are in `.gitignore` and must stay out of version control.
 - Session names follow the pattern `deck_{project}_{role}` (e.g., `deck_myapp_brain`, `deck_myapp_w1`).
 - Agent types: Process = `'claude-code' | 'codex' | 'gemini' | 'opencode' | 'shell' | 'script'`, Transport = `'openclaw' | 'qwen'` — the `AgentType` union in `src/agent/detect.ts`.
 - Server secrets (`JWT_SIGNING_KEY`) are set via environment variables, never committed.
