@@ -69,6 +69,36 @@ function getBootstrapCursorTs(events: Array<{ type: string; ts?: number }>, fall
   return Math.max(0, candidate - 1);
 }
 
+function isUserRole(message: { info?: Record<string, unknown> }): boolean {
+  return String(message.info?.role ?? '') === 'user';
+}
+
+function hasProcessableAssistantParts(message: { parts?: Array<Record<string, unknown>> }): boolean {
+  return (message.parts ?? []).some((part) => (
+    part.type === 'text'
+    || part.type === 'reasoning'
+    || part.type === 'tool'
+  ));
+}
+
+function splitCommittedMessages<T extends { info?: Record<string, unknown>; parts?: Array<Record<string, unknown>> }>(
+  messages: T[],
+): { committed: T[]; pendingTail: T[] } {
+  if (messages.length === 0) return { committed: [], pendingTail: [] };
+
+  let cut = messages.length;
+  while (cut > 0) {
+    const candidate = messages[cut - 1];
+    if (isUserRole(candidate) || hasProcessableAssistantParts(candidate)) break;
+    cut -= 1;
+  }
+
+  return {
+    committed: messages.slice(0, cut),
+    pendingTail: messages.slice(cut),
+  };
+}
+
 async function pollTick(sessionName: string, state: WatcherState): Promise<void> {
   if (state.polling) return;
   state.polling = true;
@@ -128,9 +158,19 @@ async function pollTick(sessionName: string, state: WatcherState): Promise<void>
     });
     if (!messages.length) return;
 
-    const events = buildTimelineEventsFromOpenCodeExport(sessionName, { info: { id: sessionId }, messages }, timelineEmitter.epoch);
+    const { committed, pendingTail } = splitCommittedMessages(messages);
+    if (!committed.length) {
+      if (pendingTail.length > 0) {
+        logger.debug({ sessionName, sessionId, pendingCount: pendingTail.length }, 'opencode-watcher: pending assistant rows without parts; waiting for next poll');
+      }
+      return;
+    }
+
+    const events = buildTimelineEventsFromOpenCodeExport(sessionName, { info: { id: sessionId }, messages: committed }, timelineEmitter.epoch);
+    let emittedAny = false;
     for (const event of events) {
       if (event.type === 'user.message') continue;
+      emittedAny = true;
       timelineEmitter.emit(sessionName, event.type, event.payload, {
         source: event.source,
         confidence: event.confidence,
@@ -139,13 +179,13 @@ async function pollTick(sessionName: string, state: WatcherState): Promise<void>
       });
     }
 
-    const last = messages[messages.length - 1]?.info as Record<string, unknown> | undefined;
+    const last = committed[committed.length - 1]?.info as Record<string, unknown> | undefined;
     const lastId = typeof last?.id === 'string' ? last.id : undefined;
     const lastCreated = Number((last?.time as Record<string, unknown> | undefined)?.created ?? 0);
     if (lastId) state.lastMessageId = lastId;
     if (Number.isFinite(lastCreated) && lastCreated > 0) state.lastTimeCreated = lastCreated;
     state.bootstrapMissingAssistant = false;
-    updateSessionState(sessionName, 'idle');
+    if (emittedAny) updateSessionState(sessionName, 'idle');
   } catch (err) {
     logger.debug({ err, sessionName }, 'opencode-watcher poll failed');
   } finally {
@@ -212,3 +252,7 @@ export function stopWatching(sessionName: string): void {
 export function isWatching(sessionName: string): boolean {
   return watchers.has(sessionName);
 }
+
+export const __testOnly = {
+  splitCommittedMessages,
+};

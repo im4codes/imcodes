@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   newSession: vi.fn().mockResolvedValue(undefined),
   listOpenCodeSessions: vi.fn().mockResolvedValue([{ id: 'old-session', title: 'old', updated: 1, created: 1, directory: '/proj' }]),
   discoverOpenCodeSessionId: vi.fn().mockResolvedValue('oc-main-uuid'),
+  startOpenCodeWatching: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -45,6 +46,12 @@ vi.mock('../../src/daemon/gemini-watcher.js', () => ({
   startWatching: vi.fn().mockResolvedValue(undefined),
   isWatching: vi.fn().mockReturnValue(false),
   stopWatching: vi.fn(),
+}));
+
+vi.mock('../../src/daemon/opencode-watcher.js', () => ({
+  startWatching: mocks.startOpenCodeWatching,
+  stopWatching: vi.fn(),
+  isWatching: vi.fn().mockReturnValue(false),
 }));
 
 vi.mock('../../src/daemon/opencode-history.js', () => ({
@@ -93,5 +100,6 @@ describe('launchSession — OpenCode ID handling', () => {
       exactDirectory: '/proj',
       knownSessionIds: ['old-session'],
     }));
+    expect(mocks.startOpenCodeWatching).toHaveBeenCalledWith('deck_opencode_brain', '/proj', 'oc-main-uuid');
   });
 });

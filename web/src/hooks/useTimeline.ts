@@ -169,8 +169,7 @@ export function useTimeline(
       setLoading(false);
       if (ws?.connected) {
         setRefreshing(true);
-        const afterTs = Math.max(...memCached.map((e) => e.ts));
-        historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500, afterTs);
+        historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500);
       }
       return () => { cancelled = true; };
     }
@@ -206,8 +205,7 @@ export function useTimeline(
         historyLoadedRef.current = cacheKey;
         if (ws?.connected) {
           setRefreshing(true);
-          const afterTs = stored.length > 0 ? Math.max(...stored.map((e) => e.ts)) : undefined;
-          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500, afterTs);
+          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500);
         }
       } else {
         epochRef.current = 0;
@@ -458,9 +456,7 @@ export function useTimeline(
         });
         if (ws && sessionId) {
           setRefreshing(true);
-          const cached = cacheKey ? getCachedEvents(cacheKey) : undefined;
-          const afterTs = cached && cached.length > 0 ? Math.max(...cached.map((e) => e.ts)) : undefined;
-          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500, afterTs);
+          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500);
         }
       }
       // ── Browser WS disconnected: reset in-flight pagination to prevent stuck state ──
@@ -472,9 +468,7 @@ export function useTimeline(
       // epoch mismatch and seq desync issues on mobile (app killed/backgrounded).
       if (msg.type === 'session.event' && (msg as { event: string }).event === 'connected') {
         if (ws && sessionId) {
-          const cached = cacheKey ? getCachedEvents(cacheKey) : undefined;
-          const afterTs = cached && cached.length > 0 ? Math.max(...cached.map((e) => e.ts)) : undefined;
-          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500, afterTs);
+          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500);
         }
       }
     };

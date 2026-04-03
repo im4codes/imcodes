@@ -205,6 +205,9 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     } else if (sub._fileSnapshot) {
       startWatchingDiscovered(sessionName, sub._fileSnapshot, sub._onGeminiDiscovered);
     }
+  } else if (agentType === 'opencode' && sub.cwd) {
+    const { startWatching } = await import('./opencode-watcher.js');
+    void startWatching(sessionName, sub.cwd, sub.opencodeSessionId ?? undefined);
   }
 }
 
@@ -237,6 +240,7 @@ export async function stopSubSession(sessionName: string, serverLink?: { send(ms
   (await import('./jsonl-watcher.js')).stopWatching(sessionName);
   (await import('./codex-watcher.js')).stopWatching(sessionName);
   (await import('./gemini-watcher.js')).stopWatching(sessionName);
+  (await import('./opencode-watcher.js')).stopWatching(sessionName);
   removeSession(sessionName);
 
   // Notify server so DB is updated (sub-session ID = session name without 'deck_sub_' prefix)
@@ -295,6 +299,12 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
           startGeminiWatching(sessionName, effectiveGeminiId);
         } else if (sub._fileSnapshot) {
           startGeminiWatchingDiscovered(sessionName, sub._fileSnapshot, sub._onGeminiDiscovered);
+        }
+      } else if (sub.type === 'opencode') {
+        const { startWatching: startOpenCodeWatching, isWatching: isOpenCodeWatching } = await import('./opencode-watcher.js');
+        const effectiveOpenCodeId = sub.opencodeSessionId ?? stored?.opencodeSessionId;
+        if (sub.cwd && effectiveOpenCodeId && !isOpenCodeWatching(sessionName)) {
+          void startOpenCodeWatching(sessionName, sub.cwd, effectiveOpenCodeId);
         }
       }
       // Merge all session IDs: prefer server-provided, fall back to local store

@@ -26,6 +26,7 @@ import { timelineEmitter } from '../daemon/timeline-emitter.js';
 import { startWatching, startWatchingFile, stopWatching, isWatching, findJsonlPathBySessionId } from '../daemon/jsonl-watcher.js';
 import { startWatching as startCodexWatching, startWatchingSpecificFile as startCodexWatchingFile, startWatchingById as startCodexWatchingById, stopWatching as stopCodexWatching, isWatching as isCodexWatching, findRolloutPathByUuid } from '../daemon/codex-watcher.js';
 import { startWatching as startGeminiWatching, startWatchingLatest as startGeminiWatchingLatest, stopWatching as stopGeminiWatching, isWatching as isGeminiWatching } from '../daemon/gemini-watcher.js';
+import { startWatching as startOpenCodeWatching, stopWatching as stopOpenCodeWatching, isWatching as isOpenCodeWatching } from '../daemon/opencode-watcher.js';
 import { resolveStructuredSessionBootstrap } from './structured-session-bootstrap.js';
 import { getQwenRuntimeConfig } from './qwen-runtime-config.js';
 
@@ -50,7 +51,7 @@ function startStructuredWatcher(
   name: string,
   agentType: AgentType,
   projectDir: string,
-  ids?: { ccSessionId?: string; codexSessionId?: string; geminiSessionId?: string },
+  ids?: { ccSessionId?: string; codexSessionId?: string; geminiSessionId?: string; opencodeSessionId?: string },
 ): void {
   if (agentType === 'claude-code') {
     startCCWatcher(name, projectDir, ids?.ccSessionId);
@@ -86,6 +87,10 @@ function startStructuredWatcher(
         logger.warn({ err: e, session: name }, 'gemini-watcher start latest failed'),
       );
     }
+  } else if (agentType === 'opencode') {
+    startOpenCodeWatching(name, projectDir, ids?.opencodeSessionId).catch((e) =>
+      logger.warn({ err: e, session: name }, 'opencode-watcher start failed'),
+    );
   }
 }
 
@@ -186,6 +191,7 @@ export async function stopProject(projectName: string): Promise<void> {
     stopWatching(s.name);
     stopCodexWatching(s.name);
     stopGeminiWatching(s.name);
+    stopOpenCodeWatching(s.name);
     const transportRuntime = transportRuntimes.get(s.name);
     if (transportRuntime) {
       if (transportRuntime.providerSessionId) unregisterProviderRoute(transportRuntime.providerSessionId);
@@ -211,6 +217,7 @@ export async function teardownProject(projectName: string): Promise<void> {
     stopWatching(s.name);
     stopCodexWatching(s.name);
     stopGeminiWatching(s.name);
+    stopOpenCodeWatching(s.name);
     const transportRuntime = transportRuntimes.get(s.name);
     if (transportRuntime) {
       if (transportRuntime.providerSessionId) unregisterProviderRoute(transportRuntime.providerSessionId);
@@ -343,7 +350,16 @@ export async function restoreFromStore(): Promise<void> {
           upsertSession(next);
           emitSessionPersist(next, s.name);
           logger.info({ session: s.name, opencodeSessionId: opencodeId }, 'Backfilled missing opencodeSessionId');
+          if (next.projectDir && !isOpenCodeWatching(s.name)) {
+            startOpenCodeWatching(s.name, next.projectDir, opencodeId).catch((e) =>
+              logger.warn({ err: e, session: s.name }, 'opencode-watcher start failed (restore sub-session after backfill)'),
+            );
+          }
         }
+      } else if (s.agentType === 'opencode' && s.projectDir && s.opencodeSessionId && !isOpenCodeWatching(s.name)) {
+        startOpenCodeWatching(s.name, s.projectDir, s.opencodeSessionId).catch((e) =>
+          logger.warn({ err: e, session: s.name }, 'opencode-watcher start failed (restore sub-session)'),
+        );
       }
       continue;
     }
@@ -367,6 +383,11 @@ export async function restoreFromStore(): Promise<void> {
         upsertSession(hydrated);
         emitSessionPersist(hydrated, s.name);
         logger.info({ session: s.name, opencodeSessionId: opencodeId }, 'Backfilled missing opencodeSessionId');
+        if (hydrated.projectDir && !isOpenCodeWatching(hydrated.name)) {
+          startOpenCodeWatching(hydrated.name, hydrated.projectDir, opencodeId).catch((e) =>
+            logger.warn({ err: e, session: hydrated.name }, 'opencode-watcher start failed (restore after backfill)'),
+          );
+        }
       }
     }
 
@@ -439,6 +460,10 @@ export async function restoreFromStore(): Promise<void> {
           logger.warn({ err: e, session: hydrated.name }, 'gemini-watcher start latest failed (restore)'),
         );
       }
+    } else if (hydrated.agentType === 'opencode' && hydrated.projectDir && hydrated.opencodeSessionId && !isOpenCodeWatching(hydrated.name)) {
+      startOpenCodeWatching(hydrated.name, hydrated.projectDir, hydrated.opencodeSessionId).catch((e) =>
+        logger.warn({ err: e, session: hydrated.name }, 'opencode-watcher start failed (restore)'),
+      );
     }
   }
 
@@ -461,8 +486,11 @@ export async function restoreFromStore(): Promise<void> {
 
     // Extract session UUID from pane command if it's a CC session
     let ccSessionId: string | undefined;
+    let opencodeSessionId: string | undefined;
     if (agentType === 'claude-code') {
       ccSessionId = await extractCcSessionIdFromPane(name);
+    } else if (agentType === 'opencode') {
+      opencodeSessionId = await extractOpenCodeSessionIdFromPane(name);
     }
 
     const record: SessionRecord = {
@@ -479,6 +507,7 @@ export async function restoreFromStore(): Promise<void> {
       updatedAt: Date.now(),
       ...(paneId ? { paneId } : {}),
       ...(ccSessionId ? { ccSessionId } : {}),
+      ...(opencodeSessionId ? { opencodeSessionId } : {}),
     };
 
     upsertSession(record);
@@ -486,6 +515,8 @@ export async function restoreFromStore(): Promise<void> {
     emitSessionEvent('started', name, 'running');
     if (agentType === 'claude-code' && projectDir) {
       startStructuredWatcher(name, agentType, projectDir, { ccSessionId });
+    } else if (agentType === 'opencode' && projectDir) {
+      startStructuredWatcher(name, agentType, projectDir, { opencodeSessionId });
     } else if (projectDir) {
       startStructuredWatcher(name, agentType, projectDir);
     }
@@ -622,6 +653,7 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     ccSessionId,
     codexSessionId: effectiveRecord.codexSessionId,
     geminiSessionId: effectiveRecord.geminiSessionId,
+    opencodeSessionId: effectiveRecord.opencodeSessionId,
   });
 
   // postLaunch (auto-dismiss startup prompts) + init message injection
@@ -774,6 +806,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         updatedAt: Date.now(),
         ...(effectiveQwenModel ? { qwenModel: effectiveQwenModel } : {}),
         ...(qwenRuntime?.authType ? { qwenAuthType: qwenRuntime.authType } : {}),
+        ...(qwenRuntime?.authLimit ? { qwenAuthLimit: qwenRuntime.authLimit } : {}),
         ...(availableQwenModels.length > 0 ? { qwenAvailableModels: availableQwenModels } : {}),
       });
       logger.info({ session: s.name, providerId: s.providerId, providerSid: s.providerSessionId }, 'Restored transport session runtime');
@@ -793,11 +826,13 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   let effectiveBindExistingKey = bindExistingKey;
   let effectiveSkipCreate = skipCreate;
   let qwenAuthType: SessionRecord['qwenAuthType'] | undefined;
+  let qwenAuthLimit: SessionRecord['qwenAuthLimit'] | undefined;
   let availableQwenModels: string[] | undefined;
   let effectiveQwenModel = agentType === 'qwen' ? (opts.qwenModel ?? getSession(name)?.qwenModel) : undefined;
   if (agentType === 'qwen') {
     const qwenRuntime = await getQwenRuntimeConfig().catch(() => null);
     qwenAuthType = qwenRuntime?.authType;
+    qwenAuthLimit = qwenRuntime?.authLimit;
     availableQwenModels = qwenRuntime?.availableModels ?? [];
     if (!effectiveQwenModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(effectiveQwenModel))) {
       effectiveQwenModel = availableQwenModels[0] ?? effectiveQwenModel;
@@ -848,6 +883,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         providerSessionId: runtime.providerSessionId ?? undefined,
         ...(effectiveQwenModel ? { qwenModel: effectiveQwenModel } : {}),
         ...(qwenAuthType ? { qwenAuthType } : {}),
+        ...(qwenAuthLimit ? { qwenAuthLimit } : {}),
         ...(availableQwenModels?.length ? { qwenAvailableModels: availableQwenModels } : {}),
         description,
         label,
@@ -1002,7 +1038,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   emitSessionEvent('started', name, 'running');
 
   // Start structured-event watchers for supported agent types
-  startStructuredWatcher(name, agentType, projectDir, { ccSessionId, codexSessionId, geminiSessionId });
+  startStructuredWatcher(name, agentType, projectDir, { ccSessionId, codexSessionId, geminiSessionId, opencodeSessionId });
 
   // Auto-dismiss startup prompts (trust folder, settings errors, update dialogs)
   if (driver.postLaunch) {

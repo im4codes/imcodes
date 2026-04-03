@@ -18,6 +18,9 @@ const mocks = vi.hoisted(() => ({
   restartSession: vi.fn().mockResolvedValue(true),
   newSession: vi.fn().mockResolvedValue(undefined),
   respawnPane: vi.fn().mockResolvedValue(undefined),
+  discoverLatestOpenCodeSessionId: vi.fn().mockResolvedValue(undefined),
+  openCodeStartWatching: vi.fn().mockResolvedValue(undefined),
+  openCodeIsWatching: vi.fn().mockReturnValue(false),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -81,6 +84,9 @@ vi.mock('child_process', () => ({
     if (cb) cb(null, { stdout: '', stderr: '' });
     return { stdout: { on: vi.fn() }, on: vi.fn(), kill: vi.fn() };
   }),
+  execFile: vi.fn((_file: string, _args: string[], _opts: unknown, cb?: Function) => {
+    if (cb) cb(null, { stdout: '', stderr: '' });
+  }),
   spawn: vi.fn().mockReturnValue({
     stdout: { on: vi.fn() },
     on: vi.fn(),
@@ -95,6 +101,16 @@ vi.mock('../../src/agent/signal.js', () => ({
 vi.mock('../../src/agent/notify-setup.js', () => ({
   setupCodexNotify: vi.fn().mockResolvedValue(undefined),
   setupOpenCodePlugin: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../../src/daemon/opencode-history.js', () => ({
+  discoverLatestOpenCodeSessionId: mocks.discoverLatestOpenCodeSessionId,
+}));
+
+vi.mock('../../src/daemon/opencode-watcher.js', () => ({
+  startWatching: mocks.openCodeStartWatching,
+  stopWatching: vi.fn(),
+  isWatching: mocks.openCodeIsWatching,
 }));
 
 import { restoreFromStore } from '../../src/agent/session-manager.js';
@@ -222,6 +238,35 @@ describe('Session Restoration (all agents)', () => {
     expect(mocks.storeUpsertSession).toHaveBeenCalledWith(expect.objectContaining({
       name: 'deck_proj_brain',
       opencodeSessionId: 'oc-main-restore-123',
+    }));
+    expect(mocks.openCodeStartWatching).toHaveBeenCalledWith('deck_proj_brain', '/proj', 'oc-main-restore-123');
+  });
+
+  it('backfills opencodeSessionId for live main OpenCode sessions from sqlite history when tmux command has no -s', async () => {
+    mocks.getPaneStartCommand.mockResolvedValueOnce('opencode');
+    mocks.discoverLatestOpenCodeSessionId.mockResolvedValueOnce('oc-main-sqlite-123');
+    mocks.storeListSessions.mockReturnValue([
+      {
+        name: 'deck_proj_brain',
+        agentType: 'opencode',
+        projectDir: '/proj',
+        state: 'running',
+        createdAt: 1000,
+        restartTimestamps: [],
+      },
+    ]);
+    mocks.tmuxListSessions.mockResolvedValue(['deck_proj_brain']);
+
+    await restoreFromStore();
+
+    expect(mocks.discoverLatestOpenCodeSessionId).toHaveBeenCalledWith('/proj', expect.objectContaining({
+      exactDirectory: '/proj',
+      updatedAfter: 0,
+      maxCount: 50,
+    }));
+    expect(mocks.storeUpsertSession).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_proj_brain',
+      opencodeSessionId: 'oc-main-sqlite-123',
     }));
   });
 });

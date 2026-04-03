@@ -13,7 +13,8 @@ import { describe, it, expect, vi } from 'vitest';
 
 const {
   storeMock, tmuxListMock, startWatchingMock, startWatchingFileMock,
-  isWatchingMock, restartSessionMock, getPaneStartCommandMock, upsertSessionMock,
+  isWatchingMock, restartSessionMock, getPaneStartCommandMock, upsertSessionMock, discoverLatestOpenCodeSessionIdMock,
+  opencodeStartWatchingMock, opencodeIsWatchingMock,
 } = vi.hoisted(() => ({
   storeMock: vi.fn(),
   tmuxListMock: vi.fn().mockResolvedValue(['deck_Cd_brain', 'deck_sub_5907196l']),
@@ -23,6 +24,9 @@ const {
   restartSessionMock: vi.fn().mockResolvedValue(undefined),
   getPaneStartCommandMock: vi.fn().mockResolvedValue('claude --dangerously-skip-permissions'),
   upsertSessionMock: vi.fn(),
+  discoverLatestOpenCodeSessionIdMock: vi.fn().mockResolvedValue(undefined),
+  opencodeStartWatchingMock: vi.fn().mockResolvedValue(undefined),
+  opencodeIsWatchingMock: vi.fn().mockReturnValue(false),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -73,6 +77,16 @@ vi.mock('../../src/daemon/codex-watcher.js', () => ({
 
 vi.mock('../../src/agent/detect.js', () => ({
   detectStatus: vi.fn(() => 'idle'),
+}));
+
+vi.mock('../../src/daemon/opencode-history.js', () => ({
+  discoverLatestOpenCodeSessionId: discoverLatestOpenCodeSessionIdMock,
+}));
+
+vi.mock('../../src/daemon/opencode-watcher.js', () => ({
+  startWatching: opencodeStartWatchingMock,
+  stopWatching: vi.fn(),
+  isWatching: opencodeIsWatchingMock,
 }));
 
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
@@ -155,6 +169,31 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
     expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
       name: 'deck_sub_5907196l',
       opencodeSessionId: 'oc-sub-restore-456',
+    }));
+    expect(opencodeStartWatchingMock).toHaveBeenCalledWith('deck_sub_5907196l', '/proj', 'oc-sub-restore-456');
+  });
+
+  it('backfills opencodeSessionId for live sub-sessions from sqlite history when tmux command has no -s', async () => {
+    getPaneStartCommandMock.mockResolvedValueOnce('opencode');
+    discoverLatestOpenCodeSessionIdMock.mockResolvedValueOnce('oc-sub-sqlite-789');
+    storeMock.mockReturnValue([
+      {
+        name: 'deck_sub_5907196l', agentType: 'opencode',
+        projectDir: '/proj', opencodeSessionId: undefined, state: 'running', createdAt: 2000,
+      },
+    ]);
+    tmuxListMock.mockResolvedValue(['deck_sub_5907196l']);
+
+    await restoreFromStore();
+
+    expect(discoverLatestOpenCodeSessionIdMock).toHaveBeenCalledWith('/proj', expect.objectContaining({
+      exactDirectory: '/proj',
+      updatedAfter: 0,
+      maxCount: 50,
+    }));
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_sub_5907196l',
+      opencodeSessionId: 'oc-sub-sqlite-789',
     }));
   });
 });

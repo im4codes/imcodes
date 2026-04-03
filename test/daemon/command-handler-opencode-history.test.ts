@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { hasSubstantiveTimelineHistory } from '../../src/daemon/command-handler.js';
+import { countSubstantiveTimelineEvents, hasSubstantiveTimelineHistory, getOpenCodeSynthesizedAfterTs } from '../../src/daemon/command-handler.js';
 
 describe('command-handler OpenCode history fallback gating', () => {
   it('treats state-only timeline as non-substantive so fallback can run', () => {
@@ -26,4 +26,26 @@ describe('command-handler OpenCode history fallback gating', () => {
       { type: 'tool.call' },
     ])).toBe(true);
   });
+
+  it('scores richer OpenCode synthesized history above partial live timeline', () => {
+    expect(countSubstantiveTimelineEvents([
+      { type: 'session.state' },
+      { type: 'user.message' },
+      { type: 'command.ack' },
+    ])).toBe(1);
+
+    expect(countSubstantiveTimelineEvents([
+      { type: 'user.message' },
+      { type: 'assistant.thinking' },
+      { type: 'assistant.text' },
+    ])).toBe(3);
+  });
+
+
+  it('widens opencode synthesized history afterTs to recover late backfilled assistant messages', () => {
+    expect(getOpenCodeSynthesizedAfterTs(undefined)).toBeUndefined();
+    expect(getOpenCodeSynthesizedAfterTs(1000)).toBe(0);
+    expect(getOpenCodeSynthesizedAfterTs(120000)).toBe(60000);
+  });
+
 });

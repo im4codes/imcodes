@@ -33,10 +33,12 @@ describe('opencode-history', () => {
   });
 
   it('lists sessions via `opencode session list --format json`', async () => {
-    mocks.execFile.mockImplementation((_file, _args, _opts, cb) => cb(null, {
-      stdout: JSON.stringify([{ id: 's1', title: 't', updated: 10, created: 1, directory: '/proj' }]),
-      stderr: '',
-    }));
+    mocks.execFile
+      .mockImplementationOnce((_file, _args, _opts, cb) => cb(new Error('no db path')))
+      .mockImplementationOnce((_file, _args, _opts, cb) => cb(null, {
+        stdout: JSON.stringify([{ id: 's1', title: 't', updated: 10, created: 1, directory: '/proj' }]),
+        stderr: '',
+      }));
 
     const sessions = await listOpenCodeSessions('/proj', 5);
     expect(sessions).toEqual([
@@ -44,15 +46,36 @@ describe('opencode-history', () => {
     ]);
   });
 
+  it('prefers sqlite session list when available', async () => {
+    mocks.execFile
+      .mockImplementationOnce((_file, _args, _opts, cb) => cb(null, {
+        stdout: '/tmp/opencode.db\n',
+        stderr: '',
+      }))
+      .mockImplementationOnce((_file, _args, _opts, cb) => cb(null, {
+        stdout: JSON.stringify([{ id: 's1', title: 'sqlite', time_updated: 10, time_created: 1, directory: '/proj', project_id: 'p1' }]),
+        stderr: '',
+      }));
+
+    await expect(listOpenCodeSessions('/proj', 5)).resolves.toEqual([
+      { id: 's1', title: 'sqlite', updated: 10, created: 1, directory: '/proj', projectId: 'p1' },
+    ]);
+  });
+
   it('discovers the latest matching session id by directory and timestamp', async () => {
-    mocks.execFile.mockImplementation((_file, _args, _opts, cb) => cb(null, {
-      stdout: JSON.stringify([
-        { id: 'old', title: 'old', updated: 100, created: 1, directory: '/proj' },
-        { id: 'wrong-dir', title: 'x', updated: 300, created: 1, directory: '/other' },
-        { id: 'new', title: 'new', updated: 250, created: 1, directory: '/proj' },
-      ]),
-      stderr: '',
-    }));
+    mocks.execFile
+      .mockImplementationOnce((_file, _args, _opts, cb) => cb(null, {
+        stdout: '/tmp/opencode.db\n',
+        stderr: '',
+      }))
+      .mockImplementationOnce((_file, _args, _opts, cb) => cb(null, {
+        stdout: JSON.stringify([
+          { id: 'old', title: 'old', time_updated: 100, time_created: 1, directory: '/proj' },
+          { id: 'wrong-dir', title: 'x', time_updated: 300, time_created: 1, directory: '/other' },
+          { id: 'new', title: 'new', time_updated: 250, time_created: 1, directory: '/proj' },
+        ]),
+        stderr: '',
+      }));
 
     await expect(discoverLatestOpenCodeSessionId('/proj', { updatedAfter: 200, exactDirectory: '/proj' }))
       .resolves.toBe('new');
@@ -85,9 +108,11 @@ describe('opencode-history', () => {
 
   it('retries until a session appears', async () => {
     mocks.execFile
+      .mockImplementationOnce((_file, _args, _opts, cb) => cb(null, { stdout: '/tmp/opencode.db\n', stderr: '' }))
       .mockImplementationOnce((_file, _args, _opts, cb) => cb(null, { stdout: '[]', stderr: '' }))
+      .mockImplementationOnce((_file, _args, _opts, cb) => cb(null, { stdout: '/tmp/opencode.db\n', stderr: '' }))
       .mockImplementationOnce((_file, _args, _opts, cb) => cb(null, {
-        stdout: JSON.stringify([{ id: 'appeared', title: 't', updated: 500, created: 1, directory: '/proj' }]),
+        stdout: JSON.stringify([{ id: 'appeared', title: 't', time_updated: 500, time_created: 1, directory: '/proj' }]),
         stderr: '',
       }));
 
@@ -96,14 +121,50 @@ describe('opencode-history', () => {
   });
 
   it('exports a session as JSON', async () => {
-    mocks.execFile.mockImplementation((_file, _args, _opts, cb) => cb(null, {
-      stdout: JSON.stringify({ info: { id: 's1' }, messages: [{ info: { id: 'm1' }, parts: [] }] }),
-      stderr: '',
-    }));
+    mocks.execFile
+      .mockImplementationOnce((_file, _args, _opts, cb) => cb(new Error('sqlite unavailable')))
+      .mockImplementationOnce((_file, _args, _opts, cb) => cb(null, {
+        stdout: 'Exporting session: s1\n' + JSON.stringify({ info: { id: 's1' }, messages: [{ info: { id: 'm1' }, parts: [] }] }),
+        stderr: '',
+      }));
 
     await expect(exportOpenCodeSession('/proj', 's1')).resolves.toEqual({
       info: { id: 's1' },
       messages: [{ info: { id: 'm1' }, parts: [] }],
+    });
+  });
+
+  it('exports a session from sqlite tables when available', async () => {
+    mocks.execFile
+      .mockImplementationOnce((_file, _args, _opts, cb) => cb(null, {
+        stdout: '/tmp/opencode.db\n',
+        stderr: '',
+      }))
+      .mockImplementationOnce((_file, _args, _opts, cb) => cb(null, {
+        stdout: JSON.stringify([{ id: 's1', title: 'sqlite title', directory: '/proj', time_created: 1, time_updated: 2 }]),
+        stderr: '',
+      }))
+      .mockImplementationOnce((_file, _args, _opts, cb) => cb(null, {
+        stdout: JSON.stringify([
+          { id: 'm1', time_created: 100, data: JSON.stringify({ role: 'user', time: { created: 100 } }) },
+          { id: 'm2', time_created: 110, data: JSON.stringify({ role: 'assistant', time: { created: 110 } }) },
+        ]),
+        stderr: '',
+      }))
+      .mockImplementationOnce((_file, _args, _opts, cb) => cb(null, {
+        stdout: JSON.stringify([
+          { id: 'p1', message_id: 'm1', time_created: 101, data: JSON.stringify({ type: 'text', text: 'hello' }) },
+          { id: 'p2', message_id: 'm2', time_created: 111, data: JSON.stringify({ type: 'text', text: 'world' }) },
+        ]),
+        stderr: '',
+      }));
+
+    await expect(exportOpenCodeSession('/proj', 's1')).resolves.toEqual({
+      info: { id: 's1', title: 'sqlite title', directory: '/proj', time_created: 1, time_updated: 2 },
+      messages: [
+        { info: { id: 'm1', role: 'user', time: { created: 100 } }, parts: [{ id: 'p1', type: 'text', text: 'hello' }] },
+        { info: { id: 'm2', role: 'assistant', time: { created: 110 } }, parts: [{ id: 'p2', type: 'text', text: 'world' }] },
+      ],
     });
   });
 

@@ -1082,6 +1082,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             ...record,
             qwenModel: nextModel,
             ...(runtimeConfig?.authType ? { qwenAuthType: runtimeConfig.authType } : {}),
+            ...(runtimeConfig?.authLimit ? { qwenAuthLimit: runtimeConfig.authLimit } : {}),
             ...(runtimeConfig?.availableModels?.length ? { qwenAvailableModels: runtimeConfig.availableModels } : {}),
             updatedAt: Date.now(),
           });
@@ -1239,6 +1240,7 @@ function handleGetSessions(serverLink: ServerLink): void {
       providerSessionId: s.providerSessionId,
       qwenModel: s.qwenModel,
       qwenAuthType: s.qwenAuthType,
+      qwenAuthLimit: s.qwenAuthLimit,
       qwenAvailableModels: s.qwenAvailableModels,
       description: s.description,
       label: s.label,
