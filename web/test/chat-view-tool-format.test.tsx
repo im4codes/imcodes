@@ -72,4 +72,18 @@ describe('ChatView tool payload formatting', () => {
     expect(screen.getByText('/tmp/readme.md')).toBeDefined();
     expect(screen.queryByText('[object Object]')).toBeNull();
   });
+
+  it('hides meaningless empty object tool inputs', () => {
+    const events = [
+      makeEvent({
+        type: 'tool.call',
+        payload: { tool: 'web_search', input: {} },
+      }),
+    ];
+
+    render(<ChatView events={events} loading={false} />);
+
+    expect(screen.getByText('web_search')).toBeDefined();
+    expect(screen.queryByText('{}')).toBeNull();
+  });
 });

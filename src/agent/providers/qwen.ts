@@ -109,6 +109,17 @@ function stringifyToolResultContent(content: unknown): string | undefined {
   return parts.length > 0 ? parts.join('\n') : undefined;
 }
 
+function hasMeaningfulToolValue(value: unknown): boolean {
+  if (value == null) return false;
+  if (typeof value === 'string') return value.trim().length > 0;
+  if (typeof value === 'number' || typeof value === 'boolean') return true;
+  if (Array.isArray(value)) return value.some((item) => hasMeaningfulToolValue(item));
+  if (typeof value === 'object') {
+    return Object.values(value as Record<string, unknown>).some((item) => hasMeaningfulToolValue(item));
+  }
+  return false;
+}
+
 export class QwenProvider implements TransportProvider {
   readonly id = 'qwen';
   readonly connectionMode = CONNECTION_MODES.LOCAL_SDK;
@@ -354,12 +365,14 @@ export class QwenProvider implements TransportProvider {
             input: toolInput,
             partialJson: '',
           });
-          emitTool({
-            id: toolId,
-            name: toolName,
-            status: 'running',
-            ...(toolInput !== undefined ? { input: toolInput } : {}),
-          });
+          if (hasMeaningfulToolValue(toolInput)) {
+            emitTool({
+              id: toolId,
+              name: toolName,
+              status: 'running',
+              input: toolInput,
+            });
+          }
           return;
         }
         if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta' && typeof event.delta.text === 'string') {
@@ -387,7 +400,7 @@ export class QwenProvider implements TransportProvider {
             id: tool.id,
             name: tool.name,
             status: 'running',
-            ...(tool.input !== undefined ? { input: tool.input } : {}),
+            ...(hasMeaningfulToolValue(tool.input) ? { input: tool.input } : {}),
           });
         }
         return;
@@ -396,12 +409,14 @@ export class QwenProvider implements TransportProvider {
       if (payload.type === 'assistant') {
         for (const block of payload.message?.content ?? []) {
           if (block?.type === 'tool_use' && block.id) {
-            emitTool({
-              id: block.id,
-              name: block.name ?? 'tool',
-              status: 'running',
-              ...(block.input !== undefined ? { input: block.input } : {}),
-            });
+            if (hasMeaningfulToolValue(block.input)) {
+              emitTool({
+                id: block.id,
+                name: block.name ?? 'tool',
+                status: 'running',
+                input: block.input,
+              });
+            }
           }
         }
         const finalText = collectAssistantText(payload.message?.content);

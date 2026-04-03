@@ -78,10 +78,12 @@ function formatToolPayloadValue(value: unknown): string {
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   if (Array.isArray(value)) {
     const parts = value.map((item) => formatToolPayloadValue(item)).filter(Boolean);
+    if (parts.length === 0) return '';
     return truncateToolText(parts.join(', '));
   }
   if (typeof value === 'object') {
     const record = value as Record<string, unknown>;
+    if (Object.keys(record).length === 0) return '';
     for (const key of TOOL_INPUT_SUMMARY_KEYS) {
       const candidate = record[key];
       if (candidate === undefined) continue;
@@ -1153,4 +1155,3 @@ function splitPathsAndUrls(
 
   return parts.length ? parts : [<span>{text}</span>];
 }
-
