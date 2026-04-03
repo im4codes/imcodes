@@ -14,6 +14,9 @@ env:
   GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
   ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
 
+permissions:
+  contents: write
+
 jobs:
   android-release:
     name: Android Release Build
