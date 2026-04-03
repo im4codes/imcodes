@@ -16,6 +16,20 @@ function shouldProcessReplay(
   return true;
 }
 
+function shouldProcessHistory(
+  msg: { sessionName: string; requestId?: string },
+  currentSessionId: string,
+  olderRequestId: string | null,
+  latestHistoryRequestId: string | null,
+): boolean {
+  if (msg.sessionName !== currentSessionId) return false;
+  if (msg.requestId && msg.requestId === olderRequestId) return true;
+  // Forward history batches are accepted even when requestId is stale. useTimeline
+  // merges by eventId and ts, so stale same-session history cannot delete newer
+  // events, but rejecting it can strand mobile clients on stale cache.
+  return true;
+}
+
 function makeEvent(overrides: Partial<TimelineEvent> & { seq: number; epoch: number }): TimelineEvent {
   return {
     eventId: `evt-${overrides.seq}`,
@@ -92,6 +106,35 @@ describe('timeline replay requestId filtering', () => {
       'req-2', // Browser B is waiting for req-2
     );
     expect(resultForB).toBe(false);
+  });
+});
+
+describe('timeline history requestId handling', () => {
+  it('accepts matching older pagination responses', () => {
+    expect(shouldProcessHistory(
+      { sessionName: 'session-a', requestId: 'older-1' },
+      'session-a',
+      'older-1',
+      'latest-1',
+    )).toBe(true);
+  });
+
+  it('accepts stale same-session history responses after overlapping reconnect requests', () => {
+    expect(shouldProcessHistory(
+      { sessionName: 'session-a', requestId: 'history-1' },
+      'session-a',
+      null,
+      'history-2',
+    )).toBe(true);
+  });
+
+  it('rejects history for the wrong session', () => {
+    expect(shouldProcessHistory(
+      { sessionName: 'session-b', requestId: 'history-1' },
+      'session-a',
+      null,
+      'history-2',
+    )).toBe(false);
   });
 });
 
