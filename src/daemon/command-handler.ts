@@ -362,7 +362,9 @@ function getDedup(sessionName: string): CommandDedup {
 }
 
 function expandTilde(p: string): string {
-  return p.startsWith('~/') ? homedir() + p.slice(1) : p === '~' ? homedir() : p;
+  if (p === '~') return homedir();
+  if (p.startsWith('~/') || p.startsWith('~\\')) return homedir() + p.slice(1);
+  return p;
 }
 
 // Track active terminal subscriptions for proper cleanup
@@ -2260,6 +2262,8 @@ async function handleFileSearch(cmd: Record<string, unknown>, serverLink: Server
   }
 }
 
+const FS_LIST_DEADLINE_MS = 10_000;
+
 async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawPath = cmd.path as string | undefined;
   const requestId = cmd.requestId as string | undefined;
@@ -2267,47 +2271,69 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
   const includeMetadata = cmd.includeMetadata === true;
   if (!rawPath || !requestId) return;
 
-  const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
+  const expanded = rawPath.startsWith('~') || rawPath.startsWith('~\\') ? rawPath.replace(/^~/, homedir()) : rawPath;
   const resolved = nodePath.resolve(expanded);
 
+  const deadline = new Promise<never>((_, reject) => setTimeout(() => reject(new Error('fs_list_timeout')), FS_LIST_DEADLINE_MS));
+
   try {
-    const real = await fsRealpath(resolved);
-    const allowed = isPathAllowed(real);
-    if (!allowed) {
-      try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
-      return;
-    }
-
-    const dirents = await fsReaddir(real, { withFileTypes: true });
-    const filtered = dirents.filter((d) => d.isDirectory() || (includeFiles && d.isFile()));
-
-    const entries = await Promise.all(filtered.map(async (d) => {
-      const entry: Record<string, unknown> = { name: d.name, isDir: d.isDirectory(), hidden: d.name.startsWith('.') };
-      if (includeMetadata && !d.isDirectory()) {
-        try {
-          const filePath = nodePath.join(real, d.name);
-          const fileStat = await fsStat(filePath);
-          entry.size = fileStat.size;
-          const ext = nodePath.extname(d.name).toLowerCase().slice(1);
-          entry.mime = MIME_MAP[ext] || undefined;
-          // Generate a short-lived download handle
-          const handle = createProjectFileHandle(filePath, d.name, entry.mime as string | undefined, fileStat.size);
-          entry.downloadId = handle.id;
-        } catch { /* stat failed, skip metadata */ }
-      }
-      return entry;
-    }));
-
-    entries.sort((a, b) => {
-      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-      if (a.hidden !== b.hidden) return (a.hidden ? 1 : 0) - (b.hidden ? 1 : 0);
-      return (a.name as string).localeCompare(b.name as string);
-    });
-
-    try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', entries }); } catch { /* ignore */ }
+    await Promise.race([handleFsListInner(resolved, rawPath, requestId, includeFiles, includeMetadata, serverLink), deadline]);
   } catch (err) {
-    try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg === 'fs_list_timeout') {
+      try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: 'fs_list_timeout' }); } catch { /* ignore */ }
+    } else {
+      try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: msg }); } catch { /* ignore */ }
+    }
   }
+}
+
+async function handleFsListInner(resolved: string, rawPath: string, requestId: string, includeFiles: boolean, includeMetadata: boolean, serverLink: ServerLink): Promise<void> {
+  let real: string;
+  try {
+    real = await fsRealpath(resolved);
+  } catch (err) {
+    if (process.platform === 'win32') {
+      logger.debug({ resolved, err }, 'fsRealpath failed on Windows, falling back to resolved path');
+      real = resolved;
+    } else {
+      throw err;
+    }
+  }
+
+  const allowed = isPathAllowed(real);
+  if (!allowed) {
+    try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
+    return;
+  }
+
+  const dirents = await fsReaddir(real, { withFileTypes: true });
+  const filtered = dirents.filter((d) => d.isDirectory() || (includeFiles && d.isFile()));
+
+  const entries = await Promise.all(filtered.map(async (d) => {
+    const entry: Record<string, unknown> = { name: d.name, isDir: d.isDirectory(), hidden: d.name.startsWith('.') };
+    if (includeMetadata && !d.isDirectory()) {
+      try {
+        const filePath = nodePath.join(real, d.name);
+        const fileStat = await fsStat(filePath);
+        entry.size = fileStat.size;
+        const ext = nodePath.extname(d.name).toLowerCase().slice(1);
+        entry.mime = MIME_MAP[ext] || undefined;
+        // Generate a short-lived download handle
+        const handle = createProjectFileHandle(filePath, d.name, entry.mime as string | undefined, fileStat.size);
+        entry.downloadId = handle.id;
+      } catch { /* stat failed, skip metadata */ }
+    }
+    return entry;
+  }));
+
+  entries.sort((a, b) => {
+    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+    if (a.hidden !== b.hidden) return (a.hidden ? 1 : 0) - (b.hidden ? 1 : 0);
+    return (a.name as string).localeCompare(b.name as string);
+  });
+
+  try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', entries }); } catch { /* ignore */ }
 }
 
 const FS_READ_SIZE_LIMIT = 512 * 1024; // 512 KB

@@ -149,6 +149,7 @@
     "show_hidden": "Ocultos",
     "selected_count": "{{count}} seleccionados",
     "timeout": "Tiempo de espera agotado",
+    "timeout_detail": "No se pudo leer el directorio. Puede ser causado por unidades de red lentas o no disponibles.",
     "preview_loading": "Cargando…",
     "preview_too_large": "Archivo demasiado grande para previsualizar (> 512 KB)",
     "preview_error": "Vista previa no disponible",

@@ -149,6 +149,7 @@
     "show_hidden": "隐藏文件",
     "selected_count": "已选 {{count}} 项",
     "timeout": "请求超时",
+    "timeout_detail": "无法读取目录。可能是由网络驱动器缓慢或不可用引起的。",
     "preview_loading": "加载中…",
     "preview_too_large": "文件过大，无法预览（> 512 KB）",
     "preview_error": "预览不可用",

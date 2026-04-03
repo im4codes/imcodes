@@ -149,6 +149,7 @@
     "show_hidden": "隠しファイル",
     "selected_count": "{{count}}件選択中",
     "timeout": "リクエストがタイムアウトしました",
+    "timeout_detail": "ディレクトリを読み取れませんでした。ネットワークドライブの遅延や利用不可が原因の可能性があります。",
     "preview_loading": "読み込み中…",
     "preview_too_large": "ファイルが大きすぎてプレビューできません（> 512 KB）",
     "preview_error": "プレビュー不可",

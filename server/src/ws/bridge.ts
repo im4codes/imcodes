@@ -512,42 +512,42 @@ export class WsBridge {
       // Track fs.ls requests for single-cast response routing
       if (msg.type === 'fs.ls' && typeof msg.requestId === 'string') {
         const reqId = msg.requestId;
-        const timer = setTimeout(() => this.pendingFsRequests.delete(reqId), 30_000);
+        const timer = setTimeout(() => this.pendingFsRequests.delete(reqId), 20_000);
         this.pendingFsRequests.set(reqId, { socket: ws, timer });
       }
 
       // Track fs.read requests for single-cast response routing
       if (msg.type === 'fs.read' && typeof msg.requestId === 'string') {
         const reqId = msg.requestId;
-        const timer = setTimeout(() => this.pendingFsReadRequests.delete(reqId), 30_000);
+        const timer = setTimeout(() => this.pendingFsReadRequests.delete(reqId), 20_000);
         this.pendingFsReadRequests.set(reqId, { socket: ws, timer });
       }
 
       // Track fs.git_status requests for single-cast response routing
       if (msg.type === 'fs.git_status' && typeof msg.requestId === 'string') {
         const reqId = msg.requestId;
-        const timer = setTimeout(() => this.pendingFsGitStatusRequests.delete(reqId), 30_000);
+        const timer = setTimeout(() => this.pendingFsGitStatusRequests.delete(reqId), 20_000);
         this.pendingFsGitStatusRequests.set(reqId, { socket: ws, timer });
       }
 
       // Track fs.git_diff requests for single-cast response routing
       if (msg.type === 'fs.git_diff' && typeof msg.requestId === 'string') {
         const reqId = msg.requestId;
-        const timer = setTimeout(() => this.pendingFsGitDiffRequests.delete(reqId), 30_000);
+        const timer = setTimeout(() => this.pendingFsGitDiffRequests.delete(reqId), 20_000);
         this.pendingFsGitDiffRequests.set(reqId, { socket: ws, timer });
       }
 
       // Track file.search requests for single-cast response routing
       if (msg.type === 'file.search' && typeof msg.requestId === 'string') {
         const reqId = msg.requestId;
-        const timer = setTimeout(() => this.pendingFileSearchRequests.delete(reqId), 30_000);
+        const timer = setTimeout(() => this.pendingFileSearchRequests.delete(reqId), 20_000);
         this.pendingFileSearchRequests.set(reqId, { socket: ws, timer });
       }
 
       // Track fs.write requests for single-cast response routing
       if (msg.type === 'fs.write' && typeof msg.requestId === 'string') {
         const reqId = msg.requestId;
-        const timer = setTimeout(() => this.pendingFsWriteRequests.delete(reqId), 30_000);
+        const timer = setTimeout(() => this.pendingFsWriteRequests.delete(reqId), 20_000);
         this.pendingFsWriteRequests.set(reqId, { socket: ws, timer });
       }
 
