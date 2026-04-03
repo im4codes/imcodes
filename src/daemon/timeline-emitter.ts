@@ -105,19 +105,33 @@ export class TimelineEmitter {
       payload,
     };
 
-    // Ring buffer
+    // Ring buffer — stable eventId events replace in-place (streaming delta updates)
     let buf = this.buffer.get(sessionId);
     if (!buf) {
       buf = [];
       this.buffer.set(sessionId, buf);
     }
-    buf.push(event);
+    const isStableUpdate = opts?.eventId != null;
+    if (isStableUpdate) {
+      const existingIdx = buf.findIndex((e) => e.eventId === eventId);
+      if (existingIdx >= 0) {
+        buf[existingIdx] = event;
+      } else {
+        buf.push(event);
+      }
+    } else {
+      buf.push(event);
+    }
     if (buf.length > MAX_BUFFER) {
       buf.splice(0, buf.length - MAX_BUFFER);
     }
 
-    // Persist to disk
-    timelineStore.append(event);
+    // Persist to disk — skip intermediate streaming events (streaming: true with stable eventId)
+    // to avoid JSONL bloat; the final version (streaming: false) will be persisted by onComplete
+    const isStreamingDelta = isStableUpdate && payload.streaming === true;
+    if (!isStreamingDelta) {
+      timelineStore.append(event);
+    }
 
     // Notify handlers
     for (const h of this.handlers) {
