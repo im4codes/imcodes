@@ -188,11 +188,6 @@ describe('QwenProvider', () => {
         id: 'tool-1',
         name: 'list_directory',
         status: 'running',
-      },
-      {
-        id: 'tool-1',
-        name: 'list_directory',
-        status: 'running',
         input: { path: '/tmp/project' },
       },
       {
