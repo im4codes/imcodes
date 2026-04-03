@@ -197,7 +197,8 @@ export function AtPicker({
   const [configRoundsPicker, setConfigRoundsPicker] = useState(false);
   const [configRoundsHighlight, setConfigRoundsHighlight] = useState(0);
   const [configModeOverride, setConfigModeOverride] = useState<string>('config');
-  const [configPickerFocus, setConfigPickerFocus] = useState<'rounds' | 'mode'>('rounds');
+  const [configPickerFocus, setConfigPickerFocus] = useState<'mode' | 'rounds' | 'combo'>('rounds');
+  const [comboHighlight, setComboHighlight] = useState(0);
   const CONFIG_ROUNDS_OPTIONS = [1, 2, 3, 5] as const;
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const requestIdRef = useRef<string | null>(null);
@@ -334,15 +335,24 @@ export function AtPicker({
         const ALL_MODES = ['config', 'audit', 'review', 'plan', 'brainstorm', 'discuss'] as const;
         const currentModeIdx = Math.max(0, ALL_MODES.indexOf(configModeOverride as typeof ALL_MODES[number]));
         if (e.key === 'Escape') { e.preventDefault(); setConfigRoundsPicker(false); setConfigPickerFocus('rounds'); return; }
-        if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+        const focusCycle: Array<'mode' | 'rounds' | 'combo'> = ['mode', 'rounds', 'combo'];
+        const focusIdx = focusCycle.indexOf(configPickerFocus);
+        if (e.key === 'ArrowUp') {
           e.preventDefault();
-          setConfigPickerFocus((f) => (f === 'rounds' ? 'mode' : 'rounds'));
+          setConfigPickerFocus(focusCycle[(focusIdx - 1 + focusCycle.length) % focusCycle.length]);
+          return;
+        }
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          setConfigPickerFocus(focusCycle[(focusIdx + 1) % focusCycle.length]);
           return;
         }
         if (e.key === 'ArrowLeft') {
           e.preventDefault();
           if (configPickerFocus === 'rounds') {
             setConfigRoundsHighlight((h) => (h - 1 + CONFIG_ROUNDS_OPTIONS.length) % CONFIG_ROUNDS_OPTIONS.length);
+          } else if (configPickerFocus === 'combo') {
+            setComboHighlight((h) => (h - 1 + COMBO_PRESETS.length) % COMBO_PRESETS.length);
           } else {
             const next = (currentModeIdx - 1 + ALL_MODES.length) % ALL_MODES.length;
             setConfigModeOverride(ALL_MODES[next]);
@@ -353,6 +363,8 @@ export function AtPicker({
           e.preventDefault();
           if (configPickerFocus === 'rounds') {
             setConfigRoundsHighlight((h) => (h + 1) % CONFIG_ROUNDS_OPTIONS.length);
+          } else if (configPickerFocus === 'combo') {
+            setComboHighlight((h) => (h + 1) % COMBO_PRESETS.length);
           } else {
             const next = (currentModeIdx + 1) % ALL_MODES.length;
             setConfigModeOverride(ALL_MODES[next]);
@@ -361,9 +373,15 @@ export function AtPicker({
         }
         if (e.key === 'Enter' && p2pConfig) {
           e.preventDefault(); e.stopPropagation();
-          const rounds = CONFIG_ROUNDS_OPTIONS[configRoundsHighlight];
-          const effectiveConfig = buildEffectiveConfig(p2pConfig, configModeOverride);
-          onSelectAllConfig?.(effectiveConfig, rounds, configModeOverride);
+          if (configPickerFocus === 'combo') {
+            const c = COMBO_PRESETS[comboHighlight];
+            const cfg = buildEffectiveConfig(p2pConfig, c.pipeline[0]);
+            onSelectAllConfig?.(cfg, c.pipeline.length, c.key);
+          } else {
+            const rounds = CONFIG_ROUNDS_OPTIONS[configRoundsHighlight];
+            const effectiveConfig = buildEffectiveConfig(p2pConfig, configModeOverride);
+            onSelectAllConfig?.(effectiveConfig, rounds, configModeOverride);
+          }
           setConfigRoundsPicker(false);
           setConfigPickerFocus('rounds');
           return;
@@ -441,7 +459,7 @@ export function AtPicker({
         }
       }
     },
-    [visible, category, highlightIdx, fileResults, agents, modeAgent, modeHighlight, configRoundsPicker, configRoundsHighlight, configModeOverride, configPickerFocus, p2pConfig, onClose, onSelectFile, onSelectAgent, onSelectAllConfig],
+    [visible, category, highlightIdx, fileResults, agents, modeAgent, modeHighlight, configRoundsPicker, configRoundsHighlight, configModeOverride, configPickerFocus, comboHighlight, p2pConfig, onClose, onSelectFile, onSelectAgent, onSelectAllConfig],
   );
 
   useEffect(() => {
@@ -543,23 +561,34 @@ export function AtPicker({
           </>
         )}
         {/* Combo presets — below rounds and agents */}
-        <div style={{ ...groupLabelStyle, marginTop: 6 }}>{t('p2p.combo_label')}</div>
+        <div style={{
+          ...groupLabelStyle,
+          marginTop: 6,
+          color: configPickerFocus === 'combo' ? '#93c5fd' : groupLabelStyle.color,
+        }}>{t('p2p.combo_label')}</div>
         <div style={{ ...modeContainerStyle, flexWrap: 'wrap' }}>
-          {COMBO_PRESETS.map((c) => {
+          {COMBO_PRESETS.map((c, idx) => {
             const color = comboModeColor(c.key);
+            const isHl = configPickerFocus === 'combo' && comboHighlight === idx;
             return (
               <button
                 key={c.key}
                 type="button"
-                style={{ ...modeBtnStyle, fontSize: 10, padding: '2px 6px' }}
+                style={isHl ? {
+                  ...modeBtnHoverStyle,
+                  fontSize: 10,
+                  padding: '2px 6px',
+                  borderColor: color,
+                  color,
+                  boxShadow: `0 0 0 1px ${color}55, 0 0 18px ${color}22`,
+                } : { ...modeBtnStyle, fontSize: 10, padding: '2px 6px' }}
                 onClick={() => {
                   const cfg = buildEffectiveConfig(p2pConfig, c.pipeline[0]);
                   onSelectAllConfig?.(cfg, c.pipeline.length, c.key);
                   setConfigRoundsPicker(false);
                   setConfigPickerFocus('rounds');
                 }}
-                onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.borderColor = color; (e.currentTarget as HTMLElement).style.color = color; }}
-                onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.borderColor = modeBtnStyle.borderColor as string; (e.currentTarget as HTMLElement).style.color = modeBtnStyle.color as string; }}
+                onMouseEnter={() => { setComboHighlight(idx); setConfigPickerFocus('combo'); }}
               >
                 {comboModeLabel(c.key, t)}
               </button>
