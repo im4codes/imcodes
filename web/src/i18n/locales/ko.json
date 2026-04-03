@@ -90,7 +90,12 @@
     "codex_5h_short": "5시간",
     "codex_wk_short": "주간",
     "codex_ctx_title": "컨텍스트 {{percent}}% 남음",
-    "codex_limit_title": "{{label}} {{percent}}% 남음 · {{reset}}에 재설정"
+    "codex_limit_title": "{{label}} {{percent}}% 남음 · {{reset}}에 재설정",
+    "qwen_tier_free": "무료",
+    "qwen_tier_paid": "유료",
+    "qwen_tier_byo": "자체 키",
+    "qwen_source_title": "Qwen 소스: {{tier}}",
+    "qwen_model_title": "Qwen 소스: {{tier}} · 모델: {{model}}"
   },
   "server": {
     "upgrade_daemon": "↑ Daemon 업그레이드",

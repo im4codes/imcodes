@@ -90,7 +90,12 @@
     "codex_5h_short": "5ч",
     "codex_wk_short": "нед",
     "codex_ctx_title": "Контекст осталось {{percent}}%",
-    "codex_limit_title": "{{label}} осталось {{percent}}% · сброс {{reset}}"
+    "codex_limit_title": "{{label}} осталось {{percent}}% · сброс {{reset}}",
+    "qwen_tier_free": "Бесплатно",
+    "qwen_tier_paid": "Платно",
+    "qwen_tier_byo": "Свой ключ",
+    "qwen_source_title": "Источник Qwen: {{tier}}",
+    "qwen_model_title": "Источник Qwen: {{tier}} · Модель: {{model}}"
   },
   "server": {
     "upgrade_daemon": "↑ Обновить Daemon",

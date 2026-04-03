@@ -1,6 +1,7 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
+import type { QwenAuthType } from '../../shared/qwen-auth.js';
 
 const STORE_DIR = join(homedir(), '.imcodes');
 const STORE_PATH = join(STORE_DIR, 'sessions.json');
@@ -36,6 +37,10 @@ export interface SessionRecord {
   opencodeSessionId?: string;
   /** Qwen model ID used for transport sends (`qwen --model <ID>`). */
   qwenModel?: string;
+  /** Qwen auth source detected from local CLI config/status. */
+  qwenAuthType?: QwenAuthType;
+  /** Qwen models available for the current auth source. */
+  qwenAvailableModels?: string[];
   /** Parent main session name (e.g. `deck_proj_brain`) — links sub-sessions to their parent. */
   parentSession?: string;
   /** Runtime type — 'process' for tmux, 'transport' for network-backed. Defaults to 'process' for backward compat. */

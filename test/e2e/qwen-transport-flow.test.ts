@@ -103,6 +103,13 @@ vi.mock('../../src/agent/providers/qwen.js', () => ({
   QwenProvider: mocks.MockQwenProvider,
 }));
 
+vi.mock('../../src/agent/qwen-runtime-config.js', () => ({
+  getQwenRuntimeConfig: vi.fn(async () => ({
+    authType: 'coding-plan',
+    availableModels: ['qwen3.5-plus', 'qwen3-coder-plus', 'qwen3-coder-next'],
+  })),
+}));
+
 vi.mock('../../src/store/session-store.js', () => ({
   listSessions: vi.fn(() => [...mocks.store.values()]),
   getSession: vi.fn((name: string) => mocks.store.get(name) ?? null),
@@ -200,7 +207,7 @@ describe('qwen transport flow e2e', () => {
     expect(final?.payload.text).toBe('Qwen: hello');
     expect(final?.opts?.eventId).toBe(stableEventId);
     const usage = mocks.emitted.find((e) => e.session === SESSION && e.type === 'usage.update');
-    expect(usage?.payload.model).toBeUndefined();
+    expect(usage?.payload.model).toBe('qwen3.5-plus');
     expect(usage?.payload.inputTokens).toBe(10);
     expect(ack?.payload.status).toBe('accepted');
     expect(serverLink.send).toHaveBeenCalledWith({

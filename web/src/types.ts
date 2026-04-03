@@ -40,6 +40,9 @@ export interface SessionInfo {
   description?: string | null;
   /** Runtime backing: 'process' for tmux-backed, 'transport' for network-backed. */
   runtimeType?: 'process' | 'transport';
+  qwenModel?: string;
+  qwenAuthType?: string;
+  qwenAvailableModels?: string[];
 }
 
 export interface ServerInfo {

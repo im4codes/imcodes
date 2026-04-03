@@ -90,7 +90,12 @@
     "codex_5h_short": "5 h",
     "codex_wk_short": "sem",
     "codex_ctx_title": "Contexto restante {{percent}}%",
-    "codex_limit_title": "{{label}} restante {{percent}}% · se restablece {{reset}}"
+    "codex_limit_title": "{{label}} restante {{percent}}% · se restablece {{reset}}",
+    "qwen_tier_free": "Gratis",
+    "qwen_tier_paid": "De pago",
+    "qwen_tier_byo": "Propia clave",
+    "qwen_source_title": "Origen de Qwen: {{tier}}",
+    "qwen_model_title": "Origen de Qwen: {{tier}} · Modelo: {{model}}"
   },
   "server": {
     "upgrade_daemon": "↑ Actualizar Daemon",

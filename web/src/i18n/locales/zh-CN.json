@@ -90,7 +90,12 @@
     "codex_5h_short": "5小时",
     "codex_wk_short": "周",
     "codex_ctx_title": "上下文剩余 {{percent}}%",
-    "codex_limit_title": "{{label}} 剩余 {{percent}}% · 重置于 {{reset}}"
+    "codex_limit_title": "{{label}} 剩余 {{percent}}% · 重置于 {{reset}}",
+    "qwen_tier_free": "免费",
+    "qwen_tier_paid": "付费",
+    "qwen_tier_byo": "自备密钥",
+    "qwen_source_title": "Qwen 来源：{{tier}}",
+    "qwen_model_title": "Qwen 来源：{{tier}} · 模型：{{model}}"
   },
   "server": {
     "upgrade_daemon": "↑ 升级 Daemon",

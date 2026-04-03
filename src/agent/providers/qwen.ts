@@ -320,8 +320,11 @@ export class QwenProvider implements TransportProvider {
 
       if (payload.type === 'system' && payload.subtype === 'session_start') {
         state.started = true;
-        if (payload.model) state.model = payload.model;
-        if (payload.message?.model) state.model = payload.message.model;
+        // Do not overwrite an explicitly selected model with provider-reported
+        // backend labels like "coder-model". Keep the requested model as the
+        // session truth when available.
+        if (!state.model && payload.model) state.model = payload.model;
+        if (!state.model && payload.message?.model) state.model = payload.message.model;
         return;
       }
 
@@ -407,7 +410,7 @@ export class QwenProvider implements TransportProvider {
           // stream_event message_start id. For IM.codes we must preserve the
           // streaming message id so timeline replacement stays in-place.
           emitComplete(finalText, state.currentMessageId ?? payload.message?.id ?? undefined, {
-            ...(payload.message?.model || state.model ? { model: payload.message?.model ?? state.model } : {}),
+            ...(state.model || payload.message?.model ? { model: state.model ?? payload.message?.model } : {}),
             ...(payload.message?.usage ? { usage: payload.message.usage } : {}),
           });
         }

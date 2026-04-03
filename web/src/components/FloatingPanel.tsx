@@ -115,8 +115,22 @@ export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onF
       <div style={{ position: 'fixed', inset: 0, zIndex, background: '#0f172a', display: 'flex', flexDirection: 'column' }}>
         <div style={{ height: 'env(safe-area-inset-top, 0px)', flexShrink: 0, background: '#0f172a' }} />
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', background: '#1e293b', borderBottom: '1px solid #334155', flexShrink: 0 }}>
-          <span style={{ flex: 1, fontSize: 13, color: '#94a3b8', fontWeight: 600 }}>{title}</span>
-          <button onClick={onClose} style={{ background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer', fontSize: 18, padding: '4px 8px' }}>✕</button>
+          <span
+            title={title}
+            style={{
+              flex: 1,
+              minWidth: 0,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              fontSize: 13,
+              color: '#94a3b8',
+              fontWeight: 600,
+            }}
+          >
+            {title}
+          </span>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer', fontSize: 18, padding: '4px 8px', flexShrink: 0 }}>✕</button>
         </div>
         <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
           {children}
@@ -146,7 +160,21 @@ export function FloatingPanel({ id, title, children, onClose, zIndex = 2000, onF
           borderBottom: '1px solid #334155', flexShrink: 0, userSelect: 'none',
         }}
       >
-        <span style={{ flex: 1, fontSize: 12, color: '#94a3b8', fontWeight: 600 }}>{title}</span>
+        <span
+          title={title}
+          style={{
+            flex: 1,
+            minWidth: 0,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+            fontSize: 12,
+            color: '#94a3b8',
+            fontWeight: 600,
+          }}
+        >
+          {title}
+        </span>
         {onPin && (
           <button
             onClick={onPin}

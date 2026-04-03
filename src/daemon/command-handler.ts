@@ -4,8 +4,8 @@
  */
 import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, type ProjectConfig } from '../agent/session-manager.js';
 import { isTransportAgent } from '../agent/detect.js';
-import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey } from '../agent/tmux.js';
-import { listSessions, getSession, upsertSession } from '../store/session-store.js';
+import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand } from '../agent/tmux.js';
+import { listSessions, getSession, upsertSession, type SessionRecord } from '../store/session-store.js';
 import { routeMessage, type InboundMessage, type RouterContext } from '../router/message-router.js';
 import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js';
 import type { ServerLink } from './server-link.js';
@@ -98,6 +98,7 @@ import { capturePane } from '../agent/tmux.js';
 import { countCodexStatusMatches, normalizeCodexStatusPaneText, parseCodexStatusOutput } from './codex-status.js';
 import { resolveContextWindow } from '../util/model-context.js';
 import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
+import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
 
 // ── Common MIME map for file metadata ────────────────────────────────────────
 
@@ -1056,7 +1057,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         const modelMatch = text.trim().match(/^\/model\s+(\S+)\s*$/);
         if (modelMatch) {
           const nextModel = modelMatch[1];
-          if (!QWEN_MODEL_IDS.includes(nextModel)) {
+          const runtimeConfig = !record.qwenAvailableModels?.length
+            ? await getQwenRuntimeConfig().catch(() => null)
+            : null;
+          const allowedModels = record.qwenAvailableModels?.length
+            ? record.qwenAvailableModels
+            : (runtimeConfig?.availableModels?.length ? runtimeConfig.availableModels : QWEN_MODEL_IDS);
+          if (!allowedModels.includes(nextModel)) {
             timelineEmitter.emit(sessionName, 'user.message', { text });
             timelineEmitter.emit(sessionName, 'assistant.text', {
               text: `⚠️ Unknown Qwen model: ${nextModel}`,
@@ -1067,7 +1074,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             return;
           }
           transportRuntime.setAgentId(nextModel);
-          upsertSession({ ...record, qwenModel: nextModel, updatedAt: Date.now() });
+          upsertSession({
+            ...record,
+            qwenModel: nextModel,
+            ...(runtimeConfig?.authType ? { qwenAuthType: runtimeConfig.authType } : {}),
+            ...(runtimeConfig?.availableModels?.length ? { qwenAvailableModels: runtimeConfig.availableModels } : {}),
+            updatedAt: Date.now(),
+          });
           timelineEmitter.emit(sessionName, 'user.message', { text });
           timelineEmitter.emit(sessionName, 'usage.update', {
             model: nextModel,
@@ -1215,6 +1228,9 @@ function handleGetSessions(serverLink: ServerLink): void {
       runtimeType: s.runtimeType,
       providerId: s.providerId,
       providerSessionId: s.providerSessionId,
+      qwenModel: s.qwenModel,
+      qwenAuthType: s.qwenAuthType,
+      qwenAvailableModels: s.qwenAvailableModels,
       description: s.description,
       label: s.label,
     }));
@@ -1358,6 +1374,47 @@ export function hasSubstantiveTimelineHistory(events: Array<{ type: string }>): 
   ));
 }
 
+export function countSubstantiveTimelineEvents(events: Array<{ type: string }>): number {
+  return events.filter((event) => (
+    event.type === 'user.message'
+    || event.type === 'assistant.text'
+    || event.type === 'assistant.thinking'
+    || event.type === 'tool.call'
+    || event.type === 'tool.result'
+    || event.type === 'ask.question'
+  )).length;
+}
+
+async function recoverOpenCodeSessionRecord(record: SessionRecord | undefined): Promise<SessionRecord | undefined> {
+  if (!record || record.agentType !== 'opencode' || !record.projectDir) return record;
+  try {
+    let paneCmd = '';
+    try {
+      paneCmd = await getPaneStartCommand(record.name);
+    } catch { /* ignore */ }
+    const explicitPaneId = paneCmd.match(/\bopencode\b[\s\S]*?(?:--session|-s)\s+(?:"([^"]+)"|'([^']+)'|([^\s"'`;|&]+))/)?.slice(1).find(Boolean);
+    if (explicitPaneId) {
+      if (record.opencodeSessionId === explicitPaneId) return record;
+      const next = { ...record, opencodeSessionId: explicitPaneId };
+      upsertSession(next);
+      return next;
+    }
+
+    const { discoverLatestOpenCodeSessionId } = await import('./opencode-history.js');
+    const opencodeSessionId = await discoverLatestOpenCodeSessionId(record.projectDir, {
+      exactDirectory: record.projectDir,
+      maxCount: 50,
+    });
+    if (!opencodeSessionId || opencodeSessionId === record.opencodeSessionId) return record;
+    const next = { ...record, opencodeSessionId };
+    upsertSession(next);
+    return next;
+  } catch (err) {
+    logger.debug({ err, sessionName: record.name, projectDir: record.projectDir }, 'Failed to recover OpenCode session ID from local history');
+    return record;
+  }
+}
+
 async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = cmd.sessionName as string | undefined;
   const requestId = cmd.requestId as string | undefined;
@@ -1393,19 +1450,23 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
   // Trim to requested limit after dedup
   let trimmed = deduped.length > limit ? deduped.slice(deduped.length - limit) : deduped;
 
-  if (!hasSubstantiveTimelineHistory(trimmed)) {
-    const record = getSession(sessionName);
-    if (record?.agentType === 'opencode' && record.projectDir && record.opencodeSessionId) {
-      try {
-        const { exportOpenCodeSession, buildTimelineEventsFromOpenCodeExport } = await import('./opencode-history.js');
-        const exportData = await exportOpenCodeSession(record.projectDir, record.opencodeSessionId);
-        const synthesized = buildTimelineEventsFromOpenCodeExport(sessionName, exportData, timelineEmitter.epoch)
-          .filter((event) => afterTs === undefined || event.ts > afterTs)
-          .filter((event) => beforeTs === undefined || event.ts < beforeTs);
-        trimmed = synthesized.length > limit ? synthesized.slice(synthesized.length - limit) : synthesized;
-      } catch (err) {
-        logger.debug({ err, sessionName, opencodeSessionId: record.opencodeSessionId }, 'Failed to synthesize OpenCode timeline history');
+  const record = await recoverOpenCodeSessionRecord(getSession(sessionName));
+  if (record?.agentType === 'opencode' && record.projectDir && record.opencodeSessionId) {
+    try {
+      const { exportOpenCodeSession, buildTimelineEventsFromOpenCodeExport } = await import('./opencode-history.js');
+      const exportData = await exportOpenCodeSession(record.projectDir, record.opencodeSessionId);
+      const synthesized = buildTimelineEventsFromOpenCodeExport(sessionName, exportData, timelineEmitter.epoch)
+        .filter((event) => afterTs === undefined || event.ts > afterTs)
+        .filter((event) => beforeTs === undefined || event.ts < beforeTs);
+      const synthesizedTrimmed = synthesized.length > limit ? synthesized.slice(synthesized.length - limit) : synthesized;
+      if (
+        !hasSubstantiveTimelineHistory(trimmed)
+        || countSubstantiveTimelineEvents(synthesizedTrimmed) > countSubstantiveTimelineEvents(trimmed)
+      ) {
+        trimmed = synthesizedTrimmed;
       }
+    } catch (err) {
+      logger.debug({ err, sessionName, opencodeSessionId: record.opencodeSessionId }, 'Failed to synthesize OpenCode timeline history');
     }
   }
 
@@ -1565,36 +1626,37 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
   }
   const id = sName.replace(/^deck_sub_/, '');
   try {
+    const effectiveRecord = (await recoverOpenCodeSessionRecord(record)) ?? record;
     // Stop without notifying server (preserve PG record)
     await stopSubSession(sName, null);
-    if (record.runtimeType === 'transport') {
+    if (effectiveRecord.runtimeType === 'transport') {
       await launchTransportSession({
         name: sName,
         projectName: sName,
         role: 'w1',
-        agentType: record.agentType as any,
-        projectDir: record.projectDir || process.cwd(),
-        description: record.description ?? undefined,
-        label: record.label ?? undefined,
-        bindExistingKey: record.providerSessionId ?? undefined,
-        skipCreate: !!record.providerSessionId,
-        parentSession: record.parentSession ?? undefined,
-        userCreated: record.userCreated,
+        agentType: effectiveRecord.agentType as any,
+        projectDir: effectiveRecord.projectDir || process.cwd(),
+        description: effectiveRecord.description ?? undefined,
+        label: effectiveRecord.label ?? undefined,
+        bindExistingKey: effectiveRecord.providerSessionId ?? undefined,
+        skipCreate: !!effectiveRecord.providerSessionId,
+        parentSession: effectiveRecord.parentSession ?? undefined,
+        userCreated: effectiveRecord.userCreated,
       });
       try {
         const next = getSession(sName);
         serverLink.send({
           type: 'subsession.sync',
           id,
-          sessionType: record.agentType,
-          cwd: record.projectDir ?? null,
+          sessionType: effectiveRecord.agentType,
+          cwd: effectiveRecord.projectDir ?? null,
           shellBin: null,
           ccSessionId: null,
           runtimeType: next?.runtimeType ?? null,
           providerId: next?.providerId ?? null,
           providerSessionId: next?.providerSessionId ?? null,
-          parentSession: record.parentSession ?? null,
-          description: record.description ?? null,
+          parentSession: effectiveRecord.parentSession ?? null,
+          description: effectiveRecord.description ?? null,
         });
       } catch { /* not connected */ }
       return;
@@ -1603,28 +1665,28 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
     // their conversation and ensureSessionFile skips if file already exists
     await startSubSession({
       id,
-      type: record.agentType,
-      cwd: record.projectDir || null,
-      parentSession: record.parentSession || null,
-      ccSessionId: record.ccSessionId ?? null,
-      codexSessionId: record.codexSessionId ?? null,
-      geminiSessionId: record.geminiSessionId ?? null,
-      opencodeSessionId: record.opencodeSessionId ?? null,
-      ccPreset: record.ccPreset ?? null,
-      description: record.description ?? null,
+      type: effectiveRecord.agentType,
+      cwd: effectiveRecord.projectDir || null,
+      parentSession: effectiveRecord.parentSession || null,
+      ccSessionId: effectiveRecord.ccSessionId ?? null,
+      codexSessionId: effectiveRecord.codexSessionId ?? null,
+      geminiSessionId: effectiveRecord.geminiSessionId ?? null,
+      opencodeSessionId: effectiveRecord.opencodeSessionId ?? null,
+      ccPreset: effectiveRecord.ccPreset ?? null,
+      description: effectiveRecord.description ?? null,
     });
     // Sync updated state to server
     try {
       serverLink.send({
         type: 'subsession.sync',
         id,
-        sessionType: record.agentType,
-        cwd: record.projectDir ?? null,
-        ccSessionId: record.ccSessionId ?? null,
-        geminiSessionId: record.geminiSessionId ?? null,
-        parentSession: record.parentSession ?? null,
-        ccPresetId: record.ccPreset ?? null,
-        description: record.description ?? null,
+        sessionType: effectiveRecord.agentType,
+        cwd: effectiveRecord.projectDir ?? null,
+        ccSessionId: effectiveRecord.ccSessionId ?? null,
+        geminiSessionId: effectiveRecord.geminiSessionId ?? null,
+        parentSession: effectiveRecord.parentSession ?? null,
+        ccPresetId: effectiveRecord.ccPreset ?? null,
+        description: effectiveRecord.description ?? null,
       });
     } catch { /* not connected */ }
   } catch (e: unknown) {

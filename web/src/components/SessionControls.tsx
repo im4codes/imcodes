@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'preact/hooks';
+import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { RefObject } from 'preact';
 import type { WsClient } from '../ws-client.js';
@@ -16,7 +16,8 @@ import { uploadFile, getUserPref, saveUserPref } from '../api.js';
 import { isVisuallyBusy } from '../thinking-utils.js';
 import { P2P_CONFIG_MODE } from '@shared/p2p-modes.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
-import { QWEN_MODEL_OPTIONS } from '@shared/qwen-models.js';
+import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
+import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
 
 interface Props {
   ws: WsClient | null;
@@ -70,7 +71,7 @@ interface Props {
 type MenuAction = 'restart' | 'new' | 'stop';
 type ModelChoice = 'opus' | 'sonnet' | 'haiku';
 type CodexModelChoice = 'gpt-5.4' | 'gpt-5.4-mini' | 'gpt-5.2';
-type QwenModelChoice = typeof QWEN_MODEL_OPTIONS[number]['id'];
+type QwenModelChoice = string;
 type P2pMode = 'solo' | 'audit' | 'review' | 'brainstorm' | 'discuss' | typeof P2P_CONFIG_MODE;
 
 const MODEL_STORAGE_KEY = 'imcodes-model';
@@ -78,7 +79,6 @@ const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const QWEN_MODEL_STORAGE_KEY = 'imcodes-qwen-model';
 const SINGLE_AGENT_PROMPT_PREF_KEY = 'atpicker_single_agent_prompt_dismissed';
 const CODEX_MODELS: CodexModelChoice[] = ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.2'];
-const QWEN_MODELS: QwenModelChoice[] = QWEN_MODEL_OPTIONS.map((model) => model.id as QwenModelChoice);
 const P2P_MODES: P2pMode[] = ['solo', 'audit', 'review', 'brainstorm', 'discuss', P2P_CONFIG_MODE];
 const P2P_MODE_I18N: Record<P2pMode, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
 const P2P_MODE_COLORS: Record<P2pMode, string> = { solo: '#6b7280', audit: '#f59e0b', review: '#3b82f6', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
@@ -138,7 +138,7 @@ function loadCodexModel(): CodexModelChoice | null {
 function loadQwenModel(): QwenModelChoice | null {
   try {
     const v = localStorage.getItem(QWEN_MODEL_STORAGE_KEY);
-    if (QWEN_MODELS.includes(v as QwenModelChoice)) return v as QwenModelChoice;
+    if (v?.trim()) return v;
   } catch { /* ignore */ }
   return null;
 }
@@ -301,10 +301,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (detectedModel.startsWith('gpt-') && CODEX_MODELS.includes(detectedModel as CodexModelChoice)) {
       if (codexModel !== detectedModel) setCodexModel(detectedModel as CodexModelChoice);
     }
-    if (QWEN_MODELS.includes(detectedModel as QwenModelChoice)) {
+    if (activeSession?.agentType === 'qwen' && detectedModel) {
       if (qwenModel !== detectedModel) setQwenModel(detectedModel as QwenModelChoice);
     }
-  }, [detectedModel, qwenModel, codexModel, model]);
+  }, [activeSession?.agentType, detectedModel, qwenModel, codexModel, model]);
+
+  useEffect(() => {
+    if (activeSession?.agentType !== 'qwen') return;
+    if (activeSession.qwenModel && qwenModel !== activeSession.qwenModel) {
+      setQwenModel(activeSession.qwenModel);
+    }
+  }, [activeSession?.agentType, activeSession?.qwenModel, qwenModel]);
 
   const connected = !!ws?.connected;
   const hasSession = !!activeSession;
@@ -316,6 +323,28 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const isShellLike = activeSession?.agentType === 'shell' || activeSession?.agentType === 'script';
   const isCodex = activeSession?.agentType === 'codex';
   const isQwen = activeSession?.agentType === 'qwen';
+  const qwenTier = getQwenAuthTier(activeSession?.qwenAuthType);
+  const qwenTierLabel = qwenTier === QWEN_AUTH_TIERS.FREE
+    ? t('session.qwen_tier_free')
+    : qwenTier === QWEN_AUTH_TIERS.PAID
+      ? t('session.qwen_tier_paid')
+      : qwenTier === QWEN_AUTH_TIERS.BYO
+        ? t('session.qwen_tier_byo')
+        : t('session.agentType.qwen');
+  const qwenChoices = useMemo(() => {
+    const known = getKnownQwenModelOptions(activeSession?.qwenAuthType);
+    const ids = activeSession?.qwenAvailableModels?.length
+      ? [...activeSession.qwenAvailableModels]
+      : activeSession?.qwenModel
+        ? [activeSession.qwenModel]
+        : known.map((model) => model.id);
+    if (detectedModel && !ids.includes(detectedModel)) ids.unshift(detectedModel);
+    if (qwenModel && !ids.includes(qwenModel)) ids.unshift(qwenModel);
+    return ids.map((id) => ({
+      id,
+      description: known.find((model) => model.id === id)?.description ?? getKnownQwenModelDescription(id),
+    }));
+  }, [activeSession?.qwenAuthType, activeSession?.qwenAvailableModels, detectedModel, qwenModel]);
 
   // P2P config loading moved after rootSession declaration below
 
@@ -930,19 +959,21 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               class="shortcut-btn"
               onClick={() => setModelOpen((o) => !o)}
               disabled={disabled}
-              title={qwenModel ? `Model: ${qwenModel}` : 'Model: qwen default — tap to select'}
+              title={qwenModel
+                ? t('session.qwen_model_title', { tier: qwenTierLabel, model: qwenModel })
+                : t('session.qwen_source_title', { tier: qwenTierLabel })}
               style={{ color: qwenModel ? '#f59e0b' : '#6b7280', fontSize: 10 }}
             >
-              {qwenModel ?? 'qwen'}
+              {qwenTierLabel}
             </button>
             {modelOpen && (
               <div class="menu-dropdown">
-                {QWEN_MODEL_OPTIONS.map((m) => (
+                {qwenChoices.map((m) => (
                   <button
                     key={m.id}
                     class={`menu-item ${qwenModel === m.id ? 'menu-item-active' : ''}`}
                     onClick={() => handleQwenModelSelect(m.id as QwenModelChoice)}
-                    title={m.description}
+                    title={m.description || m.id}
                   >
                     {qwenModel === m.id ? '● ' : '○ '}{m.id}
                   </button>

@@ -487,6 +487,9 @@ export function App() {
         runtimeType: s.runtime_type,
         label: s.label ?? null,
         description: s.description ?? null,
+        qwenModel: undefined,
+        qwenAuthType: undefined,
+        qwenAvailableModels: undefined,
       }));
       setSessions(mapped);
       // Only mark loaded if we got data — empty means daemon hasn't synced yet,
@@ -962,6 +965,9 @@ export function App() {
             runtimeType: s.runtimeType,
             label: s.label ?? existing?.label,
             description: s.description ?? existing?.description,
+            qwenModel: s.qwenModel ?? existing?.qwenModel,
+            qwenAuthType: s.qwenAuthType ?? existing?.qwenAuthType,
+            qwenAvailableModels: s.qwenAvailableModels ?? existing?.qwenAvailableModels,
           };
         }));
         setSessionsLoaded(true);
