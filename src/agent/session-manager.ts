@@ -789,10 +789,12 @@ export async function restoreTransportSessions(providerId: string): Promise<void
           : availableQwenModels[0])
         : s.qwenModel;
       const runtime = new TransportSessionRuntime(provider, s.name);
+      // After cancel, qwenFreshOnResume is set — don't resume the stuck conversation.
+      const freshAfterCancel = s.qwenFreshOnResume && s.providerId === 'qwen';
       await runtime.initialize({
-        sessionKey: s.providerSessionId,
-        bindExistingKey: s.providerSessionId,
-        skipCreate: true,
+        sessionKey: freshAfterCancel ? s.providerSessionId : s.providerSessionId,
+        bindExistingKey: freshAfterCancel ? undefined : s.providerSessionId,
+        skipCreate: !freshAfterCancel,
         cwd: s.projectDir,
         label: s.label ?? s.name,
         description: s.description,
@@ -806,6 +808,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         ...s,
         state: 'running',
         updatedAt: Date.now(),
+        ...(freshAfterCancel ? { qwenFreshOnResume: undefined } : {}),
         ...(effectiveQwenModel ? { qwenModel: effectiveQwenModel } : {}),
         ...(qwenRuntime?.authType ? { qwenAuthType: qwenRuntime.authType } : {}),
         ...(qwenRuntime?.authLimit ? { qwenAuthLimit: qwenRuntime.authLimit } : {}),
@@ -817,7 +820,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
           quotaUsageLabel: (qwenRuntime?.authType ?? s.qwenAuthType) === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
         }),
       });
-      logger.info({ session: s.name, providerId: s.providerId, providerSid: s.providerSessionId }, 'Restored transport session runtime');
+      logger.info({ session: s.name, providerId: s.providerId, providerSid: s.providerSessionId, freshAfterCancel }, 'Restored transport session runtime');
     } catch (err) {
       logger.warn({ err, session: s.name }, 'Failed to restore transport session runtime');
     }

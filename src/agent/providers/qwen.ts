@@ -27,6 +27,8 @@ interface QwenSessionState {
   started: boolean;
   description?: string;
   model?: string;
+  /** Internal Qwen CLI conversation ID — decoupled from provider session ID so cancel can start fresh. */
+  qwenConversationId: string;
   child: ChildProcess | null;
   currentMessageId: string | null;
   currentText: string;
@@ -192,6 +194,7 @@ export class QwenProvider implements TransportProvider {
       started: !!(config.bindExistingKey || config.skipCreate || existing?.started),
       description: config.description ?? existing?.description,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
+      qwenConversationId: existing?.qwenConversationId ?? sessionId,
       child: existing?.child ?? null,
       currentMessageId: existing?.currentMessageId ?? null,
       currentText: existing?.currentText ?? '',
@@ -258,6 +261,7 @@ export class QwenProvider implements TransportProvider {
       started: true,
       description: undefined,
       model: undefined,
+      qwenConversationId: sessionId,
       child: null,
       currentMessageId: null,
       currentText: '',
@@ -294,10 +298,15 @@ export class QwenProvider implements TransportProvider {
     if (state.model) {
       args.push('--model', state.model);
     }
+    // After cancel, qwenConversationId is regenerated so we start a fresh conversation
+    // instead of resuming the one stuck in a tool-call loop.
+    if (!state.started) {
+      state.qwenConversationId = randomUUID();
+    }
     if (state.started) {
-      args.push('--resume', sessionId);
+      args.push('--resume', state.qwenConversationId);
     } else {
-      args.push('--session-id', sessionId);
+      args.push('--session-id', state.qwenConversationId);
     }
 
     const child = spawn(QWEN_BIN, args, {
@@ -544,6 +553,17 @@ export class QwenProvider implements TransportProvider {
     if (!state?.child || state.child.killed) return;
     state.cancelled = true;
     state.child.kill('SIGTERM');
+    // SIGKILL escalation — Qwen CLI may have child processes (web_search, etc.) that ignore SIGTERM
+    const killTimer = setTimeout(() => {
+      if (state.child && !state.child.killed) {
+        logger.warn({ provider: this.id, sessionId }, 'Qwen process did not exit after SIGTERM — sending SIGKILL');
+        state.child.kill('SIGKILL');
+      }
+    }, 2000);
+    state.child.once('close', () => clearTimeout(killTimer));
+    // Reset conversation — next send() will generate a fresh qwenConversationId
+    // so we don't --resume the conversation stuck in a tool-call loop.
+    state.started = false;
   }
 
   private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {

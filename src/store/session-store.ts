@@ -37,6 +37,9 @@ export interface SessionRecord {
   opencodeSessionId?: string;
   /** Qwen model ID used for transport sends (`qwen --model <ID>`). */
   qwenModel?: string;
+  /** When true, next Qwen session restore must start a fresh conversation (not --resume).
+   *  Set after cancel to prevent resuming a stuck tool-call loop. */
+  qwenFreshOnResume?: boolean;
   /** Qwen auth source detected from local CLI config/status. */
   qwenAuthType?: QwenAuthType;
   /** Human-readable auth limit from `qwen auth status` (e.g. Up to 1,000 requests/day). */
