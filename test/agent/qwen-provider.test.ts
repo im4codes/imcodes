@@ -152,6 +152,41 @@ describe('QwenProvider', () => {
     });
   });
 
+  it('prefers assistant per-turn usage over cumulative result usage for ctx display', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-usage', cwd: '/tmp/project', agentId: 'coder-model' });
+
+    const metadata: Array<Record<string, unknown> | undefined> = [];
+    provider.onComplete((_sid, msg) => { metadata.push(msg.metadata); });
+
+    await provider.send('sess-usage', 'hello');
+    const run = lastSpawn();
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'stream-msg-usage' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({
+      type: 'assistant',
+      message: {
+        id: 'assistant-msg-usage',
+        model: 'coder-model',
+        usage: { input_tokens: 321, output_tokens: 12, cache_read_input_tokens: 45 },
+        content: [{ type: 'text', text: 'Hello' }],
+      },
+    })}\n`);
+    run.child.stdout.write(`${JSON.stringify({
+      type: 'result',
+      is_error: false,
+      result: 'Hello',
+      usage: { input_tokens: 11_000_000, output_tokens: 12, cache_read_input_tokens: 500_000 },
+    })}\n`);
+    run.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(metadata[0]).toEqual({
+      model: 'coder-model',
+      usage: { input_tokens: 321, output_tokens: 12, cache_read_input_tokens: 45 },
+    });
+  });
+
 
   it('does not release queued runtime sends until the qwen process actually finishes', async () => {
     const provider = new QwenProvider();
