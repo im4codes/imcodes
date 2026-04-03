@@ -52,6 +52,55 @@ interface ViewItem {
   lastTs?: number;
 }
 
+const TOOL_INPUT_SUMMARY_KEYS = [
+  'query',
+  'command',
+  'cmd',
+  'path',
+  'file_path',
+  'filePath',
+  'url',
+  'input',
+  'text',
+  'prompt',
+  'objective',
+  'description',
+  'name',
+] as const;
+
+function truncateToolText(text: string, max = 240): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
+function formatToolPayloadValue(value: unknown): string {
+  if (value == null) return '';
+  if (typeof value === 'string') return truncateToolText(value.replace(/\s+/g, ' ').trim());
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) {
+    const parts = value.map((item) => formatToolPayloadValue(item)).filter(Boolean);
+    return truncateToolText(parts.join(', '));
+  }
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    for (const key of TOOL_INPUT_SUMMARY_KEYS) {
+      const candidate = record[key];
+      if (candidate === undefined) continue;
+      const formatted = formatToolPayloadValue(candidate);
+      if (formatted) return formatted;
+    }
+    const entries = Object.entries(record);
+    if (entries.length === 1) {
+      return formatToolPayloadValue(entries[0][1]);
+    }
+    try {
+      return truncateToolText(JSON.stringify(value));
+    } catch {
+      return '[object]';
+    }
+  }
+  return truncateToolText(String(value));
+}
+
 /** Merge consecutive assistant.text events into blocks for display.
  *  Also:
  *  - Merge consecutive tool.call + tool.result pairs into compact single lines
@@ -97,7 +146,8 @@ function buildViewItems(events: TimelineEvent[]): ViewItem[] {
         const next = visible[resultIdx];
         consumedIds.add(next.eventId); // mark tool.result as consumed
         const toolName = String(ev.payload.tool ?? 'tool');
-        const input = ev.payload.input ? ` ${String(ev.payload.input)}` : '';
+        const inputText = formatToolPayloadValue(ev.payload.input);
+        const input = inputText ? ` ${inputText}` : '';
         const status = next.payload.error ? `✗ ${String(next.payload.error)}` : '✓';
         consolidated.push({
           ...ev,
@@ -889,7 +939,7 @@ const ChatEvent = memo(function ChatEvent({ event, nextTs, onPathClick, serverId
     }
 
     case 'tool.call': {
-      const toolInput = event.payload.input ? String(event.payload.input) : '';
+      const toolInput = formatToolPayloadValue(event.payload.input);
       return (
         <ToolBlockFold>
           <div class="chat-event chat-tool">
@@ -904,11 +954,14 @@ const ChatEvent = memo(function ChatEvent({ event, nextTs, onPathClick, serverId
     case 'tool.result': {
       // Standalone tool.result (not merged) — still rendered for cases without a preceding call
       const error = event.payload.error;
+      const output = formatToolPayloadValue(event.payload.output);
       return (
         <div class="chat-event chat-tool">
           <span class="chat-tool-icon">{'<'}</span>
           {error ? (
             <span class="chat-tool-error">{`error: ${String(error)}`}</span>
+          ) : output ? (
+            <span class="chat-tool-output">{splitPathsAndUrls(output, onPathClick)}</span>
           ) : (
             <span class="chat-tool-output">done</span>
           )}
