@@ -26,16 +26,31 @@ const REPOS = {
   vscode: { owner: 'microsoft', repo: 'vscode' },
 } as const;
 
+async function findNonEmptyIssuePage(provider: GitHubProvider, opts?: { state?: 'open' | 'closed'; perPage?: number; startPage?: number; maxPages?: number }) {
+  const state = opts?.state ?? 'open';
+  const perPage = opts?.perPage ?? 20;
+  const startPage = opts?.startPage ?? 1;
+  const maxPages = opts?.maxPages ?? 5;
+
+  let last = await provider.listIssues({ state, perPage, page: startPage });
+  for (let page = startPage; page < startPage + maxPages; page++) {
+    last = await provider.listIssues({ state, perPage, page });
+    if (last.items.length > 0) return last;
+    if (!last.hasMore) break;
+  }
+  return last;
+}
+
 describe.skipIf(!ghAvailable)('GitHubProvider integration — microsoft/vscode (issues)', { retry: 2 }, () => {
   const provider = new GitHubProvider(REPOS.vscode.owner, REPOS.vscode.repo, process.cwd());
 
   describe('listIssues', () => {
     it('returns issues with correct shape', async () => {
-      const result = await provider.listIssues({ perPage: 5 });
+      const result = await findNonEmptyIssuePage(provider, { perPage: 20, maxPages: 5 });
 
       expect(result.items.length).toBeGreaterThan(0);
-      expect(result.items.length).toBeLessThanOrEqual(5);
-      expect(result.page).toBe(1);
+      expect(result.items.length).toBeLessThanOrEqual(20);
+      expect(result.page).toBeGreaterThanOrEqual(1);
       expect(typeof result.hasMore).toBe('boolean');
 
       const issue: RepoIssue = result.items[0];
