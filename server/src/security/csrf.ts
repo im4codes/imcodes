@@ -39,6 +39,13 @@ export function csrfMiddleware() {
     // Password login sets its own session — no existing session to CSRF-attack
     if (path === '/api/auth/password/login') { await next(); return; }
 
+    // Password registration — same rationale as login
+    if (path === '/api/auth/password/register') { await next(); return; }
+
+    // Token exchange — native app exchanges a one-time nonce for an API key
+    // after passkey auth. No session exists yet, and the nonce itself is single-use.
+    if (path === '/api/auth/token-exchange') { await next(); return; }
+
     // Token refresh must bypass CSRF — it's the recovery mechanism when CSRF
     // cookie has expired. Refresh uses HttpOnly refresh_token cookie which
     // is not accessible to JS, providing equivalent CSRF protection.
