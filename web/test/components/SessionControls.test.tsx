@@ -266,6 +266,28 @@ describe('SessionControls', () => {
     expect(screen.queryByText('transport_send_queued')).toBeNull();
   });
 
+  it('pressing Escape in a running transport input sends cancel input immediately', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          runtimeType: 'transport',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    expect(ws.sendInput).toHaveBeenCalledWith('qwen-session', '\x1b');
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
+
   it('pressing Shift+Enter does not submit', () => {
     const ws = makeWs();
     render(<SessionControls ws={ws as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
