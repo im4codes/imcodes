@@ -207,6 +207,9 @@ export class WsBridge {
   /** Per-request fs.write pending map. */
   private pendingFsWriteRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
 
+  /** Per-request timeline.history / timeline.replay pending map — routes responses via requestId unicast. */
+  private pendingTimelineRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
+
   /**
    * File transfer correlation: requestId → { resolve, reject, timer }.
    * Used by HTTP upload/download handlers to await daemon responses.
@@ -548,6 +551,15 @@ export class WsBridge {
         this.pendingFsWriteRequests.set(reqId, { socket: ws, timer });
       }
 
+      // Track timeline.history_request / timeline.replay_request for single-cast response routing
+      // This eliminates the race where terminal.subscribe's async ownership check hasn't completed
+      // before the daemon responds with timeline.history — without this, the response is silently dropped.
+      if ((msg.type === 'timeline.history_request' || msg.type === 'timeline.replay_request') && typeof msg.requestId === 'string') {
+        const reqId = msg.requestId;
+        const timer = setTimeout(() => this.pendingTimelineRequests.delete(reqId), 30_000);
+        this.pendingTimelineRequests.set(reqId, { socket: ws, timer });
+      }
+
       // Track terminal subscriptions for binary routing + ref-counted daemon forwarding
       if (msg.type === 'terminal.subscribe' && typeof msg.session === 'string') {
         const sessionName = msg.session;
@@ -777,8 +789,22 @@ export class WsBridge {
       return;
     }
 
-    // Timeline history/replay contain all CC conversation content — MUST NOT broadcast.
+    // Timeline history/replay: route via requestId unicast (eliminates subscription race),
+    // falling back to session subscribers for legacy/live replay without requestId.
     if (type === 'timeline.history' || type === 'timeline.replay') {
+      const requestId = msg.requestId as string | undefined;
+      if (requestId) {
+        const pending = this.pendingTimelineRequests.get(requestId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.pendingTimelineRequests.delete(requestId);
+          if (pending.socket.readyState === WebSocket.OPEN) {
+            pending.socket.send(JSON.stringify(msg));
+          }
+          return;
+        }
+      }
+      // Fallback: no requestId or no pending request — use session subscribers
       const sessionName = msg.sessionName as string | undefined;
       if (!sessionName) {
         logger.warn({ serverId: this.serverId, type }, 'timeline message missing sessionName — discarded');
@@ -1263,6 +1289,13 @@ export class WsBridge {
     this.browserSubscriptions.delete(ws);
     this.terminalSubscriptionRevisions.delete(ws);
     this.transportSubscriptions.delete(ws);
+    // Clean up pending timeline requests for this socket
+    for (const [reqId, pending] of this.pendingTimelineRequests) {
+      if (pending.socket === ws) {
+        clearTimeout(pending.timer);
+        this.pendingTimelineRequests.delete(reqId);
+      }
+    }
   }
 
   /**

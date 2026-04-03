@@ -1491,7 +1491,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
   const sessionName = cmd.sessionName as string | undefined;
   const requestId = cmd.requestId as string | undefined;
   const rawLimit = cmd.limit;
-  const limit = typeof rawLimit === 'number' && Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 2000) : 200;
+  const limit = typeof rawLimit === 'number' && Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 2000) : 500;
   const rawAfterTs = cmd.afterTs;
   const afterTs = typeof rawAfterTs === 'number' && Number.isFinite(rawAfterTs) ? rawAfterTs : undefined;
   const rawBeforeTs = cmd.beforeTs;
@@ -1502,25 +1502,31 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
     return;
   }
 
-  // Read more than requested so dedup doesn't shrink the set too aggressively.
+  // Read generously from disk — session.state events are excluded from the limit budget
+  // so we need to read more to ensure enough substantive events.
   // Do NOT filter by epoch — history should include events across daemon restarts.
-  // Filter by afterTs/beforeTs when provided for forward/backward pagination.
-  const readLimit = Math.min(limit * 4, 2000);
+  const readLimit = Math.min(limit * 6, 10000);
   const events = timelineStore.read(sessionName, { limit: readLimit, afterTs, beforeTs });
 
-  // Deduplicate consecutive session.state events — keep only the last in each run.
+  // Content-aware limit: session.state events don't count toward the budget.
   // This prevents idle↔running oscillation storms from crowding out user.message events.
-  const deduped: typeof events = [];
-  for (let i = 0; i < events.length; i++) {
-    const ev = events[i];
-    if (ev.type === 'session.state') {
-      const next = events[i + 1];
-      if (next && next.type === 'session.state') continue; // skip, keep last
-    }
-    deduped.push(ev);
+  const substantive: typeof events = [];
+  const stateEvents: typeof events = [];
+  for (const ev of events) {
+    if (ev.type === 'session.state') stateEvents.push(ev);
+    else substantive.push(ev);
   }
-  // Trim to requested limit after dedup
-  let trimmed = deduped.length > limit ? deduped.slice(deduped.length - limit) : deduped;
+  // Trim substantive to the requested limit
+  const trimmedSubstantive = substantive.length > limit ? substantive.slice(substantive.length - limit) : substantive;
+  // Interleave state events that fall within the trimmed time range
+  let trimmed: typeof events;
+  if (trimmedSubstantive.length > 0 && stateEvents.length > 0) {
+    const cutoffTs = trimmedSubstantive[0].ts;
+    const relevantState = stateEvents.filter((e) => e.ts >= cutoffTs);
+    trimmed = [...trimmedSubstantive, ...relevantState].sort((a, b) => a.ts - b.ts);
+  } else {
+    trimmed = trimmedSubstantive;
+  }
 
   const record = await recoverOpenCodeSessionRecord(getSession(sessionName));
   if (record?.agentType === 'opencode' && record.projectDir && record.opencodeSessionId) {
