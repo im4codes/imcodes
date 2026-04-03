@@ -222,4 +222,21 @@ describe('TransportSessionRuntime', () => {
     mock.fireComplete('mock-session-123', makeMessage());
     expect(runtime.sending).toBe(false);
   });
+
+  it('queues next send until the current turn completes', async () => {
+    await runtime.initialize(defaultConfig);
+
+    await runtime.send('first');
+    expect(mock.provider.send).toHaveBeenNthCalledWith(1, 'mock-session-123', 'first', undefined, undefined);
+
+    const queued = runtime.send('second');
+    await Promise.resolve();
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+
+    mock.fireComplete('mock-session-123', makeMessage('msg-1', 'mock-session-123'));
+    await queued;
+
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'mock-session-123', 'second', undefined, undefined);
+  });
 });

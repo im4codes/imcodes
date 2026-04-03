@@ -19,6 +19,14 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _agentId: string | undefined;
   /** Unsubscribe functions for provider callbacks — called in kill(). */
   private _unsubscribes: Array<() => void> = [];
+  /** Current turn completion signal — used to queue sends until the active turn finishes. */
+  private _activeTurn:
+    | {
+      promise: Promise<void>;
+      resolve: () => void;
+      reject: (err: ProviderError) => void;
+    }
+    | null = null;
 
   constructor(
     private readonly provider: TransportProvider,
@@ -34,11 +42,15 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._status = 'idle';
         this._sending = false;
         this._history.push(message);
+        this._activeTurn?.resolve();
+        this._activeTurn = null;
       }),
-      this.provider.onError((sid: string, _error: ProviderError) => {
+      this.provider.onError((sid: string, error: ProviderError) => {
         if (sid !== this._providerSessionId) return;
         this._status = 'error';
         this._sending = false;
+        this._activeTurn?.reject(error);
+        this._activeTurn = null;
       }),
     );
   }
@@ -76,6 +88,14 @@ export class TransportSessionRuntime implements SessionRuntime {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
 
+    if (this._activeTurn) {
+      try {
+        await this._activeTurn.promise;
+      } catch {
+        // Previous turn failed. A queued send may still proceed.
+      }
+    }
+
     // Record user message in history for complete conversation replay
     this._history.push({
       id: randomUUID(),
@@ -89,12 +109,23 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     this._status = 'thinking';
     this._sending = true;
+    this._activeTurn = (() => {
+      let resolve!: () => void;
+      let reject!: (err: ProviderError) => void;
+      const promise = new Promise<void>((res, rej) => {
+        resolve = res;
+        reject = rej as (err: ProviderError) => void;
+      });
+      void promise.catch(() => {});
+      return { promise, resolve, reject };
+    })();
     try {
       await this.provider.send(this._providerSessionId, message, undefined, this._description);
     } catch (err) {
       // Reset status so session doesn't get stuck at 'thinking'
       this._status = 'idle';
       this._sending = false;
+      this._activeTurn = null;
       throw err;
     }
   }
@@ -114,6 +145,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
     this._status = 'idle';
     this._sending = false;
+    this._activeTurn = null;
   }
 
   getHistory(): AgentMessage[] {
