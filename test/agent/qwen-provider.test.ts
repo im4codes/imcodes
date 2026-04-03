@@ -57,6 +57,7 @@ vi.mock('../../src/util/logger.js', () => ({
 }));
 
 import { QwenProvider } from '../../src/agent/providers/qwen.js';
+import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
 import type { ToolCallEvent } from '../../src/agent/transport-provider.js';
 
 function lastSpawn() {
@@ -149,6 +150,31 @@ describe('QwenProvider', () => {
       model: 'qwen3.5-plus',
       usage: { input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 2 },
     });
+  });
+
+
+  it('does not release queued runtime sends until the qwen process actually finishes', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    const runtime = new TransportSessionRuntime(provider, 'sess-queue');
+    await runtime.initialize({ sessionKey: 'sess-queue', cwd: '/tmp/project' });
+
+    await runtime.send('first');
+    const first = lastSpawn();
+    first.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-queue-1' } } })}
+`);
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'assistant-queue-1', content: [{ type: 'text', text: 'Still running' }] } })}
+`);
+    await flushIO();
+
+    const queued = runtime.send('second');
+    await flushIO();
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(1);
+
+    first.child.emit('close', 0, null);
+    await queued;
+
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(2);
   });
 
   it('emits provider error on result is_error payload', async () => {

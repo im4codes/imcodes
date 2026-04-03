@@ -29,6 +29,8 @@ interface QwenSessionState {
   child: ChildProcess | null;
   currentMessageId: string | null;
   currentText: string;
+  pendingFinalText?: string;
+  pendingFinalMetadata?: Record<string, unknown>;
   toolUseByIndex: Map<number, { id: string; name: string; input?: unknown; partialJson: string }>;
   toolUseById: Map<string, { id: string; name: string; input?: unknown; partialJson: string }>;
   emittedToolSignatures: Map<string, string>;
@@ -168,6 +170,8 @@ export class QwenProvider implements TransportProvider {
       child: existing?.child ?? null,
       currentMessageId: existing?.currentMessageId ?? null,
       currentText: existing?.currentText ?? '',
+      pendingFinalText: existing?.pendingFinalText,
+      pendingFinalMetadata: existing?.pendingFinalMetadata,
       toolUseByIndex: existing?.toolUseByIndex ?? new Map(),
       toolUseById: existing?.toolUseById ?? new Map(),
       emittedToolSignatures: existing?.emittedToolSignatures ?? new Map(),
@@ -231,6 +235,8 @@ export class QwenProvider implements TransportProvider {
       child: null,
       currentMessageId: null,
       currentText: '',
+      pendingFinalText: undefined,
+      pendingFinalMetadata: undefined,
       toolUseByIndex: new Map(),
       toolUseById: new Map(),
       emittedToolSignatures: new Map(),
@@ -241,6 +247,8 @@ export class QwenProvider implements TransportProvider {
 
     state.currentMessageId = null;
     state.currentText = '';
+    state.pendingFinalText = undefined;
+    state.pendingFinalMetadata = undefined;
     state.toolUseByIndex.clear();
     state.toolUseById.clear();
     state.emittedToolSignatures.clear();
@@ -292,6 +300,8 @@ export class QwenProvider implements TransportProvider {
       state.started = true;
       state.currentMessageId = null;
       state.currentText = '';
+      state.pendingFinalText = undefined;
+      state.pendingFinalMetadata = undefined;
       const finalMessageId = messageId || randomUUID();
       const msg: AgentMessage = {
         id: finalMessageId,
@@ -421,13 +431,11 @@ export class QwenProvider implements TransportProvider {
         }
         const finalText = collectAssistantText(payload.message?.content);
         if (finalText) {
-          // Qwen may emit a different final assistant message.id than the prior
-          // stream_event message_start id. For IM.codes we must preserve the
-          // streaming message id so timeline replacement stays in-place.
-          emitComplete(finalText, state.currentMessageId ?? payload.message?.id ?? undefined, {
+          state.pendingFinalText = finalText;
+          state.pendingFinalMetadata = {
             ...(state.model || payload.message?.model ? { model: state.model ?? payload.message?.model } : {}),
             ...(payload.message?.usage ? { usage: payload.message.usage } : {}),
-          });
+          };
         }
         return;
       }
@@ -452,8 +460,12 @@ export class QwenProvider implements TransportProvider {
           emitError(payload.error?.message || stderrBuf || 'Qwen execution failed', payload);
           return;
         }
-        if (!completed && typeof payload.result === 'string' && payload.result.trim()) {
-          emitComplete(payload.result, state.currentMessageId ?? undefined, {
+        const resultText = typeof payload.result === 'string' && payload.result.trim()
+          ? payload.result
+          : state.pendingFinalText;
+        if (!completed && resultText) {
+          emitComplete(resultText, state.currentMessageId ?? undefined, {
+            ...(state.pendingFinalMetadata ?? {}),
             ...(state.model ? { model: state.model } : {}),
             ...(payload.usage ? { usage: payload.usage } : {}),
           });
@@ -470,6 +482,12 @@ export class QwenProvider implements TransportProvider {
     child.once('close', (code, signal) => {
       rl.close();
       state.child = null;
+      if (!completed && !sawError && (code === 0 || code === null)) {
+        if (state.pendingFinalText) {
+          emitComplete(state.pendingFinalText, state.currentMessageId ?? undefined, state.pendingFinalMetadata);
+          return;
+        }
+      }
       if (!completed && !sawError && code !== 0) {
         emitError(stderrBuf.trim() || `Qwen exited with code ${code ?? 'null'}${signal ? ` (${signal})` : ''}`);
       }
