@@ -144,6 +144,7 @@ export function SubSessionWindow({
     modelDisplay: matchedSession?.modelDisplay,
     planLabel: matchedSession?.planLabel,
     quotaLabel: matchedSession?.quotaLabel,
+    quotaUsageLabel: matchedSession?.quotaUsageLabel,
   };
 
   useEffect(() => {
@@ -382,6 +383,7 @@ export function SubSessionWindow({
           modelOverride={sessionInfo?.modelDisplay ?? (sessionInfo?.agentType === 'qwen' ? sessionInfo?.qwenModel : undefined)}
           planLabel={sessionInfo?.planLabel}
           quotaLabel={sessionInfo?.quotaLabel}
+          quotaUsageLabel={sessionInfo?.quotaUsageLabel}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}

@@ -100,6 +100,7 @@ import { resolveContextWindow } from '../util/model-context.js';
 import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
 import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from '../agent/provider-display.js';
+import { getQwenOAuthQuotaUsageLabel, recordQwenOAuthRequest } from '../agent/provider-quota.js';
 
 function describeTransportSendError(err: unknown): string {
   if (err && typeof err === 'object') {
@@ -107,6 +108,19 @@ function describeTransportSendError(err: unknown): string {
     if (typeof record.message === 'string' && record.message.trim()) return record.message;
   }
   return err instanceof Error ? err.message : String(err);
+}
+
+function refreshQwenQuotaUsageLabels(serverLink?: ServerLink): void {
+  const usageLabel = getQwenOAuthQuotaUsageLabel();
+  for (const session of listSessions()) {
+    if (session.agentType !== 'qwen' || session.qwenAuthType !== 'qwen-oauth') continue;
+    upsertSession({
+      ...session,
+      quotaUsageLabel: usageLabel,
+      updatedAt: Date.now(),
+    });
+  }
+  if (serverLink) handleGetSessions(serverLink);
 }
 
 // ── Common MIME map for file metadata ────────────────────────────────────────
@@ -1100,6 +1114,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
               model: nextModel,
               authType: qwenAuthType,
               authLimit: runtimeConfig?.authLimit ?? record.qwenAuthLimit,
+              quotaUsageLabel: qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
             }),
             updatedAt: Date.now(),
           });
@@ -1121,6 +1136,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       timelineEmitter.emit(sessionName, 'user.message', { text });
       timelineEmitter.emit(sessionName, 'session.state', { state: 'running' }, { source: 'daemon', confidence: 'high' });
       timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'medium' });
+      if (record?.agentType === 'qwen' && record.qwenAuthType === 'qwen-oauth') {
+        recordQwenOAuthRequest();
+        refreshQwenQuotaUsageLabels(serverLink);
+      }
       await transportRuntime.send(text);
       const status = isLegacy ? 'accepted_legacy' : 'accepted';
       timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
@@ -1262,6 +1281,7 @@ function handleGetSessions(serverLink: ServerLink): void {
       modelDisplay: s.modelDisplay,
       planLabel: s.planLabel,
       quotaLabel: s.quotaLabel,
+      quotaUsageLabel: s.quotaUsageLabel,
       description: s.description,
       label: s.label,
     }));

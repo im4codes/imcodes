@@ -228,6 +228,44 @@ describe('SessionControls', () => {
     expect(screen.queryByText(/qwen3-max-2026-01-23/)).toBeNull();
   });
 
+  it('shows queued hint when sending to a running transport session and hides after the session leaves running state', () => {
+    const ws = makeWs();
+    const runningSession = makeSession({
+      name: 'qwen-session',
+      agentType: 'qwen',
+      runtimeType: 'transport',
+      state: 'running',
+    });
+    const { rerender } = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={runningSession}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'queued send';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      sessionName: 'qwen-session',
+      text: 'queued send',
+    });
+    expect(screen.getByText('transport_send_queued')).toBeDefined();
+
+    rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={{ ...runningSession, state: 'idle' }}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.queryByText('transport_send_queued')).toBeNull();
+  });
+
   it('pressing Shift+Enter does not submit', () => {
     const ws = makeWs();
     render(<SessionControls ws={ws as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
