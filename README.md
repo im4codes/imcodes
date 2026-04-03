@@ -229,10 +229,59 @@ docker compose up -d
 
 Login at `https://your-domain` with `admin` and the printed password. Bind your dev machine with `imcodes bind`.
 
+## Windows
+
+Windows is natively supported via [ConPTY](https://devblogs.microsoft.com/commandline/windows-command-line-introducing-the-windows-pseudo-console-conpty/) (built-in on Windows 10+). No WSL required.
+
+### Install & Bind (Windows)
+
+```cmd
+npm install -g imcodes
+imcodes bind https://app.im.codes/bind/<api-key>
+```
+
+### Upgrade (Windows)
+
+```cmd
+imcodes upgrade
+```
+
+Or upgrade remotely from the web dashboard (sends upgrade command to the daemon).
+
+### Troubleshooting (Windows)
+
+If the daemon stops after an auto-upgrade, regenerate the launch chain:
+
+```cmd
+imcodes repair-watchdog
+```
+
+This rewrites the watchdog script and scheduled task with the current Node.js and imcodes paths. Needed after Node.js version switches (nvm, fnm) or if the daemon won't restart after upgrade.
+
+If `imcodes` is "not recognized as internal or external command" after upgrade, the npm global directory may not be on your PATH. Fix it:
+
+```cmd
+npm prefix -g
+```
+
+Copy the output path and add it to your PATH:
+
+```cmd
+setx PATH "<npm-prefix-path>;%PATH%"
+```
+
+Then open a **new** terminal window.
+
+Check the daemon watchdog log for errors:
+
+```
+%USERPROFILE%\.imcodes\watchdog.log
+```
+
 ## Requirements
 
 - macOS or Linux (tested on both)
-- **Windows (experimental)**: Native support via [ConPTY](https://devblogs.microsoft.com/commandline/windows-command-line-introducing-the-windows-pseudo-console-conpty/) (built-in on Windows 10+). Just `npm install -g imcodes` — no extra software needed. WSL also works.
+- **Windows**: Native support via ConPTY (built-in on Windows 10+). Just `npm install -g imcodes` — no extra software needed. WSL also works.
 - Node.js >= 20
 - Terminal multiplexer: [tmux](https://github.com/tmux/tmux) (Linux/macOS). Windows uses ConPTY (auto-detected, built-in).
 - At least one AI coding agent: [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), or [Qwen](https://github.com/QwenLM/qwen-agent)
