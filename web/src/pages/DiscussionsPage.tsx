@@ -33,6 +33,7 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
   const [loading, setLoading] = useState(true);
   // Track which id we last requested, to prevent stale response overwriting current selection
   const pendingReadIdRef = useRef<string | null>(null);
+  const detailRef = useRef<HTMLDivElement>(null);
 
   const loadList = useCallback(() => {
     if (!ws) return;
@@ -185,17 +186,33 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
           ))}
         </div>
 
-        <div class={`discussions-detail${selected ? ' discussions-detail-fullscreen' : ''}`}>
+        <div ref={detailRef} class={`discussions-detail${selected ? ' discussions-detail-fullscreen' : ''}`}>
           {!selected && (
             <div class="discussions-empty">{t('p2p.discussions.select')}</div>
           )}
           {selected && (
-            <button
-              class="discussions-back-btn"
-              onClick={() => { setSelected(null); setContent(null); }}
-            >
-              ← {t('p2p.picker.back')}
-            </button>
+            <div class="discussions-nav-row">
+              <button
+                class="discussions-back-btn"
+                onClick={() => { setSelected(null); setContent(null); }}
+              >
+                ← {t('p2p.picker.back')}
+              </button>
+              <button
+                class="discussions-scroll-btn"
+                onClick={() => detailRef.current?.scrollTo({ top: 0, behavior: 'smooth' })}
+                title={t('p2p.discussions.scroll_top')}
+              >
+                ↑
+              </button>
+              <button
+                class="discussions-scroll-btn"
+                onClick={() => detailRef.current?.scrollTo({ top: detailRef.current.scrollHeight, behavior: 'smooth' })}
+                title={t('p2p.discussions.scroll_bottom')}
+              >
+                ↓
+              </button>
+            </div>
           )}
           {selected && content === null && (
             <div class="discussions-empty">{t('common.loading')}</div>

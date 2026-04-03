@@ -323,7 +323,9 @@
       "phase_summary": "要約",
       "phase_queued": "待機中",
       "round_label": "ラウンド",
-      "hop_label": "ホップ"
+      "hop_label": "ホップ",
+      "scroll_top": "先頭へスクロール",
+      "scroll_bottom": "末尾へスクロール"
     },
     "mode_solo": "Solo",
     "mode_audit": "監査",

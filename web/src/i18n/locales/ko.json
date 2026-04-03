@@ -323,7 +323,9 @@
       "phase_summary": "요약",
       "phase_queued": "대기열",
       "round_label": "라운드",
-      "hop_label": "홉"
+      "hop_label": "홉",
+      "scroll_top": "맨 위로 스크롤",
+      "scroll_bottom": "맨 아래로 스크롤"
     },
     "mode_solo": "Solo",
     "mode_audit": "감사",
