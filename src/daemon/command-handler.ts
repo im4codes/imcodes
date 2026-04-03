@@ -28,7 +28,7 @@ import { exec as execCb } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget } from './p2p-orchestrator.js';
-import { getP2pMode, P2P_CONFIG_MODE, type P2pSessionConfig } from '../../shared/p2p-modes.js';
+import { getP2pMode, getComboRoundCount, parseModePipeline, P2P_CONFIG_MODE, type P2pSessionConfig } from '../../shared/p2p-modes.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
 import { executeCronJob } from './cron-executor.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
@@ -193,7 +193,16 @@ function expandAllTargets(initiatorName: string, mode: string, excludeSameType =
 
 // Session names: alphanumeric + underscore only (matches deck_{project}_{role} and deck_sub_{id} patterns)
 const SESSION_NAME_RE = /[a-zA-Z0-9_]+/;
-const VALID_MODES = new Set(['audit', 'review', 'plan', 'brainstorm', 'discuss', 'config']);
+const SINGLE_MODES = new Set(['audit', 'review', 'plan', 'brainstorm', 'discuss', 'config']);
+const VALID_MODES = SINGLE_MODES; // alias for parseAtTokens (individual session tokens always use single modes)
+
+/** Validate a mode string — single mode or combo pipeline (e.g. "brainstorm>discuss>plan"). */
+function isValidP2pMode(mode: string): boolean {
+  if (SINGLE_MODES.has(mode)) return true;
+  // Combo pipeline: every segment must be a known mode (not config)
+  const pipeline = parseModePipeline(mode);
+  return pipeline.length > 1 && pipeline.every((m) => SINGLE_MODES.has(m) && m !== 'config');
+}
 const DISCUSS_TOKEN_RE = /@@discuss\(([^,]+),\s*([^)]+)\)/g;
 // @@all(mode) or @@all(mode, exclude-same-type)
 const ALL_TOKEN_RE = /@@all\(([^)]+)\)/g;
@@ -221,7 +230,7 @@ export function parseAtTokens(text: string): ParsedTokens {
     const parts = allMatch[1].split(',').map((s) => s.trim());
     const mode = parts[0];
     const excludeSameType = parts.includes('exclude-same-type');
-    if (VALID_MODES.has(mode)) {
+    if (isValidP2pMode(mode)) {
       expandAll = { mode, excludeSameType };
     }
   }
@@ -953,6 +962,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   if (!p2pRounds) {
     const roundsMatch = /@@p2p-config\(rounds=(\d+)\)/.exec(text);
     if (roundsMatch) p2pRounds = Math.min(parseInt(roundsMatch[1], 10), 6);
+  }
+
+  // For combo pipelines, auto-set rounds to match pipeline length if not explicitly overridden
+  const resolvedMode = p2pModeField ?? tokens.agents[0]?.mode ?? '';
+  const comboRounds = getComboRoundCount(resolvedMode);
+  if (comboRounds && !p2pRounds) {
+    p2pRounds = comboRounds;
   }
 
   // All @@discuss tokens were rejected — sessions not found in store

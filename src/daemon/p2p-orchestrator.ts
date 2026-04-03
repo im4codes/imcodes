@@ -14,7 +14,7 @@ import { sendKeysDelayedEnter } from '../agent/tmux.js';
 import { detectStatusAsync } from '../agent/detect.js';
 import { getSession } from '../store/session-store.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
-import { P2P_BASELINE_PROMPT, getP2pMode, roundPrompt, type P2pMode } from '../../shared/p2p-modes.js';
+import { P2P_BASELINE_PROMPT, getP2pMode, getModeForRound, isComboMode, parseModePipeline, roundPrompt, type P2pMode } from '../../shared/p2p-modes.js';
 import { formatP2pParticipantIdentity, shortP2pSessionName } from '../../shared/p2p-participant.js';
 import logger from '../util/logger.js';
 import type { ServerLink } from './server-link.js';
@@ -425,16 +425,20 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
   const totalHops = run.allTargets.length;
 
   // ── Multi-round loop ──
+  const combo = isComboMode(run.mode);
   for (; run.currentRound <= run.rounds; run.currentRound++) {
     if (run._cancelled || isTerminal(run.status)) return;
 
-    const rp = roundPrompt(run.currentRound, run.rounds);
+    // For combo pipelines, resolve this round's mode; for single modes, use the fixed config
+    const roundModeConfig = combo ? getModeForRound(run.mode, run.currentRound) : modeConfig;
+    const roundModeKey = combo ? (parseModePipeline(run.mode)[Math.min(run.currentRound - 1, parseModePipeline(run.mode).length - 1)]) : run.mode;
+    const rp = roundPrompt(run.currentRound, run.rounds, combo ? roundModeKey : undefined);
     const roundLabel = run.rounds > 1 ? ` (round ${run.currentRound}/${run.rounds})` : '';
 
     // Restore full target list for this round (skipped sessions are not retried)
     if (run.currentRound > 1) {
       run.remainingTargets = [...run.allTargets];
-      logger.info({ runId: run.id, round: run.currentRound, totalRounds: run.rounds }, 'P2P: starting new round');
+      logger.info({ runId: run.id, round: run.currentRound, totalRounds: run.rounds, roundMode: roundModeKey }, 'P2P: starting new round');
     }
 
     const targets = [...run.remainingTargets];
@@ -442,8 +446,8 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
     // ── Phase 1: Initiator initial analysis (first round only) ──
     if (run.currentRound === 1) {
       if (run._cancelled) return;
-      const initialHeader = `${discussionParticipantNameWithMode(run.initiatorSession, run.mode)} — Initial Analysis${roundLabel}`;
-      const initialPrompt = buildHopPrompt(run, modeConfig, {
+      const initialHeader = `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Initial Analysis${roundLabel}`;
+      const initialPrompt = buildHopPrompt(run, roundModeConfig, {
         session: run.initiatorSession,
         sectionHeader: initialHeader,
         instruction: 'Read the context file below and provide your initial analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.',
@@ -457,18 +461,20 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
     for (let i = 0; i < targets.length; i++) {
       if (run._cancelled) return;
       const target = targets[i];
-      const hopLabel = `${discussionParticipantName(target.session)} — ${capitalize(target.mode)} (hop ${i + 1}/${totalHops}${roundLabel})`;
-      const hopModeConfig = getP2pMode(target.mode) ?? modeConfig;
+      // For combo pipelines, all hops in this round use the round's mode
+      const hopMode = combo ? roundModeKey : target.mode;
+      const hopLabel = `${discussionParticipantName(target.session)} — ${capitalize(hopMode)} (hop ${i + 1}/${totalHops}${roundLabel})`;
+      const hopModeConfig = combo ? roundModeConfig : (getP2pMode(target.mode) ?? modeConfig);
 
       const hopPrompt = buildHopPrompt(run, hopModeConfig, {
         session: target.session,
         sectionHeader: hopLabel,
-        instruction: `Read the full context file and provide your ${target.mode} analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`,
+        instruction: `Read the full context file and provide your ${hopMode} analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`,
         isInitial: false,
       }, rp);
 
       // Dispatch immediately — agent will queue the message and process after current task
-      logger.info({ runId: run.id, target: target.session, mode: target.mode, hop: i + 1, totalHops, round: run.currentRound }, 'P2P: Phase 2 — dispatching hop');
+      logger.info({ runId: run.id, target: target.session, mode: hopMode, hop: i + 1, totalHops, round: run.currentRound }, 'P2P: Phase 2 — dispatching hop');
       await dispatchHop(run, target.session, hopPrompt, serverLink, null, hopLabel);
       logger.info({ runId: run.id, target: target.session, status: run.status }, 'P2P: Phase 2 — hop dispatch returned');
       if (run._cancelled || isTerminal(run.status)) return;
@@ -477,19 +483,22 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
     // ── Round summary: Initiator synthesizes this round ──
     if (run._cancelled) return;
     const isLastRound = run.currentRound === run.rounds;
+    const summaryModeConfig = isLastRound && combo
+      ? getModeForRound(run.mode, run.rounds) // last pipeline mode for final summary
+      : roundModeConfig;
     const roundSummaryHeader = isLastRound
-      ? `${discussionParticipantNameWithMode(run.initiatorSession, run.mode)} — Final Summary`
-      : `${discussionParticipantNameWithMode(run.initiatorSession, run.mode)} — Round ${run.currentRound}/${run.rounds} Summary`;
+      ? `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Final Summary`
+      : `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Round ${run.currentRound}/${run.rounds} Summary`;
     const roundSummaryInstruction = isLastRound
-      ? (modeConfig?.summaryPrompt ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.')
+      ? (summaryModeConfig?.summaryPrompt ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.')
       : `Synthesize the key points, areas of agreement, and open questions from this round. Then assign specific focus areas or questions for each participant in the next round (round ${run.currentRound + 1}). Append to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`;
-    const roundSummaryPrompt = buildHopPrompt(run, modeConfig, {
+    const roundSummaryPrompt = buildHopPrompt(run, summaryModeConfig, {
       session: run.initiatorSession,
       sectionHeader: roundSummaryHeader,
       instruction: roundSummaryInstruction,
       isInitial: false,
     }, rp);
-    logger.info({ runId: run.id, round: run.currentRound, isLastRound }, isLastRound ? 'P2P: Final summary — initiator' : 'P2P: Round summary — initiator');
+    logger.info({ runId: run.id, round: run.currentRound, isLastRound, roundMode: roundModeKey }, isLastRound ? 'P2P: Final summary — initiator' : 'P2P: Round summary — initiator');
     await dispatchHop(run, run.initiatorSession, roundSummaryPrompt, serverLink, undefined, roundSummaryHeader);
     if (run._cancelled || isTerminal(run.status)) return;
   }

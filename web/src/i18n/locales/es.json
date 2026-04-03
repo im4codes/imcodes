@@ -333,6 +333,7 @@
     "mode_plan": "Planificación",
     "mode_brainstorm": "Lluvia de ideas",
     "mode_discuss": "Discusión",
+    "combo_label": "Combo",
     "exclude_same_type": "Excluir mismo tipo",
     "picker": {
       "back": "Atrás",

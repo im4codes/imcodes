@@ -333,6 +333,7 @@
     "mode_plan": "Plan",
     "mode_brainstorm": "Brainstorm",
     "mode_discuss": "Discuss",
+    "combo_label": "Combo",
     "exclude_same_type": "Exclude same type",
     "picker": {
       "back": "Back",
