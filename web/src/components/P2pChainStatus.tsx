@@ -2,7 +2,7 @@
  * P2pChainStatus — chain visualization and status display for P2P Quick Discussion runs.
  * Shows the hop chain (initiator -> targets -> initiator) with status icons and a cancel button.
  */
-import { useMemo } from 'preact/hooks';
+import { useMemo, useState, useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 
 interface Target {
@@ -244,15 +244,31 @@ export function P2pChainStatus({ run, onCancel }: P2pChainStatusProps) {
             )}
           </span>
         )}
-        {isActive(run.status) && (
-          <button
-            type="button"
-            style={cancelBtnStyle}
-            onClick={() => onCancel(run.id)}
-          >
-            {t('common.cancel', 'Cancel')}
-          </button>
-        )}
+        {isActive(run.status) && (() => {
+          const [confirming, setConfirming] = useState(false);
+          useEffect(() => {
+            if (!confirming) return;
+            const timer = setTimeout(() => setConfirming(false), 3000);
+            return () => clearTimeout(timer);
+          }, [confirming]);
+          return confirming ? (
+            <button
+              type="button"
+              style={{ ...cancelBtnStyle, background: 'rgba(239, 68, 68, 0.3)', borderColor: '#ef4444' }}
+              onClick={() => { onCancel(run.id); setConfirming(false); }}
+            >
+              {t('common.confirm', 'Confirm')}
+            </button>
+          ) : (
+            <button
+              type="button"
+              style={cancelBtnStyle}
+              onClick={() => setConfirming(true)}
+            >
+              {t('common.cancel', 'Cancel')}
+            </button>
+          );
+        })()}
       </div>
 
       {/* Result summary */}

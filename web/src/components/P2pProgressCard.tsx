@@ -1,4 +1,4 @@
-import { useMemo, useEffect, useRef } from 'preact/hooks';
+import { useMemo, useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 
 export interface P2pProgressNode {
@@ -107,15 +107,31 @@ export function P2pProgressCard({ discussion, compact = false, mobile = false, h
               {hidden ? '▼' : '▲'}
             </button>
           )}
-          {isActive && onStopDiscussion && (
-            <button
-              class="discussions-progress-stop"
-              style={{ padding: '2px 7px', fontSize: '10px' }}
-              onClick={(e) => { e.stopPropagation(); onStopDiscussion(discussion.id); }}
-            >
-              {t('common.cancel')}
-            </button>
-          )}
+          {isActive && onStopDiscussion && (() => {
+            const [confirming, setConfirming] = useState(false);
+            useEffect(() => {
+              if (!confirming) return;
+              const t = setTimeout(() => setConfirming(false), 3000);
+              return () => clearTimeout(t);
+            }, [confirming]);
+            return confirming ? (
+              <button
+                class="discussions-progress-stop"
+                style={{ padding: '2px 7px', fontSize: '10px', background: 'rgba(239,68,68,0.3)', borderColor: '#ef4444', color: '#f87171' }}
+                onClick={(e) => { e.stopPropagation(); onStopDiscussion(discussion.id); setConfirming(false); }}
+              >
+                {t('common.confirm', 'Confirm')}
+              </button>
+            ) : (
+              <button
+                class="discussions-progress-stop"
+                style={{ padding: '2px 7px', fontSize: '10px' }}
+                onClick={(e) => { e.stopPropagation(); setConfirming(true); }}
+              >
+                {t('common.cancel')}
+              </button>
+            );
+          })()}
         </div>
         {!hidden && (
           <div class="discussions-progress-mobile-title">{discussion.topic || t('p2p.discussions.untitled')}</div>
