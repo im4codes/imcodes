@@ -563,7 +563,7 @@ body {
 .subcard-resize-handle:hover { background: rgba(59,130,246,0.4); }
 .subcard-resize-handle:hover::after { color: #60a5fa; }
 .subcard-input-area { flex-shrink: 0; border-top: 1px solid #1e293b; background: #0d1117; padding: 4px 6px; display: flex; flex-direction: column; gap: 3px; border-radius: 0 0 8px 8px; }
-.subcard-input-area .menu-dropdown { z-index: 10000; }
+.subcard-input-area .menu-dropdown { z-index: 10000; right: auto; left: 0; max-width: calc(100vw - 24px); }
 .subcard-shortcuts { display: flex; gap: 3px; }
 .subcard-shortcut-btn { background: #1a2233; border: 1px solid #334155; border-radius: 3px; color: #64748b; font-size: 10px; padding: 1px 5px; cursor: pointer; transition: all 0.12s; line-height: 1.4; }
 .subcard-shortcut-btn:hover { border-color: #475569; color: #94a3b8; }
