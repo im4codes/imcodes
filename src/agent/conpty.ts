@@ -98,54 +98,10 @@ function feedRingBuffer(session: ConptySession, data: string): void {
 // ── Exported functions ──────────────────────────────────────────────────────────
 
 /**
- * Parse a command string into executable + args for direct spawn.
- * Handles double-quoted arguments (Windows CommandLineToArgvW semantics).
+ * Build the environment for Windows PTY spawn.
+ * Ensures Node and npm global bin directories are on PATH so that
+ * npm-installed .cmd shims (claude, codex, etc.) resolve correctly.
  */
-function splitCommand(cmd: string): { file: string; args: string[] } {
-  const tokens: string[] = [];
-  let i = 0;
-  while (i < cmd.length) {
-    // skip whitespace
-    while (i < cmd.length && cmd[i] === ' ') i++;
-    if (i >= cmd.length) break;
-    let token = '';
-    if (cmd[i] === '"') {
-      // quoted token — collect until closing quote
-      i++; // skip opening quote
-      while (i < cmd.length && cmd[i] !== '"') { token += cmd[i]; i++; }
-      if (i < cmd.length) i++; // skip closing quote
-    } else {
-      // unquoted token
-      while (i < cmd.length && cmd[i] !== ' ') { token += cmd[i]; i++; }
-    }
-    tokens.push(token);
-  }
-  return { file: tokens[0] ?? cmd, args: tokens.slice(1) };
-}
-
-function needsWindowsShell(cmd: string): boolean {
-  return /(?:\|\||&&|[<>|])/.test(cmd);
-}
-
-function shouldUseWindowsShell(file: string, cmd: string): boolean {
-  if (needsWindowsShell(cmd)) return true;
-
-  const normalized = file.trim().replace(/^"|"$/g, '');
-  if (!normalized) return true;
-
-  const lower = normalized.toLowerCase();
-  if (lower.endsWith('.cmd') || lower.endsWith('.bat')) return true;
-
-  const hasPathSeparator = /[\\/]/.test(normalized);
-  const hasKnownExecutableExtension = /\.(?:exe|com)$/i.test(normalized);
-
-  if (!hasPathSeparator && !hasKnownExecutableExtension) {
-    return true;
-  }
-
-  return false;
-}
-
 function buildWindowsEnv(extraEnv?: Record<string, string>): Record<string, string> {
   const env = { ...process.env, ...extraEnv } as Record<string, string>;
   const pathKey = Object.keys(env).find((k) => k.toUpperCase() === 'PATH') ?? 'PATH';
@@ -170,9 +126,8 @@ function buildWindowsEnv(extraEnv?: Record<string, string>): Record<string, stri
 
 /**
  * Spawn a new ConPTY session via node-pty.
- * On Windows, bare commands and shell-builtins are wrapped with cmd.exe /d /c so
- * npm-installed .cmd shims (for example codex/claude) resolve correctly. Explicit
- * executable paths still spawn directly to avoid unnecessary shell layering.
+ * Always wraps commands with cmd.exe /c — this ensures npm .cmd shims,
+ * shell builtins, and PATH resolution all work correctly on Windows.
  */
 export async function conptyNewSession(
   name: string,
@@ -196,14 +151,7 @@ export async function conptyNewSession(
     cleanCmd = cleanCmd.slice(cdMatch[0].length);
   }
 
-  let file: string;
-  let args: string[];
-  ({ file, args } = splitCommand(cleanCmd));
-  if (process.platform === 'win32' && shouldUseWindowsShell(file, cleanCmd)) {
-    file = process.env.COMSPEC ?? 'cmd.exe';
-    args = ['/d', '/c', cleanCmd];
-  }
-  const pty = spawn(file, args, {
+  const pty = spawn('cmd.exe', ['/c', cleanCmd], {
     cwd,
     env: process.platform === 'win32'
       ? buildWindowsEnv(opts?.env)
