@@ -22,6 +22,7 @@ function mapP2pRunToDiscussion(r: Record<string, any>) {
   const status = String(source.status ?? '');
   const state = mapP2pState(status);
   const mode = source.mode_key ?? 'discuss';
+  const currentRoundMode = source.current_round_mode ?? mode;
   const initiatorLabel = source.initiator_label ?? 'brain';
   const currentTarget = source.current_target_label ?? (source.current_target_session ? String(source.current_target_session).split('_').pop() : undefined);
   const totalCount = source.total_count ?? 3;
@@ -39,7 +40,7 @@ function mapP2pRunToDiscussion(r: Record<string, any>) {
     id,
     topic: `P2P ${mode} · ${initiatorLabel}`,
     state,
-    modeKey: mode,
+    modeKey: currentRoundMode,
     currentRound: source.current_round ?? 1,
     maxRounds: source.total_rounds ?? 1,
     completedHops: source.completed_hops_count ?? 0,

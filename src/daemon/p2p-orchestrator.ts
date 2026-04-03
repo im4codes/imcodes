@@ -94,6 +94,7 @@ export function serializeP2pRun(run: P2pRun): Record<string, unknown> {
     final_return_session: run.finalReturnSession,
     remaining_targets: JSON.stringify(run.remainingTargets),
     mode_key: run.mode,
+    current_round_mode: isComboMode(run.mode) ? (getModeForRound(run.mode, run.currentRound)?.key ?? run.mode) : run.mode,
     status: run.status,
     request_message_id: null,
     callback_message_id: null,
@@ -181,31 +182,47 @@ export function serializeP2pRun(run: P2pRun): Record<string, unknown> {
         };
       };
 
-      const init = getInfo(run.initiatorSession, run.mode, 'initial');
+      // For combo pipelines, resolve the display mode per round
+      const combo = isComboMode(run.mode);
+      const pipeline = combo ? parseModePipeline(run.mode) : null;
+      const resolveMode = (round: number) => {
+        if (!pipeline) return run.mode;
+        return pipeline[Math.min(round - 1, pipeline.length - 1)];
+      };
+
+      const initMode = resolveMode(1);
+      const init = getInfo(run.initiatorSession, initMode, 'initial');
       const phase1Done = run.completedHops.length > 0 || run.remainingTargets.length < run.totalTargets || run.status === 'completed';
       const phase1Active = !phase1Done && run.currentTargetSession === run.initiatorSession;
       nodes.push({ session: run.initiatorSession, ...init, status: phase1Done ? 'done' : phase1Active ? 'active' : 'pending' });
 
-      for (const t of run.completedHops) {
-        const info = getInfo(t.session, t.mode, 'hop');
+      for (let hi = 0; hi < run.completedHops.length; hi++) {
+        const t = run.completedHops[hi];
+        const hopRound = run.totalTargets > 0 ? Math.floor(hi / run.totalTargets) + 1 : 1;
+        const hopMode = combo ? resolveMode(hopRound) : t.mode;
+        const info = getInfo(t.session, hopMode, 'hop');
         nodes.push({ session: t.session, ...info, status: skippedSet.has(t.session) ? 'skipped' : 'done' });
       }
       if (run.currentTargetSession && run.currentTargetSession !== run.initiatorSession) {
-        const activeTarget = run.allTargets.find((t) => t.session === run.currentTargetSession)
-          ?? run.remainingTargets.find((t) => t.session === run.currentTargetSession)
-          ?? { session: run.currentTargetSession, mode: run.mode };
-        const info = getInfo(run.currentTargetSession, activeTarget.mode, 'hop');
+        const curMode = combo ? resolveMode(run.currentRound) : (
+          run.allTargets.find((t) => t.session === run.currentTargetSession)?.mode
+          ?? run.remainingTargets.find((t) => t.session === run.currentTargetSession)?.mode
+          ?? run.mode
+        );
+        const info = getInfo(run.currentTargetSession, curMode, 'hop');
         nodes.push({ session: run.currentTargetSession, ...info, status: 'active' });
       }
       for (const t of run.remainingTargets) {
         if (t.session === run.currentTargetSession) continue;
-        const info = getInfo(t.session, t.mode, 'hop');
+        const pendingMode = combo ? resolveMode(run.currentRound) : t.mode;
+        const info = getInfo(t.session, pendingMode, 'hop');
         nodes.push({ session: t.session, ...info, status: 'pending' });
       }
 
       const summaryDone = run.status === 'completed';
       const summaryActive = run.remainingTargets.length === 0 && !summaryDone && run.currentTargetSession === run.initiatorSession;
-      const summary = getInfo(run.initiatorSession, run.mode, 'summary');
+      const lastMode = combo ? resolveMode(run.rounds) : run.mode;
+      const summary = getInfo(run.initiatorSession, lastMode, 'summary');
       nodes.push({ session: run.initiatorSession, ...summary, status: summaryDone ? 'done' : summaryActive ? 'active' : 'pending' });
       return nodes;
     })(),
