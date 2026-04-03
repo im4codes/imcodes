@@ -333,6 +333,7 @@
     "mode_plan": "規劃",
     "mode_brainstorm": "腦力激盪",
     "mode_discuss": "討論",
+    "combo_label": "組合流程",
     "exclude_same_type": "排除同類型",
     "picker": {
       "back": "返回",

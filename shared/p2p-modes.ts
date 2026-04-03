@@ -19,12 +19,13 @@ export interface P2pSavedConfig {
 }
 
 /** Round-aware prompt wrapper — prepended to the mode's base prompt. */
-export function roundPrompt(round: number, totalRounds: number): string {
+export function roundPrompt(round: number, totalRounds: number, modeKey?: string): string {
   if (totalRounds <= 1) return '';
+  const phaseLabel = modeKey ? ` — ${modeKey.charAt(0).toUpperCase() + modeKey.slice(1)} Phase` : '';
   if (round === 1) {
-    return `[Round ${round}/${totalRounds} — Initial Analysis]\nProvide your initial analysis based on the original request.\n\n`;
+    return `[Round ${round}/${totalRounds}${phaseLabel} — Initial Analysis]\nProvide your initial analysis based on the original request.\n\n`;
   }
-  return `[Round ${round}/${totalRounds} — Deepening]\nReview ALL previous rounds\' findings above. Focus on what was MISSED, challenge conclusions you disagree with, and deepen areas that need more investigation. Do NOT repeat prior conclusions — only add new value.\n\n`;
+  return `[Round ${round}/${totalRounds}${phaseLabel} — Deepening]\nReview ALL previous rounds\' findings above. Focus on what was MISSED, challenge conclusions you disagree with, and deepen areas that need more investigation. Do NOT repeat prior conclusions — only add new value.\n\n`;
 }
 
 export interface P2pMode {
@@ -145,4 +146,51 @@ export const P2P_MODE_KEYS = BUILT_IN_MODES.map((m) => m.key) as unknown as read
 /** Look up a mode by key. Returns undefined if not found. */
 export function getP2pMode(key: string): P2pMode | undefined {
   return BUILT_IN_MODES.find((m) => m.key === key);
+}
+
+// ── Combo mode pipeline ──────────────────────────────────────────────────
+
+/** Separator used in combo mode strings, e.g. "brainstorm>discuss>plan". */
+export const COMBO_SEPARATOR = '>' as const;
+
+/** Preset combo pipelines — common multi-phase workflows. */
+export interface P2pComboPreset {
+  /** Stable key used in protocol/storage, e.g. "brainstorm>discuss>plan". */
+  key: string;
+  /** Ordered mode keys, one per round. */
+  pipeline: string[];
+}
+
+export const COMBO_PRESETS: P2pComboPreset[] = [
+  { key: 'brainstorm>discuss>plan', pipeline: ['brainstorm', 'discuss', 'plan'] },
+  { key: 'audit>plan',             pipeline: ['audit', 'plan'] },
+  { key: 'review>plan',            pipeline: ['review', 'plan'] },
+  { key: 'audit>review>plan',      pipeline: ['audit', 'review', 'plan'] },
+  { key: 'brainstorm>plan',        pipeline: ['brainstorm', 'plan'] },
+];
+
+/** Parse a mode string into a per-round pipeline. Single mode → single-element array. */
+export function parseModePipeline(mode: string): string[] {
+  if (mode.includes(COMBO_SEPARATOR)) {
+    return mode.split(COMBO_SEPARATOR).map((s) => s.trim()).filter(Boolean);
+  }
+  return [mode];
+}
+
+/** Check if a mode string is a combo pipeline. */
+export function isComboMode(mode: string): boolean {
+  return mode.includes(COMBO_SEPARATOR);
+}
+
+/** Get the mode config for a specific round in a pipeline. Falls back to last element if round exceeds pipeline length. */
+export function getModeForRound(mode: string, round: number): P2pMode | undefined {
+  const pipeline = parseModePipeline(mode);
+  const idx = Math.min(round - 1, pipeline.length - 1);
+  return getP2pMode(pipeline[idx]);
+}
+
+/** Get the recommended round count for a mode (pipeline length for combos, undefined for single modes). */
+export function getComboRoundCount(mode: string): number | undefined {
+  const pipeline = parseModePipeline(mode);
+  return pipeline.length > 1 ? pipeline.length : undefined;
 }

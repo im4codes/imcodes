@@ -333,6 +333,7 @@
     "mode_plan": "설계",
     "mode_brainstorm": "브레인스토밍",
     "mode_discuss": "토론",
+    "combo_label": "콤보",
     "exclude_same_type": "같은 유형 제외",
     "picker": {
       "back": "뒤로",

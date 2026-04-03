@@ -333,6 +333,7 @@
     "mode_plan": "Планирование",
     "mode_brainstorm": "Мозговой штурм",
     "mode_discuss": "Обсуждение",
+    "combo_label": "Комбо",
     "exclude_same_type": "Исключить тот же тип",
     "picker": {
       "back": "Назад",

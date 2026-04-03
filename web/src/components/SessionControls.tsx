@@ -14,7 +14,7 @@ import { AtPicker } from './AtPicker.js';
 import { P2pConfigPanel } from './P2pConfigPanel.js';
 import { uploadFile, getUserPref, saveUserPref } from '../api.js';
 import { isVisuallyBusy } from '../thinking-utils.js';
-import { P2P_CONFIG_MODE } from '@shared/p2p-modes.js';
+import { P2P_CONFIG_MODE, COMBO_PRESETS, COMBO_SEPARATOR } from '@shared/p2p-modes.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
@@ -72,16 +72,39 @@ type MenuAction = 'restart' | 'new' | 'stop';
 type ModelChoice = 'opus[1M]' | 'sonnet' | 'haiku';
 type CodexModelChoice = 'gpt-5.4' | 'gpt-5.4-mini' | 'gpt-5.2';
 type QwenModelChoice = string;
-type P2pMode = 'solo' | 'audit' | 'review' | 'plan' | 'brainstorm' | 'discuss' | typeof P2P_CONFIG_MODE;
+type P2pMode = string; // 'solo' | single modes | combo pipelines like 'brainstorm>discuss>plan' | typeof P2P_CONFIG_MODE
 
 const MODEL_STORAGE_KEY = 'imcodes-model';
 const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const QWEN_MODEL_STORAGE_KEY = 'imcodes-qwen-model';
 const SINGLE_AGENT_PROMPT_PREF_KEY = 'atpicker_single_agent_prompt_dismissed';
 const CODEX_MODELS: CodexModelChoice[] = ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.2'];
-const P2P_MODES: P2pMode[] = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss', P2P_CONFIG_MODE];
-const P2P_MODE_I18N: Record<P2pMode, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', plan: 'p2p.mode_plan', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
-const P2P_MODE_COLORS: Record<P2pMode, string> = { solo: '#6b7280', audit: '#f59e0b', review: '#3b82f6', plan: '#06b6d4', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
+const SINGLE_P2P_MODES: string[] = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss'];
+const P2P_MODES: string[] = [...SINGLE_P2P_MODES, ...COMBO_PRESETS.map((c) => c.key), P2P_CONFIG_MODE];
+const P2P_MODE_I18N: Record<string, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', plan: 'p2p.mode_plan', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
+const P2P_SINGLE_COLORS: Record<string, string> = { solo: '#6b7280', audit: '#f59e0b', review: '#3b82f6', plan: '#06b6d4', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
+
+function getP2pModeColor(mode: string): string {
+  if (P2P_SINGLE_COLORS[mode]) return P2P_SINGLE_COLORS[mode];
+  // Combo: use color of the last step (the deliverable)
+  if (mode.includes(COMBO_SEPARATOR)) {
+    const last = mode.split(COMBO_SEPARATOR).pop()?.trim();
+    return last ? (P2P_SINGLE_COLORS[last] ?? '#94a3b8') : '#94a3b8';
+  }
+  return '#94a3b8';
+}
+
+function getP2pModeLabel(mode: string, t: (key: string) => string): string {
+  if (P2P_MODE_I18N[mode]) return t(P2P_MODE_I18N[mode]);
+  // Combo: join translated names with →
+  if (mode.includes(COMBO_SEPARATOR)) {
+    return mode.split(COMBO_SEPARATOR).map((m) => {
+      const key = P2P_MODE_I18N[m.trim()];
+      return key ? t(key) : m.trim();
+    }).join('→');
+  }
+  return mode;
+}
 
 interface PendingAtTarget {
   session: string;
@@ -1006,10 +1029,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             data-onboarding="p2p-mode"
             onClick={() => setP2pOpen((o) => !o)}
             disabled={disabled}
-            title={p2pMode === 'solo' ? t('p2p.mode_solo') : `P2P: ${t(P2P_MODE_I18N[p2pMode])}`}
-            style={{ color: P2P_MODE_COLORS[p2pMode], fontSize: 10, fontWeight: p2pMode !== 'solo' ? 600 : 400 }}
+            title={p2pMode === 'solo' ? t('p2p.mode_solo') : `P2P: ${getP2pModeLabel(p2pMode, t)}`}
+            style={{ color: getP2pModeColor(p2pMode), fontSize: 10, fontWeight: p2pMode !== 'solo' ? 600 : 400 }}
           >
-            {p2pMode === 'solo' ? t('p2p.mode_solo') : `P2P:${t(P2P_MODE_I18N[p2pMode])}`}
+            {p2pMode === 'solo' ? t('p2p.mode_solo') : `P2P:${getP2pModeLabel(p2pMode, t)}`}
           </button>
           {/* Gear button for config panel — only shown when config mode is selected */}
           {p2pMode === P2P_CONFIG_MODE && (
@@ -1025,7 +1048,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           )}
           {p2pOpen && (
             <div class="menu-dropdown">
-              {P2P_MODES.map((m) => (
+              {/* Single modes */}
+              {SINGLE_P2P_MODES.map((m) => (
                 <button
                   key={m}
                   class={`menu-item ${p2pMode === m ? 'menu-item-active' : ''}`}
@@ -1033,15 +1057,38 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     setP2pMode(m);
                     if (m === 'solo') setP2pExcludeSameType(false);
                     setP2pOpen(false);
-                    // Only open config panel if no saved config exists yet
-                    if (m === P2P_CONFIG_MODE && !p2pSavedConfig) setP2pConfigOpen(true);
                   }}
-                  style={{ color: P2P_MODE_COLORS[m] }}
+                  style={{ color: getP2pModeColor(m) }}
                 >
-                  {p2pMode === m ? '● ' : '○ '}{t(P2P_MODE_I18N[m])}
-                  {m === P2P_CONFIG_MODE && ' ⚙'}
+                  {p2pMode === m ? '● ' : '○ '}{getP2pModeLabel(m, t)}
                 </button>
               ))}
+              {/* Combo presets */}
+              <div class="menu-divider" />
+              <div style={{ fontSize: 10, color: '#64748b', padding: '2px 12px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{t('p2p.combo_label')}</div>
+              {COMBO_PRESETS.map((c) => (
+                <button
+                  key={c.key}
+                  class={`menu-item ${p2pMode === c.key ? 'menu-item-active' : ''}`}
+                  onClick={() => { setP2pMode(c.key); setP2pOpen(false); }}
+                  style={{ color: getP2pModeColor(c.key), fontSize: 12 }}
+                >
+                  {p2pMode === c.key ? '● ' : '○ '}{getP2pModeLabel(c.key, t)}
+                </button>
+              ))}
+              {/* Config mode */}
+              <div class="menu-divider" />
+              <button
+                class={`menu-item ${p2pMode === P2P_CONFIG_MODE ? 'menu-item-active' : ''}`}
+                onClick={() => {
+                  setP2pMode(P2P_CONFIG_MODE);
+                  setP2pOpen(false);
+                  if (!p2pSavedConfig) setP2pConfigOpen(true);
+                }}
+                style={{ color: getP2pModeColor(P2P_CONFIG_MODE) }}
+              >
+                {p2pMode === P2P_CONFIG_MODE ? '● ' : '○ '}{getP2pModeLabel(P2P_CONFIG_MODE, t)} ⚙
+              </button>
               {p2pMode !== 'solo' && p2pMode !== P2P_CONFIG_MODE && (
                 <>
                   <div class="menu-divider" />
@@ -1270,7 +1317,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           aria-label="Message input"
           data-placeholder={placeholder}
           spellcheck={false}
-          style={p2pMode !== 'solo' ? { borderColor: P2P_MODE_COLORS[p2pMode], boxShadow: `0 0 0 1px ${P2P_MODE_COLORS[p2pMode]}40` } : undefined}
+          style={p2pMode !== 'solo' ? { borderColor: getP2pModeColor(p2pMode), boxShadow: `0 0 0 1px ${getP2pModeColor(p2pMode)}40` } : undefined}
           onFocus={handleFocus}
           onInput={() => {
             const currentText = divRef.current?.textContent ?? '';
@@ -1359,9 +1406,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           class="btn btn-primary"
           onClick={handleSend}
           disabled={inputDisabled || (!hasText && attachments.length === 0) || !connected}
-          style={p2pMode !== 'solo' ? { background: P2P_MODE_COLORS[p2pMode], borderColor: P2P_MODE_COLORS[p2pMode] } : undefined}
+          style={p2pMode !== 'solo' ? { background: getP2pModeColor(p2pMode), borderColor: getP2pModeColor(p2pMode) } : undefined}
         >
-          {p2pMode !== 'solo' ? `${t(P2P_MODE_I18N[p2pMode])}` : t('common.send')}
+          {p2pMode !== 'solo' ? getP2pModeLabel(p2pMode, t) : t('common.send')}
         </button>
         {/* Config mode: show gear to open settings panel inline with send row */}
         {p2pMode === P2P_CONFIG_MODE && (
