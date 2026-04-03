@@ -1,4 +1,4 @@
-import { useMemo } from 'preact/hooks';
+import { useMemo, useEffect, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 
 export interface P2pProgressNode {
@@ -140,6 +140,15 @@ export function P2pProgressCard({ discussion, compact = false, mobile = false, h
     })
   ), [discussion.currentRound, discussion.maxRounds, discussion.state]);
 
+  const nodesRef = useRef<HTMLDivElement>(null);
+  const activeNodeIdx = useMemo(() => nodes.findIndex((n) => n.status === 'active'), [nodes]);
+  useEffect(() => {
+    const container = nodesRef.current;
+    if (!container || activeNodeIdx < 0) return;
+    const child = container.children[activeNodeIdx] as HTMLElement | undefined;
+    if (child) child.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+  }, [activeNodeIdx]);
+
   const hopSegments = useMemo(() => (
     Array.from({ length: Math.max(0, discussion.totalHops ?? 0) }, (_, idx) => {
       const hopNum = idx + 1;
@@ -236,7 +245,7 @@ export function P2pProgressCard({ discussion, compact = false, mobile = false, h
       </div>
 
       {nodes.length > 0 && (
-        <div class="discussions-progress-nodes">
+        <div class="discussions-progress-nodes" ref={nodesRef}>
           {nodes.map((node, idx) => (
             <div key={idx} class={`discussions-progress-node ${statusClassName(node.status)}`}>
               <span class="discussions-progress-node-dot" />
