@@ -593,6 +593,7 @@
     "action_p2p": "P2Pディスカッション",
     "command": "コマンド",
     "command_placeholder": "エージェントに送るコマンドを入力...",
+    "shell_hint": "ヒント：Shellセッションはスクリプトを直接実行できます。スクリプトのパスを入力してください（例: /path/to/script.sh）",
     "p2p_topic": "ディスカッションのトピック",
     "p2p_topic_placeholder": "ディスカッションのトピックを入力...",
     "p2p_mode": "ディスカッションモード",

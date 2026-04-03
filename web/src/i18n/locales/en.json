@@ -593,6 +593,7 @@
     "action_p2p": "P2P Discussion",
     "command": "Command",
     "command_placeholder": "Enter command for the agent...",
+    "shell_hint": "Tip: Shell sessions can run scripts directly — just enter the script path (e.g. /path/to/script.sh)",
     "p2p_topic": "Discussion Topic",
     "p2p_topic_placeholder": "Enter discussion topic...",
     "p2p_mode": "Discussion Mode",

@@ -593,6 +593,7 @@
     "action_p2p": "P2P 토론",
     "command": "명령",
     "command_placeholder": "에이전트에 보낼 명령을 입력하세요...",
+    "shell_hint": "팁: Shell 세션은 스크립트를 직접 실행할 수 있습니다. 스크립트 경로만 입력하세요 (예: /path/to/script.sh)",
     "p2p_topic": "토론 주제",
     "p2p_topic_placeholder": "토론 주제를 입력하세요...",
     "p2p_mode": "토론 모드",
