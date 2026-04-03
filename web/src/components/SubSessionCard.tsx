@@ -271,7 +271,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
           )}
         </div>
         {showScrollBtn && (
-          <button class="subcard-scroll-bottom" onClick={scrollToBottom} title="Scroll to bottom">↓</button>
+          <button class="subcard-scroll-bottom" onClick={(e) => { e.stopPropagation(); scrollToBottom(); }} title="Scroll to bottom">↓</button>
         )}
       </div>
 
