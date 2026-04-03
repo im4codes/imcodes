@@ -476,13 +476,13 @@ describe('parseLine — function_call (Codex tool calls)', () => {
     expect(typeof (call[2] as { input: string }).input).toBe('string');
   });
 
-  it('emits tool.result for function_call_output', () => {
+  it('emits tool.result for function_call_output with truncated output', () => {
     parseLine('session-f', functionCallOutputLine('Process exited with code 0\nOutput:\nhello world'));
     expect(timelineEmitter.emit).toHaveBeenCalledOnce();
     expect(timelineEmitter.emit).toHaveBeenCalledWith(
       'session-f',
       'tool.result',
-      {},
+      { output: 'Process exited with code 0\nOutput:\nhello world' },
       expect.objectContaining({ source: 'daemon', confidence: 'high' }),
     );
   });
