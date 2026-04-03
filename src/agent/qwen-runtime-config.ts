@@ -1,6 +1,5 @@
-import { execFile } from 'node:child_process';
+import * as childProcess from 'node:child_process';
 import { readFile } from 'node:fs/promises';
-import { promisify } from 'node:util';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import logger from '../util/logger.js';
@@ -10,7 +9,6 @@ import {
   QWEN_OAUTH_MODEL_IDS,
 } from '../../shared/qwen-models.js';
 
-const execFileAsync = promisify(execFile);
 const QWEN_SETTINGS_PATH = join(homedir(), '.qwen', 'settings.json');
 const CACHE_TTL_MS = 30_000;
 
@@ -49,9 +47,23 @@ async function readSettings(): Promise<QwenSettings | null> {
   }
 }
 
+async function execFileStdout(file: string, args: string[]): Promise<string> {
+  const execFile = childProcess.execFile;
+  if (typeof execFile !== 'function') throw new Error('execFile unavailable');
+  return await new Promise<string>((resolve, reject) => {
+    execFile(file, args, (err, stdout) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve(typeof stdout === 'string' ? stdout : String(stdout ?? ''));
+    });
+  });
+}
+
 async function detectAuthTypeFromStatus(): Promise<QwenAuthType | null> {
   try {
-    const { stdout } = await execFileAsync('qwen', ['auth', 'status']);
+    const stdout = await execFileStdout('qwen', ['auth', 'status']);
     if (/Qwen OAuth/i.test(stdout)) return QWEN_AUTH_TYPES.OAUTH;
     if (/Coding Plan/i.test(stdout)) return QWEN_AUTH_TYPES.CODING_PLAN;
     if (/API[- ]?KEY/i.test(stdout) || /API Key/i.test(stdout)) return QWEN_AUTH_TYPES.API_KEY;
