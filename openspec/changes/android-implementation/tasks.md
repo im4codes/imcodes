@@ -1,24 +1,24 @@
 ## 1. Nonce Exchange — Server (BLOCKER)
 
-- [ ] 1.1 Create DB migration `server/src/db/migrations/0XX-auth-nonces.sql` — `auth_nonces` table (nonce TEXT PK, api_key, user_id, key_id, expires_at BIGINT) + TTL index
+- [x] 1.1 Create DB migration `server/src/db/migrations/0XX-auth-nonces.sql` — `auth_nonces` table (nonce TEXT PK, api_key, user_id, key_id, expires_at BIGINT) + TTL index
 - [ ] 1.2 Run migration locally and verify table exists
-- [ ] 1.3 Add `POST /api/auth/token-exchange` endpoint in `server/src/routes/auth.ts` — DELETE nonce WHERE nonce=$1 AND expires_at > now, RETURNING api_key/user_id/key_id
-- [ ] 1.4 Update passkey login callback in `server/src/routes/passkey-auth.ts` (~L365) — generate nonce, INSERT into auth_nonces, replace `key`/`userId`/`keyId` URL params with `nonce`
-- [ ] 1.5 Update passkey registration callback in `passkey-auth.ts` (~L470) — same nonce pattern
-- [ ] 1.6 Update password setup callback in `passkey-auth.ts` (~L648) — same nonce pattern
+- [x] 1.3 Add `POST /api/auth/token-exchange` endpoint in `server/src/routes/auth.ts` — DELETE nonce WHERE nonce=$1 AND expires_at > now, RETURNING api_key/user_id/key_id
+- [x] 1.4 Update passkey login callback in `server/src/routes/passkey-auth.ts` (~L365) — generate nonce, INSERT into auth_nonces, replace `key`/`userId`/`keyId` URL params with `nonce`
+- [x] 1.5 Update passkey registration callback in `passkey-auth.ts` (~L470) — same nonce pattern
+- [x] 1.6 Update password setup callback in `passkey-auth.ts` (~L648) — same nonce pattern
 - [ ] 1.7 Update `NativeAuthBridge.tsx` password_setup flow — use nonce exchange instead of encoding API key in URL hash. After password setup completes, server creates nonce and redirects to `imcodes://auth?nonce=<nonce>`
-- [ ] 1.8 Add backward compat: server generates BOTH `nonce` and `key` params during 30-day rollout window. Client tries `nonce` first, falls back to `key`.
+- [x] 1.8 Add backward compat: server generates BOTH `nonce` and `key` params during 30-day rollout window. Client tries `nonce` first, falls back to `key`.
 - [ ] 1.9 Add nonce cleanup function — DELETE expired nonces on server startup + setInterval every 5 min
-- [ ] 1.10 Write server tests for token-exchange: valid exchange, replay rejection, expired nonce, missing nonce
+- [x] 1.10 Write server tests for token-exchange: valid exchange, replay rejection, expired nonce, missing nonce
 
 ## 2. Nonce Exchange — Client (BLOCKER)
 
-- [ ] 2.1 Add `exchangeNonce(serverUrl, nonce)` function in `web/src/api.ts`
-- [ ] 2.2 Add `exchangeNonceWithRetry(serverUrl, nonce, maxRetries=3)` wrapper with exponential backoff (1s/2s/4s). Add `AbortSignal.timeout(10000)` to each fetch attempt. Total retry window capped at 30s, well within 60s nonce TTL.
-- [ ] 2.3 Update `handleNativeAuth` in `web/src/pages/LoginPage.tsx` — parse `nonce` from callback, call exchangeNonceWithRetry. Fall back to `key` param if present (30-day backward compat).
-- [ ] 2.4 Update `NativeAuthBridge.tsx` callback handling — same nonce exchange for password setup path
-- [ ] 2.5 Add i18n key for nonce exchange failure message ("Authentication completed but connection failed") in all 7 locales
-- [ ] 2.6 Write web tests for nonce exchange: success, retry, fallback to key param, AbortSignal timeout
+- [x] 2.1 Add `exchangeNonce(serverUrl, nonce)` function in `web/src/api.ts`
+- [x] 2.2 Add `exchangeNonceWithRetry(serverUrl, nonce, maxRetries=3)` wrapper with exponential backoff (1s/2s/4s). Add `AbortSignal.timeout(10000)` to each fetch attempt. Total retry window capped at 30s, well within 60s nonce TTL.
+- [x] 2.3 Update `handleNativeAuth` in `web/src/pages/LoginPage.tsx` — parse `nonce` from callback, call exchangeNonceWithRetry. Fall back to `key` param if present (30-day backward compat).
+- [x] 2.4 Update `NativeAuthBridge.tsx` callback handling — same nonce exchange for password setup path
+- [x] 2.5 Add i18n key for nonce exchange failure message ("Authentication completed but connection failed") in all 7 locales
+- [x] 2.6 Write web tests for nonce exchange: success, retry, fallback to key param, AbortSignal timeout
 
 ## 3. Android Auth Reliability
 
@@ -32,11 +32,11 @@
 
 ## 4. Auth Observability
 
-- [ ] 4.1 Add `X-Platform` header to auth API calls — use `Capacitor.getPlatform()` on native, 'web' on browser
-- [ ] 4.2 Add version attribution headers: `X-App-Version` (from `App.getInfo()`), `X-Bundle-Version` (from CapacitorUpdater or 'none')
-- [ ] 4.3 Update `logAudit` calls in `passkey-auth.ts` and `auth.ts` to include `platform`, `app_version`, `bundle_version` fields
-- [ ] 4.4 Add `outcome_code` field to audit log entries (success, passkey_failed, user_cancelled, nonce_expired, token_exchange_failed, etc.)
-- [ ] 4.5 Verify audit log includes platform + version + outcome for all auth events
+- [x] 4.1 Add `X-Platform` header to auth API calls — use `Capacitor.getPlatform()` on native, 'web' on browser
+- [x] 4.2 Add version attribution headers: `X-App-Version` (from `App.getInfo()`), `X-Bundle-Version` (from CapacitorUpdater or 'none')
+- [x] 4.3 Update `logAudit` calls in `passkey-auth.ts` and `auth.ts` to include `platform`, `app_version`, `bundle_version` fields
+- [x] 4.4 Add `outcome_code` field to audit log entries (success, passkey_failed, user_cancelled, nonce_expired, token_exchange_failed, etc.)
+- [x] 4.5 Verify audit log includes platform + version + outcome for all auth events
 
 ## 5. Firebase / Push Notifications
 
@@ -76,7 +76,7 @@
 - [x] 8.7 Sync to Android: `npx cap sync android`
 - [x] 8.8 Gradle build: `cd web/android && ./gradlew assembleRelease`
 - [x] 8.9 Upload APK/AAB as GitHub Actions workflow artifact
-- [ ] 8.10 Verify CI passes on push to dev branch
+- [x] 8.10 Verify CI passes on push to dev branch
 
 ## 9. Auth Surface Decision (after measurements)
 
