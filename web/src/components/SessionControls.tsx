@@ -351,8 +351,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   // P2P config loading moved after rootSession declaration below
 
-  // Reset P2P mode on session change
-  useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
+  // Reset P2P mode only when switching to a genuinely different session
+  const prevSessionRef = useRef(activeSession?.name);
+  useEffect(() => {
+    if (prevSessionRef.current !== activeSession?.name) {
+      prevSessionRef.current = activeSession?.name;
+      setP2pMode('solo');
+      setP2pOpen(false);
+    }
+  }, [activeSession?.name]);
 
   // Close menus when clicking outside
   useEffect(() => {
