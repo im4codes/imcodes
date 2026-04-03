@@ -833,14 +833,13 @@ body {
     linear-gradient(135deg, rgba(59, 130, 246, 0.10), rgba(34, 197, 94, 0.06));
   border: 1px solid rgba(71, 85, 105, 0.7);
   border-radius: 12px;
-  padding: 10px 12px 12px;
+  padding: 10px 12px 8px;
   box-shadow: inset 0 1px 0 rgba(148, 163, 184, 0.06), 0 10px 24px rgba(2, 6, 23, 0.28);
 }
 /* In the horizontal strip: stretch to fill, max 3 visible, scroll beyond */
 .discussions-progress-strip-scroll .discussions-progress-card {
   flex: 1 1 0;
-  min-width: 280px;
-  max-width: calc(33.333% - 7px);
+  min-width: calc(33.333% - 7px);
 }
 .discussions-progress-card::before {
   content: '';
@@ -986,12 +985,13 @@ body {
 .discussions-progress-segment.is-pending .discussions-progress-segment-index {
   color: rgba(148, 163, 184, 0.75);
 }
-.discussions-progress-nodes { display: flex; flex-wrap: wrap; gap: 6px; }
+.discussions-progress-nodes { display: flex; flex-wrap: nowrap; gap: 6px; overflow-x: auto; scrollbar-width: none; }
+.discussions-progress-nodes::-webkit-scrollbar { display: none; }
 .discussions-progress-node {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  min-width: 0;
+  flex: 0 0 auto;
   padding: 5px 8px;
   border-radius: 999px;
   border: 1px solid rgba(51, 65, 85, 0.9);
