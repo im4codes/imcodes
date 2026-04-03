@@ -914,6 +914,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   let p2pRounds = (cmd as any).p2pRounds as number | undefined;
   let p2pExtraPrompt = (cmd as any).p2pExtraPrompt as string | undefined;
   const p2pLocale = (cmd as any).p2pLocale as string | undefined;
+  const p2pHopTimeoutMs = (cmd as any).p2pHopTimeoutMs as number | undefined;
   const p2pModeField = (cmd as any).p2pMode as string | undefined;
   const p2pAtTargets = (cmd as any).p2pAtTargets as Array<{ session: string; mode: string }> | undefined;
 
@@ -1060,7 +1061,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         const langInstr = `Conduct the discussion in ${langName} so the user can understand.`;
         p2pExtraPrompt = p2pExtraPrompt ? `${p2pExtraPrompt}\n${langInstr}` : langInstr;
       }
-      const run = await startP2pRun(sessionName, tokens.agents, tokens.cleanText, fileContents, serverLink, p2pRounds, p2pExtraPrompt, resolvedMode || undefined);
+      const run = await startP2pRun(sessionName, tokens.agents, tokens.cleanText, fileContents, serverLink, p2pRounds, p2pExtraPrompt, resolvedMode || undefined, p2pHopTimeoutMs);
       const status = isLegacy ? 'accepted_legacy' : 'accepted';
       timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
       try {

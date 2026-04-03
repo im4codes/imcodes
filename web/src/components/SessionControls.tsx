@@ -559,6 +559,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           extra.p2pSessionConfig = cfg.sessions;
           extra.p2pRounds = override?.rounds ?? cfg.rounds ?? 1;
           if (cfg.extraPrompt) extra.p2pExtraPrompt = cfg.extraPrompt;
+          if (cfg.hopTimeoutMinutes) extra.p2pHopTimeoutMs = cfg.hopTimeoutMinutes * 60_000;
         }
         // For non-config mode overrides (single or combo), send as p2pMode so the daemon uses it
         if (override?.modeOverride && override.modeOverride !== 'config') {
@@ -582,6 +583,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           extra.p2pSessionConfig = p2pSavedConfig.sessions;
           extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
           if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
+          if (p2pSavedConfig.hopTimeoutMinutes) extra.p2pHopTimeoutMs = p2pSavedConfig.hopTimeoutMinutes * 60_000;
         }
       }
     }
@@ -1054,18 +1056,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           >
             {p2pMode === 'solo' ? t('p2p.mode_solo') : `P2P:${getP2pModeLabel(p2pMode, t)}`}
           </button>
-          {/* Gear button for config panel — only shown when config mode is selected */}
-          {p2pMode === P2P_CONFIG_MODE && (
-            <button
-              class="shortcut-btn"
-              onClick={() => { setP2pOpen(false); setP2pConfigOpen(true); }}
-              disabled={disabled}
-              title={t('p2p.settings_title')}
-              style={{ fontSize: 12, color: '#94a3b8', paddingLeft: 2, paddingRight: 2 }}
-            >
-              ⚙
-            </button>
-          )}
+          {/* Gear button for P2P config panel — always visible */}
+          <button
+            class="shortcut-btn"
+            onClick={() => { setP2pOpen(false); setP2pConfigOpen(true); }}
+            disabled={disabled}
+            title={t('p2p.settings_title')}
+            style={{ fontSize: 12, color: '#94a3b8', paddingLeft: 2, paddingRight: 2 }}
+          >
+            ⚙
+          </button>
           {p2pOpen && (
             <div class="menu-dropdown">
               {/* Single modes */}
