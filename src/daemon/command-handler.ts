@@ -101,6 +101,14 @@ import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
 import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from '../agent/provider-display.js';
 
+function describeTransportSendError(err: unknown): string {
+  if (err && typeof err === 'object') {
+    const record = err as { message?: unknown };
+    if (typeof record.message === 'string' && record.message.trim()) return record.message;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
 // ── Common MIME map for file metadata ────────────────────────────────────────
 
 const MIME_MAP: Record<string, string> = {
@@ -1121,7 +1129,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       } catch { /* not connected */ }
     } catch (err) {
       // Send failed — show error in chat
-      const errMsg = err instanceof Error ? err.message : String(err);
+      const errMsg = describeTransportSendError(err);
       logger.error({ sessionName, err }, 'session.send (transport) failed');
       timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Send failed: ${errMsg}`, streaming: false }, { source: 'daemon', confidence: 'high' });
       timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
