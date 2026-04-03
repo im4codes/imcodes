@@ -115,12 +115,14 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
   // Auto-scroll preview to bottom when content updates — but only if user is near the bottom.
   // This prevents yanking the view away when the user is scrolling through history.
   const userScrolledUpRef = useRef(false);
+  const [showScrollBtn, setShowScrollBtn] = useState(false);
   useEffect(() => {
     const el = previewRef.current;
     if (!el) return;
     const handleScroll = () => {
       const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
       userScrolledUpRef.current = !atBottom;
+      setShowScrollBtn(!atBottom);
     };
     el.addEventListener('scroll', handleScroll, { passive: true });
     return () => el.removeEventListener('scroll', handleScroll);
@@ -129,6 +131,14 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
     const el = previewRef.current;
     if (el && !userScrolledUpRef.current) el.scrollTop = el.scrollHeight;
   }, [events.length, sub.state]);
+  const scrollToBottom = useCallback(() => {
+    const el = previewRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+      userScrolledUpRef.current = false;
+      setShowScrollBtn(false);
+    }
+  }, []);
 
   const lastUsage = useMemo(() => {
     for (let i = events.length - 1; i >= 0; i--) {
@@ -223,24 +233,29 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
       </div>
 
       {/* Preview — scrollable, auto-scrolls to bottom on new content */}
-      <div class="subcard-preview" ref={previewRef}>
-        {isShell ? (
-          <TerminalView
-            sessionName={sub.sessionName}
-            ws={ws}
-            connected={connected}
-            onDiff={(apply) => onDiff(sub.sessionName, apply)}
-            onHistory={(apply) => onHistory(sub.sessionName, apply)}
-            onScrollBottomFn={(fn) => { termScrollRef.current = fn; }}
-          />
-        ) : (
-          <ChatView
-            events={events}
-            loading={false}
-            refreshing={refreshing}
-            sessionId={sub.sessionName}
-            preview
-          />
+      <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+        <div class="subcard-preview" ref={previewRef}>
+          {isShell ? (
+            <TerminalView
+              sessionName={sub.sessionName}
+              ws={ws}
+              connected={connected}
+              onDiff={(apply) => onDiff(sub.sessionName, apply)}
+              onHistory={(apply) => onHistory(sub.sessionName, apply)}
+              onScrollBottomFn={(fn) => { termScrollRef.current = fn; }}
+            />
+          ) : (
+            <ChatView
+              events={events}
+              loading={false}
+              refreshing={refreshing}
+              sessionId={sub.sessionName}
+              preview
+            />
+          )}
+        </div>
+        {showScrollBtn && (
+          <button class="subcard-scroll-bottom" onClick={scrollToBottom} title="Scroll to bottom">↓</button>
         )}
       </div>
 
