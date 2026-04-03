@@ -323,7 +323,9 @@
       "phase_summary": "Resumen",
       "phase_queued": "En cola",
       "round_label": "Ronda",
-      "hop_label": "Salto"
+      "hop_label": "Salto",
+      "scroll_top": "Ir arriba",
+      "scroll_bottom": "Ir abajo"
     },
     "mode_solo": "Solo",
     "mode_audit": "Auditoría",

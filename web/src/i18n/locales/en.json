@@ -323,7 +323,9 @@
       "phase_summary": "Summary",
       "phase_queued": "Queued",
       "round_label": "Round",
-      "hop_label": "Hop"
+      "hop_label": "Hop",
+      "scroll_top": "Scroll to top",
+      "scroll_bottom": "Scroll to bottom"
     },
     "mode_solo": "Solo",
     "mode_audit": "Audit",

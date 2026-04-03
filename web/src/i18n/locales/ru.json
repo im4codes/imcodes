@@ -323,7 +323,9 @@
       "phase_summary": "Сводка",
       "phase_queued": "В очереди",
       "round_label": "Раунд",
-      "hop_label": "Шаг"
+      "hop_label": "Шаг",
+      "scroll_top": "Прокрутить вверх",
+      "scroll_bottom": "Прокрутить вниз"
     },
     "mode_solo": "Solo",
     "mode_audit": "Аудит",

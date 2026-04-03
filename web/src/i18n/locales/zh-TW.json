@@ -323,7 +323,9 @@
       "phase_summary": "總結",
       "phase_queued": "排隊中",
       "round_label": "輪次",
-      "hop_label": "跳轉"
+      "hop_label": "跳轉",
+      "scroll_top": "捲動到頂部",
+      "scroll_bottom": "捲動到底部"
     },
     "mode_solo": "Solo",
     "mode_audit": "審查",
