@@ -139,6 +139,7 @@ export function useTimeline(
   const historyRequestIdRef = useRef<string | null>(null);
   const olderRequestIdRef = useRef<string | null>(null);
   const historyLoadedRef = useRef<string | null>(null); // tracks which session has been loaded
+  const historyRetryRef = useRef(0); // retry count for empty history responses
 
   useEffect(() => {
     if (!cacheKey) return;
@@ -433,10 +434,20 @@ export function useTimeline(
         epochRef.current = msg.epoch;
 
         if (msg.events.length > 0) {
+          historyRetryRef.current = 0; // reset on success
           const maxSeq = msg.events.reduce((max, e) => Math.max(max, e.seq), 0);
           seqRef.current = Math.max(seqRef.current, maxSeq);
           mergeEvents(msg.events);
           sharedDb?.putEvents(msg.events).catch(() => {});
+        } else if (historyRetryRef.current < 2 && ws?.connected && eventsRef.current.length === 0) {
+          // Empty response with no cached events — retry once after a short delay
+          // (defense-in-depth for transient bridge/daemon failures)
+          historyRetryRef.current++;
+          setTimeout(() => {
+            if (ws?.connected && sessionId) {
+              historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 1000);
+            }
+          }, 1000 * historyRetryRef.current);
         }
         setLoading(false);
         setRefreshing(false);

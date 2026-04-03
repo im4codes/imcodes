@@ -1892,4 +1892,169 @@ describe('WsBridge', () => {
       );
     });
   });
+
+  // ── Timeline history requestId unicast ────────────────────────────────────
+
+  describe('timeline history requestId unicast', () => {
+    async function setupAuth() {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      return { bridge, daemonWs };
+    }
+
+    it('routes timeline.history response to requesting browser via requestId even without subscription', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      // Browser sends timeline.history_request with requestId — NO terminal.subscribe first
+      browserWs.emit('message', JSON.stringify({
+        type: 'timeline.history_request',
+        sessionName: 'deck_sub_qwen',
+        requestId: 'req-123',
+        limit: 500,
+      }));
+      await flushAsync();
+
+      // Daemon responds with timeline.history
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.history',
+        sessionName: 'deck_sub_qwen',
+        requestId: 'req-123',
+        events: [{ type: 'user.message', text: 'hello', ts: 1000 }],
+        epoch: 1,
+      }));
+      await flushAsync();
+
+      // Browser should receive the response (routed by requestId, not subscription)
+      const received = browserWs.sentStrings.filter((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === 'timeline.history'; } catch { return false; }
+      });
+      expect(received).toHaveLength(1);
+      expect(JSON.parse(received[0]).requestId).toBe('req-123');
+    });
+
+    it('routes timeline.replay response via requestId', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      browserWs.emit('message', JSON.stringify({
+        type: 'timeline.replay_request',
+        sessionName: 'deck_sub_qwen',
+        requestId: 'replay-456',
+      }));
+      await flushAsync();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.replay',
+        sessionName: 'deck_sub_qwen',
+        requestId: 'replay-456',
+        events: [],
+        epoch: 1,
+      }));
+      await flushAsync();
+
+      const received = browserWs.sentStrings.filter((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === 'timeline.replay'; } catch { return false; }
+      });
+      expect(received).toHaveLength(1);
+    });
+
+    it('cleans up pending request after 30s timeout', async () => {
+      vi.useFakeTimers();
+      const { bridge, daemonWs } = await setupAuth();
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      browserWs.emit('message', JSON.stringify({
+        type: 'timeline.history_request',
+        sessionName: 'deck_sub_qwen',
+        requestId: 'req-timeout',
+        limit: 500,
+      }));
+      await flushAsync();
+
+      // Advance past timeout
+      vi.advanceTimersByTime(31_000);
+
+      // Late response after timeout — should NOT reach browser
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.history',
+        sessionName: 'deck_sub_qwen',
+        requestId: 'req-timeout',
+        events: [{ type: 'user.message', text: 'late', ts: 2000 }],
+        epoch: 1,
+      }));
+      await flushAsync();
+
+      const received = browserWs.sentStrings.filter((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === 'timeline.history'; } catch { return false; }
+      });
+      expect(received).toHaveLength(0);
+      vi.useRealTimers();
+    });
+
+    it('cleans up pending requests on socket close', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      browserWs.emit('message', JSON.stringify({
+        type: 'timeline.history_request',
+        sessionName: 'deck_sub_qwen',
+        requestId: 'req-close',
+        limit: 500,
+      }));
+      await flushAsync();
+
+      // Close browser socket
+      browserWs.close();
+      await flushAsync();
+
+      // Response arrives after close — should NOT throw
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.history',
+        sessionName: 'deck_sub_qwen',
+        requestId: 'req-close',
+        events: [],
+        epoch: 1,
+      }));
+      await flushAsync();
+
+      // No crash, no sent messages
+      expect(browserWs.sentStrings.filter((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === 'timeline.history'; } catch { return false; }
+      })).toHaveLength(0);
+    });
+
+    it('falls back to session subscribers when response has no requestId', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+
+      // Subscribe to session first
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'deck_sub_qwen' }));
+      await flushAsync();
+
+      browserWs.sent.length = 0;
+
+      // Daemon sends timeline.history WITHOUT requestId (legacy)
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.history',
+        sessionName: 'deck_sub_qwen',
+        events: [{ type: 'assistant.text', text: 'hi', ts: 1000 }],
+        epoch: 1,
+      }));
+      await flushAsync();
+
+      const received = browserWs.sentStrings.filter((s) => {
+        try { return (JSON.parse(s) as { type: string }).type === 'timeline.history'; } catch { return false; }
+      });
+      expect(received).toHaveLength(1);
+    });
+  });
 });

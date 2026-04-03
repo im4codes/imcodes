@@ -30,7 +30,7 @@ const accumulators = new Map<string, { messageId: string; text: string }>();
 export function wireProviderToRelay(provider: TransportProvider): void {
   provider.onDelta((providerSid: string, delta: MessageDelta) => {
     const sessionName = resolveSessionName(providerSid);
-    if (!sessionName) return;
+    if (!sessionName) { logger.warn({ providerSid }, 'transport-relay: unresolved route for delta — dropped'); return; }
 
     // Provider may send cumulative deltas (full text so far) or incremental.
     // Use delta.delta as the display text directly — the provider's internal
