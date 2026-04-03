@@ -554,7 +554,7 @@ body {
 .subcard-ctx-input { position: absolute; left: 0; top: 0; height: 100%; background: #34d399; border-radius: 2px; }
 .subcard-ctx-cache { position: absolute; left: 0; top: 0; height: 100%; background: #818cf8; border-radius: 2px; }
 
-.subcard-preview { flex: 1; overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; justify-content: flex-end; }
+.subcard-preview { flex: 1; overflow-y: auto; overflow-x: hidden; }
 .subcard-resize-handle { position: absolute; top: 0; right: -8px; width: 20px; height: 100%; cursor: ew-resize; background: transparent; z-index: 10; transition: background 0.15s; touch-action: none; }
 .subcard-resize-handle::after { content: '⋮'; position: absolute; right: 8px; top: 50%; transform: translateY(-50%); font-size: 12px; color: #334155; pointer-events: none; line-height: 1; }
 .subcard-resize-handle:hover { background: rgba(59,130,246,0.4); }

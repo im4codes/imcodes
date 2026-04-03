@@ -112,10 +112,22 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
     prevStateRef.current = sub.state;
   }, [sub.state]);
 
-  // Auto-scroll preview to bottom when content updates
+  // Auto-scroll preview to bottom when content updates — but only if user is near the bottom.
+  // This prevents yanking the view away when the user is scrolling through history.
+  const userScrolledUpRef = useRef(false);
   useEffect(() => {
     const el = previewRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    const handleScroll = () => {
+      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+      userScrolledUpRef.current = !atBottom;
+    };
+    el.addEventListener('scroll', handleScroll, { passive: true });
+    return () => el.removeEventListener('scroll', handleScroll);
+  }, []);
+  useEffect(() => {
+    const el = previewRef.current;
+    if (el && !userScrolledUpRef.current) el.scrollTop = el.scrollHeight;
   }, [events.length, sub.state]);
 
   const lastUsage = useMemo(() => {
