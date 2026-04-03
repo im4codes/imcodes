@@ -1,14 +1,14 @@
 ## 1. Nonce Exchange — Server (BLOCKER)
 
 - [x] 1.1 Create DB migration `server/src/db/migrations/0XX-auth-nonces.sql` — `auth_nonces` table (nonce TEXT PK, api_key, user_id, key_id, expires_at BIGINT) + TTL index
-- [ ] 1.2 Run migration locally and verify table exists
+- [x] 1.2 Run migration locally and verify table exists
 - [x] 1.3 Add `POST /api/auth/token-exchange` endpoint in `server/src/routes/auth.ts` — DELETE nonce WHERE nonce=$1 AND expires_at > now, RETURNING api_key/user_id/key_id
 - [x] 1.4 Update passkey login callback in `server/src/routes/passkey-auth.ts` (~L365) — generate nonce, INSERT into auth_nonces, replace `key`/`userId`/`keyId` URL params with `nonce`
 - [x] 1.5 Update passkey registration callback in `passkey-auth.ts` (~L470) — same nonce pattern
 - [x] 1.6 Update password setup callback in `passkey-auth.ts` (~L648) — same nonce pattern
-- [ ] 1.7 Update `NativeAuthBridge.tsx` password_setup flow — use nonce exchange instead of encoding API key in URL hash. After password setup completes, server creates nonce and redirects to `imcodes://auth?nonce=<nonce>`
+- [x] 1.7 Update `NativeAuthBridge.tsx` password_setup flow — use nonce exchange instead of encoding API key in URL hash. After password setup completes, server creates nonce and redirects to `imcodes://auth?nonce=<nonce>`
 - [x] 1.8 Add backward compat: server generates BOTH `nonce` and `key` params during 30-day rollout window. Client tries `nonce` first, falls back to `key`.
-- [ ] 1.9 Add nonce cleanup function — DELETE expired nonces on server startup + setInterval every 5 min
+- [x] 1.9 Add nonce cleanup function — DELETE expired nonces on server startup + setInterval every 5 min
 - [x] 1.10 Write server tests for token-exchange: valid exchange, replay rejection, expired nonce, missing nonce
 
 ## 2. Nonce Exchange — Client (BLOCKER)
@@ -41,10 +41,10 @@
 ## 5. Firebase / Push Notifications
 
 - [ ] 5.1 Create new Firebase project. Add BOTH Android and iOS apps. Download `google-services.json` (Android) and `GoogleService-Info.plist` (iOS).
-- [ ] 5.2 Add `google-services.json` to `web/android/app/`
+- [x] 5.2 Add `google-services.json` to `web/android/app/`
 - [ ] 5.3 Add `GoogleService-Info.plist` to `web/ios/App/App/` if not already present
 - [ ] 5.4 Add both files to `.gitignore` (or encrypt for CI)
-- [ ] 5.5 Uncomment `google-services.json` in `web/android/.gitignore` (currently commented out with `#`)
+- [x] 5.5 Uncomment `google-services.json` in `web/android/.gitignore` (currently commented out with `#`)
 - [ ] 5.6 Test push notification delivery on a real Android device
 - [ ] 5.7 Verify non-GMS device handles missing FCM gracefully (no crash — `build.gradle` already conditionally applies plugin)
 

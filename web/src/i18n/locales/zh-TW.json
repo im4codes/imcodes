@@ -236,6 +236,7 @@
     "username_taken": "該使用者名稱已被使用",
     "registration_disabled": "註冊功能目前已關閉",
     "invalid_username_format": "使用者名稱須 3-32 個字元，以字母或數字開頭和結尾",
+    "nonce_exchange_failed": "驗證已完成，但連線失敗。請再試一次。",
     "native_callback_fallback": "如果沒有自動跳轉，請點這裡",
     "native_status_getting_challenge": "正在取得挑戰…",
     "native_status_authenticating": "正在驗證…",

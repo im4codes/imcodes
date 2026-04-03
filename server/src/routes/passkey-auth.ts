@@ -11,7 +11,7 @@ import type { Env } from '../env.js';
 import { createUser, getUserById, getUserByUsername } from '../db/queries.js';
 import { randomHex, sha256Hex, signJwt, verifyJwt, hashPassword } from '../security/crypto.js';
 import { COOKIE_SESSION } from '../../../shared/cookie-names.js';
-import { logAudit } from '../security/audit.js';
+import { issueAuthNonce, logAuthAudit, scheduleAuthNonceCleanup } from './auth.js';
 import { z } from 'zod';
 import logger from '../util/logger.js';
 
@@ -21,6 +21,7 @@ export const passkeyRoutes = new Hono<HonoEnv>();
 
 // Cache-Control: no-store on all passkey endpoints
 passkeyRoutes.use('/*', async (c, next) => {
+  scheduleAuthNonceCleanup(c.env.DB);
   await next();
   c.header('Cache-Control', 'no-store');
   c.header('Pragma', 'no-cache');
@@ -188,6 +189,39 @@ function isUniqueViolation(err: unknown): boolean {
   return typeof err === 'object' && err !== null && 'code' in err && (err as { code?: unknown }).code === '23505';
 }
 
+async function issueNativeAuthRedirect(
+  c: Context<HonoEnv>,
+  userId: string,
+  callbackUrl: string,
+  options: {
+    keyLabel: string;
+    includeLegacyParams?: boolean;
+    extraParams?: Record<string, string>;
+  },
+): Promise<Response> {
+  const keyId = randomHex(16);
+  const rawKey = `deck_${randomHex(32)}`;
+  const keyHash = sha256Hex(rawKey);
+  const now = Date.now();
+  await c.env.DB.execute(
+    'INSERT INTO api_keys (id, user_id, key_hash, label, created_at) VALUES ($1, $2, $3, $4, $5)',
+    [keyId, userId, keyHash, options.keyLabel, now],
+  );
+
+  const nonce = await issueAuthNonce(c.env.DB, { apiKey: rawKey, userId, keyId });
+  const cbUrl = new URL(callbackUrl);
+  cbUrl.searchParams.set('nonce', nonce);
+  if (options.includeLegacyParams !== false) {
+    cbUrl.searchParams.set('key', rawKey);
+    cbUrl.searchParams.set('userId', userId);
+    cbUrl.searchParams.set('keyId', keyId);
+  }
+  for (const [key, value] of Object.entries(options.extraParams ?? {})) {
+    cbUrl.searchParams.set(key, value);
+  }
+  return nativeRedirectPage(c, cbUrl.toString());
+}
+
 // ── POST /api/auth/passkey/register/begin ─────────────────────────────────
 const registerBeginSchema = z.object({
   displayName: z.string().min(1).max(100).optional(),
@@ -351,24 +385,17 @@ passkeyRoutes.post('/register/complete', async (c) => {
   );
 
   const ip = (c.get('clientIp' as never) as string | undefined) ?? 'unknown';
-  await logAudit({ userId, action: 'auth.passkey.register', ip, details: { credentialId: credentialID } }, c.env.DB);
+  await logAuthAudit(c, {
+    userId,
+    action: 'auth.passkey.register',
+    ip,
+    details: { credentialId: credentialID },
+  }, c.env.DB);
 
   // Native callback: issue API key + redirect (skip the second login round-trip)
   const nativeCallback = c.req.query('native_callback');
   if (nativeCallback && nativeCallback.startsWith('imcodes://')) {
-    const rawKey = `deck_${randomHex(32)}`;
-    const keyHash = sha256Hex(rawKey);
-    const keyId = randomHex(16);
-    await c.env.DB.execute(
-      'INSERT INTO api_keys (id, user_id, key_hash, label, created_at) VALUES ($1, $2, $3, $4, $5)',
-      [keyId, userId, keyHash, 'mobile-app', now],
-    );
-
-    const cbUrl = new URL(nativeCallback);
-    cbUrl.searchParams.set('key', rawKey);
-    cbUrl.searchParams.set('userId', userId);
-    cbUrl.searchParams.set('keyId', keyId);
-    return c.redirect(cbUrl.toString(), 302);
+    return issueNativeAuthRedirect(c, userId, nativeCallback, { keyLabel: 'mobile-app' });
   }
 
   const accessToken = signJwt({ sub: userId }, c.env.JWT_SIGNING_KEY, 4 * 3600);
@@ -455,7 +482,12 @@ passkeyRoutes.post('/login/complete', async (c) => {
   );
 
   const ip = (c.get('clientIp' as never) as string | undefined) ?? 'unknown';
-  await logAudit({ userId: user.id, action: 'auth.passkey.login', ip, details: { credentialId: storedCred.id } }, c.env.DB);
+  await logAuthAudit(c, {
+    userId: user.id,
+    action: 'auth.passkey.login',
+    ip,
+    details: { credentialId: storedCred.id },
+  }, c.env.DB);
 
   const isNativeReq = c.req.query('native') === '1';
 
@@ -463,6 +495,12 @@ passkeyRoutes.post('/login/complete', async (c) => {
   if (isNativeReq || nativeCallback) {
     // Native app: return a persistent API key instead of setting session cookies.
     // The client stores this key in biometric-protected storage.
+    if (nativeCallback && nativeCallback.startsWith('imcodes://')) {
+      // If native_callback is provided, redirect via HTTP 302 so ASWebAuthenticationSession
+      // detects the custom-scheme navigation (JS window.location.href is unreliable).
+      return issueNativeAuthRedirect(c, user.id, nativeCallback, { keyLabel: 'mobile-app' });
+    }
+
     const rawKey = `deck_${randomHex(32)}`;
     const keyHash = sha256Hex(rawKey);
     const keyId = randomHex(16);
@@ -472,17 +510,8 @@ passkeyRoutes.post('/login/complete', async (c) => {
       [keyId, user.id, keyHash, 'mobile-app', now],
     );
 
-    // If native_callback is provided, redirect via HTTP 302 so ASWebAuthenticationSession
-    // detects the custom-scheme navigation (JS window.location.href is unreliable).
-    if (nativeCallback && nativeCallback.startsWith('imcodes://')) {
-      const cbUrl = new URL(nativeCallback);
-      cbUrl.searchParams.set('key', rawKey);
-      cbUrl.searchParams.set('userId', user.id);
-      cbUrl.searchParams.set('keyId', keyId);
-      return nativeRedirectPage(c, cbUrl.toString());
-    }
-
-    return c.json({ ok: true, userId: user.id, apiKey: rawKey, keyId });
+    const nonce = await issueAuthNonce(c.env.DB, { apiKey: rawKey, userId: user.id, keyId });
+    return c.json({ ok: true, userId: user.id, nonce });
   }
 
   const accessToken = signJwt({ sub: user.id }, c.env.JWT_SIGNING_KEY, 4 * 3600);
@@ -598,7 +627,24 @@ passkeyRoutes.post('/password/setup', async (c) => {
   }
 
   const ip = (c.get('clientIp' as never) as string | undefined) ?? 'unknown';
-  await logAudit({ userId, action: 'auth.password_setup_with_passkey', ip, details: { credentialId: storedCred.id } }, c.env.DB);
+  await logAuthAudit(c, {
+    userId,
+    action: 'auth.password_setup_with_passkey',
+    ip,
+    details: { credentialId: storedCred.id },
+  }, c.env.DB);
+
+  const nativeCallback = c.req.query('native_callback');
+  if (nativeCallback && nativeCallback.startsWith('imcodes://')) {
+    return issueNativeAuthRedirect(c, userId, nativeCallback, {
+      keyLabel: 'mobile-password-setup',
+      includeLegacyParams: false,
+      extraParams: {
+        ok: '1',
+        username: normalizedUsername,
+      },
+    });
+  }
 
   return c.json({
     ok: true,
@@ -737,7 +783,12 @@ passkeyRoutes.delete('/credentials/:credId', async (c) => {
   if (result.changes === 0) return c.json({ error: 'not_found' }, 404);
 
   const ip = (c.get('clientIp' as never) as string | undefined) ?? 'unknown';
-  await logAudit({ userId, action: 'auth.passkey.delete', ip, details: { credentialId: credId } }, c.env.DB);
+  await logAuthAudit(c, {
+    userId,
+    action: 'auth.passkey.delete',
+    ip,
+    details: { credentialId: credId },
+  }, c.env.DB);
 
   return c.json({ ok: true });
 });

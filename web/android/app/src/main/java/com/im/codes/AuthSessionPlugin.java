@@ -23,7 +23,6 @@ public class AuthSessionPlugin extends Plugin {
 
     private static final String ERROR_MISSING_PARAMETERS = "missing_parameters";
     private static final String ERROR_NO_BROWSER_AVAILABLE = "no_browser_available";
-    private static final String ERROR_CUSTOM_TAB_FAILED = "custom_tab_failed";
     private static final String ERROR_USER_CANCELLED = "user_cancelled";
     private static final int CALLBACK_TIMEOUT_MS = 3000;
 

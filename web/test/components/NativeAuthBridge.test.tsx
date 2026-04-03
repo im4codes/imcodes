@@ -22,6 +22,7 @@ const {
   passkeyRegisterBeginMock,
   passkeyRegisterCompleteMock,
   passkeyVerifyBeginMock,
+  exchangeNonceWithRetryMock,
   passwordSetupWithPasskeyMock,
   withTemporaryApiKeyMock,
   MockApiError,
@@ -41,6 +42,7 @@ const {
     passkeyRegisterBeginMock: vi.fn(),
     passkeyRegisterCompleteMock: vi.fn(),
     passkeyVerifyBeginMock: vi.fn(),
+    exchangeNonceWithRetryMock: vi.fn(),
     passwordSetupWithPasskeyMock: vi.fn(),
     withTemporaryApiKeyMock: vi.fn(async (_key: string, fn: () => Promise<unknown>) => await fn()),
     MockApiError,
@@ -54,7 +56,9 @@ vi.mock('../../src/api.js', () => ({
   passkeyRegisterBegin: (...args: unknown[]) => passkeyRegisterBeginMock(...args),
   passkeyRegisterComplete: (...args: unknown[]) => passkeyRegisterCompleteMock(...args),
   passkeyVerifyBegin: (...args: unknown[]) => passkeyVerifyBeginMock(...args),
+  exchangeNonceWithRetry: (...args: unknown[]) => exchangeNonceWithRetryMock(...args),
   passwordSetupWithPasskey: (...args: unknown[]) => passwordSetupWithPasskeyMock(...args),
+  getApiBaseUrl: () => 'https://app.im.codes',
   withTemporaryApiKey: (...args: unknown[]) => withTemporaryApiKeyMock(...args),
 }));
 
@@ -103,5 +107,28 @@ describe('NativeAuthBridge', () => {
 
     const fallback = await screen.findByText('login.native_callback_fallback');
     expect((fallback as HTMLAnchorElement).href).toBe('imcodes://password-setup?ok=1&username=alice.name');
+  });
+
+  it('uses nonce exchange for password setup when the bridge state carries a nonce', async () => {
+    const state = btoa(JSON.stringify({
+      nonce: 'nonce-123',
+      username: 'alice.name',
+      newPassword: 'strong-password-123',
+    })).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+    window.history.replaceState({}, '', `/?native_callback=${encodeURIComponent('imcodes://password-setup')}&action=password_setup#state=${state}`);
+
+    exchangeNonceWithRetryMock.mockResolvedValue({ apiKey: 'deck_key_123', userId: 'user-1', keyId: 'key-1' });
+    passkeyVerifyBeginMock.mockResolvedValue({ challengeId: 'cid-1', foo: 'bar' });
+    startAuthenticationMock.mockResolvedValue({ id: 'cred-1' });
+    passwordSetupWithPasskeyMock.mockResolvedValue({ ok: true, user: { username: 'alice.name' } });
+
+    render(<NativeAuthBridge callbackUrl="imcodes://password-setup" />);
+
+    await waitFor(() => {
+      expect(exchangeNonceWithRetryMock).toHaveBeenCalledOnce();
+      expect(exchangeNonceWithRetryMock).toHaveBeenCalledWith('https://app.im.codes', 'nonce-123');
+      expect(withTemporaryApiKeyMock).toHaveBeenCalledWith('deck_key_123', expect.any(Function));
+      expect(passwordSetupWithPasskeyMock).toHaveBeenCalledWith('alice.name', 'strong-password-123', 'cid-1', { id: 'cred-1' });
+    });
   });
 });

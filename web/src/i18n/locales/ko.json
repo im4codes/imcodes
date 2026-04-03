@@ -236,6 +236,7 @@
     "username_taken": "이미 사용 중인 사용자 이름입니다",
     "registration_disabled": "현재 회원가입이 비활성화되어 있습니다",
     "invalid_username_format": "사용자 이름은 3-32자이며 문자 또는 숫자로 시작하고 끝나야 합니다",
+    "nonce_exchange_failed": "인증은 완료되었지만 연결에 실패했습니다. 다시 시도해 주세요.",
     "native_callback_fallback": "자동으로 돌아가지 않으면 여기를 누르세요",
     "native_status_getting_challenge": "챌린지를 가져오는 중…",
     "native_status_authenticating": "인증 중…",

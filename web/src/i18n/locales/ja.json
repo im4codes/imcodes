@@ -236,6 +236,7 @@
     "username_taken": "このユーザー名は既に使用されています",
     "registration_disabled": "現在、登録は無効になっています",
     "invalid_username_format": "ユーザー名は3〜32文字で、英数字で始まり英数字で終わる必要があります",
+    "nonce_exchange_failed": "認証は完了しましたが、接続に失敗しました。もう一度お試しください。",
     "native_callback_fallback": "自動で戻らない場合はここをタップしてください",
     "native_status_getting_challenge": "チャレンジを取得中…",
     "native_status_authenticating": "認証中…",

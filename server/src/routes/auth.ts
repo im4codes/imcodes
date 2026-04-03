@@ -1,10 +1,10 @@
 import { Hono } from 'hono';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import type { Env } from '../env.js';
+import type { Database } from '../db/client.js';
 import { createUser, getUserById, getUserByUsername, getSetting, updateUserStatus } from '../db/queries.js';
 import { randomHex, sha256Hex, signJwt, verifyJwt, hashPassword, verifyPassword } from '../security/crypto.js';
 import { checkIdempotency, recordIdempotency } from '../security/replay.js';
-import { logAudit } from '../security/audit.js';
 import { checkAuthLockout, recordAuthFailure } from '../security/lockout.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
@@ -14,8 +14,16 @@ import logger from '../util/logger.js';
 
 export const authRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
+const AUTH_NONCE_TTL_MS = 60_000;
+const AUTH_NONCE_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+
+let authNonceCleanupDb: Database | null = null;
+let authNonceCleanupTimer: ReturnType<typeof setInterval> | null = null;
+let authNonceStartupCleanupPromise: Promise<void> | null = null;
+
 // Task 5: Cache-Control: no-store on all auth endpoints
 authRoutes.use('/*', async (c, next) => {
+  scheduleAuthNonceCleanup(c.env.DB);
   await next();
   c.header('Cache-Control', 'no-store');
   c.header('Pragma', 'no-cache');
@@ -24,7 +32,22 @@ authRoutes.use('/*', async (c, next) => {
 // ── Shared auth helper ────────────────────────────────────────────────────
 // Resolves the authenticated user ID from cookie (browser) or Bearer token (API key / CLI).
 // Accepts any Hono Context with Bindings: Env — Variables generic is intentionally widened.
-type AnyAuthContext = { req: { header(name: string): string | undefined }; env: Env };
+type AnyAuthContext = { req: { header(name: string): string | undefined }; env: Env; get?: (key: string) => unknown };
+
+type AuthAuditEntry = {
+  userId?: string;
+  serverId?: string;
+  action: string;
+  details?: Record<string, unknown>;
+  ip?: string;
+  outcomeCode?: string;
+};
+
+type AuthRequestMetadata = {
+  platform: string;
+  appVersion: string;
+  bundleVersion: string;
+};
 
 async function resolveUserId(c: AnyAuthContext): Promise<string | null> {
   // Task 1: Try rcc_session cookie first (parse manually to avoid Hono Context type constraint)
@@ -76,6 +99,81 @@ function toClientUser(user: Awaited<ReturnType<typeof getUserById>>) {
   };
 }
 
+function getAuthRequestMetadata(c: AnyAuthContext): AuthRequestMetadata {
+  const platform = (c.req.header('X-Platform') ?? c.req.header('x-platform') ?? 'unknown').trim().toLowerCase() || 'unknown';
+  const appVersion = (c.req.header('X-App-Version') ?? c.req.header('x-app-version') ?? 'unknown').trim() || 'unknown';
+  const bundleVersion = (c.req.header('X-Bundle-Version') ?? c.req.header('x-bundle-version') ?? 'none').trim() || 'none';
+  return { platform, appVersion, bundleVersion };
+}
+
+export async function logAuthAudit(c: AnyAuthContext, entry: AuthAuditEntry, db: Database): Promise<void> {
+  try {
+    const metadata = getAuthRequestMetadata(c);
+    const ip = entry.ip ?? ((c.get ? (c.get('clientIp' as never) as string | undefined) : undefined) ?? 'unknown');
+    await db.execute(
+      'INSERT INTO audit_log (id, user_id, server_id, action, details, ip, platform, app_version, bundle_version, outcome_code, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)',
+      [
+        randomHex(16),
+        entry.userId ?? null,
+        entry.serverId ?? null,
+        entry.action,
+        entry.details ? JSON.stringify(entry.details) : null,
+        ip,
+        metadata.platform,
+        metadata.appVersion,
+        metadata.bundleVersion,
+        entry.outcomeCode ?? 'success',
+        Date.now(),
+      ],
+    );
+  } catch (err) {
+    logger.error({ action: entry.action, err }, 'Audit log write failed');
+  }
+}
+
+export async function issueAuthNonce(
+  db: Database,
+  params: { apiKey: string; userId: string; keyId: string },
+): Promise<string> {
+  const nonce = randomHex(32);
+  const now = Date.now();
+  await db.execute(
+    'INSERT INTO auth_nonces (nonce, api_key, user_id, key_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+    [nonce, params.apiKey, params.userId, params.keyId, now + AUTH_NONCE_TTL_MS, now],
+  );
+  return nonce;
+}
+
+export async function cleanupExpiredAuthNonces(db: Database): Promise<number> {
+  const result = await db.execute('DELETE FROM auth_nonces WHERE expires_at < $1', [Date.now()]);
+  return result.changes ?? 0;
+}
+
+export function scheduleAuthNonceCleanup(db: Database): void {
+  authNonceCleanupDb = db;
+  if (authNonceCleanupTimer) return;
+  authNonceCleanupTimer = setInterval(() => {
+    if (authNonceCleanupDb) {
+      void cleanupExpiredAuthNonces(authNonceCleanupDb);
+    }
+  }, AUTH_NONCE_CLEANUP_INTERVAL_MS);
+  authNonceCleanupTimer.unref?.();
+}
+
+export async function initializeAuthNonceCleanup(db: Database): Promise<void> {
+  authNonceCleanupDb = db;
+  if (!authNonceStartupCleanupPromise) {
+    authNonceStartupCleanupPromise = cleanupExpiredAuthNonces(db)
+      .then(() => undefined)
+      .catch((err) => {
+        authNonceStartupCleanupPromise = null;
+        throw err;
+      });
+  }
+  await authNonceStartupCleanupPromise;
+  scheduleAuthNonceCleanup(db);
+}
+
 // POST /api/auth/register — create a new user and issue initial API key
 authRoutes.post('/register', async (c) => {
   // Check if registration is enabled
@@ -109,7 +207,7 @@ authRoutes.post('/register', async (c) => {
   );
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
-  await logAudit({ userId, action: 'auth.register', ip }, c.env.DB);
+  await logAuthAudit(c, { userId, action: 'auth.register', ip }, c.env.DB);
 
   const responseBody = JSON.stringify({ userId, apiKey: rawKey });
   if (idempotencyKey) {
@@ -171,7 +269,7 @@ authRoutes.post('/user/:id/rotate-key', async (c) => {
   );
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
-  await logAudit({ userId, action: 'auth.rotate_key', ip }, c.env.DB);
+  await logAuthAudit(c, { userId, action: 'auth.rotate_key', ip }, c.env.DB);
 
   return c.json({ apiKey: rawKey, graceExpiry });
 });
@@ -194,7 +292,7 @@ authRoutes.delete('/user/:id/key', async (c) => {
   );
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
-  await logAudit({ userId, action: 'auth.revoke_keys', ip }, c.env.DB);
+  await logAuthAudit(c, { userId, action: 'auth.revoke_keys', ip }, c.env.DB);
 
   return c.json({ ok: true, revokedAt: now });
 });
@@ -218,7 +316,7 @@ authRoutes.post('/user/me/keys', async (c) => {
   );
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
-  await logAudit({ userId, action: 'auth.create_key', ip }, c.env.DB);
+  await logAuthAudit(c, { userId, action: 'auth.create_key', ip }, c.env.DB);
 
   return c.json({ id: keyId, apiKey: rawKey, label, createdAt: now }, 201);
 });
@@ -274,7 +372,7 @@ authRoutes.delete('/user/me/keys/:keyId', async (c) => {
   }
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
-  await logAudit({ userId, action: 'auth.revoke_key', ip, details: { keyId, serversKicked: boundServers.length } }, c.env.DB);
+  await logAuthAudit(c, { userId, action: 'auth.revoke_key', ip, details: { keyId, serversKicked: boundServers.length } }, c.env.DB);
 
   return c.json({ ok: true, revokedAt: now });
 });
@@ -302,6 +400,65 @@ authRoutes.post('/ws-ticket', async (c) => {
   );
 
   return c.json({ ticket });
+});
+
+// POST /api/auth/token-exchange — exchange a short-lived callback nonce for a real API key
+const tokenExchangeSchema = z.object({
+  nonce: z.string().min(1),
+});
+
+authRoutes.post('/token-exchange', async (c) => {
+  scheduleAuthNonceCleanup(c.env.DB);
+
+  const ip = c.get('clientIp' as never) as string ?? 'unknown';
+  const body = await c.req.json().catch(() => null);
+  const parsed = tokenExchangeSchema.safeParse(body);
+  if (!parsed.success) {
+    await logAuthAudit(c, {
+      action: 'auth.token_exchange',
+      ip,
+      outcomeCode: 'token_exchange_failed',
+      details: { reason: 'invalid_body' },
+    }, c.env.DB);
+    return c.json({ error: 'invalid_body' }, 400);
+  }
+
+  const now = Date.now();
+  const nonceRow = await c.env.DB.queryOne<{ api_key: string; user_id: string; key_id: string }>(
+    'DELETE FROM auth_nonces WHERE nonce = $1 AND expires_at > $2 RETURNING api_key, user_id, key_id',
+    [parsed.data.nonce, now],
+  );
+
+  if (!nonceRow) {
+    const existing = await c.env.DB.queryOne<{ user_id: string; expires_at: number }>(
+      'SELECT user_id, expires_at FROM auth_nonces WHERE nonce = $1',
+      [parsed.data.nonce],
+    );
+    await logAuthAudit(c, {
+      userId: existing?.user_id,
+      action: 'auth.token_exchange',
+      ip,
+      outcomeCode: existing && existing.expires_at <= now ? 'nonce_expired' : 'token_exchange_failed',
+      details: {
+        reason: existing ? (existing.expires_at <= now ? 'expired' : 'replayed') : 'missing',
+      },
+    }, c.env.DB);
+    return c.json({ error: 'invalid_or_expired_nonce' }, 400);
+  }
+
+  await logAuthAudit(c, {
+    userId: nonceRow.user_id,
+    action: 'auth.token_exchange',
+    ip,
+    outcomeCode: 'success',
+    details: { keyId: nonceRow.key_id },
+  }, c.env.DB);
+
+  return c.json({
+    apiKey: nonceRow.api_key,
+    userId: nonceRow.user_id,
+    keyId: nonceRow.key_id,
+  });
 });
 
 // POST /api/auth/refresh — refresh JWT access token (cookie or JSON body)
@@ -533,7 +690,7 @@ authRoutes.post('/password/register', async (c) => {
   }
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
-  await logAudit({ userId, action: 'auth.password_register', ip }, c.env.DB);
+  await logAuthAudit(c, { userId, action: 'auth.password_register', ip }, c.env.DB);
 
   // Don't issue session tokens for pending users — they can't use the app until approved
   if (isPending) {
@@ -659,7 +816,7 @@ authRoutes.post('/password/login', async (c) => {
     httpOnly: false, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400,
   });
 
-  await logAudit({ userId: user.id, action: 'auth.password_login', ip }, c.env.DB);
+  await logAuthAudit(c, { userId: user.id, action: 'auth.password_login', ip }, c.env.DB);
 
   // Native apps need a long-lived API key (cookies don't work in Capacitor).
   let apiKey: string | undefined;
@@ -740,7 +897,7 @@ authRoutes.post('/password/change', async (c) => {
   );
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
-  await logAudit({ userId, action: 'auth.password_change', ip }, c.env.DB);
+  await logAuthAudit(c, { userId, action: 'auth.password_change', ip }, c.env.DB);
 
   return c.json({ ok: true });
 });
