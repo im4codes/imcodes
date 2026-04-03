@@ -333,18 +333,21 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         : t('session.agentType.qwen');
   const qwenChoices = useMemo(() => {
     const known = getKnownQwenModelOptions(activeSession?.qwenAuthType);
-    const ids = activeSession?.qwenAvailableModels?.length
-      ? [...activeSession.qwenAvailableModels]
-      : activeSession?.qwenModel
-        ? [activeSession.qwenModel]
-        : known.map((model) => model.id);
+    const shouldTrustKnownOnly = qwenTier === QWEN_AUTH_TIERS.FREE || qwenTier === QWEN_AUTH_TIERS.PAID;
+    const ids = shouldTrustKnownOnly
+      ? known.map((model) => model.id)
+      : activeSession?.qwenAvailableModels?.length
+        ? [...activeSession.qwenAvailableModels]
+        : activeSession?.qwenModel
+          ? [activeSession.qwenModel]
+          : known.map((model) => model.id);
     if (detectedModel && !ids.includes(detectedModel)) ids.unshift(detectedModel);
     if (qwenModel && !ids.includes(qwenModel)) ids.unshift(qwenModel);
     return ids.map((id) => ({
       id,
       description: known.find((model) => model.id === id)?.description ?? getKnownQwenModelDescription(id),
     }));
-  }, [activeSession?.qwenAuthType, activeSession?.qwenAvailableModels, detectedModel, qwenModel]);
+  }, [activeSession?.qwenAuthType, activeSession?.qwenAvailableModels, detectedModel, qwenModel, qwenTier]);
 
   // P2P config loading moved after rootSession declaration below
 
@@ -967,7 +970,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               {qwenTierLabel}
             </button>
             {modelOpen && (
-              <div class="menu-dropdown">
+              <div class="menu-dropdown menu-dropdown-models">
                 {qwenChoices.map((m) => (
                   <button
                     key={m.id}

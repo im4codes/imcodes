@@ -1062,20 +1062,22 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         const modelMatch = text.trim().match(/^\/model\s+(\S+)\s*$/);
         if (modelMatch) {
           const nextModel = modelMatch[1];
-          const runtimeConfig = !record.qwenAvailableModels?.length
-            ? await getQwenRuntimeConfig().catch(() => null)
-            : null;
-          const allowedModels = record.qwenAvailableModels?.length
-            ? record.qwenAvailableModels
-            : (runtimeConfig?.availableModels?.length ? runtimeConfig.availableModels : QWEN_MODEL_IDS);
+          const runtimeConfig = await getQwenRuntimeConfig(true).catch(() => null);
+          const allowedModels = runtimeConfig?.availableModels?.length
+            ? runtimeConfig.availableModels
+            : (record.qwenAvailableModels?.length ? record.qwenAvailableModels : QWEN_MODEL_IDS);
           if (!allowedModels.includes(nextModel)) {
+            const qwenAuthType = runtimeConfig?.authType ?? record.qwenAuthType;
+            const authHint = qwenAuthType === 'qwen-oauth'
+              ? ' (current tier only allows coder-model)'
+              : '';
             timelineEmitter.emit(sessionName, 'user.message', { text });
             timelineEmitter.emit(sessionName, 'assistant.text', {
-              text: `⚠️ Unknown Qwen model: ${nextModel}`,
+              text: `⚠️ Unknown Qwen model: ${nextModel}${authHint}`,
               streaming: false,
             }, { source: 'daemon', confidence: 'high' });
-            timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Qwen model: ${nextModel}` });
-            try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unknown Qwen model: ${nextModel}` }); } catch { /* */ }
+            timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Qwen model: ${nextModel}${authHint}` });
+            try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unknown Qwen model: ${nextModel}${authHint}` }); } catch { /* */ }
             return;
           }
           transportRuntime.setAgentId(nextModel);

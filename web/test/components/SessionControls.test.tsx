@@ -211,6 +211,23 @@ describe('SessionControls', () => {
     });
   });
 
+  it('qwen oauth model dropdown only shows coder-model even if stale model list exists', () => {
+    render(<SessionControls
+      ws={makeWs() as any}
+      activeSession={makeSession({
+        agentType: 'qwen',
+        qwenAuthType: 'qwen-oauth',
+        qwenModel: 'coder-model',
+        qwenAvailableModels: ['coder-model', 'qwen3-coder-plus', 'qwen3-max-2026-01-23'],
+      })}
+      quickData={makeQuickData() as any}
+    />);
+    fireEvent.click(screen.getByRole('button', { name: /qwen_tier_free/i }));
+    expect(screen.getByText(/coder-model/)).toBeDefined();
+    expect(screen.queryByText(/qwen3-coder-plus/)).toBeNull();
+    expect(screen.queryByText(/qwen3-max-2026-01-23/)).toBeNull();
+  });
+
   it('pressing Shift+Enter does not submit', () => {
     const ws = makeWs();
     render(<SessionControls ws={ws as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
