@@ -6,7 +6,7 @@ html, body, #app { margin: 0; padding: 0; height: 100%; width: 100%; overflow: h
 html { position: fixed; }
 :root { --sat: env(safe-area-inset-top, 0px); }
 /* Global: all fixed full-screen overlays respect iOS safe area (status bar/notch) */
-.dialog-overlay, .ask-dialog-overlay, .fb-overlay, .mobile-fb-overlay, .discussions-page { padding-top: var(--sat); }
+.dialog-overlay, .ask-dialog-overlay, .fb-overlay, .mobile-fb-overlay { padding-top: var(--sat); }
 @media (max-width: 640px) { .fb-body-split .fb-preview { padding-top: var(--sat); } }
 body {
   background: #0f172a;
