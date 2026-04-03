@@ -51,11 +51,11 @@ describe('fs.ls handler', () => {
     vi.restoreAllMocks();
   });
 
-  it('returns forbidden_path when path is outside $HOME', async () => {
-    const outOfBounds = '/root/secret';
-    mockRealpath.mockResolvedValue(outOfBounds as unknown as string);
+  it('returns forbidden_path for denied directories like ~/.ssh', async () => {
+    const denied = path.join(homedir(), '.ssh');
+    mockRealpath.mockResolvedValue(denied as unknown as string);
 
-    handleWebCommand({ type: 'fs.ls', path: outOfBounds, requestId: 'req-1' }, mockServerLink as any);
+    handleWebCommand({ type: 'fs.ls', path: denied, requestId: 'req-1' }, mockServerLink as any);
     await flushAsync();
 
     expect(sent[0]).toMatchObject({
