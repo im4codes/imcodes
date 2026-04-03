@@ -128,12 +128,48 @@ describe('timeline epoch mismatch handling', () => {
       makeEvent({ seq: 4, epoch: 100 }),
     ];
 
-    const existingIds = new Set(existing.map(e => e.eventId));
-    const newEvents = replay.filter(e => !existingIds.has(e.eventId));
-    const merged = [...existing, ...newEvents].sort((a, b) => a.seq - b.seq);
+    const replayById = new Map(replay.map((event) => [event.eventId, event]));
+    const replaced = existing.map((event) => {
+      const next = replayById.get(event.eventId);
+      if (!next) return event;
+      replayById.delete(event.eventId);
+      return next;
+    });
+    const newEvents = [...replayById.values()];
+    const merged = [...replaced, ...newEvents].sort((a, b) => a.seq - b.seq);
 
     expect(merged).toHaveLength(4);
     expect(merged.map(e => e.seq)).toEqual([1, 2, 3, 4]);
+  });
+
+  it('history merge replaces same-eventId transport final events instead of dropping them', () => {
+    const existing = [
+      {
+        ...makeEvent({ seq: 10, epoch: 100 }),
+        eventId: 'transport:session-a:msg-1',
+        payload: { text: 'partial', streaming: true },
+      },
+    ];
+    const replay = [
+      {
+        ...makeEvent({ seq: 11, epoch: 100 }),
+        eventId: 'transport:session-a:msg-1',
+        payload: { text: 'complete answer', streaming: false },
+      },
+    ];
+
+    const replayById = new Map(replay.map((event) => [event.eventId, event]));
+    const replaced = existing.map((event) => {
+      const next = replayById.get(event.eventId);
+      if (!next) return event;
+      replayById.delete(event.eventId);
+      return next;
+    });
+    const merged = [...replaced, ...replayById.values()];
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].payload.text).toBe('complete answer');
+    expect(merged[0].payload.streaming).toBe(false);
   });
 
   it('truncated replay should trigger snapshot request', () => {
@@ -158,4 +194,3 @@ describe('timeline epoch mismatch handling', () => {
     expect(snapshotRequested).toBe(false);
   });
 });
-

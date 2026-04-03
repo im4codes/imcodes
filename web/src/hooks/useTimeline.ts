@@ -296,21 +296,34 @@ export function useTimeline(
    *  Uses two-pointer merge instead of concatenate + full sort. */
   const mergeEvents = useCallback((incoming: TimelineEvent[]) => {
     setEvents((prev) => {
-      const existingIds = new Set(prev.map((e) => e.eventId));
-      const newEvents = incoming.filter((e) => !existingIds.has(e.eventId));
-      if (newEvents.length === 0) return prev;
+      const incomingById = new Map<string, TimelineEvent>();
+      for (const event of incoming) incomingById.set(event.eventId, event);
+
+      let changed = false;
+      const replaced = prev.map((event) => {
+        const next = incomingById.get(event.eventId);
+        if (!next) return event;
+        incomingById.delete(event.eventId);
+        changed = true;
+        return next;
+      });
+
+      const newEvents = [...incomingById.values()];
+      if (!changed && newEvents.length === 0) return prev;
 
       // Sort only the new events (typically small batch), then merge with already-sorted prev.
       newEvents.sort((a, b) => a.ts - b.ts);
 
-      // Two-pointer O(n+m) merge
+      // Two-pointer O(n+m) merge. Existing events keep their current relative
+      // order; same-eventId replacements stay in place, which is what transport
+      // streaming/finalization needs.
       const merged: TimelineEvent[] = [];
-      let i = 0, j = 0;
-      while (i < prev.length && j < newEvents.length) {
-        if (prev[i].ts <= newEvents[j].ts) merged.push(prev[i++]);
+      let i = 0; let j = 0;
+      while (i < replaced.length && j < newEvents.length) {
+        if (replaced[i].ts <= newEvents[j].ts) merged.push(replaced[i++]);
         else merged.push(newEvents[j++]);
       }
-      while (i < prev.length) merged.push(prev[i++]);
+      while (i < replaced.length) merged.push(replaced[i++]);
       while (j < newEvents.length) merged.push(newEvents[j++]);
 
       const result = merged.length > MAX_MEMORY_EVENTS
