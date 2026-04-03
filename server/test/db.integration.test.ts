@@ -82,7 +82,7 @@ describe('runMigrations', () => {
     const tables = [
       'users', 'platform_identities', 'servers', 'channel_bindings',
       'platform_bots', 'api_keys', 'refresh_tokens', 'idempotency_records',
-      'audit_log', 'pending_binds', 'sessions', 'cron_jobs', 'cron_executions',
+      'auth_nonces', 'audit_log', 'pending_binds', 'sessions', 'cron_jobs', 'cron_executions',
       'teams', 'team_members', 'push_subscriptions',
     ];
 
@@ -167,6 +167,17 @@ describe('runMigrations', () => {
     expect(row2?.timezone).toBeNull();
 
     await db.execute('DELETE FROM cron_jobs WHERE id = $1', [jobId]);
+  });
+
+  it('audit_log includes auth observability columns (migration 034)', async () => {
+    for (const column of ['platform', 'app_version', 'bundle_version', 'outcome_code']) {
+      const col = await db.queryOne<{ column_name: string }>(
+        `SELECT column_name FROM information_schema.columns
+         WHERE table_name = 'audit_log' AND column_name = $1`,
+        [column],
+      );
+      expect(col, `audit_log should include ${column}`).not.toBeNull();
+    }
   });
 });
 

@@ -236,6 +236,7 @@
     "username_taken": "Это имя пользователя уже занято",
     "registration_disabled": "Регистрация в данный момент отключена",
     "invalid_username_format": "Имя пользователя должно быть 3-32 символа, начинаться и заканчиваться буквой или цифрой",
+    "nonce_exchange_failed": "Аутентификация завершена, но подключение не удалось. Попробуйте снова.",
     "native_callback_fallback": "Нажмите здесь, если перенаправление не произошло автоматически",
     "native_status_getting_challenge": "Получение challenge…",
     "native_status_authenticating": "Аутентификация…",

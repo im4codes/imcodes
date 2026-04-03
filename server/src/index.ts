@@ -18,7 +18,7 @@ import { loadEnv, type Env, type EnvConfig } from './env.js';
 import { createDatabase, type Database } from './db/client.js';
 import { runMigrations } from './db/migrate.js';
 import { randomHex, hashPassword } from './security/crypto.js';
-import { authRoutes } from './routes/auth.js';
+import { authRoutes, initializeAuthNonceCleanup } from './routes/auth.js';
 import { githubAuthRoutes } from './routes/github-auth.js';
 import { adminRoutes } from './routes/admin.js';
 import { bindRoutes } from './routes/bind.js';
@@ -562,6 +562,7 @@ async function main() {
 
   await runMigrations(db);
   await ensureDefaultAdmin(db, envConfig);
+  await initializeAuthNonceCleanup(db);
 
   const app = buildApp(env);
 

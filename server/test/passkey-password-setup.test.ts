@@ -69,6 +69,7 @@ interface MemDb extends Database {
   failNextUsernameUpdateWithUniqueViolation(): void;
   failNextUsernameUpdateWithGenericError(): void;
   transaction<T>(fn: (tx: Database) => Promise<T>): Promise<T>;
+  getAuditLog(): unknown[];
 }
 
 function makeMemDb(): MemDb {
@@ -76,7 +77,9 @@ function makeMemDb(): MemDb {
   const passkeys = new Map<string, MemPasskey>();
   const challenges = new Map<string, MemChallenge>();
   const apiKeys = new Map<string, { user_id: string; key_hash: string; revoked_at: number | null }>();
+  const authNonces = new Map<string, { nonce: string; api_key: string; user_id: string; key_id: string; expires_at: number; created_at: number }>();
   const refreshTokens = new Map<string, { user_id: string; token_hash: string }>();
+  const auditLog: unknown[] = [];
   let failNextUsernameUpdateWithUniqueViolation = false;
   let failNextUsernameUpdateWithGenericError = false;
 
@@ -102,6 +105,20 @@ function makeMemDb(): MemDb {
       }
       if (s.includes('from passkey_credentials where id')) {
         return (passkeys.get(String(params[0])) ?? null) as T | null;
+      }
+      if (s.includes('delete from auth_nonces where nonce =') && s.includes('expires_at >') && s.includes('returning')) {
+        const row = authNonces.get(String(params[0]));
+        if (!row || row.expires_at <= Number(params[1])) return null;
+        authNonces.delete(String(params[0]));
+        return { api_key: row.api_key, user_id: row.user_id, key_id: row.key_id } as T;
+      }
+      if (s.includes('from auth_nonces where nonce =') && s.includes('expires_at >')) {
+        const row = authNonces.get(String(params[0]));
+        if (!row || row.expires_at <= Number(params[1])) return null;
+        return { api_key: row.api_key, user_id: row.user_id, key_id: row.key_id } as T;
+      }
+      if (s.includes('from auth_nonces where nonce =')) {
+        return (authNonces.get(String(params[0])) ?? null) as T | null;
       }
       if (s.includes('from api_keys where key_hash') && s.includes('revoked_at is null')) {
         for (const key of apiKeys.values()) {
@@ -215,7 +232,32 @@ function makeMemDb(): MemDb {
       if (s.includes('insert into refresh_tokens')) {
         refreshTokens.set(String(params[0]), { user_id: String(params[1]), token_hash: String(params[2]) });
       }
-      if (s.includes('insert into audit_log') || s.includes('insert into auth_lockout') || s.includes('update auth_lockout')) {
+      if (s.includes('insert into auth_nonces')) {
+        authNonces.set(String(params[0]), {
+          nonce: String(params[0]),
+          api_key: String(params[1]),
+          user_id: String(params[2]),
+          key_id: String(params[3]),
+          expires_at: Number(params[4]),
+          created_at: Number(params[5]),
+        });
+      }
+      if (s.includes('delete from auth_nonces where expires_at <')) {
+        const cutoff = Number(params[0]);
+        for (const [nonce, row] of authNonces.entries()) {
+          if (row.expires_at < cutoff) authNonces.delete(nonce);
+        }
+      }
+      if (s.includes('delete from auth_nonces where nonce =') && s.includes('expires_at >') && s.includes('returning')) {
+        const row = authNonces.get(String(params[0]));
+        if (!row || row.expires_at <= Number(params[1])) return { changes: 0 };
+        authNonces.delete(String(params[0]));
+        return { changes: 1 };
+      }
+      if (s.includes('insert into audit_log')) {
+        auditLog.push(params);
+      }
+      if (s.includes('insert into auth_lockout') || s.includes('update auth_lockout')) {
         return { changes: 1 };
       }
       return { changes: 1 };
@@ -241,6 +283,7 @@ function makeMemDb(): MemDb {
     },
     failNextUsernameUpdateWithUniqueViolation: () => { failNextUsernameUpdateWithUniqueViolation = true; },
     failNextUsernameUpdateWithGenericError: () => { failNextUsernameUpdateWithGenericError = true; },
+    getAuditLog: () => auditLog,
   } as unknown as MemDb;
   return db;
 }
@@ -724,5 +767,133 @@ describe('passkey password setup', () => {
     expect(me.username).toBe('alice');
     expect(me.has_password).toBe(true);
     expect('password_hash' in me).toBe(false);
+  });
+
+  it('issues native login callbacks with nonce plus backward-compatible key params', async () => {
+    const beginRes = await app.request('/api/auth/passkey/login/begin', { method: 'POST', body: '{}' });
+    const { challengeId } = await beginRes.json() as { challengeId: string };
+
+    const loginRes = await app.request('/api/auth/passkey/login/complete?native=1&native_callback=' + encodeURIComponent('imcodes://auth'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ challengeId, response: { id: 'cred-user-passkey' } }),
+    });
+
+    expect(loginRes.status).toBe(200);
+    const html = await loginRes.text();
+    expect(html).toContain('imcodes://auth');
+    expect(html).toContain('nonce=');
+    expect(html).toContain('key=');
+    expect(html).toContain('userId=');
+    expect(html).toContain('keyId=');
+  });
+
+  it('issues native registration callbacks with nonce plus backward-compatible key params', async () => {
+    const beginRes = await app.request('/api/auth/passkey/register/begin', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ displayName: 'Mobile User' }),
+    });
+    const { challengeId } = await beginRes.json() as { challengeId: string };
+
+    const registerRes = await app.request('/api/auth/passkey/register/complete?native_callback=' + encodeURIComponent('imcodes://auth'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ challengeId, response: { id: 'new-cred-register' } }),
+    });
+
+    expect(registerRes.status).toBe(200);
+    const html = await registerRes.text();
+    expect(html).toContain('imcodes://auth');
+    expect(html).toContain('nonce=');
+    expect(html).toContain('key=');
+    expect(html).toContain('userId=');
+    expect(html).toContain('keyId=');
+  });
+
+  it('issues password setup native callbacks with nonce and no key exposure', async () => {
+    const beginRes = await app.request('/api/auth/passkey/verify/begin', { method: 'POST', headers: authHeader, body: '{}' });
+    const { challengeId } = await beginRes.json() as { challengeId: string };
+
+    const setupRes = await app.request('/api/auth/passkey/password/setup?native_callback=' + encodeURIComponent('imcodes://auth'), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeader,
+      },
+      body: JSON.stringify({
+        username: 'passkey-user',
+        newPassword: 'Strong-Pass-456',
+        challengeId,
+        response: { id: 'cred-user-passkey' },
+      }),
+    });
+
+    expect(setupRes.status).toBe(200);
+    const html = await setupRes.text();
+    expect(html).toContain('imcodes://auth');
+    expect(html).toContain('nonce=');
+    expect(html).not.toContain('key=');
+  });
+
+  it('token-exchange returns api credentials once and rejects replay or expiry', async () => {
+    const now = Date.now();
+    await db.execute(
+      'INSERT INTO auth_nonces (nonce, api_key, user_id, key_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+      ['nonce-live', 'deck_live_api_key', 'user-passkey', 'key-live', now + 60_000, now],
+    );
+
+    const successRes = await app.request('/api/auth/token-exchange', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Platform': 'android',
+        'X-App-Version': '1.2.3',
+        'X-Bundle-Version': '42',
+      },
+      body: JSON.stringify({ nonce: 'nonce-live' }),
+    });
+    expect(successRes.status).toBe(200);
+    await expect(successRes.json()).resolves.toEqual({
+      apiKey: 'deck_live_api_key',
+      userId: 'user-passkey',
+      keyId: 'key-live',
+    });
+
+    const replayRes = await app.request('/api/auth/token-exchange', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nonce: 'nonce-live' }),
+    });
+    expect(replayRes.status).toBe(400);
+    expect(await replayRes.json()).toEqual({ error: 'invalid_or_expired_nonce' });
+
+    await db.execute(
+      'INSERT INTO auth_nonces (nonce, api_key, user_id, key_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+      ['nonce-expired', 'deck_expired_api_key', 'user-passkey', 'key-expired', now - 1_000, now - 61_000],
+    );
+    const expiredRes = await app.request('/api/auth/token-exchange', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nonce: 'nonce-expired' }),
+    });
+    expect(expiredRes.status).toBe(400);
+    expect(await expiredRes.json()).toEqual({ error: 'invalid_or_expired_nonce' });
+
+    const missingRes = await app.request('/api/auth/token-exchange', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(missingRes.status).toBe(400);
+    expect(await missingRes.json()).toEqual({ error: 'invalid_body' });
+
+    const audit = db.getAuditLog();
+    const tokenExchangeEntry = audit.find((entry) => Array.isArray(entry) && entry[3] === 'auth.token_exchange') as unknown[] | undefined;
+    expect(tokenExchangeEntry).toBeTruthy();
+    expect(tokenExchangeEntry?.[6]).toBe('android');
+    expect(tokenExchangeEntry?.[7]).toBe('1.2.3');
+    expect(tokenExchangeEntry?.[8]).toBe('42');
+    expect(tokenExchangeEntry?.[9]).toBe('success');
   });
 });

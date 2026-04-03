@@ -236,6 +236,7 @@
     "username_taken": "该用户名已被使用",
     "registration_disabled": "注册功能当前已关闭",
     "invalid_username_format": "用户名须 3-32 个字符，以字母或数字开头和结尾",
+    "nonce_exchange_failed": "身份验证已完成，但连接失败。请重试。",
     "native_callback_fallback": "如果没有自动跳转，请点这里",
     "native_status_getting_challenge": "正在获取挑战…",
     "native_status_authenticating": "正在验证…",

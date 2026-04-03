@@ -10,12 +10,14 @@ import { useState, useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { startAuthentication, startRegistration } from '@simplewebauthn/browser';
 import {
+  exchangeNonceWithRetry,
   passkeyLoginBegin,
   passkeyLoginCompleteNative,
   passkeyRegisterBegin,
   passkeyRegisterComplete,
   passkeyVerifyBegin,
   passwordSetupWithPasskey,
+  getApiBaseUrl,
   withTemporaryApiKey,
   ApiError,
 } from '../api.js';
@@ -25,7 +27,8 @@ interface Props {
 }
 
 interface NativePasswordSetupState {
-  apiKey: string;
+  apiKey?: string;
+  nonce?: string;
   username: string;
   newPassword: string;
 }
@@ -81,9 +84,11 @@ export function NativeAuthBridge({ callbackUrl }: Props) {
       const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
       const json = new TextDecoder().decode(bytes);
       const parsed = JSON.parse(json) as Partial<NativePasswordSetupState>;
-      if (!parsed.apiKey || !parsed.username || !parsed.newPassword) return null;
+      if (!parsed.username || !parsed.newPassword) return null;
+      if (!parsed.apiKey && !parsed.nonce) return null;
       return {
         apiKey: parsed.apiKey,
+        nonce: parsed.nonce,
         username: parsed.username,
         newPassword: parsed.newPassword,
       };
@@ -110,7 +115,7 @@ export function NativeAuthBridge({ callbackUrl }: Props) {
       setStatus(t('login.native_status_getting_api_key'));
       const res = await passkeyLoginCompleteNative(challengeId, authResponse);
       setStatus(t('login.native_status_redirecting'));
-      finishWithResult({ key: res.apiKey, userId: res.userId, keyId: res.keyId });
+      finishWithResult({ nonce: res.nonce, userId: res.userId });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('NotAllowedError') || msg.toLowerCase().includes('not allowed')) {
@@ -136,8 +141,18 @@ export function NativeAuthBridge({ callbackUrl }: Props) {
     setLoading(true);
     setError(null);
     setStatus(t('settings.native_status_verifying_passkey'));
+    let nonceExchangeAttempted = false;
     try {
-      await withTemporaryApiKey(state.apiKey, async () => {
+      let apiKey = state.apiKey;
+      if (!apiKey && state.nonce) {
+        nonceExchangeAttempted = true;
+        setStatus(t('login.native_status_getting_api_key'));
+        const exchanged = await exchangeNonceWithRetry(getApiBaseUrl(), state.nonce);
+        apiKey = exchanged.apiKey;
+      }
+      if (!apiKey) throw new Error('missing_auth_key');
+
+      await withTemporaryApiKey(apiKey, async () => {
         const beginRes = await passkeyVerifyBegin();
         const { challengeId, ...options } = beginRes;
         const authResponse = await startAuthentication(options as never);
@@ -147,8 +162,13 @@ export function NativeAuthBridge({ callbackUrl }: Props) {
       });
     } catch (err: unknown) {
       const errorCode = err instanceof ApiError ? err.code : null;
-      finishWithResult({ error: errorCode ?? 'password_setup_error' });
-      if (!errorCode) setError(t('settings.password_setup_error'));
+      if (nonceExchangeAttempted && (!errorCode || errorCode === 'invalid_or_expired_nonce' || errorCode === 'missing_nonce')) {
+        finishWithResult({ error: 'nonce_exchange_failed' });
+        setError(t('login.nonce_exchange_failed'));
+      } else {
+        finishWithResult({ error: errorCode ?? 'password_setup_error' });
+        if (!errorCode) setError(t('settings.password_setup_error'));
+      }
     } finally {
       setLoading(false);
     }
@@ -191,7 +211,7 @@ export function NativeAuthBridge({ callbackUrl }: Props) {
       setStatus(t('login.native_status_getting_api_key'));
       const res = await passkeyLoginCompleteNative(cid2, authResponse);
       setStatus(t('login.native_status_redirecting'));
-      finishWithResult({ key: res.apiKey, userId: res.userId, keyId: res.keyId });
+      finishWithResult({ nonce: res.nonce, userId: res.userId });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (!msg.toLowerCase().includes('cancel')) {

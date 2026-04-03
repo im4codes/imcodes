@@ -10,6 +10,13 @@ import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '@shared/preview-types.js';
 let _baseUrl = '';
 let _onAuthExpired: ((reason?: string) => void) | null = null;
 let _apiKey: string | null = null;
+type AuthTelemetryHeaders = {
+  'X-Platform': string;
+  'X-App-Version': string;
+  'X-Bundle-Version': string;
+};
+let _authTelemetryHeadersCache: AuthTelemetryHeaders | null = null;
+let _authTelemetryHeadersPromise: Promise<AuthTelemetryHeaders> | null = null;
 
 // Hydrate API key from localStorage on module load so it's available before
 // any async Capacitor Preferences read completes. This prevents race conditions
@@ -38,6 +45,49 @@ export async function withTemporaryApiKey<T>(key: string, fn: () => Promise<T>):
 export function clearApiKey(): void {
   _apiKey = null;
   try { localStorage.removeItem('rcc_api_key'); } catch { /* ignore */ }
+}
+
+async function getAuthTelemetryHeaders(): Promise<AuthTelemetryHeaders> {
+  if (_authTelemetryHeadersCache) return _authTelemetryHeadersCache;
+  if (!_authTelemetryHeadersPromise) {
+    _authTelemetryHeadersPromise = (async () => {
+      const platform = typeof (globalThis as { Capacitor?: { getPlatform?: () => string } }).Capacitor?.getPlatform === 'function'
+        ? (globalThis as { Capacitor?: { getPlatform?: () => string } }).Capacitor!.getPlatform!()
+        : 'web';
+
+      let appVersion = 'web';
+      try {
+        const { App } = await import('@capacitor/app');
+        const info = await App.getInfo();
+        appVersion = String((info as { version?: string; build?: string }).version ?? (info as { version?: string; build?: string }).build ?? 'unknown');
+      } catch {
+        appVersion = 'web';
+      }
+
+      let bundleVersion = 'none';
+      try {
+        const { CapacitorUpdater } = await import('@capgo/capacitor-updater');
+        const current = await CapacitorUpdater.current();
+        const bundle = current?.bundle;
+        if (bundle?.id && bundle.id !== 'builtin') {
+          bundleVersion = String(bundle.version ?? bundle.id);
+        }
+      } catch {
+        bundleVersion = 'none';
+      }
+
+      const headers: AuthTelemetryHeaders = {
+        'X-Platform': platform,
+        'X-App-Version': appVersion,
+        'X-Bundle-Version': bundleVersion,
+      };
+      _authTelemetryHeadersCache = headers;
+      return headers;
+    })().finally(() => {
+      _authTelemetryHeadersPromise = null;
+    });
+  }
+  return _authTelemetryHeadersPromise;
 }
 
 export function configure(baseUrl: string): void {
@@ -201,10 +251,18 @@ export function stopProactiveRefresh(): void {
   }
 }
 
-async function rawFetch(path: string, opts: RequestInit = {}): Promise<Response> {
+async function rawFetch(path: string, opts: RequestInit = {}, baseUrl = _baseUrl): Promise<Response> {
   const headers = new Headers(opts.headers);
   if (!headers.has('Content-Type') && opts.body && !(opts.body instanceof FormData)) {
     headers.set('Content-Type', 'application/json');
+  }
+  if (path.startsWith('/api/auth/') && !path.includes('ws-ticket')) {
+    try {
+      const telemetry = await getAuthTelemetryHeaders();
+      for (const [key, value] of Object.entries(telemetry)) {
+        if (!headers.has(key)) headers.set(key, value);
+      }
+    } catch { /* telemetry headers are best-effort — don't block auth requests */ }
   }
   if (_apiKey) {
     // Native: Bearer token auth (CSRF middleware skips Bearer auth requests)
@@ -220,7 +278,7 @@ async function rawFetch(path: string, opts: RequestInit = {}): Promise<Response>
   // Native (Bearer auth): omit credentials — no cookies needed, and 'include' would
   // require Access-Control-Allow-Credentials from the server (cross-origin from capacitor://).
   // Web (cookie auth): include credentials so HttpOnly cookies are sent.
-  return fetch(`${_baseUrl}${path}`, { ...opts, headers, credentials: _apiKey ? 'omit' : 'include' });
+  return fetch(`${baseUrl}${path}`, { ...opts, headers, credentials: _apiKey ? 'omit' : 'include' });
 }
 
 export interface LocalWebPreviewCreateResponse {
@@ -255,6 +313,12 @@ interface RawLocalWebPreviewCreateResponse {
 
 export interface LocalWebPreviewCloseResponse {
   ok: true;
+}
+
+export interface NativeAuthExchangeResponse {
+  apiKey: string;
+  userId: string;
+  keyId: string;
 }
 
 export async function createLocalWebPreview(
@@ -378,6 +442,80 @@ export async function apiFetch<T = unknown>(
   }
 
   return res.json() as Promise<T>;
+}
+
+function isRetryableNonceExchangeError(error: unknown): boolean {
+  if (error instanceof ApiError) {
+    if (error.code === 'invalid_or_expired_nonce') return false;
+    return error.status === 408 || error.status === 429 || error.status >= 500;
+  }
+  return true;
+}
+
+function createTimeoutSignal(timeoutMs: number): { signal: AbortSignal; clear?: () => void } {
+  const timeoutFactory = (AbortSignal as typeof AbortSignal & { timeout?: (ms: number) => AbortSignal }).timeout;
+  if (typeof timeoutFactory === 'function') {
+    return { signal: timeoutFactory(timeoutMs) };
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return {
+    signal: controller.signal,
+    clear: () => clearTimeout(timer),
+  };
+}
+
+async function postNonceExchange(serverUrl: string, nonce: string, timeoutMs: number): Promise<NativeAuthExchangeResponse> {
+  const baseUrl = serverUrl.replace(/\/$/, '');
+  const { signal, clear } = createTimeoutSignal(timeoutMs);
+  try {
+    const res = await rawFetch('/api/auth/token-exchange', {
+      method: 'POST',
+      body: JSON.stringify({ nonce }),
+      signal,
+    }, baseUrl);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new ApiError(res.status, body);
+    }
+    return res.json() as Promise<NativeAuthExchangeResponse>;
+  } finally {
+    clear?.();
+  }
+}
+
+export async function exchangeNonce(serverUrl: string, nonce: string): Promise<NativeAuthExchangeResponse> {
+  if (!nonce.trim()) {
+    throw new ApiError(400, '{"error":"missing_nonce"}');
+  }
+  return postNonceExchange(serverUrl, nonce, 10_000);
+}
+
+export async function exchangeNonceWithRetry(serverUrl: string, nonce: string, maxRetries = 3): Promise<NativeAuthExchangeResponse> {
+  const deadlineAt = Date.now() + 30_000;
+  let lastError: unknown = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const now = Date.now();
+    const remaining = deadlineAt - now;
+    if (remaining <= 0) break;
+
+    const timeoutMs = Math.min(10_000, remaining);
+    try {
+      return await postNonceExchange(serverUrl, nonce, timeoutMs);
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableNonceExchangeError(error) || attempt >= maxRetries) break;
+
+      const backoffMs = [1000, 2000, 4000][attempt] ?? 4000;
+      const nextAttemptAt = Date.now() + backoffMs;
+      if (nextAttemptAt >= deadlineAt) break;
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
+    }
+  }
+
+  if (lastError) throw lastError;
+  throw new ApiError(503, 'token_exchange_failed');
 }
 
 export class ApiError extends Error {
@@ -655,11 +793,11 @@ export async function passkeyLoginComplete(challengeId: string, response: unknow
   });
 }
 
-/** Native-only: exchange passkey credential for an API key (does not set cookie). */
+/** Native-only: exchange passkey credential for a nonce (does not set cookie). */
 export async function passkeyLoginCompleteNative(
   challengeId: string,
   response: unknown,
-): Promise<{ apiKey: string; keyId: string; userId: string }> {
+): Promise<{ nonce: string; userId: string }> {
   return apiFetch('/api/auth/passkey/login/complete?native=1', {
     method: 'POST',
     body: JSON.stringify({ challengeId, response }),

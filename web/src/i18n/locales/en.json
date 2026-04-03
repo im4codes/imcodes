@@ -236,6 +236,7 @@
     "username_taken": "This username is already taken",
     "registration_disabled": "Registration is currently disabled",
     "invalid_username_format": "Username must be 3-32 characters, start and end with a letter or number",
+    "nonce_exchange_failed": "Authentication completed but connection failed. Please try again.",
     "native_callback_fallback": "Tap here if not redirected automatically",
     "native_status_getting_challenge": "Getting challenge…",
     "native_status_authenticating": "Authenticating…",

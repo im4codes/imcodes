@@ -1,7 +1,16 @@
 import { useState, useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { startRegistration, startAuthentication } from '@simplewebauthn/browser';
-import { passkeyLoginBegin, passkeyLoginComplete, passkeyRegisterBegin, passkeyRegisterComplete, passwordLogin, passwordChange, passwordRegister } from '../api.js';
+import {
+  exchangeNonceWithRetry,
+  passkeyLoginBegin,
+  passkeyLoginComplete,
+  passkeyRegisterBegin,
+  passkeyRegisterComplete,
+  passwordLogin,
+  passwordChange,
+  passwordRegister,
+} from '../api.js';
 import { isNative } from '../native.js';
 import { validatePasswordComplexity } from '@shared/password-rules.js';
 
@@ -49,9 +58,21 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
       if (action) url += `&action=${action}`;
       const result = await AuthSession.start({ url, callbackScheme: 'imcodes' });
       const parsed = new URL(result.url);
+      const nonce = parsed.searchParams.get('nonce');
       const key = parsed.searchParams.get('key');
       const userId = parsed.searchParams.get('userId');
       const keyId = parsed.searchParams.get('keyId');
+      if (nonce) {
+        const exchanged = await exchangeNonceWithRetry(serverUrl, nonce);
+        const { configureApiKey } = await import('../api.js');
+        const { storeAuthKey } = await import('../biometric-auth.js');
+        const { Preferences } = await import('@capacitor/preferences');
+        await storeAuthKey(exchanged.apiKey);
+        configureApiKey(exchanged.apiKey);
+        await Preferences.set({ key: 'deck_api_key_id', value: exchanged.keyId });
+        onLoginSuccess?.(exchanged.userId, serverUrl);
+        return;
+      }
       if (key && userId && keyId) {
         const { configureApiKey } = await import('../api.js');
         const { storeAuthKey } = await import('../biometric-auth.js');
@@ -60,11 +81,13 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
         configureApiKey(key);
         await Preferences.set({ key: 'deck_api_key_id', value: keyId });
         onLoginSuccess?.(userId, serverUrl);
+        return;
       }
+      setError(t('login.nonce_exchange_failed'));
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (!msg.toLowerCase().includes('cancel')) {
-        setError(t('login.passkey_error'));
+        setError(t('login.nonce_exchange_failed'));
       }
     } finally {
       setLoading(false);

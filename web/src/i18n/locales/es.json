@@ -236,6 +236,7 @@
     "username_taken": "Este nombre de usuario ya está en uso",
     "registration_disabled": "El registro está deshabilitado actualmente",
     "invalid_username_format": "El nombre de usuario debe tener 3-32 caracteres, comenzar y terminar con letra o número",
+    "nonce_exchange_failed": "La autenticación se completó, pero la conexión falló. Por favor, inténtalo de nuevo.",
     "native_callback_fallback": "Toca aquí si no se redirige automáticamente",
     "native_status_getting_challenge": "Obteniendo desafío…",
     "native_status_authenticating": "Autenticando…",
