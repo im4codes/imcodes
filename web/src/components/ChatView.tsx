@@ -653,7 +653,7 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
           {!loading && viewItems.map((item, idx) => {
             const nextItem = viewItems[idx + 1];
             const nextTs = nextItem?.ts ?? nextItem?.event?.ts;
-            const onPathClick = ws && !preview ? (p: string) => setFileBrowserPath(p) : undefined;
+            const onPathClick = ws && !preview ? (p: string) => setFileBrowserPath(p.replace(/^`+|`+$/g, '')) : undefined;
             const onUrlClick = !preview ? (url: string) => setPendingUrl(url) : undefined;
             return item.type === 'assistant-block' ? (
               <div key={item.key} class="chat-event chat-assistant">
