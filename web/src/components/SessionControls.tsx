@@ -687,6 +687,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [ws, activeSession, quickData, onSend, p2pMode, p2pExcludeSameType, p2pSavedConfig]);
 
   const handleKeyDown = (e: KeyboardEvent) => {
+    if (e.key === 'Escape' && activeSession?.runtimeType === 'transport' && activeSession.state === 'running') {
+      e.preventDefault();
+      ws?.sendInput(activeSession.name, '\x1b');
+      return;
+    }
+
     // When @ picker is open, let it handle Enter/Arrow/Escape — don't send or navigate history
     // AtPicker registers a document-level capture handler that fires BEFORE this bubble handler.
     // AtPicker calls preventDefault + stopPropagation, so this code only runs if AtPicker didn't handle it.
