@@ -364,6 +364,7 @@
     "cross_session": "Incluir sesiones de otros proyectos",
     "settings_save": "Guardar",
     "settings_close": "Cerrar",
+    "confirm_cancel": "¿Seguro que desea cancelar?",
     "settings_enabled": "Participar",
     "settings_mode": "Modo",
     "settings_skip": "Omitir",

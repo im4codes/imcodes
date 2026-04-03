@@ -364,6 +364,7 @@
     "cross_session": "Включить сессии из других проектов",
     "settings_save": "Сохранить",
     "settings_close": "Закрыть",
+    "confirm_cancel": "Точно отменить?",
     "settings_enabled": "Участвовать",
     "settings_mode": "Режим",
     "settings_skip": "Пропустить",

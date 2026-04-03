@@ -111,8 +111,8 @@ export function P2pProgressCard({ discussion, compact = false, mobile = false, h
             const [confirming, setConfirming] = useState(false);
             useEffect(() => {
               if (!confirming) return;
-              const t = setTimeout(() => setConfirming(false), 3000);
-              return () => clearTimeout(t);
+              const timer = setTimeout(() => setConfirming(false), 3000);
+              return () => clearTimeout(timer);
             }, [confirming]);
             return confirming ? (
               <button
@@ -120,7 +120,7 @@ export function P2pProgressCard({ discussion, compact = false, mobile = false, h
                 style={{ padding: '2px 7px', fontSize: '10px', background: 'rgba(239,68,68,0.3)', borderColor: '#ef4444', color: '#f87171' }}
                 onClick={(e) => { e.stopPropagation(); onStopDiscussion(discussion.id); setConfirming(false); }}
               >
-                {t('common.confirm', 'Confirm')}
+                {t('p2p.confirm_cancel')}
               </button>
             ) : (
               <button

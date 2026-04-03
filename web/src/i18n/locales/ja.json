@@ -364,6 +364,7 @@
     "cross_session": "他のプロジェクトのセッションを含める",
     "settings_save": "保存",
     "settings_close": "閉じる",
+    "confirm_cancel": "キャンセルしますか?",
     "settings_enabled": "参加",
     "settings_mode": "モード",
     "settings_skip": "スキップ",

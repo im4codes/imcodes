@@ -364,6 +364,7 @@
     "cross_session": "包含其他專案的工作階段",
     "settings_save": "儲存",
     "settings_close": "關閉",
+    "confirm_cancel": "確定取消?",
     "settings_enabled": "參與",
     "settings_mode": "模式",
     "settings_skip": "跳過",

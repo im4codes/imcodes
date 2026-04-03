@@ -364,6 +364,7 @@
     "cross_session": "다른 프로젝트의 세션 포함",
     "settings_save": "저장",
     "settings_close": "닫기",
+    "confirm_cancel": "취소하시겠습니까?",
     "settings_enabled": "참여",
     "settings_mode": "모드",
     "settings_skip": "건너뛰기",
