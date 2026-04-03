@@ -40,6 +40,8 @@ export interface P2pMode {
   resultStyle: 'findings-first' | 'summary-first' | 'free-form';
   /** Max chars to carry from one hop's output into the next hop's context. */
   maxOutputChars: number;
+  /** Mode-specific instruction for the final summary. Replaces the generic "synthesize" instruction. */
+  summaryPrompt: string;
 }
 
 /** Shared baseline prompt for all P2P participants. */
@@ -60,6 +62,14 @@ export const BUILT_IN_MODES: P2pMode[] = [
     defaultTimeoutMs: 300_000,
     resultStyle: 'findings-first',
     maxOutputChars: 12_000,
+    summaryPrompt:
+      'Write a complete **Audit Report** that consolidates all findings across rounds. Structure it as:\n' +
+      '1. **Executive Summary** — one-paragraph overall risk assessment\n' +
+      '2. **Critical Findings** — security vulnerabilities and logic errors, each with: description, affected code location, severity (Critical/High/Medium/Low), exploitation scenario, and recommended fix\n' +
+      '3. **Additional Findings** — code quality issues, potential risks, and edge cases\n' +
+      '4. **Positive Observations** — things done well that should be preserved\n' +
+      '5. **Recommended Actions** — prioritized list of fixes with effort estimates\n' +
+      'Be specific: cite file paths, line numbers, and concrete code snippets for every finding.',
   },
   {
     key: 'review',
@@ -68,6 +78,14 @@ export const BUILT_IN_MODES: P2pMode[] = [
     defaultTimeoutMs: 300_000,
     resultStyle: 'findings-first',
     maxOutputChars: 12_000,
+    summaryPrompt:
+      'Write a complete **Code Review Report** that consolidates all feedback across rounds. Structure it as:\n' +
+      '1. **Summary** — overall code quality assessment and readiness verdict (approve / request changes / needs major rework)\n' +
+      '2. **Must Fix** — blocking issues that must be resolved: bugs, performance problems, security concerns, broken contracts\n' +
+      '3. **Should Fix** — non-blocking but important: naming, structure, missing error handling, test gaps\n' +
+      '4. **Consider** — optional improvements: refactoring opportunities, alternative approaches, documentation\n' +
+      '5. **Strengths** — well-designed aspects worth highlighting\n' +
+      'For each item: cite the specific file and code, explain the problem, and provide a concrete fix or code suggestion.',
   },
   {
     key: 'plan',
@@ -76,6 +94,17 @@ export const BUILT_IN_MODES: P2pMode[] = [
     defaultTimeoutMs: 300_000,
     resultStyle: 'findings-first',
     maxOutputChars: 12_000,
+    summaryPrompt:
+      'Write a complete **Implementation Plan** that synthesizes all discussion into an actionable blueprint. Structure it as:\n' +
+      '1. **Goal** — one-paragraph statement of what this plan achieves and why\n' +
+      '2. **Architecture Overview** — key components, data flow, and interfaces involved\n' +
+      '3. **Implementation Phases** — ordered list of phases, each with:\n' +
+      '   - Specific tasks with file paths and interface changes\n' +
+      '   - Dependencies (what must be done before this phase)\n' +
+      '   - Acceptance criteria (how to verify this phase is complete)\n' +
+      '4. **Risk Assessment** — identified risks with mitigation strategies\n' +
+      '5. **Open Questions** — unresolved decisions that need stakeholder input\n' +
+      'Be precise: name files, functions, types, and data structures. This plan should be directly executable by a developer.',
   },
   {
     key: 'brainstorm',
@@ -84,6 +113,13 @@ export const BUILT_IN_MODES: P2pMode[] = [
     defaultTimeoutMs: 300_000,
     resultStyle: 'free-form',
     maxOutputChars: 12_000,
+    summaryPrompt:
+      'Write a complete **Ideas & Approaches Summary** that organizes all ideas generated across rounds. Structure it as:\n' +
+      '1. **Top Recommendations** — the 3-5 strongest ideas, each with: description, key advantage, feasibility assessment, and rough effort estimate\n' +
+      '2. **Alternative Approaches** — other viable options grouped by theme, with pros/cons for each\n' +
+      '3. **Creative Angles** — unconventional ideas worth exploring further, even if not immediately actionable\n' +
+      '4. **Discarded Ideas** — approaches considered and rejected, with reasons (so they aren\'t revisited)\n' +
+      '5. **Suggested Next Steps** — concrete actions to evaluate or prototype the top recommendations',
   },
   {
     key: 'discuss',
@@ -92,6 +128,14 @@ export const BUILT_IN_MODES: P2pMode[] = [
     defaultTimeoutMs: 300_000,
     resultStyle: 'summary-first',
     maxOutputChars: 12_000,
+    summaryPrompt:
+      'Write a complete **Discussion Conclusion** that synthesizes all perspectives across rounds. Structure it as:\n' +
+      '1. **Consensus** — positions where all participants agreed, with supporting reasoning\n' +
+      '2. **Key Trade-offs** — the main trade-offs evaluated, with analysis of each option\n' +
+      '3. **Recommendation** — the recommended path forward with clear justification\n' +
+      '4. **Dissenting Views** — important disagreements that remain, with the strongest argument for each side\n' +
+      '5. **Decision Criteria** — what factors should drive the final decision if the recommendation is not accepted\n' +
+      '6. **Action Items** — concrete next steps to move forward',
   },
 ];
 
