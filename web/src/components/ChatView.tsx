@@ -124,13 +124,23 @@ function buildViewItems(events: TimelineEvent[]): ViewItem[] {
       e.type !== 'assistant.thinking',
   );
 
-  // Pre-pass: merge tool.call+tool.result pairs and dedup session.state
+  // Pre-pass: merge tool.call+tool.result pairs, dedup session.state,
+  // and dedup stable-eventId streaming events (keep last occurrence only)
   const consolidated: TimelineEvent[] = [];
   // Track tool.result eventIds that have been consumed by a preceding tool.call merge
   const consumedIds = new Set<string>();
 
+  // Dedup: for events sharing a stable eventId (streaming deltas), keep only the last
+  const lastByEventId = new Map<string, number>();
+  for (let i = 0; i < visible.length; i++) {
+    lastByEventId.set(visible[i].eventId, i);
+  }
+
   for (let i = 0; i < visible.length; i++) {
     const ev = visible[i];
+
+    // Skip earlier occurrences of duplicate eventIds (streaming delta updates — keep last only)
+    if (lastByEventId.get(ev.eventId) !== i) continue;
 
     // Skip already-consumed tool.result events
     if (consumedIds.has(ev.eventId)) continue;
