@@ -2349,6 +2349,7 @@ export function App() {
               <FloatingPanel id="filebrowser" title={`📁 ${trans('picker.files')}`} onClose={() => setShowDesktopFileBrowser(false)} onPin={() => pinPanel('filebrowser', { sessionName: activeSession, projectDir: activeSessionInfo?.projectDir, serverId: selectedServerId }, () => setShowDesktopFileBrowser(false))} pinTooltip={trans('sidebar.pin_to_sidebar')} defaultW={420} defaultH={500}>
                 <FileBrowser
                   ws={wsRef.current}
+                  serverId={selectedServerId}
                   mode="file-multi"
                   layout="panel"
                   initialPath={activeSessionInfo.projectDir ?? '~'}
@@ -2643,6 +2644,7 @@ export function App() {
           <FileBrowser
             key={previewFilePath}
             ws={wsRef.current}
+            serverId={selectedServerId ?? undefined}
             mode="file-single"
             layout="panel"
             initialPath={previewFilePath.replace(/\/[^/]+$/, '') || '~'}

@@ -75,6 +75,7 @@ registerPanelType('filebrowser', {
       <FileBrowser
         key={`${ctx.serverId}:${projectDir}`}
         ws={ctx.ws}
+        serverId={ctx.serverId}
         mode="file-multi"
         layout="panel"
         defaultTab="changes"

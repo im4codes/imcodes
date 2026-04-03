@@ -920,6 +920,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>
         <FileBrowser
           ws={ws}
+          serverId={serverId}
           mode="file-multi"
           layout="panel"
           initialPath={activeSession.projectDir ?? '~'}
