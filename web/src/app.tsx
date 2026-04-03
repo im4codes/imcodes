@@ -28,6 +28,7 @@ function mapP2pRunToDiscussion(r: Record<string, any>) {
   const totalCount = source.total_count ?? 3;
   const totalHops = source.total_hops ?? Math.max(0, totalCount - 2);
   const nodes = Array.isArray(source.all_nodes) ? source.all_nodes.map((n: any) => ({
+    session: typeof n.session === 'string' ? n.session : undefined,
     label: String(n.label ?? ''),
     displayLabel: String(n.displayLabel ?? n.display_label ?? n.label ?? ''),
     agentType: String(n.agentType ?? ''),
@@ -683,18 +684,10 @@ export function App() {
     fileId?: string;
   }>>([]);
 
-  /** Set of sub-session labels participating in active P2P discussions (running/setup). */
-  const p2pSessionLabels = useMemo(() => {
-    const labels = new Set<string>();
-    for (const d of discussions) {
-      if (d.state !== 'running' && d.state !== 'setup') continue;
-      if (!d.nodes) continue;
-      for (const n of d.nodes) {
-        if (n.label) labels.add(n.label);
-      }
-    }
-    return labels;
-  }, [discussions]);
+  /** Set of session names enabled in the P2P config for the active root session. */
+  const [p2pSessionNames, setP2pSessionNames] = useState<Set<string>>(new Set());
+  // Alias for components that receive this prop
+  const p2pSessionLabels = p2pSessionNames;
 
   const bringSubToFront = useCallback((id: string) => {
     setSubZIndexes((prev) => {
@@ -786,6 +779,28 @@ export function App() {
       void createSubSession('shell', shell);
     });
   }, [activeSession, connected, loadedServerId, selectedServerId, visibleSubSessions.length, createSubSession]);
+
+  // Load P2P config — determine which sessions are enabled for P2P tagging
+  useEffect(() => {
+    // Resolve root session: if active is a sub-session, find its parent
+    const activeSub = subSessions.find((s) => s.sessionName === activeSession);
+    const root = activeSub?.parentSession || activeSession || '';
+    if (!root) { setP2pSessionNames(new Set()); return; }
+    const configKey = `p2p_session_config:${root}`;
+    void getUserPref(configKey).then((raw) => {
+      if (!raw || typeof raw !== 'string') { setP2pSessionNames(new Set()); return; }
+      try {
+        const cfg = JSON.parse(raw) as { sessions?: Record<string, { enabled?: boolean; mode?: string }> };
+        const names = new Set<string>();
+        if (cfg.sessions) {
+          for (const [name, entry] of Object.entries(cfg.sessions)) {
+            if (entry.enabled && entry.mode !== 'skip') names.add(name);
+          }
+        }
+        setP2pSessionNames(names);
+      } catch { setP2pSessionNames(new Set()); }
+    });
+  }, [activeSession, subSessions]);
 
   const diffApplyersRef = useRef<Map<string, (diff: TerminalDiff) => void>>(new Map());
   const historyApplyersRef = useRef<Map<string, (content: string) => void>>(new Map());
@@ -2785,7 +2800,7 @@ export function App() {
               sessions={sessions}
               subSessions={subSessionsSlim}
               serverId={selectedServerId ?? undefined}
-              inP2p={!!(sub.label && p2pSessionLabels.has(sub.label))}
+              inP2p={p2pSessionLabels.has(sub.sessionName)}
               pendingPrefillText={pendingPrefills[sub.sessionName] ?? null}
               onPendingPrefillApplied={() => setPendingPrefills((prev) => {
                 if (!(sub.sessionName in prev)) return prev;
