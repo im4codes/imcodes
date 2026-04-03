@@ -93,6 +93,11 @@ function renderToken(
 
     case 'codespan': {
       const t = token as Tokens.Codespan;
+      // Detect file paths inside backtick code spans — agents commonly wrap paths in backticks
+      if (onPathClick && PATH_REGEX_INLINE.test(t.text)) {
+        PATH_REGEX_INLINE.lastIndex = 0;
+        return <code key={key} class="chat-inline-code chat-path-link" onClick={() => onPathClick(t.text)} title={t.text}>{t.text}</code>;
+      }
       return <code key={key} class="chat-inline-code">{t.text}</code>;
     }
 
