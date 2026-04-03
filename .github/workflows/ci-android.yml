@@ -3,7 +3,7 @@ name: Android CI
 on:
   workflow_dispatch:
   push:
-    branches: [dev]
+    branches: [dev, master]
 
 env:
   NODE_VERSION_PRIMARY: '22'
@@ -82,3 +82,28 @@ jobs:
           name: imcodes-android-release-apk
           path: web/android/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
+
+      - name: Get version info
+        id: version
+        run: |
+          VERSION=$(grep versionName web/android/app/build.gradle | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          COMMIT_SHORT=$(git rev-parse --short HEAD)
+          echo "tag=android-v${VERSION}-${COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
+          echo "name=Android v${VERSION} (${COMMIT_SHORT})" >> "$GITHUB_OUTPUT"
+
+      - name: Rename APK with version
+        run: |
+          APK=$(ls web/android/app/build/outputs/apk/release/*.apk | head -1)
+          cp "$APK" "imcodes-${{ steps.version.outputs.tag }}.apk"
+
+      - name: Create GitHub Release
+        if: github.ref == 'refs/heads/master'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.name }}
+          files: imcodes-*.apk
+          generate_release_notes: true
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
