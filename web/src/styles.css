@@ -525,7 +525,8 @@ body {
 .subcard-drag-wrap:active { cursor: grabbing; }
 
 /* Individual card */
-.subcard { width: 350px; height: 250px; min-width: 350px; background: #0f1117; border: 1px solid #334155; border-radius: 8px; overflow: hidden; cursor: pointer; transition: border-color 0.15s, box-shadow 0.15s; display: flex; flex-direction: column; }
+.subcard { width: 350px; height: 250px; min-width: 350px; background: #0f1117; border: 1px solid #334155; border-radius: 8px; cursor: pointer; transition: border-color 0.15s, box-shadow 0.15s; display: flex; flex-direction: column; }
+.subcard-header { border-radius: 8px 8px 0 0; overflow: hidden; }
 .subcard:hover { border-color: #475569; box-shadow: 0 2px 12px rgba(0,0,0,0.4); }
 .subcard-open { border-color: #334d6b; }
 @keyframes subcard-sci-fi { 0% { border-color: #334155; box-shadow: 0 0 4px #00e5ff22; } 40% { border-color: #00e5ff; box-shadow: 0 0 12px #00e5ff88, 0 0 24px #00e5ff33; } 70% { border-color: #818cf8; box-shadow: 0 0 12px #818cf888, 0 0 24px #818cf833; } 100% { border-color: #334155; box-shadow: 0 0 4px #00e5ff22; } }
@@ -561,7 +562,8 @@ body {
 .subcard-resize-handle::after { content: '⋮'; position: absolute; right: 8px; top: 50%; transform: translateY(-50%); font-size: 12px; color: #334155; pointer-events: none; line-height: 1; }
 .subcard-resize-handle:hover { background: rgba(59,130,246,0.4); }
 .subcard-resize-handle:hover::after { color: #60a5fa; }
-.subcard-input-area { flex-shrink: 0; border-top: 1px solid #1e293b; background: #0d1117; padding: 4px 6px; display: flex; flex-direction: column; gap: 3px; }
+.subcard-input-area { flex-shrink: 0; border-top: 1px solid #1e293b; background: #0d1117; padding: 4px 6px; display: flex; flex-direction: column; gap: 3px; border-radius: 0 0 8px 8px; }
+.subcard-input-area .menu-dropdown { z-index: 10000; }
 .subcard-shortcuts { display: flex; gap: 3px; }
 .subcard-shortcut-btn { background: #1a2233; border: 1px solid #334155; border-radius: 3px; color: #64748b; font-size: 10px; padding: 1px 5px; cursor: pointer; transition: all 0.12s; line-height: 1.4; }
 .subcard-shortcut-btn:hover { border-color: #475569; color: #94a3b8; }
