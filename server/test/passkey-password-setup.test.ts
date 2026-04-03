@@ -376,7 +376,7 @@ describe('passkey password setup', () => {
       headers: { ...authHeader, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         username: 'Alice.Set',
-        newPassword: 'strong-password-123',
+        newPassword: 'Strong-Pass-123',
         challengeId,
         response: { id: 'cred-user-passkey' },
       }),
@@ -390,7 +390,7 @@ describe('passkey password setup', () => {
     const loginRes = await app.request('/api/auth/password/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'alice.set', password: 'strong-password-123' }),
+      body: JSON.stringify({ username: 'alice.set', password: 'Strong-Pass-123' }),
     });
     expect(loginRes.status).toBe(200);
   });
@@ -404,7 +404,7 @@ describe('passkey password setup', () => {
       headers: { ...authHeader, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         username: 'takenname',
-        newPassword: 'strong-password-123',
+        newPassword: 'Strong-Pass-123',
         challengeId,
         response: { id: 'cred-user-passkey' },
       }),
@@ -423,7 +423,7 @@ describe('passkey password setup', () => {
       headers: { ...authHeader, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         username: 'bad name',
-        newPassword: 'strong-password-123',
+        newPassword: 'Strong-Pass-123',
         challengeId,
         response: { id: 'cred-user-passkey' },
       }),
@@ -446,7 +446,7 @@ describe('passkey password setup', () => {
       headers: { ...authHeader, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         username: 'alice-new',
-        newPassword: 'strong-password-123',
+        newPassword: 'Strong-Pass-123',
         challengeId,
         response: { id: 'cred-user-passkey' },
       }),
@@ -466,7 +466,7 @@ describe('passkey password setup', () => {
       headers: { ...authHeader, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         username: 'race-user',
-        newPassword: 'strong-password-123',
+        newPassword: 'Strong-Pass-123',
         challengeId,
         response: { id: 'cred-user-passkey' },
       }),
@@ -485,7 +485,7 @@ describe('passkey password setup', () => {
       headers: { ...authHeader, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         username: 'alice-new',
-        newPassword: 'strong-password-123',
+        newPassword: 'Strong-Pass-123',
         challengeId,
         response: { id: 'cred-user-other' },
       }),
@@ -504,7 +504,7 @@ describe('passkey password setup', () => {
       headers: { ...authHeader, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         username: 'alice-new',
-        newPassword: 'strong-password-123',
+        newPassword: 'Strong-Pass-123',
         challengeId,
         response: { id: 'missing-cred' },
       }),
@@ -520,7 +520,7 @@ describe('passkey password setup', () => {
       headers: { ...authHeader, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         username: 'alice-new',
-        newPassword: 'strong-password-123',
+        newPassword: 'Strong-Pass-123',
         challengeId: 'missing-challenge',
         response: { id: 'cred-user-passkey' },
       }),
@@ -541,7 +541,7 @@ describe('passkey password setup', () => {
       headers: { ...authHeader, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         username: 'alice-new',
-        newPassword: 'strong-password-123',
+        newPassword: 'Strong-Pass-123',
         challengeId: 'foreign-challenge',
         response: { id: 'cred-user-passkey' },
       }),
@@ -561,7 +561,7 @@ describe('passkey password setup', () => {
       headers: { ...authHeader, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         username: 'alice-new',
-        newPassword: 'strong-password-123',
+        newPassword: 'Strong-Pass-123',
         challengeId,
         response: { id: 'cred-user-passkey' },
       }),
@@ -581,7 +581,7 @@ describe('passkey password setup', () => {
       headers: { ...authHeader, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         username: 'alice-new',
-        newPassword: 'strong-password-123',
+        newPassword: 'Strong-Pass-123',
         challengeId,
         response: { id: 'cred-user-passkey' },
       }),
@@ -712,7 +712,7 @@ describe('passkey password setup', () => {
   });
 
   it('returns sanitized /me payload with username and has_password only', async () => {
-    const passwordHash = await hashPassword('strong-password-123');
+    const passwordHash = await hashPassword('Strong-Pass-123');
     const user = await db.queryOne<MemUser>('SELECT * FROM users WHERE id = $1', ['user-passkey']);
     if (!user) throw new Error('missing user');
     user.username = 'alice';

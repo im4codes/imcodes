@@ -510,6 +510,14 @@ passkeyRoutes.post('/password/setup', async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
   const { username, newPassword, challengeId, response } = parsed.data;
+
+  // Validate password complexity
+  const { validatePasswordComplexity } = await import('../../../shared/password-rules.js');
+  const complexity = validatePasswordComplexity(newPassword);
+  if (!complexity.valid) {
+    return c.json({ error: complexity.errorKey }, 400);
+  }
+
   const user = await getUserById(c.env.DB, userId);
   if (!user) return c.json({ error: 'user_not_found' }, 404);
   if (user.status !== 'active') {

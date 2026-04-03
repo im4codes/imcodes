@@ -472,6 +472,108 @@ authRoutes.delete('/user/me', async (c) => {
 
 // ── Password auth ─────────────────────────────────────────────────────────
 
+import { validatePasswordComplexity, USERNAME_REGEX } from '../../../shared/password-rules.js';
+
+// POST /api/auth/password/register — create a new user with username + password
+const passwordRegisterSchema = z.object({
+  username: z.string().min(3).max(32),
+  password: z.string().min(8),
+  displayName: z.string().max(100).optional(),
+  native: z.boolean().optional(),
+});
+
+authRoutes.post('/password/register', async (c) => {
+  // Check if registration is enabled
+  const regEnabled = await getSetting(c.env.DB, 'registration_enabled');
+  if (regEnabled === 'false') {
+    return c.json({ error: 'registration_disabled' }, 403);
+  }
+
+  const body = await c.req.json().catch(() => null);
+  const parsed = passwordRegisterSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+
+  const { username, password, displayName, native } = parsed.data;
+
+  // Validate password complexity
+  const complexity = validatePasswordComplexity(password);
+  if (!complexity.valid) {
+    return c.json({ error: complexity.errorKey }, 400);
+  }
+
+  // Validate username format
+  const normalizedUsername = username.trim().toLowerCase();
+  if (!USERNAME_REGEX.test(normalizedUsername)) {
+    return c.json({ error: 'invalid_username_format' }, 400);
+  }
+
+  // Check username availability
+  const existingUser = await getUserByUsername(c.env.DB, normalizedUsername);
+  if (existingUser) {
+    return c.json({ error: 'username_taken' }, 409);
+  }
+
+  // Create user
+  const userId = randomHex(16);
+  await createUser(c.env.DB, userId);
+
+  // Set username, password, display name
+  const passwordHash = await hashPassword(password);
+  const now = Date.now();
+  await c.env.DB.execute(
+    'UPDATE users SET username = $1, password_hash = $2, display_name = $3 WHERE id = $4',
+    [normalizedUsername, passwordHash, displayName?.trim() || normalizedUsername, userId],
+  );
+
+  // Set status to pending if approval is required
+  const requireApproval = await getSetting(c.env.DB, 'require_approval');
+  if (requireApproval === 'true') {
+    await updateUserStatus(c.env.DB, userId, 'pending');
+  }
+
+  // Issue session
+  const isSecure = (c.req.header('x-forwarded-proto') ?? c.req.url).includes('https');
+  const accessToken = signJwt({ sub: userId, type: 'web' }, c.env.JWT_SIGNING_KEY, 4 * 3600);
+  const refreshRaw = randomHex(32);
+  const refreshHash = sha256Hex(refreshRaw);
+  await c.env.DB.execute(
+    'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
+    [randomHex(16), userId, refreshHash, randomHex(16), now + 30 * 86400000, now],
+  );
+
+  setCookie(c, COOKIE_SESSION, accessToken, {
+    httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 15 * 60,
+  });
+  setCookie(c, 'rcc_refresh', refreshRaw, {
+    httpOnly: true, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400,
+  });
+  setCookie(c, COOKIE_CSRF, randomHex(16), {
+    httpOnly: false, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400,
+  });
+
+  const ip = c.get('clientIp' as never) as string ?? 'unknown';
+  await logAudit({ userId, action: 'auth.password_register', ip }, c.env.DB);
+
+  // Native apps need API key
+  let apiKey: string | undefined;
+  let keyId: string | undefined;
+  if (native) {
+    keyId = randomHex(16);
+    const rawKey = `deck_${randomHex(32)}`;
+    const keyHash = sha256Hex(rawKey);
+    await c.env.DB.execute(
+      'INSERT INTO api_keys (id, user_id, key_hash, label, created_at) VALUES ($1, $2, $3, $4, $5)',
+      [keyId, userId, keyHash, 'native-password-register', now],
+    );
+    apiKey = rawKey;
+  }
+
+  return c.json({
+    ok: true,
+    ...(native ? { apiKey, keyId, userId } : {}),
+  });
+});
+
 // POST /api/auth/password/login — authenticate with username + password
 const passwordLoginSchema = z.object({
   username: z.string().min(1),
@@ -612,6 +714,12 @@ authRoutes.post('/password/change', async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
   const { oldPassword, newPassword } = parsed.data;
+
+  // Validate password complexity
+  const complexity = validatePasswordComplexity(newPassword);
+  if (!complexity.valid) {
+    return c.json({ error: complexity.errorKey }, 400);
+  }
 
   const user = await getUserById(c.env.DB, userId);
   if (!user || !user.password_hash) return c.json({ error: 'no_password_set' }, 400);

@@ -2,7 +2,7 @@
 
 **The IM for agents.**
 
-A specialized instant messenger for AI agents. Keep long-running coding-agent sessions within reach from mobile or web, with terminal access, file browsing, git views, localhost preview, notifications, and multi-agent workflows built in. Works with [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), and more.
+A specialized instant messenger for AI agents. Keep long-running coding-agent sessions within reach from mobile or web, with terminal access, file browsing, git views, localhost preview, notifications, and multi-agent workflows built in. Works with [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — including native streaming output for transport-backed agents.
 
 > **Disclaimer:** This is an actively developed personal open-source project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk. Breaking changes may happen at any time without notice.
 
@@ -76,9 +76,9 @@ Full mobile support with biometric auth and push notifications. Shell sessions a
 
 Single-model output shouldn't be trusted blindly. Spawn quick discussion rounds where multiple agents — across different providers — review, audit, or brainstorm on the same topic. Each agent reads prior contributions and adds their own. Modes include `discuss`, `audit`, `review`, and `brainstorm`. Ring progress indicator shows round/hop completion in the sidebar. Works across Claude Code, Codex, and Gemini CLI, including sandboxed agents.
 
-### OpenClaw Integration
+### Streaming Transport Agents
 
-[IM.codes](https://im.codes) is a mobile/web companion for [OpenClaw](https://openclaw.com), not a replacement. It keeps your OpenClaw sessions within reach from phone or browser, with terminal access, file browsing, git views, notifications, and localhost preview built in.
+Native streaming output support for transport-backed agents like [OpenClaw](https://openclaw.com) and [Qwen](https://github.com/QwenLM/qwen-agent). These agents connect via network protocols (WebSocket or local SDK) instead of terminal scraping, delivering structured event streams with real-time delta updates, tool call tracking, and session restore.
 
 ### Agent-to-Agent Communication
 
@@ -158,7 +158,7 @@ Daemon self-upgrades via npm. Trigger from the web UI for one device or all devi
 - Not another AI IDE
 - Not just a chat wrapper
 - Not just a remote terminal client
-- Not a replacement for Claude Code, Codex, Gemini CLI, or OpenClaw
+- Not a replacement for Claude Code, Codex, Gemini CLI, OpenClaw, or Qwen
 - It is the messaging/control layer around them
 
 ## Architecture
@@ -233,7 +233,11 @@ Login at `https://your-domain` with `admin` and the printed password. Bind your 
 - **Windows (experimental)**: Native support via [ConPTY](https://devblogs.microsoft.com/commandline/windows-command-line-introducing-the-windows-pseudo-console-conpty/) (built-in on Windows 10+). Just `npm install -g imcodes` — no extra software needed. WSL also works.
 - Node.js >= 20
 - Terminal multiplexer: [tmux](https://github.com/tmux/tmux) (Linux/macOS). Windows uses ConPTY (auto-detected, built-in).
-- At least one AI coding agent: [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), or [OpenClaw](https://openclaw.com)
+- At least one AI coding agent: [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), or [Qwen](https://github.com/QwenLM/qwen-agent)
+
+## Disclaimer
+
+IM.codes is an independent open-source project and is not affiliated with, endorsed by, or sponsored by Anthropic, OpenAI, Google, Alibaba, OpenClaw, or any other company whose products are mentioned. All product names, trademarks, and registered trademarks are the property of their respective owners.
 
 ## License
 

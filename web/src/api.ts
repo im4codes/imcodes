@@ -666,6 +666,13 @@ export async function passkeyLoginCompleteNative(
   });
 }
 
+export async function passwordRegister(username: string, password: string, displayName?: string, native?: boolean): Promise<{ ok: boolean; apiKey?: string; keyId?: string; userId?: string }> {
+  return apiFetch('/api/auth/password/register', {
+    method: 'POST',
+    body: JSON.stringify({ username, password, ...(displayName ? { displayName } : {}), ...(native ? { native: true } : {}) }),
+  });
+}
+
 export async function passwordLogin(username: string, password: string, native?: boolean): Promise<{ ok: boolean; passwordMustChange?: boolean; apiKey?: string; keyId?: string; userId?: string }> {
   return apiFetch('/api/auth/password/login', {
     method: 'POST',

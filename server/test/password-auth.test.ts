@@ -64,6 +64,13 @@ function makeMemDb(): Database {
       if (s.includes('count(*) as cnt from users')) {
         return { cnt: users.size } as T;
       }
+      if (s.includes('from settings where key')) {
+        // registration_enabled=true, require_approval=false by default
+        const key = params[0] as string;
+        if (key === 'registration_enabled') return { value: 'true' } as T;
+        if (key === 'require_approval') return { value: 'false' } as T;
+        return null;
+      }
       return null;
     },
     query: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T[]> => {
@@ -127,6 +134,18 @@ function makeMemDb(): Database {
           user.password_hash = params[0] as string;
           user.password_must_change = false;
         }
+      }
+      if (s.includes('update users set username') && s.includes('password_hash') && s.includes('display_name')) {
+        const user = users.get(params[3] as string);
+        if (user) {
+          user.username = params[0] as string;
+          user.password_hash = params[1] as string;
+          user.display_name = params[2] as string;
+        }
+      }
+      if (s.includes('update users set status')) {
+        const user = users.get(params[1] as string);
+        if (user) user.status = params[0] as MemUser['status'];
       }
       if (s.includes('delete from users where id')) {
         users.delete(params[0] as string);
@@ -258,7 +277,7 @@ describe('Password authentication', () => {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${accessToken}`,
       },
-      body: JSON.stringify({ oldPassword: 'imcodes', newPassword: 'newpassword123' }),
+      body: JSON.stringify({ oldPassword: 'imcodes', newPassword: 'NewPass123' }),
     });
     expect(changeRes.status).toBe(200);
     const body = await changeRes.json() as { ok: boolean };
@@ -268,7 +287,7 @@ describe('Password authentication', () => {
     const res2 = await app.request('/api/auth/password/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'admin', password: 'newpassword123' }),
+      body: JSON.stringify({ username: 'admin', password: 'NewPass123' }),
     });
     expect(res2.status).toBe(200);
   });
@@ -287,7 +306,7 @@ describe('Password authentication', () => {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${accessToken}`,
       },
-      body: JSON.stringify({ oldPassword: 'wrongold', newPassword: 'newpassword123' }),
+      body: JSON.stringify({ oldPassword: 'wrongold', newPassword: 'NewPass123' }),
     });
     expect(changeRes.status).toBe(401);
   });
@@ -296,7 +315,7 @@ describe('Password authentication', () => {
     const res = await app.request('/api/auth/password/change', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ oldPassword: 'imcodes', newPassword: 'newpassword123' }),
+      body: JSON.stringify({ oldPassword: 'imcodes', newPassword: 'NewPass123' }),
     });
     expect(res.status).toBe(401);
   });
@@ -330,7 +349,7 @@ describe('Account deletion', () => {
     db = makeMemDb();
     env = makeEnv(db);
     app = buildApp(env);
-    await seedPasswordUser(db, 'user-del', 'delme', 'password123');
+    await seedPasswordUser(db, 'user-del', 'delme', 'Password123');
   });
 
   it('deletes account with valid auth', async () => {
@@ -338,7 +357,7 @@ describe('Account deletion', () => {
     const loginRes = await app.request('/api/auth/password/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'delme', password: 'password123' }),
+      body: JSON.stringify({ username: 'delme', password: 'Password123' }),
     });
     expect(loginRes.status).toBe(200);
     const { accessToken } = await loginRes.json() as { accessToken: string };
@@ -356,7 +375,7 @@ describe('Account deletion', () => {
     const loginRes2 = await app.request('/api/auth/password/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'delme', password: 'password123' }),
+      body: JSON.stringify({ username: 'delme', password: 'Password123' }),
     });
     expect(loginRes2.status).toBe(401);
   });
@@ -366,5 +385,156 @@ describe('Account deletion', () => {
       method: 'DELETE',
     });
     expect(res.status).toBe(401);
+  });
+});
+
+describe('Password registration', () => {
+  let db: Database;
+  let app: ReturnType<typeof buildApp>;
+  let env: Env;
+
+  beforeEach(async () => {
+    db = makeMemDb();
+    env = makeEnv(db);
+    app = buildApp(env);
+  });
+
+  it('registers a new user with username and password', async () => {
+    const res = await app.request('/api/auth/password/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'alice', password: 'Alice123!', displayName: 'Alice' }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { ok: boolean };
+    expect(body.ok).toBe(true);
+
+    // Verify login works with the registered credentials
+    const loginRes = await app.request('/api/auth/password/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'alice', password: 'Alice123!' }),
+    });
+    expect(loginRes.status).toBe(200);
+  });
+
+  it('rejects duplicate username', async () => {
+    // First registration
+    await app.request('/api/auth/password/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'bob', password: 'Bob12345', displayName: 'Bob' }),
+    });
+
+    // Duplicate
+    const res = await app.request('/api/auth/password/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'bob', password: 'Bob12345', displayName: 'Bob2' }),
+    });
+    expect(res.status).toBe(409);
+    const body = await res.json() as { error: string };
+    expect(body.error).toBe('username_taken');
+  });
+
+  it('rejects invalid username format', async () => {
+    const res = await app.request('/api/auth/password/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: '.bad', password: 'Alice123!' }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json() as { error: string };
+    expect(body.error).toBe('invalid_username_format');
+  });
+
+  it('returns native API key when native=true', async () => {
+    const res = await app.request('/api/auth/password/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'native1', password: 'Native123', native: true }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { ok: boolean; apiKey: string; keyId: string; userId: string };
+    expect(body.ok).toBe(true);
+    expect(body.apiKey).toBeTruthy();
+    expect(body.keyId).toBeTruthy();
+    expect(body.userId).toBeTruthy();
+  });
+});
+
+describe('Password complexity enforcement', () => {
+  let db: Database;
+  let app: ReturnType<typeof buildApp>;
+  let env: Env;
+
+  beforeEach(async () => {
+    db = makeMemDb();
+    env = makeEnv(db);
+    app = buildApp(env);
+    await seedPasswordUser(db, 'user1', 'admin', 'imcodes', true);
+  });
+
+  it('rejects registration without uppercase', async () => {
+    const res = await app.request('/api/auth/password/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'test1', password: 'alllower1' }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json() as { error: string };
+    expect(body.error).toBe('password_missing_uppercase');
+  });
+
+  it('rejects registration without lowercase', async () => {
+    const res = await app.request('/api/auth/password/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'test2', password: 'ALLUPPER1' }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json() as { error: string };
+    expect(body.error).toBe('password_missing_lowercase');
+  });
+
+  it('rejects registration without digit', async () => {
+    const res = await app.request('/api/auth/password/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'test3', password: 'NoDigitHere' }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json() as { error: string };
+    expect(body.error).toBe('password_missing_digit');
+  });
+
+  it('rejects password change without uppercase', async () => {
+    const loginRes = await app.request('/api/auth/password/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'imcodes' }),
+    });
+    const { accessToken } = await loginRes.json() as { accessToken: string };
+
+    const changeRes = await app.request('/api/auth/password/change', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({ oldPassword: 'imcodes', newPassword: 'alllower1' }),
+    });
+    expect(changeRes.status).toBe(400);
+    const body = await changeRes.json() as { error: string };
+    expect(body.error).toBe('password_missing_uppercase');
+  });
+
+  it('accepts password with all complexity requirements met', async () => {
+    const res = await app.request('/api/auth/password/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'good1', password: 'GoodPass1' }),
+    });
+    expect(res.status).toBe(200);
   });
 });

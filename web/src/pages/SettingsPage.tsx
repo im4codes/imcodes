@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { startAuthentication } from '@simplewebauthn/browser';
 import { ApiError, passwordChange, passkeyVerifyBegin, passwordSetupWithPasskey, updateDisplayName } from '../api.js';
 import { isNative } from '../native.js';
+import { validatePasswordComplexity } from '@shared/password-rules.js';
 
 interface Props {
   displayName: string | null;
@@ -126,8 +127,9 @@ export function SettingsPage({ displayName, username, hasPassword, serverUrl, on
       setSetupMsg({ type: 'err', text: t('settings.passwords_mismatch') });
       return;
     }
-    if (setupPassword.length < 8) {
-      setSetupMsg({ type: 'err', text: t('settings.password_too_short') });
+    const complexity = validatePasswordComplexity(setupPassword);
+    if (!complexity.valid) {
+      setSetupMsg({ type: 'err', text: t(`settings.${complexity.errorKey}`) });
       return;
     }
     setSetupSaving(true);
@@ -159,8 +161,9 @@ export function SettingsPage({ displayName, username, hasPassword, serverUrl, on
       setPwMsg({ type: 'err', text: t('settings.passwords_mismatch') });
       return;
     }
-    if (newPw.length < 8) {
-      setPwMsg({ type: 'err', text: t('settings.password_too_short') });
+    const complexity = validatePasswordComplexity(newPw);
+    if (!complexity.valid) {
+      setPwMsg({ type: 'err', text: t(`settings.${complexity.errorKey}`) });
       return;
     }
     setPwSaving(true);

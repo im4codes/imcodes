@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { startRegistration, startAuthentication } from '@simplewebauthn/browser';
-import { passkeyLoginBegin, passkeyLoginComplete, passkeyRegisterBegin, passkeyRegisterComplete, passwordLogin, passwordChange } from '../api.js';
+import { passkeyLoginBegin, passkeyLoginComplete, passkeyRegisterBegin, passkeyRegisterComplete, passwordLogin, passwordChange, passwordRegister } from '../api.js';
 import { isNative } from '../native.js';
+import { validatePasswordComplexity } from '@shared/password-rules.js';
 
 interface Props {
   onLogin?: () => void;
@@ -13,7 +14,7 @@ interface Props {
 
 export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }: Props) {
   const { t } = useTranslation();
-  const [mode, setMode] = useState<'buttons' | 'register' | 'password' | 'change_password'>('buttons');
+  const [mode, setMode] = useState<'buttons' | 'register' | 'password' | 'password_register' | 'change_password'>('buttons');
   const [displayName, setDisplayName] = useState('');
   const [deviceName, setDeviceName] = useState('');
   const [username, setUsername] = useState('');
@@ -152,13 +153,61 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
     }
   };
 
+  const handlePasswordRegister = async () => {
+    if (!username.trim() || !password) return;
+    if (password !== confirmPassword) {
+      setError(t('login.passwords_mismatch'));
+      return;
+    }
+    const complexity = validatePasswordComplexity(password);
+    if (!complexity.valid) {
+      setError(t(`login.${complexity.errorKey}`));
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      const native = isNative();
+      const res = await passwordRegister(username.trim(), password, displayName.trim() || undefined, native);
+      if (native && res.apiKey && res.userId && res.keyId) {
+        const { configureApiKey } = await import('../api.js');
+        const { storeAuthKey } = await import('../biometric-auth.js');
+        const { Preferences } = await import('@capacitor/preferences');
+        await storeAuthKey(res.apiKey);
+        configureApiKey(res.apiKey);
+        await Preferences.set({ key: 'deck_api_key_id', value: res.keyId });
+        onLoginSuccess?.(res.userId, serverUrl!);
+      } else {
+        onLogin?.();
+        window.location.reload();
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('username_taken')) {
+        setError(t('login.username_taken'));
+      } else if (msg.includes('registration_disabled')) {
+        setError(t('login.registration_disabled'));
+      } else if (msg.includes('invalid_username_format')) {
+        setError(t('login.invalid_username_format'));
+      } else if (msg.includes('password_missing_')) {
+        const key = msg.match(/password_missing_\w+/)?.[0];
+        setError(key ? t(`login.${key}`) : msg);
+      } else {
+        setError(msg);
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleChangePassword = async () => {
     if (!newPassword || newPassword !== confirmPassword) {
       setError(t('login.passwords_mismatch'));
       return;
     }
-    if (newPassword.length < 8) {
-      setError(t('login.password_too_short'));
+    const complexity = validatePasswordComplexity(newPassword);
+    if (!complexity.valid) {
+      setError(t(`login.${complexity.errorKey}`));
       return;
     }
     setLoading(true);
@@ -290,8 +339,76 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
             </button>
             <button
               class="btn btn-ghost"
+              style={{ width: '100%', marginBottom: 10 }}
+              onClick={() => { setMode('password_register'); setError(null); setPassword(''); setConfirmPassword(''); }}
+              disabled={loading}
+            >
+              {t('login.password_register')}
+            </button>
+            <button
+              class="btn btn-ghost"
               style={{ width: '100%' }}
               onClick={() => { setMode('buttons'); setError(null); }}
+              disabled={loading}
+            >
+              {t('common.cancel')}
+            </button>
+          </>
+        )}
+
+        {mode === 'password_register' && (
+          <>
+            <p style={{ color: '#94a3b8', fontSize: 13, marginBottom: 16 }}>
+              {t('login.password_register_hint')}
+            </p>
+            <input
+              class="input"
+              style={{ width: '100%', marginBottom: 10, boxSizing: 'border-box' }}
+              type="text"
+              placeholder={t('login.display_name_placeholder')}
+              value={displayName}
+              onInput={(e) => setDisplayName((e.target as HTMLInputElement).value)}
+              maxLength={100}
+              autoFocus
+            />
+            <input
+              class="input"
+              style={{ width: '100%', marginBottom: 10, boxSizing: 'border-box' }}
+              type="text"
+              placeholder={t('login.username_placeholder')}
+              value={username}
+              onInput={(e) => setUsername((e.target as HTMLInputElement).value)}
+              maxLength={32}
+            />
+            <input
+              class="input"
+              style={{ width: '100%', marginBottom: 10, boxSizing: 'border-box' }}
+              type="password"
+              placeholder={t('login.password_placeholder')}
+              value={password}
+              onInput={(e) => setPassword((e.target as HTMLInputElement).value)}
+            />
+            <input
+              class="input"
+              style={{ width: '100%', marginBottom: 16, boxSizing: 'border-box' }}
+              type="password"
+              placeholder={t('login.confirm_password_placeholder')}
+              value={confirmPassword}
+              onInput={(e) => setConfirmPassword((e.target as HTMLInputElement).value)}
+              onKeyDown={(e) => e.key === 'Enter' && handlePasswordRegister()}
+            />
+            <button
+              class="btn btn-primary"
+              style={{ width: '100%', marginBottom: 10 }}
+              onClick={handlePasswordRegister}
+              disabled={loading || !username.trim() || !password || !confirmPassword}
+            >
+              {loading ? t('common.loading') : t('login.password_register_btn')}
+            </button>
+            <button
+              class="btn btn-ghost"
+              style={{ width: '100%' }}
+              onClick={() => { setMode('password'); setError(null); }}
               disabled={loading}
             >
               {t('common.cancel')}

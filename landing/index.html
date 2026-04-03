@@ -281,7 +281,7 @@ footer {
     <li data-i18n="not_1">Not another AI IDE</li>
     <li data-i18n="not_2">Not just a chat wrapper</li>
     <li data-i18n="not_3">Not just a remote terminal client</li>
-    <li data-i18n="not_4">Not a replacement for Claude Code, Codex, Gemini CLI, or OpenClaw</li>
+    <li data-i18n="not_4">Not a replacement for Claude Code, Codex, Gemini CLI, OpenClaw, or Qwen</li>
     <li data-i18n="not_5">It is the messaging/control layer around them</li>
   </ul>
 </section>
@@ -294,7 +294,7 @@ footer {
     <div class="feat"><div class="feat-name" data-i18n="f_preview_name">local web preview</div><div class="feat-desc" data-i18n="f_preview_desc">preview localhost from any device via secure tunnel, supports HMR</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_mobile_name">mobile & notifications</div><div class="feat-desc" data-i18n="f_mobile_desc">biometric auth, push notifications, shell keyboard input</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_discuss_name">multi-agent discussions</div><div class="feat-desc" data-i18n="f_discuss_desc">discuss, audit, review across providers with ring progress</div></div>
-    <div class="feat"><div class="feat-name" data-i18n="f_openclaw_name">OpenClaw support</div><div class="feat-desc" data-i18n="f_openclaw_desc">mobile/web companion for OpenClaw — terminal, files, git, notifications, localhost preview</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_streaming_name">streaming transport agents</div><div class="feat-desc" data-i18n="f_streaming_desc">native streaming for OpenClaw & Qwen — real-time delta updates, tool tracking, session restore</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_chat_name">terminal + chat</div><div class="feat-desc" data-i18n="f_chat_desc">raw CLI or structured view with parsed tool calls</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_sidebar_name">Discord-style sidebar</div><div class="feat-desc" data-i18n="f_sidebar_desc">server icons, session tree, unread badges, idle flash</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_picker_name">@ picker</div><div class="feat-desc" data-i18n="f_picker_desc">@files, @@agents, @@all(config) for group dispatch</div></div>
@@ -319,7 +319,7 @@ footer {
  <span class="arrow">│</span> <span class="proto">WebSocket</span>
 <span class="label">Daemon</span> <span class="arrow">(your machine, manages sessions)</span>
  <span class="arrow">│</span> <span class="proto">tmux</span>
-<span class="label">Agents</span> <span class="arrow">(Claude Code / Codex / Gemini CLI / OpenClaw and more)</span></div>
+<span class="label">Agents</span> <span class="arrow">(Claude Code / Codex / Gemini CLI / OpenClaw / Qwen and more)</span></div>
   <p style="color:var(--dim); font-size:13px; margin-top:12px;" data-i18n="arch_desc">The daemon runs on your dev machine and manages agent sessions through tmux. The server relays connections between your devices and the daemon. Everything stays on your infrastructure.</p>
 </section>
 
@@ -371,6 +371,7 @@ docker compose up -d</div>
     <a class="agent-tag" href="https://github.com/openai/codex">Codex</a>
     <a class="agent-tag" href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>
     <a class="agent-tag" href="https://openclaw.com">OpenClaw</a>
+    <a class="agent-tag" href="https://github.com/QwenLM/qwen-agent">Qwen</a>
     <span class="agent-tag">Shell</span>
     <span class="agent-tag" style="color:var(--dim);border-style:dashed">+ more</span>
   </div>
@@ -393,6 +394,12 @@ docker compose up -d</div>
     with contributions from
     <a href="https://github.com/openai/codex">Codex</a> and
     <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>.
+  </p>
+</section>
+
+<section>
+  <p style="color:var(--dim); font-size:11px; line-height:1.6;" data-i18n="disclaimer">
+    IM.codes is an independent open-source project and is not affiliated with, endorsed by, or sponsored by Anthropic, OpenAI, Google, Alibaba, OpenClaw, or any other company whose products are mentioned. All product names, trademarks, and registered trademarks are the property of their respective owners.
   </p>
 </section>
 
