@@ -229,7 +229,7 @@ docker compose up -d
 
 Login at `https://your-domain` with `admin` and the printed password. Bind your dev machine with `imcodes bind`.
 
-## Windows
+## Windows (experimental)
 
 Windows is natively supported via [ConPTY](https://devblogs.microsoft.com/commandline/windows-command-line-introducing-the-windows-pseudo-console-conpty/) (built-in on Windows 10+). No WSL required.
 
@@ -281,7 +281,7 @@ Check the daemon watchdog log for errors:
 ## Requirements
 
 - macOS or Linux (tested on both)
-- **Windows**: Native support via ConPTY (built-in on Windows 10+). Just `npm install -g imcodes` — no extra software needed. WSL also works.
+- **Windows (experimental)**: Native support via ConPTY (built-in on Windows 10+). Just `npm install -g imcodes` — no extra software needed. WSL also works.
 - Node.js >= 20
 - Terminal multiplexer: [tmux](https://github.com/tmux/tmux) (Linux/macOS). Windows uses ConPTY (auto-detected, built-in).
 - At least one AI coding agent: [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), or [Qwen](https://github.com/QwenLM/qwen-agent)
