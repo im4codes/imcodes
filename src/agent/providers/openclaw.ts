@@ -161,6 +161,26 @@ export class OpenClawProvider implements TransportProvider {
     }
   }
 
+  async cancel(sessionId: string): Promise<void> {
+    const ocKey = unsanitizeKey(sessionId);
+    try {
+      await this.rpc('sessions.send', {
+        key: ocKey,
+        message: '/stop',
+        thinking: 'off',
+        idempotencyKey: randomUUID(),
+      });
+    } catch {
+      await this.rpc('agent', {
+        sessionKey: ocKey,
+        message: '/stop',
+        agentId: this.agentId,
+        thinking: 'off',
+        idempotencyKey: randomUUID(),
+      });
+    }
+  }
+
   onDelta(cb: (sessionId: string, delta: MessageDelta) => void): () => void {
     this.deltaCallbacks.push(cb);
     return () => { const i = this.deltaCallbacks.indexOf(cb); if (i >= 0) this.deltaCallbacks.splice(i, 1); };

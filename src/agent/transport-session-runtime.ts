@@ -47,7 +47,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       }),
       this.provider.onError((sid: string, error: ProviderError) => {
         if (sid !== this._providerSessionId) return;
-        this._status = 'error';
+        this._status = error.code === 'CANCELLED' ? 'idle' : 'error';
         this._sending = false;
         this._activeTurn?.reject(error);
         this._activeTurn = null;
@@ -128,6 +128,14 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._activeTurn = null;
       throw err;
     }
+  }
+
+  async cancel(): Promise<void> {
+    if (!this._providerSessionId) {
+      throw new Error('TransportSessionRuntime not initialized — call initialize() first');
+    }
+    if (!this.provider.cancel) return;
+    await this.provider.cancel(this._providerSessionId);
   }
 
   getStatus(): AgentStatus {

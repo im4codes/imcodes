@@ -1097,6 +1097,16 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   if (transportRuntime) {
     const release = await getMutex(sessionName).acquire();
     try {
+      if (text.trim() === '/stop') {
+        timelineEmitter.emit(sessionName, 'user.message', { text });
+        await transportRuntime.cancel();
+        const stopStatus = isLegacy ? 'accepted_legacy' : 'accepted';
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: stopStatus });
+        try {
+          serverLink.send({ type: 'command.ack', commandId: effectiveId, status: stopStatus, session: sessionName });
+        } catch { /* */ }
+        return;
+      }
       if (record?.agentType === 'qwen') {
         const modelMatch = text.trim().match(/^\/model\s+(\S+)\s*$/);
         if (modelMatch) {
@@ -1239,8 +1249,18 @@ async function handleInput(cmd: Record<string, unknown>): Promise<void> {
   // session.input SHALL NOT require or process commandId
   if (!sessionName || data === undefined) return;
 
-  // Transport sessions have no terminal — raw key input is not applicable.
-  if (getTransportRuntime(sessionName)) return;
+  // Transport sessions have no terminal, but ESC should cancel the active turn.
+  const transportRuntime = getTransportRuntime(sessionName);
+  if (transportRuntime) {
+    if (data === '\x1b') {
+      try {
+        await transportRuntime.cancel();
+      } catch (err) {
+        logger.error({ sessionName, err }, 'session.input transport cancel failed');
+      }
+    }
+    return;
+  }
 
   // Serialized via same per-session mutex (no commandId, no retry)
   const release = await getMutex(sessionName).acquire();

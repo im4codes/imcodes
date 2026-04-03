@@ -193,6 +193,23 @@ describe('QwenProvider', () => {
     expect(errors).toEqual(['bad request']);
   });
 
+  it('cancel() terminates the child and emits a cancelled error', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-cancel', cwd: '/tmp/project' });
+
+    const errors: Array<{ code: string; message: string }> = [];
+    provider.onError((_sid, err) => errors.push({ code: err.code, message: err.message }));
+
+    await provider.send('sess-cancel', 'cancel me');
+    const run = lastSpawn();
+    await provider.cancel?.('sess-cancel');
+    await flushIO();
+
+    expect(run.child.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(errors).toEqual([{ code: 'CANCELLED', message: 'Cancelled' }]);
+  });
+
   it('emits tool.call and tool.result events for qwen tool blocks', async () => {
     const provider = new QwenProvider();
     await provider.connect({});
