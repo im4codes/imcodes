@@ -201,6 +201,12 @@ export interface TransportProvider {
   send(sessionId: string, message: string, attachments?: unknown[], extraSystemPrompt?: string): Promise<void>;
 
   /**
+   * Best-effort cancellation of the current in-flight turn for a session.
+   * Providers that support interruption should implement this.
+   */
+  cancel?(sessionId: string): Promise<void>;
+
+  /**
    * Register a callback to receive incremental output deltas while the agent is streaming.
    * Only meaningful when capabilities.streaming is true.
    * @returns Unsubscribe function that removes the callback.

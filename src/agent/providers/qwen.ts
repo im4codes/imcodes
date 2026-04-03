@@ -31,6 +31,7 @@ interface QwenSessionState {
   currentText: string;
   pendingFinalText?: string;
   pendingFinalMetadata?: Record<string, unknown>;
+  cancelled?: boolean;
   toolUseByIndex: Map<number, { id: string; name: string; input?: unknown; partialJson: string }>;
   toolUseById: Map<string, { id: string; name: string; input?: unknown; partialJson: string }>;
   emittedToolSignatures: Map<string, string>;
@@ -172,6 +173,7 @@ export class QwenProvider implements TransportProvider {
       currentText: existing?.currentText ?? '',
       pendingFinalText: existing?.pendingFinalText,
       pendingFinalMetadata: existing?.pendingFinalMetadata,
+      cancelled: existing?.cancelled ?? false,
       toolUseByIndex: existing?.toolUseByIndex ?? new Map(),
       toolUseById: existing?.toolUseById ?? new Map(),
       emittedToolSignatures: existing?.emittedToolSignatures ?? new Map(),
@@ -227,7 +229,7 @@ export class QwenProvider implements TransportProvider {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Qwen provider not connected', false);
     }
 
-    const state = this.sessions.get(sessionId) ?? {
+    const state: QwenSessionState = this.sessions.get(sessionId) ?? {
       cwd: process.cwd(),
       started: true,
       description: undefined,
@@ -237,6 +239,7 @@ export class QwenProvider implements TransportProvider {
       currentText: '',
       pendingFinalText: undefined,
       pendingFinalMetadata: undefined,
+      cancelled: false,
       toolUseByIndex: new Map(),
       toolUseById: new Map(),
       emittedToolSignatures: new Map(),
@@ -249,6 +252,7 @@ export class QwenProvider implements TransportProvider {
     state.currentText = '';
     state.pendingFinalText = undefined;
     state.pendingFinalMetadata = undefined;
+    state.cancelled = false;
     state.toolUseByIndex.clear();
     state.toolUseById.clear();
     state.emittedToolSignatures.clear();
@@ -291,7 +295,9 @@ export class QwenProvider implements TransportProvider {
     const emitError = (messageText: string, details?: unknown): void => {
       if (sawError || completed) return;
       sawError = true;
-      this.errorCallbacks.forEach((cb) => cb(sessionId, this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, messageText, false, details)));
+      const code = state.cancelled ? 'CANCELLED' : PROVIDER_ERROR_CODES.PROVIDER_ERROR;
+      const recoverable = state.cancelled ? true : false;
+      this.errorCallbacks.forEach((cb) => cb(sessionId, this.makeError(code, messageText, recoverable, details)));
     };
 
     const emitComplete = (text: string, messageId?: string, metadata?: Record<string, unknown>): void => {
@@ -482,6 +488,10 @@ export class QwenProvider implements TransportProvider {
     child.once('close', (code, signal) => {
       rl.close();
       state.child = null;
+      if (state.cancelled) {
+        emitError('Cancelled');
+        return;
+      }
       if (!completed && !sawError && (code === 0 || code === null)) {
         if (state.pendingFinalText) {
           emitComplete(state.pendingFinalText, state.currentMessageId ?? undefined, state.pendingFinalMetadata);
@@ -501,6 +511,13 @@ export class QwenProvider implements TransportProvider {
 
   async restoreSession(sessionId: string): Promise<boolean> {
     return this.sessions.has(sessionId) || !!sessionId;
+  }
+
+  async cancel(sessionId: string): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    if (!state?.child || state.child.killed) return;
+    state.cancelled = true;
+    state.child.kill('SIGTERM');
   }
 
   private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {

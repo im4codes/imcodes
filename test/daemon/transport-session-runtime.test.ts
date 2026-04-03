@@ -27,6 +27,7 @@ function makeMockProvider() {
       connect: vi.fn(),
       disconnect: vi.fn(),
       send: vi.fn(),
+      cancel: vi.fn(),
       createSession: vi.fn().mockResolvedValue('mock-session-123'),
       endSession: vi.fn(),
       onDelta: (cb: (sid: string, d: MessageDelta) => void) => { deltaCb = cb; return () => { deltaCb = undefined; }; },
@@ -59,6 +60,10 @@ function makeMessage(id = 'msg-1', sessionId = 'mock-session-123'): AgentMessage
 
 function makeError(): ProviderError {
   return { code: 'PROVIDER_ERROR', message: 'something broke', recoverable: false };
+}
+
+function makeCancelledError(): ProviderError {
+  return { code: 'CANCELLED', message: 'Cancelled', recoverable: true };
 }
 
 const defaultConfig: SessionConfig = { sessionKey: 'deck_test_brain' };
@@ -134,6 +139,20 @@ describe('TransportSessionRuntime', () => {
 
     mock.fireError('mock-session-123', makeError());
     expect(runtime.getStatus()).toBe('error');
+  });
+
+  it('cancel() delegates to provider.cancel', async () => {
+    await runtime.initialize(defaultConfig);
+    await runtime.cancel();
+    expect(mock.provider.cancel).toHaveBeenCalledWith('mock-session-123');
+  });
+
+  it('cancelled error returns status to idle', async () => {
+    await runtime.initialize(defaultConfig);
+    await runtime.send('go');
+    mock.fireError('mock-session-123', makeCancelledError());
+    expect(runtime.getStatus()).toBe('idle');
+    expect(runtime.sending).toBe(false);
   });
 
   it('next send() clears error status back to thinking', async () => {
