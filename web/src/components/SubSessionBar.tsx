@@ -103,6 +103,7 @@ function formatUptime(seconds: number): string {
 export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId, quickData, sessions, allSubSessions }: Props) {
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
   const [collapsed, setCollapsed] = useState(isMobile);
+  const [p2pHidden, setP2pHidden] = useState(false);
   const [showSizePanel, setShowSizePanel] = useState(false);
   const [cardSize, setCardSize] = useState<CardSize>(() => load('rcc_subcard_size', DEFAULT_SIZE));
   const [draftW, setDraftW] = useState(String(cardSize.w));
@@ -386,12 +387,15 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
 
       {/* Discussions panel — above sub-session buttons */}
       {discussions.length > 0 && (
-        <div class="discussion-panel">
+        <div class={`discussion-panel${isMobile ? ' discussion-panel-mobile' : ''}`}>
           {discussions.map((d) => (
             <P2pProgressCard
               key={d.id}
               discussion={d}
-              compact
+              compact={!isMobile}
+              mobile={isMobile}
+              hidden={isMobile && p2pHidden}
+              onToggleHide={isMobile ? () => setP2pHidden((v) => !v) : undefined}
               onStopDiscussion={onStopDiscussion}
               onClick={d.fileId && onViewDiscussion ? () => onViewDiscussion(d.fileId!) : undefined}
             />

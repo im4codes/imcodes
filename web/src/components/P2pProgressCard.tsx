@@ -31,6 +31,10 @@ export interface P2pProgressDiscussion {
 interface Props {
   discussion: P2pProgressDiscussion;
   compact?: boolean;
+  /** Ultra-compact mobile mode: single line with active node only + hide button */
+  mobile?: boolean;
+  hidden?: boolean;
+  onToggleHide?: () => void;
   onClick?: () => void;
   onStopDiscussion?: (id: string) => void;
 }
@@ -45,7 +49,7 @@ function statusClassName(status: P2pProgressNode['status']): string {
         : 'is-pending';
 }
 
-export function P2pProgressCard({ discussion, compact = false, onClick, onStopDiscussion }: Props) {
+export function P2pProgressCard({ discussion, compact = false, mobile = false, hidden = false, onToggleHide, onClick, onStopDiscussion }: Props) {
   const { t } = useTranslation();
   const nodes = discussion.nodes ?? [];
   const isActive = discussion.state !== 'done' && discussion.state !== 'failed';
@@ -71,6 +75,56 @@ export function P2pProgressCard({ discussion, compact = false, onClick, onStopDi
   const phaseLabel = useMemo(() => (
     discussion.activePhase ? t(`p2p.discussions.phase_${discussion.activePhase}`) : null
   ), [discussion.activePhase, t]);
+
+  // ── Mobile ultra-compact: single-line summary ──────────────────────────
+  if (mobile) {
+    const activeNode = nodes.find((n) => n.status === 'active');
+    return (
+      <div
+        class="discussions-progress-card discussions-progress-card-mobile"
+        style={onClick ? { cursor: 'pointer' } : undefined}
+        onClick={onClick}
+      >
+        <div class="discussions-progress-mobile-row">
+          <span class="discussions-progress-kicker">P2P</span>
+          <span class="discussions-progress-badge">{roundText}</span>
+          {hopText && <span class="discussions-progress-badge">{hopText}</span>}
+          {phaseLabel && <span class="discussions-progress-badge discussions-progress-badge-phase">{phaseLabel}</span>}
+          {!hidden && activeNode && (
+            <span class={`discussions-progress-node ${statusClassName(activeNode.status)}`} style={{ margin: 0 }}>
+              <span class="discussions-progress-node-dot" />
+              <span class="discussions-progress-node-label">{activeNode.displayLabel ?? activeNode.label}</span>
+              {activeNode.phase && <span class="discussions-progress-node-phase">{t(`p2p.discussions.phase_${activeNode.phase}`)}</span>}
+            </span>
+          )}
+          <span style={{ flex: '1 1 0' }} />
+          {onToggleHide && (
+            <button
+              class="discussions-progress-stop"
+              style={{ padding: '2px 7px', fontSize: '10px' }}
+              onClick={(e) => { e.stopPropagation(); onToggleHide(); }}
+            >
+              {hidden ? '▼' : '▲'}
+            </button>
+          )}
+          {isActive && onStopDiscussion && (
+            <button
+              class="discussions-progress-stop"
+              style={{ padding: '2px 7px', fontSize: '10px' }}
+              onClick={(e) => { e.stopPropagation(); onStopDiscussion(discussion.id); }}
+            >
+              {t('common.cancel')}
+            </button>
+          )}
+        </div>
+        {!hidden && (
+          <div class="discussions-progress-mobile-title">{discussion.topic || t('p2p.discussions.untitled')}</div>
+        )}
+      </div>
+    );
+  }
+
+  // ── Desktop / standard rendering ───────────────────────────────────────
 
   const roundSegments = useMemo(() => (
     Array.from({ length: Math.max(0, discussion.maxRounds) }, (_, idx) => {

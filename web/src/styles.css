@@ -689,6 +689,46 @@ body {
   padding: 4px 7px;
   font-size: 10px;
 }
+/* Mobile ultra-compact P2P card */
+.discussion-panel-mobile { padding: 4px 6px; gap: 4px; }
+.discussions-progress-card-mobile {
+  flex: none !important;
+  min-width: 0 !important;
+  max-width: none !important;
+  width: 100%;
+  padding: 5px 8px !important;
+  border-radius: 8px !important;
+}
+.discussions-progress-card-mobile::before { display: none; }
+.discussions-progress-mobile-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+.discussions-progress-mobile-row .discussions-progress-kicker { font-size: 9px; flex: 0 0 auto; }
+.discussions-progress-mobile-row .discussions-progress-badge { padding: 1px 5px; font-size: 9px; }
+.discussions-progress-mobile-row .discussions-progress-node {
+  padding: 2px 6px;
+  font-size: 9px;
+  gap: 4px;
+  border: none;
+  background: transparent;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.discussions-progress-mobile-row .discussions-progress-node-dot { width: 5px; height: 5px; }
+.discussions-progress-mobile-row .discussions-progress-node-label { max-width: 120px; font-size: 9px; }
+.discussions-progress-mobile-row .discussions-progress-node-phase { font-size: 8px; }
+.discussions-progress-mobile-title {
+  font-size: 10px;
+  color: #94a3b8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 2px;
+}
 .discussion-card { background: #0f172a; border: 1px solid #1e293b; border-radius: 6px; padding: 10px; }
 .discussion-card.running { border-color: #22c55e40; }
 .discussion-card.verdict { border-color: #f59e0b40; }
@@ -723,10 +763,10 @@ body {
 @keyframes pulse-glow { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 .discussions-empty { padding: 40px 20px; text-align: center; color: #64748b; font-size: 14px; }
 .discussions-progress-strip {
-  padding: 12px;
+  padding: 10px 12px 8px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
   border-bottom: 1px solid #1e293b;
   background:
     radial-gradient(circle at top right, rgba(59, 130, 246, 0.12), transparent 32%),
@@ -756,7 +796,7 @@ body {
   gap: 10px;
   overflow-x: auto;
   overflow-y: hidden;
-  padding-bottom: 4px;
+  padding-bottom: 2px;
   scrollbar-width: thin;
   scrollbar-color: rgba(96, 165, 250, 0.45) rgba(15, 23, 42, 0.65);
 }
@@ -788,9 +828,6 @@ body {
 .discussions-progress-card {
   position: relative;
   overflow: hidden;
-  flex: 0 0 min(440px, calc(100vw - 48px));
-  min-width: 340px;
-  max-width: 440px;
   background:
     linear-gradient(180deg, rgba(15, 23, 42, 0.92), rgba(2, 6, 23, 0.96)),
     linear-gradient(135deg, rgba(59, 130, 246, 0.10), rgba(34, 197, 94, 0.06));
@@ -798,6 +835,12 @@ body {
   border-radius: 12px;
   padding: 10px 12px 12px;
   box-shadow: inset 0 1px 0 rgba(148, 163, 184, 0.06), 0 10px 24px rgba(2, 6, 23, 0.28);
+}
+/* In the horizontal strip: stretch to fill, max 3 visible, scroll beyond */
+.discussions-progress-strip-scroll .discussions-progress-card {
+  flex: 1 1 0;
+  min-width: 280px;
+  max-width: calc(33.333% - 7px);
 }
 .discussions-progress-card::before {
   content: '';
@@ -808,7 +851,7 @@ body {
   animation: discussions-scan 3.8s linear infinite;
   pointer-events: none;
 }
-.discussions-progress-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+.discussions-progress-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
 .discussions-progress-titlewrap { min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column; gap: 2px; }
 .discussions-progress-kicker {
   font-size: 10px;
@@ -841,12 +884,12 @@ body {
   cursor: pointer;
 }
 .discussions-progress-stop:hover { background: rgba(127, 29, 29, 0.28); }
-.discussions-progress-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.discussions-progress-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
 .discussions-progress-lines {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  margin-bottom: 10px;
+  gap: 6px;
+  margin-bottom: 8px;
 }
 .discussions-progress-line {
   display: flex;
