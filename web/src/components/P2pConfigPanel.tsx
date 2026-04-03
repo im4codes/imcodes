@@ -108,14 +108,6 @@ const checkboxStyle: Record<string, string | number> = {
   flexShrink: 0,
 };
 
-const nameStyle: Record<string, string | number> = {
-  flex: 1,
-  fontSize: 13,
-  color: '#e2e8f0',
-  overflow: 'hidden',
-  textOverflow: 'ellipsis',
-  whiteSpace: 'nowrap',
-};
 
 const badgeStyle: Record<string, string | number> = {
   fontSize: 10,
