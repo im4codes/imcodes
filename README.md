@@ -80,6 +80,8 @@ Single-model output shouldn't be trusted blindly. Spawn quick discussion rounds 
 
 Native streaming output support for transport-backed agents like [OpenClaw](https://openclaw.com) and [Qwen](https://github.com/QwenLM/qwen-agent). These agents connect via network protocols (WebSocket or local SDK) instead of terminal scraping, delivering structured event streams with real-time delta updates, tool call tracking, and session restore.
 
+> **Note on Qwen:** Qwen currently offers a free tier (1,000 requests/day) provided by Alibaba Cloud. This is an Alibaba Cloud policy, not an IM.codes offering — terms, limits, and availability may change at any time without notice. Check the [Qwen documentation](https://qwen.readthedocs.io/) for current details.
+
 ### Agent-to-Agent Communication
 
 Agents can message each other directly using `imcodes send`. An agent running in one session can ask a sibling to review code, run tests, or coordinate on a task — no user intervention needed. Target resolution by label, session name, or agent type. `--reply` flag instructs the target to send its response back automatically. Built-in circuit breakers prevent abuse (depth limit, rate limiting, broadcast cap).
