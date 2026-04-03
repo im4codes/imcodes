@@ -51,7 +51,7 @@ const panelStyle: Record<string, string | number> = {
   borderRadius: 10,
   width: '100%',
   maxWidth: 520,
-  maxHeight: '80vh',
+  maxHeight: '90vh',
   display: 'flex',
   flexDirection: 'column',
   boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
@@ -90,11 +90,14 @@ const bodyStyle: Record<string, string | number> = {
 };
 
 const rowStyle: Record<string, string | number> = {
-  display: 'flex',
+  display: 'inline-flex',
   alignItems: 'center',
-  gap: 8,
-  padding: '7px 0',
-  borderBottom: '1px solid #1e3a5f20',
+  gap: 4,
+  padding: '4px 8px',
+  borderRadius: 6,
+  background: '#0f172a',
+  border: '1px solid #334155',
+  whiteSpace: 'nowrap',
 };
 
 const checkboxStyle: Record<string, string | number> = {
@@ -225,6 +228,7 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
   // Local config state: per-session enabled + mode
   const [sessionCfg, setSessionCfg] = useState<P2pSessionConfig>({});
   const [rounds, setRounds] = useState(3);
+  const [hopTimeoutMinutes, setHopTimeoutMinutes] = useState(5);
   const [extraPrompt, setExtraPrompt] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -242,6 +246,7 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
           const parsed: P2pSavedConfig = JSON.parse(raw);
           setSessionCfg(parsed.sessions ?? {});
           setRounds(parsed.rounds ?? 3);
+          setHopTimeoutMinutes(parsed.hopTimeoutMinutes ?? 5);
           setExtraPrompt(parsed.extraPrompt ?? '');
         } catch { /* start fresh */ }
       }
@@ -281,7 +286,7 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
     for (const e of eligible) {
       merged[e.key] = sessionCfg[e.key] ?? { enabled: false, mode: 'audit' };
     }
-    const cfg: P2pSavedConfig = { sessions: merged, rounds, extraPrompt: extraPrompt.trim() || undefined };
+    const cfg: P2pSavedConfig = { sessions: merged, rounds, hopTimeoutMinutes: hopTimeoutMinutes !== 5 ? hopTimeoutMinutes : undefined, extraPrompt: extraPrompt.trim() || undefined };
     try {
       if (configKey) await saveUserPref(configKey, JSON.stringify(cfg));
       onSave(cfg);
@@ -318,27 +323,28 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
                 {t('p2p.cross_session')}
               </label>
 
-              {/* Session rows */}
+              {/* Session rows — horizontal wrap */}
               <div style={sectionLabelStyle}>{t('p2p.picker.agents')}</div>
               {eligible.length === 0 && (
                 <div style={{ color: '#64748b', fontSize: 13, padding: '8px 0' }}>
                   {t('p2p.picker.no_agents_available')}
                 </div>
               )}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
               {eligible.map((e) => {
                 const entry = getEntry(e.key);
                 return (
-                  <div key={e.key} style={rowStyle}>
+                  <div key={e.key} style={{ ...rowStyle, opacity: entry.enabled ? 1 : 0.5 }}>
                     <input
                       type="checkbox"
                       style={checkboxStyle}
                       checked={entry.enabled}
                       onChange={() => toggleEnabled(e.key)}
                     />
-                    <span style={nameStyle}>{e.shortName}</span>
-                    <span style={badgeStyle}>{e.agentType}</span>
+                    <span style={{ fontSize: 12, color: '#e2e8f0' }}>{e.shortName}</span>
+                    <span style={{ ...badgeStyle, fontSize: 9 }}>{e.agentType}</span>
                     <select
-                      style={{ ...selectStyle, opacity: entry.enabled ? 1 : 0.4 }}
+                      style={{ ...selectStyle, fontSize: 11, padding: '1px 4px' }}
                       value={entry.mode}
                       disabled={!entry.enabled}
                       onChange={(ev) => setMode(e.key, (ev.target as HTMLSelectElement).value)}
@@ -352,6 +358,7 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
                   </div>
                 );
               })}
+              </div>
 
               {/* Rounds */}
               <div style={sectionLabelStyle}>{t('p2p.settings_rounds')}</div>
@@ -369,6 +376,36 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
               </div>
               <div style={{ fontSize: 11, color: '#64748b', marginTop: 6 }}>
                 {t('p2p.settings_rounds_hint')}
+              </div>
+
+              {/* Hop timeout */}
+              <div style={sectionLabelStyle}>{t('p2p.settings_hop_timeout', 'Hop Timeout')}</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <input
+                  type="number"
+                  min={1}
+                  max={60}
+                  value={hopTimeoutMinutes}
+                  onInput={(e) => {
+                    const v = parseInt((e.target as HTMLInputElement).value, 10);
+                    if (v >= 1 && v <= 60) setHopTimeoutMinutes(v);
+                  }}
+                  style={{
+                    width: 64,
+                    background: '#0f172a',
+                    border: '1px solid #334155',
+                    borderRadius: 5,
+                    color: '#e2e8f0',
+                    fontSize: 13,
+                    padding: '4px 8px',
+                    textAlign: 'center',
+                    outline: 'none',
+                  }}
+                />
+                <span style={{ fontSize: 12, color: '#94a3b8' }}>{t('p2p.settings_hop_timeout_unit', 'minutes per hop')}</span>
+              </div>
+              <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
+                {t('p2p.settings_hop_timeout_hint', 'How long to wait for each agent to respond. Increase for complex tasks.')}
               </div>
 
               {/* Extra prompt */}

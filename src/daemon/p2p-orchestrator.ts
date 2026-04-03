@@ -314,6 +314,8 @@ export async function startP2pRun(
   extraPrompt?: string,
   /** Explicit mode override — used for combo pipelines (e.g. "brainstorm>discuss>plan"). */
   modeOverride?: string,
+  /** Custom per-hop timeout in ms. Overrides mode default (300s). */
+  hopTimeoutMs?: number,
 ): Promise<P2pRun> {
   // Validate same domain
   const mainSession = extractMainSession(initiatorSession);
@@ -365,7 +367,7 @@ export async function startP2pRun(
     status: 'queued',
     contextFilePath,
     userText,
-    timeoutMs: modeConfig?.defaultTimeoutMs ?? 300_000,
+    timeoutMs: hopTimeoutMs ?? modeConfig?.defaultTimeoutMs ?? 300_000,
     resultSummary: null,
     completedHops: [],
     skippedHops: [],
