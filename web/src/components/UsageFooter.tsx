@@ -15,6 +15,7 @@ interface Props {
   modelOverride?: string | null;
   planLabel?: string | null;
   quotaLabel?: string | null;
+  quotaUsageLabel?: string | null;
   /** Show cost tracking (requires costUsd events to have been recorded). */
   showCost?: boolean;
   /** Active thinking timestamp — shows elapsed time spinner. */
@@ -30,7 +31,7 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, modelOverride, planLabel, quotaLabel, showCost, activeThinkingTs, statusText, now }: Props) {
+export function UsageFooter({ usage, sessionName, modelOverride, planLabel, quotaLabel, quotaUsageLabel, showCost, activeThinkingTs, statusText, now }: Props) {
   const { t } = useTranslation();
 
   const displayModel = modelOverride ?? usage.model;
@@ -56,11 +57,12 @@ export function UsageFooter({ usage, sessionName, modelOverride, planLabel, quot
       `  New: ${fmt(usage.inputTokens)}  Cache: ${fmt(usage.cacheTokens)}`,
       displayPlanLabel ? t('session.provider_plan_title', { value: displayPlanLabel }) : '',
       quotaLabel ? t('session.provider_quota_title', { value: quotaLabel }) : '',
+      quotaUsageLabel ? t('session.provider_quota_usage_title', { value: quotaUsageLabel }) : '',
       usage.codexStatus?.fiveHourLeftPercent !== undefined ? `5h: ${usage.codexStatus.fiveHourLeftPercent}% (${usage.codexStatus.fiveHourResetAt ?? ''})` : '',
       usage.codexStatus?.weeklyLeftPercent !== undefined ? `Weekly: ${usage.codexStatus.weeklyLeftPercent}% (${usage.codexStatus.weeklyResetAt ?? ''})` : '',
     ].filter(Boolean).join('\n');
     return { ctx, total, totalPct, cachePct, newPct, pctStr, tip };
-  }, [usage.inputTokens, usage.cacheTokens, usage.contextWindow, displayModel, usage.codexStatus, displayPlanLabel, quotaLabel, t]);
+  }, [usage.inputTokens, usage.cacheTokens, usage.contextWindow, displayModel, usage.codexStatus, displayPlanLabel, quotaLabel, quotaUsageLabel, t]);
 
   const sessionCost = showCost ? getSessionCost(sessionName) : 0;
   const weeklyCost = sessionCost > 0 ? getWeeklyCost() : 0;
@@ -77,7 +79,7 @@ export function UsageFooter({ usage, sessionName, modelOverride, planLabel, quot
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
         </div>
       )}
-      {(displayPlanLabel || quotaLabel) && (
+      {(displayPlanLabel || quotaLabel || quotaUsageLabel) && (
         <div class="session-usage-codex-row">
           {displayPlanLabel && (
             <span class="session-usage-badge" title={displayPlanLabel}>
@@ -87,6 +89,11 @@ export function UsageFooter({ usage, sessionName, modelOverride, planLabel, quot
           {quotaLabel && (
             <span class="session-usage-badge" title={quotaLabel}>
               {quotaLabel}
+            </span>
+          )}
+          {quotaUsageLabel && (
+            <span class="session-usage-badge" title={quotaUsageLabel}>
+              {quotaUsageLabel}
             </span>
           )}
         </div>

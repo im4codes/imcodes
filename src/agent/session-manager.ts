@@ -30,6 +30,7 @@ import { startWatching as startOpenCodeWatching, stopWatching as stopOpenCodeWat
 import { resolveStructuredSessionBootstrap } from './structured-session-bootstrap.js';
 import { getQwenRuntimeConfig } from './qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from './provider-display.js';
+import { getQwenOAuthQuotaUsageLabel } from './provider-quota.js';
 
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
@@ -813,6 +814,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
           model: effectiveQwenModel,
           authType: qwenRuntime?.authType ?? s.qwenAuthType,
           authLimit: qwenRuntime?.authLimit ?? s.qwenAuthLimit,
+          quotaUsageLabel: (qwenRuntime?.authType ?? s.qwenAuthType) === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
         }),
       });
       logger.info({ session: s.name, providerId: s.providerId, providerSid: s.providerSessionId }, 'Restored transport session runtime');
@@ -895,6 +897,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
           model: effectiveQwenModel,
           authType: qwenAuthType,
           authLimit: qwenAuthLimit,
+          quotaUsageLabel: qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
         }),
         description,
         label,

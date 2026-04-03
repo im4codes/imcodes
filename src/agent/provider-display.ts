@@ -4,6 +4,7 @@ export interface ProviderDisplayMetadata {
   modelDisplay?: string;
   planLabel?: string;
   quotaLabel?: string;
+  quotaUsageLabel?: string;
 }
 
 export function formatQuotaLabel(limit?: string | null): string | undefined {
@@ -32,6 +33,7 @@ export function getQwenDisplayMetadata(opts: {
   model?: string | null;
   authType?: string | null;
   authLimit?: string | null;
+  quotaUsageLabel?: string | null;
 }): ProviderDisplayMetadata {
   const modelDisplay = opts.model?.trim() || undefined;
   const planLabel = formatQwenPlanLabel(opts.authType);
@@ -40,5 +42,6 @@ export function getQwenDisplayMetadata(opts: {
     ...(modelDisplay ? { modelDisplay } : {}),
     ...(planLabel ? { planLabel } : {}),
     ...(quotaLabel ? { quotaLabel } : {}),
+    ...(opts.quotaUsageLabel?.trim() ? { quotaUsageLabel: opts.quotaUsageLabel.trim() } : {}),
   };
 }

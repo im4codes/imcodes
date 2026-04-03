@@ -47,6 +47,7 @@ export interface SessionInfo {
   modelDisplay?: string;
   planLabel?: string;
   quotaLabel?: string;
+  quotaUsageLabel?: string;
 }
 
 export interface ServerInfo {

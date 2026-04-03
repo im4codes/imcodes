@@ -10,6 +10,7 @@ vi.mock('react-i18next', () => ({
     t: (key: string, opts?: Record<string, unknown>) => {
       if (key === 'session.provider_plan_title') return `Plan: ${String(opts?.value ?? '')}`;
       if (key === 'session.provider_quota_title') return `Quota: ${String(opts?.value ?? '')}`;
+      if (key === 'session.provider_quota_usage_title') return `Quota usage: ${String(opts?.value ?? '')}`;
       if (key === 'session.provider_plan_free') return 'Free';
       if (key === 'session.provider_plan_paid') return 'Paid';
       if (key === 'session.provider_plan_byo') return 'BYO';
@@ -37,11 +38,13 @@ describe('UsageFooter', () => {
         modelOverride="qwen3-coder-plus"
         planLabel="Free"
         quotaLabel="1,000/day"
+        quotaUsageLabel="today 12/1000 · 1m 1/60"
       />,
     );
 
     expect(screen.getByText('Free')).toBeDefined();
     expect(screen.getByText('1,000/day')).toBeDefined();
+    expect(screen.getByText('today 12/1000 · 1m 1/60')).toBeDefined();
     expect(screen.getByText('qwen3-coder-plus')).toBeDefined();
   });
 });

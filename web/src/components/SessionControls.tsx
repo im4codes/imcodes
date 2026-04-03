@@ -221,6 +221,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
   const [qwenModel, setQwenModel] = useState<QwenModelChoice | null>(loadQwenModel);
+  const [queuedNoticeVisible, setQueuedNoticeVisible] = useState(false);
   const [confirm, setConfirm] = useState<MenuAction | null>(null);
   const [confirmLevel, setConfirmLevel] = useState(0); // 0=none, 1=first warning, 2=second warning (sub-session only)
   const menuRef = useRef<HTMLDivElement>(null);
@@ -585,6 +586,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const finalizeSend = useCallback((payload: PendingSendPayload) => {
     if (!ws || !activeSession) return;
+    if (activeSession.runtimeType === 'transport' && activeSession.state === 'running') {
+      setQueuedNoticeVisible(true);
+    }
     quickData.recordHistory(payload.text, activeSession.name);
     try {
       ws.sendSessionCommand('send', { sessionName: activeSession.name, text: payload.text, ...payload.extra });
@@ -607,6 +611,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     draftRef.current = '';
     if (draftKey) sessionStorage.removeItem(draftKey);
   }, [activeSession, draftKey, onRemoveQuote, onSend, quickData, quotes, ws]);
+
+  useEffect(() => {
+    if (!activeSession || activeSession.runtimeType !== 'transport' || activeSession.state !== 'running') {
+      setQueuedNoticeVisible(false);
+    }
+  }, [activeSession?.name, activeSession?.runtimeType, activeSession?.state]);
 
   const persistSingleAgentPromptPref = useCallback(() => {
     if (!singleAgentPromptSkip) return;
@@ -638,6 +648,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       extra.p2pSessionConfig = p2pSavedConfig.sessions;
       extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
       if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
+    }
+    if (activeSession.runtimeType === 'transport' && activeSession.state === 'running') {
+      setQueuedNoticeVisible(true);
     }
     quickData.recordHistory(voiceText, activeSession.name);
     try {
@@ -1114,6 +1127,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             onSelect={fillInput}
             onSend={(text: string) => {
               if (!ws || !activeSession) return;
+              if (activeSession.runtimeType === 'transport' && activeSession.state === 'running') {
+                setQueuedNoticeVisible(true);
+              }
               quickData.recordHistory(text, activeSession.name);
               ws.sendSessionCommand('send', { sessionName: activeSession.name, text });
             }}
@@ -1416,6 +1432,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           )}
         </div>}
       </div>
+      {queuedNoticeVisible && (
+        <div class="controls-queued-hint" role="status" aria-live="polite">
+          {t('session.transport_send_queued')}
+        </div>
+      )}
     </div>
     {singleAgentPromptOpen && (
       <div class="ask-dialog-overlay" onClick={() => { setSingleAgentPromptOpen(false); pendingSendRef.current = null; }}>

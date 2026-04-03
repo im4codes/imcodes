@@ -387,6 +387,7 @@ export async function startup(): Promise<DaemonContext> {
             modelDisplay: s.modelDisplay,
             planLabel: s.planLabel,
             quotaLabel: s.quotaLabel,
+            quotaUsageLabel: s.quotaUsageLabel,
             description: s.description,
             label: s.label,
           })),

@@ -49,6 +49,8 @@ export interface SessionRecord {
   planLabel?: string;
   /** Generic quota/limit badge label (e.g. 1000/day, 60/min). */
   quotaLabel?: string;
+  /** Generic quota progress label (e.g. today 12/1000 · 1m 1/60). */
+  quotaUsageLabel?: string;
   /** Parent main session name (e.g. `deck_proj_brain`) — links sub-sessions to their parent. */
   parentSession?: string;
   /** Runtime type — 'process' for tmux, 'transport' for network-backed. Defaults to 'process' for backward compat. */
