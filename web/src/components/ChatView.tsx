@@ -161,10 +161,11 @@ function buildViewItems(events: TimelineEvent[]): ViewItem[] {
         const inputText = formatToolPayloadValue(ev.payload.input);
         const input = inputText ? ` ${inputText}` : '';
         const status = next.payload.error ? `✗ ${String(next.payload.error)}` : '✓';
+        const output = !next.payload.error && next.payload.output ? String(next.payload.output) : undefined;
         consolidated.push({
           ...ev,
           type: 'tool.call',
-          payload: { ...ev.payload, tool: toolName, input: `${input} ${status}`.trim(), _merged: true },
+          payload: { ...ev.payload, tool: toolName, input: `${input} ${status}`.trim(), _merged: true, ...(output ? { _output: output } : {}) },
         });
         continue;
       }
@@ -952,6 +953,7 @@ const ChatEvent = memo(function ChatEvent({ event, nextTs, onPathClick, serverId
 
     case 'tool.call': {
       const toolInput = formatToolPayloadValue(event.payload.input);
+      const toolOutput = event.payload._output ? String(event.payload._output) : undefined;
       return (
         <ToolBlockFold>
           <div class="chat-event chat-tool">
@@ -959,6 +961,11 @@ const ChatEvent = memo(function ChatEvent({ event, nextTs, onPathClick, serverId
             <span class="chat-tool-name">{String(event.payload.tool ?? 'tool')}</span>
             {toolInput && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInput, onPathClick)}</span>}
           </div>
+          {toolOutput && (
+            <div class="chat-event chat-tool chat-tool-result-preview">
+              <span class="chat-tool-output">{splitPathsAndUrls(toolOutput, onPathClick)}</span>
+            </div>
+          )}
         </ToolBlockFold>
       );
     }

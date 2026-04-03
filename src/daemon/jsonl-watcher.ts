@@ -356,8 +356,10 @@ function parseLine(sessionName: string, line: string, lineByteOffset?: number): 
         emitUserStringContent(sessionName, block.text, stableId, ts);
       } else if (block.type === 'tool_result') {
         const error = block.is_error ? String(block.content ?? 'error') : undefined;
+        const output = !error ? extractToolResultOutput(block) : undefined;
         timelineEmitter.emit(sessionName, 'tool.result', {
           ...(error ? { error } : {}),
+          ...(output ? { output } : {}),
         }, { source: 'daemon', confidence: 'high', ...(stableId ? { eventId: stableId('tr') } : {}), ...(ts ? { ts } : {}) });
       }
     }
@@ -373,8 +375,35 @@ function extractToolInput(tool: string, input?: Record<string, unknown>): string
     case 'Glob': return String(input['pattern'] ?? '');
     case 'Grep': return `${input['pattern'] ?? ''}${input['path'] ? ` in ${input['path']}` : ''}`;
     case 'Agent': return String(input['description'] ?? '');
-    default: return '';
+    case 'WebSearch': return String(input['query'] ?? '');
+    case 'WebFetch': return String(input['url'] ?? '');
+    case 'Skill': return String(input['skill'] ?? '');
+    case 'TodoWrite': return input['todos'] ? `${(input['todos'] as unknown[]).length} items` : '';
+    default: {
+      // Generic fallback: show first non-empty string value, truncated
+      for (const v of Object.values(input)) {
+        if (typeof v === 'string' && v.trim()) return v.length > 80 ? v.slice(0, 77) + '...' : v;
+      }
+      return '';
+    }
   }
+}
+
+/** Extract a truncated summary of tool result content for display. */
+function extractToolResultOutput(block: ContentBlock): string | undefined {
+  const raw = block.content;
+  if (!raw) return undefined;
+  let text: string;
+  if (typeof raw === 'string') {
+    text = raw;
+  } else if (Array.isArray(raw)) {
+    text = (raw as Array<{ text?: string }>).map((b) => b.text ?? '').join('\n');
+  } else {
+    return undefined;
+  }
+  text = text.trim();
+  if (!text) return undefined;
+  return text.length > 200 ? text.slice(0, 197) + '...' : text;
 }
 
 // ── Per-session watcher state ─────────────────────────────────────────────────
@@ -576,8 +605,10 @@ async function emitRecentHistory(sessionName: string, filePath: string): Promise
             emitUserStringContent(sessionName, block.text, stableId, ts);
           } else if (block.type === 'tool_result') {
             const error = block.is_error ? String(block.content ?? 'error') : undefined;
+            const output = !error ? extractToolResultOutput(block) : undefined;
             timelineEmitter.emit(sessionName, 'tool.result', {
               ...(error ? { error } : {}),
+              ...(output ? { output } : {}),
             }, { source: 'daemon', confidence: 'high', eventId: stableId('tr'), ...(ts ? { ts } : {}) });
           }
         }
