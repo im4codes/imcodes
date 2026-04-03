@@ -324,6 +324,7 @@
     "mode_solo": "Solo",
     "mode_audit": "审查",
     "mode_review": "评审",
+    "mode_plan": "规划",
     "mode_brainstorm": "头脑风暴",
     "mode_discuss": "讨论",
     "exclude_same_type": "排除同类型",
@@ -346,6 +347,7 @@
     "mode": {
       "audit": "审计",
       "review": "审查",
+      "plan": "规划",
       "brainstorm": "头脑风暴",
       "discuss": "讨论"
     },

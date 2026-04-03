@@ -72,16 +72,16 @@ type MenuAction = 'restart' | 'new' | 'stop';
 type ModelChoice = 'opus' | 'sonnet' | 'haiku';
 type CodexModelChoice = 'gpt-5.4' | 'gpt-5.4-mini' | 'gpt-5.2';
 type QwenModelChoice = string;
-type P2pMode = 'solo' | 'audit' | 'review' | 'brainstorm' | 'discuss' | typeof P2P_CONFIG_MODE;
+type P2pMode = 'solo' | 'audit' | 'review' | 'plan' | 'brainstorm' | 'discuss' | typeof P2P_CONFIG_MODE;
 
 const MODEL_STORAGE_KEY = 'imcodes-model';
 const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const QWEN_MODEL_STORAGE_KEY = 'imcodes-qwen-model';
 const SINGLE_AGENT_PROMPT_PREF_KEY = 'atpicker_single_agent_prompt_dismissed';
 const CODEX_MODELS: CodexModelChoice[] = ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.2'];
-const P2P_MODES: P2pMode[] = ['solo', 'audit', 'review', 'brainstorm', 'discuss', P2P_CONFIG_MODE];
-const P2P_MODE_I18N: Record<P2pMode, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
-const P2P_MODE_COLORS: Record<P2pMode, string> = { solo: '#6b7280', audit: '#f59e0b', review: '#3b82f6', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
+const P2P_MODES: P2pMode[] = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss', P2P_CONFIG_MODE];
+const P2P_MODE_I18N: Record<P2pMode, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', plan: 'p2p.mode_plan', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
+const P2P_MODE_COLORS: Record<P2pMode, string> = { solo: '#6b7280', audit: '#f59e0b', review: '#3b82f6', plan: '#06b6d4', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
 
 interface PendingAtTarget {
   session: string;

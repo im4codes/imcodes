@@ -31,7 +31,7 @@ interface Props {
 }
 
 const EXCLUDED_TYPES = new Set(['shell', 'script']);
-const SESSION_MODES = ['audit', 'review', 'brainstorm', 'discuss', 'skip'] as const;
+const SESSION_MODES = ['audit', 'review', 'plan', 'brainstorm', 'discuss', 'skip'] as const;
 const ROUND_OPTIONS = [1, 2, 3, 5] as const;
 
 const overlayStyle: Record<string, string | number> = {

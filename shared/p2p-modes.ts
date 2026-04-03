@@ -70,6 +70,14 @@ export const BUILT_IN_MODES: P2pMode[] = [
     maxOutputChars: 12_000,
   },
   {
+    key: 'plan',
+    prompt: 'You are a technical architect. Design an implementation plan for the provided context. Break down the work into clear steps, identify dependencies and risks, define acceptance criteria, and suggest the optimal execution order. Be specific about files, interfaces, and data flow.',
+    callbackRequired: true,
+    defaultTimeoutMs: 300_000,
+    resultStyle: 'findings-first',
+    maxOutputChars: 12_000,
+  },
+  {
     key: 'brainstorm',
     prompt: 'You are a creative collaborator. Explore the provided context from multiple angles. Generate diverse ideas, alternative approaches, and unexpected connections. Think broadly.',
     callbackRequired: true,

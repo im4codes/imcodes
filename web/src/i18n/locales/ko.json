@@ -324,6 +324,7 @@
     "mode_solo": "Solo",
     "mode_audit": "감사",
     "mode_review": "리뷰",
+    "mode_plan": "설계",
     "mode_brainstorm": "브레인스토밍",
     "mode_discuss": "토론",
     "exclude_same_type": "같은 유형 제외",
@@ -346,6 +347,7 @@
     "mode": {
       "audit": "감사",
       "review": "리뷰",
+      "plan": "설계",
       "brainstorm": "브레인스토밍",
       "discuss": "토론"
     },

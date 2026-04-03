@@ -324,6 +324,7 @@
     "mode_solo": "Solo",
     "mode_audit": "Audit",
     "mode_review": "Review",
+    "mode_plan": "Plan",
     "mode_brainstorm": "Brainstorm",
     "mode_discuss": "Discuss",
     "exclude_same_type": "Exclude same type",
@@ -346,6 +347,7 @@
     "mode": {
       "audit": "Audit",
       "review": "Review",
+      "plan": "Plan",
       "brainstorm": "Brainstorm",
       "discuss": "Discuss"
     },

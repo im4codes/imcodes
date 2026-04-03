@@ -324,6 +324,7 @@
     "mode_solo": "Solo",
     "mode_audit": "Аудит",
     "mode_review": "Обзор",
+    "mode_plan": "Планирование",
     "mode_brainstorm": "Мозговой штурм",
     "mode_discuss": "Обсуждение",
     "exclude_same_type": "Исключить тот же тип",
@@ -346,6 +347,7 @@
     "mode": {
       "audit": "Аудит",
       "review": "Обзор",
+      "plan": "Планирование",
       "brainstorm": "Мозговой штурм",
       "discuss": "Обсуждение"
     },
