@@ -495,42 +495,8 @@ export function AtPicker({
             </button>
           ))}
         </div>
-        {/* Combo presets */}
-        <div style={{ ...groupLabelStyle, marginTop: 6 }}>{t('p2p.combo_label')}</div>
-        <div style={{ ...modeContainerStyle, flexWrap: 'wrap' }}>
-          {COMBO_PRESETS.map((c) => {
-            const isActive = configModeOverride === c.key;
-            const color = comboModeColor(c.key);
-            return (
-              <button
-                key={c.key}
-                type="button"
-                style={{
-                  ...modeBtnStyle,
-                  ...(isActive ? {
-                    background: '#1e293b',
-                    borderColor: color,
-                    color,
-                    boxShadow: `0 0 0 1px ${color}55, 0 0 18px ${color}22`,
-                    fontWeight: 700,
-                  } : {}),
-                  fontSize: 10,
-                  padding: '2px 6px',
-                }}
-                onClick={() => {
-                  const cfg = buildEffectiveConfig(p2pConfig, c.pipeline[0]);
-                  onSelectAllConfig?.(cfg, c.pipeline.length, c.key);
-                  setConfigRoundsPicker(false);
-                  setConfigPickerFocus('rounds');
-                }}
-              >
-                {comboModeLabel(c.key, t)}
-              </button>
-            );
-          })}
-        </div>
-        <div style={{ ...dimStyle, padding: '2px 12px 8px', color: configModeOverride.includes(COMBO_SEPARATOR) ? comboModeColor(configModeOverride) : (MODE_COLORS[configModeOverride] ?? dimStyle.color) }}>
-          {t('p2p.settings_mode')}: {configModeOverride.includes(COMBO_SEPARATOR) ? comboModeLabel(configModeOverride, t) : t(`p2p.mode_${configModeOverride}`)}
+        <div style={{ ...dimStyle, padding: '2px 12px 8px', color: MODE_COLORS[configModeOverride] ?? dimStyle.color }}>
+          {t('p2p.settings_mode')}: {t(`p2p.mode_${configModeOverride}`)}
         </div>
         <div style={{
           ...groupLabelStyle,
@@ -576,6 +542,30 @@ export function AtPicker({
             })}
           </>
         )}
+        {/* Combo presets — below rounds and agents */}
+        <div style={{ ...groupLabelStyle, marginTop: 6 }}>{t('p2p.combo_label')}</div>
+        <div style={{ ...modeContainerStyle, flexWrap: 'wrap' }}>
+          {COMBO_PRESETS.map((c) => {
+            const color = comboModeColor(c.key);
+            return (
+              <button
+                key={c.key}
+                type="button"
+                style={{ ...modeBtnStyle, fontSize: 10, padding: '2px 6px' }}
+                onClick={() => {
+                  const cfg = buildEffectiveConfig(p2pConfig, c.pipeline[0]);
+                  onSelectAllConfig?.(cfg, c.pipeline.length, c.key);
+                  setConfigRoundsPicker(false);
+                  setConfigPickerFocus('rounds');
+                }}
+                onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.borderColor = color; (e.currentTarget as HTMLElement).style.color = color; }}
+                onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.borderColor = modeBtnStyle.borderColor as string; (e.currentTarget as HTMLElement).style.color = modeBtnStyle.color as string; }}
+              >
+                {comboModeLabel(c.key, t)}
+              </button>
+            );
+          })}
+        </div>
       </div>
     );
   }
