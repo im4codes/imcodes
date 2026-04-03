@@ -5,7 +5,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { ServerMessage } from '../ws-client.js';
-import type { P2pSavedConfig } from '@shared/p2p-modes.js';
+import { COMBO_PRESETS, COMBO_SEPARATOR, type P2pSavedConfig } from '@shared/p2p-modes.js';
 
 interface SessionEntry {
   name: string;
@@ -148,9 +148,19 @@ const MODE_COLORS: Record<string, string> = {
   config: '#94a3b8',
   audit: '#f59e0b',
   review: '#3b82f6',
+  plan: '#06b6d4',
   brainstorm: '#a78bfa',
   discuss: '#22c55e',
 };
+
+function comboModeColor(key: string): string {
+  const last = key.split(COMBO_SEPARATOR).pop()?.trim();
+  return last ? (MODE_COLORS[last] ?? '#94a3b8') : '#94a3b8';
+}
+
+function comboModeLabel(key: string, t: (k: string) => string): string {
+  return key.split(COMBO_SEPARATOR).map((m) => t(`p2p.mode_${m.trim()}`)).join('→');
+}
 
 function buildEffectiveConfig(config: P2pSavedConfig, modeOverride: string): P2pSavedConfig {
   if (modeOverride === 'config') return config;
@@ -485,8 +495,42 @@ export function AtPicker({
             </button>
           ))}
         </div>
-        <div style={{ ...dimStyle, padding: '2px 12px 8px', color: MODE_COLORS[configModeOverride] ?? dimStyle.color }}>
-          {t('p2p.settings_mode')}: {t(`p2p.mode_${configModeOverride}`)}
+        {/* Combo presets */}
+        <div style={{ ...groupLabelStyle, marginTop: 6 }}>{t('p2p.combo_label')}</div>
+        <div style={{ ...modeContainerStyle, flexWrap: 'wrap' }}>
+          {COMBO_PRESETS.map((c) => {
+            const isActive = configModeOverride === c.key;
+            const color = comboModeColor(c.key);
+            return (
+              <button
+                key={c.key}
+                type="button"
+                style={{
+                  ...modeBtnStyle,
+                  ...(isActive ? {
+                    background: '#1e293b',
+                    borderColor: color,
+                    color,
+                    boxShadow: `0 0 0 1px ${color}55, 0 0 18px ${color}22`,
+                    fontWeight: 700,
+                  } : {}),
+                  fontSize: 10,
+                  padding: '2px 6px',
+                }}
+                onClick={() => {
+                  const cfg = buildEffectiveConfig(p2pConfig, c.pipeline[0]);
+                  onSelectAllConfig?.(cfg, c.pipeline.length, c.key);
+                  setConfigRoundsPicker(false);
+                  setConfigPickerFocus('rounds');
+                }}
+              >
+                {comboModeLabel(c.key, t)}
+              </button>
+            );
+          })}
+        </div>
+        <div style={{ ...dimStyle, padding: '2px 12px 8px', color: configModeOverride.includes(COMBO_SEPARATOR) ? comboModeColor(configModeOverride) : (MODE_COLORS[configModeOverride] ?? dimStyle.color) }}>
+          {t('p2p.settings_mode')}: {configModeOverride.includes(COMBO_SEPARATOR) ? comboModeLabel(configModeOverride, t) : t(`p2p.mode_${configModeOverride}`)}
         </div>
         <div style={{
           ...groupLabelStyle,

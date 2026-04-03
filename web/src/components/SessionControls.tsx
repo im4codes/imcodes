@@ -550,6 +550,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           extra.p2pRounds = override?.rounds ?? cfg.rounds ?? 1;
           if (cfg.extraPrompt) extra.p2pExtraPrompt = cfg.extraPrompt;
         }
+        // For non-config mode overrides (single or combo), send as p2pMode so the daemon uses it
+        if (override?.modeOverride && override.modeOverride !== 'config') {
+          extra.p2pMode = override.modeOverride;
+        }
       }
     } else {
       const manual = extractManualP2pTargets(text, buildManualP2pCandidates(sessions, subSessions));
