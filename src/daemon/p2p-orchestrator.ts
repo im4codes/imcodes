@@ -481,7 +481,7 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       ? `${discussionParticipantNameWithMode(run.initiatorSession, run.mode)} — Final Summary`
       : `${discussionParticipantNameWithMode(run.initiatorSession, run.mode)} — Round ${run.currentRound}/${run.rounds} Summary`;
     const roundSummaryInstruction = isLastRound
-      ? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.'
+      ? (modeConfig?.summaryPrompt ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.')
       : `Synthesize the key points, areas of agreement, and open questions from this round. Then assign specific focus areas or questions for each participant in the next round (round ${run.currentRound + 1}). Append to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`;
     const roundSummaryPrompt = buildHopPrompt(run, modeConfig, {
       session: run.initiatorSession,
