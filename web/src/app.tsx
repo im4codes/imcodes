@@ -55,6 +55,7 @@ function mapP2pRunToDiscussion(r: Record<string, any>) {
     error: state === 'failed' ? (source.error ?? undefined) : undefined,
     filePath: undefined,
     fileId: source.discussion_id ? String(source.discussion_id) : source.id,
+    startedAt: source.created_at ? new Date(source.created_at).getTime() : undefined,
     nodes,
   };
 }
@@ -682,6 +683,8 @@ export function App() {
     }>;
     /** Discussion file ID for navigation (P2P runs use discussion_id, not run id) */
     fileId?: string;
+    /** Epoch ms when the P2P run was created (for elapsed timer) */
+    startedAt?: number;
   }>>([]);
 
   /** Set of session names enabled in the P2P config for the active root session. */
@@ -1143,7 +1146,7 @@ export function App() {
       if (msg.type === 'discussion.started') {
         setDiscussions((prev) => [
           ...prev,
-          { id: msg.discussionId, topic: msg.topic, state: 'setup', currentRound: 0, maxRounds: msg.maxRounds, completedHops: 0, totalHops: msg.totalHops ?? 0 },
+          { id: msg.discussionId, topic: msg.topic, state: 'setup', currentRound: 0, maxRounds: msg.maxRounds, completedHops: 0, totalHops: msg.totalHops ?? 0, startedAt: Date.now() },
         ]);
       }
       if (msg.type === 'discussion.update') {

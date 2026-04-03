@@ -376,11 +376,11 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
                 <input
                   type="number"
                   min={1}
-                  max={60}
+                  max={10}
                   value={hopTimeoutMinutes}
                   onInput={(e) => {
                     const v = parseInt((e.target as HTMLInputElement).value, 10);
-                    if (v >= 1 && v <= 60) setHopTimeoutMinutes(v);
+                    if (v >= 1 && v <= 10) setHopTimeoutMinutes(v);
                   }}
                   style={{
                     width: 64,

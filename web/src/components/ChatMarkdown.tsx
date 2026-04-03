@@ -93,6 +93,11 @@ function renderToken(
 
     case 'codespan': {
       const t = token as Tokens.Codespan;
+      // Detect file paths inside backtick code spans — agents commonly wrap paths in backticks
+      if (onPathClick && PATH_REGEX_INLINE.test(t.text)) {
+        PATH_REGEX_INLINE.lastIndex = 0;
+        return <code key={key} class="chat-inline-code chat-path-link" onClick={() => onPathClick(t.text)} title={t.text}>{t.text}</code>;
+      }
       return <code key={key} class="chat-inline-code">{t.text}</code>;
     }
 
@@ -218,7 +223,7 @@ function renderToken(
 // ── URL/Path detection (inline within text tokens) ──────────────────────────
 
 const URL_REGEX_INLINE = /https?:\/\/[^\s<>"\])}]+/g;
-const PATH_REGEX_INLINE = /(\.{1,2}\/[\w.\-~/]+|\/[\w.\-~][\w.\-~/]*|(?<![:/\w])[a-zA-Z_~][\w.\-~]*(?:\/[\w.\-~]+)+)/g;
+const PATH_REGEX_INLINE = /(\.{1,2}\/[\w\p{L}.\-~/]+|\/[\w\p{L}.\-~][\w\p{L}.\-~/]*|(?<![:/\w\p{L}])[a-zA-Z_~][\w\p{L}.\-~]*(?:\/[\w\p{L}.\-~]+)+)/gu;
 
 function splitPathsAndUrlsInternal(
   text: string,

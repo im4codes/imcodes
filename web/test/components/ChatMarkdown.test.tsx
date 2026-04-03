@@ -16,6 +16,21 @@ describe('ChatMarkdown', () => {
     expect(links[1].textContent).toBe('./README.md');
   });
 
+  it('detects paths inside backtick code spans', () => {
+    const clicked: string[] = [];
+    const { container } = render(
+      <ChatMarkdown
+        text="生成完毕：`~/.openclaw-ppt/projects/digital-town/output/digital-town.pdf`"
+        onPathClick={(p) => clicked.push(p)}
+      />
+    );
+    const links = container.querySelectorAll('.chat-path-link');
+    expect(links.length).toBe(1);
+    expect(links[0].textContent).toBe('~/.openclaw-ppt/projects/digital-town/output/digital-town.pdf');
+    // Should also have inline-code styling
+    expect(links[0].classList.contains('chat-inline-code')).toBe(true);
+  });
+
   it('does not detect paths inside URLs', () => {
     const { container } = render(
       <ChatMarkdown 

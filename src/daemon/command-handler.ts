@@ -1103,6 +1103,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       if (text.trim() === '/stop') {
         timelineEmitter.emit(sessionName, 'user.message', { text });
         await transportRuntime.cancel();
+        // Mark session for fresh start so daemon restart doesn't resume the stuck conversation
+        if (record?.agentType === 'qwen') {
+          upsertSession({ ...record, qwenFreshOnResume: true, updatedAt: Date.now() });
+        }
         const stopStatus = isLegacy ? 'accepted_legacy' : 'accepted';
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: stopStatus });
         try {
@@ -1171,6 +1175,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         refreshQwenQuotaUsageLabels(serverLink);
       }
       await transportRuntime.send(text);
+      // Clear fresh-start flag — the new conversation is now active
+      if (record?.qwenFreshOnResume) {
+        upsertSession({ ...record, qwenFreshOnResume: undefined, updatedAt: Date.now() });
+      }
       const status = isLegacy ? 'accepted_legacy' : 'accepted';
       timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
       try {
@@ -1258,6 +1266,11 @@ async function handleInput(cmd: Record<string, unknown>): Promise<void> {
     if (data === '\x1b') {
       try {
         await transportRuntime.cancel();
+        // Mark Qwen sessions for fresh start so restart doesn't resume stuck conversation
+        const rec = getSession(sessionName);
+        if (rec?.agentType === 'qwen') {
+          upsertSession({ ...rec, qwenFreshOnResume: true, updatedAt: Date.now() });
+        }
       } catch (err) {
         logger.error({ sessionName, err }, 'session.input transport cancel failed');
       }

@@ -367,7 +367,7 @@ export async function startP2pRun(
     status: 'queued',
     contextFilePath,
     userText,
-    timeoutMs: hopTimeoutMs ?? modeConfig?.defaultTimeoutMs ?? 300_000,
+    timeoutMs: Math.min(hopTimeoutMs ?? modeConfig?.defaultTimeoutMs ?? 300_000, 600_000),
     resultSummary: null,
     completedHops: [],
     skippedHops: [],
@@ -652,6 +652,8 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
     const GRACE_PERIOD_MS = GRACE_PERIOD_DEFAULT_MS;
     const dispatchTime = Date.now();
     const deadline = dispatchTime + run.timeoutMs;
+    // Absolute hard deadline: timeout + 60s — no exceptions, always skip
+    const hardDeadline = deadline + 60_000;
     let fileGrew = false;
     let lastSize = sizeBefore;
     let lastGrowthAt = 0;
@@ -659,8 +661,17 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
     let headingFoundAt = 0;
 
     while (Date.now() < deadline) {
+      // Hard deadline: timeout + 60s — force-skip no matter what
+      if (Date.now() >= hardDeadline) {
+        logger.warn({ runId: run.id, session }, 'P2P: hard deadline reached, force-skipping hop');
+        break;
+      }
       if (run._cancelled) { idleWaiter.cancel(); await finishHop(false); return; }
       await sleep(IDLE_POLL_MS);
+      if (Date.now() >= hardDeadline) {
+        logger.warn({ runId: run.id, session }, 'P2P: hard deadline reached, force-skipping hop');
+        break;
+      }
       if (run._cancelled) { idleWaiter.cancel(); await finishHop(false); return; }
 
       // Check file growth — track last growth time for settle detection
@@ -802,8 +813,8 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
 
     idleWaiter.cancel();
 
-    // If we got here from break (retry), continue to next attempt
-    if (!fileGrew && attempt < MAX_RETRIES) continue;
+    // If we got here from break (retry), continue to next attempt — unless hard deadline hit
+    if (!fileGrew && attempt < MAX_RETRIES && Date.now() < hardDeadline) continue;
 
     // Timeout — skip (don't fail the whole run)
     logger.warn({ runId: run.id, session }, 'P2P: hop timed out, skipping to next');
