@@ -324,6 +324,7 @@
     "mode_solo": "Solo",
     "mode_audit": "監査",
     "mode_review": "レビュー",
+    "mode_plan": "設計",
     "mode_brainstorm": "ブレスト",
     "mode_discuss": "ディスカッション",
     "exclude_same_type": "同タイプを除外",
@@ -346,6 +347,7 @@
     "mode": {
       "audit": "監査",
       "review": "レビュー",
+      "plan": "設計",
       "brainstorm": "ブレインストーミング",
       "discuss": "ディスカッション"
     },

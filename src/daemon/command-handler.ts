@@ -171,7 +171,7 @@ function expandAllTargets(initiatorName: string, mode: string, excludeSameType =
 
 // Session names: alphanumeric + underscore only (matches deck_{project}_{role} and deck_sub_{id} patterns)
 const SESSION_NAME_RE = /[a-zA-Z0-9_]+/;
-const VALID_MODES = new Set(['audit', 'review', 'brainstorm', 'discuss', 'config']);
+const VALID_MODES = new Set(['audit', 'review', 'plan', 'brainstorm', 'discuss', 'config']);
 const DISCUSS_TOKEN_RE = /@@discuss\(([^,]+),\s*([^)]+)\)/g;
 // @@all(mode) or @@all(mode, exclude-same-type)
 const ALL_TOKEN_RE = /@@all\(([^)]+)\)/g;

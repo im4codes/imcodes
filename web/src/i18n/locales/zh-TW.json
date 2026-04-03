@@ -324,6 +324,7 @@
     "mode_solo": "Solo",
     "mode_audit": "審查",
     "mode_review": "評審",
+    "mode_plan": "規劃",
     "mode_brainstorm": "腦力激盪",
     "mode_discuss": "討論",
     "exclude_same_type": "排除同類型",
@@ -346,6 +347,7 @@
     "mode": {
       "audit": "稽核",
       "review": "審查",
+      "plan": "規劃",
       "brainstorm": "腦力激盪",
       "discuss": "討論"
     },

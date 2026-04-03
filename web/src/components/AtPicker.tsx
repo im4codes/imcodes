@@ -33,7 +33,7 @@ interface AtPickerProps {
 
 type Category = 'choose' | 'files' | 'agents';
 
-const MODES = ['audit', 'review', 'brainstorm', 'discuss'] as const;
+const MODES = ['audit', 'review', 'plan', 'brainstorm', 'discuss'] as const;
 
 const DEBOUNCE_MS = 200;
 
@@ -321,7 +321,7 @@ export function AtPicker({
 
       // Config rounds sub-picker
       if (configRoundsPicker) {
-        const ALL_MODES = ['config', 'audit', 'review', 'brainstorm', 'discuss'] as const;
+        const ALL_MODES = ['config', 'audit', 'review', 'plan', 'brainstorm', 'discuss'] as const;
         const currentModeIdx = Math.max(0, ALL_MODES.indexOf(configModeOverride as typeof ALL_MODES[number]));
         if (e.key === 'Escape') { e.preventDefault(); setConfigRoundsPicker(false); setConfigPickerFocus('rounds'); return; }
         if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
@@ -451,7 +451,7 @@ export function AtPicker({
 
   // ── Config rounds sub-picker (for @all+ with custom rounds) ──
   if (configRoundsPicker && p2pConfig) {
-    const ALL_MODES = ['config', 'audit', 'review', 'brainstorm', 'discuss'];
+    const ALL_MODES = ['config', 'audit', 'review', 'plan', 'brainstorm', 'discuss'];
     const effectiveConfig = buildEffectiveConfig(p2pConfig, configModeOverride);
     const participants = Object.entries(effectiveConfig.sessions)
       .filter(([, e]) => e.enabled && e.mode !== 'skip');
