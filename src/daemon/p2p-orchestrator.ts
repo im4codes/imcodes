@@ -312,6 +312,8 @@ export async function startP2pRun(
   serverLink: ServerLink | null,
   rounds?: number,
   extraPrompt?: string,
+  /** Explicit mode override — used for combo pipelines (e.g. "brainstorm>discuss>plan"). */
+  modeOverride?: string,
 ): Promise<P2pRun> {
   // Validate same domain
   const mainSession = extractMainSession(initiatorSession);
@@ -321,8 +323,8 @@ export async function startP2pRun(
     }
   }
 
-  const mode = targets[0]?.mode ?? 'discuss';
-  const modeConfig = getP2pMode(mode);
+  const mode = modeOverride ?? targets[0]?.mode ?? 'discuss';
+  const modeConfig = getP2pMode(isComboMode(mode) ? parseModePipeline(mode)[0] : mode);
   const runId = randomUUID().slice(0, 12);
   const discussionId = `dsc_${randomUUID().slice(0, 8)}`;
   const now = new Date().toISOString();

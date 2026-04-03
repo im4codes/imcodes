@@ -1431,3 +1431,151 @@ describe('Group 18: Completion Event', () => {
     expect(final!.resultSummary!.length).toBeLessThanOrEqual(2000);
   });
 });
+
+// =============================================================================
+// Group: Combo mode pipeline
+// =============================================================================
+
+describe('Combo mode pipeline — modeOverride', () => {
+  it('run.mode is set to combo string when modeOverride is passed', async () => {
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'brainstorm' }],
+      'test combo',
+      [],
+      serverLinkMock as any,
+      3, // rounds = pipeline length
+      undefined,
+      'brainstorm>discuss>plan', // combo modeOverride
+    );
+
+    expect(run.mode).toBe('brainstorm>discuss>plan');
+    expect(run.rounds).toBe(3);
+
+    await waitForStatus(run.id, 'completed', 15_000);
+  }, 20_000);
+
+  it('without modeOverride, run.mode falls back to first target mode', async () => {
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'test single mode',
+      [],
+      serverLinkMock as any,
+    );
+
+    expect(run.mode).toBe('audit');
+    await waitForStatus(run.id, 'completed', 15_000);
+  }, 20_000);
+
+  it('combo run uses different mode prompts per round', async () => {
+    // Capture all prompts sent to agents
+    const capturedPrompts: string[] = [];
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      capturedPrompts.push(prompt);
+      const pathMatch = prompt.match(/\/[^\s]*.imc\/discussions\/[^\s]+\.md/);
+      if (pathMatch) {
+        const { appendFile } = await import('node:fs/promises');
+        await appendFile(pathMatch[0], `\n## Output from ${session}\n\nSome analysis.\n`);
+      }
+      setTimeout(() => notifySessionIdle(session), 150);
+    });
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'brainstorm' }],
+      'test combo prompts',
+      [],
+      serverLinkMock as any,
+      3,
+      undefined,
+      'brainstorm>discuss>plan',
+    );
+
+    await waitForStatus(run.id, 'completed', 20_000);
+
+    // Round 1 prompts should contain brainstorm role
+    const round1Prompts = capturedPrompts.filter(p => p.includes('Brainstorm Phase'));
+    expect(round1Prompts.length).toBeGreaterThan(0);
+
+    // Round 2 prompts should contain discuss role
+    const round2Prompts = capturedPrompts.filter(p => p.includes('Discuss Phase'));
+    expect(round2Prompts.length).toBeGreaterThan(0);
+
+    // Round 3 prompts should contain plan role
+    const round3Prompts = capturedPrompts.filter(p => p.includes('Plan Phase'));
+    expect(round3Prompts.length).toBeGreaterThan(0);
+
+    // brainstorm role prompt should appear in at least one round 1 prompt
+    const brainstormRolePrompt = 'creative collaborator';
+    const hasR1Role = capturedPrompts.some(p => p.includes('Brainstorm Phase') && p.includes(brainstormRolePrompt));
+    expect(hasR1Role).toBe(true);
+
+    // plan role prompt should appear in round 3 prompts
+    const planRolePrompt = 'technical architect';
+    const hasR3Role = capturedPrompts.some(p => p.includes('Plan Phase') && p.includes(planRolePrompt));
+    expect(hasR3Role).toBe(true);
+  }, 30_000);
+
+  it('combo run with config targets correctly uses modeOverride over individual target modes', async () => {
+    // This simulates the @@all(config) path where targets have individual modes
+    // but modeOverride is the combo string
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [
+        { session: 'deck_proj_w1', mode: 'audit' },   // individual config mode
+        { session: 'deck_proj_w2', mode: 'review' },   // different individual mode
+      ],
+      'test config combo override',
+      [],
+      serverLinkMock as any,
+      3,
+      undefined,
+      'brainstorm>discuss>plan', // combo overrides individual modes
+    );
+
+    // run.mode should be the combo, NOT the first target's individual mode
+    expect(run.mode).toBe('brainstorm>discuss>plan');
+    expect(run.mode).not.toBe('audit');
+
+    await waitForStatus(run.id, 'completed', 20_000);
+  }, 25_000);
+
+  it('4-step combo assigns correct mode to each round', async () => {
+    const capturedPrompts: string[] = [];
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      capturedPrompts.push(prompt);
+      const pathMatch = prompt.match(/\/[^\s]*.imc\/discussions\/[^\s]+\.md/);
+      if (pathMatch) {
+        const { appendFile } = await import('node:fs/promises');
+        await appendFile(pathMatch[0], `\n## Output from ${session}\n\nSome analysis.\n`);
+      }
+      setTimeout(() => notifySessionIdle(session), 150);
+    });
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'brainstorm' }],
+      'test 4-step combo',
+      [],
+      serverLinkMock as any,
+      4,
+      undefined,
+      'brainstorm>discuss>discuss>plan',
+    );
+
+    await waitForStatus(run.id, 'completed', 30_000);
+
+    // All 4 phases should appear
+    expect(capturedPrompts.some(p => p.includes('Brainstorm Phase'))).toBe(true);
+    expect(capturedPrompts.some(p => p.includes('Discuss Phase'))).toBe(true);
+    expect(capturedPrompts.some(p => p.includes('Plan Phase'))).toBe(true);
+
+    // The last round's prompts should contain plan phase
+    // Plan Phase should NOT appear in early round prompts
+    const planPrompts = capturedPrompts.filter(p => p.includes('Plan Phase'));
+    for (const p of planPrompts) {
+      expect(p).toContain('Round 4/4');
+    }
+  }, 40_000);
+});
