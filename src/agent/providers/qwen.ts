@@ -17,6 +17,7 @@ import {
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import logger from '../../util/logger.js';
+import { inferContextWindow } from '../../util/model-context.js';
 
 const execFileAsync = promisify(execFile);
 const QWEN_BIN = 'qwen';
@@ -91,6 +92,8 @@ interface QwenStreamMessage {
   };
 }
 
+type QwenUsage = NonNullable<QwenStreamMessage['usage']>;
+
 function collectAssistantText(content?: QwenAssistantContentBlock[]): string {
   if (!Array.isArray(content)) return '';
   const parts: string[] = [];
@@ -121,6 +124,27 @@ function hasMeaningfulToolValue(value: unknown): boolean {
     return Object.values(value as Record<string, unknown>).some((item) => hasMeaningfulToolValue(item));
   }
   return false;
+}
+
+function sanitizeUsageForDisplay(usage: QwenUsage | undefined, model?: string): QwenUsage | undefined {
+  if (!usage) return undefined;
+  const input = typeof usage.input_tokens === 'number' ? usage.input_tokens : undefined;
+  const cache = typeof usage.cache_read_input_tokens === 'number' ? usage.cache_read_input_tokens : 0;
+  const inferredCtx = inferContextWindow(model);
+  if (input === undefined) return usage;
+  // Qwen stream-json `result.usage` is computed from session metrics and may be
+  // cumulative across the whole conversation. That is not a valid context-bar
+  // numerator. When it is obviously beyond the model window, treat it as
+  // unusable for ctx display and reset the bar instead of showing nonsense like
+  // 11M / 1M.
+  if (inferredCtx && input + cache > inferredCtx * 2) {
+    return {
+      input_tokens: 0,
+      output_tokens: typeof usage.output_tokens === 'number' ? usage.output_tokens : 0,
+      cache_read_input_tokens: 0,
+    };
+  }
+  return usage;
 }
 
 export class QwenProvider implements TransportProvider {
@@ -440,7 +464,7 @@ export class QwenProvider implements TransportProvider {
           state.pendingFinalText = finalText;
           state.pendingFinalMetadata = {
             ...(state.model || payload.message?.model ? { model: state.model ?? payload.message?.model } : {}),
-            ...(payload.message?.usage ? { usage: payload.message.usage } : {}),
+            ...(payload.message?.usage ? { usage: sanitizeUsageForDisplay(payload.message.usage, state.model ?? payload.message?.model) } : {}),
           };
         }
         return;
@@ -470,10 +494,12 @@ export class QwenProvider implements TransportProvider {
           ? payload.result
           : state.pendingFinalText;
         if (!completed && resultText) {
+          const assistantUsage = state.pendingFinalMetadata?.usage as QwenUsage | undefined;
+          const sanitizedResultUsage = sanitizeUsageForDisplay(payload.usage, state.model);
           emitComplete(resultText, state.currentMessageId ?? undefined, {
             ...(state.pendingFinalMetadata ?? {}),
             ...(state.model ? { model: state.model } : {}),
-            ...(payload.usage ? { usage: payload.usage } : {}),
+            ...(!assistantUsage && sanitizedResultUsage ? { usage: sanitizedResultUsage } : {}),
           });
         }
       }
