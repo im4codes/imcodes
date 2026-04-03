@@ -527,8 +527,17 @@ authRoutes.post('/password/register', async (c) => {
 
   // Set status to pending if approval is required
   const requireApproval = await getSetting(c.env.DB, 'require_approval');
-  if (requireApproval === 'true') {
+  const isPending = requireApproval === 'true';
+  if (isPending) {
     await updateUserStatus(c.env.DB, userId, 'pending');
+  }
+
+  const ip = c.get('clientIp' as never) as string ?? 'unknown';
+  await logAudit({ userId, action: 'auth.password_register', ip }, c.env.DB);
+
+  // Don't issue session tokens for pending users — they can't use the app until approved
+  if (isPending) {
+    return c.json({ ok: true, pending: true });
   }
 
   // Issue session
@@ -550,9 +559,6 @@ authRoutes.post('/password/register', async (c) => {
   setCookie(c, COOKIE_CSRF, randomHex(16), {
     httpOnly: false, secure: isSecure, sameSite: 'Lax', path: '/', maxAge: 30 * 86400,
   });
-
-  const ip = c.get('clientIp' as never) as string ?? 'unknown';
-  await logAudit({ userId, action: 'auth.password_register', ip }, c.env.DB);
 
   // Native apps need API key
   let apiKey: string | undefined;

@@ -143,7 +143,11 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('invalid_credentials')) {
+      if (msg.includes('account_pending')) {
+        setError(t('login.account_pending'));
+      } else if (msg.includes('account_disabled')) {
+        setError(t('login.account_disabled'));
+      } else if (msg.includes('invalid_credentials')) {
         setError(t('login.invalid_credentials'));
       } else {
         setError(msg);
@@ -169,6 +173,11 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
     try {
       const native = isNative();
       const res = await passwordRegister(username.trim(), password, displayName.trim() || undefined, native);
+      if (res.pending) {
+        setMode('buttons');
+        setError(t('login.account_pending'));
+        return;
+      }
       if (native && res.apiKey && res.userId && res.keyId) {
         const { configureApiKey } = await import('../api.js');
         const { storeAuthKey } = await import('../biometric-auth.js');

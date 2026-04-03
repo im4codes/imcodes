@@ -216,6 +216,8 @@
     "password_placeholder": "비밀번호",
     "signin": "로그인",
     "invalid_credentials": "사용자 이름 또는 비밀번호가 올바르지 않습니다",
+    "account_pending": "계정이 관리자 승인 대기 중입니다. 관리자에게 문의해 주세요.",
+    "account_disabled": "계정이 비활성화되었습니다. 관리자에게 문의해 주세요.",
     "must_change_password": "계속하려면 비밀번호를 변경해야 합니다",
     "new_password_placeholder": "새 비밀번호",
     "confirm_password_placeholder": "새 비밀번호 확인",

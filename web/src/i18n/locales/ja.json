@@ -216,6 +216,8 @@
     "password_placeholder": "パスワード",
     "signin": "サインイン",
     "invalid_credentials": "ユーザー名またはパスワードが正しくありません",
+    "account_pending": "アカウントは管理者の承認待ちです。管理者にお問い合わせください。",
+    "account_disabled": "アカウントが無効化されています。管理者にお問い合わせください。",
     "must_change_password": "続行するにはパスワードを変更してください",
     "new_password_placeholder": "新しいパスワード",
     "confirm_password_placeholder": "新しいパスワードを確認",

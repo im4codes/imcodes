@@ -216,6 +216,8 @@
     "password_placeholder": "Password",
     "signin": "Sign In",
     "invalid_credentials": "Invalid username or password",
+    "account_pending": "Your account is pending admin approval. Please contact the administrator.",
+    "account_disabled": "Your account has been disabled. Please contact the administrator.",
     "must_change_password": "You must change your password before continuing",
     "new_password_placeholder": "New password",
     "confirm_password_placeholder": "Confirm new password",
