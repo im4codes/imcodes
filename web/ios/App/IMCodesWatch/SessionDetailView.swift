@@ -9,57 +9,27 @@ struct SessionDetailView: View {
     @State private var isSending = false
     @State private var statusMessage: String?
 
+    private let quickReplies = ["Yes", "Continue", "Fix"]
+
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 8) {
-                // Label + type
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(stateColor)
-                        .frame(width: 8, height: 8)
-                    Text(session?.title ?? route.sessionName)
-                        .font(.caption)
-                        .fontWeight(.medium)
-                    Text(session?.agentBadge ?? "")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 10) {
+                header
+
+                if historyState.hasMore {
+                    Button(historyState.isLoadingOlder ? "Loading…" : "Load older") {
+                        Task { await sessionManager.loadOlderHistory(for: route) }
+                    }
+                    .font(.caption2)
+                    .disabled(historyState.isLoadingOlder)
                 }
 
-                // Preview text
-                if let previewText = session?.previewText, !previewText.isEmpty {
-                    Text(previewText)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.primary)
-                    if let ts = session?.previewUpdatedAt, ts > 0 {
-                        Text(Date(timeIntervalSince1970: ts / 1000), style: .relative)
-                            .font(.system(size: 9))
-                            .foregroundStyle(.tertiary)
-                    }
-                }
+                chatSection
 
                 Divider()
 
-                // Reply
-                TextField("Reply…", text: $draft)
-                    .font(.caption2)
-
-                HStack(spacing: 8) {
-                    Button(isSending ? "…" : "Send") {
-                        Task { await sendReply() }
-                    }
-                    .font(.caption2)
-                    .disabled(!canSend || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSending)
-
-                    Spacer()
-
-                    // Open on iPhone
-                    Button {
-                        sessionManager.openOnPhone(route: route)
-                    } label: {
-                        Image(systemName: "iphone.and.arrow.right.outward")
-                            .font(.caption2)
-                    }
-                }
+                quickReplySection
+                replyComposer
 
                 if let statusMessage {
                     Text(statusMessage)
@@ -70,20 +40,109 @@ struct SessionDetailView: View {
             .padding(.horizontal, 4)
         }
         .navigationTitle(session?.title ?? route.sessionName)
+        .task {
+            await sessionManager.loadHistoryIfNeeded(for: route)
+        }
         .onDisappear {
             sessionManager.clearActiveRoute()
         }
     }
 
+    private var header: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(stateColor)
+                .frame(width: 8, height: 8)
+            Text(session?.title ?? route.sessionName)
+                .font(.caption)
+                .fontWeight(.medium)
+            Text(session?.agentBadge ?? "")
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var chatSection: some View {
+        if historyState.isLoading && historyState.items.isEmpty {
+            ProgressView()
+                .frame(maxWidth: .infinity, alignment: .center)
+        } else if historyState.items.isEmpty {
+            Text("No messages yet")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        } else {
+            LazyVStack(alignment: .leading, spacing: 6) {
+                ForEach(historyState.items) { item in
+                    HStack {
+                        if item.isUser { Spacer(minLength: 20) }
+                        Text(item.text)
+                            .font(.system(size: 12))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 6)
+                            .foregroundStyle(item.isUser ? Color.white : Color.primary)
+                            .background(item.isUser ? Color.green : Color.gray.opacity(0.22))
+                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        if !item.isUser { Spacer(minLength: 20) }
+                    }
+                }
+            }
+        }
+
+        if let error = historyState.errorMessage, !error.isEmpty {
+            Text(error)
+                .font(.system(size: 9))
+                .foregroundStyle(.red)
+        }
+    }
+
+    private var quickReplySection: some View {
+        HStack(spacing: 6) {
+            ForEach(quickReplies, id: \.self) { reply in
+                Button(reply) {
+                    Task { await sendReply(text: reply) }
+                }
+                .font(.system(size: 10))
+                .buttonStyle(.bordered)
+                .disabled(!canSend || isSending)
+            }
+        }
+    }
+
+    private var replyComposer: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            TextField("Reply…", text: $draft)
+                .font(.caption2)
+
+            HStack(spacing: 8) {
+                Button(isSending ? "…" : "Send") {
+                    Task { await sendReply(text: draft) }
+                }
+                .font(.caption2)
+                .disabled(!canSend || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSending)
+
+                Spacer()
+
+                Button {
+                    sessionManager.openOnPhone(route: route)
+                } label: {
+                    Image(systemName: "iphone.and.arrow.right.outward")
+                        .font(.caption2)
+                }
+            }
+        }
+    }
+
     private var canSend: Bool {
-        session != nil
-            && sessionManager.applicationContext.snapshotStatus != .switching
-            && sessionManager.applicationContext.apiKey?.isEmpty == false
-            && sessionManager.currentServer() != nil
+        sessionManager.canSend(to: route)
     }
 
     private var session: WatchSessionRow? {
-        sessionManager.applicationContext.sessions.first(where: { $0.serverId == route.serverId && $0.sessionName == route.sessionName })
+        sessionManager.session(for: route)
+    }
+
+    private var historyState: WatchHistoryViewState {
+        sessionManager.historyState(for: route)
     }
 
     private var stateColor: Color {
@@ -96,16 +155,16 @@ struct SessionDetailView: View {
         }
     }
 
-    private func sendReply() async {
+    private func sendReply(text rawText: String) async {
         guard !isSending else { return }
-        guard let server = sessionManager.currentServer(),
-              let session,
-              let apiKey = sessionManager.applicationContext.apiKey, !apiKey.isEmpty else {
+        guard let apiKey = sessionManager.currentApiKey(),
+              let baseURL = sessionManager.currentBaseUrl(for: route.serverId),
+              let session else {
             statusMessage = "Not ready"
             return
         }
 
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
 
         isSending = true
@@ -113,13 +172,12 @@ struct SessionDetailView: View {
 
         do {
             let client = WatchRestClient()
-            guard let baseURL = URL(string: server.baseUrl) else {
-                statusMessage = "Bad URL"
-                return
-            }
             let result = try await client.sendReply(
-                baseUrl: baseURL, serverId: server.id,
-                sessionName: session.sessionName, text: text, apiKey: apiKey
+                baseUrl: baseURL,
+                serverId: route.serverId,
+                sessionName: session.sessionName,
+                text: text,
+                apiKey: apiKey
             )
             switch result {
             case .accepted:

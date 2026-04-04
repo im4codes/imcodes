@@ -1,5 +1,4 @@
 import SwiftUI
-import WatchKit
 
 struct ContentView: View {
     @EnvironmentObject private var sessionManager: WatchSessionManager
@@ -7,34 +6,56 @@ struct ContentView: View {
     @State private var showServerPicker = false
     @State private var expandedSessions: Set<String> = []
 
+    private var currentSessions: [WatchSessionRow] {
+        sessionManager.displaySessions()
+    }
+
     private var mainSessions: [WatchSessionRow] {
-        sessionManager.applicationContext.sessions.filter { !$0.isSubSession }
+        currentSessions.filter { !$0.isSubSession }
     }
 
     private func subSessions(for parent: String) -> [WatchSessionRow] {
-        sessionManager.applicationContext.sessions.filter { $0.parentSessionName == parent }
+        currentSessions.filter { $0.parentSessionName == parent }
     }
 
     var body: some View {
         NavigationStack(path: $path) {
             Group {
-                if sessionManager.applicationContext.sessions.isEmpty {
-                    VStack(spacing: 6) {
-                        Text("No sessions")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                        Text("Open IM.codes on iPhone")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                if currentSessions.isEmpty {
+                    VStack(spacing: 8) {
+                        if sessionManager.currentApiKey() == nil {
+                            Text("Open IM.codes on iPhone")
+                                .font(.footnote)
+                            Text("Login once to sync Watch access")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        } else if sessionManager.isLoadingSessions || sessionManager.isLoadingServers {
+                            ProgressView()
+                        } else {
+                            Text("No sessions")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                     .padding()
                 } else {
                     List {
+                        if sessionManager.isUsingFallbackSnapshot {
+                            Text("Cached snapshot")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        if let error = sessionManager.lastErrorMessage, !error.isEmpty {
+                            Text(error)
+                                .font(.caption2)
+                                .foregroundStyle(.red)
+                        }
+
                         ForEach(mainSessions) { session in
                             let subs = subSessions(for: session.sessionName)
                             let isExpanded = expandedSessions.contains(session.sessionName)
 
-                            // Main session row + expand button
                             HStack(spacing: 0) {
                                 Button {
                                     path = [WatchRoute(serverId: session.serverId, sessionName: session.sessionName)]
@@ -80,7 +101,6 @@ struct ContentView: View {
                                 }
                             }
 
-                            // Sub-sessions
                             if isExpanded {
                                 ForEach(subs) { sub in
                                     Button {
@@ -100,7 +120,7 @@ struct ContentView: View {
             .navigationTitle("IM.codes")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    if sessionManager.applicationContext.servers.count > 1 {
+                    if sessionManager.displayServers.count > 1 {
                         Button {
                             showServerPicker = true
                         } label: {
@@ -111,16 +131,17 @@ struct ContentView: View {
                 }
             }
             .sheet(isPresented: $showServerPicker) {
-                List(sessionManager.applicationContext.servers) { server in
+                List(sessionManager.displayServers) { server in
                     Button {
                         showServerPicker = false
-                        sessionManager.requestServerSwitch(to: server.id)
+                        Task { await sessionManager.selectServer(server.id) }
                     } label: {
                         HStack {
                             Text(server.name).font(.caption)
                             Spacer()
-                            if sessionManager.applicationContext.currentServerId == server.id {
-                                Image(systemName: "checkmark").font(.caption2)
+                            if sessionManager.selectedServerId == server.id {
+                                Image(systemName: "checkmark")
+                                    .font(.caption2)
                             }
                         }
                     }
@@ -130,8 +151,10 @@ struct ContentView: View {
                 SessionDetailView(route: route)
             }
             .refreshable {
-                sessionManager.requestRefresh()
-                try? await Task.sleep(for: .seconds(2))
+                await sessionManager.refresh()
+            }
+            .task {
+                await sessionManager.ensureLoaded()
             }
             .onChange(of: sessionManager.activeRoute) { newRoute in
                 guard let newRoute else { return }
@@ -146,7 +169,6 @@ private struct SessionRowView: View {
 
     var body: some View {
         HStack(spacing: 5) {
-            // State dot + optional pin dot, stacked vertically
             VStack(spacing: 2) {
                 Circle()
                     .fill(stateColor)
@@ -159,7 +181,6 @@ private struct SessionRowView: View {
             }
             .frame(width: 8)
 
-            // Title + badge + preview, left-aligned
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     Text(session.title)
@@ -172,7 +193,7 @@ private struct SessionRowView: View {
                     }
                 }
 
-                if let previewText = session.previewText, !previewText.isEmpty {
+                if let previewText = session.effectivePreviewText, !previewText.isEmpty {
                     Text(previewText)
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)

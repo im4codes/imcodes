@@ -25,7 +25,58 @@ struct WatchIOSSmoke {
         let alias = try decoder.decode(WatchNotificationPayload.self, from: aliasPayload)
         assertCondition(alias.session == "deck_sub_beta", "`sessionName` alias should decode into session")
 
-        let request = try WatchRestClient.makeRequest(
+        let sessionListPayload = """
+        {
+          "serverId":"srv-1",
+          "sessions":[
+            {
+              "serverId":"srv-1",
+              "sessionName":"deck_proj_brain",
+              "title":"Main",
+              "state":"working",
+              "agentBadge":"cc",
+              "isSubSession":false,
+              "previewText":"latest",
+              "previewUpdatedAt":100,
+              "recentText":[
+                {"eventId":"e1","type":"user.message","text":"Yes","ts":90},
+                {"eventId":"e2","type":"assistant.text","text":"Continue","ts":100}
+              ]
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+        let sessionList = try decoder.decode(WatchSessionListResponse.self, from: sessionListPayload)
+        assertCondition(sessionList.serverId == "srv-1", "session list should decode serverId")
+        assertCondition(sessionList.sessions.count == 1, "session list should decode rows")
+        assertCondition(sessionList.sessions[0].latestRecentText?.eventId == "e2", "latest recent text should be newest row")
+        assertCondition(sessionList.sessions[0].effectivePreviewText == "latest", "preview text should win over fallback recent text")
+
+        let serverRequest = try WatchRestClient.makeServersRequest(
+            baseUrl: URL(string: "https://example.test")!,
+            apiKey: "watch-token"
+        )
+        assertCondition(serverRequest.url?.absoluteString == "https://example.test/api/watch/servers", "server list URL should be correct")
+        assertCondition(serverRequest.value(forHTTPHeaderField: "Authorization") == "Bearer watch-token", "server list auth header should be set")
+
+        let sessionsRequest = try WatchRestClient.makeSessionsRequest(
+            baseUrl: URL(string: "https://example.test")!,
+            serverId: "srv-3",
+            apiKey: "watch-token"
+        )
+        assertCondition(sessionsRequest.url?.absoluteString == "https://example.test/api/watch/sessions?serverId=srv-3", "session list URL should include serverId query")
+
+        let historyRequest = try WatchRestClient.makeHistoryRequest(
+            baseUrl: URL(string: "https://example.test")!,
+            serverId: "srv-3",
+            sessionName: "deck_sub_gamma",
+            apiKey: "watch-token",
+            limit: 50,
+            beforeTs: 1234
+        )
+        assertCondition(historyRequest.url?.absoluteString == "https://example.test/api/server/srv-3/timeline/history?sessionName=deck_sub_gamma&limit=50&beforeTs=1234", "history URL should include canonical pagination params")
+
+        let sendRequest = try WatchRestClient.makeRequest(
             baseUrl: URL(string: "https://example.test")!,
             serverId: "srv-3",
             sessionName: "deck_sub_gamma",
@@ -33,11 +84,39 @@ struct WatchIOSSmoke {
             apiKey: "watch-token",
             commandId: "cmd-123"
         )
-        assertCondition(request.url?.absoluteString == "https://example.test/api/server/srv-3/session/send", "request URL should target session send endpoint")
-        assertCondition(request.value(forHTTPHeaderField: "Authorization") == "Bearer watch-token", "Authorization header should be set")
-        let body = try JSONSerialization.jsonObject(with: request.httpBody ?? Data(), options: []) as? [String: Any]
+        assertCondition(sendRequest.url?.absoluteString == "https://example.test/api/server/srv-3/session/send", "request URL should target session send endpoint")
+        assertCondition(sendRequest.value(forHTTPHeaderField: "Authorization") == "Bearer watch-token", "Authorization header should be set")
+        let body = try JSONSerialization.jsonObject(with: sendRequest.httpBody ?? Data(), options: []) as? [String: Any]
         assertCondition(body?["commandId"] as? String == "cmd-123", "commandId should be serialized in request body")
         assertCondition(body?["sessionName"] as? String == "deck_sub_gamma", "sessionName should be serialized in request body")
+
+        let historyPayload = """
+        {
+          "sessionName":"deck_proj_brain",
+          "epoch":7,
+          "hasMore":true,
+          "nextCursor":100,
+          "events":[
+            {"eventId":"e1","sessionId":"deck_proj_brain","ts":100,"type":"user.message","payload":{"text":"old"}},
+            {"eventId":"e2","sessionId":"deck_proj_brain","ts":200,"type":"assistant.text","payload":{"text":"new"}},
+            {"eventId":"e3","sessionId":"deck_proj_brain","ts":210,"type":"tool.call","payload":{"text":"ignore"}}
+          ]
+        }
+        """.data(using: .utf8)!
+        let history = try decoder.decode(WatchHistoryResponse.self, from: historyPayload)
+        assertCondition(history.events[0].eventId == "e1", "history should preserve canonical event ids")
+        assertCondition(history.nextCursor == 100, "history should decode nextCursor")
+
+        let warmItems = sessionList.sessions[0].recentText?.compactMap { WatchConversationItem.fromRecentText($0, sessionId: "deck_proj_brain") } ?? []
+        let canonicalItems = history.events.compactMap(WatchConversationItem.fromTimelineEvent)
+        let merged = WatchConversationItem.merge(existing: warmItems, incoming: canonicalItems)
+        assertCondition(merged.map(\.eventId) == ["e1", "e2"], "merge should dedupe by canonical eventId and ignore unsupported event types")
+        assertCondition(merged[0].isUser && !merged[1].isUser, "bubble mapping should keep user on the right and assistant on the left")
+        assertCondition(merged[0].text == "old" && merged[1].text == "new", "canonical history should replace warm cache text on duplicate ids")
+
+        let olderItems = [WatchConversationItem(eventId: "e0", sessionId: "deck_proj_brain", ts: 50, type: "assistant.text", text: "earliest", isWarmCache: false)]
+        let prepended = WatchConversationItem.merge(existing: merged, incoming: olderItems)
+        assertCondition(prepended.map(\.eventId) == ["e0", "e1", "e2"], "older page merge should prepend in ts order")
 
         print("watch-ios-smoke ok")
     }

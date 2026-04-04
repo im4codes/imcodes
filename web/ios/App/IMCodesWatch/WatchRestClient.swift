@@ -7,10 +7,12 @@ actor WatchRestClient {
         case agentUnavailable
     }
 
-    enum WatchRestError: LocalizedError {
+    enum WatchRestError: LocalizedError, Equatable {
         case missingParameters
         case invalidResponse
-        case networkError(Error)
+        case authExpired
+        case agentUnavailable
+        case networkError(String)
         case serverError(statusCode: Int)
 
         var errorDescription: String? {
@@ -19,25 +21,84 @@ actor WatchRestClient {
                 return "Missing watch request parameters."
             case .invalidResponse:
                 return "The server returned an invalid response."
-            case .networkError(let error):
-                return error.localizedDescription
+            case .authExpired:
+                return "Authentication expired."
+            case .agentUnavailable:
+                return "Agent unavailable."
+            case .networkError(let message):
+                return message
             case .serverError(let statusCode):
                 return "Server responded with HTTP \(statusCode)."
             }
         }
     }
 
-    private let session: URLSession = {
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 30
-        config.timeoutIntervalForResource = 30
-        return URLSession(configuration: config)
-    }()
+    private let session: URLSession
 
-    struct SendRequestBody: Codable {
+    init(session: URLSession? = nil) {
+        if let session {
+            self.session = session
+        } else {
+            let config = URLSessionConfiguration.default
+            config.timeoutIntervalForRequest = 30
+            config.timeoutIntervalForResource = 30
+            self.session = URLSession(configuration: config)
+        }
+    }
+
+    struct SendRequestBody: Codable, Equatable {
         let commandId: String
         let sessionName: String
         let text: String
+    }
+
+    static func makeServersRequest(baseUrl: URL, apiKey: String) throws -> URLRequest {
+        guard !apiKey.isEmpty else { throw WatchRestError.missingParameters }
+        let url = baseUrl
+            .appendingPathComponent("api")
+            .appendingPathComponent("watch")
+            .appendingPathComponent("servers")
+        return try makeAuthorizedRequest(url: url, apiKey: apiKey)
+    }
+
+    static func makeSessionsRequest(baseUrl: URL, serverId: String, apiKey: String) throws -> URLRequest {
+        guard !serverId.isEmpty, !apiKey.isEmpty else { throw WatchRestError.missingParameters }
+        var components = URLComponents(url: baseUrl
+            .appendingPathComponent("api")
+            .appendingPathComponent("watch")
+            .appendingPathComponent("sessions"), resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "serverId", value: serverId)]
+        guard let url = components?.url else { throw WatchRestError.invalidResponse }
+        return try makeAuthorizedRequest(url: url, apiKey: apiKey)
+    }
+
+    static func makeHistoryRequest(
+        baseUrl: URL,
+        serverId: String,
+        sessionName: String,
+        apiKey: String,
+        limit: Int = 50,
+        beforeTs: Double? = nil
+    ) throws -> URLRequest {
+        guard !serverId.isEmpty, !sessionName.isEmpty, !apiKey.isEmpty else {
+            throw WatchRestError.missingParameters
+        }
+        var components = URLComponents(url: baseUrl
+            .appendingPathComponent("api")
+            .appendingPathComponent("server")
+            .appendingPathComponent(serverId)
+            .appendingPathComponent("timeline")
+            .appendingPathComponent("history"), resolvingAgainstBaseURL: false)
+        var queryItems = [
+            URLQueryItem(name: "sessionName", value: sessionName),
+            URLQueryItem(name: "limit", value: String(limit))
+        ]
+        if let beforeTs {
+            queryItems.append(URLQueryItem(name: "beforeTs", value: String(Int64(beforeTs))))
+        }
+        components?.queryItems = queryItems
+        guard let url = components?.url else { throw WatchRestError.invalidResponse }
+        return try makeAuthorizedRequest(url: url, apiKey: apiKey)
     }
 
     static func makeRequest(
@@ -59,14 +120,43 @@ actor WatchRestClient {
             .appendingPathComponent("session")
             .appendingPathComponent("send")
 
-        var request = URLRequest(url: url)
+        var request = try makeAuthorizedRequest(url: url, apiKey: apiKey)
         request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(
             SendRequestBody(commandId: commandId, sessionName: sessionName, text: text)
         )
         return request
+    }
+
+    func fetchServers(baseUrl: URL, apiKey: String) async throws -> [WatchServerRow] {
+        let request = try Self.makeServersRequest(baseUrl: baseUrl, apiKey: apiKey)
+        let response: WatchServerListResponse = try await performJSON(request: request)
+        return response.servers
+    }
+
+    func fetchSessions(baseUrl: URL, serverId: String, apiKey: String) async throws -> WatchSessionListResponse {
+        let request = try Self.makeSessionsRequest(baseUrl: baseUrl, serverId: serverId, apiKey: apiKey)
+        return try await performJSON(request: request)
+    }
+
+    func fetchHistory(
+        baseUrl: URL,
+        serverId: String,
+        sessionName: String,
+        apiKey: String,
+        limit: Int = 50,
+        beforeTs: Double? = nil
+    ) async throws -> WatchHistoryResponse {
+        let request = try Self.makeHistoryRequest(
+            baseUrl: baseUrl,
+            serverId: serverId,
+            sessionName: sessionName,
+            apiKey: apiKey,
+            limit: limit,
+            beforeTs: beforeTs
+        )
+        return try await performJSON(request: request)
     }
 
     func sendReply(
@@ -103,7 +193,38 @@ actor WatchRestClient {
         } catch let error as WatchRestError {
             throw error
         } catch {
-            throw WatchRestError.networkError(error)
+            throw WatchRestError.networkError(error.localizedDescription)
+        }
+    }
+
+    private static func makeAuthorizedRequest(url: URL, apiKey: String) throws -> URLRequest {
+        guard !apiKey.isEmpty else { throw WatchRestError.missingParameters }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        return request
+    }
+
+    private func performJSON<T: Decodable>(request: URLRequest) async throws -> T {
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw WatchRestError.invalidResponse
+            }
+            switch httpResponse.statusCode {
+            case 200..<300:
+                return try JSONDecoder().decode(T.self, from: data)
+            case 401, 403:
+                throw WatchRestError.authExpired
+            case 502, 503:
+                throw WatchRestError.agentUnavailable
+            default:
+                throw WatchRestError.serverError(statusCode: httpResponse.statusCode)
+            }
+        } catch let error as WatchRestError {
+            throw error
+        } catch {
+            throw WatchRestError.networkError(error.localizedDescription)
         }
     }
 }
