@@ -49,7 +49,7 @@ async function getTableColumns(tableName: string): Promise<Set<string>> {
 const SCHEMA_MAP: Array<[string, string[]]> = [
   ['users', [
     'id', 'created_at', 'username', 'password_hash', 'display_name',
-    'password_must_change', 'is_admin', 'status',
+    'password_must_change', 'is_admin', 'status', 'badge_count',
   ]],
   ['platform_identities', [
     'id', 'user_id', 'platform', 'platform_user_id', 'created_at',

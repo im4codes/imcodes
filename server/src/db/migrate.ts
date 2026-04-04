@@ -12,6 +12,20 @@ import type { Database } from './client.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = join(__dirname, 'migrations');
 
+/**
+ * Sort migration filenames by their numeric prefix (not string comparison).
+ * Handles any width: 001, 035, 100, 1000, etc. — avoids string sort pitfalls
+ * where "99_foo" > "100_bar".
+ */
+function sortMigrations(files: string[]): string[] {
+  return files.sort((a, b) => {
+    const numA = parseInt(a, 10);
+    const numB = parseInt(b, 10);
+    if (!isNaN(numA) && !isNaN(numB)) return numA - numB;
+    return a.localeCompare(b);
+  });
+}
+
 export async function runMigrations(db: Database): Promise<void> {
   // Ensure migrations tracking table exists
   await db.exec(`
@@ -25,8 +39,10 @@ export async function runMigrations(db: Database): Promise<void> {
   const results = await db.query<{ name: string }>('SELECT name FROM _migrations ORDER BY name');
   const applied = new Set(results.map((r) => r.name));
 
-  // Discover migration files sorted by name
-  const files = (await readdir(MIGRATIONS_DIR)).filter((f) => f.endsWith('.sql')).sort();
+  // Discover migration files sorted by numeric prefix
+  const files = sortMigrations(
+    (await readdir(MIGRATIONS_DIR)).filter((f) => f.endsWith('.sql')),
+  );
 
   for (const file of files) {
     if (applied.has(file)) continue;
