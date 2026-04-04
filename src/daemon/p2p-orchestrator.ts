@@ -72,6 +72,8 @@ export interface P2pRun {
   allTargets: P2pTarget[];
   /** User-defined extra prompt appended to every participant's system prompt. */
   extraPrompt: string;
+  /** Epoch ms when the current hop/phase started — used by the UI for hop-level elapsed timer. */
+  hopStartedAt: number;
   /** Internal: set to true when cancel requested */
   _cancelled: boolean;
 }
@@ -122,6 +124,7 @@ export function serializeP2pRun(run: P2pRun): Record<string, unknown> {
       if (run.status === 'completed') return 'summary';
       return 'queued';
     })(),
+    hop_started_at: run.hopStartedAt || null,
     active_hop_number: run.currentTargetSession && run.currentTargetSession !== run.initiatorSession
       ? run.completedHops.length + 1
       : null,
@@ -379,6 +382,7 @@ export async function startP2pRun(
     currentRound: 1,
     allTargets: [...targets],
     extraPrompt: extraPrompt ?? '',
+    hopStartedAt: Date.now(),
     _cancelled: false,
   };
 
@@ -557,6 +561,7 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
 
 async function dispatchHop(run: P2pRun, session: string, prompt: string, serverLink: ServerLink | null, _unused?: unknown, sectionHeader?: string): Promise<void> {
   run.currentTargetSession = session;
+  run.hopStartedAt = Date.now();
   // Don't remove from remainingTargets yet — defer until hop actually completes
   transition(run, 'dispatched', serverLink);
 

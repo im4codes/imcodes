@@ -28,6 +28,8 @@ export interface P2pProgressDiscussion {
   nodes?: P2pProgressNode[];
   /** Epoch ms when the P2P run started */
   startedAt?: number;
+  /** Epoch ms when the current hop/phase started (server-provided for accurate elapsed) */
+  hopStartedAt?: number;
 }
 
 interface Props {
@@ -76,17 +78,18 @@ function useElapsedTimer(startMs: number | undefined, active: boolean): string {
   return formatElapsed(now - startMs);
 }
 
-/** Track hop-level elapsed: resets when the hop key changes. */
-function useHopTimer(hopKey: string | null, active: boolean): string {
-  const [hopStart, setHopStart] = useState(Date.now());
+/** Track hop-level elapsed using the server-provided start time.
+ *  Falls back to Date.now() only if no server timestamp is available. */
+function useHopTimer(hopKey: string | null, active: boolean, serverStartMs?: number): string {
+  const [fallbackStart, setFallbackStart] = useState(Date.now());
   const prevKey = useRef(hopKey);
   useEffect(() => {
     if (hopKey !== prevKey.current) {
       prevKey.current = hopKey;
-      setHopStart(Date.now());
+      setFallbackStart(Date.now());
     }
   }, [hopKey]);
-  return useElapsedTimer(hopStart, active);
+  return useElapsedTimer(serverStartMs ?? fallbackStart, active);
 }
 
 export function P2pProgressCard({ discussion, compact = false, mobile = false, hidden = false, onToggleHide, onClick, onStopDiscussion }: Props) {
@@ -120,7 +123,7 @@ export function P2pProgressCard({ discussion, compact = false, mobile = false, h
   const totalElapsed = useElapsedTimer(discussion.startedAt, isActive);
   // Hop timer resets when round+hop+phase changes
   const hopKey = isActive ? `${discussion.currentRound}:${discussion.activeHop}:${discussion.activePhase}` : null;
-  const hopElapsed = useHopTimer(hopKey, isActive);
+  const hopElapsed = useHopTimer(hopKey, isActive, discussion.hopStartedAt);
 
   // ── Mobile ultra-compact: single-line summary ──────────────────────────
   if (mobile) {
