@@ -28,14 +28,8 @@ export async function initUpdateManager(): Promise<void> {
   if (!isNative() || initialized) return;
   initialized = true;
 
-  // DEV: skip OTA to test local Watch bridge code
   const { CapacitorUpdater } = await import('@capgo/capacitor-updater');
   await CapacitorUpdater.notifyAppReady();
-  return;
-
-  /* eslint-disable no-unreachable */
-  const { CapacitorUpdater: _CU } = await import('@capgo/capacitor-updater');
-  await _CU.notifyAppReady();
 
   // Cold start: check + apply immediately
   checkForUpdate(true).catch(() => {});
