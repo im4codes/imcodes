@@ -131,10 +131,8 @@ program
       if (userService) {
         execSync('systemctl --user start imcodes', { stdio: 'inherit' });
       } else {
-        try { execSync('sudo systemctl start imcodes', { stdio: 'inherit' }); } catch {
-          console.error(`No service installed. Run 'imcodes service install' first, or use 'imcodes start --foreground'.`);
-          process.exit(1);
-        }
+        console.error(`No user service installed. Run 'imcodes bind' or 'imcodes service install' first, or use 'imcodes start --foreground'.`);
+        process.exit(1);
       }
       console.log('Daemon started via systemd.');
     } else {
@@ -563,7 +561,8 @@ program
           if (isUserService) {
             execSync('systemctl --user daemon-reload && systemctl --user restart imcodes', { stdio: 'inherit' });
           } else {
-            execSync('sudo systemctl daemon-reload && sudo systemctl restart imcodes', { stdio: 'inherit' });
+            console.error('No user service found. Run "imcodes bind" to install.');
+            process.exit(1);
           }
           console.log('Done.');
         } else {
@@ -641,10 +640,7 @@ program
         console.log('Restarting daemon via systemd...');
         execSync('systemctl --user daemon-reload && systemctl --user restart imcodes', { stdio: 'inherit' });
       } else {
-        try {
-          console.log('Restarting daemon via systemd...');
-          execSync('sudo systemctl daemon-reload && sudo systemctl restart imcodes', { stdio: 'inherit' });
-        } catch { /* no service — skip */ }
+        console.log('No user service found. Skipping restart — run "imcodes bind" to install.');
       }
     } else if (platform === 'win32') {
       // Kill daemon process — watchdog will auto-relaunch with new version in ~5s.
@@ -680,7 +676,8 @@ program
       if (isUserService) {
         execSync('systemctl --user restart imcodes', { stdio: 'inherit' });
       } else {
-        execSync('sudo systemctl restart imcodes', { stdio: 'inherit' });
+        console.error('No user service found. Run "imcodes bind" to install.');
+        process.exit(1);
       }
     } else if (platform === 'win32') {
       if (!restartWindowsDaemon(process.pid)) {
@@ -748,7 +745,7 @@ program
       if (existsSync(userService)) {
         execSync('systemctl --user restart imcodes', { stdio: 'inherit' });
       } else {
-        try { execSync('sudo systemctl restart imcodes', { stdio: 'inherit' }); } catch { /* ok */ }
+        console.log('No user service found. Run "imcodes restart" manually after installing with "imcodes bind".');
       }
     }
     console.log(`Connected to ${provider}.`);
@@ -785,7 +782,7 @@ program
       if (existsSync(userService)) {
         execSync('systemctl --user restart imcodes', { stdio: 'inherit' });
       } else {
-        try { execSync('sudo systemctl restart imcodes', { stdio: 'inherit' }); } catch { /* ok */ }
+        console.log('No user service found. Run "imcodes restart" manually after installing with "imcodes bind".');
       }
     }
     console.log(`Disconnected from ${provider}.`);

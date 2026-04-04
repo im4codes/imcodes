@@ -389,9 +389,12 @@ Type=simple
 ExecStart=${nodeExec} ${imcodesPath} start --foreground
 Restart=on-failure
 RestartSec=5
+KillMode=process
+Environment=PATH=${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}
+Environment=HOME=${homedir()}
+Environment=NODE_ENV=production
 StandardOutput=append:${logPath}
 StandardError=append:${logPath}
-Environment=NODE_ENV=production
 
 [Install]
 WantedBy=default.target

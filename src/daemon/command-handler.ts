@@ -2069,7 +2069,7 @@ async function handleDaemonUpgrade(targetVersion?: string): Promise<void> {
     if (existsSync(userSvc)) {
       restartCmd = 'systemctl --user restart imcodes';
     } else {
-      restartCmd = 'sudo systemctl restart imcodes';
+      restartCmd = 'echo "No user service found. Run: imcodes bind" && exit 1';
     }
   } else if (process.platform === 'darwin') {
     const plist = join(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
