@@ -36,9 +36,9 @@ export const FILE_TRANSFER_LIMITS = {
   /** Maximum single file size in bytes (100 MB). */
   MAX_FILE_SIZE: 100 * 1024 * 1024,
   /** Server waits this long for daemon upload ack (ms). */
-  UPLOAD_TIMEOUT_MS: 120_000,
+  UPLOAD_TIMEOUT_MS: 300_000,
   /** Server waits this long for daemon download response (ms). */
-  DOWNLOAD_TIMEOUT_MS: 120_000,
+  DOWNLOAD_TIMEOUT_MS: 300_000,
   /** Temporary uploaded files are cleaned after this duration (ms). 24 hours. */
   TEMP_TTL_MS: 24 * 60 * 60 * 1000,
   /** Project-file download handles expire after this duration (ms). 1 hour. */
