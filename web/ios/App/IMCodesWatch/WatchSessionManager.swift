@@ -71,6 +71,14 @@ final class WatchSessionManager: NSObject, ObservableObject {
         activeRoute = nil
     }
 
+    func openOnPhone(route: WatchRoute) {
+        sendControlMessage([
+            "action": "openSession",
+            "serverId": route.serverId,
+            "sessionName": route.sessionName
+        ])
+    }
+
     private func hydrateCachedContext() {
         guard WCSession.isSupported() else { return }
         let cached = WCSession.default.receivedApplicationContext

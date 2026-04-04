@@ -10,50 +10,64 @@ struct SessionDetailView: View {
     @State private var statusMessage: String?
 
     var body: some View {
-        Form {
-            Section("Session") {
-                if let session {
-                    LabeledContent("Title", value: session.title)
-                    LabeledContent("Session", value: session.sessionName)
-                    LabeledContent("State", value: stateBadge)
-                    if let parentTitle = session.parentTitle, !parentTitle.isEmpty {
-                        LabeledContent("Parent", value: parentTitle)
-                    }
-                } else {
-                    Text("Session unavailable.")
+        ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+                // Label + type
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(stateColor)
+                        .frame(width: 8, height: 8)
+                    Text(session?.title ?? route.sessionName)
+                        .font(.caption)
+                        .fontWeight(.medium)
+                    Text(session?.agentBadge ?? "")
+                        .font(.system(size: 9))
                         .foregroundStyle(.secondary)
                 }
-            }
 
-            Section("Preview") {
+                // Preview text
                 if let previewText = session?.previewText, !previewText.isEmpty {
                     Text(previewText)
-                        .font(.footnote)
-                    if let previewUpdatedAt = session?.previewUpdatedAt {
-                        Text(Date(timeIntervalSince1970: previewUpdatedAt / 1000), style: .relative)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.primary)
+                    if let ts = session?.previewUpdatedAt, ts > 0 {
+                        Text(Date(timeIntervalSince1970: ts / 1000), style: .relative)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.tertiary)
                     }
-                } else {
-                    Text("No preview available.")
-                        .foregroundStyle(.secondary)
                 }
-            }
 
-            Section("Reply") {
-                TextField("Reply", text: $draft)
+                Divider()
 
-                Button(isSending ? "Sending…" : "Send") {
-                    Task { await sendReply() }
+                // Reply
+                TextField("Reply…", text: $draft)
+                    .font(.caption2)
+
+                HStack(spacing: 8) {
+                    Button(isSending ? "…" : "Send") {
+                        Task { await sendReply() }
+                    }
+                    .font(.caption2)
+                    .disabled(!canSend || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSending)
+
+                    Spacer()
+
+                    // Open on iPhone
+                    Button {
+                        sessionManager.openOnPhone(route: route)
+                    } label: {
+                        Image(systemName: "iphone.and.arrow.right.outward")
+                            .font(.caption2)
+                    }
                 }
-                .disabled(session == nil || !canSend || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSending)
-            }
 
-            if let statusMessage {
-                Section("Status") {
+                if let statusMessage {
                     Text(statusMessage)
+                        .font(.system(size: 9))
+                        .foregroundStyle(statusMessage == "Sent" ? .green : .red)
                 }
             }
+            .padding(.horizontal, 4)
         }
         .navigationTitle(session?.title ?? route.sessionName)
         .onDisappear {
@@ -62,7 +76,8 @@ struct SessionDetailView: View {
     }
 
     private var canSend: Bool {
-        sessionManager.applicationContext.snapshotStatus != .switching
+        session != nil
+            && sessionManager.applicationContext.snapshotStatus != .switching
             && sessionManager.applicationContext.apiKey?.isEmpty == false
             && sessionManager.currentServer() != nil
     }
@@ -71,28 +86,22 @@ struct SessionDetailView: View {
         sessionManager.applicationContext.sessions.first(where: { $0.serverId == route.serverId && $0.sessionName == route.sessionName })
     }
 
-    private var stateBadge: String {
-        guard let session else { return "⚪ unavailable" }
+    private var stateColor: Color {
+        guard let session else { return .gray }
         switch session.state {
-        case .working: return "🟡 working"
-        case .idle: return "🟢 idle"
-        case .error: return "🔴 error"
-        case .stopped: return "⚪ stopped"
+        case .working: return .yellow
+        case .idle: return .green
+        case .error: return .red
+        case .stopped: return .gray
         }
     }
 
     private func sendReply() async {
         guard !isSending else { return }
-        guard let server = sessionManager.currentServer() else {
-            statusMessage = "No active server"
-            return
-        }
-        guard let session else {
-            statusMessage = "Session unavailable"
-            return
-        }
-        guard let apiKey = sessionManager.applicationContext.apiKey, !apiKey.isEmpty else {
-            statusMessage = "Missing API key"
+        guard let server = sessionManager.currentServer(),
+              let session,
+              let apiKey = sessionManager.applicationContext.apiKey, !apiKey.isEmpty else {
+            statusMessage = "Not ready"
             return
         }
 
@@ -105,16 +114,12 @@ struct SessionDetailView: View {
         do {
             let client = WatchRestClient()
             guard let baseURL = URL(string: server.baseUrl) else {
-                statusMessage = "Invalid server URL"
+                statusMessage = "Bad URL"
                 return
             }
-
             let result = try await client.sendReply(
-                baseUrl: baseURL,
-                serverId: server.id,
-                sessionName: session.sessionName,
-                text: text,
-                apiKey: apiKey
+                baseUrl: baseURL, serverId: server.id,
+                sessionName: session.sessionName, text: text, apiKey: apiKey
             )
             switch result {
             case .accepted:
@@ -123,14 +128,14 @@ struct SessionDetailView: View {
                 statusMessage = "Sent"
             case .authExpired:
                 WKInterfaceDevice.current().play(.failure)
-                statusMessage = "Authentication expired"
+                statusMessage = "Auth expired"
             case .agentUnavailable:
                 WKInterfaceDevice.current().play(.failure)
-                statusMessage = "Agent unavailable"
+                statusMessage = "Agent offline"
             }
         } catch {
             WKInterfaceDevice.current().play(.failure)
-            statusMessage = error.localizedDescription
+            statusMessage = "Network error"
         }
     }
 }

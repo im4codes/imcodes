@@ -27,6 +27,8 @@ struct WatchSessionRow: Identifiable, Codable, Equatable {
     var agentBadge: String
     var isSubSession: Bool
     var parentTitle: String?
+    var parentSessionName: String?
+    var isPinned: Bool?
     var previewText: String?
     var previewUpdatedAt: Double?
 

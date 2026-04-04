@@ -20,6 +20,8 @@ export interface WatchSessionRow {
   agentBadge: string;
   isSubSession: boolean;
   parentTitle?: string;
+  parentSessionName?: string;
+  isPinned?: boolean;
   previewText?: string;
   previewUpdatedAt?: number;
 }
@@ -250,14 +252,32 @@ export class WatchProjectionStore {
   }
 
   updateFromSessionList(server: WatchServerRow, sessions: WatchSessionInput[]): void {
+    this.updateFromSessionListWithSubs(server, sessions, []);
+  }
+
+  updateFromSessionListWithSubs(server: WatchServerRow, sessions: WatchSessionInput[], subs: WatchSubSessionInput[]): void {
     this.upsertServer(server);
     this.currentServerId = server.id;
 
     const nextSessions = new Map<string, WatchSessionRow>();
     const nextParents = new Map<string, string | null>();
+
+    // Main sessions from session_list
     for (const raw of sessions) {
       const row = this.buildSessionRow(server.id, raw);
       nextParents.set(row.sessionName, raw.parentSession ?? null);
+      const preview = this.previewBySession.get(row.sessionName);
+      if (preview && row.previewText === undefined) {
+        row.previewText = preview.previewText;
+        row.previewUpdatedAt = preview.previewUpdatedAt;
+      }
+      nextSessions.set(row.sessionName, row);
+    }
+
+    // Sub-sessions from app state (daemon filters them from session_list)
+    for (const sub of subs) {
+      const row = this.buildSubSessionRow(server.id, sub);
+      nextParents.set(row.sessionName, sub.parentSession ?? null);
       const preview = this.previewBySession.get(row.sessionName);
       if (preview && row.previewText === undefined) {
         row.previewText = preview.previewText;
@@ -312,6 +332,18 @@ export class WatchProjectionStore {
       return false;
     }
     this.assistantTextBySession.set(sessionName, trimmed);
+
+    // Update previewText in real-time (debounce will coalesce rapid updates)
+    const row = this.sessionsByName.get(sessionName);
+    if (row) {
+      const preview = extractPreviewText(trimmed);
+      if (preview && preview !== row.previewText) {
+        const ts = this.now();
+        this.previewBySession.set(sessionName, { previewText: preview, previewUpdatedAt: ts });
+        this.sessionsByName.set(sessionName, { ...row, previewText: preview, previewUpdatedAt: ts });
+        this.maybePush();
+      }
+    }
     return true;
   }
 
@@ -437,9 +469,23 @@ export class WatchProjectionStore {
   }
 
   private buildSessions(): WatchSessionRow[] {
+    // Read pinned tabs from localStorage (synced by useSyncedPreference, key: rcc_sync_tab_pinned, format: {v: string[], t: number})
+    let pinnedSet: Set<string>;
+    try {
+      const raw = localStorage.getItem('rcc_sync_tab_pinned');
+      const payload = raw ? JSON.parse(raw) as { v: string[] } : null;
+      pinnedSet = new Set(payload?.v ?? []);
+    } catch {
+      pinnedSet = new Set();
+    }
+
     return [...this.sessionsByName.values()]
-      .map((row) => ({ ...row }))
+      .map((row) => ({ ...row, isPinned: pinnedSet.has(row.sessionName) || undefined }))
       .sort((a, b) => {
+        // Pinned first
+        const pinDiff = (b.isPinned ? 1 : 0) - (a.isPinned ? 1 : 0);
+        if (pinDiff !== 0) return pinDiff;
+        // Then by state priority
         const priorityDiff = STATE_PRIORITY[a.state] - STATE_PRIORITY[b.state];
         if (priorityDiff !== 0) return priorityDiff;
         const titleDiff = a.title.localeCompare(b.title, undefined, { sensitivity: 'base' });
@@ -469,7 +515,7 @@ export class WatchProjectionStore {
       const parentSessionName = this.parentSessionByName.get(sessionName);
       const parentTitle = parentSessionName ? this.sessionsByName.get(parentSessionName)?.title : undefined;
       const nextRow = parentTitle
-        ? (row.parentTitle === parentTitle ? row : { ...row, parentTitle })
+        ? (row.parentTitle === parentTitle && row.parentSessionName === parentSessionName ? row : { ...row, parentTitle, parentSessionName: parentSessionName ?? undefined })
         : row.parentTitle === undefined
           ? row
           : (() => {

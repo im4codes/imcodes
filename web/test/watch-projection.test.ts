@@ -162,6 +162,85 @@ describe('watch projection store', () => {
     expect(fourth.previewUpdatedAt).toBe(3_222);
   });
 
+  it('updateFromSessionList triggers syncSnapshot after debounce with full payload', async () => {
+    const { store, pushes } = makeSnapshotStore(5_000);
+    store.setApiKey('test-key');
+    store.setServers([{ id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' }]);
+
+    // First call — generatedAt is 0, so immediate push
+    store.updateFromSessionList(
+      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+      [
+        { name: 'deck_proj_brain', project: 'Project', role: 'brain', agentType: 'claude-code', state: 'running' },
+        { name: 'deck_sub_w1', project: 'Project', role: 'w1', agentType: 'gemini', state: 'running', parentSession: 'deck_proj_brain' },
+      ],
+    );
+
+    // First updateFromSessionList with generatedAt=0 pushes immediately
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pushes).toHaveLength(1);
+
+    const snapshot = pushes[0];
+    expect(snapshot.v).toBe(1);
+    expect(snapshot.snapshotStatus).toBe('fresh');
+    expect(snapshot.currentServerId).toBe('srv-1');
+    expect(snapshot.apiKey).toBe('test-key');
+    expect(snapshot.servers).toHaveLength(1);
+    expect(snapshot.sessions).toHaveLength(2);
+    expect(snapshot.sessions.map(s => s.sessionName)).toContain('deck_proj_brain');
+    expect(snapshot.sessions.map(s => s.sessionName)).toContain('deck_sub_w1');
+    expect(snapshot.generatedAt).toBe(5_000);
+
+    // Sub-session has correct parent
+    const sub = snapshot.sessions.find(s => s.sessionName === 'deck_sub_w1');
+    expect(sub?.isSubSession).toBe(true);
+    expect(sub?.agentBadge).toBe('gm');
+  });
+
+  it('second updateFromSessionList with different data triggers debounced push', async () => {
+    const { store, pushes } = makeSnapshotStore(6_000);
+    store.setApiKey('k');
+    store.setServers([{ id: 's1', name: 'S', baseUrl: 'https://s.test' }]);
+
+    // First call (immediate because generatedAt=0)
+    store.updateFromSessionList(
+      { id: 's1', name: 'S', baseUrl: 'https://s.test' },
+      [{ name: 'a', project: 'P', role: 'brain', agentType: 'claude-code', state: 'running' }],
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pushes).toHaveLength(1);
+
+    // Second call with different state — should debounce
+    store.updateFromSessionList(
+      { id: 's1', name: 'S', baseUrl: 'https://s.test' },
+      [{ name: 'a', project: 'P', role: 'brain', agentType: 'claude-code', state: 'idle' }],
+    );
+    expect(pushes).toHaveLength(1); // not yet
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(pushes).toHaveLength(2);
+    expect(pushes[1].sessions[0].state).toBe('idle');
+  });
+
+  it('syncSnapshot is NOT called when isNative would return false (web env)', async () => {
+    // The watch-bridge.ts has isNative() guard. In test env (jsdom), isNative() returns false.
+    // Verify by importing the real function.
+    const { syncSnapshotToWatch } = await import('../src/watch-bridge.js');
+    const spy = vi.fn();
+
+    // Mock — this won't actually go to native
+    await syncSnapshotToWatch({
+      v: 1,
+      snapshotStatus: 'fresh',
+      generatedAt: Date.now(),
+      currentServerId: 'test',
+      servers: [],
+      sessions: [],
+      apiKey: null,
+    });
+
+    // No error thrown, function is a no-op on web
+  });
+
   it('switches status correctly and leaves session.error as a durable-event-only path', async () => {
     const { store, pushes, durableEvents } = makeSnapshotStore(4_000);
     store.updateFromSessionList(

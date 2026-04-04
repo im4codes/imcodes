@@ -1,5 +1,9 @@
 import Foundation
 import Capacitor
+import WatchConnectivity
+import os.log
+
+private let pluginLogger = Logger(subsystem: "com.im.codes", category: "WatchBridgePlugin")
 
 @objc(WatchBridgePlugin)
 public class WatchBridgePlugin: CAPPlugin, CAPBridgedPlugin {
@@ -43,13 +47,25 @@ public class WatchBridgePlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     @objc func syncSnapshot(_ call: CAPPluginCall) {
-        guard let context = call.getObject("context") as? [String: Any] else {
-            call.reject("Missing context")
+        guard let context = call.getObject("context") else {
+            call.resolve([
+                "ok": false,
+                "debug": "missing_context",
+                "optionKeys": "\((call.options as? [String: Any])?.keys.sorted().joined(separator: ",") ?? "nil")"
+            ])
             return
         }
-
+        let s = WCSession.default
+        let debug: [String: Any] = [
+            "ok": true,
+            "debug_activated": s.activationState.rawValue,
+            "debug_paired": s.isPaired,
+            "debug_installed": s.isWatchAppInstalled,
+            "debug_contextKeys": context.keys.sorted().joined(separator: ","),
+            "debug_sessionCount": (context["sessions"] as? [[String: Any]])?.count ?? -1
+        ]
         WatchBridge.shared.syncSnapshot(context)
-        call.resolve(["ok": true])
+        call.resolve(debug)
     }
 
     @objc func pushDurableEvent(_ call: CAPPluginCall) {

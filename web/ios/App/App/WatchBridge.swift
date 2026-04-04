@@ -1,5 +1,9 @@
-import Foundation
+import UIKit
 import WatchConnectivity
+import UserNotifications
+import os.log
+
+private let logger = Logger(subsystem: "com.im.codes", category: "WatchBridge")
 
 extension Notification.Name {
     static let watchCommand = Notification.Name("watchCommand")
@@ -29,16 +33,30 @@ final class WatchBridge: NSObject, WCSessionDelegate {
     }
 
     func syncSnapshot(_ context: [String: Any]) {
-        guard WCSession.isSupported(),
-              session.isPaired,
-              session.isWatchAppInstalled else {
+        guard WCSession.isSupported() else {
+            logger.error("WCSession not supported")
+            return
+        }
+        let s = self.session
+        logger.info("syncSnapshot called, activationState=\(s.activationState.rawValue) isPaired=\(s.isPaired) isWatchAppInstalled=\(s.isWatchAppInstalled) keys=\(context.keys.sorted().joined(separator: ","))")
+        guard s.activationState == .activated else {
+            logger.error("WCSession not activated (state: \(s.activationState.rawValue))")
+            return
+        }
+        guard s.isPaired else {
+            logger.error("Watch not paired")
+            return
+        }
+        guard s.isWatchAppInstalled else {
+            logger.error("Watch app not installed")
             return
         }
 
         do {
             try session.updateApplicationContext(context)
+            logger.info("Snapshot pushed OK (\(context.count) keys)")
         } catch {
-            // Silent no-op by design; Watch snapshots are best-effort.
+            logger.error("updateApplicationContext failed: \(error.localizedDescription)")
         }
     }
 
@@ -74,6 +92,32 @@ final class WatchBridge: NSObject, WCSessionDelegate {
                     "action": action
                 ]
             )
+        case "openSession":
+            guard let serverId = message["serverId"] as? String,
+                  let sessionName = message["sessionName"] as? String else { return }
+            // Forward to JS for session switching
+            NotificationCenter.default.post(
+                name: .watchCommand,
+                object: nil,
+                userInfo: [
+                    "action": action,
+                    "serverId": serverId,
+                    "sessionName": sessionName
+                ]
+            )
+            // If app is in background, fire local notification so user can tap to foreground
+            if UIApplication.shared.applicationState != .active {
+                let content = UNMutableNotificationContent()
+                content.title = "IM.codes"
+                content.body = "Tap to open session"
+                content.sound = .default
+                let request = UNNotificationRequest(
+                    identifier: "watch-open-session",
+                    content: content,
+                    trigger: nil
+                )
+                UNUserNotificationCenter.current().add(request)
+            }
         default:
             break
         }

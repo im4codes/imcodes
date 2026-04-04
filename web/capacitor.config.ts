@@ -14,12 +14,12 @@ const config: CapacitorConfig = {
   },
   plugins: {
     CapacitorUpdater: {
-      autoUpdate: false,           // we use manual mode in update-manager.ts
-      directUpdate: false,         // we handle apply timing ourselves
+      autoUpdate: false,
+      directUpdate: false,
       autoDeleteFailed: true,
       autoDeletePrevious: true,
       resetWhenUpdate: true,
-      statsUrl: '',                // disable stats reporting to Capgo cloud
+      statsUrl: '',
     },
     PushNotifications: {
       presentationOptions: ['badge', 'sound', 'alert'],

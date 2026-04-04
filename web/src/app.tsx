@@ -225,6 +225,11 @@ export function App() {
         setSelectedServerId((prev) => (prev === command.serverId ? prev : command.serverId));
         return;
       }
+      if (command.action === 'openSession') {
+        setSelectedServerId(command.serverId);
+        setActiveSession(command.sessionName);
+        return;
+      }
       wsRef.current?.requestSessionList();
     }).then((dispose) => {
       cleanup = dispose;
@@ -864,6 +869,20 @@ export function App() {
   const subSessionsRef = useRef(subSessions);
   subSessionsRef.current = subSessions;
 
+  // When sub-sessions load from API (after session_list already fired), sync them to Watch projection
+  useEffect(() => {
+    if (subSessions.length === 0 || !selectedServerId) return;
+    for (const sub of subSessions) {
+      watchProjectionStore.addSubSession({
+        sessionName: sub.sessionName,
+        sessionType: sub.type ?? '',
+        state: sub.state,
+        label: sub.label,
+        parentSession: sub.parentSession,
+      }, selectedServerId);
+    }
+  }, [subSessions, selectedServerId]);
+
   const savePinnedPanelHeight = useCallback((panelKey: string, height: number) => {
     setPinnedPanelHeights((prev) => {
       const next = { ...prev, [panelKey]: height };
@@ -1033,9 +1052,19 @@ export function App() {
         const watchServerName = servers.find((server) => server.id === selectedServerId)?.name
           ?? selectedServerName
           ?? selectedServerId;
-        watchProjectionStore.updateFromSessionList(
+        // Build sub-session inputs from app state (daemon filters them from session_list)
+        // Use ref to avoid stale closure — subSessions state may not be in useEffect deps
+        const watchSubInputs = subSessionsRef.current.map((sub: any) => ({
+          sessionName: sub.sessionName,
+          sessionType: sub.type ?? '',
+          state: sub.state,
+          label: sub.label,
+          parentSession: sub.parentSession,
+        }));
+        watchProjectionStore.updateFromSessionListWithSubs(
           { id: selectedServerId, name: watchServerName, baseUrl: auth.baseUrl },
           msg.sessions,
+          watchSubInputs,
         );
         // Daemon is connected — mark this server as online now
         setDaemonOnline(true);
@@ -2677,9 +2706,31 @@ export function App() {
             {/* Footer */}
             <div class="mobile-sidebar-footer">
               {daemonStats && connected && (
-                <div style={{ fontSize: 11, color: '#64748b', marginBottom: 4 }}>
-                  {daemonStats.daemonVersion && <span>v{daemonStats.daemonVersion} · </span>}
-                  CPU {daemonStats.cpu}% · Load {daemonStats.load1}
+                <div style={{ fontSize: 11, color: '#64748b', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span>
+                    {daemonStats.daemonVersion && <span>v{daemonStats.daemonVersion} · </span>}
+                    CPU {daemonStats.cpu}% · Load {daemonStats.load1}
+                  </span>
+                  <button
+                    style={{ fontSize: 10, color: '#38bdf8', background: 'none', border: '1px solid #334155', borderRadius: 4, padding: '1px 5px', cursor: 'pointer' }}
+                    onClick={async () => {
+                      try {
+                        const snapshot = watchProjectionStore.getSnapshot();
+                        const WB = await import('./plugins/watch-bridge.js');
+                        await WB.default.syncSnapshot({ context: {
+                          ...snapshot,
+                          generatedAt: Date.now(),
+                          apiKey: getApiKey() ?? '',
+                        } } as any);
+                        const mainCount = snapshot.sessions.filter(s => !s.isSubSession).length;
+                        const subCount = snapshot.sessions.filter(s => s.isSubSession).length;
+                        const withParent = snapshot.sessions.filter(s => s.parentSessionName).length;
+                        alert(`${mainCount} main + ${subCount} sub (${withParent} with parent)\nhook has ${subSessions.length}`);
+                      } catch (e: any) {
+                        alert('Error: ' + (e?.message ?? e));
+                      }
+                    }}
+                  >⌚</button>
                 </div>
               )}
               <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>

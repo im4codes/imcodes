@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		0D5515DDFDD801E85B857720 /* SessionDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3FEF5BEBBAF97AA37366EDFA /* SessionDetailView.swift */; };
+		0FB8C34DBCAEE93E6B7FFACD /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F3FE2DC6CAB79EBA96FA243D /* Assets.xcassets */; };
 		2FAD9763203C412B000D30F8 /* config.xml in Resources */ = {isa = PBXBuildFile; fileRef = 2FAD9762203C412B000D30F8 /* config.xml */; };
 		35D693CD81AAC3DD109607FA /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 88EDBFF6951B2A83E07ACCC7 /* Foundation.framework */; };
 		4D22ABE92AF431CB00220026 /* CapApp-SPM in Frameworks */ = {isa = PBXBuildFile; productRef = 4D22ABE82AF431CB00220026 /* CapApp-SPM */; };
@@ -22,6 +23,7 @@
 		7DC29F465F6BBC3186483313 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F58337379F5C806BEACE51BC /* ContentView.swift */; };
 		8E63C56B839412039A7DAA64 /* WatchSessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0637170AC378C910837B3C39 /* WatchSessionManager.swift */; };
 		AA0000011FED79650016851F /* AuthSessionPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000001FED79650016851F /* AuthSessionPlugin.swift */; };
+		B19BE7082FFB8D46D7FA845C /* IMCodesWatch.app in Embed Watch Content */ = {isa = PBXBuildFile; fileRef = CF22FE3CE7EC962E92D3D2D5 /* IMCodesWatch.app */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		BB0000011FED79650016851F /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = BB0000001FED79650016851F /* PrivacyInfo.xcprivacy */; };
 		C10000011FED79650016851F /* WatchBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10000001FED79650016851F /* WatchBridge.swift */; };
 		C10000031FED79650016851F /* WatchBridgePlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10000021FED79650016851F /* WatchBridgePlugin.swift */; };
@@ -38,11 +40,24 @@
 		};
 /* End PBXContainerItemProxy section */
 
+/* Begin PBXCopyFilesBuildPhase section */
+		127F67290DC11B5F994C7A1F /* Embed Watch Content */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "$(CONTENTS_FOLDER_PATH)/Watch";
+			dstSubfolderSpec = 16;
+			files = (
+				B19BE7082FFB8D46D7FA845C /* IMCodesWatch.app in Embed Watch Content */,
+			);
+			name = "Embed Watch Content";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
 		0637170AC378C910837B3C39 /* WatchSessionManager.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WatchSessionManager.swift; sourceTree = "<group>"; };
 		1D7A228E5C81E9D9E918E935 /* WatchRestClient.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WatchRestClient.swift; sourceTree = "<group>"; };
 		20A16CBA698A53EF405066A1 /* Models.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
-		2719BE1FEECF36A4FB27D200 /* Contents.json */ = {isa = PBXFileReference; includeInIndex = 1; path = Contents.json; sourceTree = "<group>"; };
 		2BBCF5C44E927F58C34F853F /* IMCodesWatch.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; path = IMCodesWatch.entitlements; sourceTree = "<group>"; };
 		2FAD9762203C412B000D30F8 /* config.xml */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = config.xml; sourceTree = "<group>"; };
 		3FEF5BEBBAF97AA37366EDFA /* SessionDetailView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SessionDetailView.swift; sourceTree = "<group>"; };
@@ -56,7 +71,6 @@
 		50B271D01FEDC1A000F3C39B /* public */ = {isa = PBXFileReference; lastKnownFileType = folder; path = public; sourceTree = "<group>"; };
 		88EDBFF6951B2A83E07ACCC7 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/WatchOS.platform/Developer/SDKs/WatchOS11.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
 		958DCC722DB07C7200EA8C5F /* debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = debug.xcconfig; path = ../debug.xcconfig; sourceTree = SOURCE_ROOT; };
-		A0B65973ECB77673EAF2F96A /* Contents.json */ = {isa = PBXFileReference; includeInIndex = 1; path = Contents.json; sourceTree = "<group>"; };
 		AA0000001FED79650016851F /* AuthSessionPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthSessionPlugin.swift; sourceTree = "<group>"; };
 		BB0000001FED79650016851F /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		C10000001FED79650016851F /* WatchBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchBridge.swift; sourceTree = "<group>"; };
@@ -65,6 +79,7 @@
 		C653EF149F3AED223982F83D /* Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		CC0000001FED79650016851F /* App.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = App.entitlements; sourceTree = "<group>"; };
 		CF22FE3CE7EC962E92D3D2D5 /* IMCodesWatch.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = IMCodesWatch.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F3FE2DC6CAB79EBA96FA243D /* Assets.xcassets */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		F58337379F5C806BEACE51BC /* ContentView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -88,16 +103,6 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		2BF3ECDF8BE5F67FE9567BCF /* Assets.xcassets */ = {
-			isa = PBXGroup;
-			children = (
-				719E42A397BB268A0EB6304A /* AppIcon.appiconset */,
-				2719BE1FEECF36A4FB27D200 /* Contents.json */,
-			);
-			name = Assets.xcassets;
-			path = Assets.xcassets;
-			sourceTree = "<group>";
-		};
 		4C82A1E50228149FF54C7CD9 /* watchOS */ = {
 			isa = PBXGroup;
 			children = (
@@ -109,7 +114,6 @@
 		4F31F91F2AB8A2B7E5F9E5A0 /* IMCodesWatch */ = {
 			isa = PBXGroup;
 			children = (
-				2BF3ECDF8BE5F67FE9567BCF /* Assets.xcassets */,
 				C5CFDB10A877F708FFF508FB /* IMCodesWatchApp.swift */,
 				F58337379F5C806BEACE51BC /* ContentView.swift */,
 				3FEF5BEBBAF97AA37366EDFA /* SessionDetailView.swift */,
@@ -118,6 +122,7 @@
 				20A16CBA698A53EF405066A1 /* Models.swift */,
 				C653EF149F3AED223982F83D /* Info.plist */,
 				2BBCF5C44E927F58C34F853F /* IMCodesWatch.entitlements */,
+				F3FE2DC6CAB79EBA96FA243D /* Assets.xcassets */,
 			);
 			name = IMCodesWatch;
 			path = IMCodesWatch;
@@ -163,15 +168,6 @@
 			path = App;
 			sourceTree = "<group>";
 		};
-		719E42A397BB268A0EB6304A /* AppIcon.appiconset */ = {
-			isa = PBXGroup;
-			children = (
-				A0B65973ECB77673EAF2F96A /* Contents.json */,
-			);
-			name = AppIcon.appiconset;
-			path = AppIcon.appiconset;
-			sourceTree = "<group>";
-		};
 		8A79E499D036CE795843E865 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
@@ -190,6 +186,7 @@
 				504EC3001FED79650016851F /* Sources */,
 				504EC3011FED79650016851F /* Frameworks */,
 				504EC3021FED79650016851F /* Resources */,
+				127F67290DC11B5F994C7A1F /* Embed Watch Content */,
 			);
 			buildRules = (
 			);
@@ -278,6 +275,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				0FB8C34DBCAEE93E6B7FFACD /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -342,6 +340,8 @@
 		35476E2E640C4CC4B7074CA3 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS = YES;
 				CODE_SIGN_ENTITLEMENTS = IMCodesWatch/IMCodesWatch.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
@@ -519,6 +519,8 @@
 		6CA5FA98C65CD364A2E6D038 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS = YES;
 				CODE_SIGN_ENTITLEMENTS = IMCodesWatch/IMCodesWatch.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;

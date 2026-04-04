@@ -34,7 +34,7 @@ describe('watch bridge wrappers', () => {
     return import('../src/watch-bridge.js');
   }
 
-  it('no-ops on web without loading native bridge behavior', async () => {
+  it('calls plugin on all platforms (try/catch handles non-native gracefully)', async () => {
     mocks.isNative.mockReturnValue(false);
     const { syncSnapshotToWatch, pushDurableEventToWatch } = await importWatchBridge();
 
@@ -50,9 +50,9 @@ describe('watch bridge wrappers', () => {
 
     await pushDurableEventToWatch({ type: 'session.error', project: 'proj', message: 'boom' });
 
-    expect(mocks.syncSnapshot).not.toHaveBeenCalled();
-    expect(mocks.pushDurableEvent).not.toHaveBeenCalled();
-    expect(mocks.addListener).not.toHaveBeenCalled();
+    // Plugin is called — on real web it would throw (caught silently), on native it goes through
+    expect(mocks.syncSnapshot).toHaveBeenCalled();
+    expect(mocks.pushDurableEvent).toHaveBeenCalled();
   });
 
   it('loads the native plugin lazily and forwards snapshot/event calls', async () => {

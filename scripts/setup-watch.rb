@@ -789,7 +789,14 @@ WATCH_ROOT_ASSET_CATALOG = {
 }.freeze
 
 WATCH_ICON_SET = {
-  'images' => [],
+  'images' => [
+    {
+      'filename' => 'AppIcon.png',
+      'idiom' => 'universal',
+      'platform' => 'watchos',
+      'size' => '1024x1024',
+    },
+  ],
   'info' => {
     'author' => 'xcode',
     'version' => 1,
@@ -879,6 +886,18 @@ root_assets_contents = File.join(WATCH_DIR, 'Assets.xcassets', 'Contents.json')
 app_icon_contents = File.join(WATCH_DIR, 'Assets.xcassets', 'AppIcon.appiconset', 'Contents.json')
 save_plist_hash(root_assets_contents, WATCH_ROOT_ASSET_CATALOG.merge(load_plist_hash(root_assets_contents)))
 save_plist_hash(app_icon_contents, WATCH_ICON_SET.merge(load_plist_hash(app_icon_contents)))
+
+# Copy iOS app icon as Watch app icon (if not already present)
+ios_icon_dir = File.join(IOS_APP_DIR, 'Assets.xcassets', 'AppIcon.appiconset')
+ios_icon = Dir.glob(File.join(ios_icon_dir, '*.png')).first
+watch_icon = File.join(WATCH_DIR, 'Assets.xcassets', 'AppIcon.appiconset', 'AppIcon.png')
+if ios_icon && !File.exist?(watch_icon)
+  FileUtils.cp(ios_icon, watch_icon)
+  puts "  ✓ Copied Watch app icon from iOS app"
+elsif !ios_icon
+  puts "  ⚠ iOS app icon not found — place a 1024x1024 PNG at: #{watch_icon}"
+end
+
 ensure_file(assets_group, 'Contents.json')
 ensure_file(app_icon_group, 'Contents.json')
 
