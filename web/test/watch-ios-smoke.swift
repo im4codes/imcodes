@@ -52,6 +52,27 @@ struct WatchIOSSmoke {
         assertCondition(sessionList.sessions[0].latestRecentText?.eventId == "e2", "latest recent text should be newest row")
         assertCondition(sessionList.sessions[0].effectivePreviewText == "latest", "preview text should win over fallback recent text")
 
+        let legacySessionPayload = """
+        {
+          "serverId":"srv-1",
+          "sessions":[
+            {
+              "serverId":"srv-1",
+              "sessionName":"deck_sub_legacy",
+              "title":"Legacy Worker",
+              "state":"working",
+              "parentSessionName":"deck_proj_brain"
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+        let legacySessions = try decoder.decode(WatchSessionListResponse.self, from: legacySessionPayload)
+        assertCondition(legacySessions.sessions.count == 1, "legacy session list should decode one row")
+        assertCondition(legacySessions.sessions[0].isSubSession, "legacy deck_sub_ rows should infer sub-session status")
+        assertCondition(legacySessions.sessions[0].agentBadge.isEmpty, "legacy rows should default missing agentBadge to empty string")
+        assertCondition((legacySessions.sessions[0].recentText ?? []).isEmpty, "legacy rows should default missing recentText to empty array")
+        assertCondition(legacySessions.sessions[0].isPinned == false, "legacy rows should default missing isPinned to false")
+
         let serverRequest = try WatchRestClient.makeServersRequest(
             baseUrl: URL(string: "https://example.test")!,
             apiKey: "watch-token"

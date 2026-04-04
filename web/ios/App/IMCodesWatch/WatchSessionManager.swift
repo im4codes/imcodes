@@ -12,6 +12,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
     @Published private(set) var activeRoute: WatchRoute?
     @Published private(set) var servers: [WatchServerRow] = []
     @Published private(set) var sessionRows: [WatchSessionRow] = []
+    @Published private(set) var loadedSessionsServerId: String?
     @Published private(set) var selectedServerId: String?
     @Published private(set) var historyByRoute: [String: WatchHistoryViewState] = [:]
     @Published private(set) var isUsingFallbackSnapshot = true
@@ -36,11 +37,12 @@ final class WatchSessionManager: NSObject, ObservableObject {
     func displaySessions(for serverId: String? = nil) -> [WatchSessionRow] {
         let targetServerId = serverId ?? selectedServerId
         if let targetServerId {
-            let direct = sessionRows.filter { $0.serverId == targetServerId }
-            if !direct.isEmpty { return direct }
+            if loadedSessionsServerId == targetServerId {
+                return sessionRows.filter { $0.serverId == targetServerId }
+            }
             return applicationContext.sessions.filter { $0.serverId == targetServerId }
         }
-        if !sessionRows.isEmpty { return sessionRows }
+        if loadedSessionsServerId != nil { return sessionRows }
         return applicationContext.sessions
     }
 
@@ -253,8 +255,10 @@ final class WatchSessionManager: NSObject, ObservableObject {
         do {
             let response = try await restClient.fetchSessions(baseUrl: baseUrl, serverId: serverId, apiKey: apiKey)
             sessionRows = response.sessions
+            loadedSessionsServerId = serverId
             isUsingFallbackSnapshot = false
             lastErrorMessage = nil
+            pruneSessionState(for: serverId, keepingSessionNames: Set(response.sessions.map(\.sessionName)))
             seedVisibleHistoriesIfNeeded(serverId: serverId)
             resolvePendingRouteIfPossible()
         } catch let error as WatchRestClient.WatchRestError {
@@ -336,6 +340,22 @@ final class WatchSessionManager: NSObject, ObservableObject {
             if historyByRoute[route.id] == nil {
                 historyByRoute[route.id] = seededHistoryState(for: route)
             }
+        }
+    }
+
+    private func pruneSessionState(for serverId: String, keepingSessionNames: Set<String>) {
+        historyByRoute = historyByRoute.filter { key, _ in
+            let prefix = "\(serverId):"
+            guard key.hasPrefix(prefix) else { return true }
+            let sessionName = String(key.dropFirst(prefix.count))
+            return keepingSessionNames.contains(sessionName)
+        }
+        if let activeRoute, activeRoute.serverId == serverId, !keepingSessionNames.contains(activeRoute.sessionName) {
+            self.activeRoute = nil
+        }
+        if let pendingRoute, pendingRoute.serverId == serverId, !keepingSessionNames.contains(pendingRoute.sessionName) {
+            self.pendingRoute = nil
+            cancelRouteTimeout()
         }
     }
 

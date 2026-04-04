@@ -10,12 +10,16 @@ struct ContentView: View {
         sessionManager.displaySessions()
     }
 
+    private func isSubSessionRow(_ row: WatchSessionRow) -> Bool {
+        row.isSubSession || row.sessionName.hasPrefix("deck_sub_") || row.parentSessionName != nil
+    }
+
     private var mainSessions: [WatchSessionRow] {
-        currentSessions.filter { !$0.isSubSession }
+        currentSessions.filter { !isSubSessionRow($0) }
     }
 
     private func subSessions(for parent: String) -> [WatchSessionRow] {
-        currentSessions.filter { $0.parentSessionName == parent }
+        currentSessions.filter { isSubSessionRow($0) && $0.parentSessionName == parent }
     }
 
     var body: some View {

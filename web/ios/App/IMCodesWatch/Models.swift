@@ -42,6 +42,42 @@ struct WatchSessionRow: Identifiable, Codable, Equatable {
     var previewUpdatedAt: Double?
     var recentText: [WatchRecentTextRow]?
 
+    enum CodingKeys: String, CodingKey {
+        case sessionName
+        case serverId
+        case title
+        case state
+        case agentBadge
+        case isSubSession
+        case parentTitle
+        case parentSessionName
+        case isPinned
+        case previewText
+        case previewUpdatedAt
+        case recentText
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let sessionName = try container.decode(String.self, forKey: .sessionName)
+        let serverId = try container.decode(String.self, forKey: .serverId)
+        let parentSessionName = try container.decodeIfPresent(String.self, forKey: .parentSessionName)
+        let explicitIsSubSession = try container.decodeIfPresent(Bool.self, forKey: .isSubSession)
+
+        self.sessionName = sessionName
+        self.serverId = serverId
+        self.title = try container.decodeIfPresent(String.self, forKey: .title) ?? sessionName
+        self.state = (try? container.decode(WatchSessionState.self, forKey: .state)) ?? .stopped
+        self.agentBadge = try container.decodeIfPresent(String.self, forKey: .agentBadge) ?? ""
+        self.parentTitle = try container.decodeIfPresent(String.self, forKey: .parentTitle)
+        self.parentSessionName = parentSessionName
+        self.isSubSession = explicitIsSubSession ?? sessionName.hasPrefix("deck_sub_") || parentSessionName != nil
+        self.isPinned = try container.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
+        self.previewText = try container.decodeIfPresent(String.self, forKey: .previewText)
+        self.previewUpdatedAt = try container.decodeIfPresent(Double.self, forKey: .previewUpdatedAt)
+        self.recentText = try container.decodeIfPresent([WatchRecentTextRow].self, forKey: .recentText) ?? []
+    }
+
     var id: String { "\(serverId):\(sessionName)" }
 
     var latestRecentText: WatchRecentTextRow? {

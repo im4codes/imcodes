@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
-import { getServersByUserId, getDbSessionsByServer, getSubSessionsByServer } from '../db/queries.js';
+import { getServersByUserId, getDbSessionsByServer, getSubSessionsByServer, getUserPref } from '../db/queries.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
@@ -51,6 +51,49 @@ function titleForSubSession(sub: { id: string; label: string | null; type: strin
   return sub.type || sub.id;
 }
 
+
+async function loadTabPreferences(db: Env['DB'], userId: string): Promise<{ order: string[]; pinned: Set<string> }> {
+  const [rawOrder, rawPinned] = await Promise.all([
+    getUserPref(db, userId, 'tab_order'),
+    getUserPref(db, userId, 'tab_pinned'),
+  ]);
+
+  const parseList = (raw: string | null): string[] => {
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      const list = Array.isArray(parsed)
+        ? parsed
+        : parsed && typeof parsed === 'object' && Array.isArray((parsed as { v?: unknown }).v)
+          ? (parsed as { v: unknown[] }).v
+          : [];
+      return list.filter((item): item is string => typeof item === 'string' && item.length > 0);
+    } catch {
+      return [];
+    }
+  };
+
+  return {
+    order: parseList(rawOrder),
+    pinned: new Set(parseList(rawPinned)),
+  };
+}
+
+function orderMainSessions<T extends { sessionName: string; isPinned?: boolean | null }>(sessions: T[], order: string[], pinned: Set<string>): T[] {
+  const orderIndex = new Map(order.map((name, idx) => [name, idx]));
+  return [...sessions].sort((a, b) => {
+    const aPinned = pinned.has(a.sessionName);
+    const bPinned = pinned.has(b.sessionName);
+    if (aPinned !== bPinned) return aPinned ? -1 : 1;
+    const aOrder = orderIndex.get(a.sessionName);
+    const bOrder = orderIndex.get(b.sessionName);
+    if (aOrder != null && bOrder != null) return aOrder - bOrder;
+    if (aOrder != null) return -1;
+    if (bOrder != null) return 1;
+    return a.sessionName.localeCompare(b.sessionName);
+  });
+}
+
 watchRoutes.get('/watch/servers', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const servers = await getServersByUserId(c.env.DB, userId);
@@ -72,36 +115,52 @@ watchRoutes.get('/watch/sessions', requireAuth(), async (c) => {
   const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
 
-  const [mainSessions, subSessions] = await Promise.all([
+  const bridge = WsBridge.get(serverId);
+  const [dbMainSessions, subSessions, tabPrefs] = await Promise.all([
     getDbSessionsByServer(c.env.DB, serverId),
     getSubSessionsByServer(c.env.DB, serverId),
+    loadTabPreferences(c.env.DB, userId),
   ]);
 
-  const bridge = WsBridge.get(serverId);
-  const mainTitleBySession = new Map<string, string>();
-  for (const session of mainSessions) {
-    mainTitleBySession.set(session.name, titleForMainSession(session));
-  }
+  const liveMainSessions = bridge.hasReceivedActiveMainSessionSnapshot()
+    ? bridge.getActiveMainSessions().map((session) => ({
+        name: session.name,
+        project_name: session.project,
+        label: session.label ?? null,
+        state: session.state,
+        agent_type: session.agentType,
+      }))
+    : null;
 
-  const sessions = [
-    ...mainSessions.map((session) => {
-      const recentText = bridge.getRecentText(session.name);
-      const latest = recentText.at(-1);
-      return {
-        serverId,
-        sessionName: session.name,
-        title: titleForMainSession(session),
-        state: normalizeState(session.state),
-        agentBadge: badgeForType(session.agent_type),
-        isSubSession: false,
-        parentTitle: undefined,
-        parentSessionName: undefined,
-        previewText: latest?.text ?? undefined,
-        previewUpdatedAt: latest?.ts ?? undefined,
-        recentText,
-      };
-    }),
-    ...subSessions.map((sub) => {
+  const mainSessions = (liveMainSessions ?? dbMainSessions)
+    .filter((session) => !session.name.startsWith('deck_sub_'));
+
+  const mainTitleBySession = new Map<string, string>();
+  const mainRows = mainSessions.map((session) => {
+    const recentText = bridge.getRecentText(session.name);
+    const latest = recentText.at(-1);
+    const row = {
+      serverId,
+      sessionName: session.name,
+      title: titleForMainSession(session),
+      state: normalizeState(session.state),
+      agentBadge: badgeForType(session.agent_type),
+      isSubSession: false,
+      parentTitle: undefined,
+      parentSessionName: undefined,
+      isPinned: tabPrefs.pinned.has(session.name),
+      previewText: latest?.text ?? undefined,
+      previewUpdatedAt: latest?.ts ?? undefined,
+      recentText,
+    };
+    mainTitleBySession.set(session.name, row.title);
+    return row;
+  });
+
+  const activeMainNames = new Set(mainRows.map((row) => row.sessionName));
+  const subRows = subSessions
+    .filter((sub) => sub.parent_session && activeMainNames.has(sub.parent_session))
+    .map((sub) => {
       const sessionName = `deck_sub_${sub.id}`;
       const recentText = bridge.getRecentText(sessionName);
       const latest = recentText.at(-1);
@@ -114,12 +173,15 @@ watchRoutes.get('/watch/sessions', requireAuth(), async (c) => {
         isSubSession: true,
         parentTitle: sub.parent_session ? mainTitleBySession.get(sub.parent_session) : undefined,
         parentSessionName: sub.parent_session ?? undefined,
+        isPinned: false,
         previewText: latest?.text ?? undefined,
         previewUpdatedAt: latest?.ts ?? undefined,
         recentText,
       };
-    }),
-  ];
+    });
+
+  const orderedMainRows = orderMainSessions(mainRows, tabPrefs.order, tabPrefs.pinned);
+  const sessions = [...orderedMainRows, ...subRows];
 
   return c.json({ serverId, sessions });
 });

@@ -9,7 +9,6 @@ struct SessionDetailView: View {
     @State private var isSending = false
     @State private var statusMessage: String?
 
-    private let quickReplies = ["Yes", "Continue", "Fix"]
 
     var body: some View {
         ScrollView {
@@ -28,7 +27,6 @@ struct SessionDetailView: View {
 
                 Divider()
 
-                quickReplySection
                 replyComposer
 
                 if let statusMessage {
@@ -93,19 +91,6 @@ struct SessionDetailView: View {
             Text(error)
                 .font(.system(size: 9))
                 .foregroundStyle(.red)
-        }
-    }
-
-    private var quickReplySection: some View {
-        HStack(spacing: 6) {
-            ForEach(quickReplies, id: \.self) { reply in
-                Button(reply) {
-                    Task { await sendReply(text: reply) }
-                }
-                .font(.system(size: 10))
-                .buttonStyle(.bordered)
-                .disabled(!canSend || isSending)
-            }
         }
     }
 

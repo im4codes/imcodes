@@ -130,6 +130,14 @@ export interface WatchRecentTextRow {
   ts: number;
 }
 
+export interface WatchActiveMainSessionRow {
+  name: string;
+  project: string;
+  state: string;
+  agentType: string;
+  label?: string;
+}
+
 type PendingPreviewRequest = {
   readable: ReadableStream<Uint8Array>;
   controller: ReadableStreamDefaultController<Uint8Array> | null;
@@ -241,6 +249,10 @@ export class WsBridge {
 
   /** Lightweight per-session hot cache for Watch first-paint text. */
   private recentTextBySession = new Map<string, WatchRecentTextRow[]>();
+
+  /** Latest daemon-owned active main-session snapshot for watch list responses. */
+  private activeMainSessions = new Map<string, WatchActiveMainSessionRow>();
+  private hasActiveMainSessionSnapshot = false;
 
   /**
    * File transfer correlation: requestId → { resolve, reject, timer }.
@@ -354,6 +366,8 @@ export class WsBridge {
         this.authenticated = true;
         this.daemonVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : null;
         this.recentTextBySession.clear();
+        this.activeMainSessions.clear();
+        this.hasActiveMainSessionSnapshot = false;
         logger.info({ serverId: this.serverId, daemonVersion: this.daemonVersion }, 'Daemon authenticated');
         onAuthenticated?.();
 
@@ -465,6 +479,8 @@ export class WsBridge {
         this.daemonWs = null;
         this.authenticated = false;
         this.recentTextBySession.clear();
+        this.activeMainSessions.clear();
+        this.hasActiveMainSessionSnapshot = false;
         this.rejectAllPendingFileTransfers('daemon_disconnected');
         this.rejectAllPendingHttpTimelineRequests('daemon_disconnected');
         this.rejectAllPendingPreviewRequests('daemon_disconnected');
@@ -807,6 +823,7 @@ export class WsBridge {
     }
 
     if (type === 'session_list') {
+      this.replaceActiveMainSessions(msg.sessions);
       this.pruneMainSessionRecentText(msg.sessions);
       this.broadcastToBrowsers(JSON.stringify({
         ...msg,
@@ -1170,6 +1187,31 @@ export class WsBridge {
       return;
     }
     this.sendToRawSessionSubscribers(sessionName, data);
+  }
+
+  getActiveMainSessions(): WatchActiveMainSessionRow[] {
+    return Array.from(this.activeMainSessions.values());
+  }
+
+  hasReceivedActiveMainSessionSnapshot(): boolean {
+    return this.hasActiveMainSessionSnapshot;
+  }
+
+  private replaceActiveMainSessions(rawSessions: unknown): void {
+    this.activeMainSessions.clear();
+    this.hasActiveMainSessionSnapshot = true;
+    if (!Array.isArray(rawSessions)) return;
+    for (const item of rawSessions) {
+      if (!item || typeof item !== 'object') continue;
+      const row = item as Record<string, unknown>;
+      const name = typeof row.name === 'string' ? row.name : '';
+      const project = typeof row.project === 'string' ? row.project : '';
+      const state = typeof row.state === 'string' ? row.state : 'stopped';
+      const agentType = typeof row.agentType === 'string' ? row.agentType : '';
+      const label = typeof row.label === 'string' && row.label.trim() ? row.label.trim() : undefined;
+      if (!name) continue;
+      this.activeMainSessions.set(name, { name, project, state, agentType, label });
+    }
   }
 
   private pruneMainSessionRecentText(rawSessions: unknown): void {

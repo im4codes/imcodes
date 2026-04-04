@@ -7,8 +7,11 @@ const mockResolveServerRole = vi.fn<() => Promise<string>>().mockResolvedValue('
 const mockGetServersByUserId = vi.fn();
 const mockGetDbSessionsByServer = vi.fn();
 const mockGetSubSessionsByServer = vi.fn();
+const mockGetUserPref = vi.fn();
 const mockRequestTimelineHistory = vi.fn();
 const mockGetRecentText = vi.fn();
+const mockGetActiveMainSessions = vi.fn();
+const mockHasReceivedActiveMainSessionSnapshot = vi.fn();
 const mockSendToDaemon = vi.fn();
 const mockGetPodIdentity = vi.fn(() => 'pod-a');
 
@@ -25,6 +28,7 @@ vi.mock('../src/db/queries.js', () => ({
   getServersByUserId: (...args: unknown[]) => mockGetServersByUserId(...args),
   getDbSessionsByServer: (...args: unknown[]) => mockGetDbSessionsByServer(...args),
   getSubSessionsByServer: (...args: unknown[]) => mockGetSubSessionsByServer(...args),
+  getUserPref: (...args: unknown[]) => mockGetUserPref(...args),
   getServerById: vi.fn(async () => ({ id: 'srv-1' })),
 }));
 
@@ -33,6 +37,8 @@ vi.mock('../src/ws/bridge.js', () => ({
     get: () => ({
       requestTimelineHistory: (...args: unknown[]) => mockRequestTimelineHistory(...args),
       getRecentText: (...args: unknown[]) => mockGetRecentText(...args),
+      getActiveMainSessions: (...args: unknown[]) => mockGetActiveMainSessions(...args),
+      hasReceivedActiveMainSessionSnapshot: (...args: unknown[]) => mockHasReceivedActiveMainSessionSnapshot(...args),
       sendToDaemon: (...args: unknown[]) => mockSendToDaemon(...args),
     }),
   },
@@ -82,7 +88,10 @@ describe('Watch routes', () => {
     mockGetServersByUserId.mockResolvedValue([]);
     mockGetDbSessionsByServer.mockResolvedValue([]);
     mockGetSubSessionsByServer.mockResolvedValue([]);
+    mockGetUserPref.mockResolvedValue(null);
     mockGetRecentText.mockReturnValue([]);
+    mockGetActiveMainSessions.mockReturnValue([]);
+    mockHasReceivedActiveMainSessionSnapshot.mockReturnValue(false);
     mockRequestTimelineHistory.mockResolvedValue({ epoch: 7, events: [] });
   });
 
@@ -145,6 +154,7 @@ describe('Watch routes', () => {
           isSubSession: false,
           parentTitle: undefined,
           parentSessionName: undefined,
+          isPinned: false,
           previewText: 'latest assistant text',
           previewUpdatedAt: 100,
           recentText: [{ eventId: 'e1', type: 'assistant.text', text: 'latest assistant text', ts: 100 }],
@@ -158,12 +168,47 @@ describe('Watch routes', () => {
           isSubSession: true,
           parentTitle: 'Main',
           parentSessionName: 'deck_proj_brain',
+          isPinned: false,
           previewText: 'worker text',
           previewUpdatedAt: 200,
           recentText: [{ eventId: 'e2', type: 'user.message', text: 'worker text', ts: 200 }],
         },
       ],
     });
+  });
+
+  it('GET /api/watch/sessions prefers live active sessions, prunes stale DB rows, and orders pinned tabs first', async () => {
+    mockHasReceivedActiveMainSessionSnapshot.mockReturnValue(true);
+    mockGetActiveMainSessions.mockReturnValue([
+      { name: 'deck_proj_two', project: 'proj-two', state: 'idle', agentType: 'codex', label: 'Two' },
+      { name: 'deck_proj_one', project: 'proj-one', state: 'running', agentType: 'claude-code', label: 'One' },
+    ]);
+    mockGetDbSessionsByServer.mockResolvedValue([
+      { name: 'deck_proj_old', project_name: 'old', label: 'Old', state: 'idle', agent_type: 'codex' },
+    ]);
+    mockGetSubSessionsByServer.mockResolvedValue([
+      { id: 'sub-1', type: 'codex', label: 'Worker 1', parent_session: 'deck_proj_one', closed_at: null },
+      { id: 'sub-old', type: 'codex', label: 'Old Worker', parent_session: 'deck_proj_old', closed_at: null },
+    ]);
+    mockGetUserPref.mockImplementation(async (_db: unknown, _userId: string, key: string) => {
+      if (key === 'tab_order') return JSON.stringify({ v: ['deck_proj_one', 'deck_proj_two'], t: 1 });
+      if (key === 'tab_pinned') return JSON.stringify({ v: ['deck_proj_two'], t: 1 });
+      return null;
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/watch/sessions?serverId=srv-1');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { sessions: Array<{ sessionName: string; isPinned?: boolean; parentSessionName?: string | null }> };
+    expect(body.sessions.map((row) => row.sessionName)).toEqual([
+      'deck_proj_two',
+      'deck_proj_one',
+      'deck_sub_sub-1',
+    ]);
+    expect(body.sessions[0]?.isPinned).toBe(true);
+    expect(body.sessions[1]?.isPinned).toBe(false);
+    expect(body.sessions[2]?.parentSessionName).toBe('deck_proj_one');
   });
 
   it('GET /api/server/:id/timeline/history preserves event identity and pagination metadata', async () => {
