@@ -514,15 +514,22 @@ jobs:
         working-directory: web
         run: npx cap sync android
 
-      - name: Build Android release APK
+      - name: Build Android release APK + AAB
         working-directory: web/android
-        run: ./gradlew assembleRelease --stacktrace
+        run: ./gradlew assembleRelease bundleRelease --stacktrace
 
       - name: Upload release APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: imcodes-android-release-apk
           path: web/android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Upload release AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: imcodes-android-release-aab
+          path: web/android/app/build/outputs/bundle/release/*.aab
           if-no-files-found: error
 
       - name: Get version info
@@ -533,10 +540,12 @@ jobs:
           echo "tag=android-v${VERSION}-${COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
           echo "name=Android v${VERSION} (${COMMIT_SHORT})" >> "$GITHUB_OUTPUT"
 
-      - name: Rename APK with version
+      - name: Rename artifacts with version
         run: |
           APK=$(ls web/android/app/build/outputs/apk/release/*.apk | head -1)
           cp "$APK" "imcodes-${{ steps.version.outputs.tag }}.apk"
+          AAB=$(ls web/android/app/build/outputs/bundle/release/*.aab | head -1)
+          cp "$AAB" "imcodes-${{ steps.version.outputs.tag }}.aab"
 
       - name: Create GitHub Release
         if: github.ref == 'refs/heads/master'
@@ -544,7 +553,9 @@ jobs:
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.name }}
-          files: imcodes-*.apk
+          files: |
+            imcodes-*.apk
+            imcodes-*.aab
           generate_release_notes: true
           make_latest: true
         env:
