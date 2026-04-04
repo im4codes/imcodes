@@ -11,7 +11,6 @@ import type { TimelineEvent, WsClient } from '../ws-client.js';
 import { FileBrowser } from './FileBrowser.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
-import { useVirtualList } from '../hooks/useVirtualList.js';
 
 interface Props {
   events: TimelineEvent[];
@@ -52,9 +51,6 @@ interface ViewItem {
   ts?: number;
   lastTs?: number;
 }
-
-/** Skip virtualization for short conversations — no overhead, no interaction risk */
-const VIRTUAL_THRESHOLD = 50;
 
 const TOOL_INPUT_SUMMARY_KEYS = [
   'query',
@@ -360,72 +356,12 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
 
   const viewItems = useMemo(() => buildViewItems(events), [events]);
 
-  // ── Virtual list ──────────────────────────────────────────────────────────
-  const isMenuOpen = !!(selMenu || ctxMenu);
-  const {
-    visibleItems,
-    topSpacerHeight,
-    bottomSpacerHeight,
-    measureRef,
-    scrollToEnd: virtualScrollToEnd,
-    isVirtualized,
-  } = useVirtualList({
-    items: viewItems,
-    getKey: (item) => item.key,
-    estimatedHeight: 100,
-    overscan: 6,
-    scrollRef,
-    enabled: viewItems.length >= VIRTUAL_THRESHOLD && !isMenuOpen,
-  });
-
-  const scrollToBottom = useCallback(() => {
-    autoScrollRef.current = true;
-    if (isVirtualized) {
-      virtualScrollToEnd();
-      requestAnimationFrame(() => virtualScrollToEnd());
-    } else {
-      const el = scrollRef.current;
-      if (el) el.scrollTop = el.scrollHeight;
-    }
-  }, [isVirtualized, virtualScrollToEnd]);
-
-  // ── Load Older anchor save/restore ────────────────────────────────────────
-  const anchorRef = useRef<{ key: string; offsetTop: number } | null>(null);
-  const prevViewItemsLenRef = useRef(viewItems.length);
-
-  const handleLoadOlder = useCallback(() => {
-    if (!onLoadOlder) return;
-    const el = scrollRef.current;
-    if (el && visibleItems.length > 0) {
-      const firstVisible = visibleItems[0];
-      const target = el.querySelector(`[data-vkey="${firstVisible.key}"]`) as HTMLElement | null;
-      if (target) {
-        anchorRef.current = {
-          key: firstVisible.key,
-          offsetTop: target.getBoundingClientRect().top - el.getBoundingClientRect().top,
-        };
-      }
-    }
-    onLoadOlder();
-  }, [onLoadOlder, visibleItems]);
-
-  // Restore anchor after older events are prepended
-  useLayoutEffect(() => {
-    const anchor = anchorRef.current;
-    if (!anchor) return;
-    const prevLen = prevViewItemsLenRef.current;
-    prevViewItemsLenRef.current = viewItems.length;
-    prevViewItemsLenRef.current = viewItems.length;
-    if (viewItems.length <= prevLen) return; // not a prepend
+  const scrollToBottom = () => {
     const el = scrollRef.current;
     if (!el) return;
-    const target = el.querySelector(`[data-vkey="${anchor.key}"]`) as HTMLElement | null;
-    if (target) {
-      const currentOffset = target.getBoundingClientRect().top - el.getBoundingClientRect().top;
-      el.scrollTop += currentOffset - anchor.offsetTop;
-    }
-    anchorRef.current = null;
-  }, [viewItems]);
+    autoScrollRef.current = true;
+    el.scrollTop = el.scrollHeight;
+  };
 
   // On session change, reset scroll position to bottom
   useEffect(() => {
@@ -707,35 +643,29 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
               <button
                 class="btn btn-sm"
                 style={{ fontSize: 11, opacity: 0.7 }}
-                onClick={handleLoadOlder}
+                onClick={onLoadOlder}
                 disabled={loadingOlder}
               >
                 {loadingOlder ? t('chat.loading_older') : t('chat.load_older')}
               </button>
             </div>
           )}
-          {!loading && isVirtualized && <div style={{ height: topSpacerHeight }} />}
-          {!loading && (isVirtualized ? visibleItems : viewItems.map((item, idx) => ({ item, index: idx, key: item.key }))).map(({ item, index, key }) => {
-            const nextItem = viewItems[index + 1];
+          {!loading && viewItems.map((item, idx) => {
+            const nextItem = viewItems[idx + 1];
             const nextTs = nextItem?.ts ?? nextItem?.event?.ts;
             const onPathClick = ws && !preview ? (p: string) => setFileBrowserPath(p.replace(/^`+|`+$/g, '')) : undefined;
             const onUrlClick = !preview ? (url: string) => setPendingUrl(url) : undefined;
-            return (
-              <div key={key} ref={isVirtualized ? measureRef(key) : undefined} data-vkey={key}>
-                {item.type === 'assistant-block' ? (
-                  <div class="chat-event chat-assistant">
-                    <ChatMarkdown text={item.text!} onPathClick={onPathClick} onUrlClick={onUrlClick} />
-                    <ChatTime ts={item.lastTs ?? item.ts ?? 0} />
-                  </div>
-                ) : item.type === 'tool-group' ? (
-                  <ToolCallGroup events={item.toolEvents!} onPathClick={onPathClick} />
-                ) : (
-                  <ChatEvent event={item.event!} nextTs={nextTs} onPathClick={onPathClick} serverId={serverId} />
-                )}
+            return item.type === 'assistant-block' ? (
+              <div key={item.key} class="chat-event chat-assistant">
+                <ChatMarkdown text={item.text!} onPathClick={onPathClick} onUrlClick={onUrlClick} />
+                <ChatTime ts={item.lastTs ?? item.ts ?? 0} />
               </div>
+            ) : item.type === 'tool-group' ? (
+              <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={onPathClick} />
+            ) : (
+              <ChatEvent key={item.key} event={item.event!} nextTs={nextTs} onPathClick={onPathClick} serverId={serverId} />
             );
           })}
-          {!loading && isVirtualized && <div style={{ height: bottomSpacerHeight }} />}
           {!loading && <div ref={bottomRef} />}
         </div>
         {!preview && showScrollBtn && (
