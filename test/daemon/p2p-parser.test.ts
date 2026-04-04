@@ -132,6 +132,27 @@ describe('parseAtTokens', () => {
       expect(result.expandAll!.excludeSameType).toBe(true);
     });
 
+    it('@@all(audit ×2) returns expandAll with rounds=2', () => {
+      const result = parseAtTokens('@@all(audit ×2) please review everything');
+      expect(result.expandAll).toBeDefined();
+      expect(result.expandAll!.mode).toBe('audit');
+      expect(result.expandAll!.rounds).toBe(2);
+    });
+
+    it('@@all(brainstorm>discuss>plan ×3) returns combo mode with rounds=3', () => {
+      const result = parseAtTokens('@@all(brainstorm>discuss>plan ×3) plan this');
+      expect(result.expandAll).toBeDefined();
+      expect(result.expandAll!.mode).toBe('brainstorm>discuss>plan');
+      expect(result.expandAll!.rounds).toBe(3);
+    });
+
+    it('@@all(brainstorm>discuss>plan x3) also accepts ascii x rounds suffix', () => {
+      const result = parseAtTokens('@@all(brainstorm>discuss>plan x3) plan this');
+      expect(result.expandAll).toBeDefined();
+      expect(result.expandAll!.mode).toBe('brainstorm>discuss>plan');
+      expect(result.expandAll!.rounds).toBe(3);
+    });
+
     it('@@all(invalid) returns no expandAll for an unrecognized mode', () => {
       const result = parseAtTokens('@@all(invalid) do something');
       expect(result.expandAll).toBeUndefined();
@@ -405,5 +426,20 @@ describe('structured P2P routing via WS fields', () => {
     const [_initiator, targets] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(targets.length).toBeGreaterThan(0);
     expect(targets.every((t: any) => t.mode === 'audit')).toBe(true);
+  });
+
+  it('legacy @@all(audit ×2) in text still works and forwards rounds', async () => {
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: '@@all(audit ×2) legacy client message',
+      commandId: 'cmd-6',
+    }, mockServerLink as any);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(startP2pRun).toHaveBeenCalledOnce();
+    const call = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(call[5]).toBe(2);
   });
 });

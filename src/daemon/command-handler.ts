@@ -215,25 +215,33 @@ export interface ParsedTokens {
   files: string[];
   cleanText: string;
   /** True if @@all was used — caller must expand with active sessions. */
-  expandAll?: { mode: string; excludeSameType?: boolean };
+  expandAll?: { mode: string; excludeSameType?: boolean; rounds?: number };
   /** True if @@discuss tokens were present but ALL failed validation. */
   hadDiscussTokens?: boolean;
+}
+
+function parseAllModeSpec(raw: string): { mode: string; rounds?: number; excludeSameType?: boolean } | null {
+  const parts = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  if (parts.length === 0) return null;
+  const excludeSameType = parts.includes('exclude-same-type');
+  const first = parts[0] ?? '';
+  const roundsMatch = /^(.*?)\s*[×x]\s*(\d+)\s*$/.exec(first);
+  const mode = (roundsMatch?.[1] ?? first).trim();
+  const rounds = roundsMatch ? Math.max(1, Math.min(parseInt(roundsMatch[2] ?? '1', 10) || 1, 6)) : undefined;
+  if (!isValidP2pMode(mode)) return null;
+  return { mode, rounds, excludeSameType };
 }
 
 export function parseAtTokens(text: string): ParsedTokens {
   const agents: P2pTarget[] = [];
   const files: string[] = [];
-  let expandAll: { mode: string; excludeSameType?: boolean } | undefined;
+  let expandAll: { mode: string; excludeSameType?: boolean; rounds?: number } | undefined;
 
   // Check for @@all(mode[, flags]) first
   const allMatch = ALL_TOKEN_RE.exec(text);
   if (allMatch) {
-    const parts = allMatch[1].split(',').map((s) => s.trim());
-    const mode = parts[0];
-    const excludeSameType = parts.includes('exclude-same-type');
-    if (isValidP2pMode(mode)) {
-      expandAll = { mode, excludeSameType };
-    }
+    const parsed = parseAllModeSpec(allMatch[1]);
+    if (parsed) expandAll = parsed;
   }
   ALL_TOKEN_RE.lastIndex = 0; // reset regex state
 
@@ -1012,6 +1020,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // @@all(mode) from legacy text tokens — expand to all active sessions
   if (tokens.expandAll && tokens.agents.length === 0) {
     const mode = tokens.expandAll.mode;
+    if (!p2pRounds && tokens.expandAll.rounds) {
+      p2pRounds = tokens.expandAll.rounds;
+    }
     tokens.agents.push(...expandAllTargets(sessionName, mode, tokens.expandAll.excludeSameType, p2pSessionConfig));
     if (tokens.agents.length === 0) {
       logger.warn({ sessionName }, '@@all: no active sessions found in same domain');
