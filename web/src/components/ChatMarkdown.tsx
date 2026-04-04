@@ -9,6 +9,7 @@
  * - All existing chat CSS classes
  */
 import { h } from 'preact';
+import { memo } from 'preact/compat';
 import { useMemo } from 'preact/hooks';
 import { marked, type Token, type Tokens } from 'marked';
 
@@ -289,11 +290,11 @@ function splitPathsAndUrlsInternal(
 
 // ── Public component ────────────────────────────────────────────────────────
 
-export function ChatMarkdown({ text, onPathClick, onUrlClick }: Props) {
+export const ChatMarkdown = memo(function ChatMarkdown({ text, onPathClick, onUrlClick }: Props) {
   const tokens = useMemo(() => marked.lexer(text), [text]);
   return (
     <div class="chat-rich-text">
       {renderTokens(tokens, onPathClick, onUrlClick)}
     </div>
   );
-}
+});
