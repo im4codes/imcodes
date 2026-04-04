@@ -47,6 +47,11 @@ export function clearApiKey(): void {
   try { localStorage.removeItem('rcc_api_key'); } catch { /* ignore */ }
 }
 
+/** Return the currently configured Bearer API key, if any. */
+export function getApiKey(): string | null {
+  return _apiKey;
+}
+
 const TELEMETRY_FALLBACK: AuthTelemetryHeaders = { 'X-Platform': 'unknown', 'X-App-Version': 'unknown', 'X-Bundle-Version': 'none' };
 
 async function getAuthTelemetryHeaders(): Promise<AuthTelemetryHeaders> {

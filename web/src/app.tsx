@@ -100,7 +100,7 @@ import { useProviderStatus } from './hooks/useProviderStatus.js';
 import { DEFAULT_NEW_USER_GUIDE_PREF, shouldMarkNewUserGuidePending, shouldShowNewUserGuidePrompt, type NewUserGuidePref } from './onboarding.js';
 // useSwipeBack now handled inside FloatingPanel for discussion/repo pages
 import { WsClient } from './ws-client.js';
-import { configure as configureApi, apiFetch, onAuthExpired, getUserPref, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, normalizeLocalWebPreviewPath, listP2pRuns } from './api.js';
+import { configure as configureApi, apiFetch, onAuthExpired, getUserPref, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { getAuthKey, clearAuthKey } from './biometric-auth.js';
 import { initPushNotifications } from './push-notifications.js';
@@ -109,6 +109,8 @@ import { NativeAuthBridge } from './pages/NativeAuthBridge.js';
 import type { SessionInfo, TerminalDiff } from './types.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import { shouldSubscribeTerminalRaw, type TerminalSubscribeViewMode } from './terminal-subscribe-mode.js';
+import { onWatchCommand } from './watch-bridge.js';
+import { watchProjectionStore } from './watch-projection.js';
 
 // On web: if opened by the native app for passkey auth, render the bridge page.
 const nativeCallback = typeof window !== 'undefined'
@@ -191,6 +193,46 @@ export function App() {
   // File browser geometry now managed by FloatingPanel (id="filebrowser")
   const [serverCtxMenu, setServerCtxMenu] = useState<{ server: ServerInfo; x: number; y: number } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ServerInfo | null>(null);
+
+  useEffect(() => {
+    if (!auth) {
+      watchProjectionStore.setApiKey(null);
+      watchProjectionStore.setSnapshotStatus('switching');
+      watchProjectionStore.setServers([]);
+      watchProjectionStore.setCurrentServerId(null);
+      watchProjectionStore.setSnapshotStatus('stale');
+      return;
+    }
+
+    watchProjectionStore.setApiKey(getApiKey());
+    watchProjectionStore.setServers(servers.map((server) => ({
+      id: server.id,
+      name: server.name,
+      baseUrl: auth.baseUrl,
+    })));
+    watchProjectionStore.setCurrentServerId(selectedServerId);
+  }, [auth, servers, selectedServerId]);
+
+  useEffect(() => {
+    if (!selectedServerId) return;
+    watchProjectionStore.beginServerSwitch(selectedServerId);
+  }, [selectedServerId]);
+
+  useEffect(() => {
+    let cleanup = () => {};
+    void onWatchCommand((command) => {
+      if (command.action === 'switchServer') {
+        setSelectedServerId((prev) => (prev === command.serverId ? prev : command.serverId));
+        return;
+      }
+      wsRef.current?.requestSessionList();
+    }).then((dispose) => {
+      cleanup = dispose;
+    });
+    return () => {
+      cleanup();
+    };
+  }, []);
 
   // Keep layout height within visual viewport on mobile (keyboard-aware)
   useEffect(() => {
@@ -925,6 +967,9 @@ export function App() {
 
     const unsub = ws.onMessage((msg) => {
       if (msg.type === 'session.event') {
+        if (msg.session) {
+          watchProjectionStore.updateSessionState(msg.session, msg.state);
+        }
         if (msg.event === 'connected') {
           setConnected(true);
           setConnecting(false);
@@ -985,6 +1030,13 @@ export function App() {
         }
       }
       if (msg.type === 'session_list') {
+        const watchServerName = servers.find((server) => server.id === selectedServerId)?.name
+          ?? selectedServerName
+          ?? selectedServerId;
+        watchProjectionStore.updateFromSessionList(
+          { id: selectedServerId, name: watchServerName, baseUrl: auth.baseUrl },
+          msg.sessions,
+        );
         // Daemon is connected — mark this server as online now
         setDaemonOnline(true);
         if (sessionListRetryRef.current) { clearTimeout(sessionListRetryRef.current); sessionListRetryRef.current = null; }
@@ -1047,6 +1099,7 @@ export function App() {
       // Detect model from JSONL usage.update events (authoritative, overrides terminal scan)
       if (msg.type === 'timeline.event') {
         const event = msg.event;
+        watchProjectionStore.handleTimelineEvent(event);
         if (event.type === 'ask.question') {
           setPendingQuestion({
             sessionName: event.sessionId,
@@ -1062,6 +1115,10 @@ export function App() {
               s.name === event.sessionId ? { ...s, state: liveState as SessionInfo['state'] } : s,
             ));
           }
+        }
+        if (event.type === 'session.state') {
+          const liveState = String(event.payload.state ?? '');
+          if (liveState) watchProjectionStore.updateSessionState(event.sessionId, liveState);
         }
         if (event.type === 'usage.update') {
           // Model detection
@@ -1100,6 +1157,16 @@ export function App() {
       if (msg.type === 'session.idle') {
         const sessionName = msg.session as string;
         if (!sessionName) return;
+        watchProjectionStore.onSessionIdle(sessionName);
+        void watchProjectionStore.pushDurableEvent({
+          type: 'session.idle',
+          session: sessionName,
+          serverId: selectedServerId,
+          title: msg.project,
+          agentType: msg.agentType,
+          label: msg.label,
+          parentLabel: msg.parentLabel,
+        });
         // Format: label(type)@mainSession — fallback to local subSessions label, then agentType
         const localSub = subSessions.find(s => s.sessionName === sessionName);
         const label = (msg.label as string | undefined) || localSub?.label || undefined;
@@ -1127,6 +1194,16 @@ export function App() {
         setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 5000);
       }
       if (msg.type === 'session.notification') {
+        void watchProjectionStore.pushDurableEvent({
+          type: 'session.notification',
+          session: msg.session,
+          serverId: selectedServerId,
+          title: msg.title,
+          message: msg.message,
+          agentType: msg.agentType,
+          label: msg.label,
+          parentLabel: msg.parentLabel,
+        });
         const sessionName = msg.session;
         const localSub = subSessions.find(s => s.sessionName === sessionName);
         const label = (msg.label as string | undefined) || localSub?.label || undefined;
@@ -1145,6 +1222,25 @@ export function App() {
         const id = Date.now();
         setToasts((prev) => [...prev, { id, sessionName, project: displayProject, kind: 'notification', title: msg.title, message: msg.message }]);
         setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 8000);
+      }
+      if (msg.type === 'session.error') {
+        void watchProjectionStore.pushDurableEvent({
+          type: 'session.error',
+          project: msg.project,
+          message: msg.message,
+        });
+      }
+      if (msg.type === 'subsession.created') {
+        watchProjectionStore.addSubSession({
+          sessionName: msg.sessionName,
+          sessionType: msg.sessionType,
+          state: msg.state,
+          label: msg.label,
+          parentSession: msg.parentSession,
+        }, selectedServerId);
+      }
+      if (msg.type === 'subsession.removed') {
+        watchProjectionStore.removeSubSession(msg.sessionName);
       }
       if (msg.type === 'discussion.started') {
         setDiscussions((prev) => [
@@ -1271,6 +1367,7 @@ export function App() {
       if (msg.type === 'daemon.disconnected') {
         // Daemon went offline — keep existing session data visible, just update status
         setDaemonOnline(false);
+        watchProjectionStore.setSnapshotStatus('stale');
       }
       if (msg.type === 'daemon.reconnected') {
         setDaemonOnline(true);
