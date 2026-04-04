@@ -88,7 +88,9 @@ async function loadTabPreferences(db: Env['DB'], userId: string): Promise<{ orde
   const parseList = (raw: string | null): string[] => {
     if (!raw) return [];
     try {
-      const parsed = JSON.parse(raw) as unknown;
+      let parsed = JSON.parse(raw) as unknown;
+      // Handle double-encoded JSON (saveUserPref stores JSON.stringify of {v,t})
+      if (typeof parsed === 'string') parsed = JSON.parse(parsed) as unknown;
       const list = Array.isArray(parsed)
         ? parsed
         : parsed && typeof parsed === 'object' && Array.isArray((parsed as { v?: unknown }).v)
