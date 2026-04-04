@@ -638,17 +638,43 @@ async function handleInbound(cmd: Record<string, unknown>): Promise<void> {
   }
 }
 
+/** Sanitize project name into a tmux-safe ASCII slug.
+ *  ASCII chars kept as-is (lowercased); non-ASCII chars converted to hex codepoints
+ *  so CJK names remain deterministic and unique (e.g. "报告" → "62a5-544a"). */
+function sanitizeProjectName(raw: string): string {
+  let slug = '';
+  for (const ch of raw.trim()) {
+    const code = ch.codePointAt(0)!;
+    if ((code >= 0x30 && code <= 0x39)   // 0-9
+      || (code >= 0x41 && code <= 0x5a)  // A-Z
+      || (code >= 0x61 && code <= 0x7a)  // a-z
+      || code === 0x2d || code === 0x5f || code === 0x2e) { // - _ .
+      slug += String.fromCodePoint(code);
+    } else if (code > 0x7f) {
+      // Non-ASCII → hex codepoint
+      slug += (slug.length && !slug.endsWith('-') ? '-' : '') + code.toString(16);
+    } else {
+      // Other ASCII (spaces, punctuation) → underscore
+      if (!slug.endsWith('_')) slug += '_';
+    }
+  }
+  slug = slug.replace(/^[_-]+|[_-]+$/g, '').toLowerCase();
+  if (!slug) slug = `proj_${Date.now().toString(36)}`;
+  return slug;
+}
+
 async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  const project = cmd.project as string | undefined;
+  const rawProject = cmd.project as string | undefined;
   const agentType = (cmd.agentType as string) || 'claude-code';
   const dir = expandTilde((cmd.dir as string) || '~');
   const ccPresetName = cmd.ccPreset as string | undefined;
   const ccInitPrompt = cmd.ccInitPrompt as string | undefined;
 
-  if (!project) {
+  if (!rawProject) {
     logger.warn('session.start: missing project name');
     return;
   }
+  const project = sanitizeProjectName(rawProject);
 
   try {
     // Resolve CC env preset if specified
@@ -2069,7 +2095,7 @@ async function handleDaemonUpgrade(targetVersion?: string): Promise<void> {
     if (existsSync(userSvc)) {
       restartCmd = 'systemctl --user restart imcodes';
     } else {
-      restartCmd = 'sudo systemctl restart imcodes';
+      restartCmd = 'echo "No user service found. Run: imcodes bind" && exit 1';
     }
   } else if (process.platform === 'darwin') {
     const plist = join(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');

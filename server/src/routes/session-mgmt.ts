@@ -5,6 +5,8 @@ import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { randomHex } from '../security/crypto.js';
 import { WsBridge } from '../ws/bridge.js';
 import logger from '../util/logger.js';
+import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
+import { getPodIdentity } from '../util/pod-identity.js';
 
 export const sessionMgmtRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -184,7 +186,9 @@ async function relayToDaemon(
     // body is optional
   }
 
-  const payload = JSON.stringify({ type: command, ...body as object });
+  const { type: _ignoredType, ...rest } = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+  void _ignoredType;
+  const payload = JSON.stringify({ type: command, ...rest });
 
   try {
     WsBridge.get(serverId).sendToDaemon(payload);
@@ -193,5 +197,6 @@ async function relayToDaemon(
     return c.json({ error: 'relay_failed' }, 502);
   }
 
+  c.header(IMCODES_POD_HEADER, getPodIdentity());
   return c.json({ ok: true });
 }

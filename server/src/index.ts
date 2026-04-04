@@ -30,6 +30,7 @@ import { teamRoutes } from './routes/team.js';
 import { cronApiRoutes } from './routes/cron-api.js';
 import { pushRoutes } from './routes/push.js';
 import { quickDataRoutes } from './routes/quick-data.js';
+import { watchRoutes } from './routes/watch.js';
 import { sessionMgmtRoutes } from './routes/session-mgmt.js';
 import { subSessionRoutes } from './routes/sub-sessions.js';
 import { discussionRoutes } from './routes/discussions.js';
@@ -155,6 +156,7 @@ export function buildApp(env: Env) {
   app.route('/api/cron', cronApiRoutes);
   app.route('/api/push', pushRoutes);
   app.route('/api/quick-data', quickDataRoutes);
+  app.route('/api', watchRoutes);
   app.route('/api/server', localWebPreviewRoutes);
   app.route('/api/server', sessionMgmtRoutes);
   app.route('/api/server', subSessionRoutes);

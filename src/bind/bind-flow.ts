@@ -128,7 +128,7 @@ function restartDaemon(): void {
       if (existsSyncFs(userService)) {
         execSync('systemctl --user restart imcodes', { stdio: 'ignore' });
       } else {
-        execSync('sudo systemctl restart imcodes', { stdio: 'ignore' });
+        throw new Error('No user service found');
       }
     } else if (process.platform === 'win32') {
       if (!restartWindowsDaemon()) throw new Error('watchdog not available');

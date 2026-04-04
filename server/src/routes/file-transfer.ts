@@ -145,7 +145,11 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
 
     c.header('Content-Type', mime);
     c.header('Content-Length', String(content.length));
-    c.header('Content-Disposition', `attachment; filename="${filename.replace(/"/g, '\\"')}"`);
+    // RFC 5987: non-ASCII filenames must use filename*=UTF-8'' encoding.
+    // Always include both for maximum client compatibility.
+    const safeFilename = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
+    const encodedFilename = encodeURIComponent(filename).replace(/'/g, '%27');
+    c.header('Content-Disposition', `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`);
 
     return c.body(content);
   } catch (err) {

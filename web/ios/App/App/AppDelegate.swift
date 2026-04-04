@@ -6,16 +6,17 @@ import UserNotifications
 class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterDelegate {
 
     var window: UIWindow?
+    private var didRegisterLocalPlugins = false
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         // Set notification delegate so push notifications display in foreground
         UNUserNotificationCenter.current().delegate = self
 
+        WatchBridge.shared.activate()
+
         // Register local Capacitor plugins after the bridge initializes
         DispatchQueue.main.async {
-            if let vc = self.window?.rootViewController as? CAPBridgeViewController {
-                vc.bridge?.registerPluginInstance(AuthSessionPlugin())
-            }
+            self.registerLocalPluginsIfNeeded()
         }
         return true
     }
@@ -42,7 +43,31 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     }
 
     func applicationDidBecomeActive(_ application: UIApplication) {
-        // Restart any tasks that were paused (or not yet started) while the application was inactive. If the application was previously in the background, optionally refresh the user interface.
+        // Clear badge count on app icon
+        if #available(iOS 16.0, *) {
+            UNUserNotificationCenter.current().setBadgeCount(0)
+        } else {
+            application.applicationIconBadgeNumber = 0
+        }
+
+        WatchBridge.shared.activate()
+
+        DispatchQueue.main.async {
+            self.registerLocalPluginsIfNeeded()
+        }
+
+        // Notify server to reset badge counter
+        self.resetBadgeOnServer()
+    }
+
+    private func resetBadgeOnServer() {
+        // Call /api/push/badge-reset via the web view's cookies (session auth)
+        guard let vc = window?.rootViewController as? CAPBridgeViewController,
+              let bridge = vc.bridge else { return }
+
+        bridge.webView?.evaluateJavaScript("""
+            fetch('/api/push/badge-reset', { method: 'POST', credentials: 'same-origin' }).catch(() => {});
+        """)
     }
 
     func applicationWillTerminate(_ application: UIApplication) {
@@ -69,6 +94,18 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
         // Feel free to add additional processing here, but if you want the App API to support
         // tracking app url opens, make sure to keep this call
         return ApplicationDelegateProxy.shared.application(application, continue: userActivity, restorationHandler: restorationHandler)
+    }
+
+    private func registerLocalPluginsIfNeeded() {
+        guard !didRegisterLocalPlugins else { return }
+        guard let vc = window?.rootViewController as? CAPBridgeViewController,
+              let bridge = vc.bridge else {
+            return
+        }
+
+        bridge.registerPluginInstance(AuthSessionPlugin())
+        bridge.registerPluginInstance(WatchBridgePlugin())
+        didRegisterLocalPlugins = true
     }
 
 }

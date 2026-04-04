@@ -21,7 +21,8 @@ const eventsCache = new Map<string, TimelineEvent[]>();
 const eventsCacheAccess = new Map<string, number>();
 const cacheListeners = new Map<string, Set<(events: TimelineEvent[]) => void>>();
 
-const MAX_MEMORY_EVENTS = 2000;
+const MAX_MEMORY_EVENTS = 300;
+const MAX_HISTORY_EVENTS = 2000;
 const MAX_CACHED_SESSIONS = 12;
 const MAX_TOTAL_CACHED_EVENTS = 12_000;
 const ECHO_WINDOW_MS = 500;
@@ -112,6 +113,8 @@ export interface UseTimelineResult {
   refreshing: boolean;
   /** True while loading older events via backward pagination */
   loadingOlder: boolean;
+  /** False when backward pagination returned 0 events (no more history to load) */
+  hasOlderHistory: boolean;
   /** Immediately inject a pending user message (optimistic UI). */
   addOptimisticUserMessage: (text: string) => void;
   /** Load older events before the earliest currently loaded event. */
@@ -126,9 +129,12 @@ export function useTimeline(
   // IDB + memory cache key: scope by serverId to prevent cross-server pollution
   // when different servers share the same session name (e.g. deck_cd_brain).
   const cacheKey = serverId && sessionId ? `${serverId}:${sessionId}` : sessionId;
+  const cacheKeyRef = useRef(cacheKey);
+  cacheKeyRef.current = cacheKey;
   const [events, setEvents] = useState<TimelineEvent[]>([]);
   const eventsRef = useRef(events);
   eventsRef.current = events;
+  const [hasOlderHistory, setHasOlderHistory] = useState(true);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -160,6 +166,7 @@ export function useTimeline(
 
     setRefreshing(false);
     resetOlderState();
+    setHasOlderHistory(true);
 
     let cancelled = false;
 
@@ -170,7 +177,7 @@ export function useTimeline(
       setLoading(false);
       if (ws?.connected) {
         setRefreshing(true);
-        historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500);
+        historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
       }
       return () => { cancelled = true; };
     }
@@ -181,7 +188,7 @@ export function useTimeline(
       // Just request incremental updates
       if (ws?.connected) {
         setRefreshing(true);
-        historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500);
+        historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
       }
       return () => { cancelled = true; };
     }
@@ -203,10 +210,10 @@ export function useTimeline(
         setCachedEvents(cacheKey!, stored);
         setEvents(stored);
         setLoading(false);
-        historyLoadedRef.current = cacheKey;
+        historyLoadedRef.current = cacheKeyRef.current;
         if (ws?.connected) {
           setRefreshing(true);
-          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500);
+          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
         }
       } else {
         epochRef.current = 0;
@@ -241,10 +248,10 @@ export function useTimeline(
     };
     setEvents((prev) => {
       const result = [...prev, event];
-      if (cacheKey) setCachedEvents(cacheKey, result);
+      if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
       return result;
     });
-  }, [sessionId, cacheKey]);
+  }, [sessionId]);
 
   const olderTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const resetOlderState = useCallback(() => {
@@ -257,16 +264,17 @@ export function useTimeline(
   // Load older events (backward pagination)
   const loadOlderEvents = useCallback(() => {
     if (!ws?.connected || !sessionId || loadingOlderRef.current) return;
-    const cached = cacheKey ? getCachedEvents(cacheKey) : undefined;
+    const key = cacheKeyRef.current;
+    const cached = key ? getCachedEvents(key) : undefined;
     if (!cached || cached.length === 0) return;
     const oldestTs = Math.min(...cached.map((e) => e.ts));
     loadingOlderRef.current = true;
     setLoadingOlder(true);
-    olderRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500, undefined, oldestTs);
+    olderRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS, undefined, oldestTs);
     // Timeout: if response never arrives (packet loss, disconnect), reset after 10s
     if (olderTimeoutRef.current) clearTimeout(olderTimeoutRef.current);
     olderTimeoutRef.current = setTimeout(resetOlderState, 10_000);
-  }, [ws, sessionId, loadingOlder]);
+  }, [ws, sessionId]);
 
   // Append or replace a single event by eventId.
   // Same eventId → replace in place (supports streaming transport updates).
@@ -279,7 +287,7 @@ export function useTimeline(
           // Replace in place — enables typewriter effect for streaming events
           const updated = [...prev];
           updated[i] = event;
-          if (cacheKey) setCachedEvents(cacheKey, updated);
+          if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
           return updated;
         }
       }
@@ -287,15 +295,15 @@ export function useTimeline(
       const result = next.length > MAX_MEMORY_EVENTS
         ? next.slice(next.length - MAX_MEMORY_EVENTS)
         : next;
-      if (cacheKey) setCachedEvents(cacheKey, result);
+      if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
       return result;
     });
-  }, [cacheKey]);
+  }, []);
 
   /** Merge a batch of events into state (dedup + O(n) merge).
    *  Both `prev` and `incoming` are assumed mostly sorted by timestamp.
    *  Uses two-pointer merge instead of concatenate + full sort. */
-  const mergeEvents = useCallback((incoming: TimelineEvent[]) => {
+  const mergeEvents = useCallback((incoming: TimelineEvent[], maxEvents = MAX_MEMORY_EVENTS) => {
     setEvents((prev) => {
       const incomingById = new Map<string, TimelineEvent>();
       for (const event of incoming) incomingById.set(event.eventId, event);
@@ -327,22 +335,23 @@ export function useTimeline(
       while (i < replaced.length) merged.push(replaced[i++]);
       while (j < newEvents.length) merged.push(newEvents[j++]);
 
-      const result = merged.length > MAX_MEMORY_EVENTS
-        ? merged.slice(merged.length - MAX_MEMORY_EVENTS)
+      const result = merged.length > maxEvents
+        ? merged.slice(merged.length - maxEvents)
         : merged;
-      if (cacheKey) setCachedEvents(cacheKey, result);
+      if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
       return result;
     });
   }, []);
 
   // IDB helper: scope events by cacheKey so cross-server sessions don't collide
   const idbPutEvents = useCallback((evts: TimelineEvent[]) => {
-    if (!cacheKey || cacheKey === evts[0]?.sessionId) {
+    const key = cacheKeyRef.current;
+    if (!key || key === evts[0]?.sessionId) {
       sharedDb?.putEvents(evts).catch(() => {});
     } else {
-      sharedDb?.putEvents(evts.map(e => ({ ...e, sessionId: cacheKey }))).catch(() => {});
+      sharedDb?.putEvents(evts.map(e => ({ ...e, sessionId: key }))).catch(() => {});
     }
-  }, [cacheKey]);
+  }, []);
 
   // Listen for WS messages
   useEffect(() => {
@@ -379,7 +388,7 @@ export function useTimeline(
               (e) => !(e.type === 'user.message' && e.payload.pending && String(e.payload.text ?? '').trim() === text),
             );
             if (withoutPending.length < prev.length) {
-              if (cacheKey) setCachedEvents(cacheKey, withoutPending);
+              if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, withoutPending);
               return withoutPending;
             }
             // No pending event — check for confirmed dedup (JSONL re-emit)
@@ -413,8 +422,10 @@ export function useTimeline(
         if (msg.requestId && msg.requestId === olderRequestIdRef.current) {
           resetOlderState();
           if (msg.events.length > 0) {
-            mergeEvents(msg.events);
+            mergeEvents(msg.events, MAX_HISTORY_EVENTS);
             idbPutEvents(msg.events);
+          } else {
+            setHasOlderHistory(false);
           }
           return;
         }
@@ -429,7 +440,7 @@ export function useTimeline(
             historyRequestIdRef.current = null;
           }
         }
-        historyLoadedRef.current = cacheKey;
+        historyLoadedRef.current = cacheKeyRef.current;
 
         epochRef.current = msg.epoch;
 
@@ -445,7 +456,7 @@ export function useTimeline(
           historyRetryRef.current++;
           setTimeout(() => {
             if (ws?.connected && sessionId) {
-              historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 1000);
+              historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
             }
           }, 1000 * historyRetryRef.current);
         }
@@ -483,12 +494,12 @@ export function useTimeline(
         // will bring back any messages that were actually processed.
         setEvents((prev) => {
           const cleaned = prev.filter((e) => !(e.type === 'user.message' && e.payload.pending));
-          if (cleaned.length !== prev.length && cacheKey) setCachedEvents(cacheKey, cleaned);
+          if (cleaned.length !== prev.length && cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, cleaned);
           return cleaned;
         });
         if (ws && sessionId) {
           setRefreshing(true);
-          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500);
+          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
         }
       }
       // ── Browser WS disconnected: reset in-flight pagination to prevent stuck state ──
@@ -500,7 +511,7 @@ export function useTimeline(
       // epoch mismatch and seq desync issues on mobile (app killed/backgrounded).
       if (msg.type === 'session.event' && (msg as { event: string }).event === 'connected') {
         if (ws && sessionId) {
-          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500);
+          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
         }
       }
     };
@@ -509,5 +520,5 @@ export function useTimeline(
     return unsub;
   }, [ws, sessionId, appendEvent, mergeEvents]);
 
-  return { events, loading, refreshing, loadingOlder, addOptimisticUserMessage, loadOlderEvents };
+  return { events, loading, refreshing, loadingOlder, hasOlderHistory, addOptimisticUserMessage, loadOlderEvents };
 }

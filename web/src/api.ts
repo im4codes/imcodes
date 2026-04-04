@@ -47,6 +47,11 @@ export function clearApiKey(): void {
   try { localStorage.removeItem('rcc_api_key'); } catch { /* ignore */ }
 }
 
+/** Return the currently configured Bearer API key, if any. */
+export function getApiKey(): string | null {
+  return _apiKey;
+}
+
 const TELEMETRY_FALLBACK: AuthTelemetryHeaders = { 'X-Platform': 'unknown', 'X-App-Version': 'unknown', 'X-Bundle-Version': 'none' };
 
 async function getAuthTelemetryHeaders(): Promise<AuthTelemetryHeaders> {
@@ -913,8 +918,14 @@ export async function downloadAttachment(serverId: string, attachmentId: string)
   const disposition = res.headers.get('Content-Disposition');
   let filename = attachmentId;
   if (disposition) {
-    const match = disposition.match(/filename="?(.+?)"?$/);
-    if (match) filename = match[1];
+    // Prefer filename* (RFC 5987) for non-ASCII names
+    const starMatch = disposition.match(/filename\*\s*=\s*UTF-8''([^\s;]+)/i);
+    if (starMatch) {
+      try { filename = decodeURIComponent(starMatch[1]); } catch { /* keep default */ }
+    } else {
+      const plainMatch = disposition.match(/filename="([^"]+)"/);
+      if (plainMatch) filename = plainMatch[1];
+    }
   }
   // Trigger browser download
   const url = URL.createObjectURL(blob);

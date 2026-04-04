@@ -19,6 +19,8 @@ interface Props {
   refreshing?: boolean;
   /** True while loading older events via backward pagination */
   loadingOlder?: boolean;
+  /** False when no more history is available */
+  hasOlderHistory?: boolean;
   /** Called when user wants to load older messages */
   onLoadOlder?: () => void;
   sessionState?: string;
@@ -275,7 +277,7 @@ function readPanelOpen(id: string | null | undefined): boolean {
   try { return localStorage.getItem(panelOpenKey(id)) === '1'; } catch { return false; }
 }
 
-export function ChatView({ events, loading, refreshing: _refreshing, loadingOlder, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote }: Props) {
+export function ChatView({ events, loading, refreshing: _refreshing, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, ws, onInsertPath, workdir, serverId, onQuote }: Props) {
   const { t } = useTranslation();
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -437,6 +439,17 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
     }
   }, [lastVisibleTs]);
 
+  // Restore scroll position after Load Older prepends events
+  useLayoutEffect(() => {
+    const anchor = scrollAnchorRef.current;
+    if (!anchor) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    const delta = el.scrollHeight - anchor.scrollHeight;
+    if (delta > 0) el.scrollTop += delta;
+    scrollAnchorRef.current = null;
+  }, [events]);
+
   // Subsequent auto-scroll (new messages while at bottom) — use rAF for smooth updates.
   useEffect(() => {
     const changed = lastVisibleTs !== prevVisibleTsRef.current;
@@ -451,6 +464,12 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
   const lastScrollActivityRef = useRef(Date.now());
   const SCROLL_IDLE_RESUME_MS = 60_000;
 
+  // Scroll auto-trigger for Load Older
+  const lastLoadOlderAtRef = useRef(0);
+  const LOAD_OLDER_COOLDOWN_MS = 1000;
+  // Scroll anchor preservation: save scrollHeight before prepend, restore after
+  const scrollAnchorRef = useRef<{ scrollHeight: number } | null>(null);
+
   const handleScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
@@ -459,6 +478,15 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
     autoScrollRef.current = atBottom;
     setShowScrollBtn(!atBottom);
     if (!atBottom) lastScrollActivityRef.current = Date.now();
+    // Auto-trigger load older when scrolled near top
+    if (el.scrollTop < 100 && onLoadOlder && hasOlderHistory && !loadingOlder && !loading) {
+      const now = Date.now();
+      if (now - lastLoadOlderAtRef.current >= LOAD_OLDER_COOLDOWN_MS) {
+        lastLoadOlderAtRef.current = now;
+        scrollAnchorRef.current = { scrollHeight: el.scrollHeight };
+        onLoadOlder();
+      }
+    }
   };
 
   // Resume auto-scroll after 1 min of scroll inactivity
@@ -638,12 +666,16 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
               {sessionState ? t('chat.session_state', { state: sessionState }) : t('chat.no_events')}
             </div>
           ) : null}
-          {!loading && !preview && onLoadOlder && viewItems.length > 0 && (
+          {!loading && !preview && onLoadOlder && viewItems.length > 0 && hasOlderHistory && (
             <div style={{ textAlign: 'center', padding: '8px 0' }}>
               <button
                 class="btn btn-sm"
                 style={{ fontSize: 11, opacity: 0.7 }}
-                onClick={onLoadOlder}
+                onClick={() => {
+                  const el = scrollRef.current;
+                  if (el) scrollAnchorRef.current = { scrollHeight: el.scrollHeight };
+                  onLoadOlder();
+                }}
                 disabled={loadingOlder}
               >
                 {loadingOlder ? t('chat.loading_older') : t('chat.load_older')}

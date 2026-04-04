@@ -29,8 +29,6 @@ export async function initUpdateManager(): Promise<void> {
   initialized = true;
 
   const { CapacitorUpdater } = await import('@capgo/capacitor-updater');
-
-  // Notify the plugin the app loaded successfully — prevents rollback
   await CapacitorUpdater.notifyAppReady();
 
   // Cold start: check + apply immediately

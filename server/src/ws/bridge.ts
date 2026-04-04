@@ -123,6 +123,21 @@ type PreviewStartPayload = {
   headers: Record<string, string | string[]>;
 };
 
+export interface WatchRecentTextRow {
+  eventId: string;
+  type: 'user.message' | 'assistant.text' | 'session.error';
+  text: string;
+  ts: number;
+}
+
+export interface WatchActiveMainSessionRow {
+  name: string;
+  project: string;
+  state: string;
+  agentType: string;
+  label?: string;
+}
+
 type PendingPreviewRequest = {
   readable: ReadableStream<Uint8Array>;
   controller: ReadableStreamDefaultController<Uint8Array> | null;
@@ -148,6 +163,50 @@ interface WsTunnelState {
   messageQueue: Buffer[];
   queueBytes: number;
   createdAt: number;
+}
+
+type PendingHttpTimelineRequest = {
+  resolve: (msg: Record<string, unknown>) => void;
+  reject: (err: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+const WATCH_RECENT_TEXT_CAP = 5;
+const WATCH_RECENT_TEXT_MAX_CHARS = 160;
+const HTTP_TIMELINE_TIMEOUT_MS = 15_000;
+
+function normalizeRecentText(text: unknown): string | null {
+  if (typeof text !== 'string') return null;
+  const normalized = text.trim().replace(/\s+/g, ' ');
+  if (!normalized) return null;
+  return normalized.length > WATCH_RECENT_TEXT_MAX_CHARS
+    ? `${normalized.slice(0, WATCH_RECENT_TEXT_MAX_CHARS - 1)}…`
+    : normalized;
+}
+
+function recentTextRowFromTimelineEvent(rawEvent: Record<string, unknown>): WatchRecentTextRow | null {
+  const sessionId = rawEvent.sessionId;
+  const eventId = rawEvent.eventId;
+  const ts = rawEvent.ts;
+  const type = rawEvent.type;
+  const payload = rawEvent.payload;
+  if (typeof sessionId !== 'string' || typeof eventId !== 'string' || typeof ts !== 'number' || typeof type !== 'string') {
+    return null;
+  }
+  if (type !== 'user.message' && type !== 'assistant.text') return null;
+  const text = normalizeRecentText((payload as Record<string, unknown> | undefined)?.text);
+  if (!text) return null;
+  return { eventId, type, text, ts };
+}
+
+function mergeRecentTextRows(rows: WatchRecentTextRow[]): WatchRecentTextRow[] {
+  const deduped = new Map<string, WatchRecentTextRow>();
+  for (const row of rows) deduped.set(row.eventId, row);
+  const merged = [...deduped.values()].sort((a, b) => a.ts - b.ts);
+  if (merged.length > WATCH_RECENT_TEXT_CAP) {
+    return merged.slice(merged.length - WATCH_RECENT_TEXT_CAP);
+  }
+  return merged;
 }
 
 // Periodic cleanup interval handle (module-level, shared across all bridge instances)
@@ -209,6 +268,17 @@ export class WsBridge {
 
   /** Per-request timeline.history / timeline.replay pending map — routes responses via requestId unicast. */
   private pendingTimelineRequests = new Map<string, { socket: WebSocket; timer: ReturnType<typeof setTimeout> }>();
+
+  /** Per-request HTTP timeline/history relay pending map. */
+  private pendingHttpTimelineRequests = new Map<string, PendingHttpTimelineRequest>();
+  private pendingRecentTextBackfills = new Map<string, Promise<WatchRecentTextRow[]>>();
+
+  /** Lightweight per-session hot cache for Watch first-paint text. */
+  private recentTextBySession = new Map<string, WatchRecentTextRow[]>();
+
+  /** Latest daemon-owned active main-session snapshot for watch list responses. */
+  private activeMainSessions = new Map<string, WatchActiveMainSessionRow>();
+  private hasActiveMainSessionSnapshot = false;
 
   /**
    * File transfer correlation: requestId → { resolve, reject, timer }.
@@ -321,6 +391,9 @@ export class WsBridge {
 
         this.authenticated = true;
         this.daemonVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : null;
+        this.recentTextBySession.clear();
+        this.activeMainSessions.clear();
+        this.hasActiveMainSessionSnapshot = false;
         logger.info({ serverId: this.serverId, daemonVersion: this.daemonVersion }, 'Daemon authenticated');
         onAuthenticated?.();
 
@@ -431,7 +504,11 @@ export class WsBridge {
       if (this.daemonWs === ws) {
         this.daemonWs = null;
         this.authenticated = false;
+        this.recentTextBySession.clear();
+        this.activeMainSessions.clear();
+        this.hasActiveMainSessionSnapshot = false;
         this.rejectAllPendingFileTransfers('daemon_disconnected');
+        this.rejectAllPendingHttpTimelineRequests('daemon_disconnected');
         this.rejectAllPendingPreviewRequests('daemon_disconnected');
         // Close all preview WS tunnels — daemon is gone
         this.closeAllPreviewWsTunnels(1001, 'daemon disconnected');
@@ -452,6 +529,7 @@ export class WsBridge {
     ws.on('error', (err) => {
       logger.error({ serverId: this.serverId, err }, 'Daemon WS error');
       this.rejectAllPendingFileTransfers('daemon_error');
+      this.rejectAllPendingHttpTimelineRequests('daemon_error');
       this.rejectAllPendingPreviewRequests('daemon_error');
     });
   }
@@ -771,6 +849,8 @@ export class WsBridge {
     }
 
     if (type === 'session_list') {
+      this.replaceActiveMainSessions(msg.sessions);
+      this.pruneMainSessionRecentText(msg.sessions);
       this.broadcastToBrowsers(JSON.stringify({
         ...msg,
         daemonVersion: typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion,
@@ -785,6 +865,7 @@ export class WsBridge {
         logger.warn({ serverId: this.serverId }, 'timeline.event missing sessionId — discarded');
         return;
       }
+      this.ingestRecentTextFromTimelineEvent(msg.event as Record<string, unknown>);
       this.sendToSessionSubscribers(sessionId, JSON.stringify(msg));
       return;
     }
@@ -794,6 +875,13 @@ export class WsBridge {
     if (type === 'timeline.history' || type === 'timeline.replay') {
       const requestId = msg.requestId as string | undefined;
       if (requestId) {
+        const pendingHttp = this.pendingHttpTimelineRequests.get(requestId);
+        if (pendingHttp) {
+          clearTimeout(pendingHttp.timer);
+          this.pendingHttpTimelineRequests.delete(requestId);
+          pendingHttp.resolve(msg);
+          return;
+        }
         const pending = this.pendingTimelineRequests.get(requestId);
         if (pending) {
           clearTimeout(pending.timer);
@@ -951,6 +1039,7 @@ export class WsBridge {
     if (type === 'subsession.closed' && this.db) {
       const id = msg.id as string;
       if (id) {
+        this.recentTextBySession.delete(`deck_sub_${id}`);
         void this.db.execute('UPDATE sub_sessions SET closed_at = $1 WHERE id = $2 AND server_id = $3',
           [Date.now(), id, this.serverId]).catch(() => {});
         this.broadcastToBrowsers(JSON.stringify({ type: 'subsession.removed', id, sessionName: msg.sessionName }));
@@ -1124,6 +1213,53 @@ export class WsBridge {
       return;
     }
     this.sendToRawSessionSubscribers(sessionName, data);
+  }
+
+  getActiveMainSessions(): WatchActiveMainSessionRow[] {
+    return Array.from(this.activeMainSessions.values());
+  }
+
+  hasReceivedActiveMainSessionSnapshot(): boolean {
+    return this.hasActiveMainSessionSnapshot;
+  }
+
+  private replaceActiveMainSessions(rawSessions: unknown): void {
+    this.activeMainSessions.clear();
+    this.hasActiveMainSessionSnapshot = true;
+    if (!Array.isArray(rawSessions)) return;
+    for (const item of rawSessions) {
+      if (!item || typeof item !== 'object') continue;
+      const row = item as Record<string, unknown>;
+      const name = typeof row.name === 'string' ? row.name : '';
+      const project = typeof row.project === 'string' ? row.project : '';
+      const state = typeof row.state === 'string' ? row.state : 'stopped';
+      const agentType = typeof row.agentType === 'string' ? row.agentType : '';
+      const label = typeof row.label === 'string' && row.label.trim() ? row.label.trim() : undefined;
+      if (!name) continue;
+      this.activeMainSessions.set(name, { name, project, state, agentType, label });
+    }
+  }
+
+  private pruneMainSessionRecentText(rawSessions: unknown): void {
+    if (!Array.isArray(rawSessions)) return;
+    const activeMainSessions = new Set<string>();
+    for (const item of rawSessions) {
+      if (!item || typeof item !== 'object') continue;
+      const name = (item as Record<string, unknown>).name;
+      if (typeof name === 'string' && name) activeMainSessions.add(name);
+    }
+    for (const sessionName of this.recentTextBySession.keys()) {
+      if (sessionName.startsWith('deck_sub_')) continue;
+      if (!activeMainSessions.has(sessionName)) this.recentTextBySession.delete(sessionName);
+    }
+  }
+
+  private ingestRecentTextFromTimelineEvent(rawEvent: Record<string, unknown>): void {
+    const sessionId = rawEvent.sessionId;
+    const row = recentTextRowFromTimelineEvent(rawEvent);
+    if (typeof sessionId !== 'string' || !row) return;
+    const rows = this.recentTextBySession.get(sessionId) ?? [];
+    this.recentTextBySession.set(sessionId, mergeRecentTextRows([...rows, row]));
   }
 
   private sendToSessionSubscribers(sessionName: string, data: string | Buffer): void {
@@ -1363,6 +1499,81 @@ export class WsBridge {
     }
   }
 
+  requestTimelineHistory(params: {
+    sessionName: string;
+    limit?: number;
+    beforeTs?: number;
+    afterTs?: number;
+    timeoutMs?: number;
+  }): Promise<Record<string, unknown>> {
+    if (!this.isDaemonConnected()) {
+      return Promise.reject(new Error('daemon_offline'));
+    }
+
+    const requestId = `watch-hist-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const timeoutMs = params.timeoutMs ?? HTTP_TIMELINE_TIMEOUT_MS;
+
+    return new Promise<Record<string, unknown>>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingHttpTimelineRequests.delete(requestId);
+        reject(new Error('timeout'));
+      }, timeoutMs);
+
+      this.pendingHttpTimelineRequests.set(requestId, { resolve, reject, timer });
+
+      try {
+        this.daemonWs!.send(JSON.stringify({
+          type: 'timeline.history_request',
+          sessionName: params.sessionName,
+          requestId,
+          ...(typeof params.limit === 'number' ? { limit: params.limit } : {}),
+          ...(typeof params.beforeTs === 'number' ? { beforeTs: params.beforeTs } : {}),
+          ...(typeof params.afterTs === 'number' ? { afterTs: params.afterTs } : {}),
+        }));
+      } catch (err) {
+        this.pendingHttpTimelineRequests.delete(requestId);
+        clearTimeout(timer);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
+  }
+
+  getRecentText(sessionName: string): WatchRecentTextRow[] {
+    const rows = this.recentTextBySession.get(sessionName);
+    return rows ? rows.map((row) => ({ ...row })) : [];
+  }
+
+  async getRecentTextForWatch(sessionName: string, timeoutMs = 1500): Promise<WatchRecentTextRow[]> {
+    const cached = this.getRecentText(sessionName);
+    if (cached.length > 0 || !this.isDaemonConnected()) return cached;
+
+    const pending = this.pendingRecentTextBackfills.get(sessionName);
+    if (pending) return pending;
+
+    const backfill = this.requestTimelineHistory({
+      sessionName,
+      limit: WATCH_RECENT_TEXT_CAP * 8,
+      timeoutMs,
+    }).then((response) => {
+      const events = Array.isArray(response.events) ? response.events : [];
+      const rows = mergeRecentTextRows(
+        events
+          .filter((event): event is Record<string, unknown> => !!event && typeof event === 'object')
+          .map((event) => recentTextRowFromTimelineEvent(event))
+          .filter((row): row is WatchRecentTextRow => row !== null),
+      );
+      if (rows.length > 0) {
+        this.recentTextBySession.set(sessionName, rows);
+      }
+      return rows.map((row) => ({ ...row }));
+    }).catch(() => []).finally(() => {
+      this.pendingRecentTextBackfills.delete(sessionName);
+    });
+
+    this.pendingRecentTextBackfills.set(sessionName, backfill);
+    return backfill;
+  }
+
   createPreviewRelay(requestId: string, timeoutMs = PREVIEW_LIMITS.RESPONSE_START_TIMEOUT_MS): {
     start: Promise<PreviewStartPayload & { body: ReadableStream<Uint8Array> }>;
     abort: (reason?: string) => void;
@@ -1469,6 +1680,14 @@ export class WsBridge {
       pending.reject(new Error(reason));
     }
     this.pendingFileTransfers.clear();
+  }
+
+  private rejectAllPendingHttpTimelineRequests(reason: string): void {
+    for (const [, pending] of this.pendingHttpTimelineRequests) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error(reason));
+    }
+    this.pendingHttpTimelineRequests.clear();
   }
 
   /**

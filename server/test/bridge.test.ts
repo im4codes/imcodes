@@ -2057,4 +2057,178 @@ describe('WsBridge', () => {
       expect(received).toHaveLength(1);
     });
   });
+
+  describe('HTTP timeline history relay', () => {
+    async function setupAuth() {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      return { bridge, daemonWs };
+    }
+
+    it('resolves HTTP timeline history requests without browser subscriptions', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+
+      const pending = bridge.requestTimelineHistory({
+        sessionName: 'deck_sub_qwen',
+        limit: 50,
+        beforeTs: 200,
+      });
+
+      const outbound = daemonWs.sentStrings.find((s) => s.includes('"type":"timeline.history_request"'));
+      expect(outbound).toBeTruthy();
+      const requestId = JSON.parse(outbound!).requestId as string;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.history',
+        sessionName: 'deck_sub_qwen',
+        requestId,
+        events: [{ eventId: 'e1', sessionId: 'deck_sub_qwen', ts: 100, type: 'assistant.text', payload: { text: 'hi' } }],
+        epoch: 2,
+      }));
+      await expect(pending).resolves.toMatchObject({
+        type: 'timeline.history',
+        requestId,
+        epoch: 2,
+      });
+    });
+
+    it('rejects pending HTTP history requests when daemon disconnects', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const pending = bridge.requestTimelineHistory({ sessionName: 'deck_sub_qwen' });
+      daemonWs.close();
+      await expect(pending).rejects.toThrow('daemon_disconnected');
+    });
+
+    it('rejects HTTP history requests on timeout and cleans pending state', async () => {
+      vi.useFakeTimers();
+      try {
+        const { bridge, daemonWs } = await setupAuth();
+        const pending = bridge.requestTimelineHistory({
+          sessionName: 'deck_sub_qwen',
+          timeoutMs: 25,
+        });
+        const assertion = expect(pending).rejects.toThrow('timeout');
+
+        const outbound = daemonWs.sentStrings.find((s) => s.includes('"type":"timeline.history_request"'));
+        expect(outbound).toBeTruthy();
+
+        await vi.advanceTimersByTimeAsync(26);
+        await assertion;
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe('watch recentText cache', () => {
+    async function setupAuth() {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      return { bridge, daemonWs };
+    }
+
+    it('keeps only the newest 5 user/assistant events per session', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      for (let i = 1; i <= 6; i++) {
+        daemonWs.emit('message', JSON.stringify({
+          type: 'timeline.event',
+          event: {
+            eventId: `e${i}`,
+            sessionId: 'deck_proj_brain',
+            ts: i,
+            type: i % 2 === 0 ? 'assistant.text' : 'user.message',
+            payload: { text: `message ${i}` },
+          },
+        }));
+      }
+      await flushAsync();
+
+      expect(bridge.getRecentText('deck_proj_brain')).toEqual([
+        { eventId: 'e2', type: 'assistant.text', text: 'message 2', ts: 2 },
+        { eventId: 'e3', type: 'user.message', text: 'message 3', ts: 3 },
+        { eventId: 'e4', type: 'assistant.text', text: 'message 4', ts: 4 },
+        { eventId: 'e5', type: 'user.message', text: 'message 5', ts: 5 },
+        { eventId: 'e6', type: 'assistant.text', text: 'message 6', ts: 6 },
+      ]);
+    });
+
+    it('clears cached recentText on sub-session removal and daemon reconnect', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          eventId: 'e1',
+          sessionId: 'deck_sub_worker',
+          ts: 1,
+          type: 'assistant.text',
+          payload: { text: 'worker text' },
+        },
+      }));
+      await flushAsync();
+      expect(bridge.getRecentText('deck_sub_worker')).toHaveLength(1);
+
+      daemonWs.emit('message', JSON.stringify({ type: 'subsession.closed', id: 'worker', sessionName: 'deck_sub_worker' }));
+      await flushAsync();
+      expect(bridge.getRecentText('deck_sub_worker')).toHaveLength(0);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          eventId: 'e2',
+          sessionId: 'deck_proj_brain',
+          ts: 2,
+          type: 'assistant.text',
+          payload: { text: 'before reconnect' },
+        },
+      }));
+      await flushAsync();
+      expect(bridge.getRecentText('deck_proj_brain')).toHaveLength(1);
+
+      daemonWs.close();
+      await flushAsync();
+      expect(bridge.getRecentText('deck_proj_brain')).toHaveLength(0);
+
+      const newDaemonWs = new MockWs();
+      bridge.handleDaemonConnection(newDaemonWs as never, makeDb('valid-hash'), {} as never);
+      newDaemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      expect(bridge.getRecentText('deck_proj_brain')).toHaveLength(0);
+    });
+
+    it('backfills recentText from timeline history when the hot cache is empty', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const pending = bridge.getRecentTextForWatch('deck_proj_brain', 1000);
+
+      const outbound = daemonWs.sentStrings.find((s) => s.includes('"type":"timeline.history_request"'));
+      expect(outbound).toBeTruthy();
+      const requestId = JSON.parse(outbound!).requestId as string;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.history',
+        sessionName: 'deck_proj_brain',
+        requestId,
+        events: [
+          { eventId: 'e1', sessionId: 'deck_proj_brain', ts: 1, type: 'assistant.text', payload: { text: 'first' } },
+          { eventId: 'e2', sessionId: 'deck_proj_brain', ts: 2, type: 'tool.call', payload: { raw: { noisy: true } } },
+          { eventId: 'e3', sessionId: 'deck_proj_brain', ts: 3, type: 'user.message', payload: { text: 'second' } },
+        ],
+        epoch: 1,
+      }));
+
+      await expect(pending).resolves.toEqual([
+        { eventId: 'e1', type: 'assistant.text', text: 'first', ts: 1 },
+        { eventId: 'e3', type: 'user.message', text: 'second', ts: 3 },
+      ]);
+      expect(bridge.getRecentText('deck_proj_brain')).toEqual([
+        { eventId: 'e1', type: 'assistant.text', text: 'first', ts: 1 },
+        { eventId: 'e3', type: 'user.message', text: 'second', ts: 3 },
+      ]);
+    });
+  });
 });

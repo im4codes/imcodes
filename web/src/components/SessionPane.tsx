@@ -105,6 +105,7 @@ export function SessionPane({
     loading: timelineLoading,
     refreshing: timelineRefreshing,
     loadingOlder: timelineLoadingOlder,
+    hasOlderHistory: timelineHasOlderHistory,
     addOptimisticUserMessage,
     loadOlderEvents,
   } = useTimeline(sessionName, ws, serverId);
@@ -228,6 +229,7 @@ export function SessionPane({
           loading={timelineLoading}
           refreshing={timelineRefreshing}
           loadingOlder={timelineLoadingOlder}
+          hasOlderHistory={timelineHasOlderHistory}
           onLoadOlder={loadOlderEvents}
           sessionId={sessionName}
           sessionState={session.state}
