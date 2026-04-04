@@ -21,7 +21,7 @@ const eventsCache = new Map<string, TimelineEvent[]>();
 const eventsCacheAccess = new Map<string, number>();
 const cacheListeners = new Map<string, Set<(events: TimelineEvent[]) => void>>();
 
-const MAX_MEMORY_EVENTS = 2000;
+const MAX_MEMORY_EVENTS = 300;
 const MAX_CACHED_SESSIONS = 12;
 const MAX_TOTAL_CACHED_EVENTS = 12_000;
 const ECHO_WINDOW_MS = 500;
@@ -170,7 +170,7 @@ export function useTimeline(
       setLoading(false);
       if (ws?.connected) {
         setRefreshing(true);
-        historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500);
+        historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
       }
       return () => { cancelled = true; };
     }
@@ -181,7 +181,7 @@ export function useTimeline(
       // Just request incremental updates
       if (ws?.connected) {
         setRefreshing(true);
-        historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500);
+        historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
       }
       return () => { cancelled = true; };
     }
@@ -206,7 +206,7 @@ export function useTimeline(
         historyLoadedRef.current = cacheKey;
         if (ws?.connected) {
           setRefreshing(true);
-          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500);
+          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
         }
       } else {
         epochRef.current = 0;
@@ -445,7 +445,7 @@ export function useTimeline(
           historyRetryRef.current++;
           setTimeout(() => {
             if (ws?.connected && sessionId) {
-              historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 1000);
+              historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
             }
           }, 1000 * historyRetryRef.current);
         }
@@ -488,7 +488,7 @@ export function useTimeline(
         });
         if (ws && sessionId) {
           setRefreshing(true);
-          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500);
+          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
         }
       }
       // ── Browser WS disconnected: reset in-flight pagination to prevent stuck state ──
@@ -500,7 +500,7 @@ export function useTimeline(
       // epoch mismatch and seq desync issues on mobile (app killed/backgrounded).
       if (msg.type === 'session.event' && (msg as { event: string }).event === 'connected') {
         if (ws && sessionId) {
-          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, 500);
+          historyRequestIdRef.current = ws.sendTimelineHistoryRequest(sessionId, MAX_MEMORY_EVENTS);
         }
       }
     };
