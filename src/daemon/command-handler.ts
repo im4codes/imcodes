@@ -2535,7 +2535,12 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
   const rawPath = cmd.path as string | undefined;
   const requestId = cmd.requestId as string | undefined;
   const content = cmd.content as string | undefined;
-  if (!rawPath || !requestId || content === undefined) return;
+  if (!rawPath || !requestId || content === undefined) {
+    if (requestId) {
+      try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath ?? '', status: 'error', error: 'invalid_request' }); } catch { /* ignore */ }
+    }
+    return;
+  }
 
   const expectedMtime = typeof cmd.expectedMtime === 'number' ? cmd.expectedMtime : undefined;
 

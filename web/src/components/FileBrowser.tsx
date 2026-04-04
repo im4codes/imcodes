@@ -816,6 +816,14 @@ export function FileBrowser({
               onMessage={onEditorMessage}
               onDirtyChange={setEditDirty}
               onContentChange={setEditContent}
+              onSaved={(newMtime) => {
+                setOriginalMtime(newMtime);
+                setEditDirty(false);
+                setPreview((prev) => prev.status === 'ok' && prev.path === preview.path
+                  ? { ...prev, content: editContent, diff: undefined, diffHtml: undefined }
+                  : prev);
+              }}
+              onMtimeUpdate={setOriginalMtime}
             />
           </Suspense>
         )}

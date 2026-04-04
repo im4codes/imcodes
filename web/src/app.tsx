@@ -56,6 +56,7 @@ function mapP2pRunToDiscussion(r: Record<string, any>) {
     filePath: undefined,
     fileId: source.discussion_id ? String(source.discussion_id) : source.id,
     startedAt: source.created_at ? new Date(source.created_at).getTime() : undefined,
+    hopStartedAt: typeof source.hop_started_at === 'number' ? source.hop_started_at : undefined,
     nodes,
   };
 }
@@ -685,6 +686,8 @@ export function App() {
     fileId?: string;
     /** Epoch ms when the P2P run was created (for elapsed timer) */
     startedAt?: number;
+    /** Epoch ms when the current hop/phase started (for hop-level elapsed timer) */
+    hopStartedAt?: number;
   }>>([]);
 
   /** Set of session names enabled in the P2P config for the active root session. */
