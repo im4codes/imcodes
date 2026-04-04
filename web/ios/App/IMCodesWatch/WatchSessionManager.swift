@@ -97,6 +97,12 @@ final class WatchSessionManager: NSObject, ObservableObject {
         }
     }
 
+    /// Light refresh — reload sessions only (no servers). Used by auto-poll timer.
+    func refreshSessions() async {
+        guard canUseDirectApi, let selectedServerId else { return }
+        await loadSessions(serverId: selectedServerId, force: true)
+    }
+
     func selectServer(_ serverId: String) async {
         if selectedServerId != serverId {
             selectedServerId = serverId
@@ -108,8 +114,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
 
     func loadHistoryIfNeeded(for route: WatchRoute) async {
         seedHistoryStateIfNeeded(for: route)
-        let state = historyByRoute[route.id] ?? .init()
-        guard !state.loadedOnce else { return }
+        // Always fetch latest history when entering the detail view
         await loadHistoryPage(for: route, beforeTs: nil)
     }
 
@@ -291,7 +296,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
                 serverId: route.serverId,
                 sessionName: route.sessionName,
                 apiKey: apiKey,
-                limit: 50,
+                limit: beforeTs == nil ? 30 : 15,
                 beforeTs: beforeTs
             )
             let incoming = response.events.compactMap(WatchConversationItem.fromTimelineEvent)

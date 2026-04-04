@@ -43,12 +43,31 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     }
 
     func applicationDidBecomeActive(_ application: UIApplication) {
-        // Restart any tasks that were paused (or not yet started) while the application was inactive. If the application was previously in the background, optionally refresh the user interface.
+        // Clear badge count on app icon
+        if #available(iOS 16.0, *) {
+            UNUserNotificationCenter.current().setBadgeCount(0)
+        } else {
+            application.applicationIconBadgeNumber = 0
+        }
+
         WatchBridge.shared.activate()
 
         DispatchQueue.main.async {
             self.registerLocalPluginsIfNeeded()
         }
+
+        // Notify server to reset badge counter
+        self.resetBadgeOnServer()
+    }
+
+    private func resetBadgeOnServer() {
+        // Call /api/push/badge-reset via the web view's cookies (session auth)
+        guard let vc = window?.rootViewController as? CAPBridgeViewController,
+              let bridge = vc.bridge else { return }
+
+        bridge.webView?.evaluateJavaScript("""
+            fetch('/api/push/badge-reset', { method: 'POST', credentials: 'same-origin' }).catch(() => {});
+        """)
     }
 
     func applicationWillTerminate(_ application: UIApplication) {

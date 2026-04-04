@@ -159,6 +159,12 @@ struct ContentView: View {
             }
             .task {
                 await sessionManager.ensureLoaded()
+                // Auto-refresh every 12s while list is visible
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(12))
+                    guard !Task.isCancelled else { break }
+                    await sessionManager.refreshSessions()
+                }
             }
             .onChange(of: sessionManager.activeRoute) { newRoute in
                 guard let newRoute else { return }

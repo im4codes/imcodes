@@ -227,7 +227,7 @@ export function App() {
       }
       if (command.action === 'openSession') {
         setSelectedServerId(command.serverId);
-        setActiveSession(command.sessionName);
+        navigateToSessionRef.current(command.sessionName);
         return;
       }
       wsRef.current?.requestSessionList();
@@ -1734,6 +1734,9 @@ export function App() {
       setPendingPrefills((prev) => ({ ...prev, [session]: (prev[session] || '') + quoteText }));
     }
   }, [setActiveSession, bringSubToFront]);
+
+  const navigateToSessionRef = useRef(navigateToSession);
+  navigateToSessionRef.current = navigateToSession;
 
   // Reactive: when sub-sessions load and we have a pending nav, retry navigation
   useEffect(() => {

@@ -8,41 +8,117 @@ struct SessionDetailView: View {
     @State private var draft = ""
     @State private var isSending = false
     @State private var statusMessage: String?
+    @State private var initialScrollDone = false
+    @State private var prevItemCount = 0
+    @State private var isAtBottom = true
+    @State private var unreadCount = 0
+    @State private var scrollProxy: ScrollViewProxy?
 
     private let quickReplies = ["Yes", "Continue", "Fix"]
 
-
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 10) {
-                header
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    header
+                    chatSection
+                    Divider()
+                    replyComposer
+                    quickReplySection
 
-                if historyState.hasMore {
-                    Button(historyState.isLoadingOlder ? "Loading…" : "Load older") {
-                        Task { await sessionManager.loadOlderHistory(for: route) }
+                    if let statusMessage {
+                        Text(statusMessage)
+                            .font(.system(size: 9))
+                            .foregroundStyle(statusMessage == "Sent" ? .green : .red)
                     }
-                    .font(.caption2)
-                    .disabled(historyState.isLoadingOlder)
                 }
-
-                chatSection
-
-                Divider()
-
-                replyComposer
-                quickReplySection
-
-                if let statusMessage {
-                    Text(statusMessage)
-                        .font(.system(size: 9))
-                        .foregroundStyle(statusMessage == "Sent" ? .green : .red)
+                .padding(.horizontal, 4)
+            }
+            .onAppear {
+                scrollProxy = proxy
+                // Initial scroll — covers case where items are already seeded before onChange fires
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    if !initialScrollDone {
+                        initialScrollDone = true
+                        prevItemCount = historyState.items.count
+                        proxy.scrollTo("replyField", anchor: .bottom)
+                    }
                 }
             }
-            .padding(.horizontal, 4)
+            .onChange(of: historyState.items.count) { newCount in
+                let added = newCount - prevItemCount
+                if !initialScrollDone {
+                    initialScrollDone = true
+                    prevItemCount = newCount
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                        proxy.scrollTo("replyField", anchor: .bottom)
+                    }
+                } else if added > 0 && added <= 3 && isAtBottom {
+                    prevItemCount = newCount
+                    proxy.scrollTo("replyField", anchor: .bottom)
+                } else if added > 0 && added <= 3 && !isAtBottom {
+                    prevItemCount = newCount
+                    unreadCount += added
+                    WKInterfaceDevice.current().play(.notification)
+                } else {
+                    prevItemCount = newCount
+                }
+            }
         }
         .navigationTitle(session?.title ?? route.title ?? "Session")
+        .toolbar {
+            ToolbarItem(placement: .confirmationAction) {
+                HStack(spacing: 8) {
+                    // Load older button
+                    if historyState.hasMore && historyState.loadedOnce {
+                        Button {
+                            Task { await sessionManager.loadOlderHistory(for: route) }
+                        } label: {
+                            if historyState.isLoadingOlder {
+                                ProgressView()
+                                    .frame(width: 14, height: 14)
+                            } else {
+                                Image(systemName: "arrow.up")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(.white.opacity(0.7))
+                            }
+                        }
+                        .disabled(historyState.isLoadingOlder)
+                    }
+
+                    // Scroll to bottom button
+                    if !isAtBottom || unreadCount > 0 {
+                        Button {
+                            unreadCount = 0
+                            scrollProxy?.scrollTo("replyField", anchor: .bottom)
+                        } label: {
+                            ZStack(alignment: .topTrailing) {
+                                Image(systemName: "arrow.down")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(.white.opacity(0.85))
+
+                                if unreadCount > 0 {
+                                    Text("\(unreadCount)")
+                                        .font(.system(size: 7, weight: .bold))
+                                        .foregroundStyle(.white)
+                                        .padding(.horizontal, 2)
+                                        .background(Color.red)
+                                        .clipShape(Capsule())
+                                        .offset(x: 8, y: -4)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         .task {
             await sessionManager.loadHistoryIfNeeded(for: route)
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(12))
+                guard !Task.isCancelled else { break }
+                await sessionManager.loadHistoryIfNeeded(for: route)
+            }
         }
         .onDisappear {
             sessionManager.clearActiveRoute()
@@ -87,6 +163,11 @@ struct SessionDetailView: View {
                         if !item.isUser { Spacer(minLength: 20) }
                     }
                 }
+
+                // Bottom sentinel — tracks whether user is near the bottom
+                Color.clear.frame(height: 1).id("chatEnd")
+                    .onAppear { isAtBottom = true; unreadCount = 0 }
+                    .onDisappear { isAtBottom = false }
             }
         }
 
@@ -96,7 +177,6 @@ struct SessionDetailView: View {
                 .foregroundStyle(.red)
         }
     }
-
 
     private var quickReplySection: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -121,6 +201,7 @@ struct SessionDetailView: View {
         VStack(alignment: .leading, spacing: 8) {
             TextField("Reply…", text: $draft)
                 .font(.caption2)
+                .id("replyField")
 
             HStack(spacing: 8) {
                 Button(isSending ? "…" : "Send") {

@@ -53,6 +53,16 @@ pushRoutes.delete('/unregister', async (c) => {
   return c.json({ ok: true });
 });
 
+// POST /api/push/badge-reset — clear badge count when app opens
+pushRoutes.use('/badge-reset', requireAuth());
+pushRoutes.post('/badge-reset', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  try {
+    await c.env.DB.execute('UPDATE users SET badge_count = 0 WHERE id = $1', [userId]);
+  } catch { /* ignore */ }
+  return c.json({ ok: true });
+});
+
 // ── Push relay for self-hosted servers ─────────────────────────────────────────
 // Self-hosted servers don't have APNs keys. They call this endpoint to relay
 // push notifications through app.im.codes which owns the APNs credentials.
@@ -60,7 +70,7 @@ pushRoutes.delete('/unregister', async (c) => {
 // APNs rejects it and we return the error.
 
 pushRoutes.post('/relay', async (c) => {
-  const body = await c.req.json<{ token: string; platform: string; title: string; body: string; data?: Record<string, string> }>().catch(() => null);
+  const body = await c.req.json<{ token: string; platform: string; title: string; body: string; badge?: number; data?: Record<string, string> }>().catch(() => null);
   if (!body?.token || !body?.platform || !body?.title) {
     return c.json({ error: 'token, platform, title, body required' }, 400);
   }
@@ -72,7 +82,7 @@ pushRoutes.post('/relay', async (c) => {
 
   try {
     if (body.platform === 'ios') {
-      await sendApns(body.token, { userId: '', title: body.title, body: body.body, data: body.data }, c.env);
+      await sendApns(body.token, { userId: '', title: body.title, body: body.body, badge: body.badge, data: body.data }, c.env);
       return c.json({ ok: true });
     } else if (body.platform === 'android' && c.env.FCM_SERVER_KEY) {
       await sendFcm(body.token, { userId: '', title: body.title, body: body.body, data: body.data }, c.env.FCM_SERVER_KEY);
@@ -92,6 +102,7 @@ export interface PushPayload {
   userId: string;
   title: string;
   body: string;
+  badge?: number;
   data?: Record<string, string>;
 }
 
@@ -126,6 +137,17 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
 
   if (tokens.length === 0) return;
 
+  // Atomically increment badge count and read the new value
+  let badgeCount = 1;
+  try {
+    const rows = await db.query<{ badge_count: number }>(
+      'UPDATE users SET badge_count = badge_count + 1 WHERE id = $1 RETURNING badge_count',
+      [payload.userId],
+    );
+    if (rows.length > 0) badgeCount = rows[0].badge_count;
+  } catch { /* fallback to 1 */ }
+  payload.badge = badgeCount;
+
   const hasApns = !!(env.APNS_KEY && env.APNS_KEY_ID && env.APNS_TEAM_ID);
   const relayUrl = hasApns ? null : (env.PUSH_RELAY_URL || 'https://app.im.codes');
 
@@ -158,6 +180,7 @@ async function relayPush(relayBaseUrl: string, token: string, platform: string, 
       platform,
       title: payload.title,
       body: payload.body,
+      badge: payload.badge,
       data: payload.data,
     }),
     signal: AbortSignal.timeout(10_000),
@@ -213,6 +236,7 @@ async function sendApnsToHost(
     aps: {
       alert: { title: payload.title, body: payload.body },
       sound: 'default',
+      badge: payload.badge ?? 1,
       'mutable-content': 1,
     },
     ...payload.data,

@@ -223,8 +223,16 @@ actor WatchRestClient {
             }
         } catch let error as WatchRestError {
             throw error
-        } catch is DecodingError {
-            throw WatchRestError.invalidResponse
+        } catch let error as DecodingError {
+            let detail: String
+            switch error {
+            case .keyNotFound(let key, _): detail = "missing key '\(key.stringValue)'"
+            case .typeMismatch(let type, let ctx): detail = "type mismatch \(type) at \(ctx.codingPath.map(\.stringValue).joined(separator: "."))"
+            case .valueNotFound(let type, let ctx): detail = "null \(type) at \(ctx.codingPath.map(\.stringValue).joined(separator: "."))"
+            case .dataCorrupted(let ctx): detail = "corrupted at \(ctx.codingPath.map(\.stringValue).joined(separator: "."))"
+            @unknown default: detail = error.localizedDescription
+            }
+            throw WatchRestError.networkError("Decode: \(detail)")
         } catch {
             throw WatchRestError.networkError(error.localizedDescription)
         }

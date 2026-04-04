@@ -176,12 +176,38 @@ struct WatchTimelineEvent: Identifiable, Codable, Equatable {
     }
 }
 
-struct WatchHistoryResponse: Codable, Equatable {
+struct WatchHistoryResponse: Equatable {
     let sessionName: String
-    let epoch: Int?
+    let epoch: Double?
     let events: [WatchTimelineEvent]
     let hasMore: Bool
     let nextCursor: Double?
+}
+
+extension WatchHistoryResponse: Decodable {
+    enum CodingKeys: String, CodingKey {
+        case sessionName, epoch, events, hasMore, nextCursor
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionName = try container.decode(String.self, forKey: .sessionName)
+        epoch = try container.decodeIfPresent(Double.self, forKey: .epoch)
+        hasMore = (try? container.decode(Bool.self, forKey: .hasMore)) ?? false
+        nextCursor = try container.decodeIfPresent(Double.self, forKey: .nextCursor)
+        // Lenient event decoding — skip individual events that fail to decode
+        var eventsArray = try container.nestedUnkeyedContainer(forKey: .events)
+        var decoded: [WatchTimelineEvent] = []
+        while !eventsArray.isAtEnd {
+            if let event = try? eventsArray.decode(WatchTimelineEvent.self) {
+                decoded.append(event)
+            } else {
+                // skip malformed event
+                _ = try? eventsArray.decode(JSONValue.self)
+            }
+        }
+        events = decoded
+    }
 }
 
 struct WatchApplicationContext: Codable, Equatable {
