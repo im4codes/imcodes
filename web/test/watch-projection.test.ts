@@ -1,6 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createWatchProjectionStore, type WatchApplicationContext } from '../src/watch-projection.js';
 
+const localStorageData = new Map<string, string>();
+const localStorageMock = {
+  getItem: (key: string) => localStorageData.get(key) ?? null,
+  setItem: (key: string, value: string) => { localStorageData.set(key, value); },
+  removeItem: (key: string) => { localStorageData.delete(key); },
+  clear: () => { localStorageData.clear(); },
+};
+
 function makeSnapshotStore(now = 1_000) {
   const pushes: WatchApplicationContext[] = [];
   const durableEvents: unknown[] = [];
@@ -20,10 +28,13 @@ describe('watch projection store', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000);
+    localStorageMock.clear();
+    vi.stubGlobal('localStorage', localStorageMock);
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllGlobals();
   });
 
   it('builds a versioned snapshot with servers, sub-sessions, badges, and sorted session rows', async () => {
@@ -71,6 +82,31 @@ describe('watch projection store', () => {
       isSubSession: true,
       parentTitle: 'Project',
     });
+  });
+
+
+  it('respects pinned and tab order from synced localStorage preferences', () => {
+    localStorage.setItem('rcc_sync_tab_order', JSON.stringify({ v: ['deck_proj_two', 'deck_proj_one'], t: 1 }));
+    localStorage.setItem('rcc_sync_tab_pinned', JSON.stringify({ v: ['deck_proj_two'], t: 1 }));
+
+    const { store } = makeSnapshotStore(1_200);
+    store.updateFromSessionList(
+      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+      [
+        { name: 'deck_proj_one', project: 'One', role: 'brain', agentType: 'claude-code', state: 'idle' },
+        { name: 'deck_proj_two', project: 'Two', role: 'brain', agentType: 'codex', state: 'working' },
+        { name: 'deck_proj_three', project: 'Three', role: 'brain', agentType: 'qwen', state: 'working' },
+      ],
+    );
+
+    const snapshot = store.getSnapshot();
+    expect(snapshot.sessions.map((row) => row.sessionName)).toEqual([
+      'deck_proj_two',
+      'deck_proj_one',
+      'deck_proj_three',
+    ]);
+    expect(snapshot.sessions[0]?.isPinned).toBe(true);
+    expect(snapshot.sessions[1]?.isPinned).toBeUndefined();
   });
 
   it('keeps auth/routing fields explicit even when apiKey is unavailable', () => {

@@ -62,7 +62,7 @@ struct ContentView: View {
 
                             HStack(spacing: 0) {
                                 Button {
-                                    path = [WatchRoute(serverId: session.serverId, sessionName: session.sessionName)]
+                                    path = [WatchRoute(serverId: session.serverId, sessionName: session.sessionName, title: session.title)]
                                 } label: {
                                     SessionRowView(session: session)
                                 }
@@ -108,7 +108,7 @@ struct ContentView: View {
                             if isExpanded {
                                 ForEach(subs) { sub in
                                     Button {
-                                        path = [WatchRoute(serverId: sub.serverId, sessionName: sub.sessionName)]
+                                        path = [WatchRoute(serverId: sub.serverId, sessionName: sub.sessionName, title: sub.title)]
                                     } label: {
                                         SessionRowView(session: sub)
                                             .padding(.leading, 14)

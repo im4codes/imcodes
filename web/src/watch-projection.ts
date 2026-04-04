@@ -469,23 +469,37 @@ export class WatchProjectionStore {
   }
 
   private buildSessions(): WatchSessionRow[] {
-    // Read pinned tabs from localStorage (synced by useSyncedPreference, key: rcc_sync_tab_pinned, format: {v: string[], t: number})
-    let pinnedSet: Set<string>;
-    try {
-      const raw = localStorage.getItem('rcc_sync_tab_pinned');
-      const payload = raw ? JSON.parse(raw) as { v: string[] } : null;
-      pinnedSet = new Set(payload?.v ?? []);
-    } catch {
-      pinnedSet = new Set();
-    }
+    const readPrefList = (key: string): string[] => {
+      try {
+        const raw = localStorage.getItem(key);
+        const parsed = raw ? JSON.parse(raw) as unknown : null;
+        const list = Array.isArray(parsed)
+          ? parsed
+          : parsed && typeof parsed === 'object' && Array.isArray((parsed as { v?: unknown }).v)
+            ? (parsed as { v: unknown[] }).v
+            : [];
+        return list.filter((item): item is string => typeof item === 'string' && item.length > 0);
+      } catch {
+        return [];
+      }
+    };
+
+    const tabOrder = readPrefList('rcc_sync_tab_order');
+    const pinnedSet = new Set(readPrefList('rcc_sync_tab_pinned'));
+    const orderIndex = new Map(tabOrder.map((name, index) => [name, index]));
 
     return [...this.sessionsByName.values()]
       .map((row) => ({ ...row, isPinned: pinnedSet.has(row.sessionName) || undefined }))
       .sort((a, b) => {
-        // Pinned first
         const pinDiff = (b.isPinned ? 1 : 0) - (a.isPinned ? 1 : 0);
         if (pinDiff !== 0) return pinDiff;
-        // Then by state priority
+
+        const aOrder = orderIndex.get(a.sessionName);
+        const bOrder = orderIndex.get(b.sessionName);
+        if (aOrder != null && bOrder != null) return aOrder - bOrder;
+        if (aOrder != null) return -1;
+        if (bOrder != null) return 1;
+
         const priorityDiff = STATE_PRIORITY[a.state] - STATE_PRIORITY[b.state];
         if (priorityDiff !== 0) return priorityDiff;
         const titleDiff = a.title.localeCompare(b.title, undefined, { sensitivity: 'base' });

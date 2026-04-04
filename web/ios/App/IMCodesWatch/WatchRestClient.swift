@@ -223,6 +223,8 @@ actor WatchRestClient {
             }
         } catch let error as WatchRestError {
             throw error
+        } catch is DecodingError {
+            throw WatchRestError.invalidResponse
         } catch {
             throw WatchRestError.networkError(error.localizedDescription)
         }

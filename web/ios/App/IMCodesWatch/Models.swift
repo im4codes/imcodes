@@ -207,6 +207,7 @@ struct WatchApplicationContext: Codable, Equatable {
 struct WatchRoute: Codable, Equatable, Hashable, Identifiable {
     var serverId: String
     var sessionName: String
+    var title: String?
 
     var id: String { "\(serverId):\(sessionName)" }
 }

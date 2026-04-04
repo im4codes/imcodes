@@ -10,6 +10,7 @@ const mockGetSubSessionsByServer = vi.fn();
 const mockGetUserPref = vi.fn();
 const mockRequestTimelineHistory = vi.fn();
 const mockGetRecentText = vi.fn();
+const mockGetRecentTextForWatch = vi.fn();
 const mockGetActiveMainSessions = vi.fn();
 const mockHasReceivedActiveMainSessionSnapshot = vi.fn();
 const mockSendToDaemon = vi.fn();
@@ -37,6 +38,7 @@ vi.mock('../src/ws/bridge.js', () => ({
     get: () => ({
       requestTimelineHistory: (...args: unknown[]) => mockRequestTimelineHistory(...args),
       getRecentText: (...args: unknown[]) => mockGetRecentText(...args),
+      getRecentTextForWatch: (...args: unknown[]) => mockGetRecentTextForWatch(...args),
       getActiveMainSessions: (...args: unknown[]) => mockGetActiveMainSessions(...args),
       hasReceivedActiveMainSessionSnapshot: (...args: unknown[]) => mockHasReceivedActiveMainSessionSnapshot(...args),
       sendToDaemon: (...args: unknown[]) => mockSendToDaemon(...args),
@@ -90,6 +92,7 @@ describe('Watch routes', () => {
     mockGetSubSessionsByServer.mockResolvedValue([]);
     mockGetUserPref.mockResolvedValue(null);
     mockGetRecentText.mockReturnValue([]);
+    mockGetRecentTextForWatch.mockResolvedValue([]);
     mockGetActiveMainSessions.mockReturnValue([]);
     mockHasReceivedActiveMainSessionSnapshot.mockReturnValue(false);
     mockRequestTimelineHistory.mockResolvedValue({ epoch: 7, events: [] });
@@ -132,7 +135,7 @@ describe('Watch routes', () => {
         closed_at: null,
       },
     ]);
-    mockGetRecentText.mockImplementation((sessionName: string) => (
+    mockGetRecentTextForWatch.mockImplementation(async (sessionName: string) => (
       sessionName === 'deck_proj_brain'
         ? [{ eventId: 'e1', type: 'assistant.text', text: 'latest assistant text', ts: 100 }]
         : [{ eventId: 'e2', type: 'user.message', text: 'worker text', ts: 200 }]
@@ -211,6 +214,31 @@ describe('Watch routes', () => {
     expect(body.sessions[2]?.parentSessionName).toBe('deck_proj_one');
   });
 
+  it('GET /api/watch/sessions backfills recent text for list previews when hot cache is empty', async () => {
+    mockGetDbSessionsByServer.mockResolvedValue([
+      {
+        name: 'deck_proj_brain',
+        project_name: 'proj',
+        label: 'Main',
+        state: 'running',
+        agent_type: 'claude-code',
+      },
+    ]);
+    mockGetSubSessionsByServer.mockResolvedValue([]);
+    mockGetRecentTextForWatch.mockResolvedValue([
+      { eventId: 'e-latest', type: 'assistant.text', text: 'backfilled summary', ts: 123 },
+    ]);
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/watch/sessions?serverId=srv-1');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { sessions: Array<{ previewText?: string; recentText?: Array<{ text: string }> }> };
+    expect(body.sessions[0]?.previewText).toBe('backfilled summary');
+    expect(body.sessions[0]?.recentText?.[0]?.text).toBe('backfilled summary');
+    expect(mockGetRecentTextForWatch).toHaveBeenCalledWith('deck_proj_brain');
+  });
+
   it('GET /api/server/:id/timeline/history preserves event identity and pagination metadata', async () => {
     const events = [
       { eventId: 'e-old', sessionId: 'deck_proj_brain', ts: 100, type: 'user.message', payload: { text: 'older' } },
@@ -231,6 +259,47 @@ describe('Watch routes', () => {
       nextCursor: 100,
     });
     expect(mockRequestTimelineHistory).toHaveBeenCalledWith({ sessionName: 'deck_proj_brain', limit: 2 });
+  });
+
+  it('GET /api/server/:id/timeline/history strips non-watch-safe payload fields instead of failing decode', async () => {
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 9,
+      events: [
+        {
+          eventId: 'e-1',
+          sessionId: 'deck_proj_brain',
+          ts: 100,
+          type: 'assistant.text',
+          payload: { text: 'hello', nested: { complex: ['shape'] } },
+          source: 'daemon',
+        },
+        {
+          eventId: 'e-2',
+          sessionId: 'deck_proj_brain',
+          ts: 110,
+          type: 'tool.call',
+          payload: { tool: { raw: { shape: 'kept-out-of-watch' } } },
+        },
+        {
+          bad: 'row',
+        },
+      ],
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_proj_brain&limit=50');
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      sessionName: 'deck_proj_brain',
+      epoch: 9,
+      events: [
+        { eventId: 'e-1', sessionId: 'deck_proj_brain', ts: 100, type: 'assistant.text', payload: { text: 'hello' } },
+        { eventId: 'e-2', sessionId: 'deck_proj_brain', ts: 110, type: 'tool.call', payload: {} },
+      ],
+      hasMore: false,
+      nextCursor: null,
+    });
   });
 
   it('GET /api/server/:id/timeline/history forwards beforeTs and reports no more history when the page is short', async () => {

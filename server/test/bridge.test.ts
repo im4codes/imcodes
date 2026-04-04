@@ -2200,5 +2200,35 @@ describe('WsBridge', () => {
       await flushAsync();
       expect(bridge.getRecentText('deck_proj_brain')).toHaveLength(0);
     });
+
+    it('backfills recentText from timeline history when the hot cache is empty', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const pending = bridge.getRecentTextForWatch('deck_proj_brain', 1000);
+
+      const outbound = daemonWs.sentStrings.find((s) => s.includes('"type":"timeline.history_request"'));
+      expect(outbound).toBeTruthy();
+      const requestId = JSON.parse(outbound!).requestId as string;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.history',
+        sessionName: 'deck_proj_brain',
+        requestId,
+        events: [
+          { eventId: 'e1', sessionId: 'deck_proj_brain', ts: 1, type: 'assistant.text', payload: { text: 'first' } },
+          { eventId: 'e2', sessionId: 'deck_proj_brain', ts: 2, type: 'tool.call', payload: { raw: { noisy: true } } },
+          { eventId: 'e3', sessionId: 'deck_proj_brain', ts: 3, type: 'user.message', payload: { text: 'second' } },
+        ],
+        epoch: 1,
+      }));
+
+      await expect(pending).resolves.toEqual([
+        { eventId: 'e1', type: 'assistant.text', text: 'first', ts: 1 },
+        { eventId: 'e3', type: 'user.message', text: 'second', ts: 3 },
+      ]);
+      expect(bridge.getRecentText('deck_proj_brain')).toEqual([
+        { eventId: 'e1', type: 'assistant.text', text: 'first', ts: 1 },
+        { eventId: 'e3', type: 'user.message', text: 'second', ts: 3 },
+      ]);
+    });
   });
 });

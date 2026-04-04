@@ -143,7 +143,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
         }
 
         activeRoute = nil
-        pendingRoute = WatchRoute(serverId: serverId, sessionName: sessionName)
+        pendingRoute = WatchRoute(serverId: serverId, sessionName: sessionName, title: nil)
         startRouteTimeout()
         if selectedServerId != serverId {
             selectedServerId = serverId
@@ -336,7 +336,7 @@ final class WatchSessionManager: NSObject, ObservableObject {
 
     private func seedVisibleHistoriesIfNeeded(serverId: String) {
         for row in displaySessions(for: serverId) {
-            let route = WatchRoute(serverId: row.serverId, sessionName: row.sessionName)
+            let route = WatchRoute(serverId: row.serverId, sessionName: row.sessionName, title: row.title)
             if historyByRoute[route.id] == nil {
                 historyByRoute[route.id] = seededHistoryState(for: route)
             }

@@ -51,6 +51,33 @@ function titleForSubSession(sub: { id: string; label: string | null; type: strin
   return sub.type || sub.id;
 }
 
+function sanitizeWatchTimelineEvent(raw: unknown): {
+  eventId: string;
+  sessionId: string;
+  ts: number;
+  type: string;
+  payload: { text?: string };
+} | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const event = raw as Record<string, unknown>;
+  const eventId = typeof event.eventId === 'string' ? event.eventId : null;
+  const sessionId = typeof event.sessionId === 'string' ? event.sessionId : null;
+  const ts = typeof event.ts === 'number' ? event.ts : null;
+  const type = typeof event.type === 'string' ? event.type : null;
+  if (!eventId || !sessionId || ts === null || !type) return null;
+  const payload = event.payload && typeof event.payload === 'object'
+    ? event.payload as Record<string, unknown>
+    : null;
+  const text = typeof payload?.text === 'string' ? payload.text : undefined;
+  return {
+    eventId,
+    sessionId,
+    ts,
+    type,
+    payload: text !== undefined ? { text } : {},
+  };
+}
+
 
 async function loadTabPreferences(db: Env['DB'], userId: string): Promise<{ order: string[]; pinned: Set<string> }> {
   const [rawOrder, rawPinned] = await Promise.all([
@@ -136,8 +163,8 @@ watchRoutes.get('/watch/sessions', requireAuth(), async (c) => {
     .filter((session) => !session.name.startsWith('deck_sub_'));
 
   const mainTitleBySession = new Map<string, string>();
-  const mainRows = mainSessions.map((session) => {
-    const recentText = bridge.getRecentText(session.name);
+  const mainRows = await Promise.all(mainSessions.map(async (session) => {
+    const recentText = await bridge.getRecentTextForWatch(session.name);
     const latest = recentText.at(-1);
     const row = {
       serverId,
@@ -155,14 +182,14 @@ watchRoutes.get('/watch/sessions', requireAuth(), async (c) => {
     };
     mainTitleBySession.set(session.name, row.title);
     return row;
-  });
+  }));
 
   const activeMainNames = new Set(mainRows.map((row) => row.sessionName));
-  const subRows = subSessions
+  const subRows = await Promise.all(subSessions
     .filter((sub) => sub.parent_session && activeMainNames.has(sub.parent_session))
-    .map((sub) => {
+    .map(async (sub) => {
       const sessionName = `deck_sub_${sub.id}`;
-      const recentText = bridge.getRecentText(sessionName);
+      const recentText = await bridge.getRecentTextForWatch(sessionName);
       const latest = recentText.at(-1);
       return {
         serverId,
@@ -178,7 +205,7 @@ watchRoutes.get('/watch/sessions', requireAuth(), async (c) => {
         previewUpdatedAt: latest?.ts ?? undefined,
         recentText,
       };
-    });
+    }));
 
   const orderedMainRows = orderMainSessions(mainRows, tabPrefs.order, tabPrefs.pinned);
   const sessions = [...orderedMainRows, ...subRows];
@@ -211,9 +238,11 @@ watchRoutes.get('/server/:id/timeline/history', requireAuth(), async (c) => {
     });
     c.header(IMCODES_POD_HEADER, getPodIdentity());
 
-    const events = Array.isArray(response.events) ? response.events : [];
-    const earliestTs = events.length > 0 && typeof (events[0] as { ts?: unknown }).ts === 'number'
-      ? (events[0] as { ts: number }).ts
+    const events = (Array.isArray(response.events) ? response.events : [])
+      .map((event) => sanitizeWatchTimelineEvent(event))
+      .filter((event): event is NonNullable<typeof event> => event !== null);
+    const earliestTs = events.length > 0 && typeof events[0].ts === 'number'
+      ? events[0].ts
       : null;
     const hasMore = earliestTs !== null && events.length >= limit;
 

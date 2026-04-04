@@ -184,6 +184,31 @@ function normalizeRecentText(text: unknown): string | null {
     : normalized;
 }
 
+function recentTextRowFromTimelineEvent(rawEvent: Record<string, unknown>): WatchRecentTextRow | null {
+  const sessionId = rawEvent.sessionId;
+  const eventId = rawEvent.eventId;
+  const ts = rawEvent.ts;
+  const type = rawEvent.type;
+  const payload = rawEvent.payload;
+  if (typeof sessionId !== 'string' || typeof eventId !== 'string' || typeof ts !== 'number' || typeof type !== 'string') {
+    return null;
+  }
+  if (type !== 'user.message' && type !== 'assistant.text') return null;
+  const text = normalizeRecentText((payload as Record<string, unknown> | undefined)?.text);
+  if (!text) return null;
+  return { eventId, type, text, ts };
+}
+
+function mergeRecentTextRows(rows: WatchRecentTextRow[]): WatchRecentTextRow[] {
+  const deduped = new Map<string, WatchRecentTextRow>();
+  for (const row of rows) deduped.set(row.eventId, row);
+  const merged = [...deduped.values()].sort((a, b) => a.ts - b.ts);
+  if (merged.length > WATCH_RECENT_TEXT_CAP) {
+    return merged.slice(merged.length - WATCH_RECENT_TEXT_CAP);
+  }
+  return merged;
+}
+
 // Periodic cleanup interval handle (module-level, shared across all bridge instances)
 let cleanupSweepHandle: ReturnType<typeof setInterval> | null = null;
 
@@ -246,6 +271,7 @@ export class WsBridge {
 
   /** Per-request HTTP timeline/history relay pending map. */
   private pendingHttpTimelineRequests = new Map<string, PendingHttpTimelineRequest>();
+  private pendingRecentTextBackfills = new Map<string, Promise<WatchRecentTextRow[]>>();
 
   /** Lightweight per-session hot cache for Watch first-paint text. */
   private recentTextBySession = new Map<string, WatchRecentTextRow[]>();
@@ -1230,25 +1256,10 @@ export class WsBridge {
 
   private ingestRecentTextFromTimelineEvent(rawEvent: Record<string, unknown>): void {
     const sessionId = rawEvent.sessionId;
-    const eventId = rawEvent.eventId;
-    const ts = rawEvent.ts;
-    const type = rawEvent.type;
-    const payload = rawEvent.payload;
-    if (typeof sessionId !== 'string' || typeof eventId !== 'string' || typeof ts !== 'number' || typeof type !== 'string') {
-      return;
-    }
-    if (type !== 'user.message' && type !== 'assistant.text') return;
-    const text = normalizeRecentText((payload as Record<string, unknown> | undefined)?.text);
-    if (!text) return;
+    const row = recentTextRowFromTimelineEvent(rawEvent);
+    if (typeof sessionId !== 'string' || !row) return;
     const rows = this.recentTextBySession.get(sessionId) ?? [];
-    const nextRow: WatchRecentTextRow = { eventId, type, text, ts };
-    const deduped = rows.filter((row) => row.eventId !== eventId);
-    deduped.push(nextRow);
-    deduped.sort((a, b) => a.ts - b.ts);
-    if (deduped.length > WATCH_RECENT_TEXT_CAP) {
-      deduped.splice(0, deduped.length - WATCH_RECENT_TEXT_CAP);
-    }
-    this.recentTextBySession.set(sessionId, deduped);
+    this.recentTextBySession.set(sessionId, mergeRecentTextRows([...rows, row]));
   }
 
   private sendToSessionSubscribers(sessionName: string, data: string | Buffer): void {
@@ -1530,6 +1541,37 @@ export class WsBridge {
   getRecentText(sessionName: string): WatchRecentTextRow[] {
     const rows = this.recentTextBySession.get(sessionName);
     return rows ? rows.map((row) => ({ ...row })) : [];
+  }
+
+  async getRecentTextForWatch(sessionName: string, timeoutMs = 1500): Promise<WatchRecentTextRow[]> {
+    const cached = this.getRecentText(sessionName);
+    if (cached.length > 0 || !this.isDaemonConnected()) return cached;
+
+    const pending = this.pendingRecentTextBackfills.get(sessionName);
+    if (pending) return pending;
+
+    const backfill = this.requestTimelineHistory({
+      sessionName,
+      limit: WATCH_RECENT_TEXT_CAP * 8,
+      timeoutMs,
+    }).then((response) => {
+      const events = Array.isArray(response.events) ? response.events : [];
+      const rows = mergeRecentTextRows(
+        events
+          .filter((event): event is Record<string, unknown> => !!event && typeof event === 'object')
+          .map((event) => recentTextRowFromTimelineEvent(event))
+          .filter((row): row is WatchRecentTextRow => row !== null),
+      );
+      if (rows.length > 0) {
+        this.recentTextBySession.set(sessionName, rows);
+      }
+      return rows.map((row) => ({ ...row }));
+    }).catch(() => []).finally(() => {
+      this.pendingRecentTextBackfills.delete(sessionName);
+    });
+
+    this.pendingRecentTextBackfills.set(sessionName, backfill);
+    return backfill;
   }
 
   createPreviewRelay(requestId: string, timeoutMs = PREVIEW_LIMITS.RESPONSE_START_TIMEOUT_MS): {

@@ -40,7 +40,7 @@ struct SessionDetailView: View {
             }
             .padding(.horizontal, 4)
         }
-        .navigationTitle(session?.title ?? route.sessionName)
+        .navigationTitle(session?.title ?? route.title ?? "Session")
         .task {
             await sessionManager.loadHistoryIfNeeded(for: route)
         }
@@ -54,7 +54,7 @@ struct SessionDetailView: View {
             Circle()
                 .fill(stateColor)
                 .frame(width: 8, height: 8)
-            Text(session?.title ?? route.sessionName)
+            Text(session?.title ?? route.title ?? "Session")
                 .font(.caption)
                 .fontWeight(.medium)
             Text(session?.agentBadge ?? "")
