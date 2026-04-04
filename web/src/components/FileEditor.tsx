@@ -76,11 +76,14 @@ function getLanguageExtension(path: string) {
 export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessage, currentContent, isDirty: isDirtyProp }: FileEditorProps) {
   const { t } = useTranslation();
   const [originalMtime, setOriginalMtime] = useState(mtime);
+  // Keep local mtime in sync when parent updates (e.g. after file reload or conflict resolution)
+  useEffect(() => { setOriginalMtime(mtime); }, [mtime]);
   // isDirty is driven by the parent (FileEditorContent reports dirty via onDirtyChange → FileBrowser → isDirty prop)
   const isDirty = isDirtyProp ?? false;
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'success' | 'error' | 'timeout'>('idle');
   const [saveError, setSaveError] = useState<string | null>(null);
   const pendingWriteRef = useRef(new Map<string, string>());
+  const timeoutRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   // Listen for fs.write_response
   useEffect(() => {
     return onMessage((msg) => {
@@ -88,6 +91,9 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
       const filePath = pendingWriteRef.current.get(msg.requestId);
       if (!filePath) return;
       pendingWriteRef.current.delete(msg.requestId);
+      // Clear the timeout timer for this request
+      const timer = timeoutRef.current.get(msg.requestId);
+      if (timer) { clearTimeout(timer); timeoutRef.current.delete(msg.requestId); }
 
       if (msg.status === 'ok') {
         setOriginalMtime(msg.mtime);
@@ -96,14 +102,11 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
         if (msg.mtime) onSaved(msg.mtime);
         setTimeout(() => setSaveStatus((s) => s === 'success' ? 'idle' : s), 2000);
       } else if (msg.status === 'conflict') {
-        // File changed on disk since last read — update mtime and retry as force-write
+        // File changed on disk — update mtime baseline; conflict dialog in FileEditorContent handles user decision
         if (msg.diskMtime) setOriginalMtime(msg.diskMtime);
         setSaveStatus('error');
         setSaveError(t('fileBrowser.conflictTitle', 'File changed on disk'));
         setTimeout(() => setSaveStatus((s) => s === 'error' ? 'idle' : s), 3000);
-        // Auto force-save: user explicitly clicked Save, honor their intent
-        const retryId = ws.fsWriteFile(path, currentContent ?? content);
-        pendingWriteRef.current.set(retryId, path);
       } else {
         setSaveStatus('error');
         setSaveError(msg.error === 'file_too_large' ? t('fileBrowser.fileTooLarge') : t('fileBrowser.saveError'));
@@ -115,16 +118,18 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
   const doSave = useCallback((forceWrite = false) => {
     setSaveStatus('saving');
     setSaveError(null);
-    const requestId = ws.fsWriteFile(path, currentContent ?? content, forceWrite ? undefined : originalMtime);
+    const requestId = ws.fsWriteFile(path, currentContent || content, forceWrite ? undefined : originalMtime);
     pendingWriteRef.current.set(requestId, path);
-    setTimeout(() => {
+    const tid = setTimeout(() => {
       if (pendingWriteRef.current.has(requestId)) {
         pendingWriteRef.current.delete(requestId);
+        timeoutRef.current.delete(requestId);
         setSaveStatus('timeout');
         setSaveError(t('fileBrowser.saveTimeout'));
         setTimeout(() => setSaveStatus((s) => s === 'timeout' ? 'idle' : s), 4000);
       }
     }, 30_000);
+    timeoutRef.current.set(requestId, tid);
   }, [ws, path, originalMtime, t, currentContent, content]);
 
   // Cmd+S / Ctrl+S
@@ -158,7 +163,7 @@ export function FileEditor({ ws, path, content, mtime, onClose, onSaved, onMessa
 }
 
 /** Editor content area — CodeMirror editor + conflict dialog */
-export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage, onDirtyChange, onContentChange }: Omit<FileEditorProps, 'onClose' | 'onSaved'>) {
+export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage, onDirtyChange, onContentChange, onSaved, onMtimeUpdate }: Omit<FileEditorProps, 'onClose'> & { onMtimeUpdate?: (mtime: number) => void }) {
   const { t } = useTranslation();
   const [isDirty, setIsDirty] = useState(false);
   const [conflictData, setConflictData] = useState<{ diskContent: string; diskMtime: number } | null>(null);
@@ -178,9 +183,13 @@ export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage,
       pendingWriteRef.current.delete(msg.requestId);
       if (msg.status === 'conflict') {
         setConflictData({ diskContent: msg.diskContent ?? '', diskMtime: msg.diskMtime ?? 0 });
+      } else if (msg.status === 'ok') {
+        // Force-write from "Keep mine" succeeded — propagate mtime to parent
+        if (msg.mtime) onSaved?.(msg.mtime);
+        setIsDirty(false);
       }
     });
-  }, [onMessage]);
+  }, [onMessage, onSaved]);
 
   // Initialize CodeMirror editor
   useEffect(() => {
@@ -252,7 +261,7 @@ export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage,
                 pendingWriteRef.current.set(requestId, path);
               }}>{t('fileBrowser.conflictKeepMine')}</button>
               <button class="btn btn-secondary" onClick={() => {
-                // Replace editor content with disk version
+                // Replace editor content with disk version and update mtime baseline
                 const view = viewRef.current;
                 if (view) {
                   view.dispatch({
@@ -261,6 +270,7 @@ export function FileEditorContent({ ws, path, content, mtime: _mtime, onMessage,
                   currentContentRef.current = conflictData.diskContent;
                   onContentChange?.(conflictData.diskContent);
                 }
+                if (conflictData.diskMtime) onMtimeUpdate?.(conflictData.diskMtime);
                 setIsDirty(false);
                 setConflictData(null);
               }}>{t('fileBrowser.conflictUseDisk')}</button>

@@ -157,6 +157,39 @@ describe('fs.write handler', () => {
     });
   });
 
+  it('returns invalid_request error (not silent hang) when path is missing', async () => {
+    handleWebCommand({ type: 'fs.write', content: 'hello', requestId: 'req-no-path' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(sent[0]).toMatchObject({
+      type: 'fs.write_response',
+      requestId: 'req-no-path',
+      status: 'error',
+      error: 'invalid_request',
+    });
+  });
+
+  it('returns invalid_request error when content is missing', async () => {
+    handleWebCommand({ type: 'fs.write', path: '/tmp/test.txt', requestId: 'req-no-content' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(sent[0]).toMatchObject({
+      type: 'fs.write_response',
+      requestId: 'req-no-content',
+      status: 'error',
+      error: 'invalid_request',
+    });
+  });
+
+  it('silently returns (no crash) when requestId is also missing', async () => {
+    // No requestId means we can't send a response, but we shouldn't crash
+    handleWebCommand({ type: 'fs.write', path: '/tmp/test.txt', content: 'hello' }, mockServerLink as any);
+    await flushAsync();
+
+    // No response sent (no requestId to respond to)
+    expect(sent).toHaveLength(0);
+  });
+
   it('symlink escape — realpath of file resolving into ~/.ssh is rejected', async () => {
     // A path that looks allowed but resolves to denied dir via symlink
     const symlinkPath = path.join(homedir(), 'link-to-secret.txt');
