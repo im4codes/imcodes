@@ -157,11 +157,14 @@ export function buildApp(env: Env) {
   app.route('/api/push', pushRoutes);
   app.route('/api/quick-data', quickDataRoutes);
   app.route('/api', watchRoutes);
+  // fileTransferRoutes MUST be first — its token-auth middleware bypasses requireAuth
+  // for iOS downloads (SFSafariViewController has no cookies/Bearer). If mounted after
+  // sessionMgmtRoutes (which has blanket requireAuth on /*), the token path is shadowed.
+  app.route('/api/server', fileTransferRoutes);
   app.route('/api/server', localWebPreviewRoutes);
   app.route('/api/server', sessionMgmtRoutes);
   app.route('/api/server', subSessionRoutes);
   app.route('/api/server', discussionRoutes);
-  app.route('/api/server', fileTransferRoutes);
   app.route('/api/preferences', preferencesRoutes);
   app.route('/api/auth/passkey', passkeyRoutes);
   app.route('/api/admin', adminRoutes);

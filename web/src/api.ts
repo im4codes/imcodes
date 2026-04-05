@@ -922,7 +922,10 @@ export async function downloadAttachment(serverId: string, attachmentId: string)
   const isNative = !!(globalThis as Record<string, unknown>).Capacitor;
   if (isNative) {
     const tokenRes = await apiFetch(`/api/server/${serverId}/uploads/${attachmentId}/download-token`, { method: 'POST' });
-    const downloadToken = (tokenRes as { token: string }).token;
+    const downloadToken = (tokenRes as { token?: string }).token;
+    if (!downloadToken || typeof downloadToken !== 'string' || downloadToken.length < 32) {
+      throw new Error('Failed to acquire download token');
+    }
     const baseUrl = _baseUrl || window.location.origin;
     const downloadUrl = `${baseUrl}/api/server/${serverId}/uploads/${attachmentId}/download?token=${downloadToken}`;
     const { Browser } = await import('@capacitor/browser');

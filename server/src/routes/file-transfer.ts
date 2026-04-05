@@ -18,24 +18,28 @@ export const fileTransferRoutes = new Hono<{ Bindings: Env; Variables: { userId:
 // without needing auth cookies. Token is single-use and short-lived.
 const downloadTokens = new Map<string, { serverId: string; attachmentId: string; userId: string; expiresAt: number }>();
 
+// Token-auth middleware for download endpoint only — scoped to upload/download paths
+// to avoid shadowing other sub-apps mounted at the same /api/server prefix.
 const authMiddleware = requireAuth();
-fileTransferRoutes.use('/*', async (c, next) => {
-  // Allow token-based auth for download endpoint, otherwise require cookie/bearer auth
+
+fileTransferRoutes.use('/:id/upload', authMiddleware);
+fileTransferRoutes.use('/:id/uploads/:attachmentId/download-token', authMiddleware);
+fileTransferRoutes.use('/:id/uploads/:attachmentId/download', async (c, next) => {
+  // Token-based auth bypass for iOS downloads (SFSafariViewController has no cookies)
   const token = c.req.query('token');
-  if (token && c.req.method === 'GET' && c.req.path.endsWith('/download')) {
+  if (token && c.req.method === 'GET') {
     const entry = downloadTokens.get(token);
     if (!entry || Date.now() > entry.expiresAt) {
       downloadTokens.delete(token ?? '');
       return c.json({ error: 'invalid_or_expired_token' }, 401);
     }
-    // Consume token (single-use)
     downloadTokens.delete(token);
-    // Pass token binding so download handler can verify URL params match
     c.set('userId' as never, entry.userId as never);
     c.set('tokenServerId' as never, entry.serverId as never);
     c.set('tokenAttachmentId' as never, entry.attachmentId as never);
     return next();
   }
+  // No token — fall back to cookie/bearer auth
   return (authMiddleware as any)(c, next);
 });
 
