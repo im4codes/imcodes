@@ -1241,15 +1241,16 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         }
       }
       timelineEmitter.emit(sessionName, 'user.message', { text });
-      timelineEmitter.emit(sessionName, 'session.state', { state: 'running' }, { source: 'daemon', confidence: 'high' });
-      timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'medium' });
       if (record?.agentType === 'qwen' && record.qwenAuthType === 'qwen-oauth') {
         recordQwenOAuthRequest();
         refreshQwenQuotaUsageLabels(serverLink);
       }
-      // send() dispatches to provider — response arrives async via onComplete/onError.
-      // Transport runtime emits session.state changes via onStatusChange callback.
-      await transportRuntime.send(text);
+      // send() is synchronous: dispatches immediately if idle, queues if busy.
+      // Status changes come from transport runtime's onStatusChange callback.
+      const result = transportRuntime.send(text);
+      if (result === 'queued') {
+        timelineEmitter.emit(sessionName, 'session.state', { state: 'queued', pendingCount: transportRuntime.pendingCount }, { source: 'daemon', confidence: 'high' });
+      }
       // Clear fresh-start flag — the new conversation is now active
       if (record?.qwenFreshOnResume) {
         upsertSession({ ...record, qwenFreshOnResume: undefined, updatedAt: Date.now() });
@@ -1260,7 +1261,6 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         serverLink.send({ type: 'command.ack', commandId: effectiveId, status, session: sessionName });
       } catch { /* not connected */ }
     } catch (err) {
-      // Send failed — show error in chat
       const errMsg = describeTransportSendError(err);
       logger.error({ sessionName, err }, 'session.send (transport) failed');
       timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Send failed: ${errMsg}`, streaming: false }, { source: 'daemon', confidence: 'high' });

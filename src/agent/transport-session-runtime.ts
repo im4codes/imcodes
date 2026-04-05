@@ -5,32 +5,48 @@ import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { TransportProvider, ProviderError, SessionConfig } from './transport-provider.js';
 
+/**
+ * Transport session runtime — manages a single conversation with a remote provider.
+ *
+ * Send model:
+ *   - Idle: send() dispatches immediately, starts a new turn.
+ *   - Busy: send() enqueues the message. When the active turn completes,
+ *     ALL pending messages are merged into a single message and dispatched
+ *     as one turn. This batches rapid-fire user input instead of creating
+ *     N sequential turns.
+ *
+ * Status lifecycle:
+ *   idle → thinking → streaming → idle   (normal turn)
+ *   idle → thinking → error              (provider error)
+ *   idle → thinking → idle               (cancel / no streaming)
+ *
+ * onStatusChange fires on every transition (deduplicated).
+ */
 export class TransportSessionRuntime implements SessionRuntime {
   readonly type = RUNTIME_TYPES.TRANSPORT;
 
   private _status: AgentStatus = 'idle';
   private _history: AgentMessage[] = [];
   private _providerSessionId: string | null = null;
-  /** Guard: true while a send is in flight — prevents concurrent sends. */
   private _sending = false;
-  /** Session description — passed as extraSystemPrompt on each send. */
   private _description: string | undefined;
-  /** Provider-side model/agent selection — passed via SessionConfig.agentId. */
   private _agentId: string | undefined;
-  /** Unsubscribe functions for provider callbacks — called in kill(). */
   private _unsubscribes: Array<() => void> = [];
-  /** External callback when status changes — wired to emit timeline session.state events. */
   private _onStatusChange?: (status: AgentStatus) => void;
-  /** Current turn completion signal — resolved by onComplete/onError. */
-  private _activeTurn:
-    | {
-      promise: Promise<void>;
-      resolve: () => void;
-      reject: (err: ProviderError) => void;
-    }
-    | null = null;
-  /** FIFO send queue — ensures strict sequential execution even with concurrent send() calls. */
-  private _sendQueue: Promise<void> = Promise.resolve();
+
+  /** Current turn completion signal — resolved by onComplete, rejected by onError. */
+  private _activeTurn: {
+    promise: Promise<void>;
+    resolve: () => void;
+    reject: (err: ProviderError) => void;
+  } | null = null;
+
+  /** Messages queued while a turn is in flight. Drained and merged on turn completion. */
+  private _pendingMessages: string[] = [];
+
+  /** Callback fired when pending messages are drained into a new turn.
+   *  Allows command-handler to emit timeline events for the batched send. */
+  private _onDrain?: (mergedMessage: string, count: number) => void;
 
   constructor(
     private readonly provider: TransportProvider,
@@ -43,35 +59,40 @@ export class TransportSessionRuntime implements SessionRuntime {
       }),
       this.provider.onComplete((sid: string, message: AgentMessage) => {
         if (sid !== this._providerSessionId) return;
-        this.setStatus('idle');
         this._sending = false;
         this._history.push(message);
         this._activeTurn?.resolve();
         this._activeTurn = null;
+        // Drain pending messages before transitioning to idle.
+        // If there are queued messages, merge and send — status stays running.
+        if (!this._drainPending()) {
+          this.setStatus('idle');
+        }
       }),
       this.provider.onError((sid: string, error: ProviderError) => {
         if (sid !== this._providerSessionId) return;
-        this.setStatus(error.code === 'CANCELLED' ? 'idle' : 'error');
         this._sending = false;
         this._activeTurn?.reject(error);
         this._activeTurn = null;
+        // On error, still drain pending (users may have typed follow-up).
+        // Error status is set only if no pending messages to send.
+        if (!this._drainPending()) {
+          this.setStatus(error.code === 'CANCELLED' ? 'idle' : 'error');
+        }
       }),
     );
   }
 
-  /** Register a callback for status changes (idle/running/streaming/error). */
+  // ── Public API ──────────────────────────────────────────────────────────────
+
+  /** Register a callback for status changes (idle/streaming/thinking/error). */
   set onStatusChange(cb: (status: AgentStatus) => void) { this._onStatusChange = cb; }
 
-  private setStatus(status: AgentStatus): void {
-    if (this._status === status) return;
-    this._status = status;
-    this._onStatusChange?.(status);
-  }
+  /** Register a callback for when pending messages are drained into a new turn. */
+  set onDrain(cb: (mergedMessage: string, count: number) => void) { this._onDrain = cb; }
 
-  /** Set providerSessionId directly (used when restoring from store without calling initialize). */
+  /** Set providerSessionId directly (restore from store without initialize). */
   setProviderSessionId(id: string): void { this._providerSessionId = id; }
-
-  /** Set description (used when restoring from store — passed as extraSystemPrompt on send). */
   setDescription(desc: string): void { this._description = desc; }
   setAgentId(agentId: string): void {
     this._agentId = agentId;
@@ -80,54 +101,84 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
   }
 
-  get providerSessionId(): string | null {
-    return this._providerSessionId;
-  }
+  get providerSessionId(): string | null { return this._providerSessionId; }
+  get sending(): boolean { return this._sending; }
+  /** Number of messages waiting in the queue. */
+  get pendingCount(): number { return this._pendingMessages.length; }
 
-  /** Whether a send is currently in flight. */
-  get sending(): boolean {
-    return this._sending;
-  }
-
-  /** Initialize the runtime — must be called after construction to create the provider session. */
   async initialize(config: SessionConfig): Promise<void> {
     this._providerSessionId = await this.provider.createSession(config);
     this._description = config.description;
     this._agentId = config.agentId;
   }
 
-  async send(message: string): Promise<void> {
+  /**
+   * Send a message to the provider.
+   *
+   * - If idle: dispatches immediately (starts a new turn).
+   * - If busy: enqueues. When the current turn completes, all pending
+   *   messages are merged and dispatched as a single turn.
+   *
+   * Returns 'sent' if dispatched immediately, 'queued' if enqueued.
+   */
+  send(message: string): 'sent' | 'queued' {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
 
-    // Chain onto the FIFO queue — each send waits for all previous sends to finish.
-    // This prevents the race where multiple awaiting sends dispatch simultaneously.
-    // We capture myTurn so kill() resetting _sendQueue doesn't orphan our await.
-    let sendError: unknown;
-    const myTurn = this._sendQueue.then(async () => {
-      try {
-        await this._doSend(message);
-      } catch (err) {
-        sendError = err;
-      }
-    });
-    this._sendQueue = myTurn;
-    await myTurn;
-    if (sendError) throw sendError;
+    if (this._sending) {
+      this._pendingMessages.push(message);
+      return 'queued';
+    }
+
+    this._dispatchTurn(message);
+    return 'sent';
   }
 
-  /** Internal send — executes one turn and waits for the provider to complete it. */
-  private async _doSend(message: string): Promise<void> {
-    // Session may have been killed while this send was queued
+  async cancel(): Promise<void> {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
+    // Clear pending — user cancelled, they don't want queued messages either
+    this._pendingMessages = [];
+    if (!this.provider.cancel) return;
+    await this.provider.cancel(this._providerSessionId);
+  }
 
-    // Record user message in history for complete conversation replay
+  getStatus(): AgentStatus { return this._status; }
+
+  async kill(): Promise<void> {
+    for (const unsub of this._unsubscribes) unsub();
+    this._unsubscribes = [];
+
+    if (this._providerSessionId) {
+      await this.provider.endSession(this._providerSessionId);
+      this._providerSessionId = null;
+    }
+    if (this._activeTurn) {
+      this._activeTurn.reject({ code: 'CANCELLED', message: 'Session killed', recoverable: false });
+    }
+    this.setStatus('idle');
+    this._sending = false;
+    this._activeTurn = null;
+    this._pendingMessages = [];
+  }
+
+  getHistory(): AgentMessage[] { return [...this._history]; }
+
+  // ── Internal ────────────────────────────────────────────────────────────────
+
+  private setStatus(status: AgentStatus): void {
+    if (this._status === status) return;
+    this._status = status;
+    this._onStatusChange?.(status);
+  }
+
+  /** Dispatch a single turn to the provider. Assumes _sending is false. */
+  private _dispatchTurn(message: string): void {
     this._history.push({
       id: randomUUID(),
-      sessionId: this._providerSessionId,
+      sessionId: this._providerSessionId!,
       kind: 'text',
       role: 'user',
       content: message,
@@ -137,66 +188,36 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     this.setStatus('thinking');
     this._sending = true;
-    this._activeTurn = (() => {
-      let resolve!: () => void;
-      let reject!: (err: ProviderError) => void;
-      const promise = new Promise<void>((res, rej) => {
-        resolve = res;
-        reject = rej as (err: ProviderError) => void;
-      });
-      void promise.catch(() => {});
-      return { promise, resolve, reject };
-    })();
 
-    const turnPromise = this._activeTurn.promise;
+    let resolve!: () => void;
+    let reject!: (err: ProviderError) => void;
+    const promise = new Promise<void>((res, rej) => {
+      resolve = res;
+      reject = rej as (err: ProviderError) => void;
+    });
+    void promise.catch(() => {}); // prevent unhandled rejection
+    this._activeTurn = { promise, resolve, reject };
 
     try {
-      await this.provider.send(this._providerSessionId, message, undefined, this._description);
-    } catch (err) {
+      this.provider.send(this._providerSessionId!, message, undefined, this._description);
+    } catch {
       this.setStatus('idle');
       this._sending = false;
       this._activeTurn = null;
-      throw err;
     }
-
-    // Wait for the turn to complete (onComplete/onError resolves/rejects this).
-    // Use the captured ref — callbacks may have nulled _activeTurn during provider.send().
-    await turnPromise;
   }
 
-  async cancel(): Promise<void> {
-    if (!this._providerSessionId) {
-      throw new Error('TransportSessionRuntime not initialized — call initialize() first');
-    }
-    if (!this.provider.cancel) return;
-    await this.provider.cancel(this._providerSessionId);
-  }
+  /**
+   * Drain all pending messages into a single merged turn.
+   * Called after onComplete/onError. Returns true if a new turn was started.
+   */
+  private _drainPending(): boolean {
+    if (this._pendingMessages.length === 0 || !this._providerSessionId) return false;
 
-  getStatus(): AgentStatus {
-    return this._status;
-  }
-
-  async kill(): Promise<void> {
-    // Unsubscribe from provider callbacks to prevent O(n) accumulation
-    for (const unsub of this._unsubscribes) unsub();
-    this._unsubscribes = [];
-
-    if (this._providerSessionId) {
-      await this.provider.endSession(this._providerSessionId);
-      this._providerSessionId = null;
-    }
-    // Reject active turn so queued sends unblock and fail
-    if (this._activeTurn) {
-      this._activeTurn.reject({ code: 'CANCELLED', message: 'Session killed', recoverable: false });
-    }
-    this.setStatus('idle');
-    this._sending = false;
-    this._activeTurn = null;
-    // Reset the queue — new sends after kill() will start fresh (and fail on null providerSessionId)
-    this._sendQueue = Promise.resolve();
-  }
-
-  getHistory(): AgentMessage[] {
-    return [...this._history];
+    const messages = this._pendingMessages.splice(0);
+    const merged = messages.join('\n\n');
+    this._onDrain?.(merged, messages.length);
+    this._dispatchTurn(merged);
+    return true;
   }
 }

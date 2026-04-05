@@ -723,6 +723,18 @@ export interface LaunchOpts {
 /** In-memory map of active transport session runtimes */
 const transportRuntimes = new Map<string, TransportSessionRuntime>();
 
+/** Wire up onStatusChange and onDrain callbacks for a transport runtime. */
+function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: string): void {
+  runtime.onStatusChange = (status) => {
+    const mapped = status === 'streaming' ? 'running' : status;
+    timelineEmitter.emit(sessionName, 'session.state', { state: mapped }, { source: 'daemon', confidence: 'high' });
+  };
+  runtime.onDrain = (merged, count) => {
+    timelineEmitter.emit(sessionName, 'user.message', { text: merged, batchedCount: count });
+    timelineEmitter.emit(sessionName, 'session.state', { state: 'running' }, { source: 'daemon', confidence: 'high' });
+  };
+}
+
 /** providerSessionId → IM.codes sessionName routing map */
 const providerRouting = new Map<string, string>();
 
@@ -789,10 +801,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
           : availableQwenModels[0])
         : s.qwenModel;
       const runtime = new TransportSessionRuntime(provider, s.name);
-      runtime.onStatusChange = (status) => {
-        const mapped = status === 'streaming' ? 'running' : status;
-        timelineEmitter.emit(s.name, 'session.state', { state: mapped }, { source: 'daemon', confidence: 'high' });
-      };
+      wireTransportCallbacks(runtime, s.name);
       // After cancel, qwenFreshOnResume is set — don't resume the stuck conversation.
       const freshAfterCancel = !!(s.qwenFreshOnResume && s.providerId === 'qwen');
       const effectiveSessionKey = freshAfterCancel ? randomUUID() : s.providerSessionId;
@@ -839,10 +848,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const provider = await ensureProviderConnected(agentType, {});
 
   const runtime = new TransportSessionRuntime(provider, name);
-  runtime.onStatusChange = (status) => {
-    const mapped = status === 'streaming' ? 'running' : status;
-    timelineEmitter.emit(name, 'session.state', { state: mapped }, { source: 'daemon', confidence: 'high' });
-  };
+  wireTransportCallbacks(runtime, name);
   let effectiveSessionKey = name;
   let effectiveBindExistingKey = bindExistingKey;
   let effectiveSkipCreate = skipCreate;

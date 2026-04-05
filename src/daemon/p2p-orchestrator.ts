@@ -630,8 +630,7 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
       const transportRuntime = getTransportRuntime(session);
       if (transportRuntime) {
         timelineEmitter.emit(session, 'user.message', { text: prompt });
-        timelineEmitter.emit(session, 'session.state', { state: 'running' }, { source: 'daemon', confidence: 'high' });
-        await transportRuntime.send(prompt);
+        transportRuntime.send(prompt);
       } else {
         await sendKeysDelayedEnter(session, prompt);
       }

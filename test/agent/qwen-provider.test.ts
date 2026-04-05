@@ -188,28 +188,32 @@ describe('QwenProvider', () => {
   });
 
 
-  it('does not release queued runtime sends until the qwen process actually finishes', async () => {
+  it('queued messages batch-drain after the active turn completes', async () => {
     const provider = new QwenProvider();
     await provider.connect({});
     const runtime = new TransportSessionRuntime(provider, 'sess-queue');
     await runtime.initialize({ sessionKey: 'sess-queue', cwd: '/tmp/project' });
 
-    await runtime.send('first');
+    // First send dispatches immediately
+    runtime.send('first');
     const first = lastSpawn();
-    first.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-queue-1' } } })}
-`);
-    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'assistant-queue-1', content: [{ type: 'text', text: 'Still running' }] } })}
-`);
+    first.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-queue-1' } } })}\n`);
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'assistant-queue-1', content: [{ type: 'text', text: 'Still running' }] } })}\n`);
     await flushIO();
 
-    const queued = runtime.send('second');
+    // Second send queues (runtime is busy)
+    const result = runtime.send('second');
+    expect(result).toBe('queued');
+    expect(runtime.pendingCount).toBe(1);
     await flushIO();
     expect(childProcessMock.spawn).toHaveBeenCalledTimes(1);
 
+    // Complete first turn → pending drains as merged turn
     first.child.emit('close', 0, null);
-    await queued;
+    await flushIO();
 
     expect(childProcessMock.spawn).toHaveBeenCalledTimes(2);
+    expect(runtime.pendingCount).toBe(0);
   });
 
   it('emits provider error on result is_error payload', async () => {

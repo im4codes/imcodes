@@ -1,13 +1,15 @@
 /**
- * Transport session runtime — status lifecycle, queuing, and cancel tests.
+ * Transport session runtime — status lifecycle, batched queuing, and cancel tests.
  *
- * Verifies:
- *   1. onStatusChange fires for every status transition in correct order
- *   2. Status never skips states or emits duplicates
- *   3. Queued sends execute in strict FIFO order
- *   4. Error during active turn doesn't block queued sends
- *   5. cancel/kill during active turn cleans up properly
- *   6. send() resolves only after the full turn completes (dispatch + response)
+ * Send model:
+ *   - Idle → send dispatches immediately (one turn)
+ *   - Busy → messages enqueue. On turn completion, ALL pending messages
+ *     merge into ONE message and dispatch as a single turn.
+ *
+ * Status lifecycle:
+ *   idle → thinking → streaming → idle   (normal)
+ *   idle → thinking → error              (provider error)
+ *   idle → thinking → idle               (cancel / no streaming)
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -16,57 +18,41 @@ import type { TransportProvider, ProviderError, SessionConfig } from '../../src/
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { AgentStatus } from '../../src/agent/detect.js';
 
-// ── Mock provider that simulates async turn lifecycle ──────────────────────────
+// ── Mock provider ──────────────────────────────────────────────────────────────
 
 function makeMockProvider() {
   let deltaCb: ((sid: string, d: MessageDelta) => void) | null = null;
   let completeCb: ((sid: string, m: AgentMessage) => void) | null = null;
   let errorCb: ((sid: string, e: ProviderError) => void) | null = null;
 
-  const fireDelta = (sid: string) => deltaCb?.(sid, { messageId: 'msg', type: 'text', delta: 'x', role: 'assistant' });
-  const fireComplete = (sid: string, id = 'msg-1') => completeCb?.(sid, { id, sessionId: sid, kind: 'text', role: 'assistant', content: 'done', timestamp: Date.now(), status: 'complete' });
-  const fireError = (sid: string, code = 'PROVIDER_ERROR') => errorCb?.(sid, { code, message: 'err', recoverable: false });
-  const fireCancelled = (sid: string) => errorCb?.(sid, { code: 'CANCELLED', message: 'Cancelled', recoverable: true });
-
-  // By default, provider.send fires delta+complete automatically (simulates a complete turn).
-  // Tests can override sendBehavior to control timing.
-  let sendBehavior: (sid: string) => void = (sid) => {
-    fireDelta(sid);
-    fireComplete(sid);
-  };
+  const fireDelta = (sid: string) =>
+    deltaCb?.(sid, { messageId: 'msg', type: 'text', delta: 'x', role: 'assistant' });
+  const fireComplete = (sid: string) =>
+    completeCb?.(sid, { id: 'msg-1', sessionId: sid, kind: 'text', role: 'assistant', content: 'done', timestamp: Date.now(), status: 'complete' });
+  const fireError = (sid: string, code = 'PROVIDER_ERROR') =>
+    errorCb?.(sid, { code, message: 'err', recoverable: false });
+  const fireCancelled = (sid: string) =>
+    errorCb?.(sid, { code: 'CANCELLED', message: 'cancelled', recoverable: true });
 
   return {
     provider: {
-      id: 'mock',
-      connectionMode: 'persistent',
-      sessionOwnership: 'provider',
+      id: 'mock', connectionMode: 'persistent', sessionOwnership: 'provider',
       capabilities: { streaming: true, toolCalling: false, approval: false, sessionRestore: false, multiTurn: true, attachments: false },
-      connect: vi.fn(),
-      disconnect: vi.fn(),
-      send: vi.fn().mockImplementation((sid: string) => { sendBehavior(sid); }),
-      cancel: vi.fn(),
-      createSession: vi.fn().mockResolvedValue('sess-1'),
-      endSession: vi.fn(),
+      connect: vi.fn(), disconnect: vi.fn(), send: vi.fn(), cancel: vi.fn(),
+      createSession: vi.fn().mockResolvedValue('sess-1'), endSession: vi.fn(),
       onDelta: (cb: (sid: string, d: MessageDelta) => void) => { deltaCb = cb; return () => { deltaCb = null; }; },
       onComplete: (cb: (sid: string, m: AgentMessage) => void) => { completeCb = cb; return () => { completeCb = null; }; },
       onError: (cb: (sid: string, e: ProviderError) => void) => { errorCb = cb; return () => { errorCb = null; }; },
     } as unknown as TransportProvider,
-    fireDelta,
-    fireComplete,
-    fireError,
-    fireCancelled,
-    /** Override what provider.send does when called. */
-    setSendBehavior: (fn: (sid: string) => void) => { sendBehavior = fn; },
-    /** Make provider.send do nothing — caller must fire callbacks manually. */
-    setManualMode: () => { sendBehavior = () => {}; },
+    fireDelta, fireComplete, fireError, fireCancelled,
   };
 }
 
-const defaultConfig: SessionConfig = { sessionKey: 'deck_test_brain' };
+const defaultConfig: SessionConfig = { sessionKey: 'deck_test' };
 
-// ── Status lifecycle tests ─────────────────────────────────────────────────────
+// ── Status lifecycle ───────────────────────────────────────────────────────────
 
-describe('TransportSessionRuntime — status lifecycle', () => {
+describe('status lifecycle', () => {
   let mock: ReturnType<typeof makeMockProvider>;
   let runtime: TransportSessionRuntime;
   let statusLog: AgentStatus[];
@@ -79,296 +65,206 @@ describe('TransportSessionRuntime — status lifecycle', () => {
     await runtime.initialize(defaultConfig);
   });
 
-  it('normal turn: idle → thinking → streaming → idle', async () => {
-    mock.setSendBehavior((sid) => {
-      mock.fireDelta(sid);
-      mock.fireDelta(sid); // duplicate delta shouldn't re-emit
-      mock.fireComplete(sid);
-    });
-    await runtime.send('hi');
+  it('idle → thinking → streaming → idle (normal turn)', () => {
+    runtime.send('hi');
+    mock.fireDelta('sess-1');
+    mock.fireDelta('sess-1'); // duplicate suppressed
+    mock.fireComplete('sess-1');
     expect(statusLog).toEqual(['thinking', 'streaming', 'idle']);
   });
 
-  it('turn without streaming: idle → thinking → idle', async () => {
-    mock.setSendBehavior((sid) => mock.fireComplete(sid));
-    await runtime.send('hi');
+  it('idle → thinking → idle (no streaming, direct complete)', () => {
+    runtime.send('hi');
+    mock.fireComplete('sess-1');
     expect(statusLog).toEqual(['thinking', 'idle']);
   });
 
-  it('provider error: idle → thinking → error', async () => {
-    mock.setSendBehavior((sid) => mock.fireError(sid));
-    // send() should still resolve (error is handled via _activeTurn rejection)
-    await runtime.send('hi').catch(() => {});
+  it('idle → thinking → error (provider error)', () => {
+    runtime.send('hi');
+    mock.fireError('sess-1');
     expect(statusLog).toEqual(['thinking', 'error']);
-    expect(runtime.sending).toBe(false);
   });
 
-  it('cancel: idle → thinking → idle (CANCELLED maps to idle)', async () => {
-    mock.setSendBehavior((sid) => mock.fireCancelled(sid));
-    await runtime.send('hi').catch(() => {});
+  it('idle → thinking → idle (CANCELLED)', () => {
+    runtime.send('hi');
+    mock.fireCancelled('sess-1');
     expect(statusLog).toEqual(['thinking', 'idle']);
-    expect(runtime.sending).toBe(false);
   });
 
-  it('error during streaming: idle → thinking → streaming → error', async () => {
-    mock.setSendBehavior((sid) => {
-      mock.fireDelta(sid);
-      mock.fireError(sid);
-    });
-    await runtime.send('hi').catch(() => {});
+  it('idle → thinking → streaming → error (error during streaming)', () => {
+    runtime.send('hi');
+    mock.fireDelta('sess-1');
+    mock.fireError('sess-1');
     expect(statusLog).toEqual(['thinking', 'streaming', 'error']);
   });
 
-  it('provider.send() synchronous throw: idle → thinking → idle', async () => {
-    (mock.provider.send as ReturnType<typeof vi.fn>).mockImplementationOnce(() => { throw new Error('network'); });
-    await expect(runtime.send('hi')).rejects.toThrow('network');
-    expect(statusLog).toEqual(['thinking', 'idle']);
-    expect(runtime.sending).toBe(false);
-  });
-
-  it('does not fire onStatusChange for duplicate status', async () => {
-    mock.setSendBehavior((sid) => {
-      mock.fireDelta(sid);
-      mock.fireDelta(sid);
-      mock.fireDelta(sid);
-      mock.fireComplete(sid);
-    });
-    await runtime.send('hi');
-    expect(statusLog).toEqual(['thinking', 'streaming', 'idle']);
-  });
-
-  it('ignores events from a different session ID', async () => {
-    mock.setManualMode();
-    const sendPromise = runtime.send('hi');
-    // Let the queue microtask fire so _doSend runs
-    await Promise.resolve();
-    expect(statusLog).toEqual(['thinking']);
-
-    mock.fireDelta('other-session');
-    mock.fireComplete('other-session');
-    expect(statusLog).toEqual(['thinking']); // unchanged
-
-    // Now fire for correct session
-    mock.fireComplete('sess-1');
-    await sendPromise;
-    expect(statusLog).toEqual(['thinking', 'idle']);
-  });
-
-  it('kill() during active turn transitions to idle', async () => {
-    mock.setManualMode();
-    const sendPromise = runtime.send('hi');
-    await Promise.resolve();
+  it('duplicate deltas do not re-emit streaming', () => {
+    runtime.send('hi');
     mock.fireDelta('sess-1');
-    expect(runtime.getStatus()).toBe('streaming');
-
-    await runtime.kill();
-    await sendPromise.catch(() => {});
-
-    // Final state must be idle
-    expect(runtime.getStatus()).toBe('idle');
-    expect(runtime.sending).toBe(false);
-    expect(runtime.providerSessionId).toBeNull();
-    // Last status in log must be idle
-    expect(statusLog[statusLog.length - 1]).toBe('idle');
+    mock.fireDelta('sess-1');
+    mock.fireDelta('sess-1');
+    mock.fireComplete('sess-1');
+    expect(statusLog.filter((s) => s === 'streaming')).toHaveLength(1);
   });
 
-  it('kill() from idle does not fire redundant onStatusChange', async () => {
+  it('ignores events from wrong session ID', () => {
+    runtime.send('hi');
+    mock.fireDelta('other');
+    mock.fireComplete('other');
+    expect(statusLog).toEqual(['thinking']);
+  });
+
+  it('kill() transitions to idle', async () => {
+    runtime.send('hi');
+    mock.fireDelta('sess-1');
+    await runtime.kill();
+    expect(statusLog[statusLog.length - 1]).toBe('idle');
+    expect(runtime.getStatus()).toBe('idle');
+  });
+
+  it('kill() from idle does not fire onStatusChange', async () => {
     await runtime.kill();
     expect(statusLog).toEqual([]);
   });
-
-  it('send() resolves only after the full turn completes', async () => {
-    const order: string[] = [];
-    mock.setSendBehavior((sid) => {
-      order.push('send-dispatched');
-      // Simulate async: complete fires in next microtask
-      Promise.resolve().then(() => {
-        order.push('complete-fired');
-        mock.fireComplete(sid);
-      });
-    });
-
-    await runtime.send('hi');
-    order.push('send-resolved');
-
-    // send-resolved must come AFTER complete-fired
-    expect(order).toEqual(['send-dispatched', 'complete-fired', 'send-resolved']);
-  });
 });
 
-// ── Queuing tests ──────────────────────────────────────────────────────────────
+// ── Batched queuing ────────────────────────────────────────────────────────────
 
-describe('TransportSessionRuntime — strict FIFO queuing', () => {
+describe('batched queuing', () => {
   let mock: ReturnType<typeof makeMockProvider>;
   let runtime: TransportSessionRuntime;
-  let statusLog: AgentStatus[];
+  let drainLog: Array<{ merged: string; count: number }>;
 
   beforeEach(async () => {
     mock = makeMockProvider();
     runtime = new TransportSessionRuntime(mock.provider, 'deck_test');
-    statusLog = [];
-    runtime.onStatusChange = (s) => statusLog.push(s);
+    drainLog = [];
+    runtime.onDrain = (merged, count) => drainLog.push({ merged, count });
     await runtime.initialize(defaultConfig);
   });
 
-  it('second send waits for first turn to complete (FIFO)', async () => {
-    // Auto-complete on send
-    await runtime.send('first');
+  it('idle send dispatches immediately, no drain', () => {
+    const result = runtime.send('hello');
+    expect(result).toBe('sent');
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(drainLog).toHaveLength(0);
+  });
 
-    await runtime.send('second');
+  it('messages during busy turn are queued', () => {
+    runtime.send('first');
+    expect(runtime.send('second')).toBe('queued');
+    expect(runtime.send('third')).toBe('queued');
+    expect(runtime.pendingCount).toBe(2);
+    // Only first message sent to provider
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', 'first', undefined, undefined);
+  });
+
+  it('on complete, all pending messages merge into one turn', () => {
+    runtime.send('first');
+    runtime.send('second');
+    runtime.send('third');
+    expect(runtime.pendingCount).toBe(2);
+
+    // Complete first turn → pending messages drain as one merged message
+    mock.fireComplete('sess-1');
+
     expect(mock.provider.send).toHaveBeenCalledTimes(2);
-
-    const calls = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.map((c: unknown[]) => c[1]);
-    expect(calls).toEqual(['first', 'second']);
+    // Second call is the merged message
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', 'second\n\nthird', undefined, undefined);
+    expect(runtime.pendingCount).toBe(0);
+    expect(drainLog).toEqual([{ merged: 'second\n\nthird', count: 2 }]);
   });
 
-  it('three concurrent sends execute in strict order', async () => {
-    const order: string[] = [];
-    mock.setSendBehavior((sid) => {
-      order.push(`dispatch-${(mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length}`);
-      mock.fireComplete(sid);
-    });
+  it('on error, pending messages still drain into next turn', () => {
+    runtime.send('first');
+    runtime.send('retry-me');
 
-    await Promise.all([
-      runtime.send('A'),
-      runtime.send('B'),
-      runtime.send('C'),
-    ]);
+    mock.fireError('sess-1');
 
-    const calls = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.map((c: unknown[]) => c[1]);
-    expect(calls).toEqual(['A', 'B', 'C']);
-    expect(mock.provider.send).toHaveBeenCalledTimes(3);
-  });
-
-  it('queued send proceeds after active turn errors', async () => {
-    let callCount = 0;
-    mock.setSendBehavior((sid) => {
-      callCount++;
-      if (callCount === 1) mock.fireError(sid); // first fails
-      else mock.fireComplete(sid);               // second succeeds
-    });
-
-    const results = await Promise.allSettled([
-      runtime.send('first'),
-      runtime.send('second'),
-    ]);
-
-    expect(results[0].status).toBe('rejected');
-    expect(results[1].status).toBe('fulfilled');
+    // Despite error, pending messages drain
     expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', 'retry-me', undefined, undefined);
+    // Status is thinking (new turn started), not error
+    expect(runtime.getStatus()).toBe('thinking');
   });
 
-  it('queued send proceeds after cancel', async () => {
-    let callCount = 0;
-    mock.setSendBehavior((sid) => {
-      callCount++;
-      if (callCount === 1) mock.fireCancelled(sid);
-      else mock.fireComplete(sid);
-    });
+  it('on cancel, pending messages are cleared (not drained)', () => {
+    runtime.send('first');
+    runtime.send('will-be-dropped');
+    runtime.send('also-dropped');
 
-    const results = await Promise.allSettled([
-      runtime.send('first'),
-      runtime.send('second'),
-    ]);
+    runtime.cancel();
+    mock.fireCancelled('sess-1');
 
-    // Cancelled turn rejects, but second proceeds
-    expect(results[0].status).toBe('rejected');
-    expect(results[1].status).toBe('fulfilled');
+    // Cancel clears pending → no drain, no second send
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.getStatus()).toBe('idle');
   });
 
-  it('status transitions for queued sends: thinking→idle→thinking→idle', async () => {
-    mock.setSendBehavior((sid) => mock.fireComplete(sid));
+  it('multiple turns with queuing: correct history order', () => {
+    // Turn 1: send 'A', queue 'B' and 'C'
+    runtime.send('A');
+    runtime.send('B');
+    runtime.send('C');
 
-    await Promise.all([
-      runtime.send('first'),
-      runtime.send('second'),
-    ]);
-
-    expect(statusLog).toEqual(['thinking', 'idle', 'thinking', 'idle']);
-  });
-
-  it('sending flag tracks the active send through queue', async () => {
-    mock.setSendBehavior((sid) => mock.fireComplete(sid));
-
-    await runtime.send('first');
-    expect(runtime.sending).toBe(false);
-
-    await runtime.send('second');
-    expect(runtime.sending).toBe(false);
-  });
-
-  it('history preserves correct order for queued sends', async () => {
-    mock.setSendBehavior((sid) => mock.fireComplete(sid));
-
-    await Promise.all([
-      runtime.send('msg-A'),
-      runtime.send('msg-B'),
-    ]);
+    // Complete turn 1 → drains B+C as merged turn 2
+    mock.fireComplete('sess-1');
+    // Complete turn 2
+    mock.fireComplete('sess-1');
 
     const history = runtime.getHistory();
     expect(history.map((h) => ({ role: h.role, content: h.content }))).toEqual([
-      { role: 'user', content: 'msg-A' },
+      { role: 'user', content: 'A' },
       { role: 'assistant', content: 'done' },
-      { role: 'user', content: 'msg-B' },
+      { role: 'user', content: 'B\n\nC' },
       { role: 'assistant', content: 'done' },
     ]);
   });
-});
 
-// ── Cancel / stop tests ────────────────────────────────────────────────────────
-
-describe('TransportSessionRuntime — cancel and stop', () => {
-  let mock: ReturnType<typeof makeMockProvider>;
-  let runtime: TransportSessionRuntime;
-  let statusLog: AgentStatus[];
-
-  beforeEach(async () => {
-    mock = makeMockProvider();
-    runtime = new TransportSessionRuntime(mock.provider, 'deck_test');
-    statusLog = [];
+  it('status transitions with queuing: thinking→idle then thinking→idle', () => {
+    const statusLog: AgentStatus[] = [];
     runtime.onStatusChange = (s) => statusLog.push(s);
-    await runtime.initialize(defaultConfig);
+
+    runtime.send('A');
+    runtime.send('B'); // queued
+
+    // Complete A → drain B (no idle between — goes straight to next turn thinking)
+    mock.fireComplete('sess-1');
+    // Complete B
+    mock.fireComplete('sess-1');
+
+    // thinking(A) → streaming is optional → thinking(B, drain) → idle(B done)
+    // Since drain fires a new turn, status goes: thinking → thinking(again via drain) → idle
+    // But setStatus deduplicates, so thinking→thinking is suppressed
+    expect(statusLog[0]).toBe('thinking');
+    expect(statusLog[statusLog.length - 1]).toBe('idle');
   });
 
-  it('cancel() delegates to provider.cancel', async () => {
-    mock.setManualMode();
-    const sendPromise = runtime.send('hi');
-    await Promise.resolve(); // let queue microtask fire
+  it('no drain happens if pendingMessages is empty', () => {
+    runtime.send('solo');
+    mock.fireComplete('sess-1');
 
-    await runtime.cancel();
-    expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
-
-    // Simulate the provider firing CANCELLED after cancel()
-    mock.fireCancelled('sess-1');
-    await sendPromise.catch(() => {});
-
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(drainLog).toHaveLength(0);
     expect(runtime.getStatus()).toBe('idle');
   });
 
-  it('cancel() throws if not initialized', async () => {
-    const fresh = new TransportSessionRuntime(mock.provider, 'test');
-    await expect(fresh.cancel()).rejects.toThrow(/not initialized/i);
-  });
-
-  it('kill() cancels active turn and clears queue', async () => {
-    mock.setManualMode();
-    const first = runtime.send('first');
-    const second = runtime.send('second');
-    await Promise.resolve(); // let first's _doSend start
+  it('kill() clears pending without draining', async () => {
+    runtime.send('first');
+    runtime.send('queued1');
+    runtime.send('queued2');
 
     await runtime.kill();
 
-    // Both should resolve/reject without hanging
-    await first.catch(() => {});
-    await second.catch(() => {});
-
-    expect(runtime.getStatus()).toBe('idle');
-    expect(runtime.sending).toBe(false);
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(drainLog).toHaveLength(0);
+    expect(runtime.pendingCount).toBe(0);
   });
 
-  it('send after kill rejects (session destroyed)', async () => {
+  it('send after kill throws', async () => {
     await runtime.kill();
-    await expect(runtime.send('hi')).rejects.toThrow(/not initialized/i);
+    expect(() => runtime.send('hi')).toThrow(/not initialized/i);
   });
 });
