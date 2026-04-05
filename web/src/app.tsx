@@ -1980,10 +1980,7 @@ export function App() {
     subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession })),
     [subSessions]
   );
-  const subSessionsFull = useMemo(() =>
-    subSessions.map(s => ({ id: s.id, sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, cwd: s.cwd, parentSession: s.parentSession })),
-    [subSessions]
-  );
+
   const visiblePinnedPanels = useMemo(() =>
     pinnedPanels.filter((p) => (
       p.id
@@ -2180,7 +2177,7 @@ export function App() {
                 ws: wsRef.current,
                 connected,
                 serverId: selectedServerId ?? '',
-                subSessions: subSessionsFull,
+                subSessions,
                 inputRefsMap,
                 onPreviewFile: (path) => setPreviewFilePath(path),
                 activeSession,
@@ -2675,7 +2672,7 @@ export function App() {
                   ws: wsRef.current,
                   connected,
                   serverId: selectedServerId ?? '',
-                  subSessions: subSessionsFull,
+                  subSessions,
                   inputRefsMap,
                   onPreviewFile: (path) => { setPreviewFilePath(path); closeSidebar(); },
                   activeSession,

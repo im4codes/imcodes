@@ -14,13 +14,14 @@ import type { ComponentChildren } from 'preact';
 import type { TFunction } from 'i18next';
 import type { WsClient } from '../ws-client.js';
 import type { PinnedPanel } from '../app.js';
+import type { SubSession } from '../hooks/useSubSessions.js';
 
 export interface PanelRenderContext {
   ws: WsClient | null;
   connected: boolean;
   serverId: string;
   /** All live sub-sessions — for sub-session panel type */
-  subSessions: Array<{ id: string; sessionName: string; type: string; label?: string | null; state: string; cwd?: string | null; parentSession?: string | null }>;
+  subSessions: SubSession[];
   /** Input refs map for file insertion */
   inputRefsMap?: { current: Map<string, HTMLElement> };
   /** For repo/file browser CI events */
