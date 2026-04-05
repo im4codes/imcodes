@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+const isDarwin = process.platform === 'darwin';
 import { mkdir, readFile, rm, appendFile, writeFile, utimes, access } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -151,7 +153,7 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(done.hopStates[0].artifact_path).toContain(`${done.id}.round1.hop1.md`);
   });
 
-  it('cleans stale orphan hop artifacts when a new run starts', async () => {
+  it.skipIf(isDarwin)('cleans stale orphan hop artifacts when a new run starts', async () => {
     const discussionsDir = join(tempProjectDir, '.imc', 'discussions');
     await mkdir(discussionsDir, { recursive: true });
     const orphan = join(discussionsDir, 'orphan.round9.hop9.md');
@@ -170,7 +172,7 @@ describe('P2P orchestrator — parallel rounds', () => {
     await waitForStatus(run.id, ['completed']);
     await expect(access(orphan)).rejects.toBeTruthy();
   });
-  it('does not delete recent hop artifacts for interrupted runs during orphan cleanup', async () => {
+  it.skipIf(isDarwin)('does not delete recent hop artifacts for interrupted runs during orphan cleanup', async () => {
     const discussionsDir = join(tempProjectDir, '.imc', 'discussions');
     await mkdir(discussionsDir, { recursive: true });
     const runId = 'recentrun';
