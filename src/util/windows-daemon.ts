@@ -91,7 +91,8 @@ function tryStartStartupShortcut(): boolean {
     'imcodes-daemon.cmd',
   );
   if (!existsSync(startupCmd)) return false;
-  spawn('cmd', ['/c', startupCmd], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+  const cmdExe = process.env.COMSPEC || `${process.env.SystemRoot || 'C:\\Windows'}\\system32\\cmd.exe`;
+  spawn(cmdExe, ['/c', startupCmd], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
   return true;
 }
 

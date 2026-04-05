@@ -2132,7 +2132,9 @@ launchctl load -w "${plist}"`;
 
     writeFileSync(batchPath, batch);
 
-    const child = spawn('cmd.exe', ['/c', batchPath], {
+    // Use absolute path — bare 'cmd.exe' fails in restricted daemon environments
+    const cmdExe = process.env.COMSPEC || `${process.env.SystemRoot || 'C:\\Windows'}\\system32\\cmd.exe`;
+    const child = spawn(cmdExe, ['/c', batchPath], {
       detached: true,
       stdio: 'ignore',
       windowsHide: true,

@@ -126,12 +126,10 @@ describe('restartWindowsDaemon', () => {
 
     const { restartWindowsDaemon } = await import('../../src/util/windows-daemon.js');
     expect(restartWindowsDaemon()).toBe(true);
-    expect(state.spawnCalls).toEqual([
-      {
-        cmd: 'cmd',
-        args: ['/c', 'C:\\Users\\tester\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\imcodes-daemon.cmd'],
-      },
-    ]);
+    expect(state.spawnCalls).toHaveLength(1);
+    // cmd resolved via COMSPEC — match any path ending in cmd.exe
+    expect(state.spawnCalls[0].cmd).toMatch(/cmd(\.exe)?$/i);
+    expect(state.spawnCalls[0].args).toEqual(['/c', 'C:\\Users\\tester\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\imcodes-daemon.cmd']);
   });
 
   it('force-kills daemon if tree-kill misses it', async () => {
