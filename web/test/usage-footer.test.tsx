@@ -43,8 +43,8 @@ describe('UsageFooter', () => {
     );
 
     expect(screen.getByText('Free')).toBeDefined();
-    expect(screen.getByText('1,000/day')).toBeDefined();
-    expect(screen.getByText('today 12/1000 · 1m 1/60')).toBeDefined();
+    // quotaLabel + quotaUsageLabel are combined into a single inline element
+    expect(screen.getByText('1,000/day · today 12/1000 · 1m 1/60')).toBeDefined();
     expect(screen.getByText('qwen3-coder-plus')).toBeDefined();
   });
 });
