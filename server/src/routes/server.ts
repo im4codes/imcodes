@@ -59,7 +59,10 @@ serverRoutes.post('/:id/upgrade', requireAuth(), async (c) => {
   const dbServers = await getServersByUserId(c.env.DB, userId);
   if (!dbServers.find((s) => s.id === serverId)) return c.json({ error: 'not_found' }, 404);
   try {
-    WsBridge.get(serverId).sendToDaemon(JSON.stringify({ type: 'daemon.upgrade' }));
+    WsBridge.get(serverId).sendToDaemon(JSON.stringify({
+      type: 'daemon.upgrade',
+      ...(process.env.APP_VERSION ? { targetVersion: process.env.APP_VERSION } : {}),
+    }));
     return c.json({ ok: true });
   } catch {
     return c.json({ error: 'daemon_offline' }, 503);

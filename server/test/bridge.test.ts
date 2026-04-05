@@ -146,7 +146,7 @@ describe('WsBridge', () => {
       expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905-dev.877'))).toBe(true);
     });
 
-    it('does not send daemon.upgrade when daemon version is newer than server version', async () => {
+    it('sends daemon.upgrade when daemon is newer than server version so versions converge exactly', async () => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.4.905-dev.877';
 
@@ -159,7 +159,39 @@ describe('WsBridge', () => {
       await vi.advanceTimersByTimeAsync(5000);
       await flushAsync();
 
-      expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"'))).toBe(false);
+      expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905-dev.877'))).toBe(true);
+    });
+
+    it('sends daemon.upgrade when server is dev and daemon is stable', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.4.905-dev.877';
+
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash'), {} as never);
+
+      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.905' }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushAsync();
+
+      expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905-dev.877'))).toBe(true);
+    });
+
+    it('sends daemon.upgrade when server is stable and daemon is dev', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.4.905';
+
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash'), {} as never);
+
+      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.905-dev.877' }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushAsync();
+
+      expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905'))).toBe(true);
     });
   });
 
