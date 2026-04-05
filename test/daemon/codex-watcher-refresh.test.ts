@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, mkdir, rm, writeFile } from 'fs/promises';
+import { mkdtemp, mkdir, rm, writeFile, stat, utimes } from 'fs/promises';
 import { tmpdir, homedir } from 'os';
 import { join } from 'path';
 
@@ -76,6 +76,10 @@ describe('codex watcher refresh()', () => {
     const control = await startWatchingSpecificFile('codex-refresh', file);
     await writeFile(newerOtherUuid, `${meta(cwd, '22222222-2222-2222-2222-222222222222')}\n${user('wrong uuid')}\n`, 'utf8');
     await writeFile(newerSameUuid, `${meta(cwd)}\n${user('same uuid moved')}\n`, 'utf8');
+    // Explicitly advance mtime so checkNewer() works on HFS+ (1-second mtime resolution)
+    const fileMtime = (await stat(file)).mtimeMs;
+    const future = new Date(fileMtime + 2000);
+    await utimes(newerSameUuid, future, future);
 
     expect(await control.refresh()).toBe(true);
     await waitUntil(() => vi.mocked(timelineEmitter.emit).mock.calls.some((c) => c[1] === 'user.message'));
