@@ -560,7 +560,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           extra.p2pSessionConfig = cfg.sessions;
           extra.p2pRounds = override?.rounds ?? cfg.rounds ?? 1;
           if (cfg.extraPrompt) extra.p2pExtraPrompt = cfg.extraPrompt;
-          if (cfg.hopTimeoutMinutes) extra.p2pHopTimeoutMs = Math.min(cfg.hopTimeoutMinutes * 60_000, 600_000);
+          if (cfg.hopTimeoutMinutes != null) extra.p2pHopTimeoutMs = Math.min(cfg.hopTimeoutMinutes * 60_000, 600_000);
         }
         // For non-config mode overrides (single or combo), send as p2pMode so the daemon uses it
         if (override?.modeOverride && override.modeOverride !== 'config') {
@@ -584,23 +584,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           extra.p2pSessionConfig = p2pSavedConfig.sessions;
           extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
           if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
-          if (p2pSavedConfig.hopTimeoutMinutes) extra.p2pHopTimeoutMs = Math.min(p2pSavedConfig.hopTimeoutMinutes * 60_000, 600_000);
+          if (p2pSavedConfig.hopTimeoutMinutes != null) extra.p2pHopTimeoutMs = Math.min(p2pSavedConfig.hopTimeoutMinutes * 60_000, 600_000);
         }
-      }
-    }
-
-    if (!extra.p2pAtTargets && p2pMode !== 'solo' && !text.includes('@@')) {
-      // Dropdown P2P mode — daemon handles expansion
-      if (p2pMode === P2P_CONFIG_MODE) {
-        extra.p2pMode = 'config';
-      } else {
-        extra.p2pMode = p2pMode;
-        if (p2pExcludeSameType) extra.p2pExcludeSameType = true;
-      }
-      if (p2pMode === P2P_CONFIG_MODE && p2pSavedConfig) {
-        extra.p2pSessionConfig = p2pSavedConfig.sessions;
-        extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
-        if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
       }
     }
 
@@ -972,6 +957,18 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             </button>
           ))}
         </div>
+
+        {/* Plan/quota badges — compact inline display left of model selector */}
+        {(activeSession?.quotaLabel || activeSession?.quotaUsageLabel || activeSession?.planLabel) && (
+          <div class="session-ctx-wrap">
+            {(activeSession.quotaLabel || activeSession.quotaUsageLabel) && (
+              <span class="session-usage-quota-inline">{[activeSession.quotaLabel, activeSession.quotaUsageLabel].filter(Boolean).join(' · ')}</span>
+            )}
+            {activeSession.planLabel && (
+              <span class="session-usage-quota-inline" style={{ color: '#93c5fd' }}>{activeSession.planLabel}</span>
+            )}
+          </div>
+        )}
 
         {/* Model selector — outside overflow-x scroll area so dropdown isn't clipped */}
         {isClaudeCode && (

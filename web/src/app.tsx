@@ -1,16 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
 import { FileBrowser } from './components/FileBrowser.js';
-
-/** Map P2P orchestrator status to UI display state (shared logic, no hardcoded strings). */
-const P2P_DONE = new Set(['completed']);
-const P2P_FAILED = new Set(['failed', 'timed_out', 'cancelled']);
-const P2P_RUNNING = new Set(['running', 'awaiting_next_hop', 'dispatched']);
-function mapP2pState(status: string): 'done' | 'failed' | 'running' | 'setup' {
-  if (P2P_DONE.has(status)) return 'done';
-  if (P2P_FAILED.has(status)) return 'failed';
-  if (P2P_RUNNING.has(status)) return 'running';
-  return 'setup';
-}
+import { mapP2pStatusToUiState, type P2pActivePhase, type P2pProgressNodeStatus } from '@shared/p2p-status.js';
 
 function mapP2pRunToDiscussion(r: Record<string, any>) {
   const rawSnapshot = r.progress_snapshot;
@@ -20,7 +10,7 @@ function mapP2pRunToDiscussion(r: Record<string, any>) {
   const source = { ...r, ...snapshot } as Record<string, any>;
   const id = `p2p_${source.id}`;
   const status = String(source.status ?? '');
-  const state = mapP2pState(status);
+  const state = mapP2pStatusToUiState(status);
   const mode = source.mode_key ?? 'discuss';
   const currentRoundMode = source.current_round_mode ?? mode;
   const initiatorLabel = source.initiator_label ?? 'brain';
@@ -35,7 +25,7 @@ function mapP2pRunToDiscussion(r: Record<string, any>) {
     ccPreset: n.ccPreset ?? n.cc_preset ?? null,
     mode: typeof n.mode === 'string' ? n.mode : undefined,
     phase: typeof n.phase === 'string' ? n.phase as 'initial' | 'hop' | 'summary' : undefined,
-    status: String(n.status ?? 'pending') as 'done' | 'active' | 'pending' | 'skipped',
+    status: String(n.status ?? 'pending') as P2pProgressNodeStatus,
   })) : undefined;
   return {
     id,
@@ -48,7 +38,7 @@ function mapP2pRunToDiscussion(r: Record<string, any>) {
     totalHops,
     activeHop: source.active_hop_number ?? null,
     activeRoundHop: source.active_round_hop_number ?? null,
-    activePhase: (typeof source.active_phase === 'string' ? source.active_phase : 'queued') as 'queued' | 'initial' | 'hop' | 'summary',
+    activePhase: (typeof source.active_phase === 'string' ? source.active_phase : 'queued') as P2pActivePhase,
     initiatorLabel,
     currentSpeaker: currentTarget,
     conclusion: state === 'done' ? (source.result_summary ?? undefined) : undefined,
@@ -1980,10 +1970,7 @@ export function App() {
     subSessions.map(s => ({ sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, parentSession: s.parentSession })),
     [subSessions]
   );
-  const subSessionsFull = useMemo(() =>
-    subSessions.map(s => ({ id: s.id, sessionName: s.sessionName, type: s.type, label: s.label, state: s.state, cwd: s.cwd, parentSession: s.parentSession })),
-    [subSessions]
-  );
+
   const visiblePinnedPanels = useMemo(() =>
     pinnedPanels.filter((p) => (
       p.id
@@ -2180,7 +2167,7 @@ export function App() {
                 ws: wsRef.current,
                 connected,
                 serverId: selectedServerId ?? '',
-                subSessions: subSessionsFull,
+                subSessions,
                 inputRefsMap,
                 onPreviewFile: (path) => setPreviewFilePath(path),
                 activeSession,
@@ -2675,7 +2662,7 @@ export function App() {
                   ws: wsRef.current,
                   connected,
                   serverId: selectedServerId ?? '',
-                  subSessions: subSessionsFull,
+                  subSessions,
                   inputRefsMap,
                   onPreviewFile: (path) => { setPreviewFilePath(path); closeSidebar(); },
                   activeSession,

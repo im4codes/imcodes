@@ -26,7 +26,7 @@ call "${npmCmd}" install -g ${pkgSpec} >> "${logFile}" 2>&1\r
 if %errorlevel% neq 0 (\r
   echo Install FAILED — keeping current daemon running. >> "${logFile}"\r
   echo === upgrade aborted at %date% %time% === >> "${logFile}"\r
-  start "" cmd /c "${cleanupPath}" >nul 2>&1\r
+  start "" /min cmd /c "${cleanupPath}" >nul 2>&1\r
   goto :done\r
 )\r
 \r
@@ -35,7 +35,7 @@ for /f "usebackq delims=" %%p in (\`call "${npmCmd}" prefix -g 2^>nul\`) do if n
 if not defined NPM_PREFIX (\r
   echo Could not resolve npm global prefix after install. >> "${logFile}"\r
   echo === upgrade aborted at %date% %time% === >> "${logFile}"\r
-  start "" cmd /c "${cleanupPath}" >nul 2>&1\r
+  start "" /min cmd /c "${cleanupPath}" >nul 2>&1\r
   goto :done\r
 )\r
 \r
@@ -43,7 +43,7 @@ set "CLI_SHIM=%NPM_PREFIX%\\imcodes.cmd"\r
 if not exist "%CLI_SHIM%" (\r
   echo imcodes shim missing after install: %CLI_SHIM% >> "${logFile}"\r
   echo === upgrade aborted at %date% %time% === >> "${logFile}"\r
-  start "" cmd /c "${cleanupPath}" >nul 2>&1\r
+  start "" /min cmd /c "${cleanupPath}" >nul 2>&1\r
   goto :done\r
 )\r
 \r
@@ -53,7 +53,7 @@ echo Install succeeded. Installed version: %INSTALLED_VER%, target: ${targetVer}
 if not "${targetVer}"=="latest" if /I not "%INSTALLED_VER%"=="${targetVer}" (\r
   echo Version mismatch after install — keeping current daemon running. >> "${logFile}"\r
   echo === upgrade aborted at %date% %time% === >> "${logFile}"\r
-  start "" cmd /c "${cleanupPath}" >nul 2>&1\r
+  start "" /min cmd /c "${cleanupPath}" >nul 2>&1\r
   goto :done\r
 )\r
 where imcodes >nul 2>&1\r
@@ -82,7 +82,7 @@ if exist "%PIDFILE%" (\r
 ) else (\r
   echo Health check FAILED: daemon.pid not found >> "${logFile}"\r
 )\r
-start "" cmd /c "${cleanupPath}" >nul 2>&1\r
+start "" /min cmd /c "${cleanupPath}" >nul 2>&1\r
 :done\r
 echo === upgrade done at %date% %time% === >> "${logFile}"\r
 `;

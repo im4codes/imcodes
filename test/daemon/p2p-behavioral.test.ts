@@ -42,7 +42,7 @@ function makeRun(overrides: Partial<P2pRun> = {}): P2pRun {
 const defaultOpts: HopOpts = {
   session: 'deck_proj_w1',
   sectionHeader: '3e031o0d — Initial Analysis',
-  instruction: 'Read the context file below and provide your initial analysis.',
+  instruction: 'Read the discussion file and provide your initial analysis.',
   isInitial: false,
 };
 
@@ -61,6 +61,13 @@ describe('buildHopPrompt — production function', () => {
     const run = makeRun({ contextFilePath: '/home/user/.imc/discussions/abc123.md' });
     const prompt = buildHopPrompt(run, getP2pMode('audit'), defaultOpts);
     expect(prompt).toContain('/home/user/.imc/discussions/abc123.md');
+  });
+
+  it('does not reference a separate context file in the instruction text', () => {
+    const prompt = buildHopPrompt(makeRun(), getP2pMode('audit'), defaultOpts);
+    expect(prompt).toContain('Read the discussion file and provide your initial analysis.');
+    expect(prompt).not.toContain('Read the context file below');
+    expect(prompt).not.toContain('Read the full context file');
   });
 
   it('includes section header from opts', () => {

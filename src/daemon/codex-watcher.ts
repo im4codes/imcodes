@@ -13,6 +13,7 @@ import { readProjectMemory, buildCodexMemoryEntry, appendAgentSendDocs } from '.
 import logger from '../util/logger.js';
 import { updateSessionState } from '../store/session-store.js';
 import { resolveContextWindow } from '../util/model-context.js';
+import { registerWatcherControl, unregisterWatcherControl, refreshSessionWatcher, type WatcherControl } from './watcher-controls.js';
 
 // ── Codex SQLite helpers ────────────────────────────────────────────────────────
 
@@ -114,6 +115,27 @@ async function findLatestRollout(dir: string, workDir: string, excludeClaimed = 
   return null;
 }
 
+async function findLatestMatchingRollout(sessionName: string, projectDir: string, currentUuid: string | null, currentPath: string | null): Promise<string | null> {
+  let latestPath: string | null = null;
+  let latestMtime = -1;
+  for (const dir of recentSessionDirs()) {
+    const found = await findLatestRollout(dir, projectDir, false);
+    if (!found || found === currentPath || isFileClaimedByOther(sessionName, found)) continue;
+    if (currentUuid) {
+      const candidateUuid = extractUuidFromPath(found);
+      if (candidateUuid && candidateUuid !== currentUuid) continue;
+    }
+    try {
+      const s = await stat(found);
+      if (s.mtimeMs > latestMtime) {
+        latestMtime = s.mtimeMs;
+        latestPath = found;
+      }
+    } catch {}
+  }
+  return latestPath;
+}
+
 function normalizePath(p: string): string {
   const normalized = p
     .replace(/\\/g, '/')
@@ -131,12 +153,22 @@ function flushFinalAnswer(sessionName: string): void {
   const buf = finalAnswerBuffers.get(sessionName);
   if (!buf) return;
   finalAnswerBuffers.delete(sessionName);
+  const watcher = watchers.get(sessionName);
+  if (watcher) watcher.turnHadAssistantText = true;
   timelineEmitter.emit(sessionName, 'assistant.text', { text: buf.text, streaming: false }, { source: 'daemon', confidence: 'high' });
 }
 
 function emitSessionState(sessionName: string, state: 'running' | 'idle'): void {
-  if (sessionStates.get(sessionName) === state) return;
+  const prev = sessionStates.get(sessionName);
+  if (prev === state) return;
   sessionStates.set(sessionName, state);
+  if (state === 'running' && prev !== 'running') {
+    const watcher = watchers.get(sessionName);
+    if (watcher) {
+      watcher.turnHadAssistantText = false;
+      watcher.noTextRetrackAttempted = false;
+    }
+  }
   timelineEmitter.emit(sessionName, 'session.state', { state }, { source: 'daemon', confidence: 'high' });
   updateSessionState(sessionName, state);
 }
@@ -223,6 +255,12 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
   } else if (pl.type === 'task_started') {
     emitSessionState(sessionName, 'running');
   } else if (pl.type === 'task_complete') {
+    const watcher = watchers.get(sessionName);
+    if (watcher && !watcher.turnHadAssistantText && !watcher.noTextRetrackAttempted) {
+      watcher.noTextRetrackAttempted = true;
+      void finalizeIdleAfterRefresh(sessionName);
+      return;
+    }
     flushFinalAnswer(sessionName);
     emitSessionState(sessionName, 'idle');
   } else if (pl.type === 'user_message') {
@@ -239,6 +277,8 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
       finalAnswerBuffers.set(sessionName, { text, timer });
     } else if (pl.phase === 'commentary') {
       emitSessionState(sessionName, 'running');
+      const watcher = watchers.get(sessionName);
+      if (watcher) watcher.turnHadAssistantText = true;
       timelineEmitter.emit(sessionName, 'assistant.thinking', { text }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
     }
   }
@@ -271,6 +311,7 @@ async function emitRecentHistory(sessionName: string, filePath: string, model?: 
 
 interface WatcherState {
   workDir: string;
+  projectDir: string;
   activeFile: string | null;
   fileOffset: number;
   abort: AbortController;
@@ -278,9 +319,17 @@ interface WatcherState {
   pollTimer?: ReturnType<typeof setInterval>;
   model?: string;
   _lastRotationCheck?: number;
+  turnHadAssistantText?: boolean;
+  noTextRetrackAttempted?: boolean;
 }
 
 const watchers = new Map<string, WatcherState>();
+
+function watcherControl(sessionName: string): WatcherControl {
+  return {
+    refresh: () => refreshTrackedSession(sessionName),
+  };
+}
 const claimedFiles = new Map<string, string>(); // filePath → sessionName
 
 export function preClaimFile(sessionName: string, filePath: string): void {
@@ -393,10 +442,20 @@ export async function ensureSessionFile(uuid: string, cwd: string): Promise<stri
 
 // ── Public API ─────────────────────────────────────────────────────────────────
 
-export async function startWatching(sessionName: string, workDir: string, model?: string): Promise<void> {
+export async function startWatching(sessionName: string, workDir: string, model?: string): Promise<WatcherControl> {
   if (watchers.has(sessionName)) stopWatching(sessionName);
-  const state: WatcherState = { workDir, activeFile: null, fileOffset: 0, abort: new AbortController(), stopped: false, model };
+  const state: WatcherState = {
+    workDir,
+    projectDir: workDir,
+    activeFile: null,
+    fileOffset: 0,
+    abort: new AbortController(),
+    stopped: false,
+    model,
+  };
   watchers.set(sessionName, state);
+  const control = watcherControl(sessionName);
+  registerWatcherControl(sessionName, control);
 
   for (const dir of recentSessionDirs()) {
     const found = await findLatestRollout(dir, workDir);
@@ -411,24 +470,46 @@ export async function startWatching(sessionName: string, workDir: string, model?
   }
   startPoll(sessionName, state);
   void watchDir(sessionName, state, state.workDir || codexSessionDir(new Date()));
+  return control;
 }
 
-export async function startWatchingSpecificFile(sessionName: string, filePath: string, model?: string): Promise<void> {
+export async function startWatchingSpecificFile(sessionName: string, filePath: string, model?: string): Promise<WatcherControl> {
   if (watchers.has(sessionName)) stopWatching(sessionName);
   let size = 0; try { size = (await stat(filePath)).size; } catch {}
   const dir = filePath.substring(0, filePath.lastIndexOf('/'));
-  const state: WatcherState = { workDir: dir, activeFile: filePath, fileOffset: size, abort: new AbortController(), stopped: false, model };
+  const projectDir = (await readCwd(filePath)) ?? dir;
+  const state: WatcherState = {
+    workDir: dir,
+    projectDir,
+    activeFile: filePath,
+    fileOffset: size,
+    abort: new AbortController(),
+    stopped: false,
+    model,
+  };
   watchers.set(sessionName, state);
+  const control = watcherControl(sessionName);
+  registerWatcherControl(sessionName, control);
   claimedFiles.set(filePath, sessionName);
-  await emitRecentHistory(sessionName, filePath, model);
   startPoll(sessionName, state);
   void watchDir(sessionName, state, dir);
+  return control;
 }
 
-export async function startWatchingById(sessionName: string, uuid: string, model?: string): Promise<void> {
+export async function startWatchingById(sessionName: string, uuid: string, model?: string): Promise<WatcherControl> {
   if (watchers.has(sessionName)) stopWatching(sessionName);
-  const state: WatcherState = { workDir: '', activeFile: null, fileOffset: 0, abort: new AbortController(), stopped: false, model };
+  const state: WatcherState = {
+    workDir: '',
+    projectDir: '',
+    activeFile: null,
+    fileOffset: 0,
+    abort: new AbortController(),
+    stopped: false,
+    model,
+  };
   watchers.set(sessionName, state);
+  const control = watcherControl(sessionName);
+  registerWatcherControl(sessionName, control);
 
   for (let i = 0; i < 60 && !state.stopped; i++) {
     for (const dir of recentSessionDirs()) {
@@ -438,49 +519,25 @@ export async function startWatchingById(sessionName: string, uuid: string, model
         if (match) {
           const found = join(dir, match);
           state.activeFile = found; state.workDir = dir;
+          state.projectDir = (await readCwd(found)) ?? state.projectDir;
           claimedFiles.set(found, sessionName);
           await emitRecentHistory(sessionName, found, model);
           try { state.fileOffset = (await stat(found)).size; } catch { state.fileOffset = 0; }
           startPoll(sessionName, state);
           void watchDir(sessionName, state, dir);
-          return;
+          return control;
         }
       } catch {}
     }
     await new Promise(r => setTimeout(r, 500));
   }
+  return control;
 }
+
 
 function startPoll(sessionName: string, state: WatcherState) {
   state.pollTimer = setInterval(() => {
-    void (async () => {
-      await drainNewLines(sessionName, state);
-      const now = Date.now();
-      if (now - (state._lastRotationCheck || 0) > 30000) {
-        state._lastRotationCheck = now;
-        const uuid = state.activeFile ? extractUuidFromPath(state.activeFile) : null;
-        if (uuid) {
-          for (const dir of recentSessionDirs()) {
-            if (dir === state.workDir) continue;
-            try {
-              const entries = await readdir(dir);
-              const match = entries.find(e => e.includes(uuid));
-              if (match) {
-                const newPath = join(dir, match);
-                if (await checkNewer(newPath, state.activeFile)) {
-                  logger.info({ sessionName, new: newPath }, 'codex-watcher: date rotation detected');
-                  if (state.activeFile) claimedFiles.delete(state.activeFile);
-                  state.activeFile = newPath; state.workDir = dir; state.fileOffset = 0;
-                  claimedFiles.set(newPath, sessionName);
-                  void watchDir(sessionName, state, dir);
-                  break;
-                }
-              }
-            } catch { continue; }
-          }
-        }
-      }
-    })();
+    void refreshTrackedSession(sessionName);
   }, 2000);
 }
 
@@ -490,6 +547,7 @@ export function stopWatching(sessionName: string): void {
   state.stopped = true; state.abort.abort();
   if (state.pollTimer) clearInterval(state.pollTimer);
   watchers.delete(sessionName);
+  unregisterWatcherControl(sessionName);
   sessionStates.delete(sessionName);
   const finalAnswer = finalAnswerBuffers.get(sessionName);
   if (finalAnswer) {
@@ -500,6 +558,82 @@ export function stopWatching(sessionName: string): void {
 }
 
 export function isWatching(sessionName: string): boolean { return watchers.has(sessionName); }
+
+/**
+ * Force the registered watcher to immediately run its existing drain/rotation logic
+ * for this session. Uses the watcher's bound rollout/session identity only.
+ */
+export async function refreshTrackedSession(sessionName: string): Promise<boolean> {
+  const state = watchers.get(sessionName);
+  if (!state || state.stopped) return false;
+  await drainNewLines(sessionName, state);
+  state._lastRotationCheck = Date.now();
+  const uuid = state.activeFile ? extractUuidFromPath(state.activeFile) : null;
+  const latestPath = state.projectDir
+    ? await findLatestMatchingRollout(sessionName, state.projectDir, uuid, state.activeFile)
+    : null;
+  if (latestPath && await checkNewer(latestPath, state.activeFile)) {
+    if (state.activeFile) claimedFiles.delete(state.activeFile);
+    state.activeFile = latestPath;
+    state.workDir = latestPath.substring(0, latestPath.lastIndexOf('/'));
+    state.fileOffset = 0;
+    claimedFiles.set(latestPath, sessionName);
+    void watchDir(sessionName, state, state.workDir);
+  } else if (uuid) {
+    for (const dir of recentSessionDirs()) {
+      if (dir === state.workDir) continue;
+      try {
+        const entries = await readdir(dir);
+        const match = entries.find(e => e.includes(uuid));
+        if (!match) continue;
+        const newPath = join(dir, match);
+        if (await checkNewer(newPath, state.activeFile)) {
+          if (state.activeFile) claimedFiles.delete(state.activeFile);
+          state.activeFile = newPath;
+          state.workDir = dir;
+          state.fileOffset = 0;
+          claimedFiles.set(newPath, sessionName);
+          void watchDir(sessionName, state, dir);
+          break;
+        }
+      } catch { continue; }
+    }
+  }
+  await drainNewLines(sessionName, state);
+  return true;
+}
+
+export async function retrackLatestRollout(sessionName: string): Promise<boolean> {
+  const state = watchers.get(sessionName);
+  if (!state || state.stopped) return false;
+  const projectDir = state.projectDir || (state.activeFile ? await readCwd(state.activeFile) : null);
+  if (!projectDir) return false;
+  const currentUuid = state.activeFile ? extractUuidFromPath(state.activeFile) : null;
+
+  const latestPath = await findLatestMatchingRollout(sessionName, projectDir, currentUuid, state.activeFile);
+
+  if (!latestPath) return false;
+  logger.info({ sessionName, old: state.activeFile, new: latestPath }, 'codex-watcher: retracking latest rollout after no-text turn');
+  if (state.activeFile) claimedFiles.delete(state.activeFile);
+  state.activeFile = latestPath;
+  state.workDir = latestPath.substring(0, latestPath.lastIndexOf('/'));
+  state.fileOffset = 0;
+  claimedFiles.set(latestPath, sessionName);
+  void watchDir(sessionName, state, state.workDir);
+  await drainNewLines(sessionName, state);
+  return true;
+}
+
+async function finalizeIdleAfterRefresh(sessionName: string): Promise<void> {
+  let refreshed = false;
+  try {
+    refreshed = await refreshSessionWatcher(sessionName);
+  } finally {
+    flushFinalAnswer(sessionName);
+    if (refreshed && sessionStates.get(sessionName) === 'running') return;
+    emitSessionState(sessionName, 'idle');
+  }
+}
 
 async function watchDir(sessionName: string, state: WatcherState, dir: string): Promise<void> {
   try {

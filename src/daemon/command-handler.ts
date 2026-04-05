@@ -38,16 +38,34 @@ import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
 import { buildWindowsCleanupScript, buildWindowsUpgradeBatch } from '../util/windows-upgrade-script.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { sanitizeProjectName } from '../../shared/sanitize-project-name.js';
+import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 
 /**
  * Build a unified subsession.sync payload from the session store record.
  * Ensures all fields (including Qwen metadata) are always sent — no more
  * scattered inline objects with different field subsets.
+ *
+ * For Qwen sub-sessions, display metadata (planLabel, quotaLabel, quotaUsageLabel)
+ * is computed FRESH (same as buildSessionList for main sessions) rather than
+ * reading stale values from the session store.
  */
 function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord>): Record<string, unknown> {
   const sessionName = subSessionName(id);
   const record = getSession(sessionName);
   const r = { ...record, ...overrides };
+
+  // Compute Qwen display metadata fresh — matches session-list.ts hydration logic.
+  // The session store may have stale or missing planLabel/quotaLabel/quotaUsageLabel.
+  const isQwen = r?.agentType === 'qwen';
+  const freshDisplay = isQwen
+    ? getQwenDisplayMetadata({
+        model: r?.qwenModel,
+        authType: r?.qwenAuthType,
+        authLimit: r?.qwenAuthLimit,
+        quotaUsageLabel: r?.qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
+      })
+    : {};
+
   return {
     type: 'subsession.sync',
     id,
@@ -63,15 +81,15 @@ function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord>): Re
     runtimeType: r?.runtimeType ?? null,
     providerId: r?.providerId ?? null,
     providerSessionId: r?.providerSessionId ?? null,
-    // Qwen metadata — same fields as main session hydration in session-list.ts
+    // Qwen metadata — freshly computed display fields + stored config fields
     qwenModel: r?.qwenModel ?? null,
     qwenAuthType: r?.qwenAuthType ?? null,
     qwenAuthLimit: r?.qwenAuthLimit ?? null,
     qwenAvailableModels: r?.qwenAvailableModels ?? null,
-    modelDisplay: r?.modelDisplay ?? null,
-    planLabel: r?.planLabel ?? null,
-    quotaLabel: r?.quotaLabel ?? null,
-    quotaUsageLabel: r?.quotaUsageLabel ?? null,
+    modelDisplay: freshDisplay.modelDisplay ?? r?.modelDisplay ?? null,
+    planLabel: freshDisplay.planLabel ?? r?.planLabel ?? null,
+    quotaLabel: freshDisplay.quotaLabel ?? r?.quotaLabel ?? null,
+    quotaUsageLabel: freshDisplay.quotaUsageLabel ?? r?.quotaUsageLabel ?? null,
   };
 }
 
@@ -157,6 +175,11 @@ function refreshQwenQuotaUsageLabels(serverLink?: ServerLink): void {
       quotaUsageLabel: usageLabel,
       updatedAt: Date.now(),
     });
+    // Re-sync sub-sessions so their quota usage labels update in the browser
+    if (session.name.startsWith('deck_sub_')) {
+      const subId = session.name.replace(/^deck_sub_/, '');
+      try { serverLink?.send(buildSubSessionSync(subId)); } catch { /* not connected */ }
+    }
   }
   if (serverLink) void handleGetSessions(serverLink);
 }
@@ -1063,9 +1086,8 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     try {
       // ── Concurrency guard: check for active P2P runs on same initiator ──
       const forceNew = !!(cmd as Record<string, unknown>).force;
-      const TERMINAL_STATUSES = new Set(['completed', 'failed', 'timed_out', 'cancelled']);
       const existingRun = listP2pRuns().find(
-        (r) => r.initiatorSession === sessionName && !TERMINAL_STATUSES.has(r.status),
+        (r) => r.initiatorSession === sessionName && !P2P_TERMINAL_RUN_STATUSES.has(r.status),
       );
 
       if (existingRun && !forceNew) {

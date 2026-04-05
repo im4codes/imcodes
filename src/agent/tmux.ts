@@ -424,10 +424,10 @@ export async function isPaneAlive(name: string): Promise<boolean> {
 }
 
 /** Respawn a dead pane (remain-on-exit) with a new command. */
-export async function respawnPane(name: string, command: string): Promise<void> {
+export async function respawnPane(name: string, command: string, opts?: { env?: Record<string, string> }): Promise<void> {
   if (BACKEND === 'conpty') {
     const c = await conpty();
-    await c.conptyRespawnPane(name, command);
+    await c.conptyRespawnPane(name, command, opts);
     return;
   }
   if (BACKEND === 'wezterm') {

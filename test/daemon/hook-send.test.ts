@@ -14,6 +14,7 @@ const timelineEmitMock = vi.hoisted(() => vi.fn(() => ({})));
 const sendKeysMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const capturePane = vi.hoisted(() => vi.fn().mockResolvedValue([]));
 const getTransportRuntimeMock = vi.hoisted(() => vi.fn());
+const refreshSessionWatcherMock = vi.hoisted(() => vi.fn().mockResolvedValue(false));
 
 vi.mock('../../src/store/session-store.js', () => ({
   getSession: getSessionMock,
@@ -40,6 +41,10 @@ vi.mock('../../src/agent/detect.js', () => ({
 
 vi.mock('../../src/agent/session-manager.js', () => ({
   getTransportRuntime: getTransportRuntimeMock,
+}));
+
+vi.mock('../../src/daemon/watcher-controls.js', () => ({
+  refreshSessionWatcher: refreshSessionWatcherMock,
 }));
 
 import { startHookServer, clearQueues, getQueue, resolveTarget } from '../../src/daemon/hook-server.js';
@@ -110,6 +115,8 @@ describe('Hook server /send endpoint', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     clearQueues();
+    refreshSessionWatcherMock.mockReset();
+    refreshSessionWatcherMock.mockResolvedValue(false);
     const result = await startHookServer(hookCallback);
     server = result.server;
     port = result.port;
@@ -254,6 +261,19 @@ describe('Hook server /send endpoint', () => {
       const result = resolveTarget('nonexistent', 'target');
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.error).toContain('sender session not found');
+    });
+  });
+
+  describe('/notify idle refresh', () => {
+    it('refreshes the registered watcher before emitting idle for claude-code', async () => {
+      getSessionMock.mockReturnValue(makeSession({ name: 'deck_proj_brain', agentType: 'claude-code' }));
+      refreshSessionWatcherMock.mockResolvedValue(true);
+
+      const res = await postRaw(port, '/notify', JSON.stringify({ event: 'idle', session: 'deck_proj_brain', agentType: 'claude-code' }), 'application/json');
+
+      expect(res.status).toBe(200);
+      expect(refreshSessionWatcherMock).toHaveBeenCalledWith('deck_proj_brain');
+      expect(timelineEmitMock).toHaveBeenCalledWith('deck_proj_brain', 'session.state', { state: 'idle' }, { source: 'hook' });
     });
   });
 

@@ -38,7 +38,6 @@ import {
 import { LocalWebPreviewRegistry } from '../preview/registry.js';
 import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions } from '../db/queries.js';
 import logger from '../util/logger.js';
-import { compareImcodesVersions, isLocalDevImcodesVersion } from '../../../shared/imcodes-version.js';
 
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
@@ -402,18 +401,14 @@ export class WsBridge {
         );
 
         // Auto-upgrade: on each reconnect, retry up to 3 times with 10-minute intervals.
-        // Skip local source builds (0.x.x) — those are development checkouts, not published daemon packages.
+        // Always target the server's exact version so dev↔stable mismatches converge to
+        // the same channel in both directions.
         const serverVersion = process.env.APP_VERSION;
-        const daemonVersionCmp = serverVersion && this.daemonVersion
-          ? compareImcodesVersions(this.daemonVersion, serverVersion)
-          : null;
-        const isLocalDev = this.daemonVersion ? isLocalDevImcodesVersion(this.daemonVersion) : false;
         const shouldUpgrade = Boolean(
           serverVersion
           && serverVersion !== '0.0.0'
           && this.daemonVersion
-          && !isLocalDev
-          && (daemonVersionCmp != null ? daemonVersionCmp < 0 : this.daemonVersion !== serverVersion),
+          && this.daemonVersion !== serverVersion,
         );
         if (shouldUpgrade) {
           this.upgradeAttempts = (this.upgradeAttempts ?? 0) + 1;

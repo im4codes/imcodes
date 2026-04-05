@@ -10,7 +10,11 @@ import { RepoPage } from '../pages/RepoPage.js';
 import { CronManager } from '../pages/CronManager.js';
 import { LocalWebPreviewPanel } from './LocalWebPreviewPanel.js';
 import { useTimeline } from '../hooks/useTimeline.js';
+import { useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
+import { UsageFooter } from './UsageFooter.js';
+import { extractLatestUsage } from '../usage-data.js';
+import { getActiveThinkingTs, getActiveStatusText } from '../thinking-utils.js';
 import type { PinnedPanel } from '../app.js';
 import type { PanelRenderContext } from './PinnedPanelRegistry.js';
 
@@ -18,6 +22,10 @@ export const LOCAL_WEB_PREVIEW_PANEL_TYPE = 'localwebpreview';
 
 // ── Sub-session panel ────────────────────────────────────────────────────
 
+// SubSessionContent — compact pinned session view.
+// Intentionally includes: content (chat/terminal), model label, plan/quota badges, thinking indicator.
+// Intentionally excludes: full input composer, shortcut row, cost display, session menus.
+// For full session chrome, see SubSessionWindow.tsx and SessionPane.tsx.
 function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRenderContext }) {
   const sessionName = panel.props?.sessionName as string;
   const pinnedViewMode = panel.props?.viewMode as 'terminal' | 'chat' | undefined;
@@ -25,29 +33,57 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   const { events, refreshing } = useTimeline(sessionName, ctx.ws, ctx.serverId);
   const liveSub = ctx.subSessions.find(s => s.sessionName === sessionName);
 
+  // Derive usage/thinking state from timeline events (same as SubSessionWindow)
+  const lastUsage = useMemo(() => extractLatestUsage(events), [events]);
+  const activeThinkingTs = useMemo(() => getActiveThinkingTs(events), [events]);
+  const statusText = useMemo(() => getActiveStatusText(events), [events]);
+
   if (!liveSub) {
     return <div class="sidebar-pinned-unavailable">{t('sidebar.session_unavailable')}</div>;
   }
 
   const isShell = liveSub.type === 'shell' || liveSub.type === 'script';
   const mode = pinnedViewMode ?? (isShell ? 'terminal' : 'chat');
-
-  if (mode === 'terminal') {
-    return <TerminalView sessionName={sessionName} ws={ctx.ws} connected={ctx.connected} mobileInput={isShell} />;
-  }
+  const modelDisplay = liveSub.modelDisplay ?? (liveSub.type === 'qwen' ? liveSub.qwenModel : undefined);
 
   return (
-    <ChatView
-      events={events}
-      loading={false}
-      refreshing={refreshing}
-      sessionId={sessionName}
-      sessionState={liveSub.state}
-      ws={ctx.ws}
-      workdir={liveSub.cwd ?? null}
-      serverId={ctx.serverId}
-      onQuote={ctx.onQuote}
-    />
+    <>
+      {mode === 'terminal' ? (
+        <TerminalView sessionName={sessionName} ws={ctx.ws} connected={ctx.connected} mobileInput={isShell} />
+      ) : (
+        <ChatView
+          events={events}
+          loading={false}
+          refreshing={refreshing}
+          sessionId={sessionName}
+          sessionState={liveSub.state}
+          ws={ctx.ws}
+          workdir={liveSub.cwd ?? null}
+          serverId={ctx.serverId}
+          onQuote={ctx.onQuote}
+        />
+      )}
+      {(lastUsage || activeThinkingTs || statusText) && (
+        <UsageFooter
+          usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
+          sessionName={sessionName}
+          modelOverride={modelDisplay ?? undefined}
+          showCost={false}
+          activeThinkingTs={activeThinkingTs}
+          statusText={statusText}
+        />
+      )}
+      {(liveSub.quotaLabel || liveSub.quotaUsageLabel || liveSub.planLabel) && (
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', padding: '2px 8px', flexShrink: 0 }}>
+          {(liveSub.quotaLabel || liveSub.quotaUsageLabel) && (
+            <span class="session-usage-quota-inline">{[liveSub.quotaLabel, liveSub.quotaUsageLabel].filter(Boolean).join(' · ')}</span>
+          )}
+          {liveSub.planLabel && (
+            <span class="session-usage-quota-inline" style={{ color: '#93c5fd' }}>{liveSub.planLabel}</span>
+          )}
+        </div>
+      )}
+    </>
   );
 }
 

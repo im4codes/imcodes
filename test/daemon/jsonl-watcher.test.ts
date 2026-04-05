@@ -33,7 +33,7 @@ vi.mock('../../src/util/model-context.js', () => ({
 
 import {
   startWatching, startWatchingFile, stopWatching, isWatching,
-  watcherStatus, claudeProjectDir, preClaimFile,
+  watcherStatus, claudeProjectDir, preClaimFile, emitRecentHistory,
 } from '../../src/daemon/jsonl-watcher.js';
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -528,9 +528,13 @@ describe('emitRecentHistory — returns last N lines', () => {
     }
     await writeFile(filePath, content);
 
-    // startWatchingFile reads history on activate
+    // Start watcher first (so sessionName is registered), then call emitRecentHistory directly
     await startWatchingFile('test_session', filePath);
-    await new Promise((r) => setTimeout(r, 500));
+    emittedEvents.length = 0;
+
+    // emitRecentHistory is an on-demand call — not triggered automatically on startup
+    await emitRecentHistory('test_session', filePath);
+    await new Promise((r) => setTimeout(r, 200));
 
     // Check: the LAST messages should be present, not the first
     const textEvents = emittedEvents.filter((e) => e.type === 'assistant.text');
@@ -654,12 +658,14 @@ describe('claim management', () => {
 describe('stable eventId generation', () => {
   it('generates deterministic eventIds based on byte offset', async () => {
     const filePath = join(testDir, 'stable-id.jsonl');
-    const content = assistantText('Deterministic ID test.') + userMessage('User says hello.');
-    await writeFile(filePath, content);
-
-    // Read history — should produce stable IDs
+    // Start with empty file, then append — eventIds are based on byte offset of new content
+    await writeFile(filePath, '');
     await startWatchingFile('test_session', filePath);
-    await new Promise((r) => setTimeout(r, 300));
+    await new Promise((r) => setTimeout(r, 100));
+    emittedEvents.length = 0;
+
+    await appendFile(filePath, assistantText('Deterministic ID test.') + userMessage('User says hello.'));
+    await new Promise((r) => setTimeout(r, 500));
 
     const withIds = emittedEvents.filter((e) => e.opts?.eventId);
     expect(withIds.length).toBeGreaterThan(0);
@@ -672,11 +678,13 @@ describe('stable eventId generation', () => {
 
   it('produces same eventIds on re-read (daemon restart simulation)', async () => {
     const filePath = join(testDir, 'restart-sim.jsonl');
+    // Start with some pre-existing content (byte offset 0 is stable)
     const content = assistantText('Stable across restarts.');
     await writeFile(filePath, content);
 
-    // First read
+    // First read: call emitRecentHistory directly (not via watcher startup)
     await startWatchingFile('test_session', filePath);
+    await emitRecentHistory('test_session', filePath);
     await new Promise((r) => setTimeout(r, 300));
     const firstIds = emittedEvents.filter((e) => e.opts?.eventId).map((e) => String(e.opts!.eventId));
     stopWatching('test_session');
@@ -685,6 +693,7 @@ describe('stable eventId generation', () => {
 
     // Second read (simulating daemon restart)
     await startWatchingFile('test_session', filePath);
+    await emitRecentHistory('test_session', filePath);
     await new Promise((r) => setTimeout(r, 300));
     const secondIds = emittedEvents.filter((e) => e.opts?.eventId).map((e) => String(e.opts!.eventId));
 

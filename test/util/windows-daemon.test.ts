@@ -3,13 +3,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const state = vi.hoisted(() => ({
   pidContents: [''],
   pidIndex: 0,
-  taskQueryOutput: '',
   scheduledTaskRunOk: false,
   vbsExists: false,
   startupCmdExists: false,
   alivePids: new Set<number>(),
   execCalls: [] as string[],
   spawnCalls: [] as Array<{ cmd: string; args: string[] }>,
+  /** Simulated wmic ParentProcessId result for killWatchdogTree */
+  wmicParentPid: null as number | null,
 }));
 
 vi.mock('node:os', () => ({
@@ -41,11 +42,18 @@ vi.mock('node:fs', () => ({
 vi.mock('node:child_process', () => ({
   execSync: vi.fn((cmd: string, opts?: { encoding?: string }) => {
     state.execCalls.push(cmd);
-    if (cmd.startsWith('taskkill /f /pid ')) return '';
-    if (cmd.includes('schtasks /Query /TN imcodes-daemon')) {
-      if (!state.taskQueryOutput) throw new Error('task missing');
-      return opts?.encoding ? state.taskQueryOutput : Buffer.from(state.taskQueryOutput);
+    // killWatchdogTree: wmic query for parent PID
+    if (cmd.includes('wmic process where') && cmd.includes('ParentProcessId')) {
+      if (state.wmicParentPid !== null) {
+        const result = `\r\nParentProcessId=${state.wmicParentPid}\r\n`;
+        return opts?.encoding ? result : Buffer.from(result);
+      }
+      throw new Error('not found');
     }
+    // killWatchdogTree: taskkill /f /t (tree kill)
+    if (cmd.startsWith('taskkill /f /t /pid ')) return '';
+    // belt-and-suspenders: taskkill /f /pid (single process)
+    if (cmd.startsWith('taskkill /f /pid ')) return '';
     if (cmd.includes('schtasks /Run /TN imcodes-daemon')) {
       if (!state.scheduledTaskRunOk) throw new Error('run failed');
       return '';
@@ -63,13 +71,13 @@ describe('restartWindowsDaemon', () => {
     vi.resetModules();
     state.pidContents = [''];
     state.pidIndex = 0;
-    state.taskQueryOutput = '';
     state.scheduledTaskRunOk = false;
     state.vbsExists = false;
     state.startupCmdExists = false;
     state.alivePids = new Set<number>();
     state.execCalls = [];
     state.spawnCalls = [];
+    state.wmicParentPid = null;
     vi.spyOn(process, 'kill').mockImplementation(((pid: number) => {
       if (!state.alivePids.has(pid)) throw new Error('not running');
       return true;
@@ -79,45 +87,39 @@ describe('restartWindowsDaemon', () => {
   it('returns false when no restart path is available', async () => {
     const { restartWindowsDaemon } = await import('../../src/util/windows-daemon.js');
     expect(restartWindowsDaemon()).toBe(false);
-    expect(state.execCalls.some((c) => c.includes('schtasks /Run /TN imcodes-daemon'))).toBe(true);
+    // No VBS, no schtask, no startup shortcut — nothing to trigger
     expect(state.spawnCalls).toHaveLength(0);
   });
 
-  it('triggers scheduled task and waits for a new live daemon pid', async () => {
+  it('kills watchdog tree and launches VBS when available', async () => {
+    state.pidContents = ['123', '456'];
+    state.alivePids = new Set([456]);
+    state.vbsExists = true;
+    state.wmicParentPid = 999; // watchdog parent
+
+    const { restartWindowsDaemon } = await import('../../src/util/windows-daemon.js');
+    expect(restartWindowsDaemon()).toBe(true);
+    // Should tree-kill the watchdog parent
+    expect(state.execCalls).toContain('taskkill /f /t /pid 999');
+    // Should launch VBS (preferred over schtask)
+    expect(state.spawnCalls[0]).toEqual(
+      expect.objectContaining({ cmd: 'wscript', args: expect.arrayContaining(['C:\\Users\\tester\\.imcodes\\daemon-launcher.vbs']) }),
+    );
+  });
+
+  it('falls back to scheduled task when VBS is not available', async () => {
     state.pidContents = ['123', '456'];
     state.alivePids = new Set([456]);
     state.scheduledTaskRunOk = true;
+    state.wmicParentPid = 888;
 
     const { restartWindowsDaemon } = await import('../../src/util/windows-daemon.js');
     expect(restartWindowsDaemon()).toBe(true);
-    expect(state.execCalls).toContain('taskkill /f /pid 123');
+    expect(state.execCalls).toContain('taskkill /f /t /pid 888');
     expect(state.execCalls).toContain('schtasks /Run /TN imcodes-daemon');
   });
 
-  it('accepts an already-running watchdog if it yields a new live daemon pid', async () => {
-    state.pidContents = ['123', '123', '789'];
-    state.alivePids = new Set([789]);
-    state.taskQueryOutput = '"imcodes-daemon","Next Run Time","Status","Running"';
-
-    const { restartWindowsDaemon } = await import('../../src/util/windows-daemon.js');
-    expect(restartWindowsDaemon()).toBe(true);
-    expect(state.execCalls).toContain('taskkill /f /pid 123');
-    expect(state.execCalls.some((c) => c.includes('schtasks /Query /TN imcodes-daemon'))).toBe(true);
-  });
-
-  it('falls back to VBS launcher and waits for daemon pid', async () => {
-    state.pidContents = ['', '900'];
-    state.alivePids = new Set([900]);
-    state.vbsExists = true;
-
-    const { restartWindowsDaemon } = await import('../../src/util/windows-daemon.js');
-    expect(restartWindowsDaemon()).toBe(true);
-    expect(state.spawnCalls).toEqual([
-      { cmd: 'wscript', args: ['C:\\Users\\tester\\.imcodes\\daemon-launcher.vbs'] },
-    ]);
-  });
-
-  it('falls back to startup shortcut when no scheduled task or VBS launcher is available', async () => {
+  it('falls back to startup shortcut as last resort', async () => {
     state.pidContents = ['', '901'];
     state.alivePids = new Set([901]);
     state.startupCmdExists = true;
@@ -130,5 +132,17 @@ describe('restartWindowsDaemon', () => {
         args: ['/c', 'C:\\Users\\tester\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\imcodes-daemon.cmd'],
       },
     ]);
+  });
+
+  it('force-kills daemon if tree-kill misses it', async () => {
+    state.pidContents = ['123', '456'];
+    state.alivePids = new Set([123, 456]); // daemon still alive after tree-kill
+    state.vbsExists = true;
+    state.wmicParentPid = null; // wmic fails — no parent found
+
+    const { restartWindowsDaemon } = await import('../../src/util/windows-daemon.js');
+    expect(restartWindowsDaemon()).toBe(true);
+    // Should fall back to direct taskkill
+    expect(state.execCalls).toContain('taskkill /f /pid 123');
   });
 });

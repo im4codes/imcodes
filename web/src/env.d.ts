@@ -11,3 +11,9 @@ declare module '*?raw' {
   const src: string;
   export default src;
 }
+
+// pdfjs worker module — loaded via dynamic import for globalThis.pdfjsWorker bypass
+declare module 'pdfjs-dist/build/pdf.worker.min.mjs' {
+  const WorkerMessageHandler: unknown;
+  export { WorkerMessageHandler };
+}

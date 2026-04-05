@@ -5,6 +5,7 @@
  */
 import { useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
+import { mapP2pStatusToUiState } from '@shared/p2p-status.js';
 
 export interface P2pRingProgressProps {
   completedRounds: number;
@@ -19,8 +20,6 @@ export interface P2pRingProgressProps {
 }
 
 // Active statuses that show "Round N/M" in the center
-const ACTIVE_STATUSES = new Set(['running', 'dispatched', 'awaiting_next_hop', 'setup']);
-
 // SVG geometry constants
 const OUTER_RADIUS = 30;
 const STROKE_WIDTH = 4;
@@ -44,14 +43,16 @@ export function P2pRingProgress({
   const visibleRoundHop = useMemo(() => {
     if (totalHops <= 0) return 0;
     if (typeof activeRoundHop === 'number') return activeRoundHop;
-    const visibleGlobalHop = ACTIVE_STATUSES.has(status) ? (activeHop ?? completedHops) : completedHops;
+    const active = mapP2pStatusToUiState(status) === 'running' || status === 'setup';
+    const visibleGlobalHop = active ? (activeHop ?? completedHops) : completedHops;
     return visibleGlobalHop > 0 ? ((visibleGlobalHop - 1) % totalHops) + 1 : 0;
   }, [activeHop, activeRoundHop, completedHops, status, totalHops]);
 
   // Use hop-level progress if available, fall back to round-level
   const fraction = useMemo(() => {
+    const active = mapP2pStatusToUiState(status) === 'running' || status === 'setup';
     if (totalHops > 0) {
-      const visibleHop = ACTIVE_STATUSES.has(status) ? (activeHop ?? completedHops) : completedHops;
+      const visibleHop = active ? (activeHop ?? completedHops) : completedHops;
       const totalOverallHops = totalRounds > 1 ? totalRounds * totalHops : totalHops;
       return Math.min(1, Math.max(0, visibleHop / totalOverallHops));
     }
@@ -65,7 +66,7 @@ export function P2pRingProgress({
   }, [fraction]);
 
   const centerText = useMemo(() => {
-    if (ACTIVE_STATUSES.has(status)) {
+    if (mapP2pStatusToUiState(status) === 'running' || status === 'setup') {
       if (totalHops > 0) {
         return t('p2p.ring.active_hops', {
           round: completedRounds + 1,
@@ -85,7 +86,7 @@ export function P2pRingProgress({
   }, [status, completedRounds, totalRounds, totalHops, visibleRoundHop, t]);
 
   const statusLabel = useMemo(() => {
-    if (ACTIVE_STATUSES.has(status)) {
+    if (mapP2pStatusToUiState(status) === 'running' || status === 'setup') {
       return t('p2p.ring.label_active', {
         round: completedRounds + 1,
         totalRounds,

@@ -22,6 +22,7 @@ import { timelineEmitter } from './timeline-emitter.js';
 import logger from '../util/logger.js';
 import { resolveContextWindow } from '../util/model-context.js';
 import { getSessionContextWindow } from './cc-presets.js';
+import { registerWatcherControl, unregisterWatcherControl, type WatcherControl } from './watcher-controls.js';
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
@@ -427,6 +428,12 @@ interface WatcherState {
 
 const watchers = new Map<string, WatcherState>();
 
+function watcherControl(sessionName: string): WatcherControl {
+  return {
+    refresh: () => refreshTrackedSession(sessionName),
+  };
+}
+
 /**
  * Persistent ownership registry: maps JSONL file UUID (from filename) → watcher sessionName.
  * Unlike claimedFiles, this is NOT released on rotation — once a UUID is known to belong
@@ -485,6 +492,11 @@ function canClaim(sessionName: string, filePath: string): boolean {
   return !isOwnedByOther(sessionName, filePath);
 }
 
+function isTrackedClaudeFile(state: WatcherState, filePath: string): boolean {
+  if (state.ccSessionId) return fileUuid(filePath) === state.ccSessionId;
+  return true;
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 const HISTORY_LINES = 500; // max lines to scan for recent assistant.text history
@@ -492,7 +504,7 @@ const HISTORY_LINES = 500; // max lines to scan for recent assistant.text histor
 /**
  * Read the tail of a JSONL file and emit history events (text, thinking, tool.call, tool.result).
  */
-async function emitRecentHistory(sessionName: string, filePath: string): Promise<void> {
+export async function emitRecentHistory(sessionName: string, filePath: string): Promise<void> {
   let fh: Awaited<ReturnType<typeof open>> | null = null;
   try {
     fh = await open(filePath, 'r');
@@ -636,7 +648,7 @@ async function emitRecentHistory(sessionName: string, filePath: string): Promise
  */
 /**
  * Shared: once a specific JSONL file is confirmed to exist, claim it,
- * replay recent history, and start polling + fs.watch for new content.
+ * and start polling + fs.watch for new content from the current end of file.
  * Called by both startWatching (found via dir scan) and startWatchingFile (known path).
  */
 async function activateFile(sessionName: string, state: WatcherState, filePath: string): Promise<void> {
@@ -651,10 +663,9 @@ async function activateFile(sessionName: string, state: WatcherState, filePath: 
     state.activeFile = filePath;
     state.fileOffset = 0;
   }
-  await emitRecentHistory(sessionName, filePath);
 }
 
-export async function startWatching(sessionName: string, workDir: string, ccSessionId?: string): Promise<void> {
+export async function startWatching(sessionName: string, workDir: string, ccSessionId?: string): Promise<WatcherControl> {
   if (watchers.has(sessionName)) stopWatching(sessionName);
 
   const projectDir = claudeProjectDir(workDir);
@@ -665,15 +676,17 @@ export async function startWatching(sessionName: string, workDir: string, ccSess
     ccSessionId,
   };
   watchers.set(sessionName, state);
+  const control = watcherControl(sessionName);
+  registerWatcherControl(sessionName, control);
 
   if (!ccSessionId) {
     logger.warn({ session: sessionName }, 'jsonl-watcher: falling back to directory scan (no ccSessionId)');
   }
 
-  // Find the current active JSONL file; only claim an unclaimed one.
-  const latest = await findLatestJsonl(projectDir);
-  if (latest && canClaim(sessionName, latest)) {
-    await activateFile(sessionName, state, latest);
+  // Bind to the known Claude session transcript when possible.
+  const preferred = ccSessionId ? scanForJsonlBySessionId(ccSessionId) : await findLatestJsonl(projectDir);
+  if (preferred && isTrackedClaudeFile(state, preferred) && canClaim(sessionName, preferred)) {
+    await activateFile(sessionName, state, preferred);
     state.status = 'active';
   } else {
     state.status = 'degraded';
@@ -682,6 +695,7 @@ export async function startWatching(sessionName: string, workDir: string, ccSess
   // Poll every 2s (uses pollTick so it can re-acquire a file if the claim changes).
   state.pollTimer = setInterval(() => { void pollTick(sessionName, state); }, 2000);
   void watchDir(sessionName, state);
+  return control;
 }
 
 /** Returns true if a JSONL watcher is registered for this session. */
@@ -703,6 +717,7 @@ export function stopWatching(sessionName: string): void {
   state.abort.abort();
   if (state.pollTimer) clearInterval(state.pollTimer);
   watchers.delete(sessionName);
+  unregisterWatcherControl(sessionName);
   releaseFiles(sessionName);
   releaseOwnership(sessionName);
 }
@@ -713,7 +728,7 @@ export function stopWatching(sessionName: string): void {
  * then polls until the file appears, replays history, and tails new content.
  * Supports rotation to newer files (CC creates new JSONL on context overflow).
  */
-export async function startWatchingFile(sessionName: string, filePath: string, ccSessionId?: string): Promise<void> {
+export async function startWatchingFile(sessionName: string, filePath: string, ccSessionId?: string): Promise<WatcherControl> {
   if (watchers.has(sessionName)) stopWatching(sessionName);
 
   // Pre-claim before file exists so the main session watcher cannot steal it.
@@ -726,6 +741,8 @@ export async function startWatchingFile(sessionName: string, filePath: string, c
     ccSessionId,
   };
   watchers.set(sessionName, state);
+  const control = watcherControl(sessionName);
+  registerWatcherControl(sessionName, control);
 
   // Poll until the specific file appears (up to 120s — CC needs first conversation).
   let appeared = false;
@@ -745,7 +762,7 @@ export async function startWatchingFile(sessionName: string, filePath: string, c
     state.status = 'stopped';
     watchers.delete(sessionName);
     releaseFiles(sessionName);
-    return;
+    return control;
   }
 
   await activateFile(sessionName, state, filePath);
@@ -771,6 +788,7 @@ export async function startWatchingFile(sessionName: string, filePath: string, c
     }
   }, 2000);
   void watchFile(sessionName, state, filePath);
+  return control;
 }
 
 async function watchFile(sessionName: string, state: WatcherState, filePath: string): Promise<void> {
@@ -785,7 +803,7 @@ async function watchFile(sessionName: string, state: WatcherState, filePath: str
 
       if (changedFile === state.activeFile) {
         await drainNewLines(sessionName, state);
-      } else if (canClaim(sessionName, changedFile)) {
+      } else if (isTrackedClaudeFile(state, changedFile) && canClaim(sessionName, changedFile)) {
         // A different JSONL file is being written — CC may have rotated (context overflow).
         // Only switch if the new file is actually newer to avoid grabbing another session's file
         // whose claim was momentarily released (matches watchDir's checkNewer guard).
@@ -841,6 +859,7 @@ async function watchDir(sessionName: string, state: WatcherState): Promise<void>
       // If a new file appeared that is newer than our active file, switch to it.
       // Skip if another session has already claimed it.
       if (changedFile !== state.activeFile) {
+        if (!isTrackedClaudeFile(state, changedFile)) continue;
         if (!canClaim(sessionName, changedFile)) continue; // claimed by another session
         const isNewer = await checkNewer(changedFile, state.activeFile);
         if (isNewer || !state.activeFile) {
@@ -882,31 +901,47 @@ async function pollTick(sessionName: string, state: WatcherState): Promise<void>
   // If active file was stolen by another session, try to find a claimable replacement
   if (!state.activeFile) {
     try {
-      const entries = await readdir(state.projectDir);
-      const jsonls = entries.filter((e) => e.endsWith('.jsonl'));
-      const withStats = await Promise.all(
-        jsonls.map(async (f) => {
-          const fp = join(state.projectDir, f);
-          if (!canClaim(sessionName, fp)) return null;
-          try { return { fp, mtime: (await stat(fp)).mtimeMs }; } catch { return null; }
-        }),
-      );
-      const best = withStats
-        .filter((x): x is { fp: string; mtime: number } => x !== null)
-        .sort((a, b) => b.mtime - a.mtime)[0];
-      if (best) {
-        try {
+      const preferred = state.ccSessionId ? scanForJsonlBySessionId(state.ccSessionId) : null;
+      if (preferred && isTrackedClaudeFile(state, preferred) && canClaim(sessionName, preferred)) {
+        await activateFile(sessionName, state, preferred);
+        state.status = 'active';
+      } else if (!state.ccSessionId) {
+        const entries = await readdir(state.projectDir);
+        const jsonls = entries.filter((e) => e.endsWith('.jsonl'));
+        const withStats = await Promise.all(
+          jsonls.map(async (f) => {
+            const fp = join(state.projectDir, f);
+            if (!isTrackedClaudeFile(state, fp) || !canClaim(sessionName, fp)) return null;
+            try { return { fp, mtime: (await stat(fp)).mtimeMs }; } catch { return null; }
+          }),
+        );
+        const best = withStats
+          .filter((x): x is { fp: string; mtime: number } => x !== null)
+          .sort((a, b) => b.mtime - a.mtime)[0];
+        if (best) {
           await activateFile(sessionName, state, best.fp);
           state.status = 'active';
-        } catch {
-          state.activeFile = null;
-          state.fileOffset = 0;
-          state.status = 'degraded';
         }
       }
     } catch { /* ignore */ }
+    if (!state.activeFile) {
+      state.fileOffset = 0;
+      state.status = 'degraded';
+    }
   }
   await drainNewLines(sessionName, state);
+}
+
+/**
+ * Force the registered watcher to immediately run its normal scan/drain cycle for
+ * this session. Uses the watcher's existing state and claim rules; does not guess
+ * other files by project.
+ */
+export async function refreshTrackedSession(sessionName: string): Promise<boolean> {
+  const state = watchers.get(sessionName);
+  if (!state || state.stopped) return false;
+  await pollTick(sessionName, state);
+  return true;
 }
 
 /** Read any new lines from the active JSONL file since the last offset. */

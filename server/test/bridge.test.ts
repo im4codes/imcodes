@@ -146,7 +146,7 @@ describe('WsBridge', () => {
       expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905-dev.877'))).toBe(true);
     });
 
-    it('does not send daemon.upgrade when daemon version is newer than server version', async () => {
+    it('sends daemon.upgrade when daemon is newer than server version so versions converge exactly', async () => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.4.905-dev.877';
 
@@ -159,7 +159,39 @@ describe('WsBridge', () => {
       await vi.advanceTimersByTimeAsync(5000);
       await flushAsync();
 
-      expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"'))).toBe(false);
+      expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905-dev.877'))).toBe(true);
+    });
+
+    it('sends daemon.upgrade when server is dev and daemon is stable', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.4.905-dev.877';
+
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash'), {} as never);
+
+      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.905' }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushAsync();
+
+      expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905-dev.877'))).toBe(true);
+    });
+
+    it('sends daemon.upgrade when server is stable and daemon is dev', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.4.905';
+
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash'), {} as never);
+
+      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.4.905-dev.877' }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushAsync();
+
+      expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905'))).toBe(true);
     });
   });
 
@@ -186,6 +218,43 @@ describe('WsBridge', () => {
       daemonWs.emit('message', JSON.stringify({ type: 'terminal_update', diff: { sessionName: 'sess-tu', a: 1 } }));
       await flushAsync();
       expect(JSON.parse(browserWs.sentStrings[0]).type).toBe('terminal.diff');
+    });
+
+    it('relays additive p2p.run_update payload fields without stripping legacy fields', async () => {
+      const { daemonWs, browserWs } = await setupAuthenticatedBridge();
+      const run = {
+        id: 'run-1',
+        discussion_id: 'dsc-1',
+        status: 'running',
+        mode_key: 'audit',
+        current_round: 1,
+        total_rounds: 2,
+        active_phase: 'hop',
+        completed_hops_count: 1,
+        total_hops: 2,
+        all_nodes: [],
+        run_phase: 'round_execution',
+        summary_phase: null,
+        hop_states: [
+          { hop_index: 1, round_index: 1, session: 'deck_proj_w1', mode: 'audit', status: 'completed', started_at: 1, completed_at: null, error: null },
+          { hop_index: 2, round_index: 1, session: 'deck_proj_w2', mode: 'audit', status: 'running', started_at: 2, completed_at: null, error: null },
+        ],
+        hop_counts: { total: 2, queued: 0, dispatched: 0, running: 1, completed: 1, timed_out: 0, failed: 0, cancelled: 0 },
+      };
+
+      daemonWs.emit('message', JSON.stringify({ type: 'p2p.run_save', run }));
+      await flushAsync();
+
+      const update = browserWs.sentStrings
+        .map((msg) => JSON.parse(msg))
+        .find((msg) => msg.type === 'p2p.run_update');
+
+      expect(update).toBeTruthy();
+      expect(update.run.status).toBe('running');
+      expect(update.run.active_phase).toBe('hop');
+      expect(update.run.run_phase).toBe('round_execution');
+      expect(update.run.hop_states).toHaveLength(2);
+      expect(update.run.hop_counts.completed).toBe(1);
     });
 
     it('translates session_event → session.event', async () => {

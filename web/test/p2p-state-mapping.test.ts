@@ -5,19 +5,7 @@
  * Covers the bug where 'dispatched' was mapped to 'setup' instead of 'running'.
  */
 import { describe, it, expect } from 'vitest';
-
-// Re-implement the mapping function exactly as it is in app.tsx
-// to test the logic in isolation
-const P2P_DONE = new Set(['completed']);
-const P2P_FAILED = new Set(['failed', 'timed_out', 'cancelled']);
-const P2P_RUNNING = new Set(['running', 'awaiting_next_hop', 'dispatched']);
-
-function mapP2pState(status: string): 'done' | 'failed' | 'running' | 'setup' {
-  if (P2P_DONE.has(status)) return 'done';
-  if (P2P_FAILED.has(status)) return 'failed';
-  if (P2P_RUNNING.has(status)) return 'running';
-  return 'setup';
-}
+import { mapP2pStatusToUiState as mapP2pState } from '@shared/p2p-status.js';
 
 describe('mapP2pState — P2P status to UI state mapping', () => {
   it('completed → done', () => expect(mapP2pState('completed')).toBe('done'));

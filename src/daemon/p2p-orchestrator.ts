@@ -6,7 +6,7 @@
  * Completion = file grew + agent idle.
  */
 
-import { stat, writeFile, readFile, unlink, copyFile } from 'node:fs/promises';
+import { appendFile, readdir, stat, writeFile, readFile, unlink, copyFile } from 'node:fs/promises';
 import { join, basename, dirname } from 'node:path';
 import { ensureImcDir } from '../util/imc-dir.js';
 import { randomUUID } from 'node:crypto';
@@ -16,27 +16,37 @@ import { getSession } from '../store/session-store.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
 import { P2P_BASELINE_PROMPT, getP2pMode, getModeForRound, isComboMode, parseModePipeline, roundPrompt, type P2pMode } from '../../shared/p2p-modes.js';
 import { formatP2pParticipantIdentity, shortP2pSessionName } from '../../shared/p2p-participant.js';
+import {
+  P2P_TERMINAL_HOP_STATUSES,
+  P2P_TERMINAL_RUN_STATUSES,
+  type P2pActivePhase,
+  type P2pHopCounts,
+  type P2pHopProgress,
+  type P2pHopStatus,
+  type P2pRunPhase,
+  type P2pRunStatus,
+  type P2pRunUpdatePayload,
+  type P2pSummaryPhase,
+} from '../../shared/p2p-status.js';
 import logger from '../util/logger.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
-export type P2pRunStatus =
-  | 'queued'
-  | 'dispatched'
-  | 'running'
-  | 'awaiting_next_hop'
-  | 'completed'
-  | 'timed_out'
-  | 'failed'
-  | 'interrupted'
-  | 'cancelling'
-  | 'cancelled';
+export type { P2pRunStatus } from '../../shared/p2p-status.js';
 
 export interface P2pTarget {
   session: string; // full tmux session name e.g. deck_myapp_w2
   mode: string;    // mode key e.g. 'audit'
+}
+
+interface P2pHopRuntime extends P2pHopProgress {
+  section_header: string;
+  artifact_path: string;
+  working_path: string | null;
+  baseline_size: number;
+  baseline_content: string;
 }
 
 export interface P2pRun {
@@ -51,6 +61,9 @@ export interface P2pRun {
   totalTargets: number;
   mode: string;
   status: P2pRunStatus;
+  runPhase: P2pRunPhase;
+  summaryPhase: P2pSummaryPhase | null;
+  activePhase: P2pActivePhase;
   contextFilePath: string;
   /** Original user request text — used in Phase 3 so initiator can execute final instructions. */
   userText: string;
@@ -74,6 +87,9 @@ export interface P2pRun {
   extraPrompt: string;
   /** Epoch ms when the current hop/phase started — used by the UI for hop-level elapsed timer. */
   hopStartedAt: number;
+  /** Parallel hop runtime state across all rounds. */
+  hopStates: P2pHopRuntime[];
+  activeTargetSessions: string[];
   /** Internal: set to true when cancel requested */
   _cancelled: boolean;
 }
@@ -85,19 +101,35 @@ const activeRuns = new Map<string, P2pRun>();
 export function getP2pRun(id: string): P2pRun | undefined { return activeRuns.get(id); }
 export function listP2pRuns(): P2pRun[] { return [...activeRuns.values()]; }
 
-export function serializeP2pRun(run: P2pRun): Record<string, unknown> {
+export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
+  const completedHopCount = run.hopStates.filter((hop) => hop.status === 'completed').length;
+  const currentRoundCompletedHopCount = run.hopStates.filter(
+    (hop) => hop.round_index === run.currentRound && hop.status === 'completed',
+  ).length;
+  const currentHop = run.activeTargetSessions[0] ?? run.currentTargetSession;
+  const currentHopState = currentHop
+    ? run.hopStates.find((hop) =>
+      hop.session === currentHop &&
+      hop.round_index === run.currentRound &&
+      (hop.status === 'running' || hop.status === 'dispatched'),
+    ) ?? null
+    : null;
+  const hopCounts = countHopStates(run.hopStates);
+
   return {
     id: run.id,
     discussion_id: run.discussionId,
     server_id: '', // filled by bridge from auth context
     main_session: run.mainSession,
     initiator_session: run.initiatorSession,
-    current_target_session: run.currentTargetSession,
+    current_target_session: currentHop,
     final_return_session: run.finalReturnSession,
     remaining_targets: JSON.stringify(run.remainingTargets),
     mode_key: run.mode,
     current_round_mode: isComboMode(run.mode) ? (getModeForRound(run.mode, run.currentRound)?.key ?? run.mode) : run.mode,
     status: run.status,
+    run_phase: run.runPhase,
+    summary_phase: run.summaryPhase,
     request_message_id: null,
     callback_message_id: null,
     context_ref: JSON.stringify({ type: 'file', path: run.contextFilePath }),
@@ -111,32 +143,23 @@ export function serializeP2pRun(run: P2pRun): Record<string, unknown> {
     total_count: run.totalTargets + 2, // +2 for Phase 1 (initial) + Phase 3 (summary)
     total_hops: run.totalTargets,
     remaining_count: run.remainingTargets.length,
-    completed_hops_count: run.completedHops.length,
-    completed_round_hops_count: Math.max(0, run.completedHops.length - ((run.currentRound - 1) * run.totalTargets)),
+    completed_hops_count: completedHopCount,
+    completed_round_hops_count: currentRoundCompletedHopCount,
     current_round: run.currentRound,
     total_rounds: run.rounds,
     skipped_hops: run.skippedHops,
-    active_phase: (() => {
-      if (run.currentTargetSession === run.initiatorSession) {
-        return run.remainingTargets.length === 0 ? 'summary' : 'initial';
-      }
-      if (run.currentTargetSession) return 'hop';
-      if (run.status === 'completed') return 'summary';
-      return 'queued';
-    })(),
+    active_phase: run.activePhase,
     hop_started_at: run.hopStartedAt || null,
-    active_hop_number: run.currentTargetSession && run.currentTargetSession !== run.initiatorSession
-      ? run.completedHops.length + 1
-      : null,
-    active_round_hop_number: run.currentTargetSession && run.currentTargetSession !== run.initiatorSession && run.totalTargets > 0
-      ? ((run.completedHops.length % run.totalTargets) + 1)
+    active_hop_number: currentHopState ? currentHopState.hop_index : null,
+    active_round_hop_number: currentHopState && run.totalTargets > 0
+      ? (((currentHopState.hop_index - 1) % run.totalTargets) + 1)
       : null,
     // Agent metadata for display
     current_target_label: (() => {
-      if (!run.currentTargetSession) return null;
-      const rec = getSession(run.currentTargetSession);
+      if (!currentHop) return null;
+      const rec = getSession(currentHop);
       return formatP2pParticipantIdentity({
-        session: run.currentTargetSession,
+        session: currentHop,
         label: rec?.label,
         agentType: rec?.agentType,
         ccPreset: rec?.ccPreset,
@@ -151,7 +174,22 @@ export function serializeP2pRun(run: P2pRun): Record<string, unknown> {
         ccPreset: rec?.ccPreset,
       });
     })(),
-    // Full node list for segmented progress display — includes completed, active, pending, skipped
+    hop_states: run.hopStates.map((hop) => ({
+      hop_index: hop.hop_index,
+      round_index: hop.round_index,
+      session: hop.session,
+      mode: hop.mode,
+      status: hop.status,
+      started_at: hop.started_at,
+      completed_at: hop.completed_at,
+      error: hop.error,
+      output_path: hop.output_path ?? null,
+    })),
+    hop_counts: hopCounts,
+    terminal_reason: run.status === 'completed' || run.status === 'timed_out' || run.status === 'failed' || run.status === 'cancelled'
+      ? run.status
+      : null,
+    // Full node list for segmented progress display — compatibility projection
     all_nodes: (() => {
       type NodeInfo = {
         session: string;
@@ -195,35 +233,36 @@ export function serializeP2pRun(run: P2pRun): Record<string, unknown> {
 
       const initMode = resolveMode(1);
       const init = getInfo(run.initiatorSession, initMode, 'initial');
-      const phase1Done = run.completedHops.length > 0 || run.remainingTargets.length < run.totalTargets || run.status === 'completed';
-      const phase1Active = !phase1Done && run.currentTargetSession === run.initiatorSession;
+      const phase1Done = run.currentRound > 1 || hopCounts.completed > 0 || run.status === 'completed';
+      const phase1Active = run.activePhase === 'initial';
       nodes.push({ session: run.initiatorSession, ...init, status: phase1Done ? 'done' : phase1Active ? 'active' : 'pending' });
 
-      for (let hi = 0; hi < run.completedHops.length; hi++) {
-        const t = run.completedHops[hi];
-        const hopRound = run.totalTargets > 0 ? Math.floor(hi / run.totalTargets) + 1 : 1;
+      for (const hop of run.hopStates.filter((item) => item.status === 'completed' || item.status === 'timed_out' || item.status === 'failed' || item.status === 'cancelled')) {
+        const t = { session: hop.session, mode: hop.mode };
+        const hopRound = hop.round_index;
         const hopMode = combo ? resolveMode(hopRound) : t.mode;
         const info = getInfo(t.session, hopMode, 'hop');
-        nodes.push({ session: t.session, ...info, status: skippedSet.has(t.session) ? 'skipped' : 'done' });
+        const status = hop.status === 'completed' ? 'done' : 'skipped';
+        nodes.push({ session: t.session, ...info, status });
       }
-      if (run.currentTargetSession && run.currentTargetSession !== run.initiatorSession) {
+      if (currentHopState) {
         const curMode = combo ? resolveMode(run.currentRound) : (
-          run.allTargets.find((t) => t.session === run.currentTargetSession)?.mode
-          ?? run.remainingTargets.find((t) => t.session === run.currentTargetSession)?.mode
+          run.allTargets.find((t) => t.session === currentHopState.session)?.mode
+          ?? run.remainingTargets.find((t) => t.session === currentHopState.session)?.mode
           ?? run.mode
         );
-        const info = getInfo(run.currentTargetSession, curMode, 'hop');
-        nodes.push({ session: run.currentTargetSession, ...info, status: 'active' });
+        const info = getInfo(currentHopState.session, curMode, 'hop');
+        nodes.push({ session: currentHopState.session, ...info, status: 'active' });
       }
       for (const t of run.remainingTargets) {
-        if (t.session === run.currentTargetSession) continue;
+        if (t.session === currentHop) continue;
         const pendingMode = combo ? resolveMode(run.currentRound) : t.mode;
         const info = getInfo(t.session, pendingMode, 'hop');
         nodes.push({ session: t.session, ...info, status: 'pending' });
       }
 
       const summaryDone = run.status === 'completed';
-      const summaryActive = run.remainingTargets.length === 0 && !summaryDone && run.currentTargetSession === run.initiatorSession;
+      const summaryActive = run.activePhase === 'summary' && !summaryDone;
       const lastMode = combo ? resolveMode(run.rounds) : run.mode;
       const summary = getInfo(run.initiatorSession, lastMode, 'summary');
       nodes.push({ session: run.initiatorSession, ...summary, status: summaryDone ? 'done' : summaryActive ? 'active' : 'pending' });
@@ -338,6 +377,7 @@ export async function startP2pRun(
   const record = getSession(initiatorSession);
   const projectDir = record?.projectDir || process.cwd();
   const p2pDir = await ensureImcDir(projectDir, 'discussions');
+  await cleanupOrphanHopArtifacts(p2pDir);
   const contextFilePath = join(p2pDir, `${runId}.md`);
 
   let seed = `# P2P Discussion: ${runId}\n\n`;
@@ -368,6 +408,9 @@ export async function startP2pRun(
     totalTargets: targets.length,
     mode,
     status: 'queued',
+    runPhase: 'preparing',
+    summaryPhase: null,
+    activePhase: 'queued',
     contextFilePath,
     userText,
     timeoutMs: Math.min(hopTimeoutMs ?? modeConfig?.defaultTimeoutMs ?? 300_000, 600_000),
@@ -383,6 +426,8 @@ export async function startP2pRun(
     allTargets: [...targets],
     extraPrompt: extraPrompt ?? '',
     hopStartedAt: Date.now(),
+    hopStates: [],
+    activeTargetSessions: [],
     _cancelled: false,
   };
 
@@ -405,23 +450,25 @@ export async function cancelP2pRun(runId: string, serverLink: ServerLink | null)
   if (!run) return false;
 
   run._cancelled = true;
+  run.runPhase = 'cancelled';
 
   if (run.status === 'queued') {
+    run.activePhase = 'queued';
     transition(run, 'cancelled', serverLink);
     activeRuns.delete(runId);
     return true;
   }
 
-  if (['dispatched', 'running', 'awaiting_next_hop'].includes(run.status)) {
-    transition(run, 'interrupted', serverLink);
-    // Send Ctrl+C to current target if running
-    if (run.currentTargetSession) {
+  if (!isTerminal(run.status)) {
+    const targets = new Set(run.activeTargetSessions);
+    if (run.currentTargetSession) targets.add(run.currentTargetSession);
+    for (const target of targets) {
       try {
         const { sendKey } = await import('../agent/tmux.js');
-        await sendKey(run.currentTargetSession, 'C-c');
+        await sendKey(target, 'C-c');
       } catch { /* ignore */ }
     }
-    transition(run, 'cancelling', serverLink);
+    run.activeTargetSessions = [];
     transition(run, 'cancelled', serverLink);
     activeRuns.delete(runId);
     return true;
@@ -446,6 +493,152 @@ export async function resumePendingOrchestrations(serverLink: ServerLink | null)
 
 // ── Chain execution ───────────────────────────────────────────────────────
 
+function buildRoundHopArtifactPath(run: P2pRun, roundIndex: number, hopIndex: number): string {
+  return join(dirname(run.contextFilePath), `${run.id}.round${roundIndex}.hop${hopIndex}.md`);
+}
+
+const ORPHAN_ARTIFACT_MIN_AGE_MS = 6 * 60 * 60_000;
+
+async function cleanupOrphanHopArtifacts(discussionsDir: string): Promise<void> {
+  try {
+    const entries = await readdir(discussionsDir);
+    const now = Date.now();
+    await Promise.all(entries
+      .filter((name) => /\.round\d+\.hop\d+\.md$/.test(name))
+      .map(async (name) => {
+        const fullPath = join(discussionsDir, name);
+        try {
+          const info = await stat(fullPath);
+          if ((now - info.mtimeMs) < ORPHAN_ARTIFACT_MIN_AGE_MS) return;
+
+          const match = name.match(/^([^.]+)\.round\d+\.hop\d+\.md$/);
+          const runId = match?.[1] ?? null;
+          if (runId && activeRuns.has(runId)) return;
+
+          if (runId) {
+            const mainPath = join(discussionsDir, `${runId}.md`);
+            try {
+              const mainInfo = await stat(mainPath);
+              if ((now - mainInfo.mtimeMs) < ORPHAN_ARTIFACT_MIN_AGE_MS) return;
+            } catch {
+              // missing main file is acceptable for stale orphan cleanup
+            }
+          }
+
+          await unlink(fullPath);
+        } catch {
+          /* ignore */
+        }
+      }));
+  } catch {
+    /* ignore */
+  }
+}
+
+async function createRoundHopStates(run: P2pRun, targets: P2pTarget[], roundModeKey: string): Promise<P2pHopRuntime[]> {
+  const baselineBuffer = await readFile(run.contextFilePath);
+  const baselineSize = baselineBuffer.length;
+  const baselineContent = baselineBuffer.toString('utf8');
+  const combo = isComboMode(run.mode);
+  const roundHops: P2pHopRuntime[] = [];
+  for (let idx = 0; idx < targets.length; idx++) {
+    const target = targets[idx];
+    const artifactPath = buildRoundHopArtifactPath(run, run.currentRound, idx + 1);
+    await copyFile(run.contextFilePath, artifactPath);
+    roundHops.push({
+      hop_index: ((run.currentRound - 1) * Math.max(run.totalTargets, 1)) + idx + 1,
+      round_index: run.currentRound,
+      session: target.session,
+      mode: combo ? roundModeKey : target.mode,
+      status: 'queued',
+      started_at: null,
+      completed_at: null,
+      error: null,
+      output_path: artifactPath,
+      section_header: '',
+      artifact_path: artifactPath,
+      working_path: null,
+      baseline_size: baselineSize,
+      baseline_content: baselineContent,
+    });
+  }
+  run.hopStates = [
+    ...run.hopStates.filter((hop) => hop.round_index !== run.currentRound),
+    ...roundHops,
+  ];
+  return roundHops;
+}
+
+function extractHeadingSection(content: string, sectionHeader: string): string | null {
+  if (!sectionHeader) return null;
+  const heading = `## ${sectionHeader}`;
+  const start = content.lastIndexOf(heading);
+  if (start < 0) return null;
+  return content.slice(start);
+}
+
+function extractBestEffortEvidence(hop: P2pHopRuntime, content: string): string | null {
+  const headingSection = extractHeadingSection(content, hop.section_header);
+  if (headingSection?.trim()) return headingSection;
+
+  if (content.startsWith(hop.baseline_content)) {
+    const appended = content.slice(hop.baseline_content.length);
+    if (appended.trim()) return appended;
+  }
+
+  let prefix = 0;
+  const limit = Math.min(hop.baseline_content.length, content.length);
+  while (prefix < limit && hop.baseline_content[prefix] === content[prefix]) prefix += 1;
+  const tail = content.slice(prefix);
+  if (tail.trim()) return tail;
+
+  return content.trim() ? content : null;
+}
+
+async function appendRoundEvidence(run: P2pRun, roundHops: P2pHopRuntime[]): Promise<void> {
+  for (const hop of [...roundHops].sort((a, b) => a.hop_index - b.hop_index)) {
+    if (hop.status !== 'completed') continue;
+    const buffer = await readFile(hop.artifact_path);
+    let evidence: string | null = null;
+    if (buffer.length > hop.baseline_size) {
+      const exactAppended = buffer.subarray(hop.baseline_size).toString('utf8');
+      if (exactAppended.trim()) evidence = exactAppended;
+    }
+    if (!evidence) {
+      const content = buffer.toString('utf8');
+      evidence = extractBestEffortEvidence(hop, content);
+      if (evidence) {
+        logger.warn({ runId: run.id, session: hop.session, artifact: hop.artifact_path }, 'P2P: using best-effort evidence extraction fallback');
+      }
+    }
+    if (!evidence?.trim()) continue;
+    await appendFile(run.contextFilePath, evidence.startsWith('\n') ? evidence : `\n${evidence}`, 'utf8');
+  }
+}
+
+async function cleanupRoundHopArtifacts(roundHops: P2pHopRuntime[]): Promise<void> {
+  await Promise.all(roundHops.flatMap((hop) => {
+    const paths = [hop.artifact_path];
+    if (hop.working_path && hop.working_path !== hop.artifact_path) paths.push(hop.working_path);
+    return paths.map(async (path) => {
+      try { await unlink(path); } catch { /* ignore */ }
+    });
+  }));
+}
+
+function updateHopStatus(run: P2pRun, hop: P2pHopRuntime | null | undefined, status: P2pHopStatus, error: string | null = null): void {
+  if (!hop) return;
+  hop.status = status;
+  hop.error = error;
+  if (status === 'dispatched' || status === 'running') {
+    hop.started_at = Date.now();
+    run.hopStartedAt = hop.started_at;
+  }
+  if (P2P_TERMINAL_HOP_STATUSES.has(status)) {
+    hop.completed_at = new Date().toISOString();
+  }
+}
+
 async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, serverLink: ServerLink | null): Promise<void> {
   const totalHops = run.allTargets.length;
 
@@ -453,6 +646,8 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
   const combo = isComboMode(run.mode);
   for (; run.currentRound <= run.rounds; run.currentRound++) {
     if (run._cancelled || isTerminal(run.status)) return;
+    run.runPhase = 'round_execution';
+    run.summaryPhase = null;
 
     // For combo pipelines, resolve this round's mode; for single modes, use the fixed config
     const roundModeConfig = combo ? getModeForRound(run.mode, run.currentRound) : modeConfig;
@@ -471,42 +666,67 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
     // ── Phase 1: Initiator initial analysis (first round only) ──
     if (run.currentRound === 1) {
       if (run._cancelled) return;
+      run.activePhase = 'initial';
       const initialHeader = `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Initial Analysis${roundLabel}`;
       const initialPrompt = buildHopPrompt(run, roundModeConfig, {
         session: run.initiatorSession,
         sectionHeader: initialHeader,
-        instruction: 'Read the context file below and provide your initial analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.',
+        instruction: 'Read the discussion file and provide your initial analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.',
         isInitial: true,
       }, rp);
-      await dispatchHop(run, run.initiatorSession, initialPrompt, serverLink, undefined, initialHeader);
+      const initialOk = await dispatchHop(run, run.initiatorSession, initialPrompt, serverLink, { sectionHeader: initialHeader, required: true });
+      if (!initialOk) return;
       if (run._cancelled || isTerminal(run.status)) return;
     }
 
     // ── Phase 2: Sub-session hops ──
-    for (let i = 0; i < targets.length; i++) {
-      if (run._cancelled) return;
-      const target = targets[i];
-      // For combo pipelines, all hops in this round use the round's mode
+    run.activePhase = 'hop';
+    const roundHops = await createRoundHopStates(run, targets, roundModeKey);
+    run.activeTargetSessions = roundHops.map((hop) => hop.session);
+    const hopResults = await Promise.allSettled(targets.map(async (target, i) => {
+      if (run._cancelled) return false;
+      const hop = roundHops[i];
       const hopMode = combo ? roundModeKey : target.mode;
       const hopLabel = `${discussionParticipantName(target.session)} — ${capitalize(hopMode)} (hop ${i + 1}/${totalHops}${roundLabel})`;
+      hop.section_header = hopLabel;
       const hopModeConfig = combo ? roundModeConfig : (getP2pMode(target.mode) ?? modeConfig);
-
       const hopPrompt = buildHopPrompt(run, hopModeConfig, {
         session: target.session,
         sectionHeader: hopLabel,
-        instruction: `Read the full context file and provide your ${hopMode} analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`,
+        instruction: `Read the discussion file and provide your ${hopMode} analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`,
         isInitial: false,
+        filePath: hop.artifact_path,
       }, rp);
-
-      // Dispatch immediately — agent will queue the message and process after current task
       logger.info({ runId: run.id, target: target.session, mode: hopMode, hop: i + 1, totalHops, round: run.currentRound }, 'P2P: Phase 2 — dispatching hop');
-      await dispatchHop(run, target.session, hopPrompt, serverLink, null, hopLabel);
-      logger.info({ runId: run.id, target: target.session, status: run.status }, 'P2P: Phase 2 — hop dispatch returned');
-      if (run._cancelled || isTerminal(run.status)) return;
+      return dispatchHop(run, target.session, hopPrompt, serverLink, {
+        sectionHeader: hopLabel,
+        hop,
+        filePath: hop.artifact_path,
+      });
+    }));
+    run.activeTargetSessions = [];
+    run.currentTargetSession = null;
+    if (run._cancelled || isTerminal(run.status)) return;
+    logger.info({
+      runId: run.id,
+      round: run.currentRound,
+      settled: hopResults.length,
+      completed: roundHops.filter((hop) => hop.status === 'completed').length,
+    }, 'P2P: Phase 2 — round barrier settled');
+    await appendRoundEvidence(run, roundHops);
+    if (run._cancelled || isTerminal(run.status)) return;
+
+    if (run.currentRound === run.rounds) {
+      run.remainingTargets = [];
+    } else {
+      run.remainingTargets = [];
     }
 
     // ── Round summary: Initiator synthesizes this round ──
     if (run._cancelled) return;
+    run.runPhase = 'summarizing';
+    run.summaryPhase = 'running';
+    run.activePhase = 'summary';
     const isLastRound = run.currentRound === run.rounds;
     const summaryModeConfig = isLastRound && combo
       ? getModeForRound(run.mode, run.rounds) // last pipeline mode for final summary
@@ -515,16 +735,22 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       ? `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Final Summary`
       : `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Round ${run.currentRound}/${run.rounds} Summary`;
     const roundSummaryInstruction = isLastRound
-      ? (summaryModeConfig?.summaryPrompt ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.')
+      ? `${summaryModeConfig?.summaryPrompt ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.'}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. Append only the new summary section.`
       : `Synthesize the key points, areas of agreement, and open questions from this round. Then assign specific focus areas or questions for each participant in the next round (round ${run.currentRound + 1}). Append to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`;
     const roundSummaryPrompt = buildHopPrompt(run, summaryModeConfig, {
       session: run.initiatorSession,
       sectionHeader: roundSummaryHeader,
-      instruction: roundSummaryInstruction,
+      instruction: `${roundSummaryInstruction}\nThe orchestrator has already appended each completed hop's evidence into the discussion file. Do not re-copy or restructure prior sections; append only your round-summary section.`,
       isInitial: false,
     }, rp);
     logger.info({ runId: run.id, round: run.currentRound, isLastRound, roundMode: roundModeKey }, isLastRound ? 'P2P: Final summary — initiator' : 'P2P: Round summary — initiator');
-    await dispatchHop(run, run.initiatorSession, roundSummaryPrompt, serverLink, undefined, roundSummaryHeader);
+    const summaryOk = await dispatchHop(run, run.initiatorSession, roundSummaryPrompt, serverLink, {
+      sectionHeader: roundSummaryHeader,
+      required: true,
+    });
+    if (!summaryOk) return;
+    run.summaryPhase = 'completed';
+    setTimeout(() => { void cleanupRoundHopArtifacts(roundHops); }, 30_000);
     if (run._cancelled || isTerminal(run.status)) return;
   }
   if (run._cancelled || isTerminal(run.status)) return;
@@ -559,59 +785,68 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
 
 // ── Single hop dispatch + wait ────────────────────────────────────────────
 
-async function dispatchHop(run: P2pRun, session: string, prompt: string, serverLink: ServerLink | null, _unused?: unknown, sectionHeader?: string): Promise<void> {
+interface DispatchHopOptions {
+  sectionHeader: string;
+  filePath?: string;
+  hop?: P2pHopRuntime | null;
+  required?: boolean;
+}
+
+async function dispatchHop(
+  run: P2pRun,
+  session: string,
+  prompt: string,
+  serverLink: ServerLink | null,
+  options: DispatchHopOptions,
+): Promise<boolean> {
+  const { sectionHeader, hop = null, required = false } = options;
   run.currentTargetSession = session;
+  if (hop) {
+    run.activeTargetSessions = Array.from(new Set([...run.activeTargetSessions, session]));
+    updateHopStatus(run, hop, 'dispatched');
+  }
   run.hopStartedAt = Date.now();
-  // Don't remove from remainingTargets yet — defer until hop actually completes
   transition(run, 'dispatched', serverLink);
 
-  // ── Cross-project file copy for sandboxed agents ──
-  // If the target session's project dir differs from where the discussion file lives,
-  // copy the file into the target's .imc/discussions/ so sandboxed agents can access it.
   const targetRecord = getSession(session);
   const targetDir = targetRecord?.projectDir || null;
-  // contextFilePath = /project/.imc/discussions/runId.md → sourceDir = /project
-  const sourceDir = dirname(dirname(dirname(run.contextFilePath))) || null;
+  const sourcePath = options.filePath ?? run.contextFilePath;
+  const sourceDir = dirname(dirname(dirname(sourcePath))) || null;
   const isCrossProject = targetDir && sourceDir && targetDir !== sourceDir;
   let localCopyPath: string | null = null;
 
   if (isCrossProject) {
     const targetDiscussDir = await ensureImcDir(targetDir, 'discussions');
-    localCopyPath = join(targetDiscussDir, basename(run.contextFilePath));
+    localCopyPath = join(targetDiscussDir, basename(sourcePath));
     try {
-      await copyFile(run.contextFilePath, localCopyPath);
-      // Rewrite the prompt to reference the local copy path
-      prompt = prompt.replace(run.contextFilePath, localCopyPath);
-      logger.info({ runId: run.id, session, from: run.contextFilePath, to: localCopyPath }, 'P2P: copied discussion file to target project');
+      await copyFile(sourcePath, localCopyPath);
+      prompt = prompt.replace(sourcePath, localCopyPath);
+      logger.info({ runId: run.id, session, from: sourcePath, to: localCopyPath }, 'P2P: copied discussion file to target project');
     } catch (err) {
       logger.warn({ runId: run.id, session, err }, 'P2P: failed to copy discussion file to target project');
-      localCopyPath = null; // fall back to original path
+      localCopyPath = null;
     }
   }
 
-  const watchPath = localCopyPath ?? run.contextFilePath;
+  const watchPath = localCopyPath ?? sourcePath;
+  if (hop) hop.working_path = watchPath;
   const MAX_RETRIES = 1;
 
-  /** Helper: clean up hop state on every exit path */
-  const finishHop = async (skipped: boolean) => {
-    // Copy result back from local copy to source file
-    if (localCopyPath && !skipped) {
+  const finishHop = async (status: P2pHopStatus, error: string | null = null) => {
+    if (localCopyPath && status === 'completed') {
       try {
-        await copyFile(localCopyPath, run.contextFilePath);
+        await copyFile(localCopyPath, sourcePath);
         logger.info({ runId: run.id, session }, 'P2P: copied discussion result back to source project');
       } catch (err) {
         logger.warn({ runId: run.id, session, err }, 'P2P: failed to copy discussion result back');
       }
     }
-    // Schedule cleanup of local copy
-    if (localCopyPath) {
-      const copyToClean = localCopyPath;
-      setTimeout(async () => { try { await unlink(copyToClean); } catch { /* already deleted */ } }, 30_000);
-    }
+    updateHopStatus(run, hop, status, error);
     run.currentTargetSession = null;
+    run.activeTargetSessions = run.activeTargetSessions.filter((item) => item !== session);
     const target = run.remainingTargets.find((t) => t.session === session);
     run.remainingTargets = run.remainingTargets.filter((t) => t.session !== session);
-    if (skipped) {
+    if (status !== 'completed') {
       run.skippedHops.push(session);
     } else if (target) {
       run.completedHops.push(target);
@@ -619,13 +854,14 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
   };
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    if (run._cancelled) { await finishHop(false); return; }
+    if (run._cancelled) {
+      await finishHop('cancelled');
+      return false;
+    }
 
-    // Record file size before dispatch
     let sizeBefore = 0;
-    try { sizeBefore = (await stat(watchPath)).size; } catch { /* file should exist */ }
+    try { sizeBefore = (await stat(watchPath)).size; } catch {}
 
-    // Send the prompt — transport agents use provider runtime, tmux agents use sendKeys
     try {
       const transportRuntime = getTransportRuntime(session);
       if (transportRuntime) {
@@ -640,23 +876,21 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
         await sleep(2_000);
         continue;
       }
-      logger.warn({ runId: run.id, session, err }, 'P2P: hop dispatch failed after retry, skipping');
-      await finishHop(true);
-      return;
+      const errorMessage = String(err);
+      logger.warn({ runId: run.id, session, err }, 'P2P: hop dispatch failed after retry');
+      await finishHop('failed', errorMessage);
+      if (required) failRun(run, 'dispatch_failed', errorMessage, serverLink);
+      else pushState(run, serverLink);
+      return false;
     }
 
-    // Register idle waiter AFTER sendKeys completes — prevents pre-prompt idle from resolving it
     let idleEventReceived = false;
     const idleWaiter = waitForIdleEvent(session, run.timeoutMs);
     idleWaiter.promise.then((ok) => { idleEventReceived = ok; });
 
-    // Wait for completion: file settled (stopped growing) + agent idle.
-    // Uses file-settle window + idle confirmation to avoid premature hop completion
-    // caused by transient idle events (tool call gaps, status flicker).
     const GRACE_PERIOD_MS = GRACE_PERIOD_DEFAULT_MS;
     const dispatchTime = Date.now();
     const deadline = dispatchTime + run.timeoutMs;
-    // Absolute hard deadline: timeout + 60s — no exceptions, always skip
     const hardDeadline = deadline + 60_000;
     let fileGrew = false;
     let lastSize = sizeBefore;
@@ -665,20 +899,26 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
     let headingFoundAt = 0;
 
     while (Date.now() < deadline) {
-      // Hard deadline: timeout + 60s — force-skip no matter what
       if (Date.now() >= hardDeadline) {
         logger.warn({ runId: run.id, session }, 'P2P: hard deadline reached, force-skipping hop');
         break;
       }
-      if (run._cancelled) { idleWaiter.cancel(); await finishHop(false); return; }
+      if (run._cancelled) {
+        idleWaiter.cancel();
+        await finishHop('cancelled');
+        return false;
+      }
       await sleep(IDLE_POLL_MS);
       if (Date.now() >= hardDeadline) {
         logger.warn({ runId: run.id, session }, 'P2P: hard deadline reached, force-skipping hop');
         break;
       }
-      if (run._cancelled) { idleWaiter.cancel(); await finishHop(false); return; }
+      if (run._cancelled) {
+        idleWaiter.cancel();
+        await finishHop('cancelled');
+        return false;
+      }
 
-      // Check file growth — track last growth time for settle detection
       try {
         const currentSize = (await stat(watchPath)).size;
         if (currentSize > lastSize) {
@@ -687,16 +927,12 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
           if (!fileGrew) {
             fileGrew = true;
             if (run.status === 'dispatched') transition(run, 'running', serverLink);
+            updateHopStatus(run, hop, 'running');
           }
-          // Reset idle flag: transient idle before this growth doesn't count
           idleEventReceived = false;
         }
-        // Fast completion check: if the section heading is in the file, the agent has written its output.
-        // Runs regardless of fileGrew — stat() can miss growth between polls.
-        // Case-insensitive to handle agents that change heading capitalization.
         if (sectionHeader && !headingFound && currentSize > sizeBefore) {
           const content = await readFile(watchPath, 'utf8');
-          // Normalize: case-insensitive + dash variants (em-dash, en-dash, double-hyphen)
           const norm = (s: string) => s.toLowerCase().replace(/[–—]/g, '-').replace(/--/g, '-');
           if (norm(content).includes(norm(`## ${sectionHeader}`))) {
             headingFound = true;
@@ -704,130 +940,98 @@ async function dispatchHop(run: P2pRun, session: string, prompt: string, serverL
             if (!fileGrew) {
               fileGrew = true;
               if (run.status === 'dispatched') transition(run, 'running', serverLink);
+              updateHopStatus(run, hop, 'running');
             }
           }
         }
-      } catch { /* ignore */ }
+      } catch {}
 
-      // Heading fast-path: once heading is found, wait 2s for final writes then complete
       if (headingFound && (Date.now() - headingFoundAt) >= 2_000) {
         logger.info({ runId: run.id, session, sectionHeader }, 'P2P: heading found in file, completing hop');
         idleWaiter.cancel();
-        await finishHop(false);
-        if (run.remainingTargets.length > 0 || session !== run.finalReturnSession) {
-          transition(run, 'awaiting_next_hop', serverLink);
-        }
-        return;
+        await finishHop('completed');
+        pushState(run, serverLink);
+        return true;
       }
 
-      // Content-growth fallback: if file grew significantly and settled, treat as complete
-      // even without heading match (covers agents that use different heading format)
       const settleForGrowth = IDLE_POLL_MS * FILE_SETTLE_CYCLES;
       if (!headingFound && fileGrew && (lastSize - sizeBefore) > 500 &&
           lastGrowthAt > 0 && (Date.now() - lastGrowthAt) >= settleForGrowth &&
           (Date.now() - dispatchTime) > MIN_PROCESSING_MS) {
         logger.info({ runId: run.id, session, growth: lastSize - sizeBefore }, 'P2P: content growth fallback — completing hop without heading');
         idleWaiter.cancel();
-        await finishHop(false);
-        if (run.remainingTargets.length > 0 || session !== run.finalReturnSession) {
-          transition(run, 'awaiting_next_hop', serverLink);
-        }
-        return;
+        await finishHop('completed');
+        pushState(run, serverLink);
+        return true;
       }
 
-      // Don't trust idle detection until MIN_PROCESSING_MS after dispatch
       const canCheckIdle = (Date.now() - dispatchTime) > MIN_PROCESSING_MS;
       if (!canCheckIdle) continue;
 
       const pastGrace = (Date.now() - dispatchTime) > GRACE_PERIOD_MS;
-
-      // File must have settled: grew AND stopped growing for multiple poll cycles
       const settleMs = IDLE_POLL_MS * FILE_SETTLE_CYCLES;
       const fileSettled = fileGrew && lastGrowthAt > 0 && (Date.now() - lastGrowthAt) >= settleMs;
 
-      // Check idle — only when file has settled (or past grace with no growth)
       if (fileSettled || (pastGrace && !fileGrew)) {
         let idleConfirmed = false;
         const record = getSession(session);
         const agentType = (record?.agentType ?? 'claude-code') as import('../agent/detect.js').AgentType;
-
-        // For agents with structured watchers (Gemini), prefer session store state
-        // over raw terminal detection — the watcher has idle confirmation logic that
-        // prevents false idles during tool-call gaps.
         const useStoreState = agentType === 'gemini';
 
-        if (idleEventReceived) {
-          // Event-based: confirm agent is STILL idle right now
-          try {
-            if (useStoreState) {
-              idleConfirmed = record?.state === 'idle';
-            } else {
-              idleConfirmed = await detectStatusAsync(session, agentType) === 'idle';
-            }
-          } catch { idleConfirmed = true; /* if detection fails, trust event */ }
-        } else {
-          // Poll fallback
-          try {
-            if (useStoreState) {
-              idleConfirmed = record?.state === 'idle';
-            } else {
-              idleConfirmed = await detectStatusAsync(session, agentType) === 'idle';
-            }
-          } catch { /* ignore */ }
+        try {
+          if (useStoreState) {
+            idleConfirmed = record?.state === 'idle';
+          } else {
+            idleConfirmed = await detectStatusAsync(session, agentType) === 'idle';
+          }
+        } catch {
+          idleConfirmed = idleEventReceived;
         }
 
-        // Success: file settled AND agent confirmed idle
         if (fileSettled && idleConfirmed) {
-          // Final confirmation: file size unchanged after idle check
           try {
             const finalSize = (await stat(watchPath)).size;
             if (finalSize > lastSize) {
-              // Agent wrote more while we were checking — keep waiting
               lastSize = finalSize;
               lastGrowthAt = Date.now();
               idleEventReceived = false;
               continue;
             }
-          } catch { /* ignore */ }
+          } catch {}
           idleWaiter.cancel();
-          await finishHop(false);
-          if (run.remainingTargets.length > 0 || session !== run.finalReturnSession) {
-            transition(run, 'awaiting_next_hop', serverLink);
-          }
-          return;
+          await finishHop('completed');
+          pushState(run, serverLink);
+          return true;
         }
 
-        // Idle but file never grew (past grace) → agent ignored the prompt
         if (!fileGrew && pastGrace && idleConfirmed) {
           if (attempt < MAX_RETRIES) {
             logger.warn({ runId: run.id, session, attempt }, 'P2P: agent went idle without writing to file, retrying');
             idleWaiter.cancel();
-            break; // break inner loop to retry outer loop
+            break;
           }
-          logger.warn({ runId: run.id, session }, 'P2P: agent idle without file change after retry, skipping hop');
+          logger.warn({ runId: run.id, session }, 'P2P: agent idle without file change after retry');
           idleWaiter.cancel();
-          await finishHop(true);
-          if (run.remainingTargets.length > 0 || session !== run.finalReturnSession) {
-            transition(run, 'awaiting_next_hop', serverLink);
-          }
-          return;
+          await finishHop('failed', 'idle_without_file_change');
+          if (required) failRun(run, 'dispatch_failed', 'idle_without_file_change', serverLink);
+          else pushState(run, serverLink);
+          return false;
         }
       }
     }
 
     idleWaiter.cancel();
 
-    // If we got here from break (retry), continue to next attempt — unless hard deadline hit
     if (!fileGrew && attempt < MAX_RETRIES && Date.now() < hardDeadline) continue;
 
-    // Timeout — skip (don't fail the whole run)
-    logger.warn({ runId: run.id, session }, 'P2P: hop timed out, skipping to next');
-    await finishHop(true);
-    if (run.remainingTargets.length > 0 || session !== run.finalReturnSession) {
-      transition(run, 'awaiting_next_hop', serverLink);
-    }
-    return;
+    logger.warn({ runId: run.id, session }, 'P2P: hop timed out');
+    await finishHop('timed_out', 'timed_out');
+    if (required) failRun(run, 'timed_out', session, serverLink);
+    else pushState(run, serverLink);
+    return false;
   }
+
+  return false;
 }
 
 // ── Prompt construction ───────────────────────────────────────────────────
@@ -837,11 +1041,12 @@ export interface HopOpts {
   sectionHeader: string;
   instruction: string;
   isInitial: boolean;
+  filePath?: string;
 }
 
 export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: HopOpts, roundPrefix = ''): string {
   const parts: string[] = [];
-  const filePath = run.contextFilePath;
+  const filePath = opts.filePath ?? run.contextFilePath;
 
   // Round-aware prefix (empty for single-round runs)
   if (roundPrefix) {
@@ -872,7 +1077,7 @@ export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: Hop
     parts.push(`Steps:`);
     parts.push(`1. Read the discussion file`);
     parts.push(`2. Add a new heading "## ${opts.sectionHeader}" at the end and write your final synthesis`);
-    parts.push(`3. After writing the summary, execute the user's original request based on the discussion consensus`);
+    parts.push(`3. Base the synthesis on the collected hop evidence already appended into the discussion file for this round`);
     parts.push(``);
     parts.push(`User's original request: "${run.userText}"`);
   } else {
@@ -909,6 +1114,14 @@ export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: Hop
 
 function transition(run: P2pRun, status: P2pRunStatus, serverLink: ServerLink | null): void {
   run.status = status;
+  if (status === 'completed') {
+    run.runPhase = 'completed';
+    run.summaryPhase = 'completed';
+  } else if (status === 'cancelled') {
+    run.runPhase = 'cancelled';
+  } else if (status === 'failed' || status === 'timed_out') {
+    run.runPhase = 'failed';
+  }
   run.updatedAt = new Date().toISOString();
   logger.info({ runId: run.id, status }, 'P2P run state transition');
   pushState(run, serverLink);
@@ -919,6 +1132,8 @@ function failRun(run: P2pRun, errorType: string, message: string, serverLink: Se
   run.updatedAt = new Date().toISOString();
   const status: P2pRunStatus = errorType === 'timed_out' ? 'timed_out' : 'failed';
   run.status = status;
+  run.runPhase = 'failed';
+  if (run.activePhase === 'summary') run.summaryPhase = 'failed';
   logger.warn({ runId: run.id, errorType, message }, 'P2P run failed');
   pushState(run, serverLink);
 }
@@ -935,7 +1150,7 @@ function pushState(run: P2pRun, serverLink: ServerLink | null): void {
 }
 
 function isTerminal(status: P2pRunStatus): boolean {
-  return status === 'completed' || status === 'failed' || status === 'timed_out' || status === 'cancelled';
+  return P2P_TERMINAL_RUN_STATUSES.has(status);
 }
 
 function extractMainSession(sessionName: string): string {
@@ -974,6 +1189,19 @@ function discussionParticipantNameWithMode(session: string, mode: string): strin
 
 function capitalize(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+function countHopStates(hops: P2pHopRuntime[]): P2pHopCounts {
+  return {
+    total: hops.length,
+    queued: hops.filter((hop) => hop.status === 'queued').length,
+    dispatched: hops.filter((hop) => hop.status === 'dispatched').length,
+    running: hops.filter((hop) => hop.status === 'running').length,
+    completed: hops.filter((hop) => hop.status === 'completed').length,
+    timed_out: hops.filter((hop) => hop.status === 'timed_out').length,
+    failed: hops.filter((hop) => hop.status === 'failed').length,
+    cancelled: hops.filter((hop) => hop.status === 'cancelled').length,
+  };
 }
 
 function sleep(ms: number): Promise<void> {

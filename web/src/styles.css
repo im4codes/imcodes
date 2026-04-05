@@ -624,13 +624,14 @@ body {
 /* Usage footer — between chat/terminal and input controls */
 .session-usage-footer { flex-shrink: 0; padding: 4px 10px 3px; background: #0f1117; border-top: 1px solid #1e293b; }
 .session-ctx-bar { position: relative; width: 100%; height: 5px; background: #1e293b; border-radius: 3px; overflow: hidden; margin-bottom: 3px; }
-.session-usage-codex-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; }
+.session-usage-codex-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; align-items: center; }
 .session-ctx-input { position: absolute; left: 0; top: 0; height: 100%; background: #34d399; border-radius: 3px; }
 .session-ctx-cache { position: absolute; left: 0; top: 0; height: 100%; background: #818cf8; border-radius: 3px; }
 .session-usage-stats { display: flex; justify-content: space-between; font-size: 10px; color: #475569; }
 .session-usage-model { color: #a78bfa; font-size: 10px; font-weight: 500; margin-right: 6px; }
 .session-usage-tokens { color: #64748b; }
 .session-usage-badge { color: #93c5fd; border: 1px solid #1d4ed8; border-radius: 999px; padding: 1px 6px; line-height: 1.4; }
+.session-usage-quota-inline { color: #64748b; font-size: 9px; line-height: 1.4; white-space: nowrap; }
 .session-usage-cost { color: #94a3b8; }
 .session-thinking-inline { color: #818cf8; font-style: italic; margin-left: auto; padding-left: 8px; }
 .subsession-input-bar { display: flex; gap: 6px; padding: 6px 8px; background: #0d1117; border-top: 1px solid #1e293b; flex-shrink: 0; }

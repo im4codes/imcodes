@@ -278,7 +278,7 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
     for (const e of eligible) {
       merged[e.key] = sessionCfg[e.key] ?? { enabled: false, mode: 'audit' };
     }
-    const cfg: P2pSavedConfig = { sessions: merged, rounds, hopTimeoutMinutes: hopTimeoutMinutes !== 5 ? hopTimeoutMinutes : undefined, extraPrompt: extraPrompt.trim() || undefined };
+    const cfg: P2pSavedConfig = { sessions: merged, rounds, hopTimeoutMinutes, extraPrompt: extraPrompt.trim() || undefined };
     try {
       if (configKey) await saveUserPref(configKey, JSON.stringify(cfg));
       onSave(cfg);
