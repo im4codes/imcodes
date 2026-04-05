@@ -76,42 +76,6 @@ function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord>): Re
 }
 
 /**
- * Build a unified subsession.sync payload from the session store record.
- * Ensures all fields (including Qwen metadata) are always sent — no more
- * scattered inline objects with different field subsets.
- */
-function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord>): Record<string, unknown> {
-  const sessionName = subSessionName(id);
-  const record = getSession(sessionName);
-  const r = { ...record, ...overrides };
-  return {
-    type: 'subsession.sync',
-    id,
-    sessionType: r?.agentType ?? null,
-    cwd: r?.projectDir ?? null,
-    shellBin: null,
-    ccSessionId: r?.ccSessionId ?? null,
-    geminiSessionId: r?.geminiSessionId ?? null,
-    parentSession: r?.parentSession ?? null,
-    ccPresetId: r?.ccPreset ?? null,
-    description: r?.description ?? null,
-    label: r?.label ?? null,
-    runtimeType: r?.runtimeType ?? null,
-    providerId: r?.providerId ?? null,
-    providerSessionId: r?.providerSessionId ?? null,
-    // Qwen metadata — same fields as main session hydration in session-list.ts
-    qwenModel: r?.qwenModel ?? null,
-    qwenAuthType: r?.qwenAuthType ?? null,
-    qwenAuthLimit: r?.qwenAuthLimit ?? null,
-    qwenAvailableModels: r?.qwenAvailableModels ?? null,
-    modelDisplay: r?.modelDisplay ?? null,
-    planLabel: r?.planLabel ?? null,
-    quotaLabel: r?.quotaLabel ?? null,
-    quotaUsageLabel: r?.quotaUsageLabel ?? null,
-  };
-}
-
-/**
  * For sandboxed agents (Gemini, Codex): copy files from ~/.imcodes/ to
  * the session's project .imc/refs/ so the agent can access them.
  * Rewrites @paths in the message text. Auto-deletes copies after 30 min and
