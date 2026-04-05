@@ -151,8 +151,8 @@ describe('push notification content', () => {
   });
 });
 
-describe('mobile suppression', () => {
-  it('skips push when mobile client is connected', async () => {
+describe('push with mobile connected', () => {
+  it('sends push even when mobile client is connected (badge must increment)', async () => {
     const { dispatchPush } = await import('../src/routes/push.js');
     const { bridge, daemonWs } = await setupAuthenticatedDaemon();
 
@@ -165,7 +165,7 @@ describe('mobile suppression', () => {
     }));
     await flushAsync();
 
-    expect(dispatchPush).not.toHaveBeenCalled();
+    expect(dispatchPush).toHaveBeenCalled();
   });
 
   it('sends push when only desktop browser is connected', async () => {
@@ -185,25 +185,15 @@ describe('mobile suppression', () => {
     expect(dispatchPush).toHaveBeenCalled();
   });
 
-  it('resumes push after mobile client disconnects', async () => {
+  it('sends push even when mobile client is connected (badge must always increment)', async () => {
     const { dispatchPush } = await import('../src/routes/push.js');
     const { bridge, daemonWs } = await setupAuthenticatedDaemon();
 
     const mobileWs = new MockWs();
     bridge.handleBrowserConnection(mobileWs as never, userId, db, true);
 
-    // Send while mobile connected — no push
+    // Push should fire even with mobile connected
     daemonWs.emit('message', JSON.stringify({ type: 'session.idle', session: 'deck_cd_brain' }));
-    await flushAsync();
-    expect(dispatchPush).not.toHaveBeenCalled();
-
-    // Disconnect mobile
-    mobileWs.close();
-    await flushAsync();
-    vi.clearAllMocks();
-
-    // Send again — push should fire
-    daemonWs.emit('message', JSON.stringify({ type: 'session.idle', session: 'deck_cd_brain', lastText: 'Resumed.' }));
     await flushAsync();
     expect(dispatchPush).toHaveBeenCalled();
   });
