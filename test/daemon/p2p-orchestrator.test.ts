@@ -122,6 +122,12 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  // Cancel all active runs BEFORE deleting the temp dir to prevent background
+  // async ops (file reads, idle polls) from throwing ENOENT on deleted files.
+  await Promise.allSettled(listP2pRuns().map((r) => cancelP2pRun(r.id, serverLinkMock as any)));
+  // Brief settle so in-flight promises flush before filesystem cleanup.
+  await new Promise((r) => setTimeout(r, 50));
+
   _setIdlePollMs(3000);
   _setGracePeriodMs(180000);
   _setMinProcessingMs(30000);
