@@ -19,6 +19,8 @@ const DEFAULT_COMMANDS: Record<string, string[]> = {
   'claude-code': ['/compact', '/clear', '/usage', '/cost', '/status', '/help'],
   'codex':       ['/compact', '/help', '/model', '/approval', '/clear'],
   'opencode':    ['/compact', '/clear', '/model', '/help'],
+  'qwen':        ['/stop'],
+  'openclaw':    ['/stop'],
 };
 const DEFAULT_PHRASES = ['continue', 'fix', 'explain', 'refactor this', 'write tests', 'check errors', 'LGTM, commit', 'test & push', 'yes'];
 
