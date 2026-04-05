@@ -21,7 +21,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _unsubscribes: Array<() => void> = [];
   /** External callback when status changes — wired to emit timeline session.state events. */
   private _onStatusChange?: (status: AgentStatus) => void;
-  /** Current turn completion signal — used to queue sends until the active turn finishes. */
+  /** Current turn completion signal — resolved by onComplete/onError. */
   private _activeTurn:
     | {
       promise: Promise<void>;
@@ -29,6 +29,8 @@ export class TransportSessionRuntime implements SessionRuntime {
       reject: (err: ProviderError) => void;
     }
     | null = null;
+  /** FIFO send queue — ensures strict sequential execution even with concurrent send() calls. */
+  private _sendQueue: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly provider: TransportProvider,
@@ -99,12 +101,27 @@ export class TransportSessionRuntime implements SessionRuntime {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
 
-    if (this._activeTurn) {
+    // Chain onto the FIFO queue — each send waits for all previous sends to finish.
+    // This prevents the race where multiple awaiting sends dispatch simultaneously.
+    // We capture myTurn so kill() resetting _sendQueue doesn't orphan our await.
+    let sendError: unknown;
+    const myTurn = this._sendQueue.then(async () => {
       try {
-        await this._activeTurn.promise;
-      } catch {
-        // Previous turn failed. A queued send may still proceed.
+        await this._doSend(message);
+      } catch (err) {
+        sendError = err;
       }
+    });
+    this._sendQueue = myTurn;
+    await myTurn;
+    if (sendError) throw sendError;
+  }
+
+  /** Internal send — executes one turn and waits for the provider to complete it. */
+  private async _doSend(message: string): Promise<void> {
+    // Session may have been killed while this send was queued
+    if (!this._providerSessionId) {
+      throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
 
     // Record user message in history for complete conversation replay
@@ -130,15 +147,21 @@ export class TransportSessionRuntime implements SessionRuntime {
       void promise.catch(() => {});
       return { promise, resolve, reject };
     })();
+
+    const turnPromise = this._activeTurn.promise;
+
     try {
       await this.provider.send(this._providerSessionId, message, undefined, this._description);
     } catch (err) {
-      // Reset status so session doesn't get stuck at 'thinking'
       this.setStatus('idle');
       this._sending = false;
       this._activeTurn = null;
       throw err;
     }
+
+    // Wait for the turn to complete (onComplete/onError resolves/rejects this).
+    // Use the captured ref — callbacks may have nulled _activeTurn during provider.send().
+    await turnPromise;
   }
 
   async cancel(): Promise<void> {
@@ -162,9 +185,15 @@ export class TransportSessionRuntime implements SessionRuntime {
       await this.provider.endSession(this._providerSessionId);
       this._providerSessionId = null;
     }
+    // Reject active turn so queued sends unblock and fail
+    if (this._activeTurn) {
+      this._activeTurn.reject({ code: 'CANCELLED', message: 'Session killed', recoverable: false });
+    }
     this.setStatus('idle');
     this._sending = false;
     this._activeTurn = null;
+    // Reset the queue — new sends after kill() will start fresh (and fail on null providerSessionId)
+    this._sendQueue = Promise.resolve();
   }
 
   getHistory(): AgentMessage[] {

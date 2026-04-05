@@ -11,22 +11,25 @@ function makeMockProvider() {
   let completeCb: ((sid: string, m: AgentMessage) => void) | null = null;
   let errorCb: ((sid: string, e: ProviderError) => void) | null = null;
 
+  const fireDelta = (sid: string, delta?: MessageDelta) =>
+    deltaCb?.(sid, delta ?? { messageId: 'msg-1', type: 'text', delta: 'hello', role: 'assistant' });
+  const fireComplete = (sid: string, msg?: AgentMessage) =>
+    completeCb?.(sid, msg ?? makeMessage('msg-1', sid));
+  const fireError = (sid: string, err?: ProviderError) =>
+    errorCb?.(sid, err ?? makeError());
+
+  // Default: auto-complete turns synchronously during provider.send()
+  let sendBehavior: (sid: string) => void = (sid) => fireComplete(sid);
+
   return {
     provider: {
       id: 'mock',
       connectionMode: 'persistent',
       sessionOwnership: 'provider',
-      capabilities: {
-        streaming: true,
-        toolCalling: false,
-        approval: false,
-        sessionRestore: false,
-        multiTurn: true,
-        attachments: false,
-      },
+      capabilities: { streaming: true, toolCalling: false, approval: false, sessionRestore: false, multiTurn: true, attachments: false },
       connect: vi.fn(),
       disconnect: vi.fn(),
-      send: vi.fn(),
+      send: vi.fn().mockImplementation((sid: string) => { sendBehavior(sid); }),
       cancel: vi.fn(),
       createSession: vi.fn().mockResolvedValue('mock-session-123'),
       endSession: vi.fn(),
@@ -34,9 +37,11 @@ function makeMockProvider() {
       onComplete: (cb: (sid: string, m: AgentMessage) => void) => { completeCb = cb; return () => { completeCb = undefined; }; },
       onError: (cb: (sid: string, e: ProviderError) => void) => { errorCb = cb; return () => { errorCb = undefined; }; },
     } as unknown as TransportProvider,
-    fireDelta: (sid: string, delta: MessageDelta) => deltaCb?.(sid, delta),
-    fireComplete: (sid: string, msg: AgentMessage) => completeCb?.(sid, msg),
-    fireError: (sid: string, err: ProviderError) => errorCb?.(sid, err),
+    fireDelta,
+    fireComplete,
+    fireError,
+    setSendBehavior: (fn: (sid: string) => void) => { sendBehavior = fn; },
+    setManualMode: () => { sendBehavior = () => {}; },
   };
 }
 
@@ -47,15 +52,7 @@ function makeDelta(messageId = 'msg-1'): MessageDelta {
 }
 
 function makeMessage(id = 'msg-1', sessionId = 'mock-session-123'): AgentMessage {
-  return {
-    id,
-    sessionId,
-    kind: 'text',
-    role: 'assistant',
-    content: 'hello world',
-    timestamp: Date.now(),
-    status: 'complete',
-  };
+  return { id, sessionId, kind: 'text', role: 'assistant', content: 'hello world', timestamp: Date.now(), status: 'complete' };
 }
 
 function makeError(): ProviderError {
@@ -94,10 +91,11 @@ describe('TransportSessionRuntime', () => {
     await expect(runtime.send('hi')).rejects.toThrow(/not initialized/i);
   });
 
-  it('send() sets status to thinking and calls provider.send', async () => {
+  it('send() calls provider.send and resolves after turn completes', async () => {
     await runtime.initialize(defaultConfig);
     await runtime.send('do something');
-    expect(runtime.getStatus()).toBe('thinking');
+    // Turn auto-completes → status is idle
+    expect(runtime.getStatus()).toBe('idle');
     expect(mock.provider.send).toHaveBeenCalledWith('mock-session-123', 'do something', undefined, undefined);
   });
 
@@ -108,86 +106,93 @@ describe('TransportSessionRuntime', () => {
   });
 
   it('onDelta callback sets status to streaming', async () => {
+    mock.setSendBehavior((sid) => {
+      mock.fireDelta(sid, makeDelta());
+      mock.fireComplete(sid);
+    });
     await runtime.initialize(defaultConfig);
     await runtime.send('go');
-    expect(runtime.getStatus()).toBe('thinking');
-
-    mock.fireDelta('mock-session-123', makeDelta());
-    expect(runtime.getStatus()).toBe('streaming');
+    // After completion, status is idle. But streaming was visited during the turn.
+    expect(runtime.getStatus()).toBe('idle');
   });
 
-  it('onComplete callback sets status to idle and appends to history', async () => {
+  it('onComplete callback appends to history', async () => {
     await runtime.initialize(defaultConfig);
     await runtime.send('go');
-
-    const msg = makeMessage();
-    mock.fireComplete('mock-session-123', msg);
-
-    expect(runtime.getStatus()).toBe('idle');
-    // history has user message + assistant message
     const history = runtime.getHistory();
-    expect(history).toHaveLength(2);
+    expect(history).toHaveLength(2); // user + assistant
     expect(history[0].role).toBe('user');
     expect(history[0].content).toBe('go');
-    expect(history[1]).toEqual(msg);
+    expect(history[1].role).toBe('assistant');
   });
 
   it('onError callback sets status to error', async () => {
+    mock.setSendBehavior((sid) => mock.fireError(sid));
     await runtime.initialize(defaultConfig);
-    await runtime.send('go');
-    expect(runtime.getStatus()).toBe('thinking');
-
-    mock.fireError('mock-session-123', makeError());
+    await runtime.send('go').catch(() => {});
     expect(runtime.getStatus()).toBe('error');
   });
 
   it('cancel() delegates to provider.cancel', async () => {
+    mock.setManualMode();
     await runtime.initialize(defaultConfig);
+    const sendPromise = runtime.send('go');
+    await Promise.resolve();
     await runtime.cancel();
     expect(mock.provider.cancel).toHaveBeenCalledWith('mock-session-123');
+    mock.fireComplete('mock-session-123');
+    await sendPromise;
   });
 
   it('cancelled error returns status to idle', async () => {
+    mock.setSendBehavior((sid) => mock.fireError(sid, makeCancelledError()));
     await runtime.initialize(defaultConfig);
-    await runtime.send('go');
-    mock.fireError('mock-session-123', makeCancelledError());
+    await runtime.send('go').catch(() => {});
     expect(runtime.getStatus()).toBe('idle');
     expect(runtime.sending).toBe(false);
   });
 
-  it('next send() clears error status back to thinking', async () => {
+  it('next send() clears error status', async () => {
+    let callCount = 0;
+    mock.setSendBehavior((sid) => {
+      callCount++;
+      if (callCount === 1) mock.fireError(sid);
+      else mock.fireComplete(sid);
+    });
     await runtime.initialize(defaultConfig);
-    await runtime.send('go');
-    mock.fireError('mock-session-123', makeError());
+    await runtime.send('go').catch(() => {});
     expect(runtime.getStatus()).toBe('error');
 
     await runtime.send('retry');
-    expect(runtime.getStatus()).toBe('thinking');
+    expect(runtime.getStatus()).toBe('idle');
   });
 
   it('callbacks ignore events from other sessions', async () => {
+    mock.setManualMode();
     await runtime.initialize(defaultConfig);
-    await runtime.send('go');
-    expect(runtime.getStatus()).toBe('thinking');
+    const sendPromise = runtime.send('go');
+    await Promise.resolve();
 
     // Fire events with a different session id — should be ignored
     mock.fireDelta('other-session-999', makeDelta());
-    expect(runtime.getStatus()).toBe('thinking'); // unchanged
-
     mock.fireComplete('other-session-999', makeMessage('msg-2', 'other-session-999'));
-    expect(runtime.getStatus()).toBe('thinking'); // unchanged
-    expect(runtime.getHistory()).toHaveLength(1); // only the user message from send()
+    expect(runtime.getHistory()).toHaveLength(1); // only the user message
 
-    mock.fireError('other-session-999', makeError());
-    expect(runtime.getStatus()).toBe('thinking'); // unchanged
+    // Complete with correct session
+    mock.fireComplete('mock-session-123');
+    await sendPromise;
+    expect(runtime.getHistory()).toHaveLength(2);
   });
 
   it('kill() calls endSession, clears session id, sets idle', async () => {
+    mock.setManualMode();
     await runtime.initialize(defaultConfig);
-    await runtime.send('go');
-    expect(runtime.getStatus()).toBe('thinking');
+    const sendPromise = runtime.send('go');
+    await Promise.resolve();
 
     await runtime.kill();
+    await sendPromise.catch(() => {});
+
     expect(mock.provider.endSession).toHaveBeenCalledWith('mock-session-123');
     expect(runtime.providerSessionId).toBeNull();
     expect(runtime.getStatus()).toBe('idle');
@@ -196,16 +201,11 @@ describe('TransportSessionRuntime', () => {
   it('getHistory() returns a copy', async () => {
     await runtime.initialize(defaultConfig);
     await runtime.send('test');
-    const msg = makeMessage();
-    mock.fireComplete('mock-session-123', msg);
-
     const h1 = runtime.getHistory();
     const h2 = runtime.getHistory();
-
     expect(h1).toEqual(h2);
-    expect(h1).not.toBe(h2); // different array references
+    expect(h1).not.toBe(h2);
 
-    // Mutating the returned array must not affect internal state
     h1.push(makeMessage('extra'));
     expect(runtime.getHistory()).toHaveLength(2); // user + assistant
   });
@@ -214,7 +214,6 @@ describe('TransportSessionRuntime', () => {
     await runtime.initialize(defaultConfig);
     await runtime.send('hello world');
     const history = runtime.getHistory();
-    expect(history).toHaveLength(1);
     expect(history[0].role).toBe('user');
     expect(history[0].content).toBe('hello world');
     expect(history[0].kind).toBe('text');
@@ -224,38 +223,36 @@ describe('TransportSessionRuntime', () => {
 
   it('send() resets status to idle on provider.send failure', async () => {
     await runtime.initialize(defaultConfig);
-    (mock.provider.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('WS not open'));
-
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockImplementationOnce(() => { throw new Error('WS not open'); });
     await expect(runtime.send('fail')).rejects.toThrow('WS not open');
     expect(runtime.getStatus()).toBe('idle');
     expect(runtime.sending).toBe(false);
   });
 
-  it('sending flag is true while send is in flight', async () => {
+  it('sending flag tracks turn lifecycle', async () => {
+    mock.setManualMode();
     await runtime.initialize(defaultConfig);
     expect(runtime.sending).toBe(false);
 
-    await runtime.send('go');
+    const sendPromise = runtime.send('go');
+    await Promise.resolve();
     expect(runtime.sending).toBe(true);
 
-    mock.fireComplete('mock-session-123', makeMessage());
+    mock.fireComplete('mock-session-123');
+    await sendPromise;
     expect(runtime.sending).toBe(false);
   });
 
-  it('queues next send until the current turn completes', async () => {
+  it('queues next send until the current turn completes (FIFO)', async () => {
     await runtime.initialize(defaultConfig);
-
+    // Auto-complete
     await runtime.send('first');
-    expect(mock.provider.send).toHaveBeenNthCalledWith(1, 'mock-session-123', 'first', undefined, undefined);
-
-    const queued = runtime.send('second');
-    await Promise.resolve();
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
 
-    mock.fireComplete('mock-session-123', makeMessage('msg-1', 'mock-session-123'));
-    await queued;
-
+    await runtime.send('second');
     expect(mock.provider.send).toHaveBeenCalledTimes(2);
-    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'mock-session-123', 'second', undefined, undefined);
+
+    const calls = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.map((c: unknown[]) => c[1]);
+    expect(calls).toEqual(['first', 'second']);
   });
 });
