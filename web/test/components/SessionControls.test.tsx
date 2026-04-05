@@ -258,7 +258,7 @@ describe('SessionControls', () => {
     expect(screen.queryByText('transport_send_queued')).toBeNull();
   });
 
-  it('pressing Escape in a running transport input sends cancel input immediately', () => {
+  it('pressing Escape in a running transport input sends /stop command', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -276,8 +276,9 @@ describe('SessionControls', () => {
     const input = screen.getByRole('textbox') as HTMLDivElement;
     fireEvent.keyDown(input, { key: 'Escape' });
 
-    expect(ws.sendInput).toHaveBeenCalledWith('qwen-session', '\x1b');
-    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+    // Transport sessions send /stop instead of raw escape byte
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', { sessionName: 'qwen-session', text: '/stop' });
+    expect(ws.sendInput).not.toHaveBeenCalled();
   });
 
   it('pressing Shift+Enter does not submit', () => {

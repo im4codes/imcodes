@@ -13,7 +13,7 @@ import * as path from 'node:path';
 
 export const fileTransferRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
-// ── One-time download tokens (in-memory, 300s expiry) ─────────────────────────
+// ── One-time download tokens (in-memory, 15min expiry) ────────────────────────
 // Allows native apps (iOS WKWebView) to open download URLs in the system browser
 // without needing auth cookies. Token is single-use and short-lived.
 const downloadTokens = new Map<string, { serverId: string; attachmentId: string; userId: string; expiresAt: number }>();
@@ -135,7 +135,7 @@ fileTransferRoutes.post('/:id/uploads/:attachmentId/download-token', async (c) =
   }
 
   const token = randomHex(32);
-  downloadTokens.set(token, { serverId, attachmentId, userId, expiresAt: Date.now() + 300_000 });
+  downloadTokens.set(token, { serverId, attachmentId, userId, expiresAt: Date.now() + 900_000 });
 
   // Cleanup expired tokens periodically (max 1000 entries)
   if (downloadTokens.size > 1000) {
@@ -145,7 +145,7 @@ fileTransferRoutes.post('/:id/uploads/:attachmentId/download-token', async (c) =
     }
   }
 
-  return c.json({ token, expiresIn: 300 });
+  return c.json({ token, expiresIn: 900 });
 });
 
 // ── GET /api/server/:id/uploads/:attachmentId/download ──────────────────────
