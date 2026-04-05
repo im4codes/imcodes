@@ -36,16 +36,25 @@ function PdfPreview({ data }: { data: string }) {
         if (cancelled || !containerRef.current) return;
         containerRef.current.innerHTML = '';
 
+        // Measure container width to calculate the correct scale
+        const containerWidth = containerRef.current.clientWidth || 360;
+        const dpr = window.devicePixelRatio || 1;
+
         const maxPages = Math.min(pdf.numPages, 20);
         for (let i = 1; i <= maxPages; i++) {
           const page = await pdf.getPage(i);
-          const viewport = page.getViewport({ scale: 1.2 });
+          // Scale so the page exactly fills the container width
+          const baseViewport = page.getViewport({ scale: 1 });
+          const scale = (containerWidth / baseViewport.width) * dpr;
+          const viewport = page.getViewport({ scale });
           const canvas = document.createElement('canvas');
           canvas.width = viewport.width;
           canvas.height = viewport.height;
-          canvas.style.width = '100%';
+          // CSS size = container width, canvas pixel size = containerWidth * dpr (sharp on retina)
+          canvas.style.width = `${containerWidth}px`;
           canvas.style.height = 'auto';
-          canvas.style.marginBottom = '8px';
+          canvas.style.display = 'block';
+          canvas.style.marginBottom = '4px';
           const ctx = canvas.getContext('2d')!;
           await page.render({ canvasContext: ctx, viewport, canvas } as any).promise;
           if (cancelled) return;
