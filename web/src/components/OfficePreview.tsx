@@ -29,7 +29,9 @@ function PdfPreview({ data }: { data: string }) {
     (async () => {
       try {
         const pdfjsLib = await import('pdfjs-dist');
-        pdfjsLib.GlobalWorkerOptions.workerSrc = '';
+        // Use the bundled worker via URL import — Vite handles this
+        const workerUrl = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url);
+        pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl.href;
         const pdf = await pdfjsLib.getDocument({ data: base64ToArrayBuffer(data) }).promise;
         if (cancelled || !containerRef.current) return;
         containerRef.current.innerHTML = '';
@@ -80,7 +82,16 @@ function DocxPreview({ data }: { data: string }) {
         await docxPreview.renderAsync(buf, containerRef.current, undefined, {
           ignoreWidth: true,
           ignoreHeight: true,
+          ignoreFonts: false,
         });
+        // Force all docx-preview wrapper sections to fill width
+        const sections = containerRef.current.querySelectorAll('section');
+        for (const s of sections) {
+          (s as HTMLElement).style.width = '100%';
+          (s as HTMLElement).style.maxWidth = '100%';
+          (s as HTMLElement).style.padding = '12px';
+          (s as HTMLElement).style.boxSizing = 'border-box';
+        }
       } catch (e) {
         if (!cancelled) setError(`DOCX preview failed: ${e instanceof Error ? e.message : String(e)}`);
       }
