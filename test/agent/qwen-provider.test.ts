@@ -216,6 +216,39 @@ describe('QwenProvider', () => {
     expect(runtime.pendingCount).toBe(0);
   });
 
+  it('does not drain queued messages until the qwen process closes', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    const runtime = new TransportSessionRuntime(provider, 'sess-queue-close-gate');
+    await runtime.initialize({ sessionKey: 'sess-queue-close-gate', cwd: '/tmp/project' });
+
+    const errors: string[] = [];
+    provider.onError((_sid, err) => errors.push(err.message));
+
+    runtime.send('first');
+    const first = lastSpawn();
+    first.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-queue-close-1' } } })}\n`);
+    first.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: 'done' })}\n`);
+    await flushIO();
+
+    expect(runtime.send('second')).toBe('queued');
+    expect(runtime.pendingCount).toBe(1);
+    await flushIO();
+
+    // Result arrived, but the underlying CLI process is still alive.
+    // Do not dispatch the queued turn early, or provider.send() will see the
+    // existing child process and throw "already busy".
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(1);
+    expect(errors).toEqual([]);
+
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(2);
+    expect(runtime.pendingCount).toBe(0);
+    expect(errors).toEqual([]);
+  });
+
   it('emits provider error on result is_error payload', async () => {
     const provider = new QwenProvider();
     await provider.connect({});

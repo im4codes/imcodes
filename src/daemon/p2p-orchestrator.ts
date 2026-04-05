@@ -671,7 +671,7 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       const initialPrompt = buildHopPrompt(run, roundModeConfig, {
         session: run.initiatorSession,
         sectionHeader: initialHeader,
-        instruction: 'Read the context file below and provide your initial analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.',
+        instruction: 'Read the discussion file and provide your initial analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.',
         isInitial: true,
       }, rp);
       const initialOk = await dispatchHop(run, run.initiatorSession, initialPrompt, serverLink, { sectionHeader: initialHeader, required: true });
@@ -693,7 +693,7 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       const hopPrompt = buildHopPrompt(run, hopModeConfig, {
         session: target.session,
         sectionHeader: hopLabel,
-        instruction: `Read the full context file and provide your ${hopMode} analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`,
+        instruction: `Read the discussion file and provide your ${hopMode} analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`,
         isInitial: false,
         filePath: hop.artifact_path,
       }, rp);

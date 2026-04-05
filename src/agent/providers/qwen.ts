@@ -500,11 +500,12 @@ export class QwenProvider implements TransportProvider {
         if (!completed && resultText) {
           const assistantUsage = state.pendingFinalMetadata?.usage as QwenUsage | undefined;
           const sanitizedResultUsage = sanitizeUsageForDisplay(payload.usage, state.model);
-          emitComplete(resultText, state.currentMessageId ?? undefined, {
+          state.pendingFinalText = resultText;
+          state.pendingFinalMetadata = {
             ...(state.pendingFinalMetadata ?? {}),
             ...(state.model ? { model: state.model } : {}),
             ...(!assistantUsage && sanitizedResultUsage ? { usage: sanitizedResultUsage } : {}),
-          });
+          };
         }
       }
     });
