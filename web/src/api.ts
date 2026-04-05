@@ -928,34 +928,14 @@ export async function downloadAttachment(serverId: string, attachmentId: string)
     }
   }
   // Trigger download — WKWebView (iOS Capacitor) ignores <a download>,
-  // so on native platforms we use Capacitor Filesystem + share sheet.
+  // so on native platforms open the URL in system browser which handles
+  // downloads natively (save to Files, photo album, etc.).
   const isNative = !!(globalThis as Record<string, unknown>).Capacitor;
   if (isNative) {
-    try {
-      const { Filesystem, Directory } = await import('@capacitor/filesystem');
-      const reader = new FileReader();
-      const base64 = await new Promise<string>((resolve, reject) => {
-        reader.onload = () => {
-          const result = reader.result as string;
-          resolve(result.split(',')[1] ?? result);
-        };
-        reader.onerror = reject;
-        reader.readAsDataURL(blob);
-      });
-      const saved = await Filesystem.writeFile({
-        path: filename,
-        data: base64,
-        directory: Directory.Cache,
-      });
-      // Open share sheet so user can save/share the file
-      const { Share } = await import('@capacitor/share');
-      await Share.share({ url: saved.uri, title: filename });
-    } catch {
-      // Fallback: open blob URL in new tab (may prompt Safari download)
-      const url = URL.createObjectURL(blob);
-      window.open(url, '_blank');
-      setTimeout(() => URL.revokeObjectURL(url), 60_000);
-    }
+    const baseUrl = _baseUrl || window.location.origin;
+    const downloadUrl = `${baseUrl}/api/server/${serverId}/uploads/${attachmentId}/download`;
+    const { Browser } = await import('@capacitor/browser');
+    await Browser.open({ url: downloadUrl });
   } else {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
