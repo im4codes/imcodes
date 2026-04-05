@@ -151,8 +151,6 @@ async function writeWindowsWatchdogFiles(): Promise<void> {
 }
 
 async function installWindowsStartup(): Promise<void> {
-  const nodeExe = process.execPath;
-  const imcodesScript = join(__dirname, '..', 'index.js');
   await writeWindowsWatchdogFiles();
 
   // Remove legacy Startup folder CMD/VBS if present
