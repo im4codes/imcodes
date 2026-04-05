@@ -39,6 +39,42 @@ import { buildWindowsCleanupScript, buildWindowsUpgradeBatch } from '../util/win
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 
 /**
+ * Build a unified subsession.sync payload from the session store record.
+ * Ensures all fields (including Qwen metadata) are always sent — no more
+ * scattered inline objects with different field subsets.
+ */
+function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord>): Record<string, unknown> {
+  const sessionName = subSessionName(id);
+  const record = getSession(sessionName);
+  const r = { ...record, ...overrides };
+  return {
+    type: 'subsession.sync',
+    id,
+    sessionType: r?.agentType ?? null,
+    cwd: r?.projectDir ?? null,
+    shellBin: null,
+    ccSessionId: r?.ccSessionId ?? null,
+    geminiSessionId: r?.geminiSessionId ?? null,
+    parentSession: r?.parentSession ?? null,
+    ccPresetId: r?.ccPreset ?? null,
+    description: r?.description ?? null,
+    label: r?.label ?? null,
+    runtimeType: r?.runtimeType ?? null,
+    providerId: r?.providerId ?? null,
+    providerSessionId: r?.providerSessionId ?? null,
+    // Qwen metadata — same fields as main session hydration in session-list.ts
+    qwenModel: r?.qwenModel ?? null,
+    qwenAuthType: r?.qwenAuthType ?? null,
+    qwenAuthLimit: r?.qwenAuthLimit ?? null,
+    qwenAvailableModels: r?.qwenAvailableModels ?? null,
+    modelDisplay: r?.modelDisplay ?? null,
+    planLabel: r?.planLabel ?? null,
+    quotaLabel: r?.quotaLabel ?? null,
+    quotaUsageLabel: r?.quotaUsageLabel ?? null,
+  };
+}
+
+/**
  * For sandboxed agents (Gemini, Codex): copy files from ~/.imcodes/ to
  * the session's project .imc/refs/ so the agent can access them.
  * Rewrites @paths in the message text. Auto-deletes copies after 30 min and
@@ -1205,13 +1241,26 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         }
       }
       timelineEmitter.emit(sessionName, 'user.message', { text });
-      timelineEmitter.emit(sessionName, 'session.state', { state: 'running' }, { source: 'daemon', confidence: 'high' });
-      timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'medium' });
+      // If transport is already busy, this message will queue internally.
+      // Emit queued state so frontend knows, then running once it actually starts.
+      const isQueued = transportRuntime.sending;
+      if (isQueued) {
+        timelineEmitter.emit(sessionName, 'session.state', { state: 'queued' }, { source: 'daemon', confidence: 'high' });
+      } else {
+        timelineEmitter.emit(sessionName, 'session.state', { state: 'running' }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'medium' });
+      }
       if (record?.agentType === 'qwen' && record.qwenAuthType === 'qwen-oauth') {
         recordQwenOAuthRequest();
         refreshQwenQuotaUsageLabels(serverLink);
       }
       await transportRuntime.send(text);
+      // If was queued, now emit running → the actual send just started and completed
+      if (isQueued) {
+        timelineEmitter.emit(sessionName, 'session.state', { state: 'running' }, { source: 'daemon', confidence: 'high' });
+      }
+      // Transport turn complete — emit idle so frontend knows it can accept new input
+      timelineEmitter.emit(sessionName, 'session.state', { state: 'idle' }, { source: 'daemon', confidence: 'high' });
       // Clear fresh-start flag — the new conversation is now active
       if (record?.qwenFreshOnResume) {
         upsertSession({ ...record, qwenFreshOnResume: undefined, updatedAt: Date.now() });
@@ -1672,20 +1721,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
       });
       // Sync to server DB
       try {
-        const record = getSession(sessionName);
-        serverLink.send({
-          type: 'subsession.sync',
-          id,
-          sessionType: type,
-          cwd: cwd ?? null,
-          shellBin: null,
-          ccSessionId: null,
-          runtimeType: record?.runtimeType ?? null,
-          providerId: record?.providerId ?? null,
-          providerSessionId: record?.providerSessionId ?? null,
-          parentSession: parentSession ?? null,
-          description: description ?? null,
-        });
+        serverLink.send(buildSubSessionSync(id));
       } catch { /* not connected */ }
     } catch (e: unknown) {
       logger.error({ err: e, id, type }, 'subsession.start failed (transport)');
@@ -1718,17 +1754,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     });
     // Sync to server DB so frontend can see the sub-session
     try {
-      serverLink.send({
-        type: 'subsession.sync',
-        id,
-        sessionType: type,
-        cwd: cwd ?? null,
-        shellBin: shellBin ?? null,
-        ccSessionId: ccSessionId ?? null,
-        parentSession: parentSession ?? null,
-        ccPresetId: ccPreset ?? null,
-        description: description ?? null,
-      });
+      serverLink.send(buildSubSessionSync(id));
     } catch { /* not connected */ }
   } catch (e: unknown) {
     logger.error({ err: e, id }, 'subsession.start failed');
@@ -1775,20 +1801,7 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
         userCreated: effectiveRecord.userCreated,
       });
       try {
-        const next = getSession(sName);
-        serverLink.send({
-          type: 'subsession.sync',
-          id,
-          sessionType: effectiveRecord.agentType,
-          cwd: effectiveRecord.projectDir ?? null,
-          shellBin: null,
-          ccSessionId: null,
-          runtimeType: next?.runtimeType ?? null,
-          providerId: next?.providerId ?? null,
-          providerSessionId: next?.providerSessionId ?? null,
-          parentSession: effectiveRecord.parentSession ?? null,
-          description: effectiveRecord.description ?? null,
-        });
+        serverLink.send(buildSubSessionSync(id));
       } catch { /* not connected */ }
       return;
     }
@@ -1808,17 +1821,7 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
     });
     // Sync updated state to server
     try {
-      serverLink.send({
-        type: 'subsession.sync',
-        id,
-        sessionType: effectiveRecord.agentType,
-        cwd: effectiveRecord.projectDir ?? null,
-        ccSessionId: effectiveRecord.ccSessionId ?? null,
-        geminiSessionId: effectiveRecord.geminiSessionId ?? null,
-        parentSession: effectiveRecord.parentSession ?? null,
-        ccPresetId: effectiveRecord.ccPreset ?? null,
-        description: effectiveRecord.description ?? null,
-      });
+      serverLink.send(buildSubSessionSync(id));
     } catch { /* not connected */ }
   } catch (e: unknown) {
     logger.error({ err: e, sessionName: sName }, 'subsession.restart failed');
@@ -1862,13 +1865,7 @@ async function handleSubSessionSetModel(cmd: Record<string, unknown>, serverLink
     await startSubSession({ id, type: 'codex', cwd: cwd ?? null, codexModel: model });
     // Sync restarted sub-session to server DB
     try {
-      serverLink.send({
-        type: 'subsession.sync',
-        id,
-        sessionType: 'codex',
-        cwd: cwd ?? null,
-        codexModel: model,
-      });
+      serverLink.send(buildSubSessionSync(id));
     } catch { /* not connected */ }
   } catch (e: unknown) {
     logger.error({ err: e, sessionName, model }, 'subsession.set_model restart failed');

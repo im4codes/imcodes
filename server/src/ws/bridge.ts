@@ -969,6 +969,16 @@ export class WsBridge {
           label: msg.label || null,
           parentSession: msg.parentSession || null,
           ccPresetId: (msg.ccPresetId as string) || null,
+          runtimeType: msg.runtimeType || null,
+          providerId: msg.providerId || null,
+          providerSessionId: msg.providerSessionId || null,
+          qwenModel: msg.qwenModel || null,
+          qwenAuthType: msg.qwenAuthType || null,
+          qwenAvailableModels: msg.qwenAvailableModels || null,
+          modelDisplay: msg.modelDisplay || null,
+          planLabel: msg.planLabel || null,
+          quotaLabel: msg.quotaLabel || null,
+          quotaUsageLabel: msg.quotaUsageLabel || null,
           state: 'running',
         }));
       }).catch((e) => logger.error({ err: e, id: msg.id }, 'Failed to sync sub-session to DB'));
