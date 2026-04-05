@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { appendFile, mkdir, rm, writeFile } from 'fs/promises';
+import { appendFile, mkdir, rm, writeFile, stat, utimes } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir, homedir } from 'os';
 import { randomUUID } from 'crypto';
@@ -56,8 +56,15 @@ describe('jsonl watcher refresh()', () => {
     await mkdir(dir, { recursive: true });
     fileA = join(dir, 'a.jsonl');
     fileB = join(dir, 'b.jsonl');
-    await writeFile(fileA, '');
+    // Create fileB first so fileA has a newer mtime. On macOS APFS (nanosecond
+    // resolution) the creation order determines mtime, so watchFile won't
+    // accidentally switch from fileA to the newer-looking fileB.
     await writeFile(fileB, '');
+    await writeFile(fileA, '');
+    // Explicitly advance fileA's mtime +2s so it wins checkNewer() even on
+    // HFS+ (1-second mtime resolution) or any other low-resolution filesystem.
+    const bStat = await stat(fileB);
+    await utimes(fileA, new Date(bStat.mtimeMs + 2000), new Date(bStat.mtimeMs + 2000));
     claudeProject = claudeProjectDir(dir);
     await mkdir(claudeProject, { recursive: true });
     ccSessionId = randomUUID();
