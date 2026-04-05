@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, stat, utimes } from 'fs/promises';
 import { tmpdir, homedir } from 'os';
 import { join } from 'path';
 
@@ -141,6 +141,11 @@ describe('codex retrackLatestRollout', () => {
   it('does not force idle if retracked replay shows the agent is still running', async () => {
     const runningFile = join(sessionDir, `rollout-running-${Date.now()}-${sessionUuid}.jsonl`);
     await writeFile(runningFile, `${sessionMetaLine(projectDir)}\n${taskStartedLine()}\n`, 'utf8');
+    // Advance runningFile mtime +2s past oldFile to fix macOS HFS+ 1-second mtime
+    // resolution race: both files created in the same second → checkNewer returns false
+    // → maybeSwitchActiveFile skips the switch → running state is never detected.
+    const oldStat = await stat(oldFile);
+    await utimes(runningFile, new Date(oldStat.mtimeMs + 2000), new Date(oldStat.mtimeMs + 2000));
     vi.mocked(timelineEmitter.emit).mockClear();
 
     parseLine(sessionName, taskCompleteLine());
