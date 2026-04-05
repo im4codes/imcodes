@@ -122,7 +122,7 @@ export function useSubSessions(
               serverId: '',
               type: m.sessionType || 'shell',
               sessionName: m.sessionName || `deck_sub_${m.id}`,
-              runtimeType: m.runtimeType ?? null,
+              runtimeType: m.runtimeType ?? (m.sessionType === 'qwen' || m.sessionType === 'openclaw' ? 'transport' : null),
               providerId: m.providerId ?? null,
               providerSessionId: m.providerSessionId ?? null,
               cwd: m.cwd || null,

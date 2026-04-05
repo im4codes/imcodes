@@ -585,7 +585,8 @@ export async function listSubSessions(serverId: string): Promise<SubSessionData[
   }> }>(`/api/server/${serverId}/sub-sessions`);
   return res.subSessions.map((s) => ({
     id: s.id, serverId: s.server_id, type: s.type,
-    runtimeType: s.runtime_type, providerId: s.provider_id, providerSessionId: s.provider_session_id,
+    runtimeType: s.runtime_type ?? (s.type === 'qwen' || s.type === 'openclaw' ? 'transport' : null),
+    providerId: s.provider_id, providerSessionId: s.provider_session_id,
     shellBin: s.shell_bin, cwd: s.cwd, label: s.label,
     closedAt: s.closed_at, createdAt: s.created_at, updatedAt: s.updated_at,
     ccSessionId: s.cc_session_id,
