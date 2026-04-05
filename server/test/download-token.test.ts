@@ -57,7 +57,7 @@ describe('download-token', () => {
     const body = await res.json() as { token: string; expiresIn: number };
     expect(body.token).toBeDefined();
     expect(body.token.length).toBe(64); // 32 bytes hex
-    expect(body.expiresIn).toBe(300);
+    expect(body.expiresIn).toBe(900);
   });
 
   it('POST download-token rejects without auth', async () => {
@@ -111,7 +111,7 @@ describe('download-token', () => {
 
     // Fast-forward time past expiry
     vi.useFakeTimers();
-    vi.advanceTimersByTime(301_000);
+    vi.advanceTimersByTime(901_000);
 
     const res = await app.request(`/api/server/srv1/uploads/abc123/download?token=${token}`);
     expect(res.status).toBe(401);
