@@ -189,6 +189,8 @@ function collectCommandResult(sessionId: string, jobId: string, executionId: str
 
   const handler = (e: TimelineEvent) => {
     if (e.sessionId !== sessionId) return;
+    // Skip events from before this cron dispatch (prevents capturing stale output)
+    if (e.ts < startTs) return;
     if (Date.now() - startTs > MAX_WAIT_MS) {
       logger.warn({ jobId, executionId, sessionId }, 'Cron: command result timed out');
       sendCommandResult(serverLink, {

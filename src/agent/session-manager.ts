@@ -726,6 +726,10 @@ const transportRuntimes = new Map<string, TransportSessionRuntime>();
 /** Wire up onStatusChange and onDrain callbacks for a transport runtime. */
 function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: string): void {
   runtime.onStatusChange = (status) => {
+    // Emit assistant.thinking for chat typing indicator (matches tmux watcher behavior)
+    if (status === 'thinking') {
+      timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'high' });
+    }
     const mapped = (status === 'streaming' || status === 'thinking') ? 'running' : status;
     timelineEmitter.emit(sessionName, 'session.state', { state: mapped }, { source: 'daemon', confidence: 'high' });
   };

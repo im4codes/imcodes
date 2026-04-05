@@ -13,7 +13,7 @@ import * as path from 'node:path';
 
 export const fileTransferRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
-// ── One-time download tokens (in-memory, 60s expiry) ─────────────────────────
+// ── One-time download tokens (in-memory, 300s expiry) ─────────────────────────
 // Allows native apps (iOS WKWebView) to open download URLs in the system browser
 // without needing auth cookies. Token is single-use and short-lived.
 const downloadTokens = new Map<string, { serverId: string; attachmentId: string; userId: string; expiresAt: number }>();
