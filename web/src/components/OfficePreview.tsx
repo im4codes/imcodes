@@ -23,63 +23,97 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
 function PdfPreview({ data }: { data: string }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
+  const [retryKey, setRetryKey] = useState(0);
 
   useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
     let cancelled = false;
+    let workerBlobUrl: string | null = null;
+    let pdfDoc: any = null;
+
+    async function renderPages(width: number) {
+      if (cancelled || !pdfDoc || !container || width < 10) return;
+      container.innerHTML = '';
+      const dpr = window.devicePixelRatio || 1;
+      const maxPages = Math.min(pdfDoc.numPages, 20);
+      for (let i = 1; i <= maxPages; i++) {
+        const page = await pdfDoc.getPage(i);
+        const baseViewport = page.getViewport({ scale: 1 });
+        const scale = (width / baseViewport.width) * dpr;
+        const viewport = page.getViewport({ scale });
+        const canvas = document.createElement('canvas');
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        canvas.style.width = `${width}px`;
+        canvas.style.height = `${Math.round(viewport.height / dpr)}px`;
+        canvas.style.display = 'block';
+        canvas.style.marginBottom = '8px';
+        canvas.style.borderRadius = '2px';
+        canvas.style.boxShadow = '0 1px 4px rgba(0,0,0,0.3)';
+        const ctx = canvas.getContext('2d')!;
+        await page.render({ canvasContext: ctx, viewport, canvas } as any).promise;
+        if (cancelled) return;
+        container.appendChild(canvas);
+      }
+      if (pdfDoc.numPages > maxPages) {
+        const note = document.createElement('div');
+        note.style.cssText = 'text-align:center;color:#64748b;padding:12px;font-size:12px';
+        note.textContent = `Showing ${maxPages} of ${pdfDoc.numPages} pages`;
+        container.appendChild(note);
+      }
+    }
+
+    // Load PDF once, then render reactively via ResizeObserver
     (async () => {
       try {
         const pdfjsLib = await import('pdfjs-dist');
-        // Import worker source as raw text, create Blob URL to avoid .mjs MIME type issues
         const workerCode = await import('pdfjs-dist/build/pdf.worker.min.mjs?raw');
         const blob = new Blob([workerCode.default], { type: 'application/javascript' });
-        pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(blob);
-        const pdf = await pdfjsLib.getDocument({ data: base64ToArrayBuffer(data) }).promise;
-        if (cancelled || !containerRef.current) return;
-        containerRef.current.innerHTML = '';
-
-        // Wait one frame for container layout to settle (fixes mobile width measurement)
-        await new Promise((r) => requestAnimationFrame(r));
-        if (cancelled || !containerRef.current) return;
-
-        // Measure container width to calculate the correct scale
-        const containerWidth = containerRef.current.clientWidth || 360;
-        const dpr = window.devicePixelRatio || 1;
-
-        const maxPages = Math.min(pdf.numPages, 20);
-        for (let i = 1; i <= maxPages; i++) {
-          const page = await pdf.getPage(i);
-          // Scale so the page exactly fills the container width
-          const baseViewport = page.getViewport({ scale: 1 });
-          const scale = (containerWidth / baseViewport.width) * dpr;
-          const viewport = page.getViewport({ scale });
-          const canvas = document.createElement('canvas');
-          canvas.width = viewport.width;
-          canvas.height = viewport.height;
-          // CSS size = 100% of container; canvas pixel size = containerWidth * dpr (sharp on retina)
-          canvas.style.width = '100%';
-          canvas.style.height = 'auto';
-          canvas.style.display = 'block';
-          canvas.style.marginBottom = '4px';
-          const ctx = canvas.getContext('2d')!;
-          await page.render({ canvasContext: ctx, viewport, canvas } as any).promise;
-          if (cancelled) return;
-          containerRef.current?.appendChild(canvas);
-        }
-        if (pdf.numPages > maxPages) {
-          const note = document.createElement('div');
-          note.style.cssText = 'text-align:center;color:#64748b;padding:12px;font-size:12px';
-          note.textContent = `Showing ${maxPages} of ${pdf.numPages} pages`;
-          containerRef.current?.appendChild(note);
-        }
+        workerBlobUrl = URL.createObjectURL(blob);
+        pdfjsLib.GlobalWorkerOptions.workerSrc = workerBlobUrl;
+        pdfDoc = await pdfjsLib.getDocument({ data: base64ToArrayBuffer(data) }).promise;
+        if (cancelled) return;
+        // Initial render at current width
+        const w = container.clientWidth;
+        if (w > 10) await renderPages(w);
       } catch (e) {
         if (!cancelled) setError(`PDF preview failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     })();
-    return () => { cancelled = true; };
-  }, [data]);
 
-  if (error) return <div style={{ color: '#f87171', padding: 12 }}>{error}</div>;
-  return <div ref={containerRef} style={{ overflow: 'auto', width: '100%' }} />;
+    // ResizeObserver re-renders when container width changes
+    let lastWidth = 0;
+    let resizeTimer: ReturnType<typeof setTimeout>;
+    const observer = new ResizeObserver(([entry]) => {
+      const w = Math.floor(entry.contentRect.width);
+      if (w < 10 || Math.abs(w - lastWidth) < 6) return;
+      lastWidth = w;
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => { if (pdfDoc) renderPages(w); }, 150);
+    });
+    observer.observe(container);
+
+    return () => {
+      cancelled = true;
+      observer.disconnect();
+      clearTimeout(resizeTimer);
+      if (workerBlobUrl) URL.revokeObjectURL(workerBlobUrl);
+    };
+  }, [data, retryKey]);
+
+  if (error) {
+    return (
+      <div style={{ padding: 24, textAlign: 'center' }}>
+        <div style={{ color: '#f87171', marginBottom: 12, fontSize: 13 }}>{error}</div>
+        <button onClick={() => { setError(null); setRetryKey((k) => k + 1); }}
+          style={{ padding: '6px 16px', background: '#1e293b', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 4, cursor: 'pointer', fontSize: 12 }}>
+          Retry
+        </button>
+      </div>
+    );
+  }
+  return <div ref={containerRef} style={{ overflow: 'auto', width: '100%', height: '100%' }} />;
 }
 
 function DocxPreview({ data }: { data: string }) {
