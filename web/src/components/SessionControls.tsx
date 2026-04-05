@@ -625,9 +625,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const finalizeSend = useCallback((payload: PendingSendPayload) => {
     if (!ws || !activeSession) return;
-    if (activeSession.runtimeType === 'transport' && activeSession.state === 'running') {
-      setQueuedNoticeVisible(true);
-    }
+    // Transport sessions queue messages internally — no frontend notice needed
     quickData.recordHistory(payload.text, activeSession.name);
     try {
       ws.sendSessionCommand('send', { sessionName: activeSession.name, text: payload.text, ...payload.extra });
@@ -687,9 +685,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       extra.p2pSessionConfig = p2pSavedConfig.sessions;
       extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
       if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
-    }
-    if (activeSession.runtimeType === 'transport' && activeSession.state === 'running') {
-      setQueuedNoticeVisible(true);
     }
     quickData.recordHistory(voiceText, activeSession.name);
     try {
@@ -1205,9 +1200,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             onSelect={fillInput}
             onSend={(text: string) => {
               if (!ws || !activeSession) return;
-              if (activeSession.runtimeType === 'transport' && activeSession.state === 'running') {
-                setQueuedNoticeVisible(true);
-              }
               quickData.recordHistory(text, activeSession.name);
               ws.sendSessionCommand('send', { sessionName: activeSession.name, text });
             }}
