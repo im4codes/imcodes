@@ -13,7 +13,29 @@ import * as path from 'node:path';
 
 export const fileTransferRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
-fileTransferRoutes.use('/*', requireAuth());
+// ── One-time download tokens (in-memory, 60s expiry) ─────────────────────────
+// Allows native apps (iOS WKWebView) to open download URLs in the system browser
+// without needing auth cookies. Token is single-use and short-lived.
+const downloadTokens = new Map<string, { serverId: string; attachmentId: string; userId: string; expiresAt: number }>();
+
+const authMiddleware = requireAuth();
+fileTransferRoutes.use('/*', async (c, next) => {
+  // Allow token-based auth for download endpoint, otherwise require cookie/bearer auth
+  const token = c.req.query('token');
+  if (token && c.req.method === 'GET' && c.req.path.endsWith('/download')) {
+    const entry = downloadTokens.get(token);
+    if (!entry || Date.now() > entry.expiresAt) {
+      downloadTokens.delete(token ?? '');
+      return c.json({ error: 'invalid_or_expired_token' }, 401);
+    }
+    // Consume token (single-use)
+    downloadTokens.delete(token);
+    // Set userId so downstream handler can proceed
+    c.set('userId' as never, entry.userId as never);
+    return next();
+  }
+  return (authMiddleware as any)(c, next);
+});
 
 // ── POST /api/server/:id/upload ─────────────────────────────────────────────
 
@@ -93,6 +115,35 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
     logger.error({ serverId, uploadId, err }, 'Upload relay failed');
     return c.json({ error: 'upload_failed' }, 500);
   }
+});
+
+// ── POST /api/server/:id/uploads/:attachmentId/download-token ────────────────
+// Generate a one-time token for downloading without cookies (iOS native app).
+
+fileTransferRoutes.post('/:id/uploads/:attachmentId/download-token', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const attachmentId = c.req.param('attachmentId')!;
+
+  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  if (role === 'none') return c.json({ error: 'forbidden' }, 403);
+
+  if (!/^[a-f0-9]+(\.[a-zA-Z0-9]+)?$/.test(attachmentId)) {
+    return c.json({ error: 'invalid_attachment_id' }, 400);
+  }
+
+  const token = randomHex(32);
+  downloadTokens.set(token, { serverId, attachmentId, userId, expiresAt: Date.now() + 300_000 });
+
+  // Cleanup expired tokens periodically (max 1000 entries)
+  if (downloadTokens.size > 1000) {
+    const now = Date.now();
+    for (const [k, v] of downloadTokens) {
+      if (now > v.expiresAt) downloadTokens.delete(k);
+    }
+  }
+
+  return c.json({ token, expiresIn: 300 });
 });
 
 // ── GET /api/server/:id/uploads/:attachmentId/download ──────────────────────
