@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import type { WsClient } from '../ws-client.js';
 import { FileBrowser } from './FileBrowser.js';
 import { getUserPref, saveUserPref } from '../api.js';
+import { sanitizeProjectName } from '@shared/sanitize-project-name.js';
 
 const DEFAULT_SHELL_KEY = 'default_shell';
 
@@ -119,11 +120,12 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
     const unsub = ws.onMessage((msg) => {
       if (msg.type === 'session.event') {
         const name = msg.session ?? '';
-        if (msg.event === 'started' && name.startsWith(`deck_${project.trim()}_`)) {
+        const slug = sanitizeProjectName(project);
+        if (msg.event === 'started' && name.startsWith(`deck_${slug}_`)) {
           unsub();
           onSessionStarted(name);
           onClose();
-        } else if (msg.event === 'error' && name.startsWith(`deck_${project.trim()}_`)) {
+        } else if (msg.event === 'error' && name.startsWith(`deck_${slug}_`)) {
           unsub();
           setError(`Session failed to start: ${msg.state}`);
           setStarting(false);

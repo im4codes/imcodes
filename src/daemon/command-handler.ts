@@ -37,6 +37,7 @@ import { copyFile } from 'node:fs/promises';
 import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
 import { buildWindowsCleanupScript, buildWindowsUpgradeBatch } from '../util/windows-upgrade-script.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
+import { sanitizeProjectName } from '../../shared/sanitize-project-name.js';
 
 /**
  * Build a unified subsession.sync payload from the session store record.
@@ -682,30 +683,7 @@ async function handleInbound(cmd: Record<string, unknown>): Promise<void> {
   }
 }
 
-/** Sanitize project name into a tmux-safe ASCII slug.
- *  ASCII chars kept as-is (lowercased); non-ASCII chars converted to hex codepoints
- *  so CJK names remain deterministic and unique (e.g. "报告" → "62a5-544a"). */
-function sanitizeProjectName(raw: string): string {
-  let slug = '';
-  for (const ch of raw.trim()) {
-    const code = ch.codePointAt(0)!;
-    if ((code >= 0x30 && code <= 0x39)   // 0-9
-      || (code >= 0x41 && code <= 0x5a)  // A-Z
-      || (code >= 0x61 && code <= 0x7a)  // a-z
-      || code === 0x2d || code === 0x5f || code === 0x2e) { // - _ .
-      slug += String.fromCodePoint(code);
-    } else if (code > 0x7f) {
-      // Non-ASCII → hex codepoint
-      slug += (slug.length && !slug.endsWith('-') ? '-' : '') + code.toString(16);
-    } else {
-      // Other ASCII (spaces, punctuation) → underscore
-      if (!slug.endsWith('_')) slug += '_';
-    }
-  }
-  slug = slug.replace(/^[_-]+|[_-]+$/g, '').toLowerCase();
-  if (!slug) slug = `proj_${Date.now().toString(36)}`;
-  return slug;
-}
+// sanitizeProjectName moved to shared/sanitize-project-name.ts
 
 async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawProject = cmd.project as string | undefined;
