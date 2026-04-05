@@ -138,9 +138,18 @@ export async function conptyNewSession(
 
   const cols = opts?.cols ?? 200;
   const rows = opts?.rows ?? 50;
-  // Normalize cwd: forward slashes → backslashes on Windows (node-pty's CreateProcess requires native paths)
+  // Normalize cwd: backslashes → forward slashes. node-pty on some versions calls
+  // path.resolve() internally which can fail with error 267 (ERROR_DIRECTORY) when
+  // passed Windows-style backslash paths.
   const rawCwd = opts?.cwd ?? process.cwd();
-  const cwd = process.platform === 'win32' ? rawCwd.replace(/\//g, '\\') : rawCwd;
+  const cwd = process.platform === 'win32' ? rawCwd.replace(/\\/g, '/') : rawCwd;
+
+  // Use absolute path to cmd.exe — when the daemon is launched via a Windows
+  // Scheduled Task or Startup shortcut the environment may be restricted and
+  // CreateProcess cannot resolve a bare 'cmd.exe' through PATH.
+  const cmdExe = process.platform === 'win32'
+    ? (process.env.COMSPEC ?? `${process.env.SystemRoot ?? 'C:\\Windows'}\\system32\\cmd.exe`)
+    : 'cmd.exe';
 
   // Strip redundant cwdPrefix from the command string.
   // Drivers prepend `cd /d "C:\path" && ` or `cd "path" && ` for tmux/wezterm,
@@ -151,7 +160,7 @@ export async function conptyNewSession(
     cleanCmd = cleanCmd.slice(cdMatch[0].length);
   }
 
-  const pty = spawn('cmd.exe', ['/c', cleanCmd], {
+  const pty = spawn(cmdExe, ['/c', cleanCmd], {
     cwd,
     env: process.platform === 'win32'
       ? buildWindowsEnv(opts?.env)

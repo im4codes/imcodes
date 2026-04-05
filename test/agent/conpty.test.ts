@@ -171,6 +171,67 @@ describe('conpty backend', () => {
         cwd: expect.any(String),
       }));
     });
+
+    // ── Windows cmd.exe path resolution (regression for "File not found" on restricted launch) ──
+
+    it('uses COMSPEC absolute path on Windows instead of bare cmd.exe', async () => {
+      const origPlatform = process.platform;
+      const origComspec = process.env.COMSPEC;
+      Object.defineProperty(process, 'platform', { value: 'win32' });
+      process.env.COMSPEC = 'C:\\Windows\\system32\\cmd.exe';
+
+      try {
+        await conpty.conptyNewSession('comspec-test', 'claude --help', { cwd: 'C:/Users/admin' });
+        const spawnedExe = spawnMock.mock.calls.at(-1)?.[0] as string;
+        expect(spawnedExe).toBe('C:\\Windows\\system32\\cmd.exe');
+        // Must NOT use the bare name that fails in restricted environments
+        expect(spawnedExe).not.toBe('cmd.exe');
+      } finally {
+        Object.defineProperty(process, 'platform', { value: origPlatform });
+        if (origComspec === undefined) delete process.env.COMSPEC;
+        else process.env.COMSPEC = origComspec;
+      }
+    });
+
+    it('falls back to SystemRoot\\system32\\cmd.exe when COMSPEC is unset on Windows', async () => {
+      const origPlatform = process.platform;
+      const origComspec = process.env.COMSPEC;
+      const origSystemRoot = process.env.SystemRoot;
+      Object.defineProperty(process, 'platform', { value: 'win32' });
+      delete process.env.COMSPEC;
+      process.env.SystemRoot = 'C:\\Windows';
+
+      try {
+        await conpty.conptyNewSession('fallback-cmd', 'echo hi', { cwd: 'C:/tmp' });
+        const spawnedExe = spawnMock.mock.calls.at(-1)?.[0] as string;
+        expect(spawnedExe).toBe('C:\\Windows\\system32\\cmd.exe');
+      } finally {
+        Object.defineProperty(process, 'platform', { value: origPlatform });
+        if (origComspec === undefined) delete process.env.COMSPEC;
+        else process.env.COMSPEC = origComspec;
+        if (origSystemRoot === undefined) delete process.env.SystemRoot;
+        else process.env.SystemRoot = origSystemRoot;
+      }
+    });
+
+    it('normalizes backslash CWD to forward slashes on Windows (avoids node-pty error 267)', async () => {
+      const origPlatform = process.platform;
+      const origComspec = process.env.COMSPEC;
+      Object.defineProperty(process, 'platform', { value: 'win32' });
+      process.env.COMSPEC = 'C:\\Windows\\system32\\cmd.exe';
+
+      try {
+        await conpty.conptyNewSession('cwd-slash', 'claude', { cwd: 'C:\\Users\\admin\\project' });
+        const spawnedCwd = spawnMock.mock.calls.at(-1)?.[2]?.cwd as string;
+        // Backslashes must be converted to forward slashes
+        expect(spawnedCwd).toBe('C:/Users/admin/project');
+        expect(spawnedCwd).not.toContain('\\');
+      } finally {
+        Object.defineProperty(process, 'platform', { value: origPlatform });
+        if (origComspec === undefined) delete process.env.COMSPEC;
+        else process.env.COMSPEC = origComspec;
+      }
+    });
   });
 
   describe('conptySessionExists / conptyListSessions', () => {
