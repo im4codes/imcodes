@@ -452,7 +452,7 @@ export async function startWatching(sessionName: string, workDir: string, model?
   return control;
 }
 
-export async function startWatchingSpecificFile(sessionName: string, filePath: string, model?: string): Promise<WatcherControl> {
+export async function startWatchingSpecificFile(sessionName: string, filePath: string, model?: string, opts?: { replayHistory?: boolean }): Promise<WatcherControl> {
   if (watchers.has(sessionName)) stopWatching(sessionName);
   let size = 0; try { size = (await stat(filePath)).size; } catch {}
   const dir = filePath.substring(0, filePath.lastIndexOf('/'));
@@ -470,7 +470,9 @@ export async function startWatchingSpecificFile(sessionName: string, filePath: s
   const control = watcherControl(sessionName);
   registerWatcherControl(sessionName, control);
   claimedFiles.set(filePath, sessionName);
-  await emitRecentHistory(sessionName, filePath, model);
+  // Only replay history when restoring an existing session (daemon restart / browser reconnect).
+  // Do NOT replay on session respawn — the browser is already connected and has the history.
+  if (opts?.replayHistory) await emitRecentHistory(sessionName, filePath, model);
   startPoll(sessionName, state);
   void watchDir(sessionName, state, dir);
   return control;

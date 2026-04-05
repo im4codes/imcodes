@@ -648,10 +648,11 @@ async function emitRecentHistory(sessionName: string, filePath: string): Promise
  */
 /**
  * Shared: once a specific JSONL file is confirmed to exist, claim it,
- * replay recent history, and start polling + fs.watch for new content.
+ * optionally replay recent history, and start polling + fs.watch for new content.
  * Called by both startWatching (found via dir scan) and startWatchingFile (known path).
+ * replayHistory should only be true on daemon-restart restore paths, not session respawn.
  */
-async function activateFile(sessionName: string, state: WatcherState, filePath: string): Promise<void> {
+async function activateFile(sessionName: string, state: WatcherState, filePath: string, replayHistory = false): Promise<void> {
   preClaimFile(sessionName, filePath);
   registerOwnership(sessionName, filePath);
   state.pendingPartialLine = '';
@@ -663,10 +664,10 @@ async function activateFile(sessionName: string, state: WatcherState, filePath: 
     state.activeFile = filePath;
     state.fileOffset = 0;
   }
-  await emitRecentHistory(sessionName, filePath);
+  if (replayHistory) await emitRecentHistory(sessionName, filePath);
 }
 
-export async function startWatching(sessionName: string, workDir: string, ccSessionId?: string): Promise<WatcherControl> {
+export async function startWatching(sessionName: string, workDir: string, ccSessionId?: string, opts?: { replayHistory?: boolean }): Promise<WatcherControl> {
   if (watchers.has(sessionName)) stopWatching(sessionName);
 
   const projectDir = claudeProjectDir(workDir);
@@ -687,7 +688,7 @@ export async function startWatching(sessionName: string, workDir: string, ccSess
   // Bind to the known Claude session transcript when possible.
   const preferred = ccSessionId ? scanForJsonlBySessionId(ccSessionId) : await findLatestJsonl(projectDir);
   if (preferred && isTrackedClaudeFile(state, preferred) && canClaim(sessionName, preferred)) {
-    await activateFile(sessionName, state, preferred);
+    await activateFile(sessionName, state, preferred, opts?.replayHistory);
     state.status = 'active';
   } else {
     state.status = 'degraded';
@@ -729,7 +730,7 @@ export function stopWatching(sessionName: string): void {
  * then polls until the file appears, replays history, and tails new content.
  * Supports rotation to newer files (CC creates new JSONL on context overflow).
  */
-export async function startWatchingFile(sessionName: string, filePath: string, ccSessionId?: string): Promise<WatcherControl> {
+export async function startWatchingFile(sessionName: string, filePath: string, ccSessionId?: string, opts?: { replayHistory?: boolean }): Promise<WatcherControl> {
   if (watchers.has(sessionName)) stopWatching(sessionName);
 
   // Pre-claim before file exists so the main session watcher cannot steal it.
@@ -766,7 +767,7 @@ export async function startWatchingFile(sessionName: string, filePath: string, c
     return control;
   }
 
-  await activateFile(sessionName, state, filePath);
+  await activateFile(sessionName, state, filePath, opts?.replayHistory);
   state.status = 'active';
 
   // Poll drains new lines every 2s; rotation scan every 10s as fallback (fs.watch is primary).
