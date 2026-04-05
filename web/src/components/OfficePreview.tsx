@@ -50,8 +50,8 @@ function PdfPreview({ data }: { data: string }) {
           const canvas = document.createElement('canvas');
           canvas.width = viewport.width;
           canvas.height = viewport.height;
-          // CSS size = container width, canvas pixel size = containerWidth * dpr (sharp on retina)
-          canvas.style.width = `${containerWidth}px`;
+          // CSS size = 100% of container; canvas pixel size = containerWidth * dpr (sharp on retina)
+          canvas.style.width = '100%';
           canvas.style.height = 'auto';
           canvas.style.display = 'block';
           canvas.style.marginBottom = '4px';
