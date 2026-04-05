@@ -1241,26 +1241,15 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         }
       }
       timelineEmitter.emit(sessionName, 'user.message', { text });
-      // If transport is already busy, this message will queue internally.
-      // Emit queued state so frontend knows, then running once it actually starts.
-      const isQueued = transportRuntime.sending;
-      if (isQueued) {
-        timelineEmitter.emit(sessionName, 'session.state', { state: 'queued' }, { source: 'daemon', confidence: 'high' });
-      } else {
-        timelineEmitter.emit(sessionName, 'session.state', { state: 'running' }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'medium' });
-      }
+      timelineEmitter.emit(sessionName, 'session.state', { state: 'running' }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'medium' });
       if (record?.agentType === 'qwen' && record.qwenAuthType === 'qwen-oauth') {
         recordQwenOAuthRequest();
         refreshQwenQuotaUsageLabels(serverLink);
       }
+      // send() dispatches to provider — response arrives async via onComplete/onError.
+      // Transport runtime emits session.state changes via onStatusChange callback.
       await transportRuntime.send(text);
-      // If was queued, now emit running → the actual send just started and completed
-      if (isQueued) {
-        timelineEmitter.emit(sessionName, 'session.state', { state: 'running' }, { source: 'daemon', confidence: 'high' });
-      }
-      // Transport turn complete — emit idle so frontend knows it can accept new input
-      timelineEmitter.emit(sessionName, 'session.state', { state: 'idle' }, { source: 'daemon', confidence: 'high' });
       // Clear fresh-start flag — the new conversation is now active
       if (record?.qwenFreshOnResume) {
         upsertSession({ ...record, qwenFreshOnResume: undefined, updatedAt: Date.now() });

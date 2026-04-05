@@ -228,7 +228,7 @@ describe('SessionControls', () => {
     expect(screen.queryByText(/qwen3-max-2026-01-23/)).toBeNull();
   });
 
-  it('shows queued hint when sending to a running transport session and hides after the session leaves running state', () => {
+  it('sends message to running transport session without blocking (queuing is daemon-side)', () => {
     const ws = makeWs();
     const runningSession = makeSession({
       name: 'qwen-session',
@@ -236,7 +236,7 @@ describe('SessionControls', () => {
       runtimeType: 'transport',
       state: 'running',
     });
-    const { rerender } = render(
+    render(
       <SessionControls
         ws={ws as any}
         activeSession={runningSession}
@@ -249,20 +249,12 @@ describe('SessionControls', () => {
     fireEvent.input(input);
     fireEvent.click(screen.getByRole('button', { name: /send/i }));
 
+    // Message is sent immediately — daemon handles queuing internally
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
       sessionName: 'qwen-session',
       text: 'queued send',
     });
-    expect(screen.getByText('transport_send_queued')).toBeDefined();
-
-    rerender(
-      <SessionControls
-        ws={ws as any}
-        activeSession={{ ...runningSession, state: 'idle' }}
-        quickData={makeQuickData() as any}
-      />,
-    );
-
+    // No frontend queued notice — transport runtime queues internally
     expect(screen.queryByText('transport_send_queued')).toBeNull();
   });
 
