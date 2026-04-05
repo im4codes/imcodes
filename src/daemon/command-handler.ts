@@ -719,6 +719,8 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     return;
   }
   const project = sanitizeProjectName(rawProject);
+  // Preserve original name as label when sanitization changes it (e.g. Chinese characters)
+  const label = project !== rawProject.trim().toLowerCase() ? rawProject.trim() : undefined;
 
   try {
     // Resolve CC env preset if specified
@@ -738,6 +740,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       dir,
       brainType: agentType as ProjectConfig['brainType'],
       workerTypes: [],
+      label,
       extraEnv,
       ccPreset: ccPresetName,
     };

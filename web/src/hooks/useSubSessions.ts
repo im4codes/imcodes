@@ -180,10 +180,27 @@ export function useSubSessions(
   ): Promise<SubSession | null> => {
     if (!serverId) return null;
     try {
+      // Auto-generate label if not provided: agentType + incrementing number
+      let effectiveLabel = label;
+      if (!effectiveLabel) {
+        const siblings = subSessions.filter((s) => s.parentSession === activeSession);
+        const prefix = type === 'claude-code' ? 'CC' : type === 'codex' ? 'Cx' : type === 'gemini' ? 'Gm' : type === 'qwen' ? 'Qw' : type === 'openclaw' ? 'OC' : type;
+        let n = siblings.filter((s) => s.type === type).length + 1;
+        effectiveLabel = `${prefix}${n}`;
+        while (siblings.some((s) => s.label === effectiveLabel)) { n++; effectiveLabel = `${prefix}${n}`; }
+      } else {
+        // Prevent duplicate labels within the same parent session
+        const siblings = subSessions.filter((s) => s.parentSession === activeSession);
+        if (siblings.some((s) => s.label === effectiveLabel)) {
+          let n = 2;
+          while (siblings.some((s) => s.label === `${effectiveLabel}${n}`)) n++;
+          effectiveLabel = `${effectiveLabel}${n}`;
+        }
+      }
       const ccSessionId = type === 'claude-code' ? crypto.randomUUID() : undefined;
       const description = extra?.description as string | undefined;
       const ccPresetId = extra?.ccPreset as string | undefined;
-      const res = await apiCreate(serverId, { type, shellBin, cwd, label, ccSessionId, parentSession: activeSession ?? null, description, ccPresetId });
+      const res = await apiCreate(serverId, { type, shellBin, cwd, label: effectiveLabel, ccSessionId, parentSession: activeSession ?? null, description, ccPresetId });
       const sub: SubSession = {
         ...res.subSession,
         sessionName: res.sessionName,

@@ -129,6 +129,8 @@ export interface ProjectConfig {
   dir: string;
   brainType: AgentType;
   workerTypes: AgentType[]; // one entry per worker slot
+  /** Human-readable label (e.g. original Chinese project name before sanitization). */
+  label?: string;
   /** When true, start fresh sessions without resuming last conversation. */
   fresh?: boolean;
   /** Extra env vars merged into session launch (e.g. CC API preset). */
@@ -156,13 +158,13 @@ export function sessionName(project: string, role: 'brain' | `w${number}`): stri
 
 /** Start all sessions for a project (brain + workers). */
 export async function startProject(config: ProjectConfig): Promise<void> {
-  const { name, dir, brainType, workerTypes, fresh, extraEnv, ccPreset } = config;
+  const { name, dir, brainType, workerTypes, fresh, extraEnv, ccPreset, label } = config;
 
-  await launchSession({ name: sessionName(name, 'brain'), projectName: name, role: 'brain', agentType: brainType, projectDir: dir, fresh, extraEnv, ccPreset });
+  await launchSession({ name: sessionName(name, 'brain'), projectName: name, role: 'brain', agentType: brainType, projectDir: dir, fresh, extraEnv, ccPreset, label });
 
   for (let i = 0; i < workerTypes.length; i++) {
     const role = `w${i + 1}` as `w${number}`;
-    await launchSession({ name: sessionName(name, role), projectName: name, role, agentType: workerTypes[i], projectDir: dir, fresh });
+    await launchSession({ name: sessionName(name, role), projectName: name, role, agentType: workerTypes[i], projectDir: dir, fresh, label });
   }
 }
 
@@ -948,7 +950,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     return;
   }
 
-  const { name, projectName, role, agentType, projectDir, skipStore, extraEnv, fresh } = opts;
+  const { name, projectName, role, agentType, projectDir, skipStore, extraEnv, fresh, label } = opts;
   // Inject IMCODES_SESSION so agents can auto-detect their own session identity
   const mergedEnv: Record<string, string> = { IMCODES_SESSION: name, ...extraEnv };
   const driver = getDriver(agentType);
@@ -1051,6 +1053,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ...(geminiSessionId ? { geminiSessionId } : {}),
       ...(opencodeSessionId ? { opencodeSessionId } : {}),
       ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),
+      ...(label ? { label } : {}),
     };
     upsertSession(record);
     emitSessionPersist(record, name);
