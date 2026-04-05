@@ -927,15 +927,45 @@ export async function downloadAttachment(serverId: string, attachmentId: string)
       if (plainMatch) filename = plainMatch[1];
     }
   }
-  // Trigger browser download
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  // Trigger download — WKWebView (iOS Capacitor) ignores <a download>,
+  // so on native platforms we use Capacitor Filesystem + share sheet.
+  const isNative = !!(globalThis as Record<string, unknown>).Capacitor;
+  if (isNative) {
+    try {
+      const { Filesystem, Directory } = await import('@capacitor/filesystem');
+      const reader = new FileReader();
+      const base64 = await new Promise<string>((resolve, reject) => {
+        reader.onload = () => {
+          const result = reader.result as string;
+          resolve(result.split(',')[1] ?? result);
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+      const saved = await Filesystem.writeFile({
+        path: filename,
+        data: base64,
+        directory: Directory.Cache,
+      });
+      // Open share sheet so user can save/share the file
+      const { Share } = await import('@capacitor/share');
+      await Share.share({ url: saved.uri, title: filename });
+    } catch {
+      // Fallback: open blob URL in new tab (may prompt Safari download)
+      const url = URL.createObjectURL(blob);
+      window.open(url, '_blank');
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    }
+  } else {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
 }
 
 export async function previewAttachment(serverId: string, attachmentId: string): Promise<void> {
