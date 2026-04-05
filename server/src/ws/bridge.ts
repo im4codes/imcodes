@@ -2110,8 +2110,8 @@ export class WsBridge {
   private static readonly PUSH_DEDUP_MS = 10_000;
 
   private async dispatchEventPush(db: Database, env: Env, msg: Record<string, unknown>): Promise<void> {
-    // Skip push if mobile app is in foreground (user is actively watching)
-    if (this.mobileSockets.size > 0) return;
+    // Always send APNs push — iOS handles foreground display via UNUserNotificationCenterDelegate.
+    // Badge count must increment regardless of app state.
 
     // Dedup: same session idle/error can fire from both hook and timeline paths
     const sessionKey = `${msg.type}:${msg.session ?? msg.sessionId ?? ''}`;
