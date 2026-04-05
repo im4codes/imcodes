@@ -131,6 +131,13 @@ export function useSubSessions(
               createdAt: now,
               updatedAt: now,
               state: (m.state || 'running') as SubSession['state'],
+              qwenModel: m.qwenModel ?? null,
+              qwenAuthType: m.qwenAuthType ?? null,
+              qwenAvailableModels: m.qwenAvailableModels ?? null,
+              modelDisplay: m.modelDisplay ?? null,
+              planLabel: m.planLabel ?? null,
+              quotaLabel: m.quotaLabel ?? null,
+              quotaUsageLabel: m.quotaUsageLabel ?? null,
             }];
           });
         }
@@ -142,6 +149,27 @@ export function useSubSessions(
         const removedId = (msg as any).id as string;
         if (removedId) {
           setSubSessions((prev) => prev.filter((s) => s.id !== removedId));
+        }
+        return;
+      }
+
+      // Sub-session metadata sync from daemon (start, restart, set_model, periodic refresh)
+      if (msg.type === 'subsession.sync') {
+        const m = msg as any;
+        if (m.id) {
+          setSubSessions((prev) => prev.map((s) => {
+            if (s.id !== m.id) return s;
+            return { ...s,
+              ...(m.state ? { state: m.state as SubSession['state'] } : {}),
+              ...(m.cwd !== undefined ? { cwd: m.cwd } : {}),
+              ...(m.label !== undefined ? { label: m.label } : {}),
+              ...(m.qwenModel !== undefined ? { qwenModel: m.qwenModel } : {}),
+              ...(m.modelDisplay !== undefined ? { modelDisplay: m.modelDisplay } : {}),
+              ...(m.planLabel !== undefined ? { planLabel: m.planLabel } : {}),
+              ...(m.quotaLabel !== undefined ? { quotaLabel: m.quotaLabel } : {}),
+              ...(m.quotaUsageLabel !== undefined ? { quotaUsageLabel: m.quotaUsageLabel } : {}),
+            };
+          }));
         }
         return;
       }

@@ -50,7 +50,8 @@ export type ServerMessage =
   | { type: 'file.search_response'; requestId: string; results: string[]; error?: string }
   | { type: 'p2p.run_update'; run: any }
   | { type: 'p2p.conflict'; existingRunId: string; initiatorSession: string; commandId: string }
-  | { type: 'subsession.created'; id: string; sessionName: string; sessionType: string; cwd?: string; label?: string; parentSession?: string; state?: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null }
+  | { type: 'subsession.created'; id: string; sessionName: string; sessionType: string; cwd?: string; label?: string; parentSession?: string; state?: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; qwenModel?: string | null; qwenAuthType?: string | null; qwenAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null }
+  | { type: 'subsession.sync'; id: string; sessionName?: string; state?: string; cwd?: string; label?: string; qwenModel?: string | null; modelDisplay?: string | null; planLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null }
   | { type: 'subsession.removed'; id: string; sessionName: string }
   | { type: 'p2p.run_started'; runId: string; session: string }
   | { type: 'p2p.cancel_response'; runId: string; ok: boolean }

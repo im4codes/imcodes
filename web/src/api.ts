@@ -564,6 +564,14 @@ export interface SubSessionData {
   parentSession?: string | null;
   description?: string | null;
   ccPresetId?: string | null;
+  // Provider display metadata (populated via WS subsession.created / subsession.sync)
+  qwenModel?: string | null;
+  qwenAuthType?: string | null;
+  qwenAvailableModels?: string[] | null;
+  modelDisplay?: string | null;
+  planLabel?: string | null;
+  quotaLabel?: string | null;
+  quotaUsageLabel?: string | null;
 }
 
 export async function listSubSessions(serverId: string): Promise<SubSessionData[]> {
