@@ -38,6 +38,7 @@ import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
 import { buildWindowsCleanupScript, buildWindowsUpgradeBatch } from '../util/windows-upgrade-script.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { sanitizeProjectName } from '../../shared/sanitize-project-name.js';
+import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 
 /**
  * Build a unified subsession.sync payload from the session store record.
@@ -1085,9 +1086,8 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     try {
       // ── Concurrency guard: check for active P2P runs on same initiator ──
       const forceNew = !!(cmd as Record<string, unknown>).force;
-      const TERMINAL_STATUSES = new Set(['completed', 'failed', 'timed_out', 'cancelled']);
       const existingRun = listP2pRuns().find(
-        (r) => r.initiatorSession === sessionName && !TERMINAL_STATUSES.has(r.status),
+        (r) => r.initiatorSession === sessionName && !P2P_TERMINAL_RUN_STATUSES.has(r.status),
       );
 
       if (existingRun && !forceNew) {

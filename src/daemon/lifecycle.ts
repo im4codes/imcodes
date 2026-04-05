@@ -7,7 +7,7 @@ import { repoCache, RepoCache } from '../repo/cache.js';
 import { ServerLink } from './server-link.js';
 import { handleWebCommand, setRouterContext } from './command-handler.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
-import { notifySessionIdle, listP2pRuns } from './p2p-orchestrator.js';
+import { notifySessionIdle, listP2pRuns, serializeP2pRun } from './p2p-orchestrator.js';
 import { handlePreviewBinaryFrame } from './preview-relay.js';
 import { buildSessionList } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
@@ -25,6 +25,7 @@ import type { MemoryBackend } from '../memory/interface.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 
 /** Get the last assistant.text from a session's timeline (for push notification context). */
 function getLastAssistantText(sessionName: string): string | undefined {
@@ -334,9 +335,8 @@ export async function startup(): Promise<DaemonContext> {
       }
       // Re-broadcast active P2P runs so browsers get state after reconnect
       for (const run of listP2pRuns()) {
-        const TERMINAL = new Set(['completed', 'failed', 'timed_out', 'cancelled']);
-        if (TERMINAL.has(run.status)) continue;
-        try { serverLink.send({ type: 'p2p.run_save', run }); } catch { /* ignore */ }
+        if (P2P_TERMINAL_RUN_STATUSES.has(run.status)) continue;
+        try { serverLink.send({ type: 'p2p.run_save', run: serializeP2pRun(run) }); } catch { /* ignore */ }
       }
       // Re-sync all active sub-sessions so server DB and frontend stay in sync
       for (const session of listSessions()) {

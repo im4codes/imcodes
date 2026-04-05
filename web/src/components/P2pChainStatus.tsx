@@ -4,6 +4,7 @@
  */
 import { useMemo, useState, useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
+import { mapP2pStatusToUiState } from '@shared/p2p-status.js';
 
 interface Target {
   session: string;
@@ -37,9 +38,10 @@ interface P2pChainStatusProps {
 type StatusCategory = 'completed' | 'failed' | 'active' | 'queued';
 
 function categorize(status: string): StatusCategory {
-  if (status === 'completed') return 'completed';
-  if (status === 'failed' || status === 'timed_out' || status === 'cancelled') return 'failed';
-  if (status === 'running' || status === 'dispatched' || status === 'awaiting_next_hop') return 'active';
+  const uiState = mapP2pStatusToUiState(status);
+  if (uiState === 'done') return 'completed';
+  if (uiState === 'failed') return 'failed';
+  if (uiState === 'running') return 'active';
   return 'queued';
 }
 
@@ -58,7 +60,7 @@ const STATUS_ICON: Record<StatusCategory, string> = {
 };
 
 function isActive(status: string): boolean {
-  return status === 'queued' || status === 'dispatched' || status === 'running' || status === 'awaiting_next_hop';
+  return status === 'queued' || mapP2pStatusToUiState(status) === 'running';
 }
 
 // ── Styles ─────────────────────────────────────────────────────────────────
