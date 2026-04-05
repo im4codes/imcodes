@@ -115,6 +115,27 @@ async function findLatestRollout(dir: string, workDir: string, excludeClaimed = 
   return null;
 }
 
+async function findLatestMatchingRollout(sessionName: string, projectDir: string, currentUuid: string | null, currentPath: string | null): Promise<string | null> {
+  let latestPath: string | null = null;
+  let latestMtime = -1;
+  for (const dir of recentSessionDirs()) {
+    const found = await findLatestRollout(dir, projectDir, false);
+    if (!found || found === currentPath || isFileClaimedByOther(sessionName, found)) continue;
+    if (currentUuid) {
+      const candidateUuid = extractUuidFromPath(found);
+      if (candidateUuid && candidateUuid !== currentUuid) continue;
+    }
+    try {
+      const s = await stat(found);
+      if (s.mtimeMs > latestMtime) {
+        latestMtime = s.mtimeMs;
+        latestPath = found;
+      }
+    } catch {}
+  }
+  return latestPath;
+}
+
 function normalizePath(p: string): string {
   const normalized = p
     .replace(/\\/g, '/')
@@ -548,7 +569,17 @@ export async function refreshTrackedSession(sessionName: string): Promise<boolea
   await drainNewLines(sessionName, state);
   state._lastRotationCheck = Date.now();
   const uuid = state.activeFile ? extractUuidFromPath(state.activeFile) : null;
-  if (uuid) {
+  const latestPath = state.projectDir
+    ? await findLatestMatchingRollout(sessionName, state.projectDir, uuid, state.activeFile)
+    : null;
+  if (latestPath && await checkNewer(latestPath, state.activeFile)) {
+    if (state.activeFile) claimedFiles.delete(state.activeFile);
+    state.activeFile = latestPath;
+    state.workDir = latestPath.substring(0, latestPath.lastIndexOf('/'));
+    state.fileOffset = 0;
+    claimedFiles.set(latestPath, sessionName);
+    void watchDir(sessionName, state, state.workDir);
+  } else if (uuid) {
     for (const dir of recentSessionDirs()) {
       if (dir === state.workDir) continue;
       try {
@@ -579,23 +610,7 @@ export async function retrackLatestRollout(sessionName: string): Promise<boolean
   if (!projectDir) return false;
   const currentUuid = state.activeFile ? extractUuidFromPath(state.activeFile) : null;
 
-  let latestPath: string | null = null;
-  let latestMtime = -1;
-  for (const dir of recentSessionDirs()) {
-    const found = await findLatestRollout(dir, projectDir, false);
-    if (!found || found === state.activeFile || isFileClaimedByOther(sessionName, found)) continue;
-    if (currentUuid) {
-      const candidateUuid = extractUuidFromPath(found);
-      if (candidateUuid && candidateUuid !== currentUuid) continue;
-    }
-    try {
-      const s = await stat(found);
-      if (s.mtimeMs > latestMtime) {
-        latestMtime = s.mtimeMs;
-        latestPath = found;
-      }
-    } catch {}
-  }
+  const latestPath = await findLatestMatchingRollout(sessionName, projectDir, currentUuid, state.activeFile);
 
   if (!latestPath) return false;
   logger.info({ sessionName, old: state.activeFile, new: latestPath }, 'codex-watcher: retracking latest rollout after no-text turn');
