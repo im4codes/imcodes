@@ -63,18 +63,25 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           onQuote={ctx.onQuote}
         />
       )}
-      {(lastUsage || activeThinkingTs || statusText || liveSub.planLabel || liveSub.quotaLabel || liveSub.quotaUsageLabel) && (
+      {(lastUsage || activeThinkingTs || statusText) && (
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sessionName}
           modelOverride={modelDisplay ?? undefined}
-          planLabel={liveSub.planLabel ?? undefined}
-          quotaLabel={liveSub.quotaLabel ?? undefined}
-          quotaUsageLabel={liveSub.quotaUsageLabel ?? undefined}
           showCost={false}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}
         />
+      )}
+      {(liveSub.quotaLabel || liveSub.quotaUsageLabel || liveSub.planLabel) && (
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', padding: '2px 8px', flexShrink: 0 }}>
+          {(liveSub.quotaLabel || liveSub.quotaUsageLabel) && (
+            <span class="session-usage-quota-inline">{[liveSub.quotaLabel, liveSub.quotaUsageLabel].filter(Boolean).join(' · ')}</span>
+          )}
+          {liveSub.planLabel && (
+            <span class="session-usage-quota-inline" style={{ color: '#93c5fd' }}>{liveSub.planLabel}</span>
+          )}
+        </div>
       )}
     </>
   );

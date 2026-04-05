@@ -79,20 +79,7 @@ export function UsageFooter({ usage, sessionName, modelOverride, planLabel, quot
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
         </div>
       )}
-      {(displayPlanLabel || quotaLabel || quotaUsageLabel) && (
-        <div class="session-usage-codex-row">
-          {(quotaLabel || quotaUsageLabel) && (
-            <span class="session-usage-quota-inline">
-              {[quotaLabel, quotaUsageLabel].filter(Boolean).join(' · ')}
-            </span>
-          )}
-          {displayPlanLabel && (
-            <span class="session-usage-badge" title={displayPlanLabel}>
-              {displayPlanLabel}
-            </span>
-          )}
-        </div>
-      )}
+      {/* Plan/quota badges moved to SessionControls shortcuts row for compact inline display */}
       {hasCodexStatus && (
         <div class="session-usage-codex-row">
           {usage.codexStatus?.fiveHourLeftPercent !== undefined && (

@@ -42,9 +42,7 @@ describe('UsageFooter', () => {
       />,
     );
 
-    expect(screen.getByText('Free')).toBeDefined();
-    // quotaLabel + quotaUsageLabel are combined into a single inline element
-    expect(screen.getByText('1,000/day · today 12/1000 · 1m 1/60')).toBeDefined();
+    // Plan/quota badges moved to SessionControls — UsageFooter only renders ctx bar + stats
     expect(screen.getByText('qwen3-coder-plus')).toBeDefined();
   });
 });

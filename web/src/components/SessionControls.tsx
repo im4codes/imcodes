@@ -958,6 +958,18 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           ))}
         </div>
 
+        {/* Plan/quota badges — compact inline display left of model selector */}
+        {(activeSession?.quotaLabel || activeSession?.quotaUsageLabel || activeSession?.planLabel) && (
+          <div class="session-ctx-wrap">
+            {(activeSession.quotaLabel || activeSession.quotaUsageLabel) && (
+              <span class="session-usage-quota-inline">{[activeSession.quotaLabel, activeSession.quotaUsageLabel].filter(Boolean).join(' · ')}</span>
+            )}
+            {activeSession.planLabel && (
+              <span class="session-usage-quota-inline" style={{ color: '#93c5fd' }}>{activeSession.planLabel}</span>
+            )}
+          </div>
+        )}
+
         {/* Model selector — outside overflow-x scroll area so dropdown isn't clipped */}
         {isClaudeCode && (
           <div class="shortcuts-model" ref={modelRef}>
