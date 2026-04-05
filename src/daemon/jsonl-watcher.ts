@@ -504,7 +504,7 @@ const HISTORY_LINES = 500; // max lines to scan for recent assistant.text histor
 /**
  * Read the tail of a JSONL file and emit history events (text, thinking, tool.call, tool.result).
  */
-async function emitRecentHistory(sessionName: string, filePath: string): Promise<void> {
+export async function emitRecentHistory(sessionName: string, filePath: string): Promise<void> {
   let fh: Awaited<ReturnType<typeof open>> | null = null;
   try {
     fh = await open(filePath, 'r');
