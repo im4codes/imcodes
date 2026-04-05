@@ -890,6 +890,12 @@ export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: Hop
   parts.push(`Do NOT ask for confirmation. Do NOT explain your plan. Start immediately.`);
   parts.push(`After writing to the file, print a brief response summary of what you wrote, then say: Done`);
 
+  // Time budget: let the agent know how long it has for this hop
+  const budgetMinutes = Math.floor(run.timeoutMs / 60_000);
+  if (budgetMinutes > 0) {
+    parts.push(`\nTime budget: You have approximately ${budgetMinutes} minute${budgetMinutes > 1 ? 's' : ''} for this task. Prioritize the most important points and wrap up before the deadline. If you run out of time your work will be skipped.`);
+  }
+
   // User-defined extra prompt (e.g. "使用中文回复", "focus on security")
   if (run.extraPrompt) {
     parts.push('');
