@@ -2400,7 +2400,13 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
     // Image files: send as base64 with a higher size limit (5 MB)
     const ext = nodePath.extname(real).toLowerCase().slice(1);
     const IMAGE_MIME: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', ico: 'image/x-icon', bmp: 'image/bmp', svg: 'image/svg+xml' };
-    const mimeType = IMAGE_MIME[ext];
+    // Office documents: send as base64 for frontend preview (PDF.js, docx-preview, xlsx)
+    const OFFICE_MIME: Record<string, string> = {
+      pdf: 'application/pdf',
+      docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    };
+    const mimeType = IMAGE_MIME[ext] ?? OFFICE_MIME[ext];
     const sizeLimit = mimeType ? 5 * 1024 * 1024 : FS_READ_SIZE_LIMIT;
 
     // Always generate a download handle so the file can be downloaded even if preview fails
