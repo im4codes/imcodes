@@ -161,13 +161,16 @@ async function installWindowsStartup(): Promise<void> {
     try { await import('fs/promises').then((fs) => fs.unlink(join(startupDir, old))); } catch { /* ignore */ }
   }
 
-  // Use Task Scheduler: runs on logon, restarts on failure (up to 3 times, 10s interval)
-  // /F = force overwrite if exists
+  // Use Task Scheduler: runs on logon via VBS launcher (hidden window).
+  // Create the task directly with the VBS command — do NOT create with a bare
+  // node command first then /Change, because /Change can fail silently, leaving
+  // a visible cmd.exe window on every login/restart.
+  const vbsPath = join(homedir(), '.imcodes', 'daemon-launcher.vbs');
   try {
     execSync([
       'schtasks', '/Create',
       '/TN', TASK_NAME,
-      '/TR', `"${nodeExe}" "${imcodesScript}" start --foreground`,
+      '/TR', `wscript "${vbsPath}"`,
       '/SC', 'ONLOGON',
       '/RL', 'HIGHEST',
       '/F',
@@ -177,21 +180,10 @@ async function installWindowsStartup(): Promise<void> {
     console.warn('Task Scheduler registration failed (may need admin). Falling back to Startup folder.');
     await mkdir(startupDir, { recursive: true });
     const cmdPath = join(startupDir, 'imcodes-daemon.cmd');
-    const vbsPath = join(homedir(), '.imcodes', 'daemon-launcher.vbs');
     const cmd = `@echo off\r\nchcp 65001 >nul 2>&1\r\nstart "" /min wscript "${vbsPath}"\r\n`;
     await writeFile(cmdPath, cmd, 'utf8');
     return;
   }
-
-  // Update task to use VBS launcher (runs watchdog CMD hidden — no visible window)
-  try {
-    const vbsPath = join(homedir(), '.imcodes', 'daemon-launcher.vbs');
-    execSync([
-      'schtasks', '/Change',
-      '/TN', TASK_NAME,
-      '/TR', `wscript "${vbsPath}"`,
-    ].join(' '), { stdio: 'ignore' });
-  } catch { /* keep original task if change fails */ }
 }
 
 /** Ensure terminal backend + system service are installed. Shared by bind and re-bind. */

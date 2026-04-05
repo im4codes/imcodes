@@ -41,7 +41,7 @@ describe('buildWindowsUpgradeBatch', () => {
   });
 
   it('uses a standalone cleanup script instead of nested inline cleanup quoting', () => {
-    expect(batch).toContain('start "" cmd /c "C:\\Temp\\imcodes-upgrade-123\\cleanup.cmd" >nul 2>&1');
+    expect(batch).toContain('start "" /min cmd /c "C:\\Temp\\imcodes-upgrade-123\\cleanup.cmd" >nul 2>&1');
     expect(batch).not.toContain('rmdir /s /q ""');
   });
 });
