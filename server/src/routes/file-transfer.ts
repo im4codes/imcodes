@@ -30,8 +30,10 @@ fileTransferRoutes.use('/*', async (c, next) => {
     }
     // Consume token (single-use)
     downloadTokens.delete(token);
-    // Set userId so downstream handler can proceed
+    // Pass token binding so download handler can verify URL params match
     c.set('userId' as never, entry.userId as never);
+    c.set('tokenServerId' as never, entry.serverId as never);
+    c.set('tokenAttachmentId' as never, entry.attachmentId as never);
     return next();
   }
   return (authMiddleware as any)(c, next);
@@ -152,6 +154,13 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
   const attachmentId = c.req.param('attachmentId')!;
+
+  // Token-auth binding: verify token was minted for this exact resource
+  const tokenServerId = c.get('tokenServerId' as never) as string | undefined;
+  const tokenAttachmentId = c.get('tokenAttachmentId' as never) as string | undefined;
+  if (tokenServerId && (tokenServerId !== serverId || tokenAttachmentId !== attachmentId)) {
+    return c.json({ error: 'token_resource_mismatch' }, 403);
+  }
 
   // Permission check
   const role = await resolveServerRole(c.env.DB, serverId, userId);

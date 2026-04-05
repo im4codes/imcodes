@@ -726,7 +726,7 @@ const transportRuntimes = new Map<string, TransportSessionRuntime>();
 /** Wire up onStatusChange and onDrain callbacks for a transport runtime. */
 function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: string): void {
   runtime.onStatusChange = (status) => {
-    const mapped = status === 'streaming' ? 'running' : status;
+    const mapped = (status === 'streaming' || status === 'thinking') ? 'running' : status;
     timelineEmitter.emit(sessionName, 'session.state', { state: mapped }, { source: 'daemon', confidence: 'high' });
   };
   runtime.onDrain = (merged, count) => {

@@ -29,8 +29,8 @@ function makeMockProvider() {
     deltaCb?.(sid, { messageId: 'msg', type: 'text', delta: 'x', role: 'assistant' });
   const fireComplete = (sid: string) =>
     completeCb?.(sid, { id: 'msg-1', sessionId: sid, kind: 'text', role: 'assistant', content: 'done', timestamp: Date.now(), status: 'complete' });
-  const fireError = (sid: string, code = 'PROVIDER_ERROR') =>
-    errorCb?.(sid, { code, message: 'err', recoverable: false });
+  const fireError = (sid: string, code = 'PROVIDER_ERROR', recoverable = false) =>
+    errorCb?.(sid, { code, message: 'err', recoverable });
   const fireCancelled = (sid: string) =>
     errorCb?.(sid, { code: 'CANCELLED', message: 'cancelled', recoverable: true });
 
@@ -176,16 +176,27 @@ describe('batched queuing', () => {
     expect(drainLog).toEqual([{ merged: 'second\n\nthird', count: 2 }]);
   });
 
-  it('on error, pending messages still drain into next turn', () => {
+  it('on unrecoverable error, pending messages are NOT drained (prevents error loop)', () => {
     runtime.send('first');
     runtime.send('retry-me');
 
+    // Unrecoverable error (recoverable: false) — don't drain
     mock.fireError('sess-1');
 
-    // Despite error, pending messages drain
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.pendingCount).toBe(1); // message preserved, not consumed
+    expect(runtime.getStatus()).toBe('error');
+  });
+
+  it('on recoverable error, pending messages drain into next turn', () => {
+    runtime.send('first');
+    runtime.send('retry-me');
+
+    // Recoverable error → drain pending
+    mock.fireError('sess-1', 'RATE_LIMITED', true);
+
     expect(mock.provider.send).toHaveBeenCalledTimes(2);
     expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', 'retry-me', undefined, undefined);
-    // Status is thinking (new turn started), not error
     expect(runtime.getStatus()).toBe('thinking');
   });
 

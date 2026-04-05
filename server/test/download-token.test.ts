@@ -128,4 +128,29 @@ describe('download-token', () => {
     const res = await app.request('/api/server/srv1/uploads/abc123/download?token=bogus');
     expect(res.status).toBe(401);
   });
+
+  it('token for file-X rejects when used on file-Y (binding mismatch)', async () => {
+    const tokenRes = await app.request(
+      '/api/server/srv1/uploads/abc123/download-token',
+      { method: 'POST', headers: { Authorization: 'Bearer test' } },
+    );
+    const { token } = await tokenRes.json() as { token: string };
+
+    // Use token on different attachment
+    const res = await app.request(`/api/server/srv1/uploads/def456/download?token=${token}`);
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: 'token_resource_mismatch' });
+  });
+
+  it('token for server-A rejects when used on server-B (binding mismatch)', async () => {
+    const tokenRes = await app.request(
+      '/api/server/srv1/uploads/abc123/download-token',
+      { method: 'POST', headers: { Authorization: 'Bearer test' } },
+    );
+    const { token } = await tokenRes.json() as { token: string };
+
+    // Use token on different server
+    const res = await app.request(`/api/server/srv2/uploads/abc123/download?token=${token}`);
+    expect(res.status).toBe(403);
+  });
 });

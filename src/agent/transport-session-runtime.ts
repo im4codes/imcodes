@@ -74,11 +74,11 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._sending = false;
         this._activeTurn?.reject(error);
         this._activeTurn = null;
-        // On error, still drain pending (users may have typed follow-up).
-        // Error status is set only if no pending messages to send.
-        if (!this._drainPending()) {
-          this.setStatus(error.code === 'CANCELLED' ? 'idle' : 'error');
-        }
+        // Only drain pending on recoverable/cancel errors — unrecoverable errors
+        // (auth failure, provider down) would just fail again and consume queued messages.
+        const canDrain = error.code === 'CANCELLED' || error.recoverable;
+        if (canDrain && this._drainPending()) return;
+        this.setStatus(error.code === 'CANCELLED' ? 'idle' : 'error');
       }),
     );
   }
@@ -199,11 +199,30 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeTurn = { promise, resolve, reject };
 
     try {
-      this.provider.send(this._providerSessionId!, message, undefined, this._description);
+      const sendResult = this.provider.send(this._providerSessionId!, message, undefined, this._description);
+      // Catch async rejections from providers that return Promises (e.g. OpenClaw RPC)
+      if (sendResult && typeof (sendResult as Promise<void>).catch === 'function') {
+        (sendResult as Promise<void>).catch((err) => {
+          // Only handle if the provider didn't already fire onError callback
+          if (this._sending && this._activeTurn) {
+            this.setStatus('error');
+            this._sending = false;
+            this._activeTurn.reject(
+              typeof err === 'object' && err && 'code' in err ? err : { code: 'PROVIDER_ERROR', message: String(err), recoverable: false },
+            );
+            this._activeTurn = null;
+            // Don't drain on async send failure — the provider is likely broken
+          }
+        });
+      }
     } catch {
-      this.setStatus('idle');
+      // Sync throw from provider.send() — emit error (not silent idle)
+      this.setStatus('error');
       this._sending = false;
-      this._activeTurn = null;
+      if (this._activeTurn) {
+        this._activeTurn.reject({ code: 'PROVIDER_ERROR', message: 'provider.send() threw synchronously', recoverable: false });
+        this._activeTurn = null;
+      }
     }
   }
 
