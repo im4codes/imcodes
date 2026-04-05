@@ -20,6 +20,7 @@ import logger from '../util/logger.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { getSession, upsertSession, listSessions } from '../store/session-store.js';
 import type { SessionRecord } from '../store/session-store.js';
+import { refreshSessionWatcher } from './watcher-controls.js';
 
 export const DEFAULT_HOOK_PORT = 51913;
 const PORT_FILE = path.join(os.homedir(), '.imcodes', 'hook-port');
@@ -457,7 +458,7 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
         }
         body += chunk.toString();
       });
-      req.on('end', () => {
+      req.on('end', async () => {
         try {
           const msg = JSON.parse(body) as Record<string, unknown>;
           const event = msg['event'] as string | undefined;
@@ -484,6 +485,7 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
           if (event === 'idle') {
             const agentType = (msg['agentType'] as string | undefined) ?? 'unknown';
             logger.info({ session, agentType }, 'Hook: session idle');
+            await refreshSessionWatcher(session);
             onHook({ event: 'idle', session, agentType });
             timelineEmitter.emit(session, 'session.state', { state: 'idle' }, { source: 'hook' });
             const sess = getSession(session);

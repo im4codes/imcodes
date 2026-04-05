@@ -11,6 +11,7 @@ import { detectStatus } from '../agent/detect.js';
 import logger from '../util/logger.js';
 import { updateSessionState, getSession, upsertSession } from '../store/session-store.js';
 import { resolveContextWindow } from '../util/model-context.js';
+import { registerWatcherControl, unregisterWatcherControl, refreshSessionWatcher, type WatcherControl } from './watcher-controls.js';
 
 const GEMINI_TMP_DIR = join(homedir(), '.gemini', 'tmp');
 const POLL_INTERVAL_MS = 1500; // Balanced: responsive enough without causing state flicker
@@ -60,6 +61,7 @@ async function findLatestSessionFile(excludeClaimed = true): Promise<string | nu
 // ── Message parsing ────────────────────────────────────────────────────────────
 
 function parseMessage(sessionName: string, msg: any, hist?: any, streaming = false): void {
+  const watcher = watchers.get(sessionName);
   const stableId = (suffix: string) => {
     if (!hist) return undefined;
     const n = hist.counts.get(suffix) ?? 0;
@@ -79,7 +81,10 @@ function parseMessage(sessionName: string, msg: any, hist?: any, streaming = fal
     if (msg.thoughts) {
       for (const t of msg.thoughts) {
         const text = t.description ?? t.subject;
-        if (text?.trim()) timelineEmitter.emit(sessionName, 'assistant.thinking', { text }, { source: 'daemon', confidence: 'high', eventId: stableId('th'), ts: stableTs });
+        if (text?.trim()) {
+          if (watcher) watcher.turnHadAssistantText = true;
+          timelineEmitter.emit(sessionName, 'assistant.thinking', { text }, { source: 'daemon', confidence: 'high', eventId: stableId('th'), ts: stableTs });
+        }
       }
     }
     if (msg.toolCalls) {
@@ -96,6 +101,7 @@ function parseMessage(sessionName: string, msg: any, hist?: any, streaming = fal
       }
     }
     if (typeof msg.content === 'string' && msg.content.trim()) {
+      if (watcher) watcher.turnHadAssistantText = true;
       timelineEmitter.emit(sessionName, 'assistant.text', { text: msg.content, streaming }, { source: 'daemon', confidence: 'high', eventId: stableId('at'), ts: stableTs });
     }
     // Emit usage.update from Gemini's per-message token counts
@@ -159,9 +165,19 @@ export interface WatcherState {
   _readFailCount?: number;
   /** Last time assertSpinnerGate was called — cooldown to avoid 400ms burst every 1.5s. */
   _lastSpinnerGateTs?: number;
+  /** Whether the current running turn produced visible assistant text/thought text. */
+  turnHadAssistantText?: boolean;
+  /** Prevent repeated retrack attempts for the same no-text running→idle turn. */
+  noTextRetrackAttempted?: boolean;
 }
 
 const watchers = new Map<string, WatcherState>();
+
+function watcherControl(sessionName: string): WatcherControl {
+  return {
+    refresh: () => refreshTrackedSession(sessionName),
+  };
+}
 const claimedFiles = new Map<string, string>(); // filePath → sessionName
 
 export function preClaimFile(sessionName: string, filePath: string): void {
@@ -261,6 +277,11 @@ async function terminalThinkingCheck(sessionName: string, state: WatcherState): 
       state.idleConfirmCount = 2;
       if (state.idleDebounceTimer) { clearTimeout(state.idleDebounceTimer); state.idleDebounceTimer = undefined; }
       state._terminalThinkingEmitted = false;
+      if (watchers.has(sessionName) && state.currentState === 'running' && !state.turnHadAssistantText && !state.noTextRetrackAttempted) {
+        state.noTextRetrackAttempted = true;
+        await refreshSessionWatcher(sessionName);
+        return;
+      }
       // Both terminal and JSON agree idle — high confidence, but still respect running lock
       // to prevent flicker when JSON is stale (hasn't updated after user sent a message)
       transitionState(sessionName, state, 'idle');
@@ -277,7 +298,12 @@ async function terminalThinkingCheck(sessionName: string, state: WatcherState): 
         state.idleDebounceTimer = undefined;
         if (!state.stopped) {
           state._terminalThinkingEmitted = false;
-          transitionState(sessionName, state, 'idle');
+          if (watchers.has(sessionName) && state.currentState === 'running' && !state.turnHadAssistantText && !state.noTextRetrackAttempted) {
+            state.noTextRetrackAttempted = true;
+            void refreshSessionWatcher(sessionName);
+          } else {
+            transitionState(sessionName, state, 'idle');
+          }
         }
       }, 3000);
     }
@@ -307,6 +333,11 @@ async function terminalThinkingCheck(sessionName: string, state: WatcherState): 
  */
 function transitionState(sessionName: string, state: WatcherState, next: 'running' | 'idle', force = false): void {
   if (state.currentState === next) return; // already in this state
+  if (watchers.has(sessionName) && next === 'idle' && state.currentState === 'running' && !state.turnHadAssistantText && !state.noTextRetrackAttempted) {
+    state.noTextRetrackAttempted = true;
+    void refreshSessionWatcher(sessionName);
+    return;
+  }
   if (!force) {
     // Idle lock: don't transition to running if we just emitted idle (terminal noise)
     if (next === 'running' && state.lastIdleEmitTs && (Date.now() - state.lastIdleEmitTs) < IDLE_LOCK_MS) return;
@@ -314,6 +345,10 @@ function transitionState(sessionName: string, state: WatcherState, next: 'runnin
     if (next === 'idle' && state.lastRunningEmitTs && (Date.now() - state.lastRunningEmitTs) < RUNNING_LOCK_MS) return;
   }
   state.currentState = next;
+  if (next === 'running') {
+    state.turnHadAssistantText = false;
+    state.noTextRetrackAttempted = false;
+  }
   if (next === 'idle') state.lastIdleEmitTs = Date.now();
   if (next === 'running') state.lastRunningEmitTs = Date.now();
   logger.debug({ sessionName, state: next, activeFile: state.activeFile, seenCount: state.seenCount }, 'gemini-watcher: state transition');
@@ -506,7 +541,7 @@ function activateFile(sessionName: string, state: WatcherState, newFile: string)
 
 // ── Public API ─────────────────────────────────────────────────────────────────
 
-export async function startWatching(sessionName: string, sessionUuid: string): Promise<void> {
+export async function startWatching(sessionName: string, sessionUuid: string): Promise<WatcherControl> {
   if (watchers.has(sessionName)) stopWatching(sessionName);
   const state: WatcherState = {
     sessionUuid, activeFile: null, seenCount: 0, lastUpdated: '',
@@ -514,6 +549,8 @@ export async function startWatching(sessionName: string, sessionUuid: string): P
     stopped: false, polling: false,
   };
   watchers.set(sessionName, state);
+  const control = watcherControl(sessionName);
+  registerWatcherControl(sessionName, control);
 
   const found = await findSessionFile(sessionUuid);
   if (found) {
@@ -557,6 +594,7 @@ export async function startWatching(sessionName: string, sessionUuid: string): P
   }, POLL_INTERVAL_MS);
 
   void watchGeminiDir(sessionName, state);
+  return control;
 }
 
 /**
@@ -567,7 +605,7 @@ export async function startWatchingDiscovered(
   sessionName: string,
   snapshot: Set<string>,
   onDiscovered?: (uuid: string) => void,
-): Promise<void> {
+): Promise<WatcherControl> {
   if (watchers.has(sessionName)) stopWatching(sessionName);
   const state: WatcherState = {
     sessionUuid: '', activeFile: null, seenCount: 0, lastUpdated: '',
@@ -575,6 +613,8 @@ export async function startWatchingDiscovered(
     stopped: false, polling: false,
   };
   watchers.set(sessionName, state);
+  const control = watcherControl(sessionName);
+  registerWatcherControl(sessionName, control);
 
   state.pollTimer = setInterval(() => {
     void (async () => {
@@ -619,11 +659,50 @@ export async function startWatchingDiscovered(
       if (state.activeFile) await pollTick(sessionName, state);
     })();
   }, POLL_INTERVAL_MS);
+  return control;
 }
 
-export async function startWatchingLatest(sessionName: string): Promise<void> { return startWatching(sessionName, ''); }
+export async function startWatchingLatest(sessionName: string): Promise<WatcherControl> { return startWatching(sessionName, ''); }
 
 export function isWatching(sessionName: string): boolean { return watchers.has(sessionName); }
+
+/**
+ * Force the registered watcher to immediately run its normal poll/scan cycle for
+ * this session. Uses the watcher's existing session identity and file tracking.
+ */
+export async function refreshTrackedSession(sessionName: string): Promise<boolean> {
+  const state = watchers.get(sessionName);
+  if (!state || state.stopped) return false;
+  await pollTick(sessionName, state);
+  return true;
+}
+
+export async function retrackLatestSessionFile(sessionName: string): Promise<boolean> {
+  const state = watchers.get(sessionName);
+  if (!state || state.stopped) return false;
+  if (!state.sessionUuid) {
+    state.noTextRetrackAttempted = true;
+    if (state.currentState === 'running' && !state.stopped) transitionState(sessionName, state, 'idle', true);
+    return false;
+  }
+
+  let found: string | null = null;
+  try {
+    found = await findSessionFile(state.sessionUuid);
+  } catch {
+    found = null;
+  }
+  if (!found || found === state.activeFile) {
+    state.noTextRetrackAttempted = true;
+    if (state.currentState === 'running' && !state.stopped) transitionState(sessionName, state, 'idle', true);
+    return false;
+  }
+
+  logger.info({ sessionName, oldFile: state.activeFile, newFile: found }, 'gemini-watcher: retracking latest session file after no-text turn');
+  activateFile(sessionName, state, found);
+  await pollTick(sessionName, state);
+  return true;
+}
 
 /** Snapshot all current Gemini session file paths — used as baseline for new-file detection. */
 export async function snapshotSessionFiles(): Promise<Set<string>> {
@@ -650,6 +729,7 @@ export function stopWatching(sessionName: string): void {
   if (state.pollTimer) clearInterval(state.pollTimer);
   if (state.idleDebounceTimer) clearTimeout(state.idleDebounceTimer);
   watchers.delete(sessionName);
+  unregisterWatcherControl(sessionName);
   for (const [fp, sn] of claimedFiles) { if (sn === sessionName) claimedFiles.delete(fp); }
 }
 
