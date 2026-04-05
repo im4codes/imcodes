@@ -19,6 +19,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _agentId: string | undefined;
   /** Unsubscribe functions for provider callbacks — called in kill(). */
   private _unsubscribes: Array<() => void> = [];
+  /** External callback when status changes — wired to emit timeline session.state events. */
+  private _onStatusChange?: (status: AgentStatus) => void;
   /** Current turn completion signal — used to queue sends until the active turn finishes. */
   private _activeTurn:
     | {
@@ -35,11 +37,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._unsubscribes.push(
       this.provider.onDelta((sid: string, _delta: MessageDelta) => {
         if (sid !== this._providerSessionId) return;
-        this._status = 'streaming';
+        this.setStatus('streaming');
       }),
       this.provider.onComplete((sid: string, message: AgentMessage) => {
         if (sid !== this._providerSessionId) return;
-        this._status = 'idle';
+        this.setStatus('idle');
         this._sending = false;
         this._history.push(message);
         this._activeTurn?.resolve();
@@ -47,12 +49,21 @@ export class TransportSessionRuntime implements SessionRuntime {
       }),
       this.provider.onError((sid: string, error: ProviderError) => {
         if (sid !== this._providerSessionId) return;
-        this._status = error.code === 'CANCELLED' ? 'idle' : 'error';
+        this.setStatus(error.code === 'CANCELLED' ? 'idle' : 'error');
         this._sending = false;
         this._activeTurn?.reject(error);
         this._activeTurn = null;
       }),
     );
+  }
+
+  /** Register a callback for status changes (idle/running/streaming/error). */
+  set onStatusChange(cb: (status: AgentStatus) => void) { this._onStatusChange = cb; }
+
+  private setStatus(status: AgentStatus): void {
+    if (this._status === status) return;
+    this._status = status;
+    this._onStatusChange?.(status);
   }
 
   /** Set providerSessionId directly (used when restoring from store without calling initialize). */
@@ -107,7 +118,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       status: 'complete',
     });
 
-    this._status = 'thinking';
+    this.setStatus('thinking');
     this._sending = true;
     this._activeTurn = (() => {
       let resolve!: () => void;
@@ -123,7 +134,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       await this.provider.send(this._providerSessionId, message, undefined, this._description);
     } catch (err) {
       // Reset status so session doesn't get stuck at 'thinking'
-      this._status = 'idle';
+      this.setStatus('idle');
       this._sending = false;
       this._activeTurn = null;
       throw err;
@@ -151,7 +162,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       await this.provider.endSession(this._providerSessionId);
       this._providerSessionId = null;
     }
-    this._status = 'idle';
+    this.setStatus('idle');
     this._sending = false;
     this._activeTurn = null;
   }

@@ -789,6 +789,10 @@ export async function restoreTransportSessions(providerId: string): Promise<void
           : availableQwenModels[0])
         : s.qwenModel;
       const runtime = new TransportSessionRuntime(provider, s.name);
+      runtime.onStatusChange = (status) => {
+        const mapped = status === 'streaming' ? 'running' : status;
+        timelineEmitter.emit(s.name, 'session.state', { state: mapped }, { source: 'daemon', confidence: 'high' });
+      };
       // After cancel, qwenFreshOnResume is set — don't resume the stuck conversation.
       const freshAfterCancel = !!(s.qwenFreshOnResume && s.providerId === 'qwen');
       const effectiveSessionKey = freshAfterCancel ? randomUUID() : s.providerSessionId;
@@ -835,6 +839,10 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const provider = await ensureProviderConnected(agentType, {});
 
   const runtime = new TransportSessionRuntime(provider, name);
+  runtime.onStatusChange = (status) => {
+    const mapped = status === 'streaming' ? 'running' : status;
+    timelineEmitter.emit(name, 'session.state', { state: mapped }, { source: 'daemon', confidence: 'high' });
+  };
   let effectiveSessionKey = name;
   let effectiveBindExistingKey = bindExistingKey;
   let effectiveSkipCreate = skipCreate;
