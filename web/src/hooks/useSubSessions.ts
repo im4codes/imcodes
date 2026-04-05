@@ -114,8 +114,25 @@ export function useSubSessions(
         const m = msg as any;
         if (m.id) {
           setSubSessions((prev) => {
-            // Don't add if already exists
-            if (prev.some((s) => s.id === m.id)) return prev;
+            // Update existing sub-session metadata (subsession.sync re-broadcasts arrive as subsession.created)
+            const existingIdx = prev.findIndex((s) => s.id === m.id);
+            if (existingIdx !== -1) {
+              const updated = [...prev];
+              updated[existingIdx] = { ...updated[existingIdx],
+                ...(m.state != null && { state: m.state as SubSession['state'] }),
+                ...(m.cwd != null && { cwd: m.cwd }),
+                ...(m.label != null && { label: m.label }),
+                ...(m.modelDisplay != null && { modelDisplay: m.modelDisplay }),
+                ...(m.planLabel != null && { planLabel: m.planLabel }),
+                ...(m.quotaLabel != null && { quotaLabel: m.quotaLabel }),
+                ...(m.quotaUsageLabel != null && { quotaUsageLabel: m.quotaUsageLabel }),
+                ...(m.qwenModel != null && { qwenModel: m.qwenModel }),
+                ...(m.qwenAuthType != null && { qwenAuthType: m.qwenAuthType }),
+                ...(m.qwenAvailableModels != null && { qwenAvailableModels: m.qwenAvailableModels }),
+                updatedAt: Date.now(),
+              };
+              return updated;
+            }
             const now = Date.now();
             return [...prev, {
               id: m.id,

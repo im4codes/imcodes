@@ -29,7 +29,6 @@ function PdfPreview({ data }: { data: string }) {
     const container = containerRef.current;
     if (!container) return;
     let cancelled = false;
-    let workerBlobUrl: string | null = null;
     let pdfDoc: any = null;
 
     async function renderPages(width: number) {
@@ -68,10 +67,12 @@ function PdfPreview({ data }: { data: string }) {
     (async () => {
       try {
         const pdfjsLib = await import('pdfjs-dist');
-        const workerCode = await import('pdfjs-dist/build/pdf.worker.min.mjs?raw');
-        const blob = new Blob([workerCode.default], { type: 'application/javascript' });
-        workerBlobUrl = URL.createObjectURL(blob);
-        pdfjsLib.GlobalWorkerOptions.workerSrc = workerBlobUrl;
+        try {
+          const workerModule = await import('pdfjs-dist/build/pdf.worker.min.mjs');
+          (globalThis as any).pdfjsWorker = workerModule;
+        } catch {
+          console.warn('PDF worker module failed to load, using main-thread fallback');
+        }
         pdfDoc = await pdfjsLib.getDocument({ data: base64ToArrayBuffer(data) }).promise;
         if (cancelled) return;
         // Initial render at current width
@@ -98,7 +99,6 @@ function PdfPreview({ data }: { data: string }) {
       cancelled = true;
       observer.disconnect();
       clearTimeout(resizeTimer);
-      if (workerBlobUrl) URL.revokeObjectURL(workerBlobUrl);
     };
   }, [data, retryKey]);
 
