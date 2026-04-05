@@ -93,31 +93,18 @@ describe('codex watcher refresh()', () => {
     expect(await control.refresh()).toBe(false);
   });
 
-  it('startWatchingSpecificFile does NOT replay existing content by default (no replayHistory)', async () => {
-    // Write content to the file BEFORE starting the watcher (simulates session restart)
+  it('startWatchingSpecificFile never replays pre-existing content (no replay ever)', async () => {
+    // Write content BEFORE starting the watcher — simulates daemon restart or session respawn
     await writeFile(file, `${meta(cwd)}\n${user('pre-existing message')}\n`, 'utf8');
     vi.mocked(timelineEmitter.emit).mockClear();
 
     await startWatchingSpecificFile('codex-refresh', file);
     await new Promise((r) => setTimeout(r, 100));
 
-    // Pre-existing content must NOT be emitted
+    // Pre-existing content must NEVER be emitted — history lives in timeline store, not watcher
     expect(vi.mocked(timelineEmitter.emit).mock.calls.some(
       (c) => c[0] === 'codex-refresh' && c[1] === 'user.message' && (c[2] as any).text === 'pre-existing message',
     )).toBe(false);
-    stopWatching('codex-refresh');
-  });
-
-  it('startWatchingSpecificFile replays content when replayHistory: true (daemon restore)', async () => {
-    await writeFile(file, `${meta(cwd)}\n${user('historical message')}\n`, 'utf8');
-    vi.mocked(timelineEmitter.emit).mockClear();
-
-    await startWatchingSpecificFile('codex-refresh', file, undefined, { replayHistory: true });
-    await waitUntil(() => vi.mocked(timelineEmitter.emit).mock.calls.some((c) => c[1] === 'user.message'));
-
-    expect(vi.mocked(timelineEmitter.emit).mock.calls.some(
-      (c) => c[0] === 'codex-refresh' && c[1] === 'user.message' && (c[2] as any).text === 'historical message',
-    )).toBe(true);
     stopWatching('codex-refresh');
   });
 });

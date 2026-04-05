@@ -36,14 +36,14 @@ import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
 
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
-function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string, opts?: { replayHistory?: boolean }): void {
+function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string): void {
   if (ccSessionId) {
     const jsonlPath = findJsonlPathBySessionId(projectDir, ccSessionId);
-    startWatchingFile(sessionName, jsonlPath, ccSessionId, opts).catch((e) =>
+    startWatchingFile(sessionName, jsonlPath, ccSessionId).catch((e) =>
       logger.warn({ err: e, session: sessionName }, 'jsonl-watcher startWatchingFile failed'),
     );
   } else {
-    startWatching(sessionName, projectDir, undefined, opts).catch((e) =>
+    startWatching(sessionName, projectDir).catch((e) =>
       logger.warn({ err: e, session: sessionName }, 'jsonl-watcher start failed'),
     );
   }
@@ -322,12 +322,12 @@ export async function restoreFromStore(): Promise<void> {
         continue;
       }
       if (s.agentType === 'claude-code' && s.ccSessionId && s.projectDir && !isWatching(s.name)) {
-        startCCWatcher(s.name, s.projectDir, s.ccSessionId, { replayHistory: true });
+        startCCWatcher(s.name, s.projectDir, s.ccSessionId);
       } else if (s.agentType === 'codex' && s.codexSessionId && !isCodexWatching(s.name)) {
         findRolloutPathByUuid(s.codexSessionId).then((rolloutPath) => {
           logger.info({ session: s.name, rolloutPath }, 'Sub-session codex watcher: rollout lookup result');
           if (rolloutPath) {
-            startCodexWatchingFile(s.name, rolloutPath, undefined, { replayHistory: true }).catch((e) =>
+            startCodexWatchingFile(s.name, rolloutPath).catch((e) =>
               logger.warn({ err: e, session: s.name }, 'Sub-session codex watcher startFile failed'));
           } else {
             startCodexWatchingById(s.name, s.codexSessionId!).catch((e) =>
@@ -414,7 +414,7 @@ export async function restoreFromStore(): Promise<void> {
       }
     } else if (hydrated.agentType === 'claude-code' && hydrated.projectDir && !isWatching(hydrated.name)) {
       if (hydrated.ccSessionId) {
-        startCCWatcher(hydrated.name, hydrated.projectDir, hydrated.ccSessionId, { replayHistory: true });
+        startCCWatcher(hydrated.name, hydrated.projectDir, hydrated.ccSessionId);
       } else {
         // Session is alive but we can't recover the ccSessionId — do NOT respawn
         // (that would kill a running CC task). Skip watcher; the session continues
@@ -425,7 +425,7 @@ export async function restoreFromStore(): Promise<void> {
       if (hydrated.codexSessionId) {
         findRolloutPathByUuid(hydrated.codexSessionId).then((rolloutPath) => {
           if (rolloutPath) {
-            startCodexWatchingFile(hydrated.name, rolloutPath, undefined, { replayHistory: true }).catch((e) =>
+            startCodexWatchingFile(hydrated.name, rolloutPath).catch((e) =>
               logger.warn({ err: e, session: hydrated.name }, 'codex-watcher startWatchingSpecificFile failed (restore)'),
             );
           } else {

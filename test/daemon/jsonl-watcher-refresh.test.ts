@@ -121,26 +121,16 @@ describe('jsonl watcher refresh()', () => {
     expect(emittedEvents.some((e) => e.session === 'jsonl-cc' && e.payload.text === 'wrong session transcript')).toBe(false);
   });
 
-  it('startWatchingFile does NOT replay pre-existing content by default (no replayHistory)', async () => {
-    // Write content before watcher starts — simulates session restart with existing transcript
+  it('startWatchingFile never replays pre-existing content (no replay ever)', async () => {
+    // Write content before watcher starts — simulates daemon restart or session respawn
     await appendFile(ccSessionFile, assistantText('pre-existing old message'));
     emittedEvents.length = 0;
 
     await startWatchingFile('jsonl-cc', ccSessionFile, ccSessionId);
     await new Promise((r) => setTimeout(r, 150));
 
+    // History lives in the timeline store — the watcher must NOT re-emit it
     expect(emittedEvents.some((e) => e.session === 'jsonl-cc' && e.payload.text === 'pre-existing old message')).toBe(false);
-    stopWatching('jsonl-cc');
-  });
-
-  it('startWatchingFile replays pre-existing content when replayHistory: true (daemon restore)', async () => {
-    await appendFile(ccSessionFile, assistantText('restored message'));
-    emittedEvents.length = 0;
-
-    await startWatchingFile('jsonl-cc', ccSessionFile, ccSessionId, { replayHistory: true });
-    await waitUntil(() => emittedEvents.some((e) => e.session === 'jsonl-cc' && e.type === 'assistant.text'));
-
-    expect(emittedEvents.some((e) => e.session === 'jsonl-cc' && e.payload.text === 'restored message')).toBe(true);
     stopWatching('jsonl-cc');
   });
 });
