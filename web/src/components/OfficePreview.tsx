@@ -29,9 +29,9 @@ function PdfPreview({ data }: { data: string }) {
     (async () => {
       try {
         const pdfjsLib = await import('pdfjs-dist');
-        // Use the bundled worker via URL import — Vite handles this
-        const workerUrl = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url);
-        pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl.href;
+        // Vite ?url suffix emits the worker as a hashed asset and returns its URL
+        const workerUrl = (await import('pdfjs-dist/build/pdf.worker.min.mjs?url')).default;
+        pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
         const pdf = await pdfjsLib.getDocument({ data: base64ToArrayBuffer(data) }).promise;
         if (cancelled || !containerRef.current) return;
         containerRef.current.innerHTML = '';
