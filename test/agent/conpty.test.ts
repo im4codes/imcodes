@@ -515,5 +515,56 @@ describe('conpty backend', () => {
 
       expect(mockPty.kill).toHaveBeenCalled();
     });
+
+    it('passes env to new session when opts.env is provided', async () => {
+      await conpty.conptyNewSession('respawn-env', 'old-cmd', { cwd: '/my/dir' });
+
+      const newMock = createMockPty(7777);
+      spawnMock.mockReturnValue(newMock);
+
+      await conpty.conptyRespawnPane('respawn-env', 'new-cmd', {
+        env: { IMCODES_SESSION: 'deck_proj_brain', CUSTOM: 'value' },
+      });
+
+      // Env vars should arrive via spawn opts.env, NOT prepended as `export` shell syntax
+      const spawnEnv = spawnMock.mock.calls.at(-1)?.[2]?.env as Record<string, string>;
+      expect(spawnEnv).toHaveProperty('IMCODES_SESSION', 'deck_proj_brain');
+      expect(spawnEnv).toHaveProperty('CUSTOM', 'value');
+
+      // Command must NOT contain POSIX `export` syntax (would fail on cmd.exe)
+      const spawnCmd = spawnMock.mock.calls.at(-1)?.[1] as string[];
+      expect(spawnCmd.join(' ')).not.toContain('export IMCODES_SESSION');
+      expect(spawnCmd.join(' ')).not.toContain('export CUSTOM');
+    });
+
+    it('spawns without env when opts.env is omitted', async () => {
+      await conpty.conptyNewSession('respawn-no-env', 'old-cmd', { cwd: '/path' });
+
+      const newMock = createMockPty(8888);
+      spawnMock.mockReturnValue(newMock);
+
+      await conpty.conptyRespawnPane('respawn-no-env', 'bare-cmd');
+
+      // Should not throw, session should be live
+      expect(conpty.conptySessionExists('respawn-no-env')).toBe(true);
+    });
+
+    it('env vars are visible in the spawned process environment', async () => {
+      await conpty.conptyNewSession('respawn-env-merge', 'old-cmd', { cwd: '/app' });
+
+      const newMock = createMockPty(6666);
+      spawnMock.mockReturnValue(newMock);
+
+      await conpty.conptyRespawnPane('respawn-env-merge', 'claude --resume xyz', {
+        env: { IMCODES_SESSION: 'deck_myapp_brain', CC_PRESET: 'fast' },
+      });
+
+      const spawnEnv = spawnMock.mock.calls.at(-1)?.[2]?.env as Record<string, string>;
+      // Custom vars injected
+      expect(spawnEnv).toHaveProperty('IMCODES_SESSION', 'deck_myapp_brain');
+      expect(spawnEnv).toHaveProperty('CC_PRESET', 'fast');
+      // process.env vars still present (merged by buildWindowsEnv / conptyNewSession)
+      expect(spawnEnv).toHaveProperty('PATH');
+    });
   });
 });

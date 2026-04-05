@@ -378,14 +378,14 @@ export function conptyGetPanePids(name: string): string[] {
  * This is a backend-only operation — stream subscribers are NOT preserved.
  * terminal-streamer's handlePipeClose() → scheduleRebind() handles re-attachment.
  */
-export async function conptyRespawnPane(name: string, cmd: string): Promise<void> {
+export async function conptyRespawnPane(name: string, cmd: string, opts?: { env?: Record<string, string> }): Promise<void> {
   const session = sessions.get(name);
   const oldCwd = session?.cwd;
 
   // Kill existing (also removes from map)
   conptyKillSession(name);
 
-  // Spawn new session with same name and preserved CWD
-  await conptyNewSession(name, cmd, { cwd: oldCwd });
+  // Spawn new session with same name, preserved CWD, and injected env vars
+  await conptyNewSession(name, cmd, { cwd: oldCwd, env: opts?.env });
   logger.debug({ name, cmd }, 'conpty session respawned');
 }

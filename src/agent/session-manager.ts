@@ -1,4 +1,4 @@
-import { newSession, killSession, sessionExists, isPaneAlive, respawnPane, listSessions as tmuxListSessions, sendKeys, sendKey, capturePane, showBuffer, getPaneId, getPaneCwd, getPaneStartCommand, cleanupOrphanFifos } from './tmux.js';
+import { newSession, killSession, sessionExists, isPaneAlive, respawnPane, listSessions as tmuxListSessions, sendKeys, sendKey, capturePane, showBuffer, getPaneId, getPaneCwd, getPaneStartCommand, cleanupOrphanFifos, BACKEND } from './tmux.js';
 import { randomUUID } from 'node:crypto';
 import { ClaudeCodeDriver } from './drivers/claude-code.js';
 import { CodexDriver } from './drivers/codex.js';
@@ -630,15 +630,20 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     opencodeSessionId: effectiveRecord.opencodeSessionId,
   });
 
-  // Env injection: respawnPane doesn't support -e, prepend exports to the command
+  // Env injection: on ConPTY (Windows), pass env directly to the PTY spawn so cmd.exe
+  // doesn't need to parse POSIX `export` syntax.  On tmux/wezterm, prepend `export` to cmd.
   const mergedEnv: Record<string, string> = { IMCODES_SESSION: record.name };
   if (record.ccPreset && record.agentType === 'claude-code') {
     const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
     Object.assign(mergedEnv, await resolvePresetEnv(record.ccPreset, ccSessionId));
   }
-  const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
-  const envPrefix = Object.entries(mergedEnv).map(([k, v]) => `export ${k}=${sq(v)}`).join('; ');
-  await respawnPane(record.name, `${envPrefix}; ${cmd}`);
+  if (BACKEND === 'conpty') {
+    await respawnPane(record.name, cmd, { env: mergedEnv });
+  } else {
+    const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+    const envPrefix = Object.entries(mergedEnv).map(([k, v]) => `export ${k}=${sq(v)}`).join('; ');
+    await respawnPane(record.name, `${envPrefix}; ${cmd}`);
+  }
 
   // Immediately rebind pipe-pane stream (don't wait for old pipe close + 1s delay)
   const { terminalStreamer } = await import('../daemon/terminal-streamer.js');
