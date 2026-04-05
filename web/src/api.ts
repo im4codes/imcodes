@@ -564,6 +564,14 @@ export interface SubSessionData {
   parentSession?: string | null;
   description?: string | null;
   ccPresetId?: string | null;
+  // Provider display metadata (populated via WS subsession.created / subsession.sync)
+  qwenModel?: string | null;
+  qwenAuthType?: string | null;
+  qwenAvailableModels?: string[] | null;
+  modelDisplay?: string | null;
+  planLabel?: string | null;
+  quotaLabel?: string | null;
+  quotaUsageLabel?: string | null;
 }
 
 export async function listSubSessions(serverId: string): Promise<SubSessionData[]> {
@@ -577,7 +585,8 @@ export async function listSubSessions(serverId: string): Promise<SubSessionData[
   }> }>(`/api/server/${serverId}/sub-sessions`);
   return res.subSessions.map((s) => ({
     id: s.id, serverId: s.server_id, type: s.type,
-    runtimeType: s.runtime_type, providerId: s.provider_id, providerSessionId: s.provider_session_id,
+    runtimeType: s.runtime_type ?? (s.type === 'qwen' || s.type === 'openclaw' ? 'transport' : null),
+    providerId: s.provider_id, providerSessionId: s.provider_session_id,
     shellBin: s.shell_bin, cwd: s.cwd, label: s.label,
     closedAt: s.closed_at, createdAt: s.created_at, updatedAt: s.updated_at,
     ccSessionId: s.cc_session_id,
@@ -909,6 +918,23 @@ export async function uploadFile(
 }
 
 export async function downloadAttachment(serverId: string, attachmentId: string): Promise<void> {
+  // Native (iOS): skip blob fetch — WKWebView can't trigger downloads from blob URLs.
+  // Get a one-time token and open in system browser which handles save natively.
+  const isNative = !!(globalThis as Record<string, unknown>).Capacitor;
+  if (isNative) {
+    const tokenRes = await apiFetch(`/api/server/${serverId}/uploads/${attachmentId}/download-token`, { method: 'POST' });
+    const downloadToken = (tokenRes as { token?: string }).token;
+    if (!downloadToken || typeof downloadToken !== 'string' || downloadToken.length < 32) {
+      throw new Error('Failed to acquire download token');
+    }
+    const baseUrl = _baseUrl || window.location.origin;
+    const downloadUrl = `${baseUrl}/api/server/${serverId}/uploads/${attachmentId}/download?token=${downloadToken}`;
+    const { Browser } = await import('@capacitor/browser');
+    await Browser.open({ url: downloadUrl });
+    return;
+  }
+
+  // Desktop: fetch blob and trigger <a download>
   const res = await rawFetch(`/api/server/${serverId}/uploads/${attachmentId}/download`);
   if (!res.ok) {
     const body = await res.text().catch(() => '');
@@ -918,7 +944,6 @@ export async function downloadAttachment(serverId: string, attachmentId: string)
   const disposition = res.headers.get('Content-Disposition');
   let filename = attachmentId;
   if (disposition) {
-    // Prefer filename* (RFC 5987) for non-ASCII names
     const starMatch = disposition.match(/filename\*\s*=\s*UTF-8''([^\s;]+)/i);
     if (starMatch) {
       try { filename = decodeURIComponent(starMatch[1]); } catch { /* keep default */ }
@@ -927,27 +952,14 @@ export async function downloadAttachment(serverId: string, attachmentId: string)
       if (plainMatch) filename = plainMatch[1];
     }
   }
-  // Trigger download — WKWebView (iOS Capacitor) ignores <a download>,
-  // so on native platforms get a one-time download token and open the URL
-  // in the system browser. No extra native plugins needed.
-  const isNative = !!(globalThis as Record<string, unknown>).Capacitor;
-  if (isNative) {
-    const tokenRes = await apiFetch(`/api/server/${serverId}/uploads/${attachmentId}/download-token`, { method: 'POST' });
-    const downloadToken = (tokenRes as { token: string }).token;
-    const baseUrl = _baseUrl || window.location.origin;
-    const downloadUrl = `${baseUrl}/api/server/${serverId}/uploads/${attachmentId}/download?token=${downloadToken}`;
-    const { Browser } = await import('@capacitor/browser');
-    await Browser.open({ url: downloadUrl });
-  } else {
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 export async function previewAttachment(serverId: string, attachmentId: string): Promise<void> {

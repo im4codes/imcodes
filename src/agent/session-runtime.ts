@@ -12,8 +12,8 @@ export interface SessionRuntime {
   /** 'process' for tmux-backed, 'transport' for network-backed */
   readonly type: RuntimeType;
 
-  /** Send a message to the agent */
-  send(message: string): Promise<void>;
+  /** Send a message to the agent. Returns a status string or void. */
+  send(message: string): Promise<void> | 'sent' | 'queued';
 
   /** Get current agent status */
   getStatus(): AgentStatus;

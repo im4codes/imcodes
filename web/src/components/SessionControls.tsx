@@ -347,6 +347,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const disabled = !connected || !hasSession;
   const isClaudeCode = activeSession?.agentType === 'claude-code';
   const isShellLike = activeSession?.agentType === 'shell' || activeSession?.agentType === 'script';
+  const isTransport = activeSession?.runtimeType === 'transport';
   const isCodex = activeSession?.agentType === 'codex';
   const isQwen = activeSession?.agentType === 'qwen';
   const qwenTier = getQwenAuthTier(activeSession?.qwenAuthType);
@@ -696,7 +697,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const handleKeyDown = (e: KeyboardEvent) => {
     if (e.key === 'Escape' && activeSession?.runtimeType === 'transport' && activeSession.state === 'running') {
       e.preventDefault();
-      ws?.sendInput(activeSession.name, '\x1b');
+      ws?.sendSessionCommand('send', { sessionName: activeSession.name, text: '/stop' });
       return;
     }
 
@@ -945,7 +946,21 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               onClick={() => setQuickOpen((o) => !o)}
             >⚡</button>
           )}
-          {SHORTCUTS.map((s) => (
+          {/* Transport sessions: single Stop button instead of terminal shortcuts */}
+          {isTransport ? (
+            <button
+              class="shortcut-btn shortcut-btn-wide"
+              title="Stop (/stop)"
+              disabled={disabled || activeSession?.state !== 'running'}
+              onClick={() => {
+                if (!ws || !activeSession) return;
+                ws.sendSessionCommand('send', { sessionName: activeSession.name, text: '/stop' });
+              }}
+              style={activeSession?.state === 'running' ? { color: '#f87171' } : undefined}
+            >
+              Stop
+            </button>
+          ) : SHORTCUTS.map((s) => (
             <button
               key={s.label}
               class={`shortcut-btn${s.wide ? ' shortcut-btn-wide' : ''}`}

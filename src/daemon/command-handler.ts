@@ -37,6 +37,43 @@ import { copyFile } from 'node:fs/promises';
 import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
 import { buildWindowsCleanupScript, buildWindowsUpgradeBatch } from '../util/windows-upgrade-script.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
+import { sanitizeProjectName } from '../../shared/sanitize-project-name.js';
+
+/**
+ * Build a unified subsession.sync payload from the session store record.
+ * Ensures all fields (including Qwen metadata) are always sent — no more
+ * scattered inline objects with different field subsets.
+ */
+function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord>): Record<string, unknown> {
+  const sessionName = subSessionName(id);
+  const record = getSession(sessionName);
+  const r = { ...record, ...overrides };
+  return {
+    type: 'subsession.sync',
+    id,
+    sessionType: r?.agentType ?? null,
+    cwd: r?.projectDir ?? null,
+    shellBin: null,
+    ccSessionId: r?.ccSessionId ?? null,
+    geminiSessionId: r?.geminiSessionId ?? null,
+    parentSession: r?.parentSession ?? null,
+    ccPresetId: r?.ccPreset ?? null,
+    description: r?.description ?? null,
+    label: r?.label ?? null,
+    runtimeType: r?.runtimeType ?? null,
+    providerId: r?.providerId ?? null,
+    providerSessionId: r?.providerSessionId ?? null,
+    // Qwen metadata — same fields as main session hydration in session-list.ts
+    qwenModel: r?.qwenModel ?? null,
+    qwenAuthType: r?.qwenAuthType ?? null,
+    qwenAuthLimit: r?.qwenAuthLimit ?? null,
+    qwenAvailableModels: r?.qwenAvailableModels ?? null,
+    modelDisplay: r?.modelDisplay ?? null,
+    planLabel: r?.planLabel ?? null,
+    quotaLabel: r?.quotaLabel ?? null,
+    quotaUsageLabel: r?.quotaUsageLabel ?? null,
+  };
+}
 
 /**
  * Build a unified subsession.sync payload from the session store record.
@@ -682,30 +719,7 @@ async function handleInbound(cmd: Record<string, unknown>): Promise<void> {
   }
 }
 
-/** Sanitize project name into a tmux-safe ASCII slug.
- *  ASCII chars kept as-is (lowercased); non-ASCII chars converted to hex codepoints
- *  so CJK names remain deterministic and unique (e.g. "报告" → "62a5-544a"). */
-function sanitizeProjectName(raw: string): string {
-  let slug = '';
-  for (const ch of raw.trim()) {
-    const code = ch.codePointAt(0)!;
-    if ((code >= 0x30 && code <= 0x39)   // 0-9
-      || (code >= 0x41 && code <= 0x5a)  // A-Z
-      || (code >= 0x61 && code <= 0x7a)  // a-z
-      || code === 0x2d || code === 0x5f || code === 0x2e) { // - _ .
-      slug += String.fromCodePoint(code);
-    } else if (code > 0x7f) {
-      // Non-ASCII → hex codepoint
-      slug += (slug.length && !slug.endsWith('-') ? '-' : '') + code.toString(16);
-    } else {
-      // Other ASCII (spaces, punctuation) → underscore
-      if (!slug.endsWith('_')) slug += '_';
-    }
-  }
-  slug = slug.replace(/^[_-]+|[_-]+$/g, '').toLowerCase();
-  if (!slug) slug = `proj_${Date.now().toString(36)}`;
-  return slug;
-}
+// sanitizeProjectName moved to shared/sanitize-project-name.ts
 
 async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawProject = cmd.project as string | undefined;
@@ -719,6 +733,8 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     return;
   }
   const project = sanitizeProjectName(rawProject);
+  // Preserve original name as label when sanitization changes it (e.g. Chinese characters)
+  const label = project !== rawProject.trim().toLowerCase() ? rawProject.trim() : undefined;
 
   try {
     // Resolve CC env preset if specified
@@ -738,6 +754,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       dir,
       brainType: agentType as ProjectConfig['brainType'],
       workerTypes: [],
+      label,
       extraEnv,
       ccPreset: ccPresetName,
     };
@@ -1241,15 +1258,16 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         }
       }
       timelineEmitter.emit(sessionName, 'user.message', { text });
-      timelineEmitter.emit(sessionName, 'session.state', { state: 'running' }, { source: 'daemon', confidence: 'high' });
-      timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'medium' });
       if (record?.agentType === 'qwen' && record.qwenAuthType === 'qwen-oauth') {
         recordQwenOAuthRequest();
         refreshQwenQuotaUsageLabels(serverLink);
       }
-      // send() dispatches to provider — response arrives async via onComplete/onError.
-      // Transport runtime emits session.state changes via onStatusChange callback.
-      await transportRuntime.send(text);
+      // send() is synchronous: dispatches immediately if idle, queues if busy.
+      // Status changes come from transport runtime's onStatusChange callback.
+      const result = transportRuntime.send(text);
+      if (result === 'queued') {
+        timelineEmitter.emit(sessionName, 'session.state', { state: 'queued', pendingCount: transportRuntime.pendingCount }, { source: 'daemon', confidence: 'high' });
+      }
       // Clear fresh-start flag — the new conversation is now active
       if (record?.qwenFreshOnResume) {
         upsertSession({ ...record, qwenFreshOnResume: undefined, updatedAt: Date.now() });
@@ -1260,7 +1278,6 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         serverLink.send({ type: 'command.ack', commandId: effectiveId, status, session: sessionName });
       } catch { /* not connected */ }
     } catch (err) {
-      // Send failed — show error in chat
       const errMsg = describeTransportSendError(err);
       logger.error({ sessionName, err }, 'session.send (transport) failed');
       timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Send failed: ${errMsg}`, streaming: false }, { source: 'daemon', confidence: 'high' });
@@ -2400,7 +2417,13 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
     // Image files: send as base64 with a higher size limit (5 MB)
     const ext = nodePath.extname(real).toLowerCase().slice(1);
     const IMAGE_MIME: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', ico: 'image/x-icon', bmp: 'image/bmp', svg: 'image/svg+xml' };
-    const mimeType = IMAGE_MIME[ext];
+    // Office documents: send as base64 for frontend preview (PDF.js, docx-preview, xlsx)
+    const OFFICE_MIME: Record<string, string> = {
+      pdf: 'application/pdf',
+      docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    };
+    const mimeType = IMAGE_MIME[ext] ?? OFFICE_MIME[ext];
     const sizeLimit = mimeType ? 5 * 1024 * 1024 : FS_READ_SIZE_LIMIT;
 
     // Always generate a download handle so the file can be downloaded even if preview fails

@@ -61,13 +61,12 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     }
 
     private func resetBadgeOnServer() {
-        // Call /api/push/badge-reset via the web view's cookies (session auth)
+        // Use JS bridge function that calls apiFetch with correct baseUrl + Bearer token.
+        // Relative URLs resolve to capacitor://localhost in WKWebView, not the server.
         guard let vc = window?.rootViewController as? CAPBridgeViewController,
               let bridge = vc.bridge else { return }
 
-        bridge.webView?.evaluateJavaScript("""
-            fetch('/api/push/badge-reset', { method: 'POST', credentials: 'same-origin' }).catch(() => {});
-        """)
+        bridge.webView?.evaluateJavaScript("window.__imcodesResetBadge?.()")
     }
 
     func applicationWillTerminate(_ application: UIApplication) {

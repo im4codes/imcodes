@@ -7,6 +7,13 @@ const isNative = (): boolean => typeof (globalThis as any).Capacitor?.isNativePl
 
 let pushSupported = false;
 
+// Expose badge-reset to native layer (AppDelegate calls via evaluateJavaScript on app foreground).
+// Uses apiFetch which prepends baseUrl and includes Bearer token — relative URLs fail in Capacitor.
+import { apiFetch } from './api.js';
+(window as any).__imcodesResetBadge = () => {
+  apiFetch('/api/push/badge-reset', { method: 'POST' }).catch(() => {});
+};
+
 export async function initPushNotifications(
   apiKey: string,
   cfWorkerUrl: string,

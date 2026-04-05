@@ -687,9 +687,23 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
             const nextTs = nextItem?.ts ?? nextItem?.event?.ts;
             const onPathClick = ws && !preview ? (p: string) => setFileBrowserPath(p.replace(/^`+|`+$/g, '')) : undefined;
             const onUrlClick = !preview ? (url: string) => setPendingUrl(url) : undefined;
+            const onDownload = serverId && ws ? (p: string) => {
+              const reqId = ws.fsReadFile(p);
+              const unsub = ws.onMessage((msg) => {
+                if (msg.type !== 'fs.read_response' || msg.requestId !== reqId) return;
+                unsub();
+                if (msg.downloadId) {
+                  import('../api.js').then(({ downloadAttachment }) => {
+                    downloadAttachment(serverId!, msg.downloadId as string).catch(() => {});
+                  });
+                }
+              });
+              // Auto-cleanup after 30s
+              setTimeout(unsub, 30_000);
+            } : undefined;
             return item.type === 'assistant-block' ? (
               <div key={item.key} class="chat-event chat-assistant">
-                <ChatMarkdown text={item.text!} onPathClick={onPathClick} onUrlClick={onUrlClick} />
+                <ChatMarkdown text={item.text!} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} />
                 <ChatTime ts={item.lastTs ?? item.ts ?? 0} />
               </div>
             ) : item.type === 'tool-group' ? (

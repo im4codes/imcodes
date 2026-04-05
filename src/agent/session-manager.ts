@@ -129,6 +129,8 @@ export interface ProjectConfig {
   dir: string;
   brainType: AgentType;
   workerTypes: AgentType[]; // one entry per worker slot
+  /** Human-readable label (e.g. original Chinese project name before sanitization). */
+  label?: string;
   /** When true, start fresh sessions without resuming last conversation. */
   fresh?: boolean;
   /** Extra env vars merged into session launch (e.g. CC API preset). */
@@ -156,13 +158,13 @@ export function sessionName(project: string, role: 'brain' | `w${number}`): stri
 
 /** Start all sessions for a project (brain + workers). */
 export async function startProject(config: ProjectConfig): Promise<void> {
-  const { name, dir, brainType, workerTypes, fresh, extraEnv, ccPreset } = config;
+  const { name, dir, brainType, workerTypes, fresh, extraEnv, ccPreset, label } = config;
 
-  await launchSession({ name: sessionName(name, 'brain'), projectName: name, role: 'brain', agentType: brainType, projectDir: dir, fresh, extraEnv, ccPreset });
+  await launchSession({ name: sessionName(name, 'brain'), projectName: name, role: 'brain', agentType: brainType, projectDir: dir, fresh, extraEnv, ccPreset, label });
 
   for (let i = 0; i < workerTypes.length; i++) {
     const role = `w${i + 1}` as `w${number}`;
-    await launchSession({ name: sessionName(name, role), projectName: name, role, agentType: workerTypes[i], projectDir: dir, fresh });
+    await launchSession({ name: sessionName(name, role), projectName: name, role, agentType: workerTypes[i], projectDir: dir, fresh, label });
   }
 }
 
@@ -723,6 +725,22 @@ export interface LaunchOpts {
 /** In-memory map of active transport session runtimes */
 const transportRuntimes = new Map<string, TransportSessionRuntime>();
 
+/** Wire up onStatusChange and onDrain callbacks for a transport runtime. */
+function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: string): void {
+  runtime.onStatusChange = (status) => {
+    // Emit assistant.thinking for chat typing indicator (matches tmux watcher behavior)
+    if (status === 'thinking') {
+      timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'high' });
+    }
+    const mapped = (status === 'streaming' || status === 'thinking') ? 'running' : status;
+    timelineEmitter.emit(sessionName, 'session.state', { state: mapped }, { source: 'daemon', confidence: 'high' });
+  };
+  runtime.onDrain = (merged, count) => {
+    timelineEmitter.emit(sessionName, 'user.message', { text: merged, batchedCount: count });
+    timelineEmitter.emit(sessionName, 'session.state', { state: 'running' }, { source: 'daemon', confidence: 'high' });
+  };
+}
+
 /** providerSessionId → IM.codes sessionName routing map */
 const providerRouting = new Map<string, string>();
 
@@ -789,10 +807,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
           : availableQwenModels[0])
         : s.qwenModel;
       const runtime = new TransportSessionRuntime(provider, s.name);
-      runtime.onStatusChange = (status) => {
-        const mapped = status === 'streaming' ? 'running' : status;
-        timelineEmitter.emit(s.name, 'session.state', { state: mapped }, { source: 'daemon', confidence: 'high' });
-      };
+      wireTransportCallbacks(runtime, s.name);
       // After cancel, qwenFreshOnResume is set — don't resume the stuck conversation.
       const freshAfterCancel = !!(s.qwenFreshOnResume && s.providerId === 'qwen');
       const effectiveSessionKey = freshAfterCancel ? randomUUID() : s.providerSessionId;
@@ -839,10 +854,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const provider = await ensureProviderConnected(agentType, {});
 
   const runtime = new TransportSessionRuntime(provider, name);
-  runtime.onStatusChange = (status) => {
-    const mapped = status === 'streaming' ? 'running' : status;
-    timelineEmitter.emit(name, 'session.state', { state: mapped }, { source: 'daemon', confidence: 'high' });
-  };
+  wireTransportCallbacks(runtime, name);
   let effectiveSessionKey = name;
   let effectiveBindExistingKey = bindExistingKey;
   let effectiveSkipCreate = skipCreate;
@@ -938,7 +950,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     return;
   }
 
-  const { name, projectName, role, agentType, projectDir, skipStore, extraEnv, fresh } = opts;
+  const { name, projectName, role, agentType, projectDir, skipStore, extraEnv, fresh, label } = opts;
   // Inject IMCODES_SESSION so agents can auto-detect their own session identity
   const mergedEnv: Record<string, string> = { IMCODES_SESSION: name, ...extraEnv };
   const driver = getDriver(agentType);
@@ -1041,6 +1053,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ...(geminiSessionId ? { geminiSessionId } : {}),
       ...(opencodeSessionId ? { opencodeSessionId } : {}),
       ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),
+      ...(label ? { label } : {}),
     };
     upsertSession(record);
     emitSessionPersist(record, name);

@@ -16,6 +16,7 @@ import type { WsClient, ServerMessage } from '../ws-client.js';
 import { lazy, Suspense } from 'preact/compat';
 import { FileEditor, FileEditorContent } from './file-editor-lazy.js';
 const FilePreviewPane = lazy(() => import('./FilePreviewPane.js'));
+const OfficePreview = lazy(() => import('./OfficePreview.js'));
 import { downloadAttachment } from '../api.js';
 
 const PREF_KEY = 'fb_prefer_editor';
@@ -148,7 +149,20 @@ type PreviewState =
   | { status: 'loading'; path: string }
   | { status: 'ok'; path: string; content: string; diff?: string; diffHtml?: string; downloadId?: string }
   | { status: 'image'; path: string; dataUrl: string; downloadId?: string }
+  | { status: 'office'; path: string; data: string; mimeType: string; downloadId?: string }
   | { status: 'error'; path: string; error: string; downloadId?: string };
+
+/** File extensions that can be previewed with office document libraries. */
+const OFFICE_EXTENSIONS: Record<string, string> = {
+  '.pdf': 'application/pdf',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+};
+
+function getOfficeType(path: string): string | null {
+  const ext = path.match(/\.[a-zA-Z0-9]+$/i)?.[0]?.toLowerCase();
+  return ext ? (OFFICE_EXTENSIONS[ext] ?? null) : null;
+}
 
 const REQUEST_TIMEOUT_MS = 15_000;
 
@@ -354,6 +368,13 @@ export function FileBrowser({
             : msg.error === 'forbidden_path' ? 'file_browser.preview_error'
             : 'file_browser.preview_error';
           setPreview({ status: 'error', path: filePath, error: t(errKey), downloadId: dlId });
+          return;
+        }
+
+        // Office document preview (PDF, DOCX, XLSX) — check before image
+        const officeType = getOfficeType(filePath);
+        if (officeType && msg.encoding === 'base64') {
+          setPreview({ status: 'office', path: filePath, data: msg.content ?? '', mimeType: officeType, downloadId: dlId });
           return;
         }
 
@@ -763,7 +784,7 @@ export function FileBrowser({
             {showDiff ? t('file_browser.view_source') : t('file_browser.view_diff')}
           </button>
         )}
-        {(preview.status === 'ok' || preview.status === 'image' || preview.status === 'error') && serverId && preview.downloadId && (
+        {(preview.status === 'ok' || preview.status === 'image' || preview.status === 'office' || preview.status === 'error') && serverId && preview.downloadId && (
           <button
             class="fb-diff-toggle"
             title={downloadError || t('upload.download_file')}
@@ -804,6 +825,11 @@ export function FileBrowser({
           <div class="fb-preview-image">
             <img src={preview.dataUrl} alt={preview.path.split(/[/\\]/).pop() ?? ''} onClick={() => setLightbox(preview.dataUrl)} style={{ cursor: 'zoom-in' }} />
           </div>
+        )}
+        {preview.status === 'office' && (
+          <Suspense fallback={<div class="fb-preview-loading"><div class="fb-loading-spinner" /></div>}>
+            <OfficePreview data={preview.data} mimeType={preview.mimeType} path={preview.path} />
+          </Suspense>
         )}
         {preview.status === 'ok' && isEditing && (
           <Suspense fallback={null}>

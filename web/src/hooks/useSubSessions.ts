@@ -122,7 +122,7 @@ export function useSubSessions(
               serverId: '',
               type: m.sessionType || 'shell',
               sessionName: m.sessionName || `deck_sub_${m.id}`,
-              runtimeType: m.runtimeType ?? null,
+              runtimeType: m.runtimeType ?? (m.sessionType === 'qwen' || m.sessionType === 'openclaw' ? 'transport' : null),
               providerId: m.providerId ?? null,
               providerSessionId: m.providerSessionId ?? null,
               cwd: m.cwd || null,
@@ -131,6 +131,13 @@ export function useSubSessions(
               createdAt: now,
               updatedAt: now,
               state: (m.state || 'running') as SubSession['state'],
+              qwenModel: m.qwenModel ?? null,
+              qwenAuthType: m.qwenAuthType ?? null,
+              qwenAvailableModels: m.qwenAvailableModels ?? null,
+              modelDisplay: m.modelDisplay ?? null,
+              planLabel: m.planLabel ?? null,
+              quotaLabel: m.quotaLabel ?? null,
+              quotaUsageLabel: m.quotaUsageLabel ?? null,
             }];
           });
         }
@@ -142,6 +149,27 @@ export function useSubSessions(
         const removedId = (msg as any).id as string;
         if (removedId) {
           setSubSessions((prev) => prev.filter((s) => s.id !== removedId));
+        }
+        return;
+      }
+
+      // Sub-session metadata sync from daemon (start, restart, set_model, periodic refresh)
+      if (msg.type === 'subsession.sync') {
+        const m = msg as any;
+        if (m.id) {
+          setSubSessions((prev) => prev.map((s) => {
+            if (s.id !== m.id) return s;
+            return { ...s,
+              ...(m.state ? { state: m.state as SubSession['state'] } : {}),
+              ...(m.cwd !== undefined ? { cwd: m.cwd } : {}),
+              ...(m.label !== undefined ? { label: m.label } : {}),
+              ...(m.qwenModel !== undefined ? { qwenModel: m.qwenModel } : {}),
+              ...(m.modelDisplay !== undefined ? { modelDisplay: m.modelDisplay } : {}),
+              ...(m.planLabel !== undefined ? { planLabel: m.planLabel } : {}),
+              ...(m.quotaLabel !== undefined ? { quotaLabel: m.quotaLabel } : {}),
+              ...(m.quotaUsageLabel !== undefined ? { quotaUsageLabel: m.quotaUsageLabel } : {}),
+            };
+          }));
         }
         return;
       }
@@ -180,10 +208,27 @@ export function useSubSessions(
   ): Promise<SubSession | null> => {
     if (!serverId) return null;
     try {
+      // Auto-generate label if not provided: agentType + incrementing number
+      let effectiveLabel = label;
+      if (!effectiveLabel) {
+        const siblings = subSessions.filter((s) => s.parentSession === activeSession);
+        const prefix = type === 'claude-code' ? 'CC' : type === 'codex' ? 'Cx' : type === 'gemini' ? 'Gm' : type === 'qwen' ? 'Qw' : type === 'openclaw' ? 'OC' : type;
+        let n = siblings.filter((s) => s.type === type).length + 1;
+        effectiveLabel = `${prefix}${n}`;
+        while (siblings.some((s) => s.label === effectiveLabel)) { n++; effectiveLabel = `${prefix}${n}`; }
+      } else {
+        // Prevent duplicate labels within the same parent session
+        const siblings = subSessions.filter((s) => s.parentSession === activeSession);
+        if (siblings.some((s) => s.label === effectiveLabel)) {
+          let n = 2;
+          while (siblings.some((s) => s.label === `${effectiveLabel}${n}`)) n++;
+          effectiveLabel = `${effectiveLabel}${n}`;
+        }
+      }
       const ccSessionId = type === 'claude-code' ? crypto.randomUUID() : undefined;
       const description = extra?.description as string | undefined;
       const ccPresetId = extra?.ccPreset as string | undefined;
-      const res = await apiCreate(serverId, { type, shellBin, cwd, label, ccSessionId, parentSession: activeSession ?? null, description, ccPresetId });
+      const res = await apiCreate(serverId, { type, shellBin, cwd, label: effectiveLabel, ccSessionId, parentSession: activeSession ?? null, description, ccPresetId });
       const sub: SubSession = {
         ...res.subSession,
         sessionName: res.sessionName,

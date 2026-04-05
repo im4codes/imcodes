@@ -1491,6 +1491,8 @@ body {
 /* inline path links in chat */
 .chat-path-link { color: #818cf8; cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
 .chat-path-link:hover { color: #a5b4fc; }
+.chat-dl-btn { background: none; border: none; color: #64748b; cursor: pointer; font-size: 11px; padding: 0 2px; margin-left: 2px; vertical-align: middle; line-height: 1; }
+.chat-dl-btn:hover { color: #818cf8; }
 .chat-external-link { color: #60a5fa; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
 .chat-external-link:hover { color: #93c5fd; }
 /* GFM tables in chat */

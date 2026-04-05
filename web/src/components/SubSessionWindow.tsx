@@ -130,8 +130,7 @@ export function SubSessionWindow({
   const onTermScrollBottomFn = useCallback((fn: () => void) => { termScrollRef.current = fn; }, []);
   const onChatScrollBottomFn = useCallback((fn: () => void) => { chatScrollRef.current = fn; }, []);
 
-  // SessionInfo shape for SessionControls
-  const matchedSession = sessions?.find((s) => s.name === sub.sessionName);
+  // SessionInfo shape for SessionControls — read metadata from sub-session object directly
   const sessionInfo: SessionInfo = {
     name: sub.sessionName,
     project: sub.label ?? sub.type,
@@ -139,14 +138,13 @@ export function SubSessionWindow({
     agentType: sub.type,
     state: sub.state === 'running' ? 'running' : sub.state === 'stopped' ? 'stopped' : 'idle',
     projectDir: sub.cwd ?? undefined,
-    qwenModel: matchedSession?.qwenModel,
-    qwenAuthType: matchedSession?.qwenAuthType,
-    qwenAuthLimit: matchedSession?.qwenAuthLimit,
-    qwenAvailableModels: matchedSession?.qwenAvailableModels,
-    modelDisplay: matchedSession?.modelDisplay,
-    planLabel: matchedSession?.planLabel,
-    quotaLabel: matchedSession?.quotaLabel,
-    quotaUsageLabel: matchedSession?.quotaUsageLabel,
+    qwenModel: sub.qwenModel ?? undefined,
+    qwenAuthType: sub.qwenAuthType ?? undefined,
+    qwenAvailableModels: sub.qwenAvailableModels ?? undefined,
+    modelDisplay: sub.modelDisplay ?? undefined,
+    planLabel: sub.planLabel ?? undefined,
+    quotaLabel: sub.quotaLabel ?? undefined,
+    quotaUsageLabel: sub.quotaUsageLabel ?? undefined,
   };
 
   useEffect(() => {

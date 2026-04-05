@@ -16,6 +16,14 @@ interface Props {
   text: string;
   onPathClick?: (path: string) => void;
   onUrlClick?: (url: string) => void;
+  /** Called to download a file path. Only shown for paths with extensions. */
+  onDownload?: (path: string) => void;
+}
+
+/** Returns true if the path has a file extension (not a directory). */
+function hasFileExtension(path: string): boolean {
+  const basename = path.split('/').pop() ?? '';
+  return /\.\w{1,10}$/.test(basename);
 }
 
 // ── Token rendering ─────────────────────────────────────────────────────────
@@ -32,8 +40,9 @@ function renderTokens(
   onPathClick?: (p: string) => void,
   onUrlClick?: (url: string) => void,
   inLink = false,
+  onDownload?: (p: string) => void,
 ): h.JSX.Element[] {
-  return tokens.map((token, i) => renderToken(token, i, onPathClick, onUrlClick, inLink));
+  return tokens.map((token, i) => renderToken(token, i, onPathClick, onUrlClick, inLink, onDownload));
 }
 
 function renderInlineTokens(
@@ -41,9 +50,10 @@ function renderInlineTokens(
   onPathClick?: (p: string) => void,
   onUrlClick?: (url: string) => void,
   inLink = false,
+  onDownload?: (p: string) => void,
 ): h.JSX.Element[] {
   if (!tokens || tokens.length === 0) return [];
-  return renderTokens(tokens, onPathClick, onUrlClick, inLink);
+  return renderTokens(tokens, onPathClick, onUrlClick, inLink, onDownload);
 }
 
 function renderToken(
@@ -52,6 +62,7 @@ function renderToken(
   onPathClick?: (p: string) => void,
   onUrlClick?: (url: string) => void,
   inLink = false,
+  onDownload?: (p: string) => void,
 ): h.JSX.Element {
   switch (token.type) {
     case 'heading': {
@@ -73,7 +84,7 @@ function renderToken(
       }
       // Plain text — apply path/URL detection IF NOT already inside a link
       if (inLink) return <span key={key}>{t.raw}</span>;
-      return <span key={key}>{splitPathsAndUrlsInternal(t.raw, onPathClick, onUrlClick)}</span>;
+      return <span key={key}>{splitPathsAndUrlsInternal(t.raw, onPathClick, onUrlClick, onDownload)}</span>;
     }
 
     case 'strong': {
@@ -96,7 +107,10 @@ function renderToken(
       // Detect file paths inside backtick code spans — agents commonly wrap paths in backticks
       if (onPathClick && PATH_REGEX_INLINE.test(t.text)) {
         PATH_REGEX_INLINE.lastIndex = 0;
-        return <code key={key} class="chat-inline-code chat-path-link" onClick={() => onPathClick(t.text)} title={t.text}>{t.text}</code>;
+        return <span key={key}>
+          <code class="chat-inline-code chat-path-link" onClick={() => onPathClick(t.text)} title={t.text}>{t.text}</code>
+          {onDownload && hasFileExtension(t.text) && <button class="chat-dl-btn" title="Download" onClick={(e: Event) => { e.stopPropagation(); onDownload(t.text); }}>⬇</button>}
+        </span>;
       }
       return <code key={key} class="chat-inline-code">{t.text}</code>;
     }
@@ -229,6 +243,7 @@ function splitPathsAndUrlsInternal(
   text: string,
   onPathClick?: (p: string) => void,
   onUrlClick?: (url: string) => void,
+  onDownload?: (p: string) => void,
 ): h.JSX.Element[] {
   if (!onPathClick && !onUrlClick) return [<span>{text}</span>];
 
@@ -272,8 +287,9 @@ function splitPathsAndUrlsInternal(
         if (path.length < 3) continue;
         if (pm.index > pathLast) parts.push(<span key={`t${chunk.start + pathLast}`}>{chunk.value.slice(pathLast, pm.index)}</span>);
         parts.push(
-          <span key={`p${chunk.start + pm.index}`} class="chat-path-link" onClick={() => onPathClick(path)} title={path}>
-            {path}
+          <span key={`p${chunk.start + pm.index}`}>
+            <span class="chat-path-link" onClick={() => onPathClick(path)} title={path}>{path}</span>
+            {onDownload && hasFileExtension(path) && <button class="chat-dl-btn" title="Download" onClick={(e: Event) => { e.stopPropagation(); onDownload(path); }}>⬇</button>}
           </span>,
         );
         pathLast = pm.index + pm[0].length;
@@ -289,11 +305,11 @@ function splitPathsAndUrlsInternal(
 
 // ── Public component ────────────────────────────────────────────────────────
 
-export function ChatMarkdown({ text, onPathClick, onUrlClick }: Props) {
+export function ChatMarkdown({ text, onPathClick, onUrlClick, onDownload }: Props) {
   const tokens = useMemo(() => marked.lexer(text), [text]);
   return (
     <div class="chat-rich-text">
-      {renderTokens(tokens, onPathClick, onUrlClick)}
+      {renderTokens(tokens, onPathClick, onUrlClick, false, onDownload)}
     </div>
   );
 }
