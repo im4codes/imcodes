@@ -5,3 +5,9 @@ declare module '*?url' {
   const src: string;
   export default src;
 }
+
+// Vite ?raw suffix — returns file content as a string
+declare module '*?raw' {
+  const src: string;
+  export default src;
+}

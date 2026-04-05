@@ -29,12 +29,17 @@ function PdfPreview({ data }: { data: string }) {
     (async () => {
       try {
         const pdfjsLib = await import('pdfjs-dist');
-        // Vite ?url suffix emits the worker as a hashed asset and returns its URL
-        const workerUrl = (await import('pdfjs-dist/build/pdf.worker.min.mjs?url')).default;
-        pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
+        // Import worker source as raw text, create Blob URL to avoid .mjs MIME type issues
+        const workerCode = await import('pdfjs-dist/build/pdf.worker.min.mjs?raw');
+        const blob = new Blob([workerCode.default], { type: 'application/javascript' });
+        pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(blob);
         const pdf = await pdfjsLib.getDocument({ data: base64ToArrayBuffer(data) }).promise;
         if (cancelled || !containerRef.current) return;
         containerRef.current.innerHTML = '';
+
+        // Wait one frame for container layout to settle (fixes mobile width measurement)
+        await new Promise((r) => requestAnimationFrame(r));
+        if (cancelled || !containerRef.current) return;
 
         // Measure container width to calculate the correct scale
         const containerWidth = containerRef.current.clientWidth || 360;
