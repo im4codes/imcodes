@@ -63,7 +63,7 @@ function PdfPreview({ data }: { data: string }) {
   }, [data]);
 
   if (error) return <div style={{ color: '#f87171', padding: 12 }}>{error}</div>;
-  return <div ref={containerRef} style={{ overflow: 'auto', padding: '8px' }} />;
+  return <div ref={containerRef} style={{ overflow: 'auto', width: '100%' }} />;
 }
 
 function DocxPreview({ data }: { data: string }) {
@@ -89,7 +89,7 @@ function DocxPreview({ data }: { data: string }) {
   }, [data]);
 
   if (error) return <div style={{ color: '#f87171', padding: 12 }}>{error}</div>;
-  return <div ref={containerRef} style={{ overflow: 'auto', padding: '8px', background: '#fff', color: '#000', borderRadius: 4 }} />;
+  return <div ref={containerRef} style={{ overflow: 'auto', width: '100%', background: '#fff', color: '#000', borderRadius: 4 }} />;
 }
 
 function XlsxPreview({ data }: { data: string }) {
