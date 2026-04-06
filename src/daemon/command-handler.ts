@@ -36,6 +36,7 @@ import { getProvider } from '../agent/provider-registry.js';
 import { copyFile } from 'node:fs/promises';
 import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
 import { buildWindowsCleanupScript, buildWindowsUpgradeBatch } from '../util/windows-upgrade-script.js';
+import { UPGRADE_LOCK_FILE } from '../util/windows-launch-artifacts.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { sanitizeProjectName } from '../../shared/sanitize-project-name.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
@@ -2127,6 +2128,7 @@ launchctl load -w "${plist}"`;
       pkgSpec,
       targetVer,
       vbsLauncherPath,
+      upgradeLockFile: UPGRADE_LOCK_FILE,
     });
 
     writeFileSync(batchPath, batch);

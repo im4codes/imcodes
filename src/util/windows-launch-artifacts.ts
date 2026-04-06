@@ -10,6 +10,10 @@ const __dirname = dirname(__filename);
 
 const TASK_NAME = 'imcodes-daemon';
 
+/** Sentinel file that tells the watchdog loop to pause.
+ *  Created by the upgrade batch before npm install, deleted after restart. */
+export const UPGRADE_LOCK_FILE = join(homedir(), '.imcodes', 'upgrade.lock');
+
 export interface LaunchPaths {
   nodeExe: string;
   imcodesScript: string;
@@ -43,7 +47,21 @@ export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
   const launchCmd = existsSync(shimPath)
     ? `"${shimPath}" start --foreground`
     : `"${paths.nodeExe}" "${paths.imcodesScript}" start --foreground`;
-  const watchdog = `@echo off\r\nchcp 65001 >nul 2>&1\r\n:loop\r\n${launchCmd} >> "${paths.logPath}" 2>&1\r\ntimeout /t 5 /nobreak >nul\r\ngoto loop\r\n`;
+  const lockFile = UPGRADE_LOCK_FILE.replace(/\//g, '\\');
+  const watchdog = [
+    '@echo off',
+    'chcp 65001 >nul 2>&1',
+    ':loop',
+    `if exist "${lockFile}" (`,
+    `  echo Upgrade in progress, waiting... >> "${paths.logPath}"`,
+    '  timeout /t 5 /nobreak >nul',
+    '  goto loop',
+    ')',
+    `${launchCmd} >> "${paths.logPath}" 2>&1`,
+    'timeout /t 5 /nobreak >nul',
+    'goto loop',
+    '',
+  ].join('\r\n');
   await writeFile(paths.watchdogPath, watchdog, 'utf8');
 }
 
