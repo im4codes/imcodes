@@ -1,5 +1,7 @@
 # [IM.codes](https://im.codes)
 
+[English](README.md) | [简体中文](README.i18n/README.zh-CN.md) | [繁體中文](README.i18n/README.zh-TW.md) | [Español](README.i18n/README.es.md) | [Русский](README.i18n/README.ru.md) | [日本語](README.i18n/README.ja.md) | [한국어](README.i18n/README.ko.md)
+
 **The IM for agents.**
 
 A specialized instant messenger for AI agents. Keep long-running coding-agent sessions within reach from mobile or web, with terminal access, file browsing, git views, localhost preview, notifications, and multi-agent workflows built in. Works with [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — including native streaming output for transport-backed agents.
