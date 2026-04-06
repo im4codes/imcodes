@@ -646,11 +646,15 @@ export async function retrackLatestRollout(sessionName: string): Promise<boolean
 
 async function finalizeIdleAfterRefresh(sessionName: string): Promise<void> {
   let refreshed = false;
+  let retracked = false;
   try {
     refreshed = await refreshSessionWatcher(sessionName);
+    if (sessionStates.get(sessionName) !== 'running') {
+      retracked = await retrackLatestRollout(sessionName).catch(() => false);
+    }
   } finally {
     flushFinalAnswer(sessionName);
-    if (refreshed && sessionStates.get(sessionName) === 'running') return;
+    if ((refreshed || retracked) && sessionStates.get(sessionName) === 'running') return;
     emitSessionState(sessionName, 'idle');
   }
 }
