@@ -15,14 +15,12 @@ import logger from '../util/logger.js';
 import { resolveContextWindow } from '../util/model-context.js';
 
 let sendToServer: ((msg: Record<string, unknown>) => void) | null = null;
+const inFlightMessages = new Map<string, { messageId: string; eventId: string; text: string }>();
 
 /** Set the send function (called once during server-link setup) */
 export function setTransportRelaySend(fn: (msg: Record<string, unknown>) => void): void {
   sendToServer = fn;
 }
-
-/** Per-session text accumulator for streaming deltas → assistant.text events. */
-const accumulators = new Map<string, { messageId: string; text: string }>();
 
 /** Wire up a provider's callbacks to emit standard timeline events.
  *  Provider callbacks use providerSessionId; we resolve to IM.codes sessionName
@@ -35,12 +33,13 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     // Provider may send cumulative deltas (full text so far) or incremental.
     // Use delta.delta as the display text directly — the provider's internal
     // accumulator handles cumulative vs incremental differences.
-    const accKey = `${sessionName}:${delta.messageId}`;
-    accumulators.set(accKey, { messageId: delta.messageId, text: delta.delta });
-
-    // Emit streaming event via timelineEmitter — use stable eventId so frontend
-    // replaces in place (typewriter effect).
     const stableEventId = `transport:${sessionName}:${delta.messageId}`;
+    inFlightMessages.set(sessionName, {
+      messageId: delta.messageId,
+      eventId: stableEventId,
+      text: delta.delta,
+    });
+
     timelineEmitter.emit(sessionName, 'assistant.text', {
       text: delta.delta,
       streaming: true,
@@ -53,14 +52,14 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       logger.debug({ providerSid }, 'transport-relay: unresolved route for complete — dropped');
       return;
     }
-
-    const accKey = `${sessionName}:${message.id}`;
-    // Use message.content as authoritative final text (provider accumulated internally)
     const finalText = message.content;
-    accumulators.delete(accKey);
 
     // Replace streaming event with final version (same eventId → in-place update)
-    const stableEventId = `transport:${sessionName}:${message.id}`;
+    const tracked = inFlightMessages.get(sessionName);
+    const stableEventId = tracked?.messageId === message.id
+      ? tracked.eventId
+      : `transport:${sessionName}:${message.id}`;
+    inFlightMessages.delete(sessionName);
     timelineEmitter.emit(sessionName, 'assistant.text', {
       text: finalText,
       streaming: false,
@@ -101,11 +100,20 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       return;
     }
 
-    // Show error as a visible message in the chat so the user knows what happened
+    const tracked = inFlightMessages.get(sessionName);
+    inFlightMessages.delete(sessionName);
+    const errorText = tracked?.text
+      ? `${tracked.text}\n\n⚠️ Error: ${error.message}`
+      : `⚠️ Error: ${error.message}`;
+
     timelineEmitter.emit(sessionName, 'assistant.text', {
-      text: `⚠️ Error: ${error.message}`,
+      text: errorText,
       streaming: false,
-    }, { source: 'daemon', confidence: 'high' });
+    }, {
+      source: 'daemon',
+      confidence: 'high',
+      ...(tracked ? { eventId: tracked.eventId } : {}),
+    });
 
     timelineEmitter.emit(sessionName, 'session.state', {
       state: 'idle',

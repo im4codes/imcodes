@@ -157,4 +157,36 @@ describe('NewSessionDialog', () => {
     fireEvent.click(backdrop, { target: backdrop });
     expect(onClose).toHaveBeenCalledOnce();
   });
+
+  it('matches started events for non-ASCII project names deterministically', () => {
+    const ws = makeWs();
+    const onClose = vi.fn();
+    const onSessionStarted = vi.fn();
+    render(<NewSessionDialog ws={ws as any} onClose={onClose} onSessionStarted={onSessionStarted} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), {
+      target: { value: '测试' },
+    });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), {
+      target: { value: '~/projects/test' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      project: '测试',
+      agentType: 'claude-code',
+    }));
+
+    const handler = ws.onMessage.mock.calls.at(-1)?.[0];
+    expect(typeof handler).toBe('function');
+    handler?.({
+      type: 'session.event',
+      event: 'started',
+      session: 'deck_u6d4b_u8bd5_brain',
+      state: 'running',
+    });
+
+    expect(onSessionStarted).toHaveBeenCalledWith('deck_u6d4b_u8bd5_brain');
+    expect(onClose).toHaveBeenCalledOnce();
+  });
 });

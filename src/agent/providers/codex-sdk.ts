@@ -21,7 +21,7 @@ import {
   SESSION_OWNERSHIP,
   PROVIDER_ERROR_CODES,
 } from '../transport-provider.js';
-import type { AgentMessage } from '../../../shared/agent-message.js';
+import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import logger from '../../util/logger.js';
 
 const CODEX_BIN = 'codex';
@@ -77,7 +77,7 @@ export class CodexSdkProvider implements TransportProvider {
   readonly connectionMode = CONNECTION_MODES.LOCAL_SDK;
   readonly sessionOwnership = SESSION_OWNERSHIP.SHARED;
   readonly capabilities: ProviderCapabilities = {
-    streaming: false,
+    streaming: true,
     toolCalling: true,
     approval: false,
     sessionRestore: true,
@@ -87,7 +87,7 @@ export class CodexSdkProvider implements TransportProvider {
 
   private config: ProviderConfig | null = null;
   private sessions = new Map<string, CodexSdkSessionState>();
-  private deltaCallbacks: Array<(sessionId: string, delta: never) => void> = [];
+  private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
@@ -116,7 +116,7 @@ export class CodexSdkProvider implements TransportProvider {
 
   async createSession(config: SessionConfig): Promise<string> {
     const routeId = config.bindExistingKey ?? config.sessionKey;
-    const existing = this.sessions.get(routeId);
+    const existing = config.fresh ? undefined : this.sessions.get(routeId);
     this.sessions.set(routeId, {
       routeId,
       cwd: config.cwd ?? existing?.cwd ?? process.cwd(),
@@ -139,7 +139,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.sessions.delete(sessionId);
   }
 
-  onDelta(cb: (sessionId: string, delta: never) => void): () => void {
+  onDelta(cb: (sessionId: string, delta: MessageDelta) => void): () => void {
     this.deltaCallbacks.push(cb);
     return () => {
       const idx = this.deltaCallbacks.indexOf(cb);
@@ -271,9 +271,16 @@ export class CodexSdkProvider implements TransportProvider {
       if (tool) {
         for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
       }
-      if (event.type === 'item.completed' && event.item.type === 'agent_message') {
+      if ((event.type === 'item.updated' || event.type === 'item.completed') && event.item.type === 'agent_message') {
         state.currentMessageId = event.item.id;
         state.currentText = event.item.text;
+        const delta: MessageDelta = {
+          messageId: event.item.id,
+          type: 'text',
+          delta: event.item.text,
+          role: 'assistant',
+        };
+        for (const cb of this.deltaCallbacks) cb(sessionId, delta);
       }
       return;
     }

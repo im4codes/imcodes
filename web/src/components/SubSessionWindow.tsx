@@ -94,7 +94,6 @@ export function SubSessionWindow({
   const removeQuote = useCallback((i: number) => setQuotes((prev) => prev.filter((_, j) => j !== i)), []);
 
   const [thinkingNow, setThinkingNow] = useState(() => Date.now());
-  const lastCodexStatusRequestRef = useRef(0);
   useEffect(() => {
     if (!activeThinkingTs || !active) return;
     setThinkingNow(Date.now());
@@ -182,16 +181,6 @@ export function SubSessionWindow({
       try { ws.subscribeTerminal(sub.sessionName, false); } catch { /* ignore */ }
     };
   }, [ws, connected, sub.sessionName, active]);
-
-
-  useEffect(() => {
-    if (!active || !connected || !ws) return;
-    if (sub.type !== 'codex' || sub.runtimeType === 'transport' || sub.state !== 'idle') return;
-    const now = Date.now();
-    if (now - lastCodexStatusRequestRef.current < 30_000) return;
-    lastCodexStatusRequestRef.current = now;
-    try { ws.requestCodexStatus(sub.sessionName); } catch { /* ignore */ }
-  }, [active, connected, ws, sub.sessionName, sub.type, sub.runtimeType, sub.state]);
 
   const scrollToBottom = useCallback(() => {
     setTimeout(() => {

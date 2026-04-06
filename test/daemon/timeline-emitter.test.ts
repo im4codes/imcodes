@@ -69,6 +69,17 @@ describe('TimelineEmitter — seq counter', () => {
     emitter.emit('session-a', 'assistant.text', { text: 'hello' });
     expect(timelineStore.append).toHaveBeenCalledTimes(2);
   });
+
+  it('does not let a stale streaming update overwrite a newer final event with the same eventId', () => {
+    emitter.emit('session-a', 'assistant.text', { text: 'partial', streaming: true }, { eventId: 'transport:session-a:msg-1', ts: 10 });
+    emitter.emit('session-a', 'assistant.text', { text: 'final', streaming: false }, { eventId: 'transport:session-a:msg-1', ts: 20 });
+    emitter.emit('session-a', 'assistant.text', { text: 'partial-again', streaming: true }, { eventId: 'transport:session-a:msg-1', ts: 15 });
+
+    const { events } = emitter.replay('session-a', 1);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.payload.text).toBe('final');
+    expect(events[0]?.payload.streaming).toBe(false);
+  });
 });
 
 describe('TimelineEmitter — ring buffer', () => {

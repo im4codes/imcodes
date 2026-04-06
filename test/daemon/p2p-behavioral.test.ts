@@ -70,6 +70,13 @@ describe('buildHopPrompt — production function', () => {
     expect(prompt).not.toContain('Read the full context file');
   });
 
+  it('treats the current project codebase as referenced audit context when no explicit code context is attached', () => {
+    const prompt = buildHopPrompt(makeRun(), getP2pMode('audit'), defaultOpts);
+    expect(prompt).toContain('For this task, if the discussion file does not explicitly provide the relevant code, diff, or file paths, treat the current project codebase in your working directory as the referenced context for the audit.');
+    expect(prompt).toContain('You MUST inspect the relevant source files in the current project codebase directly and base your analysis on that code.');
+    expect(prompt).toContain('Do NOT respond that code context is missing if the working-directory project codebase is available.');
+  });
+
   it('includes section header from opts', () => {
     const prompt = buildHopPrompt(makeRun(), getP2pMode('review'), defaultOpts);
     expect(prompt).toContain('3e031o0d — Initial Analysis');

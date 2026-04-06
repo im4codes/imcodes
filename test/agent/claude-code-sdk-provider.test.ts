@@ -116,4 +116,23 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(run.closed).toBe(true);
     expect(errors).toContain('CANCELLED');
   });
+
+  it('fresh createSession ignores previous internal continuity for the same route', async () => {
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-fresh', cwd: '/tmp/project', resumeId: 'old-session' });
+    await provider.createSession({ sessionKey: 'route-fresh', cwd: '/tmp/project', fresh: true, resumeId: 'new-session' });
+
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'new-session', model: 'claude-sonnet-4-6' },
+      { type: 'result', session_id: 'new-session', subtype: 'success', is_error: false, result: 'ACK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    await provider.send('route-fresh', 'hello');
+    await flush();
+
+    const run = sdkMock.runs.at(-1)!;
+    expect(run.options.sessionId).toBe('new-session');
+    expect(run.options.resume).toBeUndefined();
+  });
 });

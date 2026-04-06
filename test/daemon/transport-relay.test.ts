@@ -400,6 +400,22 @@ describe('transport-relay (timeline-emitter based)', () => {
       const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
       expect(textCall![2].text).toBe('⚠️ Error: AI service overloaded');
     });
+
+    it('reuses the streaming eventId on error and preserves partial text', () => {
+      const { provider, fireDelta, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireDelta('sess-err', makeDelta({ messageId: 'msg-err', delta: 'partial answer' }));
+      const deltaEventId = emitMock.mock.calls[0][3].eventId;
+      emitMock.mockClear();
+
+      fireError('sess-err', { code: 'PROVIDER_ERROR', message: 'boom', recoverable: true });
+
+      const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
+      expect(textCall?.[3]?.eventId).toBe(deltaEventId);
+      expect(textCall?.[2]?.streaming).toBe(false);
+      expect(textCall?.[2]?.text).toBe('partial answer\n\n⚠️ Error: boom');
+    });
   });
 
   // ── emitTransportUserMessage ─────────────────────────────────────────────

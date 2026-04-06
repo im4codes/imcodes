@@ -909,6 +909,20 @@ export async function restoreTransportSessions(providerId: string): Promise<void
 export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate, parentSession } = opts;
 
+  if (opts.fresh) {
+    const existingRuntime = transportRuntimes.get(name);
+    if (existingRuntime) {
+      const oldProviderSid = existingRuntime.providerSessionId;
+      try {
+        await existingRuntime.kill();
+      } catch (err) {
+        logger.warn({ err, session: name }, 'Failed to kill existing transport runtime before fresh launch');
+      }
+      transportRuntimes.delete(name);
+      if (oldProviderSid) unregisterProviderRoute(oldProviderSid);
+    }
+  }
+
   const provider = await ensureProviderConnected(agentType, {});
 
   const runtime = new TransportSessionRuntime(provider, name);
@@ -952,6 +966,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   // Create session on provider
   await runtime.initialize({
     sessionKey: effectiveSessionKey,
+    fresh: !!opts.fresh,
     cwd: projectDir,
     label: label || name,
     description,

@@ -58,9 +58,11 @@ describe('CodexSdkProvider', () => {
     await provider.createSession({ sessionKey: 'route-1', cwd: '/tmp/project' });
 
     const tools: string[] = [];
+    const deltas: string[] = [];
     const completed: string[] = [];
     const sessionInfo: Array<Record<string, unknown>> = [];
     provider.onToolCall((_, tool) => tools.push(`${tool.name}:${tool.status}`));
+    provider.onDelta((_sid, delta) => deltas.push(delta.delta));
     provider.onComplete((_sid, msg) => completed.push(msg.content));
     provider.onSessionInfo?.((_sid, info) => sessionInfo.push(info as Record<string, unknown>));
 
@@ -71,6 +73,7 @@ describe('CodexSdkProvider', () => {
       { type: 'turn.started' },
       { type: 'item.started', item: { id: 'cmd-1', type: 'command_execution', command: 'ls', aggregated_output: '', status: 'in_progress' } },
       { type: 'item.completed', item: { id: 'cmd-1', type: 'command_execution', command: 'ls', aggregated_output: 'a\n', exit_code: 0, status: 'completed' } },
+      { type: 'item.updated', item: { id: 'msg-1', type: 'agent_message', text: 'O' } },
       { type: 'item.completed', item: { id: 'msg-1', type: 'agent_message', text: 'OK' } },
       { type: 'turn.completed', usage: { input_tokens: 3, cached_input_tokens: 1, output_tokens: 2 } },
     );
@@ -78,6 +81,7 @@ describe('CodexSdkProvider', () => {
     await flush();
 
     expect(tools).toEqual(['Bash:running', 'Bash:complete']);
+    expect(deltas).toEqual(['O', 'OK']);
     expect(completed).toEqual(['OK']);
     expect(sessionInfo).toContainEqual({ resumeId: 'thread-1' });
   });
@@ -93,6 +97,24 @@ describe('CodexSdkProvider', () => {
     expect(thread.id).toBe('thread-existing');
     thread.events.push(
       { type: 'item.completed', item: { id: 'msg-2', type: 'agent_message', text: 'ACK' } },
+      { type: 'turn.completed', usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 } },
+    );
+    await sendPromise;
+  });
+
+  it('fresh createSession ignores previous stored thread state for the same route', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-fresh', cwd: '/tmp/project', resumeId: 'thread-old' });
+    await provider.createSession({ sessionKey: 'route-fresh', cwd: '/tmp/project', fresh: true });
+
+    const sendPromise = provider.send('route-fresh', 'hello');
+    const thread = codexMock.threads[0];
+    expect(thread.mode).toBe('start');
+    expect(thread.id).toBeNull();
+    thread.events.push(
+      { type: 'thread.started', thread_id: 'thread-new' },
+      { type: 'item.completed', item: { id: 'msg-fresh', type: 'agent_message', text: 'ACK' } },
       { type: 'turn.completed', usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 } },
     );
     await sendPromise;

@@ -1,8 +1,8 @@
 /**
  * @vitest-environment jsdom
  */
-import { describe, it, expect, vi } from 'vitest';
-import { render, screen } from '@testing-library/preact';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { render, screen, cleanup } from '@testing-library/preact';
 import { h } from 'preact';
 
 vi.mock('react-i18next', () => ({
@@ -14,8 +14,6 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.provider_plan_free') return 'Free';
       if (key === 'session.provider_plan_paid') return 'Paid';
       if (key === 'session.provider_plan_byo') return 'BYO';
-      if (key === 'session.codex_5h_short') return '5h';
-      if (key === 'session.codex_wk_short') return '7d';
       if (key === 'chat.thinking_running') return `thinking ${String(opts?.sec ?? '')}`;
       return key;
     },
@@ -31,8 +29,12 @@ vi.mock('../src/cost-tracker.js', () => ({
 
 import { UsageFooter } from '../src/components/UsageFooter.js';
 
+afterEach(() => {
+  cleanup();
+});
+
 describe('UsageFooter', () => {
-  it('renders inline CLI codex quota text in the ctx footer', () => {
+  it('renders explicit quota label inline in the ctx footer', () => {
     render(
       <UsageFooter
         usage={{
@@ -42,7 +44,7 @@ describe('UsageFooter', () => {
           model: 'coder-model',
         }}
         sessionName="deck_test_brain"
-        agentType="codex"
+        agentType="codex-sdk"
         modelOverride="gpt-5"
         planLabel="Free"
         quotaLabel="5h 43% 2h03m 4/6 14:40 · 7d 34% 1d04h 4/8 15:48"
@@ -52,5 +54,32 @@ describe('UsageFooter', () => {
     expect(screen.getByText('gpt-5')).toBeDefined();
     expect(screen.getByText(/5h 43% 2h03m 4\/6 14:40/)).toBeDefined();
     expect(screen.getByText(/7d 34% 1d04h 4\/8 15:48/)).toBeDefined();
+  });
+
+  it('does not render stale codexStatus data when no explicit quota label is present', () => {
+    render(
+      <UsageFooter
+        usage={{
+          inputTokens: 2000,
+          cacheTokens: 1000,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+          codexStatus: {
+            capturedAt: 1,
+            fiveHourLeftPercent: 43,
+            fiveHourResetAt: '4/6 14:40',
+            weeklyLeftPercent: 34,
+            weeklyResetAt: '4/8 15:48',
+          },
+        }}
+        sessionName="deck_test_brain"
+        agentType="codex"
+        modelOverride="gpt-5"
+      />,
+    );
+
+    expect(screen.getByText('gpt-5')).toBeDefined();
+    expect(screen.queryByText(/5h 43% 4\/6 14:40/)).toBeNull();
+    expect(screen.queryByText(/7d 34% 4\/8 15:48/)).toBeNull();
   });
 });

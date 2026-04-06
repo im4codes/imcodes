@@ -32,11 +32,6 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-function formatCodexStatusPart(label: string, percent: number | undefined, reset: string | undefined): string | null {
-  if (percent === undefined) return null;
-  return `${label} ${percent}%${reset ? ` ${reset}` : ''}`;
-}
-
 export function UsageFooter({ usage, sessionName, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, showCost, activeThinkingTs, statusText, now }: Props) {
   const { t } = useTranslation();
 
@@ -64,26 +59,18 @@ export function UsageFooter({ usage, sessionName, agentType, modelOverride, plan
       displayPlanLabel ? t('session.provider_plan_title', { value: displayPlanLabel }) : '',
       quotaLabel ? t('session.provider_quota_title', { value: quotaLabel }) : '',
       quotaUsageLabel ? t('session.provider_quota_usage_title', { value: quotaUsageLabel }) : '',
-      usage.codexStatus?.fiveHourLeftPercent !== undefined ? `5h: ${usage.codexStatus.fiveHourLeftPercent}% (${usage.codexStatus.fiveHourResetAt ?? ''})` : '',
-      usage.codexStatus?.weeklyLeftPercent !== undefined ? `Weekly: ${usage.codexStatus.weeklyLeftPercent}% (${usage.codexStatus.weeklyResetAt ?? ''})` : '',
     ].filter(Boolean).join('\n');
     return { ctx, total, totalPct, cachePct, newPct, pctStr, tip };
-  }, [usage.inputTokens, usage.cacheTokens, usage.contextWindow, displayModel, usage.codexStatus, displayPlanLabel, quotaLabel, quotaUsageLabel, t]);
+  }, [usage.inputTokens, usage.cacheTokens, usage.contextWindow, displayModel, displayPlanLabel, quotaLabel, quotaUsageLabel, t]);
 
   const sessionCost = showCost ? getSessionCost(sessionName) : 0;
   const weeklyCost = sessionCost > 0 ? getWeeklyCost() : 0;
   const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const modelLabel = shortModelLabel(displayModel);
-  const codexStatusText = [
-    formatCodexStatusPart(t('session.codex_5h_short'), usage.codexStatus?.fiveHourLeftPercent, usage.codexStatus?.fiveHourResetAt),
-    formatCodexStatusPart(t('session.codex_wk_short'), usage.codexStatus?.weeklyLeftPercent, usage.codexStatus?.weeklyResetAt),
-  ].filter(Boolean).join(' · ');
-  const inlineQuotaText = agentType === 'codex'
-    ? (quotaLabel ?? codexStatusText)
-    : codexStatusText;
+  const inlineQuotaText = quotaLabel;
 
   return (
-    <div class="session-usage-footer" title={tip}>
+    <div class="session-usage-footer" title={tip} data-agent-type={agentType ?? undefined}>
       {total > 0 && (
         <div class="session-ctx-bar">
           <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />

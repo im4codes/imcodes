@@ -139,7 +139,6 @@ export function SessionPane({
 
   const activeThinkingTs = useMemo(() => getActiveThinkingTs(timelineEvents), [timelineEvents]);
   const statusText = useMemo(() => getActiveStatusText(timelineEvents), [timelineEvents]);
-  const lastCodexStatusRequestRef = useRef(0);
 
   // 1-second tick for thinking elapsed display (only while thinking)
   const [thinkingNow, setThinkingNow] = useState(() => Date.now());
@@ -202,14 +201,6 @@ export function SessionPane({
     try { ws.sendSnapshotRequest(sessionName); } catch { /* ignore */ }
   }, [terminalVisible, connected, ws, sessionName]);
 
-  useEffect(() => {
-    if (!isActive || !connected || !ws) return;
-    if (session.agentType !== 'codex' || session.runtimeType === 'transport' || session.state !== 'idle') return;
-    const now = Date.now();
-    if (now - lastCodexStatusRequestRef.current < 30_000) return;
-    lastCodexStatusRequestRef.current = now;
-    try { ws.requestCodexStatus(sessionName); } catch { /* ignore */ }
-  }, [isActive, connected, ws, session.agentType, session.runtimeType, session.state, sessionName]);
 
   return (
     <div class={isShellTerminal ? 'shell-terminal-pane' : undefined} style={{ display: 'contents' }}>

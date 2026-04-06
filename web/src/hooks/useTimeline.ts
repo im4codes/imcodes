@@ -7,6 +7,7 @@
 import { useEffect, useRef, useState, useCallback } from 'preact/hooks';
 import type { WsClient, TimelineEvent, ServerMessage } from '../ws-client.js';
 import { TimelineDB } from '../timeline-db.js';
+import { mergeTimelineEvents, preferTimelineEvent } from '../../../src/shared/timeline/merge.js';
 
 // Singleton DB shared across all useTimeline instances — opened once at module load.
 // This avoids per-hook open() latency and ensures the DB is ready before any hook queries it.
@@ -285,8 +286,11 @@ export function useTimeline(
       for (let i = prev.length - 1; i >= Math.max(0, prev.length - 10); i--) {
         if (prev[i].eventId === event.eventId) {
           // Replace in place — enables typewriter effect for streaming events
+          const current = prev[i]!;
+          const preferred = preferTimelineEvent(current, event);
+          if (preferred === current) return prev;
           const updated = [...prev];
-          updated[i] = event;
+          updated[i] = preferred;
           if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
           return updated;
         }
@@ -305,39 +309,8 @@ export function useTimeline(
    *  Uses two-pointer merge instead of concatenate + full sort. */
   const mergeEvents = useCallback((incoming: TimelineEvent[], maxEvents = MAX_MEMORY_EVENTS) => {
     setEvents((prev) => {
-      const incomingById = new Map<string, TimelineEvent>();
-      for (const event of incoming) incomingById.set(event.eventId, event);
-
-      let changed = false;
-      const replaced = prev.map((event) => {
-        const next = incomingById.get(event.eventId);
-        if (!next) return event;
-        incomingById.delete(event.eventId);
-        changed = true;
-        return next;
-      });
-
-      const newEvents = [...incomingById.values()];
-      if (!changed && newEvents.length === 0) return prev;
-
-      // Sort only the new events (typically small batch), then merge with already-sorted prev.
-      newEvents.sort((a, b) => a.ts - b.ts);
-
-      // Two-pointer O(n+m) merge. Existing events keep their current relative
-      // order; same-eventId replacements stay in place, which is what transport
-      // streaming/finalization needs.
-      const merged: TimelineEvent[] = [];
-      let i = 0; let j = 0;
-      while (i < replaced.length && j < newEvents.length) {
-        if (replaced[i].ts <= newEvents[j].ts) merged.push(replaced[i++]);
-        else merged.push(newEvents[j++]);
-      }
-      while (i < replaced.length) merged.push(replaced[i++]);
-      while (j < newEvents.length) merged.push(newEvents[j++]);
-
-      const result = merged.length > maxEvents
-        ? merged.slice(merged.length - maxEvents)
-        : merged;
+      const result = mergeTimelineEvents(prev, incoming, maxEvents);
+      if (result === prev) return prev;
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
       return result;
     });

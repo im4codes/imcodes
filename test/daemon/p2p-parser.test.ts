@@ -289,6 +289,24 @@ describe('structured P2P routing via WS fields', () => {
     expect(sendKeysDelayedEnter).not.toHaveBeenCalled();
   });
 
+
+  it('auto-appends the selected i18n language instruction for p2p runs', async () => {
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'check the tests',
+      commandId: 'cmd-2lang',
+      p2pAtTargets: [{ session: 'deck_proj_w1', mode: 'review' }],
+      p2pLocale: 'zh-CN',
+    }, mockServerLink as any);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(startP2pRun).toHaveBeenCalledOnce();
+    const extraPrompt = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0][6];
+    expect(extraPrompt).toContain("Use the user's selected i18n language (Chinese (Simplified)) for the discussion.");
+  });
+
   it('structured p2pAtTargets stays authoritative for single-target P2P runs', async () => {
     handleWebCommand({
       type: 'session.send',

@@ -97,7 +97,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
 
   async createSession(config: SessionConfig): Promise<string> {
     const routeId = config.bindExistingKey ?? config.sessionKey;
-    const existing = this.sessions.get(routeId);
+    const existing = config.fresh ? undefined : this.sessions.get(routeId);
     const resumeId = config.resumeId ?? existing?.resumeId ?? routeId;
     this.sessions.set(routeId, {
       routeId,

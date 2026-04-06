@@ -4,6 +4,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import type { TimelineEvent } from '../src/ws-client.js';
+import { mergeTimelineEvents } from '../../src/shared/timeline/merge.js';
 
 // Reproduce the requestId filtering logic from useTimeline
 function shouldProcessReplay(
@@ -201,14 +202,30 @@ describe('timeline epoch mismatch handling', () => {
       },
     ];
 
-    const replayById = new Map(replay.map((event) => [event.eventId, event]));
-    const replaced = existing.map((event) => {
-      const next = replayById.get(event.eventId);
-      if (!next) return event;
-      replayById.delete(event.eventId);
-      return next;
-    });
-    const merged = [...replaced, ...replayById.values()];
+    const merged = mergeTimelineEvents(existing, replay, 50);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].payload.text).toBe('complete answer');
+    expect(merged[0].payload.streaming).toBe(false);
+  });
+
+  it('history merge does not let stale transport streaming overwrite an existing final event', () => {
+    const existing = [
+      {
+        ...makeEvent({ seq: 11, epoch: 100 }),
+        eventId: 'transport:session-a:msg-1',
+        payload: { text: 'complete answer', streaming: false },
+      },
+    ];
+    const replay = [
+      {
+        ...makeEvent({ seq: 10, epoch: 100 }),
+        eventId: 'transport:session-a:msg-1',
+        payload: { text: 'partial', streaming: true },
+      },
+    ];
+
+    const merged = mergeTimelineEvents(existing, replay, 50);
 
     expect(merged).toHaveLength(1);
     expect(merged[0].payload.text).toBe('complete answer');

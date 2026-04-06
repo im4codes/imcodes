@@ -56,6 +56,7 @@ vi.mock('@openai/codex-sdk', () => ({
             yield { type: 'thread.started', thread_id: 'thread-codex-e2e' };
             yield { type: 'item.started', item: { id: 'cmd-codex-e2e', type: 'command_execution', command: 'echo hi', aggregated_output: '', status: 'in_progress' } };
             yield { type: 'item.completed', item: { id: 'cmd-codex-e2e', type: 'command_execution', command: 'echo hi', aggregated_output: 'hi\n', exit_code: 0, status: 'completed' } };
+            yield { type: 'item.updated', item: { id: 'msg-codex-e2e', type: 'agent_message', text: 'Codex' } };
             yield { type: 'item.completed', item: { id: 'msg-codex-e2e', type: 'agent_message', text: 'Codex: hello' } };
             yield { type: 'turn.completed', usage: { input_tokens: 7, cached_input_tokens: 2, output_tokens: 4 } };
           })(),
@@ -352,13 +353,18 @@ describe('sdk transport flow e2e', () => {
     expect(record?.providerId).toBe('codex-sdk');
     expect(record?.codexSessionId).toBe('thread-codex-e2e');
 
+    const streaming = mocks.emitted.filter((e) => e.session === SESSION_CX && e.type === 'assistant.text' && e.payload.streaming === true);
     const final = mocks.emitted.find((e) => e.session === SESSION_CX && e.type === 'assistant.text' && e.payload.streaming === false);
     const usage = mocks.emitted.find((e) => e.session === SESSION_CX && e.type === 'usage.update');
     const toolCall = mocks.emitted.find((e) => e.session === SESSION_CX && e.type === 'tool.call');
     const toolResult = mocks.emitted.find((e) => e.session === SESSION_CX && e.type === 'tool.result');
     const ack = mocks.emitted.find((e) => e.session === SESSION_CX && e.type === 'command.ack');
 
+    expect(streaming.map((e) => e.payload.text)).toEqual(['Codex', 'Codex: hello']);
+    expect(streaming[0]?.opts?.eventId).toBe(`transport:${SESSION_CX}:msg-codex-e2e`);
+    expect(streaming[1]?.opts?.eventId).toBe(`transport:${SESSION_CX}:msg-codex-e2e`);
     expect(final?.payload.text).toBe('Codex: hello');
+    expect(final?.opts?.eventId).toBe(`transport:${SESSION_CX}:msg-codex-e2e`);
     expect(usage?.payload.inputTokens).toBe(7);
     expect(toolCall?.payload.tool).toBe('Bash');
     expect(toolResult?.payload.output).toBe('hi\n');

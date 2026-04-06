@@ -58,6 +58,20 @@ const mocks = vi.hoisted(() => {
     onError(cb: (sid: string, err: any) => void) { this.errorCallbacks.push(cb); return () => {}; }
     setSessionAgentId(sessionId: string, agentId: string) { this.modelBySession.set(sessionId, agentId); }
     async send(sessionId: string, message: string) {
+      if (message === 'fail') {
+        this.deltaCallbacks.forEach((cb) => cb(sessionId, {
+          messageId: 'msg-qwen-e2e-error',
+          type: 'text',
+          delta: 'partial failure',
+          role: 'assistant',
+        }));
+        this.errorCallbacks.forEach((cb) => cb(sessionId, {
+          code: 'PROVIDER_ERROR',
+          message: 'provider exploded',
+          recoverable: true,
+        }));
+        return;
+      }
       this.deltaCallbacks.forEach((cb) => cb(sessionId, {
         messageId: 'msg-qwen-e2e',
         type: 'text',
@@ -252,5 +266,32 @@ describe('qwen transport flow e2e', () => {
 
     const laterUsage = mocks.emitted.find((e) => e.session === SESSION && e.type === 'usage.update');
     expect(laterUsage?.payload.model).toBe('qwen3-coder-plus');
+  });
+
+  it('finalizes a streaming transport error onto the same eventId instead of appending a second message', async () => {
+    await launchSession({
+      name: SESSION,
+      projectName: 'qwene2e',
+      role: 'brain',
+      agentType: 'qwen',
+      projectDir: '/tmp/qwen-e2e',
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({
+      type: 'session.send',
+      session: SESSION,
+      text: 'fail',
+      commandId: 'cmd-qwen-fail',
+    }, serverLink);
+    await flushAsync();
+
+    const textEvents = mocks.emitted.filter((e) => e.session === SESSION && e.type === 'assistant.text');
+    expect(textEvents).toHaveLength(2);
+    expect(textEvents[0]?.payload.streaming).toBe(true);
+    expect(textEvents[0]?.opts?.eventId).toBe(`transport:${SESSION}:msg-qwen-e2e-error`);
+    expect(textEvents[1]?.payload.streaming).toBe(false);
+    expect(textEvents[1]?.opts?.eventId).toBe(`transport:${SESSION}:msg-qwen-e2e-error`);
+    expect(textEvents[1]?.payload.text).toBe('partial failure\n\n⚠️ Error: provider exploded');
   });
 });
