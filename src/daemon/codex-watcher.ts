@@ -13,7 +13,7 @@ import { readProjectMemory, buildCodexMemoryEntry, appendAgentSendDocs } from '.
 import logger from '../util/logger.js';
 import { updateSessionState } from '../store/session-store.js';
 import { resolveContextWindow } from '../util/model-context.js';
-import { registerWatcherControl, unregisterWatcherControl, refreshSessionWatcher, type WatcherControl } from './watcher-controls.js';
+import { registerWatcherControl, unregisterWatcherControl, type WatcherControl } from './watcher-controls.js';
 
 // ── Codex SQLite helpers ────────────────────────────────────────────────────────
 
@@ -648,9 +648,12 @@ async function finalizeIdleAfterRefresh(sessionName: string): Promise<void> {
   let refreshed = false;
   let retracked = false;
   try {
-    refreshed = await refreshSessionWatcher(sessionName);
+    refreshed = await refreshTrackedSession(sessionName).catch(() => false);
     if (sessionStates.get(sessionName) !== 'running') {
       retracked = await retrackLatestRollout(sessionName).catch(() => false);
+      if (retracked && sessionStates.get(sessionName) !== 'running') {
+        refreshed = (await refreshTrackedSession(sessionName).catch(() => false)) || refreshed;
+      }
     }
   } finally {
     flushFinalAnswer(sessionName);

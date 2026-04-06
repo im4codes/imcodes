@@ -9,6 +9,8 @@ IM.codes es un mensajero especializado para agentes de programación con IA. Te 
 
 > **Nota:** Este archivo es una traducción. **El README en inglés (`../README.md`) es la versión canónica.** Si hay alguna diferencia, prevalece la versión en inglés.
 
+Claude Code y Codex ahora admiten dos modos de integración: CLI y SDK.
+
 ## Capturas
 
 ### Escritorio
@@ -167,12 +169,12 @@ You (browser / mobile)
 Server (self-hosted)
         ↓ WebSocket
 Daemon (your machine)
-        ↓ tmux / WezTerm / transport
+        ↓ tmux / transport
 AI Agents (Claude Code / Codex / Gemini CLI / OpenClaw)
         ↔ imcodes send (agent-to-agent)
 ```
 
-El daemon se ejecuta en tu máquina y gestiona sesiones a través de tmux, WezTerm o protocolos transport. El servidor reenvía las conexiones entre tus dispositivos y el daemon. Todo permanece en tu propia infraestructura.
+El daemon se ejecuta en tu máquina y gestiona sesiones a través de tmux o protocolos transport. El servidor reenvía las conexiones entre tus dispositivos y el daemon. Todo permanece en tu propia infraestructura.
 
 ## Instalación
 

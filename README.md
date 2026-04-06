@@ -4,7 +4,7 @@
 
 **The IM for agents.**
 
-A specialized instant messenger for AI agents. Keep long-running coding-agent sessions within reach from mobile or web, with terminal access, file browsing, git views, localhost preview, notifications, and multi-agent workflows built in. Works with [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — including native streaming output for transport-backed agents.
+A specialized instant messenger for AI agents. Keep long-running coding-agent sessions within reach from mobile or web, with terminal access, file browsing, git views, localhost preview, notifications, and multi-agent workflows built in. Works with [Claude Code](https://github.com/anthropics/claude-code) and [Codex](https://github.com/openai/codex) via both CLI and SDK integrations, plus [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — including native streaming output for transport-backed agents.
 
 > **Disclaimer:** This is an actively developed personal open-source project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk. Breaking changes may happen at any time without notice.
 
@@ -90,7 +90,7 @@ Single-model output shouldn't be trusted blindly. Spawn quick discussion rounds 
 
 ### Streaming Transport Agents
 
-Native streaming output support for transport-backed agents like [OpenClaw](https://openclaw.com) and [Qwen](https://github.com/QwenLM/qwen-agent). These agents connect via network protocols (WebSocket or local SDK) instead of terminal scraping, delivering structured event streams with real-time delta updates, tool call tracking, and session restore.
+Native streaming output support for transport-backed agents like [Claude Code SDK](https://github.com/anthropics/claude-agent-sdk-typescript), [Codex SDK](https://github.com/openai/codex/tree/main/sdk/typescript), [OpenClaw](https://openclaw.com), and [Qwen](https://github.com/QwenLM/qwen-agent). These agents connect via network protocols or local SDKs instead of terminal scraping, delivering structured event streams with real-time delta updates, tool call tracking, and session restore.
 
 > **Note on Qwen:** Qwen currently offers a free tier (1,000 requests/day) provided by Alibaba Cloud. This is an Alibaba Cloud policy, not an IM.codes offering — terms, limits, and availability may change at any time without notice. Check the [Qwen documentation](https://qwen.readthedocs.io/) for current details.
 
@@ -185,12 +185,12 @@ You (browser / mobile)
 Server (self-hosted)
         ↓ WebSocket
 Daemon (your machine)
-        ↓ tmux / WezTerm / transport
+        ↓ tmux / transport
 AI Agents (Claude Code / Codex / Gemini CLI / OpenClaw)
         ↔ imcodes send (agent-to-agent)
 ```
 
-The daemon runs on your dev machine and manages agent sessions through tmux or WezTerm (process-backed) or network protocols (transport-backed, e.g. OpenClaw gateway). Agents can communicate with each other via `imcodes send`. The server relays connections between your devices and the daemon. Everything stays on your infrastructure.
+The daemon runs on your dev machine and manages process-backed agent sessions through tmux or transport-backed sessions through network protocols / local SDKs (for example Claude Code SDK, Codex SDK, OpenClaw gateway, and Qwen). Agents can communicate with each other via `imcodes send`. The server relays connections between your devices and the daemon. Everything stays on your infrastructure.
 
 ## Install
 
@@ -328,7 +328,7 @@ Check the daemon watchdog log for errors:
 - **Windows (experimental)**: Native support via ConPTY (built-in on Windows 10+). Just `npm install -g imcodes` — no extra software needed. WSL also works.
 - Node.js >= 20
 - Terminal multiplexer: [tmux](https://github.com/tmux/tmux) (Linux/macOS). Windows uses ConPTY (auto-detected, built-in).
-- At least one AI coding agent: [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), or [Qwen](https://github.com/QwenLM/qwen-agent)
+- At least one AI coding agent: [Claude Code](https://github.com/anthropics/claude-code) (CLI or SDK), [Codex](https://github.com/openai/codex) (CLI or SDK), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), or [Qwen](https://github.com/QwenLM/qwen-agent)
 
 ## Disclaimer
 
