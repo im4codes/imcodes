@@ -145,4 +145,51 @@ describe('ChatView tool payload formatting', () => {
     expect(screen.getByText('input')).toBeDefined();
     expect(screen.getByText('output')).toBeDefined();
   });
+
+  it('renders OpenClaw transport tool rows for realistic sessions_send payloads', () => {
+    const events = [
+      makeEvent({
+        eventId: 'transport-tool:test:oc-1:call',
+        type: 'tool.call',
+        payload: {
+          tool: 'sessions_send',
+          input: { sessionKey: 'agent:emma:main', message: 'hello from openclaw' },
+          detail: {
+            kind: 'openclaw.tool',
+            summary: 'sessions_send',
+            input: { sessionKey: 'agent:emma:main', message: 'hello from openclaw' },
+            raw: {
+              phase: 'start',
+              name: 'sessions_send',
+              toolCallId: 'oc-1',
+              args: { sessionKey: 'agent:emma:main', message: 'hello from openclaw' },
+            },
+          },
+        },
+      }),
+      makeEvent({
+        eventId: 'transport-tool:test:oc-1:result',
+        type: 'tool.result',
+        payload: {
+          output: JSON.stringify({ delivered: true, target: 'agent:emma:main' }),
+          detail: {
+            kind: 'openclaw.tool',
+            output: { delivered: true, target: 'agent:emma:main' },
+            meta: { durationMs: 42 },
+          },
+        },
+      }),
+    ];
+
+    render(<ChatView events={events} loading={false} />);
+
+    expect(screen.getByText('sessions_send')).toBeDefined();
+    expect(screen.getAllByText(/agent:emma:main/).length).toBeGreaterThan(0);
+    expect(screen.queryByText('[object Object]')).toBeNull();
+
+    fireEvent.click(screen.getByText('details'));
+    expect(screen.getByText('input')).toBeDefined();
+    expect(screen.getByText('output')).toBeDefined();
+    expect(screen.getAllByText(/delivered/).length).toBeGreaterThan(0);
+  });
 });
