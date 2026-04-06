@@ -63,21 +63,24 @@ import {
  * is computed FRESH (same as buildSessionList for main sessions) rather than
  * reading stale values from the session store.
  */
-function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord>): Record<string, unknown> {
+async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord>): Promise<Record<string, unknown>> {
   const sessionName = subSessionName(id);
   const record = getSession(sessionName);
   const r = { ...record, ...overrides };
 
-  // Compute Qwen display metadata fresh — matches session-list.ts hydration logic.
-  // The session store may have stale or missing planLabel/quotaLabel/quotaUsageLabel.
-  const isQwen = r?.agentType === 'qwen';
-  const freshDisplay = isQwen
+  // Compute transport display metadata fresh — matches session-list.ts hydration logic.
+  // The session store may have stale or missing metadata during early launch/update windows.
+  const freshDisplay: Partial<Pick<SessionRecord, 'modelDisplay' | 'planLabel' | 'quotaLabel' | 'quotaUsageLabel'>> = r?.agentType === 'qwen'
     ? getQwenDisplayMetadata({
         model: r?.qwenModel,
         authType: r?.qwenAuthType,
         authLimit: r?.qwenAuthLimit,
         quotaUsageLabel: r?.qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
       })
+    : r?.agentType === 'claude-code-sdk'
+      ? await getClaudeSdkRuntimeConfig().catch(() => ({}))
+      : r?.agentType === 'codex-sdk'
+        ? await getCodexRuntimeConfig().catch(() => ({}))
     : {};
 
   return {
@@ -128,10 +131,10 @@ function getDefaultThinkingLevel(agentType: string | undefined): TransportEffort
   return supportsEffort(agentType) ? DEFAULT_TRANSPORT_EFFORT : undefined;
 }
 
-function syncSubSessionIfNeeded(sessionName: string, serverLink: ServerLink): void {
+async function syncSubSessionIfNeeded(sessionName: string, serverLink: ServerLink): Promise<void> {
   if (!sessionName.startsWith('deck_sub_')) return;
   const subId = sessionName.slice('deck_sub_'.length);
-  try { serverLink.send(buildSubSessionSync(subId)); } catch { /* ignore */ }
+  try { serverLink.send(await buildSubSessionSync(subId)); } catch { /* ignore */ }
 }
 
 /**
@@ -216,7 +219,9 @@ function refreshQwenQuotaUsageLabels(serverLink?: ServerLink): void {
     // Re-sync sub-sessions so their quota usage labels update in the browser
     if (session.name.startsWith('deck_sub_')) {
       const subId = session.name.replace(/^deck_sub_/, '');
-      try { serverLink?.send(buildSubSessionSync(subId)); } catch { /* not connected */ }
+      if (serverLink) void buildSubSessionSync(subId).then((payload) => {
+        serverLink.send(payload);
+      }).catch(() => { /* not connected */ });
     }
   }
   if (serverLink) void handleGetSessions(serverLink);
@@ -1739,7 +1744,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
       });
       // Sync to server DB
       try {
-        serverLink.send(buildSubSessionSync(id));
+        serverLink.send(await buildSubSessionSync(id));
       } catch { /* not connected */ }
     } catch (e: unknown) {
       logger.error({ err: e, id, type }, 'subsession.start failed (transport)');
@@ -1773,7 +1778,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     });
     // Sync to server DB so frontend can see the sub-session
     try {
-      serverLink.send(buildSubSessionSync(id));
+      serverLink.send(await buildSubSessionSync(id));
     } catch { /* not connected */ }
   } catch (e: unknown) {
     logger.error({ err: e, id }, 'subsession.start failed');
@@ -1821,7 +1826,7 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
         userCreated: effectiveRecord.userCreated,
       });
       try {
-        serverLink.send(buildSubSessionSync(id));
+        serverLink.send(await buildSubSessionSync(id));
       } catch { /* not connected */ }
       return;
     }
@@ -1841,7 +1846,7 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
     });
     // Sync updated state to server
     try {
-      serverLink.send(buildSubSessionSync(id));
+      serverLink.send(await buildSubSessionSync(id));
     } catch { /* not connected */ }
   } catch (e: unknown) {
     logger.error({ err: e, sessionName: sName }, 'subsession.restart failed');
@@ -1885,7 +1890,7 @@ async function handleSubSessionSetModel(cmd: Record<string, unknown>, serverLink
     await startSubSession({ id, type: 'codex', cwd: cwd ?? null, codexModel: model });
     // Sync restarted sub-session to server DB
     try {
-      serverLink.send(buildSubSessionSync(id));
+      serverLink.send(await buildSubSessionSync(id));
     } catch { /* not connected */ }
   } catch (e: unknown) {
     logger.error({ err: e, sessionName, model }, 'subsession.set_model restart failed');

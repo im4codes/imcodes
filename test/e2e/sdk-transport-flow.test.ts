@@ -336,6 +336,31 @@ describe('sdk transport flow e2e', () => {
   });
 
 
+
+  it('includes codex-sdk quota metadata when a sub-session is created', async () => {
+    const serverLink = { send: vi.fn() } as any;
+
+    handleWebCommand({
+      type: 'subsession.start',
+      id: 'cxsdk_created',
+      sessionType: 'codex-sdk',
+      cwd: '/tmp/cxsdk-sub-created',
+      parentSession: 'deck_parent_brain',
+      thinking: 'high',
+    }, serverLink);
+    await flushAsync();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'subsession.sync',
+      id: 'cxsdk_created',
+      sessionType: 'codex-sdk',
+      planLabel: 'Pro',
+      quotaLabel: expect.stringContaining('5h 11%'),
+      effort: 'high',
+    }));
+  });
+
   it('syncs codex-sdk sub-session model changes back to the frontend', async () => {
     const SUB = 'deck_sub_cxsdk_e2e';
     mocks.store.set(SUB, {
