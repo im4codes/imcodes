@@ -18,7 +18,8 @@ import { P2P_CONFIG_MODE, COMBO_PRESETS, COMBO_SEPARATOR } from '@shared/p2p-mod
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
-import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../../../src/shared/models/options.js';
+import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
+import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
 
 interface Props {
   ws: WsClient | null;
@@ -143,9 +144,7 @@ const SHORTCUTS: Array<{ label: string; title: string; data: string; wide?: bool
 
 function loadModel(): ModelChoice | null {
   try {
-    const v = localStorage.getItem(MODEL_STORAGE_KEY);
-    if (v === 'opus[1M]' || v === 'sonnet' || v === 'haiku') return v;
-    if (v === 'opus') return 'opus[1M]';
+    return normalizeClaudeCodeModelId(localStorage.getItem(MODEL_STORAGE_KEY)) ?? null;
   } catch { /* ignore */ }
   return null;
 }
@@ -234,6 +233,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const atSelectionLockRef = useRef(false);
   const atSelectionSnapshotRef = useRef('');
   const [modelOpen, setModelOpen] = useState(false);
+  const [thinkingOpen, setThinkingOpen] = useState(false);
   const [quickOpen, setQuickOpen] = useState(false);
   const [p2pMode, setP2pMode] = useState<P2pMode>('solo');
   const [p2pExcludeSameType, setP2pExcludeSameType] = useState(true);
@@ -249,6 +249,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [confirmLevel, setConfirmLevel] = useState(0); // 0=none, 1=first warning, 2=second warning (sub-session only)
   const menuRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef<HTMLDivElement>(null);
+  const thinkingRef = useRef<HTMLDivElement>(null);
   const p2pRef = useRef<HTMLDivElement>(null);
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -306,8 +307,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   useEffect(() => {
     if (!detectedModel) return;
     // CC models
-    if (detectedModel === 'opus[1M]' || detectedModel === 'sonnet' || detectedModel === 'haiku') {
-      if (model !== detectedModel) setModel(detectedModel);
+    const normalizedClaudeModel = normalizeClaudeCodeModelId(detectedModel);
+    if (normalizedClaudeModel) {
+      if (model !== normalizedClaudeModel) setModel(normalizedClaudeModel);
     }
     // Codex models
     if (detectedModel.startsWith('gpt-') && CODEX_MODELS.includes(detectedModel as CodexModelChoice)) {
@@ -334,8 +336,25 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const isClaudeCode = activeSession?.agentType === 'claude-code' || activeSession?.agentType === 'claude-code-sdk';
   const isShellLike = activeSession?.agentType === 'shell' || activeSession?.agentType === 'script';
   const isTransport = activeSession?.runtimeType === 'transport';
+  const isTransportSubSession = isTransport && !!onSubStop;
   const isCodex = activeSession?.agentType === 'codex' || activeSession?.agentType === 'codex-sdk';
   const isQwen = activeSession?.agentType === 'qwen';
+  const thinkingLevels = useMemo((): readonly TransportEffortLevel[] => (
+    activeSession?.agentType === 'claude-code-sdk'
+      ? CLAUDE_SDK_EFFORT_LEVELS
+      : activeSession?.agentType === 'codex-sdk'
+        ? CODEX_SDK_EFFORT_LEVELS
+        : activeSession?.agentType === 'qwen'
+          ? QWEN_EFFORT_LEVELS
+        : activeSession?.agentType === 'openclaw'
+          ? OPENCLAW_THINKING_LEVELS
+          : []
+  ), [activeSession?.agentType]);
+  const supportsThinking = thinkingLevels.length > 0;
+  const currentThinking = (activeSession?.effort as TransportEffortLevel | undefined)
+    ?? (activeSession?.agentType === 'qwen' || activeSession?.agentType === 'openclaw'
+      ? 'high'
+      : undefined);
   const compactQuotaText = activeSession?.agentType === 'codex'
     ? ''
     : isCodex
@@ -383,7 +402,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   // Close menus when clicking outside
   useEffect(() => {
-    if (!menuOpen && !modelOpen && !p2pOpen) return;
+    if (!menuOpen && !modelOpen && !p2pOpen && !thinkingOpen) return;
     const handleClick = (e: MouseEvent) => {
       if (menuOpen && menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setMenuOpen(false);
@@ -393,13 +412,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (modelOpen && modelRef.current && !modelRef.current.contains(e.target as Node)) {
         setModelOpen(false);
       }
+      if (thinkingOpen && thinkingRef.current && !thinkingRef.current.contains(e.target as Node)) {
+        setThinkingOpen(false);
+      }
       if (p2pOpen && p2pRef.current && !p2pRef.current.contains(e.target as Node)) {
         setP2pOpen(false);
       }
     };
     document.addEventListener('mousedown', handleClick);
     return () => document.removeEventListener('mousedown', handleClick);
-  }, [menuOpen, modelOpen, p2pOpen]);
+  }, [menuOpen, modelOpen, p2pOpen, thinkingOpen]);
 
   const getText = () => (divRef.current?.textContent ?? '').trim();
 
@@ -867,6 +889,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     onAfterAction?.();
   };
 
+  const handleThinkingSelect = (level: TransportEffortLevel) => {
+    if (!ws || !activeSession) return;
+    setThinkingOpen(false);
+    ws.sendSessionCommand('send', { sessionName: activeSession.name, text: `/thinking ${level}` });
+    onAfterAction?.();
+  };
+
   const placeholder = !hasSession ? t('session.no_session') : !connected ? t('session.send_queued') : t('session.send_placeholder', { name: sessionDisplayName ?? activeSession?.label ?? activeSession?.project ?? 'session' });
 
   return (
@@ -937,7 +966,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>
 
         {/* Plan/quota badges — compact inline display left of model selector */}
-        {(compactQuotaText || activeSession?.planLabel) && (
+        {!isTransportSubSession && (compactQuotaText || activeSession?.planLabel) && (
           <div class="session-ctx-wrap">
             {compactQuotaText && (
               <span class="session-usage-quota-inline">{compactQuotaText}</span>
@@ -949,7 +978,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         )}
 
         {/* Model selector — outside overflow-x scroll area so dropdown isn't clipped */}
-        {isClaudeCode && (
+        {!isTransportSubSession && isClaudeCode && (
           <div class="shortcuts-model" ref={modelRef}>
             <button
               class="shortcut-btn"
@@ -975,7 +1004,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             )}
           </div>
         )}
-        {isCodex && (
+        {!isTransportSubSession && isCodex && (
           <div class="shortcuts-model" ref={modelRef}>
             <button
               class="shortcut-btn"
@@ -1001,7 +1030,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             )}
           </div>
         )}
-        {isQwen && (
+        {!isTransportSubSession && isQwen && (
           <div class="shortcuts-model" ref={modelRef}>
             <button
               class="shortcut-btn"
@@ -1030,8 +1059,34 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             )}
           </div>
         )}
+        {!isTransportSubSession && supportsThinking && (
+          <div class="shortcuts-model" ref={thinkingRef}>
+            <button
+              class="shortcut-btn"
+              onClick={() => setThinkingOpen((o) => !o)}
+              disabled={disabled}
+              title={currentThinking ? t('session.thinking_title', { value: currentThinking }) : t('session.thinking')}
+              style={{ color: currentThinking ? '#38bdf8' : '#6b7280', fontSize: 10 }}
+            >
+              {currentThinking ?? t('session.thinking')}
+            </button>
+            {thinkingOpen && (
+              <div class="menu-dropdown">
+                {thinkingLevels.map((level) => (
+                  <button
+                    key={level}
+                    class={`menu-item ${currentThinking === level ? 'menu-item-active' : ''}`}
+                    onClick={() => handleThinkingSelect(level)}
+                  >
+                    {currentThinking === level ? '● ' : '○ '}{level}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
         {/* P2P mode selector — hidden for shell/script sessions */}
-        {!isShellLike && <div class="shortcuts-model" ref={p2pRef}>
+        {!isTransportSubSession && !isShellLike && <div class="shortcuts-model" ref={p2pRef}>
           <button
             class="shortcut-btn"
             data-onboarding="p2p-mode"
@@ -1424,7 +1479,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           {p2pMode !== 'solo' ? getP2pModeLabel(p2pMode, t) : t('common.send')}
         </button>
         {/* Config mode: show gear to open settings panel inline with send row */}
-        {p2pMode === P2P_CONFIG_MODE && (
+        {!isTransportSubSession && p2pMode === P2P_CONFIG_MODE && (
           <button
             class="btn btn-secondary"
             onClick={() => setP2pConfigOpen(true)}
@@ -1437,7 +1492,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         )}
 
         {/* Menu button — hidden in compact mode */}
-        {!compact && <div class="menu-wrap" ref={menuRef}>
+        {!compact && !isTransportSubSession && <div class="menu-wrap" ref={menuRef}>
           <button
             class="btn btn-secondary"
             onClick={() => { setMenuOpen((o) => !o); resetConfirm(); }}

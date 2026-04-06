@@ -228,6 +228,27 @@ describe('SessionControls', () => {
     expect(screen.queryByText(/qwen3-max-2026-01-23/)).toBeNull();
   });
 
+  it('shows level control for qwen and sends /thinking', () => {
+    const ws = makeWs();
+    render(<SessionControls
+      ws={ws as any}
+      activeSession={makeSession({
+        name: 'qwen-session',
+        agentType: 'qwen',
+        runtimeType: 'transport',
+        effort: 'medium',
+      })}
+      quickData={makeQuickData() as any}
+    />);
+
+    fireEvent.click(screen.getByRole('button', { name: /^medium$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /high/i }));
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      sessionName: 'qwen-session',
+      text: '/thinking high',
+    });
+  });
+
 
   it('sends message to running transport session without blocking (queuing is daemon-side)', () => {
     const ws = makeWs();
@@ -811,6 +832,56 @@ describe('SessionControls', () => {
         sessionName: 'deck_my-project_brain',
         text: 'please review',
       }));
+    });
+  });
+
+
+  it('shows only stop in shortcut row for transport sub-sessions', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-sub',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          effort: 'high',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+        onSubStop={vi.fn()}
+        onSubRestart={vi.fn()}
+        onSubNew={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /^Stop$/ })).toBeDefined();
+    expect(screen.queryByTitle('actions')).toBeNull();
+    expect(screen.queryByRole('button', { name: /^high$/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /^gpt-/i })).toBeNull();
+  });
+
+  it('shows thinking control for codex-sdk and sends /thinking command', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-session',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          effort: 'medium',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^medium$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /high/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      sessionName: 'codex-sdk-session',
+      text: '/thinking high',
     });
   });
 });

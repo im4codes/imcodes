@@ -40,10 +40,19 @@ import { buildWindowsCleanupScript, buildWindowsUpgradeBatch } from '../util/win
 import { UPGRADE_LOCK_FILE } from '../util/windows-launch-artifacts.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { sanitizeProjectName } from '../../shared/sanitize-project-name.js';
-import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../shared/models/options.js';
+import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
 import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
+import {
+  CLAUDE_SDK_EFFORT_LEVELS,
+  CODEX_SDK_EFFORT_LEVELS,
+  DEFAULT_TRANSPORT_EFFORT,
+  OPENCLAW_THINKING_LEVELS,
+  QWEN_EFFORT_LEVELS,
+  isTransportEffortLevel,
+  type TransportEffortLevel,
+} from '../../shared/effort-levels.js';
 
 /**
  * Build a unified subsession.sync payload from the session store record.
@@ -95,7 +104,28 @@ function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord>): Re
     planLabel: freshDisplay.planLabel ?? r?.planLabel ?? null,
     quotaLabel: freshDisplay.quotaLabel ?? r?.quotaLabel ?? null,
     quotaUsageLabel: freshDisplay.quotaUsageLabel ?? r?.quotaUsageLabel ?? null,
+    effort: r?.effort ?? null,
   };
+}
+
+function supportsEffort(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'openclaw' | 'qwen' {
+  return agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'openclaw' || agentType === 'qwen';
+}
+
+function getSupportedEffortLevels(agentType: string | undefined): readonly TransportEffortLevel[] {
+  return agentType === 'claude-code-sdk'
+    ? CLAUDE_SDK_EFFORT_LEVELS
+    : agentType === 'codex-sdk'
+      ? CODEX_SDK_EFFORT_LEVELS
+      : agentType === 'qwen'
+        ? QWEN_EFFORT_LEVELS
+      : agentType === 'openclaw'
+        ? OPENCLAW_THINKING_LEVELS
+        : [];
+}
+
+function getDefaultThinkingLevel(agentType: string | undefined): TransportEffortLevel | undefined {
+  return supportsEffort(agentType) ? DEFAULT_TRANSPORT_EFFORT : undefined;
 }
 
 /**
@@ -669,6 +699,10 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
   const dir = expandTilde((cmd.dir as string) || '~');
   const ccPresetName = cmd.ccPreset as string | undefined;
   const ccInitPrompt = cmd.ccInitPrompt as string | undefined;
+  const requestedEffort: unknown = cmd.thinking ?? cmd.effort;
+  const effort = isTransportEffortLevel(requestedEffort)
+    ? requestedEffort
+    : getDefaultThinkingLevel(agentType);
 
   if (!rawProject) {
     logger.warn('session.start: missing project name');
@@ -707,6 +741,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk',
       extraEnv,
       ccPreset: ccPresetName,
+      effort,
     };
     if (agentType === 'claude-code-sdk') {
       logger.info({ project }, 'SDK fresh session.start launching new Claude SDK main session');
@@ -721,6 +756,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         extraEnv,
         ccPreset: ccPresetName,
         label,
+        effort,
       });
     } else if (agentType === 'codex-sdk') {
       logger.info({ project }, 'SDK fresh session.start launching new Codex SDK main session');
@@ -732,6 +768,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         projectDir: dir,
         fresh: true,
         label,
+        effort,
       });
     } else {
       await startProject(config);
@@ -1081,6 +1118,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         return;
       }
       const modelMatch = text.trim().match(/^\/model\s+(\S+)(?:\s+.*)?$/);
+      const effortMatch = text.trim().match(/^\/(?:thinking|effort)\s+(\S+)\s*$/);
       if (record?.agentType === 'qwen' && modelMatch) {
         const nextModel = modelMatch[1];
           const runtimeConfig = await getQwenRuntimeConfig(true).catch(() => null);
@@ -1132,12 +1170,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           return;
       }
       if (record?.agentType === 'claude-code-sdk' && modelMatch) {
-        const selectedModel = modelMatch[1];
-        if (!CLAUDE_CODE_MODEL_IDS.includes(selectedModel as any)) {
+        const requestedModel = modelMatch[1];
+        const selectedModel = normalizeClaudeCodeModelId(requestedModel);
+        if (!selectedModel) {
           timelineEmitter.emit(sessionName, 'user.message', { text });
-          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Claude model: ${selectedModel}`, streaming: false }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Claude model: ${selectedModel}` });
-          try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unknown Claude model: ${selectedModel}` }); } catch {}
+          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Claude model: ${requestedModel}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Claude model: ${requestedModel}` });
+          try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unknown Claude model: ${requestedModel}` }); } catch {}
           return;
         }
         transportRuntime.setAgentId(normalizeClaudeSdkModelForProvider(selectedModel));
@@ -1179,6 +1218,36 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         timelineEmitter.emit(sessionName, 'user.message', { text });
         timelineEmitter.emit(sessionName, 'usage.update', { model: nextModel, contextWindow: resolveContextWindow(undefined, nextModel) }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'assistant.text', { text: `Switched model to ${nextModel}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
+        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
+        return;
+      }
+      if (supportsEffort(record?.agentType) && effortMatch) {
+        const nextEffort = effortMatch[1];
+        const allowed = getSupportedEffortLevels(record?.agentType);
+        if (!isTransportEffortLevel(nextEffort) || !allowed.includes(nextEffort)) {
+          const supported = allowed.join(', ');
+          timelineEmitter.emit(sessionName, 'user.message', { text });
+          timelineEmitter.emit(sessionName, 'assistant.text', {
+            text: `⚠️ Unsupported thinking level: ${nextEffort}. Supported: ${supported}`,
+            streaming: false,
+          }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unsupported thinking level: ${nextEffort}` });
+          try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unsupported thinking level: ${nextEffort}` }); } catch {}
+          return;
+        }
+        transportRuntime.setEffort(nextEffort);
+        upsertSession({
+          ...record,
+          effort: nextEffort,
+          updatedAt: Date.now(),
+        });
+        await handleGetSessions(serverLink);
+        timelineEmitter.emit(sessionName, 'user.message', { text });
+        timelineEmitter.emit(sessionName, 'assistant.text', {
+          text: `Switched thinking level to ${nextEffort}`,
+          streaming: false,
+        }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
         try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
         return;
@@ -1626,6 +1695,10 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
   const shellBin = cmd.shellBin as string | null | undefined;
   const ccSessionId = cmd.ccSessionId as string | null | undefined;
   const parentSession = cmd.parentSession as string | null | undefined;
+  const requestedEffort: unknown = cmd.thinking ?? cmd.effort;
+  const effort = isTransportEffortLevel(requestedEffort)
+    ? requestedEffort
+    : getDefaultThinkingLevel(type);
 
   // Transport-backed providers: launch without tmux.
   if (isTransportAgent(type)) {
@@ -1650,6 +1723,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
         bindExistingKey,
         ...(type === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
         ...(type === 'codex-sdk' ? { fresh: true } : {}),
+        ...(effort ? { effort } : {}),
         userCreated: true,
         parentSession: parentSession || undefined,
       });
@@ -1679,6 +1753,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
       ccPreset,
       ccInitPrompt: subCcInitPrompt,
       description,
+      effort,
       fresh: type === 'gemini' && !geminiSessionId,
       _fileSnapshot: fileSnapshot,
       _onGeminiDiscovered: fileSnapshot ? (sessionId: string) => {
@@ -1732,6 +1807,7 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
         bindExistingKey: effectiveRecord.providerSessionId ?? undefined,
         skipCreate: !!effectiveRecord.providerSessionId,
         parentSession: effectiveRecord.parentSession ?? undefined,
+        effort: effectiveRecord.effort ?? undefined,
         userCreated: effectiveRecord.userCreated,
       });
       try {
