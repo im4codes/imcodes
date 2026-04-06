@@ -304,12 +304,24 @@ describe('QwenProvider', () => {
         name: 'list_directory',
         status: 'running',
         input: { path: '/tmp/project' },
+        detail: {
+          kind: 'tool_use',
+          summary: 'list_directory',
+          input: { path: '/tmp/project' },
+          raw: { id: 'tool-1', name: 'list_directory', input: { path: '/tmp/project' }, partialJson: '{"path":"/tmp/project"}' },
+        },
       },
       {
         id: 'tool-1',
         name: 'list_directory',
         status: 'complete',
         output: 'ok',
+        detail: {
+          kind: 'tool_result',
+          summary: 'list_directory',
+          output: 'ok',
+          raw: { type: 'tool_result', tool_use_id: 'tool-1', content: 'ok', is_error: false },
+        },
       },
     ]);
   });

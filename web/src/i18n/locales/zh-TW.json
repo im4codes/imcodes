@@ -41,7 +41,12 @@
     "external_link_title": "開啟外部連結",
     "external_link_warning": "此連結由 AI 代理產生。造訪外部網站的風險由您自行承擔。",
     "external_link_cancel": "取消",
-    "external_link_open": "開啟連結"
+    "external_link_open": "開啟連結",
+    "tool_detail_toggle": "詳情",
+    "tool_detail_input": "輸入",
+    "tool_detail_output": "輸出",
+    "tool_detail_meta": "中繼資訊",
+    "tool_detail_raw": "原始資料"
   },
   "session": {
     "restart": "↺ 重新啟動",

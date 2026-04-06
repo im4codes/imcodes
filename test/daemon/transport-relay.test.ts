@@ -501,12 +501,13 @@ describe('transport-relay (timeline-emitter based)', () => {
         name: 'list_directory',
         status: 'running',
         input: { path: '/tmp' },
+        detail: { kind: 'tool_use', input: { path: '/tmp' } },
       });
 
       const call = emitMock.mock.calls.find((c) => c[1] === 'tool.call');
       expect(call).toBeDefined();
       expect(call![0]).toBe('sess-tool');
-      expect(call![2]).toEqual({ tool: 'list_directory', input: { path: '/tmp' } });
+      expect(call![2]).toEqual({ tool: 'list_directory', input: { path: '/tmp' }, detail: { kind: 'tool_use', input: { path: '/tmp' } } });
       expect(call![3].eventId).toBe('transport-tool:sess-tool:tool-1:call');
     });
 
@@ -519,12 +520,13 @@ describe('transport-relay (timeline-emitter based)', () => {
         name: 'list_directory',
         status: 'complete',
         output: 'done',
+        detail: { kind: 'tool_result', output: 'done' },
       });
 
       const call = emitMock.mock.calls.find((c) => c[1] === 'tool.result');
       expect(call).toBeDefined();
       expect(call![0]).toBe('sess-tool');
-      expect(call![2]).toEqual({ output: 'done' });
+      expect(call![2]).toEqual({ output: 'done', detail: { kind: 'tool_result', output: 'done' } });
       expect(call![3].eventId).toBe('transport-tool:sess-tool:tool-1:result');
     });
   });

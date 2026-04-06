@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, cleanup } from '@testing-library/preact';
+import { render, screen, cleanup, fireEvent } from '@testing-library/preact';
 
 if (!HTMLElement.prototype.scrollIntoView) {
   HTMLElement.prototype.scrollIntoView = vi.fn();
@@ -13,6 +13,11 @@ vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, vars?: Record<string, unknown>) => {
       if (key === 'chat.tool_group_more') return `${String(vars?.count ?? '')} more`;
+      if (key === 'chat.tool_detail_toggle') return 'details';
+      if (key === 'chat.tool_detail_input') return 'input';
+      if (key === 'chat.tool_detail_output') return 'output';
+      if (key === 'chat.tool_detail_meta') return 'meta';
+      if (key === 'chat.tool_detail_raw') return 'raw';
       return key.split('.').pop() ?? key;
     },
   }),
@@ -123,18 +128,21 @@ describe('ChatView tool payload formatting', () => {
       makeEvent({
         eventId: 'transport-tool:test:read-1:call',
         type: 'tool.call',
-        payload: { tool: 'Read', input: { file_path: 'package.json' } },
+        payload: { tool: 'Read', input: { file_path: 'package.json' }, detail: { kind: 'tool_use', input: { file_path: 'package.json' }, raw: { file_path: 'package.json' } } },
       }),
       makeEvent({
         eventId: 'transport-tool:test:read-1:result',
         type: 'tool.result',
-        payload: {},
+        payload: { detail: { kind: 'tool_result', output: { ok: true } } },
       }),
     ];
 
     render(<ChatView events={events} loading={false} />);
 
     expect(screen.getByText('Read')).toBeDefined();
-    expect(screen.getByText(/package\.json/)).toBeDefined();
+    expect(screen.getAllByText(/package\.json/).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByText('details'));
+    expect(screen.getByText('input')).toBeDefined();
+    expect(screen.getByText('output')).toBeDefined();
   });
 });

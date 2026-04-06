@@ -109,6 +109,27 @@ export interface ToolUseDelta {
   input?: unknown;
   /** Raw text output from the tool (present after completion). */
   output?: string;
+  /** Structured detail payload for richer UI rendering and future provider parity. */
+  detail?: ToolCallDetail;
+}
+
+/**
+ * Provider-neutral structured tool details.
+ * Providers should populate this with the richest stable shape they have.
+ */
+export interface ToolCallDetail {
+  /** Provider/tool-specific kind (e.g. commandExecution, webSearch, tool_use). */
+  kind?: string;
+  /** Human-readable subtitle or short summary. */
+  summary?: string;
+  /** Full structured input payload. */
+  input?: unknown;
+  /** Full structured output payload. */
+  output?: unknown;
+  /** Extra machine-readable metadata. */
+  meta?: Record<string, unknown>;
+  /** Raw provider item/block for debugging and future UI expansion. */
+  raw?: unknown;
 }
 
 // ── Tool call event (standalone, used in TransportEvent) ─────────────────────
@@ -129,4 +150,6 @@ export interface ToolCallEvent {
   input?: unknown;
   /** Raw text output from the tool (present after completion). */
   output?: string;
+  /** Structured detail payload for richer UI rendering and future provider parity. */
+  detail?: ToolCallDetail;
 }

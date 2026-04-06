@@ -117,11 +117,11 @@ describe('CodexSdkProvider', () => {
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-1', cwd: '/tmp/project' });
 
-    const tools: string[] = [];
+    const tools: Array<{ name: string; status: string; detail?: unknown }> = [];
     const deltas: string[] = [];
     const completed: string[] = [];
     const sessionInfo: Array<Record<string, unknown>> = [];
-    provider.onToolCall((_, tool) => tools.push(`${tool.name}:${tool.status}`));
+    provider.onToolCall((_, tool) => tools.push({ name: tool.name, status: tool.status, detail: tool.detail }));
     provider.onDelta((_sid, delta) => deltas.push(delta.delta));
     provider.onComplete((_sid, msg) => completed.push(msg.content));
     provider.onSessionInfo?.((_sid, info) => sessionInfo.push(info as Record<string, unknown>));
@@ -154,7 +154,32 @@ describe('CodexSdkProvider', () => {
     child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
     await flush();
 
-    expect(tools).toEqual(['Bash:running', 'Bash:complete']);
+    expect(tools).toEqual([
+      {
+        name: 'Bash',
+        status: 'running',
+        detail: {
+          kind: 'commandExecution',
+          summary: 'ls',
+          input: { command: 'ls', cwd: undefined, actions: undefined },
+          output: '',
+          meta: { status: 'inProgress', exitCode: undefined, durationMs: undefined, processId: undefined },
+          raw: { id: 'cmd-1', type: 'commandExecution', command: 'ls', aggregatedOutput: '', status: 'inProgress' },
+        },
+      },
+      {
+        name: 'Bash',
+        status: 'complete',
+        detail: {
+          kind: 'commandExecution',
+          summary: 'ls',
+          input: { command: 'ls', cwd: undefined, actions: undefined },
+          output: 'a\n',
+          meta: { status: 'completed', exitCode: undefined, durationMs: undefined, processId: undefined },
+          raw: { id: 'cmd-1', type: 'commandExecution', command: 'ls', aggregatedOutput: 'a\n', status: 'completed' },
+        },
+      },
+    ]);
     expect(threadStartReq?.params?.sandbox).toBe('danger-full-access');
     expect(threadStartReq?.params?.approvalPolicy).toBe('never');
     expect(deltas).toEqual(['O', 'OK']);
@@ -201,8 +226,8 @@ describe('CodexSdkProvider', () => {
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-websearch', cwd: '/tmp/project' });
 
-    const tools: Array<{ name: string; status: string; input: unknown }> = [];
-    provider.onToolCall((_, tool) => tools.push({ name: tool.name, status: tool.status, input: tool.input }));
+    const tools: Array<{ name: string; status: string; input: unknown; detail?: unknown }> = [];
+    provider.onToolCall((_, tool) => tools.push({ name: tool.name, status: tool.status, input: tool.input, detail: tool.detail }));
 
     await provider.send('route-websearch', 'search');
     const child = childProcessMock.children[0];
@@ -218,8 +243,30 @@ describe('CodexSdkProvider', () => {
     await flush();
 
     expect(tools).toEqual([
-      { name: 'WebSearch', status: 'running', input: { query: 'nyc weather' } },
-      { name: 'WebSearch', status: 'complete', input: { query: 'nyc weather', action: { type: 'search', query: 'nyc weather' } } },
+      {
+        name: 'WebSearch',
+        status: 'running',
+        input: { query: 'nyc weather' },
+        detail: {
+          kind: 'webSearch',
+          summary: 'nyc weather',
+          input: { query: 'nyc weather', action: undefined },
+          meta: { actionType: undefined },
+          raw: { id: 'ws-1', type: 'webSearch', query: 'nyc weather' },
+        },
+      },
+      {
+        name: 'WebSearch',
+        status: 'complete',
+        input: { query: 'nyc weather', action: { type: 'search', query: 'nyc weather' } },
+        detail: {
+          kind: 'webSearch',
+          summary: 'nyc weather',
+          input: { query: 'nyc weather', action: { type: 'search', query: 'nyc weather' } },
+          meta: { actionType: 'search' },
+          raw: { id: 'ws-1', type: 'webSearch', query: 'nyc weather', action: { type: 'search', query: 'nyc weather' } },
+        },
+      },
     ]);
   });
 });

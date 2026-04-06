@@ -136,6 +136,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       timelineEmitter.emit(sessionName, 'tool.call', {
         tool: tool.name,
         ...(tool.input !== undefined ? { input: tool.input } : {}),
+        ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
       }, {
         source: 'daemon',
         confidence: 'high',
@@ -146,6 +147,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
         sessionId: sessionName,
         tool: tool.name,
         ...(tool.input !== undefined ? { input: tool.input } : {}),
+        ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
       });
       return;
     }
@@ -156,6 +158,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
         : tool.output !== undefined
           ? { output: tool.output }
           : {}),
+      ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
     }, {
       source: 'daemon',
       confidence: 'high',
@@ -169,6 +172,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
         : tool.output !== undefined
           ? { output: tool.output }
           : {}),
+      ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
     });
   });
 }

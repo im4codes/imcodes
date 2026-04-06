@@ -321,6 +321,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
           name: tool.name,
           status: 'complete',
           ...(tool.input !== undefined ? { input: tool.input } : {}),
+          detail: {
+            kind: 'tool_use_complete',
+            summary: tool.name,
+            input: tool.input,
+            raw: tool,
+          },
         });
         state.toolCalls.delete(event.index);
       }
@@ -379,6 +385,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
           name: 'tool',
           status: block.is_error ? 'error' : 'complete',
           ...(output ? { output } : {}),
+          detail: {
+            kind: 'tool_result',
+            output,
+            raw: block,
+          },
         });
       }
       return;
@@ -453,11 +464,18 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
   }
 
   private normalizeToolCall(block: ClaudeToolBlock): ToolCallEvent {
+    const name = typeof block.name === 'string' && block.name ? block.name : 'tool';
     return {
       id: typeof block.id === 'string' && block.id ? block.id : randomUUID(),
-      name: typeof block.name === 'string' && block.name ? block.name : 'tool',
+      name,
       status: 'running',
       ...(block.input !== undefined ? { input: block.input } : {}),
+      detail: {
+        kind: block.type,
+        summary: name,
+        input: block.input,
+        raw: block,
+      },
     };
   }
 

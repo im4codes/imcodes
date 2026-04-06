@@ -41,7 +41,12 @@
     "external_link_title": "Abrir enlace externo",
     "external_link_warning": "Este enlace fue generado por un agente de IA. Usted es responsable de los riesgos asociados con visitar sitios web externos.",
     "external_link_cancel": "Cancelar",
-    "external_link_open": "Abrir enlace"
+    "external_link_open": "Abrir enlace",
+    "tool_detail_toggle": "detalles",
+    "tool_detail_input": "entrada",
+    "tool_detail_output": "salida",
+    "tool_detail_meta": "meta",
+    "tool_detail_raw": "raw"
   },
   "session": {
     "restart": "↺ Reiniciar",

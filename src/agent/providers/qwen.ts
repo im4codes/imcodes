@@ -415,6 +415,12 @@ export class QwenProvider implements TransportProvider {
               name: toolName,
               status: 'running',
               input: toolInput,
+              detail: {
+                kind: 'tool_use',
+                summary: toolName,
+                input: toolInput,
+                raw: event.content_block,
+              },
             });
           }
           return;
@@ -445,6 +451,12 @@ export class QwenProvider implements TransportProvider {
             name: tool.name,
             status: 'running',
             ...(hasMeaningfulToolValue(tool.input) ? { input: tool.input } : {}),
+            detail: {
+              kind: 'tool_use',
+              summary: tool.name,
+              input: tool.input,
+              raw: tool,
+            },
           });
         }
         return;
@@ -459,6 +471,12 @@ export class QwenProvider implements TransportProvider {
                 name: block.name ?? 'tool',
                 status: 'running',
                 input: block.input,
+                detail: {
+                  kind: 'tool_use',
+                  summary: block.name ?? 'tool',
+                  input: block.input,
+                  raw: block,
+                },
               });
             }
           }
@@ -484,6 +502,12 @@ export class QwenProvider implements TransportProvider {
             name: tool?.name ?? 'tool',
             status: block.is_error ? 'error' : 'complete',
             ...(output ? { output } : {}),
+            detail: {
+              kind: 'tool_result',
+              summary: tool?.name ?? 'tool',
+              output,
+              raw: block,
+            },
           });
         }
         return;

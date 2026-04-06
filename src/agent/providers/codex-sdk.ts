@@ -61,6 +61,23 @@ function toolFromItem(item: Record<string, any>, lifecycle: 'started' | 'complet
         status: item.status === 'inProgress' || lifecycle === 'started' ? 'running' : item.status === 'completed' ? 'complete' : 'error',
         input: { command: item.command },
         ...(item.status !== 'inProgress' ? { output: item.aggregatedOutput ?? item.output ?? '' } : {}),
+        detail: {
+          kind: 'commandExecution',
+          summary: item.command,
+          input: {
+            command: item.command,
+            cwd: item.cwd,
+            actions: item.commandActions,
+          },
+          output: item.aggregatedOutput ?? item.output ?? '',
+          meta: {
+            status: item.status,
+            exitCode: item.exitCode,
+            durationMs: item.durationMs,
+            processId: item.processId,
+          },
+          raw: item,
+        },
       };
     case 'mcpToolCall':
       return {
@@ -73,6 +90,18 @@ function toolFromItem(item: Record<string, any>, lifecycle: 'started' | 'complet
           : item.status === 'failed'
             ? { output: item.error?.message ?? 'failed' }
             : {}),
+        detail: {
+          kind: 'mcpToolCall',
+          summary: `${item.server}:${item.tool}`,
+          input: item.arguments,
+          output: item.result?.structuredContent ?? item.result?.content ?? item.error?.message,
+          meta: {
+            server: item.server,
+            tool: item.tool,
+            status: item.status,
+          },
+          raw: item,
+        },
       };
     case 'fileChange':
       return {
@@ -84,6 +113,14 @@ function toolFromItem(item: Record<string, any>, lifecycle: 'started' | 'complet
             ? 'complete'
             : 'error',
         input: { changes: item.changes },
+        detail: {
+          kind: 'fileChange',
+          summary: Array.isArray(item.changes) ? `${item.changes.length} change(s)` : undefined,
+          input: { changes: item.changes },
+          output: item.output,
+          meta: { status: item.status },
+          raw: item,
+        },
       };
     case 'webSearch':
       return {
@@ -93,6 +130,16 @@ function toolFromItem(item: Record<string, any>, lifecycle: 'started' | 'complet
         input: {
           query: item.query,
           ...(item.action ? { action: item.action } : {}),
+        },
+        detail: {
+          kind: 'webSearch',
+          summary: item.query,
+          input: {
+            query: item.query,
+            action: item.action,
+          },
+          meta: { actionType: item.action?.type },
+          raw: item,
         },
       };
     default:

@@ -41,7 +41,12 @@
     "external_link_title": "Открыть внешнюю ссылку",
     "external_link_warning": "Эта ссылка была сгенерирована ИИ-агентом. Вы несёте ответственность за риски, связанные с посещением внешних сайтов.",
     "external_link_cancel": "Отмена",
-    "external_link_open": "Открыть ссылку"
+    "external_link_open": "Открыть ссылку",
+    "tool_detail_toggle": "подробно",
+    "tool_detail_input": "ввод",
+    "tool_detail_output": "вывод",
+    "tool_detail_meta": "мета",
+    "tool_detail_raw": "raw"
   },
   "session": {
     "restart": "↺ Перезапустить",

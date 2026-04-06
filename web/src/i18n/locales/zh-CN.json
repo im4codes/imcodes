@@ -41,7 +41,12 @@
     "external_link_title": "打开外部链接",
     "external_link_warning": "此链接由 AI 代理生成。访问外部网站的风险由您自行承担。",
     "external_link_cancel": "取消",
-    "external_link_open": "打开链接"
+    "external_link_open": "打开链接",
+    "tool_detail_toggle": "详情",
+    "tool_detail_input": "输入",
+    "tool_detail_output": "输出",
+    "tool_detail_meta": "元信息",
+    "tool_detail_raw": "原始数据"
   },
   "session": {
     "restart": "↺ 重启",

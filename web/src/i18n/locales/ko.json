@@ -41,7 +41,12 @@
     "external_link_title": "외부 링크 열기",
     "external_link_warning": "이 링크는 AI 에이전트가 생성했습니다. 외부 웹사이트 방문에 따른 위험은 본인 책임입니다.",
     "external_link_cancel": "취소",
-    "external_link_open": "링크 열기"
+    "external_link_open": "링크 열기",
+    "tool_detail_toggle": "세부정보",
+    "tool_detail_input": "입력",
+    "tool_detail_output": "출력",
+    "tool_detail_meta": "메타",
+    "tool_detail_raw": "원본"
   },
   "session": {
     "restart": "↺ 재시작",

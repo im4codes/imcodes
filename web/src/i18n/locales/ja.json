@@ -41,7 +41,12 @@
     "external_link_title": "外部リンクを開く",
     "external_link_warning": "このリンクはAIエージェントによって生成されました。外部サイトへのアクセスに伴うリスクはご自身の責任となります。",
     "external_link_cancel": "キャンセル",
-    "external_link_open": "リンクを開く"
+    "external_link_open": "リンクを開く",
+    "tool_detail_toggle": "詳細",
+    "tool_detail_input": "入力",
+    "tool_detail_output": "出力",
+    "tool_detail_meta": "メタ",
+    "tool_detail_raw": "生データ"
   },
   "session": {
     "restart": "↺ 再起動",

@@ -252,16 +252,37 @@ describe('ClaudeCodeSdkProvider', () => {
     await provider.createSession({ sessionKey: 'route-tool-msg', cwd: '/tmp/project', resumeId: 'session-tool-msg' });
 
     const tools: ToolEventSnapshot[] = [];
-    provider.onToolCall?.((_sid, tool) => tools.push({ name: tool.name, status: tool.status, input: tool.input, output: tool.output }));
+    provider.onToolCall?.((_sid, tool) => tools.push({ name: tool.name, status: tool.status, input: tool.input, output: tool.output, detail: tool.detail }));
 
     await provider.send('route-tool-msg', 'hello');
     await flush();
 
     expect(tools).toEqual([
-      { name: 'WebSearch', status: 'running', input: { query: 'nyc weather' }, output: undefined },
-      { name: 'tool', status: 'complete', input: undefined, output: 'Sunny 12C' },
+      {
+        name: 'WebSearch',
+        status: 'running',
+        input: { query: 'nyc weather' },
+        output: undefined,
+        detail: {
+          kind: 'tool_use',
+          summary: 'WebSearch',
+          input: { query: 'nyc weather' },
+          raw: { type: 'tool_use', id: 'tool-msg-1', name: 'WebSearch', input: { query: 'nyc weather' } },
+        },
+      },
+      {
+        name: 'tool',
+        status: 'complete',
+        input: undefined,
+        output: 'Sunny 12C',
+        detail: {
+          kind: 'tool_result',
+          output: 'Sunny 12C',
+          raw: { type: 'tool_result', tool_use_id: 'tool-msg-1', content: 'Sunny 12C', is_error: false },
+        },
+      },
     ]);
   });
 });
 
-type ToolEventSnapshot = { name: string; status: string; input: unknown; output?: unknown };
+type ToolEventSnapshot = { name: string; status: string; input: unknown; output?: unknown; detail?: unknown };

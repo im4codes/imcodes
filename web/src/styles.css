@@ -452,6 +452,11 @@ body {
 .chat-tool-fold-btn:hover { color: #94a3b8; border-color: #475569; }
 .chat-tool-fold-inline { background: none; border: none; color: #64748b; font-size: 11px; cursor: pointer; padding: 0 2px; }
 .chat-tool-fold-inline:hover { color: #94a3b8; }
+.chat-tool-detail { margin-top: 4px; border-top: 1px dashed #334155; padding-top: 4px; }
+.chat-tool-detail-summary { cursor: pointer; color: #94a3b8; font-size: 11px; user-select: none; }
+.chat-tool-detail-section { margin-top: 6px; }
+.chat-tool-detail-label { color: #64748b; font-size: 11px; margin-bottom: 2px; text-transform: uppercase; letter-spacing: 0.04em; }
+.chat-tool-detail-pre { margin: 0; padding: 6px 8px; background: #0f172a; border-radius: 4px; color: #cbd5e1; font-size: 11px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; overflow-x: auto; }
 .chat-mode { display: inline-block; background: #1e1338; color: #a78bfa; padding: 2px 8px; border-radius: 4px; font-size: 11px; }
 .chat-system { text-align: center; color: #475569; font-size: 11px; padding: 4px 0; }
 .chat-loading { text-align: center; color: #475569; padding: 24px; }
