@@ -38,10 +38,12 @@
     "prepare": "husky"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.92",
+    "@openai/codex-sdk": "^0.118.0",
     "commander": "^12.1.0",
-    "node-pty": "^1.0.0",
     "croner": "^10.0.1",
     "fzf": "^0.5.2",
+    "node-pty": "^1.0.0",
     "octokit": "^4.0.2",
     "pino": "^9.5.0",
     "pino-pretty": "^13.1.3",

@@ -88,6 +88,14 @@ async function createProvider(id: string): Promise<TransportProvider> {
       const { QwenProvider } = await import('./providers/qwen.js');
       return new QwenProvider();
     }
+    case 'claude-code-sdk': {
+      const { ClaudeCodeSdkProvider } = await import('./providers/claude-code-sdk.js');
+      return new ClaudeCodeSdkProvider();
+    }
+    case 'codex-sdk': {
+      const { CodexSdkProvider } = await import('./providers/codex-sdk.js');
+      return new CodexSdkProvider();
+    }
     default:
       throw new Error(`Unknown provider: ${id}`);
   }

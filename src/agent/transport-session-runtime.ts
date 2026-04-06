@@ -3,7 +3,7 @@ import type { SessionRuntime } from './session-runtime.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
-import type { TransportProvider, ProviderError, SessionConfig } from './transport-provider.js';
+import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate } from './transport-provider.js';
 
 /**
  * Transport session runtime — manages a single conversation with a remote provider.
@@ -47,6 +47,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   /** Callback fired when pending messages are drained into a new turn.
    *  Allows command-handler to emit timeline events for the batched send. */
   private _onDrain?: (mergedMessage: string, count: number) => void;
+  private _onSessionInfoChange?: (info: SessionInfoUpdate) => void;
 
   constructor(
     private readonly provider: TransportProvider,
@@ -80,6 +81,10 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (canDrain && this._drainPending()) return;
         this.setStatus(error.code === 'CANCELLED' ? 'idle' : 'error');
       }),
+      ...(this.provider.onSessionInfo ? [this.provider.onSessionInfo((sid: string, info: SessionInfoUpdate) => {
+        if (sid !== this._providerSessionId) return;
+        this._onSessionInfoChange?.(info);
+      })] : []),
     );
   }
 
@@ -90,6 +95,8 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   /** Register a callback for when pending messages are drained into a new turn. */
   set onDrain(cb: (mergedMessage: string, count: number) => void) { this._onDrain = cb; }
+  /** Register a callback for provider session metadata updates. */
+  set onSessionInfoChange(cb: (info: SessionInfoUpdate) => void) { this._onSessionInfoChange = cb; }
 
   /** Set providerSessionId directly (restore from store without initialize). */
   setProviderSessionId(id: string): void { this._providerSessionId = id; }

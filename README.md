@@ -38,11 +38,21 @@ A specialized instant messenger for AI agents. Keep long-running coding-agent se
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m0.png"><img src="landing/imcodes-m0.png" width="18%" /></a>
 </p>
 
+### Apple Watch
+
+<p>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-watch1.png"><img src="landing/imcodes-watch1.png" width="31%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-watch0.png"><img src="landing/imcodes-watch0.png" width="31%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-watch2.png"><img src="landing/imcodes-watch2.png" width="31%" /></a>
+</p>
+
+Watch support covers quick session monitoring, unread counts, push notifications, and quick replies directly from the wrist.
+
 ## Download
 
 <a href="https://apps.apple.com/us/app/im-codes/id6761014424"><img src="https://developer.apple.com/assets/elements/badges/download-on-the-app-store.svg" height="40" alt="Download on the App Store" /></a>
 
-Also available as a [web app](https://app.im.codes) and via `npm install -g imcodes` (daemon CLI).
+Supports iPhone, iPad, and Apple Watch. Also available as a [web app](https://app.im.codes) and via `npm install -g imcodes` (daemon CLI).
 
 ## Why
 
@@ -68,9 +78,9 @@ Browse project files with a tree view. Upload files, images, and photos from any
 
 Preview your local dev server from any device — phone, tablet, or remote browser — without deploying. The daemon proxies `localhost` traffic through a secure WebSocket tunnel to the server. HTML rewriting and a runtime patch handle URL remapping so links, fetch, and WebSocket connections just work. Supports HMR/hot-reload via WebSocket tunneling. No public URLs, no third-party tunnels — traffic stays within your IM.codes server.
 
-### Mobile & Notifications
+### Mobile, Watch & Notifications
 
-Full mobile support with biometric auth and push notifications. Shell sessions allow interactive keyboard input on mobile (SSH-like). Sub-session preview cards always show latest messages. Toast notifications navigate directly to the relevant session.
+Full mobile support with biometric auth and push notifications. Shell sessions allow interactive keyboard input on mobile (SSH-like). Sub-session preview cards always show latest messages. Toast notifications navigate directly to the relevant session. Apple Watch support adds quick session monitoring, unread counts, and quick replies from the wrist.
 
 ### Multi-Agent Discussions & Audit
 

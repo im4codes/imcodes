@@ -73,7 +73,9 @@
     "new_btn": "新建 Session",
     "agentType": {
       "openclaw": "OpenClaw",
-      "qwen": "Qwen Code"
+      "qwen": "Qwen Code",
+      "claude_code_sdk": "Claude Code SDK",
+      "codex_sdk": "Codex SDK"
     },
     "openclaw_not_connected": "未連接",
     "openclaw_connect_hint": "OpenClaw 閘道未連接。請在 daemon 機器上執行以下命令連接：",

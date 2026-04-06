@@ -39,6 +39,9 @@ export const PROVIDER_ERROR_CODES = {
   SESSION_NOT_FOUND:'SESSION_NOT_FOUND',
   RATE_LIMITED:     'RATE_LIMITED',
   PROVIDER_ERROR:   'PROVIDER_ERROR',
+  CANCELLED:        'CANCELLED',
+  PARSE_ERROR:      'PARSE_ERROR',
+  PROVIDER_NOT_FOUND:'PROVIDER_NOT_FOUND',
 } as const;
 
 // ── Derived types ───────────────────────────────────────────────────────────
@@ -106,6 +109,8 @@ export interface SessionConfig {
   parentSessionKey?: string;
   /** If binding to an already-existing remote session, use this key directly. */
   bindExistingKey?: string;
+  /** Provider-specific durable conversation/session identifier used for resume. */
+  resumeId?: string;
   /** Skip the sessions.create RPC — session already exists on provider (auto-sync bind). */
   skipCreate?: boolean;
 }
@@ -144,6 +149,14 @@ export interface ApprovalRequest {
   description: string;
   /** Name of the tool requesting approval, if applicable. */
   tool?: string;
+}
+
+/** Provider-reported session metadata updates (e.g. learned resume/thread ID). */
+export interface SessionInfoUpdate {
+  /** Durable session/thread identifier used for restoring continuity. */
+  resumeId?: string;
+  /** Human-readable active model identifier, if known. */
+  model?: string;
 }
 
 // ── TransportProvider interface ─────────────────────────────────────────────
@@ -245,6 +258,12 @@ export interface TransportProvider {
    * Only call when capabilities.toolCalling is true.
    */
   onToolCall?(cb: (sessionId: string, tool: ToolCallEvent) => void): void;
+
+  /**
+   * Register a callback for provider session metadata changes.
+   * Used by SDK-backed providers that learn durable resume IDs after the first turn.
+   */
+  onSessionInfo?(cb: (sessionId: string, info: SessionInfoUpdate) => void): () => void;
 
   /**
    * Register a callback for approval requests from the agent.

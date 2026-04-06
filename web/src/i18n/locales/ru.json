@@ -73,7 +73,9 @@
     "new_btn": "Новая сессия",
     "agentType": {
       "openclaw": "OpenClaw",
-      "qwen": "Qwen Code"
+      "qwen": "Qwen Code",
+      "claude_code_sdk": "Claude Code SDK",
+      "codex_sdk": "Codex SDK"
     },
     "openclaw_not_connected": "не подключено",
     "openclaw_connect_hint": "Шлюз OpenClaw не подключён. Запустите следующую команду на машине с демоном:",

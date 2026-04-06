@@ -746,6 +746,35 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
   };
 }
 
+function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName: string, agentType: string): void {
+  runtime.onSessionInfoChange = (info) => {
+    const existing = getSession(sessionName);
+    if (!existing) return;
+    const next: SessionRecord = { ...existing };
+    let changed = false;
+
+    if (typeof info.resumeId === 'string' && info.resumeId) {
+      if (agentType === 'claude-code-sdk' && next.ccSessionId !== info.resumeId) {
+        next.ccSessionId = info.resumeId;
+        changed = true;
+      }
+      if (agentType === 'codex-sdk' && next.codexSessionId !== info.resumeId) {
+        next.codexSessionId = info.resumeId;
+        changed = true;
+      }
+    }
+
+    if (typeof info.model === 'string' && info.model && next.modelDisplay !== info.model) {
+      next.modelDisplay = info.model;
+      changed = true;
+    }
+
+    if (!changed) return;
+    upsertSession(next);
+    emitSessionPersist(next, sessionName);
+  };
+}
+
 /** providerSessionId → IM.codes sessionName routing map */
 const providerRouting = new Map<string, string>();
 
@@ -813,9 +842,15 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         : s.qwenModel;
       const runtime = new TransportSessionRuntime(provider, s.name);
       wireTransportCallbacks(runtime, s.name);
+      wireTransportSessionInfo(runtime, s.name, s.agentType);
       // After cancel, qwenFreshOnResume is set — don't resume the stuck conversation.
       const freshAfterCancel = !!(s.qwenFreshOnResume && s.providerId === 'qwen');
       const effectiveSessionKey = freshAfterCancel ? randomUUID() : s.providerSessionId;
+      const resumeId = s.providerId === 'claude-code-sdk'
+        ? s.ccSessionId
+        : s.providerId === 'codex-sdk'
+          ? s.codexSessionId
+          : undefined;
       await runtime.initialize({
         sessionKey: effectiveSessionKey,
         bindExistingKey: freshAfterCancel ? undefined : s.providerSessionId,
@@ -824,6 +859,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         label: s.label ?? s.name,
         description: s.description,
         agentId: effectiveQwenModel,
+        resumeId,
       });
       if (s.description) runtime.setDescription(s.description);
       if (effectiveQwenModel) runtime.setAgentId(effectiveQwenModel);
@@ -860,6 +896,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
 
   const runtime = new TransportSessionRuntime(provider, name);
   wireTransportCallbacks(runtime, name);
+  wireTransportSessionInfo(runtime, name, agentType);
   let effectiveSessionKey = name;
   let effectiveBindExistingKey = bindExistingKey;
   let effectiveSkipCreate = skipCreate;
@@ -867,6 +904,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   let qwenAuthLimit: SessionRecord['qwenAuthLimit'] | undefined;
   let availableQwenModels: string[] | undefined;
   let effectiveQwenModel = agentType === 'qwen' ? (opts.qwenModel ?? getSession(name)?.qwenModel) : undefined;
+  let transportResumeId: string | undefined;
   if (agentType === 'qwen') {
     const qwenRuntime = await getQwenRuntimeConfig().catch(() => null);
     qwenAuthType = qwenRuntime?.authType;
@@ -885,6 +923,10 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
       effectiveBindExistingKey = undefined;
       effectiveSkipCreate = false;
     }
+  } else if (agentType === 'claude-code-sdk') {
+    transportResumeId = opts.ccSessionId ?? (!opts.fresh ? getSession(name)?.ccSessionId : undefined) ?? randomUUID();
+  } else if (agentType === 'codex-sdk') {
+    transportResumeId = opts.codexSessionId ?? (!opts.fresh ? getSession(name)?.codexSessionId : undefined);
   }
 
   // Create session on provider
@@ -896,6 +938,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     agentId: effectiveQwenModel,
     bindExistingKey: effectiveBindExistingKey,
     skipCreate: effectiveSkipCreate,
+    resumeId: transportResumeId,
   });
 
   // Atomic: store runtime + register provider route + persist — rollback all on failure
@@ -919,6 +962,8 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         runtimeType: RUNTIME_TYPES.TRANSPORT,
         providerId: provider.id,
         providerSessionId: runtime.providerSessionId ?? undefined,
+        ...(agentType === 'claude-code-sdk' && transportResumeId ? { ccSessionId: transportResumeId } : {}),
+        ...(agentType === 'codex-sdk' && transportResumeId ? { codexSessionId: transportResumeId } : {}),
         ...(effectiveQwenModel ? { qwenModel: effectiveQwenModel } : {}),
         ...(qwenAuthType ? { qwenAuthType } : {}),
         ...(qwenAuthLimit ? { qwenAuthLimit } : {}),

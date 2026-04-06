@@ -594,12 +594,13 @@ async function autoReconnectProviders(): Promise<void> {
     const { connectProvider, ensureProviderConnected } = await import('../agent/provider-registry.js');
     const { restoreTransportSessions } = await import('../agent/session-manager.js');
 
-    if (listSessions().some((s) => s.runtimeType === 'transport' && s.providerId === 'qwen')) {
+    for (const providerId of ['qwen', 'claude-code-sdk', 'codex-sdk'] as const) {
+      if (!listSessions().some((s) => s.runtimeType === 'transport' && s.providerId === providerId)) continue;
       try {
-        await ensureProviderConnected('qwen', {});
-        await restoreTransportSessions('qwen');
+        await ensureProviderConnected(providerId, {});
+        await restoreTransportSessions(providerId);
       } catch (err) {
-        logger.warn({ err }, 'Qwen local provider auto-connect failed');
+        logger.warn({ err, providerId }, 'Local transport provider auto-connect failed');
       }
     }
 
