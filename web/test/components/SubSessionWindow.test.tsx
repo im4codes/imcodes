@@ -92,6 +92,39 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     cleanup();
   });
 
+
+  it('clamps a persisted off-screen window back into the visible viewport', async () => {
+    localStorage.setItem('rcc_subsession_sub-1', JSON.stringify({
+      geom: { x: 5000, y: 5000, w: 620, h: 480 },
+      viewMode: 'chat',
+    }));
+
+    const sub = makeSubSession();
+    const { container } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const panel = container.querySelector('.subsession-window') as HTMLElement | null;
+      expect(panel).toBeTruthy();
+      expect(panel?.style.left).toBe(`${window.innerWidth - 32}px`);
+      expect(panel?.style.top).toBe(`${window.innerHeight - 32}px`);
+    });
+  });
+
   it('subscribes raw=false when minimized, upgrades to raw=true when active, and downgrades back to raw=false', async () => {
     const sub = makeSubSession();
 
