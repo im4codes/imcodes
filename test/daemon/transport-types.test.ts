@@ -149,14 +149,17 @@ describe('src/agent/transport-provider', () => {
     expect(Object.keys(SESSION_OWNERSHIP)).toHaveLength(3);
   });
 
-  it('PROVIDER_ERROR_CODES has all 6 codes', () => {
+  it('PROVIDER_ERROR_CODES has all 9 codes', () => {
     expect(PROVIDER_ERROR_CODES.AUTH_FAILED).toBe('AUTH_FAILED');
     expect(PROVIDER_ERROR_CODES.CONFIG_ERROR).toBe('CONFIG_ERROR');
     expect(PROVIDER_ERROR_CODES.CONNECTION_LOST).toBe('CONNECTION_LOST');
     expect(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND).toBe('SESSION_NOT_FOUND');
     expect(PROVIDER_ERROR_CODES.RATE_LIMITED).toBe('RATE_LIMITED');
     expect(PROVIDER_ERROR_CODES.PROVIDER_ERROR).toBe('PROVIDER_ERROR');
-    expect(Object.keys(PROVIDER_ERROR_CODES)).toHaveLength(6);
+    expect(PROVIDER_ERROR_CODES.CANCELLED).toBe('CANCELLED');
+    expect(PROVIDER_ERROR_CODES.PARSE_ERROR).toBe('PARSE_ERROR');
+    expect(PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND).toBe('PROVIDER_NOT_FOUND');
+    expect(Object.keys(PROVIDER_ERROR_CODES)).toHaveLength(9);
   });
 });
 
@@ -185,6 +188,14 @@ describe('src/agent/detect — transport/process classification', () => {
     expect(isTransportAgent('claude-code')).toBe(false);
   });
 
+  it('isTransportAgent returns true for claude-code-sdk', () => {
+    expect(isTransportAgent('claude-code-sdk')).toBe(true);
+  });
+
+  it('isTransportAgent returns true for codex-sdk', () => {
+    expect(isTransportAgent('codex-sdk')).toBe(true);
+  });
+
   it('isProcessAgent returns true for claude-code', () => {
     expect(isProcessAgent('claude-code')).toBe(true);
   });
@@ -203,6 +214,11 @@ describe('src/agent/detect — transport/process classification', () => {
 
   it('TRANSPORT_AGENTS contains qwen', () => {
     expect(TRANSPORT_AGENTS.has('qwen')).toBe(true);
+  });
+
+  it('TRANSPORT_AGENTS contains claude-code-sdk and codex-sdk', () => {
+    expect(TRANSPORT_AGENTS.has('claude-code-sdk')).toBe(true);
+    expect(TRANSPORT_AGENTS.has('codex-sdk')).toBe(true);
   });
 
   it('PROCESS_AGENTS contains all process agent types', () => {

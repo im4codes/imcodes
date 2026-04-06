@@ -364,6 +364,22 @@ footer {
 </section>
 
 <section>
+  <h2 data-i18n="h_openclaw">openclaw connect</h2>
+  <p style="color:var(--fg); margin-bottom:12px; font-size:13px;" data-i18n="oc_intro">If OpenClaw is running on the same machine as the daemon, connect IM.codes to the local OpenClaw gateway with:</p>
+  <div class="code-block">imcodes connect openclaw</div>
+  <ul class="reqs" style="margin-bottom:16px;">
+    <li data-i18n="oc_1">Default gateway URL: <code>ws://127.0.0.1:18789</code></li>
+    <li data-i18n="oc_2">Token auto-detected from <code>~/.openclaw/openclaw.json</code>, or pass <code>--token</code> / <code>OPENCLAW_GATEWAY_TOKEN</code></li>
+    <li data-i18n="oc_3">OpenClaw sessions and child sessions sync into IM.codes automatically</li>
+    <li data-i18n="oc_4">Saved to <code>~/.imcodes/openclaw.json</code> so the daemon can reconnect automatically</li>
+    <li data-i18n="oc_5">Use <code>imcodes disconnect openclaw</code> to remove the saved config</li>
+  </ul>
+  <div class="code-block">imcodes connect openclaw --url wss://gateway.example.com
+OPENCLAW_GATEWAY_TOKEN=... imcodes connect openclaw</div>
+  <p style="color:var(--dim); font-size:12px;" data-i18n="oc_note">Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.</p>
+</section>
+
+<section>
   <h2 data-i18n="h_selfhost">self-host</h2>
   <p style="color:var(--fg); margin-bottom:12px; font-size:13px;" data-i18n="sh_intro">Deploy server + daemon on a single machine. Requires Docker and a domain with DNS pointing to the server.</p>
   <div class="code-block">npm install -g imcodes
@@ -435,7 +451,19 @@ docker compose up -d</div>
 
 <script>
 const I18N = {
-  en: { watch_intro: 'Watch support covers quick session monitoring, unread counts, OTA update visibility, push notifications, and quick replies from the wrist.', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Watch app includes session list, unread counts, and quick replies.' },
+  en: {
+    watch_intro: 'Watch support covers quick session monitoring, unread counts, OTA update visibility, push notifications, and quick replies from the wrist.',
+    watch_badge: 'iPhone · iPad · Apple Watch',
+    watch_download: 'Watch app includes session list, unread counts, and quick replies.',
+    h_openclaw: 'openclaw connect',
+    oc_intro: 'If OpenClaw is running on the same machine as the daemon, connect IM.codes to the local OpenClaw gateway with:',
+    oc_1: 'Default gateway URL: <code>ws://127.0.0.1:18789</code>',
+    oc_2: 'Token auto-detected from <code>~/.openclaw/openclaw.json</code>, or pass <code>--token</code> / <code>OPENCLAW_GATEWAY_TOKEN</code>',
+    oc_3: 'OpenClaw sessions and child sessions sync into IM.codes automatically',
+    oc_4: 'Saved to <code>~/.imcodes/openclaw.json</code> so the daemon can reconnect automatically',
+    oc_5: 'Use <code>imcodes disconnect openclaw</code> to remove the saved config',
+    oc_note: 'Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.',
+  },
   'zh-CN': {
     tagline: '为 AI 代理而生的即时通讯',
     hero_intro: '让长时间运行的 coding agent 会话始终触手可及：手机或网页即可查看终端、文件、Git、localhost 预览、通知和多代理工作流。',
@@ -478,6 +506,14 @@ const I18N = {
     qs_1: '使用 <a href="https://app.im.codes">app.im.codes</a> 或自行部署服务端',
     qs_2: '运行 <code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code>',
     qs_3: '打开面板 —— 你的代理已上线',
+    h_openclaw: '连接 OpenClaw',
+    oc_intro: '如果 OpenClaw 和 daemon 跑在同一台机器上，用下面的命令把 IM.codes 接到本地 OpenClaw gateway：',
+    oc_1: '默认网关地址：<code>ws://127.0.0.1:18789</code>',
+    oc_2: '会自动从 <code>~/.openclaw/openclaw.json</code> 读取 token，也可传 <code>--token</code> 或 <code>OPENCLAW_GATEWAY_TOKEN</code>',
+    oc_3: 'OpenClaw 的 session 和子 session 会自动同步进 IM.codes',
+    oc_4: '配置会保存到 <code>~/.imcodes/openclaw.json</code>，daemon 重启后可自动重连',
+    oc_5: '使用 <code>imcodes disconnect openclaw</code> 删除已保存配置',
+    oc_note: '目前只在 macOS 上测试过。远程明文 <code>ws://</code> 地址需要加 <code>--insecure</code>。',
     sh_intro: '在一台机器上部署服务端和守护进程。需要 Docker 和指向该服务器的域名。',
     sh_desc: '自动生成配置、启动 PostgreSQL + 服务端 + Caddy（自动 HTTPS）、创建管理员账户并绑定本地守护进程。凭证在最后打印。',
     sh_connect: '连接其他机器：', sh_manual: '手动部署：',
@@ -528,6 +564,14 @@ const I18N = {
     qs_1: '使用 <a href="https://app.im.codes">app.im.codes</a> 或自行部署伺服器',
     qs_2: '執行 <code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code>',
     qs_3: '開啟面板 —— 你的代理已上線',
+    h_openclaw: '連接 OpenClaw',
+    oc_intro: '如果 OpenClaw 和 daemon 跑在同一台機器上，用下面的命令把 IM.codes 接到本地 OpenClaw gateway：',
+    oc_1: '預設 gateway 位址：<code>ws://127.0.0.1:18789</code>',
+    oc_2: '會自動從 <code>~/.openclaw/openclaw.json</code> 讀取 token，也可傳入 <code>--token</code> 或 <code>OPENCLAW_GATEWAY_TOKEN</code>',
+    oc_3: 'OpenClaw 的 session 和子 session 會自動同步進 IM.codes',
+    oc_4: '設定會保存到 <code>~/.imcodes/openclaw.json</code>，daemon 重啟後可自動重連',
+    oc_5: '使用 <code>imcodes disconnect openclaw</code> 刪除已保存設定',
+    oc_note: '目前只在 macOS 上測試過。遠端明文 <code>ws://</code> 位址需要加上 <code>--insecure</code>。',
     sh_intro: '在一台機器上部署伺服器和守護程序。需要 Docker 和指向該伺服器的網域。',
     sh_desc: '自動產生設定、啟動 PostgreSQL + 伺服器 + Caddy（自動 HTTPS）、建立管理員帳戶並綁定本地守護程序。憑證在最後列印。',
     sh_connect: '連接其他機器：', sh_manual: '手動部署：',
@@ -578,6 +622,14 @@ const I18N = {
     qs_1: '<a href="https://app.im.codes">app.im.codes</a> を使用するか、サーバーをセルフホスト',
     qs_2: '<code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code> を実行',
     qs_3: 'ダッシュボードを開く — エージェントが稼働中',
+    h_openclaw: 'openclaw connect',
+    oc_intro: 'If OpenClaw is running on the same machine as the daemon, connect IM.codes to the local OpenClaw gateway with:',
+    oc_1: 'Default gateway URL: <code>ws://127.0.0.1:18789</code>',
+    oc_2: 'Token auto-detected from <code>~/.openclaw/openclaw.json</code>, or pass <code>--token</code> / <code>OPENCLAW_GATEWAY_TOKEN</code>',
+    oc_3: 'OpenClaw sessions and child sessions sync into IM.codes automatically',
+    oc_4: 'Saved to <code>~/.imcodes/openclaw.json</code> so the daemon can reconnect automatically',
+    oc_5: 'Use <code>imcodes disconnect openclaw</code> to remove the saved config',
+    oc_note: 'Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.',
     sh_intro: '1台のマシンにサーバーとデーモンをデプロイ。DockerとDNS設定済みのドメインが必要です。',
     sh_desc: '設定を自動生成、PostgreSQL + サーバー + Caddy（自動HTTPS）を起動、管理者アカウントを作成しローカルデーモンをバインド。認証情報は最後に表示されます。',
     sh_connect: '追加マシンの接続：', sh_manual: '手動セットアップ：',
@@ -628,6 +680,14 @@ const I18N = {
     qs_1: '<a href="https://app.im.codes">app.im.codes</a> 사용 또는 서버 셀프 호스팅',
     qs_2: '<code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code> 실행',
     qs_3: '대시보드 열기 — 에이전트가 실행 중',
+    h_openclaw: 'openclaw connect',
+    oc_intro: 'If OpenClaw is running on the same machine as the daemon, connect IM.codes to the local OpenClaw gateway with:',
+    oc_1: 'Default gateway URL: <code>ws://127.0.0.1:18789</code>',
+    oc_2: 'Token auto-detected from <code>~/.openclaw/openclaw.json</code>, or pass <code>--token</code> / <code>OPENCLAW_GATEWAY_TOKEN</code>',
+    oc_3: 'OpenClaw sessions and child sessions sync into IM.codes automatically',
+    oc_4: 'Saved to <code>~/.imcodes/openclaw.json</code> so the daemon can reconnect automatically',
+    oc_5: 'Use <code>imcodes disconnect openclaw</code> to remove the saved config',
+    oc_note: 'Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.',
     sh_intro: '단일 머신에 서버와 데몬을 배포합니다. Docker와 서버를 가리키는 도메인이 필요합니다.',
     sh_desc: '모든 설정 자동 생성, PostgreSQL + 서버 + Caddy(자동 HTTPS) 시작, 관리자 계정 생성 및 로컬 데몬 바인딩. 자격 증명은 마지막에 출력됩니다.',
     sh_connect: '추가 머신 연결:', sh_manual: '수동 설정:',
@@ -678,6 +738,14 @@ const I18N = {
     qs_1: 'Usa <a href="https://app.im.codes">app.im.codes</a> o autoaloja el servidor',
     qs_2: 'Ejecuta <code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code>',
     qs_3: 'Abre el panel — tus agentes están activos',
+    h_openclaw: 'openclaw connect',
+    oc_intro: 'If OpenClaw is running on the same machine as the daemon, connect IM.codes to the local OpenClaw gateway with:',
+    oc_1: 'Default gateway URL: <code>ws://127.0.0.1:18789</code>',
+    oc_2: 'Token auto-detected from <code>~/.openclaw/openclaw.json</code>, or pass <code>--token</code> / <code>OPENCLAW_GATEWAY_TOKEN</code>',
+    oc_3: 'OpenClaw sessions and child sessions sync into IM.codes automatically',
+    oc_4: 'Saved to <code>~/.imcodes/openclaw.json</code> so the daemon can reconnect automatically',
+    oc_5: 'Use <code>imcodes disconnect openclaw</code> to remove the saved config',
+    oc_note: 'Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.',
     sh_intro: 'Despliega servidor + daemon en una sola máquina. Requiere Docker y un dominio con DNS apuntando al servidor.',
     sh_desc: 'Genera toda la configuración, inicia PostgreSQL + servidor + Caddy con HTTPS automático, crea la cuenta admin y vincula el daemon local. Las credenciales se imprimen al final.',
     sh_connect: 'Para conectar máquinas adicionales:', sh_manual: 'Configuración manual:',
@@ -728,6 +796,14 @@ const I18N = {
     qs_1: 'Используйте <a href="https://app.im.codes">app.im.codes</a> или разверните свой сервер',
     qs_2: 'Выполните <code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code>',
     qs_3: 'Откройте панель — ваши агенты работают',
+    h_openclaw: 'openclaw connect',
+    oc_intro: 'If OpenClaw is running on the same machine as the daemon, connect IM.codes to the local OpenClaw gateway with:',
+    oc_1: 'Default gateway URL: <code>ws://127.0.0.1:18789</code>',
+    oc_2: 'Token auto-detected from <code>~/.openclaw/openclaw.json</code>, or pass <code>--token</code> / <code>OPENCLAW_GATEWAY_TOKEN</code>',
+    oc_3: 'OpenClaw sessions and child sessions sync into IM.codes automatically',
+    oc_4: 'Saved to <code>~/.imcodes/openclaw.json</code> so the daemon can reconnect automatically',
+    oc_5: 'Use <code>imcodes disconnect openclaw</code> to remove the saved config',
+    oc_note: 'Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.',
     sh_intro: 'Разверните сервер + демон на одной машине. Требуется Docker и домен с DNS, указывающим на сервер.',
     sh_desc: 'Автоматически генерирует конфигурацию, запускает PostgreSQL + сервер + Caddy с автоматическим HTTPS, создаёт учётную запись администратора и привязывает локальный демон. Данные для входа выводятся в конце.',
     sh_connect: 'Подключение дополнительных машин:', sh_manual: 'Ручная настройка:',

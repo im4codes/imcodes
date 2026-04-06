@@ -99,7 +99,13 @@ export async function readCwd(filePath: string): Promise<string | null> {
   }
 }
 
-async function findLatestRollout(dir: string, workDir: string, excludeClaimed = true): Promise<string | null> {
+async function findLatestRollout(
+  dir: string,
+  workDir: string,
+  excludeClaimed = true,
+  sessionName?: string,
+  requiredUuid?: string | null,
+): Promise<string | null> {
   let entries: string[];
   try { entries = await readdir(dir); } catch { return null; }
   const rollouts = entries.filter((e) => e.startsWith('rollout-') && e.endsWith('.jsonl')).sort().reverse();
@@ -108,6 +114,11 @@ async function findLatestRollout(dir: string, workDir: string, excludeClaimed = 
     if (excludeClaimed) {
       const owner = claimedFiles.get(fpath);
       if (owner && owner !== 'UNKNOWN') continue;
+    }
+    if (sessionName && isFileClaimedByOther(sessionName, fpath)) continue;
+    if (requiredUuid) {
+      const candidateUuid = extractUuidFromPath(fpath);
+      if (candidateUuid !== requiredUuid) continue;
     }
     const cwd = await readCwd(fpath);
     if (cwd && normalizePath(cwd) === normalizePath(workDir)) return fpath;
@@ -119,12 +130,8 @@ async function findLatestMatchingRollout(sessionName: string, projectDir: string
   let latestPath: string | null = null;
   let latestMtime = -1;
   for (const dir of recentSessionDirs()) {
-    const found = await findLatestRollout(dir, projectDir, false);
-    if (!found || found === currentPath || isFileClaimedByOther(sessionName, found)) continue;
-    if (currentUuid) {
-      const candidateUuid = extractUuidFromPath(found);
-      if (candidateUuid && candidateUuid !== currentUuid) continue;
-    }
+    const found = await findLatestRollout(dir, projectDir, false, sessionName, currentUuid);
+    if (!found || found === currentPath) continue;
     try {
       const s = await stat(found);
       if (s.mtimeMs > latestMtime) {

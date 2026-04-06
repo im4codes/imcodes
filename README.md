@@ -92,6 +92,8 @@ Native streaming output support for transport-backed agents like [OpenClaw](http
 
 > **Note on Qwen:** Qwen currently offers a free tier (1,000 requests/day) provided by Alibaba Cloud. This is an Alibaba Cloud policy, not an IM.codes offering — terms, limits, and availability may change at any time without notice. Check the [Qwen documentation](https://qwen.readthedocs.io/) for current details.
 
+> **Note on OpenClaw:** `imcodes connect openclaw` has only been tested on macOS so far.
+
 ### Agent-to-Agent Communication
 
 Agents can message each other directly using `imcodes send`. An agent running in one session can ask a sibling to review code, run tests, or coordinate on a task — no user intervention needed. Target resolution by label, session name, or agent type. `--reply` flag instructs the target to send its response back automatically. Built-in circuit breakers prevent abuse (depth limit, rate limiting, broadcast cap).
@@ -205,6 +207,36 @@ imcodes bind https://app.im.codes/bind/<api-key>
 ```
 
 This binds your machine, starts the daemon, registers it as a system service, and brings the machine into the web/mobile dashboard.
+
+### OpenClaw Connect
+
+If OpenClaw is running locally, connect IM.codes to the OpenClaw gateway on the daemon machine:
+
+```bash
+imcodes connect openclaw
+```
+
+What this does:
+
+- connects to `ws://127.0.0.1:18789` by default
+- reuses the OpenClaw gateway token automatically from `~/.openclaw/openclaw.json`
+- syncs OpenClaw sessions and child sessions into IM.codes so they appear as transport-backed sessions/sub-sessions
+- saves the IM.codes-side connection config to `~/.imcodes/openclaw.json`
+- restarts the daemon so OpenClaw transport sessions can reconnect automatically
+
+Common variants:
+
+```bash
+imcodes connect openclaw --url ws://127.0.0.1:18789
+OPENCLAW_GATEWAY_TOKEN=... imcodes connect openclaw
+imcodes connect openclaw --url wss://gateway.example.com
+```
+
+Notes:
+
+- remote non-TLS `ws://` URLs require `--insecure`
+- use `imcodes disconnect openclaw` to remove the saved config and drop the connection
+- this flow has only been tested on macOS
 
 ## Self-Host
 
