@@ -52,13 +52,13 @@ interface CodexSdkSessionState {
   };
 }
 
-function toolFromItem(item: Record<string, any>): ToolCallEvent | null {
+function toolFromItem(item: Record<string, any>, lifecycle: 'started' | 'completed'): ToolCallEvent | null {
   switch (item.type) {
     case 'commandExecution':
       return {
         id: item.id,
         name: 'Bash',
-        status: item.status === 'inProgress' ? 'running' : item.status === 'completed' ? 'complete' : 'error',
+        status: item.status === 'inProgress' || lifecycle === 'started' ? 'running' : item.status === 'completed' ? 'complete' : 'error',
         input: { command: item.command },
         ...(item.status !== 'inProgress' ? { output: item.aggregatedOutput ?? item.output ?? '' } : {}),
       };
@@ -66,7 +66,7 @@ function toolFromItem(item: Record<string, any>): ToolCallEvent | null {
       return {
         id: item.id,
         name: `mcp:${item.server}:${item.tool}`,
-        status: item.status === 'inProgress' ? 'running' : item.status === 'completed' ? 'complete' : 'error',
+        status: item.status === 'inProgress' || lifecycle === 'started' ? 'running' : item.status === 'completed' ? 'complete' : 'error',
         input: item.arguments,
         ...(item.status === 'completed'
           ? { output: JSON.stringify(item.result?.structuredContent ?? item.result?.content ?? '') }
@@ -78,8 +78,22 @@ function toolFromItem(item: Record<string, any>): ToolCallEvent | null {
       return {
         id: item.id,
         name: 'Patch',
-        status: item.status === 'completed' ? 'complete' : 'error',
+        status: lifecycle === 'started' || item.status === 'inProgress'
+          ? 'running'
+          : item.status === 'completed'
+            ? 'complete'
+            : 'error',
         input: { changes: item.changes },
+      };
+    case 'webSearch':
+      return {
+        id: item.id,
+        name: 'WebSearch',
+        status: lifecycle === 'started' ? 'running' : 'complete',
+        input: {
+          query: item.query,
+          ...(item.action ? { action: item.action } : {}),
+        },
       };
     default:
       return null;
@@ -396,7 +410,7 @@ export class CodexSdkProvider implements TransportProvider {
       const item = params.item as Record<string, any> | undefined;
       if (!item) return;
 
-      const tool = toolFromItem(item);
+      const tool = toolFromItem(item, method === 'item/started' ? 'started' : 'completed');
       if (tool) {
         for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
       }

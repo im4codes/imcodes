@@ -195,4 +195,31 @@ describe('CodexSdkProvider', () => {
     await provider.cancel('route-cancel');
     expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(true);
   });
+
+  it('emits WebSearch tool events for webSearch items', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-websearch', cwd: '/tmp/project' });
+
+    const tools: Array<{ name: string; status: string; input: unknown }> = [];
+    provider.onToolCall((_, tool) => tools.push({ name: tool.name, status: tool.status, input: tool.input }));
+
+    await provider.send('route-websearch', 'search');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-1', type: 'webSearch', query: 'nyc weather' } },
+    });
+    child.emits({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'ws-1', type: 'webSearch', query: 'nyc weather', action: { type: 'search', query: 'nyc weather' } } },
+    });
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await flush();
+
+    expect(tools).toEqual([
+      { name: 'WebSearch', status: 'running', input: { query: 'nyc weather' } },
+      { name: 'WebSearch', status: 'complete', input: { query: 'nyc weather', action: { type: 'search', query: 'nyc weather' } } },
+    ]);
+  });
 });

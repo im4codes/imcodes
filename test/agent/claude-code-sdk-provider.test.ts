@@ -222,6 +222,46 @@ describe('ClaudeCodeSdkProvider', () => {
       { name: 'Bash', status: 'complete', input: { command: 'echo hi' } },
     ]);
   });
+
+  it('emits tool events from assistant/user message content when stream events are absent', async () => {
+    sdkMock.setNextMessages([
+      {
+        type: 'assistant',
+        session_id: 'session-tool-msg',
+        message: {
+          content: [
+            { type: 'tool_use', id: 'tool-msg-1', name: 'WebSearch', input: { query: 'nyc weather' } },
+            { type: 'text', text: 'Checking.' },
+          ],
+        },
+      },
+      {
+        type: 'user',
+        session_id: 'session-tool-msg',
+        message: {
+          content: [
+            { type: 'tool_result', tool_use_id: 'tool-msg-1', content: 'Sunny 12C', is_error: false },
+          ],
+        },
+      },
+      { type: 'result', session_id: 'session-tool-msg', subtype: 'success', is_error: false, result: 'Sunny 12C', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-tool-msg', cwd: '/tmp/project', resumeId: 'session-tool-msg' });
+
+    const tools: ToolEventSnapshot[] = [];
+    provider.onToolCall?.((_sid, tool) => tools.push({ name: tool.name, status: tool.status, input: tool.input, output: tool.output }));
+
+    await provider.send('route-tool-msg', 'hello');
+    await flush();
+
+    expect(tools).toEqual([
+      { name: 'WebSearch', status: 'running', input: { query: 'nyc weather' }, output: undefined },
+      { name: 'tool', status: 'complete', input: undefined, output: 'Sunny 12C' },
+    ]);
+  });
 });
 
-type ToolEventSnapshot = { name: string; status: string; input: unknown };
+type ToolEventSnapshot = { name: string; status: string; input: unknown; output?: unknown };

@@ -39,6 +39,7 @@ interface ClaudeSdkSessionState {
   finalMetadata?: Record<string, unknown>;
   pendingComplete?: AgentMessage;
   toolCalls: Map<number, ToolCallEvent & { partialInputJson?: string }>;
+  emittedToolStates: Map<string, string>;
 }
 
 type ClaudeToolBlock = {
@@ -127,6 +128,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       finalMetadata: existing?.finalMetadata,
       pendingComplete: undefined,
       toolCalls: new Map(),
+      emittedToolStates: new Map(),
     });
     this.emitSessionInfo(routeId, { resumeId });
     return routeId;
@@ -201,6 +203,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     state.finalMetadata = undefined;
     state.pendingComplete = undefined;
     state.toolCalls.clear();
+    state.emittedToolStates.clear();
 
     const options: Record<string, unknown> = {
       cwd: state.cwd,
@@ -282,7 +285,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       if (event.type === 'content_block_start' && this.isToolBlock(event.content_block)) {
         const tool = this.normalizeToolCall(event.content_block);
         state.toolCalls.set(event.index, { ...tool, partialInputJson: undefined });
-        this.emitToolCall(sessionId, tool);
+        this.emitToolCall(sessionId, state, tool);
         return;
       }
       if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta' && typeof event.delta.text === 'string') {
@@ -313,7 +316,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
           const parsed = this.tryParsePartialJson(tool.partialInputJson);
           if (parsed !== undefined) tool.input = parsed;
         }
-        this.emitToolCall(sessionId, {
+        this.emitToolCall(sessionId, state, {
           id: tool.id,
           name: tool.name,
           status: 'complete',
@@ -326,6 +329,13 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
 
     if (msg.type === 'assistant') {
       const text = collectAssistantText(msg);
+      if (Array.isArray(msg.message.content)) {
+        for (const block of msg.message.content) {
+          if (this.isToolBlock(block)) {
+            this.emitToolCall(sessionId, state, this.normalizeToolCall(block));
+          }
+        }
+      }
       if (text) {
         if (text !== state.currentText) {
           const messageId = makeMessageId(state);
@@ -343,6 +353,33 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
         }
       } else {
         state.currentText = text;
+      }
+      return;
+    }
+
+    if (msg.type === 'user' && Array.isArray(msg.message?.content)) {
+      for (const block of msg.message.content) {
+        if (!block || typeof block !== 'object' || block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue;
+        const output = Array.isArray(block.content)
+          ? block.content
+            .map((entry) => {
+              if (!entry || typeof entry !== 'object') return '';
+              if ('text' in entry && typeof (entry as { text?: unknown }).text === 'string') {
+                return (entry as { text: string }).text;
+              }
+              return '';
+            })
+            .filter(Boolean)
+            .join('\n')
+          : typeof block.content === 'string'
+            ? block.content
+            : undefined;
+        this.emitToolCall(sessionId, state, {
+          id: block.tool_use_id,
+          name: 'tool',
+          status: block.is_error ? 'error' : 'complete',
+          ...(output ? { output } : {}),
+        });
       }
       return;
     }
@@ -397,7 +434,15 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     for (const cb of this.errorCallbacks) cb(sessionId, error);
   }
 
-  private emitToolCall(sessionId: string, tool: ToolCallEvent): void {
+  private emitToolCall(sessionId: string, state: ClaudeSdkSessionState, tool: ToolCallEvent): void {
+    const signature = JSON.stringify({
+      status: tool.status,
+      name: tool.name,
+      input: tool.input ?? null,
+      output: tool.output ?? null,
+    });
+    if (state.emittedToolStates.get(tool.id) === signature) return;
+    state.emittedToolStates.set(tool.id, signature);
     for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
   }
 
