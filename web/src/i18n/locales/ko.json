@@ -105,7 +105,8 @@
     "qwen_tier_byo": "자체 키",
     "qwen_source_title": "Qwen 소스: {{tier}}",
     "qwen_model_title": "Qwen 소스: {{tier}} · 모델: {{model}}",
-    "p2p_tag": "P2P"
+    "p2p_tag": "P2P",
+    "permissions_all": "전체 권한"
   },
   "server": {
     "upgrade_daemon": "↑ Daemon 업그레이드",
@@ -156,6 +157,7 @@
     "preview_too_large": "파일이 너무 커서 미리볼 수 없습니다 (> 512 KB)",
     "preview_error": "미리보기 불가",
     "preview_binary": "바이너리 파일 — 미리보기 불가",
+    "mkdir_failed": "폴더를 만들 수 없습니다",
     "view_diff": "차이",
     "view_source": "소스",
     "tab_files": "파일",

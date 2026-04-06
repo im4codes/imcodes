@@ -686,10 +686,13 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       extraEnv = await resolvePresetEnv(ccPresetName);
     }
 
-    // If project already has sessions, teardown first (keep store records)
-    const existing = listSessions(project);
-    if (existing.length > 0) {
-      await teardownProject(project);
+    // Reject duplicate main-session starts for an existing project/session namespace.
+    const existingByProject = listSessions(project).filter((s) => s.role === 'brain' && s.state !== 'stopped');
+    if (existingByProject.length > 0) {
+      const message = `Session already exists for project ${project}. Stop or restart it instead of starting a duplicate.`;
+      logger.warn({ project, dir, agentType, existing: existingByProject.map((s) => s.name) }, 'session.start rejected because project already has an active main session');
+      try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
+      return;
     }
     if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk') {
       logger.info({ project, agentType }, 'SDK fresh session.start removing stale main-session store record');

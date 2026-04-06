@@ -140,4 +140,25 @@ describe('jsonl watcher refresh()', () => {
     expect(emittedEvents.some((e) => e.session === 'jsonl-cc' && e.payload.text === 'pre-existing old message')).toBe(false);
     stopWatching('jsonl-cc');
   });
+
+  it('startWatchingFile does not steal a newer transcript from another Claude session in the same project dir', async () => {
+    vi.useFakeTimers();
+    const control = await startWatchingFile('jsonl-cc', ccSessionFile, ccSessionId);
+    await vi.advanceTimersByTimeAsync(100);
+    emittedEvents.length = 0;
+
+    await appendFile(ccSessionFile, assistantText('belongs to tracked session'));
+    expect(await control.refresh()).toBe(true);
+    await vi.advanceTimersByTimeAsync(100);
+    emittedEvents.length = 0;
+
+    await appendFile(otherSessionFile, assistantText('belongs to other session'));
+    const otherStat = await stat(otherSessionFile);
+    await utimes(otherSessionFile, new Date(otherStat.mtimeMs + 3000), new Date(otherStat.mtimeMs + 3000));
+    await vi.advanceTimersByTimeAsync(10000);
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(emittedEvents.some((e) => e.session === 'jsonl-cc' && e.payload.text === 'belongs to other session')).toBe(false);
+    vi.useRealTimers();
+  });
 });

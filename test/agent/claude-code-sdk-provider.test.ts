@@ -91,6 +91,8 @@ describe('ClaudeCodeSdkProvider', () => {
     const run = sdkMock.runs[0];
     expect(run.options.sessionId).toBe('session-1');
     expect(run.options.resume).toBeUndefined();
+    expect(run.options.includePartialMessages).toBe(true);
+    expect(run.options.permissionMode).toBe('bypassPermissions');
     expect(deltas).toEqual(['Hel', 'Hello']);
     expect(completed).toEqual(['Hello']);
     expect(sessionInfo.some((info) => info.resumeId === 'session-1')).toBe(true);
@@ -134,5 +136,28 @@ describe('ClaudeCodeSdkProvider', () => {
     const run = sdkMock.runs.at(-1)!;
     expect(run.options.sessionId).toBe('new-session');
     expect(run.options.resume).toBeUndefined();
+  });
+
+  it('emits a fallback streaming delta from assistant text when the SDK does not send text_delta events', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-fallback', model: 'claude-sonnet-4-6' },
+      { type: 'assistant', session_id: 'session-fallback', message: { content: [{ type: 'text', text: 'STREAM_OK' }] } },
+      { type: 'result', session_id: 'session-fallback', subtype: 'success', is_error: false, result: 'STREAM_OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-fallback', cwd: '/tmp/project', resumeId: 'session-fallback' });
+
+    const deltas: string[] = [];
+    const completed: string[] = [];
+    provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    await provider.send('route-fallback', 'hello');
+    await flush();
+
+    expect(deltas).toEqual(['STREAM_OK']);
+    expect(completed).toEqual(['STREAM_OK']);
   });
 });

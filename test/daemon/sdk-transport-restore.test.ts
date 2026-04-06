@@ -7,12 +7,66 @@ const mocks = vi.hoisted(() => {
   return { store, claudeRuns, codexRuns };
 });
 
-vi.mock('node:child_process', () => ({
-  execFile: vi.fn((_file: string, _args: string[], cb?: (err: Error | null, stdout: string, stderr: string) => void) => {
-    cb?.(null, 'ok\n', '');
-    return {} as never;
-  }),
-}));
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  const { EventEmitter } = await import('node:events');
+  const { PassThrough, Writable } = await import('node:stream');
+  const spawn = vi.fn(() => {
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const stdin = new Writable({
+      write(chunk, _enc, cb) {
+        const lines = chunk.toString().split('\n').filter(Boolean);
+        for (const line of lines) {
+          const msg = JSON.parse(line) as { id?: number; method?: string; params?: Record<string, any> };
+          if (msg.method === 'initialize' && typeof msg.id === 'number') {
+            stdout.write(JSON.stringify({ id: msg.id, result: { userAgent: 'test' } }) + '\n');
+          }
+          if (msg.method === 'thread/start' && typeof msg.id === 'number') {
+            mocks.codexRuns.push({ mode: 'start', id: null, options: msg.params ?? {}, input: '' });
+            stdout.write(JSON.stringify({ id: msg.id, result: { thread: { id: 'thread-restored' } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'thread/started', params: { thread: { id: 'thread-restored' } } }) + '\n');
+          }
+          if (msg.method === 'thread/resume' && typeof msg.id === 'number') {
+            const threadId = String(msg.params?.threadId ?? 'thread-restored');
+            mocks.codexRuns.push({ mode: 'resume', id: threadId, options: msg.params ?? {}, input: '' });
+            stdout.write(JSON.stringify({ id: msg.id, result: { thread: { id: threadId } } }) + '\n');
+          }
+          if (msg.method === 'turn/start' && typeof msg.id === 'number') {
+            const last = mocks.codexRuns[mocks.codexRuns.length - 1];
+            if (last) last.input = String(msg.params?.input?.[0]?.text ?? '');
+            stdout.write(JSON.stringify({ id: msg.id, result: { turn: { id: 'turn-restore', status: 'inProgress', items: [], error: null } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'item/completed', params: { threadId: String(msg.params?.threadId ?? 'thread-restored'), turnId: 'turn-restore', item: { id: 'msg-restore', type: 'agentMessage', text: 'MANGO' } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'turn/completed', params: { threadId: String(msg.params?.threadId ?? 'thread-restored'), turn: { id: 'turn-restore', status: 'completed', error: null } } }) + '\n');
+          }
+          if (msg.method === 'thread/unsubscribe' && typeof msg.id === 'number') {
+            stdout.write(JSON.stringify({ id: msg.id, result: { status: 'unsubscribed' } }) + '\n');
+          }
+        }
+        cb();
+      },
+    });
+    const child = new EventEmitter() as actual.ChildProcessWithoutNullStreams;
+    child.stdout = stdout as any;
+    child.stderr = stderr as any;
+    child.stdin = stdin as any;
+    child.killed = false;
+    child.kill = (() => {
+      child.killed = true;
+      child.emit('exit', 0);
+      return true;
+    }) as any;
+    return child;
+  });
+  return {
+    ...actual,
+    spawn,
+    execFile: vi.fn((_file: string, _args: string[], cb?: (err: Error | null, stdout: string, stderr: string) => void) => {
+      cb?.(null, 'ok\n', '');
+      return {} as never;
+    }),
+  };
+});
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   query: vi.fn(({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
@@ -26,36 +80,6 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
     q.interrupt = async () => {};
     return q;
   }),
-}));
-
-vi.mock('@openai/codex-sdk', () => ({
-  Codex: vi.fn().mockImplementation(() => ({
-    startThread: (options: Record<string, unknown>) => ({
-      get id() { return null; },
-      runStreamed: async (input: string) => {
-        mocks.codexRuns.push({ mode: 'start', id: null, options, input });
-        return {
-          events: (async function* () {
-            yield { type: 'thread.started', thread_id: 'thread-restored' };
-            yield { type: 'item.completed', item: { id: 'msg-start', type: 'agent_message', text: input.includes('token') ? 'MANGO' : 'ACK' } };
-            yield { type: 'turn.completed', usage: { input_tokens: 4, cached_input_tokens: 1, output_tokens: 2 } };
-          })(),
-        };
-      },
-    }),
-    resumeThread: (id: string, options: Record<string, unknown>) => ({
-      get id() { return id; },
-      runStreamed: async (input: string) => {
-        mocks.codexRuns.push({ mode: 'resume', id, options, input });
-        return {
-          events: (async function* () {
-            yield { type: 'item.completed', item: { id: 'msg-resume', type: 'agent_message', text: input.includes('token') ? 'MANGO' : 'ACK' } };
-            yield { type: 'turn.completed', usage: { input_tokens: 4, cached_input_tokens: 1, output_tokens: 2 } };
-          })(),
-        };
-      },
-    }),
-  })),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({

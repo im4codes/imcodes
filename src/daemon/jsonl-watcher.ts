@@ -778,7 +778,7 @@ export async function startWatchingFile(sessionName: string, filePath: string, c
     if (pollCount % 5 === 0 && state.activeFile) {
       try {
         const latest = await findLatestJsonl(state.projectDir);
-        if (latest && latest !== state.activeFile && canClaim(sessionName, latest)) {
+        if (latest && latest !== state.activeFile && isTrackedClaudeFile(state, latest) && canClaim(sessionName, latest)) {
           logger.info({ sessionName, oldFile: basename(state.activeFile), newFile: basename(latest) },
             'jsonl-watcher: newer file detected (poll fallback), switching (CC rotation)');
           await activateFile(sessionName, state, latest);

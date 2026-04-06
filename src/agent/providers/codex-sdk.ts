@@ -1,12 +1,7 @@
 import { access } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
-import {
-  Codex,
-  type Thread,
-  type ThreadEvent,
-  type ThreadItem,
-  type ThreadOptions,
-} from '@openai/codex-sdk';
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import readline, { type Interface as ReadlineInterface } from 'node:readline';
 import type {
   TransportProvider,
   ProviderCapabilities,
@@ -26,41 +21,60 @@ import logger from '../../util/logger.js';
 
 const CODEX_BIN = 'codex';
 
+type JsonRpcResponse = {
+  id?: number;
+  result?: Record<string, any>;
+  error?: { code?: number; message?: string; data?: unknown };
+  method?: string;
+  params?: Record<string, any>;
+};
+
+type PendingRequest = {
+  resolve: (value: any) => void;
+  reject: (error: Error) => void;
+};
+
 interface CodexSdkSessionState {
   routeId: string;
   cwd: string;
   model?: string;
   threadId?: string;
-  thread: Thread | null;
-  runningAbort?: AbortController;
+  loaded: boolean;
+  runningTurnId?: string;
   currentMessageId: string | null;
   currentText: string;
   pendingComplete?: AgentMessage;
+  cancelled: boolean;
+  lastUsage?: {
+    input_tokens: number;
+    cached_input_tokens: number;
+    output_tokens: number;
+  };
 }
 
-function toolFromThreadItem(item: ThreadItem): ToolCallEvent | null {
+function toolFromItem(item: Record<string, any>): ToolCallEvent | null {
   switch (item.type) {
-    case 'command_execution':
+    case 'commandExecution':
       return {
         id: item.id,
         name: 'Bash',
-        status: item.status === 'in_progress' ? 'running' : item.status === 'completed' ? 'complete' : 'error',
+        status: item.status === 'inProgress' ? 'running' : item.status === 'completed' ? 'complete' : 'error',
         input: { command: item.command },
-        ...(item.status !== 'in_progress' ? { output: item.aggregated_output } : {}),
+        ...(item.status !== 'inProgress' ? { output: item.aggregatedOutput ?? item.output ?? '' } : {}),
       };
-    case 'mcp_tool_call':
+    case 'mcpToolCall':
       return {
         id: item.id,
         name: `mcp:${item.server}:${item.tool}`,
-        status: item.status === 'in_progress' ? 'running' : item.status === 'completed' ? 'complete' : 'error',
+        status: item.status === 'inProgress' ? 'running' : item.status === 'completed' ? 'complete' : 'error',
         input: item.arguments,
         ...(item.status === 'completed'
-          ? { output: JSON.stringify(item.result?.structured_content ?? item.result?.content ?? '') }
+          ? { output: JSON.stringify(item.result?.structuredContent ?? item.result?.content ?? '') }
           : item.status === 'failed'
             ? { output: item.error?.message ?? 'failed' }
             : {}),
       };
-    case 'file_change':
+    case 'fileChange':
       return {
         id: item.id,
         name: 'Patch',
@@ -87,11 +101,16 @@ export class CodexSdkProvider implements TransportProvider {
 
   private config: ProviderConfig | null = null;
   private sessions = new Map<string, CodexSdkSessionState>();
+  private threadToSession = new Map<string, string>();
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
   private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
+  private child: ChildProcessWithoutNullStreams | null = null;
+  private rl: ReadlineInterface | null = null;
+  private nextRequestId = 1;
+  private pendingRequests = new Map<number, PendingRequest>();
 
   async connect(config: ProviderConfig): Promise<void> {
     const binaryPath = this.resolveBinaryPath(config);
@@ -102,14 +121,18 @@ export class CodexSdkProvider implements TransportProvider {
         execFile(binaryPath, ['--version'], (err) => (err ? reject(err) : resolve()));
       });
     });
+    await this.startAppServer(binaryPath);
     this.config = config;
-    logger.info({ provider: this.id }, 'Codex SDK provider connected');
+    logger.info({ provider: this.id }, 'Codex SDK provider connected via app-server');
   }
 
   async disconnect(): Promise<void> {
-    for (const state of this.sessions.values()) {
-      state.runningAbort?.abort();
-    }
+    this.rejectPending(new Error('Codex app-server disconnected'));
+    this.rl?.close();
+    this.rl = null;
+    if (this.child && !this.child.killed) this.child.kill('SIGTERM');
+    this.child = null;
+    this.threadToSession.clear();
     this.sessions.clear();
     this.config = null;
   }
@@ -122,11 +145,13 @@ export class CodexSdkProvider implements TransportProvider {
       cwd: config.cwd ?? existing?.cwd ?? process.cwd(),
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
       threadId: config.resumeId ?? existing?.threadId,
-      thread: null,
-      runningAbort: undefined,
+      loaded: false,
+      runningTurnId: undefined,
       currentMessageId: null,
       currentText: '',
       pendingComplete: undefined,
+      cancelled: false,
+      lastUsage: undefined,
     });
     if (config.resumeId) this.emitSessionInfo(routeId, { resumeId: config.resumeId });
     return routeId;
@@ -135,7 +160,10 @@ export class CodexSdkProvider implements TransportProvider {
   async endSession(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state) return;
-    state.runningAbort?.abort();
+    if (state.threadId && state.loaded) {
+      await this.request('thread/unsubscribe', { threadId: state.threadId }).catch(() => {});
+      this.threadToSession.delete(state.threadId);
+    }
     this.sessions.delete(sessionId);
   }
 
@@ -182,53 +210,232 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   async send(sessionId: string, message: string): Promise<void> {
-    if (!this.config) {
-      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex SDK provider not connected', false);
+    if (!this.config || !this.child) {
+      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
     }
     const state = this.sessions.get(sessionId);
     if (!state) {
       throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown Codex SDK session: ${sessionId}`, false);
     }
-    if (state.runningAbort) {
+    if (state.runningTurnId) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Codex SDK session is already busy', true);
     }
 
-    const abort = new AbortController();
-    state.runningAbort = abort;
     state.currentText = '';
     state.currentMessageId = null;
     state.pendingComplete = undefined;
-
-    const thread = this.getThread(state);
-    state.thread = thread;
-    void this.consumeThread(sessionId, state, thread, message, abort);
+    state.cancelled = false;
+    state.lastUsage = undefined;
+    await this.startTurn(sessionId, state, message);
   }
 
   async cancel(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
-    state?.runningAbort?.abort();
+    if (!state?.threadId || !state.runningTurnId) return;
+    state.cancelled = true;
+    await this.request('turn/interrupt', {
+      threadId: state.threadId,
+      turnId: state.runningTurnId,
+    }).catch(() => {});
   }
 
-  private getThread(state: CodexSdkSessionState): Thread {
-    if (state.thread) return state.thread;
-    const options: ThreadOptions = {
-      workingDirectory: state.cwd,
-      skipGitRepoCheck: true,
-      ...(state.model ? { model: state.model } : {}),
-    };
-    const client = new Codex({ codexPathOverride: this.resolveBinaryPath(this.config) });
-    state.thread = state.threadId ? client.resumeThread(state.threadId, options) : client.startThread(options);
-    return state.thread;
+  private async startAppServer(binaryPath: string): Promise<void> {
+    await this.disconnect().catch(() => {});
+    const child = spawn(binaryPath, ['app-server'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: process.env,
+    });
+    this.child = child;
+    this.rl = readline.createInterface({ input: child.stdout });
+    this.rl.on('line', (line) => this.handleLine(line));
+    child.stderr.on('data', (chunk) => {
+      const text = chunk.toString();
+      if (text.trim()) logger.debug({ provider: this.id, stderr: text.trim() }, 'Codex app-server stderr');
+    });
+    child.on('exit', (code) => {
+      const err = new Error(`Codex app-server exited with code ${code ?? 'unknown'}`);
+      this.rejectPending(err);
+      const sessions = [...this.sessions.keys()];
+      for (const sid of sessions) {
+        this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, false));
+      }
+      this.child = null;
+    });
+
+    await this.request('initialize', {
+      clientInfo: { name: 'imcodes', title: 'IM.codes', version: '0.1.0' },
+      capabilities: { experimentalApi: true },
+    });
+    this.notify('initialized', {});
   }
 
-  private async consumeThread(sessionId: string, state: CodexSdkSessionState, thread: Thread, message: string, abort: AbortController): Promise<void> {
-    let usage: { input_tokens: number; cached_input_tokens: number; output_tokens: number } | null = null;
-    let pendingError: ProviderError | null = null;
+  private async startTurn(sessionId: string, state: CodexSdkSessionState, message: string): Promise<void> {
     try {
-      const { events } = await thread.runStreamed(message, { signal: abort.signal });
-      for await (const event of events) {
-        this.handleEvent(sessionId, state, event);
-        if (event.type === 'turn.completed') usage = event.usage;
+      await this.ensureThreadLoaded(sessionId, state);
+      const result = await this.request('turn/start', {
+        threadId: state.threadId,
+        input: [{ type: 'text', text: message }],
+        cwd: state.cwd,
+        approvalPolicy: 'never',
+        ...(state.model ? { model: state.model } : {}),
+      });
+      state.runningTurnId = result?.turn?.id;
+    } catch (err) {
+      state.runningTurnId = undefined;
+      this.emitError(sessionId, this.normalizeError(err));
+    }
+  }
+
+  private async ensureThreadLoaded(sessionId: string, state: CodexSdkSessionState): Promise<void> {
+    if (state.threadId && state.loaded) return;
+    if (state.threadId) {
+      const result = await this.request('thread/resume', {
+        threadId: state.threadId,
+        ...(state.model ? { model: state.model } : {}),
+      });
+      const resumedId = result?.thread?.id ?? state.threadId;
+      state.threadId = resumedId;
+      state.loaded = true;
+      this.threadToSession.set(resumedId, sessionId);
+      this.emitSessionInfo(sessionId, { resumeId: resumedId, ...(state.model ? { model: state.model } : {}) });
+      return;
+    }
+
+    const result = await this.request('thread/start', {
+      cwd: state.cwd,
+      approvalPolicy: 'never',
+      sandbox: 'danger-full-access',
+      personality: 'none',
+      ...(state.model ? { model: state.model } : {}),
+    });
+    const threadId = result?.thread?.id;
+    if (!threadId) {
+      throw new Error('Codex app-server did not return a thread id');
+    }
+    state.threadId = threadId;
+    state.loaded = true;
+    this.threadToSession.set(threadId, sessionId);
+    this.emitSessionInfo(sessionId, { resumeId: threadId, ...(state.model ? { model: state.model } : {}) });
+  }
+
+  private handleLine(line: string): void {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let msg: JsonRpcResponse;
+    try {
+      msg = JSON.parse(trimmed);
+    } catch (err) {
+      logger.warn({ provider: this.id, line: trimmed, err }, 'Failed to parse Codex app-server line');
+      return;
+    }
+
+    if (typeof msg.id === 'number') {
+      const pending = this.pendingRequests.get(msg.id);
+      if (!pending) return;
+      this.pendingRequests.delete(msg.id);
+      if (msg.error) {
+        pending.reject(new Error(msg.error.message ?? 'Codex app-server request failed'));
+      } else {
+        pending.resolve(msg.result);
+      }
+      return;
+    }
+
+    if (!msg.method) return;
+    this.handleNotification(msg.method, msg.params ?? {});
+  }
+
+  private handleNotification(method: string, params: Record<string, any>): void {
+    if (method === 'thread/started') {
+      const threadId = params.thread?.id;
+      if (!threadId) return;
+      const sessionId = this.threadToSession.get(threadId);
+      if (!sessionId) return;
+      const state = this.sessions.get(sessionId);
+      if (!state) return;
+      state.threadId = threadId;
+      state.loaded = true;
+      this.emitSessionInfo(sessionId, { resumeId: threadId, ...(state.model ? { model: state.model } : {}) });
+      return;
+    }
+
+    if (method === 'thread/tokenUsage/updated') {
+      const sessionId = this.threadToSession.get(params.threadId);
+      const state = sessionId ? this.sessions.get(sessionId) : null;
+      const last = params.tokenUsage?.last;
+      if (!state || !last) return;
+      state.lastUsage = {
+        input_tokens: Number(last.inputTokens ?? 0),
+        cached_input_tokens: Number(last.cachedInputTokens ?? 0),
+        output_tokens: Number(last.outputTokens ?? 0),
+      };
+      return;
+    }
+
+    if (method === 'item/agentMessage/delta') {
+      const sessionId = this.threadToSession.get(params.threadId);
+      const state = sessionId ? this.sessions.get(sessionId) : null;
+      if (!sessionId || !state) return;
+      state.currentMessageId = params.itemId;
+      state.currentText += String(params.delta ?? '');
+      const delta: MessageDelta = {
+        messageId: params.itemId,
+        type: 'text',
+        delta: state.currentText,
+        role: 'assistant',
+      };
+      for (const cb of this.deltaCallbacks) cb(sessionId, delta);
+      return;
+    }
+
+    if (method === 'item/started' || method === 'item/completed') {
+      const sessionId = this.threadToSession.get(params.threadId);
+      const state = sessionId ? this.sessions.get(sessionId) : null;
+      if (!sessionId || !state) return;
+
+      const item = params.item as Record<string, any> | undefined;
+      if (!item) return;
+
+      const tool = toolFromItem(item);
+      if (tool) {
+        for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+      }
+
+      if (item.type === 'agentMessage') {
+        state.currentMessageId = item.id;
+        if (method === 'item/completed' && typeof item.text === 'string') {
+          const prior = state.currentText;
+          state.currentText = item.text;
+          if (!prior && item.text) {
+            const delta: MessageDelta = {
+              messageId: item.id,
+              type: 'text',
+              delta: item.text,
+              role: 'assistant',
+            };
+            for (const cb of this.deltaCallbacks) cb(sessionId, delta);
+          }
+        }
+      }
+      return;
+    }
+
+    if (method === 'turn/completed') {
+      const sessionId = this.threadToSession.get(params.threadId);
+      const state = sessionId ? this.sessions.get(sessionId) : null;
+      if (!sessionId || !state) return;
+      const turn = params.turn ?? {};
+      const status = turn.status;
+
+      if (status === 'failed') {
+        state.runningTurnId = undefined;
+        this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, turn.error?.message ?? 'Codex turn failed', false, turn.error));
+        return;
+      }
+      if (status === 'interrupted') {
+        state.runningTurnId = undefined;
+        this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
+        return;
       }
 
       state.pendingComplete = {
@@ -240,60 +447,49 @@ export class CodexSdkProvider implements TransportProvider {
         timestamp: Date.now(),
         status: 'complete',
         metadata: {
-          ...(usage ? { usage } : {}),
+          ...(state.lastUsage ? { usage: state.lastUsage } : {}),
           ...(state.model ? { model: state.model } : {}),
           ...(state.threadId ? { resumeId: state.threadId } : {}),
         },
       };
-    } catch (err) {
-      const aborted = abort.signal.aborted;
-      pendingError = aborted ? this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true, err) : this.normalizeError(err);
-    } finally {
-      state.runningAbort = undefined;
-      const pendingComplete = state.pendingComplete;
+      state.runningTurnId = undefined;
+      const completed = state.pendingComplete;
       state.pendingComplete = undefined;
-      if (pendingComplete) {
-        for (const cb of this.completeCallbacks) cb(sessionId, pendingComplete);
-      } else if (pendingError) {
-        for (const cb of this.errorCallbacks) cb(sessionId, pendingError);
+      if (completed) {
+        for (const cb of this.completeCallbacks) cb(sessionId, completed);
       }
+      return;
     }
   }
 
-  private handleEvent(sessionId: string, state: CodexSdkSessionState, event: ThreadEvent): void {
-    if (event.type === 'thread.started') {
-      state.threadId = event.thread_id;
-      this.emitSessionInfo(sessionId, { resumeId: event.thread_id, ...(state.model ? { model: state.model } : {}) });
-      return;
+  private request(method: string, params: Record<string, any>): Promise<any> {
+    if (!this.child?.stdin.writable) {
+      return Promise.reject(new Error('Codex app-server stdin is not writable'));
     }
-    if (event.type === 'item.started' || event.type === 'item.updated' || event.type === 'item.completed') {
-      const tool = toolFromThreadItem(event.item);
-      if (tool) {
-        for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
-      }
-      if ((event.type === 'item.updated' || event.type === 'item.completed') && event.item.type === 'agent_message') {
-        state.currentMessageId = event.item.id;
-        state.currentText = event.item.text;
-        const delta: MessageDelta = {
-          messageId: event.item.id,
-          type: 'text',
-          delta: event.item.text,
-          role: 'assistant',
-        };
-        for (const cb of this.deltaCallbacks) cb(sessionId, delta);
-      }
-      return;
-    }
-    if (event.type === 'turn.failed') {
-      throw new Error(event.error.message);
-    }
-    if (event.type === 'error') {
-      throw new Error(event.message);
-    }
+    const id = this.nextRequestId++;
+    const payload = JSON.stringify({ id, method, params });
+    return new Promise((resolve, reject) => {
+      this.pendingRequests.set(id, { resolve, reject });
+      this.child!.stdin.write(`${payload}\n`);
+    });
+  }
+
+  private notify(method: string, params: Record<string, any>): void {
+    if (!this.child?.stdin.writable) return;
+    this.child.stdin.write(`${JSON.stringify({ method, params })}\n`);
+  }
+
+  private rejectPending(err: Error): void {
+    for (const pending of this.pendingRequests.values()) pending.reject(err);
+    this.pendingRequests.clear();
   }
 
   private emitSessionInfo(sessionId: string, info: SessionInfoUpdate): void {
     for (const cb of this.sessionInfoCallbacks) cb(sessionId, info);
+  }
+
+  private emitError(sessionId: string, error: ProviderError): void {
+    for (const cb of this.errorCallbacks) cb(sessionId, error);
   }
 
   private resolveBinaryPath(config: ProviderConfig | null): string {
@@ -302,7 +498,7 @@ export class CodexSdkProvider implements TransportProvider {
 
   private normalizeError(err: unknown): ProviderError {
     const message = err instanceof Error ? err.message : String(err);
-    if (/ENOENT|not found|Unable to locate Codex CLI binaries/i.test(message)) {
+    if (/ENOENT|not found|spawn .*codex/i.test(message)) {
       return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND, `Codex binary not found: ${message}`, false, err);
     }
     if (/resume|thread/i.test(message) && /not found|invalid|unknown/i.test(message)) {

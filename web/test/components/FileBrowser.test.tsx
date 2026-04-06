@@ -43,7 +43,11 @@ vi.mock('react-i18next', () => {
     'file_browser.browse': 'Browse',
     'file_browser.show_hidden': 'Hidden',
     'file_browser.timeout': 'Request timed out',
+    'file_browser.mkdir_failed': 'Failed to create folder',
     'common.cancel': 'Cancel',
+    'chat.new_folder': 'New folder',
+    'chat.new_folder_name': 'Folder name',
+    'chat.create': 'Create',
   };
   const t = (key: string, opts?: Record<string, unknown>) => {
     if (key === 'file_browser.insert') return `Insert ${opts?.count ?? 0}`;
@@ -66,6 +70,11 @@ function makeWsFactory() {
     lastSentIncludeFiles = includeFiles;
     return lastRequestId;
   });
+  const fsMkdir = vi.fn((path: string) => {
+    lastSentPath = path;
+    lastRequestId = 'mock-mkdir-id';
+    return lastRequestId;
+  });
 
   const ws: WsClient = {
     onMessage: (handler: (msg: ServerMessage) => void) => {
@@ -73,6 +82,7 @@ function makeWsFactory() {
       return () => { messageHandler = null; };
     },
     fsListDir,
+    fsMkdir,
     fsReadFile: vi.fn(() => 'mock-read-id'),
     fsGitStatus: vi.fn(() => 'mock-git-status-id'),
     fsGitDiff: vi.fn(() => 'mock-git-diff-id'),
@@ -101,7 +111,7 @@ function makeWsFactory() {
 
   const sendMsg = (msg: ServerMessage) => messageHandler?.(msg);
 
-  return { ws, fsListDir, respond, respondError, sendMsg, getLastPath: () => lastSentPath, getIncludeFiles: () => lastSentIncludeFiles };
+  return { ws, fsListDir, fsMkdir, respond, respondError, sendMsg, getLastPath: () => lastSentPath, getIncludeFiles: () => lastSentIncludeFiles };
 }
 
 describe('FileBrowser', () => {
@@ -226,6 +236,35 @@ describe('FileBrowser', () => {
     // Re-click the already-loaded node's parent (root breadcrumb area)
     // The key check: clicking the root node's expand arrow should not re-fetch
     expect(fsListDir.mock.calls.length).toBeGreaterThanOrEqual(callsBefore); // at minimum no regression
+  });
+
+  it('creates a new folder and refreshes the parent directory after fs.mkdir_response', async () => {
+    const { ws, respond, sendMsg, fsMkdir, fsListDir } = makeWsFactory();
+    const { getByTitle, getByPlaceholderText, getByText } = render(
+      <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath="/home/user" onConfirm={vi.fn()} onClose={vi.fn()} />,
+    );
+
+    await act(async () => {
+      respond([{ name: 'projects', isDir: true }], '/home/user');
+    });
+
+    await act(async () => {
+      fireEvent.click(getByTitle('New folder'));
+    });
+    await act(async () => {
+      fireEvent.input(getByPlaceholderText('Folder name'), { target: { value: 'newdir' } });
+    });
+    await act(async () => {
+      fireEvent.click(getByText('Create'));
+    });
+
+    expect(fsMkdir).toHaveBeenCalledWith('/home/user/newdir');
+
+    await act(async () => {
+      sendMsg({ type: 'fs.mkdir_response', requestId: 'mock-mkdir-id', path: '/home/user/newdir', resolvedPath: '/home/user/newdir', status: 'ok' } as any);
+    });
+
+    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', false, false);
   });
 
   // ── Selection ──────────────────────────────────────────────────────────
@@ -409,4 +448,3 @@ describe('FileBrowser', () => {
     expect(fsListDir.mock.calls.length).toBeGreaterThan(callsBefore);
   });
 });
-

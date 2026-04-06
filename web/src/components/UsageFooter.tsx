@@ -32,6 +32,13 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
+function hasAllPermissions(agentType?: string | null): boolean {
+  return agentType === 'claude-code'
+    || agentType === 'claude-code-sdk'
+    || agentType === 'codex'
+    || agentType === 'codex-sdk';
+}
+
 export function UsageFooter({ usage, sessionName, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, showCost, activeThinkingTs, statusText, now }: Props) {
   const { t } = useTranslation();
 
@@ -68,6 +75,10 @@ export function UsageFooter({ usage, sessionName, agentType, modelOverride, plan
   const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const modelLabel = shortModelLabel(displayModel);
   const inlineQuotaText = quotaLabel;
+  const codexQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk')
+    ? (quotaLabel ?? '').split(' · ').filter(Boolean)
+    : [];
+  const permissionText = hasAllPermissions(agentType) ? t('session.permissions_all') : null;
 
   return (
     <div class="session-usage-footer" title={tip} data-agent-type={agentType ?? undefined}>
@@ -75,6 +86,13 @@ export function UsageFooter({ usage, sessionName, agentType, modelOverride, plan
         <div class="session-ctx-bar">
           <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
+        </div>
+      )}
+      {codexQuotaLines.length > 0 && (
+        <div class="session-usage-codex-quota">
+          {codexQuotaLines.map((line) => (
+            <div class="session-usage-codex-line">{line}</div>
+          ))}
         </div>
       )}
       <div class="session-usage-stats">
@@ -89,7 +107,8 @@ export function UsageFooter({ usage, sessionName, agentType, modelOverride, plan
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
           {modelLabel && <span class="session-usage-model">{modelLabel}</span>}
           {total > 0 && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}
-          {inlineQuotaText && <span class="session-usage-tokens">{inlineQuotaText}</span>}
+          {permissionText && <span class="session-usage-tokens">{permissionText}</span>}
+          {inlineQuotaText && codexQuotaLines.length === 0 && <span class="session-usage-tokens">{inlineQuotaText}</span>}
           {sessionCost > 0 && (
             <span class="session-usage-cost">
               {formatCost(sessionCost)} · wk {formatCost(weeklyCost)} · mo {formatCost(monthlyCost)}

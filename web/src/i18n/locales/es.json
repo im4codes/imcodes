@@ -105,7 +105,8 @@
     "qwen_tier_byo": "Propia clave",
     "qwen_source_title": "Origen de Qwen: {{tier}}",
     "qwen_model_title": "Origen de Qwen: {{tier}} · Modelo: {{model}}",
-    "p2p_tag": "P2P"
+    "p2p_tag": "P2P",
+    "permissions_all": "Todos permisos"
   },
   "server": {
     "upgrade_daemon": "↑ Actualizar Daemon",
@@ -156,6 +157,7 @@
     "preview_too_large": "Archivo demasiado grande para previsualizar (> 512 KB)",
     "preview_error": "Vista previa no disponible",
     "preview_binary": "Archivo binario — vista previa no disponible",
+    "mkdir_failed": "No se pudo crear la carpeta",
     "view_diff": "Diff",
     "view_source": "Fuente",
     "tab_files": "Archivos",

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, stat, utimes } from 'fs/promises';
 import { tmpdir, homedir } from 'os';
 import { join } from 'path';
 
@@ -107,5 +107,29 @@ describe('gemini retrackLatestSessionFile', () => {
 
     stopWatching(latestSessionName);
     await rm(unknownChatsDir.substring(0, unknownChatsDir.indexOf('/chats')), { recursive: true, force: true });
+  });
+
+  it('bound watcher does not switch to a newer file for a different sessionUuid', async () => {
+    vi.useFakeTimers();
+    const wrongFile = join(chatsDir, 'session-wrong-deadbeef.json');
+    await writeFile(wrongFile, JSON.stringify({
+      sessionId: 'deadbeef-9999-8888-7777-666666666666',
+      lastUpdated: '2026-04-05T00:02:00Z',
+      messages: [{ type: 'gemini', content: 'wrong gemini reply', timestamp: '2026-04-05T00:02:00Z' }],
+    }), 'utf8');
+    const oldStat = await stat(newFile);
+    await utimes(wrongFile, new Date(oldStat.mtimeMs + 4000), new Date(oldStat.mtimeMs + 4000));
+    vi.mocked(timelineEmitter.emit).mockClear();
+
+    await vi.advanceTimersByTimeAsync(11000);
+
+    expect(
+      vi.mocked(timelineEmitter.emit).mock.calls.some(
+        (call) => call[0] === sessionName && call[1] === 'assistant.text' && (call[2] as any).text === 'wrong gemini reply',
+      ),
+    ).toBe(false);
+
+    await rm(wrongFile, { force: true });
+    vi.useRealTimers();
   });
 });

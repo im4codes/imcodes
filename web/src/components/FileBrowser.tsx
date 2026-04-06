@@ -258,6 +258,7 @@ export function FileBrowser({
   const pendingReadRef = useRef(new Map<string, string>()); // requestId → filePath
   const pendingGitStatusRef = useRef(new Map<string, string>()); // requestId → dirPath
   const pendingGitDiffRef = useRef(new Map<string, string>()); // requestId → filePath
+  const pendingMkdirRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
   const mountedRef = useRef(true);
 
   // History navigation
@@ -273,6 +274,7 @@ export function FileBrowser({
       pendingReadRef.current.clear();
       pendingGitStatusRef.current.clear();
       pendingGitDiffRef.current.clear();
+      pendingMkdirRef.current.clear();
       pendingChangesRef.current.clear();
       editorMsgHandlers.current.clear();
       if (pendingChangesTimerRef.current) clearTimeout(pendingChangesTimerRef.current);
@@ -462,6 +464,23 @@ export function FileBrowser({
         }
         return;
       }
+
+      if (msg.type === 'fs.mkdir_response') {
+        const pending = pendingMkdirRef.current.get(msg.requestId);
+        if (!pending) return;
+        pendingMkdirRef.current.delete(msg.requestId);
+        if (!mountedRef.current) return;
+
+        if (msg.status === 'error') {
+          setError(msg.error ?? t('file_browser.mkdir_failed'));
+          return;
+        }
+
+        loadedRef.current.delete(pending.parentPath);
+        setError(null);
+        fetchDir(pending.parentPath);
+        return;
+      }
     });
   }, [ws, showHidden, highlightPath, t]);
 
@@ -515,6 +534,17 @@ export function FileBrowser({
   }, [ws, t]);
 
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
+
+  const requestMkdir = useCallback((parentPath: string, folderName: string) => {
+    const trimmed = folderName.trim();
+    if (!trimmed) return;
+    const sep = parentPath.includes('\\') ? '\\' : '/';
+    const fullPath = `${parentPath}${parentPath.endsWith(sep) ? '' : sep}${trimmed}`;
+    const requestId = ws.fsMkdir(fullPath);
+    pendingMkdirRef.current.set(requestId, { parentPath, targetPath: fullPath });
+    setNewFolderParent(null);
+    setNewFolderName('');
+  }, [ws]);
 
   // Navigate to a path and push to history
   const jumpTo = useCallback((newPath: string) => {
@@ -1027,15 +1057,7 @@ export function FileBrowser({
         onInput={(e) => setNewFolderName((e.target as HTMLInputElement).value)}
         onKeyDown={(e) => {
           if (e.key === 'Enter' && newFolderName.trim()) {
-            const fullPath = `${newFolderParent}/${newFolderName.trim()}`;
-            ws.fsMkdir(fullPath);
-            // Refresh parent after a short delay
-            setTimeout(() => {
-              loadedRef.current.delete(newFolderParent!);
-              toggleExpand(newFolderParent!);
-              toggleExpand(newFolderParent!);
-            }, 300);
-            setNewFolderParent(null);
+            requestMkdir(newFolderParent!, newFolderName);
           }
           if (e.key === 'Escape') setNewFolderParent(null);
         }}
@@ -1046,15 +1068,7 @@ export function FileBrowser({
         style={{ padding: '4px 10px', fontSize: 12 }}
         disabled={!newFolderName.trim()}
         onClick={() => {
-          if (!newFolderName.trim()) return;
-          const fullPath = `${newFolderParent}/${newFolderName.trim()}`;
-          ws.fsMkdir(fullPath);
-          setTimeout(() => {
-            loadedRef.current.delete(newFolderParent!);
-            toggleExpand(newFolderParent!);
-            toggleExpand(newFolderParent!);
-          }, 300);
-          setNewFolderParent(null);
+          requestMkdir(newFolderParent!, newFolderName);
         }}
       >{t('chat.create')}</button>
       <button class="fb-close" onClick={() => setNewFolderParent(null)} style={{ fontSize: 12 }}>✕</button>
@@ -1142,6 +1156,7 @@ export function FileBrowser({
             <button class="fb-close" onClick={onClose}>✕</button>
           </div>
           {breadcrumb}
+          {newFolderDialog}
           <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}`}>
             {tree}
             {previewPane}

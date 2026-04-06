@@ -105,7 +105,8 @@
     "qwen_tier_byo": "自备密钥",
     "qwen_source_title": "Qwen 来源：{{tier}}",
     "qwen_model_title": "Qwen 来源：{{tier}} · 模型：{{model}}",
-    "p2p_tag": "P2P"
+    "p2p_tag": "P2P",
+    "permissions_all": "全权限"
   },
   "server": {
     "upgrade_daemon": "↑ 升级 Daemon",
@@ -156,6 +157,7 @@
     "preview_too_large": "文件过大，无法预览（> 512 KB）",
     "preview_error": "预览不可用",
     "preview_binary": "二进制文件 — 无法预览",
+    "mkdir_failed": "创建文件夹失败",
     "view_diff": "差异",
     "view_source": "源码",
     "tab_files": "文件",

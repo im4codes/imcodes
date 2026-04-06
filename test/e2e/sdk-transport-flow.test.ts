@@ -15,16 +15,75 @@ const mocks = vi.hoisted(() => {
   return { store, emitted, claudeCalls, codexCalls };
 });
 
-vi.mock('node:child_process', () => ({
-  execFile: vi.fn((_file: string, _args: string[], cb?: (err: Error | null, stdout: string, stderr: string) => void) => {
-    cb?.(null, 'ok\n', '');
-    return {} as never;
-  }),
-  exec: vi.fn((_cmd: string, cb?: (err: Error | null, stdout: string, stderr: string) => void) => {
-    cb?.(null, '', '');
-    return {} as never;
-  }),
-}));
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  const { EventEmitter } = await import('node:events');
+  const { PassThrough, Writable } = await import('node:stream');
+  const spawn = vi.fn(() => {
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const stdin = new Writable({
+      write(chunk, _enc, cb) {
+        const lines = chunk.toString().split('\n').filter(Boolean);
+        for (const line of lines) {
+          const msg = JSON.parse(line) as { id?: number; method?: string; params?: Record<string, any> };
+          if (msg.method === 'initialize' && typeof msg.id === 'number') {
+            stdout.write(JSON.stringify({ id: msg.id, result: { userAgent: 'test' } }) + '\n');
+          }
+          if (msg.method === 'thread/start' && typeof msg.id === 'number') {
+            stdout.write(JSON.stringify({ id: msg.id, result: { thread: { id: 'thread-codex-e2e' } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'thread/started', params: { thread: { id: 'thread-codex-e2e' } } }) + '\n');
+          }
+          if (msg.method === 'thread/resume' && typeof msg.id === 'number') {
+            const threadId = String(msg.params?.threadId ?? 'thread-codex-e2e');
+            stdout.write(JSON.stringify({ id: msg.id, result: { thread: { id: threadId } } }) + '\n');
+          }
+          if (msg.method === 'turn/start' && typeof msg.id === 'number') {
+            stdout.write(JSON.stringify({ id: msg.id, result: { turn: { id: 'turn-codex-e2e', status: 'inProgress', items: [], error: null } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'item/started', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', item: { id: 'cmd-codex-e2e', type: 'commandExecution', command: 'echo hi', aggregatedOutput: '', status: 'inProgress' } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'item/completed', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', item: { id: 'cmd-codex-e2e', type: 'commandExecution', command: 'echo hi', aggregatedOutput: 'hi\n', status: 'completed' } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'item/started', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', item: { id: 'msg-codex-e2e', type: 'agentMessage', text: '' } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'item/agentMessage/delta', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', itemId: 'msg-codex-e2e', delta: 'Codex' } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'item/agentMessage/delta', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', itemId: 'msg-codex-e2e', delta: ': hello' } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'thread/tokenUsage/updated', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', tokenUsage: { last: { inputTokens: 7, cachedInputTokens: 2, outputTokens: 4 }, total: { inputTokens: 7, cachedInputTokens: 2, outputTokens: 4, totalTokens: 13, reasoningOutputTokens: 0 }, modelContextWindow: 1000000 } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'item/completed', params: { threadId: 'thread-codex-e2e', turnId: 'turn-codex-e2e', item: { id: 'msg-codex-e2e', type: 'agentMessage', text: 'Codex: hello' } } }) + '\n');
+            stdout.write(JSON.stringify({ method: 'turn/completed', params: { threadId: 'thread-codex-e2e', turn: { id: 'turn-codex-e2e', status: 'completed', error: null } } }) + '\n');
+          }
+          if (msg.method === 'turn/interrupt' && typeof msg.id === 'number') {
+            stdout.write(JSON.stringify({ id: msg.id, result: {} }) + '\n');
+          }
+          if (msg.method === 'thread/unsubscribe' && typeof msg.id === 'number') {
+            stdout.write(JSON.stringify({ id: msg.id, result: { status: 'unsubscribed' } }) + '\n');
+          }
+        }
+        cb();
+      },
+    });
+    const child = new EventEmitter() as actual.ChildProcessWithoutNullStreams;
+    child.stdout = stdout as any;
+    child.stderr = stderr as any;
+    child.stdin = stdin as any;
+    child.killed = false;
+    child.kill = (() => {
+      child.killed = true;
+      child.emit('exit', 0);
+      return true;
+    }) as any;
+    return child;
+  });
+  return {
+    ...actual,
+    spawn,
+    execFile: vi.fn((_file: string, _args: string[], cb?: (err: Error | null, stdout: string, stderr: string) => void) => {
+      cb?.(null, 'ok\n', '');
+      return {} as never;
+    }),
+    exec: vi.fn((_cmd: string, cb?: (err: Error | null, stdout: string, stderr: string) => void) => {
+      cb?.(null, '', '');
+      return {} as never;
+    }),
+  };
+});
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   query: vi.fn(({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
@@ -162,7 +221,7 @@ import { handleWebCommand } from '../../src/daemon/command-handler.js';
 
 describe('sdk transport flow e2e', () => {
 
-  it('starts a fresh claude-code-sdk main session id on session.start instead of reusing stored continuity', async () => {
+  it('rejects duplicate claude-code-sdk main session starts for the same project name', async () => {
     mocks.store.set('deck_ccsdk_main_brain', {
       name: 'deck_ccsdk_main_brain',
       projectName: 'ccsdk_main',
@@ -187,19 +246,19 @@ describe('sdk transport flow e2e', () => {
       dir: '/tmp/ccsdk-main-e2e',
       agentType: 'claude-code-sdk',
     }, serverLink);
-    await flushAsync();    await new Promise((resolve) => setTimeout(resolve, 50));
-    handleWebCommand({ type: 'session.send', session: 'deck_ccsdk_main_brain', text: 'hello', commandId: 'cmd-ccsdk-main' }, serverLink);
     await flushAsync();
+    await new Promise((resolve) => setTimeout(resolve, 50));
 
-    const record = mocks.store.get('deck_ccsdk_main_brain');
-    expect(record?.ccSessionId).toBeTruthy();
-    expect(record?.ccSessionId).not.toBe('old-cc-session-id');
-    expect(mocks.claudeCalls.some((call) => call.options.resume === 'old-cc-session-id')).toBe(false);
-    expect(mocks.claudeCalls.some((call) => call.options.sessionId === 'old-cc-session-id')).toBe(false);
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.error',
+      project: 'ccsdk_main',
+      message: expect.stringContaining('already exists'),
+    }));
+    expect(mocks.claudeCalls).toEqual([]);
+    expect(mocks.store.get('deck_ccsdk_main_brain')?.ccSessionId).toBe('old-cc-session-id');
   });
 
-
-  it('starts a fresh codex-sdk main session through session.start instead of resuming old continuity', async () => {
+  it('rejects duplicate codex-sdk main session starts for the same project name', async () => {
     mocks.store.set('deck_cxsdk_main_brain', {
       name: 'deck_cxsdk_main_brain',
       projectName: 'cxsdk_main',
@@ -224,13 +283,16 @@ describe('sdk transport flow e2e', () => {
       dir: '/tmp/cxsdk-main-e2e',
       agentType: 'codex-sdk',
     }, serverLink);
-    await flushAsync();    await new Promise((resolve) => setTimeout(resolve, 50));
-    handleWebCommand({ type: 'session.send', session: 'deck_cxsdk_main_brain', text: 'hello', commandId: 'cmd-cxsdk-main' }, serverLink);
     await flushAsync();
+    await new Promise((resolve) => setTimeout(resolve, 50));
 
-    const record = mocks.store.get('deck_cxsdk_main_brain');
-    expect(record?.codexSessionId).toBe('thread-codex-e2e');
-    expect(mocks.codexCalls.some((call) => call.mode === 'resume' && call.id === 'old-codex-thread-id')).toBe(false);
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.error',
+      project: 'cxsdk_main',
+      message: expect.stringContaining('already exists'),
+    }));
+    expect(mocks.codexCalls).toEqual([]);
+    expect(mocks.store.get('deck_cxsdk_main_brain')?.codexSessionId).toBe('old-codex-thread-id');
   });
 
   it('switches claude-code-sdk model through /model and updates display metadata', async () => {
@@ -369,6 +431,5 @@ describe('sdk transport flow e2e', () => {
     expect(toolCall?.payload.tool).toBe('Bash');
     expect(toolResult?.payload.output).toBe('hi\n');
     expect(ack?.payload.status).toBe('accepted');
-    expect(mocks.codexCalls[0]).toMatchObject({ mode: 'start' });
   });
 });

@@ -105,7 +105,8 @@
     "qwen_tier_byo": "自備金鑰",
     "qwen_source_title": "Qwen 來源：{{tier}}",
     "qwen_model_title": "Qwen 來源：{{tier}} · 模型：{{model}}",
-    "p2p_tag": "P2P"
+    "p2p_tag": "P2P",
+    "permissions_all": "全權限"
   },
   "server": {
     "upgrade_daemon": "↑ 升級 Daemon",
@@ -156,6 +157,7 @@
     "preview_too_large": "檔案過大，無法預覽（> 512 KB）",
     "preview_error": "預覽不可用",
     "preview_binary": "二進位檔案 — 無法預覽",
+    "mkdir_failed": "建立資料夾失敗",
     "view_diff": "差異",
     "view_source": "原始碼",
     "tab_files": "檔案",

@@ -50,6 +50,8 @@ export interface SessionRecord {
   modelDisplay?: string;
   /** Generic commercial/plan badge label (e.g. Free, Paid, BYO). */
   planLabel?: string;
+  /** Generic permission/sandbox badge label (e.g. all, ask). */
+  permissionLabel?: string;
   /** Generic quota/limit badge label (e.g. 1000/day, 60/min). */
   quotaLabel?: string;
   /** Generic quota progress label (e.g. today 12/1000 · 1m 1/60). */

@@ -12,6 +12,7 @@ import type {
   FsGitStatusResponse,
   FsGitDiffResponse,
   FsWriteResponse,
+  FsMkdirResponse,
 } from '../../src/shared/transport/fs.js';
 
 export type MessageHandler = (msg: ServerMessage) => void;
@@ -27,7 +28,7 @@ export type ServerMessage =
   | { type: 'session.tool'; session: string; tool: string | null }
   | { type: 'daemon.reconnected' }
   | { type: 'daemon.disconnected' }
-  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; qwenModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; quotaLabel?: string; quotaUsageLabel?: string }> }
+  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; qwenModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string }> }
   | { type: 'outbound'; platform: string; channelId: string; content: string }
   | { type: 'timeline.event'; event: TimelineEvent }
   | { type: 'timeline.replay'; sessionName: string; requestId?: string; events: TimelineEvent[]; truncated: boolean; epoch: number }
@@ -49,8 +50,8 @@ export type ServerMessage =
   | { type: 'file.search_response'; requestId: string; results: string[]; error?: string }
   | { type: 'p2p.run_update'; run: any }
   | { type: 'p2p.conflict'; existingRunId: string; initiatorSession: string; commandId: string }
-  | { type: 'subsession.created'; id: string; sessionName: string; sessionType: string; cwd?: string; label?: string; parentSession?: string; state?: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; qwenModel?: string | null; qwenAuthType?: string | null; qwenAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null }
-  | { type: 'subsession.sync'; id: string; sessionName?: string; state?: string; cwd?: string; label?: string; qwenModel?: string | null; modelDisplay?: string | null; planLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null }
+  | { type: 'subsession.created'; id: string; sessionName: string; sessionType: string; cwd?: string; label?: string; parentSession?: string; state?: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; qwenModel?: string | null; qwenAuthType?: string | null; qwenAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null }
+  | { type: 'subsession.sync'; id: string; sessionName?: string; state?: string; cwd?: string; label?: string; qwenModel?: string | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null }
   | { type: 'subsession.removed'; id: string; sessionName: string }
   | { type: 'p2p.run_started'; runId: string; session: string }
   | { type: 'p2p.cancel_response'; runId: string; ok: boolean }
@@ -61,6 +62,7 @@ export type ServerMessage =
   | { type: 'cc.presets.save_response'; ok: boolean }
   | FsGitDiffResponse
   | FsWriteResponse
+  | FsMkdirResponse
   | { type: 'repo.detect_response'; requestId: string; projectDir: string; context: any }
   | { type: 'repo.issues_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
   | { type: 'repo.prs_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
@@ -87,6 +89,7 @@ export type {
   FsReadResponse,
   FsGitStatusResponse,
   FsGitDiffResponse,
+  FsMkdirResponse,
 } from '../../src/shared/transport/fs.js';
 
 const RECONNECT_BASE_MS = 1000;

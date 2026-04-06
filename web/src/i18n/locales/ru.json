@@ -105,7 +105,8 @@
     "qwen_tier_byo": "Свой ключ",
     "qwen_source_title": "Источник Qwen: {{tier}}",
     "qwen_model_title": "Источник Qwen: {{tier}} · Модель: {{model}}",
-    "p2p_tag": "P2P"
+    "p2p_tag": "P2P",
+    "permissions_all": "Все права"
   },
   "server": {
     "upgrade_daemon": "↑ Обновить Daemon",
@@ -156,6 +157,7 @@
     "preview_too_large": "Файл слишком большой для предпросмотра (> 512 КБ)",
     "preview_error": "Предпросмотр недоступен",
     "preview_binary": "Двоичный файл — предпросмотр недоступен",
+    "mkdir_failed": "Не удалось создать папку",
     "view_diff": "Diff",
     "view_source": "Источник",
     "tab_files": "Файлы",

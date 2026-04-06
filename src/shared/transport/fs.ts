@@ -70,3 +70,7 @@ export interface FsGitDiffResponse extends FsBaseResponse {
   type: 'fs.git_diff_response';
   diff?: string;
 }
+
+export interface FsMkdirResponse extends FsBaseResponse {
+  type: 'fs.mkdir_response';
+}

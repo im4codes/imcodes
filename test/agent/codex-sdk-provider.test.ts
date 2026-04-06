@@ -1,41 +1,100 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { EventEmitter } from 'node:events';
+import { PassThrough, Writable } from 'node:stream';
 
-const childProcessMock = vi.hoisted(() => ({
-  execFile: vi.fn((_file: string, _args: string[], cb?: (err: Error | null, stdout: string, stderr: string) => void) => {
+const childProcessMock = vi.hoisted(() => {
+  type Request = { id?: number; method?: string; params?: Record<string, any> };
+  type ChildRecord = {
+    child: EventEmitter & {
+      stdout: PassThrough;
+      stderr: PassThrough;
+      stdin: Writable;
+      killed: boolean;
+      kill: (signal?: string) => boolean;
+    };
+    requests: Request[];
+    emits: (msg: Record<string, any>) => void;
+  };
+
+  const children: ChildRecord[] = [];
+
+  const spawn = vi.fn(() => {
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    let childRecord!: ChildRecord;
+    const stdin = new Writable({
+      write(chunk, _enc, cb) {
+        const lines = chunk.toString().split('\n').filter(Boolean);
+        for (const line of lines) {
+          const msg = JSON.parse(line) as Request;
+          childRecord.requests.push(msg);
+          if (msg.method === 'initialize' && typeof msg.id === 'number') {
+            childRecord.emits({ id: msg.id, result: { userAgent: 'test' } });
+          }
+          if (msg.method === 'thread/start' && typeof msg.id === 'number') {
+            childRecord.emits({
+              id: msg.id,
+              result: { thread: { id: 'thread-1' } },
+            });
+            childRecord.emits({ method: 'thread/started', params: { thread: { id: 'thread-1' } } });
+          }
+          if (msg.method === 'thread/resume' && typeof msg.id === 'number') {
+            childRecord.emits({
+              id: msg.id,
+              result: { thread: { id: msg.params?.threadId } },
+            });
+          }
+          if (msg.method === 'turn/start' && typeof msg.id === 'number') {
+            childRecord.emits({
+              id: msg.id,
+              result: { turn: { id: 'turn-1', status: 'inProgress', items: [], error: null } },
+            });
+          }
+          if (msg.method === 'turn/interrupt' && typeof msg.id === 'number') {
+            childRecord.emits({ id: msg.id, result: {} });
+          }
+          if (msg.method === 'thread/unsubscribe' && typeof msg.id === 'number') {
+            childRecord.emits({ id: msg.id, result: { status: 'unsubscribed' } });
+          }
+          if (msg.method === 'initialized') {
+            // notification
+          }
+        }
+        cb();
+      },
+    });
+    const child = new EventEmitter() as ChildRecord['child'];
+    child.stdout = stdout;
+    child.stderr = stderr;
+    child.stdin = stdin;
+    child.killed = false;
+    child.kill = () => {
+      child.killed = true;
+      child.emit('exit', 0);
+      return true;
+    };
+    childRecord = {
+      child,
+      requests: [],
+      emits: (msg: Record<string, any>) => {
+        stdout.write(`${JSON.stringify(msg)}\n`);
+      },
+    };
+    children.push(childRecord);
+    return child;
+  });
+
+  const execFile = vi.fn((_file: string, _args: string[], cb?: (err: Error | null, stdout: string, stderr: string) => void) => {
     cb?.(null, 'ok\n', '');
     return {} as never;
-  }),
-}));
+  });
 
-vi.mock('node:child_process', () => ({
-  execFile: childProcessMock.execFile,
-}));
-
-const codexMock = vi.hoisted(() => {
-  const threads: Array<{ mode: 'start' | 'resume'; id: string | null; options: Record<string, unknown>; events: any[] }> = [];
-  const Codex = vi.fn().mockImplementation(() => ({
-    startThread: (options: Record<string, unknown>) => {
-      const thread = { mode: 'start' as const, id: null, options, events: [] as any[] };
-      threads.push(thread);
-      return {
-        get id() { return thread.id; },
-        runStreamed: async () => ({ events: (async function* () { for (const event of thread.events) yield event; })() }),
-      };
-    },
-    resumeThread: (id: string, options: Record<string, unknown>) => {
-      const thread = { mode: 'resume' as const, id, options, events: [] as any[] };
-      threads.push(thread);
-      return {
-        get id() { return thread.id; },
-        runStreamed: async () => ({ events: (async function* () { for (const event of thread.events) yield event; })() }),
-      };
-    },
-  }));
-  return { Codex, threads };
+  return { spawn, execFile, children };
 });
 
-vi.mock('@openai/codex-sdk', () => ({
-  Codex: codexMock.Codex,
+vi.mock('node:child_process', () => ({
+  spawn: childProcessMock.spawn,
+  execFile: childProcessMock.execFile,
 }));
 
 vi.mock('../../src/util/logger.js', () => ({
@@ -48,11 +107,12 @@ const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 describe('CodexSdkProvider', () => {
   beforeEach(() => {
-    codexMock.Codex.mockClear();
-    codexMock.threads.length = 0;
+    childProcessMock.spawn.mockClear();
+    childProcessMock.execFile.mockClear();
+    childProcessMock.children.length = 0;
   });
 
-  it('starts a thread, captures resume id, emits tool calls, and completes from agent_message', async () => {
+  it('starts a thread, captures resume id, emits tool calls, streams message deltas, and completes', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-1', cwd: '/tmp/project' });
@@ -66,21 +126,37 @@ describe('CodexSdkProvider', () => {
     provider.onComplete((_sid, msg) => completed.push(msg.content));
     provider.onSessionInfo?.((_sid, info) => sessionInfo.push(info as Record<string, unknown>));
 
-    const sendPromise = provider.send('route-1', 'hello');
-    const thread = codexMock.threads[0];
-    thread.events.push(
-      { type: 'thread.started', thread_id: 'thread-1' },
-      { type: 'turn.started' },
-      { type: 'item.started', item: { id: 'cmd-1', type: 'command_execution', command: 'ls', aggregated_output: '', status: 'in_progress' } },
-      { type: 'item.completed', item: { id: 'cmd-1', type: 'command_execution', command: 'ls', aggregated_output: 'a\n', exit_code: 0, status: 'completed' } },
-      { type: 'item.updated', item: { id: 'msg-1', type: 'agent_message', text: 'O' } },
-      { type: 'item.completed', item: { id: 'msg-1', type: 'agent_message', text: 'OK' } },
-      { type: 'turn.completed', usage: { input_tokens: 3, cached_input_tokens: 1, output_tokens: 2 } },
-    );
-    await sendPromise;
+    await provider.send('route-1', 'hello');
+    const child = childProcessMock.children[0];
+    const threadStartReq = child.requests.find((req) => req.method === 'thread/start');
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'cmd-1', type: 'commandExecution', command: 'ls', aggregatedOutput: '', status: 'inProgress' } },
+    });
+    child.emits({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'cmd-1', type: 'commandExecution', command: 'ls', aggregatedOutput: 'a\n', status: 'completed' } },
+    });
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: '' } },
+    });
+    child.emits({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'msg-1', delta: 'O' } });
+    child.emits({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'msg-1', delta: 'K' } });
+    child.emits({
+      method: 'thread/tokenUsage/updated',
+      params: { threadId: 'thread-1', turnId: 'turn-1', tokenUsage: { last: { inputTokens: 3, cachedInputTokens: 1, outputTokens: 2 }, total: { inputTokens: 3, cachedInputTokens: 1, outputTokens: 2, totalTokens: 6, reasoningOutputTokens: 0 }, modelContextWindow: 258400 } },
+    });
+    child.emits({
+      method: 'item/completed',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'msg-1', type: 'agentMessage', text: 'OK' } },
+    });
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
     await flush();
 
     expect(tools).toEqual(['Bash:running', 'Bash:complete']);
+    expect(threadStartReq?.params?.sandbox).toBe('danger-full-access');
+    expect(threadStartReq?.params?.approvalPolicy).toBe('never');
     expect(deltas).toEqual(['O', 'OK']);
     expect(completed).toEqual(['OK']);
     expect(sessionInfo).toContainEqual({ resumeId: 'thread-1' });
@@ -91,15 +167,10 @@ describe('CodexSdkProvider', () => {
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-2', cwd: '/tmp/project', resumeId: 'thread-existing' });
 
-    const sendPromise = provider.send('route-2', 'hello');
-    const thread = codexMock.threads[0];
-    expect(thread.mode).toBe('resume');
-    expect(thread.id).toBe('thread-existing');
-    thread.events.push(
-      { type: 'item.completed', item: { id: 'msg-2', type: 'agent_message', text: 'ACK' } },
-      { type: 'turn.completed', usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 } },
-    );
-    await sendPromise;
+    await provider.send('route-2', 'hello');
+    const child = childProcessMock.children[0];
+    const resumeReq = child.requests.find((req) => req.method === 'thread/resume');
+    expect(resumeReq?.params?.threadId).toBe('thread-existing');
   });
 
   it('fresh createSession ignores previous stored thread state for the same route', async () => {
@@ -108,15 +179,20 @@ describe('CodexSdkProvider', () => {
     await provider.createSession({ sessionKey: 'route-fresh', cwd: '/tmp/project', resumeId: 'thread-old' });
     await provider.createSession({ sessionKey: 'route-fresh', cwd: '/tmp/project', fresh: true });
 
-    const sendPromise = provider.send('route-fresh', 'hello');
-    const thread = codexMock.threads[0];
-    expect(thread.mode).toBe('start');
-    expect(thread.id).toBeNull();
-    thread.events.push(
-      { type: 'thread.started', thread_id: 'thread-new' },
-      { type: 'item.completed', item: { id: 'msg-fresh', type: 'agent_message', text: 'ACK' } },
-      { type: 'turn.completed', usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 } },
-    );
-    await sendPromise;
+    await provider.send('route-fresh', 'hello');
+    const child = childProcessMock.children[0];
+    expect(child.requests.some((req) => req.method === 'thread/resume' && req.params?.threadId === 'thread-old')).toBe(false);
+    expect(child.requests.some((req) => req.method === 'thread/start')).toBe(true);
+  });
+
+  it('cancels an in-flight turn through turn/interrupt', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-cancel', cwd: '/tmp/project' });
+
+    await provider.send('route-cancel', 'hello');
+    const child = childProcessMock.children[0];
+    await provider.cancel('route-cancel');
+    expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(true);
   });
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, mkdir, writeFile, rm, stat, utimes } from 'fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, stat, utimes, appendFile } from 'fs/promises';
 import { tmpdir, homedir } from 'os';
 import { join } from 'path';
 
@@ -164,5 +164,27 @@ describe('codex retrackLatestRollout', () => {
     expect(states.at(-1)).toBe('running');
 
     await rm(runningFile, { force: true });
+  });
+
+  it('active watcher does not switch to a newer rollout with a different UUID in the same project', async () => {
+    vi.useFakeTimers();
+    const wrongUuid = '33333333-3333-3333-3333-333333333333';
+    const wrongFile = join(sessionDir, `rollout-wrong-${Date.now()}-${wrongUuid}.jsonl`);
+    await writeFile(wrongFile, `${sessionMetaLine(projectDir)}\n`, 'utf8');
+    await appendFile(wrongFile, `${userMessageLine('wrong active watcher uuid')}\n`, 'utf8');
+    const oldStat = await stat(oldFile);
+    await utimes(wrongFile, new Date(oldStat.mtimeMs + 4000), new Date(oldStat.mtimeMs + 4000));
+    vi.mocked(timelineEmitter.emit).mockClear();
+
+    await vi.advanceTimersByTimeAsync(2500);
+
+    expect(
+      vi.mocked(timelineEmitter.emit).mock.calls.some(
+        (call) => call[0] === sessionName && call[1] === 'user.message' && (call[2] as any).text === 'wrong active watcher uuid',
+      ),
+    ).toBe(false);
+
+    await rm(wrongFile, { force: true });
+    vi.useRealTimers();
   });
 });

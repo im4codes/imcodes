@@ -23,6 +23,7 @@ export interface SessionListItem {
   qwenAvailableModels?: string[];
   modelDisplay?: string;
   planLabel?: string;
+  permissionLabel?: string;
   quotaLabel?: string;
   quotaUsageLabel?: string;
   description?: string;
@@ -47,11 +48,18 @@ function baseItem(s: SessionRecord): SessionListItem {
     qwenAvailableModels: s.qwenAvailableModels,
     modelDisplay: s.modelDisplay,
     planLabel: s.planLabel,
+    permissionLabel: s.permissionLabel,
     quotaLabel: s.quotaLabel,
     quotaUsageLabel: s.quotaUsageLabel,
     description: s.description,
     label: s.label,
   };
+}
+
+function getPermissionLabel(agentType: string): string | undefined {
+  return (agentType === 'claude-code' || agentType === 'claude-code-sdk' || agentType === 'codex' || agentType === 'codex-sdk')
+    ? 'all'
+    : undefined;
 }
 
 function arraysEqual(a: string[] | undefined, b: string[] | undefined): boolean {
@@ -91,9 +99,9 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
     if (s.agentType === 'claude-code-sdk') {
       const hydrated: Partial<SessionRecord> = {
         ...(claudeSdkRuntime?.planLabel ? { planLabel: claudeSdkRuntime.planLabel } : {}),
-        
+        permissionLabel: getPermissionLabel(s.agentType),
       };
-      if (hydrated.planLabel !== s.planLabel || hydrated.quotaLabel !== s.quotaLabel || hydrated.quotaUsageLabel != s.quotaUsageLabel) {
+      if (hydrated.planLabel !== s.planLabel || hydrated.permissionLabel !== s.permissionLabel || hydrated.quotaLabel !== s.quotaLabel || hydrated.quotaUsageLabel != s.quotaUsageLabel) {
         upsertSession({ ...s, ...hydrated, updatedAt: Date.now() });
       }
       return { ...baseItem(s), ...hydrated };
@@ -101,10 +109,11 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
     if (s.agentType === 'codex' || s.agentType === 'codex-sdk') {
       const hydrated: Partial<SessionRecord> = {
         planLabel: codexRuntime?.planLabel,
+        permissionLabel: getPermissionLabel(s.agentType),
         quotaLabel: codexRuntime?.quotaLabel,
         quotaUsageLabel: codexRuntime?.quotaUsageLabel,
       };
-      if (hydrated.planLabel !== s.planLabel || hydrated.quotaLabel !== s.quotaLabel || hydrated.quotaUsageLabel != s.quotaUsageLabel) {
+      if (hydrated.planLabel !== s.planLabel || hydrated.permissionLabel !== s.permissionLabel || hydrated.quotaLabel !== s.quotaLabel || hydrated.quotaUsageLabel != s.quotaUsageLabel) {
         upsertSession({ ...s, ...hydrated, updatedAt: Date.now() });
       }
       return { ...baseItem(s), ...hydrated };

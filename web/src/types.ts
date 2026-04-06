@@ -46,6 +46,7 @@ export interface SessionInfo {
   qwenAvailableModels?: string[];
   modelDisplay?: string;
   planLabel?: string;
+  permissionLabel?: string;
   quotaLabel?: string;
   quotaUsageLabel?: string;
 }

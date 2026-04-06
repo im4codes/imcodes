@@ -336,6 +336,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const isTransport = activeSession?.runtimeType === 'transport';
   const isCodex = activeSession?.agentType === 'codex' || activeSession?.agentType === 'codex-sdk';
   const isQwen = activeSession?.agentType === 'qwen';
+  const permissionBadge = (isClaudeCode || isCodex) ? t('session.permissions_all') : '';
   const compactQuotaText = activeSession?.agentType === 'codex'
     ? ''
     : isCodex
@@ -937,8 +938,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>
 
         {/* Plan/quota badges — compact inline display left of model selector */}
-        {(compactQuotaText || activeSession?.planLabel) && (
+        {(compactQuotaText || activeSession?.planLabel || permissionBadge) && (
           <div class="session-ctx-wrap">
+            {permissionBadge && (
+              <span class="session-usage-quota-inline" style={{ color: '#fca5a5' }}>{permissionBadge}</span>
+            )}
             {compactQuotaText && (
               <span class="session-usage-quota-inline">{compactQuotaText}</span>
             )}

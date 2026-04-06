@@ -139,6 +139,7 @@ export function SessionPane({
 
   const activeThinkingTs = useMemo(() => getActiveThinkingTs(timelineEvents), [timelineEvents]);
   const statusText = useMemo(() => getActiveStatusText(timelineEvents), [timelineEvents]);
+  const shouldShowFooter = !!(lastUsage || activeThinkingTs || statusText || session.planLabel || session.quotaLabel || session.quotaUsageLabel);
 
   // 1-second tick for thinking elapsed display (only while thinking)
   const [thinkingNow, setThinkingNow] = useState(() => Date.now());
@@ -243,15 +244,15 @@ export function SessionPane({
       )}
 
       {/* Usage footer: shown only when active */}
-      {isActive && (lastUsage || activeThinkingTs || statusText) && (
+      {isActive && shouldShowFooter && (
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sessionName}
           agentType={session.agentType}
           modelOverride={session.modelDisplay ?? (session.agentType === 'qwen' ? session.qwenModel : undefined)}
           planLabel={session.planLabel}
-          quotaLabel={session.agentType === 'codex' ? session.quotaLabel : undefined}
-          quotaUsageLabel={undefined}
+          quotaLabel={session.quotaLabel}
+          quotaUsageLabel={session.quotaUsageLabel}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}

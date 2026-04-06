@@ -19,7 +19,7 @@ import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.j
 import logger from '../../util/logger.js';
 
 const CLAUDE_BIN = 'claude';
-const DEFAULT_PERMISSION_MODE: PermissionMode = 'default';
+const DEFAULT_PERMISSION_MODE: PermissionMode = 'bypassPermissions';
 
 interface ClaudeSdkSessionState {
   routeId: string;
@@ -188,6 +188,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       cwd: state.cwd,
       permissionMode: state.permissionMode,
       pathToClaudeCodeExecutable: this.resolveBinaryPath(this.config),
+      includePartialMessages: true,
       ...(state.started ? { resume: state.resumeId } : { sessionId: state.resumeId }),
       ...(state.model ? { model: state.model } : {}),
       ...(extraSystemPrompt ? { appendSystemPrompt: extraSystemPrompt } : {}),
@@ -277,6 +278,21 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     if (msg.type === 'assistant') {
       const text = collectAssistantText(msg);
       if (text) {
+        if (text !== state.currentText) {
+          const messageId = makeMessageId(state);
+          state.currentMessageId = messageId;
+          state.currentText = text;
+          const delta: MessageDelta = {
+            messageId,
+            type: 'text',
+            delta: text,
+            role: 'assistant',
+          };
+          for (const cb of this.deltaCallbacks) cb(sessionId, delta);
+        } else {
+          state.currentText = text;
+        }
+      } else {
         state.currentText = text;
       }
       return;

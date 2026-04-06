@@ -105,7 +105,8 @@
     "qwen_tier_byo": "自前キー",
     "qwen_source_title": "Qwen ソース: {{tier}}",
     "qwen_model_title": "Qwen ソース: {{tier}} · モデル: {{model}}",
-    "p2p_tag": "P2P"
+    "p2p_tag": "P2P",
+    "permissions_all": "全権限"
   },
   "server": {
     "upgrade_daemon": "↑ Daemonをアップグレード",
@@ -156,6 +157,7 @@
     "preview_too_large": "ファイルが大きすぎてプレビューできません（> 512 KB）",
     "preview_error": "プレビュー不可",
     "preview_binary": "バイナリファイル — プレビュー不可",
+    "mkdir_failed": "フォルダを作成できませんでした",
     "view_diff": "差分",
     "view_source": "ソース",
     "tab_files": "ファイル",

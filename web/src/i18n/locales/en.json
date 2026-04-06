@@ -105,7 +105,8 @@
     "qwen_tier_byo": "BYO",
     "qwen_source_title": "Qwen source: {{tier}}",
     "qwen_model_title": "Qwen source: {{tier}} · Model: {{model}}",
-    "p2p_tag": "P2P"
+    "p2p_tag": "P2P",
+    "permissions_all": "All perms"
   },
   "server": {
     "upgrade_daemon": "↑ Upgrade Daemon",
@@ -156,6 +157,7 @@
     "preview_too_large": "File too large to preview (> 512 KB)",
     "preview_error": "Preview unavailable",
     "preview_binary": "Binary file — preview unavailable",
+    "mkdir_failed": "Failed to create folder",
     "view_diff": "Diff",
     "view_source": "Source",
     "tab_files": "Files",
