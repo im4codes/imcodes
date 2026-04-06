@@ -75,7 +75,9 @@
       "openclaw": "OpenClaw",
       "qwen": "Qwen Code",
       "claude_code_sdk": "Claude Code SDK",
-      "codex_sdk": "Codex SDK"
+      "codex_sdk": "Codex SDK",
+      "claude_code_cli": "Claude Code CLI",
+      "codex_cli": "Codex CLI"
     },
     "openclaw_not_connected": "no conectado",
     "openclaw_connect_hint": "El gateway de OpenClaw no está conectado. Ejecuta el siguiente comando en tu máquina daemon:",
@@ -183,7 +185,14 @@
     "daemon_offline": "El daemon está desconectado — verifica que imcodes daemon esté en ejecución",
     "start": "Iniciar",
     "starting": "Iniciando...",
-    "timeout": "Tiempo de espera agotado para iniciar la sesión. Revisa los registros del daemon."
+    "timeout": "Tiempo de espera agotado para iniciar la sesión. Revisa los registros del daemon.",
+    "title": "Iniciar nueva sesión",
+    "project_name": "Nombre del proyecto",
+    "working_directory": "Directorio de trabajo",
+    "browse": "Examinar",
+    "agent_type": "Tipo de agente",
+    "agent_flavor_cli": "CLI: interfaz nativa para quienes prefieren la UI original. El modo chat no admite streaming.",
+    "agent_flavor_sdk": "SDK: admite streaming y usa una interfaz más simple."
   },
   "api_key": {
     "copy": "Copiar",

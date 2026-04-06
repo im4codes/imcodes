@@ -75,7 +75,9 @@
       "openclaw": "OpenClaw",
       "qwen": "Qwen Code",
       "claude_code_sdk": "Claude Code SDK",
-      "codex_sdk": "Codex SDK"
+      "codex_sdk": "Codex SDK",
+      "claude_code_cli": "Claude Code CLI",
+      "codex_cli": "Codex CLI"
     },
     "openclaw_not_connected": "не подключено",
     "openclaw_connect_hint": "Шлюз OpenClaw не подключён. Запустите следующую команду на машине с демоном:",
@@ -183,7 +185,14 @@
     "daemon_offline": "Daemon не в сети — убедитесь, что imcodes daemon запущен",
     "start": "Запустить",
     "starting": "Запуск...",
-    "timeout": "Истекло время ожидания запуска сессии. Проверьте журналы daemon."
+    "timeout": "Истекло время ожидания запуска сессии. Проверьте журналы daemon.",
+    "title": "Новая сессия",
+    "project_name": "Имя проекта",
+    "working_directory": "Рабочая директория",
+    "browse": "Обзор",
+    "agent_type": "Тип агента",
+    "agent_flavor_cli": "CLI: нативный интерфейс для тех, кто предпочитает оригинальный UI. В режиме чата нет стриминга.",
+    "agent_flavor_sdk": "SDK: поддерживает стриминг и использует более простой интерфейс."
   },
   "api_key": {
     "copy": "Копировать",

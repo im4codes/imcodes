@@ -53,22 +53,23 @@ describe('NewSessionDialog', () => {
     expect(select).toBeDefined();
   });
 
-  it('agent type selector has claude-code, claude-code-sdk, codex, codex-sdk, opencode, qwen options', () => {
+  it('agent type selector orders sdk agents before cli agents', () => {
     render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     const select = screen.getByRole('combobox') as HTMLSelectElement;
     const options = Array.from(select.options).map((o) => o.value);
-    expect(options).toContain('claude-code');
-    expect(options).toContain('claude-code-sdk');
-    expect(options).toContain('codex');
-    expect(options).toContain('codex-sdk');
-    expect(options).toContain('opencode');
-    expect(options).toContain('qwen');
+    expect(options.slice(0, 4)).toEqual([
+      'claude-code-sdk',
+      'claude-code',
+      'codex-sdk',
+      'codex',
+    ]);
   });
 
-  it('defaults agent type to claude-code', () => {
+  it('defaults agent type to claude-code-sdk', () => {
     render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     const select = screen.getByRole('combobox') as HTMLSelectElement;
-    expect(select.value).toBe('claude-code');
+    expect(select.value).toBe('claude-code-sdk');
+    expect(screen.getByText('agent_flavor_sdk')).toBeDefined();
   });
 
   it('cancel button calls onClose', () => {
@@ -95,7 +96,7 @@ describe('NewSessionDialog', () => {
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', {
       project: 'my-app',
       dir: '~/projects/my-app',
-      agentType: 'claude-code',
+      agentType: 'claude-code-sdk',
     });
   });
 
@@ -174,7 +175,7 @@ describe('NewSessionDialog', () => {
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
       project: '测试',
-      agentType: 'claude-code',
+      agentType: 'claude-code-sdk',
     }));
 
     const handler = ws.onMessage.mock.calls.at(-1)?.[0];
@@ -188,5 +189,17 @@ describe('NewSessionDialog', () => {
 
     expect(onSessionStarted).toHaveBeenCalledWith('deck_u6d4b_u8bd5_brain');
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it('shows cli/sdk difference hint when switching agent type', () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    expect(screen.getByText('agent_flavor_sdk')).toBeDefined();
+
+    const select = screen.getByRole('combobox') as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: 'claude-code' } });
+
+    expect(screen.getByText('agent_flavor_cli')).toBeDefined();
   });
 });

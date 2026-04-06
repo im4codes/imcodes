@@ -75,7 +75,9 @@
       "openclaw": "OpenClaw",
       "qwen": "Qwen Code",
       "claude_code_sdk": "Claude Code SDK",
-      "codex_sdk": "Codex SDK"
+      "codex_sdk": "Codex SDK",
+      "claude_code_cli": "Claude Code CLI",
+      "codex_cli": "Codex CLI"
     },
     "openclaw_not_connected": "未連接",
     "openclaw_connect_hint": "OpenClaw 閘道未連接。請在 daemon 機器上執行以下命令連接：",
@@ -183,7 +185,14 @@
     "daemon_offline": "Daemon 已離線 — 請確認 imcodes daemon 正在執行",
     "start": "啟動",
     "starting": "啟動中...",
-    "timeout": "等待 Session 啟動逾時，請查看 Daemon 日誌。"
+    "timeout": "等待 Session 啟動逾時，請查看 Daemon 日誌。",
+    "title": "啟動新工作階段",
+    "project_name": "專案名稱",
+    "working_directory": "工作目錄",
+    "browse": "瀏覽",
+    "agent_type": "Agent 類型",
+    "agent_flavor_cli": "CLI：適合喜歡原生介面的使用者。聊天模式不支援串流輸出。",
+    "agent_flavor_sdk": "SDK：支援串流輸出，介面更精簡。"
   },
   "api_key": {
     "copy": "複製",

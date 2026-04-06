@@ -75,7 +75,9 @@
       "openclaw": "OpenClaw",
       "qwen": "Qwen Code",
       "claude_code_sdk": "Claude Code SDK",
-      "codex_sdk": "Codex SDK"
+      "codex_sdk": "Codex SDK",
+      "claude_code_cli": "Claude Code CLI",
+      "codex_cli": "Codex CLI"
     },
     "openclaw_not_connected": "未连接",
     "openclaw_connect_hint": "OpenClaw 网关未连接。请在 daemon 机器上运行以下命令连接：",
@@ -183,7 +185,14 @@
     "daemon_offline": "Daemon 离线 — 请确认 imcodes daemon 正在运行",
     "start": "启动",
     "starting": "启动中...",
-    "timeout": "等待会话启动超时，请检查 daemon 日志。"
+    "timeout": "等待会话启动超时，请检查 daemon 日志。",
+    "title": "启动新会话",
+    "project_name": "项目名",
+    "working_directory": "工作目录",
+    "browse": "浏览",
+    "agent_type": "Agent 类型",
+    "agent_flavor_cli": "CLI：适合喜欢原生界面的用户。聊天模式不支持流式输出。",
+    "agent_flavor_sdk": "SDK：支持流式输出，界面更简洁。"
   },
   "api_key": {
     "copy": "复制",
