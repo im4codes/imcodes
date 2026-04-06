@@ -204,7 +204,13 @@
     "label_placeholder": "標籤（選填）",
     "generate": "生成金鑰",
     "generating": "生成中...",
-    "revoke": "撤銷"
+    "revoke": "撤銷",
+    "save_once": "請保存這個金鑰——之後不會再次顯示",
+    "raw_key": "API 金鑰",
+    "bind_url": "綁定連結",
+    "bind_command": "綁定命令",
+    "copy_bind_command": "複製綁定命令",
+    "dismiss": "關閉"
   },
   "getting_started": {
     "step1_pending": "步驟 1：生成 API 金鑰",

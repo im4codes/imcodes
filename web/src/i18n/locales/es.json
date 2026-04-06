@@ -204,7 +204,13 @@
     "label_placeholder": "Etiqueta (opcional)",
     "generate": "Generar clave",
     "generating": "Generando...",
-    "revoke": "Revocar"
+    "revoke": "Revocar",
+    "save_once": "Guarda esta clave: no se mostrará otra vez",
+    "raw_key": "Clave API",
+    "bind_url": "URL de vinculación",
+    "bind_command": "Comando de vinculación",
+    "copy_bind_command": "Copiar comando",
+    "dismiss": "Cerrar"
   },
   "getting_started": {
     "step1_pending": "Paso 1: Genera una clave API",

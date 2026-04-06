@@ -204,7 +204,13 @@
     "label_placeholder": "Label (optional)",
     "generate": "Generate Key",
     "generating": "Generating...",
-    "revoke": "Revoke"
+    "revoke": "Revoke",
+    "save_once": "Save this key — it will not be shown again",
+    "raw_key": "API key",
+    "bind_url": "Bind URL",
+    "bind_command": "Bind command",
+    "copy_bind_command": "Copy bind command",
+    "dismiss": "Dismiss"
   },
   "getting_started": {
     "step1_pending": "Step 1: Generate an API Key",

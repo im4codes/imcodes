@@ -204,7 +204,13 @@
     "label_placeholder": "레이블 (선택사항)",
     "generate": "키 생성",
     "generating": "생성 중...",
-    "revoke": "취소"
+    "revoke": "취소",
+    "save_once": "이 키를 저장하세요. 다시 표시되지 않습니다",
+    "raw_key": "API 키",
+    "bind_url": "바인드 URL",
+    "bind_command": "바인드 명령어",
+    "copy_bind_command": "바인드 명령어 복사",
+    "dismiss": "닫기"
   },
   "getting_started": {
     "step1_pending": "1단계: API 키 생성",

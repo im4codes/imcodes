@@ -204,7 +204,13 @@
     "label_placeholder": "标签（可选）",
     "generate": "生成 Key",
     "generating": "生成中...",
-    "revoke": "撤销"
+    "revoke": "撤销",
+    "save_once": "保存好这个 Key——之后不会再显示",
+    "raw_key": "API Key",
+    "bind_url": "绑定链接",
+    "bind_command": "绑定命令",
+    "copy_bind_command": "复制绑定命令",
+    "dismiss": "关闭"
   },
   "getting_started": {
     "step1_pending": "步骤 1：生成 API Key",

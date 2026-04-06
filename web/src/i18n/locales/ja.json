@@ -204,7 +204,13 @@
     "label_placeholder": "ラベル（任意）",
     "generate": "キーを生成",
     "generating": "生成中...",
-    "revoke": "無効化"
+    "revoke": "無効化",
+    "save_once": "このキーを保存してください。再表示されません",
+    "raw_key": "APIキー",
+    "bind_url": "バインドURL",
+    "bind_command": "バインドコマンド",
+    "copy_bind_command": "バインドコマンドをコピー",
+    "dismiss": "閉じる"
   },
   "getting_started": {
     "step1_pending": "ステップ1: APIキーを生成する",

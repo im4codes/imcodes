@@ -204,7 +204,13 @@
     "label_placeholder": "Метка (необязательно)",
     "generate": "Сгенерировать ключ",
     "generating": "Генерация...",
-    "revoke": "Отозвать"
+    "revoke": "Отозвать",
+    "save_once": "Сохраните этот ключ — он больше не будет показан",
+    "raw_key": "API-ключ",
+    "bind_url": "URL привязки",
+    "bind_command": "Команда привязки",
+    "copy_bind_command": "Скопировать команду",
+    "dismiss": "Закрыть"
   },
   "getting_started": {
     "step1_pending": "Шаг 1: Сгенерируйте API-ключ",
