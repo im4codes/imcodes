@@ -63,6 +63,13 @@ vi.mock('../../src/agent/notify-setup.js', () => ({
   setupOpenCodePlugin: vi.fn().mockResolvedValue(undefined),
 }));
 
+vi.mock('../../src/agent/codex-runtime-config.js', () => ({
+  getCodexRuntimeConfig: vi.fn().mockResolvedValue({
+    planLabel: 'Pro',
+    quotaLabel: '5h 11% 2h03m 4/5 13:00 · 7d 50% 1d04h 4/7 14:00',
+  }),
+}));
+
 import { launchSession } from '../../src/agent/session-manager.js';
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
