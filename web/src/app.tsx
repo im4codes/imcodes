@@ -1081,9 +1081,9 @@ export function App() {
             qwenAuthLimit: s.qwenAuthLimit ?? existing?.qwenAuthLimit,
             qwenAvailableModels: s.qwenAvailableModels ?? existing?.qwenAvailableModels,
             modelDisplay: s.modelDisplay ?? existing?.modelDisplay,
-            planLabel: s.planLabel ?? existing?.planLabel,
-            quotaLabel: s.quotaLabel ?? existing?.quotaLabel,
-            quotaUsageLabel: s.quotaUsageLabel ?? existing?.quotaUsageLabel,
+            planLabel: s.planLabel,
+            quotaLabel: s.quotaLabel,
+            quotaUsageLabel: s.quotaUsageLabel,
           };
         }));
         setSessionsLoaded(true);

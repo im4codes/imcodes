@@ -1315,9 +1315,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         upsertSession({
           ...record,
           modelDisplay: nextModel,
-          ...(sdkDisplay.planLabel ? { planLabel: sdkDisplay.planLabel } : {}),
-          ...(sdkDisplay.quotaLabel ? { quotaLabel: sdkDisplay.quotaLabel } : {}),
-          ...(sdkDisplay.quotaUsageLabel ? { quotaUsageLabel: sdkDisplay.quotaUsageLabel } : {}),
+          planLabel: sdkDisplay.planLabel,
+          quotaLabel: sdkDisplay.quotaLabel,
+          quotaUsageLabel: sdkDisplay.quotaUsageLabel,
           updatedAt: Date.now(),
         });
         await handleGetSessions(serverLink);

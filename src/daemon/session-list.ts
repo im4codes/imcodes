@@ -100,9 +100,9 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
     }
     if (s.agentType === 'codex' || s.agentType === 'codex-sdk') {
       const hydrated: Partial<SessionRecord> = {
-        ...(codexRuntime?.planLabel ? { planLabel: codexRuntime.planLabel } : {}),
-        ...(codexRuntime?.quotaLabel ? { quotaLabel: codexRuntime.quotaLabel } : {}),
-        ...(codexRuntime?.quotaUsageLabel ? { quotaUsageLabel: codexRuntime.quotaUsageLabel } : {}),
+        planLabel: codexRuntime?.planLabel,
+        quotaLabel: codexRuntime?.quotaLabel,
+        quotaUsageLabel: codexRuntime?.quotaUsageLabel,
       };
       if (hydrated.planLabel !== s.planLabel || hydrated.quotaLabel !== s.quotaLabel || hydrated.quotaUsageLabel != s.quotaUsageLabel) {
         upsertSession({ ...s, ...hydrated, updatedAt: Date.now() });

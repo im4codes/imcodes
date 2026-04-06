@@ -45,6 +45,9 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   const isShell = liveSub.type === 'shell' || liveSub.type === 'script';
   const mode = pinnedViewMode ?? (isShell ? 'terminal' : 'chat');
   const modelDisplay = liveSub.modelDisplay ?? (liveSub.type === 'qwen' ? liveSub.qwenModel : undefined);
+  const compactQuotaText = liveSub.type === 'codex' || liveSub.type === 'codex-sdk'
+    ? (liveSub.quotaLabel ?? '')
+    : [liveSub.quotaLabel, liveSub.quotaUsageLabel].filter(Boolean).join(' · ');
 
   return (
     <>
@@ -73,10 +76,10 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           statusText={statusText}
         />
       )}
-      {(liveSub.quotaLabel || liveSub.quotaUsageLabel || liveSub.planLabel) && (
+      {(compactQuotaText || liveSub.planLabel) && (
         <div style={{ display: 'flex', gap: 6, alignItems: 'center', padding: '2px 8px', flexShrink: 0 }}>
-          {(liveSub.quotaLabel || liveSub.quotaUsageLabel) && (
-            <span class="session-usage-quota-inline">{[liveSub.quotaLabel, liveSub.quotaUsageLabel].filter(Boolean).join(' · ')}</span>
+          {compactQuotaText && (
+            <span class="session-usage-quota-inline">{compactQuotaText}</span>
           )}
           {liveSub.planLabel && (
             <span class="session-usage-quota-inline" style={{ color: '#93c5fd' }}>{liveSub.planLabel}</span>

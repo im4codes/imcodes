@@ -351,6 +351,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const isTransport = activeSession?.runtimeType === 'transport';
   const isCodex = activeSession?.agentType === 'codex' || activeSession?.agentType === 'codex-sdk';
   const isQwen = activeSession?.agentType === 'qwen';
+  const compactQuotaText = isCodex
+    ? (activeSession?.quotaLabel ?? '')
+    : [activeSession?.quotaLabel, activeSession?.quotaUsageLabel].filter(Boolean).join(' · ');
   const qwenTier = getQwenAuthTier(activeSession?.qwenAuthType);
   const qwenTierLabel = qwenTier === QWEN_AUTH_TIERS.FREE
     ? t('session.qwen_tier_free')
@@ -962,12 +965,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>
 
         {/* Plan/quota badges — compact inline display left of model selector */}
-        {(activeSession?.quotaLabel || activeSession?.quotaUsageLabel || activeSession?.planLabel) && (
+        {(compactQuotaText || activeSession?.planLabel) && (
           <div class="session-ctx-wrap">
-            {(activeSession.quotaLabel || activeSession.quotaUsageLabel) && (
-              <span class="session-usage-quota-inline">{[activeSession.quotaLabel, activeSession.quotaUsageLabel].filter(Boolean).join(' · ')}</span>
+            {compactQuotaText && (
+              <span class="session-usage-quota-inline">{compactQuotaText}</span>
             )}
-            {activeSession.planLabel && (
+            {activeSession?.planLabel && (
               <span class="session-usage-quota-inline" style={{ color: '#93c5fd' }}>{activeSession.planLabel}</span>
             )}
           </div>
