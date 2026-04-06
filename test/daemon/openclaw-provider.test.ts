@@ -35,7 +35,7 @@ function lastWs(): any {
 
 import { OpenClawProvider } from '../../src/agent/providers/openclaw.js';
 import type { ProviderError } from '../../src/agent/transport-provider.js';
-import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
+import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -114,7 +114,7 @@ describe('OpenClawProvider', () => {
     expect(provider.sessionOwnership).toBe('provider');
     expect(provider.capabilities).toEqual({
       streaming: true,
-      toolCalling: false,
+      toolCalling: true,
       approval: false,
       sessionRestore: true,
       multiTurn: true,
@@ -472,6 +472,168 @@ describe('OpenClawProvider', () => {
       emitAgentEvent({ runId, stream: 'lifecycle', data: { phase: 'end' }, key: 'sess-c' });
 
       expect(completes[0].message.content).toBe('Full text');
+    });
+  });
+
+  describe('agent event: tool stream', () => {
+    it('fires running and result tool callbacks with preserved args/result payloads', async () => {
+      await connectProvider(provider);
+
+      const tools: Array<{ sessionId: string; tool: ToolCallEvent }> = [];
+      provider.onToolCall((sessionId, tool) => tools.push({ sessionId, tool }));
+
+      const runId = 'run-tool-1';
+      emitAgentEvent({ runId, stream: 'lifecycle', data: { phase: 'start' }, key: 'sess-tool' });
+      emitAgentEvent({
+        runId,
+        stream: 'tool',
+        key: 'sess-tool',
+        data: {
+          phase: 'start',
+          name: 'bash',
+          toolCallId: 'tool-1',
+          args: { command: 'pwd' },
+          meta: { mutatingAction: false },
+        },
+      });
+      emitAgentEvent({
+        runId,
+        stream: 'tool',
+        key: 'sess-tool',
+        data: {
+          phase: 'result',
+          name: 'bash',
+          toolCallId: 'tool-1',
+          result: { stdout: '/tmp/project\n' },
+          meta: { exitCode: 0 },
+        },
+      });
+
+      expect(tools).toHaveLength(2);
+      expect(tools[0].sessionId).toBe('sess-tool');
+      expect(tools[0].tool).toMatchObject({
+        id: 'run-tool-1:tool-1',
+        name: 'bash',
+        status: 'running',
+        input: { command: 'pwd' },
+      });
+      expect(tools[0].tool.detail).toMatchObject({
+        kind: 'openclaw.tool',
+        input: { command: 'pwd' },
+        meta: { mutatingAction: false },
+      });
+      expect(tools[1].tool).toMatchObject({
+        id: 'run-tool-1:tool-1',
+        name: 'bash',
+        status: 'complete',
+        input: { command: 'pwd' },
+        output: JSON.stringify({ stdout: '/tmp/project\n' }),
+      });
+      expect(tools[1].tool.detail).toMatchObject({
+        kind: 'openclaw.tool',
+        input: { command: 'pwd' },
+        output: { stdout: '/tmp/project\n' },
+        meta: { exitCode: 0 },
+      });
+    });
+
+    it('emits tool update events for realistic sessions_send payloads before final result', async () => {
+      await connectProvider(provider);
+
+      const tools: Array<{ sessionId: string; tool: ToolCallEvent }> = [];
+      provider.onToolCall((sessionId, tool) => tools.push({ sessionId, tool }));
+
+      const runId = 'run-tool-update';
+      emitAgentEvent({ runId, stream: 'lifecycle', data: { phase: 'start' }, key: 'agent:main:discord:channel:123' });
+      emitAgentEvent({
+        runId,
+        stream: 'tool',
+        key: 'agent:main:discord:channel:123',
+        data: {
+          phase: 'start',
+          name: 'sessions_send',
+          toolCallId: 'tool-3',
+          args: { sessionKey: 'agent:emma:main', message: 'hello from openclaw' },
+          meta: { mutatingAction: true },
+        },
+      });
+      emitAgentEvent({
+        runId,
+        stream: 'tool',
+        key: 'agent:main:discord:channel:123',
+        data: {
+          phase: 'update',
+          name: 'sessions_send',
+          toolCallId: 'tool-3',
+          partialResult: { delivered: false, stage: 'queued' },
+        },
+      });
+      emitAgentEvent({
+        runId,
+        stream: 'tool',
+        key: 'agent:main:discord:channel:123',
+        data: {
+          phase: 'result',
+          name: 'sessions_send',
+          toolCallId: 'tool-3',
+          result: { delivered: true, target: 'agent:emma:main' },
+          meta: { durationMs: 42 },
+        },
+      });
+
+      expect(tools).toHaveLength(3);
+      expect(tools[0].sessionId).toBe('agent___main___discord___channel___123');
+      expect(tools[0].tool).toMatchObject({
+        id: 'run-tool-update:tool-3',
+        name: 'sessions_send',
+        status: 'running',
+        input: { sessionKey: 'agent:emma:main', message: 'hello from openclaw' },
+      });
+      expect(tools[1].tool).toMatchObject({
+        id: 'run-tool-update:tool-3',
+        name: 'sessions_send',
+        status: 'running',
+        output: JSON.stringify({ delivered: false, stage: 'queued' }),
+      });
+      expect(tools[2].tool).toMatchObject({
+        id: 'run-tool-update:tool-3',
+        name: 'sessions_send',
+        status: 'complete',
+        output: JSON.stringify({ delivered: true, target: 'agent:emma:main' }),
+      });
+      expect(tools[2].tool.detail).toMatchObject({
+        kind: 'openclaw.tool',
+        meta: { durationMs: 42 },
+      });
+    });
+
+    it('marks error tool results as error and falls back to payload session key without lifecycle accumulator', async () => {
+      await connectProvider(provider);
+
+      const tools: Array<{ sessionId: string; tool: ToolCallEvent }> = [];
+      provider.onToolCall((sessionId, tool) => tools.push({ sessionId, tool }));
+
+      emitAgentEvent({
+        runId: 'run-tool-err',
+        stream: 'tool',
+        key: 'agent:main:test:room',
+        data: {
+          phase: 'result',
+          name: 'sessions_send',
+          toolCallId: 'tool-2',
+          isError: true,
+          result: { error: 'target not found' },
+        },
+      });
+
+      expect(tools).toHaveLength(1);
+      expect(tools[0].sessionId).toBe('agent___main___test___room');
+      expect(tools[0].tool).toMatchObject({
+        id: 'run-tool-err:tool-2',
+        name: 'sessions_send',
+        status: 'error',
+        output: JSON.stringify({ error: 'target not found' }),
+      });
     });
   });
 

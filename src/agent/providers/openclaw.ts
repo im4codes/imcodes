@@ -23,7 +23,7 @@ import {
   SESSION_OWNERSHIP,
   PROVIDER_ERROR_CODES,
 } from '../transport-provider.js';
-import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
+import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../../shared/agent-message.js';
 import logger from '../../util/logger.js';
 import { normalizeOpenClawDisplayName } from '../openclaw-display.js';
 
@@ -66,6 +66,20 @@ function unsanitizeKey(key: string): string { return key.replaceAll('___', ':');
 /** Returns true if a raw OC key contains `___`, which would cause unsanitize collision. */
 function hasCollisionRisk(rawKey: string): boolean { return rawKey.includes('___'); }
 
+function makeRunToolKey(runId: string, toolCallId: string): string {
+  return `${runId}:${toolCallId}`;
+}
+
+function stringifyToolValue(value: unknown): string | undefined {
+  if (value == null) return undefined;
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
 // ── OpenClawProvider ─────────────────────────────────────────────────────────
 
 export class OpenClawProvider implements TransportProvider {
@@ -74,7 +88,7 @@ export class OpenClawProvider implements TransportProvider {
   readonly sessionOwnership = SESSION_OWNERSHIP.PROVIDER;
   readonly capabilities: ProviderCapabilities = {
     streaming: true,
-    toolCalling: false,
+    toolCalling: true,
     approval: false,
     sessionRestore: true,
     multiTurn: true,
@@ -93,9 +107,11 @@ export class OpenClawProvider implements TransportProvider {
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
+  private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
 
   /** Accumulator: partial text per runId while streaming. */
   private runAccumulator = new Map<string, { sessionId: string; messageId: string; text: string }>();
+  private toolStates = new Map<string, Map<string, OpenClawToolState>>();
 
   /** Reconnect state. */
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -132,6 +148,7 @@ export class OpenClawProvider implements TransportProvider {
     }
     this.connected = false;
     this.runAccumulator.clear();
+    this.toolStates.clear();
     logger.info({ provider: this.id }, 'Disconnected from OpenClaw gateway');
   }
 
@@ -195,6 +212,10 @@ export class OpenClawProvider implements TransportProvider {
   onError(cb: (sessionId: string, error: ProviderError) => void): () => void {
     this.errorCallbacks.push(cb);
     return () => { const i = this.errorCallbacks.indexOf(cb); if (i >= 0) this.errorCallbacks.splice(i, 1); };
+  }
+
+  onToolCall(cb: (sessionId: string, tool: ToolCallEvent) => void): void {
+    this.toolCallCallbacks.push(cb);
   }
 
   async createSession(config: SessionConfig): Promise<string> {
@@ -465,6 +486,7 @@ export class OpenClawProvider implements TransportProvider {
 
       if (phase === 'end') {
         const acc = this.runAccumulator.get(runId);
+        this.toolStates.delete(runId);
         if (acc) {
           this.runAccumulator.delete(runId);
           const message: AgentMessage = {
@@ -486,6 +508,7 @@ export class OpenClawProvider implements TransportProvider {
         const acc = this.runAccumulator.get(runId);
         const sessionId = acc?.sessionId ?? sanitizeKey(payload.key ?? payload.sessionKey ?? runId);
         this.runAccumulator.delete(runId);
+        this.toolStates.delete(runId);
         // Extract actual error message from OC data (e.g. "AI service overloaded", "OAuth token expired")
         const errorData = data as { error?: string; message?: string } | undefined;
         const errorMsg = errorData?.error ?? errorData?.message ?? `Agent run error for session ${sessionId}`;
@@ -558,6 +581,91 @@ export class OpenClawProvider implements TransportProvider {
         role: 'assistant',
       };
       this.deltaCallbacks.forEach((cb) => cb(acc.sessionId, delta));
+      return;
+    }
+
+    if (stream === 'tool') {
+      const toolData = data as OpenClawToolEventData | undefined;
+      if (!toolData?.phase || !toolData.toolCallId || !toolData.name) return;
+      const sessionId = this.runAccumulator.get(runId)?.sessionId
+        ?? sanitizeKey(payload.key ?? payload.sessionKey ?? runId);
+      const runTools = this.toolStates.get(runId) ?? new Map<string, OpenClawToolState>();
+      this.toolStates.set(runId, runTools);
+      const toolKey = makeRunToolKey(runId, toolData.toolCallId);
+      const current = runTools.get(toolData.toolCallId);
+
+      if (toolData.phase === 'start') {
+        const state: OpenClawToolState = {
+          id: toolKey,
+          sessionId,
+          name: toolData.name,
+          input: toolData.args,
+          meta: toolData.meta,
+        };
+        runTools.set(toolData.toolCallId, state);
+        this.toolCallCallbacks.forEach((cb) => cb(sessionId, {
+          id: state.id,
+          name: state.name,
+          status: 'running',
+          ...(state.input !== undefined ? { input: state.input } : {}),
+          detail: {
+            kind: 'openclaw.tool',
+            summary: state.name,
+            input: state.input,
+            meta: state.meta,
+            raw: toolData,
+          },
+        }));
+        return;
+      }
+
+      if (toolData.phase === 'update') {
+        if (!current) return;
+        const partialOutput = stringifyToolValue(toolData.partialResult);
+        this.toolCallCallbacks.forEach((cb) => cb(sessionId, {
+          id: current.id,
+          name: current.name,
+          status: 'running',
+          ...(current.input !== undefined ? { input: current.input } : {}),
+          ...(partialOutput !== undefined ? { output: partialOutput } : {}),
+          detail: {
+            kind: 'openclaw.tool',
+            summary: current.name,
+            input: current.input,
+            output: toolData.partialResult,
+            meta: current.meta,
+            raw: toolData,
+          },
+        }));
+        return;
+      }
+
+      if (toolData.phase === 'result') {
+        const state = current ?? {
+          id: toolKey,
+          sessionId,
+          name: toolData.name,
+          input: undefined,
+          meta: toolData.meta,
+        };
+        runTools.delete(toolData.toolCallId);
+        const output = stringifyToolValue(toolData.result);
+        this.toolCallCallbacks.forEach((cb) => cb(sessionId, {
+          id: state.id,
+          name: state.name,
+          status: toolData.isError ? 'error' : 'complete',
+          ...(state.input !== undefined ? { input: state.input } : {}),
+          ...(output !== undefined ? { output } : {}),
+          detail: {
+            kind: 'openclaw.tool',
+            summary: state.name,
+            input: state.input,
+            output: toolData.result,
+            meta: toolData.meta ?? state.meta,
+            raw: toolData,
+          },
+        }));
+      }
     }
   }
 
@@ -702,4 +810,23 @@ interface ChatEventPayload {
   key?: string;
   state?: string;
   [k: string]: unknown;
+}
+
+interface OpenClawToolState {
+  id: string;
+  sessionId: string;
+  name: string;
+  input?: unknown;
+  meta?: Record<string, unknown>;
+}
+
+interface OpenClawToolEventData {
+  phase?: 'start' | 'update' | 'result';
+  name?: string;
+  toolCallId?: string;
+  args?: unknown;
+  partialResult?: unknown;
+  result?: unknown;
+  isError?: boolean;
+  meta?: Record<string, unknown>;
 }
