@@ -158,7 +158,15 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                   class={`subsession-type-btn${type === at.id ? ' active' : ''}`}
                   onClick={() => setType(at.id)}
                 >
-                  <span>{at.icon}</span> {at.id === 'openclaw' || at.id === 'qwen' || at.id === 'claude-code-sdk' || at.id === 'codex-sdk' ? t(`session.agentType.${at.id}`) : at.label}
+                  <span>{at.icon}</span> {at.id === 'openclaw'
+                    ? t('session.agentType.openclaw')
+                    : at.id === 'qwen'
+                      ? t('session.agentType.qwen')
+                      : at.id === 'claude-code-sdk'
+                        ? t('session.agentType.claude_code_sdk')
+                        : at.id === 'codex-sdk'
+                          ? t('session.agentType.codex_sdk')
+                          : at.label}
                 </button>
               ))}
             </div>

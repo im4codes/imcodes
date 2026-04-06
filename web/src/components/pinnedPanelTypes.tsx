@@ -45,9 +45,11 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   const isShell = liveSub.type === 'shell' || liveSub.type === 'script';
   const mode = pinnedViewMode ?? (isShell ? 'terminal' : 'chat');
   const modelDisplay = liveSub.modelDisplay ?? (liveSub.type === 'qwen' ? liveSub.qwenModel : undefined);
-  const compactQuotaText = liveSub.type === 'codex' || liveSub.type === 'codex-sdk'
-    ? (liveSub.quotaLabel ?? '')
-    : [liveSub.quotaLabel, liveSub.quotaUsageLabel].filter(Boolean).join(' · ');
+  const compactQuotaText = liveSub.type === 'codex'
+    ? ''
+    : liveSub.type === 'codex-sdk'
+      ? (liveSub.quotaLabel ?? '')
+      : [liveSub.quotaLabel, liveSub.quotaUsageLabel].filter(Boolean).join(' · ');
 
   return (
     <>
@@ -70,7 +72,9 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sessionName}
+          agentType={liveSub.type}
           modelOverride={modelDisplay ?? undefined}
+          quotaLabel={liveSub.type === 'codex' ? liveSub.quotaLabel : undefined}
           showCost={false}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}

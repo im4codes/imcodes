@@ -32,7 +32,7 @@ vi.mock('../src/cost-tracker.js', () => ({
 import { UsageFooter } from '../src/components/UsageFooter.js';
 
 describe('UsageFooter', () => {
-  it('renders inline codex quota text in the ctx footer', () => {
+  it('renders inline CLI codex quota text in the ctx footer', () => {
     render(
       <UsageFooter
         usage={{
@@ -40,22 +40,17 @@ describe('UsageFooter', () => {
           cacheTokens: 1000,
           contextWindow: 1_000_000,
           model: 'coder-model',
-          codexStatus: {
-            capturedAt: 1,
-            fiveHourLeftPercent: 43,
-            fiveHourResetAt: 'Apr 6 14:40',
-            weeklyLeftPercent: 34,
-            weeklyResetAt: 'Apr 8 15:48',
-          },
         }}
         sessionName="deck_test_brain"
+        agentType="codex"
         modelOverride="gpt-5"
         planLabel="Free"
+        quotaLabel="5h 43% 2h03m 4/6 14:40 · 7d 34% 1d04h 4/8 15:48"
       />,
     );
 
     expect(screen.getByText('gpt-5')).toBeDefined();
-    expect(screen.getByText(/5h 43% Apr 6 14:40/)).toBeDefined();
-    expect(screen.getByText(/7d 34% Apr 8 15:48/)).toBeDefined();
+    expect(screen.getByText(/5h 43% 2h03m 4\/6 14:40/)).toBeDefined();
+    expect(screen.getByText(/7d 34% 1d04h 4\/8 15:48/)).toBeDefined();
   });
 });

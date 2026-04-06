@@ -256,10 +256,11 @@ export function SessionPane({
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sessionName}
+          agentType={session.agentType}
           modelOverride={session.modelDisplay ?? (session.agentType === 'qwen' ? session.qwenModel : undefined)}
           planLabel={session.planLabel}
-          quotaLabel={session.quotaLabel}
-          quotaUsageLabel={session.quotaUsageLabel}
+          quotaLabel={session.agentType === 'codex' ? session.quotaLabel : undefined}
+          quotaUsageLabel={undefined}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}

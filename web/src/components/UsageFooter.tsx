@@ -12,6 +12,7 @@ import type { UsageData } from '../usage-data.js';
 interface Props {
   usage: UsageData;
   sessionName: string;
+  agentType?: string | null;
   modelOverride?: string | null;
   planLabel?: string | null;
   quotaLabel?: string | null;
@@ -36,7 +37,7 @@ function formatCodexStatusPart(label: string, percent: number | undefined, reset
   return `${label} ${percent}%${reset ? ` ${reset}` : ''}`;
 }
 
-export function UsageFooter({ usage, sessionName, modelOverride, planLabel, quotaLabel, quotaUsageLabel, showCost, activeThinkingTs, statusText, now }: Props) {
+export function UsageFooter({ usage, sessionName, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, showCost, activeThinkingTs, statusText, now }: Props) {
   const { t } = useTranslation();
 
   const displayModel = modelOverride ?? usage.model;
@@ -77,6 +78,9 @@ export function UsageFooter({ usage, sessionName, modelOverride, planLabel, quot
     formatCodexStatusPart(t('session.codex_5h_short'), usage.codexStatus?.fiveHourLeftPercent, usage.codexStatus?.fiveHourResetAt),
     formatCodexStatusPart(t('session.codex_wk_short'), usage.codexStatus?.weeklyLeftPercent, usage.codexStatus?.weeklyResetAt),
   ].filter(Boolean).join(' · ');
+  const inlineQuotaText = agentType === 'codex'
+    ? (quotaLabel ?? codexStatusText)
+    : codexStatusText;
 
   return (
     <div class="session-usage-footer" title={tip}>
@@ -98,7 +102,7 @@ export function UsageFooter({ usage, sessionName, modelOverride, planLabel, quot
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
           {modelLabel && <span class="session-usage-model">{modelLabel}</span>}
           {total > 0 && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}
-          {codexStatusText && <span class="session-usage-tokens">{codexStatusText}</span>}
+          {inlineQuotaText && <span class="session-usage-tokens">{inlineQuotaText}</span>}
           {sessionCost > 0 && (
             <span class="session-usage-cost">
               {formatCost(sessionCost)} · wk {formatCost(weeklyCost)} · mo {formatCost(monthlyCost)}

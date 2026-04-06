@@ -393,10 +393,11 @@ export function SubSessionWindow({
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sub.sessionName}
+          agentType={sessionInfo?.agentType}
           modelOverride={sessionInfo?.modelDisplay ?? (sessionInfo?.agentType === 'qwen' ? sessionInfo?.qwenModel : undefined)}
           planLabel={sessionInfo?.planLabel}
           quotaLabel={sessionInfo?.quotaLabel}
-          quotaUsageLabel={sessionInfo?.quotaUsageLabel}
+          quotaUsageLabel={sessionInfo?.agentType === 'codex' ? undefined : sessionInfo?.quotaUsageLabel}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}

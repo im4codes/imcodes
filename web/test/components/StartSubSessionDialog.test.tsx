@@ -44,7 +44,7 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    expect(screen.getByRole('button', { name: /claude-code-sdk/i })).toBeDefined();
-    expect(screen.getByRole('button', { name: /codex-sdk/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /claude_code_sdk/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /codex_sdk/i })).toBeDefined();
   });
 });

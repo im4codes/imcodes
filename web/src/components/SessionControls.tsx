@@ -351,9 +351,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const isTransport = activeSession?.runtimeType === 'transport';
   const isCodex = activeSession?.agentType === 'codex' || activeSession?.agentType === 'codex-sdk';
   const isQwen = activeSession?.agentType === 'qwen';
-  const compactQuotaText = isCodex
-    ? (activeSession?.quotaLabel ?? '')
-    : [activeSession?.quotaLabel, activeSession?.quotaUsageLabel].filter(Boolean).join(' · ');
+  const compactQuotaText = activeSession?.agentType === 'codex'
+    ? ''
+    : isCodex
+      ? (activeSession?.quotaLabel ?? '')
+      : [activeSession?.quotaLabel, activeSession?.quotaUsageLabel].filter(Boolean).join(' · ');
   const qwenTier = getQwenAuthTier(activeSession?.qwenAuthType);
   const qwenTierLabel = qwenTier === QWEN_AUTH_TIERS.FREE
     ? t('session.qwen_tier_free')
