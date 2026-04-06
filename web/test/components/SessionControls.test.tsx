@@ -366,14 +366,9 @@ describe('SessionControls', () => {
     expect(input.textContent).toBe('@@w1(audit) ');
 
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
-    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
-
     input.textContent = `${input.textContent}please review`;
     fireEvent.input(input);
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
-
-    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: /send_anyway/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       sessionName: 'deck_my-project_brain',
@@ -490,7 +485,7 @@ describe('SessionControls', () => {
     getSelectionSpy.mockRestore();
   });
 
-  it('manual @@label(mode) text also triggers the single-agent reminder when exactly one target resolves', () => {
+  it('manual @@label(mode) text sends p2pAtTargets when exactly one target resolves', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -507,9 +502,6 @@ describe('SessionControls', () => {
     input.textContent = '@@plan(Audit) check this';
     fireEvent.input(input);
     fireEvent.click(screen.getByRole('button', { name: /send/i }));
-
-    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: /send_anyway/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       sessionName: 'deck_my-project_brain',
@@ -727,7 +719,7 @@ describe('SessionControls', () => {
       expect(document.querySelector('.attachment-badge')).toBeNull();
     });
 
-    it('shows a single-agent reminder before sending one @-picked target', () => {
+    it('sends a full P2P command immediately for one @-picked target', () => {
       const ws = makeWs();
       render(
         <SessionControls
@@ -753,11 +745,6 @@ describe('SessionControls', () => {
       input.textContent = `${input.textContent}please review`;
       fireEvent.input(input);
       fireEvent.click(screen.getByRole('button', { name: /send/i }));
-
-      expect(ws.sendSessionCommand).not.toHaveBeenCalled();
-      expect(screen.getByText('title')).toBeDefined();
-
-      fireEvent.click(screen.getByRole('button', { name: /send_anyway/i }));
 
       expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
         sessionName: 'deck_my-project_brain',
@@ -766,53 +753,12 @@ describe('SessionControls', () => {
           { session: 'deck_sub_w1', mode: 'audit' },
         ],
       }));
-
-      getSelectionSpy.mockRestore();
-    });
-
-    it('can suppress the single-agent reminder for this account', () => {
-      const ws = makeWs();
-      render(
-        <SessionControls
-          ws={ws as any}
-          activeSession={mainSession}
-          quickData={makeQuickData() as any}
-          sessions={[mainSession]}
-          subSessions={[
-            { sessionName: 'deck_sub_w1', type: 'codex', label: 'w1', state: 'idle', parentSession: 'deck_my-project_brain' },
-          ]}
-        />,
-      );
-      const input = screen.getByRole('textbox') as HTMLDivElement;
-      const getSelectionSpy = vi.spyOn(window, 'getSelection').mockImplementation(() => ({
-        anchorOffset: input.textContent?.length ?? 0,
-      }) as any);
-
-      input.textContent = '@';
-      fireEvent.input(input);
-      fireEvent.click(screen.getByText('agents'));
-      fireEvent.click(screen.getByText('w1'));
-      fireEvent.click(screen.getByText('audit'));
-      input.textContent = `${input.textContent}please review`;
-      fireEvent.input(input);
-      fireEvent.click(screen.getByRole('button', { name: /send/i }));
-
-      fireEvent.click(screen.getByRole('checkbox'));
-      fireEvent.click(screen.getByRole('button', { name: /send_anyway/i }));
-
-      expect(saveUserPrefMock).toHaveBeenCalledWith('atpicker_single_agent_prompt_dismissed', '1');
-
-      input.textContent = '@@w1(audit) again';
-      fireEvent.input(input);
-      fireEvent.click(screen.getByRole('button', { name: /send/i }));
-
       expect(screen.queryByText('title')).toBeNull();
-      expect(ws.sendSessionCommand).toHaveBeenCalledTimes(2);
 
       getSelectionSpy.mockRestore();
     });
 
-    it('also warns for handwritten single-agent @@ targets', () => {
+    it('sends a full P2P command immediately for handwritten single-agent @@ targets', () => {
       const ws = makeWs();
       render(
         <SessionControls
@@ -830,11 +776,17 @@ describe('SessionControls', () => {
       fireEvent.input(input);
       fireEvent.click(screen.getByRole('button', { name: /send/i }));
 
-      expect(ws.sendSessionCommand).not.toHaveBeenCalled();
-      expect(screen.getByText('title')).toBeDefined();
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+        sessionName: 'deck_my-project_brain',
+        text: 'please review',
+        p2pAtTargets: [
+          { session: 'deck_sub_w1', mode: 'audit' },
+        ],
+      }));
+      expect(screen.queryByText('title')).toBeNull();
     });
 
-    it('does not warn for @@all', () => {
+    it('does not show any warning for @@all', () => {
       const ws = makeWs();
       render(
         <SessionControls

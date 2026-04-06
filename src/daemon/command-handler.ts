@@ -892,45 +892,6 @@ async function sendShellAwareCommand(sessionName: string, text: string, agentTyp
   }
 }
 
-function describeSession(sessionName: string): string {
-  const record = getSession(sessionName);
-  return record?.label?.trim() || sessionName.replace(/^deck_sub_/, '');
-}
-
-function buildSingleTargetConsultPrompt(
-  targetSession: string,
-  targetMode: string,
-  userText: string,
-): string {
-  const targetLabel = describeSession(targetSession);
-  const modeConfig = getP2pMode(targetMode);
-  const modePrompt = modeConfig?.prompt ?? `Provide ${targetMode} analysis for the request below.`;
-
-  return [
-    '',
-    '[Peer Consultation Task]',
-    '',
-    `User request: "${userText}"`,
-    '',
-    `Before replying to the user, consult ${targetLabel} (${targetSession}) once and then synthesize the final answer yourself.`,
-    '',
-    `Consultation mode for ${targetLabel}: ${targetMode}`,
-    `Peer guidance: ${modePrompt}`,
-    '',
-    'Required flow:',
-    `1. Briefly analyze the user's request and decide what you need from ${targetLabel}.`,
-    `2. Send ${targetLabel} a focused request using: imcodes send --reply "${targetSession}" "<your request>"`,
-    `3. Wait for ${targetLabel}'s reply. It will come back once via imcodes send --no-reply.`,
-    `4. Then answer the user, explicitly incorporating ${targetLabel}'s findings.`,
-    '',
-    'Rules:',
-    `- Do NOT answer the user before consulting ${targetLabel}.`,
-    `- Do NOT ask the user for confirmation before consulting ${targetLabel}.`,
-    `- Keep the peer request narrow, concrete, and aligned with the ${targetMode} mode.`,
-    '- Start immediately.',
-  ].join('\n');
-}
-
 function resolveSingleTargetMode(
   targetSession: string,
   requestedMode: string,
@@ -939,53 +900,6 @@ function resolveSingleTargetMode(
   if (requestedMode !== P2P_CONFIG_MODE) return requestedMode;
   const configuredMode = sessionConfig?.[targetSession]?.mode;
   return configuredMode && configuredMode !== 'skip' ? configuredMode : 'discuss';
-}
-
-async function handleSingleTargetConsult(
-  sessionName: string,
-  targetSession: string,
-  targetMode: string,
-  text: string,
-  effectiveId: string,
-  isLegacy: boolean,
-  serverLink: ServerLink,
-): Promise<void> {
-  const targetRecord = getSession(targetSession);
-  if (!targetRecord) {
-    logger.warn({ sessionName, targetSession }, 'session.send: single target not found');
-    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: 'Direct target not found' });
-    try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: 'direct_target_not_found' }); } catch {}
-    return;
-  }
-
-  const release = await getMutex(sessionName).acquire();
-  try {
-    const agentType = getSession(sessionName)?.agentType ?? 'unknown';
-    let sendText = buildSingleTargetConsultPrompt(targetSession, targetMode, text);
-    if (agentType === 'gemini' || agentType === 'codex') {
-      sendText = await rewritePathsForSandbox(sessionName, sendText);
-    }
-    await sendShellAwareCommand(sessionName, sendText, agentType);
-    timelineEmitter.emit(sessionName, 'user.message', { text });
-    const status = isLegacy ? 'accepted_legacy' : 'accepted';
-    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
-    try {
-      serverLink.send({ type: 'command.ack', commandId: effectiveId, status, session: sessionName });
-    } catch { /* not connected */ }
-    if (agentType === 'opencode') {
-      const { scheduleCatchup } = await import('./opencode-watcher.js');
-      scheduleCatchup(sessionName);
-    }
-  } catch (err) {
-    logger.error({ sessionName, targetSession, err }, 'session.send single target consult failed');
-    const errMsg = err instanceof Error ? err.message : String(err);
-    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
-    try {
-      serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg });
-    } catch { /* not connected */ }
-  } finally {
-    release();
-  }
 }
 
 async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
@@ -1015,12 +929,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   }
   dedup.add(effectiveId);
 
-  if (directTargetSession) {
-    await handleSingleTargetConsult(sessionName, directTargetSession, directTargetMode, text, effectiveId, isLegacy, serverLink);
-    return;
-  }
-
-  // ── P2P routing: structured WS fields (new) or inline @@tokens (legacy) ──
+// ── P2P routing: structured WS fields (new) or inline @@tokens (legacy) ──
   const p2pSessionConfig = (cmd as any).p2pSessionConfig as P2pSessionConfig | undefined;
   let p2pRounds = (cmd as any).p2pRounds as number | undefined;
   let p2pExtraPrompt = (cmd as any).p2pExtraPrompt as string | undefined;
@@ -1028,27 +937,17 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const p2pHopTimeoutMs = (cmd as any).p2pHopTimeoutMs as number | undefined;
   const p2pModeField = (cmd as any).p2pMode as string | undefined;
   const p2pAtTargets = (cmd as any).p2pAtTargets as Array<{ session: string; mode: string }> | undefined;
-
-  if (p2pAtTargets?.length === 1 && p2pAtTargets[0]?.session !== '__all__') {
-    await handleSingleTargetConsult(
-      sessionName,
-      p2pAtTargets[0].session,
-      resolveSingleTargetMode(p2pAtTargets[0].session, p2pAtTargets[0].mode ?? 'discuss', p2pSessionConfig),
-      text,
-      effectiveId,
-      isLegacy,
-      serverLink,
-    );
-    return;
-  }
+  const explicitTargets = directTargetSession
+    ? [{ session: directTargetSession, mode: resolveSingleTargetMode(directTargetSession, directTargetMode, p2pSessionConfig) }]
+    : p2pAtTargets;
 
   // Build P2P tokens from structured fields (frontend no longer injects @@tokens into text)
   let tokens: ParsedTokens;
-  if (p2pAtTargets && p2pAtTargets.length > 0) {
+  if (explicitTargets && explicitTargets.length > 0) {
     // @ picker targets — expand __all__ or use specific sessions
     const agents: P2pTarget[] = [];
     const files: string[] = [];
-    for (const t of p2pAtTargets) {
+    for (const t of explicitTargets) {
       if (t.session === '__all__') {
         agents.push(...expandAllTargets(sessionName, t.mode, false, p2pSessionConfig));
       } else if (getSession(t.session)) {
@@ -1109,7 +1008,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   }
 
   // No targets found from any source
-  if ((p2pAtTargets || p2pModeField) && tokens.agents.length === 0) {
+  if ((explicitTargets || p2pModeField) && tokens.agents.length === 0) {
     logger.warn({ sessionName, p2pModeField }, 'P2P: no active sessions found for structured routing');
     timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: 'No active sessions found' });
     try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: 'no_sessions' }); } catch {}

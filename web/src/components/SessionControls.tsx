@@ -78,7 +78,6 @@ type P2pMode = string; // 'solo' | single modes | combo pipelines like 'brainsto
 const MODEL_STORAGE_KEY = 'imcodes-model';
 const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const QWEN_MODEL_STORAGE_KEY = 'imcodes-qwen-model';
-const SINGLE_AGENT_PROMPT_PREF_KEY = 'atpicker_single_agent_prompt_dismissed';
 const CODEX_MODELS: CodexModelChoice[] = [...CODEX_MODEL_IDS] as CodexModelChoice[];
 const SINGLE_P2P_MODES: string[] = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss'];
 const P2P_MODES: string[] = [...SINGLE_P2P_MODES, ...COMBO_PRESETS.map((c) => c.key), P2P_CONFIG_MODE];
@@ -116,7 +115,6 @@ interface PendingAtTarget {
 interface PendingSendPayload {
   text: string;
   extra: Record<string, unknown>;
-  singleAgentTargetSelected: boolean;
 }
 
 type ManualP2pTargetCandidate = {
@@ -265,10 +263,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<Array<{ path: string; name: string }>>([]);
-  const [singleAgentPromptSuppressed, setSingleAgentPromptSuppressed] = useState(false);
-  const [singleAgentPromptOpen, setSingleAgentPromptOpen] = useState(false);
-  const [singleAgentPromptSkip, setSingleAgentPromptSkip] = useState(false);
-  const pendingSendRef = useRef<PendingSendPayload | null>(null);
 
   // Keep external inputRef in sync so parent can call .focus()
   useEffect(() => {
@@ -291,15 +285,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     } catch { /* ignore selection API failures */ }
     onPendingPrefillApplied?.();
   }, [pendingPrefillText, onPendingPrefillApplied]);
-
-  useEffect(() => {
-    let cancelled = false;
-    void getUserPref(SINGLE_AGENT_PROMPT_PREF_KEY).then((raw) => {
-      if (cancelled) return;
-      setSingleAgentPromptSuppressed(raw === '1');
-    }).catch(() => {});
-    return () => { cancelled = true; };
-  }, []);
 
   // Persist input draft across unmount/remount (sub-session minimize/restore)
   const draftKey = activeSession ? `rcc_draft_${activeSession.name}` : null;
@@ -548,7 +533,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     // Build P2P routing as structured WS fields — keep text clean for display.
     const extra: Record<string, unknown> = {};
     const pendingTargets = [...pendingAtTargetsRef.current];
-    let singleAgentTargetSelected = false;
 
     if (pendingTargets.length > 0) {
       // @ picker was used — derive routing from the visible textbox order, then strip matched labels.
@@ -610,9 +594,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       const refs = attachments.map((a) => `@${a.path}`).join(' ');
       text = text ? `${refs} ${text}` : refs;
     }
-    const parsedTargets = Array.isArray(extra.p2pAtTargets) ? extra.p2pAtTargets as Array<{ session: string; mode: string }> : [];
-    singleAgentTargetSelected = parsedTargets.length === 1 && parsedTargets[0]?.session !== '__all__';
-    return { text, extra, singleAgentTargetSelected };
+    return { text, extra };
   }, [attachments, activeSession, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, sessions, subSessions, ws]);
 
   const finalizeSend = useCallback((payload: PendingSendPayload) => {
@@ -647,23 +629,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     }
   }, [activeSession?.name, activeSession?.runtimeType, activeSession?.state]);
 
-  const persistSingleAgentPromptPref = useCallback(() => {
-    if (!singleAgentPromptSkip) return;
-    setSingleAgentPromptSuppressed(true);
-    void saveUserPref(SINGLE_AGENT_PROMPT_PREF_KEY, '1').catch(() => {});
-  }, [singleAgentPromptSkip]);
-
   const handleSend = useCallback(() => {
     const payload = buildSendPayload();
     if (!payload) return;
-    if (payload.singleAgentTargetSelected && !singleAgentPromptSuppressed) {
-      pendingSendRef.current = payload;
-      setSingleAgentPromptSkip(false);
-      setSingleAgentPromptOpen(true);
-      return;
-    }
     finalizeSend(payload);
-  }, [buildSendPayload, finalizeSend, singleAgentPromptSuppressed]);
+  }, [buildSendPayload, finalizeSend]);
 
   // Voice overlay send handler — applies same P2P mode as text send
   const handleVoiceSend = useCallback((voiceText: string) => {
@@ -1528,66 +1498,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>
       )}
     </div>
-    {singleAgentPromptOpen && (
-      <div class="ask-dialog-overlay" onClick={() => { setSingleAgentPromptOpen(false); pendingSendRef.current = null; }}>
-        <div class="ask-dialog single-agent-dialog" onClick={(e) => e.stopPropagation()}>
-          <div class="single-agent-dialog-icon">🧠</div>
-          <div class="single-agent-dialog-title">{t('p2p.single_agent_prompt.title')}</div>
-          <div class="single-agent-dialog-body">
-            <div>{t('p2p.single_agent_prompt.body')}</div>
-            <div>{t('p2p.single_agent_prompt.tip_multi')}</div>
-            <div>{t('p2p.single_agent_prompt.tip_history')}</div>
-            <div>{t('p2p.single_agent_prompt.tip_rounds')}</div>
-          </div>
-          <label class="single-agent-dialog-checkbox">
-            <input
-              type="checkbox"
-              checked={singleAgentPromptSkip}
-              onChange={(e) => setSingleAgentPromptSkip((e.target as HTMLInputElement).checked)}
-            />
-            <span>{t('p2p.single_agent_prompt.dont_show_again')}</span>
-          </label>
-          <div class="ask-actions">
-            <button
-              class="ask-btn-cancel"
-              onClick={() => {
-                persistSingleAgentPromptPref();
-                setSingleAgentPromptOpen(false);
-                pendingSendRef.current = null;
-              }}
-            >
-              {t('common.cancel')}
-            </button>
-            <button
-              class="ask-btn-cancel"
-              onClick={() => {
-                persistSingleAgentPromptPref();
-                setSingleAgentPromptOpen(false);
-                pendingSendRef.current = null;
-                setAtQuery('');
-                setAtPickerStage('agents');
-                setAtPickerOpen(true);
-                divRef.current?.focus();
-              }}
-            >
-              {t('p2p.single_agent_prompt.more_agents')}
-            </button>
-            <button
-              class="ask-btn-submit"
-              onClick={() => {
-                const pending = pendingSendRef.current;
-                persistSingleAgentPromptPref();
-                setSingleAgentPromptOpen(false);
-                pendingSendRef.current = null;
-                if (pending) finalizeSend(pending);
-              }}
-            >
-              {t('p2p.single_agent_prompt.send_anyway')}
-            </button>
-          </div>
-        </div>
-      </div>
-    )}
     <VoiceOverlay open={voiceOpen} onClose={() => setVoiceOpen(false)} onSend={handleVoiceSend} initialText={divRef.current?.textContent ?? ''} />
     {p2pConfigOpen && (
       <P2pConfigPanel
