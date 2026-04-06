@@ -128,6 +128,12 @@ function getDefaultThinkingLevel(agentType: string | undefined): TransportEffort
   return supportsEffort(agentType) ? DEFAULT_TRANSPORT_EFFORT : undefined;
 }
 
+function syncSubSessionIfNeeded(sessionName: string, serverLink: ServerLink): void {
+  if (!sessionName.startsWith('deck_sub_')) return;
+  const subId = sessionName.slice('deck_sub_'.length);
+  try { serverLink.send(buildSubSessionSync(subId)); } catch { /* ignore */ }
+}
+
 /**
  * For sandboxed agents (Gemini, Codex): copy files from ~/.imcodes/ to
  * the session's project .imc/refs/ so the agent can access them.
@@ -1156,6 +1162,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             updatedAt: Date.now(),
           });
           await handleGetSessions(serverLink);
+          syncSubSessionIfNeeded(sessionName, serverLink);
           timelineEmitter.emit(sessionName, 'user.message', { text });
           timelineEmitter.emit(sessionName, 'usage.update', {
             model: nextModel,
@@ -1188,6 +1195,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           updatedAt: Date.now(),
         });
         await handleGetSessions(serverLink);
+        syncSubSessionIfNeeded(sessionName, serverLink);
         timelineEmitter.emit(sessionName, 'user.message', { text });
         timelineEmitter.emit(sessionName, 'usage.update', { model: selectedModel, contextWindow: resolveContextWindow(undefined, selectedModel) }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'assistant.text', { text: `Switched model to ${selectedModel}`, streaming: false }, { source: 'daemon', confidence: 'high' });
@@ -1215,6 +1223,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           updatedAt: Date.now(),
         });
         await handleGetSessions(serverLink);
+        syncSubSessionIfNeeded(sessionName, serverLink);
         timelineEmitter.emit(sessionName, 'user.message', { text });
         timelineEmitter.emit(sessionName, 'usage.update', { model: nextModel, contextWindow: resolveContextWindow(undefined, nextModel) }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'assistant.text', { text: `Switched model to ${nextModel}`, streaming: false }, { source: 'daemon', confidence: 'high' });
@@ -1243,6 +1252,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           updatedAt: Date.now(),
         });
         await handleGetSessions(serverLink);
+        syncSubSessionIfNeeded(sessionName, serverLink);
         timelineEmitter.emit(sessionName, 'user.message', { text });
         timelineEmitter.emit(sessionName, 'assistant.text', {
           text: `Switched thinking level to ${nextEffort}`,

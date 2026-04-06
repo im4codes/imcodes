@@ -335,6 +335,96 @@ describe('sdk transport flow e2e', () => {
     expect(record?.modelDisplay).toBe('opus[1M]');
   });
 
+
+  it('syncs codex-sdk sub-session model changes back to the frontend', async () => {
+    const SUB = 'deck_sub_cxsdk_e2e';
+    mocks.store.set(SUB, {
+      name: SUB,
+      projectName: 'deck_sub_cxsdk_e2e',
+      role: 'w1',
+      label: 'Cx1',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/cxsdk-sub-e2e',
+      state: 'idle',
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: SUB,
+      parentSession: 'deck_parent_brain',
+      codexSessionId: 'thread-codex-e2e',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    await launchSession({
+      name: SUB,
+      projectName: 'deck_sub_cxsdk_e2e',
+      role: 'w1',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/cxsdk-sub-e2e',
+      label: 'Cx1',
+      fresh: false,
+      codexSessionId: 'thread-codex-e2e',
+      parentSession: 'deck_parent_brain',
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({ type: 'session.send', session: SUB, text: '/model gpt-5.4', commandId: 'cmd-cxsdk-sub-model' }, serverLink);
+    await flushAsync();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'subsession.sync',
+      id: 'cxsdk_e2e',
+      modelDisplay: 'gpt-5.4',
+      quotaLabel: expect.stringContaining('5h 11%'),
+    }));
+  });
+
+  it('syncs codex-sdk sub-session thinking changes back to the frontend', async () => {
+    const SUB = 'deck_sub_cxsdk_effort';
+    mocks.store.set(SUB, {
+      name: SUB,
+      projectName: 'deck_sub_cxsdk_effort',
+      role: 'w1',
+      label: 'Cx2',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/cxsdk-sub-e2e',
+      state: 'idle',
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: SUB,
+      parentSession: 'deck_parent_brain',
+      codexSessionId: 'thread-codex-e2e',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    await launchSession({
+      name: SUB,
+      projectName: 'deck_sub_cxsdk_effort',
+      role: 'w1',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/cxsdk-sub-e2e',
+      label: 'Cx2',
+      fresh: false,
+      codexSessionId: 'thread-codex-e2e',
+      parentSession: 'deck_parent_brain',
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({ type: 'session.send', session: SUB, text: '/thinking high', commandId: 'cmd-cxsdk-sub-thinking' }, serverLink);
+    await flushAsync();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'subsession.sync',
+      id: 'cxsdk_effort',
+      effort: 'high',
+    }));
+  });
+
   it('switches codex-sdk model through /model and updates display metadata', async () => {
     await launchSession({
       name: SESSION_CX,
