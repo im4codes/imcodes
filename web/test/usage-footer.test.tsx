@@ -14,6 +14,8 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.provider_plan_free') return 'Free';
       if (key === 'session.provider_plan_paid') return 'Paid';
       if (key === 'session.provider_plan_byo') return 'BYO';
+      if (key === 'session.codex_5h_short') return '5h';
+      if (key === 'session.codex_wk_short') return '7d';
       if (key === 'chat.thinking_running') return `thinking ${String(opts?.sec ?? '')}`;
       return key;
     },
@@ -30,19 +32,30 @@ vi.mock('../src/cost-tracker.js', () => ({
 import { UsageFooter } from '../src/components/UsageFooter.js';
 
 describe('UsageFooter', () => {
-  it('renders generic plan and quota badges with translated plan labels', () => {
+  it('renders inline codex quota text in the ctx footer', () => {
     render(
       <UsageFooter
-        usage={{ inputTokens: 2000, cacheTokens: 1000, contextWindow: 1_000_000, model: 'coder-model' }}
+        usage={{
+          inputTokens: 2000,
+          cacheTokens: 1000,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+          codexStatus: {
+            capturedAt: 1,
+            fiveHourLeftPercent: 43,
+            fiveHourResetAt: 'Apr 6 14:40',
+            weeklyLeftPercent: 34,
+            weeklyResetAt: 'Apr 8 15:48',
+          },
+        }}
         sessionName="deck_test_brain"
-        modelOverride="qwen3-coder-plus"
+        modelOverride="gpt-5"
         planLabel="Free"
-        quotaLabel="1,000/day"
-        quotaUsageLabel="today 12/1000 · 1m 1/60"
       />,
     );
 
-    // Plan/quota badges moved to SessionControls — UsageFooter only renders ctx bar + stats
-    expect(screen.getByText('qwen3-coder-plus')).toBeDefined();
+    expect(screen.getByText('gpt-5')).toBeDefined();
+    expect(screen.getByText(/5h 43% Apr 6 14:40/)).toBeDefined();
+    expect(screen.getByText(/7d 34% Apr 8 15:48/)).toBeDefined();
   });
 });

@@ -31,6 +31,11 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
+function formatCodexStatusPart(label: string, percent: number | undefined, reset: string | undefined): string | null {
+  if (percent === undefined) return null;
+  return `${label} ${percent}%${reset ? ` ${reset}` : ''}`;
+}
+
 export function UsageFooter({ usage, sessionName, modelOverride, planLabel, quotaLabel, quotaUsageLabel, showCost, activeThinkingTs, statusText, now }: Props) {
   const { t } = useTranslation();
 
@@ -68,8 +73,10 @@ export function UsageFooter({ usage, sessionName, modelOverride, planLabel, quot
   const weeklyCost = sessionCost > 0 ? getWeeklyCost() : 0;
   const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const modelLabel = shortModelLabel(displayModel);
-  const hasCodexStatus = usage.codexStatus?.fiveHourLeftPercent !== undefined
-    || usage.codexStatus?.weeklyLeftPercent !== undefined;
+  const codexStatusText = [
+    formatCodexStatusPart(t('session.codex_5h_short'), usage.codexStatus?.fiveHourLeftPercent, usage.codexStatus?.fiveHourResetAt),
+    formatCodexStatusPart(t('session.codex_wk_short'), usage.codexStatus?.weeklyLeftPercent, usage.codexStatus?.weeklyResetAt),
+  ].filter(Boolean).join(' · ');
 
   return (
     <div class="session-usage-footer" title={tip}>
@@ -77,35 +84,6 @@ export function UsageFooter({ usage, sessionName, modelOverride, planLabel, quot
         <div class="session-ctx-bar">
           <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
-        </div>
-      )}
-      {/* Plan/quota badges moved to SessionControls shortcuts row for compact inline display */}
-      {hasCodexStatus && (
-        <div class="session-usage-codex-row">
-          {usage.codexStatus?.fiveHourLeftPercent !== undefined && (
-            <span
-              class="session-usage-badge"
-              title={t('session.codex_limit_title', {
-                label: t('session.codex_5h_short'),
-                percent: usage.codexStatus.fiveHourLeftPercent,
-                reset: usage.codexStatus.fiveHourResetAt ?? '—',
-              })}
-            >
-              {t('session.codex_5h_short')} {usage.codexStatus.fiveHourLeftPercent}%
-            </span>
-          )}
-          {usage.codexStatus?.weeklyLeftPercent !== undefined && (
-            <span
-              class="session-usage-badge"
-              title={t('session.codex_limit_title', {
-                label: t('session.codex_wk_short'),
-                percent: usage.codexStatus.weeklyLeftPercent,
-                reset: usage.codexStatus.weeklyResetAt ?? '—',
-              })}
-            >
-              {t('session.codex_wk_short')} {usage.codexStatus.weeklyLeftPercent}%
-            </span>
-          )}
         </div>
       )}
       <div class="session-usage-stats">
@@ -117,9 +95,10 @@ export function UsageFooter({ usage, sessionName, modelOverride, planLabel, quot
               : statusText}
           </span>
         )}
-        <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' }}>
+        <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
           {modelLabel && <span class="session-usage-model">{modelLabel}</span>}
           {total > 0 && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}
+          {codexStatusText && <span class="session-usage-tokens">{codexStatusText}</span>}
           {sessionCost > 0 && (
             <span class="session-usage-cost">
               {formatCost(sessionCost)} · wk {formatCost(weeklyCost)} · mo {formatCost(monthlyCost)}
