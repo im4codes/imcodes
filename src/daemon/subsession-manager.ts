@@ -15,6 +15,7 @@ import { upsertSession, getSession, removeSession } from '../store/session-store
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { resolveStructuredSessionBootstrap } from '../agent/structured-session-bootstrap.js';
+import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 
 import logger from '../util/logger.js';
 import { getAgentVersion } from '../agent/agent-version.js';
@@ -40,6 +41,7 @@ export interface SubSessionRecord {
   ccInitPrompt?: string | null;
   /** Session description/persona — injected as background info on start and respawn. */
   description?: string | null;
+  effort?: TransportEffortLevel;
   fresh?: boolean;
   _fileSnapshot?: Set<string>;
   _onGeminiDiscovered?: (sessionId: string) => void;
@@ -89,6 +91,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
       ...(sub.providerSessionId ? { ccSessionId: sub.ccSessionId ?? undefined, codexSessionId: sub.codexSessionId ?? undefined, fresh: sub.fresh } : {}),
       ...(!sub.providerSessionId && agentType === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
       ...(!sub.providerSessionId && agentType === 'codex-sdk' ? { fresh: true } : {}),
+      ...(sub.effort ? { effort: sub.effort } : {}),
       userCreated: true,
       parentSession: sub.parentSession ?? undefined,
     });
@@ -211,6 +214,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     parentSession: sub.parentSession ?? undefined,
     ccPreset: sub.ccPreset ?? undefined,
     description: sub.description ?? undefined,
+    ...(sub.effort ? { effort: sub.effort } : {}),
     restarts: 0, restartTimestamps: [], createdAt: Date.now(), updatedAt: Date.now()
   });
 
@@ -283,18 +287,19 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
     if (isTransportAgent(sub.type)) {
       const existingRuntime = getTransportRuntime(sessionName);
       if (!existingRuntime) {
-        await launchTransportSession({
-          name: sessionName,
-          projectName: sessionName,
-          role: 'w1',
-          agentType: sub.type,
+      await launchTransportSession({
+        name: sessionName,
+        projectName: sessionName,
+        role: 'w1',
+        agentType: sub.type,
           projectDir: sub.cwd ?? process.cwd(),
-          description: sub.description ?? undefined,
-          label: sub.label ?? undefined,
-          bindExistingKey: sub.providerSessionId ?? undefined,
-          skipCreate: !!sub.providerSessionId,
-          parentSession: sub.parentSession ?? undefined,
-        }).catch((e) => logger.warn({ err: e, sessionName }, 'Failed to rebuild transport sub-session'));
+        description: sub.description ?? undefined,
+        label: sub.label ?? undefined,
+        bindExistingKey: sub.providerSessionId ?? undefined,
+        skipCreate: !!sub.providerSessionId,
+        parentSession: sub.parentSession ?? undefined,
+        effort: sub.effort ?? undefined,
+      }).catch((e) => logger.warn({ err: e, sessionName }, 'Failed to rebuild transport sub-session'));
       }
       continue;
     }
@@ -342,6 +347,7 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         geminiSessionId: effectiveGeminiSessionId ?? undefined,
         opencodeSessionId: effectiveOpenCodeSessionId ?? undefined,
         parentSession: sub.parentSession ?? stored?.parentSession,
+        effort: sub.effort ?? stored?.effort,
         // Preserve existing diagnostic fields instead of resetting
         restarts: stored?.restarts ?? 0,
         restartTimestamps: stored?.restartTimestamps ?? [],

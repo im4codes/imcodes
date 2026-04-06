@@ -11,6 +11,7 @@
  */
 
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
+import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 
 // Re-export shared types used by consumers of this module so they can import from one place.
 export type { AgentMessage, MessageDelta, ToolCallEvent };
@@ -74,6 +75,10 @@ export interface ProviderCapabilities {
   multiTurn: boolean;
   /** Provider can accept file/image attachments in send(). */
   attachments: boolean;
+  /** Provider supports configurable reasoning/thinking effort. */
+  reasoningEffort?: boolean;
+  /** Supported effort levels when reasoningEffort is true. */
+  supportedEffortLevels?: readonly TransportEffortLevel[];
 }
 
 /**
@@ -115,6 +120,8 @@ export interface SessionConfig {
   bindExistingKey?: string;
   /** Provider-specific durable conversation/session identifier used for resume. */
   resumeId?: string;
+  /** Reasoning/thinking effort for future turns. */
+  effort?: TransportEffortLevel;
   /** Skip the sessions.create RPC — session already exists on provider (auto-sync bind). */
   skipCreate?: boolean;
 }
@@ -167,6 +174,8 @@ export interface SessionInfoUpdate {
   quotaLabel?: string;
   /** Human-readable quota progress / reset label, if known. */
   quotaUsageLabel?: string;
+  /** Current reasoning/thinking effort, if known. */
+  effort?: TransportEffortLevel;
 }
 
 // ── TransportProvider interface ─────────────────────────────────────────────
@@ -302,6 +311,12 @@ export interface TransportProvider {
    * Used by local-sdk providers that apply model choice on each send.
    */
   setSessionAgentId?(sessionId: string, agentId: string): void;
+
+  /**
+   * Update provider-side reasoning/thinking effort for an existing session record.
+   * Used by local-sdk providers that apply the effort on subsequent turns.
+   */
+  setSessionEffort?(sessionId: string, effort: TransportEffortLevel): void;
 
   /**
    * Enumerate all remote sessions visible to this provider.

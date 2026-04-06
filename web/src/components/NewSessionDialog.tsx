@@ -4,6 +4,7 @@ import type { WsClient } from '../ws-client.js';
 import { FileBrowser } from './FileBrowser.js';
 import { getUserPref, saveUserPref } from '../api.js';
 import { sanitizeProjectName } from '@shared/sanitize-project-name.js';
+import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
 
 const DEFAULT_SHELL_KEY = 'default_shell';
 
@@ -30,6 +31,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
   const [error, setError] = useState('');
   const [starting, setStarting] = useState(false);
   const [showDirBrowser, setShowDirBrowser] = useState(false);
+  const [thinking, setThinking] = useState<TransportEffortLevel>('high');
   const [shells, setShells] = useState<string[]>([]);
   const [shellBin, setShellBin] = useState<string>('');
 
@@ -163,12 +165,13 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
         ocMode === 'bind'
           ? { ocMode: 'bind', ocSessionId: ocSelectedSession }
           : { ocMode: 'new', ocSessionKey: ocSessionKey.trim(), ocDescription: ocDescription.trim() };
-      ws.sendSessionCommand('start', { project: project.trim(), dir: dir.trim(), agentType, ...extra });
+      ws.sendSessionCommand('start', { project: project.trim(), dir: dir.trim(), agentType, ...extra, thinking });
     } else {
       ws.sendSessionCommand('start', {
         project: project.trim(), dir: dir.trim(), agentType,
         ...(ccPreset ? { ccPreset } : {}),
         ...(ccInitPrompt.trim() ? { ccInitPrompt: ccInitPrompt.trim() } : {}),
+        ...((agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'qwen') ? { thinking } : {}),
       });
     }
   };
@@ -180,6 +183,19 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
     agentType === 'claude-code-sdk'
     || agentType === 'codex-sdk'
   ) ? 'sdk' : null;
+  const thinkingLevels = agentType === 'claude-code-sdk'
+    ? CLAUDE_SDK_EFFORT_LEVELS
+    : agentType === 'codex-sdk'
+      ? CODEX_SDK_EFFORT_LEVELS
+      : agentType === 'qwen'
+        ? QWEN_EFFORT_LEVELS
+      : agentType === 'openclaw'
+        ? OPENCLAW_THINKING_LEVELS
+        : [];
+
+  useEffect(() => {
+    setThinking('high');
+  }, [agentType]);
 
   const handleKey = (e: KeyboardEvent) => {
     if (e.key === 'Escape' && !starting) onClose();
@@ -270,6 +286,22 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
             </div>
           )}
         </div>
+
+        {thinkingLevels.length > 0 && (
+          <div class="form-group">
+            <label>{t('session.thinking')}</label>
+            <select
+              value={thinking}
+              disabled={starting}
+              onChange={(e) => setThinking((e.target as HTMLSelectElement).value as TransportEffortLevel)}
+              style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#e2e8f0', padding: '8px 12px', borderRadius: 4, fontFamily: 'inherit' }}
+            >
+              {thinkingLevels.map((level) => (
+                <option key={level} value={level}>{level}</option>
+              ))}
+            </select>
+          </div>
+        )}
 
         {/* CC env preset selector + editor */}
         {agentType === 'claude-code' && (

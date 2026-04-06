@@ -74,6 +74,15 @@ const { QwenProvider } = await import('../../src/agent/providers/qwen.js');
 
 const flushAsync = () => new Promise<void>((r) => setTimeout(r, 50));
 
+async function waitForSpawn(index: number): Promise<MockChild> {
+  for (let i = 0; i < 10; i += 1) {
+    const child = spawnedChildren[index];
+    if (child) return child;
+    await flushAsync();
+  }
+  throw new Error(`Spawned child ${index} not found`);
+}
+
 describe('Qwen provider cancel', () => {
   let provider: InstanceType<typeof QwenProvider>;
 
@@ -96,10 +105,7 @@ describe('Qwen provider cancel', () => {
 
     // Start a send (don't await — it waits for process to finish)
     const sendPromise = provider.send(sessionId, 'hello').catch(() => {});
-    await vi.advanceTimersByTimeAsync(10);
-
-    const child = spawnedChildren[0];
-    expect(child).toBeDefined();
+    const child = await waitForSpawn(0);
 
     await provider.cancel(sessionId);
     expect(child.getSignals()).toContain('SIGTERM');
@@ -113,9 +119,7 @@ describe('Qwen provider cancel', () => {
     const sessionId = await provider.createSession({ sessionKey: 'test-2', cwd: '/tmp' });
 
     const sendPromise = provider.send(sessionId, 'hello').catch(() => {});
-    await vi.advanceTimersByTimeAsync(10);
-
-    const child = spawnedChildren[0];
+    const child = await waitForSpawn(0);
 
     await provider.cancel(sessionId);
     expect(child.getSignals()).toEqual(['SIGTERM']);
@@ -132,9 +136,7 @@ describe('Qwen provider cancel', () => {
     const sessionId = await provider.createSession({ sessionKey: 'test-3', cwd: '/tmp' });
 
     const sendPromise = provider.send(sessionId, 'hello').catch(() => {});
-    await vi.advanceTimersByTimeAsync(10);
-
-    const child = spawnedChildren[0];
+    const child = await waitForSpawn(0);
 
     await provider.cancel(sessionId);
     expect(child.getSignals()).toEqual(['SIGTERM']);
@@ -154,9 +156,7 @@ describe('Qwen provider cancel', () => {
 
     // First send — establishes session
     const sendPromise1 = provider.send(sessionId, 'first message').catch(() => {});
-    await vi.advanceTimersByTimeAsync(10);
-
-    const child1 = spawnedChildren[0];
+    const child1 = await waitForSpawn(0);
     // Simulate successful completion via stdout
     child1.stdout.emit('data', JSON.stringify({ type: 'system', subtype: 'session_start' }) + '\n');
     child1.stdout.emit('data', JSON.stringify({ type: 'result', result: 'done' }) + '\n');
@@ -166,18 +166,14 @@ describe('Qwen provider cancel', () => {
     // Session is now started — next send would normally use --resume
     // Now cancel
     const sendPromise2 = provider.send(sessionId, 'trigger loop').catch(() => {});
-    await vi.advanceTimersByTimeAsync(10);
-
-    const child2 = spawnedChildren[1];
+    const child2 = await waitForSpawn(1);
     await provider.cancel(sessionId);
     child2.exit(null, 'SIGTERM');
     await sendPromise2;
 
     // Next send should use --session-id (fresh) not --resume
     const sendPromise3 = provider.send(sessionId, 'after cancel').catch(() => {});
-    await vi.advanceTimersByTimeAsync(10);
-
-    const child3 = spawnedChildren[2];
+    const child3 = await waitForSpawn(2);
     const { spawn: spawnMock } = await import('node:child_process');
     const lastCall = vi.mocked(spawnMock).mock.calls[2];
     const args = lastCall[1] as string[];

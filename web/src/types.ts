@@ -49,6 +49,7 @@ export interface SessionInfo {
   permissionLabel?: string;
   quotaLabel?: string;
   quotaUsageLabel?: string;
+  effort?: import('../../shared/effort-levels.js').TransportEffortLevel;
 }
 
 export interface ServerInfo {

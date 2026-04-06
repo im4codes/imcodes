@@ -18,6 +18,7 @@ import {
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import logger from '../../util/logger.js';
+import { CODEX_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 
 const CODEX_BIN = 'codex';
 
@@ -38,6 +39,7 @@ interface CodexSdkSessionState {
   routeId: string;
   cwd: string;
   model?: string;
+  effort?: TransportEffortLevel;
   threadId?: string;
   loaded: boolean;
   runningTurnId?: string;
@@ -158,6 +160,8 @@ export class CodexSdkProvider implements TransportProvider {
     sessionRestore: true,
     multiTurn: true,
     attachments: false,
+    reasoningEffort: true,
+    supportedEffortLevels: CODEX_SDK_EFFORT_LEVELS,
   };
 
   private config: ProviderConfig | null = null;
@@ -205,6 +209,7 @@ export class CodexSdkProvider implements TransportProvider {
       routeId,
       cwd: config.cwd ?? existing?.cwd ?? process.cwd(),
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
+      effort: config.effort ?? existing?.effort,
       threadId: config.resumeId ?? existing?.threadId,
       loaded: false,
       runningTurnId: undefined,
@@ -214,7 +219,7 @@ export class CodexSdkProvider implements TransportProvider {
       cancelled: false,
       lastUsage: undefined,
     });
-    if (config.resumeId) this.emitSessionInfo(routeId, { resumeId: config.resumeId });
+    if (config.resumeId || config.effort) this.emitSessionInfo(routeId, { ...(config.resumeId ? { resumeId: config.resumeId } : {}), ...(config.effort ? { effort: config.effort } : {}) });
     return routeId;
   }
 
@@ -268,6 +273,13 @@ export class CodexSdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state) return;
     state.model = agentId;
+  }
+
+  setSessionEffort(sessionId: string, effort: TransportEffortLevel): void {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    state.effort = effort;
+    this.emitSessionInfo(sessionId, { effort });
   }
 
   async send(sessionId: string, message: string): Promise<void> {
@@ -339,6 +351,7 @@ export class CodexSdkProvider implements TransportProvider {
         cwd: state.cwd,
         approvalPolicy: 'never',
         ...(state.model ? { model: state.model } : {}),
+        ...(state.effort ? { effort: state.effort } : {}),
       });
       state.runningTurnId = result?.turn?.id;
     } catch (err) {

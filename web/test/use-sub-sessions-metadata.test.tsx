@@ -60,6 +60,7 @@ describe('sub-session metadata via subsession.created', () => {
       planLabel: 'Free',
       quotaLabel: '1,000/day',
       quotaUsageLabel: 'today 5/1000',
+      effort: 'medium',
     }));
 
     expect(captured).toHaveLength(1);
@@ -70,6 +71,7 @@ describe('sub-session metadata via subsession.created', () => {
     expect(s.planLabel).toBe('Free');
     expect(s.quotaLabel).toBe('1,000/day');
     expect(s.quotaUsageLabel).toBe('today 5/1000');
+    expect(s.effort).toBe('medium');
   });
 
   it('defaults metadata to null when not provided', async () => {
@@ -118,11 +120,13 @@ describe('sub-session metadata via subsession.sync', () => {
       modelDisplay: 'Qwen Turbo',
       planLabel: 'Paid',
       quotaUsageLabel: 'today 10/5000',
+      effort: 'high',
     }));
 
     expect(captured[0].modelDisplay).toBe('Qwen Turbo');
     expect(captured[0].planLabel).toBe('Paid');
     expect(captured[0].quotaUsageLabel).toBe('today 10/5000');
+    expect(captured[0].effort).toBe('high');
   });
 
   it('ignores sync for unknown id', async () => {

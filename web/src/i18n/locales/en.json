@@ -112,7 +112,9 @@
     "qwen_tier_byo": "BYO",
     "qwen_source_title": "Qwen source: {{tier}}",
     "qwen_model_title": "Qwen source: {{tier}} · Model: {{model}}",
-    "p2p_tag": "P2P"
+    "p2p_tag": "P2P",
+    "thinking": "Level",
+    "thinking_title": "Level: {{value}}"
   },
   "server": {
     "upgrade_daemon": "↑ Upgrade Daemon",

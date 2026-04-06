@@ -112,7 +112,9 @@
     "qwen_tier_byo": "自備金鑰",
     "qwen_source_title": "Qwen 來源：{{tier}}",
     "qwen_model_title": "Qwen 來源：{{tier}} · 模型：{{model}}",
-    "p2p_tag": "P2P"
+    "p2p_tag": "P2P",
+    "thinking": "等級",
+    "thinking_title": "等級：{{value}}"
   },
   "server": {
     "upgrade_daemon": "↑ 升級 Daemon",

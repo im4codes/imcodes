@@ -572,6 +572,7 @@ export interface SubSessionData {
   planLabel?: string | null;
   quotaLabel?: string | null;
   quotaUsageLabel?: string | null;
+  effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null;
 }
 
 export async function listSubSessions(serverId: string): Promise<SubSessionData[]> {

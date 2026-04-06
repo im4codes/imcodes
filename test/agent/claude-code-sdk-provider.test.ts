@@ -283,6 +283,24 @@ describe('ClaudeCodeSdkProvider', () => {
       },
     ]);
   });
+
+  it('applies thinking level to subsequent Claude SDK turns', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-think', model: 'claude-sonnet-4-6' },
+      { type: 'result', session_id: 'session-think', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-think', cwd: '/tmp/project', resumeId: 'session-think', effort: 'medium' });
+    provider.setSessionEffort('route-think', 'high');
+
+    await provider.send('route-think', 'hello');
+    await flush();
+
+    const run = sdkMock.runs.at(-1)!;
+    expect(run.options.effort).toBe('high');
+  });
 });
 
 type ToolEventSnapshot = { name: string; status: string; input: unknown; output?: unknown; detail?: unknown };

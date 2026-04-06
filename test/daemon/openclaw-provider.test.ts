@@ -119,6 +119,8 @@ describe('OpenClawProvider', () => {
       sessionRestore: true,
       multiTurn: true,
       attachments: false,
+      reasoningEffort: true,
+      supportedEffortLevels: ['off', 'minimal', 'low', 'medium', 'high', 'adaptive'],
     });
   });
 
@@ -221,6 +223,24 @@ describe('OpenClawProvider', () => {
   });
 
   // 4. send()
+
+  it('stores and patches the current thinking level', async () => {
+    await connectProvider(provider);
+
+    const infos: Array<Record<string, unknown>> = [];
+    provider.onSessionInfo?.((_sid, info) => infos.push(info as Record<string, unknown>));
+    provider.setSessionEffort('agent___main___sess-1', 'high');
+
+    const ws = lastWs();
+    const rpcFrame = JSON.parse(ws.sent[ws.sent.length - 1]);
+    expect(rpcFrame.method).toBe('sessions.patch');
+    expect(rpcFrame.params).toMatchObject({ key: 'agent:main:sess-1', thinkingLevel: 'high' });
+    expect(infos).toContainEqual({ effort: 'high' });
+
+    replyToLastRpc();
+    await Promise.resolve();
+  });
+
   describe('send()', () => {
     it('sends sessions.send RPC with correct params', async () => {
       await connectProvider(provider);

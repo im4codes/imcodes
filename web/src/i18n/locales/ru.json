@@ -112,7 +112,9 @@
     "qwen_tier_byo": "Свой ключ",
     "qwen_source_title": "Источник Qwen: {{tier}}",
     "qwen_model_title": "Источник Qwen: {{tier}} · Модель: {{model}}",
-    "p2p_tag": "P2P"
+    "p2p_tag": "P2P",
+    "thinking": "Уровень",
+    "thinking_title": "Уровень: {{value}}"
   },
   "server": {
     "upgrade_daemon": "↑ Обновить Daemon",

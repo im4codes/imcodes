@@ -4,6 +4,7 @@ import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate } from './transport-provider.js';
+import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 
 /**
  * Transport session runtime — manages a single conversation with a remote provider.
@@ -31,6 +32,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _sending = false;
   private _description: string | undefined;
   private _agentId: string | undefined;
+  private _effort: TransportEffortLevel | undefined;
   private _unsubscribes: Array<() => void> = [];
   private _onStatusChange?: (status: AgentStatus) => void;
 
@@ -107,6 +109,12 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.provider.setSessionAgentId?.(this._providerSessionId, agentId);
     }
   }
+  setEffort(effort: TransportEffortLevel): void {
+    this._effort = effort;
+    if (this._providerSessionId) {
+      this.provider.setSessionEffort?.(this._providerSessionId, effort);
+    }
+  }
 
   get providerSessionId(): string | null { return this._providerSessionId; }
   get sending(): boolean { return this._sending; }
@@ -117,6 +125,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._providerSessionId = await this.provider.createSession(config);
     this._description = config.description;
     this._agentId = config.agentId;
+    this._effort = config.effort;
   }
 
   /**

@@ -68,13 +68,15 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           onQuote={ctx.onQuote}
         />
       )}
-      {(lastUsage || activeThinkingTs || statusText) && (
+      {(lastUsage || activeThinkingTs || statusText || liveSub.planLabel || liveSub.quotaLabel || liveSub.quotaUsageLabel) && (
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sessionName}
           agentType={liveSub.type}
           modelOverride={modelDisplay ?? undefined}
-          quotaLabel={liveSub.type === 'codex' ? liveSub.quotaLabel : undefined}
+          planLabel={liveSub.planLabel}
+          quotaLabel={liveSub.quotaLabel}
+          quotaUsageLabel={(liveSub.type === 'codex' || liveSub.type === 'codex-sdk') ? undefined : liveSub.quotaUsageLabel}
           showCost={false}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}

@@ -269,4 +269,16 @@ describe('CodexSdkProvider', () => {
       },
     ]);
   });
+
+  it('applies thinking level to subsequent Codex SDK turns', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-think', cwd: '/tmp/project', effort: 'medium' });
+    provider.setSessionEffort('route-think', 'high');
+
+    await provider.send('route-think', 'hello');
+    const child = childProcessMock.children[0];
+    const turnStartReq = child.requests.find((req) => req.method === 'turn/start');
+    expect(turnStartReq?.params?.effort).toBe('high');
+  });
 });

@@ -1,3 +1,6 @@
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
@@ -16,6 +19,7 @@ import {
   PROVIDER_ERROR_CODES,
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
+import { DEFAULT_TRANSPORT_EFFORT, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import logger from '../../util/logger.js';
 import { inferContextWindow } from '../../util/model-context.js';
 
@@ -27,6 +31,9 @@ interface QwenSessionState {
   started: boolean;
   description?: string;
   model?: string;
+  effort: TransportEffortLevel;
+  settingsDir?: string;
+  settingsPath?: string;
   /** Internal Qwen CLI conversation ID — decoupled from provider session ID so cancel can start fresh. */
   qwenConversationId: string;
   child: ChildProcess | null;
@@ -38,6 +45,13 @@ interface QwenSessionState {
   toolUseByIndex: Map<number, { id: string; name: string; input?: unknown; partialJson: string }>;
   toolUseById: Map<string, { id: string; name: string; input?: unknown; partialJson: string }>;
   emittedToolSignatures: Map<string, string>;
+}
+
+function toQwenReasoning(effort: TransportEffortLevel): false | { effort: 'low' | 'medium' | 'high' } {
+  if (effort === 'off') return false;
+  if (effort === 'high') return { effort: 'high' };
+  if (effort === 'low') return { effort: 'low' };
+  return { effort: 'medium' };
 }
 
 interface QwenStreamEvent {
@@ -160,6 +174,8 @@ export class QwenProvider implements TransportProvider {
     sessionRestore: true,
     multiTurn: true,
     attachments: false,
+    reasoningEffort: true,
+    supportedEffortLevels: QWEN_EFFORT_LEVELS,
   };
 
   private config: ProviderConfig | null = null;
@@ -180,6 +196,7 @@ export class QwenProvider implements TransportProvider {
       if (state.child && !state.child.killed) {
         state.child.kill('SIGTERM');
       }
+      await this.cleanupSessionSettings(state);
       this.sessions.delete(sessionId);
     }
     this.config = null;
@@ -194,6 +211,9 @@ export class QwenProvider implements TransportProvider {
       started: !!(config.bindExistingKey || config.skipCreate || existing?.started),
       description: config.description ?? existing?.description,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
+      effort: config.effort ?? existing?.effort ?? DEFAULT_TRANSPORT_EFFORT,
+      settingsDir: existing?.settingsDir,
+      settingsPath: existing?.settingsPath,
       qwenConversationId: existing?.qwenConversationId ?? sessionId,
       child: existing?.child ?? null,
       currentMessageId: existing?.currentMessageId ?? null,
@@ -213,6 +233,7 @@ export class QwenProvider implements TransportProvider {
     if (state?.child && !state.child.killed) {
       state.child.kill('SIGTERM');
     }
+    if (state) await this.cleanupSessionSettings(state);
     this.sessions.delete(sessionId);
   }
 
@@ -251,6 +272,13 @@ export class QwenProvider implements TransportProvider {
     this.sessions.set(sessionId, state);
   }
 
+  async setSessionEffort(sessionId: string, effort: TransportEffortLevel): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    state.effort = effort;
+    await this.ensureSettingsPath(state);
+  }
+
   async send(sessionId: string, message: string, _attachments?: unknown[], extraSystemPrompt?: string): Promise<void> {
     if (!this.config) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Qwen provider not connected', false);
@@ -261,6 +289,9 @@ export class QwenProvider implements TransportProvider {
       started: true,
       description: undefined,
       model: undefined,
+      effort: DEFAULT_TRANSPORT_EFFORT,
+      settingsDir: undefined,
+      settingsPath: undefined,
       qwenConversationId: sessionId,
       child: null,
       currentMessageId: null,
@@ -309,6 +340,7 @@ export class QwenProvider implements TransportProvider {
       env: {
         ...process.env,
         ...((this.config.env as Record<string, string> | undefined) ?? {}),
+        QWEN_CODE_SYSTEM_SETTINGS_PATH: await this.ensureSettingsPath(state),
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: false,
@@ -590,5 +622,40 @@ export class QwenProvider implements TransportProvider {
 
   private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {
     return { code, message, recoverable, details };
+  }
+
+  private async ensureSettingsPath(state: QwenSessionState): Promise<string> {
+    if (!state.settingsDir) {
+      state.settingsDir = await mkdtemp(path.join(os.tmpdir(), 'imcodes-qwen-thinking-'));
+      state.settingsPath = path.join(state.settingsDir, 'settings.json');
+    }
+    const next = {
+      model: {
+        generationConfig: {
+          reasoning: toQwenReasoning(state.effort),
+        },
+      },
+    };
+    let current = '';
+    if (state.settingsPath) {
+      try {
+        current = await readFile(state.settingsPath, 'utf8');
+      } catch {}
+      const serialized = JSON.stringify(next);
+      if (current.trim() !== serialized) {
+        await writeFile(state.settingsPath, serialized, 'utf8');
+      }
+    }
+    return state.settingsPath!;
+  }
+
+  private async cleanupSessionSettings(state: QwenSessionState): Promise<void> {
+    if (!state.settingsDir) return;
+    const dir = state.settingsDir;
+    state.settingsDir = undefined;
+    state.settingsPath = undefined;
+    try {
+      await rm(dir, { recursive: true, force: true });
+    } catch {}
   }
 }

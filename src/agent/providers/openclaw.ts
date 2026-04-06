@@ -17,6 +17,7 @@ import type {
   ProviderCapabilities,
   ProviderError,
   RemoteSessionInfo,
+  SessionInfoUpdate,
 } from '../transport-provider.js';
 import {
   CONNECTION_MODES,
@@ -26,6 +27,7 @@ import {
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../../shared/agent-message.js';
 import logger from '../../util/logger.js';
 import { normalizeOpenClawDisplayName } from '../openclaw-display.js';
+import { OPENCLAW_THINKING_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 
 // ── Internal frame types ─────────────────────────────────────────────────────
 
@@ -93,6 +95,8 @@ export class OpenClawProvider implements TransportProvider {
     sessionRestore: true,
     multiTurn: true,
     attachments: false,
+    reasoningEffort: true,
+    supportedEffortLevels: OPENCLAW_THINKING_LEVELS,
   };
 
   // ── Private state ──────────────────────────────────────────────────────────
@@ -108,10 +112,12 @@ export class OpenClawProvider implements TransportProvider {
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
+  private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
 
   /** Accumulator: partial text per runId while streaming. */
   private runAccumulator = new Map<string, { sessionId: string; messageId: string; text: string }>();
   private toolStates = new Map<string, Map<string, OpenClawToolState>>();
+  private sessionThinking = new Map<string, TransportEffortLevel>();
 
   /** Reconnect state. */
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -149,17 +155,19 @@ export class OpenClawProvider implements TransportProvider {
     this.connected = false;
     this.runAccumulator.clear();
     this.toolStates.clear();
+    this.sessionThinking.clear();
     logger.info({ provider: this.id }, 'Disconnected from OpenClaw gateway');
   }
 
   async send(sessionId: string, message: string, _attachments?: unknown[], extraSystemPrompt?: string): Promise<void> {
     const ocKey = unsanitizeKey(sessionId);
+    const thinking = this.sessionThinking.get(sessionId) ?? 'off';
     try {
       // Prefer sessions.send (v2026.3.24+): auto canonicalKey, messageSeq, subagent reactivation
       await this.rpc('sessions.send', {
         key: ocKey,
         message,
-        thinking: 'off',
+        thinking,
         idempotencyKey: randomUUID(),
         ...(extraSystemPrompt ? { extraSystemPrompt } : {}),
       });
@@ -171,7 +179,7 @@ export class OpenClawProvider implements TransportProvider {
         sessionKey: ocKey,
         message,
         agentId: this.agentId,
-        thinking: 'off',
+        thinking,
         idempotencyKey: randomUUID(),
         ...(extraSystemPrompt ? { extraSystemPrompt } : {}),
       });
@@ -181,11 +189,12 @@ export class OpenClawProvider implements TransportProvider {
 
   async cancel(sessionId: string): Promise<void> {
     const ocKey = unsanitizeKey(sessionId);
+    const thinking = this.sessionThinking.get(sessionId) ?? 'off';
     try {
       await this.rpc('sessions.send', {
         key: ocKey,
         message: '/stop',
-        thinking: 'off',
+        thinking,
         idempotencyKey: randomUUID(),
       });
     } catch {
@@ -193,7 +202,7 @@ export class OpenClawProvider implements TransportProvider {
         sessionKey: ocKey,
         message: '/stop',
         agentId: this.agentId,
-        thinking: 'off',
+        thinking,
         idempotencyKey: randomUUID(),
       });
     }
@@ -216,6 +225,14 @@ export class OpenClawProvider implements TransportProvider {
 
   onToolCall(cb: (sessionId: string, tool: ToolCallEvent) => void): void {
     this.toolCallCallbacks.push(cb);
+  }
+
+  onSessionInfo(cb: (sessionId: string, info: SessionInfoUpdate) => void): () => void {
+    this.sessionInfoCallbacks.push(cb);
+    return () => {
+      const i = this.sessionInfoCallbacks.indexOf(cb);
+      if (i >= 0) this.sessionInfoCallbacks.splice(i, 1);
+    };
   }
 
   async createSession(config: SessionConfig): Promise<string> {
@@ -241,9 +258,30 @@ export class OpenClawProvider implements TransportProvider {
     const canonicalKey = config.bindExistingKey
       ? ocKey
       : `agent:${agentId}:${ocKey}`;
+    if (config.effort) {
+      const safeKey = sanitizeKey(canonicalKey);
+      this.sessionThinking.set(safeKey, config.effort);
+      this.emitSessionInfo(safeKey, { effort: config.effort });
+    }
     logger.info({ provider: this.id, sessionKey: ocKey, canonicalKey }, 'Session created');
     // Return sanitized key — all internal code sees `___` instead of `:`
     return sanitizeKey(canonicalKey);
+  }
+
+  setSessionEffort(sessionId: string, effort: TransportEffortLevel): void {
+    this.sessionThinking.set(sessionId, effort);
+    this.emitSessionInfo(sessionId, { effort });
+    const ocKey = unsanitizeKey(sessionId);
+    void this.rpc('sessions.patch', {
+      key: ocKey,
+      thinkingLevel: effort,
+    }).catch((err) => {
+      logger.warn({ provider: this.id, sessionId, effort, err: err instanceof Error ? err.message : String(err) }, 'Failed to patch OpenClaw thinking level');
+    });
+  }
+
+  private emitSessionInfo(sessionId: string, info: SessionInfoUpdate): void {
+    for (const cb of this.sessionInfoCallbacks) cb(sessionId, info);
   }
 
   async endSession(sessionId: string): Promise<void> {

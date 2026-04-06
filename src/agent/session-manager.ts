@@ -33,6 +33,7 @@ import { getQwenDisplayMetadata } from './provider-display.js';
 import { getQwenOAuthQuotaUsageLabel } from './provider-quota.js';
 import { getClaudeSdkRuntimeConfig } from './sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from './codex-runtime-config.js';
+import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
@@ -139,6 +140,8 @@ export interface ProjectConfig {
   extraEnv?: Record<string, string>;
   /** CC env preset name — persisted for respawn env injection. */
   ccPreset?: string;
+  /** Transport thinking level for supported main sessions. */
+  effort?: TransportEffortLevel;
 }
 
 export function getDriver(type: AgentType): AgentDriver {
@@ -160,9 +163,9 @@ export function sessionName(project: string, role: 'brain' | `w${number}`): stri
 
 /** Start all sessions for a project (brain + workers). */
 export async function startProject(config: ProjectConfig): Promise<void> {
-  const { name, dir, brainType, workerTypes, fresh, extraEnv, ccPreset, label } = config;
+  const { name, dir, brainType, workerTypes, fresh, extraEnv, ccPreset, label, effort } = config;
 
-  await launchSession({ name: sessionName(name, 'brain'), projectName: name, role: 'brain', agentType: brainType, projectDir: dir, fresh, extraEnv, ccPreset, label });
+  await launchSession({ name: sessionName(name, 'brain'), projectName: name, role: 'brain', agentType: brainType, projectDir: dir, fresh, extraEnv, ccPreset, label, effort });
 
   for (let i = 0; i < workerTypes.length; i++) {
     const role = `w${i + 1}` as `w${number}`;
@@ -715,6 +718,8 @@ export interface LaunchOpts {
   qwenModel?: string;
   /** Human-readable label for UI display. */
   label?: string;
+  /** Reasoning/thinking effort for supported transport providers. */
+  effort?: TransportEffortLevel;
   /** Session description for transport sessions (persona/system prompt injection). */
   description?: string;
   /** CC env preset name — resolved to env vars at launch, persisted for respawn. */
@@ -783,6 +788,11 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
 
     if (typeof info.quotaUsageLabel === 'string' && info.quotaUsageLabel && next.quotaUsageLabel !== info.quotaUsageLabel) {
       next.quotaUsageLabel = info.quotaUsageLabel;
+      changed = true;
+    }
+
+    if (typeof info.effort === 'string' && next.effort !== info.effort) {
+      next.effort = info.effort;
       changed = true;
     }
 
@@ -883,9 +893,11 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         description: s.description,
         agentId: effectiveQwenModel,
         resumeId,
+        effort: s.effort,
       });
       if (s.description) runtime.setDescription(s.description);
       if (effectiveQwenModel) runtime.setAgentId(effectiveQwenModel);
+      if (s.effort) runtime.setEffort(s.effort);
       transportRuntimes.set(s.name, runtime);
       const actualProviderSid = runtime.providerSessionId ?? effectiveSessionKey;
       registerProviderRoute(actualProviderSid, s.name);
@@ -986,6 +998,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     bindExistingKey: effectiveBindExistingKey,
     skipCreate: effectiveSkipCreate,
     resumeId: transportResumeId,
+    effort: opts.effort,
   });
 
   // Atomic: store runtime + register provider route + persist — rollback all on failure
@@ -1022,6 +1035,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
           quotaUsageLabel: qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
         }),
         ...(sdkDisplay ?? {}),
+        ...(opts.effort ? { effort: opts.effort } : {}),
         description,
         label,
         parentSession,

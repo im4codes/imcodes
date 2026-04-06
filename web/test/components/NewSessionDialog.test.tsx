@@ -49,13 +49,13 @@ describe('NewSessionDialog', () => {
 
   it('renders agent type selector', () => {
     render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
-    const select = screen.getByRole('combobox') as HTMLSelectElement;
+    const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     expect(select).toBeDefined();
   });
 
   it('agent type selector orders sdk agents before cli agents', () => {
     render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
-    const select = screen.getByRole('combobox') as HTMLSelectElement;
+    const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     const options = Array.from(select.options).map((o) => o.value);
     expect(options.slice(0, 4)).toEqual([
       'claude-code-sdk',
@@ -67,7 +67,7 @@ describe('NewSessionDialog', () => {
 
   it('defaults agent type to claude-code-sdk', () => {
     render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
-    const select = screen.getByRole('combobox') as HTMLSelectElement;
+    const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     expect(select.value).toBe('claude-code-sdk');
     expect(screen.getByText('agent_flavor_sdk')).toBeDefined();
   });
@@ -97,6 +97,7 @@ describe('NewSessionDialog', () => {
       project: 'my-app',
       dir: '~/projects/my-app',
       agentType: 'claude-code-sdk',
+      thinking: 'high',
     });
   });
 
@@ -128,7 +129,7 @@ describe('NewSessionDialog', () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
-    const select = screen.getByRole('combobox') as HTMLSelectElement;
+    const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     fireEvent.change(select, { target: { value: 'codex' } });
     expect(select.value).toBe('codex');
 
@@ -197,9 +198,43 @@ describe('NewSessionDialog', () => {
 
     expect(screen.getByText('agent_flavor_sdk')).toBeDefined();
 
-    const select = screen.getByRole('combobox') as HTMLSelectElement;
+    const select = screen.getAllByRole('combobox')[0] as HTMLSelectElement;
     fireEvent.change(select, { target: { value: 'claude-code' } });
 
     expect(screen.getByText('agent_flavor_cli')).toBeDefined();
+  });
+
+  it('includes thinking level when starting codex-sdk', () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    fireEvent.change(screen.getAllByRole('combobox')[0], { target: { value: 'codex-sdk' } });
+    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    fireEvent.change(selects[1], { target: { value: 'high' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'codex-sdk',
+      thinking: 'high',
+    }));
+  });
+
+  it('includes thinking level when starting qwen', () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    fireEvent.change(screen.getAllByRole('combobox')[0], { target: { value: 'qwen' } });
+    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    fireEvent.change(selects[1], { target: { value: 'high' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'qwen',
+      thinking: 'high',
+    }));
   });
 });

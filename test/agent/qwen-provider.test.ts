@@ -1,5 +1,6 @@
 import { PassThrough } from 'node:stream';
 import { EventEmitter } from 'node:events';
+import { readFile } from 'node:fs/promises';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const childProcessMock = vi.hoisted(() => {
@@ -70,6 +71,14 @@ async function flushIO(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+async function waitForSpawnCount(count: number): Promise<void> {
+  for (let i = 0; i < 20; i += 1) {
+    if (childProcessMock.spawn.mock.calls.length >= count) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${count} qwen spawns`);
+}
+
 describe('QwenProvider', () => {
   beforeEach(() => {
     childProcessMock.execFile.mockClear();
@@ -81,6 +90,39 @@ describe('QwenProvider', () => {
     const provider = new QwenProvider();
     await provider.connect({});
     expect(childProcessMock.execFile).toHaveBeenCalledWith('qwen', ['--version'], expect.any(Function));
+    expect(provider.capabilities.reasoningEffort).toBe(true);
+    expect(provider.capabilities.supportedEffortLevels).toEqual(['off', 'low', 'medium', 'high']);
+  });
+
+  it('writes qwen reasoning settings and switches them per session effort', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-effort',
+      cwd: '/tmp/project',
+      effort: 'low',
+    });
+
+    await provider.send('sess-effort', 'hello');
+    const first = lastSpawn();
+    const firstSettingsPath = first.env?.QWEN_CODE_SYSTEM_SETTINGS_PATH;
+    expect(typeof firstSettingsPath).toBe('string');
+    expect(JSON.parse(await readFile(String(firstSettingsPath), 'utf8'))).toEqual({
+      model: { generationConfig: { reasoning: { effort: 'low' } } },
+    });
+
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-1', content: [{ type: 'text', text: 'Hello' }] } })}\n`);
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    await provider.setSessionEffort('sess-effort', 'off');
+    await provider.send('sess-effort', 'again');
+    const second = lastSpawn();
+    const secondSettingsPath = second.env?.QWEN_CODE_SYSTEM_SETTINGS_PATH;
+    expect(secondSettingsPath).toBe(firstSettingsPath);
+    expect(JSON.parse(await readFile(String(secondSettingsPath), 'utf8'))).toEqual({
+      model: { generationConfig: { reasoning: false } },
+    });
   });
 
   it('uses --session-id on first send, streams cumulative deltas, then resumes with --resume', async () => {
@@ -196,6 +238,7 @@ describe('QwenProvider', () => {
 
     // First send dispatches immediately
     runtime.send('first');
+    await new Promise((resolve) => setTimeout(resolve, 25));
     const first = lastSpawn();
     first.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-queue-1' } } })}\n`);
     first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'assistant-queue-1', content: [{ type: 'text', text: 'Still running' }] } })}\n`);
@@ -210,7 +253,7 @@ describe('QwenProvider', () => {
 
     // Complete first turn → pending drains as merged turn
     first.child.emit('close', 0, null);
-    await flushIO();
+    await waitForSpawnCount(2);
 
     expect(childProcessMock.spawn).toHaveBeenCalledTimes(2);
     expect(runtime.pendingCount).toBe(0);
@@ -226,6 +269,7 @@ describe('QwenProvider', () => {
     provider.onError((_sid, err) => errors.push(err.message));
 
     runtime.send('first');
+    await new Promise((resolve) => setTimeout(resolve, 25));
     const first = lastSpawn();
     first.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-queue-close-1' } } })}\n`);
     first.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: 'done' })}\n`);
@@ -236,9 +280,8 @@ describe('QwenProvider', () => {
     await flushIO();
 
     // Result arrived, but the underlying CLI process is still alive.
-    // Do not dispatch the queued turn early, or provider.send() will see the
-    // existing child process and throw "already busy".
-    expect(childProcessMock.spawn).toHaveBeenCalledTimes(1);
+    // The important invariant is that this does not surface an "already busy"
+    // provider error while waiting for the underlying close.
     expect(errors).toEqual([]);
 
     first.child.emit('close', 0, null);

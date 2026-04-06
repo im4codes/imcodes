@@ -26,6 +26,7 @@ export interface SessionListItem {
   permissionLabel?: string;
   quotaLabel?: string;
   quotaUsageLabel?: string;
+  effort?: import('../../shared/effort-levels.js').TransportEffortLevel;
   description?: string;
   label?: string;
 }
@@ -51,6 +52,7 @@ function baseItem(s: SessionRecord): SessionListItem {
     permissionLabel: s.permissionLabel,
     quotaLabel: s.quotaLabel,
     quotaUsageLabel: s.quotaUsageLabel,
+    effort: s.effort,
     description: s.description,
     label: s.label,
   };

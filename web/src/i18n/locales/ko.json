@@ -112,7 +112,9 @@
     "qwen_tier_byo": "자체 키",
     "qwen_source_title": "Qwen 소스: {{tier}}",
     "qwen_model_title": "Qwen 소스: {{tier}} · 모델: {{model}}",
-    "p2p_tag": "P2P"
+    "p2p_tag": "P2P",
+    "thinking": "레벨",
+    "thinking_title": "레벨: {{value}}"
   },
   "server": {
     "upgrade_daemon": "↑ Daemon 업그레이드",

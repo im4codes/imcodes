@@ -354,6 +354,11 @@ export async function startup(): Promise<DaemonContext> {
             parentSession: session.parentSession ?? null,
             ccPresetId: session.ccPreset ?? null,
             description: session.description ?? null,
+            modelDisplay: session.modelDisplay ?? null,
+            planLabel: session.planLabel ?? null,
+            quotaLabel: session.quotaLabel ?? null,
+            quotaUsageLabel: session.quotaUsageLabel ?? null,
+            effort: session.effort ?? null,
           });
         } catch { /* ignore */ }
       }

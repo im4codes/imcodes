@@ -18,6 +18,7 @@ import {
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import logger from '../../util/logger.js';
+import { CLAUDE_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 
 const CLAUDE_BIN = 'claude';
 const DEFAULT_PERMISSION_MODE: PermissionMode = 'bypassPermissions';
@@ -29,6 +30,7 @@ interface ClaudeSdkSessionState {
   model?: string;
   description?: string;
   permissionMode: PermissionMode;
+  effort?: TransportEffortLevel;
   started: boolean;
   resumeId: string;
   currentMessageId: string | null;
@@ -75,6 +77,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     sessionRestore: true,
     multiTurn: true,
     attachments: false,
+    reasoningEffort: true,
+    supportedEffortLevels: CLAUDE_SDK_EFFORT_LEVELS,
   };
 
   private config: ProviderConfig | null = null;
@@ -118,6 +122,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
       description: config.description ?? existing?.description,
       permissionMode: this.resolvePermissionMode(),
+      effort: config.effort ?? existing?.effort,
       started: !!(config.resumeId && config.skipCreate),
       resumeId,
       currentMessageId: existing?.currentMessageId ?? null,
@@ -130,7 +135,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       toolCalls: new Map(),
       emittedToolStates: new Map(),
     });
-    this.emitSessionInfo(routeId, { resumeId });
+    this.emitSessionInfo(routeId, { resumeId, ...(config.effort ? { effort: config.effort } : {}) });
     return routeId;
   }
 
@@ -184,6 +189,13 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     state.model = agentId;
   }
 
+  setSessionEffort(sessionId: string, effort: TransportEffortLevel): void {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    state.effort = effort;
+    this.emitSessionInfo(sessionId, { effort });
+  }
+
   async send(sessionId: string, message: string, _attachments?: unknown[], extraSystemPrompt?: string): Promise<void> {
     if (!this.config) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Claude Code SDK provider not connected', false);
@@ -213,6 +225,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       includePartialMessages: true,
       ...(state.started ? { resume: state.resumeId } : { sessionId: state.resumeId }),
       ...(state.model ? { model: state.model } : {}),
+      ...(state.effort ? { effort: state.effort } : {}),
       ...(extraSystemPrompt ? { appendSystemPrompt: extraSystemPrompt } : {}),
     };
 

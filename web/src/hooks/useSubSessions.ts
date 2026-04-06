@@ -94,6 +94,7 @@ export function useSubSessions(
       parentSession: s.parentSession,
       label: s.label,
       ccPresetId: s.ccPresetId,
+      effort: s.effort,
     })));
   }, [connected, ws, subSessions]);
 
@@ -126,6 +127,7 @@ export function useSubSessions(
                 ...(m.planLabel != null && { planLabel: m.planLabel }),
                 ...(m.quotaLabel != null && { quotaLabel: m.quotaLabel }),
                 ...(m.quotaUsageLabel != null && { quotaUsageLabel: m.quotaUsageLabel }),
+                ...(m.effort != null && { effort: m.effort }),
                 ...(m.qwenModel != null && { qwenModel: m.qwenModel }),
                 ...(m.qwenAuthType != null && { qwenAuthType: m.qwenAuthType }),
                 ...(m.qwenAvailableModels != null && { qwenAvailableModels: m.qwenAvailableModels }),
@@ -155,6 +157,7 @@ export function useSubSessions(
               planLabel: m.planLabel ?? null,
               quotaLabel: m.quotaLabel ?? null,
               quotaUsageLabel: m.quotaUsageLabel ?? null,
+              effort: m.effort ?? null,
             }];
           });
         }
@@ -185,6 +188,7 @@ export function useSubSessions(
               ...(m.planLabel !== undefined ? { planLabel: m.planLabel } : {}),
               ...(m.quotaLabel !== undefined ? { quotaLabel: m.quotaLabel } : {}),
               ...(m.quotaUsageLabel !== undefined ? { quotaUsageLabel: m.quotaUsageLabel } : {}),
+              ...(m.effort !== undefined ? { effort: m.effort } : {}),
             };
           }));
         }
@@ -252,6 +256,7 @@ export function useSubSessions(
         runtimeType: res.subSession.runtimeType ?? (type === 'openclaw' || type === 'qwen' ? 'transport' : 'process'),
         providerId: res.subSession.providerId ?? (type === 'openclaw' || type === 'qwen' ? type : null),
         state: 'starting',
+        effort: (extra?.thinking as SubSession['effort'] | undefined) ?? res.subSession.effort ?? null,
       };
       setSubSessions((prev) => [...prev, sub]);
       // Ask daemon to start it — transport providers may need extra fields
@@ -264,7 +269,7 @@ export function useSubSessions(
           parentSession: activeSession,
           ...extra,
         });
-      } else if (extra?.ccPreset || extra?.ccInitPrompt) {
+      } else if (extra?.ccPreset || extra?.ccInitPrompt || extra?.thinking) {
         // CC with preset — send as raw message to include extra fields
         ws?.send({
           type: 'subsession.start',

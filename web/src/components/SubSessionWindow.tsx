@@ -159,6 +159,7 @@ export function SubSessionWindow({
     planLabel: sub.planLabel ?? undefined,
     quotaLabel: sub.quotaLabel ?? undefined,
     quotaUsageLabel: sub.quotaUsageLabel ?? undefined,
+    effort: sub.effort ?? undefined,
     runtimeType: sub.runtimeType ?? undefined,
   };
 
@@ -406,7 +407,7 @@ export function SubSessionWindow({
           modelOverride={sessionInfo?.modelDisplay ?? (sessionInfo?.agentType === 'qwen' ? sessionInfo?.qwenModel : undefined)}
           planLabel={sessionInfo?.planLabel}
           quotaLabel={sessionInfo?.quotaLabel}
-          quotaUsageLabel={sessionInfo?.agentType === 'codex' ? undefined : sessionInfo?.quotaUsageLabel}
+          quotaUsageLabel={(sessionInfo?.agentType === 'codex' || sessionInfo?.agentType === 'codex-sdk') ? undefined : sessionInfo?.quotaUsageLabel}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}

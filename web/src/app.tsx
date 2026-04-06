@@ -1084,6 +1084,7 @@ export function App() {
             planLabel: s.planLabel,
             quotaLabel: s.quotaLabel,
             quotaUsageLabel: s.quotaUsageLabel,
+            effort: s.effort ?? existing?.effort,
           };
         }));
         setSessionsLoaded(true);

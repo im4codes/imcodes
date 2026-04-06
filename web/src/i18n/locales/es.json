@@ -112,7 +112,9 @@
     "qwen_tier_byo": "Propia clave",
     "qwen_source_title": "Origen de Qwen: {{tier}}",
     "qwen_model_title": "Origen de Qwen: {{tier}} · Modelo: {{model}}",
-    "p2p_tag": "P2P"
+    "p2p_tag": "P2P",
+    "thinking": "Nivel",
+    "thinking_title": "Nivel: {{value}}"
   },
   "server": {
     "upgrade_daemon": "↑ Actualizar Daemon",

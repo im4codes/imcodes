@@ -317,6 +317,24 @@ describe('sdk transport flow e2e', () => {
     expect(usage?.payload.contextWindow).toBe(200000);
   });
 
+  it('accepts /model opus as an alias for opus[1M] on claude-code-sdk', async () => {
+    await launchSession({
+      name: SESSION_CC,
+      projectName: 'ccsdk',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/ccsdk-e2e',
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({ type: 'session.send', session: SESSION_CC, text: '/model opus', commandId: 'cmd-ccsdk-model-opus' }, serverLink);
+    await flushAsync();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const record = mocks.store.get(SESSION_CC);
+    expect(record?.modelDisplay).toBe('opus[1M]');
+  });
+
   it('switches codex-sdk model through /model and updates display metadata', async () => {
     await launchSession({
       name: SESSION_CX,
