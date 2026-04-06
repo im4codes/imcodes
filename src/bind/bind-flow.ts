@@ -1,15 +1,11 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync as existsSyncFs } from 'fs';
-import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
+import { join } from 'path';
 import { homedir, hostname } from 'os';
 import { execSync } from 'child_process';
 import logger from '../util/logger.js';
 import { BACKEND } from '../agent/tmux.js';
 import { restartWindowsDaemon } from '../util/windows-daemon.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
 
 const CREDS_DIR = join(homedir(), '.imcodes');
 const CREDS_PATH = join(CREDS_DIR, 'server.json');

@@ -202,7 +202,6 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
         status: 'done' | 'active' | 'pending' | 'skipped';
       };
       const nodes: NodeInfo[] = [];
-      const skippedSet = new Set(run.skippedHops);
       const getInfo = (s: string, mode: string, phase: 'initial' | 'hop' | 'summary') => {
         const r = getSession(s);
         const label = r?.label || shortName(s);

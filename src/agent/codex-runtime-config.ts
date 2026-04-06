@@ -110,7 +110,6 @@ async function readCodexRateLimitsViaAppServer(): Promise<RateLimitSnapshot | un
 
     let settled = false;
     let stdoutBuffer = '';
-    let stderrBuffer = '';
     let initialized = false;
     const requestId = 2;
 
@@ -125,7 +124,6 @@ async function readCodexRateLimitsViaAppServer(): Promise<RateLimitSnapshot | un
     const timeout = setTimeout(() => finish(undefined), APP_SERVER_TIMEOUT_MS);
 
     child.on('error', () => finish(undefined));
-    child.stderr.on('data', (chunk) => { stderrBuffer += chunk.toString('utf8'); });
     child.stdout.on('data', (chunk) => {
       stdoutBuffer += chunk.toString('utf8');
       while (true) {

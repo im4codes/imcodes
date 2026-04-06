@@ -28,7 +28,7 @@ import { exec as execCb } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget } from './p2p-orchestrator.js';
-import { getP2pMode, getComboRoundCount, parseModePipeline, P2P_CONFIG_MODE, type P2pSessionConfig } from '../../shared/p2p-modes.js';
+import { getComboRoundCount, parseModePipeline, P2P_CONFIG_MODE, type P2pSessionConfig } from '../../shared/p2p-modes.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
 import { executeCronJob } from './cron-executor.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
@@ -40,7 +40,7 @@ import { buildWindowsCleanupScript, buildWindowsUpgradeBatch } from '../util/win
 import { UPGRADE_LOCK_FILE } from '../util/windows-launch-artifacts.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { sanitizeProjectName } from '../../shared/sanitize-project-name.js';
-import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
+import { CODEX_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
 import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
@@ -2102,8 +2102,6 @@ async function handleDaemonUpgrade(targetVersion?: string): Promise<void> {
   const scriptDir = mkdtempSync(join(tmpdir(), 'imcodes-upgrade-'));
   const logFile = join(scriptDir, 'upgrade.log');
   const scriptPath = join(scriptDir, 'upgrade.sh');
-  const cliEntry = process.argv[1] || join(process.cwd(), 'dist', 'src', 'index.js');
-
   // Build the platform-specific restart command.
   // We always restart regardless of whether npm install succeeded, so the daemon
   // is never left permanently dead.
@@ -2230,7 +2228,6 @@ sleep 60 && rm -rf "${scriptDir}" &
 
 // ── File system browser ────────────────────────────────────────────────────
 
-const UPLOAD_DIR = nodePath.join(homedir(), '.imcodes', 'uploads');
 // On Windows, don't restrict paths — projects commonly live on any drive (D:\code, etc.)
 // The daemon runs as the user, so OS-level permissions are the real security boundary.
 // Deny-list: block access to sensitive directories regardless of platform.
