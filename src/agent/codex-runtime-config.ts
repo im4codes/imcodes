@@ -66,31 +66,38 @@ function formatPercent(value: number | undefined): string | undefined {
   return `${Math.max(0, Math.min(100, Math.round(value)))}%`;
 }
 
-function formatResetTime(epochSeconds: number | undefined): string | undefined {
+function formatRemainingTime(epochSeconds: number | undefined, nowMs = Date.now()): string | undefined {
+  if (typeof epochSeconds !== 'number' || !Number.isFinite(epochSeconds)) return undefined;
+  const diffMs = Math.max(0, epochSeconds * 1000 - nowMs);
+  const totalMinutes = Math.floor(diffMs / 60_000);
+  const days = Math.floor(totalMinutes / (60 * 24));
+  const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days}d${String(hours).padStart(2, '0')}h`;
+  if (hours > 0) return `${hours}h${String(minutes).padStart(2, '0')}m`;
+  return `${minutes}m`;
+}
+
+function formatResetDateTime(epochSeconds: number | undefined): string | undefined {
   if (typeof epochSeconds !== 'number' || !Number.isFinite(epochSeconds)) return undefined;
   const date = new Date(epochSeconds * 1000);
   if (Number.isNaN(date.getTime())) return undefined;
-  const month = date.toLocaleString('en-US', { month: 'short' });
+  const month = date.getMonth() + 1;
   const day = date.getDate();
   const hh = String(date.getHours()).padStart(2, '0');
   const mm = String(date.getMinutes()).padStart(2, '0');
-  return `${month} ${day} ${hh}:${mm}`;
+  return `${month}/${day} ${hh}:${mm}`;
 }
 
-function buildQuotaDisplay(snapshot: RateLimitSnapshot | null | undefined): Pick<CodexRuntimeConfig, 'quotaLabel' | 'quotaUsageLabel'> {
+function buildQuotaDisplay(snapshot: RateLimitSnapshot | null | undefined): Pick<CodexRuntimeConfig, 'quotaLabel'> {
   const primary = snapshot?.primary ?? undefined;
   const secondary = snapshot?.secondary ?? undefined;
   const quotaParts = [
-    primary ? `5h ${formatPercent(primary.usedPercent) ?? '—'}` : null,
-    secondary ? `7d ${formatPercent(secondary.usedPercent) ?? '—'}` : null,
-  ].filter((value): value is string => !!value);
-  const resetParts = [
-    primary?.resetsAt ? `5h reset ${formatResetTime(primary.resetsAt)}` : null,
-    secondary?.resetsAt ? `7d reset ${formatResetTime(secondary.resetsAt)}` : null,
+    primary ? `5h ${formatPercent(primary.usedPercent) ?? '—'}${primary?.resetsAt ? ` ${formatRemainingTime(primary.resetsAt)} ${formatResetDateTime(primary.resetsAt)}` : ''}` : null,
+    secondary ? `7d ${formatPercent(secondary.usedPercent) ?? '—'}${secondary?.resetsAt ? ` ${formatRemainingTime(secondary.resetsAt)} ${formatResetDateTime(secondary.resetsAt)}` : ''}` : null,
   ].filter((value): value is string => !!value);
   return {
     ...(quotaParts.length ? { quotaLabel: quotaParts.join(' · ') } : {}),
-    ...(resetParts.length ? { quotaUsageLabel: resetParts.join(' · ') } : {}),
   };
 }
 
