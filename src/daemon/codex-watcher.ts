@@ -108,8 +108,12 @@ async function findLatestRollout(
 ): Promise<string | null> {
   let entries: string[];
   try { entries = await readdir(dir); } catch { return null; }
-  const rollouts = entries.filter((e) => e.startsWith('rollout-') && e.endsWith('.jsonl')).sort().reverse();
-  for (const name of rollouts) {
+
+  let latestPath: string | null = null;
+  let latestMtime = -1;
+
+  for (const name of entries) {
+    if (!name.startsWith('rollout-') || !name.endsWith('.jsonl')) continue;
     const fpath = join(dir, name);
     if (excludeClaimed) {
       const owner = claimedFiles.get(fpath);
@@ -121,9 +125,18 @@ async function findLatestRollout(
       if (candidateUuid !== requiredUuid) continue;
     }
     const cwd = await readCwd(fpath);
-    if (cwd && normalizePath(cwd) === normalizePath(workDir)) return fpath;
+    if (!cwd || normalizePath(cwd) !== normalizePath(workDir)) continue;
+    try {
+      const s = await stat(fpath);
+      if (s.mtimeMs > latestMtime) {
+        latestMtime = s.mtimeMs;
+        latestPath = fpath;
+      }
+    } catch {
+      continue;
+    }
   }
-  return null;
+  return latestPath;
 }
 
 async function findLatestMatchingRollout(sessionName: string, projectDir: string, currentUuid: string | null, currentPath: string | null): Promise<string | null> {
