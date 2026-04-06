@@ -32,13 +32,6 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-function hasAllPermissions(agentType?: string | null): boolean {
-  return agentType === 'claude-code'
-    || agentType === 'claude-code-sdk'
-    || agentType === 'codex'
-    || agentType === 'codex-sdk';
-}
-
 export function UsageFooter({ usage, sessionName, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, showCost, activeThinkingTs, statusText, now }: Props) {
   const { t } = useTranslation();
 
@@ -78,7 +71,6 @@ export function UsageFooter({ usage, sessionName, agentType, modelOverride, plan
   const codexQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk')
     ? (quotaLabel ?? '').split(' · ').filter(Boolean)
     : [];
-  const permissionText = hasAllPermissions(agentType) ? t('session.permissions_all') : null;
 
   return (
     <div class="session-usage-footer" title={tip} data-agent-type={agentType ?? undefined}>
@@ -107,7 +99,6 @@ export function UsageFooter({ usage, sessionName, agentType, modelOverride, plan
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
           {modelLabel && <span class="session-usage-model">{modelLabel}</span>}
           {total > 0 && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}
-          {permissionText && <span class="session-usage-tokens">{permissionText}</span>}
           {inlineQuotaText && codexQuotaLines.length === 0 && <span class="session-usage-tokens">{inlineQuotaText}</span>}
           {sessionCost > 0 && (
             <span class="session-usage-cost">

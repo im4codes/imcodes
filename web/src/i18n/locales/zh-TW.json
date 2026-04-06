@@ -107,8 +107,7 @@
     "qwen_tier_byo": "自備金鑰",
     "qwen_source_title": "Qwen 來源：{{tier}}",
     "qwen_model_title": "Qwen 來源：{{tier}} · 模型：{{model}}",
-    "p2p_tag": "P2P",
-    "permissions_all": "全權限"
+    "p2p_tag": "P2P"
   },
   "server": {
     "upgrade_daemon": "↑ 升級 Daemon",

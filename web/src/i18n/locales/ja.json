@@ -107,8 +107,7 @@
     "qwen_tier_byo": "自前キー",
     "qwen_source_title": "Qwen ソース: {{tier}}",
     "qwen_model_title": "Qwen ソース: {{tier}} · モデル: {{model}}",
-    "p2p_tag": "P2P",
-    "permissions_all": "全権限"
+    "p2p_tag": "P2P"
   },
   "server": {
     "upgrade_daemon": "↑ Daemonをアップグレード",

@@ -86,4 +86,55 @@ describe('ChatView tool payload formatting', () => {
     expect(screen.getByText('web_search')).toBeDefined();
     expect(screen.queryByText('{}')).toBeNull();
   });
+
+  it('renders transport Codex tool calls alongside streaming assistant text', () => {
+    const events = [
+      makeEvent({
+        eventId: 'transport:test:msg-1',
+        type: 'assistant.text',
+        payload: { text: 'Running `pwd`', streaming: true },
+      }),
+      makeEvent({
+        eventId: 'transport-tool:test:call-1:call',
+        type: 'tool.call',
+        payload: { tool: 'Bash', input: { command: '/usr/bin/bash -lc pwd' } },
+      }),
+      makeEvent({
+        eventId: 'transport-tool:test:call-1:result',
+        type: 'tool.result',
+        payload: { output: '/tmp/project\n' },
+      }),
+      makeEvent({
+        eventId: 'transport:test:msg-2',
+        type: 'assistant.text',
+        payload: { text: '/tmp/project', streaming: false },
+      }),
+    ];
+
+    render(<ChatView events={events} loading={false} />);
+
+    expect(screen.getByText('Bash')).toBeDefined();
+    expect(screen.getByText(/\/usr\/bin\/bash -lc pwd/)).toBeDefined();
+    expect(screen.getAllByText('/tmp/project').length).toBeGreaterThan(0);
+  });
+
+  it('renders Claude-style merged tool rows when tool.call is followed by tool.result', () => {
+    const events = [
+      makeEvent({
+        eventId: 'transport-tool:test:read-1:call',
+        type: 'tool.call',
+        payload: { tool: 'Read', input: { file_path: 'package.json' } },
+      }),
+      makeEvent({
+        eventId: 'transport-tool:test:read-1:result',
+        type: 'tool.result',
+        payload: {},
+      }),
+    ];
+
+    render(<ChatView events={events} loading={false} />);
+
+    expect(screen.getByText('Read')).toBeDefined();
+    expect(screen.getByText(/package\.json/)).toBeDefined();
+  });
 });

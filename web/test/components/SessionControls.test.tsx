@@ -228,14 +228,6 @@ describe('SessionControls', () => {
     expect(screen.queryByText(/qwen3-max-2026-01-23/)).toBeNull();
   });
 
-  it('shows all-permissions badge for claude-code-sdk sessions', () => {
-    render(<SessionControls
-      ws={makeWs() as any}
-      activeSession={makeSession({ agentType: 'claude-code-sdk' })}
-      quickData={makeQuickData() as any}
-    />);
-    expect(screen.getByText('permissions_all')).toBeDefined();
-  });
 
   it('sends message to running transport session without blocking (queuing is daemon-side)', () => {
     const ws = makeWs();
