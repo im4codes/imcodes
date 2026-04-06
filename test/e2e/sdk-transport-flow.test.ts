@@ -401,7 +401,9 @@ describe('sdk transport flow e2e', () => {
     expect(final?.opts?.eventId).toBe(stableEventId);
     expect(usage?.payload.model).toBe('claude-sonnet-4-6');
     expect(toolCall?.payload.tool).toBe('Read');
-    expect(toolResult?.payload).toEqual({});
+    expect(toolResult?.payload).toEqual(expect.objectContaining({
+      detail: expect.objectContaining({ kind: 'tool_use_complete' }),
+    }));
     expect(claudeCall?.options.env).toMatchObject({ ANTHROPIC_BASE_URL: 'https://example.invalid' });
     expect(ack?.payload.status).toBe('accepted');
   });
