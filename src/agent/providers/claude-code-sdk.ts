@@ -19,6 +19,7 @@ import {
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import logger from '../../util/logger.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
+import { normalizeTransportCwd } from '../transport-paths.js';
 
 const CLAUDE_BIN = 'claude';
 const DEFAULT_PERMISSION_MODE: PermissionMode = 'bypassPermissions';
@@ -117,7 +118,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     const resumeId = config.resumeId ?? existing?.resumeId ?? routeId;
     this.sessions.set(routeId, {
       routeId,
-      cwd: config.cwd ?? existing?.cwd ?? process.cwd(),
+      cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       env: config.env ?? existing?.env,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
       description: config.description ?? existing?.description,

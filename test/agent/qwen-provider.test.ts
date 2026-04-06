@@ -170,6 +170,27 @@ describe('QwenProvider', () => {
     expect(second.args).not.toContain('--session-id');
   });
 
+  it('normalizes Windows cwd before spawning qwen', async () => {
+    const origPlatform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+
+    try {
+      const provider = new QwenProvider();
+      await provider.connect({});
+      await provider.createSession({
+        sessionKey: 'sess-win',
+        cwd: 'C:\\Users\\admin\\project',
+      });
+
+      await provider.send('sess-win', 'hello');
+      const run = lastSpawn();
+      expect(run.cwd).toBe('C:/Users/admin/project');
+      expect(run.cwd).not.toContain('\\');
+    } finally {
+      Object.defineProperty(process, 'platform', { value: origPlatform });
+    }
+  });
+
   it('keeps the streaming message id for final completion when qwen emits a different assistant id', async () => {
     const provider = new QwenProvider();
     await provider.connect({});

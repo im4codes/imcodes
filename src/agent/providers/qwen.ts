@@ -22,6 +22,7 @@ import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.j
 import { DEFAULT_TRANSPORT_EFFORT, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import logger from '../../util/logger.js';
 import { inferContextWindow } from '../../util/model-context.js';
+import { normalizeTransportCwd } from '../transport-paths.js';
 
 const execFileAsync = promisify(execFile);
 const QWEN_BIN = 'qwen';
@@ -207,7 +208,7 @@ export class QwenProvider implements TransportProvider {
     const sessionId = config.bindExistingKey ?? config.sessionKey;
     const existing = this.sessions.get(sessionId);
     this.sessions.set(sessionId, {
-      cwd: config.cwd ?? existing?.cwd ?? process.cwd(),
+      cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       started: !!(config.bindExistingKey || config.skipCreate || existing?.started),
       description: config.description ?? existing?.description,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
@@ -285,7 +286,7 @@ export class QwenProvider implements TransportProvider {
     }
 
     const state: QwenSessionState = this.sessions.get(sessionId) ?? {
-      cwd: process.cwd(),
+      cwd: normalizeTransportCwd(process.cwd())!,
       started: true,
       description: undefined,
       model: undefined,

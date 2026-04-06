@@ -19,6 +19,7 @@ import {
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import logger from '../../util/logger.js';
 import { CODEX_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
+import { normalizeTransportCwd } from '../transport-paths.js';
 
 const CODEX_BIN = 'codex';
 
@@ -207,7 +208,7 @@ export class CodexSdkProvider implements TransportProvider {
     const existing = config.fresh ? undefined : this.sessions.get(routeId);
     this.sessions.set(routeId, {
       routeId,
-      cwd: config.cwd ?? existing?.cwd ?? process.cwd(),
+      cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
       effort: config.effort ?? existing?.effort,
       threadId: config.resumeId ?? existing?.threadId,

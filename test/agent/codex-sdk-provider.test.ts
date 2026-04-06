@@ -198,6 +198,27 @@ describe('CodexSdkProvider', () => {
     expect(resumeReq?.params?.threadId).toBe('thread-existing');
   });
 
+  it('normalizes Windows cwd before sending app-server thread requests', async () => {
+    const origPlatform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+
+    try {
+      const provider = new CodexSdkProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-win', cwd: 'C:\\Users\\admin\\project' });
+
+      await provider.send('route-win', 'hello');
+      const child = childProcessMock.children[0];
+      const threadStartReq = child.requests.find((req) => req.method === 'thread/start');
+      const turnStartReq = child.requests.find((req) => req.method === 'turn/start');
+
+      expect(threadStartReq?.params?.cwd).toBe('C:/Users/admin/project');
+      expect(turnStartReq?.params?.cwd).toBe('C:/Users/admin/project');
+    } finally {
+      Object.defineProperty(process, 'platform', { value: origPlatform });
+    }
+  });
+
   it('fresh createSession ignores previous stored thread state for the same route', async () => {
     const provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });
