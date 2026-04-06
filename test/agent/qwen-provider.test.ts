@@ -285,7 +285,7 @@ describe('QwenProvider', () => {
     expect(errors).toEqual([]);
 
     first.child.emit('close', 0, null);
-    await flushIO();
+    await waitForSpawnCount(2);
 
     expect(childProcessMock.spawn).toHaveBeenCalledTimes(2);
     expect(runtime.pendingCount).toBe(0);
