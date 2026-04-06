@@ -9,6 +9,7 @@ import type {
   ProviderError,
   SessionConfig,
   SessionInfoUpdate,
+  ToolCallEvent,
 } from '../transport-provider.js';
 import {
   CONNECTION_MODES,
@@ -24,6 +25,7 @@ const DEFAULT_PERMISSION_MODE: PermissionMode = 'bypassPermissions';
 interface ClaudeSdkSessionState {
   routeId: string;
   cwd: string;
+  env?: Record<string, string>;
   model?: string;
   description?: string;
   permissionMode: PermissionMode;
@@ -36,7 +38,15 @@ interface ClaudeSdkSessionState {
   cancelled: boolean;
   finalMetadata?: Record<string, unknown>;
   pendingComplete?: AgentMessage;
+  toolCalls: Map<number, ToolCallEvent & { partialInputJson?: string }>;
 }
+
+type ClaudeToolBlock = {
+  type: 'tool_use' | 'server_tool_use' | 'mcp_tool_use';
+  id?: string;
+  name?: string;
+  input?: unknown;
+};
 
 function collectAssistantText(message: SDKMessage): string {
   if (message.type !== 'assistant' || !Array.isArray(message.message.content)) return '';
@@ -59,7 +69,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
   readonly sessionOwnership = SESSION_OWNERSHIP.SHARED;
   readonly capabilities: ProviderCapabilities = {
     streaming: true,
-    toolCalling: false,
+    toolCalling: true,
     approval: false,
     sessionRestore: true,
     multiTurn: true,
@@ -71,6 +81,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
+  private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
   private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
 
   async connect(config: ProviderConfig): Promise<void> {
@@ -102,6 +113,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     this.sessions.set(routeId, {
       routeId,
       cwd: config.cwd ?? existing?.cwd ?? process.cwd(),
+      env: config.env ?? existing?.env,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
       description: config.description ?? existing?.description,
       permissionMode: this.resolvePermissionMode(),
@@ -114,6 +126,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       cancelled: false,
       finalMetadata: existing?.finalMetadata,
       pendingComplete: undefined,
+      toolCalls: new Map(),
     });
     this.emitSessionInfo(routeId, { resumeId });
     return routeId;
@@ -151,6 +164,10 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     };
   }
 
+  onToolCall(cb: (sessionId: string, tool: ToolCallEvent) => void): void {
+    this.toolCallCallbacks.push(cb);
+  }
+
   onSessionInfo(cb: (sessionId: string, info: SessionInfoUpdate) => void): () => void {
     this.sessionInfoCallbacks.push(cb);
     return () => {
@@ -183,9 +200,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     state.cancelled = false;
     state.finalMetadata = undefined;
     state.pendingComplete = undefined;
+    state.toolCalls.clear();
 
     const options: Record<string, unknown> = {
       cwd: state.cwd,
+      ...(state.env ? { env: { ...process.env, ...state.env } } : {}),
       permissionMode: state.permissionMode,
       pathToClaudeCodeExecutable: this.resolveBinaryPath(this.config),
       includePartialMessages: true,
@@ -260,6 +279,12 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
         state.currentMessageId = String(event.message.id);
         return;
       }
+      if (event.type === 'content_block_start' && this.isToolBlock(event.content_block)) {
+        const tool = this.normalizeToolCall(event.content_block);
+        state.toolCalls.set(event.index, { ...tool, partialInputJson: undefined });
+        this.emitToolCall(sessionId, tool);
+        return;
+      }
       if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta' && typeof event.delta.text === 'string') {
         state.currentText += event.delta.text;
         const messageId = makeMessageId(state);
@@ -271,6 +296,30 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
           role: 'assistant',
         };
         for (const cb of this.deltaCallbacks) cb(sessionId, delta);
+        return;
+      }
+      if (event.type === 'content_block_delta' && event.delta?.type === 'input_json_delta' && typeof event.delta.partial_json === 'string') {
+        const tool = state.toolCalls.get(event.index);
+        if (!tool) return;
+        tool.partialInputJson = (tool.partialInputJson ?? '') + event.delta.partial_json;
+        const parsed = this.tryParsePartialJson(tool.partialInputJson);
+        if (parsed !== undefined) tool.input = parsed;
+        return;
+      }
+      if (event.type === 'content_block_stop') {
+        const tool = state.toolCalls.get(event.index);
+        if (!tool) return;
+        if (tool.partialInputJson && tool.input === undefined) {
+          const parsed = this.tryParsePartialJson(tool.partialInputJson);
+          if (parsed !== undefined) tool.input = parsed;
+        }
+        this.emitToolCall(sessionId, {
+          id: tool.id,
+          name: tool.name,
+          status: 'complete',
+          ...(tool.input !== undefined ? { input: tool.input } : {}),
+        });
+        state.toolCalls.delete(event.index);
       }
       return;
     }
@@ -346,6 +395,33 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
   private emitError(sessionId: string, error: ProviderError): void {
     if (this.sessions.get(sessionId)?.completed && error.code === PROVIDER_ERROR_CODES.CANCELLED) return;
     for (const cb of this.errorCallbacks) cb(sessionId, error);
+  }
+
+  private emitToolCall(sessionId: string, tool: ToolCallEvent): void {
+    for (const cb of this.toolCallCallbacks) cb(sessionId, tool);
+  }
+
+  private isToolBlock(block: unknown): block is ClaudeToolBlock {
+    if (!block || typeof block !== 'object') return false;
+    const type = (block as { type?: unknown }).type;
+    return type === 'tool_use' || type === 'server_tool_use' || type === 'mcp_tool_use';
+  }
+
+  private normalizeToolCall(block: ClaudeToolBlock): ToolCallEvent {
+    return {
+      id: typeof block.id === 'string' && block.id ? block.id : randomUUID(),
+      name: typeof block.name === 'string' && block.name ? block.name : 'tool',
+      status: 'running',
+      ...(block.input !== undefined ? { input: block.input } : {}),
+    };
+  }
+
+  private tryParsePartialJson(value: string): unknown {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return undefined;
+    }
   }
 
   private normalizeError(err: unknown): ProviderError {

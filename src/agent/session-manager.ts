@@ -868,10 +868,16 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         : s.providerId === 'codex-sdk'
           ? s.codexSessionId
           : undefined;
+      let extraEnv: Record<string, string> | undefined;
+      if (s.providerId === 'claude-code-sdk' && s.ccPreset) {
+        const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
+        extraEnv = await resolvePresetEnv(s.ccPreset, s.ccSessionId ?? undefined);
+      }
       await runtime.initialize({
         sessionKey: effectiveSessionKey,
         bindExistingKey: freshAfterCancel ? undefined : s.providerSessionId,
         skipCreate: !freshAfterCancel,
+        ...(extraEnv ? { env: extraEnv } : {}),
         cwd: s.projectDir,
         label: s.label ?? s.name,
         description: s.description,
@@ -937,6 +943,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   let sdkDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel'> | undefined;
   let effectiveQwenModel = agentType === 'qwen' ? (opts.qwenModel ?? getSession(name)?.qwenModel) : undefined;
   let transportResumeId: string | undefined;
+  let transportEnv: Record<string, string> | undefined = opts.extraEnv;
   if (agentType === 'qwen') {
     const qwenRuntime = await getQwenRuntimeConfig().catch(() => null);
     qwenAuthType = qwenRuntime?.authType;
@@ -957,7 +964,11 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     }
   } else if (agentType === 'claude-code-sdk') {
     transportResumeId = opts.ccSessionId ?? (!opts.fresh ? getSession(name)?.ccSessionId : undefined) ?? randomUUID();
-        sdkDisplay = await getClaudeSdkRuntimeConfig().catch(() => ({}));
+    if (opts.ccPreset) {
+      const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
+      transportEnv = { ...(transportEnv ?? {}), ...(await resolvePresetEnv(opts.ccPreset, transportResumeId)) };
+    }
+    sdkDisplay = await getClaudeSdkRuntimeConfig().catch(() => ({}));
   } else if (agentType === 'codex-sdk') {
     transportResumeId = opts.codexSessionId ?? (!opts.fresh ? getSession(name)?.codexSessionId : undefined);
     sdkDisplay = await getCodexRuntimeConfig().catch(() => ({}));
@@ -967,6 +978,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   await runtime.initialize({
     sessionKey: effectiveSessionKey,
     fresh: !!opts.fresh,
+    ...(transportEnv ? { env: transportEnv } : {}),
     cwd: projectDir,
     label: label || name,
     description,

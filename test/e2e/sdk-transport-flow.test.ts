@@ -92,6 +92,8 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
     async function* gen() {
       yield { type: 'system', subtype: 'init', session_id: sessionId, model: 'claude-sonnet-4-6' };
       yield { type: 'stream_event', session_id: sessionId, event: { type: 'message_start', message: { id: 'msg-cc-e2e' } } };
+      yield { type: 'stream_event', session_id: sessionId, event: { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'tool-cc-e2e', name: 'Read', input: { file_path: 'README.md' } } } };
+      yield { type: 'stream_event', session_id: sessionId, event: { type: 'content_block_stop', index: 0 } };
       yield { type: 'stream_event', session_id: sessionId, event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Claude' } } };
       yield { type: 'stream_event', session_id: sessionId, event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ': hello' } } };
       yield { type: 'assistant', session_id: sessionId, message: { content: [{ type: 'text', text: 'Claude: hello' }] } };
@@ -371,6 +373,7 @@ describe('sdk transport flow e2e', () => {
       role: 'brain',
       agentType: 'claude-code-sdk',
       projectDir: '/tmp/ccsdk-e2e',
+      extraEnv: { ANTHROPIC_BASE_URL: 'https://example.invalid' },
     });
 
     const serverLink = { send: vi.fn() } as any;
@@ -387,6 +390,9 @@ describe('sdk transport flow e2e', () => {
     const final = mocks.emitted.find((e) => e.session === SESSION_CC && e.type === 'assistant.text' && e.payload.streaming === false);
     const usage = mocks.emitted.find((e) => e.session === SESSION_CC && e.type === 'usage.update');
     const ack = mocks.emitted.find((e) => e.session === SESSION_CC && e.type === 'command.ack');
+    const toolCall = mocks.emitted.find((e) => e.session === SESSION_CC && e.type === 'tool.call');
+    const toolResult = mocks.emitted.find((e) => e.session === SESSION_CC && e.type === 'tool.result');
+    const claudeCall = mocks.claudeCalls.at(-1);
 
     expect(streaming.map((e) => e.payload.text)).toEqual(['Claude', 'Claude: hello']);
     expect(streaming[0]?.opts?.eventId).toBe(stableEventId);
@@ -394,6 +400,9 @@ describe('sdk transport flow e2e', () => {
     expect(final?.payload.text).toBe('Claude: hello');
     expect(final?.opts?.eventId).toBe(stableEventId);
     expect(usage?.payload.model).toBe('claude-sonnet-4-6');
+    expect(toolCall?.payload.tool).toBe('Read');
+    expect(toolResult?.payload).toEqual({});
+    expect(claudeCall?.options.env).toMatchObject({ ANTHROPIC_BASE_URL: 'https://example.invalid' });
     expect(ack?.payload.status).toBe('accepted');
   });
 

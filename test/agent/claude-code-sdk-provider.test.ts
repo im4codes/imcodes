@@ -68,6 +68,8 @@ describe('ClaudeCodeSdkProvider', () => {
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-1', model: 'claude-sonnet-4-6' },
       { type: 'stream_event', session_id: 'session-1', event: { type: 'message_start', message: { id: 'msg-1' } } },
+      { type: 'stream_event', session_id: 'session-1', event: { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'tool-1', name: 'Read', input: { file_path: 'a.ts' } } } },
+      { type: 'stream_event', session_id: 'session-1', event: { type: 'content_block_stop', index: 0 } },
       { type: 'stream_event', session_id: 'session-1', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Hel' } } },
       { type: 'stream_event', session_id: 'session-1', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'lo' } } },
       { type: 'assistant', session_id: 'session-1', message: { content: [{ type: 'text', text: 'Hello' }] } },
@@ -80,9 +82,11 @@ describe('ClaudeCodeSdkProvider', () => {
 
     const deltas: string[] = [];
     const completed: string[] = [];
+    const tools: string[] = [];
     const sessionInfo: Array<Record<string, unknown>> = [];
     provider.onDelta((_sid, delta) => deltas.push(delta.delta));
     provider.onComplete((_sid, msg) => completed.push(msg.content));
+    provider.onToolCall?.((_sid, tool) => tools.push(`${tool.name}:${tool.status}:${JSON.stringify(tool.input ?? null)}`));
     provider.onSessionInfo?.((_sid, info) => sessionInfo.push(info as Record<string, unknown>));
 
     await provider.send('route-1', 'hello');
@@ -93,6 +97,10 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(run.options.resume).toBeUndefined();
     expect(run.options.includePartialMessages).toBe(true);
     expect(run.options.permissionMode).toBe('bypassPermissions');
+    expect(tools).toEqual([
+      'Read:running:{"file_path":"a.ts"}',
+      'Read:complete:{"file_path":"a.ts"}',
+    ]);
     expect(deltas).toEqual(['Hel', 'Hello']);
     expect(completed).toEqual(['Hello']);
     expect(sessionInfo.some((info) => info.resumeId === 'session-1')).toBe(true);
@@ -138,6 +146,34 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(run.options.resume).toBeUndefined();
   });
 
+  it('passes session env through to the Claude SDK query options', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-env', model: 'claude-sonnet-4-6' },
+      { type: 'result', session_id: 'session-env', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-env',
+      cwd: '/tmp/project',
+      resumeId: 'session-env',
+      env: {
+        ANTHROPIC_BASE_URL: 'https://example.invalid',
+        ANTHROPIC_MODEL: 'claude-haiku-test',
+      },
+    });
+
+    await provider.send('route-env', 'hello');
+    await flush();
+
+    const run = sdkMock.runs.at(-1)!;
+    expect(run.options.env).toMatchObject({
+      ANTHROPIC_BASE_URL: 'https://example.invalid',
+      ANTHROPIC_MODEL: 'claude-haiku-test',
+    });
+  });
+
   it('emits a fallback streaming delta from assistant text when the SDK does not send text_delta events', async () => {
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-fallback', model: 'claude-sonnet-4-6' },
@@ -160,4 +196,32 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(deltas).toEqual(['STREAM_OK']);
     expect(completed).toEqual(['STREAM_OK']);
   });
+
+  it('builds tool input from input_json_delta events', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-tool-json', model: 'claude-sonnet-4-6' },
+      { type: 'stream_event', session_id: 'session-tool-json', event: { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'tool-json', name: 'Bash' } } },
+      { type: 'stream_event', session_id: 'session-tool-json', event: { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{\"command\":\"echo' } } },
+      { type: 'stream_event', session_id: 'session-tool-json', event: { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: ' hi\"}' } } },
+      { type: 'stream_event', session_id: 'session-tool-json', event: { type: 'content_block_stop', index: 0 } },
+      { type: 'result', session_id: 'session-tool-json', subtype: 'success', is_error: false, result: 'done', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-tool-json', cwd: '/tmp/project', resumeId: 'session-tool-json' });
+
+    const tools: ToolEventSnapshot[] = [];
+    provider.onToolCall?.((_sid, tool) => tools.push({ name: tool.name, status: tool.status, input: tool.input }));
+
+    await provider.send('route-tool-json', 'hello');
+    await flush();
+
+    expect(tools).toEqual([
+      { name: 'Bash', status: 'running', input: undefined },
+      { name: 'Bash', status: 'complete', input: { command: 'echo hi' } },
+    ]);
+  });
 });
+
+type ToolEventSnapshot = { name: string; status: string; input: unknown };

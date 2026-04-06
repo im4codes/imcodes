@@ -681,7 +681,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
   try {
     // Resolve CC env preset if specified
     let extraEnv: Record<string, string> | undefined;
-    if (ccPresetName && agentType === 'claude-code') {
+    if (ccPresetName && (agentType === 'claude-code' || agentType === 'claude-code-sdk')) {
       const { resolvePresetEnv } = await import('./cc-presets.js');
       extraEnv = await resolvePresetEnv(ccPresetName);
     }
@@ -718,6 +718,8 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         projectDir: dir,
         fresh: true,
         ccSessionId: randomUUID(),
+        extraEnv,
+        ccPreset: ccPresetName,
         label,
       });
     } else if (agentType === 'codex-sdk') {

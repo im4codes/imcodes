@@ -99,6 +99,8 @@ export interface SessionConfig {
   sessionKey: string;
   /** Force a brand-new provider conversation; do not reuse provider-side continuity. */
   fresh?: boolean;
+  /** Environment variables to pass through for SDK-backed local providers. */
+  env?: Record<string, string>;
   /** Working directory for providers that need local project context. */
   cwd?: string;
   /** Provider-side agent/model identifier (overrides ProviderConfig.agentId). */
