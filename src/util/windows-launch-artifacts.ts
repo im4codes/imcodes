@@ -1,4 +1,5 @@
 import { writeFile, mkdir, stat, truncate } from 'fs/promises';
+import { existsSync } from 'fs';
 import { execSync } from 'child_process';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -29,10 +30,20 @@ export function resolveLaunchPaths(): LaunchPaths {
   };
 }
 
-/** Write the daemon-watchdog.cmd that loops and restarts the daemon. */
+/** Write the daemon-watchdog.cmd that loops and restarts the daemon.
+ *  Uses the npm global shim (`imcodes.cmd`) instead of hard-coding
+ *  node.exe + script paths — this way the watchdog always launches
+ *  whatever version is currently installed, even after npm upgrades. */
 export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
   await mkdir(dirname(paths.watchdogPath), { recursive: true });
-  const watchdog = `@echo off\r\nchcp 65001 >nul 2>&1\r\n:loop\r\n"${paths.nodeExe}" "${paths.imcodesScript}" start --foreground >> "${paths.logPath}" 2>&1\r\ntimeout /t 5 /nobreak >nul\r\ngoto loop\r\n`;
+  // Resolve the npm global shim path (e.g. C:\Users\X\AppData\Roaming\npm\imcodes.cmd)
+  const npmGlobalBin = dirname(paths.imcodesScript).replace(/[/\\]node_modules[/\\]imcodes[/\\]dist[/\\]src$/i, '');
+  const shimPath = join(npmGlobalBin, 'imcodes.cmd');
+  // Prefer the shim if it exists; fall back to direct node+script for dev setups
+  const launchCmd = existsSync(shimPath)
+    ? `"${shimPath}" start --foreground`
+    : `"${paths.nodeExe}" "${paths.imcodesScript}" start --foreground`;
+  const watchdog = `@echo off\r\nchcp 65001 >nul 2>&1\r\n:loop\r\n${launchCmd} >> "${paths.logPath}" 2>&1\r\ntimeout /t 5 /nobreak >nul\r\ngoto loop\r\n`;
   await writeFile(paths.watchdogPath, watchdog, 'utf8');
 }
 

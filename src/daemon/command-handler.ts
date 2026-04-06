@@ -2118,9 +2118,7 @@ launchctl load -w "${plist}"`;
     const targetVer = targetVersion ?? 'latest';
     const cleanupScript = buildWindowsCleanupScript(scriptDir);
     writeFileSync(cleanupPath, cleanupScript);
-    // Windows: install first while the daemon is still running. On success,
-    // delegate restart to the CLI's shared watchdog logic (`imcodes restart`)
-    // instead of reimplementing restart behavior in batch.
+    const vbsLauncherPath = join(homedir(), '.imcodes', 'daemon-launcher.vbs');
     const batch = buildWindowsUpgradeBatch({
       logFile,
       scriptDir,
@@ -2128,6 +2126,7 @@ launchctl load -w "${plist}"`;
       npmCmd,
       pkgSpec,
       targetVer,
+      vbsLauncherPath,
     });
 
     writeFileSync(batchPath, batch);
