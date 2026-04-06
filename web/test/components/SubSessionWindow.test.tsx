@@ -19,12 +19,15 @@ vi.mock('../../src/components/ChatView.js', () => ({
   ChatView: () => null,
 }));
 
+const sessionControlsSpy = vi.fn((props: any) => <div data-testid="session-controls" data-model={props.activeSession?.modelDisplay ?? ''} data-effort={props.activeSession?.effort ?? ''} data-quota={props.activeSession?.quotaLabel ?? ''} />);
+const usageFooterSpy = vi.fn((props: any) => <div data-testid="usage-footer" data-quota={props.quotaLabel ?? ''} />);
+
 vi.mock('../../src/components/SessionControls.js', () => ({
-  SessionControls: () => null,
+  SessionControls: (props: any) => sessionControlsSpy(props),
 }));
 
 vi.mock('../../src/components/UsageFooter.js', () => ({
-  UsageFooter: () => null,
+  UsageFooter: (props: any) => usageFooterSpy(props),
 }));
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
@@ -74,6 +77,59 @@ function makeSubSession(overrides: Partial<SubSession> = {}): SubSession {
     ...overrides,
   };
 }
+
+
+describe('SubSessionWindow metadata wiring', () => {
+  const ws = {
+    subscribeTerminal: vi.fn(),
+    unsubscribeTerminal: vi.fn(),
+    sendSnapshotRequest: vi.fn(),
+    sendResize: vi.fn(),
+  } as any;
+
+  beforeEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  it('passes model, level, and quota metadata through for transport sub-sessions', async () => {
+    const sub = makeSubSession({
+      type: 'codex-sdk',
+      runtimeType: 'transport' as any,
+      label: 'codex-sub',
+      effort: 'high' as any,
+      modelDisplay: 'gpt-5.4',
+      quotaLabel: '5h 11% 2h03m 4/6 14:40 · 7d 50% 1d04h 4/8 15:48',
+      planLabel: 'Pro',
+    } as any);
+
+    render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const controls = document.querySelector('[data-testid="session-controls"]') as HTMLElement | null;
+      const footer = document.querySelector('[data-testid="usage-footer"]') as HTMLElement | null;
+      expect(controls?.dataset.model).toBe('gpt-5.4');
+      expect(controls?.dataset.effort).toBe('high');
+      expect(controls?.dataset.quota).toContain('5h 11%');
+      expect(footer?.dataset.quota).toContain('5h 11%');
+    });
+  });
+});
 
 describe('SubSessionWindow terminal subscription raw mode', () => {
   const ws = {

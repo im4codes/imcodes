@@ -336,7 +336,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const isClaudeCode = activeSession?.agentType === 'claude-code' || activeSession?.agentType === 'claude-code-sdk';
   const isShellLike = activeSession?.agentType === 'shell' || activeSession?.agentType === 'script';
   const isTransport = activeSession?.runtimeType === 'transport';
-  const isTransportSubSession = isTransport && !!onSubStop;
   const isCodex = activeSession?.agentType === 'codex' || activeSession?.agentType === 'codex-sdk';
   const isQwen = activeSession?.agentType === 'qwen';
   const thinkingLevels = useMemo((): readonly TransportEffortLevel[] => (
@@ -355,11 +354,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     ?? (activeSession?.agentType === 'qwen' || activeSession?.agentType === 'openclaw'
       ? 'high'
       : undefined);
-  const compactQuotaText = activeSession?.agentType === 'codex'
-    ? ''
-    : isCodex
-      ? (activeSession?.quotaLabel ?? '')
-      : [activeSession?.quotaLabel, activeSession?.quotaUsageLabel].filter(Boolean).join(' · ');
   const qwenTier = getQwenAuthTier(activeSession?.qwenAuthType);
   const qwenTierLabel = qwenTier === QWEN_AUTH_TIERS.FREE
     ? t('session.qwen_tier_free')
@@ -965,20 +959,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           ))}
         </div>
 
-        {/* Plan/quota badges — compact inline display left of model selector */}
-        {!isTransportSubSession && (compactQuotaText || activeSession?.planLabel) && (
-          <div class="session-ctx-wrap">
-            {compactQuotaText && (
-              <span class="session-usage-quota-inline">{compactQuotaText}</span>
-            )}
-            {activeSession?.planLabel && (
-              <span class="session-usage-quota-inline" style={{ color: '#93c5fd' }}>{activeSession.planLabel}</span>
-            )}
-          </div>
-        )}
-
         {/* Model selector — outside overflow-x scroll area so dropdown isn't clipped */}
-        {!isTransportSubSession && isClaudeCode && (
+        {isClaudeCode && (
           <div class="shortcuts-model" ref={modelRef}>
             <button
               class="shortcut-btn"
@@ -1004,7 +986,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             )}
           </div>
         )}
-        {!isTransportSubSession && isCodex && (
+        {isCodex && (
           <div class="shortcuts-model" ref={modelRef}>
             <button
               class="shortcut-btn"
@@ -1030,7 +1012,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             )}
           </div>
         )}
-        {!isTransportSubSession && isQwen && (
+        {isQwen && (
           <div class="shortcuts-model" ref={modelRef}>
             <button
               class="shortcut-btn"
@@ -1059,7 +1041,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             )}
           </div>
         )}
-        {!isTransportSubSession && supportsThinking && (
+        {supportsThinking && (
           <div class="shortcuts-model" ref={thinkingRef}>
             <button
               class="shortcut-btn"
@@ -1086,7 +1068,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           </div>
         )}
         {/* P2P mode selector — hidden for shell/script sessions */}
-        {!isTransportSubSession && !isShellLike && <div class="shortcuts-model" ref={p2pRef}>
+        {!isShellLike && <div class="shortcuts-model" ref={p2pRef}>
           <button
             class="shortcut-btn"
             data-onboarding="p2p-mode"
@@ -1479,7 +1461,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           {p2pMode !== 'solo' ? getP2pModeLabel(p2pMode, t) : t('common.send')}
         </button>
         {/* Config mode: show gear to open settings panel inline with send row */}
-        {!isTransportSubSession && p2pMode === P2P_CONFIG_MODE && (
+        {p2pMode === P2P_CONFIG_MODE && (
           <button
             class="btn btn-secondary"
             onClick={() => setP2pConfigOpen(true)}
@@ -1492,7 +1474,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         )}
 
         {/* Menu button — hidden in compact mode */}
-        {!compact && !isTransportSubSession && <div class="menu-wrap" ref={menuRef}>
+        {!compact && <div class="menu-wrap" ref={menuRef}>
           <button
             class="btn btn-secondary"
             onClick={() => { setMenuOpen((o) => !o); resetConfirm(); }}

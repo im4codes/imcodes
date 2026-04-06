@@ -147,6 +147,35 @@ describe('sub-session metadata via subsession.sync', () => {
     expect(captured).toEqual(before);
   });
 
+
+  it('stores codex-sdk model, level, and quota metadata from sync', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'cxsdk1',
+      sessionName: 'deck_sub_cxsdk1',
+      sessionType: 'codex-sdk',
+      state: 'running',
+    }));
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'cxsdk1',
+      modelDisplay: 'gpt-5.4',
+      planLabel: 'Pro',
+      quotaLabel: '5h 11% 2h03m 4/6 14:40 · 7d 50% 1d04h 4/8 15:48',
+      effort: 'high',
+    }));
+
+    expect(captured[0].modelDisplay).toBe('gpt-5.4');
+    expect(captured[0].planLabel).toBe('Pro');
+    expect(captured[0].quotaLabel).toContain('5h 11%');
+    expect(captured[0].effort).toBe('high');
+  });
+
   it('partial sync keeps existing values', async () => {
     const { ws, send } = createMockWs();
     render(<Harness ws={ws} connected={true} />);

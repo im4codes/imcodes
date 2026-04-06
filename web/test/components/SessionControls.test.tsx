@@ -836,7 +836,7 @@ describe('SessionControls', () => {
   });
 
 
-  it('shows only stop in shortcut row for transport sub-sessions', () => {
+  it('shows the same transport controls for sub-sessions as main sessions', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -847,6 +847,7 @@ describe('SessionControls', () => {
           runtimeType: 'transport',
           effort: 'high',
           state: 'running',
+          quotaLabel: '5h 11% 2h03m 4/6 14:40 · 7d 50% 1d04h 4/8 15:48',
         })}
         quickData={makeQuickData() as any}
         onSubStop={vi.fn()}
@@ -856,9 +857,9 @@ describe('SessionControls', () => {
     );
 
     expect(screen.getByRole('button', { name: /^Stop$/ })).toBeDefined();
-    expect(screen.queryByTitle('actions')).toBeNull();
-    expect(screen.queryByRole('button', { name: /^high$/i })).toBeNull();
-    expect(screen.queryByRole('button', { name: /^gpt-/i })).toBeNull();
+    expect(screen.getByTitle('actions')).toBeDefined();
+    expect(screen.getByRole('button', { name: /^high$/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /^default$/i })).toBeDefined();
   });
 
   it('shows thinking control for codex-sdk and sends /thinking command', () => {
