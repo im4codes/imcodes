@@ -129,6 +129,7 @@ describe('CodexSdkProvider', () => {
     await provider.send('route-1', 'hello');
     const child = childProcessMock.children[0];
     const threadStartReq = child.requests.find((req) => req.method === 'thread/start');
+    const turnStartReq = child.requests.find((req) => req.method === 'turn/start');
     child.emits({
       method: 'item/started',
       params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'cmd-1', type: 'commandExecution', command: 'ls', aggregatedOutput: '', status: 'inProgress' } },
@@ -182,6 +183,8 @@ describe('CodexSdkProvider', () => {
     ]);
     expect(threadStartReq?.params?.sandbox).toBe('danger-full-access');
     expect(threadStartReq?.params?.approvalPolicy).toBe('never');
+    expect(turnStartReq?.params?.sandboxPolicy).toEqual({ type: 'dangerFullAccess' });
+    expect(turnStartReq?.params?.approvalPolicy).toBe('never');
     expect(deltas).toEqual(['O', 'OK']);
     expect(completed).toEqual(['OK']);
     expect(sessionInfo).toContainEqual({ resumeId: 'thread-1' });

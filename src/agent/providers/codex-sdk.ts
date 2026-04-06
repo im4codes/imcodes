@@ -351,6 +351,7 @@ export class CodexSdkProvider implements TransportProvider {
         input: [{ type: 'text', text: message }],
         cwd: state.cwd,
         approvalPolicy: 'never',
+        sandboxPolicy: { type: 'dangerFullAccess' },
         ...(state.model ? { model: state.model } : {}),
         ...(state.effort ? { effort: state.effort } : {}),
       });
