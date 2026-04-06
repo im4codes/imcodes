@@ -31,6 +31,8 @@ import { resolveStructuredSessionBootstrap } from './structured-session-bootstra
 import { getQwenRuntimeConfig } from './qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from './provider-display.js';
 import { getQwenOAuthQuotaUsageLabel } from './provider-quota.js';
+import { getClaudeSdkRuntimeConfig } from './sdk-runtime-config.js';
+import { getCodexRuntimeConfig } from './codex-runtime-config.js';
 
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
@@ -769,6 +771,21 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
       changed = true;
     }
 
+    if (typeof info.planLabel === 'string' && info.planLabel && next.planLabel !== info.planLabel) {
+      next.planLabel = info.planLabel;
+      changed = true;
+    }
+
+    if (typeof info.quotaLabel === 'string' && info.quotaLabel && next.quotaLabel !== info.quotaLabel) {
+      next.quotaLabel = info.quotaLabel;
+      changed = true;
+    }
+
+    if (typeof info.quotaUsageLabel === 'string' && info.quotaUsageLabel && next.quotaUsageLabel !== info.quotaUsageLabel) {
+      next.quotaUsageLabel = info.quotaUsageLabel;
+      changed = true;
+    }
+
     if (!changed) return;
     upsertSession(next);
     emitSessionPersist(next, sessionName);
@@ -903,6 +920,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   let qwenAuthType: SessionRecord['qwenAuthType'] | undefined;
   let qwenAuthLimit: SessionRecord['qwenAuthLimit'] | undefined;
   let availableQwenModels: string[] | undefined;
+  let sdkDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel'> | undefined;
   let effectiveQwenModel = agentType === 'qwen' ? (opts.qwenModel ?? getSession(name)?.qwenModel) : undefined;
   let transportResumeId: string | undefined;
   if (agentType === 'qwen') {
@@ -925,8 +943,10 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     }
   } else if (agentType === 'claude-code-sdk') {
     transportResumeId = opts.ccSessionId ?? (!opts.fresh ? getSession(name)?.ccSessionId : undefined) ?? randomUUID();
+        sdkDisplay = await getClaudeSdkRuntimeConfig().catch(() => ({}));
   } else if (agentType === 'codex-sdk') {
     transportResumeId = opts.codexSessionId ?? (!opts.fresh ? getSession(name)?.codexSessionId : undefined);
+    sdkDisplay = await getCodexRuntimeConfig().catch(() => ({}));
   }
 
   // Create session on provider
@@ -974,6 +994,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
           authLimit: qwenAuthLimit,
           quotaUsageLabel: qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
         }),
+        ...(sdkDisplay ?? {}),
         description,
         label,
         parentSession,
@@ -1083,6 +1104,13 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     }
   }
 
+  let familyDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel'> | undefined;
+  if (agentType === 'codex') {
+    familyDisplay = await getCodexRuntimeConfig().catch(() => ({}));
+  } else if (agentType === 'claude-code' && !opts.ccPreset) {
+    familyDisplay = undefined;
+  }
+
   if (!skipStore) {
     const existing = getSession(name);
     const record: SessionRecord = {
@@ -1104,6 +1132,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ...(opencodeSessionId ? { opencodeSessionId } : {}),
       ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),
       ...(label ? { label } : {}),
+      ...(familyDisplay ?? {}),
     };
     upsertSession(record);
     emitSessionPersist(record, name);

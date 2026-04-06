@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { access } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
-import { query, type PermissionMode, type SDKMessage, type SDKSystemMessage } from '@anthropic-ai/claude-agent-sdk';
+import { query, type PermissionMode, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import type {
   TransportProvider,
   ProviderCapabilities,
@@ -293,7 +293,6 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       const messageId = makeMessageId(state);
       const success = msg as any;
       state.pendingComplete = {
-
         id: messageId,
         sessionId,
         kind: 'text',

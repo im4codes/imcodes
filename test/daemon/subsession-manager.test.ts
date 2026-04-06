@@ -9,6 +9,7 @@ const {
   geminiStartWatchingMock, geminiIsWatchingMock,
   codexStartWatchingByIdMock, codexIsWatchingMock, codexIsFileClaimedMock,
   removeSessionMock, resolveGeminiSessionIdMock, injectGeminiMemoryMock,
+  launchTransportSessionMock, getTransportRuntimeMock,
 } = vi.hoisted(() => ({
   upsertSessionMock: vi.fn(),
   startWatchingMock: vi.fn().mockResolvedValue(undefined),
@@ -28,6 +29,8 @@ const {
   removeSessionMock: vi.fn(),
   resolveGeminiSessionIdMock: vi.fn().mockResolvedValue('resolved-gemini-uuid'),
   injectGeminiMemoryMock: vi.fn().mockResolvedValue(undefined),
+  launchTransportSessionMock: vi.fn().mockResolvedValue(undefined),
+  getTransportRuntimeMock: vi.fn().mockReturnValue(null),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -75,6 +78,8 @@ vi.mock('../../src/agent/tmux.js', () => ({
 
 vi.mock('../../src/agent/session-manager.js', () => ({
   getDriver: getDriverMock,
+  launchTransportSession: launchTransportSessionMock,
+  getTransportRuntime: getTransportRuntimeMock,
 }));
 
 vi.mock('../../src/agent/drivers/gemini.js', () => ({
@@ -313,6 +318,38 @@ describe('startSubSession — geminiSessionId stored in session-store', () => {
     const call = vi.mocked(upsertSession).mock.calls[0]?.[0] as Record<string, unknown>;
     expect(call.geminiSessionId).toBe('resolved-gemini-uuid');
     expect(injectGeminiMemoryMock).toHaveBeenCalledWith('resolved-gemini-uuid', '/proj');
+  });
+});
+
+describe('startSubSession — transport SDK agents do not use tmux', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionExistsMock.mockResolvedValue(false);
+    getTransportRuntimeMock.mockReturnValue(null);
+  });
+
+  it('launches claude-code-sdk via launchTransportSession instead of getDriver/newSession', async () => {
+    await startSubSession({
+      id: 'sdk-sub1',
+      type: 'claude-code-sdk',
+      cwd: '/proj',
+      ccSessionId: 'cc-sdk-session-id',
+      parentSession: 'deck_proj_brain',
+      description: 'SDK test',
+    });
+
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_sub_sdk-sub1',
+      agentType: 'claude-code-sdk',
+      projectDir: '/proj',
+      parentSession: 'deck_proj_brain',
+      description: 'SDK test',
+      fresh: true,
+      userCreated: true,
+    }));
+    expect(String(launchTransportSessionMock.mock.calls[0][0].ccSessionId)).toMatch(/^[0-9a-f-]{36}$/);
+    expect(getDriverMock).not.toHaveBeenCalled();
+    expect(newSessionMock).not.toHaveBeenCalled();
   });
 });
 

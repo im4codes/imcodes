@@ -126,8 +126,19 @@ vi.mock('../../src/agent/qwen-runtime-config.js', () => ({
 
 vi.mock('../../src/agent/tmux.js', () => ({
   listSessions: vi.fn().mockResolvedValue([]),
-  newSession: vi.fn(), killSession: vi.fn(), sessionExists: vi.fn(), isPaneAlive: vi.fn(), respawnPane: vi.fn(),
-  sendKeys: vi.fn(), sendKey: vi.fn(), capturePane: vi.fn(), showBuffer: vi.fn(), getPaneId: vi.fn(), getPaneCwd: vi.fn(), getPaneStartCommand: vi.fn(), cleanupOrphanFifos: vi.fn(), BACKEND: 'tmux',
+  newSession: vi.fn().mockResolvedValue(undefined),
+  killSession: vi.fn().mockResolvedValue(undefined),
+  sessionExists: vi.fn().mockResolvedValue(false),
+  isPaneAlive: vi.fn().mockResolvedValue(false),
+  respawnPane: vi.fn().mockResolvedValue(undefined),
+  sendKeys: vi.fn().mockResolvedValue(undefined),
+  sendKey: vi.fn().mockResolvedValue(undefined),
+  capturePane: vi.fn().mockResolvedValue(''),
+  showBuffer: vi.fn().mockResolvedValue(''),
+  getPaneId: vi.fn().mockResolvedValue(undefined),
+  getPaneCwd: vi.fn().mockResolvedValue(undefined),
+  getPaneStartCommand: vi.fn().mockResolvedValue(''),
+  cleanupOrphanFifos: vi.fn().mockResolvedValue(undefined), BACKEND: 'tmux',
 }));
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({ startWatching: vi.fn(), startWatchingFile: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findJsonlPathBySessionId: vi.fn() }));
 vi.mock('../../src/daemon/codex-watcher.js', () => ({ startWatching: vi.fn(), startWatchingSpecificFile: vi.fn(), startWatchingById: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findRolloutPathByUuid: vi.fn(async () => null) }));
@@ -136,6 +147,13 @@ vi.mock('../../src/daemon/opencode-watcher.js', () => ({ startWatching: vi.fn(),
 vi.mock('../../src/agent/structured-session-bootstrap.js', () => ({ resolveStructuredSessionBootstrap: vi.fn(async (x) => x) }));
 vi.mock('../../src/agent/provider-display.js', () => ({ getQwenDisplayMetadata: vi.fn(() => ({})) }));
 vi.mock('../../src/agent/provider-quota.js', () => ({ getQwenOAuthQuotaUsageLabel: vi.fn(() => '') }));
+vi.mock('../../src/agent/codex-runtime-config.js', () => ({
+  getCodexRuntimeConfig: vi.fn(async () => ({
+    planLabel: 'Pro',
+    quotaLabel: '5h 11% · 7d 50%',
+    quotaUsageLabel: '5h reset Apr 5 13:00 · 7d reset Apr 7 14:00',
+  })),
+}));
 vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })) }));
 
 import { launchSession } from '../../src/agent/session-manager.js';
@@ -143,6 +161,136 @@ import { disconnectAll } from '../../src/agent/provider-registry.js';
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
 
 describe('sdk transport flow e2e', () => {
+
+  it('starts a fresh claude-code-sdk main session id on session.start instead of reusing stored continuity', async () => {
+    mocks.store.set('deck_ccsdk_main_brain', {
+      name: 'deck_ccsdk_main_brain',
+      projectName: 'ccsdk_main',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/ccsdk-main-e2e',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      providerSessionId: 'deck_ccsdk_main_brain',
+      ccSessionId: 'old-cc-session-id',
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({
+      type: 'session.start',
+      project: 'ccsdk main',
+      dir: '/tmp/ccsdk-main-e2e',
+      agentType: 'claude-code-sdk',
+    }, serverLink);
+    await flushAsync();    await new Promise((resolve) => setTimeout(resolve, 50));
+    handleWebCommand({ type: 'session.send', session: 'deck_ccsdk_main_brain', text: 'hello', commandId: 'cmd-ccsdk-main' }, serverLink);
+    await flushAsync();
+
+    const record = mocks.store.get('deck_ccsdk_main_brain');
+    expect(record?.ccSessionId).toBeTruthy();
+    expect(record?.ccSessionId).not.toBe('old-cc-session-id');
+    expect(mocks.claudeCalls.some((call) => call.options.resume === 'old-cc-session-id')).toBe(false);
+    expect(mocks.claudeCalls.some((call) => call.options.sessionId === 'old-cc-session-id')).toBe(false);
+  });
+
+
+  it('starts a fresh codex-sdk main session through session.start instead of resuming old continuity', async () => {
+    mocks.store.set('deck_cxsdk_main_brain', {
+      name: 'deck_cxsdk_main_brain',
+      projectName: 'cxsdk_main',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/cxsdk-main-e2e',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'deck_cxsdk_main_brain',
+      codexSessionId: 'old-codex-thread-id',
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({
+      type: 'session.start',
+      project: 'cxsdk main',
+      dir: '/tmp/cxsdk-main-e2e',
+      agentType: 'codex-sdk',
+    }, serverLink);
+    await flushAsync();    await new Promise((resolve) => setTimeout(resolve, 50));
+    handleWebCommand({ type: 'session.send', session: 'deck_cxsdk_main_brain', text: 'hello', commandId: 'cmd-cxsdk-main' }, serverLink);
+    await flushAsync();
+
+    const record = mocks.store.get('deck_cxsdk_main_brain');
+    expect(record?.codexSessionId).toBe('thread-codex-e2e');
+    expect(record?.quotaLabel).toBe('5h 11% · 7d 50%');
+    expect(mocks.codexCalls.some((call) => call.mode === 'resume' && call.id === 'old-codex-thread-id')).toBe(false);
+  });
+
+  it('switches claude-code-sdk model through /model and updates display metadata', async () => {
+    await launchSession({
+      name: SESSION_CC,
+      projectName: 'ccsdk',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/ccsdk-e2e',
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({ type: 'session.send', session: SESSION_CC, text: '/model haiku', commandId: 'cmd-ccsdk-model' }, serverLink);
+    await flushAsync();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const record = mocks.store.get(SESSION_CC);
+    const usage = mocks.emitted.find((e) => e.session === SESSION_CC && e.type === 'usage.update' && e.payload.model === 'haiku');
+    expect(record?.modelDisplay).toBe('haiku');
+    expect(usage?.payload.contextWindow).toBe(200000);
+  });
+
+  it('switches codex-sdk model through /model and updates display metadata', async () => {
+    await launchSession({
+      name: SESSION_CX,
+      projectName: 'cxsdk',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/cxsdk-e2e',
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({ type: 'session.send', session: SESSION_CX, text: '/model gpt-5.4-mini', commandId: 'cmd-cxsdk-model' }, serverLink);
+    await flushAsync();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const record = mocks.store.get(SESSION_CX);
+    const usage = mocks.emitted.find((e) => e.session === SESSION_CX && e.type === 'usage.update' && e.payload.model === 'gpt-5.4-mini');
+    expect(record?.modelDisplay).toBe('gpt-5.4-mini');
+    expect(usage?.payload.contextWindow).toBe(1000000);
+  });
+  it('starts a claude-code-sdk main session through session.start without tmux driver errors', async () => {
+    const serverLink = { send: vi.fn() } as any;
+
+    handleWebCommand({
+      type: 'session.start',
+      project: 'ccsdk main',
+      dir: '/tmp/ccsdk-main-e2e',
+      agentType: 'claude-code-sdk',
+    }, serverLink);
+    await flushAsync();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const record = mocks.store.get('deck_ccsdk_main_brain');
+    expect(record?.runtimeType).toBe('transport');
+    expect(record?.providerId).toBe('claude-code-sdk');
+    expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'session.error' }));
+  });
+
   beforeEach(() => {
     mocks.store.clear();
     mocks.emitted.length = 0;

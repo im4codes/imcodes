@@ -4,6 +4,12 @@ export const OPENAI_CONTEXT_WINDOWS = {
   GPT_41_FAMILY: 1_000_000,
 } as const;
 
+export const CLAUDE_CONTEXT_WINDOWS = {
+  OPUS_1M_ALIAS: 1_000_000,
+  CLAUDE_4_FAMILY: 200_000,
+  CLAUDE_3_FAMILY: 200_000,
+} as const;
+
 export const QWEN_CONTEXT_WINDOWS = {
   CODER_MODEL: 1_000_000,
   QWEN35_PLUS: 1_000_000,
@@ -31,6 +37,11 @@ export function inferContextWindow(model?: string | null): number | undefined {
   }
 
   if (/^gpt-4\.1(?:$|[-_.])/.test(m)) return OPENAI_CONTEXT_WINDOWS.GPT_41_FAMILY;
+
+  if (m == 'opus[1m]') return CLAUDE_CONTEXT_WINDOWS.OPUS_1M_ALIAS;
+  if (m == 'sonnet' || m == 'haiku') return CLAUDE_CONTEXT_WINDOWS.CLAUDE_4_FAMILY;
+  if (/^claude-(?:opus|sonnet|haiku)-4(?:$|[-_.])/.test(m)) return CLAUDE_CONTEXT_WINDOWS.CLAUDE_4_FAMILY;
+  if (/^claude-3(?:[.-]|$)/.test(m)) return CLAUDE_CONTEXT_WINDOWS.CLAUDE_3_FAMILY;
 
   if (/^coder-model$/.test(m)) return QWEN_CONTEXT_WINDOWS.CODER_MODEL;
   if (/^qwen3\.5-plus(?:$|[-_.])/.test(m)) return QWEN_CONTEXT_WINDOWS.QWEN35_PLUS;

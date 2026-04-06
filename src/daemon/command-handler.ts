@@ -5,7 +5,7 @@
 import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, type ProjectConfig } from '../agent/session-manager.js';
 import { isTransportAgent } from '../agent/detect.js';
 import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand } from '../agent/tmux.js';
-import { listSessions, getSession, upsertSession, type SessionRecord } from '../store/session-store.js';
+import { listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
 import { routeMessage, type InboundMessage, type RouterContext } from '../router/message-router.js';
 import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js';
 import type { ServerLink } from './server-link.js';
@@ -34,11 +34,15 @@ import { executeCronJob } from './cron-executor.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { getProvider } from '../agent/provider-registry.js';
 import { copyFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
 import { buildWindowsCleanupScript, buildWindowsUpgradeBatch } from '../util/windows-upgrade-script.js';
 import { UPGRADE_LOCK_FILE } from '../util/windows-launch-artifacts.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { sanitizeProjectName } from '../../shared/sanitize-project-name.js';
+import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../shared/models/options.js';
+import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
+import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 
 /**
@@ -737,16 +741,46 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     if (existing.length > 0) {
       await teardownProject(project);
     }
+    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk') {
+      logger.info({ project, agentType }, 'SDK fresh session.start removing stale main-session store record');
+      removeSession(`deck_${project}_brain`);
+    }
     const config: ProjectConfig = {
       name: project,
       dir,
       brainType: agentType as ProjectConfig['brainType'],
       workerTypes: [],
       label,
+      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk',
       extraEnv,
       ccPreset: ccPresetName,
     };
-    await startProject(config);
+    if (agentType === 'claude-code-sdk') {
+      logger.info({ project }, 'SDK fresh session.start launching new Claude SDK main session');
+      await launchTransportSession({
+        name: `deck_${project}_brain`,
+        projectName: project,
+        role: 'brain',
+        agentType: 'claude-code-sdk',
+        projectDir: dir,
+        fresh: true,
+        ccSessionId: randomUUID(),
+        label,
+      });
+    } else if (agentType === 'codex-sdk') {
+      logger.info({ project }, 'SDK fresh session.start launching new Codex SDK main session');
+      await launchTransportSession({
+        name: `deck_${project}_brain`,
+        projectName: project,
+        role: 'brain',
+        agentType: 'codex-sdk',
+        projectDir: dir,
+        fresh: true,
+        label,
+      });
+    } else {
+      await startProject(config);
+    }
     logger.info({ project }, 'Session started via web');
 
     // Inject preset init message after session starts
@@ -1191,10 +1225,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         } catch { /* */ }
         return;
       }
-      if (record?.agentType === 'qwen') {
-        const modelMatch = text.trim().match(/^\/model\s+(\S+)\s*$/);
-        if (modelMatch) {
-          const nextModel = modelMatch[1];
+      const modelMatch = text.trim().match(/^\/model\s+(\S+)(?:\s+.*)?$/);
+      if (record?.agentType === 'qwen' && modelMatch) {
+        const nextModel = modelMatch[1];
           const runtimeConfig = await getQwenRuntimeConfig(true).catch(() => null);
           const allowedModels = runtimeConfig?.availableModels?.length
             ? runtimeConfig.availableModels
@@ -1242,7 +1275,58 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
           try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch { /* */ }
           return;
+      }
+      if (record?.agentType === 'claude-code-sdk' && modelMatch) {
+        const selectedModel = modelMatch[1];
+        if (!CLAUDE_CODE_MODEL_IDS.includes(selectedModel as any)) {
+          timelineEmitter.emit(sessionName, 'user.message', { text });
+          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Claude model: ${selectedModel}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Claude model: ${selectedModel}` });
+          try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unknown Claude model: ${selectedModel}` }); } catch {}
+          return;
         }
+        transportRuntime.setAgentId(normalizeClaudeSdkModelForProvider(selectedModel));
+        const sdkDisplay = await getClaudeSdkRuntimeConfig(true).catch(() => ({}) as import('../agent/sdk-runtime-config.js').SdkRuntimeConfig);
+        upsertSession({
+          ...record,
+          modelDisplay: selectedModel,
+          ...(sdkDisplay.planLabel ? { planLabel: sdkDisplay.planLabel } : {}),
+          updatedAt: Date.now(),
+        });
+        await handleGetSessions(serverLink);
+        timelineEmitter.emit(sessionName, 'user.message', { text });
+        timelineEmitter.emit(sessionName, 'usage.update', { model: selectedModel, contextWindow: resolveContextWindow(undefined, selectedModel) }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'assistant.text', { text: `Switched model to ${selectedModel}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
+        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
+        return;
+      }
+      if (record?.agentType === 'codex-sdk' && modelMatch) {
+        const nextModel = modelMatch[1];
+        if (!CODEX_MODEL_IDS.includes(nextModel as any)) {
+          timelineEmitter.emit(sessionName, 'user.message', { text });
+          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Codex model: ${nextModel}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Codex model: ${nextModel}` });
+          try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unknown Codex model: ${nextModel}` }); } catch {}
+          return;
+        }
+        transportRuntime.setAgentId(nextModel);
+        const sdkDisplay = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
+        upsertSession({
+          ...record,
+          modelDisplay: nextModel,
+          ...(sdkDisplay.planLabel ? { planLabel: sdkDisplay.planLabel } : {}),
+          ...(sdkDisplay.quotaLabel ? { quotaLabel: sdkDisplay.quotaLabel } : {}),
+          ...(sdkDisplay.quotaUsageLabel ? { quotaUsageLabel: sdkDisplay.quotaUsageLabel } : {}),
+          updatedAt: Date.now(),
+        });
+        await handleGetSessions(serverLink);
+        timelineEmitter.emit(sessionName, 'user.message', { text });
+        timelineEmitter.emit(sessionName, 'usage.update', { model: nextModel, contextWindow: resolveContextWindow(undefined, nextModel) }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'assistant.text', { text: `Switched model to ${nextModel}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
+        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
+        return;
       }
       timelineEmitter.emit(sessionName, 'user.message', { text });
       if (record?.agentType === 'qwen' && record.qwenAuthType === 'qwen-oauth') {
@@ -1709,6 +1793,8 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
         projectDir: (cwd as string) || process.cwd(),
         description,
         bindExistingKey,
+        ...(type === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
+        ...(type === 'codex-sdk' ? { fresh: true } : {}),
         userCreated: true,
         parentSession: parentSession || undefined,
       });

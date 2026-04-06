@@ -157,6 +157,12 @@ export interface SessionInfoUpdate {
   resumeId?: string;
   /** Human-readable active model identifier, if known. */
   model?: string;
+  /** Human-readable plan label, if known. */
+  planLabel?: string;
+  /** Human-readable quota summary label, if known. */
+  quotaLabel?: string;
+  /** Human-readable quota progress / reset label, if known. */
+  quotaUsageLabel?: string;
 }
 
 // ── TransportProvider interface ─────────────────────────────────────────────

@@ -18,6 +18,7 @@ import { P2P_CONFIG_MODE, COMBO_PRESETS, COMBO_SEPARATOR } from '@shared/p2p-mod
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
+import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../../../src/shared/models/options.js';
 
 interface Props {
   ws: WsClient | null;
@@ -78,7 +79,7 @@ const MODEL_STORAGE_KEY = 'imcodes-model';
 const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const QWEN_MODEL_STORAGE_KEY = 'imcodes-qwen-model';
 const SINGLE_AGENT_PROMPT_PREF_KEY = 'atpicker_single_agent_prompt_dismissed';
-const CODEX_MODELS: CodexModelChoice[] = ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.2'];
+const CODEX_MODELS: CodexModelChoice[] = [...CODEX_MODEL_IDS] as CodexModelChoice[];
 const SINGLE_P2P_MODES: string[] = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss'];
 const P2P_MODES: string[] = [...SINGLE_P2P_MODES, ...COMBO_PRESETS.map((c) => c.key), P2P_CONFIG_MODE];
 const P2P_MODE_I18N: Record<string, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', plan: 'p2p.mode_plan', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
@@ -345,10 +346,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const inputDisabled = !hasSession;
   // Send/action buttons disabled when disconnected or no session
   const disabled = !connected || !hasSession;
-  const isClaudeCode = activeSession?.agentType === 'claude-code';
+  const isClaudeCode = activeSession?.agentType === 'claude-code' || activeSession?.agentType === 'claude-code-sdk';
   const isShellLike = activeSession?.agentType === 'shell' || activeSession?.agentType === 'script';
   const isTransport = activeSession?.runtimeType === 'transport';
-  const isCodex = activeSession?.agentType === 'codex';
+  const isCodex = activeSession?.agentType === 'codex' || activeSession?.agentType === 'codex-sdk';
   const isQwen = activeSession?.agentType === 'qwen';
   const qwenTier = getQwenAuthTier(activeSession?.qwenAuthType);
   const qwenTierLabel = qwenTier === QWEN_AUTH_TIERS.FREE
@@ -868,13 +869,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (!ws || !activeSession) return;
     setCodexModel(m);
     try { localStorage.setItem(CODEX_MODEL_STORAGE_KEY, m); } catch { /* ignore */ }
-    const isBrain = activeSession.role === 'brain';
-    if (isBrain) {
-      // Send /model command directly to Codex terminal (like CC)
-      ws.sendSessionCommand('send', { sessionName: activeSession.name, text: `/model ${m} medium` });
+    if (activeSession.agentType === 'codex-sdk') {
+      ws.sendSessionCommand('send', { sessionName: activeSession.name, text: `/model ${m}` });
     } else {
-      // Sub-sessions: restart with new model
-      ws.subSessionSetModel(activeSession.name, m, activeSession.projectDir);
+      const isBrain = activeSession.role === 'brain';
+      if (isBrain) {
+        ws.sendSessionCommand('send', { sessionName: activeSession.name, text: `/model ${m} medium` });
+      } else {
+        ws.subSessionSetModel(activeSession.name, m, activeSession.projectDir);
+      }
     }
     setModelOpen(false);
     onAfterAction?.();
@@ -984,7 +987,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             </button>
             {modelOpen && (
               <div class="menu-dropdown">
-                {(['opus[1M]', 'sonnet', 'haiku'] as const).map((m) => (
+                {CLAUDE_CODE_MODEL_IDS.map((m) => (
                   <button
                     key={m}
                     class={`menu-item ${model === m ? 'menu-item-active' : ''}`}

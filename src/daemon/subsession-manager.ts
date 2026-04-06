@@ -13,6 +13,7 @@ import { timelineStore } from './timeline-store.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { upsertSession, getSession, removeSession } from '../store/session-store.js';
 import { existsSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { resolveStructuredSessionBootstrap } from '../agent/structured-session-bootstrap.js';
 
 import logger from '../util/logger.js';
@@ -72,6 +73,28 @@ export function normalizeShellBinForHost(shellBin?: string | null): string | und
 export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   const sessionName = subSessionName(sub.id);
   const agentType = sub.type as AgentType;
+
+  if (isTransportAgent(agentType)) {
+    if (await getTransportRuntime(sessionName)) return;
+    await launchTransportSession({
+      name: sessionName,
+      projectName: sessionName,
+      role: 'w1',
+      agentType,
+      projectDir: sub.cwd ?? process.cwd(),
+      label: sub.label ?? undefined,
+      description: sub.description ?? undefined,
+      bindExistingKey: sub.providerSessionId ?? undefined,
+      skipCreate: !!sub.providerSessionId,
+      ...(sub.providerSessionId ? { ccSessionId: sub.ccSessionId ?? undefined, codexSessionId: sub.codexSessionId ?? undefined, fresh: sub.fresh } : {}),
+      ...(!sub.providerSessionId && agentType === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
+      ...(!sub.providerSessionId && agentType === 'codex-sdk' ? { fresh: true } : {}),
+      userCreated: true,
+      parentSession: sub.parentSession ?? undefined,
+    });
+    return;
+  }
+
   if (agentType === 'shell' || agentType === 'script') {
     const normalizedShellBin = normalizeShellBinForHost(sub.shellBin);
     if (sub.shellBin && !normalizedShellBin) {

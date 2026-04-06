@@ -1,5 +1,5 @@
 /**
- * StartSubSessionDialog — choose type (cc/codex/opencode/gemini/qwen/shell/openclaw) and launch a sub-session.
+ * StartSubSessionDialog — choose type (cc/cc-sdk/codex/codex-sdk/opencode/gemini/qwen/shell/openclaw) and launch a sub-session.
  */
 import { useState, useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
@@ -20,7 +20,9 @@ interface Props {
 
 const BASE_AGENT_TYPES = [
   { id: 'claude-code', label: 'Claude Code', icon: '⚡' },
+  { id: 'claude-code-sdk', label: 'Claude Code SDK', icon: '⚡' },
   { id: 'codex', label: 'Codex', icon: '📦' },
+  { id: 'codex-sdk', label: 'Codex SDK', icon: '📦' },
   { id: 'opencode', label: 'OpenCode', icon: '🔆' },
   { id: 'gemini', label: 'Gemini CLI', icon: '♊' },
   { id: 'qwen', label: 'Qwen Code', icon: '千' },
@@ -132,8 +134,8 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     }
     const extra: Record<string, unknown> = {};
     if (desc) extra.description = desc;
-    if (ccPreset && type === 'claude-code') extra.ccPreset = ccPreset;
-    if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
+    if (ccPreset && (type === 'claude-code' || type === 'claude-code-sdk')) extra.ccPreset = ccPreset;
+    if (ccInitPrompt.trim() && (type === 'claude-code' || type === 'claude-code-sdk')) extra.ccInitPrompt = ccInitPrompt.trim();
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
 
@@ -156,7 +158,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                   class={`subsession-type-btn${type === at.id ? ' active' : ''}`}
                   onClick={() => setType(at.id)}
                 >
-                  <span>{at.icon}</span> {at.id === 'openclaw' || at.id === 'qwen' ? t(`session.agentType.${at.id}`) : at.label}
+                  <span>{at.icon}</span> {at.id === 'openclaw' || at.id === 'qwen' || at.id === 'claude-code-sdk' || at.id === 'codex-sdk' ? t(`session.agentType.${at.id}`) : at.label}
                 </button>
               ))}
             </div>
