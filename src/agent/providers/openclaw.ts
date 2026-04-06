@@ -25,6 +25,7 @@ import {
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import logger from '../../util/logger.js';
+import { normalizeOpenClawDisplayName } from '../openclaw-display.js';
 
 // ── Internal frame types ─────────────────────────────────────────────────────
 
@@ -269,7 +270,7 @@ export class OpenClawProvider implements TransportProvider {
         })
         .map((s) => ({
           key: sanitizeKey(s.key),
-          displayName: s.displayName ?? s.label,
+          displayName: normalizeOpenClawDisplayName(s.displayName ?? s.label),
           agentId: s.agentId,
           updatedAt: s.updatedAt ?? undefined,
           percentUsed: s.percentUsed,

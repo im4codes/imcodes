@@ -735,5 +735,21 @@ describe('OpenClawProvider', () => {
       const sessions = await listPromise;
       expect(sessions).toEqual([]);
     });
+
+    it('normalizes discord display names to only keep the #suffix', async () => {
+      await connectProvider(provider);
+
+      const listPromise = provider.listSessions();
+
+      replyToLastRpc({
+        sessions: [
+          { key: 'agent:main:discord:channel:111', displayName: 'discord:1476187408042033309#videos', updatedAt: 1000 },
+          { key: 'agent:main:discord:channel:222', displayName: 'discord:#general', updatedAt: 1001 },
+        ],
+      });
+
+      const sessions = await listPromise;
+      expect(sessions.map((s) => s.displayName)).toEqual(['#videos', '#general']);
+    });
   });
 });
