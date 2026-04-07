@@ -474,6 +474,13 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
     }
   }, [lastVisibleTs]);
 
+  // Preview cards should always show the latest content, including streaming
+  // updates that mutate the last visible event without changing its timestamp.
+  useLayoutEffect(() => {
+    if (!preview) return;
+    scrollToBottom();
+  }, [preview, viewItems, loading]);
+
   // Restore scroll position after Load Older prepends events
   useLayoutEffect(() => {
     const anchor = scrollAnchorRef.current;
