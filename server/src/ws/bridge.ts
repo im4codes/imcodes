@@ -2137,7 +2137,10 @@ export class WsBridge {
     const server = await db.queryOne<{ user_id: string; name: string }>('SELECT user_id, name FROM servers WHERE id = $1', [this.serverId]);
     if (!server) return;
 
-    const { dispatchPush } = await import('../routes/push.js').catch(() => ({ dispatchPush: null }));
+    const { dispatchPush } = await import('../routes/push.js').catch((err) => {
+      logger.error({ err }, 'Failed to import push module — push notifications disabled');
+      return { dispatchPush: null };
+    });
     if (!dispatchPush) return;
 
     const sessionName = String(msg.session ?? msg.sessionId ?? '');
