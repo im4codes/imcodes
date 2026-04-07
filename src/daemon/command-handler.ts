@@ -2,7 +2,7 @@
  * Handle commands from the web UI and inbound chat messages via ServerLink.
  * Commands arrive as JSON objects with a `type` field.
  */
-import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, type ProjectConfig } from '../agent/session-manager.js';
+import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, persistSessionRecord, type ProjectConfig } from '../agent/session-manager.js';
 import { isTransportAgent } from '../agent/detect.js';
 import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand } from '../agent/tmux.js';
 import { listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
@@ -98,6 +98,9 @@ async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord
     runtimeType: r?.runtimeType ?? null,
     providerId: r?.providerId ?? null,
     providerSessionId: r?.providerSessionId ?? null,
+    requestedModel: r?.requestedModel ?? null,
+    activeModel: r?.activeModel ?? r?.modelDisplay ?? null,
+    transportConfig: r?.transportConfig ?? null,
     // Qwen metadata — freshly computed display fields + stored config fields
     qwenModel: r?.qwenModel ?? null,
     qwenAuthType: r?.qwenAuthType ?? null,
@@ -1152,8 +1155,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           }
           transportRuntime.setAgentId(nextModel);
           const qwenAuthType = runtimeConfig?.authType ?? record.qwenAuthType;
-          upsertSession({
+          const nextRecord = {
             ...record,
+            requestedModel: nextModel,
+            activeModel: nextModel,
+            modelDisplay: nextModel,
             qwenModel: nextModel,
             ...(qwenAuthType ? { qwenAuthType } : {}),
             ...(runtimeConfig?.authLimit ? { qwenAuthLimit: runtimeConfig.authLimit } : {}),
@@ -1165,7 +1171,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
               quotaUsageLabel: qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
             }),
             updatedAt: Date.now(),
-          });
+          };
+          upsertSession(nextRecord);
+          persistSessionRecord(nextRecord, sessionName);
           await handleGetSessions(serverLink);
           syncSubSessionIfNeeded(sessionName, serverLink);
           timelineEmitter.emit(sessionName, 'user.message', { text });
@@ -1193,12 +1201,16 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         }
         transportRuntime.setAgentId(normalizeClaudeSdkModelForProvider(selectedModel));
         const sdkDisplay = await getClaudeSdkRuntimeConfig(true).catch(() => ({}) as import('../agent/sdk-runtime-config.js').SdkRuntimeConfig);
-        upsertSession({
+        const nextRecord = {
           ...record,
+          requestedModel: selectedModel,
+          activeModel: selectedModel,
           modelDisplay: selectedModel,
           ...(sdkDisplay.planLabel ? { planLabel: sdkDisplay.planLabel } : {}),
           updatedAt: Date.now(),
-        });
+        };
+        upsertSession(nextRecord);
+        persistSessionRecord(nextRecord, sessionName);
         await handleGetSessions(serverLink);
         syncSubSessionIfNeeded(sessionName, serverLink);
         timelineEmitter.emit(sessionName, 'user.message', { text });
@@ -1219,14 +1231,18 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         }
         transportRuntime.setAgentId(nextModel);
         const sdkDisplay = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
-        upsertSession({
+        const nextRecord = {
           ...record,
+          requestedModel: nextModel,
+          activeModel: nextModel,
           modelDisplay: nextModel,
           planLabel: sdkDisplay.planLabel,
           quotaLabel: sdkDisplay.quotaLabel,
           quotaUsageLabel: sdkDisplay.quotaUsageLabel,
           updatedAt: Date.now(),
-        });
+        };
+        upsertSession(nextRecord);
+        persistSessionRecord(nextRecord, sessionName);
         await handleGetSessions(serverLink);
         syncSubSessionIfNeeded(sessionName, serverLink);
         timelineEmitter.emit(sessionName, 'user.message', { text });
@@ -1251,11 +1267,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           return;
         }
         transportRuntime.setEffort(nextEffort);
-        upsertSession({
+        const nextRecord = {
           ...record,
           effort: nextEffort,
           updatedAt: Date.now(),
-        });
+        };
+        upsertSession(nextRecord);
+        persistSessionRecord(nextRecord, sessionName);
         await handleGetSessions(serverLink);
         syncSubSessionIfNeeded(sessionName, serverLink);
         timelineEmitter.emit(sessionName, 'user.message', { text });
@@ -1735,6 +1753,8 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
         agentType: type as any,
         projectDir: (cwd as string) || process.cwd(),
         description,
+        requestedModel: (cmd.requestedModel as string | undefined) ?? (cmd.model as string | undefined),
+        transportConfig: (cmd.transportConfig as Record<string, unknown> | undefined) ?? undefined,
         bindExistingKey,
         ...(type === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
         ...(type === 'codex-sdk' ? { fresh: true } : {}),
@@ -1822,7 +1842,9 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
         bindExistingKey: effectiveRecord.providerSessionId ?? undefined,
         skipCreate: !!effectiveRecord.providerSessionId,
         parentSession: effectiveRecord.parentSession ?? undefined,
+        requestedModel: effectiveRecord.requestedModel ?? undefined,
         effort: effectiveRecord.effort ?? undefined,
+        transportConfig: effectiveRecord.transportConfig ?? undefined,
         userCreated: effectiveRecord.userCreated,
       });
       try {

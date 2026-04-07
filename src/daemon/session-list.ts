@@ -18,6 +18,8 @@ export interface SessionListItem {
   providerId?: string;
   providerSessionId?: string;
   qwenModel?: string;
+  requestedModel?: string;
+  activeModel?: string;
   qwenAuthType?: string;
   qwenAuthLimit?: string;
   qwenAvailableModels?: string[];
@@ -44,10 +46,12 @@ function baseItem(s: SessionRecord): SessionListItem {
     providerId: s.providerId,
     providerSessionId: s.providerSessionId,
     qwenModel: s.qwenModel,
+    requestedModel: s.requestedModel,
+    activeModel: s.activeModel,
     qwenAuthType: s.qwenAuthType,
     qwenAuthLimit: s.qwenAuthLimit,
     qwenAvailableModels: s.qwenAvailableModels,
-    modelDisplay: s.modelDisplay,
+    modelDisplay: s.modelDisplay ?? s.activeModel,
     planLabel: s.planLabel,
     permissionLabel: s.permissionLabel,
     quotaLabel: s.quotaLabel,

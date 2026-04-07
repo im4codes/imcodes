@@ -568,11 +568,14 @@ export interface SubSessionData {
   qwenModel?: string | null;
   qwenAuthType?: string | null;
   qwenAvailableModels?: string[] | null;
+  requestedModel?: string | null;
+  activeModel?: string | null;
   modelDisplay?: string | null;
   planLabel?: string | null;
   quotaLabel?: string | null;
   quotaUsageLabel?: string | null;
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null;
+  transportConfig?: Record<string, unknown> | null;
 }
 
 export async function listSubSessions(serverId: string): Promise<SubSessionData[]> {
@@ -583,6 +586,8 @@ export async function listSubSessions(serverId: string): Promise<SubSessionData[
     created_at: number; updated_at: number; cc_session_id: string | null;
     gemini_session_id: string | null; parent_session: string | null;
     description: string | null; cc_preset_id: string | null;
+    requested_model: string | null; active_model: string | null; effort: import('../../shared/effort-levels.js').TransportEffortLevel | null;
+    transport_config: Record<string, unknown> | string | null;
   }> }>(`/api/server/${serverId}/sub-sessions`);
   return res.subSessions.map((s) => ({
     id: s.id, serverId: s.server_id, type: s.type,
@@ -595,12 +600,32 @@ export async function listSubSessions(serverId: string): Promise<SubSessionData[
     parentSession: s.parent_session,
     description: s.description,
     ccPresetId: s.cc_preset_id,
+    requestedModel: s.requested_model,
+    activeModel: s.active_model,
+    modelDisplay: s.active_model,
+    effort: s.effort,
+    transportConfig: (typeof s.transport_config === 'string'
+      ? JSON.parse(s.transport_config)
+      : (s.transport_config ?? null)) as Record<string, unknown> | null,
   }));
 }
 
 export async function createSubSession(
   serverId: string,
-  body: { type: string; shellBin?: string; cwd?: string; label?: string; ccSessionId?: string; parentSession?: string | null; description?: string; ccPresetId?: string },
+  body: {
+    type: string;
+    shellBin?: string;
+    cwd?: string;
+    label?: string;
+    ccSessionId?: string;
+    parentSession?: string | null;
+    description?: string;
+    ccPresetId?: string;
+    requestedModel?: string | null;
+    activeModel?: string | null;
+    effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null;
+    transportConfig?: Record<string, unknown> | null;
+  },
 ): Promise<{ id: string; sessionName: string; subSession: SubSessionData }> {
   const res = await apiFetch<{ id: string; sessionName: string; subSession: {
     id: string; server_id: string; type: string; shell_bin: string | null;
@@ -608,9 +633,20 @@ export async function createSubSession(
     cwd: string | null; label: string | null; closed_at: number | null;
     created_at: number; updated_at: number; cc_session_id: string | null;
     gemini_session_id: string | null; parent_session: string | null; description: string | null; cc_preset_id: string | null;
+    requested_model: string | null; active_model: string | null; effort: import('../../shared/effort-levels.js').TransportEffortLevel | null;
+    transport_config: Record<string, unknown> | string | null;
   } }>(`/api/server/${serverId}/sub-sessions`, {
     method: 'POST',
-    body: JSON.stringify({ ...body, cc_session_id: body.ccSessionId ?? null, parent_session: body.parentSession ?? null, cc_preset_id: body.ccPresetId ?? null }),
+    body: JSON.stringify({
+      ...body,
+      cc_session_id: body.ccSessionId ?? null,
+      parent_session: body.parentSession ?? null,
+      cc_preset_id: body.ccPresetId ?? null,
+      requested_model: body.requestedModel ?? null,
+      active_model: body.activeModel ?? null,
+      effort: body.effort ?? null,
+      transport_config: body.transportConfig ?? null,
+    }),
   });
   const s = res.subSession;
   return {
@@ -626,6 +662,13 @@ export async function createSubSession(
       parentSession: s.parent_session,
       description: s.description,
       ccPresetId: s.cc_preset_id,
+      requestedModel: s.requested_model,
+      activeModel: s.active_model,
+      modelDisplay: s.active_model,
+      effort: s.effort,
+      transportConfig: (typeof s.transport_config === 'string'
+        ? JSON.parse(s.transport_config)
+        : (s.transport_config ?? null)) as Record<string, unknown> | null,
     },
   };
 }
@@ -633,7 +676,17 @@ export async function createSubSession(
 export async function patchSubSession(
   serverId: string,
   subId: string,
-  body: { label?: string | null; closedAt?: number | null; description?: string | null; cwd?: string | null; ccPresetId?: string | null },
+  body: {
+    label?: string | null;
+    closedAt?: number | null;
+    description?: string | null;
+    cwd?: string | null;
+    ccPresetId?: string | null;
+    requestedModel?: string | null;
+    activeModel?: string | null;
+    effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null;
+    transportConfig?: Record<string, unknown> | null;
+  },
 ): Promise<void> {
   await apiFetch(`/api/server/${serverId}/sub-sessions/${subId}`, {
     method: 'PATCH',

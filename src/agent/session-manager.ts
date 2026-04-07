@@ -127,6 +127,10 @@ function emitSessionPersist(record: SessionRecord | null, name: string): void {
   _onSessionPersist?.(record, name).catch((e) => logger.warn({ err: e, name }, 'session persist callback failed'));
 }
 
+export function persistSessionRecord(record: SessionRecord | null, name: string): void {
+  emitSessionPersist(record, name);
+}
+
 export interface ProjectConfig {
   name: string;
   dir: string;
@@ -716,10 +720,14 @@ export interface LaunchOpts {
   opencodeSessionId?: string;
   /** Qwen model ID for `qwen --model <ID>`. */
   qwenModel?: string;
+  /** Unified requested transport model for launch/restore. */
+  requestedModel?: string;
   /** Human-readable label for UI display. */
   label?: string;
   /** Reasoning/thinking effort for supported transport providers. */
   effort?: TransportEffortLevel;
+  /** Provider-specific runtime config persisted outside top-level schema. */
+  transportConfig?: Record<string, unknown>;
   /** Session description for transport sessions (persona/system prompt injection). */
   description?: string;
   /** CC env preset name — resolved to env vars at launch, persisted for respawn. */
@@ -771,9 +779,15 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
       }
     }
 
-    if (typeof info.model === 'string' && info.model && next.modelDisplay !== info.model) {
-      next.modelDisplay = info.model;
-      changed = true;
+    if (typeof info.model === 'string' && info.model) {
+      if (next.activeModel !== info.model) {
+        next.activeModel = info.model;
+        changed = true;
+      }
+      if (next.modelDisplay !== info.model) {
+        next.modelDisplay = info.model;
+        changed = true;
+      }
     }
 
     if (typeof info.planLabel === 'string' && info.planLabel && next.planLabel !== info.planLabel) {
@@ -862,11 +876,12 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       const availableQwenModels = s.providerId === 'qwen'
         ? (s.qwenAvailableModels?.length ? s.qwenAvailableModels : (qwenRuntime?.availableModels ?? []))
         : [];
+      const requestedTransportModel = s.requestedModel ?? s.qwenModel;
       const effectiveQwenModel = s.providerId === 'qwen'
-        ? (s.qwenModel && (availableQwenModels.length === 0 || availableQwenModels.includes(s.qwenModel))
-          ? s.qwenModel
+        ? (requestedTransportModel && (availableQwenModels.length === 0 || availableQwenModels.includes(requestedTransportModel))
+          ? requestedTransportModel
           : availableQwenModels[0])
-        : s.qwenModel;
+        : requestedTransportModel;
       const runtime = new TransportSessionRuntime(provider, s.name);
       wireTransportCallbacks(runtime, s.name);
       wireTransportSessionInfo(runtime, s.name, s.agentType);
@@ -906,6 +921,10 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         state: 'running',
         updatedAt: Date.now(),
         ...(freshAfterCancel ? { providerSessionId: actualProviderSid, qwenFreshOnResume: undefined } : {}),
+        requestedModel: effectiveQwenModel ?? s.requestedModel,
+        activeModel: effectiveQwenModel ?? s.activeModel ?? s.modelDisplay,
+        modelDisplay: effectiveQwenModel ?? s.modelDisplay,
+        transportConfig: s.transportConfig ?? {},
         ...(effectiveQwenModel ? { qwenModel: effectiveQwenModel } : {}),
         ...(qwenRuntime?.authType ? { qwenAuthType: qwenRuntime.authType } : {}),
         ...(qwenRuntime?.authLimit ? { qwenAuthLimit: qwenRuntime.authLimit } : {}),
@@ -926,6 +945,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
 
 export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate, parentSession } = opts;
+  const existing = getSession(name);
 
   if (opts.fresh) {
     const existingRuntime = transportRuntimes.get(name);
@@ -953,7 +973,9 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   let qwenAuthLimit: SessionRecord['qwenAuthLimit'] | undefined;
   let availableQwenModels: string[] | undefined;
   let sdkDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel'> | undefined;
-  let effectiveQwenModel = agentType === 'qwen' ? (opts.qwenModel ?? getSession(name)?.qwenModel) : undefined;
+  const storedRequestedModel = !opts.fresh ? existing?.requestedModel : undefined;
+  let requestedTransportModel = opts.requestedModel ?? storedRequestedModel ?? (agentType === 'qwen' ? (opts.qwenModel ?? existing?.qwenModel) : undefined);
+  const effectiveTransportConfig = opts.transportConfig ?? existing?.transportConfig ?? {};
   let transportResumeId: string | undefined;
   let transportEnv: Record<string, string> | undefined = opts.extraEnv;
   if (agentType === 'qwen') {
@@ -961,10 +983,10 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     qwenAuthType = qwenRuntime?.authType;
     qwenAuthLimit = qwenRuntime?.authLimit;
     availableQwenModels = qwenRuntime?.availableModels ?? [];
-    if (!effectiveQwenModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(effectiveQwenModel))) {
-      effectiveQwenModel = availableQwenModels[0] ?? effectiveQwenModel;
+    if (!requestedTransportModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(requestedTransportModel))) {
+      requestedTransportModel = availableQwenModels[0] ?? requestedTransportModel;
     }
-    const stored = !opts.fresh ? getSession(name)?.providerSessionId : undefined;
+    const stored = !opts.fresh ? existing?.providerSessionId : undefined;
     const qwenSessionId = effectiveBindExistingKey ?? stored ?? randomUUID();
     effectiveSessionKey = qwenSessionId;
     if (!opts.fresh && (effectiveBindExistingKey || stored)) {
@@ -994,7 +1016,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     cwd: projectDir,
     label: label || name,
     description,
-    agentId: effectiveQwenModel,
+    agentId: requestedTransportModel,
     bindExistingKey: effectiveBindExistingKey,
     skipCreate: effectiveSkipCreate,
     resumeId: transportResumeId,
@@ -1024,12 +1046,16 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         providerSessionId: runtime.providerSessionId ?? undefined,
         ...(agentType === 'claude-code-sdk' && transportResumeId ? { ccSessionId: transportResumeId } : {}),
         ...(agentType === 'codex-sdk' && transportResumeId ? { codexSessionId: transportResumeId } : {}),
-        ...(effectiveQwenModel ? { qwenModel: effectiveQwenModel } : {}),
+        requestedModel: requestedTransportModel,
+        activeModel: requestedTransportModel,
+        modelDisplay: requestedTransportModel,
+        transportConfig: effectiveTransportConfig,
+        ...(requestedTransportModel && agentType === 'qwen' ? { qwenModel: requestedTransportModel } : {}),
         ...(qwenAuthType ? { qwenAuthType } : {}),
         ...(qwenAuthLimit ? { qwenAuthLimit } : {}),
         ...(availableQwenModels?.length ? { qwenAvailableModels: availableQwenModels } : {}),
         ...getQwenDisplayMetadata({
-          model: effectiveQwenModel,
+          model: requestedTransportModel,
           authType: qwenAuthType,
           authLimit: qwenAuthLimit,
           quotaUsageLabel: qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,

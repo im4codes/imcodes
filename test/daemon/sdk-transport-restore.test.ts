@@ -159,6 +159,10 @@ describe('sdk transport session restore', () => {
       providerId: 'claude-code-sdk',
       providerSessionId: 'route-cc-restore',
       ccSessionId: 'cc-session-restore',
+      requestedModel: 'sonnet',
+      activeModel: 'sonnet',
+      effort: 'high',
+      transportConfig: { provider: { mode: 'safe' } },
     });
 
     await connectProvider('claude-code-sdk', {});
@@ -173,7 +177,11 @@ describe('sdk transport session restore', () => {
 
     expect(mocks.claudeRuns).toHaveLength(1);
     expect(mocks.claudeRuns[0].options.resume).toBe('cc-session-restore');
+    expect(mocks.claudeRuns[0].options.model).toBe('sonnet');
+    expect(mocks.claudeRuns[0].options.effort).toBe('high');
     expect(mocks.store.get('deck_sdk_cc_brain')?.modelDisplay).toBe('claude-sonnet-4-6');
+    expect(mocks.store.get('deck_sdk_cc_brain')?.requestedModel).toBe('sonnet');
+    expect(mocks.store.get('deck_sdk_cc_brain')?.effort).toBe('high');
   });
 
   it('restores codex-sdk sessions with persisted thread id and sends via resumeThread()', async () => {
@@ -192,6 +200,10 @@ describe('sdk transport session restore', () => {
       providerId: 'codex-sdk',
       providerSessionId: 'route-cx-restore',
       codexSessionId: 'codex-thread-restore',
+      requestedModel: 'gpt-5.4',
+      activeModel: 'gpt-5.4',
+      effort: 'medium',
+      transportConfig: { provider: { mode: 'balanced' } },
     });
 
     await connectProvider('codex-sdk', {});
@@ -206,5 +218,7 @@ describe('sdk transport session restore', () => {
 
     expect(mocks.codexRuns).toHaveLength(1);
     expect(mocks.codexRuns[0]).toMatchObject({ mode: 'resume', id: 'codex-thread-restore' });
+    expect(mocks.store.get('deck_sdk_cx_brain')?.requestedModel).toBe('gpt-5.4');
+    expect(mocks.store.get('deck_sdk_cx_brain')?.effort).toBe('medium');
   });
 });

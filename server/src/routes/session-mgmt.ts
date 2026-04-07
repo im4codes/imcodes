@@ -48,19 +48,53 @@ sessionMgmtRoutes.put('/:id/sessions/:name', async (c) => {
   const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (role !== 'owner' && role !== 'admin') return c.json({ error: 'forbidden' }, 403);
 
-  let body: Record<string, string>;
+  let body: Record<string, unknown>;
   try {
     body = await c.req.json() as Record<string, string>;
   } catch {
     return c.json({ error: 'invalid_json' }, 400);
   }
 
-  const { projectName, projectRole, agentType, agentVersion, projectDir, state, runtimeType, providerId, providerSessionId, description } = body;
+  const {
+    projectName,
+    projectRole,
+    agentType,
+    agentVersion,
+    projectDir,
+    state,
+    runtimeType,
+    providerId,
+    providerSessionId,
+    description,
+    requestedModel,
+    activeModel,
+    effort,
+    transportConfig,
+  } = body;
   if (!projectName || !projectRole || !agentType || !projectDir || !state) {
     return c.json({ error: 'missing_fields' }, 400);
   }
 
-  await upsertDbSession(c.env.DB, randomHex(16), serverId, sessionName, projectName, projectRole, agentType, projectDir, state, agentVersion, runtimeType, providerId, providerSessionId, description);
+  await upsertDbSession(
+    c.env.DB,
+    randomHex(16),
+    serverId,
+    sessionName,
+    String(projectName),
+    String(projectRole),
+    String(agentType),
+    String(projectDir),
+    String(state),
+    typeof agentVersion === 'string' ? agentVersion : null,
+    typeof runtimeType === 'string' ? runtimeType : null,
+    typeof providerId === 'string' ? providerId : null,
+    typeof providerSessionId === 'string' ? providerSessionId : null,
+    typeof description === 'string' ? description : null,
+    typeof requestedModel === 'string' ? requestedModel : null,
+    typeof activeModel === 'string' ? activeModel : null,
+    typeof effort === 'string' ? effort : null,
+    transportConfig && typeof transportConfig === 'object' ? transportConfig as Record<string, unknown> : null,
+  );
   return c.json({ ok: true });
 });
 
@@ -92,17 +126,37 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
   const role = await resolveServerRole(c.env.DB, serverId, userId);
   if (role === 'none') return c.json({ error: 'forbidden' }, 403);
 
-  let body: { label?: string | null; description?: string | null; cwd?: string | null };
+  let body: {
+    label?: string | null;
+    description?: string | null;
+    cwd?: string | null;
+    requestedModel?: string | null;
+    activeModel?: string | null;
+    effort?: string | null;
+    transportConfig?: Record<string, unknown> | null;
+  };
   try {
     body = await c.req.json() as typeof body;
   } catch {
     return c.json({ error: 'invalid_json' }, 400);
   }
 
-  const fields: { label?: string | null; description?: string | null; project_dir?: string | null } = {};
+  const fields: {
+    label?: string | null;
+    description?: string | null;
+    project_dir?: string | null;
+    requested_model?: string | null;
+    active_model?: string | null;
+    effort?: string | null;
+    transport_config?: Record<string, unknown> | null;
+  } = {};
   if ('label' in body) fields.label = body.label ?? null;
   if ('description' in body) fields.description = body.description ?? null;
   if ('cwd' in body) fields.project_dir = body.cwd ?? null;
+  if ('requestedModel' in body) fields.requested_model = body.requestedModel ?? null;
+  if ('activeModel' in body) fields.active_model = body.activeModel ?? null;
+  if ('effort' in body) fields.effort = body.effort ?? null;
+  if ('transportConfig' in body) fields.transport_config = body.transportConfig ?? null;
 
   await updateSession(c.env.DB, serverId, sessionName, fields);
   return c.json({ ok: true });

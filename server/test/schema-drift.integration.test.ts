@@ -73,6 +73,7 @@ const SCHEMA_MAP: Array<[string, string[]]> = [
     'id', 'server_id', 'name', 'project_name', 'role', 'agent_type',
     'agent_version', 'project_dir', 'state', 'label',
     'runtime_type', 'provider_id', 'provider_session_id', 'description',
+    'requested_model', 'active_model', 'effort', 'transport_config',
     'created_at', 'updated_at',
   ]],
   ['sub_sessions', [
@@ -80,7 +81,7 @@ const SCHEMA_MAP: Array<[string, string[]]> = [
     'closed_at', 'created_at', 'updated_at',
     'cc_session_id', 'gemini_session_id', 'parent_session', 'sort_order',
     'runtime_type', 'provider_id', 'provider_session_id', 'description',
-    'cc_preset_id',
+    'cc_preset_id', 'requested_model', 'active_model', 'effort', 'transport_config',
   ]],
   ['discussions', [
     'id', 'server_id', 'topic', 'state', 'max_rounds', 'current_round',

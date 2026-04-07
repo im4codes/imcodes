@@ -51,6 +51,10 @@ describe('sub-session routes', () => {
       created_at: Date.now(),
       updated_at: Date.now(),
       cc_preset_id: null,
+      requested_model: null,
+      active_model: null,
+      effort: null,
+      transport_config: {},
     }));
   });
 
@@ -78,6 +82,10 @@ describe('sub-session routes', () => {
       null,
       null,
       null,
+      null,
+      null,
+      null,
+      null,
     );
   });
 
@@ -97,6 +105,10 @@ describe('sub-session routes', () => {
       null,
       '/tmp/test',
       'Codex SDK',
+      null,
+      null,
+      null,
+      null,
       null,
       null,
       null,

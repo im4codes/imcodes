@@ -41,6 +41,8 @@ export interface SessionInfo {
   /** Runtime backing: 'process' for tmux-backed, 'transport' for network-backed. */
   runtimeType?: 'process' | 'transport';
   qwenModel?: string;
+  requestedModel?: string;
+  activeModel?: string;
   qwenAuthType?: string;
   qwenAuthLimit?: string;
   qwenAvailableModels?: string[];

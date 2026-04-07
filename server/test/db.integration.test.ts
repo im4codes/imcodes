@@ -983,7 +983,7 @@ describe('transport session metadata persistence', () => {
     // Upsert same session with a new state — transport fields should survive
     await upsertDbSession(
       db, 'tmd-sid-1', serverId, 'deck_transport_brain', 'tproj', 'brain', 'claude-code', '/home/dev',
-      'idle', null, 'transport', 'openclaw', 'oc-key-123', 'test persona',
+      'idle', null, 'transport', 'openclaw', 'oc-key-123', 'test persona', 'sonnet', 'sonnet', 'high', { provider: { mode: 'safe' } },
     );
     const sessions = await getDbSessionsByServer(db, serverId);
     const s = sessions.find(s => s.name === 'deck_transport_brain');
@@ -993,12 +993,16 @@ describe('transport session metadata persistence', () => {
     expect(s!.provider_id).toBe('openclaw');
     expect(s!.provider_session_id).toBe('oc-key-123');
     expect(s!.description).toBe('test persona');
+    expect(s!.requested_model).toBe('sonnet');
+    expect(s!.active_model).toBe('sonnet');
+    expect(s!.effort).toBe('high');
+    expect(s!.transport_config).toEqual({ provider: { mode: 'safe' } });
   });
 
   it('createSubSession with transport fields roundtrip', async () => {
     await createSubSession(
       db, 'tmd-sub-1', serverId, 'claude-code', null, '/transport', null, null,
-      null, null, 'transport', 'openclaw', 'oc-sub-456', 'sub persona',
+      null, null, 'transport', 'openclaw', 'oc-sub-456', 'sub persona', null, 'sonnet', 'sonnet', 'high', { provider: { mode: 'safe' } },
     );
     const sub = await getSubSessionById(db, 'tmd-sub-1', serverId);
     expect(sub).not.toBeNull();
@@ -1006,5 +1010,9 @@ describe('transport session metadata persistence', () => {
     expect(sub!.provider_id).toBe('openclaw');
     expect(sub!.provider_session_id).toBe('oc-sub-456');
     expect(sub!.description).toBe('sub persona');
+    expect(sub!.requested_model).toBe('sonnet');
+    expect(sub!.active_model).toBe('sonnet');
+    expect(sub!.effort).toBe('high');
+    expect(sub!.transport_config).toEqual({ provider: { mode: 'safe' } });
   });
 });

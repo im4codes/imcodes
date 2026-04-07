@@ -34,6 +34,9 @@ export interface SubSessionRecord {
   runtimeType?: 'process' | 'transport' | null;
   providerId?: string | null;
   providerSessionId?: string | null;
+  requestedModel?: string | null;
+  activeModel?: string | null;
+  transportConfig?: Record<string, unknown> | null;
   parentSession?: string | null;
   /** CC env preset name (e.g. "MiniMax", "DeepSeek"). Resolves to env vars at launch. */
   ccPreset?: string | null;
@@ -86,6 +89,8 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
       projectDir: sub.cwd ?? process.cwd(),
       label: sub.label ?? undefined,
       description: sub.description ?? undefined,
+      requestedModel: sub.requestedModel ?? undefined,
+      transportConfig: sub.transportConfig ?? undefined,
       bindExistingKey: sub.providerSessionId ?? undefined,
       skipCreate: !!sub.providerSessionId,
       ...(sub.providerSessionId ? { ccSessionId: sub.ccSessionId ?? undefined, codexSessionId: sub.codexSessionId ?? undefined, fresh: sub.fresh } : {}),
@@ -298,7 +303,9 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         bindExistingKey: sub.providerSessionId ?? undefined,
         skipCreate: !!sub.providerSessionId,
         parentSession: sub.parentSession ?? undefined,
+        requestedModel: sub.requestedModel ?? undefined,
         effort: sub.effort ?? undefined,
+        transportConfig: sub.transportConfig ?? undefined,
       }).catch((e) => logger.warn({ err: e, sessionName }, 'Failed to rebuild transport sub-session'));
       }
       continue;
@@ -347,7 +354,11 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         geminiSessionId: effectiveGeminiSessionId ?? undefined,
         opencodeSessionId: effectiveOpenCodeSessionId ?? undefined,
         parentSession: sub.parentSession ?? stored?.parentSession,
+        requestedModel: sub.requestedModel ?? stored?.requestedModel,
+        activeModel: sub.activeModel ?? stored?.activeModel,
+        modelDisplay: sub.activeModel ?? stored?.modelDisplay,
         effort: sub.effort ?? stored?.effort,
+        transportConfig: sub.transportConfig ?? stored?.transportConfig,
         // Preserve existing diagnostic fields instead of resetting
         restarts: stored?.restarts ?? 0,
         restartTimestamps: stored?.restartTimestamps ?? [],

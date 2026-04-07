@@ -49,6 +49,10 @@ export interface SessionRecord {
   qwenAvailableModels?: string[];
   /** Generic display model override for UI footer/header. */
   modelDisplay?: string;
+  /** User-requested transport model persisted for restart/rebuild/cross-device restore. */
+  requestedModel?: string;
+  /** Active/effective transport model persisted from runtime/provider state. */
+  activeModel?: string;
   /** Generic commercial/plan badge label (e.g. Free, Paid, BYO). */
   planLabel?: string;
   /** Generic permission/sandbox badge label (e.g. all, ask). */
@@ -59,6 +63,8 @@ export interface SessionRecord {
   quotaUsageLabel?: string;
   /** Generic reasoning/thinking effort for supported providers. */
   effort?: TransportEffortLevel;
+  /** Provider-specific transport settings that must not expand the top-level schema. */
+  transportConfig?: Record<string, unknown>;
   /** Parent main session name (e.g. `deck_proj_brain`) — links sub-sessions to their parent. */
   parentSession?: string;
   /** Runtime type — 'process' for tmux, 'transport' for network-backed. Defaults to 'process' for backward compat. */

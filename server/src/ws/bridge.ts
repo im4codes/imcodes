@@ -953,6 +953,10 @@ export class WsBridge {
         (msg.providerSessionId as string) || null,
         (msg.description as string) || null,
         (msg.ccPresetId as string) || null,
+        (msg.requestedModel as string) || null,
+        ((msg.activeModel as string) || (msg.modelDisplay as string)) || null,
+        (msg.effort as string) || null,
+        (msg.transportConfig as Record<string, unknown>) || null,
       ).then(() => {
         // Notify browsers so sub-session appears immediately without page refresh
         this.broadcastToBrowsers(JSON.stringify({
@@ -967,6 +971,10 @@ export class WsBridge {
           runtimeType: msg.runtimeType || null,
           providerId: msg.providerId || null,
           providerSessionId: msg.providerSessionId || null,
+          requestedModel: msg.requestedModel || null,
+          activeModel: msg.activeModel || msg.modelDisplay || null,
+          effort: msg.effort || null,
+          transportConfig: msg.transportConfig || null,
           qwenModel: msg.qwenModel || null,
           qwenAuthType: msg.qwenAuthType || null,
           qwenAvailableModels: msg.qwenAvailableModels || null,

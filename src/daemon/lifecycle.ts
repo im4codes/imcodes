@@ -79,6 +79,10 @@ async function persistSessionToWorker(
         providerId: record.providerId ?? null,
         providerSessionId: record.providerSessionId ?? null,
         description: record.description ?? null,
+        requestedModel: record.requestedModel ?? null,
+        activeModel: record.activeModel ?? record.modelDisplay ?? null,
+        effort: record.effort ?? null,
+        transportConfig: record.transportConfig ?? null,
       }),
     });
     if (!res.ok) logger.warn({ status: res.status, name }, 'persistSessionToWorker: non-ok response');
@@ -144,7 +148,7 @@ async function syncSessionsFromWorker(workerUrl: string, serverId: string, token
       return;
     }
 
-    const data = await sessionRes.json() as { sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; project_dir: string; state: string }> };
+    const data = await sessionRes.json() as { sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; project_dir: string; state: string; requested_model?: string | null; active_model?: string | null; effort?: SessionRecord['effort'] | null; transport_config?: Record<string, unknown> | string | null }> };
     const subData = await subRes.json() as { subSessions: Array<{ id: string }> };
     const remoteSessionNames = new Set(
       data.sessions
@@ -180,6 +184,13 @@ async function syncSessionsFromWorker(workerUrl: string, serverId: string, token
         agentType: s.agent_type,
         projectDir: s.project_dir,
         state: s.state as import('../store/session-store.js').SessionState,
+        requestedModel: s.requested_model ?? existing?.requestedModel,
+        activeModel: s.active_model ?? existing?.activeModel,
+        modelDisplay: s.active_model ?? existing?.modelDisplay,
+        effort: s.effort ?? existing?.effort,
+        transportConfig: (typeof s.transport_config === 'string'
+          ? JSON.parse(s.transport_config)
+          : (s.transport_config ?? existing?.transportConfig)) as Record<string, unknown> | undefined,
         restarts: existing?.restarts ?? 0,
         restartTimestamps: existing?.restartTimestamps ?? [],
         createdAt: existing?.createdAt ?? Date.now(),
@@ -349,16 +360,26 @@ export async function startup(): Promise<DaemonContext> {
             id,
             sessionType: session.agentType,
             cwd: session.projectDir || null,
+            label: session.label ?? null,
             ccSessionId: session.ccSessionId ?? null,
             geminiSessionId: session.geminiSessionId ?? null,
             parentSession: session.parentSession ?? null,
             ccPresetId: session.ccPreset ?? null,
             description: session.description ?? null,
+            runtimeType: session.runtimeType ?? null,
+            providerId: session.providerId ?? null,
+            providerSessionId: session.providerSessionId ?? null,
+            qwenModel: session.qwenModel ?? null,
+            qwenAuthType: session.qwenAuthType ?? null,
+            qwenAvailableModels: session.qwenAvailableModels ?? null,
+            requestedModel: session.requestedModel ?? null,
+            activeModel: session.activeModel ?? session.modelDisplay ?? null,
             modelDisplay: session.modelDisplay ?? null,
             planLabel: session.planLabel ?? null,
             quotaLabel: session.quotaLabel ?? null,
             quotaUsageLabel: session.quotaUsageLabel ?? null,
             effort: session.effort ?? null,
+            transportConfig: session.transportConfig ?? null,
           });
         } catch { /* ignore */ }
       }
