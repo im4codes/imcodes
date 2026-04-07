@@ -8,6 +8,7 @@ import { FilePreviewPane } from '../components/FilePreviewPane.js';
 interface P2pDiscussion {
   id: string;
   fileName: string;
+  path?: string;
   preview: string;
   mtime: number;
 }
@@ -30,9 +31,14 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
   const [selected, setSelected] = useState<string | null>(initialSelectedId ?? null);
   const [content, setContent] = useState<string | null>(null);
   const [autoFollow, setAutoFollow] = useState(true);
+  const [copyMenuId, setCopyMenuId] = useState<string | null>(null);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   // Track which id we last requested, to prevent stale response overwriting current selection
   const pendingReadIdRef = useRef<string | null>(null);
+  const pendingReadRequestIdRef = useRef<string | null>(null);
+  const pendingCopyRef = useRef<{ id: string; requestId: string } | null>(null);
+  const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const detailScrollRef = useRef<HTMLDivElement>(null);
 
   const scrollDetailToTop = useCallback((behavior: ScrollBehavior = 'smooth') => {
@@ -44,6 +50,10 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
     if (!el) return;
     el.scrollTo({ top: el.scrollHeight, behavior });
   }, []);
+
+  const sendReadDiscussion = useCallback((id: string, requestId: string) => {
+    ws?.send({ type: 'p2p.read_discussion', id, requestId });
+  }, [ws]);
 
   const loadList = useCallback(() => {
     if (!ws) return;
@@ -57,9 +67,47 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
     setSelected(id);
     setContent(null);
     setAutoFollow(true);
+    setCopyMenuId(null);
     pendingReadIdRef.current = id;
-    ws?.send({ type: 'p2p.read_discussion', id });
-  }, [ws]);
+    pendingReadRequestIdRef.current = crypto.randomUUID();
+    sendReadDiscussion(id, pendingReadRequestIdRef.current);
+  }, [sendReadDiscussion]);
+
+  const markCopied = useCallback((id: string) => {
+    if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+    setCopiedId(id);
+    copiedTimerRef.current = setTimeout(() => {
+      setCopiedId((current) => (current === id ? null : current));
+      copiedTimerRef.current = null;
+    }, 1500);
+  }, []);
+
+  const copyText = useCallback(async (id: string, text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopyMenuId(null);
+      markCopied(id);
+    } catch {
+      setCopyMenuId(null);
+    }
+  }, [markCopied]);
+
+  const handleCopyPath = useCallback(async (discussion: P2pDiscussion) => {
+    const text = discussion.path ?? discussion.fileName;
+    if (!text) return;
+    await copyText(discussion.id, text);
+  }, [copyText]);
+
+  const handleCopyContent = useCallback(async (discussion: P2pDiscussion) => {
+    if (selected === discussion.id && content !== null) {
+      await copyText(discussion.id, content);
+      return;
+    }
+    const requestId = crypto.randomUUID();
+    pendingCopyRef.current = { id: discussion.id, requestId };
+    setCopyMenuId(null);
+    sendReadDiscussion(discussion.id, requestId);
+  }, [content, copyText, selected, sendReadDiscussion]);
 
   // Auto-refresh selected discussion content every 5s (like file browser preview)
   useEffect(() => {
@@ -67,11 +115,12 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
     const timer = setInterval(() => {
       if (!pendingReadIdRef.current) {
         pendingReadIdRef.current = selected;
-        ws.send({ type: 'p2p.read_discussion', id: selected });
+        pendingReadRequestIdRef.current = crypto.randomUUID();
+        sendReadDiscussion(selected, pendingReadRequestIdRef.current);
       }
     }, 5000);
     return () => clearInterval(timer);
-  }, [selected, ws]);
+  }, [selected, sendReadDiscussion, ws]);
 
   // Auto-select initialSelectedId: try immediately (even before list loads)
   const initialAppliedRef = useRef(false);
@@ -89,9 +138,10 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
     // Even if not in list yet (active run), try to read directly
     if (selected === initialSelectedId && content === null && !pendingReadIdRef.current) {
       pendingReadIdRef.current = initialSelectedId;
-      ws?.send({ type: 'p2p.read_discussion', id: initialSelectedId });
+      pendingReadRequestIdRef.current = crypto.randomUUID();
+      sendReadDiscussion(initialSelectedId, pendingReadRequestIdRef.current);
     }
-  }, [discussions, initialSelectedId, selected, content, ws, selectDiscussion]);
+  }, [discussions, initialSelectedId, selected, content, sendReadDiscussion, selectDiscussion]);
 
   useEffect(() => {
     if (!ws) return;
@@ -101,9 +151,20 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
         setLoading(false);
       }
       if (msg.type === 'p2p.read_discussion_response') {
+        const responseRequestId = msg.requestId;
+        const pendingCopy = pendingCopyRef.current;
+        if (pendingCopy && responseRequestId === pendingCopy.requestId) {
+          pendingCopyRef.current = null;
+          if (!msg.error && typeof msg.content === 'string') {
+            void copyText(pendingCopy.id, msg.content);
+          }
+          return;
+        }
+        if (responseRequestId && pendingReadRequestIdRef.current && responseRequestId !== pendingReadRequestIdRef.current) return;
         // Only accept response matching the most recent request (prevent stale overwrite)
         const responseId = (msg as any).id as string | undefined;
         if (responseId && pendingReadIdRef.current && responseId !== pendingReadIdRef.current) return;
+        pendingReadRequestIdRef.current = null;
         pendingReadIdRef.current = null;
         if (msg.error) {
           setContent(t('p2p.discussions.load_failed'));
@@ -123,12 +184,28 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
           // Debounce: don't reload if we already have a pending read
           if (!pendingReadIdRef.current) {
             pendingReadIdRef.current = selected;
-            ws?.send({ type: 'p2p.read_discussion', id: selected });
+            pendingReadRequestIdRef.current = crypto.randomUUID();
+            sendReadDiscussion(selected, pendingReadRequestIdRef.current);
           }
         }
       }
     });
-  }, [ws, selected, loadList]);
+  }, [copyText, loadList, selected, sendReadDiscussion, t, ws]);
+
+  useEffect(() => () => {
+    if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+  }, []);
+
+  useEffect(() => {
+    if (!copyMenuId) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('.discussions-copy-wrap')) return;
+      setCopyMenuId(null);
+    };
+    document.addEventListener('pointerdown', onPointerDown);
+    return () => document.removeEventListener('pointerdown', onPointerDown);
+  }, [copyMenuId]);
 
   useEffect(() => {
     if (!selected || content === null || !autoFollow) return;
@@ -189,7 +266,30 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
               <div class="discussions-list-topic">{d.preview}</div>
               <div class="discussions-list-meta">
                 <span style={{ color: '#64748b', fontSize: 11 }}>{d.id}</span>
-                <span class="discussions-list-time">{formatTime(d.mtime)}</span>
+                <div class="discussions-list-actions">
+                  <div class="discussions-copy-wrap" onClick={(e) => e.stopPropagation()}>
+                    <button
+                      type="button"
+                      class={`discussions-copy-btn${copiedId === d.id ? ' is-copied' : ''}`}
+                      aria-label={copiedId === d.id ? t('common.copied') : t('common.copy')}
+                      title={copiedId === d.id ? t('common.copied') : t('common.copy')}
+                      onClick={() => setCopyMenuId((current) => (current === d.id ? null : d.id))}
+                    >
+                      ⧉
+                    </button>
+                    {copyMenuId === d.id && (
+                      <div class="discussions-copy-menu">
+                        <button type="button" class="discussions-copy-menu-item" onClick={() => { void handleCopyPath(d); }}>
+                          {t('p2p.discussions.copy_path')}
+                        </button>
+                        <button type="button" class="discussions-copy-menu-item" onClick={() => { void handleCopyContent(d); }}>
+                          {t('p2p.discussions.copy_content')}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                  <span class="discussions-list-time">{formatTime(d.mtime)}</span>
+                </div>
               </div>
             </div>
           ))}

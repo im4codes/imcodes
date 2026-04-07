@@ -357,6 +357,8 @@
       "round_label": "ラウンド",
       "hop_label": "ホップ",
       "auto_follow_latest": "最新に自動追従",
+      "copy_path": "パスをコピー",
+      "copy_content": "内容をコピー",
       "scroll_top": "先頭へスクロール",
       "scroll_bottom": "末尾へスクロール"
     },

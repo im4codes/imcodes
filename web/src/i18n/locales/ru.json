@@ -357,6 +357,8 @@
       "round_label": "Раунд",
       "hop_label": "Шаг",
       "auto_follow_latest": "Автопрокрутка к последнему",
+      "copy_path": "Скопировать путь",
+      "copy_content": "Скопировать содержимое",
       "scroll_top": "Прокрутить вверх",
       "scroll_bottom": "Прокрутить вниз"
     },

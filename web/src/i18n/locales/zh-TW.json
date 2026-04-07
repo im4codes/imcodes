@@ -357,6 +357,8 @@
       "round_label": "輪次",
       "hop_label": "跳轉",
       "auto_follow_latest": "自動跟隨最新",
+      "copy_path": "複製路徑",
+      "copy_content": "複製內容",
       "scroll_top": "捲動到頂部",
       "scroll_bottom": "捲動到底部"
     },

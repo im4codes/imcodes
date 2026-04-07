@@ -1983,7 +1983,7 @@ async function handleP2pListDiscussions(_cmd: Record<string, unknown>, serverLin
   for (const s of listSessions()) {
     if (s.projectDir) projectDirs.add(s.projectDir);
   }
-  const discussions: Array<{ id: string; fileName: string; preview: string; mtime: number }> = [];
+  const discussions: Array<{ id: string; fileName: string; path: string; preview: string; mtime: number }> = [];
   for (const projectDir of projectDirs) {
     const dir = imcSubDir(projectDir, 'discussions');
     try {
@@ -1996,7 +1996,7 @@ async function handleP2pListDiscussions(_cmd: Record<string, unknown>, serverLin
           const content = await fsReadFileRaw(fullPath, 'utf8');
           const reqMatch = content.match(/## User Request\s*\n+(.+)/);
           const preview = reqMatch?.[1]?.trim().slice(0, 120) || f;
-          discussions.push({ id: f.replace('.md', ''), fileName: f, preview, mtime: s.mtimeMs });
+          discussions.push({ id: f.replace('.md', ''), fileName: f, path: fullPath, preview, mtime: s.mtimeMs });
         } catch { /* skip unreadable */ }
       }
     } catch { /* dir may not exist */ }
@@ -2008,14 +2008,15 @@ async function handleP2pListDiscussions(_cmd: Record<string, unknown>, serverLin
 
 async function handleP2pReadDiscussion(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const id = cmd.id as string | undefined;
-  if (!id) { serverLink.send({ type: 'p2p.read_discussion_response', error: 'missing_id' }); return; }
+  const requestId = cmd.requestId as string | undefined;
+  if (!id) { serverLink.send({ type: 'p2p.read_discussion_response', requestId, error: 'missing_id' }); return; }
 
   // 1. Check active P2P runs first (in-memory, always fresh)
   for (const run of listP2pRuns()) {
     if (run.id === id || run.discussionId === id) {
       try {
         const content = await fsReadFileRaw(run.contextFilePath, 'utf8');
-        serverLink.send({ type: 'p2p.read_discussion_response', id, content });
+        serverLink.send({ type: 'p2p.read_discussion_response', id, requestId, content });
         return;
       } catch { /* file may not exist yet */ }
     }
@@ -2030,11 +2031,11 @@ async function handleP2pReadDiscussion(cmd: Record<string, unknown>, serverLink:
     const filePath = nodePath.join(imcSubDir(projectDir, 'discussions'), `${id}.md`);
     try {
       const content = await fsReadFileRaw(filePath, 'utf8');
-      serverLink.send({ type: 'p2p.read_discussion_response', id, content });
+      serverLink.send({ type: 'p2p.read_discussion_response', id, requestId, content });
       return;
     } catch { /* try next project */ }
   }
-  serverLink.send({ type: 'p2p.read_discussion_response', id, error: 'not_found' });
+  serverLink.send({ type: 'p2p.read_discussion_response', id, requestId, error: 'not_found' });
 }
 
 // ── Discussion handlers ────────────────────────────────────────────────────

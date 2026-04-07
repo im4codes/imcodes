@@ -357,6 +357,8 @@
       "round_label": "轮次",
       "hop_label": "跳转",
       "auto_follow_latest": "自动跟随最新",
+      "copy_path": "复制路径",
+      "copy_content": "复制内容",
       "scroll_top": "滚动到顶部",
       "scroll_bottom": "滚动到底部"
     },

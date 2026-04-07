@@ -357,6 +357,8 @@
       "round_label": "Round",
       "hop_label": "Hop",
       "auto_follow_latest": "Auto-follow latest",
+      "copy_path": "Copy path",
+      "copy_content": "Copy content",
       "scroll_top": "Scroll to top",
       "scroll_bottom": "Scroll to bottom"
     },

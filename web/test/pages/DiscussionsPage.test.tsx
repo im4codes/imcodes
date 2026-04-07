@@ -25,12 +25,18 @@ describe('DiscussionsPage', () => {
   let handler: ((msg: ServerMessage) => void) | null = null;
   let ws: WsClient;
   let scrollToMock: ReturnType<typeof vi.fn>;
+  let clipboardWriteText: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     scrollToMock = vi.fn();
+    clipboardWriteText = vi.fn().mockResolvedValue(undefined);
     vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
       cb(0);
       return 1;
+    });
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: clipboardWriteText },
     });
     Object.defineProperty(HTMLElement.prototype, 'scrollTo', {
       configurable: true,
@@ -65,7 +71,7 @@ describe('DiscussionsPage', () => {
     });
 
     fireEvent.click(screen.getByText('Topic 1'));
-    expect(ws.send).toHaveBeenLastCalledWith({ type: 'p2p.read_discussion', id: 'disc-1' });
+    expect(ws.send).toHaveBeenLastCalledWith(expect.objectContaining({ type: 'p2p.read_discussion', id: 'disc-1' }));
 
     const scrollEl = container.querySelector('.discussions-detail-scroll') as HTMLDivElement;
     Object.defineProperty(scrollEl, 'scrollHeight', {
@@ -140,5 +146,69 @@ describe('DiscussionsPage', () => {
     fireEvent.click(screen.getByTitle('p2p.discussions.scroll_bottom'));
     expect(checkbox.checked).toBe(true);
     expect(scrollToMock).toHaveBeenCalledWith({ top: 720, behavior: 'smooth' });
+  });
+
+  it('copies discussion path from the list action menu', async () => {
+    render(<DiscussionsPage ws={ws} />);
+
+    await act(async () => {
+      handler?.({
+        type: 'p2p.list_discussions_response',
+        discussions: [{ id: 'disc-3', fileName: 'disc-3.md', path: '/tmp/disc-3.md', preview: 'Topic 3', mtime: 100 }],
+      } as ServerMessage);
+    });
+
+    fireEvent.click(screen.getByLabelText('common.copy'));
+    fireEvent.click(screen.getByText('p2p.discussions.copy_path'));
+
+    await waitFor(() => {
+      expect(clipboardWriteText).toHaveBeenCalledWith('/tmp/disc-3.md');
+    });
+  });
+
+  it('requests and copies discussion content without changing the current preview', async () => {
+    render(<DiscussionsPage ws={ws} />);
+
+    await act(async () => {
+      handler?.({
+        type: 'p2p.list_discussions_response',
+        discussions: [
+          { id: 'disc-4', fileName: 'disc-4.md', path: '/tmp/disc-4.md', preview: 'Topic 4', mtime: 100 },
+          { id: 'disc-5', fileName: 'disc-5.md', path: '/tmp/disc-5.md', preview: 'Topic 5', mtime: 90 },
+        ],
+      } as ServerMessage);
+    });
+
+    fireEvent.click(screen.getByText('Topic 4'));
+    const initialRead = vi.mocked(ws.send).mock.calls.at(-1)?.[0] as { requestId?: string };
+
+    await act(async () => {
+      handler?.({
+        type: 'p2p.read_discussion_response',
+        id: 'disc-4',
+        requestId: initialRead.requestId,
+        content: 'Current preview content',
+      } as ServerMessage);
+    });
+
+    fireEvent.click(screen.getAllByLabelText('common.copy')[1]!);
+    fireEvent.click(screen.getByText('p2p.discussions.copy_content'));
+
+    const copyRead = vi.mocked(ws.send).mock.calls.at(-1)?.[0] as { type: string; id?: string; requestId?: string };
+    expect(copyRead).toEqual(expect.objectContaining({ type: 'p2p.read_discussion', id: 'disc-5' }));
+
+    await act(async () => {
+      handler?.({
+        type: 'p2p.read_discussion_response',
+        id: 'disc-5',
+        requestId: copyRead.requestId,
+        content: 'Copied discussion content',
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(clipboardWriteText).toHaveBeenCalledWith('Copied discussion content');
+    });
+    expect(screen.getByTestId('discussion-preview').textContent).toBe('Current preview content');
   });
 });
