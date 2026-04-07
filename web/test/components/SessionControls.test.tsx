@@ -52,6 +52,8 @@ vi.mock('../../src/api.js', () => ({
 import { SessionControls } from '../../src/components/SessionControls.js';
 import type { SessionInfo } from '../../src/types.js';
 
+const flushAsync = () => new Promise((resolve) => setTimeout(resolve, 0));
+
 const makeWs = () => ({
   sendSessionCommand: vi.fn(),
   sendInput: vi.fn(),
@@ -106,7 +108,18 @@ describe('SessionControls', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    getUserPrefMock.mockResolvedValue(null);
+    getUserPrefMock.mockImplementation(async (key: unknown) => {
+      if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
+        const sessionKey = key.slice('p2p_session_config:'.length);
+        return JSON.stringify({
+          sessions: {
+            [sessionKey]: { enabled: true, mode: 'audit' },
+          },
+          rounds: 3,
+        });
+      }
+      return null;
+    });
     saveUserPrefMock.mockResolvedValue(undefined);
   });
 
@@ -176,8 +189,9 @@ describe('SessionControls', () => {
     });
   });
 
-  it('keeps the send button label unchanged after selecting a combo mode', () => {
+  it('keeps the send button label unchanged after selecting a combo mode', async () => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
+    await flushAsync();
 
     fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
     fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
@@ -186,9 +200,10 @@ describe('SessionControls', () => {
     expect(screen.getByRole('button', { name: /mode_audit→mode_plan/i })).toBeDefined();
   });
 
-  it('asks for confirmation before directly sending a selected combo mode', () => {
+  it('asks for confirmation before directly sending a selected combo mode', async () => {
     const ws = makeWs();
     render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    await flushAsync();
 
     fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
     fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
@@ -207,9 +222,48 @@ describe('SessionControls', () => {
     expect(screen.getByText(/P2P:mode_audit→mode_plan/i)).toBeDefined();
   });
 
-  it('remembers skipping combo confirmation across later sends', () => {
+  it('blocks combo sends that only contain routing markup and shows a warning', () => {
     const ws = makeWs();
     render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = '@@all(audit>plan)';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /^send$/i }));
+
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+    expect(screen.queryByText('combo_send_confirm_title')).toBeNull();
+    expect(screen.getByText('combo_empty_message_warning')).toBeDefined();
+  });
+
+  it('disables combo modes when no participants are configured', async () => {
+    getUserPrefMock.mockImplementation(async (key: unknown) => {
+      if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
+        return JSON.stringify({
+          sessions: {
+            'my-session': { enabled: false, mode: 'audit' },
+          },
+          rounds: 3,
+        });
+      }
+      return null;
+    });
+
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+
+    expect(screen.getByText('combo_requires_participants_hint')).toBeDefined();
+    const comboBtn = screen.getByRole('button', { name: /mode_audit→mode_plan/i }) as HTMLButtonElement;
+    expect(comboBtn.disabled).toBe(true);
+    expect(comboBtn.title).toBe('combo_requires_participants_hint');
+  });
+
+  it('remembers skipping combo confirmation across later sends', async () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    await flushAsync();
 
     fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
     fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
@@ -246,9 +300,10 @@ describe('SessionControls', () => {
     });
   });
 
-  it('routes quick panel sends through the same combo confirmation flow', () => {
+  it('routes quick panel sends through the same combo confirmation flow', async () => {
     const ws = makeWs();
     render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    await flushAsync();
 
     fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
     fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
@@ -269,9 +324,10 @@ describe('SessionControls', () => {
     });
   });
 
-  it('routes voice sends through the same combo confirmation flow', () => {
+  it('routes voice sends through the same combo confirmation flow', async () => {
     const ws = makeWs();
     render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    await flushAsync();
 
     fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
     fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));

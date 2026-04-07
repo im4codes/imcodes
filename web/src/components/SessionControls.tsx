@@ -279,7 +279,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [sendWarning, setSendWarning] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<Array<{ path: string; name: string }>>([]);
+  const sendWarningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Keep external inputRef in sync so parent can call .focus()
   useEffect(() => {
@@ -303,6 +305,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     onPendingPrefillApplied?.();
   }, [pendingPrefillText, onPendingPrefillApplied]);
 
+  const clearSendWarning = useCallback(() => {
+    if (sendWarningTimerRef.current) {
+      clearTimeout(sendWarningTimerRef.current);
+      sendWarningTimerRef.current = null;
+    }
+    setSendWarning(null);
+  }, []);
+
+  const showSendWarning = useCallback((message: string) => {
+    if (sendWarningTimerRef.current) clearTimeout(sendWarningTimerRef.current);
+    setSendWarning(message);
+    sendWarningTimerRef.current = setTimeout(() => {
+      sendWarningTimerRef.current = null;
+      setSendWarning(null);
+    }, 5000);
+  }, []);
+
   // Persist input draft across unmount/remount (sub-session minimize/restore)
   const draftKey = activeSession ? `rcc_draft_${activeSession.name}` : null;
   useEffect(() => {
@@ -317,6 +336,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (draftKey) sessionStorage.setItem(draftKey, text);
     };
   }, [draftKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => () => {
+    if (sendWarningTimerRef.current) clearTimeout(sendWarningTimerRef.current);
+  }, []);
 
   // Auto-sync model selector with detected model from terminal/ctx
   // Detection is the real-time truth — always override the selector
@@ -497,6 +520,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const activeSub = (subSessions ?? []).find((s) => s.sessionName === activeSession?.name);
   const rootSession = activeSub?.parentSession || activeSession?.name || '';
+  const hasConfiguredP2pParticipants = useMemo(() => {
+    if (!p2pSavedConfig?.sessions) return false;
+    return Object.values(p2pSavedConfig.sessions).some((entry) => entry?.enabled && entry.mode !== 'skip');
+  }, [p2pSavedConfig]);
 
   // P2P config is per main-session (sub-sessions follow parent), stored on server for cross-device sync
   const p2pConfigKey = rootSession ? `p2p_session_config:${rootSession}` : null;
@@ -520,6 +547,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       });
     });
   }, [p2pConfigKey]);
+
+  useEffect(() => {
+    if (!hasConfiguredP2pParticipants && isComboMode(p2pMode)) {
+      setP2pMode('solo');
+    }
+  }, [hasConfiguredP2pParticipants, p2pMode]);
 
   /** Build a short display label for the input box — prefer sub-session label over raw ID. */
   const buildAgentLabel = (session: string, mode: string) => {
@@ -700,6 +733,28 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     void saveUserPref(P2P_COMBO_CONFIRM_SKIP_PREF_KEY, true).catch(() => {});
   }, [rememberComboSendChoice]);
 
+  const getSendValidationError = useCallback((payload: PendingSendPayload): string | null => {
+    const text = payload.text.trim();
+    const routedModes: string[] = [];
+    const directMode = payload.extra.p2pMode;
+    if (typeof directMode === 'string') routedModes.push(directMode);
+    const atTargets = payload.extra.p2pAtTargets;
+    if (Array.isArray(atTargets)) {
+      for (const target of atTargets) {
+        if (target && typeof target === 'object' && 'mode' in target && typeof target.mode === 'string') {
+          routedModes.push(target.mode);
+        }
+      }
+    }
+    if (!text && routedModes.some((mode) => isComboMode(mode))) {
+      return t('p2p.combo_empty_message_warning');
+    }
+    if (!hasConfiguredP2pParticipants && routedModes.some((mode) => isComboMode(mode))) {
+      return t('p2p.combo_requires_participants_hint');
+    }
+    return null;
+  }, [hasConfiguredP2pParticipants, t]);
+
   useEffect(() => {
     if (!activeSession || activeSession.runtimeType !== 'transport' || activeSession.state !== 'running') {
       setQueuedNoticeVisible(false);
@@ -708,6 +763,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const requestSend = useCallback((payload: PendingSendPayload | null, options?: { clearComposer?: boolean }) => {
     if (!payload) return;
+    const validationError = getSendValidationError(payload);
+    if (validationError) {
+      showSendWarning(validationError);
+      return;
+    }
+    clearSendWarning();
     const comboMode = typeof payload.extra.p2pMode === 'string' ? payload.extra.p2pMode : null;
     if (comboMode && isComboMode(comboMode) && !skipComboSendConfirm) {
       setRememberComboSendChoice(false);
@@ -719,7 +780,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       return;
     }
     finalizeSend(payload, options);
-  }, [finalizeSend, skipComboSendConfirm, t]);
+  }, [clearSendWarning, finalizeSend, getSendValidationError, showSendWarning, skipComboSendConfirm, t]);
 
   const handleSend = useCallback(() => {
     requestSend(buildSendPayload(), { clearComposer: true });
@@ -1183,12 +1244,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               {/* Combo presets */}
               <div class="menu-divider" />
               <div class="p2p-menu-section-label">{t('p2p.combo_label')}</div>
+              {!hasConfiguredP2pParticipants && (
+                <div class="p2p-menu-section-label" style={{ textTransform: 'none', letterSpacing: 'normal', color: '#fbbf24', marginTop: 4 }}>
+                  {t('p2p.combo_requires_participants_hint')}
+                </div>
+              )}
               {COMBO_PRESETS.map((c) => (
                 <button
                   key={c.key}
                   class={`menu-item ${p2pMode === c.key ? 'menu-item-active' : ''}`}
-                  onClick={() => { setP2pMode(c.key); setP2pOpen(false); }}
-                  style={{ color: getP2pModeColor(c.key), fontSize: 12 }}
+                  onClick={() => {
+                    if (!hasConfiguredP2pParticipants) return;
+                    setP2pMode(c.key);
+                    setP2pOpen(false);
+                  }}
+                  disabled={!hasConfiguredP2pParticipants}
+                  title={!hasConfiguredP2pParticipants ? t('p2p.combo_requires_participants_hint') : undefined}
+                  style={{ color: getP2pModeColor(c.key), fontSize: 12, opacity: hasConfiguredP2pParticipants ? 1 : 0.45, cursor: hasConfiguredP2pParticipants ? 'pointer' : 'not-allowed' }}
                 >
                   {p2pMode === c.key ? '● ' : '○ '}{getP2pModeLabel(c.key, t)}
                 </button>
@@ -1197,8 +1269,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 <button
                   key={key}
                   class={`menu-item ${p2pMode === key ? 'menu-item-active' : ''}`}
-                  onClick={() => { setP2pMode(key); setP2pOpen(false); }}
-                  style={{ color: getP2pModeColor(key), fontSize: 12 }}
+                  onClick={() => {
+                    if (!hasConfiguredP2pParticipants) return;
+                    setP2pMode(key);
+                    setP2pOpen(false);
+                  }}
+                  disabled={!hasConfiguredP2pParticipants}
+                  title={!hasConfiguredP2pParticipants ? t('p2p.combo_requires_participants_hint') : undefined}
+                  style={{ color: getP2pModeColor(key), fontSize: 12, opacity: hasConfiguredP2pParticipants ? 1 : 0.45, cursor: hasConfiguredP2pParticipants ? 'pointer' : 'not-allowed' }}
                 >
                   {p2pMode === key ? '● ' : '○ '}{getP2pModeLabel(key, t)}
                 </button>
@@ -1247,6 +1325,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       {uploadError && (
         <div style={{ padding: '4px 12px', fontSize: 12, color: '#ef4444', background: 'rgba(239,68,68,0.1)', borderRadius: 4, margin: '0 8px 4px' }}>
           {uploadError}
+        </div>
+      )}
+
+      {sendWarning && (
+        <div style={{ padding: '4px 12px', fontSize: 12, color: '#fbbf24', background: 'rgba(251,191,36,0.12)', borderRadius: 4, margin: '0 8px 4px', border: '1px solid rgba(251,191,36,0.25)' }}>
+          {sendWarning}
         </div>
       )}
 
@@ -1444,6 +1528,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           onInput={() => {
             const currentText = divRef.current?.textContent ?? '';
             setHasText(!!currentText.trim());
+            if (sendWarning) clearSendWarning();
             if (atSelectionLockRef.current && currentText !== atSelectionSnapshotRef.current) {
               atSelectionLockRef.current = false;
               atSelectionSnapshotRef.current = currentText;
