@@ -275,6 +275,7 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
 
   // Find matching live discussion for progress display
   const activeLive = liveDiscussions.filter((d) => d.state !== 'done' && d.state !== 'failed');
+  const selectedDiscussion = selected ? discussions.find((d) => d.id === selected) ?? null : null;
 
   return (
     <div class="discussions-page">
@@ -323,30 +324,7 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
               <div class="discussions-list-topic">{d.preview}</div>
               <div class="discussions-list-meta">
                 <span style={{ color: '#64748b', fontSize: 11 }}>{d.id}</span>
-                <div class="discussions-list-actions">
-                  <div class="discussions-copy-wrap" onClick={(e) => e.stopPropagation()}>
-                    <button
-                      type="button"
-                      class={`discussions-copy-btn${copiedId === d.id ? ' is-copied' : ''}`}
-                      aria-label={copiedId === d.id ? t('common.copied') : t('common.copy')}
-                      title={copiedId === d.id ? t('common.copied') : t('common.copy')}
-                      onClick={() => setCopyMenuId((current) => (current === d.id ? null : d.id))}
-                    >
-                      ⧉
-                    </button>
-                    {copyMenuId === d.id && (
-                      <div class="discussions-copy-menu">
-                        <button type="button" class="discussions-copy-menu-item" onClick={() => { void handleCopyPath(d); }}>
-                          {t('p2p.discussions.copy_path')}
-                        </button>
-                        <button type="button" class="discussions-copy-menu-item" onClick={() => { void handleCopyContent(d); }}>
-                          {t('p2p.discussions.copy_content')}
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                  <span class="discussions-list-time">{formatTime(d.mtime)}</span>
-                </div>
+                <span class="discussions-list-time">{formatTime(d.mtime)}</span>
               </div>
             </div>
           ))}
@@ -386,26 +364,51 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
           </div>
           {selected && (
             <div class="discussions-scroll-dock">
-              <button
-                class="discussions-scroll-btn discussions-scroll-btn-floating"
-                onClick={() => {
-                  setAutoFollow(false);
-                  scrollDetailToTop('button');
-                }}
-                title={t('p2p.discussions.scroll_top')}
-              >
-                ↑
-              </button>
-              <button
-                class="discussions-scroll-btn discussions-scroll-btn-floating"
-                onClick={() => {
-                  setAutoFollow(true);
-                  scrollDetailToBottom('button');
-                }}
-                title={t('p2p.discussions.scroll_bottom')}
-              >
-                ↓
-              </button>
+              {selectedDiscussion && (
+                <div class="discussions-copy-wrap">
+                  <button
+                    type="button"
+                    class={`discussions-copy-btn discussions-scroll-btn-floating${copiedId === selectedDiscussion.id ? ' is-copied' : ''}`}
+                    aria-label={copiedId === selectedDiscussion.id ? t('common.copied') : t('common.copy')}
+                    title={copiedId === selectedDiscussion.id ? t('common.copied') : t('common.copy')}
+                    onClick={() => setCopyMenuId((current) => (current === selectedDiscussion.id ? null : selectedDiscussion.id))}
+                  >
+                    ⧉
+                  </button>
+                  {copyMenuId === selectedDiscussion.id && (
+                    <div class="discussions-copy-menu">
+                      <button type="button" class="discussions-copy-menu-item" onClick={() => { void handleCopyPath(selectedDiscussion); }}>
+                        {t('p2p.discussions.copy_path')}
+                      </button>
+                      <button type="button" class="discussions-copy-menu-item" onClick={() => { void handleCopyContent(selectedDiscussion); }}>
+                        {t('p2p.discussions.copy_content')}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+              <div class="discussions-scroll-arrows">
+                <button
+                  class="discussions-scroll-btn discussions-scroll-btn-floating"
+                  onClick={() => {
+                    setAutoFollow(false);
+                    scrollDetailToTop('button');
+                  }}
+                  title={t('p2p.discussions.scroll_top')}
+                >
+                  ↑
+                </button>
+                <button
+                  class="discussions-scroll-btn discussions-scroll-btn-floating"
+                  onClick={() => {
+                    setAutoFollow(true);
+                    scrollDetailToBottom('button');
+                  }}
+                  title={t('p2p.discussions.scroll_bottom')}
+                >
+                  ↓
+                </button>
+              </div>
             </div>
           )}
         </div>

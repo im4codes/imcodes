@@ -161,6 +161,17 @@ describe('DiscussionsPage', () => {
       } as ServerMessage);
     });
 
+    fireEvent.click(screen.getByText('Topic 3'));
+    const readReq = vi.mocked(ws.send).mock.calls.at(-1)?.[0] as { requestId?: string };
+    await act(async () => {
+      handler?.({
+        type: 'p2p.read_discussion_response',
+        id: 'disc-3',
+        requestId: readReq.requestId,
+        content: 'Preview 3',
+      } as ServerMessage);
+    });
+
     fireEvent.click(screen.getByLabelText('common.copy'));
     fireEvent.click(screen.getByText('p2p.discussions.copy_path'));
 
@@ -169,7 +180,7 @@ describe('DiscussionsPage', () => {
     });
   });
 
-  it('requests and copies discussion content without changing the current preview', async () => {
+  it('copies the current discussion content from the detail dock', async () => {
     render(<DiscussionsPage ws={ws} />);
 
     await act(async () => {
@@ -177,7 +188,6 @@ describe('DiscussionsPage', () => {
         type: 'p2p.list_discussions_response',
         discussions: [
           { id: 'disc-4', fileName: 'disc-4.md', path: '/tmp/disc-4.md', preview: 'Topic 4', mtime: 100 },
-          { id: 'disc-5', fileName: 'disc-5.md', path: '/tmp/disc-5.md', preview: 'Topic 5', mtime: 90 },
         ],
       } as ServerMessage);
     });
@@ -194,24 +204,39 @@ describe('DiscussionsPage', () => {
       } as ServerMessage);
     });
 
-    fireEvent.click(screen.getAllByLabelText('common.copy')[1]!);
+    fireEvent.click(screen.getByLabelText('common.copy'));
     fireEvent.click(screen.getByText('p2p.discussions.copy_content'));
 
-    const copyRead = vi.mocked(ws.send).mock.calls.at(-1)?.[0] as { type: string; id?: string; requestId?: string };
-    expect(copyRead).toEqual(expect.objectContaining({ type: 'p2p.read_discussion', id: 'disc-5' }));
+    await waitFor(() => {
+      expect(clipboardWriteText).toHaveBeenCalledWith('Current preview content');
+    });
+    expect(screen.getByTestId('discussion-preview').textContent).toBe('Current preview content');
+  });
+
+  it('renders copy control next to the floating arrows instead of inside the list', async () => {
+    const { container } = render(<DiscussionsPage ws={ws} />);
 
     await act(async () => {
       handler?.({
-        type: 'p2p.read_discussion_response',
-        id: 'disc-5',
-        requestId: copyRead.requestId,
-        content: 'Copied discussion content',
+        type: 'p2p.list_discussions_response',
+        discussions: [{ id: 'disc-6', fileName: 'disc-6.md', path: '/tmp/disc-6.md', preview: 'Topic 6', mtime: 100 }],
       } as ServerMessage);
     });
 
-    await waitFor(() => {
-      expect(clipboardWriteText).toHaveBeenCalledWith('Copied discussion content');
+    expect(container.querySelector('.discussions-list .discussions-copy-btn')).toBeNull();
+
+    fireEvent.click(screen.getByText('Topic 6'));
+    const readReq = vi.mocked(ws.send).mock.calls.at(-1)?.[0] as { requestId?: string };
+    await act(async () => {
+      handler?.({
+        type: 'p2p.read_discussion_response',
+        id: 'disc-6',
+        requestId: readReq.requestId,
+        content: 'Preview 6',
+      } as ServerMessage);
     });
-    expect(screen.getByTestId('discussion-preview').textContent).toBe('Current preview content');
+
+    expect(container.querySelector('.discussions-scroll-dock .discussions-copy-btn')).toBeTruthy();
+    expect(container.querySelectorAll('.discussions-scroll-dock .discussions-scroll-btn-floating')).toHaveLength(3);
   });
 });
