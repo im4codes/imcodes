@@ -158,6 +158,8 @@
     "insert": "插入 {{count}} 項",
     "browse": "瀏覽",
     "show_hidden": "隱藏檔案",
+    "this_pc": "本機",
+    "home": "主目錄",
     "selected_count": "已選 {{count}} 項",
     "timeout": "請求逾時",
     "timeout_detail": "無法讀取目錄。可能是由網路磁碟緩慢或不可用所導致。",

@@ -2248,6 +2248,10 @@ sleep 60 && rm -rf "${scriptDir}" &
 // Deny-list: block access to sensitive directories regardless of platform.
 // Everything else is allowed — the daemon runs as the user and inherits their permissions.
 const FS_DENIED_DIRS = ['.ssh', '.gnupg', '.pki'];
+
+/** Special sentinel path that browses Windows drive roots (C:\, D:\, ...).
+ *  Distinct from `~` so the home directory remains accessible on Windows. */
+const WINDOWS_DRIVES_PATH = ':drives:';
 const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
 
 function isPathAllowed(realPath: string): boolean {
@@ -2348,8 +2352,12 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
   const includeMetadata = cmd.includeMetadata === true;
   if (!rawPath || !requestId) return;
 
-  const expanded = rawPath.startsWith('~') || rawPath.startsWith('~\\') ? rawPath.replace(/^~/, homedir()) : rawPath;
-  const resolved = nodePath.resolve(expanded);
+  // Special sentinel paths bypass normal path resolution
+  const isDrivesSentinel = rawPath === WINDOWS_DRIVES_PATH;
+  const expanded = isDrivesSentinel
+    ? rawPath
+    : (rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath);
+  const resolved = isDrivesSentinel ? rawPath : nodePath.resolve(expanded);
 
   const deadline = new Promise<never>((_, reject) => setTimeout(() => reject(new Error('fs_list_timeout')), FS_LIST_DEADLINE_MS));
 
@@ -2366,7 +2374,9 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
 }
 
 async function handleFsListInner(resolved: string, rawPath: string, requestId: string, includeFiles: boolean, includeMetadata: boolean, serverLink: ServerLink): Promise<void> {
-  if (process.platform === 'win32' && rawPath === '~') {
+  // Windows drive picker — only triggered by the explicit `:drives:` path,
+  // NOT by `~` (which always means the user's home directory on every OS).
+  if (process.platform === 'win32' && rawPath === WINDOWS_DRIVES_PATH) {
     const entries = await Promise.all(
       Array.from({ length: 26 }, (_, i) => String.fromCharCode(65 + i))
         .map(async (letter) => {

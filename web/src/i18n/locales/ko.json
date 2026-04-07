@@ -158,6 +158,8 @@
     "insert": "{{count}}개 삽입",
     "browse": "찾아보기",
     "show_hidden": "숨김 파일",
+    "this_pc": "내 PC",
+    "home": "홈",
     "selected_count": "{{count}}개 선택됨",
     "timeout": "요청 시간 초과",
     "timeout_detail": "디렉토리를 읽을 수 없습니다. 느리거나 사용할 수 없는 네트워크 드라이브가 원인일 수 있습니다.",

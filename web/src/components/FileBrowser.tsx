@@ -21,6 +21,8 @@ import { downloadAttachment } from '../api.js';
 
 const PREF_KEY = 'fb_prefer_editor';
 const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
+/** Sentinel path that asks the daemon to list Windows drive roots. */
+const WINDOWS_DRIVES_PATH = ':drives:';
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -336,7 +338,7 @@ export function FileBrowser({
 
         setData((prev) => updateNode(prev, nodeId, {
           id: resolvedParent,
-          name: resolvedParent === WINDOWS_DRIVES_ROOT ? 'This PC' : resolvedParent.split(/[/\\]/).pop() || resolvedParent,
+          name: resolvedParent === WINDOWS_DRIVES_ROOT ? t('file_browser.this_pc') : resolvedParent.split(/[/\\]/).pop() || resolvedParent,
           children,
           isLoading: false,
         }));
@@ -350,7 +352,7 @@ export function FileBrowser({
             return next;
           });
         }
-        setCurrentLabel(resolvedParent === WINDOWS_DRIVES_ROOT ? 'This PC' : resolvedParent);
+        setCurrentLabel(resolvedParent === WINDOWS_DRIVES_ROOT ? t('file_browser.this_pc') : resolvedParent);
         setError(null);
 
         // If highlightPath is under this dir, auto-expand
@@ -1019,10 +1021,23 @@ export function FileBrowser({
     return [{ label, path: label }];
   }, [currentLabel]);
 
+  // Show drive picker / home button on Windows daemons.
+  // Detected by current path looking like a Windows path or label being the localized "This PC".
+  const thisPcLabel = t('file_browser.this_pc');
+  const looksLikeWindows = /^[A-Za-z]:[\\/]/.test(currentLabel) || currentLabel === thisPcLabel;
+  const isAtDrives = currentLabel === thisPcLabel;
+
   const breadcrumb = (
     <div class="fb-nav">
       <button class="fb-nav-btn" disabled={!canGoBack} onClick={goBack}>←</button>
       <button class="fb-nav-btn" onClick={goUp} title="Go up">⬆</button>
+      {looksLikeWindows && (
+        <button
+          class="fb-nav-btn"
+          onClick={() => navigateTo(isAtDrives ? '~' : WINDOWS_DRIVES_PATH)}
+          title={isAtDrives ? t('file_browser.home') : t('file_browser.this_pc')}
+        >{isAtDrives ? '🏠' : '💾'}</button>
+      )}
       <div class="fb-breadcrumb-segments">
         {breadcrumbSegments.map((seg, i) => {
           const isLast = i === breadcrumbSegments.length - 1;

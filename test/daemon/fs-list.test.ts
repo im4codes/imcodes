@@ -51,7 +51,7 @@ describe('fs.ls handler', () => {
     vi.restoreAllMocks();
   });
 
-  it('lists all accessible Windows drive roots when browsing ~ on Windows', async () => {
+  it('lists all accessible Windows drive roots when browsing :drives: on Windows', async () => {
     const origPlatform = process.platform;
     Object.defineProperty(process, 'platform', { value: 'win32' });
     mockReaddir.mockImplementation(async (dir: any) => {
@@ -60,7 +60,7 @@ describe('fs.ls handler', () => {
     });
 
     try {
-      handleWebCommand({ type: 'fs.ls', path: '~', requestId: 'req-win-drives' }, mockServerLink as any);
+      handleWebCommand({ type: 'fs.ls', path: ':drives:', requestId: 'req-win-drives' }, mockServerLink as any);
       await flushAsync();
       expect(sent[0]).toMatchObject({
         type: 'fs.ls_response',
@@ -72,6 +72,66 @@ describe('fs.ls handler', () => {
         { name: 'C:\\', path: 'C:\\', isDir: true, hidden: false },
         { name: 'D:\\', path: 'D:\\', isDir: true, hidden: false },
       ]);
+    } finally {
+      Object.defineProperty(process, 'platform', { value: origPlatform });
+    }
+  });
+
+  it('expands ~ to home directory on Windows (NOT to drives list)', async () => {
+    // Regression: ~ must always mean home, not drives.
+    // Drives are accessed via the explicit `:drives:` sentinel.
+    const origPlatform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    const home = homedir();
+    mockRealpath.mockResolvedValue(home as unknown as string);
+    mockReaddir.mockResolvedValue([makeDirent('Documents', true), makeDirent('Desktop', true)] as any);
+
+    try {
+      handleWebCommand({ type: 'fs.ls', path: '~', requestId: 'req-win-home' }, mockServerLink as any);
+      await flushAsync();
+      const resp = sent[0] as any;
+      expect(resp.status).toBe('ok');
+      // Should be home, NOT __imcodes_windows_drives__
+      expect(resp.resolvedPath).toBe(home);
+      expect(resp.resolvedPath).not.toBe('__imcodes_windows_drives__');
+      expect(resp.entries.map((e: any) => e.name)).toEqual(expect.arrayContaining(['Documents', 'Desktop']));
+    } finally {
+      Object.defineProperty(process, 'platform', { value: origPlatform });
+    }
+  });
+
+  it('expands ~ to home directory on Linux', async () => {
+    const origPlatform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+    const home = homedir();
+    mockRealpath.mockResolvedValue(home as unknown as string);
+    mockReaddir.mockResolvedValue([makeDirent('projects', true)] as any);
+
+    try {
+      handleWebCommand({ type: 'fs.ls', path: '~', requestId: 'req-lin-home' }, mockServerLink as any);
+      await flushAsync();
+      const resp = sent[0] as any;
+      expect(resp.status).toBe('ok');
+      expect(resp.resolvedPath).toBe(home);
+    } finally {
+      Object.defineProperty(process, 'platform', { value: origPlatform });
+    }
+  });
+
+  it(':drives: sentinel returns error on non-Windows platforms', async () => {
+    // The drives sentinel should not be a magic root on Linux/Mac;
+    // it should fall through to normal path handling and fail safely.
+    const origPlatform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+    mockRealpath.mockRejectedValue(new Error('ENOENT'));
+
+    try {
+      handleWebCommand({ type: 'fs.ls', path: ':drives:', requestId: 'req-lin-drives' }, mockServerLink as any);
+      await flushAsync();
+      const resp = sent[0] as any;
+      expect(resp.status).toBe('error');
+      // Must NOT pretend drives exist on non-Windows
+      expect(resp.resolvedPath).not.toBe('__imcodes_windows_drives__');
     } finally {
       Object.defineProperty(process, 'platform', { value: origPlatform });
     }

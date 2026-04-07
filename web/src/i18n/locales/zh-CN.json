@@ -158,6 +158,8 @@
     "insert": "插入 {{count}} 项",
     "browse": "浏览",
     "show_hidden": "隐藏文件",
+    "this_pc": "此电脑",
+    "home": "主目录",
     "selected_count": "已选 {{count}} 项",
     "timeout": "请求超时",
     "timeout_detail": "无法读取目录。可能是由网络驱动器缓慢或不可用引起的。",

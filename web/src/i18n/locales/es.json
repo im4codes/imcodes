@@ -158,6 +158,8 @@
     "insert": "Insertar {{count}}",
     "browse": "Explorar",
     "show_hidden": "Ocultos",
+    "this_pc": "Este equipo",
+    "home": "Inicio",
     "selected_count": "{{count}} seleccionados",
     "timeout": "Tiempo de espera agotado",
     "timeout_detail": "No se pudo leer el directorio. Puede ser causado por unidades de red lentas o no disponibles.",

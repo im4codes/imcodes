@@ -158,6 +158,8 @@
     "insert": "Insert {{count}}",
     "browse": "Browse",
     "show_hidden": "Hidden",
+    "this_pc": "This PC",
+    "home": "Home",
     "selected_count": "{{count}} selected",
     "timeout": "Request timed out",
     "timeout_detail": "Could not read directory. This may be caused by slow or unavailable network drives.",

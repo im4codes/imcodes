@@ -158,6 +158,8 @@
     "insert": "{{count}}件挿入",
     "browse": "参照",
     "show_hidden": "隠しファイル",
+    "this_pc": "PC",
+    "home": "ホーム",
     "selected_count": "{{count}}件選択中",
     "timeout": "リクエストがタイムアウトしました",
     "timeout_detail": "ディレクトリを読み取れませんでした。ネットワークドライブの遅延や利用不可が原因の可能性があります。",
