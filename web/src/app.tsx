@@ -111,6 +111,7 @@ import { REPO_MSG } from '@shared/repo-types.js';
 import { shouldSubscribeTerminalRaw, type TerminalSubscribeViewMode } from './terminal-subscribe-mode.js';
 import { onWatchCommand } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
+import { isRunningTimelineEvent } from './timeline-running.js';
 
 // On web: if opened by the native app for passkey auth, render the bridge page.
 const nativeCallback = typeof window !== 'undefined'
@@ -1173,6 +1174,13 @@ export function App() {
       if (msg.type === 'timeline.event') {
         const event = msg.event;
         watchProjectionStore.handleTimelineEvent(event);
+        if (isRunningTimelineEvent(event) && !event.sessionId.startsWith('deck_sub_')) {
+          setSessions((prev) => prev.map((s) =>
+            s.name === event.sessionId && s.state !== 'running'
+              ? { ...s, state: 'running' as SessionInfo['state'] }
+              : s,
+          ));
+        }
         if (event.type === 'ask.question') {
           setPendingQuestion({
             sessionName: event.sessionId,

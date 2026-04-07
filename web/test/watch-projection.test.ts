@@ -198,6 +198,45 @@ describe('watch projection store', () => {
     expect(fourth.previewUpdatedAt).toBe(3_222);
   });
 
+  it('marks sessions working on assistant/tool timeline events and returns to idle on session idle', () => {
+    const { store } = makeSnapshotStore(3_000);
+    store.updateFromSessionList(
+      { id: 'srv-1', name: 'Main', baseUrl: 'https://main.test' },
+      [
+        { name: 'deck_proj_brain', project: 'Project', role: 'brain', agentType: 'claude-code', state: 'idle' },
+      ],
+    );
+
+    store.handleTimelineEvent({
+      eventId: 'e1',
+      sessionId: 'deck_proj_brain',
+      ts: 100,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.call',
+      payload: { tool: 'read_file' },
+    });
+    expect(store.getSnapshot().sessions[0]?.state).toBe('working');
+
+    store.handleTimelineEvent({
+      eventId: 'e2',
+      sessionId: 'deck_proj_brain',
+      ts: 101,
+      seq: 2,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.result',
+      payload: { ok: true },
+    });
+    expect(store.getSnapshot().sessions[0]?.state).toBe('working');
+
+    store.onSessionIdle('deck_proj_brain', 102);
+    expect(store.getSnapshot().sessions[0]?.state).toBe('idle');
+  });
+
   it('updateFromSessionList triggers syncSnapshot after debounce with full payload', async () => {
     const { store, pushes } = makeSnapshotStore(5_000);
     store.setApiKey('test-key');

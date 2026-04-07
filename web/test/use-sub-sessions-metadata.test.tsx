@@ -269,3 +269,60 @@ describe('sub-session metadata integration', () => {
     expect(captured).toHaveLength(0);
   });
 });
+
+describe('sub-session realtime state sync', () => {
+  afterEach(() => { cleanup(); vi.clearAllMocks(); captured = []; });
+
+  it('marks a sub-session running on assistant/tool timeline events and idle on session.idle', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'run1',
+      sessionName: 'deck_sub_run1',
+      sessionType: 'codex-sdk',
+      state: 'idle',
+    }));
+    expect(captured[0]?.state).toBe('idle');
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        eventId: 'e1',
+        sessionId: 'deck_sub_run1',
+        ts: 100,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: 'working' },
+      },
+    }));
+    expect(captured[0]?.state).toBe('running');
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        eventId: 'e2',
+        sessionId: 'deck_sub_run1',
+        ts: 101,
+        seq: 2,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'tool.call',
+        payload: { tool: 'read_file' },
+      },
+    }));
+    expect(captured[0]?.state).toBe('running');
+
+    act(() => send({
+      type: 'session.idle',
+      session: 'deck_sub_run1',
+    }));
+    expect(captured[0]?.state).toBe('idle');
+  });
+});

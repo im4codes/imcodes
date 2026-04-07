@@ -2,6 +2,7 @@ import { formatLabel } from './format-label.js';
 import { getApiKey } from './api.js';
 import { pushDurableEventToWatch, syncSnapshotToWatch } from './watch-bridge.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
+import { isRunningTimelineEvent } from './timeline-running.js';
 
 export type WatchSnapshotStatus = 'fresh' | 'stale' | 'switching';
 export type WatchSessionState = 'working' | 'idle' | 'error' | 'stopped';
@@ -370,9 +371,13 @@ export class WatchProjectionStore {
   }
 
   handleTimelineEvent(event: TimelineEvent): boolean {
-    if (event.type !== 'assistant.text') return false;
+    let changed = false;
+    if (isRunningTimelineEvent(event)) {
+      changed = this.updateSessionState(event.sessionId, 'working') || changed;
+    }
+    if (event.type !== 'assistant.text') return changed;
     const text = typeof event.payload.text === 'string' ? event.payload.text : '';
-    return this.trackAssistantText(event.sessionId, text);
+    return this.trackAssistantText(event.sessionId, text) || changed;
   }
 
   async pushDurableEvent(event: WatchDurableEvent): Promise<void> {

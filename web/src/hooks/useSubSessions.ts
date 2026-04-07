@@ -10,6 +10,7 @@ import {
   type SubSessionData,
 } from '../api.js';
 import type { WsClient } from '../ws-client.js';
+import { isRunningTimelineEvent } from '../timeline-running.js';
 
 export interface SubSession extends SubSessionData {
   sessionName: string;
@@ -212,9 +213,15 @@ export function useSubSessions(
 
       if (msg.type === 'timeline.event') {
         const ev = msg.event;
-        if (ev.type !== 'session.state') return;
-        state = String(ev.payload.state ?? '');
-        sessionName = ev.sessionId;
+        if (ev.type === 'session.state') {
+          state = String(ev.payload.state ?? '');
+          sessionName = ev.sessionId;
+        } else if (isRunningTimelineEvent(ev)) {
+          state = 'running';
+          sessionName = ev.sessionId;
+        } else {
+          return;
+        }
       } else if (msg.type === 'session.idle') {
         state = 'idle';
         sessionName = msg.session as string | undefined;
