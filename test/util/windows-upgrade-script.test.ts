@@ -17,8 +17,10 @@ describe('buildWindowsCleanupScript', () => {
   it('generates a standalone cleanup cmd script', () => {
     const script = buildWindowsCleanupScript('C:\\Temp\\imcodes-upgrade-123');
     expect(script).toContain('@echo off');
+    expect(script).toContain('chcp 65001 >nul 2>&1');
     expect(script).toContain('timeout /t 120 /nobreak >nul');
-    expect(script).toContain('rmdir /s /q "C:\\Temp\\imcodes-upgrade-123"');
+    expect(script).toContain('for %%I in ("%~dp0.") do set "SCRIPT_DIR=%%~fI"');
+    expect(script).toContain('rmdir /s /q "%SCRIPT_DIR%"');
   });
 });
 
@@ -57,11 +59,19 @@ describe('buildWindowsUpgradeBatch', () => {
   // ── Lock file lifecycle ──
 
   it('creates upgrade lock BEFORE npm install', () => {
-    const lockIdx = batch.indexOf(`echo upgrade > "${INPUT.upgradeLockFile}"`);
+    const lockIdx = batch.indexOf('echo upgrade > "%UPGRADE_LOCK%"');
     const installIdx = batch.indexOf(`call "${INPUT.npmCmd}" install`);
     expect(lockIdx).toBeGreaterThan(-1);
     expect(installIdx).toBeGreaterThan(-1);
     expect(lockIdx).toBeLessThan(installIdx);
+  });
+
+  it('switches cmd.exe to UTF-8 before touching path variables', () => {
+    expect(batch).toContain('chcp 65001 >nul 2>&1');
+    expect(batch).toContain('set "LOG_FILE=%SCRIPT_DIR%\\upgrade.log"');
+    expect(batch).toContain('set "CLEANUP_VBS=%SCRIPT_DIR%\\cleanup.vbs"');
+    expect(batch).toContain('set "VBS_LAUNCHER=%USERPROFILE%\\.imcodes\\daemon-launcher.vbs"');
+    expect(batch).toContain('set "UPGRADE_LOCK=%USERPROFILE%\\.imcodes\\upgrade.lock"');
   });
 
   it('every abort path deletes lock AND restarts VBS', () => {
@@ -72,7 +82,7 @@ describe('buildWindowsUpgradeBatch', () => {
     // At least 4 abort paths: install fail, no prefix, no shim, version mismatch
     expect(abortBlocks.length).toBeGreaterThanOrEqual(4);
     for (const block of abortBlocks) {
-      expect(block).toContain(`del "${INPUT.upgradeLockFile}"`);
+      expect(block).toContain('del "%UPGRADE_LOCK%"');
       expect(block).toContain('wscript');
     }
   });
@@ -156,9 +166,9 @@ describe('buildWindowsUpgradeBatch', () => {
     // No `start /min` either — flashes briefly in taskbar
     expect(batch).not.toContain('/min cmd /c');
     // Cleanup must be invoked via wscript on the cleanup VBS
-    expect(batch).toContain(`wscript "${INPUT.cleanupVbsPath}"`);
+    expect(batch).toContain('wscript "%CLEANUP_VBS%"');
     // Should be invoked at least 5 times (4 abort paths + 1 success)
-    const wscriptCleanupCalls = batch.match(new RegExp(`wscript "${INPUT.cleanupVbsPath.replace(/\\/g, '\\\\')}"`, 'g')) ?? [];
+    const wscriptCleanupCalls = batch.match(/wscript "%CLEANUP_VBS%"/g) ?? [];
     expect(wscriptCleanupCalls.length).toBeGreaterThanOrEqual(5);
   });
 
@@ -173,12 +183,25 @@ describe('buildWindowsUpgradeBatch', () => {
     const abortBlocks = batch.split('goto :done').slice(0, -1);
     for (const block of abortBlocks) {
       // Every abort must restart the daemon via VBS
-      expect(block).toContain(`wscript "${INPUT.vbsLauncherPath}"`);
+      expect(block).toContain('wscript "%VBS_LAUNCHER%"');
     }
 
     // Success path must start new watchdog
     const successPath = batch.slice(batch.indexOf('Regenerating daemon launch chain'));
-    expect(successPath).toContain(`wscript "${INPUT.vbsLauncherPath}"`);
+    expect(successPath).toContain('wscript "%VBS_LAUNCHER%"');
+  });
+
+  it('avoids embedding non-ASCII user paths directly in the batch body', () => {
+    const nonAscii = buildWindowsUpgradeBatch({
+      ...INPUT,
+      logFile: 'C:\\Users\\云科1\\AppData\\Local\\Temp\\imcodes-upgrade-123\\upgrade.log',
+      cleanupVbsPath: 'C:\\Users\\云科1\\AppData\\Local\\Temp\\imcodes-upgrade-123\\cleanup.vbs',
+      vbsLauncherPath: 'C:\\Users\\云科1\\.imcodes\\daemon-launcher.vbs',
+      upgradeLockFile: 'C:\\Users\\云科1\\.imcodes\\upgrade.lock',
+    });
+    expect(nonAscii).not.toContain('云科1');
+    expect(nonAscii).toContain('%USERPROFILE%\\.imcodes\\daemon-launcher.vbs');
+    expect(nonAscii).toContain('%SCRIPT_DIR%\\cleanup.vbs');
   });
 });
 

@@ -2204,7 +2204,8 @@ launchctl load -w "${plist}"`;
     const cleanupPath = join(scriptDir, 'cleanup.cmd');
     const cleanupVbsPath = join(scriptDir, 'cleanup.vbs');
     const targetVer = targetVersion ?? 'latest';
-    // .cmd files: UTF-8 + BOM so cmd.exe handles non-ASCII paths.
+    // .cmd files: UTF-8 + BOM, and the script itself switches to UTF-8 with
+    // `chcp 65001` before touching any non-ASCII paths.
     // .vbs files: UTF-16 LE + BOM so wscript handles non-ASCII paths.
     writeFileSync(cleanupPath, encodeCmdAsUtf8Bom(buildWindowsCleanupScript(scriptDir)));
     writeFileSync(cleanupVbsPath, encodeVbsAsUtf16(buildWindowsCleanupVbs(cleanupPath)));
