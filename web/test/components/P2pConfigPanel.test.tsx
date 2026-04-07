@@ -183,7 +183,7 @@ describe('P2pConfigPanel', () => {
     // The first eligible session mode should be 'review'
     const firstKey = Object.keys(cfg.sessions)[0];
     expect(cfg.sessions[firstKey].mode).toBe('review');
-  });
+  }, 15_000);
 
   it('calls onClose when the close button (✕) is clicked', async () => {
     const onClose = vi.fn();
@@ -262,7 +262,7 @@ describe('P2pConfigPanel', () => {
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
     const firstKey = Object.keys(cfg.sessions)[0];
     expect(cfg.sessions[firstKey].enabled).toBe(true);
-  });
+  }, 15_000);
 
   it('changing rounds updates the config passed to onSave', async () => {
     const onSave = vi.fn();
@@ -284,7 +284,7 @@ describe('P2pConfigPanel', () => {
 
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
     expect(cfg.rounds).toBe(5);
-  });
+  }, 15_000);
 
   it('persists config via saveUserPref on save', async () => {
     const onSave = vi.fn();

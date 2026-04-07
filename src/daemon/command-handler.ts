@@ -11,6 +11,7 @@ import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js'
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { timelineStore } from './timeline-store.js';
+import { emitSessionInlineError } from './session-error.js';
 import {
   startSubSession,
   stopSubSession,
@@ -32,7 +33,6 @@ import { getComboRoundCount, parseModePipeline, P2P_CONFIG_MODE, type P2pSession
 import { CRON_MSG } from '../../shared/cron-types.js';
 import { executeCronJob } from './cron-executor.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
-import { getProvider } from '../agent/provider-registry.js';
 import { copyFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
@@ -202,6 +202,7 @@ import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from '../agent/provider-display.js';
 import { buildSessionList } from './session-list.js';
 import { getQwenOAuthQuotaUsageLabel, recordQwenOAuthRequest } from '../agent/provider-quota.js';
+import { listProviderSessions as listProviderSessionsImpl } from './provider-sessions.js';
 
 function describeTransportSendError(err: unknown): string {
   if (err && typeof err === 'object') {
@@ -874,6 +875,7 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
   } catch (err) {
     logger.error({ project, err }, 'session.restart failed');
     const message = err instanceof Error ? err.message : String(err);
+    emitSessionInlineError(brain.name, message);
     try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
   }
 }
@@ -2880,10 +2882,7 @@ export function fileSearchByLengthAsc(a: FzfEntry, b: FzfEntry): number {
 
 /** Reusable: fetch remote sessions from a provider. */
 export async function listProviderSessions(providerId: string): Promise<Array<{ key: string; displayName?: string; agentId?: string; updatedAt?: number; percentUsed?: number }>> {
-  const provider = getProvider(providerId);
-  if (!provider) return [];
-  if (!provider.capabilities.sessionRestore || !provider.listSessions) return [];
-  return provider.listSessions();
+  return listProviderSessionsImpl(providerId);
 }
 
 // ── CC env presets ────────────────────────────────────────────────────────

@@ -389,6 +389,7 @@
       "discuss": "Discuss"
     },
     "mode_config": "Config",
+    "settings_button": "P2P Settings",
     "settings_title": "P2P Participant Settings",
     "cross_session": "Include sessions from other projects",
     "settings_save": "Save",

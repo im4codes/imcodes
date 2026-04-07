@@ -23,6 +23,7 @@ import {
 } from '../store/session-store.js';
 import logger from '../util/logger.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
+import { emitSessionInlineError } from '../daemon/session-error.js';
 import { startWatching, startWatchingFile, stopWatching, isWatching, findJsonlPathBySessionId } from '../daemon/jsonl-watcher.js';
 import { startWatching as startCodexWatching, startWatchingSpecificFile as startCodexWatchingFile, startWatchingById as startCodexWatchingById, stopWatching as stopCodexWatching, isWatching as isCodexWatching, findRolloutPathByUuid } from '../daemon/codex-watcher.js';
 import { startWatching as startGeminiWatching, startWatchingLatest as startGeminiWatchingLatest, stopWatching as stopGeminiWatching, isWatching as isGeminiWatching } from '../daemon/gemini-watcher.js';
@@ -112,6 +113,11 @@ export function setSessionEventCallback(cb: SessionEventCallback): void {
 
 function emitSessionEvent(event: 'started' | 'stopped' | 'error', session: string, state: string): void {
   try { _onSessionEvent?.(event, session, state); } catch { /* ignore */ }
+  if (event === 'error') {
+    emitSessionInlineError(session, state);
+    timelineEmitter.emit(session, 'session.state', { state: event, error: state });
+    return;
+  }
   timelineEmitter.emit(session, 'session.state', { state: event });
 }
 
@@ -413,6 +419,7 @@ export async function restoreFromStore(): Promise<void> {
       try { await restartSession(hydrated); } catch (err) {
         logger.error({ err, session: hydrated.name }, 'Failed to restart session on restore — skipping (tmux may be unavailable)');
         updateSessionState(hydrated.name, 'error');
+        emitSessionEvent('error', hydrated.name, err instanceof Error ? err.message : String(err));
       }
     } else if (isLiveSession && !paneAlive) {
       // Session exists (remain-on-exit) but process is dead — respawn instead of creating a new session
@@ -420,6 +427,7 @@ export async function restoreFromStore(): Promise<void> {
       try { await respawnSession(hydrated); } catch (err) {
         logger.error({ err, session: hydrated.name }, 'Failed to respawn session on restore — skipping');
         updateSessionState(hydrated.name, 'error');
+        emitSessionEvent('error', hydrated.name, err instanceof Error ? err.message : String(err));
       }
     } else if (hydrated.agentType === 'claude-code' && hydrated.projectDir && !isWatching(hydrated.name)) {
       if (hydrated.ccSessionId) {
@@ -553,9 +561,10 @@ export async function restartSession(record: SessionRecord): Promise<boolean> {
   const recentRestarts = record.restartTimestamps.filter((t) => t > windowStart);
 
   if (recentRestarts.length >= MAX_RESTARTS) {
+    const message = `Restart loop detected: more than ${MAX_RESTARTS} restarts within 5 minutes`;
     logger.error({ session: record.name }, 'Restart loop detected — marking as error');
     updateSessionState(record.name, 'error');
-    emitSessionEvent('error', record.name, 'error');
+    emitSessionEvent('error', record.name, message);
     return false;
   }
 
@@ -608,9 +617,10 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
   const recentRestarts = record.restartTimestamps.filter((t) => t > windowStart);
 
   if (recentRestarts.length >= MAX_RESTARTS) {
+    const message = `Restart loop detected: more than ${MAX_RESTARTS} restarts within 5 minutes`;
     logger.error({ session: record.name }, 'Restart loop detected — marking as error');
     updateSessionState(record.name, 'error');
-    emitSessionEvent('error', record.name, 'error');
+    emitSessionEvent('error', record.name, message);
     return false;
   }
 

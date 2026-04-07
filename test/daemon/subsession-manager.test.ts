@@ -10,6 +10,7 @@ const {
   codexStartWatchingByIdMock, codexIsWatchingMock, codexIsFileClaimedMock,
   removeSessionMock, resolveGeminiSessionIdMock, injectGeminiMemoryMock,
   launchTransportSessionMock, getTransportRuntimeMock,
+  getAgentVersionMock,
 } = vi.hoisted(() => ({
   upsertSessionMock: vi.fn(),
   startWatchingMock: vi.fn().mockResolvedValue(undefined),
@@ -31,6 +32,7 @@ const {
   injectGeminiMemoryMock: vi.fn().mockResolvedValue(undefined),
   launchTransportSessionMock: vi.fn().mockResolvedValue(undefined),
   getTransportRuntimeMock: vi.fn().mockReturnValue(null),
+  getAgentVersionMock: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -80,6 +82,10 @@ vi.mock('../../src/agent/session-manager.js', () => ({
   getDriver: getDriverMock,
   launchTransportSession: launchTransportSessionMock,
   getTransportRuntime: getTransportRuntimeMock,
+}));
+
+vi.mock('../../src/agent/agent-version.js', () => ({
+  getAgentVersion: getAgentVersionMock,
 }));
 
 vi.mock('../../src/agent/drivers/gemini.js', () => ({

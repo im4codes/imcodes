@@ -83,7 +83,7 @@ const CODEX_MODELS: CodexModelChoice[] = [...CODEX_MODEL_IDS] as CodexModelChoic
 const SINGLE_P2P_MODES: string[] = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss'];
 const P2P_MODES: string[] = [...SINGLE_P2P_MODES, ...COMBO_PRESETS.map((c) => c.key), P2P_CONFIG_MODE];
 const P2P_MODE_I18N: Record<string, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', plan: 'p2p.mode_plan', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
-const P2P_SINGLE_COLORS: Record<string, string> = { solo: '#6b7280', audit: '#f59e0b', review: '#3b82f6', plan: '#06b6d4', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
+const P2P_SINGLE_COLORS: Record<string, string> = { solo: '#dbe7f5', audit: '#f59e0b', review: '#3b82f6', plan: '#06b6d4', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
 
 function getP2pModeColor(mode: string): string {
   if (P2P_SINGLE_COLORS[mode]) return P2P_SINGLE_COLORS[mode];
@@ -105,6 +105,11 @@ function getP2pModeLabel(mode: string, t: (key: string) => string): string {
     }).join('→');
   }
   return mode;
+}
+
+function getP2pMenuItemColor(mode: string, active: boolean): string {
+  if (mode === 'solo') return active ? '#f8fafc' : '#dbe7f5';
+  return getP2pModeColor(mode);
 }
 
 interface PendingAtTarget {
@@ -1070,24 +1075,24 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         {/* P2P mode selector — hidden for shell/script sessions */}
         {!isShellLike && <div class="shortcuts-model" ref={p2pRef}>
           <button
-            class="shortcut-btn"
+            class={`shortcut-btn p2p-mode-btn${p2pMode === 'solo' ? ' p2p-mode-btn-solo' : ''}`}
             data-onboarding="p2p-mode"
             onClick={() => setP2pOpen((o) => !o)}
             disabled={disabled}
             title={p2pMode === 'solo' ? t('p2p.mode_solo') : `P2P: ${getP2pModeLabel(p2pMode, t)}`}
-            style={{ color: getP2pModeColor(p2pMode), fontSize: 10, fontWeight: p2pMode !== 'solo' ? 600 : 400 }}
+            style={{ color: getP2pModeColor(p2pMode), fontSize: 10, fontWeight: p2pMode === 'solo' ? 600 : 700 }}
           >
             {p2pMode === 'solo' ? t('p2p.mode_solo') : `P2P:${getP2pModeLabel(p2pMode, t)}`}
           </button>
-          {/* Gear button for P2P config panel — always visible */}
           <button
-            class="shortcut-btn"
+            class="shortcut-btn p2p-settings-btn"
             onClick={() => { setP2pOpen(false); setP2pConfigOpen(true); }}
             disabled={disabled}
             title={t('p2p.settings_title')}
-            style={{ fontSize: 12, color: '#94a3b8', paddingLeft: 2, paddingRight: 2 }}
+            aria-label={t('p2p.settings_button')}
           >
-            ⚙
+            <span class="p2p-settings-icon" aria-hidden="true">⚙</span>
+            <span class="p2p-settings-label">{t('p2p.settings_button')}</span>
           </button>
           {p2pOpen && (
             <div class="menu-dropdown">
@@ -1101,7 +1106,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     if (m === 'solo') setP2pExcludeSameType(false);
                     setP2pOpen(false);
                   }}
-                  style={{ color: getP2pModeColor(m) }}
+                  style={{ color: getP2pMenuItemColor(m, p2pMode === m), fontWeight: p2pMode === m ? 700 : (m === 'solo' ? 600 : 400) }}
                 >
                   {p2pMode === m ? '● ' : '○ '}{getP2pModeLabel(m, t)}
                 </button>

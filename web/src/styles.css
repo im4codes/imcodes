@@ -116,6 +116,13 @@ body {
 .shortcut-btn:hover:not(:disabled) { background: #1e3a5f; border-color: #3b82f6; color: #93c5fd; }
 .shortcut-btn:disabled { opacity: 0.4; cursor: default; }
 .shortcut-btn-wide { padding-left: 14px; padding-right: 14px; }
+.p2p-mode-btn { letter-spacing: 0.01em; }
+.p2p-mode-btn-solo { background: #132033; border-color: #425a78; box-shadow: inset 0 0 0 1px rgba(219, 231, 245, 0.08); }
+.p2p-mode-btn-solo:hover:not(:disabled) { background: #1a3150; border-color: #60a5fa; color: #f8fafc; }
+.p2p-settings-btn { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; color: #dbe7f5; }
+.p2p-settings-btn:hover:not(:disabled) { color: #eff6ff; }
+.p2p-settings-icon { font-size: 12px; line-height: 1; }
+.p2p-settings-label { font-size: 11px; font-weight: 600; letter-spacing: 0.01em; }
 .controls { padding: 6px 8px; display: flex; gap: 6px; align-items: center; }
 .controls-queued-hint { padding: 0 12px 8px; color: #fbbf24; font-size: 12px; line-height: 1.35; }
 .attachment-badges { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 2px 2px; }
@@ -389,6 +396,8 @@ body {
   .controls { padding: 6px 8px; gap: 6px; }
   .controls-input { font-size: 16px; } /* prevent iOS zoom on focus */
   .btn { padding: 8px 10px; font-size: 13px; }
+  .p2p-settings-btn { gap: 0; padding: 6px 7px; min-width: auto; }
+  .p2p-settings-label { display: none; }
 }
 
 /* Mobile sidebar overlay — always mounted, shown/hidden via .open class */

@@ -389,6 +389,7 @@
       "discuss": "讨论"
     },
     "mode_config": "配置",
+    "settings_button": "P2P设置",
     "settings_title": "P2P 参与者设置",
     "cross_session": "包含其他项目的会话",
     "settings_save": "保存",

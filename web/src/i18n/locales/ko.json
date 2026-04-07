@@ -389,6 +389,7 @@
       "discuss": "토론"
     },
     "mode_config": "설정",
+    "settings_button": "P2P 설정",
     "settings_title": "P2P 참가자 설정",
     "cross_session": "다른 프로젝트의 세션 포함",
     "settings_save": "저장",

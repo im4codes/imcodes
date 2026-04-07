@@ -141,7 +141,13 @@ async function probeSessionStates(): Promise<void> {
 function scheduleWrite(): void {
   if (writeTimer) clearTimeout(writeTimer);
   writeTimer = setTimeout(async () => {
-    await writeFile(STORE_PATH, JSON.stringify(store, null, 2), 'utf8');
+    try {
+      await mkdir(STORE_DIR, { recursive: true });
+      await writeFile(STORE_PATH, JSON.stringify(store, null, 2), 'utf8');
+    } catch {
+      // Tests may tear down temp HOME dirs while a debounced write is pending.
+      // Losing that best-effort write is fine; a later flush/load will recreate it.
+    }
     writeTimer = null;
   }, DEBOUNCE_MS);
 }
@@ -183,5 +189,6 @@ export async function flushStore(): Promise<void> {
     clearTimeout(writeTimer);
     writeTimer = null;
   }
+  await mkdir(STORE_DIR, { recursive: true });
   await writeFile(STORE_PATH, JSON.stringify(store, null, 2), 'utf8');
 }

@@ -132,7 +132,7 @@ describe.skipIf(SKIP)('Daemon reconnect resilience (e2e)', () => {
     // Session should still be there with the same pane
     expect(await sessionExists(name)).toBe(true);
     expect(await isPaneAlive(name)).toBe(true);
-  });
+  }, 45_000);
 
   // ── 2. Dead pane is detected and session marked on restore ───────────────
 

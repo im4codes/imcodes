@@ -389,6 +389,7 @@
       "discuss": "Обсуждение"
     },
     "mode_config": "Конфиг",
+    "settings_button": "Настройки P2P",
     "settings_title": "Настройки участников P2P",
     "cross_session": "Включить сессии из других проектов",
     "settings_save": "Сохранить",

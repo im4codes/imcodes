@@ -235,6 +235,7 @@ vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn()
 import { launchSession } from '../../src/agent/session-manager.js';
 import { disconnectAll } from '../../src/agent/provider-registry.js';
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import { newSession } from '../../src/agent/tmux.js';
 
 describe('sdk transport flow e2e', () => {
 
@@ -310,6 +311,46 @@ describe('sdk transport flow e2e', () => {
     }));
     expect(mocks.codexCalls).toEqual([]);
     expect(mocks.store.get('deck_cxsdk_main_brain')?.codexSessionId).toBe('old-codex-thread-id');
+  });
+
+  it('emits a brain-session inline error when session.restart fails', async () => {
+    const tmuxNewSession = newSession as ReturnType<typeof vi.fn>;
+    tmuxNewSession.mockRejectedValueOnce(new Error('tmux create failed'));
+
+    mocks.store.set('deck_restart_fail_brain', {
+      name: 'deck_restart_fail_brain',
+      projectName: 'restart_fail',
+      role: 'brain',
+      agentType: 'shell',
+      projectDir: '/tmp/restart-fail',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({
+      type: 'session.restart',
+      project: 'restart_fail',
+    }, serverLink);
+    await flushAsync();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.error',
+      project: 'restart_fail',
+      message: 'tmux create failed',
+    }));
+    expect(mocks.emitted).toContainEqual(expect.objectContaining({
+      session: 'deck_restart_fail_brain',
+      type: 'assistant.text',
+      payload: {
+        text: '⚠️ Error: tmux create failed',
+        streaming: false,
+      },
+    }));
   });
 
   it('switches claude-code-sdk model through /model and updates display metadata', async () => {
