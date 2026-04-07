@@ -1168,7 +1168,7 @@ body {
 }
 .discussions-progress-node.is-skipped { color: #f87171; border-color: rgba(248, 113, 113, 0.3); }
 .discussions-progress-node.is-pending { color: #64748b; }
-.discussions-detail { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.discussions-detail { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .discussions-detail-scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior-x: contain; }
 .discussions-file-preview {
   width: 100%;
@@ -1227,6 +1227,24 @@ body {
 .discussions-follow-toggle span {
   white-space: nowrap;
 }
+.discussions-scroll-dock {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  pointer-events: none;
+}
+.discussions-scroll-btn-floating {
+  width: 38px;
+  height: 38px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.94);
+  box-shadow: 0 10px 28px rgba(2, 6, 23, 0.34);
+  pointer-events: auto;
+}
 .discussions-scroll-btn { background: none; border: 1px solid #334155; color: #94a3b8; cursor: pointer; border-radius: 4px; width: 28px; height: 28px; font-size: 14px; display: flex; align-items: center; justify-content: center; padding: 0; flex-shrink: 0; }
 .discussions-scroll-btn:active { background: #334155; color: #e2e8f0; }
 .discussions-detail-header { padding: 16px; border-bottom: 1px solid #1e293b; }
@@ -1257,6 +1275,8 @@ body {
     display: flex; flex-direction: column;
   }
   .discussions-follow-toggle span { white-space: normal; line-height: 1.2; }
+  .discussions-scroll-dock { right: 12px; bottom: 12px; }
+  .discussions-scroll-btn-floating { width: 42px; height: 42px; }
 }
 
 /* AskQuestionDialog */

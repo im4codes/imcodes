@@ -24,23 +24,19 @@ vi.mock('../../src/components/FilePreviewPane.js', () => ({
 describe('DiscussionsPage', () => {
   let handler: ((msg: ServerMessage) => void) | null = null;
   let ws: WsClient;
-  let scrollToMock: ReturnType<typeof vi.fn>;
   let clipboardWriteText: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
-    scrollToMock = vi.fn();
     clipboardWriteText = vi.fn().mockResolvedValue(undefined);
+    let rafTime = 0;
     vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
-      cb(0);
-      return 1;
+      rafTime += 120;
+      cb(rafTime);
+      return rafTime;
     });
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
       value: { writeText: clipboardWriteText },
-    });
-    Object.defineProperty(HTMLElement.prototype, 'scrollTo', {
-      configurable: true,
-      value: scrollToMock,
     });
 
     ws = {
@@ -78,6 +74,11 @@ describe('DiscussionsPage', () => {
       configurable: true,
       value: 640,
     });
+    Object.defineProperty(scrollEl, 'scrollTop', {
+      configurable: true,
+      writable: true,
+      value: 0,
+    });
 
     await act(async () => {
       handler?.({
@@ -89,9 +90,9 @@ describe('DiscussionsPage', () => {
 
     expect(screen.getByTestId('discussion-preview').textContent).toBe('Updated markdown');
     expect((screen.getByLabelText('p2p.discussions.auto_follow_latest') as HTMLInputElement).checked).toBe(true);
-    await waitFor(() => {
-      expect(scrollToMock).toHaveBeenCalledWith({ top: 640, behavior: 'smooth' });
-    });
+    await waitFor(() => expect(scrollEl.scrollTop).toBe(640));
+    expect(screen.getByTitle('p2p.discussions.scroll_top')).toBeTruthy();
+    expect(screen.getByTitle('p2p.discussions.scroll_bottom')).toBeTruthy();
   });
 
   it('disables follow when unchecked, and re-enables it from the bottom arrow', async () => {
@@ -111,6 +112,11 @@ describe('DiscussionsPage', () => {
       configurable: true,
       value: 720,
     });
+    Object.defineProperty(scrollEl, 'scrollTop', {
+      configurable: true,
+      writable: true,
+      value: 0,
+    });
 
     await act(async () => {
       handler?.({
@@ -119,8 +125,6 @@ describe('DiscussionsPage', () => {
         content: 'Initial content',
       } as ServerMessage);
     });
-
-    scrollToMock.mockClear();
 
     const checkbox = screen.getByLabelText('p2p.discussions.auto_follow_latest') as HTMLInputElement;
     fireEvent.click(checkbox);
@@ -135,17 +139,16 @@ describe('DiscussionsPage', () => {
     });
 
     expect(screen.getByTestId('discussion-preview').textContent).toBe('New content after manual scroll');
-    expect(scrollToMock).not.toHaveBeenCalled();
+    expect(scrollEl.scrollTop).toBe(720);
 
+    scrollEl.scrollTop = 720;
     fireEvent.click(screen.getByTitle('p2p.discussions.scroll_top'));
     expect(checkbox.checked).toBe(false);
-    expect(scrollToMock).toHaveBeenCalledWith({ top: 0, behavior: 'smooth' });
-
-    scrollToMock.mockClear();
+    expect(scrollEl.scrollTop).toBe(0);
 
     fireEvent.click(screen.getByTitle('p2p.discussions.scroll_bottom'));
     expect(checkbox.checked).toBe(true);
-    expect(scrollToMock).toHaveBeenCalledWith({ top: 720, behavior: 'smooth' });
+    expect(scrollEl.scrollTop).toBe(720);
   });
 
   it('copies discussion path from the list action menu', async () => {

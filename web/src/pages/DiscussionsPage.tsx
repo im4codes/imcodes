@@ -39,17 +39,73 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
   const pendingReadRequestIdRef = useRef<string | null>(null);
   const pendingCopyRef = useRef<{ id: string; requestId: string } | null>(null);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scrollAnimFrameRef = useRef<number | null>(null);
   const detailScrollRef = useRef<HTMLDivElement>(null);
 
-  const scrollDetailToTop = useCallback((behavior: ScrollBehavior = 'smooth') => {
-    detailScrollRef.current?.scrollTo({ top: 0, behavior });
+  const stopDetailScrollAnimation = useCallback(() => {
+    if (scrollAnimFrameRef.current !== null) {
+      cancelAnimationFrame(scrollAnimFrameRef.current);
+      scrollAnimFrameRef.current = null;
+    }
   }, []);
 
-  const scrollDetailToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
+  const scrollDetailTo = useCallback((targetTop: number, mode: 'auto' | 'button' | 'follow') => {
     const el = detailScrollRef.current;
     if (!el) return;
-    el.scrollTo({ top: el.scrollHeight, behavior });
-  }, []);
+    stopDetailScrollAnimation();
+    const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
+    const clampedTarget = Math.max(0, Math.min(targetTop, maxTop));
+    const currentTop = el.scrollTop;
+    const distance = clampedTarget - currentTop;
+    if (Math.abs(distance) < 1) {
+      el.scrollTop = clampedTarget;
+      return;
+    }
+
+    const prefersReducedMotion = typeof window !== 'undefined'
+      && typeof window.matchMedia === 'function'
+      && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const mobileViewport = typeof window !== 'undefined'
+      && typeof window.matchMedia === 'function'
+      && window.matchMedia('(max-width: 768px)').matches;
+
+    if (
+      mode === 'auto'
+      || prefersReducedMotion
+      || (mobileViewport && mode === 'follow')
+      || (mobileViewport && Math.abs(distance) > 4000)
+    ) {
+      el.scrollTop = clampedTarget;
+      return;
+    }
+
+    const duration = mobileViewport ? 220 : mode === 'button' ? 320 : 220;
+    const startAt = performance.now();
+
+    const tick = (now: number) => {
+      const progress = Math.min(1, (now - startAt) / duration);
+      const eased = 1 - ((1 - progress) ** 3);
+      el.scrollTop = currentTop + (distance * eased);
+      if (progress < 1) {
+        scrollAnimFrameRef.current = requestAnimationFrame(tick);
+      } else {
+        el.scrollTop = clampedTarget;
+        scrollAnimFrameRef.current = null;
+      }
+    };
+
+    scrollAnimFrameRef.current = requestAnimationFrame(tick);
+  }, [stopDetailScrollAnimation]);
+
+  const scrollDetailToTop = useCallback((mode: 'auto' | 'button' | 'follow' = 'button') => {
+    scrollDetailTo(0, mode);
+  }, [scrollDetailTo]);
+
+  const scrollDetailToBottom = useCallback((mode: 'auto' | 'button' | 'follow' = 'button') => {
+    const el = detailScrollRef.current;
+    if (!el) return;
+    scrollDetailTo(el.scrollHeight, mode);
+  }, [scrollDetailTo]);
 
   const sendReadDiscussion = useCallback((id: string, requestId: string) => {
     ws?.send({ type: 'p2p.read_discussion', id, requestId });
@@ -194,7 +250,8 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
 
   useEffect(() => () => {
     if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
-  }, []);
+    stopDetailScrollAnimation();
+  }, [stopDetailScrollAnimation]);
 
   useEffect(() => {
     if (!copyMenuId) return;
@@ -210,7 +267,7 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
   useEffect(() => {
     if (!selected || content === null || !autoFollow) return;
     requestAnimationFrame(() => {
-      scrollDetailToBottom(content.length > 4000 ? 'auto' : 'smooth');
+      scrollDetailToBottom(content.length > 4000 ? 'auto' : 'follow');
     });
   }, [selected, content, autoFollow, scrollDetailToBottom]);
 
@@ -312,26 +369,6 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
                 />
                 <span>{t('p2p.discussions.auto_follow_latest')}</span>
               </label>
-              <button
-                class="discussions-scroll-btn"
-                onClick={() => {
-                  setAutoFollow(false);
-                  scrollDetailToTop();
-                }}
-                title={t('p2p.discussions.scroll_top')}
-              >
-                ↑
-              </button>
-              <button
-                class="discussions-scroll-btn"
-                onClick={() => {
-                  setAutoFollow(true);
-                  scrollDetailToBottom();
-                }}
-                title={t('p2p.discussions.scroll_bottom')}
-              >
-                ↓
-              </button>
             </div>
           )}
           <div ref={detailScrollRef} class="discussions-detail-scroll">
@@ -347,6 +384,30 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
               </div>
             )}
           </div>
+          {selected && (
+            <div class="discussions-scroll-dock">
+              <button
+                class="discussions-scroll-btn discussions-scroll-btn-floating"
+                onClick={() => {
+                  setAutoFollow(false);
+                  scrollDetailToTop('button');
+                }}
+                title={t('p2p.discussions.scroll_top')}
+              >
+                ↑
+              </button>
+              <button
+                class="discussions-scroll-btn discussions-scroll-btn-floating"
+                onClick={() => {
+                  setAutoFollow(true);
+                  scrollDetailToBottom('button');
+                }}
+                title={t('p2p.discussions.scroll_bottom')}
+              >
+                ↓
+              </button>
+            </div>
+          )}
         </div>
       </div>
     </div>
