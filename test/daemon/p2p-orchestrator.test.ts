@@ -330,6 +330,39 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(done.summaryPhase).toBe('completed');
   });
 
+  it('completes the discussion when a single hop times out', async () => {
+    detectStatusAsyncMock.mockImplementation(async (session: string) => (
+      session === 'deck_proj_w1' ? 'running' : 'idle'
+    ));
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      if (session === 'deck_proj_w1') return;
+      const filePath = pathFromPrompt(prompt);
+      const heading = headingFromPrompt(prompt);
+      await appendFile(filePath, `\n## ${heading}\n\nBRAIN-${session}\n`, 'utf8');
+      setTimeout(() => notifySessionIdle(session), 20);
+    });
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'single hop timeout should not fail the run',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      120,
+    );
+
+    const done = await waitForStatus(run.id, ['completed']);
+    expect(done.status).toBe('completed');
+    expect(done.hopStates).toHaveLength(1);
+    expect(done.hopStates[0].status).toBe('timed_out');
+    expect(done.summaryPhase).toBe('completed');
+    const content = await readFile(done.contextFilePath, 'utf8');
+    expect(content).toContain('BRAIN-deck_proj_brain');
+  });
+
   it('preserves completed evidence and still summarizes on partial hop failure', async () => {
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
       const filePath = pathFromPrompt(prompt);
@@ -449,6 +482,35 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(completedSessions).toContain('deck_proj_w1');
     expect(cancelledSessions).toContain('deck_proj_w2');
     expect(sendKeyMock).toHaveBeenCalled();
+  });
+
+  it('treats cancel on a terminal run as close and removes it from memory', async () => {
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      if (session === 'deck_proj_w1') return;
+      const filePath = pathFromPrompt(prompt);
+      const heading = headingFromPrompt(prompt);
+      await appendFile(filePath, `\n## ${heading}\n\nBRAIN-${session}\n`, 'utf8');
+      setTimeout(() => notifySessionIdle(session), 20);
+    });
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'close failed/timed-out p2p',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      120,
+    );
+
+    await waitForStatus(run.id, ['completed']);
+    expect(getP2pRun(run.id)?.status).toBe('completed');
+
+    const closed = await cancelP2pRun(run.id, serverLinkMock as any);
+    expect(closed).toBe(true);
+    expect(getP2pRun(run.id)).toBeUndefined();
   });
 
   it('emits additive hop/run payload fields without breaking legacy fields', async () => {

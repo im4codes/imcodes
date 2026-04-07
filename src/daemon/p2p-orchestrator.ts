@@ -473,7 +473,8 @@ export async function cancelP2pRun(runId: string, serverLink: ServerLink | null)
     return true;
   }
 
-  return false;
+  activeRuns.delete(runId);
+  return true;
 }
 
 // ── Resume after daemon restart ───────────────────────────────────────────
@@ -1124,6 +1125,9 @@ function transition(run: P2pRun, status: P2pRunStatus, serverLink: ServerLink | 
   } else if (status === 'failed' || status === 'timed_out') {
     run.runPhase = 'failed';
   }
+  if (P2P_TERMINAL_RUN_STATUSES.has(status)) {
+    run.completedAt = run.completedAt ?? new Date().toISOString();
+  }
   run.updatedAt = new Date().toISOString();
   logger.info({ runId: run.id, status }, 'P2P run state transition');
   pushState(run, serverLink);
@@ -1131,6 +1135,7 @@ function transition(run: P2pRun, status: P2pRunStatus, serverLink: ServerLink | 
 
 function failRun(run: P2pRun, errorType: string, message: string, serverLink: ServerLink | null): void {
   run.error = `${errorType}: ${message}`;
+  run.completedAt = run.completedAt ?? new Date().toISOString();
   run.updatedAt = new Date().toISOString();
   const status: P2pRunStatus = errorType === 'timed_out' ? 'timed_out' : 'failed';
   run.status = status;

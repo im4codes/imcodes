@@ -43,6 +43,12 @@ interface Props {
   onStopDiscussion?: (id: string) => void;
 }
 
+interface ActionButtonProps {
+  active: boolean;
+  compact: boolean;
+  onAction: () => void;
+}
+
 function statusClassName(status: P2pProgressNode['status']): string {
   return status === 'done'
     ? 'is-done'
@@ -92,10 +98,67 @@ function useHopTimer(hopKey: string | null, active: boolean, serverStartMs?: num
   return useElapsedTimer(serverStartMs ?? fallbackStart, active);
 }
 
+function DiscussionActionButton({ active, compact, onAction }: ActionButtonProps) {
+  const { t } = useTranslation();
+  const [confirming, setConfirming] = useState(false);
+
+  useEffect(() => {
+    if (!active || !confirming) return;
+    const timer = setTimeout(() => setConfirming(false), 3000);
+    return () => clearTimeout(timer);
+  }, [active, confirming]);
+
+  if (!active) {
+    return (
+      <button
+        class="discussions-progress-stop"
+        style={compact ? { padding: '2px 7px', fontSize: '10px' } : undefined}
+        onClick={(e) => {
+          e.stopPropagation();
+          onAction();
+        }}
+      >
+        {t('common.close')}
+      </button>
+    );
+  }
+
+  if (compact && confirming) {
+    return (
+      <button
+        class="discussions-progress-stop"
+        style={{ padding: '2px 7px', fontSize: '10px', background: 'rgba(239,68,68,0.3)', borderColor: '#ef4444', color: '#f87171' }}
+        onClick={(e) => {
+          e.stopPropagation();
+          onAction();
+          setConfirming(false);
+        }}
+      >
+        {t('p2p.confirm_cancel')}
+      </button>
+    );
+  }
+
+  return (
+    <button
+      class="discussions-progress-stop"
+      style={compact ? { padding: '2px 7px', fontSize: '10px' } : undefined}
+      onClick={(e) => {
+        e.stopPropagation();
+        if (compact) setConfirming(true);
+        else onAction();
+      }}
+    >
+      {t('common.cancel')}
+    </button>
+  );
+}
+
 export function P2pProgressCard({ discussion, compact = false, mobile = false, hidden = false, onToggleHide, onClick, onStopDiscussion }: Props) {
   const { t } = useTranslation();
   const nodes = discussion.nodes ?? [];
   const isActive = discussion.state !== 'done' && discussion.state !== 'failed';
+  const showActionButton = discussion.state === 'failed' || isActive;
   const totalHopsPerRound = discussion.totalHops ?? 0;
   const completedRoundHops = useMemo(() => {
     if (totalHopsPerRound <= 0) return 0;
@@ -158,31 +221,13 @@ export function P2pProgressCard({ discussion, compact = false, mobile = false, h
               {hidden ? '▼' : '▲'}
             </button>
           )}
-          {isActive && onStopDiscussion && (() => {
-            const [confirming, setConfirming] = useState(false);
-            useEffect(() => {
-              if (!confirming) return;
-              const timer = setTimeout(() => setConfirming(false), 3000);
-              return () => clearTimeout(timer);
-            }, [confirming]);
-            return confirming ? (
-              <button
-                class="discussions-progress-stop"
-                style={{ padding: '2px 7px', fontSize: '10px', background: 'rgba(239,68,68,0.3)', borderColor: '#ef4444', color: '#f87171' }}
-                onClick={(e) => { e.stopPropagation(); onStopDiscussion(discussion.id); setConfirming(false); }}
-              >
-                {t('p2p.confirm_cancel')}
-              </button>
-            ) : (
-              <button
-                class="discussions-progress-stop"
-                style={{ padding: '2px 7px', fontSize: '10px' }}
-                onClick={(e) => { e.stopPropagation(); setConfirming(true); }}
-              >
-                {t('common.cancel')}
-              </button>
-            );
-          })()}
+          {showActionButton && onStopDiscussion && (
+            <DiscussionActionButton
+              active={isActive}
+              compact={true}
+              onAction={() => onStopDiscussion(discussion.id)}
+            />
+          )}
         </div>
         {!hidden && (
           <div class="discussions-progress-mobile-title">{discussion.topic || t('p2p.discussions.untitled')}</div>
@@ -243,16 +288,12 @@ export function P2pProgressCard({ discussion, compact = false, mobile = false, h
           <div class="discussions-progress-title">{discussion.topic || t('p2p.discussions.untitled')}</div>
         </div>
         {isActive && <span class="p2p-timer p2p-timer-total">{totalElapsed}</span>}
-        {isActive && onStopDiscussion && (
-          <button
-            class="discussions-progress-stop"
-            onClick={(e) => {
-              e.stopPropagation();
-              onStopDiscussion(discussion.id);
-            }}
-          >
-            {t('common.cancel')}
-          </button>
+        {showActionButton && onStopDiscussion && (
+          <DiscussionActionButton
+            active={isActive}
+            compact={false}
+            onAction={() => onStopDiscussion(discussion.id)}
+          />
         )}
       </div>
 

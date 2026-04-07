@@ -1330,6 +1330,9 @@ export function App() {
           }, 120_000);
         }
       }
+      if (msg.type === 'p2p.cancel_response' && msg.ok && msg.runId) {
+        setDiscussions((prev) => prev.filter((d) => d.id !== `p2p_${msg.runId}`));
+      }
       if (msg.type === 'p2p.status_response') {
         const runs = Array.isArray(msg.runs)
           ? msg.runs
@@ -1341,7 +1344,6 @@ export function App() {
         setDiscussions((prev) => {
           const retained = prev.filter((d) => {
             if (!d.id.startsWith('p2p_')) return true;
-            if (d.state === 'done' || d.state === 'failed') return true;
             return activeIds.has(d.id);
           });
           const merged = [...retained];

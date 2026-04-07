@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, cleanup } from '@testing-library/preact';
+import { render, screen, cleanup, fireEvent } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -41,5 +41,33 @@ describe('P2pProgressCard', () => {
 
     expect(screen.getAllByText('H2/2').length).toBeGreaterThan(0);
     expect(screen.queryByText('H4/2')).toBeNull();
+  });
+
+  it('shows a close action for failed discussions', () => {
+    const onStopDiscussion = vi.fn();
+
+    render(
+      <P2pProgressCard
+        discussion={{
+          id: 'p2p_run_failed',
+          topic: 'P2P audit · brain',
+          state: 'failed',
+          modeKey: 'audit',
+          currentRound: 1,
+          maxRounds: 1,
+          completedHops: 0,
+          totalHops: 1,
+          activePhase: 'summary',
+          error: 'timed_out',
+          nodes: [],
+        }}
+        onStopDiscussion={onStopDiscussion}
+      />,
+    );
+
+    const closeButton = screen.getByText(/close/i);
+    expect(screen.queryByText(/cancel/i)).toBeNull();
+    fireEvent.click(closeButton);
+    expect(onStopDiscussion).toHaveBeenCalledWith('p2p_run_failed');
   });
 });
