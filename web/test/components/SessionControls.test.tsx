@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, fireEvent, cleanup } from '@testing-library/preact';
+import { render, screen, fireEvent, cleanup, within } from '@testing-library/preact';
 
 if (!HTMLElement.prototype.scrollIntoView) {
   HTMLElement.prototype.scrollIntoView = vi.fn();
@@ -161,6 +161,76 @@ describe('SessionControls', () => {
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
       sessionName: 'my-session',
       text: 'run tests',
+    });
+  });
+
+  it('keeps the send button label unchanged after selecting a combo mode', () => {
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
+
+    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+
+    expect(screen.getByRole('button', { name: /^send$/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /mode_audit→mode_plan/i })).toBeDefined();
+  });
+
+  it('asks for confirmation before directly sending a selected combo mode', () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+
+    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'run combo';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /^send$/i }));
+
+    expect(screen.getByText('combo_send_confirm_title')).toBeDefined();
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: /^cancel$/i }));
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: /^send$/i })).toBeDefined();
+    expect(screen.getByText(/P2P:mode_audit→mode_plan/i)).toBeDefined();
+  });
+
+  it('remembers skipping combo confirmation across later sends', () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+
+    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'first combo';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /^send$/i }));
+
+    const dialog = screen.getByText('combo_send_confirm_title').closest('.dialog') as HTMLElement;
+    fireEvent.click(within(dialog).getByRole('checkbox'));
+    fireEvent.click(within(dialog).getByRole('button', { name: /^send$/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      sessionName: 'my-session',
+      text: 'first combo',
+      p2pMode: 'audit>plan',
+      p2pExcludeSameType: true,
+      p2pLocale: 'en',
+    });
+    expect(saveUserPrefMock).toHaveBeenCalledWith('p2p_combo_direct_send_skip_confirm', true);
+
+    input.textContent = 'second combo';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /^send$/i }));
+
+    expect(screen.queryByText('combo_send_confirm_title')).toBeNull();
+    expect(ws.sendSessionCommand).toHaveBeenLastCalledWith('send', {
+      sessionName: 'my-session',
+      text: 'second combo',
+      p2pMode: 'audit>plan',
+      p2pExcludeSameType: true,
+      p2pLocale: 'en',
     });
   });
 

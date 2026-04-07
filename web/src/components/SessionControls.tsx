@@ -14,7 +14,7 @@ import { AtPicker } from './AtPicker.js';
 import { P2pConfigPanel } from './P2pConfigPanel.js';
 import { uploadFile, getUserPref, saveUserPref } from '../api.js';
 import { isRunningSessionState } from '../thinking-utils.js';
-import { P2P_CONFIG_MODE, COMBO_PRESETS, COMBO_SEPARATOR } from '@shared/p2p-modes.js';
+import { P2P_CONFIG_MODE, COMBO_PRESETS, COMBO_SEPARATOR, isComboMode } from '@shared/p2p-modes.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
@@ -79,6 +79,7 @@ type P2pMode = string; // 'solo' | single modes | combo pipelines like 'brainsto
 const MODEL_STORAGE_KEY = 'imcodes-model';
 const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const QWEN_MODEL_STORAGE_KEY = 'imcodes-qwen-model';
+const P2P_COMBO_CONFIRM_SKIP_PREF_KEY = 'p2p_combo_direct_send_skip_confirm';
 const CODEX_MODELS: CodexModelChoice[] = [...CODEX_MODEL_IDS] as CodexModelChoice[];
 const SINGLE_P2P_MODES: string[] = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss'];
 const P2P_MODES: string[] = [...SINGLE_P2P_MODES, ...COMBO_PRESETS.map((c) => c.key), P2P_CONFIG_MODE];
@@ -121,6 +122,11 @@ interface PendingAtTarget {
 interface PendingSendPayload {
   text: string;
   extra: Record<string, unknown>;
+}
+
+interface PendingComboSendConfirmation {
+  payload: PendingSendPayload;
+  modeLabel: string;
 }
 
 type ManualP2pTargetCandidate = {
@@ -252,6 +258,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [queuedNoticeVisible, setQueuedNoticeVisible] = useState(false);
   const [confirm, setConfirm] = useState<MenuAction | null>(null);
   const [confirmLevel, setConfirmLevel] = useState(0); // 0=none, 1=first warning, 2=second warning (sub-session only)
+  const [skipComboSendConfirm, setSkipComboSendConfirm] = useState(false);
+  const [pendingComboSendConfirm, setPendingComboSendConfirm] = useState<PendingComboSendConfirmation | null>(null);
+  const [rememberComboSendChoice, setRememberComboSendChoice] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef<HTMLDivElement>(null);
   const thinkingRef = useRef<HTMLDivElement>(null);
@@ -397,8 +406,18 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     });
   }, []);
 
+  useEffect(() => {
+    void getUserPref(P2P_COMBO_CONFIRM_SKIP_PREF_KEY).then((raw) => {
+      if (raw === true || raw === 'true') setSkipComboSendConfirm(true);
+    });
+  }, []);
+
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
+  useEffect(() => {
+    setPendingComboSendConfirm(null);
+    setRememberComboSendChoice(false);
+  }, [activeSession?.name]);
 
   // Close menus when clicking outside
   useEffect(() => {
@@ -645,6 +664,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (draftKey) sessionStorage.removeItem(draftKey);
   }, [activeSession, draftKey, onRemoveQuote, onSend, quickData, quotes, ws]);
 
+  const maybePersistComboSendSkip = useCallback(() => {
+    if (!rememberComboSendChoice) return;
+    setSkipComboSendConfirm(true);
+    void saveUserPref(P2P_COMBO_CONFIRM_SKIP_PREF_KEY, true).catch(() => {});
+  }, [rememberComboSendChoice]);
+
   useEffect(() => {
     if (!activeSession || activeSession.runtimeType !== 'transport' || activeSession.state !== 'running') {
       setQueuedNoticeVisible(false);
@@ -654,8 +679,32 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const handleSend = useCallback(() => {
     const payload = buildSendPayload();
     if (!payload) return;
+    const comboMode = typeof payload.extra.p2pMode === 'string' ? payload.extra.p2pMode : null;
+    if (comboMode && isComboMode(comboMode) && !skipComboSendConfirm) {
+      setRememberComboSendChoice(false);
+      setPendingComboSendConfirm({
+        payload,
+        modeLabel: getP2pModeLabel(comboMode, t),
+      });
+      return;
+    }
     finalizeSend(payload);
-  }, [buildSendPayload, finalizeSend]);
+  }, [buildSendPayload, finalizeSend, skipComboSendConfirm, t]);
+
+  const handleComboSendCancel = useCallback(() => {
+    maybePersistComboSendSkip();
+    setPendingComboSendConfirm(null);
+    setRememberComboSendChoice(false);
+  }, [maybePersistComboSendSkip]);
+
+  const handleComboSendConfirm = useCallback(() => {
+    const pending = pendingComboSendConfirm;
+    if (!pending) return;
+    maybePersistComboSendSkip();
+    setPendingComboSendConfirm(null);
+    setRememberComboSendChoice(false);
+    finalizeSend(pending.payload);
+  }, [finalizeSend, maybePersistComboSendSkip, pendingComboSendConfirm]);
 
   // Voice overlay send handler — applies same P2P mode as text send
   const handleVoiceSend = useCallback((voiceText: string) => {
@@ -1096,7 +1145,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             <span class="p2p-settings-label">{t('p2p.settings_button')}</span>
           </button>
           {p2pOpen && (
-            <div class="menu-dropdown">
+            <div class="menu-dropdown menu-dropdown-p2p">
               {/* Single modes */}
               {SINGLE_P2P_MODES.map((m) => (
                 <button
@@ -1114,7 +1163,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               ))}
               {/* Combo presets */}
               <div class="menu-divider" />
-              <div style={{ fontSize: 10, color: '#64748b', padding: '2px 12px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{t('p2p.combo_label')}</div>
+              <div class="p2p-menu-section-label">{t('p2p.combo_label')}</div>
               {COMBO_PRESETS.map((c) => (
                 <button
                   key={c.key}
@@ -1462,9 +1511,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           class="btn btn-primary"
           onClick={handleSend}
           disabled={inputDisabled || (!hasText && attachments.length === 0) || !connected}
-          style={p2pMode !== 'solo' ? { background: getP2pModeColor(p2pMode), borderColor: getP2pModeColor(p2pMode) } : undefined}
         >
-          {p2pMode !== 'solo' ? getP2pModeLabel(p2pMode, t) : t('common.send')}
+          {t('common.send')}
         </button>
         {/* Config mode: show gear to open settings panel inline with send row */}
         {p2pMode === P2P_CONFIG_MODE && (
@@ -1541,6 +1589,33 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>
       )}
     </div>
+    {pendingComboSendConfirm && (
+      <div class="dialog-overlay">
+        <div class="dialog" style={{ maxWidth: 420 }}>
+          <div class="dialog-header">
+            <h2>{t('p2p.combo_send_confirm_title')}</h2>
+            <button class="dialog-close" onClick={handleComboSendCancel} aria-label={t('common.close')}>×</button>
+          </div>
+          <div class="dialog-body" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <div style={{ color: '#cbd5e1', fontSize: 13, lineHeight: 1.5 }}>
+              {t('p2p.combo_send_confirm_body', { mode: pendingComboSendConfirm.modeLabel })}
+            </div>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, color: '#94a3b8', fontSize: 13 }}>
+              <input
+                type="checkbox"
+                checked={rememberComboSendChoice}
+                onChange={(e) => setRememberComboSendChoice((e.target as HTMLInputElement).checked)}
+              />
+              {t('p2p.combo_send_confirm_skip')}
+            </label>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button class="btn btn-secondary" onClick={handleComboSendCancel}>{t('common.cancel')}</button>
+              <button class="btn btn-primary" onClick={handleComboSendConfirm}>{t('common.send')}</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    )}
     <VoiceOverlay open={voiceOpen} onClose={() => setVoiceOpen(false)} onSend={handleVoiceSend} initialText={divRef.current?.textContent ?? ''} />
     {p2pConfigOpen && (
       <P2pConfigPanel
