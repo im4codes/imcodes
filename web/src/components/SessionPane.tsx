@@ -248,6 +248,7 @@ export function SessionPane({
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sessionName}
+          sessionState={session.state}
           agentType={session.agentType}
           modelOverride={session.modelDisplay ?? (session.agentType === 'qwen' ? session.qwenModel : undefined)}
           planLabel={session.planLabel}

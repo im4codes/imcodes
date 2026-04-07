@@ -72,6 +72,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sessionName}
+          sessionState={liveSub.state}
           agentType={liveSub.type}
           modelOverride={modelDisplay ?? undefined}
           planLabel={liveSub.planLabel}

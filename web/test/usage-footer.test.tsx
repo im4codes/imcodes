@@ -34,6 +34,40 @@ afterEach(() => {
 });
 
 describe('UsageFooter', () => {
+  it('only shows the animated thinking dots while the session is running', () => {
+    const { container, rerender } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        sessionState="idle"
+        activeThinkingTs={Date.now() - 5_000}
+      />,
+    );
+
+    expect(container.querySelector('.chat-thinking-dots')).toBeNull();
+
+    rerender(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        sessionState="running"
+        activeThinkingTs={Date.now() - 5_000}
+      />,
+    );
+
+    expect(container.querySelector('.chat-thinking-dots')).toBeTruthy();
+  });
+
   it('renders explicit quota label inline in the ctx footer', () => {
     render(
       <UsageFooter
