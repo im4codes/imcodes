@@ -7,11 +7,24 @@
  * Android: FCM legacy HTTP API
  */
 import { Hono } from 'hono';
+import { Agent } from 'undici';
 import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
 import { requireAuth } from '../security/authorization.js';
 import { SignJWT, importPKCS8 } from 'jose';
 import logger from '../util/logger.js';
+
+// Dedicated dispatcher for relay calls. Cloudflare edge sometimes silently
+// half-closes long-lived keep-alive sockets, leaving undici's pool with stale
+// connections that produce a persistent 502 storm until the process restarts.
+// Short keepAliveTimeout + small max connections forces fresh sockets often
+// enough to recover automatically.
+const relayDispatcher = new Agent({
+  keepAliveTimeout: 4_000,
+  keepAliveMaxTimeout: 10_000,
+  connections: 8,
+  pipelining: 0,
+});
 
 export const pushRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -184,6 +197,8 @@ async function relayPush(relayBaseUrl: string, token: string, platform: string, 
       data: payload.data,
     }),
     signal: AbortSignal.timeout(10_000),
+    // @ts-expect-error undici dispatcher option, not in standard fetch types
+    dispatcher: relayDispatcher,
   });
 
   if (!res.ok) {
