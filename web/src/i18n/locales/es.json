@@ -582,6 +582,24 @@
     "collapse_all": "Contraer todo",
     "drag_to_resize": "Arrastra para cambiar el tamaño"
   },
+  "subsessionBar": {
+    "show": "Mostrar",
+    "hide": "Ocultar",
+    "layout_double": "Doble fila",
+    "layout_single": "Fila única",
+    "card_size": "Tamaño de tarjeta",
+    "subs_count": "Subs ({{count}})",
+    "new_sub_session": "Nueva sub-sesión",
+    "p2p_discussions": "Discusiones P2P",
+    "repository": "Repositorio",
+    "scheduled_tasks": "Tareas programadas",
+    "width_short": "A",
+    "height_short": "H",
+    "apply": "Aplicar",
+    "reset": "Restablecer",
+    "empty_prefix": "No hay sub-sesiones; haz clic en",
+    "empty_suffix": "para agregar una"
+  },
   "localWebPreview": {
     "title": "Vista previa web local",
     "port": "Puerto",

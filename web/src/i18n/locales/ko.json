@@ -582,6 +582,24 @@
     "collapse_all": "모두 접기",
     "drag_to_resize": "드래그하여 크기 조절"
   },
+  "subsessionBar": {
+    "show": "표시",
+    "hide": "숨기기",
+    "layout_double": "2줄",
+    "layout_single": "1줄",
+    "card_size": "카드 크기",
+    "subs_count": "Subs ({{count}})",
+    "new_sub_session": "새 하위 세션",
+    "p2p_discussions": "P2P 토론",
+    "repository": "저장소",
+    "scheduled_tasks": "예약 작업",
+    "width_short": "너비",
+    "height_short": "높이",
+    "apply": "적용",
+    "reset": "재설정",
+    "empty_prefix": "하위 세션이 없습니다. ",
+    "empty_suffix": "를 눌러 추가하세요"
+  },
   "localWebPreview": {
     "title": "로컬 웹 미리보기",
     "port": "포트",

@@ -582,6 +582,24 @@
     "collapse_all": "Свернуть все",
     "drag_to_resize": "Перетащите для изменения размера"
   },
+  "subsessionBar": {
+    "show": "Показать",
+    "hide": "Скрыть",
+    "layout_double": "Две строки",
+    "layout_single": "Одна строка",
+    "card_size": "Размер карточки",
+    "subs_count": "Subs ({{count}})",
+    "new_sub_session": "Новая подсессия",
+    "p2p_discussions": "P2P-обсуждения",
+    "repository": "Репозиторий",
+    "scheduled_tasks": "Запланированные задачи",
+    "width_short": "Ш",
+    "height_short": "В",
+    "apply": "Применить",
+    "reset": "Сбросить",
+    "empty_prefix": "Подсессий пока нет — нажмите",
+    "empty_suffix": "чтобы добавить"
+  },
   "localWebPreview": {
     "title": "Локальный веб‑предпросмотр",
     "port": "Порт",

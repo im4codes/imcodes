@@ -582,6 +582,24 @@
     "collapse_all": "すべて折りたたむ",
     "drag_to_resize": "ドラッグしてサイズ変更"
   },
+  "subsessionBar": {
+    "show": "表示",
+    "hide": "非表示",
+    "layout_double": "2段表示",
+    "layout_single": "1段表示",
+    "card_size": "カードサイズ",
+    "subs_count": "Subs ({{count}})",
+    "new_sub_session": "新しいサブセッション",
+    "p2p_discussions": "P2P ディスカッション",
+    "repository": "リポジトリ",
+    "scheduled_tasks": "スケジュールされたタスク",
+    "width_short": "幅",
+    "height_short": "高",
+    "apply": "適用",
+    "reset": "リセット",
+    "empty_prefix": "サブセッションはまだありません。",
+    "empty_suffix": "をクリックして追加"
+  },
   "localWebPreview": {
     "title": "ローカルWebプレビュー",
     "port": "ポート",

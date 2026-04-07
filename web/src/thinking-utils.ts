@@ -63,7 +63,10 @@ export function getActiveStatusText(events: Array<{ type: string; payload?: Reco
   return null;
 }
 
-export function isVisuallyBusy(sessionState: string | undefined, _activeThinking: boolean): boolean {
-  if (!sessionState || sessionState === 'idle' || sessionState === 'stopped') return false;
+export function isRunningSessionState(sessionState: string | undefined): boolean {
   return sessionState === 'running';
+}
+
+export function isVisuallyBusy(sessionState: string | undefined, _activeThinking: boolean): boolean {
+  return isRunningSessionState(sessionState);
 }

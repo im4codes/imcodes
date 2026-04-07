@@ -260,22 +260,22 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
     <div class="subcard-bar">
       {/* Toolbar */}
       <div class="subcard-toolbar">
-        <button class="subcard-toolbar-btn" onClick={() => setCollapsed(!collapsed)} title={collapsed ? 'Show' : 'Hide'}>
+        <button class="subcard-toolbar-btn" onClick={() => setCollapsed(!collapsed)} title={collapsed ? t('subsessionBar.show') : t('subsessionBar.hide')}>
           {collapsed ? '▲' : '▼'}
         </button>
         {!collapsed && (
           <>
-            <button class="subcard-toolbar-btn" onClick={toggleLayout} title={layout === 'single' ? 'Double row' : 'Single row'}>
+            <button class="subcard-toolbar-btn" onClick={toggleLayout} title={layout === 'single' ? t('subsessionBar.layout_double') : t('subsessionBar.layout_single')}>
               {layout === 'single' ? '⊞' : '☰'}
             </button>
             <button
               class={`subcard-toolbar-btn${showSizePanel ? ' subcard-toolbar-btn-active' : ''}`}
               onClick={() => { setShowSizePanel(!showSizePanel); setDraftW(String(cardSize.w)); setDraftH(String(cardSize.h)); }}
-              title="Card size"
+              title={t('subsessionBar.card_size')}
             >
               ⚙
             </button>
-            <span class="subcard-toolbar-label">Subs ({subSessions.length})</span>
+            <span class="subcard-toolbar-label">{t('subsessionBar.subs_count', { count: subSessions.length })}</span>
             {/* Desktop: full stats in expanded toolbar */}
             {stats && (
               <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`}>
@@ -324,9 +324,9 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
             </span>
           );
         })()}
-        <button class="subcard-toolbar-add" data-onboarding="new-sub-session" onClick={onNew} title="New sub-session">+</button>
+        <button class="subcard-toolbar-add" data-onboarding="new-sub-session" onClick={onNew} title={t('subsessionBar.new_sub_session')}>+</button>
         {onViewDiscussions && (
-          <button class="subcard-toolbar-btn" data-onboarding="discussion-history" onClick={onViewDiscussions} title="P2P discussions" style={{ marginLeft: 4, fontSize: 11 }}>
+          <button class="subcard-toolbar-btn" data-onboarding="discussion-history" onClick={onViewDiscussions} title={t('subsessionBar.p2p_discussions')} style={{ marginLeft: 4, fontSize: 11 }}>
             📋
           </button>
         )}
@@ -335,7 +335,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
             class="subcard-toolbar-btn"
             data-onboarding="repo-page"
             onClick={() => onViewRepo()}
-            title="Repository"
+            title={t('subsessionBar.repository')}
             style={{
               marginLeft: 4,
               fontSize: 11,
@@ -345,7 +345,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
           </button>
         )}
         {onViewCron && (
-          <button class="subcard-toolbar-btn" data-onboarding="cron-manager" onClick={onViewCron} title="Scheduled Tasks" style={{ marginLeft: 4, fontSize: 11 }}>
+          <button class="subcard-toolbar-btn" data-onboarding="cron-manager" onClick={onViewCron} title={t('subsessionBar.scheduled_tasks')} style={{ marginLeft: 4, fontSize: 11 }}>
             ⏰
           </button>
         )}
@@ -354,9 +354,9 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
       {/* Size settings panel */}
       {!collapsed && showSizePanel && (
         <div class="subcard-size-panel">
-          <span class="subcard-size-label">Card size</span>
+          <span class="subcard-size-label">{t('subsessionBar.card_size')}</span>
           <label class="subcard-size-field">
-            W
+            {t('subsessionBar.width_short')}
             <input
               type="number"
               class="subcard-size-input"
@@ -367,7 +367,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
             />
           </label>
           <label class="subcard-size-field">
-            H
+            {t('subsessionBar.height_short')}
             <input
               type="number"
               class="subcard-size-input"
@@ -377,15 +377,15 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
               onKeyDown={(e) => e.key === 'Enter' && applySize()}
             />
           </label>
-          <button class="subcard-toolbar-btn" onClick={applySize}>Apply</button>
-          <button class="subcard-toolbar-btn" onClick={resetSize}>Reset</button>
+          <button class="subcard-toolbar-btn" onClick={applySize}>{t('subsessionBar.apply')}</button>
+          <button class="subcard-toolbar-btn" onClick={resetSize}>{t('subsessionBar.reset')}</button>
         </div>
       )}
 
       {/* Empty state: no sub-sessions and expanded */}
       {!collapsed && subSessions.length === 0 && discussions.length === 0 && (
         <div class="subcard-empty-state">
-          No sub-sessions — click <strong>+</strong> to add one
+          {t('subsessionBar.empty_prefix')} <strong>+</strong> {t('subsessionBar.empty_suffix')}
         </div>
       )}
 

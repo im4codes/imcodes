@@ -13,6 +13,7 @@ import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
 import { P2pConfigPanel } from './P2pConfigPanel.js';
 import { uploadFile, getUserPref, saveUserPref } from '../api.js';
+import { isRunningSessionState } from '../thinking-utils.js';
 import { P2P_CONFIG_MODE, COMBO_PRESETS, COMBO_SEPARATOR } from '@shared/p2p-modes.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
@@ -46,7 +47,7 @@ interface Props {
   onSubRestart?: () => void;
   onSubNew?: () => void;
   onSubStop?: () => void;
-  /** When true, show the scan-sweep animation even if session state is not 'running'. */
+  /** Legacy prop retained for callers that still pass thinking state for labels/timers. */
   activeThinking?: boolean;
   /** Mobile: open full-screen file browser overlay. */
   mobileFileBrowserOpen?: boolean;
@@ -257,7 +258,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const p2pRef = useRef<HTMLDivElement>(null);
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const showRunningSweep = !compact && activeSession?.state === 'running';
+  const showRunningSweep = !compact && isRunningSessionState(activeSession?.state);
   // Internal ref for contenteditable — also written to the external inputRef
   const divRef = useRef<HTMLDivElement>(null);
   // History navigation state

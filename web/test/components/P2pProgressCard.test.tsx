@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, cleanup, fireEvent } from '@testing-library/preact';
 
@@ -14,6 +14,10 @@ vi.mock('react-i18next', () => ({
 import { P2pProgressCard } from '../../src/components/P2pProgressCard.js';
 
 describe('P2pProgressCard', () => {
+  beforeEach(() => {
+    HTMLElement.prototype.scrollIntoView = vi.fn();
+  });
+
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
@@ -69,5 +73,58 @@ describe('P2pProgressCard', () => {
     expect(screen.queryByText(/cancel/i)).toBeNull();
     fireEvent.click(closeButton);
     expect(onStopDiscussion).toHaveBeenCalledWith('p2p_run_failed');
+  });
+
+  it('keeps active progress highlighted but static once the discussion is no longer running', () => {
+    const { container } = render(
+      <P2pProgressCard
+        discussion={{
+          id: 'p2p_run_failed',
+          topic: 'P2P audit · brain',
+          state: 'failed',
+          modeKey: 'audit',
+          currentRound: 1,
+          maxRounds: 2,
+          completedHops: 0,
+          totalHops: 2,
+          activeHop: 1,
+          activeRoundHop: 1,
+          activePhase: 'hop',
+          nodes: [
+            { label: 'brain', agentType: 'codex', status: 'active', phase: 'hop' },
+          ],
+        }}
+      />,
+    );
+
+    expect(container.querySelectorAll('.is-active').length).toBe(0);
+    expect(container.querySelectorAll('.is-active-static').length).toBeGreaterThan(0);
+    expect(container.querySelector('.p2p-timer-total')).toBeNull();
+  });
+
+  it('preserves animated progress while the discussion is running', () => {
+    const { container } = render(
+      <P2pProgressCard
+        discussion={{
+          id: 'p2p_run_running',
+          topic: 'P2P audit · brain',
+          state: 'running',
+          modeKey: 'audit',
+          currentRound: 1,
+          maxRounds: 2,
+          completedHops: 0,
+          totalHops: 2,
+          activeHop: 1,
+          activeRoundHop: 1,
+          activePhase: 'hop',
+          nodes: [
+            { label: 'brain', agentType: 'codex', status: 'active', phase: 'hop' },
+          ],
+        }}
+      />,
+    );
+
+    expect(container.querySelectorAll('.is-active').length).toBeGreaterThan(0);
+    expect(container.querySelector('.p2p-timer-total')).toBeTruthy();
   });
 });

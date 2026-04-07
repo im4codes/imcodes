@@ -582,6 +582,24 @@
     "collapse_all": "Collapse all",
     "drag_to_resize": "Drag to resize"
   },
+  "subsessionBar": {
+    "show": "Show",
+    "hide": "Hide",
+    "layout_double": "Double row",
+    "layout_single": "Single row",
+    "card_size": "Card size",
+    "subs_count": "Subs ({{count}})",
+    "new_sub_session": "New sub-session",
+    "p2p_discussions": "P2P discussions",
+    "repository": "Repository",
+    "scheduled_tasks": "Scheduled Tasks",
+    "width_short": "W",
+    "height_short": "H",
+    "apply": "Apply",
+    "reset": "Reset",
+    "empty_prefix": "No sub-sessions — click",
+    "empty_suffix": "to add one"
+  },
   "localWebPreview": {
     "title": "Local Web Preview",
     "port": "Port",

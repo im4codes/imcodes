@@ -582,6 +582,24 @@
     "collapse_all": "全部折疊",
     "drag_to_resize": "拖動調整寬度"
   },
+  "subsessionBar": {
+    "show": "顯示",
+    "hide": "隱藏",
+    "layout_double": "雙行",
+    "layout_single": "單行",
+    "card_size": "卡片尺寸",
+    "subs_count": "Subs（{{count}}）",
+    "new_sub_session": "新增子會話",
+    "p2p_discussions": "P2P 討論",
+    "repository": "儲存庫",
+    "scheduled_tasks": "排程任務",
+    "width_short": "寬",
+    "height_short": "高",
+    "apply": "套用",
+    "reset": "重設",
+    "empty_prefix": "目前沒有子會話，點擊",
+    "empty_suffix": "新增一個"
+  },
   "localWebPreview": {
     "title": "本機網頁預覽",
     "port": "連接埠",

@@ -1033,13 +1033,16 @@ body {
   opacity: 0.95;
 }
 .discussions-progress-segment.is-done { background: linear-gradient(90deg, #16a34a, #4ade80); box-shadow: 0 0 10px rgba(74, 222, 128, 0.35); }
-.discussions-progress-segment.is-active {
+.discussions-progress-segment.is-active,
+.discussions-progress-segment.is-active-static {
   background: linear-gradient(90deg, #2563eb, #38bdf8);
   box-shadow: 0 0 12px rgba(56, 189, 248, 0.45);
-  animation: discussions-active-pulse 3s ease-in-out infinite;
-  will-change: opacity, transform;
   outline: 1px solid rgba(125, 211, 252, 0.75);
   z-index: 1;
+}
+.discussions-progress-segment.is-active {
+  animation: discussions-active-pulse 3s ease-in-out infinite;
+  will-change: opacity, transform;
 }
 .discussions-progress-segment.is-skipped { background: linear-gradient(90deg, #dc2626, #f87171); box-shadow: 0 0 10px rgba(248, 113, 113, 0.35); }
 .discussions-progress-segment.is-pending { background: linear-gradient(90deg, #1e293b, #475569); }
@@ -1088,10 +1091,13 @@ body {
   color: #64748b;
 }
 .discussions-progress-node.is-done { color: #4ade80; border-color: rgba(34, 197, 94, 0.25); }
-.discussions-progress-node.is-active {
+.discussions-progress-node.is-active,
+.discussions-progress-node.is-active-static {
   color: #60a5fa;
   border-color: rgba(59, 130, 246, 0.4);
   box-shadow: 0 0 16px rgba(37, 99, 235, 0.14);
+}
+.discussions-progress-node.is-active {
   animation: discussions-active-chip 3s ease-in-out infinite;
   will-change: opacity;
 }

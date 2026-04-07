@@ -59,6 +59,11 @@ function statusClassName(status: P2pProgressNode['status']): string {
         : 'is-pending';
 }
 
+function progressStatusClassName(status: P2pProgressNode['status'], animateActive: boolean): string {
+  if (status !== 'active') return statusClassName(status);
+  return animateActive ? 'is-active' : 'is-active-static';
+}
+
 // ── Elapsed timer ──────────────────────────────────────────────────────────
 
 function formatElapsed(ms: number): string {
@@ -157,7 +162,9 @@ function DiscussionActionButton({ active, compact, onAction }: ActionButtonProps
 export function P2pProgressCard({ discussion, compact = false, mobile = false, hidden = false, onToggleHide, onClick, onStopDiscussion }: Props) {
   const { t } = useTranslation();
   const nodes = discussion.nodes ?? [];
-  const isActive = discussion.state !== 'done' && discussion.state !== 'failed';
+  const isRunning = discussion.state === 'running';
+  const isTerminal = discussion.state === 'done' || discussion.state === 'failed';
+  const isActive = !isTerminal;
   const showActionButton = discussion.state === 'failed' || isActive;
   const totalHopsPerRound = discussion.totalHops ?? 0;
   const completedRoundHops = useMemo(() => {
@@ -183,10 +190,10 @@ export function P2pProgressCard({ discussion, compact = false, mobile = false, h
   ), [discussion.activePhase, t]);
 
   // ── Timers ───────────────────────────────────────────────────────────────
-  const totalElapsed = useElapsedTimer(discussion.startedAt, isActive);
+  const totalElapsed = useElapsedTimer(discussion.startedAt, isRunning);
   // Hop timer resets when round+hop+phase changes
-  const hopKey = isActive ? `${discussion.currentRound}:${discussion.activeHop}:${discussion.activePhase}` : null;
-  const hopElapsed = useHopTimer(hopKey, isActive, discussion.hopStartedAt);
+  const hopKey = isRunning ? `${discussion.currentRound}:${discussion.activeHop}:${discussion.activePhase}` : null;
+  const hopElapsed = useHopTimer(hopKey, isRunning, discussion.hopStartedAt);
 
   // ── Mobile ultra-compact: single-line summary ──────────────────────────
   if (mobile) {
@@ -201,17 +208,17 @@ export function P2pProgressCard({ discussion, compact = false, mobile = false, h
           <span class="discussions-progress-kicker">P2P</span>
           <span class="discussions-progress-badge">{roundText}</span>
           {hopText && <span class="discussions-progress-badge">{hopText}</span>}
-          {isActive && <span class="p2p-timer p2p-timer-compact">{totalElapsed}</span>}
+          {isRunning && <span class="p2p-timer p2p-timer-compact">{totalElapsed}</span>}
           {phaseLabel && <span class="discussions-progress-badge discussions-progress-badge-phase">{phaseLabel}</span>}
           {!hidden && activeNode && (
-            <span class={`discussions-progress-node ${statusClassName(activeNode.status)}`} style={{ margin: 0 }}>
+            <span class={`discussions-progress-node ${progressStatusClassName(activeNode.status, isRunning)}`} style={{ margin: 0 }}>
               <span class="discussions-progress-node-dot" />
               <span class="discussions-progress-node-label">{activeNode.displayLabel ?? activeNode.label}</span>
               {activeNode.phase && <span class="discussions-progress-node-phase">{t(`p2p.discussions.phase_${activeNode.phase}`)}</span>}
             </span>
           )}
           <span style={{ flex: '1 1 0' }} />
-          {isActive && <span class="p2p-timer p2p-timer-hop-compact">{hopElapsed}</span>}
+          {isRunning && <span class="p2p-timer p2p-timer-hop-compact">{hopElapsed}</span>}
           {onToggleHide && (
             <button
               class="discussions-progress-stop"
@@ -287,7 +294,7 @@ export function P2pProgressCard({ discussion, compact = false, mobile = false, h
           <div class="discussions-progress-kicker">P2P</div>
           <div class="discussions-progress-title">{discussion.topic || t('p2p.discussions.untitled')}</div>
         </div>
-        {isActive && <span class="p2p-timer p2p-timer-total">{totalElapsed}</span>}
+        {isRunning && <span class="p2p-timer p2p-timer-total">{totalElapsed}</span>}
         {showActionButton && onStopDiscussion && (
           <DiscussionActionButton
             active={isActive}
@@ -305,7 +312,7 @@ export function P2pProgressCard({ discussion, compact = false, mobile = false, h
         )}
         <span class="discussions-progress-badge">{roundText}</span>
         {hopText && <span class="discussions-progress-badge">{hopText}</span>}
-        {isActive && <span class="p2p-timer p2p-timer-hop">{hopElapsed}</span>}
+        {isRunning && <span class="p2p-timer p2p-timer-hop">{hopElapsed}</span>}
         {phaseLabel && (
           <span class="discussions-progress-badge discussions-progress-badge-phase">{phaseLabel}</span>
         )}
@@ -321,7 +328,7 @@ export function P2pProgressCard({ discussion, compact = false, mobile = false, h
             {roundSegments.map((seg) => (
               <div
                 key={seg.roundNum}
-                class={`discussions-progress-segment ${statusClassName(seg.status as P2pProgressNode['status'])}`}
+                class={`discussions-progress-segment ${progressStatusClassName(seg.status as P2pProgressNode['status'], isRunning)}`}
                 title={`${t('p2p.discussions.round_label')} ${seg.roundNum}/${discussion.maxRounds}`}
               >
                 <span class="discussions-progress-segment-index">{seg.roundNum}</span>
@@ -342,7 +349,7 @@ export function P2pProgressCard({ discussion, compact = false, mobile = false, h
                 {hopSegments.map((seg) => (
                   <div
                     key={seg.hopNum}
-                    class={`discussions-progress-segment ${statusClassName(seg.status as P2pProgressNode['status'])}`}
+                    class={`discussions-progress-segment ${progressStatusClassName(seg.status as P2pProgressNode['status'], isRunning)}`}
                     title={`${t('p2p.discussions.hop_label')} ${seg.hopNum}/${discussion.totalHops}`}
                   >
                     <span class="discussions-progress-segment-index">{seg.hopNum}</span>
@@ -357,7 +364,7 @@ export function P2pProgressCard({ discussion, compact = false, mobile = false, h
       {nodes.length > 0 && (
         <div class="discussions-progress-nodes" ref={nodesRef}>
           {nodes.map((node, idx) => (
-            <div key={idx} class={`discussions-progress-node ${statusClassName(node.status)}`}>
+            <div key={idx} class={`discussions-progress-node ${progressStatusClassName(node.status, isRunning)}`}>
               <span class="discussions-progress-node-dot" />
               <span class="discussions-progress-node-label">{node.displayLabel ?? node.label}</span>
               {node.mode && <span class="discussions-progress-node-mode">{t(`p2p.mode.${node.mode}`, node.mode)}</span>}
