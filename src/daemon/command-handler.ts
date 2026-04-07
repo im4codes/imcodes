@@ -70,7 +70,7 @@ async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord
 
   // Compute transport display metadata fresh — matches session-list.ts hydration logic.
   // The session store may have stale or missing metadata during early launch/update windows.
-  const freshDisplay: Partial<Pick<SessionRecord, 'modelDisplay' | 'planLabel' | 'quotaLabel' | 'quotaUsageLabel'>> = r?.agentType === 'qwen'
+  const freshDisplay: Partial<Pick<SessionRecord, 'modelDisplay' | 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'>> = r?.agentType === 'qwen'
     ? getQwenDisplayMetadata({
         model: r?.qwenModel,
         authType: r?.qwenAuthType,
@@ -110,6 +110,7 @@ async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord
     planLabel: freshDisplay.planLabel ?? r?.planLabel ?? null,
     quotaLabel: freshDisplay.quotaLabel ?? r?.quotaLabel ?? null,
     quotaUsageLabel: freshDisplay.quotaUsageLabel ?? r?.quotaUsageLabel ?? null,
+    quotaMeta: freshDisplay.quotaMeta ?? r?.quotaMeta ?? null,
     effort: r?.effort ?? null,
   };
 }
@@ -228,6 +229,29 @@ function refreshQwenQuotaUsageLabels(serverLink?: ServerLink): void {
     }
   }
   if (serverLink) void handleGetSessions(serverLink);
+}
+
+export async function refreshCodexQuotaMetadata(serverLink?: ServerLink): Promise<void> {
+  const sessions = listSessions();
+  const codexSessions = sessions.filter((session) => session.agentType === 'codex' || session.agentType === 'codex-sdk');
+  if (codexSessions.length === 0) return;
+
+  if (serverLink) {
+    await handleGetSessions(serverLink);
+  } else {
+    await buildSessionList();
+  }
+
+  if (!serverLink) return;
+  for (const session of codexSessions) {
+    if (!session.name.startsWith('deck_sub_')) continue;
+    const subId = session.name.replace(/^deck_sub_/, '');
+    try {
+      serverLink.send(await buildSubSessionSync(subId));
+    } catch {
+      // not connected
+    }
+  }
 }
 
 // ── Common MIME map for file metadata ────────────────────────────────────────
@@ -548,7 +572,7 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       void handleSubSessionRestart(cmd, serverLink);
       break;
     case 'subsession.rebuild_all':
-      void handleSubSessionRebuildAll(cmd);
+      void handleSubSessionRebuildAll(cmd, serverLink);
       break;
     case 'subsession.detect_shells':
       void handleSubSessionDetectShells(serverLink);
@@ -1875,10 +1899,17 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
   }
 }
 
-async function handleSubSessionRebuildAll(cmd: Record<string, unknown>): Promise<void> {
+async function handleSubSessionRebuildAll(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const subSessions = cmd.subSessions as SubSessionRecord[] | undefined;
   if (!Array.isArray(subSessions)) return;
   await rebuildSubSessions(subSessions).catch((e: unknown) => logger.error({ err: e }, 'subsession.rebuild_all failed'));
+  for (const sub of subSessions) {
+    try {
+      serverLink.send(await buildSubSessionSync(sub.id));
+    } catch (e) {
+      logger.warn({ err: e, id: sub.id }, 'Failed to sync rebuilt sub-session');
+    }
+  }
 }
 
 async function handleSubSessionDetectShells(serverLink: ServerLink): Promise<void> {

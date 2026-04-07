@@ -132,6 +132,7 @@ export function useSubSessions(
                 ...(m.planLabel != null && { planLabel: m.planLabel }),
                 ...(m.quotaLabel != null && { quotaLabel: m.quotaLabel }),
                 ...(m.quotaUsageLabel != null && { quotaUsageLabel: m.quotaUsageLabel }),
+                ...(m.quotaMeta !== undefined && { quotaMeta: m.quotaMeta }),
                 ...(m.effort != null && { effort: m.effort }),
                 ...(m.transportConfig !== undefined && { transportConfig: m.transportConfig }),
                 ...(m.qwenModel != null && { qwenModel: m.qwenModel }),
@@ -165,6 +166,7 @@ export function useSubSessions(
               planLabel: m.planLabel ?? null,
               quotaLabel: m.quotaLabel ?? null,
               quotaUsageLabel: m.quotaUsageLabel ?? null,
+              quotaMeta: m.quotaMeta ?? null,
               effort: m.effort ?? null,
               transportConfig: m.transportConfig ?? null,
             }];
@@ -199,6 +201,7 @@ export function useSubSessions(
               ...(m.planLabel !== undefined ? { planLabel: m.planLabel } : {}),
               ...(m.quotaLabel !== undefined ? { quotaLabel: m.quotaLabel } : {}),
               ...(m.quotaUsageLabel !== undefined ? { quotaUsageLabel: m.quotaUsageLabel } : {}),
+              ...(m.quotaMeta !== undefined ? { quotaMeta: m.quotaMeta } : {}),
               ...(m.effort !== undefined ? { effort: m.effort } : {}),
               ...(m.transportConfig !== undefined ? { transportConfig: m.transportConfig } : {}),
             };

@@ -51,6 +51,7 @@ export interface SessionInfo {
   permissionLabel?: string;
   quotaLabel?: string;
   quotaUsageLabel?: string;
+  quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null;
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel;
 }
 

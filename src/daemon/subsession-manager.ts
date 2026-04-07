@@ -356,7 +356,12 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         parentSession: sub.parentSession ?? stored?.parentSession,
         requestedModel: sub.requestedModel ?? stored?.requestedModel,
         activeModel: sub.activeModel ?? stored?.activeModel,
-        modelDisplay: sub.activeModel ?? stored?.modelDisplay,
+        modelDisplay: sub.activeModel ?? stored?.activeModel ?? stored?.modelDisplay,
+        planLabel: stored?.planLabel,
+        permissionLabel: stored?.permissionLabel,
+        quotaLabel: stored?.quotaLabel,
+        quotaUsageLabel: stored?.quotaUsageLabel,
+        quotaMeta: stored?.quotaMeta,
         effort: sub.effort ?? stored?.effort,
         transportConfig: sub.transportConfig ?? stored?.transportConfig,
         // Preserve existing diagnostic fields instead of resetting

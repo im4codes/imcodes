@@ -159,6 +159,7 @@ export function SubSessionWindow({
     planLabel: sub.planLabel ?? undefined,
     quotaLabel: sub.quotaLabel ?? undefined,
     quotaUsageLabel: sub.quotaUsageLabel ?? undefined,
+    quotaMeta: sub.quotaMeta ?? undefined,
     effort: sub.effort ?? undefined,
     runtimeType: sub.runtimeType ?? undefined,
   };
@@ -408,6 +409,7 @@ export function SubSessionWindow({
           planLabel={sessionInfo?.planLabel}
           quotaLabel={sessionInfo?.quotaLabel}
           quotaUsageLabel={(sessionInfo?.agentType === 'codex' || sessionInfo?.agentType === 'codex-sdk') ? undefined : sessionInfo?.quotaUsageLabel}
+          quotaMeta={sessionInfo?.quotaMeta}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}

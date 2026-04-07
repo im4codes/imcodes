@@ -77,6 +77,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           planLabel={liveSub.planLabel}
           quotaLabel={liveSub.quotaLabel}
           quotaUsageLabel={(liveSub.type === 'codex' || liveSub.type === 'codex-sdk') ? undefined : liveSub.quotaUsageLabel}
+          quotaMeta={liveSub.quotaMeta}
           showCost={false}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}

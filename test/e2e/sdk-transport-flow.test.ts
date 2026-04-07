@@ -7,6 +7,15 @@ const flushAsync = async () => {
   for (let i = 0; i < 6; i++) await new Promise((resolve) => process.nextTick(resolve));
 };
 
+async function waitForCondition(check: () => boolean, timeoutMs = 3000, intervalMs = 20): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) return;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error('Timed out waiting for condition');
+}
+
 const mocks = vi.hoisted(() => {
   const store = new Map<string, Record<string, any>>();
   const emitted: Array<{ session: string; type: string; payload: Record<string, any>; opts?: Record<string, any> }> = [];
@@ -74,7 +83,13 @@ vi.mock('node:child_process', async (importOriginal) => {
   return {
     ...actual,
     spawn,
-    execFile: vi.fn((_file: string, _args: string[], cb?: (err: Error | null, stdout: string, stderr: string) => void) => {
+    execFile: vi.fn((
+      _file: string,
+      _args: string[],
+      optionsOrCb?: Record<string, unknown> | ((err: Error | null, stdout: string, stderr: string) => void),
+      maybeCb?: (err: Error | null, stdout: string, stderr: string) => void,
+    ) => {
+      const cb = typeof optionsOrCb === 'function' ? optionsOrCb : maybeCb;
       cb?.(null, 'ok\n', '');
       return {} as never;
     }),
@@ -329,7 +344,7 @@ describe('sdk transport flow e2e', () => {
     const serverLink = { send: vi.fn() } as any;
     handleWebCommand({ type: 'session.send', session: SESSION_CC, text: '/model opus', commandId: 'cmd-ccsdk-model-opus' }, serverLink);
     await flushAsync();
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await waitForCondition(() => mocks.store.get(SESSION_CC)?.modelDisplay != null);
 
     const record = mocks.store.get(SESSION_CC);
     expect(record?.modelDisplay).toBe('opus[1M]');
@@ -349,7 +364,7 @@ describe('sdk transport flow e2e', () => {
       thinking: 'high',
     }, serverLink);
     await flushAsync();
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await waitForCondition(() => serverLink.send.mock.calls.length > 0);
 
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'subsession.sync',
@@ -358,6 +373,59 @@ describe('sdk transport flow e2e', () => {
       planLabel: 'Pro',
       quotaLabel: expect.stringContaining('5h 11%'),
       effort: 'high',
+    }));
+  });
+
+  it('re-syncs codex-sdk quota metadata during sub-session rebuild', async () => {
+    const sessionName = 'deck_sub_cxsdk_rebuild';
+    const serverLink = { send: vi.fn() } as any;
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      projectName: sessionName,
+      role: 'w1',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/cxsdk-sub-rebuild',
+      state: 'idle',
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'deck_sub_cxsdk_rebuild',
+      parentSession: 'deck_parent_brain',
+      requestedModel: 'gpt-5.4-mini',
+      activeModel: 'gpt-5.4-mini',
+      modelDisplay: 'gpt-5.4-mini',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+
+    handleWebCommand({
+      type: 'subsession.rebuild_all',
+      subSessions: [{
+        id: 'cxsdk_rebuild',
+        type: 'codex-sdk',
+        runtimeType: 'transport',
+        providerId: 'codex-sdk',
+        providerSessionId: 'deck_sub_cxsdk_rebuild',
+        cwd: '/tmp/cxsdk-sub-rebuild',
+        parentSession: 'deck_parent_brain',
+        requestedModel: 'gpt-5.4-mini',
+      }],
+    }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => {
+      const record = mocks.store.get(sessionName);
+      return record?.agentType === 'codex-sdk' && record?.modelDisplay === 'gpt-5.4-mini';
+    });
+
+    const record = mocks.store.get(sessionName);
+    expect(record).toEqual(expect.objectContaining({
+      agentType: 'codex-sdk',
+      modelDisplay: 'gpt-5.4-mini',
+    }));
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'subsession.sync',
+      id: 'cxsdk_rebuild',
     }));
   });
 

@@ -253,6 +253,7 @@ export function SessionPane({
           planLabel={session.planLabel}
           quotaLabel={session.quotaLabel}
           quotaUsageLabel={session.quotaUsageLabel}
+          quotaMeta={session.quotaMeta}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}

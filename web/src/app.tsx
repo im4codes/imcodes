@@ -536,6 +536,7 @@ export function App() {
         planLabel: undefined,
         quotaLabel: undefined,
         quotaUsageLabel: undefined,
+        quotaMeta: undefined,
       }));
       setSessions(mapped);
       // Only mark loaded if we got data — empty means daemon hasn't synced yet,
@@ -1086,6 +1087,7 @@ export function App() {
             planLabel: s.planLabel,
             quotaLabel: s.quotaLabel,
             quotaUsageLabel: s.quotaUsageLabel,
+            quotaMeta: s.quotaMeta ?? existing?.quotaMeta,
             effort: s.effort ?? existing?.effort,
           };
         }));

@@ -5,7 +5,7 @@ import { detectMemoryBackend } from '../memory/detector.js';
 import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
 import { ServerLink } from './server-link.js';
-import { handleWebCommand, setRouterContext } from './command-handler.js';
+import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata } from './command-handler.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
 import { notifySessionIdle, listP2pRuns, serializeP2pRun } from './p2p-orchestrator.js';
 import { handlePreviewBinaryFrame } from './preview-relay.js';
@@ -604,6 +604,7 @@ export async function startup(): Promise<DaemonContext> {
   ctx = { config, memory, serverLink, persistBinding, removeBinding, sendSessionEvent };
   setupSignalHandlers();
   startHealthPoller();
+  startCodexQuotaPoller(serverLink);
 
   logger.info('Daemon started');
 
@@ -689,6 +690,7 @@ export async function shutdown(exitCode = 0): Promise<void> {
 
   try {
     if (healthTimer) clearInterval(healthTimer);
+    if (codexQuotaTimer) clearInterval(codexQuotaTimer);
     hookServer?.close();
     ctx?.serverLink?.disconnect();
     await flushStore();
@@ -709,7 +711,9 @@ export async function shutdown(exitCode = 0): Promise<void> {
 }
 
 const HEALTH_POLL_MS = 30_000;
+const CODEX_QUOTA_REFRESH_MS = 60_000;
 let healthTimer: ReturnType<typeof setInterval> | null = null;
+let codexQuotaTimer: ReturnType<typeof setInterval> | null = null;
 let hookServer: http.Server | null = null;
 
 /** Periodically check all running sessions; restart any that have disappeared or died. */
@@ -748,6 +752,15 @@ function startHealthPoller(): void {
       }
     }
   }, HEALTH_POLL_MS);
+}
+
+function startCodexQuotaPoller(serverLink: ServerLink | null): void {
+  if (!serverLink) return;
+  codexQuotaTimer = setInterval(() => {
+    void refreshCodexQuotaMetadata(serverLink).catch((err) => {
+      logger.warn({ err }, 'Codex quota refresh failed');
+    });
+  }, CODEX_QUOTA_REFRESH_MS);
 }
 
 function setupSignalHandlers(): void {

@@ -82,4 +82,38 @@ describe('UsageFooter', () => {
     expect(screen.queryByText(/5h 43% 4\/6 14:40/)).toBeNull();
     expect(screen.queryByText(/7d 34% 4\/8 15:48/)).toBeNull();
   });
+
+  it('recomputes codex quota countdown from quotaMeta', () => {
+    render(
+      <UsageFooter
+        usage={{
+          inputTokens: 2000,
+          cacheTokens: 1000,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        agentType="codex-sdk"
+        modelOverride="gpt-5"
+        quotaLabel="stale quota text"
+        quotaMeta={{
+          primary: {
+            usedPercent: 43,
+            windowDurationMins: 300,
+            resetsAt: Math.floor((2 * 60_000 + 15_000) / 1000),
+          },
+          secondary: {
+            usedPercent: 34,
+            windowDurationMins: 7 * 24 * 60,
+            resetsAt: Math.floor((26 * 60 * 60_000) / 1000),
+          },
+        }}
+        now={0}
+      />,
+    );
+
+    expect(screen.queryByText('stale quota text')).toBeNull();
+    expect(screen.getByText(/5h 43% 2m/)).toBeDefined();
+    expect(screen.getByText(/7d 34% 1d02h/)).toBeDefined();
+  });
 });

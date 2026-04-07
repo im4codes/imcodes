@@ -574,6 +574,7 @@ export interface SubSessionData {
   planLabel?: string | null;
   quotaLabel?: string | null;
   quotaUsageLabel?: string | null;
+  quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null;
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null;
   transportConfig?: Record<string, unknown> | null;
 }

@@ -5,6 +5,7 @@ import { getQwenDisplayMetadata } from '../agent/provider-display.js';
 import { getQwenOAuthQuotaUsageLabel } from '../agent/provider-quota.js';
 import { getClaudeSdkRuntimeConfig } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
+import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 
 export interface SessionListItem {
   name: string;
@@ -28,6 +29,7 @@ export interface SessionListItem {
   permissionLabel?: string;
   quotaLabel?: string;
   quotaUsageLabel?: string;
+  quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta;
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel;
   description?: string;
   label?: string;
@@ -56,6 +58,7 @@ function baseItem(s: SessionRecord): SessionListItem {
     permissionLabel: s.permissionLabel,
     quotaLabel: s.quotaLabel,
     quotaUsageLabel: s.quotaUsageLabel,
+    quotaMeta: s.quotaMeta,
     effort: s.effort,
     description: s.description,
     label: s.label,
@@ -118,8 +121,15 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
         permissionLabel: getPermissionLabel(s.agentType),
         quotaLabel: codexRuntime?.quotaLabel,
         quotaUsageLabel: codexRuntime?.quotaUsageLabel,
+        quotaMeta: codexRuntime?.quotaMeta,
       };
-      if (hydrated.planLabel !== s.planLabel || hydrated.permissionLabel !== s.permissionLabel || hydrated.quotaLabel !== s.quotaLabel || hydrated.quotaUsageLabel != s.quotaUsageLabel) {
+      if (
+        hydrated.planLabel !== s.planLabel
+        || hydrated.permissionLabel !== s.permissionLabel
+        || hydrated.quotaLabel !== s.quotaLabel
+        || hydrated.quotaUsageLabel != s.quotaUsageLabel
+        || !providerQuotaMetaEquals(hydrated.quotaMeta, s.quotaMeta)
+      ) {
         upsertSession({ ...s, ...hydrated, updatedAt: Date.now() });
       }
       return { ...baseItem(s), ...hydrated };

@@ -3,6 +3,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import type { QwenAuthType } from '../../shared/qwen-auth.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
+import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 
 const STORE_DIR = join(homedir(), '.imcodes');
 const STORE_PATH = join(STORE_DIR, 'sessions.json');
@@ -61,6 +62,8 @@ export interface SessionRecord {
   quotaLabel?: string;
   /** Generic quota progress label (e.g. today 12/1000 · 1m 1/60). */
   quotaUsageLabel?: string;
+  /** Structured quota metadata for client-side countdown rendering. */
+  quotaMeta?: ProviderQuotaMeta;
   /** Generic reasoning/thinking effort for supported providers. */
   effort?: TransportEffortLevel;
   /** Provider-specific transport settings that must not expand the top-level schema. */
