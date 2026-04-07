@@ -12,9 +12,10 @@ import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
 import { P2pConfigPanel } from './P2pConfigPanel.js';
+import { useP2pCustomCombos } from './p2p-combos.js';
 import { uploadFile, getUserPref, saveUserPref } from '../api.js';
 import { isRunningSessionState } from '../thinking-utils.js';
-import { P2P_CONFIG_MODE, COMBO_PRESETS, COMBO_SEPARATOR, isComboMode } from '@shared/p2p-modes.js';
+import { P2P_CONFIG_MODE, COMBO_SEPARATOR, isComboMode } from '@shared/p2p-modes.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
@@ -81,8 +82,7 @@ const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const QWEN_MODEL_STORAGE_KEY = 'imcodes-qwen-model';
 const P2P_COMBO_CONFIRM_SKIP_PREF_KEY = 'p2p_combo_direct_send_skip_confirm';
 const CODEX_MODELS: CodexModelChoice[] = [...CODEX_MODEL_IDS] as CodexModelChoice[];
-const SINGLE_P2P_MODES: string[] = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss'];
-const P2P_MODES: string[] = [...SINGLE_P2P_MODES, ...COMBO_PRESETS.map((c) => c.key), P2P_CONFIG_MODE];
+const P2P_BASE_MODES = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss', P2P_CONFIG_MODE] as const;
 const P2P_MODE_I18N: Record<string, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', plan: 'p2p.mode_plan', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
 const P2P_SINGLE_COLORS: Record<string, string> = { solo: '#dbe7f5', audit: '#f59e0b', review: '#3b82f6', plan: '#06b6d4', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
 
@@ -179,7 +179,8 @@ function loadQwenModel(): QwenModelChoice | null {
 
 function normalizeP2pMode(mode: string): string | null {
   const normalized = mode.trim().toLowerCase();
-  return P2P_MODES.includes(normalized as P2pMode) ? normalized : null;
+  if ((P2P_BASE_MODES as readonly string[]).includes(normalized)) return normalized;
+  return isComboMode(normalized) ? normalized : null;
 }
 
 function buildManualP2pCandidates(
@@ -250,7 +251,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [p2pMode, setP2pMode] = useState<P2pMode>('solo');
   const [p2pExcludeSameType, setP2pExcludeSameType] = useState(true);
   const [p2pOpen, setP2pOpen] = useState(false);
-  const [customCombos, setCustomCombos] = useState<string[]>([]);
   const [p2pConfigOpen, setP2pConfigOpen] = useState(false);
   const [p2pSavedConfig, setP2pSavedConfig] = useState<P2pSavedConfig | null>(null);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
@@ -418,17 +418,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       description: known.find((model) => model.id === id)?.description ?? getKnownQwenModelDescription(id),
     }));
   }, [activeSession?.qwenAuthType, activeSession?.qwenAvailableModels, detectedModel, qwenModel, qwenTier]);
+  const { allCombos } = useP2pCustomCombos();
+  const comboMenuItems = useMemo(
+    () => [...allCombos.presets.map((combo) => combo.key), ...allCombos.custom],
+    [allCombos],
+  );
 
   // P2P config loading moved after rootSession declaration below
-
-  // Load custom combos from server
-  useEffect(() => {
-    void getUserPref('p2p_custom_combos').then((raw) => {
-      if (raw && typeof raw === 'string') {
-        try { setCustomCombos(JSON.parse(raw)); } catch { /* ignore */ }
-      }
-    });
-  }, []);
 
   useEffect(() => {
     void getUserPref(P2P_COMBO_CONFIRM_SKIP_PREF_KEY).then((raw) => {
@@ -1226,22 +1222,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           </button>
           {p2pOpen && (
             <div class="menu-dropdown menu-dropdown-p2p">
-              {/* Single modes */}
-              {SINGLE_P2P_MODES.map((m) => (
-                <button
-                  key={m}
-                  class={`menu-item ${p2pMode === m ? 'menu-item-active' : ''}`}
-                  onClick={() => {
-                    setP2pMode(m);
-                    if (m === 'solo') setP2pExcludeSameType(false);
-                    setP2pOpen(false);
-                  }}
-                  style={{ color: getP2pMenuItemColor(m, p2pMode === m), fontWeight: p2pMode === m ? 700 : (m === 'solo' ? 600 : 400) }}
-                >
-                  {p2pMode === m ? '● ' : '○ '}{getP2pModeLabel(m, t)}
-                </button>
-              ))}
-              {/* Combo presets */}
+              <button
+                class={`menu-item ${p2pMode === 'solo' ? 'menu-item-active' : ''}`}
+                onClick={() => {
+                  setP2pMode('solo');
+                  setP2pExcludeSameType(false);
+                  setP2pOpen(false);
+                }}
+                style={{ color: getP2pMenuItemColor('solo', p2pMode === 'solo'), fontWeight: p2pMode === 'solo' ? 700 : 600 }}
+              >
+                {p2pMode === 'solo' ? '● ' : '○ '}{getP2pModeLabel('solo', t)}
+              </button>
               <div class="menu-divider" />
               <div class="p2p-menu-section-label">{t('p2p.combo_label')}</div>
               {!hasConfiguredP2pParticipants && (
@@ -1249,23 +1240,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   {t('p2p.combo_requires_participants_hint')}
                 </div>
               )}
-              {COMBO_PRESETS.map((c) => (
-                <button
-                  key={c.key}
-                  class={`menu-item ${p2pMode === c.key ? 'menu-item-active' : ''}`}
-                  onClick={() => {
-                    if (!hasConfiguredP2pParticipants) return;
-                    setP2pMode(c.key);
-                    setP2pOpen(false);
-                  }}
-                  disabled={!hasConfiguredP2pParticipants}
-                  title={!hasConfiguredP2pParticipants ? t('p2p.combo_requires_participants_hint') : undefined}
-                  style={{ color: getP2pModeColor(c.key), fontSize: 12, opacity: hasConfiguredP2pParticipants ? 1 : 0.45, cursor: hasConfiguredP2pParticipants ? 'pointer' : 'not-allowed' }}
-                >
-                  {p2pMode === c.key ? '● ' : '○ '}{getP2pModeLabel(c.key, t)}
-                </button>
-              ))}
-              {customCombos.filter((k) => !COMBO_PRESETS.some((p) => p.key === k)).map((key) => (
+              {comboMenuItems.map((key) => (
                 <button
                   key={key}
                   class={`menu-item ${p2pMode === key ? 'menu-item-active' : ''}`}
@@ -1281,20 +1256,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   {p2pMode === key ? '● ' : '○ '}{getP2pModeLabel(key, t)}
                 </button>
               ))}
-              {/* Config mode */}
-              <div class="menu-divider" />
-              <button
-                class={`menu-item ${p2pMode === P2P_CONFIG_MODE ? 'menu-item-active' : ''}`}
-                onClick={() => {
-                  setP2pMode(P2P_CONFIG_MODE);
-                  setP2pOpen(false);
-                  if (!p2pSavedConfig) setP2pConfigOpen(true);
-                }}
-                style={{ color: getP2pModeColor(P2P_CONFIG_MODE) }}
-              >
-                {p2pMode === P2P_CONFIG_MODE ? '● ' : '○ '}{getP2pModeLabel(P2P_CONFIG_MODE, t)} ⚙
-              </button>
-              {p2pMode !== 'solo' && p2pMode !== P2P_CONFIG_MODE && (
+              {p2pMode !== 'solo' && (
                 <>
                   <div class="menu-divider" />
                   <button

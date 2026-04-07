@@ -260,6 +260,49 @@ describe('SessionControls', () => {
     expect(comboBtn.title).toBe('combo_requires_participants_hint');
   });
 
+  it('only shows solo plus combo items in the p2p dropdown', async () => {
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+
+    expect(screen.getByText('mode_solo')).toBeDefined();
+    expect(screen.queryByText(/^mode_audit$/i)).toBeNull();
+    expect(screen.queryByText(/^mode_review$/i)).toBeNull();
+    expect(screen.queryByText(/^mode_plan$/i)).toBeNull();
+    expect(screen.queryByText(/^mode_brainstorm$/i)).toBeNull();
+    expect(screen.queryByText(/^mode_discuss$/i)).toBeNull();
+    expect(screen.queryByText(/^mode_config$/i)).toBeNull();
+    expect(screen.getByText(/mode_audit→mode_plan/i)).toBeDefined();
+  });
+
+  it('updates the p2p dropdown when custom combos are created without a page refresh', async () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    await flushAsync();
+
+    const { P2pConfigPanel } = await import('../../src/components/P2pConfigPanel.js');
+    render(
+      <P2pConfigPanel
+        sessions={[{ name: 'my-session', agentType: 'claude-code', state: 'idle' }]}
+        subSessions={[]}
+        activeSession="my-session"
+        onClose={() => {}}
+        onSave={() => {}}
+      />,
+    );
+    await flushAsync();
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'combo_label' }).at(-1)!);
+    fireEvent.click(screen.getByText('+mode_brainstorm'));
+    fireEvent.click(screen.getByText('+mode_review'));
+    fireEvent.click(screen.getByText('✓'));
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+    expect(screen.getAllByText(/mode_brainstorm→mode_review/i).length).toBeGreaterThanOrEqual(1);
+  });
+
   it('remembers skipping combo confirmation across later sends', async () => {
     const ws = makeWs();
     render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
