@@ -127,4 +127,33 @@ describe('P2pProgressCard', () => {
     expect(container.querySelectorAll('.is-active').length).toBeGreaterThan(0);
     expect(container.querySelector('.p2p-timer-total')).toBeTruthy();
   });
+
+  it('shows parallel hop ranges and highlights all active hop segments', () => {
+    const { container } = render(
+      <P2pProgressCard
+        discussion={{
+          id: 'p2p_run_parallel',
+          topic: 'P2P audit · brain',
+          state: 'running',
+          modeKey: 'audit',
+          currentRound: 1,
+          maxRounds: 1,
+          completedHops: 1,
+          totalHops: 4,
+          activeHop: 2,
+          activeRoundHop: 2,
+          activePhase: 'hop',
+          nodes: [
+            { label: 'w1', agentType: 'codex', status: 'done', phase: 'hop' },
+            { label: 'w2', agentType: 'codex', status: 'active', phase: 'hop' },
+            { label: 'w3', agentType: 'codex', status: 'active', phase: 'hop' },
+            { label: 'w4', agentType: 'codex', status: 'active', phase: 'hop' },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getAllByText('H2-4/4').length).toBeGreaterThan(0);
+    expect(container.querySelectorAll('.discussions-progress-segments-hop .is-active').length).toBe(3);
+  });
 });

@@ -534,4 +534,88 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(payload.summary_phase).toBe('completed');
     expect(payload.hop_counts?.completed).toBeGreaterThanOrEqual(1);
   });
+
+  it('projects all active hops into all_nodes for parallel round progress', () => {
+    const run: P2pRun = {
+      id: 'run_parallel',
+      discussionId: 'disc_parallel',
+      mainSession: 'deck_proj_brain',
+      initiatorSession: 'deck_proj_brain',
+      currentTargetSession: 'deck_proj_w1',
+      finalReturnSession: 'deck_proj_brain',
+      remainingTargets: [
+        { session: 'deck_proj_w1', mode: 'audit' },
+        { session: 'deck_proj_w2', mode: 'review' },
+      ],
+      totalTargets: 2,
+      mode: 'discuss',
+      status: 'running',
+      runPhase: 'round_execution',
+      summaryPhase: null,
+      activePhase: 'hop',
+      contextFilePath: '/tmp/run_parallel.md',
+      userText: 'parallel progress',
+      timeoutMs: 120000,
+      resultSummary: null,
+      completedHops: [],
+      skippedHops: [],
+      error: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      completedAt: null,
+      rounds: 1,
+      currentRound: 1,
+      allTargets: [
+        { session: 'deck_proj_w1', mode: 'audit' },
+        { session: 'deck_proj_w2', mode: 'review' },
+      ],
+      extraPrompt: '',
+      hopStartedAt: Date.now(),
+      hopStates: [
+        {
+          hop_index: 1,
+          round_index: 1,
+          session: 'deck_proj_w1',
+          mode: 'audit',
+          status: 'running',
+          started_at: Date.now(),
+          completed_at: null,
+          error: null,
+          output_path: null,
+          section_header: 'W1',
+          artifact_path: '/tmp/run_parallel.round1.hop1.md',
+          working_path: null,
+          baseline_size: 0,
+          baseline_content: '',
+        },
+        {
+          hop_index: 2,
+          round_index: 1,
+          session: 'deck_proj_w2',
+          mode: 'review',
+          status: 'dispatched',
+          started_at: Date.now(),
+          completed_at: null,
+          error: null,
+          output_path: null,
+          section_header: 'W2',
+          artifact_path: '/tmp/run_parallel.round1.hop2.md',
+          working_path: null,
+          baseline_size: 0,
+          baseline_content: '',
+        },
+      ],
+      activeTargetSessions: ['deck_proj_w1', 'deck_proj_w2'],
+      _cancelled: false,
+    };
+
+    const payload = serializeP2pRun(run);
+    const activeNodes = payload.all_nodes?.filter((node) => node.phase === 'hop' && node.status === 'active') ?? [];
+    const pendingNodes = payload.all_nodes?.filter((node) => node.phase === 'hop' && node.status === 'pending') ?? [];
+
+    expect(activeNodes.map((node) => node.session)).toEqual(['deck_proj_w1', 'deck_proj_w2']);
+    expect(pendingNodes).toHaveLength(0);
+    expect(payload.current_target_session).toBe('deck_proj_w1');
+    expect(payload.active_hop_number).toBe(1);
+  });
 });

@@ -106,14 +106,12 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
   const currentRoundCompletedHopCount = run.hopStates.filter(
     (hop) => hop.round_index === run.currentRound && hop.status === 'completed',
   ).length;
-  const currentHop = run.activeTargetSessions[0] ?? run.currentTargetSession;
-  const currentHopState = currentHop
-    ? run.hopStates.find((hop) =>
-      hop.session === currentHop &&
-      hop.round_index === run.currentRound &&
-      (hop.status === 'running' || hop.status === 'dispatched'),
-    ) ?? null
-    : null;
+  const activeHopStates = run.hopStates.filter((hop) =>
+    hop.round_index === run.currentRound &&
+    (hop.status === 'running' || hop.status === 'dispatched'),
+  );
+  const currentHopState = activeHopStates[0] ?? null;
+  const currentHop = currentHopState?.session ?? run.activeTargetSessions[0] ?? run.currentTargetSession;
   const hopCounts = countHopStates(run.hopStates);
 
   return {
@@ -244,17 +242,18 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
         const status = hop.status === 'completed' ? 'done' : 'skipped';
         nodes.push({ session: t.session, ...info, status });
       }
-      if (currentHopState) {
+      const activeSessions = new Set(activeHopStates.map((hop) => hop.session));
+      for (const activeHop of activeHopStates) {
         const curMode = combo ? resolveMode(run.currentRound) : (
-          run.allTargets.find((t) => t.session === currentHopState.session)?.mode
-          ?? run.remainingTargets.find((t) => t.session === currentHopState.session)?.mode
+          run.allTargets.find((t) => t.session === activeHop.session)?.mode
+          ?? run.remainingTargets.find((t) => t.session === activeHop.session)?.mode
           ?? run.mode
         );
-        const info = getInfo(currentHopState.session, curMode, 'hop');
-        nodes.push({ session: currentHopState.session, ...info, status: 'active' });
+        const info = getInfo(activeHop.session, curMode, 'hop');
+        nodes.push({ session: activeHop.session, ...info, status: 'active' });
       }
       for (const t of run.remainingTargets) {
-        if (t.session === currentHop) continue;
+        if (activeSessions.has(t.session)) continue;
         const pendingMode = combo ? resolveMode(run.currentRound) : t.mode;
         const info = getInfo(t.session, pendingMode, 'hop');
         nodes.push({ session: t.session, ...info, status: 'pending' });
