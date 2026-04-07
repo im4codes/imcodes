@@ -474,12 +474,12 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
     }
   }, [lastVisibleTs]);
 
-  // Preview cards should always show the latest content, including streaming
-  // updates that mutate the last visible event without changing its timestamp.
+  // Any visible content update should force-follow to the latest message.
+  // Skip while prepending older history so anchor restoration can preserve position.
   useLayoutEffect(() => {
-    if (!preview) return;
+    if (loadingOlder || scrollAnchorRef.current) return;
     scrollToBottom();
-  }, [preview, viewItems, loading]);
+  }, [preview, viewItems, loading, loadingOlder]);
 
   // Restore scroll position after Load Older prepends events
   useLayoutEffect(() => {
@@ -492,14 +492,14 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
     scrollAnchorRef.current = null;
   }, [events]);
 
-  // Subsequent auto-scroll (new messages while at bottom) — use rAF for smooth updates.
+  // Fallback for timestamp-based message additions. The layout effect above handles
+  // streaming edits and other view changes that do not advance timestamps.
   useEffect(() => {
     const changed = lastVisibleTs !== prevVisibleTsRef.current;
     prevVisibleTsRef.current = lastVisibleTs;
     if (!changed && !preview) return;
     requestAnimationFrame(() => {
-      if (preview) { scrollToBottom(); return; }
-      if (autoScrollRef.current) scrollToBottom();
+      scrollToBottom();
     });
   }, [lastVisibleTs, preview]);
 
