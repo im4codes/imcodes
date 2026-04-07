@@ -20,6 +20,7 @@ const OfficePreview = lazy(() => import('./OfficePreview.js'));
 import { downloadAttachment } from '../api.js';
 
 const PREF_KEY = 'fb_prefer_editor';
+const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -323,7 +324,7 @@ export function FileBrowser({
         const children: FsNode[] = entries
           .filter((e) => showHidden || !e.hidden)
           .map((e) => ({
-            id: `${resolvedParent}${pathSep}${e.name}`,
+            id: e.path ?? `${resolvedParent}${pathSep}${e.name}`,
             name: e.name,
             isDir: e.isDir,
             hidden: e.hidden,
@@ -333,7 +334,12 @@ export function FileBrowser({
         loadedRef.current.add(nodeId);
         if (resolvedParent !== nodeId) loadedRef.current.add(resolvedParent);
 
-        setData((prev) => updateNode(prev, nodeId, { id: resolvedParent, name: resolvedParent.split(/[/\\]/).pop() || resolvedParent, children, isLoading: false }));
+        setData((prev) => updateNode(prev, nodeId, {
+          id: resolvedParent,
+          name: resolvedParent === WINDOWS_DRIVES_ROOT ? 'This PC' : resolvedParent.split(/[/\\]/).pop() || resolvedParent,
+          children,
+          isLoading: false,
+        }));
         // Keep the node expanded after its ID changes from alias (e.g. '~') to resolved path
         if (resolvedParent !== nodeId) {
           setExpandedPaths((prev) => {
@@ -344,7 +350,7 @@ export function FileBrowser({
             return next;
           });
         }
-        setCurrentLabel(resolvedParent);
+        setCurrentLabel(resolvedParent === WINDOWS_DRIVES_ROOT ? 'This PC' : resolvedParent);
         setError(null);
 
         // If highlightPath is under this dir, auto-expand

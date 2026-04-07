@@ -2248,6 +2248,7 @@ sleep 60 && rm -rf "${scriptDir}" &
 // Deny-list: block access to sensitive directories regardless of platform.
 // Everything else is allowed — the daemon runs as the user and inherits their permissions.
 const FS_DENIED_DIRS = ['.ssh', '.gnupg', '.pki'];
+const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
 
 function isPathAllowed(realPath: string): boolean {
   // Block sensitive directories (e.g. ~/.ssh, ~/.gnupg)
@@ -2365,6 +2366,32 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
 }
 
 async function handleFsListInner(resolved: string, rawPath: string, requestId: string, includeFiles: boolean, includeMetadata: boolean, serverLink: ServerLink): Promise<void> {
+  if (process.platform === 'win32' && rawPath === '~') {
+    const entries = await Promise.all(
+      Array.from({ length: 26 }, (_, i) => String.fromCharCode(65 + i))
+        .map(async (letter) => {
+          const drive = `${letter}:\\`;
+          try {
+            await fsReaddir(drive, { withFileTypes: true });
+            return { name: drive, path: drive, isDir: true, hidden: false };
+          } catch {
+            return null;
+          }
+        }),
+    );
+    try {
+      serverLink.send({
+        type: 'fs.ls_response',
+        requestId,
+        path: rawPath,
+        resolvedPath: WINDOWS_DRIVES_ROOT,
+        status: 'ok',
+        entries: entries.filter(Boolean),
+      });
+    } catch { /* ignore */ }
+    return;
+  }
+
   let real: string;
   try {
     real = await fsRealpath(resolved);
@@ -2387,7 +2414,7 @@ async function handleFsListInner(resolved: string, rawPath: string, requestId: s
   const filtered = dirents.filter((d) => d.isDirectory() || (includeFiles && d.isFile()));
 
   const entries = await Promise.all(filtered.map(async (d) => {
-    const entry: Record<string, unknown> = { name: d.name, isDir: d.isDirectory(), hidden: d.name.startsWith('.') };
+    const entry: Record<string, unknown> = { name: d.name, path: nodePath.join(real, d.name), isDir: d.isDirectory(), hidden: d.name.startsWith('.') };
     if (includeMetadata && !d.isDirectory()) {
       try {
         const filePath = nodePath.join(real, d.name);

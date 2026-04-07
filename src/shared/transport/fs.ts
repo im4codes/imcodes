@@ -1,5 +1,7 @@
 export interface FsEntry {
   name: string;
+  /** Absolute path for this entry when the parent is a virtual root (e.g. Windows drives). */
+  path?: string;
   isDir: boolean;
   hidden: boolean;
   /** File size in bytes (only when includeMetadata requested). */

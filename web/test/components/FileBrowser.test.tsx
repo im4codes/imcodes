@@ -202,6 +202,21 @@ describe('FileBrowser', () => {
     expect(getByText('documents')).toBeDefined();
   });
 
+  it('uses entry.path from a Windows drive root listing', async () => {
+    const { ws, respond } = makeWsFactory();
+    render(
+      <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath="~" onConfirm={vi.fn()} onClose={vi.fn()} />,
+    );
+
+    act(() => respond([
+      { name: 'C:\\', path: 'C:\\', isDir: true },
+      { name: 'D:\\', path: 'D:\\', isDir: true },
+    ] as any, '__imcodes_windows_drives__'));
+
+    expect(await screen.findByText('C:\\')).toBeTruthy();
+    expect(await screen.findByText('D:\\')).toBeTruthy();
+  });
+
   it('shows error indicator on fs.ls_response with status error', async () => {
     const { ws, respondError } = makeWsFactory();
     const { getByTitle } = render(

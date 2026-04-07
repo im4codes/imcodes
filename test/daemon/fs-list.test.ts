@@ -51,6 +51,32 @@ describe('fs.ls handler', () => {
     vi.restoreAllMocks();
   });
 
+  it('lists all accessible Windows drive roots when browsing ~ on Windows', async () => {
+    const origPlatform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    mockReaddir.mockImplementation(async (dir: any) => {
+      if (dir === 'C:\\' || dir === 'D:\\') return [] as any;
+      throw new Error('ENOENT');
+    });
+
+    try {
+      handleWebCommand({ type: 'fs.ls', path: '~', requestId: 'req-win-drives' }, mockServerLink as any);
+      await flushAsync();
+      expect(sent[0]).toMatchObject({
+        type: 'fs.ls_response',
+        requestId: 'req-win-drives',
+        status: 'ok',
+        resolvedPath: '__imcodes_windows_drives__',
+      });
+      expect((sent[0] as any).entries).toEqual([
+        { name: 'C:\\', path: 'C:\\', isDir: true, hidden: false },
+        { name: 'D:\\', path: 'D:\\', isDir: true, hidden: false },
+      ]);
+    } finally {
+      Object.defineProperty(process, 'platform', { value: origPlatform });
+    }
+  });
+
   it('returns forbidden_path for denied directories like ~/.ssh', async () => {
     const denied = path.join(homedir(), '.ssh');
     mockRealpath.mockResolvedValue(denied as unknown as string);
