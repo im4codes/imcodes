@@ -2181,43 +2181,37 @@ export class WsBridge {
       }
     }
 
-    // Build display name: label(type)@mainSession — fallback label to sub-session ID
+    // Push title uses a stable 3-part shape: server · displayLabel · agentType.
+    // sessionName is the final fallback only when no label/project-style name exists.
     const label = daemonLabel || sessionRow?.label;
     const agentType = subType || sessionRow?.agent_type || String(msg.agentType ?? '');
-    const parentContext = daemonParentLabel || sessionRow?.project_name;
     const isSub = sessionName.startsWith('deck_sub_');
-
-    let displayName: string;
-    const typeSuffix = agentType ? `(${agentType})` : '';
-    if (isSub) {
-      // Prefer label, fallback to agentType, last resort raw ID
-      const name = label || agentType || sessionName.replace(/^deck_sub_/, '');
-      displayName = `${name}${label ? typeSuffix : ''}${parentContext ? `@${parentContext}` : ''}`;
-    } else {
-      const name = label || parentContext || sessionName;
-      displayName = `${name}${typeSuffix}`;
-    }
-    const agentLabel = '';
+    const mainDisplayName = sessionRow?.project_name || daemonParentLabel || sessionName;
+    const displayName = isSub
+      ? (label || sessionName)
+      : (label || mainDisplayName || sessionName);
+    const titleParts = [server.name, displayName];
+    if (agentType) titleParts.push(agentType);
     const lastText = String(msg.lastText ?? msg.message ?? '').slice(0, 200);
 
     let title: string;
     let body: string;
     switch (eventType) {
       case 'session.idle':
-        title = `${server.name} · ${displayName}${agentLabel}`;
+        title = titleParts.join(' · ');
         body = lastText || 'Task complete — ready for input';
         break;
       case 'session.notification': {
-        title = `${server.name} · ${displayName}`;
+        title = titleParts.join(' · ');
         body = String(msg.message ?? 'Notification');
         break;
       }
       case 'session.error':
-        title = `${server.name} · ${displayName}`;
+        title = titleParts.join(' · ');
         body = `Error: ${String(msg.error ?? 'unknown')}`;
         break;
       case 'ask.question':
-        title = `${server.name} · ${displayName}${agentLabel}`;
+        title = titleParts.join(' · ');
         body = lastText || 'Waiting for your answer';
         break;
       default:

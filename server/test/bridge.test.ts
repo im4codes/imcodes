@@ -1438,10 +1438,15 @@ describe('WsBridge', () => {
   describe('push notifications', () => {
     function makePushDb(tokenHash: string) {
       return {
-        queryOne: async (sql: string) => {
+        queryOne: async (sql: string, params?: unknown[]) => {
           if (sql.includes('FROM servers')) return { token_hash: tokenHash, user_id: 'user-1', name: 'my-server' };
-          if (sql.includes('FROM sessions')) return { project_name: 'codedeck', agent_type: 'claude-code', label: null };
-          return { token_hash: tokenHash };
+          if (sql.includes('FROM sessions') && params?.[1] === 'deck_cd_brain') {
+            return { project_name: 'codedeck', agent_type: 'claude-code', label: null };
+          }
+          if (sql.includes('FROM sub_sessions')) {
+            return { type: 'codex', label: 'worker-1', parent_session: 'deck_cd_brain' };
+          }
+          return null;
         },
         query: async () => [],
         execute: async () => ({ changes: 1 }),
@@ -1473,10 +1478,24 @@ describe('WsBridge', () => {
       expect(dispatchPush).toHaveBeenCalled();
       const call = vi.mocked(dispatchPush).mock.calls[0];
       const payload = call[0];
-      expect(payload.title).toContain('my-server');
-      expect(payload.title).toContain('codedeck');
-      expect(payload.title).toContain('claude-code');
+      expect(payload.title).toBe('my-server · codedeck · claude-code');
       expect(payload.body).toContain('Done implementing');
+    });
+
+    it('prefers sub-session label over session name in push title', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle',
+        session: 'deck_sub_ab12cd34',
+        lastText: 'Stopped early.',
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls[0][0];
+      expect(payload.title).toBe('my-server · worker-1 · codex');
+      expect(payload.title).not.toContain('deck_sub_ab12cd34');
     });
 
     it('uses lastText as push body for session.idle', async () => {
