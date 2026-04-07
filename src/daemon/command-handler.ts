@@ -2156,6 +2156,16 @@ async function handleDiscussionStop(cmd: Record<string, unknown>): Promise<void>
  *     sending any in-flight messages.
  */
 async function handleDaemonUpgrade(targetVersion?: string): Promise<void> {
+  const activeRuns = getActiveP2pRunsBlockingDaemonUpgrade();
+  if (activeRuns.length > 0) {
+    logger.warn({
+      targetVersion,
+      activeRunIds: activeRuns.map((run) => run.id),
+      activeRunStatuses: activeRuns.map((run) => run.status),
+    }, 'daemon.upgrade: blocked because P2P runs are active');
+    return;
+  }
+
   const { spawn } = await import('child_process');
   const { writeFileSync, mkdtempSync, existsSync } = await import('fs');
   const { join, dirname } = await import('path');
@@ -2355,6 +2365,10 @@ const FILE_SEARCH_EXCLUDES = new Set([
 ]);
 
 const FILE_SEARCH_MAX = 20;
+
+export function getActiveP2pRunsBlockingDaemonUpgrade(runs = listP2pRuns()) {
+  return runs.filter((run) => !P2P_TERMINAL_RUN_STATUSES.has(run.status));
+}
 
 async function handleFileSearch(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const query = (cmd.query as string ?? '').trim();
