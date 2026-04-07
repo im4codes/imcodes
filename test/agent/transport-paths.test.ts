@@ -89,7 +89,7 @@ describe('resolveBinaryOnWindows', () => {
     }
   });
 
-  it('prefers .CMD over extensionless Unix shim', () => {
+  it('prefers .cmd over extensionless Unix shim', () => {
     const origPlatform = process.platform;
     const origPath = process.env.PATH;
     const origPathExt = process.env.PATHEXT;
@@ -98,7 +98,10 @@ describe('resolveBinaryOnWindows', () => {
     fs.writeFileSync(path.join(tmpDir, 'tool.cmd'), '@echo off\r\necho hi\r\n');
     Object.defineProperty(process, 'platform', { value: 'win32' });
     process.env.PATH = tmpDir;
-    process.env.PATHEXT = '.COM;.EXE;.BAT;.CMD';
+    // Lowercase PATHEXT — Linux test runners are case-sensitive and the file
+    // we created above is `tool.cmd`. On real Windows the FS is
+    // case-insensitive so this works there too.
+    process.env.PATHEXT = '.com;.exe;.bat;.cmd';
     try {
       const resolved = resolveBinaryOnWindows('tool');
       expect(resolved.toLowerCase().endsWith('.cmd')).toBe(true);
@@ -127,10 +130,12 @@ describe('resolveExecutableForSpawn', () => {
   it('returns .exe paths unchanged with no prepended args', () => {
     const origPlatform = process.platform;
     const origPath = process.env.PATH;
+    const origPathExt = process.env.PATHEXT;
     const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'spawn-exe-test-'));
     fs.writeFileSync(path.join(tmpDir, 'tool.exe'), 'fake exe');
     Object.defineProperty(process, 'platform', { value: 'win32' });
     process.env.PATH = tmpDir;
+    process.env.PATHEXT = '.com;.exe;.bat;.cmd';
     try {
       const r = resolveExecutableForSpawn('tool');
       expect(r.executable.toLowerCase().endsWith('.exe')).toBe(true);
@@ -138,6 +143,7 @@ describe('resolveExecutableForSpawn', () => {
     } finally {
       Object.defineProperty(process, 'platform', { value: origPlatform });
       process.env.PATH = origPath;
+      if (origPathExt === undefined) delete process.env.PATHEXT; else process.env.PATHEXT = origPathExt;
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
@@ -145,6 +151,7 @@ describe('resolveExecutableForSpawn', () => {
   it('parses npm .cmd shim and returns (node.exe, [scriptPath])', () => {
     const origPlatform = process.platform;
     const origPath = process.env.PATH;
+    const origPathExt = process.env.PATHEXT;
     const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'spawn-shim-test-'));
     const scriptDir = path.join(tmpDir, 'node_modules', '@scope', 'pkg', 'bin');
     fs.mkdirSync(scriptDir, { recursive: true });
@@ -156,6 +163,7 @@ describe('resolveExecutableForSpawn', () => {
       'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\@scope\\pkg\\bin\\cli.js" %*\r\n');
     Object.defineProperty(process, 'platform', { value: 'win32' });
     process.env.PATH = tmpDir;
+    process.env.PATHEXT = '.com;.exe;.bat;.cmd';
     try {
       const r = resolveExecutableForSpawn('mytool');
       // executable should be node.exe (process.execPath)
@@ -166,6 +174,7 @@ describe('resolveExecutableForSpawn', () => {
     } finally {
       Object.defineProperty(process, 'platform', { value: origPlatform });
       process.env.PATH = origPath;
+      if (origPathExt === undefined) delete process.env.PATHEXT; else process.env.PATHEXT = origPathExt;
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
