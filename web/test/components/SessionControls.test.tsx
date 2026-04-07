@@ -323,8 +323,10 @@ describe('SessionControls', () => {
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
       sessionName: 'my-session',
       text: 'first combo',
+      p2pAtTargets: [
+        { session: '__all__', mode: 'config' },
+      ],
       p2pMode: 'audit>plan',
-      p2pExcludeSameType: true,
       p2pSessionConfig: {
         'my-session': { enabled: true, mode: 'audit' },
       },
@@ -342,8 +344,10 @@ describe('SessionControls', () => {
     expect(ws.sendSessionCommand).toHaveBeenLastCalledWith('send', {
       sessionName: 'my-session',
       text: 'second combo',
+      p2pAtTargets: [
+        { session: '__all__', mode: 'config' },
+      ],
       p2pMode: 'audit>plan',
-      p2pExcludeSameType: true,
       p2pSessionConfig: {
         'my-session': { enabled: true, mode: 'audit' },
       },
@@ -370,8 +374,10 @@ describe('SessionControls', () => {
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
       sessionName: 'my-session',
       text: 'direct combo',
+      p2pAtTargets: [
+        { session: '__all__', mode: 'config' },
+      ],
       p2pMode: 'audit>plan',
-      p2pExcludeSameType: true,
       p2pSessionConfig: {
         'my-session': { enabled: true, mode: 'audit' },
       },

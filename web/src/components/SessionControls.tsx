@@ -129,6 +129,16 @@ interface PendingSendPayload {
   extra: Record<string, unknown>;
 }
 
+interface BuildSendPayloadOptions {
+  modeOverride?: string;
+  syntheticAtTargets?: PendingAtTarget[];
+  syntheticConfigOverride?: {
+    config: P2pSavedConfig;
+    rounds: number;
+    modeOverride: string;
+  } | null;
+}
+
 interface PendingComboSendConfirmation {
   payload: PendingSendPayload;
   modeLabel: string;
@@ -611,15 +621,27 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (selection.config.hopTimeoutMinutes != null) extra.p2pHopTimeoutMs = Math.min(selection.config.hopTimeoutMinutes * 60_000, 600_000);
   }, [p2pSavedConfig]);
 
-  const buildSendPayload = useCallback((modeOverride?: string): PendingSendPayload | null => {
+  const buildSendPayload = useCallback((options?: string | BuildSendPayloadOptions): PendingSendPayload | null => {
+    const normalizedOptions: BuildSendPayloadOptions =
+      typeof options === 'string' ? { modeOverride: options } : (options ?? {});
     let text = getText();
-    const effectiveMode = modeOverride ?? p2pMode;
-    const allowEmptyCombo = !!modeOverride && isComboMode(modeOverride);
+    if (normalizedOptions.syntheticAtTargets && normalizedOptions.syntheticAtTargets.length > 0) {
+      const syntheticPrefix = normalizedOptions.syntheticAtTargets.map((target) => target.label).join(' ');
+      text = text ? `${syntheticPrefix} ${text}` : syntheticPrefix;
+    }
+    const effectiveMode = normalizedOptions.modeOverride ?? p2pMode;
+    const syntheticModeOverride = normalizedOptions.syntheticConfigOverride?.modeOverride;
+    const allowEmptyCombo = (
+      (!!normalizedOptions.modeOverride && isComboMode(normalizedOptions.modeOverride)) ||
+      (!!syntheticModeOverride && isComboMode(syntheticModeOverride))
+    );
     if (((!text && attachments.length === 0) && !allowEmptyCombo) || !ws || !activeSession) return null;
 
     // Build P2P routing as structured WS fields — keep text clean for display.
     const extra: Record<string, unknown> = {};
-    const pendingTargets = [...pendingAtTargetsRef.current];
+    const pendingTargets = normalizedOptions.syntheticAtTargets
+      ? [...normalizedOptions.syntheticAtTargets]
+      : [...pendingAtTargetsRef.current];
 
     if (pendingTargets.length > 0) {
       // @ picker was used — derive routing from the visible textbox order, then strip matched labels.
@@ -631,7 +653,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       // Attach config data when any target uses config mode
       const hasConfigTarget = orderedTargets.some(t => t.mode === 'config');
       if (extra.p2pAtTargets && hasConfigTarget) {
-        const override = pendingConfigOverrideRef.current;
+        const override = normalizedOptions.syntheticConfigOverride ?? pendingConfigOverrideRef.current;
         const cfg = override?.config ?? p2pSavedConfig;
         if (cfg) {
           extra.p2pSessionConfig = cfg.sessions;
@@ -792,8 +814,20 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const handleDirectComboSelect = useCallback((mode: string) => {
     setP2pOpen(false);
-    requestSend(buildSendPayload(mode), { clearComposer: true });
-  }, [buildSendPayload, requestSend]);
+    const selection = p2pSavedConfig ? buildP2pConfigSelection(p2pSavedConfig, mode) : null;
+    const payloadOptions: BuildSendPayloadOptions = selection
+      ? {
+          modeOverride: mode,
+          syntheticAtTargets: [{
+            session: '__all__',
+            mode: 'config',
+            label: selection.rounds > 1 ? `@@all(${selection.modeOverride} ×${selection.rounds})` : `@@all(${selection.modeOverride})`,
+          }],
+          syntheticConfigOverride: selection,
+        }
+      : { modeOverride: mode };
+    requestSend(buildSendPayload(payloadOptions), { clearComposer: true });
+  }, [buildSendPayload, p2pSavedConfig, requestSend]);
 
   const handleComboSendCancel = useCallback(() => {
     maybePersistComboSendSkip();

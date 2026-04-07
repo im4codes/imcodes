@@ -525,7 +525,7 @@ export function FileBrowser({
     timersRef.current.set(requestId, timer);
   }, [ws, includeFiles, t]);
 
-  const fetchPreview = useCallback((filePath: string) => {
+  const fetchPreview = useCallback((filePath: string, preferDiff = false) => {
     if (onPreviewFile) { onPreviewFile(filePath); return; }
     if (editDirtyRef.current) {
       if (!window.confirm(t('fileBrowser.unsavedChanges'))) return;
@@ -535,7 +535,7 @@ export function FileBrowser({
     setOriginalMtime(undefined);
     setIsEditing(() => { try { return localStorage.getItem(PREF_KEY) === '1'; } catch { return false; } });
     setPreview({ status: 'loading', path: filePath });
-    setShowDiff(false);
+    setShowDiff(preferDiff);
     const requestId = ws.fsReadFile(filePath);
     pendingReadRef.current.set(requestId, filePath);
     const diffId = ws.fsGitDiff(filePath);
@@ -959,7 +959,7 @@ export function FileBrowser({
                 <div
                   key={f.path}
                   class={`fb-changes-item${previewPath === f.path ? ' active' : ''}`}
-                  onClick={() => fetchPreview(f.path)}
+                  onClick={() => fetchPreview(f.path, true)}
                   title={f.path}
                 >
                   <span class="fb-changes-item-badge">{f.code === '??' ? 'U' : f.code}</span>
