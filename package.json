@@ -30,7 +30,7 @@
     "test:web": "vitest run --project web",
     "test:e2e": "vitest run --project e2e",
     "test:integration": "vitest run --workspace vitest.integration.config.ts",
-    "test:coverage": "vitest run --coverage && node scripts/write-coverage-summary.mjs",
+    "test:coverage": "vitest run --coverage --no-file-parallelism --maxWorkers 1 --testTimeout 60000 --hookTimeout 60000 && node scripts/write-coverage-summary.mjs",
     "test:watch": "vitest",
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit",

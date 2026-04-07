@@ -48,6 +48,27 @@ describe('StartSubSessionDialog', () => {
     expect(screen.getByRole('button', { name: /codex_sdk/i })).toBeDefined();
   });
 
+  it('defaults to claude-code-sdk and keeps sdk options on the left', () => {
+    const { container } = render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const activeBtn = container.querySelector('.subsession-type-btn.active') as HTMLButtonElement | null;
+    expect(activeBtn?.textContent).toMatch(/claude_code_sdk/i);
+
+    const typeButtons = Array.from(container.querySelectorAll('.subsession-type-btn')).map((el) => el.textContent ?? '');
+    expect(typeButtons.indexOf('⚡ claude_code_sdk')).toBeLessThan(typeButtons.indexOf('⚡ Claude Code'));
+    expect(typeButtons.indexOf('📦 codex_sdk')).toBeLessThan(typeButtons.indexOf('📦 Codex'));
+  });
+
   it('defaults level to high for supported transports', () => {
     render(
       <StartSubSessionDialog

@@ -20,10 +20,10 @@ interface Props {
 }
 
 const BASE_AGENT_TYPES = [
-  { id: 'claude-code', label: 'Claude Code', icon: '⚡' },
   { id: 'claude-code-sdk', label: 'Claude Code SDK', icon: '⚡' },
-  { id: 'codex', label: 'Codex', icon: '📦' },
+  { id: 'claude-code', label: 'Claude Code', icon: '⚡' },
   { id: 'codex-sdk', label: 'Codex SDK', icon: '📦' },
+  { id: 'codex', label: 'Codex', icon: '📦' },
   { id: 'opencode', label: 'OpenCode', icon: '🔆' },
   { id: 'gemini', label: 'Gemini CLI', icon: '♊' },
   { id: 'qwen', label: 'Qwen Code', icon: '千' },
@@ -37,7 +37,7 @@ type OpenClawMode = 'new' | 'bind';
 
 export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _isProviderConnected, getRemoteSessions, refreshSessions, onStart, onClose }: Props) {
   const { t } = useTranslation();
-  const [type, setType] = useState('claude-code');
+  const [type, setType] = useState('claude-code-sdk');
   const [shells, setShells] = useState<string[]>([]);
   const [shellBin, setShellBin] = useState<string>('/bin/bash');
   const [cwd, setCwd] = useState(defaultCwd ?? '');
