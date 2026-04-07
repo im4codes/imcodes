@@ -1138,10 +1138,39 @@ body {
 .discussions-markdown strong { color: #f1f5f9; }
 .discussions-markdown a { color: #60a5fa; text-decoration: none; }
 .discussions-markdown a:hover { text-decoration: underline; }
-.discussions-detail { flex: 1; overflow-y: auto; display: flex; flex-direction: column; }
-.discussions-nav-row { display: none; align-items: center; gap: 8px; padding: 8px 16px 0; flex-shrink: 0; }
-@media (max-width: 768px) { .discussions-nav-row { display: flex; } }
+.discussions-detail { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.discussions-detail-scroll { flex: 1; min-height: 0; overflow-y: auto; }
+.discussions-nav-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  flex-shrink: 0;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: linear-gradient(180deg, rgba(10, 14, 26, 0.98), rgba(10, 14, 26, 0.94));
+  border-bottom: 1px solid rgba(30, 41, 59, 0.9);
+}
 .discussions-back-btn { background: none; border: none; color: #3b82f6; cursor: pointer; padding: 0; font-size: 14px; line-height: 1.2; text-align: left; }
+@media (min-width: 769px) { .discussions-back-btn { display: none; } }
+.discussions-follow-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin-right: auto;
+  color: #cbd5e1;
+  font-size: 13px;
+  user-select: none;
+}
+.discussions-follow-toggle input {
+  margin: 0;
+  accent-color: #38bdf8;
+}
+.discussions-follow-toggle span {
+  white-space: nowrap;
+}
 .discussions-scroll-btn { background: none; border: 1px solid #334155; color: #94a3b8; cursor: pointer; border-radius: 4px; width: 28px; height: 28px; font-size: 14px; display: flex; align-items: center; justify-content: center; padding: 0; flex-shrink: 0; }
 .discussions-scroll-btn:active { background: #334155; color: #e2e8f0; }
 .discussions-detail-header { padding: 16px; border-bottom: 1px solid #1e293b; }
@@ -1169,8 +1198,9 @@ body {
   /* When a discussion is selected on mobile, detail goes full-screen over the list */
   .discussions-layout .discussions-detail-fullscreen {
     position: absolute; inset: 0; z-index: 10; background: #0a0e1a;
-    display: flex; flex-direction: column; overflow-y: auto;
+    display: flex; flex-direction: column;
   }
+  .discussions-follow-toggle span { white-space: normal; line-height: 1.2; }
 }
 
 /* AskQuestionDialog */

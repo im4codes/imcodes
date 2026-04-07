@@ -356,6 +356,7 @@
       "phase_queued": "В очереди",
       "round_label": "Раунд",
       "hop_label": "Шаг",
+      "auto_follow_latest": "Автопрокрутка к последнему",
       "scroll_top": "Прокрутить вверх",
       "scroll_bottom": "Прокрутить вниз"
     },

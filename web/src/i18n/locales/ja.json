@@ -356,6 +356,7 @@
       "phase_queued": "待機中",
       "round_label": "ラウンド",
       "hop_label": "ホップ",
+      "auto_follow_latest": "最新に自動追従",
       "scroll_top": "先頭へスクロール",
       "scroll_bottom": "末尾へスクロール"
     },

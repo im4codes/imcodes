@@ -356,6 +356,7 @@
       "phase_queued": "排队中",
       "round_label": "轮次",
       "hop_label": "跳转",
+      "auto_follow_latest": "自动跟随最新",
       "scroll_top": "滚动到顶部",
       "scroll_bottom": "滚动到底部"
     },

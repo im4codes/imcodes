@@ -30,10 +30,21 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
   const [discussions, setDiscussions] = useState<P2pDiscussion[]>([]);
   const [selected, setSelected] = useState<string | null>(initialSelectedId ?? null);
   const [content, setContent] = useState<string | null>(null);
+  const [autoFollow, setAutoFollow] = useState(true);
   const [loading, setLoading] = useState(true);
   // Track which id we last requested, to prevent stale response overwriting current selection
   const pendingReadIdRef = useRef<string | null>(null);
-  const detailRef = useRef<HTMLDivElement>(null);
+  const detailScrollRef = useRef<HTMLDivElement>(null);
+
+  const scrollDetailToTop = useCallback((behavior: ScrollBehavior = 'smooth') => {
+    detailScrollRef.current?.scrollTo({ top: 0, behavior });
+  }, []);
+
+  const scrollDetailToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
+    const el = detailScrollRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior });
+  }, []);
 
   const loadList = useCallback(() => {
     if (!ws) return;
@@ -46,6 +57,7 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
   const selectDiscussion = useCallback((id: string) => {
     setSelected(id);
     setContent(null);
+    setAutoFollow(true);
     pendingReadIdRef.current = id;
     ws?.send({ type: 'p2p.read_discussion', id });
   }, [ws]);
@@ -119,6 +131,13 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
     });
   }, [ws, selected, loadList]);
 
+  useEffect(() => {
+    if (!selected || content === null || !autoFollow) return;
+    requestAnimationFrame(() => {
+      scrollDetailToBottom(content.length > 4000 ? 'auto' : 'smooth');
+    });
+  }, [selected, content, autoFollow, scrollDetailToBottom]);
+
   const formatTime = (ts: number) => new Date(ts).toLocaleString();
 
   // Find matching live discussion for progress display
@@ -186,43 +205,59 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
           ))}
         </div>
 
-        <div ref={detailRef} class={`discussions-detail${selected ? ' discussions-detail-fullscreen' : ''}`}>
-          {!selected && (
-            <div class="discussions-empty">{t('p2p.discussions.select')}</div>
-          )}
+        <div class={`discussions-detail${selected ? ' discussions-detail-fullscreen' : ''}`}>
           {selected && (
             <div class="discussions-nav-row">
               <button
                 class="discussions-back-btn"
-                onClick={() => { setSelected(null); setContent(null); }}
+                onClick={() => { setSelected(null); setContent(null); setAutoFollow(true); }}
               >
                 ← {t('p2p.picker.back')}
               </button>
+              <label class="discussions-follow-toggle">
+                <input
+                  type="checkbox"
+                  checked={autoFollow}
+                  onChange={(e) => setAutoFollow((e.target as HTMLInputElement).checked)}
+                />
+                <span>{t('p2p.discussions.auto_follow_latest')}</span>
+              </label>
               <button
                 class="discussions-scroll-btn"
-                onClick={() => detailRef.current?.scrollTo({ top: 0, behavior: 'smooth' })}
+                onClick={() => {
+                  setAutoFollow(false);
+                  scrollDetailToTop();
+                }}
                 title={t('p2p.discussions.scroll_top')}
               >
                 ↑
               </button>
               <button
                 class="discussions-scroll-btn"
-                onClick={() => detailRef.current?.scrollTo({ top: detailRef.current.scrollHeight, behavior: 'smooth' })}
+                onClick={() => {
+                  setAutoFollow(true);
+                  scrollDetailToBottom();
+                }}
                 title={t('p2p.discussions.scroll_bottom')}
               >
                 ↓
               </button>
             </div>
           )}
-          {selected && content === null && (
-            <div class="discussions-empty">{t('common.loading')}</div>
-          )}
-          {selected && content !== null && (
-            <div
-              class="discussions-markdown"
-              dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
-            />
-          )}
+          <div ref={detailScrollRef} class="discussions-detail-scroll">
+            {!selected && (
+              <div class="discussions-empty">{t('p2p.discussions.select')}</div>
+            )}
+            {selected && content === null && (
+              <div class="discussions-empty">{t('common.loading')}</div>
+            )}
+            {selected && content !== null && (
+              <div
+                class="discussions-markdown"
+                dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
+              />
+            )}
+          </div>
         </div>
       </div>
     </div>
