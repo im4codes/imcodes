@@ -28,6 +28,7 @@ export type ServerMessage =
   | { type: 'session.tool'; session: string; tool: string | null }
   | { type: 'daemon.reconnected' }
   | { type: 'daemon.disconnected' }
+  | { type: 'daemon.error'; kind: 'uncaughtException' | 'unhandledRejection' | 'warning'; message: string; stack?: string; ts: number }
   | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel }> }
   | { type: 'outbound'; platform: string; channelId: string; content: string }
   | { type: 'timeline.event'; event: TimelineEvent }

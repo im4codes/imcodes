@@ -1393,6 +1393,22 @@ export function App() {
         setDaemonOnline(false);
         watchProjectionStore.setSnapshotStatus('stale');
       }
+      if (msg.type === 'daemon.error') {
+        // Surface uncaught daemon errors as a toast so users aren't left in the dark.
+        const id = Date.now() + Math.random();
+        setToasts((prev) => [...prev, {
+          id,
+          sessionName: '',
+          project: '',
+          kind: 'notification',
+          title: 'Daemon error',
+          message: msg.message,
+        }]);
+        // eslint-disable-next-line no-console
+        console.error('[daemon.error]', msg.kind, msg.message, msg.stack);
+        // Auto-dismiss after 10 seconds
+        setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 10_000);
+      }
       if (msg.type === 'daemon.reconnected') {
         setDaemonOnline(true);
         // Daemon process (re)started — all its subscriptions are gone.

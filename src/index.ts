@@ -10,16 +10,47 @@
 // handlers; structured logging is fine to skip — what matters is that the
 // process does NOT exit.
 /* eslint-disable no-console */
+
+/**
+ * Forward an error to all connected browsers via the global ServerLink.
+ * Falls back to console-only when the link isn't ready yet.  This is the
+ * single channel for surfacing uncaught daemon errors to end users so they
+ * are never left wondering "why isn't anything working?".
+ */
+function forwardDaemonError(kind: 'uncaughtException' | 'unhandledRejection' | 'warning', err: unknown): void {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const link = (globalThis as any).__imcodesGlobalServerLink as { send: (msg: unknown) => void } | undefined;
+  if (!link) return;
+  try {
+    const message = err instanceof Error
+      ? err.message
+      : (err && typeof err === 'object' && 'message' in err ? String((err as { message: unknown }).message) : String(err));
+    const stack = err instanceof Error ? err.stack : undefined;
+    link.send({
+      type: 'daemon.error',
+      kind,
+      message,
+      stack,
+      ts: Date.now(),
+    });
+  } catch {
+    // ServerLink not connected — only console will show this error
+  }
+}
+
 process.on('uncaughtException', (err) => {
   console.error('[imcodes-daemon] UNCAUGHT EXCEPTION (daemon stays alive):', err && (err.stack ?? err));
+  forwardDaemonError('uncaughtException', err);
 });
 process.on('unhandledRejection', (reason) => {
   console.error('[imcodes-daemon] UNHANDLED REJECTION (daemon stays alive):', reason);
+  forwardDaemonError('unhandledRejection', reason);
 });
 // Also catch warnings — node-pty sometimes emits MaxListenersExceededWarning
 // which we want to log but not crash on.
 process.on('warning', (warning) => {
   console.warn('[imcodes-daemon] warning:', warning.name, warning.message);
+  // Don't forward warnings — too noisy.
 });
 /* eslint-enable no-console */
 
