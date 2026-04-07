@@ -23,12 +23,13 @@ import { P2pConfigPanel } from '../../src/components/P2pConfigPanel.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 
 const sessions = [
-  { name: 'deck_proj_brain', agentType: 'claude-code', state: 'running' },
+  { name: 'deck_proj_brain', agentType: 'claude-code-sdk', state: 'running' },
   { name: 'deck_proj_w1', agentType: 'codex', state: 'idle' },
 ];
 
 const subSessions = [
-  { sessionName: 'deck_sub_abc', type: 'gemini', label: 'worker', state: 'running' },
+  { sessionName: 'deck_sub_abc', type: 'qwen', label: 'worker', state: 'running', parentSession: 'deck_proj_brain' },
+  { sessionName: 'deck_sub_cli', type: 'codex', label: 'reviewer', state: 'running', parentSession: 'deck_proj_brain' },
   { sessionName: 'deck_sub_def', type: 'shell', label: null, state: 'idle' },
 ];
 
@@ -73,7 +74,7 @@ describe('P2pConfigPanel', () => {
   it('renders session list excluding shell and script types', async () => {
     renderPanel({
       sessions: [
-        { name: 'deck_proj_brain', agentType: 'claude-code', state: 'running' },
+        { name: 'deck_proj_brain', agentType: 'claude-code-sdk', state: 'running' },
         { name: 'deck_proj_w1', agentType: 'shell', state: 'idle' },
         { name: 'deck_proj_w2', agentType: 'script', state: 'idle' },
       ],
@@ -222,11 +223,9 @@ describe('P2pConfigPanel', () => {
     await flush();
 
     // Checkboxes should all be unchecked (enabled=false by default for new sessions)
-    // First checkbox is the cross-session toggle — skip it
     const checkboxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
-    const sessionCheckboxes = checkboxes.slice(1); // skip cross-session toggle
-    expect(sessionCheckboxes.length).toBeGreaterThan(0);
-    for (const cb of sessionCheckboxes) {
+    expect(checkboxes.length).toBeGreaterThan(0);
+    for (const cb of checkboxes) {
       expect(cb.checked).toBe(false);
     }
 
@@ -245,13 +244,12 @@ describe('P2pConfigPanel', () => {
     await flush();
 
     const checkboxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
-    // First checkbox is cross-session toggle, session checkboxes start at index 1
     // New sessions default to unchecked (enabled=false)
-    expect(checkboxes[1].checked).toBe(false);
+    expect(checkboxes[0].checked).toBe(false);
 
     // Check the first session (toggle from disabled to enabled)
-    fireEvent.click(checkboxes[1]);
-    expect(checkboxes[1].checked).toBe(true);
+    fireEvent.click(checkboxes[0]);
+    expect(checkboxes[0].checked).toBe(true);
 
     const saveBtn = screen.getByText('settings_save');
     await act(async () => {
@@ -360,6 +358,42 @@ describe('P2pConfigPanel', () => {
     const roundBtns = screen.getAllByRole('button').filter(b => b.textContent === '2');
     expect(roundBtns.length).toBeGreaterThan(0);
   });
+
+  it('shows sdk sessions by default and switches to cli sessions on demand', async () => {
+    renderPanel();
+    await flush();
+
+    expect(screen.getByText('brain')).toBeDefined();
+    expect(screen.getByText('worker')).toBeDefined();
+    expect(screen.queryByText('reviewer')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'CLI' }));
+
+    expect(screen.getByText('reviewer')).toBeDefined();
+    expect(screen.queryByText('brain')).toBeNull();
+    expect(screen.queryByText('worker')).toBeNull();
+  });
+
+  it('preserves hidden sdk entries when saving from the cli filter', async () => {
+    const onSave = vi.fn();
+    renderPanel({ onSave });
+    await flush();
+
+    fireEvent.click(screen.getAllByRole('checkbox')[0]);
+    fireEvent.click(screen.getByRole('button', { name: 'CLI' }));
+    fireEvent.click(screen.getAllByRole('checkbox')[0]);
+    await act(async () => {
+      fireEvent.click(screen.getByText('settings_save'));
+    });
+    await flush();
+
+    const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
+    expect(cfg.sessions['deck_proj_brain']).toBeDefined();
+    expect(cfg.sessions['deck_proj_brain'].enabled).toBe(true);
+    expect(cfg.sessions['deck_sub_cli']).toBeDefined();
+    expect(cfg.sessions['deck_sub_cli'].enabled).toBe(true);
+    expect(cfg.sessions['deck_sub_abc']).toBeDefined();
+  }, 15_000);
 
   it('manages shared custom combos from the combo tab', async () => {
     getUserPrefMock.mockImplementation(async (key: string) => {

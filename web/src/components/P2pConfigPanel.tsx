@@ -35,6 +35,12 @@ interface Props {
 const EXCLUDED_TYPES = new Set(['shell', 'script']);
 const SESSION_MODES = ['audit', 'review', 'plan', 'brainstorm', 'discuss', 'skip'] as const;
 const ROUND_OPTIONS = [1, 2, 3, 5] as const;
+type AgentFlavorFilter = 'sdk' | 'cli';
+
+function getAgentFlavor(agentType: string): AgentFlavorFilter {
+  if (agentType === 'claude-code' || agentType === 'codex' || agentType === 'gemini' || agentType === 'opencode') return 'cli';
+  return 'sdk';
+}
 
 const headerStyle: Record<string, string | number> = {
   display: 'flex',
@@ -191,7 +197,7 @@ const btnPrimaryStyle: Record<string, string | number> = {
 
 export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, onSave }: Props) {
   const { t } = useTranslation();
-  const [crossSession, setCrossSession] = useState(false);
+  const [agentFlavorFilter, setAgentFlavorFilter] = useState<AgentFlavorFilter>('sdk');
   const [activeTab, setActiveTab] = useState<'participants' | 'combos'>('participants');
   const { customCombos, saveCustomCombos } = useP2pCustomCombos();
   const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' && window.innerWidth < 768);
@@ -207,28 +213,28 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
     return activeSession;
   })();
 
-  const eligible: Array<{ key: string; shortName: string; agentType: string }> = [];
+  const allEligible: Array<{ key: string; shortName: string; agentType: string; flavor: AgentFlavorFilter }> = [];
   const seen = new Set<string>();
 
   for (const s of sessions) {
     if (EXCLUDED_TYPES.has(s.agentType)) continue;
-    // When not cross-session, only show the scoped main session
-    if (!crossSession && scopeSession && s.name !== scopeSession) continue;
+    if (scopeSession && s.name !== scopeSession) continue;
     if (seen.has(s.name)) continue;
     seen.add(s.name);
     const shortName = s.name.split('_').pop() || s.name;
-    eligible.push({ key: s.name, shortName, agentType: s.agentType });
+    allEligible.push({ key: s.name, shortName, agentType: s.agentType, flavor: getAgentFlavor(s.agentType) });
   }
 
   for (const s of subSessions) {
     if (EXCLUDED_TYPES.has(s.type)) continue;
-    // When not cross-session, only show sub-sessions under the scoped main session
-    if (!crossSession && scopeSession && s.parentSession && s.parentSession !== scopeSession) continue;
+    if (scopeSession && s.parentSession && s.parentSession !== scopeSession) continue;
     if (seen.has(s.sessionName)) continue;
     seen.add(s.sessionName);
     const shortName = s.label || s.sessionName;
-    eligible.push({ key: s.sessionName, shortName, agentType: s.type });
+    allEligible.push({ key: s.sessionName, shortName, agentType: s.type, flavor: getAgentFlavor(s.type) });
   }
+
+  const visibleEligible = allEligible.filter((entry) => entry.flavor === agentFlavorFilter);
 
   // Local config state: per-session enabled + mode
   const [sessionCfg, setSessionCfg] = useState<P2pSessionConfig>({});
@@ -296,7 +302,7 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
     // Only keep entries for currently eligible sessions — drop stale entries
     // from old/closed sessions or other daemons to prevent config rot.
     const merged: P2pSessionConfig = {};
-    for (const e of eligible) {
+    for (const e of allEligible) {
       merged[e.key] = sessionCfg[e.key] ?? { enabled: false, mode: 'audit' };
     }
     const cfg: P2pSavedConfig = { sessions: merged, rounds, hopTimeoutMinutes, extraPrompt: extraPrompt.trim() || undefined };
@@ -314,10 +320,10 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
     inset: 0,
     background: 'rgba(0,0,0,0.6)',
     display: 'flex',
-    alignItems: 'center',
+    alignItems: isMobile ? 'flex-start' : 'center',
     justifyContent: 'center',
     zIndex: 9999,
-    padding: isMobile ? 0 : 16,
+    padding: isMobile ? 'calc(env(safe-area-inset-top, 0px) + 12px) 0 0' : 16,
   };
   const panelStyle: Record<string, string | number> = {
     background: '#1e293b',
@@ -325,8 +331,8 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
     borderRadius: isMobile ? 0 : 10,
     width: isMobile ? '100vw' : 'min(780px, calc(100vw - 32px))',
     maxWidth: isMobile ? '100vw' : 780,
-    height: isMobile ? '100vh' : 'auto',
-    maxHeight: isMobile ? '100vh' : '90vh',
+    height: isMobile ? 'calc(100vh - env(safe-area-inset-top, 0px) - 12px)' : 'auto',
+    maxHeight: isMobile ? 'calc(100vh - env(safe-area-inset-top, 0px) - 12px)' : '90vh',
     display: 'flex',
     flexDirection: 'column',
     boxShadow: isMobile ? 'none' : '0 8px 32px rgba(0,0,0,0.5)',
@@ -357,25 +363,32 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
           ) : (
             activeTab === 'participants' ? (
               <>
-                <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: '#94a3b8', cursor: 'pointer', marginBottom: 4 }}>
-                  <input
-                    type="checkbox"
-                    style={checkboxStyle}
-                    checked={crossSession}
-                    onChange={() => setCrossSession((v) => !v)}
-                  />
-                  {t('p2p.cross_session')}
-                </label>
+                <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+                  <button
+                    type="button"
+                    style={tabStyle(agentFlavorFilter === 'sdk')}
+                    onClick={() => setAgentFlavorFilter('sdk')}
+                  >
+                    {t('p2p.settings_filter_sdk', 'SDK')}
+                  </button>
+                  <button
+                    type="button"
+                    style={tabStyle(agentFlavorFilter === 'cli')}
+                    onClick={() => setAgentFlavorFilter('cli')}
+                  >
+                    {t('p2p.settings_filter_cli', 'CLI')}
+                  </button>
+                </div>
 
                 <div style={sectionCardStyle}>
                   <div style={{ ...sectionLabelStyle, marginTop: 0 }}>{t('p2p.picker.agents')}</div>
-                  {eligible.length === 0 && (
+                  {visibleEligible.length === 0 && (
                     <div style={{ color: '#64748b', fontSize: 13, padding: '8px 0' }}>
                       {t('p2p.picker.no_agents_available')}
                     </div>
                   )}
                   <div style={agentGridStyle(isMobile)}>
-                  {eligible.map((e) => {
+                  {visibleEligible.map((e) => {
                     const entry = getEntry(e.key);
                     return (
                       <div key={e.key} style={{ ...rowStyle, opacity: entry.enabled ? 1 : 0.6 }}>

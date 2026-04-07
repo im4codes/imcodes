@@ -396,6 +396,8 @@
     "settings_button": "P2P 설정",
     "settings_title": "P2P 참가자 설정",
     "cross_session": "다른 프로젝트의 세션 포함",
+    "settings_filter_sdk": "SDK",
+    "settings_filter_cli": "CLI",
     "settings_save": "저장",
     "settings_close": "닫기",
     "confirm_cancel": "취소하시겠습니까?",

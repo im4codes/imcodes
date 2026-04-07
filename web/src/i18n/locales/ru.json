@@ -396,6 +396,8 @@
     "settings_button": "Настройки P2P",
     "settings_title": "Настройки участников P2P",
     "cross_session": "Включить сессии из других проектов",
+    "settings_filter_sdk": "SDK",
+    "settings_filter_cli": "CLI",
     "settings_save": "Сохранить",
     "settings_close": "Закрыть",
     "confirm_cancel": "Точно отменить?",

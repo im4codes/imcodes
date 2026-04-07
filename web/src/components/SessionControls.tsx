@@ -597,9 +597,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return { orderedTargets, cleanText };
   };
 
-  const buildSendPayload = useCallback((): PendingSendPayload | null => {
+  const buildSendPayload = useCallback((modeOverride?: string): PendingSendPayload | null => {
     let text = getText();
-    if ((!text && attachments.length === 0) || !ws || !activeSession) return null;
+    const effectiveMode = modeOverride ?? p2pMode;
+    const allowEmptyCombo = !!modeOverride && isComboMode(modeOverride);
+    if (((!text && attachments.length === 0) && !allowEmptyCombo) || !ws || !activeSession) return null;
 
     // Build P2P routing as structured WS fields — keep text clean for display.
     const extra: Record<string, unknown> = {};
@@ -633,15 +635,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (manual.orderedTargets.length > 0) {
         text = manual.cleanText;
         extra.p2pAtTargets = manual.orderedTargets;
-      } else if (p2pMode !== 'solo' && !text.includes('@@')) {
+      } else if (effectiveMode !== 'solo' && !text.includes('@@')) {
         // Dropdown P2P mode — daemon handles expansion
-        if (p2pMode === P2P_CONFIG_MODE) {
+        if (effectiveMode === P2P_CONFIG_MODE) {
           extra.p2pMode = 'config';
         } else {
-          extra.p2pMode = p2pMode;
+          extra.p2pMode = effectiveMode;
           if (p2pExcludeSameType) extra.p2pExcludeSameType = true;
         }
-        if (p2pMode === P2P_CONFIG_MODE && p2pSavedConfig) {
+        if (effectiveMode === P2P_CONFIG_MODE && p2pSavedConfig) {
           extra.p2pSessionConfig = p2pSavedConfig.sessions;
           extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
           if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
@@ -668,9 +670,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return { text, extra };
   }, [attachments, activeSession, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, sessions, subSessions, ws]);
 
-  const buildModeOnlySendPayload = useCallback((rawText: string): PendingSendPayload | null => {
+  const buildModeOnlySendPayload = useCallback((rawText: string, modeOverride?: string): PendingSendPayload | null => {
     const text = rawText.trim();
-    if (!text || !ws || !activeSession) return null;
+    const effectiveMode = modeOverride ?? p2pMode;
+    const allowEmptyCombo = !!modeOverride && isComboMode(modeOverride);
+    if ((!text && !allowEmptyCombo) || !ws || !activeSession) return null;
 
     const extra: Record<string, unknown> = {};
     const manual = extractManualP2pTargets(text, buildManualP2pCandidates(sessions, subSessions));
@@ -678,10 +682,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
     if (manual.orderedTargets.length > 0) {
       extra.p2pAtTargets = manual.orderedTargets;
-    } else if (p2pMode !== 'solo' && !text.includes('@@')) {
-      extra.p2pMode = p2pMode === P2P_CONFIG_MODE ? 'config' : p2pMode;
-      if (p2pExcludeSameType && p2pMode !== P2P_CONFIG_MODE) extra.p2pExcludeSameType = true;
-      if (p2pMode === P2P_CONFIG_MODE && p2pSavedConfig) {
+    } else if (effectiveMode !== 'solo' && !text.includes('@@')) {
+      extra.p2pMode = effectiveMode === P2P_CONFIG_MODE ? 'config' : effectiveMode;
+      if (p2pExcludeSameType && effectiveMode !== P2P_CONFIG_MODE) extra.p2pExcludeSameType = true;
+      if (effectiveMode === P2P_CONFIG_MODE && p2pSavedConfig) {
         extra.p2pSessionConfig = p2pSavedConfig.sessions;
         extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
         if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
@@ -780,6 +784,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const handleSend = useCallback(() => {
     requestSend(buildSendPayload(), { clearComposer: true });
+  }, [buildSendPayload, requestSend]);
+
+  const handleDirectComboSelect = useCallback((mode: string) => {
+    setP2pOpen(false);
+    requestSend(buildSendPayload(mode), { clearComposer: true });
   }, [buildSendPayload, requestSend]);
 
   const handleComboSendCancel = useCallback(() => {
@@ -1243,17 +1252,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               {comboMenuItems.map((key) => (
                 <button
                   key={key}
-                  class={`menu-item ${p2pMode === key ? 'menu-item-active' : ''}`}
+                  class="menu-item"
                   onClick={() => {
                     if (!hasConfiguredP2pParticipants) return;
-                    setP2pMode(key);
-                    setP2pOpen(false);
+                    handleDirectComboSelect(key);
                   }}
                   disabled={!hasConfiguredP2pParticipants}
                   title={!hasConfiguredP2pParticipants ? t('p2p.combo_requires_participants_hint') : undefined}
                   style={{ color: getP2pModeColor(key), fontSize: 12, opacity: hasConfiguredP2pParticipants ? 1 : 0.45, cursor: hasConfiguredP2pParticipants ? 'pointer' : 'not-allowed' }}
                 >
-                  {p2pMode === key ? '● ' : '○ '}{getP2pModeLabel(key, t)}
+                  ○ {getP2pModeLabel(key, t)}
                 </button>
               ))}
               {p2pMode !== 'solo' && (

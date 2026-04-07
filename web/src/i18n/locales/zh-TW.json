@@ -396,6 +396,8 @@
     "settings_button": "P2P設定",
     "settings_title": "P2P 參與者設定",
     "cross_session": "包含其他專案的工作階段",
+    "settings_filter_sdk": "SDK",
+    "settings_filter_cli": "CLI",
     "settings_save": "儲存",
     "settings_close": "關閉",
     "confirm_cancel": "確定取消?",

@@ -189,29 +189,31 @@ describe('SessionControls', () => {
     });
   });
 
-  it('keeps the send button label unchanged after selecting a combo mode', async () => {
+  it('keeps the p2p button in solo mode after triggering a combo from the dropdown', async () => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
     await flushAsync();
-
-    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
-    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
-
-    expect(screen.getByRole('button', { name: /^send$/i })).toBeDefined();
-    expect(screen.getByRole('button', { name: /mode_audit→mode_plan/i })).toBeDefined();
-  });
-
-  it('asks for confirmation before directly sending a selected combo mode', async () => {
-    const ws = makeWs();
-    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
-    await flushAsync();
-
-    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
-    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
 
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'run combo';
     fireEvent.input(input);
-    fireEvent.click(screen.getByRole('button', { name: /^send$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+
+    expect(screen.getByText('combo_send_confirm_title')).toBeDefined();
+    expect(screen.getAllByRole('button', { name: /^send$/i }).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByRole('button', { name: /mode_solo/i })).toBeDefined();
+  });
+
+  it('asks for confirmation before directly sending from a combo dropdown item', async () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    await flushAsync();
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'run combo';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
 
     expect(screen.getByText('combo_send_confirm_title')).toBeDefined();
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
@@ -219,7 +221,7 @@ describe('SessionControls', () => {
     fireEvent.click(screen.getByRole('button', { name: /^cancel$/i }));
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: /^send$/i })).toBeDefined();
-    expect(screen.getByText(/P2P:mode_audit→mode_plan/i)).toBeDefined();
+    expect(screen.getByRole('button', { name: /mode_solo/i })).toBeDefined();
   });
 
   it('blocks combo sends that only contain routing markup and shows a warning', () => {
@@ -303,18 +305,16 @@ describe('SessionControls', () => {
     expect(screen.getAllByText(/mode_brainstorm→mode_review/i).length).toBeGreaterThanOrEqual(1);
   });
 
-  it('remembers skipping combo confirmation across later sends', async () => {
+  it('remembers skipping combo confirmation across later dropdown combo sends', async () => {
     const ws = makeWs();
     render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
     await flushAsync();
 
-    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
-    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
-
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'first combo';
     fireEvent.input(input);
-    fireEvent.click(screen.getByRole('button', { name: /^send$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
 
     const dialog = screen.getByText('combo_send_confirm_title').closest('.dialog') as HTMLElement;
     fireEvent.click(within(dialog).getByRole('checkbox'));
@@ -331,7 +331,8 @@ describe('SessionControls', () => {
 
     input.textContent = 'second combo';
     fireEvent.input(input);
-    fireEvent.click(screen.getByRole('button', { name: /^send$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
 
     expect(screen.queryByText('combo_send_confirm_title')).toBeNull();
     expect(ws.sendSessionCommand).toHaveBeenLastCalledWith('send', {
@@ -343,48 +344,24 @@ describe('SessionControls', () => {
     });
   });
 
-  it('routes quick panel sends through the same combo confirmation flow', async () => {
+  it('clicking a combo dropdown item sends immediately once confirmation is accepted', async () => {
     const ws = makeWs();
     render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
     await flushAsync();
 
-    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
-    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
-    fireEvent.click(screen.getByTitle('title'));
-    fireEvent.click(screen.getByText('quick-panel-send'));
-
-    expect(screen.getByText('combo_send_confirm_title')).toBeDefined();
-    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
-
-    const dialog = screen.getByText('combo_send_confirm_title').closest('.dialog') as HTMLElement;
-    fireEvent.click(within(dialog).getByRole('button', { name: /^send$/i }));
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
-      sessionName: 'my-session',
-      text: 'quick combo message',
-      p2pMode: 'audit>plan',
-      p2pExcludeSameType: true,
-      p2pLocale: 'en',
-    });
-  });
-
-  it('routes voice sends through the same combo confirmation flow', async () => {
-    const ws = makeWs();
-    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
-    await flushAsync();
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'direct combo';
+    fireEvent.input(input);
 
     fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
     fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
-    fireEvent.click(screen.getByTitle('voice_input'));
-    fireEvent.click(screen.getByText('voice-overlay-send'));
-
-    expect(screen.getByText('combo_send_confirm_title')).toBeDefined();
-    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
 
     const dialog = screen.getByText('combo_send_confirm_title').closest('.dialog') as HTMLElement;
     fireEvent.click(within(dialog).getByRole('button', { name: /^send$/i }));
+
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
       sessionName: 'my-session',
-      text: 'voice combo message',
+      text: 'direct combo',
       p2pMode: 'audit>plan',
       p2pExcludeSameType: true,
       p2pLocale: 'en',

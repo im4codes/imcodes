@@ -396,6 +396,8 @@
     "settings_button": "Ajustes P2P",
     "settings_title": "Ajustes de participantes P2P",
     "cross_session": "Incluir sesiones de otros proyectos",
+    "settings_filter_sdk": "SDK",
+    "settings_filter_cli": "CLI",
     "settings_save": "Guardar",
     "settings_close": "Cerrar",
     "confirm_cancel": "¿Seguro que desea cancelar?",
