@@ -112,6 +112,7 @@ import { shouldSubscribeTerminalRaw, type TerminalSubscribeViewMode } from './te
 import { onWatchCommand } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
 import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timeline-running.js';
+import { ingestTimelineEventForCache } from './hooks/useTimeline.js';
 
 // On web: if opened by the native app for passkey auth, render the bridge page.
 const nativeCallback = typeof window !== 'undefined'
@@ -1173,6 +1174,7 @@ export function App() {
       // Detect model from JSONL usage.update events (authoritative, overrides terminal scan)
       if (msg.type === 'timeline.event') {
         const event = msg.event;
+        ingestTimelineEventForCache(event, selectedServerId);
         watchProjectionStore.handleTimelineEvent(event);
         if (isRunningTimelineEvent(event) && !event.sessionId.startsWith('deck_sub_')) {
           setSessions((prev) => prev.map((s) =>

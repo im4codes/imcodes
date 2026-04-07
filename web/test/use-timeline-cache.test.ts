@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, cleanup, act, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
 import type { ServerMessage, TimelineEvent, WsClient } from '../src/ws-client.js';
@@ -9,6 +9,7 @@ import {
   __getTimelineCacheKeysForTests,
   __resetTimelineCacheForTests,
   __setTimelineCacheForTests,
+  ingestTimelineEventForCache,
   useTimeline,
 } from '../src/hooks/useTimeline.js';
 
@@ -136,6 +137,58 @@ describe('useTimeline global cache bounds', () => {
     await waitFor(() => {
       expect(screen.getByTestId('probe-2').textContent).toBe('1');
     });
+  });
+
+  it('renders immediately from globally ingested timeline events before the first history request returns', async () => {
+    const sessionName = `deck_sub_codex_sdk_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const sendTimelineHistoryRequest = vi.fn(() => 'history-live');
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-live-1`,
+      sessionId: sessionName,
+      ts: 1,
+      epoch: 7,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'live cached text' },
+    }, serverId);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest,
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, serverId);
+      return h('div', { 'data-testid': 'probe' }, events[0]?.payload.text as string ?? '');
+    }
+
+    render(h(Probe, {}));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('live cached text');
+    });
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300);
+
+    await act(async () => {
+      handler?.({
+        type: 'timeline.history',
+        sessionName,
+        requestId: 'history-live',
+        epoch: 7,
+        events: [],
+      } as ServerMessage);
+    });
+
+    expect(screen.getByTestId('probe').textContent).toBe('live cached text');
   });
 
   it('keeps timeline history isolated across servers for the same session name', async () => {

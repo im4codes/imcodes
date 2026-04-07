@@ -94,6 +94,20 @@ function pruneTimelineCache(): void {
   }
 }
 
+function scopeCacheKey(serverId: string | null | undefined, sessionId: string): string {
+  return serverId ? `${serverId}:${sessionId}` : sessionId;
+}
+
+function scopeEventsForDb(cacheKey: string, events: TimelineEvent[]): TimelineEvent[] {
+  if (cacheKey === events[0]?.sessionId) return events;
+  return events.map((event) => ({ ...event, sessionId: cacheKey }));
+}
+
+function persistTimelineEvents(cacheKey: string, events: TimelineEvent[]): void {
+  if (events.length === 0) return;
+  sharedDb.putEvents(scopeEventsForDb(cacheKey, events)).catch(() => {});
+}
+
 export function __resetTimelineCacheForTests(): void {
   eventsCache.clear();
   eventsCacheAccess.clear();
@@ -106,6 +120,14 @@ export function __getTimelineCacheKeysForTests(): string[] {
 
 export function __setTimelineCacheForTests(cacheKey: string, events: TimelineEvent[]): void {
   setCachedEvents(cacheKey, events);
+}
+
+export function ingestTimelineEventForCache(event: TimelineEvent, serverId?: string | null): void {
+  const cacheKey = scopeCacheKey(serverId, event.sessionId);
+  const existing = getCachedEvents(cacheKey) ?? [];
+  const merged = mergeTimelineEvents(existing, [event], MAX_MEMORY_EVENTS);
+  if (merged !== existing) setCachedEvents(cacheKey, merged);
+  persistTimelineEvents(cacheKey, [event]);
 }
 
 export interface UseTimelineResult {
@@ -130,7 +152,7 @@ export function useTimeline(
 ): UseTimelineResult {
   // IDB + memory cache key: scope by serverId to prevent cross-server pollution
   // when different servers share the same session name (e.g. deck_cd_brain).
-  const cacheKey = serverId && sessionId ? `${serverId}:${sessionId}` : sessionId;
+  const cacheKey = sessionId ? scopeCacheKey(serverId, sessionId) : sessionId;
   const cacheKeyRef = useRef(cacheKey);
   cacheKeyRef.current = cacheKey;
   const [events, setEvents] = useState<TimelineEvent[]>([]);
@@ -320,11 +342,8 @@ export function useTimeline(
   // IDB helper: scope events by cacheKey so cross-server sessions don't collide
   const idbPutEvents = useCallback((evts: TimelineEvent[]) => {
     const key = cacheKeyRef.current;
-    if (!key || key === evts[0]?.sessionId) {
-      sharedDb?.putEvents(evts).catch(() => {});
-    } else {
-      sharedDb?.putEvents(evts.map(e => ({ ...e, sessionId: key }))).catch(() => {});
-    }
+    if (!key) return;
+    persistTimelineEvents(key, evts);
   }, []);
 
   // Listen for WS messages
