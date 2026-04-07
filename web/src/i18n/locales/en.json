@@ -176,7 +176,9 @@
     "no_changes": "No changes"
   },
   "toast": {
-    "finished": "finished"
+    "finished": "finished",
+    "upgrade_blocked_title": "Upgrade blocked",
+    "upgrade_blocked_p2p_active": "P2P is still running. Stop it before upgrading the daemon."
   },
   "discussion": {
     "role_critic": "Critic",

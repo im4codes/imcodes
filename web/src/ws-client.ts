@@ -6,6 +6,7 @@ import type { TerminalDiff } from './types.js';
 import { apiFetch, ApiError } from './api.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { REPO_MSG } from '@shared/repo-types.js';
+import { DAEMON_MSG } from '@shared/daemon-events.js';
 import type {
   FsLsResponse,
   FsReadResponse,
@@ -26,8 +27,9 @@ export type ServerMessage =
   | { type: 'session.idle'; session: string; project: string; agentType: string; label?: string; parentLabel?: string }
   | { type: 'session.notification'; session: string; project: string; title: string; message: string; agentType?: string; label?: string; parentLabel?: string }
   | { type: 'session.tool'; session: string; tool: string | null }
-  | { type: 'daemon.reconnected' }
-  | { type: 'daemon.disconnected' }
+  | { type: typeof DAEMON_MSG.RECONNECTED }
+  | { type: typeof DAEMON_MSG.DISCONNECTED }
+  | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'p2p_active'; activeRunIds?: string[] }
   | { type: 'daemon.error'; kind: 'uncaughtException' | 'unhandledRejection' | 'warning'; message: string; stack?: string; ts: number }
   | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel }> }
   | { type: 'outbound'; platform: string; channelId: string; content: string }

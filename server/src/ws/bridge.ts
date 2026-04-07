@@ -437,7 +437,7 @@ export class WsBridge {
         }
         this.queue = [];
 
-        this.broadcastToBrowsers(JSON.stringify({ type: 'daemon.reconnected' }));
+        this.broadcastToBrowsers(JSON.stringify({ type: DAEMON_MSG.RECONNECTED }));
 
         // Re-subscribe daemon to all sessions that still have active browser subscribers
         for (const [sessionName, refs] of this.daemonSessionRefs) {
@@ -512,7 +512,7 @@ export class WsBridge {
           this.broadcastToBrowsers(JSON.stringify({ type: TRANSPORT_MSG.PROVIDER_STATUS, providerId, connected: false }));
         }
         this.providerStatus.clear();
-        this.broadcastToBrowsers(JSON.stringify({ type: 'daemon.disconnected' }));
+        this.broadcastToBrowsers(JSON.stringify({ type: DAEMON_MSG.DISCONNECTED }));
         void clearProviderStatus(db, this.serverId).catch(() => {});
         updateServerStatus(db, this.serverId, 'offline').catch((err) =>
           logger.error({ err }, 'Failed to mark server offline'),

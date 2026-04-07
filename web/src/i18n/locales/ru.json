@@ -176,7 +176,9 @@
     "no_changes": "Нет изменений"
   },
   "toast": {
-    "finished": "завершено"
+    "finished": "завершено",
+    "upgrade_blocked_title": "Обновление заблокировано",
+    "upgrade_blocked_p2p_active": "P2P всё ещё выполняется. Остановите его перед обновлением daemon."
   },
   "discussion": {
     "role_critic": "Критик",

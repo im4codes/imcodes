@@ -176,7 +176,9 @@
     "no_changes": "변경 없음"
   },
   "toast": {
-    "finished": "완료"
+    "finished": "완료됨",
+    "upgrade_blocked_title": "업그레이드 차단됨",
+    "upgrade_blocked_p2p_active": "P2P가 아직 실행 중입니다. daemon을 업그레이드하기 전에 먼저 중지하세요."
   },
   "discussion": {
     "role_critic": "비평가",

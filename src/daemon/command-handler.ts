@@ -44,6 +44,7 @@ import { CODEX_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/op
 import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
+import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import {
   CLAUDE_SDK_EFFORT_LEVELS,
   CODEX_SDK_EFFORT_LEVELS,
@@ -621,7 +622,7 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       void handleServerDelete();
       break;
     case 'daemon.upgrade':
-      void handleDaemonUpgrade(cmd.targetVersion as string | undefined);
+      void handleDaemonUpgrade(cmd.targetVersion as string | undefined, serverLink);
       break;
     case 'file.search':
       void handleFileSearch(cmd, serverLink);
@@ -2155,7 +2156,7 @@ async function handleDiscussionStop(cmd: Record<string, unknown>): Promise<void>
  *  3. A short sleep before the restart gives the current daemon time to finish
  *     sending any in-flight messages.
  */
-async function handleDaemonUpgrade(targetVersion?: string): Promise<void> {
+async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLink): Promise<void> {
   const activeRuns = getActiveP2pRunsBlockingDaemonUpgrade();
   if (activeRuns.length > 0) {
     logger.warn({
@@ -2163,6 +2164,13 @@ async function handleDaemonUpgrade(targetVersion?: string): Promise<void> {
       activeRunIds: activeRuns.map((run) => run.id),
       activeRunStatuses: activeRuns.map((run) => run.status),
     }, 'daemon.upgrade: blocked because P2P runs are active');
+    try {
+      serverLink?.send({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: 'p2p_active',
+        activeRunIds: activeRuns.map((run) => run.id),
+      });
+    } catch { /* ignore */ }
     return;
   }
 

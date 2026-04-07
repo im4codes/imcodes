@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
 import { FileBrowser } from './components/FileBrowser.js';
 import { mapP2pStatusToUiState, type P2pActivePhase, type P2pProgressNodeStatus } from '@shared/p2p-status.js';
+import { DAEMON_MSG } from '@shared/daemon-events.js';
 
 function mapP2pRunToDiscussion(r: Record<string, any>) {
   const rawSnapshot = r.progress_snapshot;
@@ -108,6 +109,7 @@ const nativeCallback = typeof window !== 'undefined'
   : null;
 
 type ViewMode = TerminalSubscribeViewMode;
+const IDLE_FLASH_DURATION_MS = 3000;
 
 /** A panel pinned to the sidebar. Uses sessionName as stable identity. */
 export interface PinnedPanel {
@@ -566,6 +568,7 @@ export function App() {
   const stoppedNavTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [idleAlerts, setIdleAlerts] = useState<Set<string>>(new Set());
+  const [idleFlashes, setIdleFlashes] = useState<Set<string>>(new Set());
   const [toasts, setToasts] = useState<Array<{ id: number; sessionName: string; project: string; kind: 'idle' | 'notification'; title?: string; message?: string; openRepoLatest?: boolean; failedJobName?: string; failedStepName?: string }>>([]);
   const [detectedModels, setDetectedModels] = useState<Map<string, string>>(new Map());
   const [subUsages, setSubUsages] = useState<Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string }>>(new Map());
@@ -607,8 +610,37 @@ export function App() {
     }
     return maxId;
   }, [subZIndexes, openSubIds]);
+  const idleFlashTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const flashIdleSession = useCallback((sessionName: string) => {
+    const timers = idleFlashTimersRef.current;
+    const existingTimer = timers.get(sessionName);
+    if (existingTimer) clearTimeout(existingTimer);
+
+    setIdleFlashes((prev) => {
+      if (prev.has(sessionName)) return prev;
+      const next = new Set(prev);
+      next.add(sessionName);
+      return next;
+    });
+
+    const timer = setTimeout(() => {
+      timers.delete(sessionName);
+      setIdleFlashes((prev) => {
+        if (!prev.has(sessionName)) return prev;
+        const next = new Set(prev);
+        next.delete(sessionName);
+        return next;
+      });
+    }, IDLE_FLASH_DURATION_MS);
+    timers.set(sessionName, timer);
+  }, []);
   const focusedSubIdRef = useRef(focusedSubId);
   focusedSubIdRef.current = focusedSubId;
+
+  useEffect(() => () => {
+    for (const timer of idleFlashTimersRef.current.values()) clearTimeout(timer);
+    idleFlashTimersRef.current.clear();
+  }, []);
 
   useEffect(() => {
     if (sessionsLoaded && sessions.length === 0) {
@@ -1212,6 +1244,7 @@ export function App() {
           // Always flash the tab — even if it's the active one
           setIdleAlerts((prev) => new Set([...prev, sessionName]));
         }
+        flashIdleSession(sessionName);
         // Always show a toast (main + sub sessions)
         const id = Date.now();
         setToasts((prev) => [...prev, { id, sessionName, project: displayProject, kind: 'idle' }]);
@@ -1390,7 +1423,19 @@ export function App() {
           }
         }
       }
-      if (msg.type === 'daemon.disconnected') {
+      if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED) {
+        const id = Date.now() + Math.random();
+        setToasts((prev) => [...prev, {
+          id,
+          sessionName: '',
+          project: '',
+          kind: 'notification',
+          title: trans('toast.upgrade_blocked_title'),
+          message: trans('toast.upgrade_blocked_p2p_active'),
+        }]);
+        setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
+      }
+      if (msg.type === DAEMON_MSG.DISCONNECTED) {
         // Daemon went offline — keep existing session data visible, just update status
         setDaemonOnline(false);
         watchProjectionStore.setSnapshotStatus('stale');
@@ -1411,7 +1456,7 @@ export function App() {
         // Auto-dismiss after 10 seconds
         setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 10_000);
       }
-      if (msg.type === 'daemon.reconnected') {
+      if (msg.type === DAEMON_MSG.RECONNECTED) {
         setDaemonOnline(true);
         // Daemon process (re)started — all its subscriptions are gone.
         // Re-subscribe active targets first, then stagger the rest to avoid a herd.
@@ -2152,6 +2197,7 @@ export function App() {
               subSessions={subSessions}
               activeSession={activeSession}
               unreadCounts={unreadCounts}
+              idleFlashes={idleFlashes}
               p2pSessionLabels={p2pSessionLabels}
               onSelectSession={(name) => {
                 setActiveSession(name);
@@ -2553,6 +2599,7 @@ export function App() {
               <SubSessionBar
                 subSessions={visibleSubSessions}
                 openIds={openSubIds}
+                idleFlashes={idleFlashes}
                 onOpen={toggleSubSession}
                 onClose={closeSubSession}
                 onRestart={restartSubSession}
@@ -2647,6 +2694,7 @@ export function App() {
                 subSessions={subSessions}
                 activeSession={activeSession}
                 unreadCounts={unreadCounts}
+                idleFlashes={idleFlashes}
                 p2pSessionLabels={p2pSessionLabels}
                 onSelectSession={(name) => {
                   setActiveSession(name);
@@ -2953,6 +3001,7 @@ export function App() {
               ws={wsRef.current}
               connected={connected}
               active={isOpen}
+              idleFlash={idleFlashes.has(sub.sessionName)}
               onDiff={registerDiffApplyer}
               onHistory={registerHistoryApplyer}
               onMinimize={() => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; })}

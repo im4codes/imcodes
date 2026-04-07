@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { WsClient } from '../src/ws-client.js';
+import { DAEMON_MSG } from '@shared/daemon-events.js';
 import type { MessageHandler } from '../src/ws-client.js';
 
 // Mock WebSocket implementation
@@ -259,8 +260,8 @@ describe('WsClient', () => {
       client.onMessage(handler);
       handler.mockClear();
 
-      lastWs!.emit('message', { data: JSON.stringify({ type: 'daemon.disconnected' }) });
-      expect(handler).toHaveBeenCalledWith({ type: 'daemon.disconnected' });
+      lastWs!.emit('message', { data: JSON.stringify({ type: DAEMON_MSG.DISCONNECTED }) });
+      expect(handler).toHaveBeenCalledWith({ type: DAEMON_MSG.DISCONNECTED });
       client.disconnect();
     });
 
@@ -270,16 +271,27 @@ describe('WsClient', () => {
       client.onMessage(handler);
       handler.mockClear();
 
-      lastWs!.emit('message', { data: JSON.stringify({ type: 'daemon.reconnected' }) });
-      expect(handler).toHaveBeenCalledWith({ type: 'daemon.reconnected' });
+      lastWs!.emit('message', { data: JSON.stringify({ type: DAEMON_MSG.RECONNECTED }) });
+      expect(handler).toHaveBeenCalledWith({ type: DAEMON_MSG.RECONNECTED });
       client.disconnect();
     });
 
     it('stays connected (browser WS alive) even when daemon.disconnected arrives', async () => {
       const client = await connectClient();
-      lastWs!.emit('message', { data: JSON.stringify({ type: 'daemon.disconnected' }) });
+      lastWs!.emit('message', { data: JSON.stringify({ type: DAEMON_MSG.DISCONNECTED }) });
       // The browser WebSocket should still be connected
       expect(client.connected).toBe(true);
+      client.disconnect();
+    });
+
+    it('dispatches daemon.upgrade_blocked to handlers', async () => {
+      const client = await connectClient();
+      const handler = vi.fn();
+      client.onMessage(handler);
+      handler.mockClear();
+
+      lastWs!.emit('message', { data: JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'p2p_active', activeRunIds: ['run_1'] }) });
+      expect(handler).toHaveBeenCalledWith({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'p2p_active', activeRunIds: ['run_1'] });
       client.disconnect();
     });
   });

@@ -176,7 +176,9 @@
     "no_changes": "変更なし"
   },
   "toast": {
-    "finished": "完了"
+    "finished": "完了",
+    "upgrade_blocked_title": "アップグレードはブロックされました",
+    "upgrade_blocked_p2p_active": "P2P がまだ実行中です。daemon をアップグレードする前に停止してください。"
   },
   "discussion": {
     "role_critic": "批評家",

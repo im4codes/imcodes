@@ -4,6 +4,7 @@ import type { ComponentChildren } from 'preact';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 import { ChatMarkdown } from '../components/ChatMarkdown.js';
 import { REPO_MSG } from '@shared/repo-types.js';
+import { DAEMON_MSG } from '@shared/daemon-events.js';
 
 // ── Pull-to-refresh component ────────────────────────────────────────────
 
@@ -386,7 +387,7 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
   useEffect(() => {
     return ws.onMessage((msg: ServerMessage) => {
       // WS reconnected — clear stale pending requests, re-detect
-      if (msg.type === 'daemon.reconnected' || (msg.type === 'session.event' && (msg as any).event === 'connected')) {
+      if (msg.type === DAEMON_MSG.RECONNECTED || (msg.type === 'session.event' && (msg as any).event === 'connected')) {
         pendingRef.current.clear();
         detailReqRef.current.clear();
         tabReqRef.current.clear();

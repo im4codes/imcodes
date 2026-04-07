@@ -176,7 +176,9 @@
     "no_changes": "無變更"
   },
   "toast": {
-    "finished": "完成"
+    "finished": "已完成",
+    "upgrade_blocked_title": "升級已阻止",
+    "upgrade_blocked_p2p_active": "P2P 仍在執行中。請先停止，再升級 daemon。"
   },
   "discussion": {
     "role_critic": "評論者",

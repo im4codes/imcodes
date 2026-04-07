@@ -1,3 +1,4 @@
+import { DAEMON_MSG } from '@shared/daemon-events.js';
 /**
  * FileBrowser — universal reusable file/directory browser.
  *
@@ -294,7 +295,7 @@ export function FileBrowser({
       if (!mountedRef.current) return;
 
       // WS reconnected — clear loaded cache so directories re-fetch on next expand/navigate
-      if (msg.type === 'daemon.reconnected' || (msg.type === 'session.event' && (msg as any).event === 'connected')) {
+      if (msg.type === DAEMON_MSG.RECONNECTED || (msg.type === 'session.event' && (msg as any).event === 'connected')) {
         loadedRef.current.clear();
         pendingRef.current.clear();
         pendingChangesRef.current.clear();

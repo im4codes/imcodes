@@ -1,3 +1,4 @@
+import { DAEMON_MSG } from '@shared/daemon-events.js';
 /**
  * React hook for timeline event state management.
  * Loads from daemon file store on connect, caches in IndexedDB,
@@ -461,7 +462,7 @@ export function useTimeline(
       }
 
       // ── Reconnect: daemon restarted → epoch changed, replay is useless. Request only new events. ──
-      if (msg.type === 'daemon.reconnected') {
+      if (msg.type === DAEMON_MSG.RECONNECTED) {
         // Clear pending optimistic messages — they were sent to the old connection
         // and we can't guarantee they reached the agent. The history replay below
         // will bring back any messages that were actually processed.

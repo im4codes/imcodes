@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
 import type { WsClient } from '../ws-client.js';
+import { DAEMON_MSG } from '@shared/daemon-events.js';
 
 export interface ProviderStatus {
   id: string;
@@ -53,7 +54,7 @@ export function useProviderStatus(ws: WsClient | null) {
       }
       // On daemon reconnect, provider status cache in bridge is refreshed.
       // Request session list which also triggers a fresh status push.
-      if (msg.type === 'daemon.reconnected') {
+      if (msg.type === DAEMON_MSG.RECONNECTED) {
         try { ws.send({ type: 'provider.list_sessions', providerId: 'openclaw' }); } catch { /* */ }
       }
     });

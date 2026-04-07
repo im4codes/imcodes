@@ -176,7 +176,9 @@
     "no_changes": "Sin cambios"
   },
   "toast": {
-    "finished": "completado"
+    "finished": "terminó",
+    "upgrade_blocked_title": "Actualización bloqueada",
+    "upgrade_blocked_p2p_active": "P2P sigue en ejecución. Deténlo antes de actualizar el daemon."
   },
   "discussion": {
     "role_critic": "Crítico",
