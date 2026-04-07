@@ -422,7 +422,7 @@ export function useTimeline(
           const maxSeq = msg.events.reduce((max, e) => Math.max(max, e.seq), 0);
           seqRef.current = Math.max(seqRef.current, maxSeq);
           mergeEvents(msg.events);
-          sharedDb?.putEvents(msg.events).catch(() => {});
+          idbPutEvents(msg.events);
         } else if (historyRetryRef.current < 2 && ws?.connected && eventsRef.current.length === 0) {
           // Empty response with no cached events — retry once after a short delay
           // (defense-in-depth for transient bridge/daemon failures)
