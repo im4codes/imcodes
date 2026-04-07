@@ -127,6 +127,7 @@ interface PendingSendPayload {
 interface PendingComboSendConfirmation {
   payload: PendingSendPayload;
   modeLabel: string;
+  clearComposer: boolean;
 }
 
 type ManualP2pTargetCandidate = {
@@ -638,7 +639,35 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return { text, extra };
   }, [attachments, activeSession, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, sessions, subSessions, ws]);
 
-  const finalizeSend = useCallback((payload: PendingSendPayload) => {
+  const buildModeOnlySendPayload = useCallback((rawText: string): PendingSendPayload | null => {
+    const text = rawText.trim();
+    if (!text || !ws || !activeSession) return null;
+
+    const extra: Record<string, unknown> = {};
+    const manual = extractManualP2pTargets(text, buildManualP2pCandidates(sessions, subSessions));
+    let cleanText = manual.cleanText;
+
+    if (manual.orderedTargets.length > 0) {
+      extra.p2pAtTargets = manual.orderedTargets;
+    } else if (p2pMode !== 'solo' && !text.includes('@@')) {
+      extra.p2pMode = p2pMode === P2P_CONFIG_MODE ? 'config' : p2pMode;
+      if (p2pExcludeSameType && p2pMode !== P2P_CONFIG_MODE) extra.p2pExcludeSameType = true;
+      if (p2pMode === P2P_CONFIG_MODE && p2pSavedConfig) {
+        extra.p2pSessionConfig = p2pSavedConfig.sessions;
+        extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
+        if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
+        if (p2pSavedConfig.hopTimeoutMinutes != null) extra.p2pHopTimeoutMs = Math.min(p2pSavedConfig.hopTimeoutMinutes * 60_000, 600_000);
+      }
+    }
+
+    if (extra.p2pAtTargets || extra.p2pMode) {
+      extra.p2pLocale = i18n?.language ?? 'en';
+    }
+
+    return { text: cleanText, extra };
+  }, [activeSession, i18n?.language, p2pExcludeSameType, p2pMode, p2pSavedConfig, sessions, subSessions, ws]);
+
+  const finalizeSend = useCallback((payload: PendingSendPayload, options?: { clearComposer?: boolean }) => {
     if (!ws || !activeSession) return;
     // Transport sessions queue messages internally — no frontend notice needed
     quickData.recordHistory(payload.text, activeSession.name);
@@ -647,21 +676,22 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     } catch {
       return;
     }
-    pendingAtTargetsRef.current = [];
-    pendingConfigOverrideRef.current = null;
     onSend?.(activeSession.name, payload.text);
-    if (divRef.current) divRef.current.textContent = '';
-    setHasText(false);
-    setAttachments([]);
-    // Clear quotes after send
-    if (quotes && quotes.length > 0) {
-      for (let i = quotes.length - 1; i >= 0; i--) onRemoveQuote?.(i);
+    if (options?.clearComposer) {
+      pendingAtTargetsRef.current = [];
+      pendingConfigOverrideRef.current = null;
+      if (divRef.current) divRef.current.textContent = '';
+      setHasText(false);
+      setAttachments([]);
+      if (quotes && quotes.length > 0) {
+        for (let i = quotes.length - 1; i >= 0; i--) onRemoveQuote?.(i);
+      }
+      atSelectionLockRef.current = false;
+      atSelectionSnapshotRef.current = '';
+      histIdxRef.current = -1;
+      draftRef.current = '';
+      if (draftKey) sessionStorage.removeItem(draftKey);
     }
-    atSelectionLockRef.current = false;
-    atSelectionSnapshotRef.current = '';
-    histIdxRef.current = -1;
-    draftRef.current = '';
-    if (draftKey) sessionStorage.removeItem(draftKey);
   }, [activeSession, draftKey, onRemoveQuote, onSend, quickData, quotes, ws]);
 
   const maybePersistComboSendSkip = useCallback(() => {
@@ -676,8 +706,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     }
   }, [activeSession?.name, activeSession?.runtimeType, activeSession?.state]);
 
-  const handleSend = useCallback(() => {
-    const payload = buildSendPayload();
+  const requestSend = useCallback((payload: PendingSendPayload | null, options?: { clearComposer?: boolean }) => {
     if (!payload) return;
     const comboMode = typeof payload.extra.p2pMode === 'string' ? payload.extra.p2pMode : null;
     if (comboMode && isComboMode(comboMode) && !skipComboSendConfirm) {
@@ -685,11 +714,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       setPendingComboSendConfirm({
         payload,
         modeLabel: getP2pModeLabel(comboMode, t),
+        clearComposer: !!options?.clearComposer,
       });
       return;
     }
-    finalizeSend(payload);
-  }, [buildSendPayload, finalizeSend, skipComboSendConfirm, t]);
+    finalizeSend(payload, options);
+  }, [finalizeSend, skipComboSendConfirm, t]);
+
+  const handleSend = useCallback(() => {
+    requestSend(buildSendPayload(), { clearComposer: true });
+  }, [buildSendPayload, requestSend]);
 
   const handleComboSendCancel = useCallback(() => {
     maybePersistComboSendSkip();
@@ -703,28 +737,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     maybePersistComboSendSkip();
     setPendingComboSendConfirm(null);
     setRememberComboSendChoice(false);
-    finalizeSend(pending.payload);
+    finalizeSend(pending.payload, { clearComposer: pending.clearComposer });
   }, [finalizeSend, maybePersistComboSendSkip, pendingComboSendConfirm]);
 
   // Voice overlay send handler — applies same P2P mode as text send
   const handleVoiceSend = useCallback((voiceText: string) => {
-    if (!ws || !activeSession) return;
-    const extra: Record<string, unknown> = {};
-    if (p2pMode !== 'solo') {
-      extra.p2pMode = p2pMode === P2P_CONFIG_MODE ? 'config' : p2pMode;
-      if (p2pExcludeSameType && p2pMode !== P2P_CONFIG_MODE) extra.p2pExcludeSameType = true;
-    }
-    if (p2pMode === P2P_CONFIG_MODE && p2pSavedConfig) {
-      extra.p2pSessionConfig = p2pSavedConfig.sessions;
-      extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
-      if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
-    }
-    quickData.recordHistory(voiceText, activeSession.name);
-    try {
-      ws.sendSessionCommand('send', { sessionName: activeSession.name, text: voiceText, ...extra });
-    } catch { return; }
-    onSend?.(activeSession.name, voiceText);
-  }, [ws, activeSession, quickData, onSend, p2pMode, p2pExcludeSameType, p2pSavedConfig]);
+    requestSend(buildModeOnlySendPayload(voiceText));
+  }, [buildModeOnlySendPayload, requestSend]);
 
   const handleKeyDown = (e: KeyboardEvent) => {
     if (e.key === 'Escape' && activeSession?.runtimeType === 'transport' && activeSession.state === 'running') {
@@ -1281,9 +1300,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             onClose={() => setQuickOpen(false)}
             onSelect={fillInput}
             onSend={(text: string) => {
-              if (!ws || !activeSession) return;
-              quickData.recordHistory(text, activeSession.name);
-              ws.sendSessionCommand('send', { sessionName: activeSession.name, text });
+              requestSend(buildModeOnlySendPayload(text));
             }}
             agentType={activeSession?.agentType ?? 'claude-code'}
             sessionName={activeSession?.name ?? ''}

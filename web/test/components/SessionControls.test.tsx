@@ -19,13 +19,25 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../../src/components/QuickInputPanel.js', () => ({
-  QuickInputPanel: () => null,
+  QuickInputPanel: ({ open, onSend }: { open: boolean; onSend: (text: string) => void }) => open ? (
+    <button onClick={() => onSend('quick combo message')}>quick-panel-send</button>
+  ) : null,
   EMPTY_QUICK_DATA: { history: [], sessionHistory: {}, commands: [], phrases: [] },
   getNavigableHistory: (data: { history: string[]; sessionHistory: Record<string, string[]> }, sessionName?: string) => {
     if (!sessionName) return data.history;
     const sessionHist = data.sessionHistory[sessionName] ?? [];
     return sessionHist.length > 0 ? sessionHist : data.history;
   },
+}));
+
+vi.mock('../../src/components/VoiceOverlay.js', () => ({
+  VoiceOverlay: ({ open, onSend }: { open: boolean; onSend: (text: string) => void }) => open ? (
+    <button onClick={() => onSend('voice combo message')}>voice-overlay-send</button>
+  ) : null,
+}));
+
+vi.mock('../../src/components/VoiceInput.js', () => ({
+  isAvailable: () => true,
 }));
 
 const uploadFileMock = vi.fn();
@@ -228,6 +240,52 @@ describe('SessionControls', () => {
     expect(ws.sendSessionCommand).toHaveBeenLastCalledWith('send', {
       sessionName: 'my-session',
       text: 'second combo',
+      p2pMode: 'audit>plan',
+      p2pExcludeSameType: true,
+      p2pLocale: 'en',
+    });
+  });
+
+  it('routes quick panel sends through the same combo confirmation flow', () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+
+    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+    fireEvent.click(screen.getByTitle('title'));
+    fireEvent.click(screen.getByText('quick-panel-send'));
+
+    expect(screen.getByText('combo_send_confirm_title')).toBeDefined();
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    const dialog = screen.getByText('combo_send_confirm_title').closest('.dialog') as HTMLElement;
+    fireEvent.click(within(dialog).getByRole('button', { name: /^send$/i }));
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      sessionName: 'my-session',
+      text: 'quick combo message',
+      p2pMode: 'audit>plan',
+      p2pExcludeSameType: true,
+      p2pLocale: 'en',
+    });
+  });
+
+  it('routes voice sends through the same combo confirmation flow', () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+
+    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+    fireEvent.click(screen.getByTitle('voice_input'));
+    fireEvent.click(screen.getByText('voice-overlay-send'));
+
+    expect(screen.getByText('combo_send_confirm_title')).toBeDefined();
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    const dialog = screen.getByText('combo_send_confirm_title').closest('.dialog') as HTMLElement;
+    fireEvent.click(within(dialog).getByRole('button', { name: /^send$/i }));
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      sessionName: 'my-session',
+      text: 'voice combo message',
       p2pMode: 'audit>plan',
       p2pExcludeSameType: true,
       p2pLocale: 'en',
