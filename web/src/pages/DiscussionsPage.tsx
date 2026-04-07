@@ -1,10 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
-import { marked } from 'marked';
-import DOMPurify from 'dompurify';
 import { useTranslation } from 'react-i18next';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 import { P2pProgressCard } from '../components/P2pProgressCard.js';
 import type { P2pProgressDiscussion } from '../components/P2pProgressCard.js';
+import { FilePreviewPane } from '../components/FilePreviewPane.js';
 
 interface P2pDiscussion {
   id: string;
@@ -143,15 +142,6 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
   // Find matching live discussion for progress display
   const activeLive = liveDiscussions.filter((d) => d.state !== 'done' && d.state !== 'failed');
 
-  // Render markdown content safely
-  const renderMarkdown = (md: string): string => {
-    try {
-      return DOMPurify.sanitize(marked(md) as string);
-    } catch {
-      return DOMPurify.sanitize(md);
-    }
-  };
-
   return (
     <div class="discussions-page">
       {/* Active P2P progress cards at top */}
@@ -252,10 +242,9 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
               <div class="discussions-empty">{t('common.loading')}</div>
             )}
             {selected && content !== null && (
-              <div
-                class="discussions-markdown"
-                dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
-              />
+              <div class="discussions-file-preview">
+                <FilePreviewPane content={content} path={`${selected}.md`} />
+              </div>
             )}
           </div>
         </div>

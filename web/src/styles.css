@@ -1120,26 +1120,34 @@ body {
 }
 .discussions-progress-node.is-skipped { color: #f87171; border-color: rgba(248, 113, 113, 0.3); }
 .discussions-progress-node.is-pending { color: #64748b; }
-.discussions-markdown { padding: 16px 20px; font-size: 14px; line-height: 1.7; color: #cbd5e1; overflow-y: auto; }
-.discussions-markdown h1 { font-size: 20px; margin: 24px 0 12px; color: #f1f5f9; border-bottom: 1px solid #334155; padding-bottom: 6px; }
-.discussions-markdown h2 { font-size: 17px; margin: 20px 0 10px; color: #e2e8f0; border-bottom: 1px solid #1e293b; padding-bottom: 4px; }
-.discussions-markdown h3 { font-size: 15px; margin: 16px 0 8px; color: #e2e8f0; }
-.discussions-markdown p { margin: 8px 0; }
-.discussions-markdown ul, .discussions-markdown ol { margin: 8px 0; padding-left: 24px; }
-.discussions-markdown li { margin: 4px 0; }
-.discussions-markdown code { background: #1e293b; padding: 2px 6px; border-radius: 3px; font-size: 13px; color: #f59e0b; }
-.discussions-markdown pre { background: #0f172a; border: 1px solid #334155; border-radius: 6px; padding: 12px; overflow-x: auto; margin: 12px 0; }
-.discussions-markdown pre code { background: none; padding: 0; color: #e2e8f0; }
-.discussions-markdown blockquote { border-left: 3px solid #3b82f6; margin: 12px 0; padding: 4px 12px; color: #94a3b8; }
-.discussions-markdown table { border-collapse: collapse; width: 100%; margin: 12px 0; }
-.discussions-markdown th, .discussions-markdown td { border: 1px solid #334155; padding: 6px 10px; text-align: left; font-size: 13px; }
-.discussions-markdown th { background: #1e293b; color: #e2e8f0; }
-.discussions-markdown hr { border: none; border-top: 1px solid #334155; margin: 16px 0; }
-.discussions-markdown strong { color: #f1f5f9; }
-.discussions-markdown a { color: #60a5fa; text-decoration: none; }
-.discussions-markdown a:hover { text-decoration: underline; }
 .discussions-detail { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.discussions-detail-scroll { flex: 1; min-height: 0; overflow-y: auto; }
+.discussions-detail-scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior-x: contain; }
+.discussions-file-preview {
+  width: 100%;
+  min-width: 0;
+  overflow-x: hidden;
+}
+.discussions-file-preview .fb-preview-md {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: hidden;
+  overflow-y: visible;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+.discussions-file-preview .fb-preview-md pre,
+.discussions-file-preview .fb-preview-md table {
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.discussions-file-preview .fb-preview-md table {
+  display: block;
+}
+.discussions-file-preview .fb-preview-md img {
+  max-width: 100%;
+  height: auto;
+}
 .discussions-nav-row {
   display: flex;
   align-items: center;
@@ -1460,7 +1468,7 @@ body {
 .fb-lightbox img { max-width: 92vw; max-height: 92vh; object-fit: contain; border-radius: 6px; cursor: default; }
 .fb-lightbox-close { position: absolute; top: 16px; right: 16px; background: rgba(255,255,255,0.15); border: none; color: #fff; font-size: 20px; width: 36px; height: 36px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; }
 .fb-preview-code { margin: 0; padding: 10px 12px; font-size: 12px; line-height: 1.5; font-family: 'Menlo', 'Monaco', 'Consolas', monospace; overflow: auto; background: #0f172a; color: #e2e8f0; white-space: pre; tab-size: 2; }
-.fb-preview-md { padding: 12px 16px; font-size: 13px; line-height: 1.6; color: #e2e8f0; overflow: auto; }
+.fb-preview-md { padding: 12px 16px; font-size: 13px; line-height: 1.6; color: #e2e8f0; overflow: auto; max-width: 100%; }
 .fb-preview-md h1, .fb-preview-md h2, .fb-preview-md h3 { margin: 0.8em 0 0.4em; color: #f1f5f9; }
 .fb-preview-md p { margin: 0.4em 0; }
 .fb-preview-md code { font-family: monospace; font-size: 11px; background: #1e293b; padding: 1px 4px; border-radius: 3px; }
@@ -1469,6 +1477,10 @@ body {
 .fb-preview-md a { color: #818cf8; }
 .fb-preview-md ul, .fb-preview-md ol { padding-left: 1.4em; }
 .fb-preview-md blockquote { border-left: 3px solid #334155; margin: 0; padding-left: 12px; color: #94a3b8; }
+.fb-preview-md table { display: block; width: max-content; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
+.fb-preview-md th, .fb-preview-md td { border: 1px solid #334155; padding: 6px 10px; text-align: left; font-size: 12px; white-space: nowrap; }
+.fb-preview-md th { background: #1e293b; color: #e2e8f0; }
+.fb-preview-md img { max-width: 100%; height: auto; }
 .fb-modal-wide { width: min(92vw, 900px) !important; }
 .mobile-fb-overlay { position: fixed; inset: 0; z-index: 2000; background: #0f172a; display: flex; flex-direction: column; }
 .mobile-fb-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid #334155; flex-shrink: 0; }

@@ -17,6 +17,10 @@ vi.mock('../../src/components/P2pProgressCard.js', () => ({
   P2pProgressCard: () => null,
 }));
 
+vi.mock('../../src/components/FilePreviewPane.js', () => ({
+  FilePreviewPane: ({ content }: { content: string }) => <div data-testid="discussion-preview">{content}</div>,
+}));
+
 describe('DiscussionsPage', () => {
   let handler: ((msg: ServerMessage) => void) | null = null;
   let ws: WsClient;
@@ -77,6 +81,7 @@ describe('DiscussionsPage', () => {
       } as ServerMessage);
     });
 
+    expect(screen.getByTestId('discussion-preview').textContent).toBe('Updated markdown');
     expect((screen.getByLabelText('p2p.discussions.auto_follow_latest') as HTMLInputElement).checked).toBe(true);
     await waitFor(() => {
       expect(scrollToMock).toHaveBeenCalledWith({ top: 640, behavior: 'smooth' });
@@ -123,6 +128,7 @@ describe('DiscussionsPage', () => {
       } as ServerMessage);
     });
 
+    expect(screen.getByTestId('discussion-preview').textContent).toBe('New content after manual scroll');
     expect(scrollToMock).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByTitle('p2p.discussions.scroll_top'));
