@@ -16,6 +16,7 @@ import type { SubSession } from '../hooks/useSubSessions.js';
 import { getActiveThinkingTs, isVisuallyBusy } from '../thinking-utils.js';
 import { SessionControls } from './SessionControls.js';
 import type { SessionInfo } from '../types.js';
+import { IdleFlashLayer } from './IdleFlashLayer.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
@@ -42,7 +43,7 @@ interface Props {
   connected: boolean;
   isOpen: boolean;
   isFocused?: boolean;
-  idleFlash?: boolean;
+  idleFlashToken?: number;
   onOpen: () => void;
   onClose?: () => void;
   onRestart?: () => void;
@@ -66,9 +67,10 @@ function loadCardW(id: string, fallback: number): number {
   return fallback;
 }
 
-export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlash, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, inP2p }: Props) {
+export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, inP2p }: Props) {
   const { t } = useTranslation();
   const isShell = sub.type === 'shell' || sub.type === 'script';
+  const isTransport = sub.runtimeType === 'transport';
   const { events, refreshing } = isShell ? { events: [], refreshing: false } : useTimeline(sub.sessionName, ws, serverId);
   const termScrollRef = useRef<(() => void) | null>(null);
   const chatScrollRef = useRef<(() => void) | null>(null);
@@ -110,6 +112,13 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     cardInputRef.current!.value = '';
     requestAnimationFrame(() => { forceFollowLatest(); });
   }, [ws, connected, sub.sessionName, forceFollowLatest]);
+
+  const handleTransportStop = useCallback(() => {
+    if (!ws || !connected || sub.state === 'stopped') return;
+    try {
+      ws.sendSessionCommand('send', { sessionName: sub.sessionName, text: '/stop' });
+    } catch { /* ignore */ }
+  }, [ws, connected, sub.sessionName, sub.state]);
 
 
   const busy = useMemo(() => isVisuallyBusy(sub.state, !!getActiveThinkingTs(events)), [events, sub.state]);
@@ -189,10 +198,11 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
 
   return (
     <div
-      class={`subcard${isOpen ? ' subcard-open' : ''}${isFocused ? ' subcard-focused' : ''}${busy ? ' subcard-running-pulse' : ''}${idleFlash ? ' subcard-idle-flash' : ''}`}
+      class={`subcard${isOpen ? ' subcard-open' : ''}${isFocused ? ' subcard-focused' : ''}${busy ? ' subcard-running-pulse' : ''}`}
       style={{ width: effectiveW, height: cardH, minWidth: effectiveW, position: 'relative' }}
       onClick={() => { if (!draggingRef.current) onOpen(); }}
     >
+      {idleFlashToken ? <IdleFlashLayer key={`subcard-idle-${idleFlashToken}`} variant="frame" /> : null}
       {/* Header */}
       <div class="subcard-header">
         <span class="subcard-icon">{icon}</span>
@@ -254,36 +264,55 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
 
       {/* Compact input — reuses SessionControls with @picker, ⚡, 📎, paste upload */}
       <div class="subcard-input-area" onClick={(e) => e.stopPropagation()}>
-        {quickData ? (
-          <SessionControls
-            ws={ws}
-            activeSession={sessionInfo}
-            quickData={quickData}
-            compact
-            hideShortcuts
-            onSubStop={onClose}
-            onSubRestart={onRestart}
-            sessions={sessions}
-            subSessions={subSessions}
-            serverId={serverId}
-          />
-        ) : (
-          <input
-            ref={cardInputRef}
-            class="subcard-input"
-            type="text"
-            placeholder={t('common.send') + '...'}
-            disabled={!connected}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.isComposing) {
-                e.preventDefault();
-                handleCardSend();
-              }
-              e.stopPropagation();
-            }}
-            onClick={(e) => e.stopPropagation()}
-          />
-        )}
+        <div class="subcard-input-row">
+          {isTransport && (
+            <button
+              class="subcard-stop-btn"
+              type="button"
+              title={t('session.stop')}
+              aria-label={t('session.stop')}
+              disabled={!connected || sub.state === 'stopped'}
+              onClick={(e) => {
+                e.stopPropagation();
+                handleTransportStop();
+              }}
+            >
+              ■
+            </button>
+          )}
+          <div class="subcard-input-main">
+            {quickData ? (
+              <SessionControls
+                ws={ws}
+                activeSession={sessionInfo}
+                quickData={quickData}
+                compact
+                hideShortcuts
+                onSubStop={onClose}
+                onSubRestart={onRestart}
+                sessions={sessions}
+                subSessions={subSessions}
+                serverId={serverId}
+              />
+            ) : (
+              <input
+                ref={cardInputRef}
+                class="subcard-input"
+                type="text"
+                placeholder={t('common.send') + '...'}
+                disabled={!connected}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.isComposing) {
+                    e.preventDefault();
+                    handleCardSend();
+                  }
+                  e.stopPropagation();
+                }}
+                onClick={(e) => e.stopPropagation()}
+              />
+            )}
+          </div>
+        </div>
       </div>
 
       {/* Resize handle — uses pointer capture to bypass parent's HTML5 draggable */}

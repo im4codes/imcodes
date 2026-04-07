@@ -19,6 +19,7 @@ import { useTranslation } from 'react-i18next';
 import type { SessionInfo } from '../types.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import { formatLabel } from '../format-label.js';
+import { IdleFlashLayer } from './IdleFlashLayer.js';
 
 // ── Agent badge config (matches SessionTabs.tsx AGENT_BADGE) ─────────────────
 const AGENT_BADGE: Record<string, { label: string; color: string }> = {
@@ -50,8 +51,8 @@ interface Props {
   activeSession: string | null;
   /** Map<sessionName, unreadCount> — supplied by useUnreadCounts */
   unreadCounts: Map<string, number>;
-  /** Sessions that should currently show an idle flash animation. */
-  idleFlashes?: Set<string>;
+  /** Per-session idle flash replay token. */
+  idleFlashTokens?: Map<string, number>;
   /** Set of sub-session labels participating in active P2P discussions. */
   p2pSessionLabels?: Set<string>;
   onSelectSession: (sessionName: string) => void;
@@ -103,13 +104,13 @@ interface NodeProps {
   isTransport?: boolean;
   isSub?: boolean;
   unread: number;
-  idleFlash: boolean;
+  idleFlashToken: number;
   inP2p?: boolean;
   onClick: () => void;
 }
 
 function SessionNode({
-  label, agentType, state, isActive, isTransport, isSub, unread, idleFlash, inP2p, onClick,
+  label, agentType, state, isActive, isTransport, isSub, unread, idleFlashToken, inP2p, onClick,
 }: NodeProps) {
   const { t } = useTranslation();
   const badge = isSub
@@ -120,11 +121,11 @@ function SessionNode({
     'session-tree-node',
     isSub ? 'session-tree-node--sub' : 'session-tree-node--main',
     isActive ? 'session-tree-node--active' : '',
-    idleFlash ? 'sidebar-idle-flash' : '',
   ].filter(Boolean).join(' ');
 
   return (
     <button class={classes} onClick={onClick} title={`${agentType} — ${state}`}>
+      {idleFlashToken ? <IdleFlashLayer key={`tree-idle-${idleFlashToken}`} variant="fill" /> : null}
       {/* Icon: only for sub-sessions (main sessions use the tree toggle arrow) */}
       {isSub && (
         <span class="session-tree-icon" aria-hidden="true">
@@ -175,7 +176,7 @@ function SessionTreeInner({
   subSessions,
   activeSession,
   unreadCounts,
-  idleFlashes,
+  idleFlashTokens,
   p2pSessionLabels,
   onSelectSession,
   onSelectSubSession,
@@ -241,7 +242,7 @@ function SessionTreeInner({
         const isActive = session.name === activeSession;
         const isTransport = session.runtimeType === 'transport';
         const unread = unreadCounts.get(session.name) ?? 0;
-        const idleFlash = idleFlashes?.has(session.name) ?? false;
+        const idleFlashToken = idleFlashTokens?.get(session.name) ?? 0;
 
         // Sub-sessions belonging to this main session
         const children = subSessions.filter(
@@ -270,7 +271,7 @@ function SessionTreeInner({
                 isTransport={isTransport}
                 isSub={false}
                 unread={unread}
-                idleFlash={idleFlash}
+                idleFlashToken={idleFlashToken}
                 inP2p={!!p2pSessionLabels?.has(session.name)}
                 onClick={() => onSelectSession(session.name)}
               />
@@ -287,7 +288,7 @@ function SessionTreeInner({
             {!isCollapsed && children.map((sub) => {
               const subLabel = sub.label ? formatLabel(sub.label) : sub.type;
               const subUnread = unreadCounts.get(sub.sessionName) ?? 0;
-              const subIdleFlash = idleFlashes?.has(sub.sessionName) ?? false;
+              const subIdleFlashToken = idleFlashTokens?.get(sub.sessionName) ?? 0;
               return (
                 <SessionNode
                   key={sub.id}
@@ -298,7 +299,7 @@ function SessionTreeInner({
                   isTransport={false}
                   isSub={true}
                   unread={subUnread}
-                  idleFlash={subIdleFlash}
+                  idleFlashToken={subIdleFlashToken}
                   inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
                   onClick={() => onSelectSubSession(sub)}
                 />

@@ -18,6 +18,7 @@ import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff, SessionInfo } from '../types.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import { extractLatestUsage } from '../usage-data.js';
+import { IdleFlashLayer } from './IdleFlashLayer.js';
 
 interface WindowGeometry { x: number; y: number; w: number; h: number }
 
@@ -27,7 +28,7 @@ interface Props {
   connected: boolean;
   /** When false, timeline and terminal subscriptions are paused to save CPU. */
   active: boolean;
-  idleFlash?: boolean;
+  idleFlashToken?: number;
   onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void;
   onHistory: (sessionName: string, apply: (c: string) => void) => void;
   onMinimize: () => void;
@@ -87,7 +88,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, idleFlash, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, zIndex, onFocus, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, inP2p,
+  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, zIndex, onFocus, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, inP2p,
 }: Props) {
   const { t } = useTranslation();
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -334,7 +335,8 @@ export function SubSessionWindow({
     : { position: 'fixed', left: geom.x, top: geom.y, width: geom.w, height: geom.h, zIndex };
 
   return (
-    <div ref={swipeBackRef} class={`subsession-window${idleFlash ? ' subsession-window-idle-flash' : ''}`} style={style} onMouseDown={onFocus}>
+    <div ref={swipeBackRef} class="subsession-window" style={style} onMouseDown={onFocus}>
+      {idleFlashToken ? <IdleFlashLayer key={`subwindow-idle-${idleFlashToken}`} variant="frame" /> : null}
       {/* 8-direction resize handles (desktop only) */}
       {!isMobile && (['n','s','e','w','ne','nw','se','sw'] as ResizeDir[]).map((dir) => (
         <div key={dir} class={`resize-handle resize-${dir}`} onMouseDown={onResizeMouseDown(dir)} />

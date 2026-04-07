@@ -36,7 +36,7 @@ type DiscussionSummary = P2pProgressDiscussion & {
 interface Props {
   subSessions: SubSession[];
   openIds: Set<string>;
-  idleFlashes?: Set<string>;
+  idleFlashTokens?: Map<string, number>;
   onOpen: (id: string) => void;
   onClose: (id: string) => void;
   onRestart: (id: string) => void;
@@ -104,7 +104,7 @@ function formatUptime(seconds: number): string {
   return d > 0 ? `${d}d ${h}h` : `${h}h`;
 }
 
-export function SubSessionBar({ subSessions, openIds, idleFlashes, onOpen, onClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId, quickData, sessions, allSubSessions, p2pSessionLabels }: Props) {
+export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, onClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId, quickData, sessions, allSubSessions, p2pSessionLabels }: Props) {
   const { t } = useTranslation();
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
   const [collapsed, setCollapsed] = useState(isMobile);
@@ -494,7 +494,7 @@ export function SubSessionBar({ subSessions, openIds, idleFlashes, onOpen, onClo
                 connected={connected}
                 isOpen={openIds.has(sub.id)}
                 isFocused={focusedSubId === sub.id}
-                idleFlash={idleFlashes?.has(sub.sessionName) ?? false}
+                idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
                 onOpen={() => onOpen(sub.id)}
                 onClose={() => onClose(sub.id)}
                 onRestart={() => onRestart(sub.id)}

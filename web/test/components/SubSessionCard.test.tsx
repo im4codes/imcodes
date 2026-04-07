@@ -4,7 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
 import { useEffect } from 'preact/hooks';
-import { cleanup, render, waitFor } from '@testing-library/preact';
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 
 const chatScrollBottomSpy = vi.fn();
 const terminalScrollBottomSpy = vi.fn();
@@ -101,7 +101,7 @@ describe('SubSessionCard', () => {
     });
   });
 
-  it('does not apply running or idle-flash classes to idle cards', () => {
+  it('does not render idle-flash layer for idle cards by default', () => {
     const { container } = render(
       <SubSessionCard
         sub={makeSubSession({ state: 'idle' })}
@@ -118,25 +118,24 @@ describe('SubSessionCard', () => {
     const card = container.querySelector('.subcard') as HTMLDivElement;
     expect(card.className).toContain('subcard-focused');
     expect(card.className).not.toContain('subcard-running-pulse');
-    expect(card.className).not.toContain('subcard-idle-flash');
+    expect(container.querySelector('.idle-flash-layer--frame')).toBeNull();
   });
 
-  it('applies idle flash only when explicitly requested', () => {
+  it('renders an idle-flash layer only when explicitly requested', () => {
     const { container } = render(
       <SubSessionCard
         sub={makeSubSession({ state: 'idle' })}
         ws={null}
         connected={true}
         isOpen={false}
-        idleFlash={true}
+        idleFlashToken={1}
         onOpen={vi.fn()}
         onDiff={vi.fn()}
         onHistory={vi.fn()}
       />,
     );
 
-    const card = container.querySelector('.subcard') as HTMLDivElement;
-    expect(card.className).toContain('subcard-idle-flash');
+    expect(container.querySelector('.idle-flash-layer--frame')).not.toBeNull();
   });
 
   it('forces chat preview to follow when timeline events update', async () => {
@@ -201,6 +200,53 @@ describe('SubSessionCard', () => {
     await waitFor(() => {
       expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', { sessionName: 'deck_sub_sub-card-1', text: 'echo hi' });
       expect(terminalScrollBottomSpy).toHaveBeenCalled();
+    });
+  });
+
+  it('renders a transport stop icon button and sends /stop from the fallback input path', async () => {
+    const ws = { sendSessionCommand: vi.fn() } as any;
+    const { container } = render(
+      <SubSessionCard
+        sub={makeSubSession({ runtimeType: 'transport', state: 'running' } as any)}
+        ws={ws}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const stopBtn = container.querySelector('.subcard-stop-btn') as HTMLButtonElement;
+    expect(stopBtn).toBeTruthy();
+    fireEvent.click(stopBtn);
+
+    await waitFor(() => {
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', { sessionName: 'deck_sub_sub-card-1', text: '/stop' });
+    });
+  });
+
+  it('keeps the transport stop icon when the card uses compact SessionControls', async () => {
+    const ws = { sendSessionCommand: vi.fn() } as any;
+    const { container } = render(
+      <SubSessionCard
+        sub={makeSubSession({ runtimeType: 'transport', state: 'running' } as any)}
+        ws={ws}
+        connected={true}
+        isOpen={false}
+        quickData={{} as any}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const stopBtn = container.querySelector('.subcard-stop-btn') as HTMLButtonElement;
+    expect(stopBtn).toBeTruthy();
+    fireEvent.click(stopBtn);
+
+    await waitFor(() => {
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', { sessionName: 'deck_sub_sub-card-1', text: '/stop' });
     });
   });
 });

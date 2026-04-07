@@ -120,7 +120,6 @@ const nativeCallback = typeof window !== 'undefined'
   : null;
 
 type ViewMode = TerminalSubscribeViewMode;
-const IDLE_FLASH_DURATION_MS = 3000;
 
 /** A panel pinned to the sidebar. Uses sessionName as stable identity. */
 export interface PinnedPanel {
@@ -579,7 +578,7 @@ export function App() {
   const stoppedNavTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [idleAlerts, setIdleAlerts] = useState<Set<string>>(new Set());
-  const [idleFlashes, setIdleFlashes] = useState<Set<string>>(new Set());
+  const [idleFlashTokens, setIdleFlashTokens] = useState<Map<string, number>>(() => new Map());
   const [toasts, setToasts] = useState<Array<{ id: number; sessionName: string; project: string; kind: 'idle' | 'notification'; title?: string; message?: string; openRepoLatest?: boolean; failedJobName?: string; failedStepName?: string }>>([]);
   const [detectedModels, setDetectedModels] = useState<Map<string, string>>(new Map());
   const [subUsages, setSubUsages] = useState<Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string }>>(new Map());
@@ -621,37 +620,15 @@ export function App() {
     }
     return maxId;
   }, [subZIndexes, openSubIds]);
-  const idleFlashTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const flashIdleSession = useCallback((sessionName: string) => {
-    const timers = idleFlashTimersRef.current;
-    const existingTimer = timers.get(sessionName);
-    if (existingTimer) clearTimeout(existingTimer);
-
-    setIdleFlashes((prev) => {
-      if (prev.has(sessionName)) return prev;
-      const next = new Set(prev);
-      next.add(sessionName);
+    setIdleFlashTokens((prev) => {
+      const next = new Map(prev);
+      next.set(sessionName, (next.get(sessionName) ?? 0) + 1);
       return next;
     });
-
-    const timer = setTimeout(() => {
-      timers.delete(sessionName);
-      setIdleFlashes((prev) => {
-        if (!prev.has(sessionName)) return prev;
-        const next = new Set(prev);
-        next.delete(sessionName);
-        return next;
-      });
-    }, IDLE_FLASH_DURATION_MS);
-    timers.set(sessionName, timer);
   }, []);
   const focusedSubIdRef = useRef(focusedSubId);
   focusedSubIdRef.current = focusedSubId;
-
-  useEffect(() => () => {
-    for (const timer of idleFlashTimersRef.current.values()) clearTimeout(timer);
-    idleFlashTimersRef.current.clear();
-  }, []);
 
   useEffect(() => {
     if (sessionsLoaded && sessions.length === 0) {
@@ -910,6 +887,25 @@ export function App() {
   openSubIdsRef.current = openSubIds;
   const subSessionsRef = useRef(subSessions);
   subSessionsRef.current = subSessions;
+
+  useEffect(() => {
+    const liveSessionNames = new Set<string>([
+      ...sessions.map((session) => session.name),
+      ...subSessions.map((sub) => sub.sessionName),
+    ]);
+    setIdleFlashTokens((prev) => {
+      let changed = false;
+      const next = new Map<string, number>();
+      for (const [sessionName, token] of prev) {
+        if (liveSessionNames.has(sessionName)) {
+          next.set(sessionName, token);
+          continue;
+        }
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [sessions, subSessions]);
 
   // When sub-sessions load from API (after session_list already fired), sync them to Watch projection
   useEffect(() => {
@@ -2230,7 +2226,7 @@ export function App() {
               subSessions={subSessions}
               activeSession={activeSession}
               unreadCounts={unreadCounts}
-              idleFlashes={idleFlashes}
+              idleFlashTokens={idleFlashTokens}
               p2pSessionLabels={p2pSessionLabels}
               onSelectSession={(name) => {
                 setActiveSession(name);
@@ -2632,7 +2628,7 @@ export function App() {
               <SubSessionBar
                 subSessions={visibleSubSessions}
                 openIds={openSubIds}
-                idleFlashes={idleFlashes}
+                idleFlashTokens={idleFlashTokens}
                 onOpen={toggleSubSession}
                 onClose={closeSubSession}
                 onRestart={restartSubSession}
@@ -2727,7 +2723,7 @@ export function App() {
                 subSessions={subSessions}
                 activeSession={activeSession}
                 unreadCounts={unreadCounts}
-                idleFlashes={idleFlashes}
+                idleFlashTokens={idleFlashTokens}
                 p2pSessionLabels={p2pSessionLabels}
                 onSelectSession={(name) => {
                   setActiveSession(name);
@@ -3034,7 +3030,7 @@ export function App() {
               ws={wsRef.current}
               connected={connected}
               active={isOpen}
-              idleFlash={idleFlashes.has(sub.sessionName)}
+              idleFlashToken={idleFlashTokens.get(sub.sessionName) ?? 0}
               onDiff={registerDiffApplyer}
               onHistory={registerHistoryApplyer}
               onMinimize={() => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; })}
