@@ -156,4 +156,40 @@ describe('P2pProgressCard', () => {
     expect(screen.getAllByText('H2-4/4').length).toBeGreaterThan(0);
     expect(container.querySelectorAll('.discussions-progress-segments-hop .is-active').length).toBe(3);
   });
+
+  it('uses hopStates and completedRoundHops to render parallel hop bars even when global hop counters are stale', () => {
+    const { container } = render(
+      <P2pProgressCard
+        discussion={{
+          id: 'p2p_run_parallel_stale',
+          topic: 'P2P audit · brain',
+          state: 'running',
+          modeKey: 'audit',
+          currentRound: 2,
+          maxRounds: 3,
+          completedHops: 4,
+          completedRoundHops: 1,
+          totalHops: 4,
+          activeHop: 6,
+          activeRoundHop: 2,
+          activePhase: 'hop',
+          nodes: [],
+          hopStates: [
+            { hopIndex: 5, roundIndex: 2, status: 'completed' },
+            { hopIndex: 6, roundIndex: 2, status: 'running' },
+            { hopIndex: 7, roundIndex: 2, status: 'dispatched' },
+            { hopIndex: 8, roundIndex: 2, status: 'running' },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getAllByText('H2-4/4').length).toBeGreaterThan(0);
+    const hopSegments = [...container.querySelectorAll('.discussions-progress-segments-hop .discussions-progress-segment')];
+    expect(hopSegments).toHaveLength(4);
+    expect(hopSegments[0]?.className).toContain('is-done');
+    expect(hopSegments[1]?.className).toContain('is-active');
+    expect(hopSegments[2]?.className).toContain('is-active');
+    expect(hopSegments[3]?.className).toContain('is-active');
+  });
 });

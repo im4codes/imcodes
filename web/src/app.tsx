@@ -28,6 +28,13 @@ function mapP2pRunToDiscussion(r: Record<string, any>) {
     phase: typeof n.phase === 'string' ? n.phase as 'initial' | 'hop' | 'summary' : undefined,
     status: String(n.status ?? 'pending') as P2pProgressNodeStatus,
   })) : undefined;
+  const hopStates = Array.isArray(source.hop_states) ? source.hop_states.map((hop: any) => ({
+    hopIndex: Number(hop.hop_index ?? 0),
+    roundIndex: Number(hop.round_index ?? 0),
+    session: typeof hop.session === 'string' ? hop.session : undefined,
+    mode: typeof hop.mode === 'string' ? hop.mode : undefined,
+    status: String(hop.status ?? 'queued') as 'queued' | 'dispatched' | 'running' | 'completed' | 'timed_out' | 'failed' | 'cancelled',
+  })) : undefined;
   return {
     id,
     topic: `P2P ${mode} · ${initiatorLabel}`,
@@ -36,6 +43,7 @@ function mapP2pRunToDiscussion(r: Record<string, any>) {
     currentRound: source.current_round ?? 1,
     maxRounds: source.total_rounds ?? 1,
     completedHops: source.completed_hops_count ?? 0,
+    completedRoundHops: typeof source.completed_round_hops_count === 'number' ? source.completed_round_hops_count : undefined,
     totalHops,
     activeHop: source.active_hop_number ?? null,
     activeRoundHop: source.active_round_hop_number ?? null,
@@ -49,6 +57,7 @@ function mapP2pRunToDiscussion(r: Record<string, any>) {
     startedAt: source.created_at ? new Date(source.created_at).getTime() : undefined,
     hopStartedAt: typeof source.hop_started_at === 'number' ? source.hop_started_at : undefined,
     nodes,
+    hopStates,
   };
 }
 import { useTranslation } from 'react-i18next';
@@ -735,6 +744,7 @@ export function App() {
     currentRound: number;
     maxRounds: number;
     completedHops: number;
+    completedRoundHops?: number;
     totalHops: number;
     activeHop?: number | null;
     activeRoundHop?: number | null;
@@ -751,6 +761,13 @@ export function App() {
       mode?: string;
       phase?: 'initial' | 'hop' | 'summary';
       status: 'done' | 'active' | 'pending' | 'skipped';
+    }>;
+    hopStates?: Array<{
+      hopIndex: number;
+      roundIndex: number;
+      session?: string;
+      mode?: string;
+      status: 'queued' | 'dispatched' | 'running' | 'completed' | 'timed_out' | 'failed' | 'cancelled';
     }>;
     /** Discussion file ID for navigation (P2P runs use discussion_id, not run id) */
     fileId?: string;

@@ -11,6 +11,14 @@ export interface P2pProgressNode {
   status: 'done' | 'active' | 'pending' | 'skipped';
 }
 
+export interface P2pHopState {
+  hopIndex: number;
+  roundIndex: number;
+  session?: string;
+  mode?: string;
+  status: 'queued' | 'dispatched' | 'running' | 'completed' | 'timed_out' | 'failed' | 'cancelled';
+}
+
 export interface P2pProgressDiscussion {
   id: string;
   topic: string;
@@ -19,6 +27,7 @@ export interface P2pProgressDiscussion {
   currentRound: number;
   maxRounds: number;
   completedHops?: number;
+  completedRoundHops?: number;
   totalHops?: number;
   activeHop?: number | null;
   activeRoundHop?: number | null;
@@ -26,6 +35,7 @@ export interface P2pProgressDiscussion {
   conclusion?: string;
   error?: string;
   nodes?: P2pProgressNode[];
+  hopStates?: P2pHopState[];
   /** Epoch ms when the P2P run started */
   startedAt?: number;
   /** Epoch ms when the current hop/phase started (server-provided for accurate elapsed) */
@@ -167,34 +177,66 @@ export function P2pProgressCard({ discussion, compact = false, mobile = false, h
   const isActive = !isTerminal;
   const showActionButton = discussion.state === 'failed' || isActive;
   const totalHopsPerRound = discussion.totalHops ?? 0;
+  const activeHopNumbers = useMemo(() => {
+    if (totalHopsPerRound <= 0) return [];
+    return (discussion.hopStates ?? [])
+      .filter((hop) =>
+        hop.roundIndex === discussion.currentRound &&
+        (hop.status === 'running' || hop.status === 'dispatched'),
+      )
+      .map((hop) => ((hop.hopIndex - 1) % totalHopsPerRound) + 1)
+      .filter((hopNum) => hopNum > 0 && hopNum <= totalHopsPerRound)
+      .sort((a, b) => a - b);
+  }, [discussion.currentRound, discussion.hopStates, totalHopsPerRound]);
   const activeHopCount = useMemo(
-    () => nodes.filter((node) => node.phase === 'hop' && node.status === 'active').length,
-    [nodes],
+    () => activeHopNumbers.length > 0
+      ? activeHopNumbers.length
+      : nodes.filter((node) => node.phase === 'hop' && node.status === 'active').length,
+    [activeHopNumbers, nodes],
   );
   const completedRoundHops = useMemo(() => {
     if (totalHopsPerRound <= 0) return 0;
+    if (typeof discussion.completedRoundHops === 'number') {
+      return Math.max(0, Math.min(totalHopsPerRound, discussion.completedRoundHops));
+    }
     const roundOffset = Math.max(0, discussion.currentRound - 1) * totalHopsPerRound;
     return Math.max(0, Math.min(totalHopsPerRound, (discussion.completedHops ?? 0) - roundOffset));
-  }, [discussion.completedHops, discussion.currentRound, totalHopsPerRound]);
+  }, [discussion.completedHops, discussion.completedRoundHops, discussion.currentRound, totalHopsPerRound]);
   const visibleRoundHop = useMemo(() => {
     if (totalHopsPerRound <= 0) return null;
+    if (activeHopNumbers.length > 0) return activeHopNumbers[0];
     if (typeof discussion.activeRoundHop === 'number') return discussion.activeRoundHop;
     if (typeof discussion.activeHop === 'number' && discussion.activeHop > 0) {
       return ((discussion.activeHop - 1) % totalHopsPerRound) + 1;
     }
     return completedRoundHops;
-  }, [discussion.activeHop, discussion.activeRoundHop, completedRoundHops, totalHopsPerRound]);
+  }, [activeHopNumbers, discussion.activeHop, discussion.activeRoundHop, completedRoundHops, totalHopsPerRound]);
+  const activeHopRange = useMemo(() => {
+    if (discussion.activePhase !== 'hop' || totalHopsPerRound <= 0 || activeHopCount <= 0) return null;
+    if (activeHopNumbers.length > 0) {
+      return {
+        start: activeHopNumbers[0]!,
+        end: activeHopNumbers[activeHopNumbers.length - 1]!,
+      };
+    }
+    const start = Math.min(totalHopsPerRound, completedRoundHops + 1);
+    const end = Math.min(totalHopsPerRound, completedRoundHops + activeHopCount);
+    return { start, end };
+  }, [activeHopCount, activeHopNumbers, completedRoundHops, discussion.activePhase, totalHopsPerRound]);
   const hopText = useMemo(() => {
     if (discussion.totalHops == null || discussion.totalHops <= 0) return null;
-    if (discussion.activePhase === 'hop' && activeHopCount > 1) {
-      const startHop = Math.min(discussion.totalHops, completedRoundHops + 1);
-      const endHop = Math.min(discussion.totalHops, completedRoundHops + activeHopCount);
+    if (activeHopRange && activeHopCount > 1) {
+      const startHop = activeHopRange.start;
+      const endHop = activeHopRange.end;
       return startHop >= endHop
         ? `H${endHop}/${discussion.totalHops}`
         : `H${startHop}-${endHop}/${discussion.totalHops}`;
     }
+    if (activeHopRange && activeHopCount === 1) {
+      return `H${activeHopRange.start}/${discussion.totalHops}`;
+    }
     return `H${visibleRoundHop ?? completedRoundHops}/${discussion.totalHops}`;
-  }, [activeHopCount, completedRoundHops, discussion.activePhase, discussion.totalHops, visibleRoundHop]);
+  }, [activeHopCount, activeHopRange, completedRoundHops, discussion.totalHops, visibleRoundHop]);
   const roundText = `R${discussion.currentRound}/${discussion.maxRounds}`;
 
   const phaseLabel = useMemo(() => (
@@ -283,23 +325,23 @@ export function P2pProgressCard({ discussion, compact = false, mobile = false, h
   const hopSegments = useMemo(() => (
     Array.from({ length: Math.max(0, discussion.totalHops ?? 0) }, (_, idx) => {
       const hopNum = idx + 1;
+      const isActiveHop = !!activeHopRange
+        && hopNum >= activeHopRange.start
+        && hopNum <= activeHopRange.end
+        && (activeHopNumbers.length === 0 || activeHopNumbers.includes(hopNum));
       const activeHopNum = visibleRoundHop ?? completedRoundHops;
-      const isActiveHopRange = discussion.activePhase === 'hop'
-        && activeHopCount > 0
-        && hopNum > completedRoundHops
-        && hopNum <= Math.min(discussion.totalHops ?? 0, completedRoundHops + activeHopCount);
       const status = discussion.state === 'done'
         ? 'done'
-        : hopNum < activeHopNum
+        : isActiveHop
+          ? 'active'
+        : hopNum <= completedRoundHops
           ? 'done'
-          : isActiveHopRange
+          : hopNum === activeHopNum && discussion.activePhase === 'hop'
             ? 'active'
-            : hopNum === activeHopNum && discussion.activePhase === 'hop'
-            ? 'active'
-          : 'pending';
+            : 'pending';
       return { hopNum, status };
     })
-  ), [activeHopCount, completedRoundHops, discussion.activePhase, discussion.state, discussion.totalHops, visibleRoundHop]);
+  ), [activeHopNumbers, activeHopRange, completedRoundHops, discussion.activePhase, discussion.state, discussion.totalHops, visibleRoundHop]);
 
   return (
     <div
