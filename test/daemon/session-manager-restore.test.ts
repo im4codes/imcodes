@@ -42,6 +42,7 @@ vi.mock('../../src/store/session-store.js', () => ({
 }));
 
 vi.mock('../../src/agent/tmux.js', () => ({
+  BACKEND: 'tmux',
   listSessions: tmuxListMock,
   newSession: newSessionMock,
   killSession: vi.fn().mockResolvedValue(undefined),
@@ -108,7 +109,7 @@ vi.mock('../../src/agent/brain-dispatcher.js', () => ({
   BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })),
 }));
 
-import { restoreFromStore, restartSession, respawnSession } from '../../src/agent/session-manager.js';
+import { restoreFromStore, restartSession, respawnSession, setSessionEventCallback } from '../../src/agent/session-manager.js';
 import { startWatching, startWatchingFile } from '../../src/daemon/jsonl-watcher.js';
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -116,6 +117,7 @@ import { startWatching, startWatchingFile } from '../../src/daemon/jsonl-watcher
 describe('restoreFromStore — sub-session JSONL watcher regression', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    setSessionEventCallback(() => {});
     tmuxListMock.mockResolvedValue(['deck_Cd_brain', 'deck_sub_5907196l']);
     isWatchingMock.mockReturnValue(false);
     getPaneStartCommandMock.mockResolvedValue('claude --dangerously-skip-permissions');
@@ -269,5 +271,49 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
       }),
       expect.any(Object),
     );
+  });
+
+  it('persists idle before restarting a missing session', async () => {
+    const now = Date.now();
+
+    await restartSession({
+      name: 'deck_restart_brain',
+      projectName: 'restart',
+      role: 'brain',
+      agentType: 'shell',
+      projectDir: '/proj',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_restart_brain',
+      state: 'idle',
+    }));
+  });
+
+  it('persists idle before respawning a dead pane', async () => {
+    const now = Date.now();
+
+    await respawnSession({
+      name: 'deck_respawn_w1',
+      projectName: 'respawn',
+      role: 'w1',
+      agentType: 'shell',
+      projectDir: '/proj',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_respawn_w1',
+      state: 'idle',
+    }));
   });
 });

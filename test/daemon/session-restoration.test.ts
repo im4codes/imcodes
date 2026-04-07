@@ -113,13 +113,14 @@ vi.mock('../../src/daemon/opencode-watcher.js', () => ({
   isWatching: mocks.openCodeIsWatching,
 }));
 
-import { restoreFromStore } from '../../src/agent/session-manager.js';
+import { restoreFromStore, setSessionEventCallback } from '../../src/agent/session-manager.js';
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('Session Restoration (all agents)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    setSessionEventCallback(() => {});
   });
 
   it('restores Gemini watcher for live sessions', async () => {
@@ -268,5 +269,21 @@ describe('Session Restoration (all agents)', () => {
       name: 'deck_proj_brain',
       opencodeSessionId: 'oc-main-sqlite-123',
     }));
+  });
+
+  it('discovers orphan tmux sessions as idle until live state is observed', async () => {
+    const onSessionEvent = vi.fn();
+    setSessionEventCallback(onSessionEvent);
+    mocks.storeListSessions.mockReturnValue([]);
+    mocks.tmuxListSessions.mockResolvedValue(['deck_orphan_brain']);
+    mocks.getPaneStartCommand.mockResolvedValueOnce('codex');
+
+    await restoreFromStore();
+
+    expect(mocks.storeUpsertSession).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_orphan_brain',
+      state: 'idle',
+    }));
+    expect(onSessionEvent).toHaveBeenCalledWith('started', 'deck_orphan_brain', 'idle');
   });
 });

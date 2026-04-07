@@ -1354,7 +1354,7 @@ describe('WsBridge', () => {
       expect(msg.activeModel).toBe('sonnet');
       expect(msg.effort).toBe('high');
       expect(msg.transportConfig).toEqual({ provider: { mode: 'safe' } });
-      expect(msg.state).toBe('running');
+      expect(msg.state).toBe('idle');
     });
 
     it('subsession.closed from daemon → updates DB + broadcasts subsession.removed to browsers', async () => {

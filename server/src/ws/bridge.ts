@@ -983,7 +983,7 @@ export class WsBridge {
           quotaLabel: msg.quotaLabel || null,
           quotaUsageLabel: msg.quotaUsageLabel || null,
           quotaMeta: msg.quotaMeta || null,
-          state: 'running',
+          state: (msg.state as string) || 'idle',
         }));
       }).catch((e) => logger.error({ err: e, id: msg.id }, 'Failed to sync sub-session to DB'));
       return;

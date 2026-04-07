@@ -84,11 +84,11 @@ describe('sub-session metadata via subsession.created', () => {
       id: 'cc1',
       sessionName: 'deck_sub_cc1',
       sessionType: 'claude-code',
-      state: 'running',
     }));
 
     expect(captured).toHaveLength(1);
     const s = captured[0];
+    expect(s.state).toBe('idle');
     expect(s.modelDisplay).toBeNull();
     expect(s.planLabel).toBeNull();
     expect(s.quotaLabel).toBeNull();

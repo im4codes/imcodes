@@ -521,7 +521,7 @@ export async function restoreFromStore(): Promise<void> {
       agentType,
       agentVersion: await getAgentVersion(agentType),
       projectDir,
-      state: 'running',
+      state: 'idle',
       restarts: 0,
       restartTimestamps: [],
       createdAt: Date.now(),
@@ -533,7 +533,7 @@ export async function restoreFromStore(): Promise<void> {
 
     upsertSession(record);
     emitSessionPersist(record, name);
-    emitSessionEvent('started', name, 'running');
+    emitSessionEvent('started', name, 'idle');
     if (agentType === 'claude-code' && projectDir) {
       startStructuredWatcher(name, agentType, projectDir, { ccSessionId });
     } else if (agentType === 'opencode' && projectDir) {
@@ -580,7 +580,7 @@ export async function restartSession(record: SessionRecord): Promise<boolean> {
     ...effectiveRecord,
     restarts: record.restarts + 1,
     restartTimestamps: [...recentRestarts, now],
-    state: 'running',
+    state: 'idle',
     updatedAt: now,
   };
   upsertSession(updated);
@@ -672,7 +672,7 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     ...effectiveRecord,
     restarts: record.restarts + 1,
     restartTimestamps: [...recentRestarts, now],
-    state: 'running',
+    state: 'idle',
     updatedAt: now,
   };
   upsertSession(updated);
@@ -928,7 +928,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       registerProviderRoute(actualProviderSid, s.name);
       upsertSession({
         ...s,
-        state: 'running',
+        state: 'idle',
         updatedAt: Date.now(),
         ...(freshAfterCancel ? { providerSessionId: actualProviderSid, qwenFreshOnResume: undefined } : {}),
         requestedModel: effectiveQwenModel ?? s.requestedModel,
@@ -1046,7 +1046,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         role,
         agentType,
         projectDir,
-        state: 'running',
+        state: 'idle',
         restarts: 0,
         restartTimestamps: [],
         createdAt: Date.now(),
@@ -1081,7 +1081,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
       emitSessionPersist(record, name);
     }
 
-    emitSessionEvent('started', name, 'running');
+    emitSessionEvent('started', name, 'idle');
     logger.info({ session: name, agentType, providerId: provider.id }, 'Launched transport session');
   } catch (err) {
     // Rollback runtime + route on persistence failure
@@ -1197,7 +1197,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       agentType,
       agentVersion,
       projectDir,
-      state: 'running',
+      state: 'idle',
       restarts: existing?.restarts ?? 0,
       restartTimestamps: existing?.restartTimestamps ?? [],
       createdAt: existing?.createdAt ?? Date.now(),
@@ -1231,7 +1231,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     }
   }
 
-  emitSessionEvent('started', name, 'running');
+  emitSessionEvent('started', name, 'idle');
 
   // Start structured-event watchers for supported agent types
   startStructuredWatcher(name, agentType, projectDir, { ccSessionId, codexSessionId, geminiSessionId, opencodeSessionId });

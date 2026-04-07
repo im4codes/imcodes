@@ -156,7 +156,7 @@ export function useSubSessions(
               parentSession: m.parentSession || null,
               createdAt: now,
               updatedAt: now,
-              state: (m.state || 'running') as SubSession['state'],
+              state: (m.state || 'idle') as SubSession['state'],
               qwenModel: m.qwenModel ?? null,
               requestedModel: m.requestedModel ?? null,
               activeModel: m.activeModel ?? m.modelDisplay ?? null,

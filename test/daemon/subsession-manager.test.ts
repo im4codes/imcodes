@@ -459,7 +459,7 @@ describe('rebuildSubSessions — geminiSessionId preserved', () => {
 
     // upsertSession must include the stored geminiSessionId
     expect(upsertSessionMock).toHaveBeenCalledWith(
-      expect.objectContaining({ geminiSessionId: 'stored-uuid-1234' }),
+      expect.objectContaining({ geminiSessionId: 'stored-uuid-1234', state: 'idle' }),
     );
   });
 
@@ -482,7 +482,7 @@ describe('rebuildSubSessions — geminiSessionId preserved', () => {
     }]);
 
     expect(upsertSessionMock).toHaveBeenCalledWith(
-      expect.objectContaining({ geminiSessionId: 'new-uuid-from-server' }),
+      expect.objectContaining({ geminiSessionId: 'new-uuid-from-server', state: 'idle' }),
     );
   });
 
@@ -506,6 +506,9 @@ describe('rebuildSubSessions — geminiSessionId preserved', () => {
     expect(geminiStartWatchingMock).toHaveBeenCalledWith(
       'deck_sub_rebuild3',
       'fallback-uuid',
+    );
+    expect(upsertSessionMock).toHaveBeenCalledWith(
+      expect.objectContaining({ geminiSessionId: 'fallback-uuid', state: 'idle' }),
     );
   });
 

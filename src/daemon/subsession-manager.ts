@@ -210,7 +210,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   timelineEmitter.emit(sessionName, 'session.state', { state: 'started' });
 
   upsertSession({
-    name: sessionName, projectName: sessionName, agentType: sub.type, agentVersion, role: 'w1', state: 'running',
+    name: sessionName, projectName: sessionName, agentType: sub.type, agentVersion, role: 'w1', state: 'idle',
     projectDir: sub.cwd ?? '', label: sub.label ?? undefined,
     ccSessionId: sub.ccSessionId ?? undefined,
     codexSessionId: sub.codexSessionId ?? undefined,
@@ -347,7 +347,7 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
       const effectiveGeminiSessionId = sub.geminiSessionId ?? stored?.geminiSessionId;
       const effectiveOpenCodeSessionId = sub.opencodeSessionId ?? stored?.opencodeSessionId;
       upsertSession({
-        name: sessionName, projectName: sessionName, agentType: sub.type, agentVersion: stored?.agentVersion ?? await getAgentVersion(sub.type as AgentType, sub.shellBin ?? undefined), role: 'w1', state: 'running',
+        name: sessionName, projectName: sessionName, agentType: sub.type, agentVersion: stored?.agentVersion ?? await getAgentVersion(sub.type as AgentType, sub.shellBin ?? undefined), role: 'w1', state: 'idle',
         projectDir: sub.cwd ?? '', label: sub.label ?? stored?.label ?? undefined,
         ccSessionId: effectiveCcSessionId ?? undefined,
         codexSessionId: effectiveCodexSessionId ?? undefined,

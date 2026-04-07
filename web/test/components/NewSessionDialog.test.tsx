@@ -185,7 +185,7 @@ describe('NewSessionDialog', () => {
       type: 'session.event',
       event: 'started',
       session: 'deck_u6d4b_u8bd5_brain',
-      state: 'running',
+      state: 'idle',
     });
 
     expect(onSessionStarted).toHaveBeenCalledWith('deck_u6d4b_u8bd5_brain');

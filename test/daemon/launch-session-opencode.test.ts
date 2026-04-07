@@ -96,6 +96,7 @@ describe('launchSession — OpenCode ID handling', () => {
     const upsertCalls = mocks.upsertSession.mock.calls;
     const lastRecord = upsertCalls[upsertCalls.length - 1][0];
     expect(lastRecord.opencodeSessionId).toBe('oc-main-uuid');
+    expect(lastRecord.state).toBe('idle');
     expect(mocks.discoverOpenCodeSessionId).toHaveBeenCalledWith('/proj', expect.objectContaining({
       exactDirectory: '/proj',
       knownSessionIds: ['old-session'],

@@ -129,7 +129,7 @@ vi.mock('../../src/repo/cache.js', () => ({ repoCache: { invalidate: vi.fn() } }
 vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })) }));
 
 import { connectProvider, disconnectAll } from '../../src/agent/provider-registry.js';
-import { getTransportRuntime, restoreTransportSessions } from '../../src/agent/session-manager.js';
+import { getTransportRuntime, launchTransportSession, restoreTransportSessions, setSessionEventCallback } from '../../src/agent/session-manager.js';
 
 const flush = async () => {
   for (let i = 0; i < 4; i++) await new Promise((resolve) => setTimeout(resolve, 0));
@@ -140,6 +140,7 @@ describe('sdk transport session restore', () => {
     mocks.store.clear();
     mocks.claudeRuns.length = 0;
     mocks.codexRuns.length = 0;
+    setSessionEventCallback(() => {});
   });
 
   afterEach(async () => {
@@ -182,6 +183,7 @@ describe('sdk transport session restore', () => {
     expect(mocks.claudeRuns[0].options.resume).toBe('cc-session-restore');
     expect(mocks.claudeRuns[0].options.model).toBe('sonnet');
     expect(mocks.claudeRuns[0].options.effort).toBe('high');
+    expect(mocks.store.get('deck_sdk_cc_brain')?.state).toBe('idle');
     expect(mocks.store.get('deck_sdk_cc_brain')?.modelDisplay).toBe('claude-sonnet-4-6');
     expect(mocks.store.get('deck_sdk_cc_brain')?.requestedModel).toBe('sonnet');
     expect(mocks.store.get('deck_sdk_cc_brain')?.effort).toBe('high');
@@ -221,7 +223,27 @@ describe('sdk transport session restore', () => {
 
     expect(mocks.codexRuns).toHaveLength(1);
     expect(mocks.codexRuns[0]).toMatchObject({ mode: 'resume', id: 'codex-thread-restore' });
+    expect(mocks.store.get('deck_sdk_cx_brain')?.state).toBe('idle');
     expect(mocks.store.get('deck_sdk_cx_brain')?.requestedModel).toBe('gpt-5.4');
     expect(mocks.store.get('deck_sdk_cx_brain')?.effort).toBe('medium');
+  });
+
+  it('emits started idle when launching a new transport session', async () => {
+    const onSessionEvent = vi.fn();
+    setSessionEventCallback(onSessionEvent);
+
+    await connectProvider('claude-code-sdk', {});
+    await launchTransportSession({
+      name: 'deck_sdk_new_brain',
+      projectName: 'sdknew',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/sdk-new',
+      requestedModel: 'sonnet',
+      effort: 'high',
+    });
+
+    expect(mocks.store.get('deck_sdk_new_brain')?.state).toBe('idle');
+    expect(onSessionEvent).toHaveBeenCalledWith('started', 'deck_sdk_new_brain', 'idle');
   });
 });
