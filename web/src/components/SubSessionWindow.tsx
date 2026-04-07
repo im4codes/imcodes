@@ -122,17 +122,6 @@ export function SubSessionWindow({
   const [viewMode, setViewMode] = useState<ViewMode>(isShell ? 'terminal' : isTransport ? 'chat' : initial.viewMode);
   // confirmClose removed — × now minimizes instead of terminating
 
-  // Flash red when sub-session transitions to idle
-  const [idleFlash, setIdleFlash] = useState(false);
-  const prevStateRef = useRef(sub.state);
-  useEffect(() => {
-    if (prevStateRef.current === 'running' && sub.state === 'idle') {
-      setIdleFlash(true);
-      const t = setTimeout(() => setIdleFlash(false), 3000);
-      return () => clearTimeout(t);
-    }
-    prevStateRef.current = sub.state;
-  }, [sub.state]);
   const inputRef = useRef<HTMLDivElement>(null);
   const termFitFnRef = useRef<(() => void) | null>(null);
   const geomRef = useRef(geom);
@@ -344,7 +333,7 @@ export function SubSessionWindow({
     : { position: 'fixed', left: geom.x, top: geom.y, width: geom.w, height: geom.h, zIndex };
 
   return (
-    <div ref={swipeBackRef} class={`subsession-window${idleFlash ? ' subcard-idle-flash' : ''}`} style={style} onMouseDown={onFocus}>
+    <div ref={swipeBackRef} class="subsession-window" style={style} onMouseDown={onFocus}>
       {/* 8-direction resize handles (desktop only) */}
       {!isMobile && (['n','s','e','w','ne','nw','se','sw'] as ResizeDir[]).map((dir) => (
         <div key={dir} class={`resize-handle resize-${dir}`} onMouseDown={onResizeMouseDown(dir)} />

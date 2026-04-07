@@ -111,6 +111,29 @@ describe('SessionControls', () => {
     expect(menuBtn).toBeDefined();
   });
 
+  it('only shows the scan sweep while the session is running', () => {
+    const idleView = render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ state: 'idle' })}
+        activeThinking={true}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(idleView.container.querySelector('.controls-wrapper-running')).toBeNull();
+    idleView.unmount();
+
+    const runningView = render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ state: 'running' })}
+        activeThinking={false}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(runningView.container.querySelector('.controls-wrapper-running')).toBeTruthy();
+  });
+
   it('send button is disabled when input is empty', () => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
     const sendBtn = screen.getByRole('button', { name: /send/i });

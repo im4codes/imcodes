@@ -107,18 +107,6 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
 
   const busy = useMemo(() => isVisuallyBusy(sub.state, !!getActiveThinkingTs(events)), [events, sub.state]);
 
-  // Flash red when sub-session transitions to idle
-  const [idleFlash, setIdleFlash] = useState(false);
-  const prevStateRef = useRef(sub.state);
-  useEffect(() => {
-    if (prevStateRef.current === 'running' && sub.state === 'idle') {
-      setIdleFlash(true);
-      const t = setTimeout(() => setIdleFlash(false), 3000);
-      return () => clearTimeout(t);
-    }
-    prevStateRef.current = sub.state;
-  }, [sub.state]);
-
   // Preview cards always follow the latest content.
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   useEffect(() => {
@@ -204,7 +192,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
 
   return (
     <div
-      class={`subcard${isOpen ? ' subcard-open' : ''}${isFocused ? ' subcard-focused' : ''}${busy ? ' subcard-running-pulse' : ''}${idleFlash ? ' subcard-idle-flash' : ''}`}
+      class={`subcard${isOpen ? ' subcard-open' : ''}${isFocused ? ' subcard-focused' : ''}${busy ? ' subcard-running-pulse' : ''}`}
       style={{ width: effectiveW, height: cardH, minWidth: effectiveW, position: 'relative' }}
       onClick={() => { if (!draggingRef.current) onOpen(); }}
     >

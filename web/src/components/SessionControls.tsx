@@ -13,7 +13,6 @@ import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
 import { P2pConfigPanel } from './P2pConfigPanel.js';
 import { uploadFile, getUserPref, saveUserPref } from '../api.js';
-import { isVisuallyBusy } from '../thinking-utils.js';
 import { P2P_CONFIG_MODE, COMBO_PRESETS, COMBO_SEPARATOR } from '@shared/p2p-modes.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
@@ -225,7 +224,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking: _activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -258,6 +257,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const p2pRef = useRef<HTMLDivElement>(null);
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showRunningSweep = !compact && activeSession?.state === 'running';
   // Internal ref for contenteditable — also written to the external inputRef
   const divRef = useRef<HTMLDivElement>(null);
   // History navigation state
@@ -925,7 +925,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         />
       </div>
     )}
-    <div class={`controls-wrapper${!compact && isVisuallyBusy(activeSession?.state, !!activeThinking) ? ' controls-wrapper-running' : ''}`}>
+    <div class={`controls-wrapper${showRunningSweep ? ' controls-wrapper-running' : ''}`}>
       {/* Shortcut row — hidden in chat mode and compact mode */}
       {!hideShortcuts && !compact && <div class="shortcuts-row">
         <div class="shortcuts">

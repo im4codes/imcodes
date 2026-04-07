@@ -84,4 +84,24 @@ describe('SubSessionCard', () => {
       expect(preview.scrollTop).toBe(1500);
     });
   });
+
+  it('does not apply running or idle-flash classes to idle cards', () => {
+    const { container } = render(
+      <SubSessionCard
+        sub={makeSubSession({ state: 'idle' })}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        isFocused={true}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const card = container.querySelector('.subcard') as HTMLDivElement;
+    expect(card.className).toContain('subcard-focused');
+    expect(card.className).not.toContain('subcard-running-pulse');
+    expect(card.className).not.toContain('subcard-idle-flash');
+  });
 });
