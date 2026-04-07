@@ -42,6 +42,7 @@ interface Props {
   connected: boolean;
   isOpen: boolean;
   isFocused?: boolean;
+  idleFlash?: boolean;
   onOpen: () => void;
   onClose?: () => void;
   onRestart?: () => void;
@@ -65,7 +66,7 @@ function loadCardW(id: string, fallback: number): number {
   return fallback;
 }
 
-export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, inP2p }: Props) {
+export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlash, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, inP2p }: Props) {
   const { t } = useTranslation();
   const isShell = sub.type === 'shell' || sub.type === 'script';
   const { events, refreshing } = isShell ? { events: [], refreshing: false } : useTimeline(sub.sessionName, ws, serverId);
@@ -192,7 +193,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
 
   return (
     <div
-      class={`subcard${isOpen ? ' subcard-open' : ''}${isFocused ? ' subcard-focused' : ''}${busy ? ' subcard-running-pulse' : ''}`}
+      class={`subcard${isOpen ? ' subcard-open' : ''}${isFocused ? ' subcard-focused' : ''}${busy ? ' subcard-running-pulse' : ''}${idleFlash ? ' subcard-idle-flash' : ''}`}
       style={{ width: effectiveW, height: cardH, minWidth: effectiveW, position: 'relative' }}
       onClick={() => { if (!draggingRef.current) onOpen(); }}
     >

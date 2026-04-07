@@ -633,6 +633,7 @@ body {
 
 /* ── Sub-session window ───────────────────────────────────────────────────── */
 .subsession-window { display: flex; flex-direction: column; background: #0f1117; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); overflow: hidden; min-width: 300px; min-height: 200px; }
+.subsession-window-idle-flash { animation: subcard-idle-flash 0.5s ease-in-out 6 !important; }
 .subsession-header { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: #1a2233; border-bottom: 1px solid #1e293b; cursor: move; user-select: none; flex-shrink: 0; }
 .subsession-drag-icon { color: #475569; font-size: 16px; cursor: grab; }
 .subsession-title { font-size: 12px; color: #94a3b8; font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

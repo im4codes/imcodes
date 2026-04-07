@@ -104,4 +104,22 @@ describe('SubSessionCard', () => {
     expect(card.className).not.toContain('subcard-running-pulse');
     expect(card.className).not.toContain('subcard-idle-flash');
   });
+
+  it('applies idle flash only when explicitly requested', () => {
+    const { container } = render(
+      <SubSessionCard
+        sub={makeSubSession({ state: 'idle' })}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        idleFlash={true}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const card = container.querySelector('.subcard') as HTMLDivElement;
+    expect(card.className).toContain('subcard-idle-flash');
+  });
 });
