@@ -2,10 +2,28 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 
 // ── Mock fs so writeWatchdogCmd doesn't touch disk ─────────────────────────
 
+/** Captures both string and Buffer writes — Buffers are decoded to text for assertions. */
 const written: Record<string, string> = {};
+const writtenRaw: Record<string, Buffer | string> = {};
+
+function decodeWritten(content: Buffer | string): string {
+  if (typeof content === 'string') return content;
+  // UTF-16 LE BOM
+  if (content[0] === 0xFF && content[1] === 0xFE) {
+    return content.slice(2).toString('utf16le');
+  }
+  // UTF-8 BOM
+  if (content[0] === 0xEF && content[1] === 0xBB && content[2] === 0xBF) {
+    return content.slice(3).toString('utf8');
+  }
+  return content.toString('utf8');
+}
 
 vi.mock('fs/promises', () => ({
-  writeFile: vi.fn(async (path: string, content: string) => { written[path] = content; }),
+  writeFile: vi.fn(async (path: string, content: string | Buffer) => {
+    writtenRaw[path] = content;
+    written[path] = decodeWritten(content);
+  }),
   mkdir: vi.fn(async () => undefined),
   stat: vi.fn(async () => ({ size: 0 })),
   truncate: vi.fn(async () => undefined),
@@ -120,6 +138,7 @@ describe('writeWatchdogCmd', () => {
 describe('writeVbsLauncher', () => {
   beforeEach(() => {
     for (const k of Object.keys(written)) delete written[k];
+    for (const k of Object.keys(writtenRaw)) delete writtenRaw[k];
   });
 
   it('runs watchdog CMD hidden (window style 0)', async () => {
@@ -137,6 +156,99 @@ describe('writeVbsLauncher', () => {
     expect(vbs).toContain('daemon-watchdog.cmd');
     // Window style 0 = hidden
     expect(vbs).toContain(', 0, False');
+  });
+
+  it('writes VBS as UTF-16 LE with BOM (required for non-ASCII paths)', async () => {
+    const { writeVbsLauncher } = await import('../../src/util/windows-launch-artifacts.js');
+    const paths = {
+      nodeExe: '', imcodesScript: '', logPath: '',
+      watchdogPath: 'C:\\Users\\云科I\\.imcodes\\daemon-watchdog.cmd',
+      vbsPath: 'C:\\Users\\云科I\\.imcodes\\daemon-launcher.vbs',
+    };
+
+    await writeVbsLauncher(paths);
+    const raw = writtenRaw[paths.vbsPath];
+
+    // Must be a Buffer (not a string written via 'utf8' encoding)
+    expect(Buffer.isBuffer(raw)).toBe(true);
+    if (Buffer.isBuffer(raw)) {
+      // First 2 bytes must be UTF-16 LE BOM
+      expect(raw[0]).toBe(0xFF);
+      expect(raw[1]).toBe(0xFE);
+      // Decoded content must contain the Chinese path intact
+      const decoded = raw.slice(2).toString('utf16le');
+      expect(decoded).toContain('云科I');
+      expect(decoded).toContain('daemon-watchdog.cmd');
+    }
+  });
+
+  it('uses On Error Resume Next so wscript never pops up an error dialog', async () => {
+    const { writeVbsLauncher } = await import('../../src/util/windows-launch-artifacts.js');
+    const paths = {
+      nodeExe: '', imcodesScript: '', logPath: '',
+      watchdogPath: 'C:\\nonexistent\\path.cmd',
+      vbsPath: 'C:\\Users\\X\\.imcodes\\daemon-launcher.vbs',
+    };
+
+    await writeVbsLauncher(paths);
+    const vbs = written[paths.vbsPath];
+    expect(vbs).toContain('On Error Resume Next');
+  });
+});
+
+describe('encodeCmdAsUtf8Bom', () => {
+  it('prepends UTF-8 BOM (EF BB BF)', async () => {
+    const { encodeCmdAsUtf8Bom } = await import('../../src/util/windows-launch-artifacts.js');
+    const buf = encodeCmdAsUtf8Bom('@echo off\r\necho 云科\r\n');
+    expect(buf[0]).toBe(0xEF);
+    expect(buf[1]).toBe(0xBB);
+    expect(buf[2]).toBe(0xBF);
+    // Rest is UTF-8 of the content
+    const decoded = buf.slice(3).toString('utf8');
+    expect(decoded).toContain('云科');
+  });
+});
+
+describe('encodeVbsAsUtf16', () => {
+  it('prepends UTF-16 LE BOM (FF FE)', async () => {
+    const { encodeVbsAsUtf16 } = await import('../../src/util/windows-launch-artifacts.js');
+    const buf = encodeVbsAsUtf16('WScript.Echo "云科"');
+    expect(buf[0]).toBe(0xFF);
+    expect(buf[1]).toBe(0xFE);
+    const decoded = buf.slice(2).toString('utf16le');
+    expect(decoded).toContain('云科');
+  });
+});
+
+describe('writeWatchdogCmd encoding', () => {
+  beforeEach(() => {
+    for (const k of Object.keys(written)) delete written[k];
+    for (const k of Object.keys(writtenRaw)) delete writtenRaw[k];
+  });
+
+  it('writes watchdog .cmd as UTF-8 with BOM (required for non-ASCII paths)', async () => {
+    const { writeWatchdogCmd } = await import('../../src/util/windows-launch-artifacts.js');
+    const paths = {
+      nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
+      imcodesScript: 'C:\\Users\\云科I\\AppData\\Roaming\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
+      watchdogPath: 'C:\\Users\\云科I\\.imcodes\\daemon-watchdog.cmd',
+      vbsPath: 'C:\\Users\\云科I\\.imcodes\\daemon-launcher.vbs',
+      logPath: 'C:\\Users\\云科I\\.imcodes\\watchdog.log',
+    };
+
+    await writeWatchdogCmd(paths);
+    const raw = writtenRaw[paths.watchdogPath];
+
+    expect(Buffer.isBuffer(raw)).toBe(true);
+    if (Buffer.isBuffer(raw)) {
+      // UTF-8 BOM
+      expect(raw[0]).toBe(0xEF);
+      expect(raw[1]).toBe(0xBB);
+      expect(raw[2]).toBe(0xBF);
+      // Path with Chinese characters preserved as UTF-8
+      const decoded = raw.slice(3).toString('utf8');
+      expect(decoded).toContain('云科I');
+    }
   });
 });
 

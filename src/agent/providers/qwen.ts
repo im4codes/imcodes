@@ -22,7 +22,7 @@ import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.j
 import { DEFAULT_TRANSPORT_EFFORT, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import logger from '../../util/logger.js';
 import { inferContextWindow } from '../../util/model-context.js';
-import { normalizeTransportCwd } from '../transport-paths.js';
+import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 
 const execFileAsync = promisify(execFile);
 const QWEN_BIN = 'qwen';
@@ -187,9 +187,10 @@ export class QwenProvider implements TransportProvider {
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
 
   async connect(config: ProviderConfig): Promise<void> {
-    await execFileAsync(QWEN_BIN, ['--version']);
+    const resolved = resolveExecutableForSpawn(QWEN_BIN);
+    await execFileAsync(resolved.executable, [...resolved.prependArgs, '--version'], { windowsHide: true });
     this.config = config;
-    logger.info({ provider: this.id }, 'Qwen provider connected');
+    logger.info({ provider: this.id, resolved: resolved.executable }, 'Qwen provider connected');
   }
 
   async disconnect(): Promise<void> {
@@ -336,7 +337,9 @@ export class QwenProvider implements TransportProvider {
       args.push('--session-id', state.qwenConversationId);
     }
 
-    const child = spawn(QWEN_BIN, args, {
+    const resolved = resolveExecutableForSpawn(QWEN_BIN);
+    const finalArgs = [...resolved.prependArgs, ...args];
+    const child = spawn(resolved.executable, finalArgs, {
       cwd: state.cwd,
       env: {
         ...process.env,
@@ -345,6 +348,7 @@ export class QwenProvider implements TransportProvider {
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: false,
+      windowsHide: true,
     });
     state.child = child;
     this.sessions.set(sessionId, state);

@@ -20,16 +20,18 @@ rmdir /s /q "${scriptDir}"\r
 `;
 }
 
-/** VBS wrapper that runs the cleanup cmd in a hidden window (no taskbar flash). */
+/** VBS wrapper that runs the cleanup cmd in a hidden window (no taskbar flash).
+ *  `On Error Resume Next` ensures no error dialog pops up. */
 export function buildWindowsCleanupVbs(cleanupPath: string): string {
-  return `Set WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${cleanupPath}""", 0, False\r\n`;
+  return `On Error Resume Next\r\nSet WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${cleanupPath}""", 0, False\r\n`;
 }
 
 /** VBS wrapper that runs the upgrade batch in a hidden window.
  *  Without this, child processes spawned by the batch (wmic, find, tasklist)
- *  may flash visible console windows on some Windows versions. */
+ *  may flash visible console windows on some Windows versions.
+ *  `On Error Resume Next` ensures no error dialog pops up. */
 export function buildWindowsUpgradeVbs(batchPath: string): string {
-  return `Set WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${batchPath}""", 0, False\r\n`;
+  return `On Error Resume Next\r\nSet WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${batchPath}""", 0, False\r\n`;
 }
 
 export function buildWindowsUpgradeBatch(input: WindowsUpgradeScriptInput): string {

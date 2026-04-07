@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildWindowsCleanupScript, buildWindowsCleanupVbs, buildWindowsUpgradeBatch } from '../../src/util/windows-upgrade-script.js';
+import { buildWindowsCleanupScript, buildWindowsCleanupVbs, buildWindowsUpgradeBatch, buildWindowsUpgradeVbs } from '../../src/util/windows-upgrade-script.js';
 
 const INPUT = {
   logFile: 'C:\\Temp\\upgrade.log',
@@ -27,8 +27,27 @@ describe('buildWindowsCleanupVbs', () => {
     const vbs = buildWindowsCleanupVbs('C:\\Temp\\cleanup.cmd');
     expect(vbs).toContain('CreateObject("WScript.Shell")');
     expect(vbs).toContain('"C:\\Temp\\cleanup.cmd"');
-    // Window style 0 = hidden, no taskbar flash
     expect(vbs).toContain(', 0, False');
+  });
+
+  it('uses On Error Resume Next so wscript never pops up an error dialog', () => {
+    const vbs = buildWindowsCleanupVbs('C:\\Temp\\cleanup.cmd');
+    expect(vbs).toContain('On Error Resume Next');
+  });
+
+  it('handles non-ASCII paths in the cleanup target', () => {
+    const vbs = buildWindowsCleanupVbs('C:\\Users\\云科I\\Temp\\cleanup.cmd');
+    expect(vbs).toContain('云科I');
+  });
+});
+
+describe('buildWindowsUpgradeVbs', () => {
+  it('runs upgrade.cmd hidden with error suppression', () => {
+    const vbs = buildWindowsUpgradeVbs('C:\\Temp\\upgrade.cmd');
+    expect(vbs).toContain('CreateObject("WScript.Shell")');
+    expect(vbs).toContain('"C:\\Temp\\upgrade.cmd"');
+    expect(vbs).toContain(', 0, False');
+    expect(vbs).toContain('On Error Resume Next');
   });
 });
 

@@ -4,8 +4,17 @@ import { readFile } from 'node:fs/promises';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const childProcessMock = vi.hoisted(() => {
-  const execFile = vi.fn((file: string, args: string[], cb?: (err: Error | null, stdout: string, stderr: string) => void) => {
-    cb?.(null, file === 'qwen' && args[0] === '--version' ? '0.13.2\n' : '', '');
+  // execFile may be called with (file, args, cb) or (file, args, opts, cb)
+  const execFile = vi.fn((...callArgs: unknown[]) => {
+    const file = callArgs[0] as string;
+    const args = callArgs[1] as string[];
+    const cb = (typeof callArgs[2] === 'function' ? callArgs[2] : callArgs[3]) as
+      | ((err: Error | null, stdout: string, stderr: string) => void)
+      | undefined;
+    // Match either bare 'qwen' or a resolved node + cli.js path
+    const isVersionCall = (file === 'qwen' || file.toLowerCase().endsWith('node.exe') || file.toLowerCase().endsWith('node'))
+      && args.includes('--version');
+    cb?.(null, isVersionCall ? '0.13.2\n' : '', '');
     return {} as never;
   });
 
@@ -89,7 +98,12 @@ describe('QwenProvider', () => {
   it('connects by validating qwen CLI', async () => {
     const provider = new QwenProvider();
     await provider.connect({});
-    expect(childProcessMock.execFile).toHaveBeenCalledWith('qwen', ['--version'], expect.any(Function));
+    // execFile signature is (file, args, opts, cb) — opts contains windowsHide
+    const call = childProcessMock.execFile.mock.calls.find(
+      (c) => Array.isArray(c[1]) && (c[1] as string[]).includes('--version'),
+    );
+    expect(call).toBeDefined();
+    expect(call?.[1]).toContain('--version');
     expect(provider.capabilities.reasoningEffort).toBe(true);
     expect(provider.capabilities.supportedEffortLevels).toEqual(['off', 'low', 'medium', 'high']);
   });
@@ -142,7 +156,8 @@ describe('QwenProvider', () => {
 
     await provider.send('sess-1', 'hello');
     const first = lastSpawn();
-    expect(first.file).toBe('qwen');
+    // file may be 'qwen' (Linux/Mac) or node.exe (Windows where qwen is a .cmd shim)
+    expect(first.file === 'qwen' || /node(\.exe)?$/i.test(first.file)).toBe(true);
     expect(first.cwd).toBe('/tmp/project');
     expect(first.args).toContain('--session-id');
     expect(first.args).toContain('sess-1');

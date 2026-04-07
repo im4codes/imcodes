@@ -37,7 +37,7 @@ import { copyFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
 import { buildWindowsCleanupScript, buildWindowsCleanupVbs, buildWindowsUpgradeBatch, buildWindowsUpgradeVbs } from '../util/windows-upgrade-script.js';
-import { UPGRADE_LOCK_FILE } from '../util/windows-launch-artifacts.js';
+import { UPGRADE_LOCK_FILE, encodeVbsAsUtf16, encodeCmdAsUtf8Bom } from '../util/windows-launch-artifacts.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { sanitizeProjectName } from '../../shared/sanitize-project-name.js';
 import { CODEX_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
@@ -2171,8 +2171,10 @@ launchctl load -w "${plist}"`;
     const cleanupPath = join(scriptDir, 'cleanup.cmd');
     const cleanupVbsPath = join(scriptDir, 'cleanup.vbs');
     const targetVer = targetVersion ?? 'latest';
-    writeFileSync(cleanupPath, buildWindowsCleanupScript(scriptDir));
-    writeFileSync(cleanupVbsPath, buildWindowsCleanupVbs(cleanupPath));
+    // .cmd files: UTF-8 + BOM so cmd.exe handles non-ASCII paths.
+    // .vbs files: UTF-16 LE + BOM so wscript handles non-ASCII paths.
+    writeFileSync(cleanupPath, encodeCmdAsUtf8Bom(buildWindowsCleanupScript(scriptDir)));
+    writeFileSync(cleanupVbsPath, encodeVbsAsUtf16(buildWindowsCleanupVbs(cleanupPath)));
     const vbsLauncherPath = join(homedir(), '.imcodes', 'daemon-launcher.vbs');
     const batch = buildWindowsUpgradeBatch({
       logFile,
@@ -2186,8 +2188,8 @@ launchctl load -w "${plist}"`;
       upgradeLockFile: UPGRADE_LOCK_FILE,
     });
 
-    writeFileSync(batchPath, batch);
-    writeFileSync(upgradeVbsPath, buildWindowsUpgradeVbs(batchPath));
+    writeFileSync(batchPath, encodeCmdAsUtf8Bom(batch));
+    writeFileSync(upgradeVbsPath, encodeVbsAsUtf16(buildWindowsUpgradeVbs(batchPath)));
 
     // Launch via wscript on the wrapper VBS — this guarantees that ALL child
     // processes spawned by the batch (wmic, find, tasklist, etc.) inherit a

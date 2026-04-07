@@ -62,14 +62,37 @@ export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
     'goto loop',
     '',
   ].join('\r\n');
-  await writeFile(paths.watchdogPath, watchdog, 'utf8');
+  // Write as UTF-8 + BOM so cmd.exe parses non-ASCII paths correctly
+  // (e.g. usernames with Chinese characters).  Without the BOM cmd.exe
+  // reads the file using the system codepage and mangles UTF-8 bytes.
+  await writeFile(paths.watchdogPath, encodeCmdAsUtf8Bom(watchdog));
 }
 
-/** Write the daemon-launcher.vbs that starts the watchdog CMD hidden. */
+/** Encode a .cmd file as UTF-8 with BOM so cmd.exe handles non-ASCII paths. */
+export function encodeCmdAsUtf8Bom(content: string): Buffer {
+  return Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), Buffer.from(content, 'utf8')]);
+}
+
+/** Write the daemon-launcher.vbs that starts the watchdog CMD hidden.
+ *
+ *  IMPORTANT: VBS files MUST be saved as UTF-16 LE with BOM on Windows.
+ *  wscript reads BOM-less files as ANSI (the system codepage, e.g. GBK on
+ *  Chinese Windows), so a UTF-8 file with non-ASCII characters in the
+ *  watchdog path (e.g. a username with Chinese characters) gets garbled
+ *  and wscript can't find the .cmd file.
+ *
+ *  Also: `On Error Resume Next` ensures wscript NEVER pops up an error
+ *  dialog (e.g. if the watchdog .cmd is missing).  Errors fail silently. */
 export async function writeVbsLauncher(paths: LaunchPaths): Promise<void> {
   await mkdir(dirname(paths.vbsPath), { recursive: true });
-  const vbs = `Set WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${paths.watchdogPath}""", 0, False\r\n`;
-  await writeFile(paths.vbsPath, vbs, 'utf8');
+  const vbs = `On Error Resume Next\r\nSet WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${paths.watchdogPath}""", 0, False\r\n`;
+  await writeFile(paths.vbsPath, encodeVbsAsUtf16(vbs));
+}
+
+/** Encode a VBS source string as UTF-16 LE with BOM (the only encoding
+ *  Windows wscript reliably parses for non-ASCII paths). */
+export function encodeVbsAsUtf16(content: string): Buffer {
+  return Buffer.concat([Buffer.from([0xFF, 0xFE]), Buffer.from(content, 'utf16le')]);
 }
 
 /** Update the existing scheduled task to point at the current VBS launcher.

@@ -19,7 +19,7 @@ import {
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import logger from '../../util/logger.js';
 import { CODEX_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
-import { normalizeTransportCwd } from '../transport-paths.js';
+import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 
 const CODEX_BIN = 'codex';
 
@@ -180,16 +180,18 @@ export class CodexSdkProvider implements TransportProvider {
 
   async connect(config: ProviderConfig): Promise<void> {
     const binaryPath = this.resolveBinaryPath(config);
-    await access(binaryPath, fsConstants.X_OK).catch(async () => {
-      if (binaryPath !== CODEX_BIN) throw new Error(binaryPath);
+    // Resolve the binary (handles npm .cmd shims on Windows) and verify it.
+    const resolved = resolveExecutableForSpawn(binaryPath);
+    await access(resolved.executable, fsConstants.X_OK).catch(async () => {
+      // Fall back to spawn-based version probe (works for things on PATH).
       const { execFile } = await import('node:child_process');
       await new Promise<void>((resolve, reject) => {
-        execFile(binaryPath, ['--version'], (err) => (err ? reject(err) : resolve()));
+        execFile(resolved.executable, [...resolved.prependArgs, '--version'], { windowsHide: true }, (err) => (err ? reject(err) : resolve()));
       });
     });
     await this.startAppServer(binaryPath);
     this.config = config;
-    logger.info({ provider: this.id }, 'Codex SDK provider connected via app-server');
+    logger.info({ provider: this.id, resolved: resolved.executable, prepend: resolved.prependArgs }, 'Codex SDK provider connected via app-server');
   }
 
   async disconnect(): Promise<void> {
@@ -315,9 +317,14 @@ export class CodexSdkProvider implements TransportProvider {
 
   private async startAppServer(binaryPath: string): Promise<void> {
     await this.disconnect().catch(() => {});
-    const child = spawn(binaryPath, ['app-server'], {
+    // Resolve npm .cmd shims into (node.exe, [scriptPath]) so spawn works
+    // without shell:true (which has its own quoting issues on Windows).
+    const resolved = resolveExecutableForSpawn(binaryPath);
+    const args = [...resolved.prependArgs, 'app-server'];
+    const child = spawn(resolved.executable, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: process.env,
+      windowsHide: true,
     });
     this.child = child;
     this.rl = readline.createInterface({ input: child.stdout });
