@@ -248,6 +248,51 @@ describe('structured P2P routing via WS fields', () => {
     (startP2pRun as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'run-1' });
   });
 
+  it('structured combo mode with p2pSessionConfig filters __all__ expansion to enabled participants', async () => {
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'review this code',
+      commandId: 'cmd-combo-config',
+      p2pMode: 'brainstorm>discuss',
+      p2pSessionConfig: {
+        deck_proj_w1: { enabled: true, mode: 'audit' },
+        deck_proj_w2: { enabled: false, mode: 'review' },
+      },
+    }, mockServerLink as any);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(startP2pRun).toHaveBeenCalledTimes(1);
+    const [_initiator, targets] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(targets).toEqual([
+      { session: 'deck_proj_w1', mode: 'brainstorm>discuss' },
+    ]);
+  });
+
+  it('config mode still uses per-session configured modes', async () => {
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'review this code',
+      commandId: 'cmd-config-mode',
+      p2pMode: 'config',
+      p2pSessionConfig: {
+        deck_proj_w1: { enabled: true, mode: 'audit' },
+        deck_proj_w2: { enabled: true, mode: 'review' },
+      },
+    }, mockServerLink as any);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(startP2pRun).toHaveBeenCalledTimes(1);
+    const [_initiator, targets] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(targets).toEqual([
+      { session: 'deck_proj_w1', mode: 'audit' },
+      { session: 'deck_proj_w2', mode: 'review' },
+    ]);
+  });
+
   it('p2pAtTargets with __all__ expands to all active sessions', async () => {
     handleWebCommand({
       type: 'session.send',

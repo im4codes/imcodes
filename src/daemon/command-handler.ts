@@ -310,11 +310,11 @@ function expandAllTargets(initiatorName: string, mode: string, excludeSameType =
 
     if (!inDomain) continue;
 
-    if (mode === P2P_CONFIG_MODE && sessionConfig) {
+    if (sessionConfig) {
       const entry = sessionConfig[s.name];
       if (!entry || !entry.enabled) continue;        // strict: missing = excluded
       if (entry.mode === 'skip') continue;
-      targets.push({ session: s.name, mode: entry.mode });
+      targets.push({ session: s.name, mode: mode === P2P_CONFIG_MODE ? entry.mode : mode });
     } else {
       targets.push({ session: s.name, mode });
     }

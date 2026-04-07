@@ -15,7 +15,12 @@ import { P2pConfigPanel } from './P2pConfigPanel.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
 import { uploadFile, getUserPref, saveUserPref } from '../api.js';
 import { isRunningSessionState } from '../thinking-utils.js';
-import { P2P_CONFIG_MODE, COMBO_SEPARATOR, isComboMode } from '@shared/p2p-modes.js';
+import {
+  buildP2pConfigSelection,
+  P2P_CONFIG_MODE,
+  COMBO_SEPARATOR,
+  isComboMode,
+} from '@shared/p2p-modes.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
@@ -597,6 +602,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return { orderedTargets, cleanText };
   };
 
+  const applySavedP2pConfigSelection = useCallback((extra: Record<string, unknown>, mode: string) => {
+    if (!p2pSavedConfig || (mode !== P2P_CONFIG_MODE && !isComboMode(mode))) return;
+    const selection = buildP2pConfigSelection(p2pSavedConfig, mode);
+    extra.p2pSessionConfig = selection.config.sessions;
+    extra.p2pRounds = selection.rounds;
+    if (selection.config.extraPrompt) extra.p2pExtraPrompt = selection.config.extraPrompt;
+    if (selection.config.hopTimeoutMinutes != null) extra.p2pHopTimeoutMs = Math.min(selection.config.hopTimeoutMinutes * 60_000, 600_000);
+  }, [p2pSavedConfig]);
+
   const buildSendPayload = useCallback((modeOverride?: string): PendingSendPayload | null => {
     let text = getText();
     const effectiveMode = modeOverride ?? p2pMode;
@@ -643,12 +657,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           extra.p2pMode = effectiveMode;
           if (p2pExcludeSameType) extra.p2pExcludeSameType = true;
         }
-        if (effectiveMode === P2P_CONFIG_MODE && p2pSavedConfig) {
-          extra.p2pSessionConfig = p2pSavedConfig.sessions;
-          extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
-          if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
-          if (p2pSavedConfig.hopTimeoutMinutes != null) extra.p2pHopTimeoutMs = Math.min(p2pSavedConfig.hopTimeoutMinutes * 60_000, 600_000);
-        }
+        applySavedP2pConfigSelection(extra, effectiveMode);
       }
     }
 
@@ -668,7 +677,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       text = text ? `${refs} ${text}` : refs;
     }
     return { text, extra };
-  }, [attachments, activeSession, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, sessions, subSessions, ws]);
+  }, [activeSession, applySavedP2pConfigSelection, attachments, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, sessions, subSessions, ws]);
 
   const buildModeOnlySendPayload = useCallback((rawText: string, modeOverride?: string): PendingSendPayload | null => {
     const text = rawText.trim();
@@ -685,12 +694,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     } else if (effectiveMode !== 'solo' && !text.includes('@@')) {
       extra.p2pMode = effectiveMode === P2P_CONFIG_MODE ? 'config' : effectiveMode;
       if (p2pExcludeSameType && effectiveMode !== P2P_CONFIG_MODE) extra.p2pExcludeSameType = true;
-      if (effectiveMode === P2P_CONFIG_MODE && p2pSavedConfig) {
-        extra.p2pSessionConfig = p2pSavedConfig.sessions;
-        extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
-        if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
-        if (p2pSavedConfig.hopTimeoutMinutes != null) extra.p2pHopTimeoutMs = Math.min(p2pSavedConfig.hopTimeoutMinutes * 60_000, 600_000);
-      }
+      applySavedP2pConfigSelection(extra, effectiveMode);
     }
 
     if (extra.p2pAtTargets || extra.p2pMode) {
@@ -698,7 +702,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     }
 
     return { text: cleanText, extra };
-  }, [activeSession, i18n?.language, p2pExcludeSameType, p2pMode, p2pSavedConfig, sessions, subSessions, ws]);
+  }, [activeSession, applySavedP2pConfigSelection, i18n?.language, p2pExcludeSameType, p2pMode, p2pSavedConfig, sessions, subSessions, ws]);
 
   const finalizeSend = useCallback((payload: PendingSendPayload, options?: { clearComposer?: boolean }) => {
     if (!ws || !activeSession) return;

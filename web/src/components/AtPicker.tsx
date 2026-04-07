@@ -5,7 +5,11 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { ServerMessage } from '../ws-client.js';
-import { COMBO_PRESETS, COMBO_SEPARATOR, type P2pSavedConfig } from '@shared/p2p-modes.js';
+import {
+  buildP2pConfigSelection,
+  COMBO_PRESETS,
+  type P2pSavedConfig,
+} from '@shared/p2p-modes.js';
 import { P2pComboManager } from './P2pComboManager.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
 
@@ -154,17 +158,6 @@ const MODE_COLORS: Record<string, string> = {
   brainstorm: '#a78bfa',
   discuss: '#22c55e',
 };
-
-function buildEffectiveConfig(config: P2pSavedConfig, modeOverride: string): P2pSavedConfig {
-  if (modeOverride === 'config') return config;
-  const overriddenSessions: P2pSavedConfig['sessions'] = {};
-  for (const [session, entry] of Object.entries(config.sessions)) {
-    overriddenSessions[session] = entry.enabled && entry.mode !== 'skip'
-      ? { ...entry, mode: modeOverride }
-      : { ...entry };
-  }
-  return { ...config, sessions: overriddenSessions };
-}
 
 export function AtPicker({
   query,
@@ -372,13 +365,12 @@ export function AtPicker({
           if (configPickerFocus === 'combo') {
             const allKeys = [...COMBO_PRESETS.map((c) => c.key), ...allCombos.custom];
             const key = allKeys[comboHighlight] ?? allKeys[0];
-            const pipeline = key.split(COMBO_SEPARATOR);
-            const cfg = buildEffectiveConfig(p2pConfig, pipeline[0]);
-            onSelectAllConfig?.(cfg, pipeline.length, key);
+            const selection = buildP2pConfigSelection(p2pConfig, key);
+            onSelectAllConfig?.(selection.config, selection.rounds, selection.modeOverride);
           } else {
             const rounds = CONFIG_ROUNDS_OPTIONS[configRoundsHighlight];
-            const effectiveConfig = buildEffectiveConfig(p2pConfig, configModeOverride);
-            onSelectAllConfig?.(effectiveConfig, rounds, configModeOverride);
+            const selection = buildP2pConfigSelection(p2pConfig, configModeOverride, rounds);
+            onSelectAllConfig?.(selection.config, selection.rounds, selection.modeOverride);
           }
           setConfigRoundsPicker(false);
           setConfigPickerFocus('rounds');
@@ -478,7 +470,7 @@ export function AtPicker({
   // ── Config rounds sub-picker (for @all+ with custom rounds) ──
   if (configRoundsPicker && p2pConfig) {
     const ALL_MODES = ['config', 'audit', 'review', 'plan', 'brainstorm', 'discuss'];
-    const effectiveConfig = buildEffectiveConfig(p2pConfig, configModeOverride);
+    const effectiveConfig = buildP2pConfigSelection(p2pConfig, configModeOverride).config;
     const participants = Object.entries(effectiveConfig.sessions)
       .filter(([, e]) => e.enabled && e.mode !== 'skip');
     return (
@@ -530,8 +522,8 @@ export function AtPicker({
                   : modeBtnHoverStyle.boxShadow,
               } : modeBtnStyle}
               onClick={() => {
-                const cfg = buildEffectiveConfig(p2pConfig, configModeOverride);
-                onSelectAllConfig?.(cfg, r, configModeOverride);
+                const selection = buildP2pConfigSelection(p2pConfig, configModeOverride, r);
+                onSelectAllConfig?.(selection.config, selection.rounds, selection.modeOverride);
                 setConfigRoundsPicker(false);
                 setConfigPickerFocus('rounds');
               }}
@@ -577,9 +569,8 @@ export function AtPicker({
             setConfigPickerFocus('combo');
           }}
           onSelectCombo={(key) => {
-            const pipeline = key.split(COMBO_SEPARATOR);
-            const cfg = buildEffectiveConfig(p2pConfig, pipeline[0]);
-            onSelectAllConfig?.(cfg, pipeline.length, key);
+            const selection = buildP2pConfigSelection(p2pConfig, key);
+            onSelectAllConfig?.(selection.config, selection.rounds, selection.modeOverride);
             setConfigRoundsPicker(false);
             setConfigPickerFocus('rounds');
           }}

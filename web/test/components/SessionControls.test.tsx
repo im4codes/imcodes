@@ -325,6 +325,10 @@ describe('SessionControls', () => {
       text: 'first combo',
       p2pMode: 'audit>plan',
       p2pExcludeSameType: true,
+      p2pSessionConfig: {
+        'my-session': { enabled: true, mode: 'audit' },
+      },
+      p2pRounds: 2,
       p2pLocale: 'en',
     });
     expect(saveUserPrefMock).toHaveBeenCalledWith('p2p_combo_direct_send_skip_confirm', true);
@@ -340,6 +344,10 @@ describe('SessionControls', () => {
       text: 'second combo',
       p2pMode: 'audit>plan',
       p2pExcludeSameType: true,
+      p2pSessionConfig: {
+        'my-session': { enabled: true, mode: 'audit' },
+      },
+      p2pRounds: 2,
       p2pLocale: 'en',
     });
   });
@@ -364,6 +372,10 @@ describe('SessionControls', () => {
       text: 'direct combo',
       p2pMode: 'audit>plan',
       p2pExcludeSameType: true,
+      p2pSessionConfig: {
+        'my-session': { enabled: true, mode: 'audit' },
+      },
+      p2pRounds: 2,
       p2pLocale: 'en',
     });
   });

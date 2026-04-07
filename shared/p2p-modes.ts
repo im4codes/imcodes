@@ -20,6 +20,39 @@ export interface P2pSavedConfig {
   hopTimeoutMinutes?: number;
 }
 
+
+export interface P2pConfigSelection {
+  config: P2pSavedConfig;
+  rounds: number;
+  modeOverride: string;
+}
+
+export function buildEffectiveP2pConfig(config: P2pSavedConfig, modeOverride: string): P2pSavedConfig {
+  if (modeOverride === P2P_CONFIG_MODE) return config;
+  const overriddenSessions: P2pSavedConfig['sessions'] = {};
+  for (const [session, entry] of Object.entries(config.sessions)) {
+    overriddenSessions[session] = entry.enabled && entry.mode !== 'skip'
+      ? { ...entry, mode: modeOverride }
+      : { ...entry };
+  }
+  return { ...config, sessions: overriddenSessions };
+}
+
+export function buildP2pConfigSelection(
+  config: P2pSavedConfig,
+  modeOverride: string,
+  rounds = config.rounds ?? 1,
+): P2pConfigSelection {
+  const effectiveMode = isComboMode(modeOverride)
+    ? (parseModePipeline(modeOverride)[0] ?? modeOverride)
+    : modeOverride;
+  return {
+    config: buildEffectiveP2pConfig(config, effectiveMode),
+    rounds: getComboRoundCount(modeOverride) ?? rounds,
+    modeOverride,
+  };
+}
+
 /** Round-aware prompt wrapper — prepended to the mode's base prompt. */
 export function roundPrompt(round: number, totalRounds: number, modeKey?: string): string {
   if (totalRounds <= 1) return '';
