@@ -237,13 +237,21 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       const override = this.windowsSpawnOverride;
       options.spawnClaudeCodeProcess = (req: { command: string; args: string[]; cwd?: string; env?: Record<string, string>; signal?: AbortSignal }) => {
         const finalArgs = [...override.prependArgs, ...req.args];
-        return spawn(override.executable, finalArgs, {
+        const child = spawn(override.executable, finalArgs, {
           cwd: req.cwd,
           env: req.env,
           signal: req.signal,
           stdio: ['pipe', 'pipe', 'pipe'],
           windowsHide: true,
         });
+        // CRITICAL: always listen for 'error' so spawn failures don't bubble
+        // up to uncaughtException and crash the daemon. The SDK will also
+        // observe the error via the child's exit/stderr, but if it doesn't
+        // we still need to swallow it here.
+        child.on('error', (err) => {
+          logger.error({ provider: this.id, err }, 'Claude SDK spawn error (suppressed)');
+        });
+        return child;
       };
     }
 

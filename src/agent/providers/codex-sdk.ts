@@ -342,6 +342,17 @@ export class CodexSdkProvider implements TransportProvider {
       }
       this.child = null;
     });
+    // CRITICAL: must listen for 'error' or spawn failures (e.g. ENOENT) become
+    // uncaughtException and crash the daemon.
+    child.on('error', (err) => {
+      logger.error({ provider: this.id, err }, 'Codex app-server spawn error');
+      this.rejectPending(err);
+      const sessions = [...this.sessions.keys()];
+      for (const sid of sessions) {
+        this.emitError(sid, this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, false));
+      }
+      this.child = null;
+    });
 
     await this.request('initialize', {
       clientInfo: { name: 'imcodes', title: 'IM.codes', version: '0.1.0' },

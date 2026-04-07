@@ -4,27 +4,24 @@
 // throws synchronously from socket event handlers (e.g. resize on a dead pty)
 // which propagates as uncaughtException.  These handlers MUST be installed
 // before any module imports that might trigger such errors.
+//
+// We use console.error here (not the pino logger) because the logger module
+// hasn't been loaded yet at this point.  These are global last-resort
+// handlers; structured logging is fine to skip — what matters is that the
+// process does NOT exit.
+/* eslint-disable no-console */
 process.on('uncaughtException', (err) => {
-  // Use console.error if logger isn't loaded yet, otherwise use the logger.
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const log = require('./util/logger.js').default;
-    log.error({ err }, 'Uncaught exception — daemon stays alive');
-  } catch {
-    // eslint-disable-next-line no-console
-    console.error('Uncaught exception (logger not loaded):', err);
-  }
+  console.error('[imcodes-daemon] UNCAUGHT EXCEPTION (daemon stays alive):', err && (err.stack ?? err));
 });
-process.on('unhandledRejection', (err) => {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const log = require('./util/logger.js').default;
-    log.error({ err }, 'Unhandled rejection — daemon stays alive');
-  } catch {
-    // eslint-disable-next-line no-console
-    console.error('Unhandled rejection (logger not loaded):', err);
-  }
+process.on('unhandledRejection', (reason) => {
+  console.error('[imcodes-daemon] UNHANDLED REJECTION (daemon stays alive):', reason);
 });
+// Also catch warnings — node-pty sometimes emits MaxListenersExceededWarning
+// which we want to log but not crash on.
+process.on('warning', (warning) => {
+  console.warn('[imcodes-daemon] warning:', warning.name, warning.message);
+});
+/* eslint-enable no-console */
 
 import { Command } from 'commander';
 // These modules are imported lazily to avoid eager tmux backend detection on Windows.

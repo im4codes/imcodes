@@ -599,6 +599,12 @@ export class QwenProvider implements TransportProvider {
       child.once('spawn', () => resolve());
       child.once('error', (err) => reject(this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, err.message, false)));
     });
+    // Persistent error listener so post-spawn errors don't escalate to
+    // uncaughtException and crash the daemon.
+    child.on('error', (err) => {
+      logger.error({ provider: this.id, err }, 'Qwen child process error');
+      emitError(err.message, err);
+    });
   }
 
   async restoreSession(sessionId: string): Promise<boolean> {
