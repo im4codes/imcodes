@@ -25,7 +25,7 @@ export function AutoFixControls({ apiKey, serverId, projectName, isRunning, onSt
   const [stopImmediate, setStopImmediate] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const agentTypes = ['claude-code', 'codex', 'opencode'];
+  const agentTypes = ['claude-code', 'claude-code-sdk', 'codex', 'codex-sdk', 'opencode'];
 
   useEffect(() => {
     if (mode === 'issue' || mode === 'continuous') {

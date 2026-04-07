@@ -4,6 +4,7 @@ import type { WsClient } from '../ws-client.js';
 import { FileBrowser } from './FileBrowser.js';
 import { getUserPref, saveUserPref } from '../api.js';
 import { sanitizeProjectName } from '@shared/sanitize-project-name.js';
+import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
 
 const DEFAULT_SHELL_KEY = 'default_shell';
 
@@ -14,7 +15,7 @@ interface Props {
   isProviderConnected: (id: string) => boolean;
 }
 
-type AgentType = 'claude-code' | 'codex' | 'opencode' | 'gemini' | 'openclaw' | 'qwen';
+type AgentType = 'claude-code' | 'claude-code-sdk' | 'codex' | 'codex-sdk' | 'opencode' | 'gemini' | 'openclaw' | 'qwen';
 type OpenClawMode = 'new' | 'bind';
 
 interface RemoteSession {
@@ -26,10 +27,11 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
   const { t } = useTranslation();
   const [project, setProject] = useState('');
   const [dir, setDir] = useState('~/');
-  const [agentType, setAgentType] = useState<AgentType>('claude-code');
+  const [agentType, setAgentType] = useState<AgentType>('claude-code-sdk');
   const [error, setError] = useState('');
   const [starting, setStarting] = useState(false);
   const [showDirBrowser, setShowDirBrowser] = useState(false);
+  const [thinking, setThinking] = useState<TransportEffortLevel>('high');
   const [shells, setShells] = useState<string[]>([]);
   const [shellBin, setShellBin] = useState<string>('');
 
@@ -163,15 +165,37 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
         ocMode === 'bind'
           ? { ocMode: 'bind', ocSessionId: ocSelectedSession }
           : { ocMode: 'new', ocSessionKey: ocSessionKey.trim(), ocDescription: ocDescription.trim() };
-      ws.sendSessionCommand('start', { project: project.trim(), dir: dir.trim(), agentType, ...extra });
+      ws.sendSessionCommand('start', { project: project.trim(), dir: dir.trim(), agentType, ...extra, thinking });
     } else {
       ws.sendSessionCommand('start', {
         project: project.trim(), dir: dir.trim(), agentType,
         ...(ccPreset ? { ccPreset } : {}),
         ...(ccInitPrompt.trim() ? { ccInitPrompt: ccInitPrompt.trim() } : {}),
+        ...((agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'qwen') ? { thinking } : {}),
       });
     }
   };
+
+  const agentFlavor = (
+    agentType === 'claude-code'
+    || agentType === 'codex'
+  ) ? 'cli' : (
+    agentType === 'claude-code-sdk'
+    || agentType === 'codex-sdk'
+  ) ? 'sdk' : null;
+  const thinkingLevels = agentType === 'claude-code-sdk'
+    ? CLAUDE_SDK_EFFORT_LEVELS
+    : agentType === 'codex-sdk'
+      ? CODEX_SDK_EFFORT_LEVELS
+      : agentType === 'qwen'
+        ? QWEN_EFFORT_LEVELS
+      : agentType === 'openclaw'
+        ? OPENCLAW_THINKING_LEVELS
+        : [];
+
+  useEffect(() => {
+    setThinking('high');
+  }, [agentType]);
 
   const handleKey = (e: KeyboardEvent) => {
     if (e.key === 'Escape' && !starting) onClose();
@@ -186,10 +210,10 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
       role="dialog"
     >
       <div style={{ background: '#1e293b', border: '1px solid #334155', borderRadius: 8, padding: 24, width: 400 }}>
-        <h2 style={{ margin: '0 0 20px', fontSize: 16, color: '#f1f5f9' }}>Start New Session</h2>
+        <h2 style={{ margin: '0 0 20px', fontSize: 16, color: '#f1f5f9' }}>{t('new_session.title')}</h2>
 
         <div class="form-group">
-          <label>Project name</label>
+          <label>{t('new_session.project_name')}</label>
           <input
             type="text"
             placeholder="my-project"
@@ -207,7 +231,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
         </div>
 
         <div class="form-group">
-          <label>Working directory</label>
+          <label>{t('new_session.working_directory')}</label>
           <div class="input-with-browse">
             <input
               type="text"
@@ -223,7 +247,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
               data-1p-ignore
             />
             {ws && (
-              <button class="btn-browse" type="button" disabled={starting} onClick={() => setShowDirBrowser(true)} title="Browse">📁</button>
+              <button class="btn-browse" type="button" disabled={starting} onClick={() => setShowDirBrowser(true)} title={t('new_session.browse')}>📁</button>
             )}
           </div>
         </div>
@@ -240,21 +264,44 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
         )}
 
         <div class="form-group">
-          <label>Agent type</label>
+          <label>{t('new_session.agent_type')}</label>
           <select
             value={agentType}
             disabled={starting}
             onChange={(e) => setAgentType((e.target as HTMLSelectElement).value as AgentType)}
             style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#e2e8f0', padding: '8px 12px', borderRadius: 4, fontFamily: 'inherit' }}
           >
-            <option value="claude-code">Claude Code</option>
-            <option value="codex">Codex CLI</option>
+            <option value="claude-code-sdk">{t('session.agentType.claude_code_sdk')}</option>
+            <option value="claude-code">{t('session.agentType.claude_code_cli')}</option>
+            <option value="codex-sdk">{t('session.agentType.codex_sdk')}</option>
+            <option value="codex">{t('session.agentType.codex_cli')}</option>
             <option value="opencode">OpenCode</option>
             <option value="gemini">Gemini CLI</option>
             <option value="qwen">{t('session.agentType.qwen')}</option>
             <option value="openclaw">{t('session.agentType.openclaw')}</option>
           </select>
+          {agentFlavor && (
+            <div style={{ marginTop: 8, fontSize: 12, color: '#94a3b8', lineHeight: 1.4 }}>
+              {agentFlavor === 'cli' ? t('new_session.agent_flavor_cli') : t('new_session.agent_flavor_sdk')}
+            </div>
+          )}
         </div>
+
+        {thinkingLevels.length > 0 && (
+          <div class="form-group">
+            <label>{t('session.thinking')}</label>
+            <select
+              value={thinking}
+              disabled={starting}
+              onChange={(e) => setThinking((e.target as HTMLSelectElement).value as TransportEffortLevel)}
+              style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#e2e8f0', padding: '8px 12px', borderRadius: 4, fontFamily: 'inherit' }}
+            >
+              {thinkingLevels.map((level) => (
+                <option key={level} value={level}>{level}</option>
+              ))}
+            </select>
+          </div>
+        )}
 
         {/* CC env preset selector + editor */}
         {agentType === 'claude-code' && (

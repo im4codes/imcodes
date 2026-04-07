@@ -67,7 +67,10 @@ export class GitHubProvider implements RepoProvider {
     const perPage = opts?.perPage ?? DEFAULT_PAGE_SIZE;
     const state = opts?.state ?? 'open';
 
-    const jq = `[.[] | select(.pull_request == null) | {id: (.id | tostring), number, title, body: (.body // ""), state, author: .user.login, labels: [.labels[].name], url: .html_url, assignee: (.assignee.login // null), createdAt: (.created_at | fromdateiso8601 * 1000), updatedAt: (.updated_at | fromdateiso8601 * 1000)}]`;
+    // The /issues endpoint mixes issues and PRs. Filtering on `.pull_request == null`
+    // is not reliable across all gh/jq combinations for closed pages, so prefer the
+    // canonical HTML route shape instead.
+    const jq = `[.[] | select(.html_url | contains("/issues/")) | {id: (.id | tostring), number, title, body: (.body // ""), state, author: .user.login, labels: [.labels[].name], url: .html_url, assignee: (.assignee.login // null), createdAt: (.created_at | fromdateiso8601 * 1000), updatedAt: (.updated_at | fromdateiso8601 * 1000)}]`;
 
     try {
       const { stdout } = await execFileAsync('gh', [

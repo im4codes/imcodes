@@ -95,6 +95,13 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
       ws.sendSessionCommand('send', { sessionName: sub.sessionName, text });
     } catch { /* ignore */ }
     cardInputRef.current!.value = '';
+    requestAnimationFrame(() => {
+      const el = previewRef.current;
+      if (el) {
+        el.scrollTop = el.scrollHeight;
+        setShowScrollBtn(false);
+      }
+    });
   }, [ws, connected, sub.sessionName]);
 
 
@@ -112,46 +119,30 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, onOpen, 
     prevStateRef.current = sub.state;
   }, [sub.state]);
 
-  // Auto-scroll preview to bottom when content updates — but only if user is near the bottom.
-  // This prevents yanking the view away when the user is scrolling through history.
-  const userScrolledUpRef = useRef(false);
-  const lastScrollActivityRef = useRef(Date.now());
+  // Preview cards always follow the latest content.
   const [showScrollBtn, setShowScrollBtn] = useState(false);
-  const SCROLL_IDLE_RESUME_MS = 60_000;
   useEffect(() => {
     const el = previewRef.current;
     if (!el) return;
     const handleScroll = () => {
       const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-      userScrolledUpRef.current = !atBottom;
       setShowScrollBtn(!atBottom);
-      if (!atBottom) lastScrollActivityRef.current = Date.now();
     };
     el.addEventListener('scroll', handleScroll, { passive: true });
+    handleScroll();
     return () => el.removeEventListener('scroll', handleScroll);
   }, []);
-  // Resume auto-scroll after 1 min of scroll inactivity
-  useEffect(() => {
-    if (!userScrolledUpRef.current) return;
-    const timer = setInterval(() => {
-      if (userScrolledUpRef.current && Date.now() - lastScrollActivityRef.current >= SCROLL_IDLE_RESUME_MS) {
-        const el = previewRef.current;
-        if (el) el.scrollTop = el.scrollHeight;
-        userScrolledUpRef.current = false;
-        setShowScrollBtn(false);
-      }
-    }, 10_000);
-    return () => clearInterval(timer);
-  }, [showScrollBtn]);
   useEffect(() => {
     const el = previewRef.current;
-    if (el && !userScrolledUpRef.current) el.scrollTop = el.scrollHeight;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+      setShowScrollBtn(false);
+    }
   }, [events.length, sub.state]);
   const scrollToBottom = useCallback(() => {
     const el = previewRef.current;
     if (el) {
       el.scrollTop = el.scrollHeight;
-      userScrolledUpRef.current = false;
       setShowScrollBtn(false);
     }
   }, []);

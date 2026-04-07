@@ -9,6 +9,7 @@ import { resolve, basename } from 'path';
 import { tmpdir } from 'os';
 import type { TimelineEvent, TimelineEventType, TimelineSource, TimelineConfidence } from './timeline-event.js';
 import { timelineStore } from './timeline-store.js';
+import { preferTimelineEvent } from '../shared/timeline/merge.js';
 
 /** Pattern matching temp file instruction: "Read and execute all instructions in @<path>" */
 const TEMP_FILE_RE = /^Read and execute all instructions in @(.+\.imcodes-prompt-[0-9a-f]+\.md)$/;
@@ -115,7 +116,7 @@ export class TimelineEmitter {
     if (isStableUpdate) {
       const existingIdx = buf.findIndex((e) => e.eventId === eventId);
       if (existingIdx >= 0) {
-        buf[existingIdx] = event;
+        buf[existingIdx] = preferTimelineEvent(buf[existingIdx]!, event);
       } else {
         buf.push(event);
       }

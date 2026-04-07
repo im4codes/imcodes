@@ -2,20 +2,23 @@
  * UsageFooter — shared context bar + usage stats + cost display.
  * Used by both main session (app.tsx) and SubSessionWindow.
  */
-import { useMemo } from 'preact/hooks';
+import { useEffect, useMemo, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { resolveContextWindow } from '../model-context.js';
 import { shortModelLabel } from '../model-label.js';
 import { getSessionCost, getWeeklyCost, getMonthlyCost, formatCost } from '../cost-tracker.js';
 import type { UsageData } from '../usage-data.js';
+import { formatProviderQuotaLabel, type ProviderQuotaMeta } from '@shared/provider-quota.js';
 
 interface Props {
   usage: UsageData;
   sessionName: string;
+  agentType?: string | null;
   modelOverride?: string | null;
   planLabel?: string | null;
   quotaLabel?: string | null;
   quotaUsageLabel?: string | null;
+  quotaMeta?: ProviderQuotaMeta | null;
   /** Show cost tracking (requires costUsd events to have been recorded). */
   showCost?: boolean;
   /** Active thinking timestamp — shows elapsed time spinner. */
@@ -31,10 +34,33 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, modelOverride, planLabel, quotaLabel, quotaUsageLabel, showCost, activeThinkingTs, statusText, now }: Props) {
+export function UsageFooter({ usage, sessionName, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, now }: Props) {
   const { t } = useTranslation();
+  const isCodexFamily = agentType === 'codex' || agentType === 'codex-sdk';
+  const [quotaNow, setQuotaNow] = useState(() => Date.now());
 
   const displayModel = modelOverride ?? usage.model;
+  useEffect(() => {
+    if (!isCodexFamily || !quotaMeta) return;
+    let intervalId: number | undefined;
+    const tick = () => setQuotaNow(Date.now());
+    tick();
+    const delay = Math.max(250, 60_000 - (Date.now() % 60_000));
+    const timeoutId = window.setTimeout(() => {
+      tick();
+      intervalId = window.setInterval(tick, 60_000);
+    }, delay);
+    return () => {
+      window.clearTimeout(timeoutId);
+      if (intervalId !== undefined) window.clearInterval(intervalId);
+    };
+  }, [isCodexFamily, quotaMeta]);
+
+  const displayQuotaLabel = useMemo(() => {
+    if (!isCodexFamily || !quotaMeta) return quotaLabel;
+    return formatProviderQuotaLabel(quotaMeta, now ?? quotaNow) ?? quotaLabel;
+  }, [isCodexFamily, now, quotaLabel, quotaMeta, quotaNow]);
+
   const displayPlanLabel = useMemo(() => {
     const normalized = planLabel?.trim().toLowerCase();
     if (!normalized) return null;
@@ -56,56 +82,34 @@ export function UsageFooter({ usage, sessionName, modelOverride, planLabel, quot
       `Context: ${fmt(total)} / ${fmt(ctx)} (${pctStr}%)`,
       `  New: ${fmt(usage.inputTokens)}  Cache: ${fmt(usage.cacheTokens)}`,
       displayPlanLabel ? t('session.provider_plan_title', { value: displayPlanLabel }) : '',
-      quotaLabel ? t('session.provider_quota_title', { value: quotaLabel }) : '',
+      displayQuotaLabel ? t('session.provider_quota_title', { value: displayQuotaLabel }) : '',
       quotaUsageLabel ? t('session.provider_quota_usage_title', { value: quotaUsageLabel }) : '',
-      usage.codexStatus?.fiveHourLeftPercent !== undefined ? `5h: ${usage.codexStatus.fiveHourLeftPercent}% (${usage.codexStatus.fiveHourResetAt ?? ''})` : '',
-      usage.codexStatus?.weeklyLeftPercent !== undefined ? `Weekly: ${usage.codexStatus.weeklyLeftPercent}% (${usage.codexStatus.weeklyResetAt ?? ''})` : '',
     ].filter(Boolean).join('\n');
     return { ctx, total, totalPct, cachePct, newPct, pctStr, tip };
-  }, [usage.inputTokens, usage.cacheTokens, usage.contextWindow, displayModel, usage.codexStatus, displayPlanLabel, quotaLabel, quotaUsageLabel, t]);
+  }, [usage.inputTokens, usage.cacheTokens, usage.contextWindow, displayModel, displayPlanLabel, displayQuotaLabel, quotaUsageLabel, t]);
 
   const sessionCost = showCost ? getSessionCost(sessionName) : 0;
   const weeklyCost = sessionCost > 0 ? getWeeklyCost() : 0;
   const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const modelLabel = shortModelLabel(displayModel);
-  const hasCodexStatus = usage.codexStatus?.fiveHourLeftPercent !== undefined
-    || usage.codexStatus?.weeklyLeftPercent !== undefined;
+  const inlineQuotaText = displayQuotaLabel;
+  const codexQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk')
+    ? (displayQuotaLabel ?? '').split(' · ').filter(Boolean)
+    : [];
 
   return (
-    <div class="session-usage-footer" title={tip}>
+    <div class="session-usage-footer" title={tip} data-agent-type={agentType ?? undefined}>
       {total > 0 && (
         <div class="session-ctx-bar">
           <div class="session-ctx-cache" style={{ width: `${cachePct}%` }} />
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
         </div>
       )}
-      {/* Plan/quota badges moved to SessionControls shortcuts row for compact inline display */}
-      {hasCodexStatus && (
-        <div class="session-usage-codex-row">
-          {usage.codexStatus?.fiveHourLeftPercent !== undefined && (
-            <span
-              class="session-usage-badge"
-              title={t('session.codex_limit_title', {
-                label: t('session.codex_5h_short'),
-                percent: usage.codexStatus.fiveHourLeftPercent,
-                reset: usage.codexStatus.fiveHourResetAt ?? '—',
-              })}
-            >
-              {t('session.codex_5h_short')} {usage.codexStatus.fiveHourLeftPercent}%
-            </span>
-          )}
-          {usage.codexStatus?.weeklyLeftPercent !== undefined && (
-            <span
-              class="session-usage-badge"
-              title={t('session.codex_limit_title', {
-                label: t('session.codex_wk_short'),
-                percent: usage.codexStatus.weeklyLeftPercent,
-                reset: usage.codexStatus.weeklyResetAt ?? '—',
-              })}
-            >
-              {t('session.codex_wk_short')} {usage.codexStatus.weeklyLeftPercent}%
-            </span>
-          )}
+      {codexQuotaLines.length > 0 && (
+        <div class="session-usage-codex-quota">
+          {codexQuotaLines.map((line) => (
+            <div class="session-usage-codex-line">{line}</div>
+          ))}
         </div>
       )}
       <div class="session-usage-stats">
@@ -117,9 +121,10 @@ export function UsageFooter({ usage, sessionName, modelOverride, planLabel, quot
               : statusText}
           </span>
         )}
-        <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' }}>
+        <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
           {modelLabel && <span class="session-usage-model">{modelLabel}</span>}
           {total > 0 && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}
+          {inlineQuotaText && codexQuotaLines.length === 0 && <span class="session-usage-tokens">{inlineQuotaText}</span>}
           {sessionCost > 0 && (
             <span class="session-usage-cost">
               {formatCost(sessionCost)} · wk {formatCost(weeklyCost)} · mo {formatCost(monthlyCost)}

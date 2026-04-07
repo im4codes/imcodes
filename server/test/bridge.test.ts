@@ -1333,6 +1333,10 @@ describe('WsBridge', () => {
         label: 'worker-1',
         ccSessionId: 'cc-abc',
         parentSession: 'deck_myapp_brain',
+        requestedModel: 'sonnet',
+        activeModel: 'sonnet',
+        effort: 'high',
+        transportConfig: { provider: { mode: 'safe' } },
       }));
       await flushAsync();
 
@@ -1346,6 +1350,10 @@ describe('WsBridge', () => {
       expect(msg.cwd).toBe('/home/user/project');
       expect(msg.label).toBe('worker-1');
       expect(msg.parentSession).toBe('deck_myapp_brain');
+      expect(msg.requestedModel).toBe('sonnet');
+      expect(msg.activeModel).toBe('sonnet');
+      expect(msg.effort).toBe('high');
+      expect(msg.transportConfig).toEqual({ provider: { mode: 'safe' } });
       expect(msg.state).toBe('running');
     });
 

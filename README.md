@@ -1,8 +1,10 @@
 # [IM.codes](https://im.codes)
 
+[English](README.md) | [简体中文](README.i18n/README.zh-CN.md) | [繁體中文](README.i18n/README.zh-TW.md) | [Español](README.i18n/README.es.md) | [Русский](README.i18n/README.ru.md) | [日本語](README.i18n/README.ja.md) | [한국어](README.i18n/README.ko.md)
+
 **The IM for agents.**
 
-A specialized instant messenger for AI agents. Keep long-running coding-agent sessions within reach from mobile or web, with terminal access, file browsing, git views, localhost preview, notifications, and multi-agent workflows built in. Works with [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — including native streaming output for transport-backed agents.
+A specialized instant messenger for AI agents. Keep long-running coding-agent sessions within reach from mobile or web, with terminal access, file browsing, git views, localhost preview, notifications, and multi-agent workflows built in. Works with [Claude Code](https://github.com/anthropics/claude-code) and [Codex](https://github.com/openai/codex) via both CLI and SDK integrations, plus [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more — including native streaming output for transport-backed agents.
 
 > **Disclaimer:** This is an actively developed personal open-source project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk. Breaking changes may happen at any time without notice.
 
@@ -38,11 +40,21 @@ A specialized instant messenger for AI agents. Keep long-running coding-agent se
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m0.png"><img src="landing/imcodes-m0.png" width="18%" /></a>
 </p>
 
+### Apple Watch
+
+<p>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-watch1.png"><img src="landing/imcodes-watch1.png" width="31%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-watch0.png"><img src="landing/imcodes-watch0.png" width="31%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-watch2.png"><img src="landing/imcodes-watch2.png" width="31%" /></a>
+</p>
+
+Watch support covers quick session monitoring, unread counts, push notifications, and quick replies directly from the wrist.
+
 ## Download
 
 <a href="https://apps.apple.com/us/app/im-codes/id6761014424"><img src="https://developer.apple.com/assets/elements/badges/download-on-the-app-store.svg" height="40" alt="Download on the App Store" /></a>
 
-Also available as a [web app](https://app.im.codes) and via `npm install -g imcodes` (daemon CLI).
+Supports iPhone, iPad, and Apple Watch. Also available as a [web app](https://app.im.codes) and via `npm install -g imcodes` (daemon CLI).
 
 ## Why
 
@@ -68,9 +80,9 @@ Browse project files with a tree view. Upload files, images, and photos from any
 
 Preview your local dev server from any device — phone, tablet, or remote browser — without deploying. The daemon proxies `localhost` traffic through a secure WebSocket tunnel to the server. HTML rewriting and a runtime patch handle URL remapping so links, fetch, and WebSocket connections just work. Supports HMR/hot-reload via WebSocket tunneling. No public URLs, no third-party tunnels — traffic stays within your IM.codes server.
 
-### Mobile & Notifications
+### Mobile, Watch & Notifications
 
-Full mobile support with biometric auth and push notifications. Shell sessions allow interactive keyboard input on mobile (SSH-like). Sub-session preview cards always show latest messages. Toast notifications navigate directly to the relevant session.
+Full mobile support with biometric auth and push notifications. Shell sessions allow interactive keyboard input on mobile (SSH-like). Sub-session preview cards always show latest messages. Toast notifications navigate directly to the relevant session. Apple Watch support adds quick session monitoring, unread counts, and quick replies from the wrist.
 
 ### Multi-Agent Discussions & Audit
 
@@ -78,9 +90,11 @@ Single-model output shouldn't be trusted blindly. Spawn quick discussion rounds 
 
 ### Streaming Transport Agents
 
-Native streaming output support for transport-backed agents like [OpenClaw](https://openclaw.com) and [Qwen](https://github.com/QwenLM/qwen-agent). These agents connect via network protocols (WebSocket or local SDK) instead of terminal scraping, delivering structured event streams with real-time delta updates, tool call tracking, and session restore.
+Native streaming output support for transport-backed agents like [Claude Code SDK](https://github.com/anthropics/claude-agent-sdk-typescript), [Codex SDK](https://github.com/openai/codex/tree/main/sdk/typescript), [OpenClaw](https://openclaw.com), and [Qwen](https://github.com/QwenLM/qwen-agent). These agents connect via network protocols or local SDKs instead of terminal scraping, delivering structured event streams with real-time delta updates, tool call tracking, and session restore.
 
 > **Note on Qwen:** Qwen currently offers a free tier (1,000 requests/day) provided by Alibaba Cloud. This is an Alibaba Cloud policy, not an IM.codes offering — terms, limits, and availability may change at any time without notice. Check the [Qwen documentation](https://qwen.readthedocs.io/) for current details.
+
+> **Note on OpenClaw:** `imcodes connect openclaw` has only been tested on macOS so far.
 
 ### Agent-to-Agent Communication
 
@@ -171,12 +185,12 @@ You (browser / mobile)
 Server (self-hosted)
         ↓ WebSocket
 Daemon (your machine)
-        ↓ tmux / WezTerm / transport
+        ↓ tmux / transport
 AI Agents (Claude Code / Codex / Gemini CLI / OpenClaw)
         ↔ imcodes send (agent-to-agent)
 ```
 
-The daemon runs on your dev machine and manages agent sessions through tmux or WezTerm (process-backed) or network protocols (transport-backed, e.g. OpenClaw gateway). Agents can communicate with each other via `imcodes send`. The server relays connections between your devices and the daemon. Everything stays on your infrastructure.
+The daemon runs on your dev machine and manages process-backed agent sessions through tmux or transport-backed sessions through network protocols / local SDKs (for example Claude Code SDK, Codex SDK, OpenClaw gateway, and Qwen). Agents can communicate with each other via `imcodes send`. The server relays connections between your devices and the daemon. Everything stays on your infrastructure.
 
 ## Install
 
@@ -195,6 +209,36 @@ imcodes bind https://app.im.codes/bind/<api-key>
 ```
 
 This binds your machine, starts the daemon, registers it as a system service, and brings the machine into the web/mobile dashboard.
+
+### OpenClaw Connect
+
+If OpenClaw is running locally, connect IM.codes to the OpenClaw gateway on the daemon machine:
+
+```bash
+imcodes connect openclaw
+```
+
+What this does:
+
+- connects to `ws://127.0.0.1:18789` by default
+- reuses the OpenClaw gateway token automatically from `~/.openclaw/openclaw.json`
+- syncs OpenClaw sessions and child sessions into IM.codes so they appear as transport-backed sessions/sub-sessions
+- saves the IM.codes-side connection config to `~/.imcodes/openclaw.json`
+- restarts the daemon so OpenClaw transport sessions can reconnect automatically
+
+Common variants:
+
+```bash
+imcodes connect openclaw --url ws://127.0.0.1:18789
+OPENCLAW_GATEWAY_TOKEN=... imcodes connect openclaw
+imcodes connect openclaw --url wss://gateway.example.com
+```
+
+Notes:
+
+- remote non-TLS `ws://` URLs require `--insecure`
+- use `imcodes disconnect openclaw` to remove the saved config and drop the connection
+- this flow has only been tested on macOS
 
 ## Self-Host
 
@@ -284,7 +328,7 @@ Check the daemon watchdog log for errors:
 - **Windows (experimental)**: Native support via ConPTY (built-in on Windows 10+). Just `npm install -g imcodes` — no extra software needed. WSL also works.
 - Node.js >= 20
 - Terminal multiplexer: [tmux](https://github.com/tmux/tmux) (Linux/macOS). Windows uses ConPTY (auto-detected, built-in).
-- At least one AI coding agent: [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), or [Qwen](https://github.com/QwenLM/qwen-agent)
+- At least one AI coding agent: [Claude Code](https://github.com/anthropics/claude-code) (CLI or SDK), [Codex](https://github.com/openai/codex) (CLI or SDK), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), or [Qwen](https://github.com/QwenLM/qwen-agent)
 
 ## Disclaimer
 

@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, cleanup } from '@testing-library/preact';
+import { render, screen, cleanup, fireEvent } from '@testing-library/preact';
 
 if (!HTMLElement.prototype.scrollIntoView) {
   HTMLElement.prototype.scrollIntoView = vi.fn();
@@ -13,6 +13,11 @@ vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, vars?: Record<string, unknown>) => {
       if (key === 'chat.tool_group_more') return `${String(vars?.count ?? '')} more`;
+      if (key === 'chat.tool_detail_toggle') return 'details';
+      if (key === 'chat.tool_detail_input') return 'input';
+      if (key === 'chat.tool_detail_output') return 'output';
+      if (key === 'chat.tool_detail_meta') return 'meta';
+      if (key === 'chat.tool_detail_raw') return 'raw';
       return key.split('.').pop() ?? key;
     },
   }),
@@ -85,5 +90,106 @@ describe('ChatView tool payload formatting', () => {
 
     expect(screen.getByText('web_search')).toBeDefined();
     expect(screen.queryByText('{}')).toBeNull();
+  });
+
+  it('renders transport Codex tool calls alongside streaming assistant text', () => {
+    const events = [
+      makeEvent({
+        eventId: 'transport:test:msg-1',
+        type: 'assistant.text',
+        payload: { text: 'Running `pwd`', streaming: true },
+      }),
+      makeEvent({
+        eventId: 'transport-tool:test:call-1:call',
+        type: 'tool.call',
+        payload: { tool: 'Bash', input: { command: '/usr/bin/bash -lc pwd' } },
+      }),
+      makeEvent({
+        eventId: 'transport-tool:test:call-1:result',
+        type: 'tool.result',
+        payload: { output: '/tmp/project\n' },
+      }),
+      makeEvent({
+        eventId: 'transport:test:msg-2',
+        type: 'assistant.text',
+        payload: { text: '/tmp/project', streaming: false },
+      }),
+    ];
+
+    render(<ChatView events={events} loading={false} />);
+
+    expect(screen.getByText('Bash')).toBeDefined();
+    expect(screen.getByText(/\/usr\/bin\/bash -lc pwd/)).toBeDefined();
+    expect(screen.getAllByText('/tmp/project').length).toBeGreaterThan(0);
+  });
+
+  it('renders Claude-style merged tool rows when tool.call is followed by tool.result', () => {
+    const events = [
+      makeEvent({
+        eventId: 'transport-tool:test:read-1:call',
+        type: 'tool.call',
+        payload: { tool: 'Read', input: { file_path: 'package.json' }, detail: { kind: 'tool_use', input: { file_path: 'package.json' }, raw: { file_path: 'package.json' } } },
+      }),
+      makeEvent({
+        eventId: 'transport-tool:test:read-1:result',
+        type: 'tool.result',
+        payload: { detail: { kind: 'tool_result', output: { ok: true } } },
+      }),
+    ];
+
+    render(<ChatView events={events} loading={false} />);
+
+    expect(screen.getByText('Read')).toBeDefined();
+    expect(screen.getAllByText(/package\.json/).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByText('details'));
+    expect(screen.getByText('input')).toBeDefined();
+    expect(screen.getByText('output')).toBeDefined();
+  });
+
+  it('renders OpenClaw transport tool rows for realistic sessions_send payloads', () => {
+    const events = [
+      makeEvent({
+        eventId: 'transport-tool:test:oc-1:call',
+        type: 'tool.call',
+        payload: {
+          tool: 'sessions_send',
+          input: { sessionKey: 'agent:emma:main', message: 'hello from openclaw' },
+          detail: {
+            kind: 'openclaw.tool',
+            summary: 'sessions_send',
+            input: { sessionKey: 'agent:emma:main', message: 'hello from openclaw' },
+            raw: {
+              phase: 'start',
+              name: 'sessions_send',
+              toolCallId: 'oc-1',
+              args: { sessionKey: 'agent:emma:main', message: 'hello from openclaw' },
+            },
+          },
+        },
+      }),
+      makeEvent({
+        eventId: 'transport-tool:test:oc-1:result',
+        type: 'tool.result',
+        payload: {
+          output: JSON.stringify({ delivered: true, target: 'agent:emma:main' }),
+          detail: {
+            kind: 'openclaw.tool',
+            output: { delivered: true, target: 'agent:emma:main' },
+            meta: { durationMs: 42 },
+          },
+        },
+      }),
+    ];
+
+    render(<ChatView events={events} loading={false} />);
+
+    expect(screen.getByText('sessions_send')).toBeDefined();
+    expect(screen.getAllByText(/agent:emma:main/).length).toBeGreaterThan(0);
+    expect(screen.queryByText('[object Object]')).toBeNull();
+
+    fireEvent.click(screen.getByText('details'));
+    expect(screen.getByText('input')).toBeDefined();
+    expect(screen.getByText('output')).toBeDefined();
+    expect(screen.getAllByText(/delivered/).length).toBeGreaterThan(0);
   });
 });

@@ -99,7 +99,9 @@ const NOISE_PREFIXES = [
 
 const BADGE_MAP: Record<string, string> = {
   'claude-code': 'cc',
+  'claude-code-sdk': 'cc',
   'codex': 'cx',
+  'codex-sdk': 'cx',
   'opencode': 'oc',
   'openclaw': 'oc',
   'qwen': 'qw',

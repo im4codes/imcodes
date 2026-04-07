@@ -79,6 +79,10 @@ export interface DbSession {
   provider_id: string | null;
   provider_session_id: string | null;
   description: string | null;
+  requested_model: string | null;
+  active_model: string | null;
+  effort: string | null;
+  transport_config: Record<string, unknown> | string | null;
   created_at: number;
   updated_at: number;
 }
@@ -369,11 +373,15 @@ export async function upsertDbSession(
   providerId?: string | null,
   providerSessionId?: string | null,
   description?: string | null,
+  requestedModel?: string | null,
+  activeModel?: string | null,
+  effort?: string | null,
+  transportConfig?: Record<string, unknown> | null,
 ): Promise<void> {
   const now = Date.now();
   await db.execute(
-    `INSERT INTO sessions (id, server_id, name, project_name, role, agent_type, agent_version, project_dir, state, runtime_type, provider_id, provider_session_id, description, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+    `INSERT INTO sessions (id, server_id, name, project_name, role, agent_type, agent_version, project_dir, state, runtime_type, provider_id, provider_session_id, description, requested_model, active_model, effort, transport_config, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18, $19)
      ON CONFLICT(server_id, name) DO UPDATE SET
        role = excluded.role,
        agent_type = excluded.agent_type,
@@ -384,8 +392,32 @@ export async function upsertDbSession(
        provider_id = excluded.provider_id,
        provider_session_id = excluded.provider_session_id,
        description = excluded.description,
+       requested_model = excluded.requested_model,
+       active_model = excluded.active_model,
+       effort = excluded.effort,
+       transport_config = excluded.transport_config,
        updated_at = excluded.updated_at`,
-    [id, serverId, name, projectName, role, agentType, agentVersion ?? null, projectDir, state, runtimeType ?? null, providerId ?? null, providerSessionId ?? null, description ?? null, now, now],
+    [
+      id,
+      serverId,
+      name,
+      projectName,
+      role,
+      agentType,
+      agentVersion ?? null,
+      projectDir,
+      state,
+      runtimeType ?? null,
+      providerId ?? null,
+      providerSessionId ?? null,
+      description ?? null,
+      requestedModel ?? null,
+      activeModel ?? null,
+      effort ?? null,
+      JSON.stringify(transportConfig ?? {}),
+      now,
+      now,
+    ],
   );
 }
 
@@ -411,7 +443,15 @@ export async function updateSession(
   db: Database,
   serverId: string,
   name: string,
-  fields: { label?: string | null; description?: string | null; project_dir?: string | null },
+  fields: {
+    label?: string | null;
+    description?: string | null;
+    project_dir?: string | null;
+    requested_model?: string | null;
+    active_model?: string | null;
+    effort?: string | null;
+    transport_config?: Record<string, unknown> | null;
+  },
 ): Promise<void> {
   const parts: string[] = [];
   const vals: unknown[] = [];
@@ -419,6 +459,10 @@ export async function updateSession(
   if ('label' in fields) { parts.push(`label = $${idx++}`); vals.push(fields.label ?? null); }
   if ('description' in fields) { parts.push(`description = $${idx++}`); vals.push(fields.description ?? null); }
   if ('project_dir' in fields) { parts.push(`project_dir = $${idx++}`); vals.push(fields.project_dir ?? null); }
+  if ('requested_model' in fields) { parts.push(`requested_model = $${idx++}`); vals.push(fields.requested_model ?? null); }
+  if ('active_model' in fields) { parts.push(`active_model = $${idx++}`); vals.push(fields.active_model ?? null); }
+  if ('effort' in fields) { parts.push(`effort = $${idx++}`); vals.push(fields.effort ?? null); }
+  if ('transport_config' in fields) { parts.push(`transport_config = $${idx++}::jsonb`); vals.push(JSON.stringify(fields.transport_config ?? {})); }
   if (parts.length === 0) return;
   parts.push(`updated_at = $${idx++}`);
   vals.push(Date.now());
@@ -471,6 +515,10 @@ export interface DbSubSession {
   provider_session_id: string | null;
   description: string | null;
   cc_preset_id: string | null;
+  requested_model: string | null;
+  active_model: string | null;
+  effort: string | null;
+  transport_config: Record<string, unknown> | string | null;
 }
 
 export async function getSubSessionsByServer(db: Database, serverId: string): Promise<DbSubSession[]> {
@@ -514,22 +562,82 @@ export async function createSubSession(
   providerSessionId: string | null = null,
   description: string | null = null,
   ccPresetId: string | null = null,
+  requestedModel: string | null = null,
+  activeModel: string | null = null,
+  effort: string | null = null,
+  transportConfig: Record<string, unknown> | null = null,
 ): Promise<DbSubSession> {
   const now = Date.now();
   await db.execute(
-    `INSERT INTO sub_sessions (id, server_id, type, shell_bin, cwd, label, closed_at, cc_session_id, gemini_session_id, parent_session, runtime_type, provider_id, provider_session_id, description, created_at, updated_at, cc_preset_id)
-     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-     ON CONFLICT (id, server_id) DO UPDATE SET type = EXCLUDED.type, shell_bin = EXCLUDED.shell_bin, cwd = EXCLUDED.cwd, label = COALESCE(EXCLUDED.label, sub_sessions.label), closed_at = NULL, cc_session_id = COALESCE(EXCLUDED.cc_session_id, sub_sessions.cc_session_id), gemini_session_id = COALESCE(EXCLUDED.gemini_session_id, sub_sessions.gemini_session_id), parent_session = COALESCE(EXCLUDED.parent_session, sub_sessions.parent_session), runtime_type = COALESCE(EXCLUDED.runtime_type, sub_sessions.runtime_type), provider_id = COALESCE(EXCLUDED.provider_id, sub_sessions.provider_id), provider_session_id = COALESCE(EXCLUDED.provider_session_id, sub_sessions.provider_session_id), description = COALESCE(EXCLUDED.description, sub_sessions.description), updated_at = EXCLUDED.updated_at, cc_preset_id = COALESCE(EXCLUDED.cc_preset_id, sub_sessions.cc_preset_id)`,
-    [id, serverId, type, shellBin, cwd, label, ccSessionId, geminiSessionId, parentSession, runtimeType, providerId, providerSessionId, description, now, now, ccPresetId],
+    `INSERT INTO sub_sessions (id, server_id, type, shell_bin, cwd, label, closed_at, cc_session_id, gemini_session_id, parent_session, runtime_type, provider_id, provider_session_id, description, created_at, updated_at, cc_preset_id, requested_model, active_model, effort, transport_config)
+     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20::jsonb)
+     ON CONFLICT (id, server_id) DO UPDATE SET type = EXCLUDED.type, shell_bin = EXCLUDED.shell_bin, cwd = EXCLUDED.cwd, label = COALESCE(EXCLUDED.label, sub_sessions.label), closed_at = NULL, cc_session_id = COALESCE(EXCLUDED.cc_session_id, sub_sessions.cc_session_id), gemini_session_id = COALESCE(EXCLUDED.gemini_session_id, sub_sessions.gemini_session_id), parent_session = COALESCE(EXCLUDED.parent_session, sub_sessions.parent_session), runtime_type = COALESCE(EXCLUDED.runtime_type, sub_sessions.runtime_type), provider_id = COALESCE(EXCLUDED.provider_id, sub_sessions.provider_id), provider_session_id = COALESCE(EXCLUDED.provider_session_id, sub_sessions.provider_session_id), description = COALESCE(EXCLUDED.description, sub_sessions.description), updated_at = EXCLUDED.updated_at, cc_preset_id = COALESCE(EXCLUDED.cc_preset_id, sub_sessions.cc_preset_id), requested_model = COALESCE(EXCLUDED.requested_model, sub_sessions.requested_model), active_model = COALESCE(EXCLUDED.active_model, sub_sessions.active_model), effort = COALESCE(EXCLUDED.effort, sub_sessions.effort), transport_config = CASE WHEN EXCLUDED.transport_config = '{}'::jsonb THEN sub_sessions.transport_config ELSE EXCLUDED.transport_config END`,
+    [
+      id,
+      serverId,
+      type,
+      shellBin,
+      cwd,
+      label,
+      ccSessionId,
+      geminiSessionId,
+      parentSession,
+      runtimeType,
+      providerId,
+      providerSessionId,
+      description,
+      now,
+      now,
+      ccPresetId,
+      requestedModel,
+      activeModel,
+      effort,
+      JSON.stringify(transportConfig ?? {}),
+    ],
   );
-  return { id, server_id: serverId, type, shell_bin: shellBin, cwd, label, closed_at: null, cc_session_id: ccSessionId, gemini_session_id: geminiSessionId, parent_session: parentSession, sort_order: null, runtime_type: runtimeType, provider_id: providerId, provider_session_id: providerSessionId, description, created_at: now, updated_at: now, cc_preset_id: ccPresetId };
+  return {
+    id,
+    server_id: serverId,
+    type,
+    shell_bin: shellBin,
+    cwd,
+    label,
+    closed_at: null,
+    cc_session_id: ccSessionId,
+    gemini_session_id: geminiSessionId,
+    parent_session: parentSession,
+    sort_order: null,
+    runtime_type: runtimeType,
+    provider_id: providerId,
+    provider_session_id: providerSessionId,
+    description,
+    created_at: now,
+    updated_at: now,
+    cc_preset_id: ccPresetId,
+    requested_model: requestedModel,
+    active_model: activeModel,
+    effort,
+    transport_config: transportConfig ?? {},
+  };
 }
 
 export async function updateSubSession(
   db: Database,
   id: string,
   serverId: string,
-  fields: { label?: string | null; closed_at?: number | null; gemini_session_id?: string | null; sort_order?: number | null; description?: string | null; cwd?: string | null; cc_preset_id?: string | null },
+  fields: {
+    label?: string | null;
+    closed_at?: number | null;
+    gemini_session_id?: string | null;
+    sort_order?: number | null;
+    description?: string | null;
+    cwd?: string | null;
+    cc_preset_id?: string | null;
+    requested_model?: string | null;
+    active_model?: string | null;
+    effort?: string | null;
+    transport_config?: Record<string, unknown> | null;
+  },
 ): Promise<void> {
   const parts: string[] = [];
   const vals: unknown[] = [];
@@ -541,6 +649,10 @@ export async function updateSubSession(
   if ('description' in fields) { parts.push(`description = $${idx++}`); vals.push(fields.description ?? null); }
   if ('cwd' in fields) { parts.push(`cwd = $${idx++}`); vals.push(fields.cwd ?? null); }
   if ('cc_preset_id' in fields) { parts.push(`cc_preset_id = $${idx++}`); vals.push(fields.cc_preset_id ?? null); }
+  if ('requested_model' in fields) { parts.push(`requested_model = $${idx++}`); vals.push(fields.requested_model ?? null); }
+  if ('active_model' in fields) { parts.push(`active_model = $${idx++}`); vals.push(fields.active_model ?? null); }
+  if ('effort' in fields) { parts.push(`effort = $${idx++}`); vals.push(fields.effort ?? null); }
+  if ('transport_config' in fields) { parts.push(`transport_config = $${idx++}::jsonb`); vals.push(JSON.stringify(fields.transport_config ?? {})); }
   if (parts.length === 0) return;
   parts.push(`updated_at = $${idx++}`);
   vals.push(Date.now());

@@ -6,13 +6,13 @@ import type { TerminalDiff } from './types.js';
 import { apiFetch, ApiError } from './api.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { REPO_MSG } from '@shared/repo-types.js';
-import { CODEX_STATUS_MSG } from '@shared/codex-status.js';
 import type {
   FsLsResponse,
   FsReadResponse,
   FsGitStatusResponse,
   FsGitDiffResponse,
   FsWriteResponse,
+  FsMkdirResponse,
 } from '../../src/shared/transport/fs.js';
 
 export type MessageHandler = (msg: ServerMessage) => void;
@@ -28,7 +28,8 @@ export type ServerMessage =
   | { type: 'session.tool'; session: string; tool: string | null }
   | { type: 'daemon.reconnected' }
   | { type: 'daemon.disconnected' }
-  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; qwenModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; quotaLabel?: string; quotaUsageLabel?: string }> }
+  | { type: 'daemon.error'; kind: 'uncaughtException' | 'unhandledRejection' | 'warning'; message: string; stack?: string; ts: number }
+  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel }> }
   | { type: 'outbound'; platform: string; channelId: string; content: string }
   | { type: 'timeline.event'; event: TimelineEvent }
   | { type: 'timeline.replay'; sessionName: string; requestId?: string; events: TimelineEvent[]; truncated: boolean; epoch: number }
@@ -50,8 +51,8 @@ export type ServerMessage =
   | { type: 'file.search_response'; requestId: string; results: string[]; error?: string }
   | { type: 'p2p.run_update'; run: any }
   | { type: 'p2p.conflict'; existingRunId: string; initiatorSession: string; commandId: string }
-  | { type: 'subsession.created'; id: string; sessionName: string; sessionType: string; cwd?: string; label?: string; parentSession?: string; state?: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; qwenModel?: string | null; qwenAuthType?: string | null; qwenAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null }
-  | { type: 'subsession.sync'; id: string; sessionName?: string; state?: string; cwd?: string; label?: string; qwenModel?: string | null; modelDisplay?: string | null; planLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null }
+  | { type: 'subsession.created'; id: string; sessionName: string; sessionType: string; cwd?: string; label?: string; parentSession?: string; state?: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; requestedModel?: string | null; activeModel?: string | null; transportConfig?: Record<string, unknown> | null; qwenModel?: string | null; qwenAuthType?: string | null; qwenAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null }
+  | { type: 'subsession.sync'; id: string; sessionName?: string; state?: string; cwd?: string; label?: string; requestedModel?: string | null; activeModel?: string | null; transportConfig?: Record<string, unknown> | null; qwenModel?: string | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null }
   | { type: 'subsession.removed'; id: string; sessionName: string }
   | { type: 'p2p.run_started'; runId: string; session: string }
   | { type: 'p2p.cancel_response'; runId: string; ok: boolean }
@@ -62,6 +63,7 @@ export type ServerMessage =
   | { type: 'cc.presets.save_response'; ok: boolean }
   | FsGitDiffResponse
   | FsWriteResponse
+  | FsMkdirResponse
   | { type: 'repo.detect_response'; requestId: string; projectDir: string; context: any }
   | { type: 'repo.issues_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
   | { type: 'repo.prs_response'; requestId: string; projectDir: string; items: any[]; page: number; hasMore: boolean }
@@ -88,6 +90,7 @@ export type {
   FsReadResponse,
   FsGitStatusResponse,
   FsGitDiffResponse,
+  FsMkdirResponse,
 } from '../../src/shared/transport/fs.js';
 
 const RECONNECT_BASE_MS = 1000;
@@ -245,7 +248,7 @@ export class WsClient {
     this.send({ type: 'subsession.restart', sessionName });
   }
 
-  subSessionRebuildAll(subSessions: Array<{ id: string; type: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; shellBin?: string | null; cwd?: string | null; ccSessionId?: string | null; geminiSessionId?: string | null; parentSession?: string | null; label?: string | null; ccPresetId?: string | null }>): void {
+  subSessionRebuildAll(subSessions: Array<{ id: string; type: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; shellBin?: string | null; cwd?: string | null; ccSessionId?: string | null; geminiSessionId?: string | null; parentSession?: string | null; label?: string | null; ccPresetId?: string | null; requestedModel?: string | null; activeModel?: string | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null; transportConfig?: Record<string, unknown> | null }>): void {
     this.send({ type: 'subsession.rebuild_all', subSessions });
   }
 
@@ -409,11 +412,6 @@ export class WsClient {
     const requestId = crypto.randomUUID();
     this.send({ type: REPO_MSG.ACTION_DETAIL, projectDir, runId, requestId, ...opts });
     return requestId;
-  }
-
-  /** Ask the daemon to query Codex /status for an idle session. */
-  requestCodexStatus(sessionName: string): void {
-    this.send({ type: CODEX_STATUS_MSG.REQUEST, sessionName });
   }
 
   /** Get commit detail (diff stats, files). Returns requestId. */

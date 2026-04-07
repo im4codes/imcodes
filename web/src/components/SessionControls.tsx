@@ -18,6 +18,8 @@ import { P2P_CONFIG_MODE, COMBO_PRESETS, COMBO_SEPARATOR } from '@shared/p2p-mod
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
+import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
+import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
 
 interface Props {
   ws: WsClient | null;
@@ -77,8 +79,7 @@ type P2pMode = string; // 'solo' | single modes | combo pipelines like 'brainsto
 const MODEL_STORAGE_KEY = 'imcodes-model';
 const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const QWEN_MODEL_STORAGE_KEY = 'imcodes-qwen-model';
-const SINGLE_AGENT_PROMPT_PREF_KEY = 'atpicker_single_agent_prompt_dismissed';
-const CODEX_MODELS: CodexModelChoice[] = ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.2'];
+const CODEX_MODELS: CodexModelChoice[] = [...CODEX_MODEL_IDS] as CodexModelChoice[];
 const SINGLE_P2P_MODES: string[] = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss'];
 const P2P_MODES: string[] = [...SINGLE_P2P_MODES, ...COMBO_PRESETS.map((c) => c.key), P2P_CONFIG_MODE];
 const P2P_MODE_I18N: Record<string, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', plan: 'p2p.mode_plan', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
@@ -115,7 +116,6 @@ interface PendingAtTarget {
 interface PendingSendPayload {
   text: string;
   extra: Record<string, unknown>;
-  singleAgentTargetSelected: boolean;
 }
 
 type ManualP2pTargetCandidate = {
@@ -144,9 +144,7 @@ const SHORTCUTS: Array<{ label: string; title: string; data: string; wide?: bool
 
 function loadModel(): ModelChoice | null {
   try {
-    const v = localStorage.getItem(MODEL_STORAGE_KEY);
-    if (v === 'opus[1M]' || v === 'sonnet' || v === 'haiku') return v;
-    if (v === 'opus') return 'opus[1M]';
+    return normalizeClaudeCodeModelId(localStorage.getItem(MODEL_STORAGE_KEY)) ?? null;
   } catch { /* ignore */ }
   return null;
 }
@@ -235,6 +233,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const atSelectionLockRef = useRef(false);
   const atSelectionSnapshotRef = useRef('');
   const [modelOpen, setModelOpen] = useState(false);
+  const [thinkingOpen, setThinkingOpen] = useState(false);
   const [quickOpen, setQuickOpen] = useState(false);
   const [p2pMode, setP2pMode] = useState<P2pMode>('solo');
   const [p2pExcludeSameType, setP2pExcludeSameType] = useState(true);
@@ -250,6 +249,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [confirmLevel, setConfirmLevel] = useState(0); // 0=none, 1=first warning, 2=second warning (sub-session only)
   const menuRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef<HTMLDivElement>(null);
+  const thinkingRef = useRef<HTMLDivElement>(null);
   const p2pRef = useRef<HTMLDivElement>(null);
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -264,10 +264,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<Array<{ path: string; name: string }>>([]);
-  const [singleAgentPromptSuppressed, setSingleAgentPromptSuppressed] = useState(false);
-  const [singleAgentPromptOpen, setSingleAgentPromptOpen] = useState(false);
-  const [singleAgentPromptSkip, setSingleAgentPromptSkip] = useState(false);
-  const pendingSendRef = useRef<PendingSendPayload | null>(null);
 
   // Keep external inputRef in sync so parent can call .focus()
   useEffect(() => {
@@ -291,15 +287,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     onPendingPrefillApplied?.();
   }, [pendingPrefillText, onPendingPrefillApplied]);
 
-  useEffect(() => {
-    let cancelled = false;
-    void getUserPref(SINGLE_AGENT_PROMPT_PREF_KEY).then((raw) => {
-      if (cancelled) return;
-      setSingleAgentPromptSuppressed(raw === '1');
-    }).catch(() => {});
-    return () => { cancelled = true; };
-  }, []);
-
   // Persist input draft across unmount/remount (sub-session minimize/restore)
   const draftKey = activeSession ? `rcc_draft_${activeSession.name}` : null;
   useEffect(() => {
@@ -320,8 +307,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   useEffect(() => {
     if (!detectedModel) return;
     // CC models
-    if (detectedModel === 'opus[1M]' || detectedModel === 'sonnet' || detectedModel === 'haiku') {
-      if (model !== detectedModel) setModel(detectedModel);
+    const normalizedClaudeModel = normalizeClaudeCodeModelId(detectedModel);
+    if (normalizedClaudeModel) {
+      if (model !== normalizedClaudeModel) setModel(normalizedClaudeModel);
     }
     // Codex models
     if (detectedModel.startsWith('gpt-') && CODEX_MODELS.includes(detectedModel as CodexModelChoice)) {
@@ -345,11 +333,27 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const inputDisabled = !hasSession;
   // Send/action buttons disabled when disconnected or no session
   const disabled = !connected || !hasSession;
-  const isClaudeCode = activeSession?.agentType === 'claude-code';
+  const isClaudeCode = activeSession?.agentType === 'claude-code' || activeSession?.agentType === 'claude-code-sdk';
   const isShellLike = activeSession?.agentType === 'shell' || activeSession?.agentType === 'script';
   const isTransport = activeSession?.runtimeType === 'transport';
-  const isCodex = activeSession?.agentType === 'codex';
+  const isCodex = activeSession?.agentType === 'codex' || activeSession?.agentType === 'codex-sdk';
   const isQwen = activeSession?.agentType === 'qwen';
+  const thinkingLevels = useMemo((): readonly TransportEffortLevel[] => (
+    activeSession?.agentType === 'claude-code-sdk'
+      ? CLAUDE_SDK_EFFORT_LEVELS
+      : activeSession?.agentType === 'codex-sdk'
+        ? CODEX_SDK_EFFORT_LEVELS
+        : activeSession?.agentType === 'qwen'
+          ? QWEN_EFFORT_LEVELS
+        : activeSession?.agentType === 'openclaw'
+          ? OPENCLAW_THINKING_LEVELS
+          : []
+  ), [activeSession?.agentType]);
+  const supportsThinking = thinkingLevels.length > 0;
+  const currentThinking = (activeSession?.effort as TransportEffortLevel | undefined)
+    ?? (activeSession?.agentType === 'qwen' || activeSession?.agentType === 'openclaw'
+      ? 'high'
+      : undefined);
   const qwenTier = getQwenAuthTier(activeSession?.qwenAuthType);
   const qwenTierLabel = qwenTier === QWEN_AUTH_TIERS.FREE
     ? t('session.qwen_tier_free')
@@ -392,7 +396,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   // Close menus when clicking outside
   useEffect(() => {
-    if (!menuOpen && !modelOpen && !p2pOpen) return;
+    if (!menuOpen && !modelOpen && !p2pOpen && !thinkingOpen) return;
     const handleClick = (e: MouseEvent) => {
       if (menuOpen && menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setMenuOpen(false);
@@ -402,13 +406,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (modelOpen && modelRef.current && !modelRef.current.contains(e.target as Node)) {
         setModelOpen(false);
       }
+      if (thinkingOpen && thinkingRef.current && !thinkingRef.current.contains(e.target as Node)) {
+        setThinkingOpen(false);
+      }
       if (p2pOpen && p2pRef.current && !p2pRef.current.contains(e.target as Node)) {
         setP2pOpen(false);
       }
     };
     document.addEventListener('mousedown', handleClick);
     return () => document.removeEventListener('mousedown', handleClick);
-  }, [menuOpen, modelOpen, p2pOpen]);
+  }, [menuOpen, modelOpen, p2pOpen, thinkingOpen]);
 
   const getText = () => (divRef.current?.textContent ?? '').trim();
 
@@ -542,7 +549,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     // Build P2P routing as structured WS fields — keep text clean for display.
     const extra: Record<string, unknown> = {};
     const pendingTargets = [...pendingAtTargetsRef.current];
-    let singleAgentTargetSelected = false;
 
     if (pendingTargets.length > 0) {
       // @ picker was used — derive routing from the visible textbox order, then strip matched labels.
@@ -604,9 +610,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       const refs = attachments.map((a) => `@${a.path}`).join(' ');
       text = text ? `${refs} ${text}` : refs;
     }
-    const parsedTargets = Array.isArray(extra.p2pAtTargets) ? extra.p2pAtTargets as Array<{ session: string; mode: string }> : [];
-    singleAgentTargetSelected = parsedTargets.length === 1 && parsedTargets[0]?.session !== '__all__';
-    return { text, extra, singleAgentTargetSelected };
+    return { text, extra };
   }, [attachments, activeSession, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, sessions, subSessions, ws]);
 
   const finalizeSend = useCallback((payload: PendingSendPayload) => {
@@ -641,23 +645,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     }
   }, [activeSession?.name, activeSession?.runtimeType, activeSession?.state]);
 
-  const persistSingleAgentPromptPref = useCallback(() => {
-    if (!singleAgentPromptSkip) return;
-    setSingleAgentPromptSuppressed(true);
-    void saveUserPref(SINGLE_AGENT_PROMPT_PREF_KEY, '1').catch(() => {});
-  }, [singleAgentPromptSkip]);
-
   const handleSend = useCallback(() => {
     const payload = buildSendPayload();
     if (!payload) return;
-    if (payload.singleAgentTargetSelected && !singleAgentPromptSuppressed) {
-      pendingSendRef.current = payload;
-      setSingleAgentPromptSkip(false);
-      setSingleAgentPromptOpen(true);
-      return;
-    }
     finalizeSend(payload);
-  }, [buildSendPayload, finalizeSend, singleAgentPromptSuppressed]);
+  }, [buildSendPayload, finalizeSend]);
 
   // Voice overlay send handler — applies same P2P mode as text send
   const handleVoiceSend = useCallback((voiceText: string) => {
@@ -868,13 +860,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (!ws || !activeSession) return;
     setCodexModel(m);
     try { localStorage.setItem(CODEX_MODEL_STORAGE_KEY, m); } catch { /* ignore */ }
-    const isBrain = activeSession.role === 'brain';
-    if (isBrain) {
-      // Send /model command directly to Codex terminal (like CC)
-      ws.sendSessionCommand('send', { sessionName: activeSession.name, text: `/model ${m} medium` });
+    if (activeSession.agentType === 'codex-sdk') {
+      ws.sendSessionCommand('send', { sessionName: activeSession.name, text: `/model ${m}` });
     } else {
-      // Sub-sessions: restart with new model
-      ws.subSessionSetModel(activeSession.name, m, activeSession.projectDir);
+      const isBrain = activeSession.role === 'brain';
+      if (isBrain) {
+        ws.sendSessionCommand('send', { sessionName: activeSession.name, text: `/model ${m} medium` });
+      } else {
+        ws.subSessionSetModel(activeSession.name, m, activeSession.projectDir);
+      }
     }
     setModelOpen(false);
     onAfterAction?.();
@@ -886,6 +880,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     try { localStorage.setItem(QWEN_MODEL_STORAGE_KEY, m); } catch { /* ignore */ }
     ws.sendSessionCommand('send', { sessionName: activeSession.name, text: `/model ${m}` });
     setModelOpen(false);
+    onAfterAction?.();
+  };
+
+  const handleThinkingSelect = (level: TransportEffortLevel) => {
+    if (!ws || !activeSession) return;
+    setThinkingOpen(false);
+    ws.sendSessionCommand('send', { sessionName: activeSession.name, text: `/thinking ${level}` });
     onAfterAction?.();
   };
 
@@ -936,7 +937,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             <button
               class="shortcut-btn shortcut-btn-wide"
               title="Stop (/stop)"
-              disabled={disabled || activeSession?.state !== 'running'}
+              disabled={disabled || activeSession?.state === 'stopped'}
               onClick={() => {
                 if (!ws || !activeSession) return;
                 ws.sendSessionCommand('send', { sessionName: activeSession.name, text: '/stop' });
@@ -958,18 +959,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           ))}
         </div>
 
-        {/* Plan/quota badges — compact inline display left of model selector */}
-        {(activeSession?.quotaLabel || activeSession?.quotaUsageLabel || activeSession?.planLabel) && (
-          <div class="session-ctx-wrap">
-            {(activeSession.quotaLabel || activeSession.quotaUsageLabel) && (
-              <span class="session-usage-quota-inline">{[activeSession.quotaLabel, activeSession.quotaUsageLabel].filter(Boolean).join(' · ')}</span>
-            )}
-            {activeSession.planLabel && (
-              <span class="session-usage-quota-inline" style={{ color: '#93c5fd' }}>{activeSession.planLabel}</span>
-            )}
-          </div>
-        )}
-
         {/* Model selector — outside overflow-x scroll area so dropdown isn't clipped */}
         {isClaudeCode && (
           <div class="shortcuts-model" ref={modelRef}>
@@ -984,7 +973,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             </button>
             {modelOpen && (
               <div class="menu-dropdown">
-                {(['opus[1M]', 'sonnet', 'haiku'] as const).map((m) => (
+                {CLAUDE_CODE_MODEL_IDS.map((m) => (
                   <button
                     key={m}
                     class={`menu-item ${model === m ? 'menu-item-active' : ''}`}
@@ -1046,6 +1035,32 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     title={m.description || m.id}
                   >
                     {qwenModel === m.id ? '● ' : '○ '}{m.id}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+        {supportsThinking && (
+          <div class="shortcuts-model" ref={thinkingRef}>
+            <button
+              class="shortcut-btn"
+              onClick={() => setThinkingOpen((o) => !o)}
+              disabled={disabled}
+              title={currentThinking ? t('session.thinking_title', { value: currentThinking }) : t('session.thinking')}
+              style={{ color: currentThinking ? '#38bdf8' : '#6b7280', fontSize: 10 }}
+            >
+              {currentThinking ?? t('session.thinking')}
+            </button>
+            {thinkingOpen && (
+              <div class="menu-dropdown">
+                {thinkingLevels.map((level) => (
+                  <button
+                    key={level}
+                    class={`menu-item ${currentThinking === level ? 'menu-item-active' : ''}`}
+                    onClick={() => handleThinkingSelect(level)}
+                  >
+                    {currentThinking === level ? '● ' : '○ '}{level}
                   </button>
                 ))}
               </div>
@@ -1520,66 +1535,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>
       )}
     </div>
-    {singleAgentPromptOpen && (
-      <div class="ask-dialog-overlay" onClick={() => { setSingleAgentPromptOpen(false); pendingSendRef.current = null; }}>
-        <div class="ask-dialog single-agent-dialog" onClick={(e) => e.stopPropagation()}>
-          <div class="single-agent-dialog-icon">🧠</div>
-          <div class="single-agent-dialog-title">{t('p2p.single_agent_prompt.title')}</div>
-          <div class="single-agent-dialog-body">
-            <div>{t('p2p.single_agent_prompt.body')}</div>
-            <div>{t('p2p.single_agent_prompt.tip_multi')}</div>
-            <div>{t('p2p.single_agent_prompt.tip_history')}</div>
-            <div>{t('p2p.single_agent_prompt.tip_rounds')}</div>
-          </div>
-          <label class="single-agent-dialog-checkbox">
-            <input
-              type="checkbox"
-              checked={singleAgentPromptSkip}
-              onChange={(e) => setSingleAgentPromptSkip((e.target as HTMLInputElement).checked)}
-            />
-            <span>{t('p2p.single_agent_prompt.dont_show_again')}</span>
-          </label>
-          <div class="ask-actions">
-            <button
-              class="ask-btn-cancel"
-              onClick={() => {
-                persistSingleAgentPromptPref();
-                setSingleAgentPromptOpen(false);
-                pendingSendRef.current = null;
-              }}
-            >
-              {t('common.cancel')}
-            </button>
-            <button
-              class="ask-btn-cancel"
-              onClick={() => {
-                persistSingleAgentPromptPref();
-                setSingleAgentPromptOpen(false);
-                pendingSendRef.current = null;
-                setAtQuery('');
-                setAtPickerStage('agents');
-                setAtPickerOpen(true);
-                divRef.current?.focus();
-              }}
-            >
-              {t('p2p.single_agent_prompt.more_agents')}
-            </button>
-            <button
-              class="ask-btn-submit"
-              onClick={() => {
-                const pending = pendingSendRef.current;
-                persistSingleAgentPromptPref();
-                setSingleAgentPromptOpen(false);
-                pendingSendRef.current = null;
-                if (pending) finalizeSend(pending);
-              }}
-            >
-              {t('p2p.single_agent_prompt.send_anyway')}
-            </button>
-          </div>
-        </div>
-      </div>
-    )}
     <VoiceOverlay open={voiceOpen} onClose={() => setVoiceOpen(false)} onSend={handleVoiceSend} initialText={divRef.current?.textContent ?? ''} />
     {p2pConfigOpen && (
       <P2pConfigPanel

@@ -2,10 +2,10 @@
  * Handle commands from the web UI and inbound chat messages via ServerLink.
  * Commands arrive as JSON objects with a `type` field.
  */
-import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, type ProjectConfig } from '../agent/session-manager.js';
+import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, persistSessionRecord, type ProjectConfig } from '../agent/session-manager.js';
 import { isTransportAgent } from '../agent/detect.js';
 import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand } from '../agent/tmux.js';
-import { listSessions, getSession, upsertSession, type SessionRecord } from '../store/session-store.js';
+import { listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
 import { routeMessage, type InboundMessage, type RouterContext } from '../router/message-router.js';
 import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js';
 import type { ServerLink } from './server-link.js';
@@ -28,17 +28,31 @@ import { exec as execCb } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget } from './p2p-orchestrator.js';
-import { getP2pMode, getComboRoundCount, parseModePipeline, P2P_CONFIG_MODE, type P2pSessionConfig } from '../../shared/p2p-modes.js';
+import { getComboRoundCount, parseModePipeline, P2P_CONFIG_MODE, type P2pSessionConfig } from '../../shared/p2p-modes.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
 import { executeCronJob } from './cron-executor.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { getProvider } from '../agent/provider-registry.js';
 import { copyFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
-import { buildWindowsCleanupScript, buildWindowsUpgradeBatch } from '../util/windows-upgrade-script.js';
+import { buildWindowsCleanupScript, buildWindowsCleanupVbs, buildWindowsUpgradeBatch, buildWindowsUpgradeVbs } from '../util/windows-upgrade-script.js';
+import { UPGRADE_LOCK_FILE, encodeVbsAsUtf16, encodeCmdAsUtf8Bom } from '../util/windows-launch-artifacts.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { sanitizeProjectName } from '../../shared/sanitize-project-name.js';
+import { CODEX_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
+import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
+import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
+import {
+  CLAUDE_SDK_EFFORT_LEVELS,
+  CODEX_SDK_EFFORT_LEVELS,
+  DEFAULT_TRANSPORT_EFFORT,
+  OPENCLAW_THINKING_LEVELS,
+  QWEN_EFFORT_LEVELS,
+  isTransportEffortLevel,
+  type TransportEffortLevel,
+} from '../../shared/effort-levels.js';
 
 /**
  * Build a unified subsession.sync payload from the session store record.
@@ -49,21 +63,24 @@ import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
  * is computed FRESH (same as buildSessionList for main sessions) rather than
  * reading stale values from the session store.
  */
-function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord>): Record<string, unknown> {
+async function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord>): Promise<Record<string, unknown>> {
   const sessionName = subSessionName(id);
   const record = getSession(sessionName);
   const r = { ...record, ...overrides };
 
-  // Compute Qwen display metadata fresh — matches session-list.ts hydration logic.
-  // The session store may have stale or missing planLabel/quotaLabel/quotaUsageLabel.
-  const isQwen = r?.agentType === 'qwen';
-  const freshDisplay = isQwen
+  // Compute transport display metadata fresh — matches session-list.ts hydration logic.
+  // The session store may have stale or missing metadata during early launch/update windows.
+  const freshDisplay: Partial<Pick<SessionRecord, 'modelDisplay' | 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'>> = r?.agentType === 'qwen'
     ? getQwenDisplayMetadata({
         model: r?.qwenModel,
         authType: r?.qwenAuthType,
         authLimit: r?.qwenAuthLimit,
         quotaUsageLabel: r?.qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
       })
+    : r?.agentType === 'claude-code-sdk'
+      ? await getClaudeSdkRuntimeConfig().catch(() => ({}))
+      : r?.agentType === 'codex-sdk'
+        ? await getCodexRuntimeConfig().catch(() => ({}))
     : {};
 
   return {
@@ -81,6 +98,9 @@ function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord>): Re
     runtimeType: r?.runtimeType ?? null,
     providerId: r?.providerId ?? null,
     providerSessionId: r?.providerSessionId ?? null,
+    requestedModel: r?.requestedModel ?? null,
+    activeModel: r?.activeModel ?? r?.modelDisplay ?? null,
+    transportConfig: r?.transportConfig ?? null,
     // Qwen metadata — freshly computed display fields + stored config fields
     qwenModel: r?.qwenModel ?? null,
     qwenAuthType: r?.qwenAuthType ?? null,
@@ -90,7 +110,35 @@ function buildSubSessionSync(id: string, overrides?: Partial<SessionRecord>): Re
     planLabel: freshDisplay.planLabel ?? r?.planLabel ?? null,
     quotaLabel: freshDisplay.quotaLabel ?? r?.quotaLabel ?? null,
     quotaUsageLabel: freshDisplay.quotaUsageLabel ?? r?.quotaUsageLabel ?? null,
+    quotaMeta: freshDisplay.quotaMeta ?? r?.quotaMeta ?? null,
+    effort: r?.effort ?? null,
   };
+}
+
+function supportsEffort(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'openclaw' | 'qwen' {
+  return agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'openclaw' || agentType === 'qwen';
+}
+
+function getSupportedEffortLevels(agentType: string | undefined): readonly TransportEffortLevel[] {
+  return agentType === 'claude-code-sdk'
+    ? CLAUDE_SDK_EFFORT_LEVELS
+    : agentType === 'codex-sdk'
+      ? CODEX_SDK_EFFORT_LEVELS
+      : agentType === 'qwen'
+        ? QWEN_EFFORT_LEVELS
+      : agentType === 'openclaw'
+        ? OPENCLAW_THINKING_LEVELS
+        : [];
+}
+
+function getDefaultThinkingLevel(agentType: string | undefined): TransportEffortLevel | undefined {
+  return supportsEffort(agentType) ? DEFAULT_TRANSPORT_EFFORT : undefined;
+}
+
+async function syncSubSessionIfNeeded(sessionName: string, serverLink: ServerLink): Promise<void> {
+  if (!sessionName.startsWith('deck_sub_')) return;
+  const subId = sessionName.slice('deck_sub_'.length);
+  try { serverLink.send(await buildSubSessionSync(subId)); } catch { /* ignore */ }
 }
 
 /**
@@ -147,10 +195,7 @@ import { handleFileUpload, handleFileDownload, createProjectFileHandle, lookupAt
 import { REPO_MSG } from '../shared/repo-types.js';
 import { handlePreviewCommand } from './preview-relay.js';
 import { PREVIEW_MSG } from '../../shared/preview-types.js';
-import { CODEX_STATUS_MSG } from '../../shared/codex-status.js';
-import { detectStatusAsync } from '../agent/detect.js';
-import { capturePane } from '../agent/tmux.js';
-import { countCodexStatusMatches, normalizeCodexStatusPaneText, parseCodexStatusOutput } from './codex-status.js';
+
 import { resolveContextWindow } from '../util/model-context.js';
 import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
 import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
@@ -178,10 +223,35 @@ function refreshQwenQuotaUsageLabels(serverLink?: ServerLink): void {
     // Re-sync sub-sessions so their quota usage labels update in the browser
     if (session.name.startsWith('deck_sub_')) {
       const subId = session.name.replace(/^deck_sub_/, '');
-      try { serverLink?.send(buildSubSessionSync(subId)); } catch { /* not connected */ }
+      if (serverLink) void buildSubSessionSync(subId).then((payload) => {
+        serverLink.send(payload);
+      }).catch(() => { /* not connected */ });
     }
   }
   if (serverLink) void handleGetSessions(serverLink);
+}
+
+export async function refreshCodexQuotaMetadata(serverLink?: ServerLink): Promise<void> {
+  const sessions = listSessions();
+  const codexSessions = sessions.filter((session) => session.agentType === 'codex' || session.agentType === 'codex-sdk');
+  if (codexSessions.length === 0) return;
+
+  if (serverLink) {
+    await handleGetSessions(serverLink);
+  } else {
+    await buildSessionList();
+  }
+
+  if (!serverLink) return;
+  for (const session of codexSessions) {
+    if (!session.name.startsWith('deck_sub_')) continue;
+    const subId = session.name.replace(/^deck_sub_/, '');
+    try {
+      serverLink.send(await buildSubSessionSync(subId));
+    } catch {
+      // not connected
+    }
+  }
 }
 
 // ── Common MIME map for file metadata ────────────────────────────────────────
@@ -502,7 +572,7 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       void handleSubSessionRestart(cmd, serverLink);
       break;
     case 'subsession.rebuild_all':
-      void handleSubSessionRebuildAll(cmd);
+      void handleSubSessionRebuildAll(cmd, serverLink);
       break;
     case 'subsession.detect_shells':
       void handleSubSessionDetectShells(serverLink);
@@ -605,9 +675,6 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case PREVIEW_MSG.WS_CLOSE:
       if (handlePreviewCommand(cmd, serverLink)) break;
       break;
-    case CODEX_STATUS_MSG.REQUEST:
-      void handleCodexStatusRequest(cmd);
-      break;
     case 'auth_ok':
     case 'heartbeat':
     case 'heartbeat_ack':
@@ -645,50 +712,6 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
   }
 }
 
-const codexStatusInflight = new Set<string>();
-
-async function handleCodexStatusRequest(cmd: Record<string, unknown>): Promise<void> {
-  const sessionName = cmd.sessionName as string | undefined;
-  if (!sessionName || codexStatusInflight.has(sessionName)) return;
-
-  const record = getSession(sessionName);
-  if (!record || record.agentType !== 'codex' || record.state !== 'idle') return;
-
-  codexStatusInflight.add(sessionName);
-  const release = await getMutex(sessionName).acquire();
-  try {
-    const current = getSession(sessionName);
-    if (!current || current.agentType !== 'codex' || current.state !== 'idle') return;
-    const liveStatus = await detectStatusAsync(sessionName, 'codex').catch(() => 'unknown');
-    if (liveStatus !== 'idle') return;
-
-    const beforeText = normalizeCodexStatusPaneText((await capturePane(sessionName, 160)).join('\n'));
-    const beforeWeeklyMatches = countCodexStatusMatches(beforeText, /Weekly limit:/gi);
-
-    await sendRawInput(sessionName, '/status');
-    await sendKey(sessionName, 'Enter');
-
-    let snapshot = null;
-    for (let attempt = 0; attempt < 12; attempt++) {
-      await new Promise((resolve) => setTimeout(resolve, 250));
-      const afterText = normalizeCodexStatusPaneText((await capturePane(sessionName, 160)).join('\n'));
-      const changed = afterText !== beforeText;
-      snapshot = parseCodexStatusOutput(afterText);
-      if (!snapshot) continue;
-      const weeklyMatches = countCodexStatusMatches(afterText, /Weekly limit:/gi);
-      if (weeklyMatches > beforeWeeklyMatches || changed || attempt === 11) break;
-    }
-
-    if (!snapshot) return;
-    timelineEmitter.emit(sessionName, 'usage.update', { codexStatus: snapshot }, { source: 'daemon', confidence: 'medium' });
-  } catch (err) {
-    logger.debug({ sessionName, err }, 'codex.status_request failed');
-  } finally {
-    release();
-    codexStatusInflight.delete(sessionName);
-  }
-}
-
 async function handleInbound(cmd: Record<string, unknown>): Promise<void> {
   const msg = cmd.msg as InboundMessage | undefined;
   if (!msg) {
@@ -714,6 +737,10 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
   const dir = expandTilde((cmd.dir as string) || '~');
   const ccPresetName = cmd.ccPreset as string | undefined;
   const ccInitPrompt = cmd.ccInitPrompt as string | undefined;
+  const requestedEffort: unknown = cmd.thinking ?? cmd.effort;
+  const effort = isTransportEffortLevel(requestedEffort)
+    ? requestedEffort
+    : getDefaultThinkingLevel(agentType);
 
   if (!rawProject) {
     logger.warn('session.start: missing project name');
@@ -726,15 +753,22 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
   try {
     // Resolve CC env preset if specified
     let extraEnv: Record<string, string> | undefined;
-    if (ccPresetName && agentType === 'claude-code') {
+    if (ccPresetName && (agentType === 'claude-code' || agentType === 'claude-code-sdk')) {
       const { resolvePresetEnv } = await import('./cc-presets.js');
       extraEnv = await resolvePresetEnv(ccPresetName);
     }
 
-    // If project already has sessions, teardown first (keep store records)
-    const existing = listSessions(project);
-    if (existing.length > 0) {
-      await teardownProject(project);
+    // Reject duplicate main-session starts for an existing project/session namespace.
+    const existingByProject = listSessions(project).filter((s) => s.role === 'brain' && s.state !== 'stopped');
+    if (existingByProject.length > 0) {
+      const message = `Session already exists for project ${project}. Stop or restart it instead of starting a duplicate.`;
+      logger.warn({ project, dir, agentType, existing: existingByProject.map((s) => s.name) }, 'session.start rejected because project already has an active main session');
+      try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
+      return;
+    }
+    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk') {
+      logger.info({ project, agentType }, 'SDK fresh session.start removing stale main-session store record');
+      removeSession(`deck_${project}_brain`);
     }
     const config: ProjectConfig = {
       name: project,
@@ -742,10 +776,41 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       brainType: agentType as ProjectConfig['brainType'],
       workerTypes: [],
       label,
+      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk',
       extraEnv,
       ccPreset: ccPresetName,
+      effort,
     };
-    await startProject(config);
+    if (agentType === 'claude-code-sdk') {
+      logger.info({ project }, 'SDK fresh session.start launching new Claude SDK main session');
+      await launchTransportSession({
+        name: `deck_${project}_brain`,
+        projectName: project,
+        role: 'brain',
+        agentType: 'claude-code-sdk',
+        projectDir: dir,
+        fresh: true,
+        ccSessionId: randomUUID(),
+        extraEnv,
+        ccPreset: ccPresetName,
+        label,
+        effort,
+      });
+    } else if (agentType === 'codex-sdk') {
+      logger.info({ project }, 'SDK fresh session.start launching new Codex SDK main session');
+      await launchTransportSession({
+        name: `deck_${project}_brain`,
+        projectName: project,
+        role: 'brain',
+        agentType: 'codex-sdk',
+        projectDir: dir,
+        fresh: true,
+        label,
+        effort,
+      });
+    } else {
+      await startProject(config);
+    }
     logger.info({ project }, 'Session started via web');
 
     // Inject preset init message after session starts
@@ -857,45 +922,6 @@ async function sendShellAwareCommand(sessionName: string, text: string, agentTyp
   }
 }
 
-function describeSession(sessionName: string): string {
-  const record = getSession(sessionName);
-  return record?.label?.trim() || sessionName.replace(/^deck_sub_/, '');
-}
-
-function buildSingleTargetConsultPrompt(
-  targetSession: string,
-  targetMode: string,
-  userText: string,
-): string {
-  const targetLabel = describeSession(targetSession);
-  const modeConfig = getP2pMode(targetMode);
-  const modePrompt = modeConfig?.prompt ?? `Provide ${targetMode} analysis for the request below.`;
-
-  return [
-    '',
-    '[Peer Consultation Task]',
-    '',
-    `User request: "${userText}"`,
-    '',
-    `Before replying to the user, consult ${targetLabel} (${targetSession}) once and then synthesize the final answer yourself.`,
-    '',
-    `Consultation mode for ${targetLabel}: ${targetMode}`,
-    `Peer guidance: ${modePrompt}`,
-    '',
-    'Required flow:',
-    `1. Briefly analyze the user's request and decide what you need from ${targetLabel}.`,
-    `2. Send ${targetLabel} a focused request using: imcodes send --reply "${targetSession}" "<your request>"`,
-    `3. Wait for ${targetLabel}'s reply. It will come back once via imcodes send --no-reply.`,
-    `4. Then answer the user, explicitly incorporating ${targetLabel}'s findings.`,
-    '',
-    'Rules:',
-    `- Do NOT answer the user before consulting ${targetLabel}.`,
-    `- Do NOT ask the user for confirmation before consulting ${targetLabel}.`,
-    `- Keep the peer request narrow, concrete, and aligned with the ${targetMode} mode.`,
-    '- Start immediately.',
-  ].join('\n');
-}
-
 function resolveSingleTargetMode(
   targetSession: string,
   requestedMode: string,
@@ -904,53 +930,6 @@ function resolveSingleTargetMode(
   if (requestedMode !== P2P_CONFIG_MODE) return requestedMode;
   const configuredMode = sessionConfig?.[targetSession]?.mode;
   return configuredMode && configuredMode !== 'skip' ? configuredMode : 'discuss';
-}
-
-async function handleSingleTargetConsult(
-  sessionName: string,
-  targetSession: string,
-  targetMode: string,
-  text: string,
-  effectiveId: string,
-  isLegacy: boolean,
-  serverLink: ServerLink,
-): Promise<void> {
-  const targetRecord = getSession(targetSession);
-  if (!targetRecord) {
-    logger.warn({ sessionName, targetSession }, 'session.send: single target not found');
-    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: 'Direct target not found' });
-    try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: 'direct_target_not_found' }); } catch {}
-    return;
-  }
-
-  const release = await getMutex(sessionName).acquire();
-  try {
-    const agentType = getSession(sessionName)?.agentType ?? 'unknown';
-    let sendText = buildSingleTargetConsultPrompt(targetSession, targetMode, text);
-    if (agentType === 'gemini' || agentType === 'codex') {
-      sendText = await rewritePathsForSandbox(sessionName, sendText);
-    }
-    await sendShellAwareCommand(sessionName, sendText, agentType);
-    timelineEmitter.emit(sessionName, 'user.message', { text });
-    const status = isLegacy ? 'accepted_legacy' : 'accepted';
-    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
-    try {
-      serverLink.send({ type: 'command.ack', commandId: effectiveId, status, session: sessionName });
-    } catch { /* not connected */ }
-    if (agentType === 'opencode') {
-      const { scheduleCatchup } = await import('./opencode-watcher.js');
-      scheduleCatchup(sessionName);
-    }
-  } catch (err) {
-    logger.error({ sessionName, targetSession, err }, 'session.send single target consult failed');
-    const errMsg = err instanceof Error ? err.message : String(err);
-    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
-    try {
-      serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg });
-    } catch { /* not connected */ }
-  } finally {
-    release();
-  }
 }
 
 async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
@@ -980,12 +959,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   }
   dedup.add(effectiveId);
 
-  if (directTargetSession) {
-    await handleSingleTargetConsult(sessionName, directTargetSession, directTargetMode, text, effectiveId, isLegacy, serverLink);
-    return;
-  }
-
-  // ── P2P routing: structured WS fields (new) or inline @@tokens (legacy) ──
+// ── P2P routing: structured WS fields (new) or inline @@tokens (legacy) ──
   const p2pSessionConfig = (cmd as any).p2pSessionConfig as P2pSessionConfig | undefined;
   let p2pRounds = (cmd as any).p2pRounds as number | undefined;
   let p2pExtraPrompt = (cmd as any).p2pExtraPrompt as string | undefined;
@@ -993,27 +967,17 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const p2pHopTimeoutMs = (cmd as any).p2pHopTimeoutMs as number | undefined;
   const p2pModeField = (cmd as any).p2pMode as string | undefined;
   const p2pAtTargets = (cmd as any).p2pAtTargets as Array<{ session: string; mode: string }> | undefined;
-
-  if (p2pAtTargets?.length === 1 && p2pAtTargets[0]?.session !== '__all__') {
-    await handleSingleTargetConsult(
-      sessionName,
-      p2pAtTargets[0].session,
-      resolveSingleTargetMode(p2pAtTargets[0].session, p2pAtTargets[0].mode ?? 'discuss', p2pSessionConfig),
-      text,
-      effectiveId,
-      isLegacy,
-      serverLink,
-    );
-    return;
-  }
+  const explicitTargets = directTargetSession
+    ? [{ session: directTargetSession, mode: resolveSingleTargetMode(directTargetSession, directTargetMode, p2pSessionConfig) }]
+    : p2pAtTargets;
 
   // Build P2P tokens from structured fields (frontend no longer injects @@tokens into text)
   let tokens: ParsedTokens;
-  if (p2pAtTargets && p2pAtTargets.length > 0) {
+  if (explicitTargets && explicitTargets.length > 0) {
     // @ picker targets — expand __all__ or use specific sessions
     const agents: P2pTarget[] = [];
     const files: string[] = [];
-    for (const t of p2pAtTargets) {
+    for (const t of explicitTargets) {
       if (t.session === '__all__') {
         agents.push(...expandAllTargets(sessionName, t.mode, false, p2pSessionConfig));
       } else if (getSession(t.session)) {
@@ -1074,7 +1038,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   }
 
   // No targets found from any source
-  if ((p2pAtTargets || p2pModeField) && tokens.agents.length === 0) {
+  if ((explicitTargets || p2pModeField) && tokens.agents.length === 0) {
     logger.warn({ sessionName, p2pModeField }, 'P2P: no active sessions found for structured routing');
     timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: 'No active sessions found' });
     try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: 'no_sessions' }); } catch {}
@@ -1129,14 +1093,15 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           fileContents.push({ path: fp, content: capped }); // cap at 50KB
         } catch { /* ignore unreadable files */ }
       }
-      // Auto-append language instruction based on user's locale (unless extraPrompt already specifies language)
-      if (p2pLocale && p2pLocale !== 'en' && !p2pExtraPrompt?.match(/语言|language|lang|中文|日本語|한국어|español|русский/i)) {
+      // Auto-append language instruction based on the user's selected i18n locale
+      if (p2pLocale && !p2pExtraPrompt?.match(/语言|language|lang|中文|日本語|한국어|español|русский/i)) {
         const LOCALE_NAMES: Record<string, string> = {
+          'en': 'English',
           'zh-CN': 'Chinese (Simplified)', 'zh-TW': 'Chinese (Traditional)',
           'ja': 'Japanese', 'ko': 'Korean', 'es': 'Spanish', 'ru': 'Russian',
         };
         const langName = LOCALE_NAMES[p2pLocale] ?? p2pLocale;
-        const langInstr = `Conduct the discussion in ${langName} so the user can understand.`;
+        const langInstr = `Use the user's selected i18n language (${langName}) for the discussion.`;
         p2pExtraPrompt = p2pExtraPrompt ? `${p2pExtraPrompt}\n${langInstr}` : langInstr;
       }
       const run = await startP2pRun(sessionName, tokens.agents, tokens.cleanText, fileContents, serverLink, p2pRounds, p2pExtraPrompt, resolvedMode || undefined, p2pHopTimeoutMs);
@@ -1190,10 +1155,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         } catch { /* */ }
         return;
       }
-      if (record?.agentType === 'qwen') {
-        const modelMatch = text.trim().match(/^\/model\s+(\S+)\s*$/);
-        if (modelMatch) {
-          const nextModel = modelMatch[1];
+      const modelMatch = text.trim().match(/^\/model\s+(\S+)(?:\s+.*)?$/);
+      const effortMatch = text.trim().match(/^\/(?:thinking|effort)\s+(\S+)\s*$/);
+      if (record?.agentType === 'qwen' && modelMatch) {
+        const nextModel = modelMatch[1];
           const runtimeConfig = await getQwenRuntimeConfig(true).catch(() => null);
           const allowedModels = runtimeConfig?.availableModels?.length
             ? runtimeConfig.availableModels
@@ -1214,8 +1179,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           }
           transportRuntime.setAgentId(nextModel);
           const qwenAuthType = runtimeConfig?.authType ?? record.qwenAuthType;
-          upsertSession({
+          const nextRecord = {
             ...record,
+            requestedModel: nextModel,
+            activeModel: nextModel,
+            modelDisplay: nextModel,
             qwenModel: nextModel,
             ...(qwenAuthType ? { qwenAuthType } : {}),
             ...(runtimeConfig?.authLimit ? { qwenAuthLimit: runtimeConfig.authLimit } : {}),
@@ -1227,8 +1195,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
               quotaUsageLabel: qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
             }),
             updatedAt: Date.now(),
-          });
+          };
+          upsertSession(nextRecord);
+          persistSessionRecord(nextRecord, sessionName);
           await handleGetSessions(serverLink);
+          syncSubSessionIfNeeded(sessionName, serverLink);
           timelineEmitter.emit(sessionName, 'user.message', { text });
           timelineEmitter.emit(sessionName, 'usage.update', {
             model: nextModel,
@@ -1241,7 +1212,102 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
           try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch { /* */ }
           return;
+      }
+      if (record?.agentType === 'claude-code-sdk' && modelMatch) {
+        const requestedModel = modelMatch[1];
+        const selectedModel = normalizeClaudeCodeModelId(requestedModel);
+        if (!selectedModel) {
+          timelineEmitter.emit(sessionName, 'user.message', { text });
+          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Claude model: ${requestedModel}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Claude model: ${requestedModel}` });
+          try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unknown Claude model: ${requestedModel}` }); } catch {}
+          return;
         }
+        transportRuntime.setAgentId(normalizeClaudeSdkModelForProvider(selectedModel));
+        const sdkDisplay = await getClaudeSdkRuntimeConfig(true).catch(() => ({}) as import('../agent/sdk-runtime-config.js').SdkRuntimeConfig);
+        const nextRecord = {
+          ...record,
+          requestedModel: selectedModel,
+          activeModel: selectedModel,
+          modelDisplay: selectedModel,
+          ...(sdkDisplay.planLabel ? { planLabel: sdkDisplay.planLabel } : {}),
+          updatedAt: Date.now(),
+        };
+        upsertSession(nextRecord);
+        persistSessionRecord(nextRecord, sessionName);
+        await handleGetSessions(serverLink);
+        syncSubSessionIfNeeded(sessionName, serverLink);
+        timelineEmitter.emit(sessionName, 'user.message', { text });
+        timelineEmitter.emit(sessionName, 'usage.update', { model: selectedModel, contextWindow: resolveContextWindow(undefined, selectedModel) }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'assistant.text', { text: `Switched model to ${selectedModel}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
+        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
+        return;
+      }
+      if (record?.agentType === 'codex-sdk' && modelMatch) {
+        const nextModel = modelMatch[1];
+        if (!CODEX_MODEL_IDS.includes(nextModel as any)) {
+          timelineEmitter.emit(sessionName, 'user.message', { text });
+          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Codex model: ${nextModel}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Codex model: ${nextModel}` });
+          try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unknown Codex model: ${nextModel}` }); } catch {}
+          return;
+        }
+        transportRuntime.setAgentId(nextModel);
+        const sdkDisplay = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
+        const nextRecord = {
+          ...record,
+          requestedModel: nextModel,
+          activeModel: nextModel,
+          modelDisplay: nextModel,
+          planLabel: sdkDisplay.planLabel,
+          quotaLabel: sdkDisplay.quotaLabel,
+          quotaUsageLabel: sdkDisplay.quotaUsageLabel,
+          updatedAt: Date.now(),
+        };
+        upsertSession(nextRecord);
+        persistSessionRecord(nextRecord, sessionName);
+        await handleGetSessions(serverLink);
+        syncSubSessionIfNeeded(sessionName, serverLink);
+        timelineEmitter.emit(sessionName, 'user.message', { text });
+        timelineEmitter.emit(sessionName, 'usage.update', { model: nextModel, contextWindow: resolveContextWindow(undefined, nextModel) }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'assistant.text', { text: `Switched model to ${nextModel}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
+        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
+        return;
+      }
+      if (supportsEffort(record?.agentType) && effortMatch) {
+        const nextEffort = effortMatch[1];
+        const allowed = getSupportedEffortLevels(record?.agentType);
+        if (!isTransportEffortLevel(nextEffort) || !allowed.includes(nextEffort)) {
+          const supported = allowed.join(', ');
+          timelineEmitter.emit(sessionName, 'user.message', { text });
+          timelineEmitter.emit(sessionName, 'assistant.text', {
+            text: `⚠️ Unsupported thinking level: ${nextEffort}. Supported: ${supported}`,
+            streaming: false,
+          }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unsupported thinking level: ${nextEffort}` });
+          try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unsupported thinking level: ${nextEffort}` }); } catch {}
+          return;
+        }
+        transportRuntime.setEffort(nextEffort);
+        const nextRecord = {
+          ...record,
+          effort: nextEffort,
+          updatedAt: Date.now(),
+        };
+        upsertSession(nextRecord);
+        persistSessionRecord(nextRecord, sessionName);
+        await handleGetSessions(serverLink);
+        syncSubSessionIfNeeded(sessionName, serverLink);
+        timelineEmitter.emit(sessionName, 'user.message', { text });
+        timelineEmitter.emit(sessionName, 'assistant.text', {
+          text: `Switched thinking level to ${nextEffort}`,
+          streaming: false,
+        }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
+        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
+        return;
       }
       timelineEmitter.emit(sessionName, 'user.message', { text });
       if (record?.agentType === 'qwen' && record.qwenAuthType === 'qwen-oauth') {
@@ -1686,6 +1752,10 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
   const shellBin = cmd.shellBin as string | null | undefined;
   const ccSessionId = cmd.ccSessionId as string | null | undefined;
   const parentSession = cmd.parentSession as string | null | undefined;
+  const requestedEffort: unknown = cmd.thinking ?? cmd.effort;
+  const effort = isTransportEffortLevel(requestedEffort)
+    ? requestedEffort
+    : getDefaultThinkingLevel(type);
 
   // Transport-backed providers: launch without tmux.
   if (isTransportAgent(type)) {
@@ -1707,13 +1777,18 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
         agentType: type as any,
         projectDir: (cwd as string) || process.cwd(),
         description,
+        requestedModel: (cmd.requestedModel as string | undefined) ?? (cmd.model as string | undefined),
+        transportConfig: (cmd.transportConfig as Record<string, unknown> | undefined) ?? undefined,
         bindExistingKey,
+        ...(type === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
+        ...(type === 'codex-sdk' ? { fresh: true } : {}),
+        ...(effort ? { effort } : {}),
         userCreated: true,
         parentSession: parentSession || undefined,
       });
       // Sync to server DB
       try {
-        serverLink.send(buildSubSessionSync(id));
+        serverLink.send(await buildSubSessionSync(id));
       } catch { /* not connected */ }
     } catch (e: unknown) {
       logger.error({ err: e, id, type }, 'subsession.start failed (transport)');
@@ -1737,6 +1812,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
       ccPreset,
       ccInitPrompt: subCcInitPrompt,
       description,
+      effort,
       fresh: type === 'gemini' && !geminiSessionId,
       _fileSnapshot: fileSnapshot,
       _onGeminiDiscovered: fileSnapshot ? (sessionId: string) => {
@@ -1746,7 +1822,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     });
     // Sync to server DB so frontend can see the sub-session
     try {
-      serverLink.send(buildSubSessionSync(id));
+      serverLink.send(await buildSubSessionSync(id));
     } catch { /* not connected */ }
   } catch (e: unknown) {
     logger.error({ err: e, id }, 'subsession.start failed');
@@ -1790,10 +1866,13 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
         bindExistingKey: effectiveRecord.providerSessionId ?? undefined,
         skipCreate: !!effectiveRecord.providerSessionId,
         parentSession: effectiveRecord.parentSession ?? undefined,
+        requestedModel: effectiveRecord.requestedModel ?? undefined,
+        effort: effectiveRecord.effort ?? undefined,
+        transportConfig: effectiveRecord.transportConfig ?? undefined,
         userCreated: effectiveRecord.userCreated,
       });
       try {
-        serverLink.send(buildSubSessionSync(id));
+        serverLink.send(await buildSubSessionSync(id));
       } catch { /* not connected */ }
       return;
     }
@@ -1813,17 +1892,24 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
     });
     // Sync updated state to server
     try {
-      serverLink.send(buildSubSessionSync(id));
+      serverLink.send(await buildSubSessionSync(id));
     } catch { /* not connected */ }
   } catch (e: unknown) {
     logger.error({ err: e, sessionName: sName }, 'subsession.restart failed');
   }
 }
 
-async function handleSubSessionRebuildAll(cmd: Record<string, unknown>): Promise<void> {
+async function handleSubSessionRebuildAll(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const subSessions = cmd.subSessions as SubSessionRecord[] | undefined;
   if (!Array.isArray(subSessions)) return;
   await rebuildSubSessions(subSessions).catch((e: unknown) => logger.error({ err: e }, 'subsession.rebuild_all failed'));
+  for (const sub of subSessions) {
+    try {
+      serverLink.send(await buildSubSessionSync(sub.id));
+    } catch (e) {
+      logger.warn({ err: e, id: sub.id }, 'Failed to sync rebuilt sub-session');
+    }
+  }
 }
 
 async function handleSubSessionDetectShells(serverLink: ServerLink): Promise<void> {
@@ -1857,7 +1943,7 @@ async function handleSubSessionSetModel(cmd: Record<string, unknown>, serverLink
     await startSubSession({ id, type: 'codex', cwd: cwd ?? null, codexModel: model });
     // Sync restarted sub-session to server DB
     try {
-      serverLink.send(buildSubSessionSync(id));
+      serverLink.send(await buildSubSessionSync(id));
     } catch { /* not connected */ }
   } catch (e: unknown) {
     logger.error({ err: e, sessionName, model }, 'subsession.set_model restart failed');
@@ -2084,8 +2170,6 @@ async function handleDaemonUpgrade(targetVersion?: string): Promise<void> {
   const scriptDir = mkdtempSync(join(tmpdir(), 'imcodes-upgrade-'));
   const logFile = join(scriptDir, 'upgrade.log');
   const scriptPath = join(scriptDir, 'upgrade.sh');
-  const cliEntry = process.argv[1] || join(process.cwd(), 'dist', 'src', 'index.js');
-
   // Build the platform-specific restart command.
   // We always restart regardless of whether npm install succeeded, so the daemon
   // is never left permanently dead.
@@ -2114,25 +2198,34 @@ launchctl load -w "${plist}"`;
     const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
     const pkgSpec = targetVersion ? `imcodes@${targetVersion}` : 'imcodes@latest';
     const batchPath = join(scriptDir, 'upgrade.cmd');
+    const upgradeVbsPath = join(scriptDir, 'upgrade.vbs');
     const cleanupPath = join(scriptDir, 'cleanup.cmd');
+    const cleanupVbsPath = join(scriptDir, 'cleanup.vbs');
     const targetVer = targetVersion ?? 'latest';
-    const cleanupScript = buildWindowsCleanupScript(scriptDir);
-    writeFileSync(cleanupPath, cleanupScript);
-    // Windows: install first while the daemon is still running. On success,
-    // delegate restart to the CLI's shared watchdog logic (`imcodes restart`)
-    // instead of reimplementing restart behavior in batch.
+    // .cmd files: UTF-8 + BOM so cmd.exe handles non-ASCII paths.
+    // .vbs files: UTF-16 LE + BOM so wscript handles non-ASCII paths.
+    writeFileSync(cleanupPath, encodeCmdAsUtf8Bom(buildWindowsCleanupScript(scriptDir)));
+    writeFileSync(cleanupVbsPath, encodeVbsAsUtf16(buildWindowsCleanupVbs(cleanupPath)));
+    const vbsLauncherPath = join(homedir(), '.imcodes', 'daemon-launcher.vbs');
     const batch = buildWindowsUpgradeBatch({
       logFile,
       scriptDir,
       cleanupPath,
+      cleanupVbsPath,
       npmCmd,
       pkgSpec,
       targetVer,
+      vbsLauncherPath,
+      upgradeLockFile: UPGRADE_LOCK_FILE,
     });
 
-    writeFileSync(batchPath, batch);
+    writeFileSync(batchPath, encodeCmdAsUtf8Bom(batch));
+    writeFileSync(upgradeVbsPath, encodeVbsAsUtf16(buildWindowsUpgradeVbs(batchPath)));
 
-    const child = spawn('cmd.exe', ['/c', batchPath], {
+    // Launch via wscript on the wrapper VBS — this guarantees that ALL child
+    // processes spawned by the batch (wmic, find, tasklist, etc.) inherit a
+    // fully hidden parent and never flash console windows.
+    const child = spawn('wscript', [upgradeVbsPath], {
       detached: true,
       stdio: 'ignore',
       windowsHide: true,
@@ -2210,12 +2303,16 @@ sleep 60 && rm -rf "${scriptDir}" &
 
 // ── File system browser ────────────────────────────────────────────────────
 
-const UPLOAD_DIR = nodePath.join(homedir(), '.imcodes', 'uploads');
 // On Windows, don't restrict paths — projects commonly live on any drive (D:\code, etc.)
 // The daemon runs as the user, so OS-level permissions are the real security boundary.
 // Deny-list: block access to sensitive directories regardless of platform.
 // Everything else is allowed — the daemon runs as the user and inherits their permissions.
 const FS_DENIED_DIRS = ['.ssh', '.gnupg', '.pki'];
+
+/** Special sentinel path that browses Windows drive roots (C:\, D:\, ...).
+ *  Distinct from `~` so the home directory remains accessible on Windows. */
+const WINDOWS_DRIVES_PATH = ':drives:';
+const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
 
 function isPathAllowed(realPath: string): boolean {
   // Block sensitive directories (e.g. ~/.ssh, ~/.gnupg)
@@ -2315,8 +2412,12 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
   const includeMetadata = cmd.includeMetadata === true;
   if (!rawPath || !requestId) return;
 
-  const expanded = rawPath.startsWith('~') || rawPath.startsWith('~\\') ? rawPath.replace(/^~/, homedir()) : rawPath;
-  const resolved = nodePath.resolve(expanded);
+  // Special sentinel paths bypass normal path resolution
+  const isDrivesSentinel = rawPath === WINDOWS_DRIVES_PATH;
+  const expanded = isDrivesSentinel
+    ? rawPath
+    : (rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath);
+  const resolved = isDrivesSentinel ? rawPath : nodePath.resolve(expanded);
 
   const deadline = new Promise<never>((_, reject) => setTimeout(() => reject(new Error('fs_list_timeout')), FS_LIST_DEADLINE_MS));
 
@@ -2333,6 +2434,34 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
 }
 
 async function handleFsListInner(resolved: string, rawPath: string, requestId: string, includeFiles: boolean, includeMetadata: boolean, serverLink: ServerLink): Promise<void> {
+  // Windows drive picker — only triggered by the explicit `:drives:` path,
+  // NOT by `~` (which always means the user's home directory on every OS).
+  if (process.platform === 'win32' && rawPath === WINDOWS_DRIVES_PATH) {
+    const entries = await Promise.all(
+      Array.from({ length: 26 }, (_, i) => String.fromCharCode(65 + i))
+        .map(async (letter) => {
+          const drive = `${letter}:\\`;
+          try {
+            await fsReaddir(drive, { withFileTypes: true });
+            return { name: drive, path: drive, isDir: true, hidden: false };
+          } catch {
+            return null;
+          }
+        }),
+    );
+    try {
+      serverLink.send({
+        type: 'fs.ls_response',
+        requestId,
+        path: rawPath,
+        resolvedPath: WINDOWS_DRIVES_ROOT,
+        status: 'ok',
+        entries: entries.filter(Boolean),
+      });
+    } catch { /* ignore */ }
+    return;
+  }
+
   let real: string;
   try {
     real = await fsRealpath(resolved);
@@ -2355,7 +2484,7 @@ async function handleFsListInner(resolved: string, rawPath: string, requestId: s
   const filtered = dirents.filter((d) => d.isDirectory() || (includeFiles && d.isFile()));
 
   const entries = await Promise.all(filtered.map(async (d) => {
-    const entry: Record<string, unknown> = { name: d.name, isDir: d.isDirectory(), hidden: d.name.startsWith('.') };
+    const entry: Record<string, unknown> = { name: d.name, path: nodePath.join(real, d.name), isDir: d.isDirectory(), hidden: d.name.startsWith('.') };
     if (includeMetadata && !d.isDirectory()) {
       try {
         const filePath = nodePath.join(real, d.name);

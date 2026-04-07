@@ -400,6 +400,22 @@ describe('transport-relay (timeline-emitter based)', () => {
       const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
       expect(textCall![2].text).toBe('⚠️ Error: AI service overloaded');
     });
+
+    it('reuses the streaming eventId on error and preserves partial text', () => {
+      const { provider, fireDelta, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireDelta('sess-err', makeDelta({ messageId: 'msg-err', delta: 'partial answer' }));
+      const deltaEventId = emitMock.mock.calls[0][3].eventId;
+      emitMock.mockClear();
+
+      fireError('sess-err', { code: 'PROVIDER_ERROR', message: 'boom', recoverable: true });
+
+      const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
+      expect(textCall?.[3]?.eventId).toBe(deltaEventId);
+      expect(textCall?.[2]?.streaming).toBe(false);
+      expect(textCall?.[2]?.text).toBe('partial answer\n\n⚠️ Error: boom');
+    });
   });
 
   // ── emitTransportUserMessage ─────────────────────────────────────────────
@@ -485,12 +501,13 @@ describe('transport-relay (timeline-emitter based)', () => {
         name: 'list_directory',
         status: 'running',
         input: { path: '/tmp' },
+        detail: { kind: 'tool_use', input: { path: '/tmp' } },
       });
 
       const call = emitMock.mock.calls.find((c) => c[1] === 'tool.call');
       expect(call).toBeDefined();
       expect(call![0]).toBe('sess-tool');
-      expect(call![2]).toEqual({ tool: 'list_directory', input: { path: '/tmp' } });
+      expect(call![2]).toEqual({ tool: 'list_directory', input: { path: '/tmp' }, detail: { kind: 'tool_use', input: { path: '/tmp' } } });
       expect(call![3].eventId).toBe('transport-tool:sess-tool:tool-1:call');
     });
 
@@ -503,12 +520,13 @@ describe('transport-relay (timeline-emitter based)', () => {
         name: 'list_directory',
         status: 'complete',
         output: 'done',
+        detail: { kind: 'tool_result', output: 'done' },
       });
 
       const call = emitMock.mock.calls.find((c) => c[1] === 'tool.result');
       expect(call).toBeDefined();
       expect(call![0]).toBe('sess-tool');
-      expect(call![2]).toEqual({ output: 'done' });
+      expect(call![2]).toEqual({ output: 'done', detail: { kind: 'tool_result', output: 'done' } });
       expect(call![3].eventId).toBe('transport-tool:sess-tool:tool-1:result');
     });
   });

@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── Hoisted mocks ─────────────────────────────────────────────────────────────
 
-const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider } = vi.hoisted(() => {
+const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider } = vi.hoisted(() => {
   const mockConnect = vi.fn().mockResolvedValue(undefined);
   const mockDisconnect = vi.fn().mockResolvedValue(undefined);
   const MockOpenClawProvider = vi.fn().mockImplementation(() => ({
@@ -47,7 +47,49 @@ const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider } = 
     createSession: vi.fn().mockResolvedValue('session-1'),
     endSession: vi.fn().mockResolvedValue(undefined),
   }));
-  return { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider };
+  const MockClaudeCodeSdkProvider = vi.fn().mockImplementation(() => ({
+    id: 'claude-code-sdk',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'shared',
+    capabilities: {
+      streaming: true,
+      toolCalling: false,
+      approval: false,
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: false,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('session-1'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
+  const MockCodexSdkProvider = vi.fn().mockImplementation(() => ({
+    id: 'codex-sdk',
+    connectionMode: 'local-sdk',
+    sessionOwnership: 'shared',
+    capabilities: {
+      streaming: false,
+      toolCalling: true,
+      approval: false,
+      sessionRestore: true,
+      multiTurn: true,
+      attachments: false,
+    },
+    connect: mockConnect,
+    disconnect: mockDisconnect,
+    send: vi.fn().mockResolvedValue(undefined),
+    onDelta: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+    createSession: vi.fn().mockResolvedValue('session-1'),
+    endSession: vi.fn().mockResolvedValue(undefined),
+  }));
+  return { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockCodexSdkProvider };
 });
 
 vi.mock('../../src/agent/providers/openclaw.js', () => ({
@@ -56,6 +98,14 @@ vi.mock('../../src/agent/providers/openclaw.js', () => ({
 
 vi.mock('../../src/agent/providers/qwen.js', () => ({
   QwenProvider: MockQwenProvider,
+}));
+
+vi.mock('../../src/agent/providers/claude-code-sdk.js', () => ({
+  ClaudeCodeSdkProvider: MockClaudeCodeSdkProvider,
+}));
+
+vi.mock('../../src/agent/providers/codex-sdk.js', () => ({
+  CodexSdkProvider: MockCodexSdkProvider,
 }));
 
 vi.mock('../../src/util/logger.js', () => ({
@@ -108,6 +158,20 @@ describe('getProvider', () => {
     expect(provider!.id).toBe('qwen');
   });
 
+  it('returns claude-code-sdk after connectProvider()', async () => {
+    await connectProvider('claude-code-sdk', CONFIG);
+    const provider = getProvider('claude-code-sdk');
+    expect(provider).toBeDefined();
+    expect(provider!.id).toBe('claude-code-sdk');
+  });
+
+  it('returns codex-sdk after connectProvider()', async () => {
+    await connectProvider('codex-sdk', CONFIG);
+    const provider = getProvider('codex-sdk');
+    expect(provider).toBeDefined();
+    expect(provider!.id).toBe('codex-sdk');
+  });
+
   it('returns undefined for an unknown id', () => {
     expect(getProvider('minimax')).toBeUndefined();
   });
@@ -124,6 +188,18 @@ describe('connectProvider', () => {
   it('instantiates QwenProvider and calls connect()', async () => {
     await connectProvider('qwen', CONFIG);
     expect(MockQwenProvider).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
+  it('instantiates ClaudeCodeSdkProvider and calls connect()', async () => {
+    await connectProvider('claude-code-sdk', CONFIG);
+    expect(MockClaudeCodeSdkProvider).toHaveBeenCalledOnce();
+    expect(mockConnect).toHaveBeenCalledWith(CONFIG);
+  });
+
+  it('instantiates CodexSdkProvider and calls connect()', async () => {
+    await connectProvider('codex-sdk', CONFIG);
+    expect(MockCodexSdkProvider).toHaveBeenCalledOnce();
     expect(mockConnect).toHaveBeenCalledWith(CONFIG);
   });
 

@@ -202,7 +202,6 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
         status: 'done' | 'active' | 'pending' | 'skipped';
       };
       const nodes: NodeInfo[] = [];
-      const skippedSet = new Set(run.skippedHops);
       const getInfo = (s: string, mode: string, phase: 'initial' | 'hop' | 'summary') => {
         const r = getSession(s);
         const label = r?.label || shortName(s);
@@ -1091,6 +1090,9 @@ export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: Hop
     parts.push(`3. Add a new heading "## ${opts.sectionHeader}" at the end of this file and write your analysis below it`);
     parts.push(``);
     parts.push(`Rules: ALL analysis goes into this same file. Do NOT edit code files. Do NOT implement fixes.`);
+    parts.push(`For this task, if the discussion file does not explicitly provide the relevant code, diff, or file paths, treat the current project codebase in your working directory as the referenced context for the audit.`);
+    parts.push(`You MUST inspect the relevant source files in the current project codebase directly and base your analysis on that code.`);
+    parts.push(`Do NOT respond that code context is missing if the working-directory project codebase is available.`);
   }
   parts.push(`Do NOT ask for confirmation. Do NOT explain your plan. Start immediately.`);
   parts.push(`After writing to the file, print a brief response summary of what you wrote, then say: Done`);

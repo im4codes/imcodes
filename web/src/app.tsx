@@ -536,6 +536,7 @@ export function App() {
         planLabel: undefined,
         quotaLabel: undefined,
         quotaUsageLabel: undefined,
+        quotaMeta: undefined,
       }));
       setSessions(mapped);
       // Only mark loaded if we got data — empty means daemon hasn't synced yet,
@@ -1077,13 +1078,17 @@ export function App() {
             label: s.label ?? existing?.label,
             description: s.description ?? existing?.description,
             qwenModel: s.qwenModel ?? existing?.qwenModel,
+            requestedModel: s.requestedModel ?? existing?.requestedModel,
+            activeModel: s.activeModel ?? existing?.activeModel,
             qwenAuthType: s.qwenAuthType ?? existing?.qwenAuthType,
             qwenAuthLimit: s.qwenAuthLimit ?? existing?.qwenAuthLimit,
             qwenAvailableModels: s.qwenAvailableModels ?? existing?.qwenAvailableModels,
-            modelDisplay: s.modelDisplay ?? existing?.modelDisplay,
-            planLabel: s.planLabel ?? existing?.planLabel,
-            quotaLabel: s.quotaLabel ?? existing?.quotaLabel,
-            quotaUsageLabel: s.quotaUsageLabel ?? existing?.quotaUsageLabel,
+            modelDisplay: s.modelDisplay ?? s.activeModel ?? existing?.modelDisplay,
+            planLabel: s.planLabel,
+            quotaLabel: s.quotaLabel,
+            quotaUsageLabel: s.quotaUsageLabel,
+            quotaMeta: s.quotaMeta ?? existing?.quotaMeta,
+            effort: s.effort ?? existing?.effort,
           };
         }));
         setSessionsLoaded(true);
@@ -1387,6 +1392,22 @@ export function App() {
         // Daemon went offline — keep existing session data visible, just update status
         setDaemonOnline(false);
         watchProjectionStore.setSnapshotStatus('stale');
+      }
+      if (msg.type === 'daemon.error') {
+        // Surface uncaught daemon errors as a toast so users aren't left in the dark.
+        const id = Date.now() + Math.random();
+        setToasts((prev) => [...prev, {
+          id,
+          sessionName: '',
+          project: '',
+          kind: 'notification',
+          title: 'Daemon error',
+          message: msg.message,
+        }]);
+        // eslint-disable-next-line no-console
+        console.error('[daemon.error]', msg.kind, msg.message, msg.stack);
+        // Auto-dismiss after 10 seconds
+        setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 10_000);
       }
       if (msg.type === 'daemon.reconnected') {
         setDaemonOnline(true);

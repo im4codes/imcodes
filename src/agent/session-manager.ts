@@ -31,6 +31,9 @@ import { resolveStructuredSessionBootstrap } from './structured-session-bootstra
 import { getQwenRuntimeConfig } from './qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from './provider-display.js';
 import { getQwenOAuthQuotaUsageLabel } from './provider-quota.js';
+import { getClaudeSdkRuntimeConfig } from './sdk-runtime-config.js';
+import { getCodexRuntimeConfig } from './codex-runtime-config.js';
+import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
@@ -124,6 +127,10 @@ function emitSessionPersist(record: SessionRecord | null, name: string): void {
   _onSessionPersist?.(record, name).catch((e) => logger.warn({ err: e, name }, 'session persist callback failed'));
 }
 
+export function persistSessionRecord(record: SessionRecord | null, name: string): void {
+  emitSessionPersist(record, name);
+}
+
 export interface ProjectConfig {
   name: string;
   dir: string;
@@ -137,6 +144,8 @@ export interface ProjectConfig {
   extraEnv?: Record<string, string>;
   /** CC env preset name — persisted for respawn env injection. */
   ccPreset?: string;
+  /** Transport thinking level for supported main sessions. */
+  effort?: TransportEffortLevel;
 }
 
 export function getDriver(type: AgentType): AgentDriver {
@@ -158,9 +167,9 @@ export function sessionName(project: string, role: 'brain' | `w${number}`): stri
 
 /** Start all sessions for a project (brain + workers). */
 export async function startProject(config: ProjectConfig): Promise<void> {
-  const { name, dir, brainType, workerTypes, fresh, extraEnv, ccPreset, label } = config;
+  const { name, dir, brainType, workerTypes, fresh, extraEnv, ccPreset, label, effort } = config;
 
-  await launchSession({ name: sessionName(name, 'brain'), projectName: name, role: 'brain', agentType: brainType, projectDir: dir, fresh, extraEnv, ccPreset, label });
+  await launchSession({ name: sessionName(name, 'brain'), projectName: name, role: 'brain', agentType: brainType, projectDir: dir, fresh, extraEnv, ccPreset, label, effort });
 
   for (let i = 0; i < workerTypes.length; i++) {
     const role = `w${i + 1}` as `w${number}`;
@@ -711,8 +720,14 @@ export interface LaunchOpts {
   opencodeSessionId?: string;
   /** Qwen model ID for `qwen --model <ID>`. */
   qwenModel?: string;
+  /** Unified requested transport model for launch/restore. */
+  requestedModel?: string;
   /** Human-readable label for UI display. */
   label?: string;
+  /** Reasoning/thinking effort for supported transport providers. */
+  effort?: TransportEffortLevel;
+  /** Provider-specific runtime config persisted outside top-level schema. */
+  transportConfig?: Record<string, unknown>;
   /** Session description for transport sessions (persona/system prompt injection). */
   description?: string;
   /** CC env preset name — resolved to env vars at launch, persisted for respawn. */
@@ -743,6 +758,61 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
   runtime.onDrain = (merged, count) => {
     timelineEmitter.emit(sessionName, 'user.message', { text: merged, batchedCount: count });
     timelineEmitter.emit(sessionName, 'session.state', { state: 'running' }, { source: 'daemon', confidence: 'high' });
+  };
+}
+
+function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName: string, agentType: string): void {
+  runtime.onSessionInfoChange = (info) => {
+    const existing = getSession(sessionName);
+    if (!existing) return;
+    const next: SessionRecord = { ...existing };
+    let changed = false;
+
+    if (typeof info.resumeId === 'string' && info.resumeId) {
+      if (agentType === 'claude-code-sdk' && next.ccSessionId !== info.resumeId) {
+        next.ccSessionId = info.resumeId;
+        changed = true;
+      }
+      if (agentType === 'codex-sdk' && next.codexSessionId !== info.resumeId) {
+        next.codexSessionId = info.resumeId;
+        changed = true;
+      }
+    }
+
+    if (typeof info.model === 'string' && info.model) {
+      if (next.activeModel !== info.model) {
+        next.activeModel = info.model;
+        changed = true;
+      }
+      if (next.modelDisplay !== info.model) {
+        next.modelDisplay = info.model;
+        changed = true;
+      }
+    }
+
+    if (typeof info.planLabel === 'string' && info.planLabel && next.planLabel !== info.planLabel) {
+      next.planLabel = info.planLabel;
+      changed = true;
+    }
+
+    if (typeof info.quotaLabel === 'string' && info.quotaLabel && next.quotaLabel !== info.quotaLabel) {
+      next.quotaLabel = info.quotaLabel;
+      changed = true;
+    }
+
+    if (typeof info.quotaUsageLabel === 'string' && info.quotaUsageLabel && next.quotaUsageLabel !== info.quotaUsageLabel) {
+      next.quotaUsageLabel = info.quotaUsageLabel;
+      changed = true;
+    }
+
+    if (typeof info.effort === 'string' && next.effort !== info.effort) {
+      next.effort = info.effort;
+      changed = true;
+    }
+
+    if (!changed) return;
+    upsertSession(next);
+    emitSessionPersist(next, sessionName);
   };
 }
 
@@ -806,27 +876,43 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       const availableQwenModels = s.providerId === 'qwen'
         ? (s.qwenAvailableModels?.length ? s.qwenAvailableModels : (qwenRuntime?.availableModels ?? []))
         : [];
+      const requestedTransportModel = s.requestedModel ?? s.qwenModel;
       const effectiveQwenModel = s.providerId === 'qwen'
-        ? (s.qwenModel && (availableQwenModels.length === 0 || availableQwenModels.includes(s.qwenModel))
-          ? s.qwenModel
+        ? (requestedTransportModel && (availableQwenModels.length === 0 || availableQwenModels.includes(requestedTransportModel))
+          ? requestedTransportModel
           : availableQwenModels[0])
-        : s.qwenModel;
+        : requestedTransportModel;
       const runtime = new TransportSessionRuntime(provider, s.name);
       wireTransportCallbacks(runtime, s.name);
+      wireTransportSessionInfo(runtime, s.name, s.agentType);
       // After cancel, qwenFreshOnResume is set — don't resume the stuck conversation.
       const freshAfterCancel = !!(s.qwenFreshOnResume && s.providerId === 'qwen');
       const effectiveSessionKey = freshAfterCancel ? randomUUID() : s.providerSessionId;
+      const resumeId = s.providerId === 'claude-code-sdk'
+        ? s.ccSessionId
+        : s.providerId === 'codex-sdk'
+          ? s.codexSessionId
+          : undefined;
+      let extraEnv: Record<string, string> | undefined;
+      if (s.providerId === 'claude-code-sdk' && s.ccPreset) {
+        const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
+        extraEnv = await resolvePresetEnv(s.ccPreset, s.ccSessionId ?? undefined);
+      }
       await runtime.initialize({
         sessionKey: effectiveSessionKey,
         bindExistingKey: freshAfterCancel ? undefined : s.providerSessionId,
         skipCreate: !freshAfterCancel,
+        ...(extraEnv ? { env: extraEnv } : {}),
         cwd: s.projectDir,
         label: s.label ?? s.name,
         description: s.description,
         agentId: effectiveQwenModel,
+        resumeId,
+        effort: s.effort,
       });
       if (s.description) runtime.setDescription(s.description);
       if (effectiveQwenModel) runtime.setAgentId(effectiveQwenModel);
+      if (s.effort) runtime.setEffort(s.effort);
       transportRuntimes.set(s.name, runtime);
       const actualProviderSid = runtime.providerSessionId ?? effectiveSessionKey;
       registerProviderRoute(actualProviderSid, s.name);
@@ -835,6 +921,10 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         state: 'running',
         updatedAt: Date.now(),
         ...(freshAfterCancel ? { providerSessionId: actualProviderSid, qwenFreshOnResume: undefined } : {}),
+        requestedModel: effectiveQwenModel ?? s.requestedModel,
+        activeModel: effectiveQwenModel ?? s.activeModel ?? s.modelDisplay,
+        modelDisplay: effectiveQwenModel ?? s.modelDisplay,
+        transportConfig: s.transportConfig ?? {},
         ...(effectiveQwenModel ? { qwenModel: effectiveQwenModel } : {}),
         ...(qwenRuntime?.authType ? { qwenAuthType: qwenRuntime.authType } : {}),
         ...(qwenRuntime?.authLimit ? { qwenAuthLimit: qwenRuntime.authLimit } : {}),
@@ -855,27 +945,48 @@ export async function restoreTransportSessions(providerId: string): Promise<void
 
 export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate, parentSession } = opts;
+  const existing = getSession(name);
+
+  if (opts.fresh) {
+    const existingRuntime = transportRuntimes.get(name);
+    if (existingRuntime) {
+      const oldProviderSid = existingRuntime.providerSessionId;
+      try {
+        await existingRuntime.kill();
+      } catch (err) {
+        logger.warn({ err, session: name }, 'Failed to kill existing transport runtime before fresh launch');
+      }
+      transportRuntimes.delete(name);
+      if (oldProviderSid) unregisterProviderRoute(oldProviderSid);
+    }
+  }
 
   const provider = await ensureProviderConnected(agentType, {});
 
   const runtime = new TransportSessionRuntime(provider, name);
   wireTransportCallbacks(runtime, name);
+  wireTransportSessionInfo(runtime, name, agentType);
   let effectiveSessionKey = name;
   let effectiveBindExistingKey = bindExistingKey;
   let effectiveSkipCreate = skipCreate;
   let qwenAuthType: SessionRecord['qwenAuthType'] | undefined;
   let qwenAuthLimit: SessionRecord['qwenAuthLimit'] | undefined;
   let availableQwenModels: string[] | undefined;
-  let effectiveQwenModel = agentType === 'qwen' ? (opts.qwenModel ?? getSession(name)?.qwenModel) : undefined;
+  let sdkDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel'> | undefined;
+  const storedRequestedModel = !opts.fresh ? existing?.requestedModel : undefined;
+  let requestedTransportModel = opts.requestedModel ?? storedRequestedModel ?? (agentType === 'qwen' ? (opts.qwenModel ?? existing?.qwenModel) : undefined);
+  const effectiveTransportConfig = opts.transportConfig ?? existing?.transportConfig ?? {};
+  let transportResumeId: string | undefined;
+  let transportEnv: Record<string, string> | undefined = opts.extraEnv;
   if (agentType === 'qwen') {
     const qwenRuntime = await getQwenRuntimeConfig().catch(() => null);
     qwenAuthType = qwenRuntime?.authType;
     qwenAuthLimit = qwenRuntime?.authLimit;
     availableQwenModels = qwenRuntime?.availableModels ?? [];
-    if (!effectiveQwenModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(effectiveQwenModel))) {
-      effectiveQwenModel = availableQwenModels[0] ?? effectiveQwenModel;
+    if (!requestedTransportModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(requestedTransportModel))) {
+      requestedTransportModel = availableQwenModels[0] ?? requestedTransportModel;
     }
-    const stored = !opts.fresh ? getSession(name)?.providerSessionId : undefined;
+    const stored = !opts.fresh ? existing?.providerSessionId : undefined;
     const qwenSessionId = effectiveBindExistingKey ?? stored ?? randomUUID();
     effectiveSessionKey = qwenSessionId;
     if (!opts.fresh && (effectiveBindExistingKey || stored)) {
@@ -885,17 +996,31 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
       effectiveBindExistingKey = undefined;
       effectiveSkipCreate = false;
     }
+  } else if (agentType === 'claude-code-sdk') {
+    transportResumeId = opts.ccSessionId ?? (!opts.fresh ? getSession(name)?.ccSessionId : undefined) ?? randomUUID();
+    if (opts.ccPreset) {
+      const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
+      transportEnv = { ...(transportEnv ?? {}), ...(await resolvePresetEnv(opts.ccPreset, transportResumeId)) };
+    }
+    sdkDisplay = await getClaudeSdkRuntimeConfig().catch(() => ({}));
+  } else if (agentType === 'codex-sdk') {
+    transportResumeId = opts.codexSessionId ?? (!opts.fresh ? getSession(name)?.codexSessionId : undefined);
+    sdkDisplay = await getCodexRuntimeConfig().catch(() => ({}));
   }
 
   // Create session on provider
   await runtime.initialize({
     sessionKey: effectiveSessionKey,
+    fresh: !!opts.fresh,
+    ...(transportEnv ? { env: transportEnv } : {}),
     cwd: projectDir,
     label: label || name,
     description,
-    agentId: effectiveQwenModel,
+    agentId: requestedTransportModel,
     bindExistingKey: effectiveBindExistingKey,
     skipCreate: effectiveSkipCreate,
+    resumeId: transportResumeId,
+    effort: opts.effort,
   });
 
   // Atomic: store runtime + register provider route + persist — rollback all on failure
@@ -919,16 +1044,24 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         runtimeType: RUNTIME_TYPES.TRANSPORT,
         providerId: provider.id,
         providerSessionId: runtime.providerSessionId ?? undefined,
-        ...(effectiveQwenModel ? { qwenModel: effectiveQwenModel } : {}),
+        ...(agentType === 'claude-code-sdk' && transportResumeId ? { ccSessionId: transportResumeId } : {}),
+        ...(agentType === 'codex-sdk' && transportResumeId ? { codexSessionId: transportResumeId } : {}),
+        requestedModel: requestedTransportModel,
+        activeModel: requestedTransportModel,
+        modelDisplay: requestedTransportModel,
+        transportConfig: effectiveTransportConfig,
+        ...(requestedTransportModel && agentType === 'qwen' ? { qwenModel: requestedTransportModel } : {}),
         ...(qwenAuthType ? { qwenAuthType } : {}),
         ...(qwenAuthLimit ? { qwenAuthLimit } : {}),
         ...(availableQwenModels?.length ? { qwenAvailableModels: availableQwenModels } : {}),
         ...getQwenDisplayMetadata({
-          model: effectiveQwenModel,
+          model: requestedTransportModel,
           authType: qwenAuthType,
           authLimit: qwenAuthLimit,
           quotaUsageLabel: qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
         }),
+        ...(sdkDisplay ?? {}),
+        ...(opts.effort ? { effort: opts.effort } : {}),
         description,
         label,
         parentSession,
@@ -1038,6 +1171,13 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     }
   }
 
+  let familyDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel'> | undefined;
+  if (agentType === 'codex') {
+    familyDisplay = await getCodexRuntimeConfig().catch(() => ({}));
+  } else if (agentType === 'claude-code' && !opts.ccPreset) {
+    familyDisplay = undefined;
+  }
+
   if (!skipStore) {
     const existing = getSession(name);
     const record: SessionRecord = {
@@ -1059,6 +1199,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ...(opencodeSessionId ? { opencodeSessionId } : {}),
       ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),
       ...(label ? { label } : {}),
+      ...(familyDisplay ?? {}),
     };
     upsertSession(record);
     emitSessionPersist(record, name);

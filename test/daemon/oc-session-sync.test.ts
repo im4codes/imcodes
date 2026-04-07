@@ -13,6 +13,7 @@ import {
   mainSessionProjectDir,
   setOcRoot,
 } from '../../src/daemon/oc-session-sync.js';
+import { normalizeOpenClawDisplayName, preferredOpenClawLabel } from '../../src/agent/openclaw-display.js';
 import type { RemoteSessionInfo } from '../../src/agent/transport-provider.js';
 
 // ── Key parsing ─────────────────────────────────────────────────────────────
@@ -149,6 +150,22 @@ describe('session naming', () => {
     setOcRoot('/home/test/clawd');
     expect(mainSessionProjectDir('emma')).toBe('/home/test/clawd/agents/emma');
     expect(mainSessionProjectDir('ppt')).toBe('/home/test/clawd/agents/ppt');
+  });
+});
+
+describe('OpenClaw display labels', () => {
+  it('normalizes discord display names to the #suffix', () => {
+    expect(normalizeOpenClawDisplayName('discord:1476187408042033309#videos')).toBe('#videos');
+    expect(normalizeOpenClawDisplayName('discord:#general')).toBe('#general');
+    expect(normalizeOpenClawDisplayName('feishu:emma')).toBe('feishu:emma');
+  });
+
+  it('replaces stale discord-prefixed stored labels with normalized labels', () => {
+    expect(preferredOpenClawLabel('discord:1476187408042033309#videos', 'discord:1476187408042033309#videos', 'agent___main___discord___channel___111')).toBe('#videos');
+  });
+
+  it('preserves custom labels that do not match the stale discord-prefixed form', () => {
+    expect(preferredOpenClawLabel('Team videos', 'discord:1476187408042033309#videos', 'agent___main___discord___channel___111')).toBe('Team videos');
   });
 });
 

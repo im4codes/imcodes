@@ -17,4 +17,7 @@ export default defineConfig({
     environment: 'node',
     globals: false,
   },
+  coverage: {
+    reporter: ['text', 'json-summary', 'lcov'],
+  },
 });

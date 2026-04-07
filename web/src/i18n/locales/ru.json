@@ -41,7 +41,12 @@
     "external_link_title": "Открыть внешнюю ссылку",
     "external_link_warning": "Эта ссылка была сгенерирована ИИ-агентом. Вы несёте ответственность за риски, связанные с посещением внешних сайтов.",
     "external_link_cancel": "Отмена",
-    "external_link_open": "Открыть ссылку"
+    "external_link_open": "Открыть ссылку",
+    "tool_detail_toggle": "подробно",
+    "tool_detail_input": "ввод",
+    "tool_detail_output": "вывод",
+    "tool_detail_meta": "мета",
+    "tool_detail_raw": "raw"
   },
   "session": {
     "restart": "↺ Перезапустить",
@@ -73,7 +78,11 @@
     "new_btn": "Новая сессия",
     "agentType": {
       "openclaw": "OpenClaw",
-      "qwen": "Qwen Code"
+      "qwen": "Qwen Code",
+      "claude_code_sdk": "Claude Code SDK",
+      "codex_sdk": "Codex SDK",
+      "claude_code_cli": "Claude Code CLI",
+      "codex_cli": "Codex CLI"
     },
     "openclaw_not_connected": "не подключено",
     "openclaw_connect_hint": "Шлюз OpenClaw не подключён. Запустите следующую команду на машине с демоном:",
@@ -103,7 +112,9 @@
     "qwen_tier_byo": "Свой ключ",
     "qwen_source_title": "Источник Qwen: {{tier}}",
     "qwen_model_title": "Источник Qwen: {{tier}} · Модель: {{model}}",
-    "p2p_tag": "P2P"
+    "p2p_tag": "P2P",
+    "thinking": "Уровень",
+    "thinking_title": "Уровень: {{value}}"
   },
   "server": {
     "upgrade_daemon": "↑ Обновить Daemon",
@@ -147,6 +158,8 @@
     "insert": "Вставить {{count}}",
     "browse": "Обзор",
     "show_hidden": "Скрытые",
+    "this_pc": "Этот компьютер",
+    "home": "Домой",
     "selected_count": "Выбрано {{count}}",
     "timeout": "Превышено время ожидания",
     "timeout_detail": "Не удалось прочитать каталог. Возможно, это вызвано медленными или недоступными сетевыми дисками.",
@@ -154,6 +167,7 @@
     "preview_too_large": "Файл слишком большой для предпросмотра (> 512 КБ)",
     "preview_error": "Предпросмотр недоступен",
     "preview_binary": "Двоичный файл — предпросмотр недоступен",
+    "mkdir_failed": "Не удалось создать папку",
     "view_diff": "Diff",
     "view_source": "Источник",
     "tab_files": "Файлы",
@@ -179,7 +193,14 @@
     "daemon_offline": "Daemon не в сети — убедитесь, что imcodes daemon запущен",
     "start": "Запустить",
     "starting": "Запуск...",
-    "timeout": "Истекло время ожидания запуска сессии. Проверьте журналы daemon."
+    "timeout": "Истекло время ожидания запуска сессии. Проверьте журналы daemon.",
+    "title": "Новая сессия",
+    "project_name": "Имя проекта",
+    "working_directory": "Рабочая директория",
+    "browse": "Обзор",
+    "agent_type": "Тип агента",
+    "agent_flavor_cli": "CLI: нативный интерфейс для тех, кто предпочитает оригинальный UI. В режиме чата нет стриминга.",
+    "agent_flavor_sdk": "SDK: поддерживает стриминг и использует более простой интерфейс."
   },
   "api_key": {
     "copy": "Копировать",
@@ -187,7 +208,13 @@
     "label_placeholder": "Метка (необязательно)",
     "generate": "Сгенерировать ключ",
     "generating": "Генерация...",
-    "revoke": "Отозвать"
+    "revoke": "Отозвать",
+    "save_once": "Сохраните этот ключ — он больше не будет показан",
+    "raw_key": "API-ключ",
+    "bind_url": "URL привязки",
+    "bind_command": "Команда привязки",
+    "copy_bind_command": "Скопировать команду",
+    "dismiss": "Закрыть"
   },
   "getting_started": {
     "step1_pending": "Шаг 1: Сгенерируйте API-ключ",

@@ -1,8 +1,8 @@
 /**
  * @vitest-environment jsdom
  */
-import { describe, it, expect, vi } from 'vitest';
-import { render, screen } from '@testing-library/preact';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { render, screen, cleanup } from '@testing-library/preact';
 import { h } from 'preact';
 
 vi.mock('react-i18next', () => ({
@@ -29,20 +29,91 @@ vi.mock('../src/cost-tracker.js', () => ({
 
 import { UsageFooter } from '../src/components/UsageFooter.js';
 
+afterEach(() => {
+  cleanup();
+});
+
 describe('UsageFooter', () => {
-  it('renders generic plan and quota badges with translated plan labels', () => {
+  it('renders explicit quota label inline in the ctx footer', () => {
     render(
       <UsageFooter
-        usage={{ inputTokens: 2000, cacheTokens: 1000, contextWindow: 1_000_000, model: 'coder-model' }}
+        usage={{
+          inputTokens: 2000,
+          cacheTokens: 1000,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
         sessionName="deck_test_brain"
-        modelOverride="qwen3-coder-plus"
+        agentType="codex-sdk"
+        modelOverride="gpt-5"
         planLabel="Free"
-        quotaLabel="1,000/day"
-        quotaUsageLabel="today 12/1000 · 1m 1/60"
+        quotaLabel="5h 43% 2h03m 4/6 14:40 · 7d 34% 1d04h 4/8 15:48"
       />,
     );
 
-    // Plan/quota badges moved to SessionControls — UsageFooter only renders ctx bar + stats
-    expect(screen.getByText('qwen3-coder-plus')).toBeDefined();
+    expect(screen.getByText('gpt-5')).toBeDefined();
+    expect(screen.getByText(/5h 43% 2h03m 4\/6 14:40/)).toBeDefined();
+    expect(screen.getByText(/7d 34% 1d04h 4\/8 15:48/)).toBeDefined();
+  });
+
+  it('does not render stale codexStatus data when no explicit quota label is present', () => {
+    render(
+      <UsageFooter
+        usage={{
+          inputTokens: 2000,
+          cacheTokens: 1000,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+          codexStatus: {
+            capturedAt: 1,
+            fiveHourLeftPercent: 43,
+            fiveHourResetAt: '4/6 14:40',
+            weeklyLeftPercent: 34,
+            weeklyResetAt: '4/8 15:48',
+          },
+        }}
+        sessionName="deck_test_brain"
+        agentType="codex"
+        modelOverride="gpt-5"
+      />,
+    );
+
+    expect(screen.getByText('gpt-5')).toBeDefined();
+    expect(screen.queryByText(/5h 43% 4\/6 14:40/)).toBeNull();
+    expect(screen.queryByText(/7d 34% 4\/8 15:48/)).toBeNull();
+  });
+
+  it('recomputes codex quota countdown from quotaMeta', () => {
+    render(
+      <UsageFooter
+        usage={{
+          inputTokens: 2000,
+          cacheTokens: 1000,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        agentType="codex-sdk"
+        modelOverride="gpt-5"
+        quotaLabel="stale quota text"
+        quotaMeta={{
+          primary: {
+            usedPercent: 43,
+            windowDurationMins: 300,
+            resetsAt: Math.floor((2 * 60_000 + 15_000) / 1000),
+          },
+          secondary: {
+            usedPercent: 34,
+            windowDurationMins: 7 * 24 * 60,
+            resetsAt: Math.floor((26 * 60 * 60_000) / 1000),
+          },
+        }}
+        now={0}
+      />,
+    );
+
+    expect(screen.queryByText('stale quota text')).toBeNull();
+    expect(screen.getByText(/5h 43% 2m/)).toBeDefined();
+    expect(screen.getByText(/7d 34% 1d02h/)).toBeDefined();
   });
 });

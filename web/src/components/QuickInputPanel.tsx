@@ -56,6 +56,22 @@ export function getNavigableHistory(data: QuickData, sessionName?: string): stri
   return sessionHist.length > 0 ? sessionHist : data.history;
 }
 
+export function getAccountHistory(data: QuickData): string[] {
+  const merged: string[] = [];
+  const seen = new Set<string>();
+  const append = (items: string[]) => {
+    for (const item of items) {
+      if (!seen.has(item)) {
+        seen.add(item);
+        merged.push(item);
+      }
+    }
+  };
+  append(data.history);
+  for (const items of Object.values(data.sessionHistory)) append(items);
+  return merged;
+}
+
 // ── Hook ──────────────────────────────────────────────────────────────────
 
 let _debounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -264,7 +280,7 @@ export function QuickInputPanel({
   const defaultCmds = DEFAULT_COMMANDS[agentType] ?? DEFAULT_COMMANDS['claude-code'];
   const activeHistory = historyScope === 'session'
     ? (data.sessionHistory[sessionName] ?? [])
-    : data.history;
+    : getAccountHistory(data);
   const totalHistoryPages = Math.ceil(activeHistory.length / HISTORY_PAGE_SIZE);
   const historySlice = activeHistory.slice(historyPage * HISTORY_PAGE_SIZE, (historyPage + 1) * HISTORY_PAGE_SIZE);
 

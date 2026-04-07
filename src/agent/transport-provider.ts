@@ -11,6 +11,7 @@
  */
 
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
+import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 
 // Re-export shared types used by consumers of this module so they can import from one place.
 export type { AgentMessage, MessageDelta, ToolCallEvent };
@@ -39,6 +40,9 @@ export const PROVIDER_ERROR_CODES = {
   SESSION_NOT_FOUND:'SESSION_NOT_FOUND',
   RATE_LIMITED:     'RATE_LIMITED',
   PROVIDER_ERROR:   'PROVIDER_ERROR',
+  CANCELLED:        'CANCELLED',
+  PARSE_ERROR:      'PARSE_ERROR',
+  PROVIDER_NOT_FOUND:'PROVIDER_NOT_FOUND',
 } as const;
 
 // ── Derived types ───────────────────────────────────────────────────────────
@@ -71,6 +75,10 @@ export interface ProviderCapabilities {
   multiTurn: boolean;
   /** Provider can accept file/image attachments in send(). */
   attachments: boolean;
+  /** Provider supports configurable reasoning/thinking effort. */
+  reasoningEffort?: boolean;
+  /** Supported effort levels when reasoningEffort is true. */
+  supportedEffortLevels?: readonly TransportEffortLevel[];
 }
 
 /**
@@ -94,6 +102,10 @@ export interface ProviderConfig {
 export interface SessionConfig {
   /** Local session key used by the daemon to identify this session. */
   sessionKey: string;
+  /** Force a brand-new provider conversation; do not reuse provider-side continuity. */
+  fresh?: boolean;
+  /** Environment variables to pass through for SDK-backed local providers. */
+  env?: Record<string, string>;
   /** Working directory for providers that need local project context. */
   cwd?: string;
   /** Provider-side agent/model identifier (overrides ProviderConfig.agentId). */
@@ -106,6 +118,10 @@ export interface SessionConfig {
   parentSessionKey?: string;
   /** If binding to an already-existing remote session, use this key directly. */
   bindExistingKey?: string;
+  /** Provider-specific durable conversation/session identifier used for resume. */
+  resumeId?: string;
+  /** Reasoning/thinking effort for future turns. */
+  effort?: TransportEffortLevel;
   /** Skip the sessions.create RPC — session already exists on provider (auto-sync bind). */
   skipCreate?: boolean;
 }
@@ -144,6 +160,22 @@ export interface ApprovalRequest {
   description: string;
   /** Name of the tool requesting approval, if applicable. */
   tool?: string;
+}
+
+/** Provider-reported session metadata updates (e.g. learned resume/thread ID). */
+export interface SessionInfoUpdate {
+  /** Durable session/thread identifier used for restoring continuity. */
+  resumeId?: string;
+  /** Human-readable active model identifier, if known. */
+  model?: string;
+  /** Human-readable plan label, if known. */
+  planLabel?: string;
+  /** Human-readable quota summary label, if known. */
+  quotaLabel?: string;
+  /** Human-readable quota progress / reset label, if known. */
+  quotaUsageLabel?: string;
+  /** Current reasoning/thinking effort, if known. */
+  effort?: TransportEffortLevel;
 }
 
 // ── TransportProvider interface ─────────────────────────────────────────────
@@ -247,6 +279,12 @@ export interface TransportProvider {
   onToolCall?(cb: (sessionId: string, tool: ToolCallEvent) => void): void;
 
   /**
+   * Register a callback for provider session metadata changes.
+   * Used by SDK-backed providers that learn durable resume IDs after the first turn.
+   */
+  onSessionInfo?(cb: (sessionId: string, info: SessionInfoUpdate) => void): () => void;
+
+  /**
    * Register a callback for approval requests from the agent.
    * Only call when capabilities.approval is true.
    */
@@ -273,6 +311,12 @@ export interface TransportProvider {
    * Used by local-sdk providers that apply model choice on each send.
    */
   setSessionAgentId?(sessionId: string, agentId: string): void;
+
+  /**
+   * Update provider-side reasoning/thinking effort for an existing session record.
+   * Used by local-sdk providers that apply the effort on subsequent turns.
+   */
+  setSessionEffort?(sessionId: string, effort: TransportEffortLevel): void;
 
   /**
    * Enumerate all remote sessions visible to this provider.

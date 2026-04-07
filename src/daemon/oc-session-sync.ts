@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import logger from '../util/logger.js';
 import type { ServerLink } from './server-link.js';
 import type { RemoteSessionInfo } from '../agent/transport-provider.js';
+import { normalizeOpenClawDisplayName, preferredOpenClawLabel } from '../agent/openclaw-display.js';
 
 // ── Configuration ───────────────────────────────────────────────────────────
 
@@ -152,7 +153,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
       const mainRecord = getSession(mName);
       const needsRuntime = !getTransportRuntime(mName);
       // Preserve existing label — only fall back to OC displayName if store has none
-      const mainLabel = mainRecord?.label || group.mainSession.displayName || mainSessionLabel(group.agentName);
+      const mainLabel = preferredOpenClawLabel(mainRecord?.label, group.mainSession.displayName, group.mainSession.key) || mainSessionLabel(group.agentName);
 
       if (mainExists && needsRuntime) {
         // Session in store but runtime lost (daemon restart / OC reconnect) — recreate runtime
@@ -182,7 +183,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
               agentType: 'openclaw',
               label: mainLabel,
               projectDir: mainSessionProjectDir(group.agentName),
-              description: group.mainSession.displayName,
+              description: normalizeOpenClawDisplayName(group.mainSession.displayName),
               bindExistingKey: group.mainSession.key,
               skipCreate: true,
             };
@@ -210,13 +211,12 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
           try {
             await launchTransportSession({
               name: storeEntry.name, projectName: storeEntry.name, role: 'w1', agentType: 'openclaw',
-              label: ch.displayName || ch.key,
+              label: preferredOpenClawLabel(storeEntry.label, ch.displayName, ch.key),
               projectDir: mainSessionProjectDir(group.agentName),
               bindExistingKey: ch.key, skipCreate: true, skipStore: true,
               parentSession: mName,
             });
-            // Preserve existing label — only set if store has none
-            const newLabel = storeEntry.label || ch.displayName || ch.key;
+            const newLabel = preferredOpenClawLabel(storeEntry.label, ch.displayName, ch.key);
             upsertSession({ ...storeEntry, state: 'running', parentSession: mName, label: newLabel, updatedAt: Date.now() });
             // Update server DB label (may have been stored with sanitized key before displayName fix)
             const subId = storeEntry.name.replace('deck_sub_', '');
@@ -244,13 +244,13 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
           try {
             await launchTransportSession({
               name: existingInStore.name, projectName: existingInStore.name, role: 'w1', agentType: 'openclaw',
-              label: ch.displayName || ch.key,
+              label: preferredOpenClawLabel(existingInStore.label, ch.displayName, ch.key),
               projectDir: mainSessionProjectDir(group.agentName),
               bindExistingKey: ch.key, skipCreate: true, skipStore: true,
               parentSession: mName,
             });
             // Update store: mark running, set parentSession + label (preserve existing label)
-            const reconnLabel = existingInStore.label || ch.displayName || ch.key;
+            const reconnLabel = preferredOpenClawLabel(existingInStore.label, ch.displayName, ch.key);
             upsertSession({
               ...existingInStore,
               state: 'running',
@@ -289,9 +289,9 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
           projectName: subName,
           role: 'w1',
           agentType: 'openclaw',
-          label: ch.displayName || ch.key,
+          label: preferredOpenClawLabel(undefined, ch.displayName, ch.key),
           projectDir: mainSessionProjectDir(group.agentName),
-          description: ch.displayName,
+          description: normalizeOpenClawDisplayName(ch.displayName),
           bindExistingKey: ch.key,
           skipCreate: true,
           parentSession: mName,
@@ -309,7 +309,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
             shellBin: null,
             ccSessionId: null,
             parentSession,
-            label: ch.displayName || ch.key,
+            label: preferredOpenClawLabel(undefined, ch.displayName, ch.key),
             runtimeType: 'transport',
             providerId: 'openclaw',
             providerSessionId: ch.key,

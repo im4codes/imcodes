@@ -105,6 +105,33 @@ function formatToolPayloadValue(value: unknown): string {
   return truncateToolText(String(value));
 }
 
+function formatToolDetailJson(value: unknown): string | null {
+  if (value == null) return null;
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function ToolDetailSection({
+  label,
+  value,
+}: {
+  label: string;
+  value: unknown;
+}) {
+  const text = formatToolDetailJson(value);
+  if (!text) return null;
+  return (
+    <div class="chat-tool-detail-section">
+      <div class="chat-tool-detail-label">{label}</div>
+      <pre class="chat-tool-detail-pre">{text}</pre>
+    </div>
+  );
+}
+
 /** Merge consecutive assistant.text events into blocks for display.
  *  Also:
  *  - Merge consecutive tool.call + tool.result pairs into compact single lines
@@ -167,7 +194,15 @@ function buildViewItems(events: TimelineEvent[]): ViewItem[] {
         consolidated.push({
           ...ev,
           type: 'tool.call',
-          payload: { ...ev.payload, tool: toolName, input: `${input} ${status}`.trim(), _merged: true, ...(output ? { _output: output } : {}) },
+          payload: {
+            ...ev.payload,
+            tool: toolName,
+            input: `${input} ${status}`.trim(),
+            _merged: true,
+            ...(output ? { _output: output } : {}),
+            ...(ev.payload.detail ? { _callDetail: ev.payload.detail } : {}),
+            ...(next.payload.detail ? { _resultDetail: next.payload.detail } : {}),
+          },
         });
         continue;
       }
@@ -995,6 +1030,7 @@ function AttachmentDownloadButton({ att, serverId, onPathClick }: { att: { id: s
 }
 
 const ChatEvent = memo(function ChatEvent({ event, nextTs, onPathClick, serverId }: { event: TimelineEvent; nextTs?: number; onPathClick?: (p: string) => void; serverId?: string }) {
+  const { t } = useTranslation();
   switch (event.type) {
     case 'user.message': {
       let userText = String(event.payload.text ?? '');
@@ -1019,6 +1055,8 @@ const ChatEvent = memo(function ChatEvent({ event, nextTs, onPathClick, serverId
     case 'tool.call': {
       const toolInput = formatToolPayloadValue(event.payload.input);
       const toolOutput = event.payload._output ? String(event.payload._output) : undefined;
+      const callDetail = event.payload._callDetail ?? event.payload.detail;
+      const resultDetail = event.payload._resultDetail;
       return (
         <ToolBlockFold>
           <div class="chat-event chat-tool">
@@ -1031,6 +1069,15 @@ const ChatEvent = memo(function ChatEvent({ event, nextTs, onPathClick, serverId
               <span class="chat-tool-output">{splitPathsAndUrls(toolOutput, onPathClick)}</span>
             </div>
           )}
+          {(callDetail || resultDetail) && (
+            <details class="chat-tool-detail">
+              <summary class="chat-tool-detail-summary">{t('chat.tool_detail_toggle')}</summary>
+              <ToolDetailSection label={t('chat.tool_detail_input')} value={(callDetail as any)?.input} />
+              <ToolDetailSection label={t('chat.tool_detail_output')} value={(resultDetail as any)?.output} />
+              <ToolDetailSection label={t('chat.tool_detail_meta')} value={(callDetail as any)?.meta ?? (resultDetail as any)?.meta} />
+              <ToolDetailSection label={t('chat.tool_detail_raw')} value={(callDetail as any)?.raw ?? (resultDetail as any)?.raw} />
+            </details>
+          )}
         </ToolBlockFold>
       );
     }
@@ -1039,17 +1086,28 @@ const ChatEvent = memo(function ChatEvent({ event, nextTs, onPathClick, serverId
       // Standalone tool.result (not merged) — still rendered for cases without a preceding call
       const error = event.payload.error;
       const output = formatToolPayloadValue(event.payload.output);
+      const detail = event.payload.detail;
       return (
-        <div class="chat-event chat-tool">
-          <span class="chat-tool-icon">{'<'}</span>
-          {error ? (
-            <span class="chat-tool-error">{`error: ${String(error)}`}</span>
-          ) : output ? (
-            <span class="chat-tool-output">{splitPathsAndUrls(output, onPathClick)}</span>
-          ) : (
-            <span class="chat-tool-output">done</span>
+        <ToolBlockFold>
+          <div class="chat-event chat-tool">
+            <span class="chat-tool-icon">{'<'}</span>
+            {error ? (
+              <span class="chat-tool-error">{`error: ${String(error)}`}</span>
+            ) : output ? (
+              <span class="chat-tool-output">{splitPathsAndUrls(output, onPathClick)}</span>
+            ) : (
+              <span class="chat-tool-output">done</span>
+            )}
+          </div>
+          {detail && (
+            <details class="chat-tool-detail">
+              <summary class="chat-tool-detail-summary">{t('chat.tool_detail_toggle')}</summary>
+              <ToolDetailSection label={t('chat.tool_detail_output')} value={(detail as any).output} />
+              <ToolDetailSection label={t('chat.tool_detail_meta')} value={(detail as any).meta} />
+              <ToolDetailSection label={t('chat.tool_detail_raw')} value={(detail as any).raw} />
+            </details>
           )}
-        </div>
+        </ToolBlockFold>
       );
     }
 

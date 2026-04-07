@@ -1,5 +1,7 @@
 export interface FsEntry {
   name: string;
+  /** Absolute path for this entry when the parent is a virtual root (e.g. Windows drives). */
+  path?: string;
   isDir: boolean;
   hidden: boolean;
   /** File size in bytes (only when includeMetadata requested). */
@@ -69,4 +71,8 @@ export interface FsGitStatusResponse extends FsBaseResponse {
 export interface FsGitDiffResponse extends FsBaseResponse {
   type: 'fs.git_diff_response';
   diff?: string;
+}
+
+export interface FsMkdirResponse extends FsBaseResponse {
+  type: 'fs.mkdir_response';
 }

@@ -41,7 +41,12 @@
     "external_link_title": "打开外部链接",
     "external_link_warning": "此链接由 AI 代理生成。访问外部网站的风险由您自行承担。",
     "external_link_cancel": "取消",
-    "external_link_open": "打开链接"
+    "external_link_open": "打开链接",
+    "tool_detail_toggle": "详情",
+    "tool_detail_input": "输入",
+    "tool_detail_output": "输出",
+    "tool_detail_meta": "元信息",
+    "tool_detail_raw": "原始数据"
   },
   "session": {
     "restart": "↺ 重启",
@@ -73,7 +78,11 @@
     "new_btn": "新建会话",
     "agentType": {
       "openclaw": "OpenClaw",
-      "qwen": "Qwen Code"
+      "qwen": "Qwen Code",
+      "claude_code_sdk": "Claude Code SDK",
+      "codex_sdk": "Codex SDK",
+      "claude_code_cli": "Claude Code CLI",
+      "codex_cli": "Codex CLI"
     },
     "openclaw_not_connected": "未连接",
     "openclaw_connect_hint": "OpenClaw 网关未连接。请在 daemon 机器上运行以下命令连接：",
@@ -103,7 +112,9 @@
     "qwen_tier_byo": "自备密钥",
     "qwen_source_title": "Qwen 来源：{{tier}}",
     "qwen_model_title": "Qwen 来源：{{tier}} · 模型：{{model}}",
-    "p2p_tag": "P2P"
+    "p2p_tag": "P2P",
+    "thinking": "级别",
+    "thinking_title": "级别：{{value}}"
   },
   "server": {
     "upgrade_daemon": "↑ 升级 Daemon",
@@ -147,6 +158,8 @@
     "insert": "插入 {{count}} 项",
     "browse": "浏览",
     "show_hidden": "隐藏文件",
+    "this_pc": "此电脑",
+    "home": "主目录",
     "selected_count": "已选 {{count}} 项",
     "timeout": "请求超时",
     "timeout_detail": "无法读取目录。可能是由网络驱动器缓慢或不可用引起的。",
@@ -154,6 +167,7 @@
     "preview_too_large": "文件过大，无法预览（> 512 KB）",
     "preview_error": "预览不可用",
     "preview_binary": "二进制文件 — 无法预览",
+    "mkdir_failed": "创建文件夹失败",
     "view_diff": "差异",
     "view_source": "源码",
     "tab_files": "文件",
@@ -179,7 +193,14 @@
     "daemon_offline": "Daemon 离线 — 请确认 imcodes daemon 正在运行",
     "start": "启动",
     "starting": "启动中...",
-    "timeout": "等待会话启动超时，请检查 daemon 日志。"
+    "timeout": "等待会话启动超时，请检查 daemon 日志。",
+    "title": "启动新会话",
+    "project_name": "项目名",
+    "working_directory": "工作目录",
+    "browse": "浏览",
+    "agent_type": "Agent 类型",
+    "agent_flavor_cli": "CLI：适合喜欢原生界面的用户。聊天模式不支持流式输出。",
+    "agent_flavor_sdk": "SDK：支持流式输出，界面更简洁。"
   },
   "api_key": {
     "copy": "复制",
@@ -187,7 +208,13 @@
     "label_placeholder": "标签（可选）",
     "generate": "生成 Key",
     "generating": "生成中...",
-    "revoke": "撤销"
+    "revoke": "撤销",
+    "save_once": "保存好这个 Key——之后不会再显示",
+    "raw_key": "API Key",
+    "bind_url": "绑定链接",
+    "bind_command": "绑定命令",
+    "copy_bind_command": "复制绑定命令",
+    "dismiss": "关闭"
   },
   "getting_started": {
     "step1_pending": "步骤 1：生成 API Key",

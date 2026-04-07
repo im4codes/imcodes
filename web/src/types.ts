@@ -41,13 +41,18 @@ export interface SessionInfo {
   /** Runtime backing: 'process' for tmux-backed, 'transport' for network-backed. */
   runtimeType?: 'process' | 'transport';
   qwenModel?: string;
+  requestedModel?: string;
+  activeModel?: string;
   qwenAuthType?: string;
   qwenAuthLimit?: string;
   qwenAvailableModels?: string[];
   modelDisplay?: string;
   planLabel?: string;
+  permissionLabel?: string;
   quotaLabel?: string;
   quotaUsageLabel?: string;
+  quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null;
+  effort?: import('../../shared/effort-levels.js').TransportEffortLevel;
 }
 
 export interface ServerInfo {

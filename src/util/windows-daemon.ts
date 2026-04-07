@@ -29,37 +29,6 @@ function sleepMs(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-// ── Kill the watchdog cmd.exe tree that parents the daemon ──────────────────
-
-/** Find the parent PID of a process via wmic. Returns null on failure. */
-function getParentPid(pid: number): number | null {
-  try {
-    const raw = execSync(`wmic process where "ProcessId=${pid}" get ParentProcessId /format:list`, {
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'ignore'],
-    });
-    const m = raw.match(/ParentProcessId=(\d+)/);
-    return m ? parseInt(m[1], 10) : null;
-  } catch {
-    return null;
-  }
-}
-
-/** Kill the watchdog process tree that parents the daemon.
- *  The tree is: wscript → cmd.exe (watchdog loop) → node.exe (daemon).
- *  We kill the top-level process tree so no stale watchdog keeps respawning. */
-function killWatchdogTree(daemonPid: number): void {
-  // Walk up to the watchdog (cmd.exe or wscript)
-  const parentPid = getParentPid(daemonPid);
-  if (!parentPid) return;
-
-  // The parent of the daemon is the watchdog cmd.exe loop.
-  // Kill the entire process tree from the watchdog down — this also kills the daemon.
-  try {
-    execSync(`taskkill /f /t /pid ${parentPid}`, { stdio: 'ignore' });
-  } catch { /* already dead */ }
-}
-
 // ── Launcher methods (all hidden — no visible windows) ──────────────────────
 
 function tryStartVbsLauncher(): boolean {
@@ -91,7 +60,8 @@ function tryStartStartupShortcut(): boolean {
     'imcodes-daemon.cmd',
   );
   if (!existsSync(startupCmd)) return false;
-  spawn('cmd', ['/c', startupCmd], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+  const cmdExe = process.env.COMSPEC || `${process.env.SystemRoot || 'C:\\Windows'}\\system32\\cmd.exe`;
+  spawn(cmdExe, ['/c', startupCmd], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
   return true;
 }
 
@@ -110,18 +80,16 @@ function tryStartStartupShortcut(): boolean {
 export function restartWindowsDaemon(currentPid?: number): boolean {
   const previousPid = readDaemonPid(currentPid);
   if (previousPid) {
-    // Kill the entire watchdog tree, not just the daemon.
-    // This prevents the old watchdog from racing with the new one.
-    killWatchdogTree(previousPid);
-    // Belt-and-suspenders: ensure the daemon itself is dead even if tree-kill missed it
-    sleepMs(500);
-    if (isPidAlive(previousPid)) {
-      try { execSync(`taskkill /f /pid ${previousPid}`, { stdio: 'ignore' }); } catch { /* ignore */ }
-    }
+    // Kill the daemon process. The watchdog loop will detect the exit and
+    // restart it automatically (within ~5 seconds).
+    try { execSync(`taskkill /f /pid ${previousPid}`, { stdio: 'ignore' }); } catch { /* not running */ }
   }
 
-  // Launch a fresh hidden watchdog.
+  // If no watchdog is running (e.g. first start after bind), launch one.
   // Priority: VBS (always hidden) > scheduled task > startup shortcut.
+  // If a watchdog IS already running, it will restart the daemon on its own —
+  // but launching a second VBS is harmless (the daemon lock prevents duplicates,
+  // and the extra watchdog exits when it sees "already running").
   let triggered = false;
   if (tryStartVbsLauncher()) {
     triggered = true;

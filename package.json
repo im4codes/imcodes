@@ -30,7 +30,7 @@
     "test:web": "vitest run --project web",
     "test:e2e": "vitest run --project e2e",
     "test:integration": "vitest run --workspace vitest.integration.config.ts",
-    "test:coverage": "vitest run --coverage",
+    "test:coverage": "vitest run --coverage && node scripts/write-coverage-summary.mjs",
     "test:watch": "vitest",
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit",
@@ -38,10 +38,12 @@
     "prepare": "husky"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.92",
+    "@openai/codex-sdk": "^0.118.0",
     "commander": "^12.1.0",
-    "node-pty": "^1.0.0",
     "croner": "^10.0.1",
     "fzf": "^0.5.2",
+    "node-pty": "^1.0.0",
     "octokit": "^4.0.2",
     "pino": "^9.5.0",
     "pino-pretty": "^13.1.3",

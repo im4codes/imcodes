@@ -41,7 +41,12 @@
     "external_link_title": "외부 링크 열기",
     "external_link_warning": "이 링크는 AI 에이전트가 생성했습니다. 외부 웹사이트 방문에 따른 위험은 본인 책임입니다.",
     "external_link_cancel": "취소",
-    "external_link_open": "링크 열기"
+    "external_link_open": "링크 열기",
+    "tool_detail_toggle": "세부정보",
+    "tool_detail_input": "입력",
+    "tool_detail_output": "출력",
+    "tool_detail_meta": "메타",
+    "tool_detail_raw": "원본"
   },
   "session": {
     "restart": "↺ 재시작",
@@ -73,7 +78,11 @@
     "new_btn": "새 세션",
     "agentType": {
       "openclaw": "OpenClaw",
-      "qwen": "Qwen Code"
+      "qwen": "Qwen Code",
+      "claude_code_sdk": "Claude Code SDK",
+      "codex_sdk": "Codex SDK",
+      "claude_code_cli": "Claude Code CLI",
+      "codex_cli": "Codex CLI"
     },
     "openclaw_not_connected": "미연결",
     "openclaw_connect_hint": "OpenClaw 게이트웨이가 연결되지 않았습니다. 데몬 머신에서 다음 명령을 실행하세요:",
@@ -103,7 +112,9 @@
     "qwen_tier_byo": "자체 키",
     "qwen_source_title": "Qwen 소스: {{tier}}",
     "qwen_model_title": "Qwen 소스: {{tier}} · 모델: {{model}}",
-    "p2p_tag": "P2P"
+    "p2p_tag": "P2P",
+    "thinking": "레벨",
+    "thinking_title": "레벨: {{value}}"
   },
   "server": {
     "upgrade_daemon": "↑ Daemon 업그레이드",
@@ -147,6 +158,8 @@
     "insert": "{{count}}개 삽입",
     "browse": "찾아보기",
     "show_hidden": "숨김 파일",
+    "this_pc": "내 PC",
+    "home": "홈",
     "selected_count": "{{count}}개 선택됨",
     "timeout": "요청 시간 초과",
     "timeout_detail": "디렉토리를 읽을 수 없습니다. 느리거나 사용할 수 없는 네트워크 드라이브가 원인일 수 있습니다.",
@@ -154,6 +167,7 @@
     "preview_too_large": "파일이 너무 커서 미리볼 수 없습니다 (> 512 KB)",
     "preview_error": "미리보기 불가",
     "preview_binary": "바이너리 파일 — 미리보기 불가",
+    "mkdir_failed": "폴더를 만들 수 없습니다",
     "view_diff": "차이",
     "view_source": "소스",
     "tab_files": "파일",
@@ -179,7 +193,14 @@
     "daemon_offline": "Daemon이 오프라인입니다 — imcodes daemon이 실행 중인지 확인하세요",
     "start": "시작",
     "starting": "시작 중...",
-    "timeout": "세션 시작 대기 시간 초과. Daemon 로그를 확인하세요."
+    "timeout": "세션 시작 대기 시간 초과. Daemon 로그를 확인하세요.",
+    "title": "새 세션 시작",
+    "project_name": "프로젝트 이름",
+    "working_directory": "작업 디렉터리",
+    "browse": "찾아보기",
+    "agent_type": "에이전트 유형",
+    "agent_flavor_cli": "CLI: 원래 UI를 선호하는 사용자를 위한 네이티브 인터페이스입니다. 채팅 모드는 스트리밍을 지원하지 않습니다.",
+    "agent_flavor_sdk": "SDK: 스트리밍을 지원하고 더 단순한 UI를 사용합니다."
   },
   "api_key": {
     "copy": "복사",
@@ -187,7 +208,13 @@
     "label_placeholder": "레이블 (선택사항)",
     "generate": "키 생성",
     "generating": "생성 중...",
-    "revoke": "취소"
+    "revoke": "취소",
+    "save_once": "이 키를 저장하세요. 다시 표시되지 않습니다",
+    "raw_key": "API 키",
+    "bind_url": "바인드 URL",
+    "bind_command": "바인드 명령어",
+    "copy_bind_command": "바인드 명령어 복사",
+    "dismiss": "닫기"
   },
   "getting_started": {
     "step1_pending": "1단계: API 키 생성",

@@ -5,7 +5,7 @@ import { detectMemoryBackend } from '../memory/detector.js';
 import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
 import { ServerLink } from './server-link.js';
-import { handleWebCommand, setRouterContext } from './command-handler.js';
+import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata } from './command-handler.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
 import { notifySessionIdle, listP2pRuns, serializeP2pRun } from './p2p-orchestrator.js';
 import { handlePreviewBinaryFrame } from './preview-relay.js';
@@ -79,6 +79,10 @@ async function persistSessionToWorker(
         providerId: record.providerId ?? null,
         providerSessionId: record.providerSessionId ?? null,
         description: record.description ?? null,
+        requestedModel: record.requestedModel ?? null,
+        activeModel: record.activeModel ?? record.modelDisplay ?? null,
+        effort: record.effort ?? null,
+        transportConfig: record.transportConfig ?? null,
       }),
     });
     if (!res.ok) logger.warn({ status: res.status, name }, 'persistSessionToWorker: non-ok response');
@@ -144,7 +148,7 @@ async function syncSessionsFromWorker(workerUrl: string, serverId: string, token
       return;
     }
 
-    const data = await sessionRes.json() as { sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; project_dir: string; state: string }> };
+    const data = await sessionRes.json() as { sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; project_dir: string; state: string; requested_model?: string | null; active_model?: string | null; effort?: SessionRecord['effort'] | null; transport_config?: Record<string, unknown> | string | null }> };
     const subData = await subRes.json() as { subSessions: Array<{ id: string }> };
     const remoteSessionNames = new Set(
       data.sessions
@@ -180,6 +184,13 @@ async function syncSessionsFromWorker(workerUrl: string, serverId: string, token
         agentType: s.agent_type,
         projectDir: s.project_dir,
         state: s.state as import('../store/session-store.js').SessionState,
+        requestedModel: s.requested_model ?? existing?.requestedModel,
+        activeModel: s.active_model ?? existing?.activeModel,
+        modelDisplay: s.active_model ?? existing?.modelDisplay,
+        effort: s.effort ?? existing?.effort,
+        transportConfig: (typeof s.transport_config === 'string'
+          ? JSON.parse(s.transport_config)
+          : (s.transport_config ?? existing?.transportConfig)) as Record<string, unknown> | undefined,
         restarts: existing?.restarts ?? 0,
         restartTimestamps: existing?.restartTimestamps ?? [],
         createdAt: existing?.createdAt ?? Date.now(),
@@ -320,6 +331,11 @@ export async function startup(): Promise<DaemonContext> {
     });
     serverLink.connect();
 
+    // Expose to the global error handlers in src/index.ts so uncaught
+    // exceptions can be surfaced to browsers via daemon.error broadcasts.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).__imcodesGlobalServerLink = serverLink;
+
     // Broadcast cached repo detections after connect so browsers that missed
     // the initial repo.detected push (e.g. connected late, reconnected) get the data.
     setTimeout(() => {
@@ -349,11 +365,26 @@ export async function startup(): Promise<DaemonContext> {
             id,
             sessionType: session.agentType,
             cwd: session.projectDir || null,
+            label: session.label ?? null,
             ccSessionId: session.ccSessionId ?? null,
             geminiSessionId: session.geminiSessionId ?? null,
             parentSession: session.parentSession ?? null,
             ccPresetId: session.ccPreset ?? null,
             description: session.description ?? null,
+            runtimeType: session.runtimeType ?? null,
+            providerId: session.providerId ?? null,
+            providerSessionId: session.providerSessionId ?? null,
+            qwenModel: session.qwenModel ?? null,
+            qwenAuthType: session.qwenAuthType ?? null,
+            qwenAvailableModels: session.qwenAvailableModels ?? null,
+            requestedModel: session.requestedModel ?? null,
+            activeModel: session.activeModel ?? session.modelDisplay ?? null,
+            modelDisplay: session.modelDisplay ?? null,
+            planLabel: session.planLabel ?? null,
+            quotaLabel: session.quotaLabel ?? null,
+            quotaUsageLabel: session.quotaUsageLabel ?? null,
+            effort: session.effort ?? null,
+            transportConfig: session.transportConfig ?? null,
           });
         } catch { /* ignore */ }
       }
@@ -578,6 +609,7 @@ export async function startup(): Promise<DaemonContext> {
   ctx = { config, memory, serverLink, persistBinding, removeBinding, sendSessionEvent };
   setupSignalHandlers();
   startHealthPoller();
+  startCodexQuotaPoller(serverLink);
 
   logger.info('Daemon started');
 
@@ -594,12 +626,13 @@ async function autoReconnectProviders(): Promise<void> {
     const { connectProvider, ensureProviderConnected } = await import('../agent/provider-registry.js');
     const { restoreTransportSessions } = await import('../agent/session-manager.js');
 
-    if (listSessions().some((s) => s.runtimeType === 'transport' && s.providerId === 'qwen')) {
+    for (const providerId of ['qwen', 'claude-code-sdk', 'codex-sdk'] as const) {
+      if (!listSessions().some((s) => s.runtimeType === 'transport' && s.providerId === providerId)) continue;
       try {
-        await ensureProviderConnected('qwen', {});
-        await restoreTransportSessions('qwen');
+        await ensureProviderConnected(providerId, {});
+        await restoreTransportSessions(providerId);
       } catch (err) {
-        logger.warn({ err }, 'Qwen local provider auto-connect failed');
+        logger.warn({ err, providerId }, 'Local transport provider auto-connect failed');
       }
     }
 
@@ -662,6 +695,7 @@ export async function shutdown(exitCode = 0): Promise<void> {
 
   try {
     if (healthTimer) clearInterval(healthTimer);
+    if (codexQuotaTimer) clearInterval(codexQuotaTimer);
     hookServer?.close();
     ctx?.serverLink?.disconnect();
     await flushStore();
@@ -682,7 +716,9 @@ export async function shutdown(exitCode = 0): Promise<void> {
 }
 
 const HEALTH_POLL_MS = 30_000;
+const CODEX_QUOTA_REFRESH_MS = 60_000;
 let healthTimer: ReturnType<typeof setInterval> | null = null;
+let codexQuotaTimer: ReturnType<typeof setInterval> | null = null;
 let hookServer: http.Server | null = null;
 
 /** Periodically check all running sessions; restart any that have disappeared or died. */
@@ -723,14 +759,23 @@ function startHealthPoller(): void {
   }, HEALTH_POLL_MS);
 }
 
+function startCodexQuotaPoller(serverLink: ServerLink | null): void {
+  if (!serverLink) return;
+  codexQuotaTimer = setInterval(() => {
+    void refreshCodexQuotaMetadata(serverLink).catch((err) => {
+      logger.warn({ err }, 'Codex quota refresh failed');
+    });
+  }, CODEX_QUOTA_REFRESH_MS);
+}
+
 function setupSignalHandlers(): void {
   const handler = () => shutdown(0);
   process.on('SIGTERM', handler);
   process.on('SIGINT', handler);
-  process.on('uncaughtException', (err) => {
-    logger.error({ err }, 'Uncaught exception');
-    shutdown(1);
-  });
+  // NOTE: uncaughtException / unhandledRejection are handled in src/index.ts
+  // with a "daemon stays alive" policy.  We must NOT register a shutdown
+  // handler here — that would override the keep-alive behavior and let any
+  // stray error take the daemon down.
 }
 
 export function getDaemonContext(): DaemonContext {

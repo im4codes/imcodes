@@ -228,6 +228,28 @@ describe('SessionControls', () => {
     expect(screen.queryByText(/qwen3-max-2026-01-23/)).toBeNull();
   });
 
+  it('shows level control for qwen and sends /thinking', () => {
+    const ws = makeWs();
+    render(<SessionControls
+      ws={ws as any}
+      activeSession={makeSession({
+        name: 'qwen-session',
+        agentType: 'qwen',
+        runtimeType: 'transport',
+        effort: 'medium',
+      })}
+      quickData={makeQuickData() as any}
+    />);
+
+    fireEvent.click(screen.getByRole('button', { name: /^medium$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /high/i }));
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      sessionName: 'qwen-session',
+      text: '/thinking high',
+    });
+  });
+
+
   it('sends message to running transport session without blocking (queuing is daemon-side)', () => {
     const ws = makeWs();
     const runningSession = makeSession({
@@ -279,6 +301,30 @@ describe('SessionControls', () => {
     // Transport sessions send /stop instead of raw escape byte
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', { sessionName: 'qwen-session', text: '/stop' });
     expect(ws.sendInput).not.toHaveBeenCalled();
+  });
+
+  it('keeps transport Stop enabled even when session state is idle', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-session',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          state: 'idle',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const stopBtn = screen.getByRole('button', { name: /^stop$/i }) as HTMLButtonElement;
+    expect(stopBtn.disabled).toBe(false);
+    fireEvent.click(stopBtn);
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      sessionName: 'codex-sdk-session',
+      text: '/stop',
+    });
   });
 
   it('pressing Shift+Enter does not submit', () => {
@@ -366,14 +412,9 @@ describe('SessionControls', () => {
     expect(input.textContent).toBe('@@w1(audit) ');
 
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
-    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
-
     input.textContent = `${input.textContent}please review`;
     fireEvent.input(input);
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
-
-    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: /send_anyway/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       sessionName: 'deck_my-project_brain',
@@ -490,7 +531,7 @@ describe('SessionControls', () => {
     getSelectionSpy.mockRestore();
   });
 
-  it('manual @@label(mode) text also triggers the single-agent reminder when exactly one target resolves', () => {
+  it('manual @@label(mode) text sends p2pAtTargets when exactly one target resolves', () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -507,9 +548,6 @@ describe('SessionControls', () => {
     input.textContent = '@@plan(Audit) check this';
     fireEvent.input(input);
     fireEvent.click(screen.getByRole('button', { name: /send/i }));
-
-    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: /send_anyway/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
       sessionName: 'deck_my-project_brain',
@@ -727,7 +765,7 @@ describe('SessionControls', () => {
       expect(document.querySelector('.attachment-badge')).toBeNull();
     });
 
-    it('shows a single-agent reminder before sending one @-picked target', () => {
+    it('sends a full P2P command immediately for one @-picked target', () => {
       const ws = makeWs();
       render(
         <SessionControls
@@ -753,11 +791,6 @@ describe('SessionControls', () => {
       input.textContent = `${input.textContent}please review`;
       fireEvent.input(input);
       fireEvent.click(screen.getByRole('button', { name: /send/i }));
-
-      expect(ws.sendSessionCommand).not.toHaveBeenCalled();
-      expect(screen.getByText('title')).toBeDefined();
-
-      fireEvent.click(screen.getByRole('button', { name: /send_anyway/i }));
 
       expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
         sessionName: 'deck_my-project_brain',
@@ -766,53 +799,12 @@ describe('SessionControls', () => {
           { session: 'deck_sub_w1', mode: 'audit' },
         ],
       }));
-
-      getSelectionSpy.mockRestore();
-    });
-
-    it('can suppress the single-agent reminder for this account', () => {
-      const ws = makeWs();
-      render(
-        <SessionControls
-          ws={ws as any}
-          activeSession={mainSession}
-          quickData={makeQuickData() as any}
-          sessions={[mainSession]}
-          subSessions={[
-            { sessionName: 'deck_sub_w1', type: 'codex', label: 'w1', state: 'idle', parentSession: 'deck_my-project_brain' },
-          ]}
-        />,
-      );
-      const input = screen.getByRole('textbox') as HTMLDivElement;
-      const getSelectionSpy = vi.spyOn(window, 'getSelection').mockImplementation(() => ({
-        anchorOffset: input.textContent?.length ?? 0,
-      }) as any);
-
-      input.textContent = '@';
-      fireEvent.input(input);
-      fireEvent.click(screen.getByText('agents'));
-      fireEvent.click(screen.getByText('w1'));
-      fireEvent.click(screen.getByText('audit'));
-      input.textContent = `${input.textContent}please review`;
-      fireEvent.input(input);
-      fireEvent.click(screen.getByRole('button', { name: /send/i }));
-
-      fireEvent.click(screen.getByRole('checkbox'));
-      fireEvent.click(screen.getByRole('button', { name: /send_anyway/i }));
-
-      expect(saveUserPrefMock).toHaveBeenCalledWith('atpicker_single_agent_prompt_dismissed', '1');
-
-      input.textContent = '@@w1(audit) again';
-      fireEvent.input(input);
-      fireEvent.click(screen.getByRole('button', { name: /send/i }));
-
       expect(screen.queryByText('title')).toBeNull();
-      expect(ws.sendSessionCommand).toHaveBeenCalledTimes(2);
 
       getSelectionSpy.mockRestore();
     });
 
-    it('also warns for handwritten single-agent @@ targets', () => {
+    it('sends a full P2P command immediately for handwritten single-agent @@ targets', () => {
       const ws = makeWs();
       render(
         <SessionControls
@@ -830,11 +822,17 @@ describe('SessionControls', () => {
       fireEvent.input(input);
       fireEvent.click(screen.getByRole('button', { name: /send/i }));
 
-      expect(ws.sendSessionCommand).not.toHaveBeenCalled();
-      expect(screen.getByText('title')).toBeDefined();
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+        sessionName: 'deck_my-project_brain',
+        text: 'please review',
+        p2pAtTargets: [
+          { session: 'deck_sub_w1', mode: 'audit' },
+        ],
+      }));
+      expect(screen.queryByText('title')).toBeNull();
     });
 
-    it('does not warn for @@all', () => {
+    it('does not show any warning for @@all', () => {
       const ws = makeWs();
       render(
         <SessionControls
@@ -858,6 +856,57 @@ describe('SessionControls', () => {
         sessionName: 'deck_my-project_brain',
         text: 'please review',
       }));
+    });
+  });
+
+
+  it('shows the same transport controls for sub-sessions as main sessions', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-sub',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          effort: 'high',
+          state: 'running',
+          quotaLabel: '5h 11% 2h03m 4/6 14:40 · 7d 50% 1d04h 4/8 15:48',
+        })}
+        quickData={makeQuickData() as any}
+        onSubStop={vi.fn()}
+        onSubRestart={vi.fn()}
+        onSubNew={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /^Stop$/ })).toBeDefined();
+    expect(screen.getByTitle('actions')).toBeDefined();
+    expect(screen.getByRole('button', { name: /^high$/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /^default$/i })).toBeDefined();
+  });
+
+  it('shows thinking control for codex-sdk and sends /thinking command', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-session',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          effort: 'medium',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^medium$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /high/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      sessionName: 'codex-sdk-session',
+      text: '/thinking high',
     });
   });
 });

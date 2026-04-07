@@ -2,9 +2,15 @@ export interface WindowsUpgradeScriptInput {
   logFile: string;
   scriptDir: string;
   cleanupPath: string;
+  /** VBS wrapper that runs the cleanup cmd hidden (no flashing window) */
+  cleanupVbsPath: string;
   npmCmd: string;
   pkgSpec: string;
   targetVer: string;
+  /** Absolute path to daemon-launcher.vbs for hidden restart */
+  vbsLauncherPath: string;
+  /** Sentinel file — while it exists the watchdog loop pauses */
+  upgradeLockFile: string;
 }
 
 export function buildWindowsCleanupScript(scriptDir: string): string {
@@ -14,19 +20,58 @@ rmdir /s /q "${scriptDir}"\r
 `;
 }
 
+/** VBS wrapper that runs the cleanup cmd in a hidden window (no taskbar flash).
+ *  `On Error Resume Next` ensures no error dialog pops up. */
+export function buildWindowsCleanupVbs(cleanupPath: string): string {
+  return `On Error Resume Next\r\nSet WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${cleanupPath}""", 0, False\r\n`;
+}
+
+/** VBS wrapper that runs the upgrade batch in a hidden window.
+ *  Without this, child processes spawned by the batch (wmic, find, tasklist)
+ *  may flash visible console windows on some Windows versions.
+ *  `On Error Resume Next` ensures no error dialog pops up. */
+export function buildWindowsUpgradeVbs(batchPath: string): string {
+  return `On Error Resume Next\r\nSet WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${batchPath}""", 0, False\r\n`;
+}
+
 export function buildWindowsUpgradeBatch(input: WindowsUpgradeScriptInput): string {
-  const { logFile, cleanupPath, npmCmd, pkgSpec, targetVer } = input;
+  const { logFile, cleanupVbsPath, npmCmd, pkgSpec, targetVer, vbsLauncherPath, upgradeLockFile } = input;
   return `@echo off\r
 setlocal EnableDelayedExpansion\r
 echo === imcodes upgrade started at %date% %time% === >> "${logFile}"\r
 timeout /t 2 /nobreak > nul\r
 \r
+rem ── Create upgrade lock — watchdog will pause while this file exists ──\r
+echo upgrade > "${upgradeLockFile}"\r
+echo Upgrade lock created >> "${logFile}"\r
+\r
+rem ── Kill daemon + old watchdog so npm can overwrite files cleanly ─────\r
+rem Old watchdog versions don't know about the lock file, so we must kill\r
+rem them.  After npm install, repair-watchdog generates a new watchdog\r
+rem that respects the lock.\r
+set "PIDFILE=%USERPROFILE%\\.imcodes\\daemon.pid"\r
+if exist "%PIDFILE%" (\r
+  set /p OLD_PID=<"%PIDFILE%"\r
+  echo Stopping daemon PID !OLD_PID! and old watchdog... >> "${logFile}"\r
+  rem Find watchdog (parent of daemon) and tree-kill it\r
+  for /f "tokens=2 delims==" %%a in ('wmic process where "ProcessId=!OLD_PID!" get ParentProcessId /format:list 2^>nul ^| find "="') do (\r
+    set "WD_PID=%%a"\r
+  )\r
+  if defined WD_PID (\r
+    taskkill /f /t /pid !WD_PID! >nul 2>&1\r
+  )\r
+  taskkill /f /pid !OLD_PID! >nul 2>&1\r
+  timeout /t 2 /nobreak >nul\r
+)\r
+\r
 echo Installing ${pkgSpec}... >> "${logFile}"\r
 call "${npmCmd}" install -g ${pkgSpec} >> "${logFile}" 2>&1\r
 if %errorlevel% neq 0 (\r
-  echo Install FAILED — keeping current daemon running. >> "${logFile}"\r
+  echo Install FAILED — removing lock, watchdog will restart current version. >> "${logFile}"\r
   echo === upgrade aborted at %date% %time% === >> "${logFile}"\r
-  start "" /min cmd /c "${cleanupPath}" >nul 2>&1\r
+  del "${upgradeLockFile}" >nul 2>&1\r
+  if exist "${vbsLauncherPath}" wscript "${vbsLauncherPath}"\r
+  wscript "${cleanupVbsPath}" >nul 2>&1\r
   goto :done\r
 )\r
 \r
@@ -35,7 +80,9 @@ for /f "usebackq delims=" %%p in (\`call "${npmCmd}" prefix -g 2^>nul\`) do if n
 if not defined NPM_PREFIX (\r
   echo Could not resolve npm global prefix after install. >> "${logFile}"\r
   echo === upgrade aborted at %date% %time% === >> "${logFile}"\r
-  start "" /min cmd /c "${cleanupPath}" >nul 2>&1\r
+  del "${upgradeLockFile}" >nul 2>&1\r
+  if exist "${vbsLauncherPath}" wscript "${vbsLauncherPath}"\r
+  wscript "${cleanupVbsPath}" >nul 2>&1\r
   goto :done\r
 )\r
 \r
@@ -43,7 +90,9 @@ set "CLI_SHIM=%NPM_PREFIX%\\imcodes.cmd"\r
 if not exist "%CLI_SHIM%" (\r
   echo imcodes shim missing after install: %CLI_SHIM% >> "${logFile}"\r
   echo === upgrade aborted at %date% %time% === >> "${logFile}"\r
-  start "" /min cmd /c "${cleanupPath}" >nul 2>&1\r
+  del "${upgradeLockFile}" >nul 2>&1\r
+  if exist "${vbsLauncherPath}" wscript "${vbsLauncherPath}"\r
+  wscript "${cleanupVbsPath}" >nul 2>&1\r
   goto :done\r
 )\r
 \r
@@ -51,9 +100,11 @@ set "INSTALLED_VER="\r
 for /f "usebackq delims=" %%v in (\`call "%CLI_SHIM%" --version 2^>nul\`) do if not defined INSTALLED_VER set "INSTALLED_VER=%%v"\r
 echo Install succeeded. Installed version: %INSTALLED_VER%, target: ${targetVer}, shim: %CLI_SHIM% >> "${logFile}"\r
 if not "${targetVer}"=="latest" if /I not "%INSTALLED_VER%"=="${targetVer}" (\r
-  echo Version mismatch after install — keeping current daemon running. >> "${logFile}"\r
+  echo Version mismatch after install — removing lock, watchdog will restart. >> "${logFile}"\r
   echo === upgrade aborted at %date% %time% === >> "${logFile}"\r
-  start "" /min cmd /c "${cleanupPath}" >nul 2>&1\r
+  del "${upgradeLockFile}" >nul 2>&1\r
+  if exist "${vbsLauncherPath}" wscript "${vbsLauncherPath}"\r
+  wscript "${cleanupVbsPath}" >nul 2>&1\r
   goto :done\r
 )\r
 where imcodes >nul 2>&1\r
@@ -66,11 +117,22 @@ call "%CLI_SHIM%" repair-watchdog >> "${logFile}" 2>&1\r
 if %errorlevel% neq 0 (\r
   echo WARNING: Launch chain regeneration failed >> "${logFile}"\r
 )\r
-echo Restarting daemon via CLI watchdog path... >> "${logFile}"\r
-call "%CLI_SHIM%" restart >> "${logFile}" 2>&1\r
-if %errorlevel% neq 0 echo Restart command failed (exit %errorlevel%). >> "${logFile}"\r
-timeout /t 8 /nobreak >nul\r
-set "PIDFILE=%USERPROFILE%\\.imcodes\\daemon.pid"\r
+\r
+rem ── Start new watchdog (lock-aware), then remove lock ─────────────────\r
+rem The new watchdog (generated by repair-watchdog) checks the lock file.\r
+rem It will loop/wait while the lock exists, then start the daemon once\r
+rem we delete it below.\r
+echo Starting new watchdog via VBS... >> "${logFile}"\r
+if exist "${vbsLauncherPath}" (\r
+  wscript "${vbsLauncherPath}"\r
+) else (\r
+  echo WARNING: VBS launcher not found at ${vbsLauncherPath} >> "${logFile}"\r
+)\r
+echo Removing upgrade lock... >> "${logFile}"\r
+del "${upgradeLockFile}" >nul 2>&1\r
+\r
+rem Wait for new watchdog to start the daemon, then health-check\r
+timeout /t 10 /nobreak >nul\r
 if exist "%PIDFILE%" (\r
   set /p DAEMON_PID=<"%PIDFILE%"\r
   tasklist /fi "PID eq !DAEMON_PID!" /nh 2^>nul | find "!DAEMON_PID!" >nul\r
@@ -82,7 +144,7 @@ if exist "%PIDFILE%" (\r
 ) else (\r
   echo Health check FAILED: daemon.pid not found >> "${logFile}"\r
 )\r
-start "" /min cmd /c "${cleanupPath}" >nul 2>&1\r
+wscript "${cleanupVbsPath}" >nul 2>&1\r
 :done\r
 echo === upgrade done at %date% %time% === >> "${logFile}"\r
 `;

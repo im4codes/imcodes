@@ -1,5 +1,5 @@
 /**
- * StartSubSessionDialog — choose type (cc/codex/opencode/gemini/qwen/shell/openclaw) and launch a sub-session.
+ * StartSubSessionDialog — choose type (cc/cc-sdk/codex/codex-sdk/opencode/gemini/qwen/shell/openclaw) and launch a sub-session.
  */
 import { useState, useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
@@ -7,6 +7,7 @@ import type { WsClient } from '../ws-client.js';
 import type { RemoteSession } from '../hooks/useProviderStatus.js';
 import { FileBrowser } from './FileBrowser.js';
 import { getUserPref, saveUserPref } from '../api.js';
+import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '@shared/effort-levels.js';
 
 interface Props {
   ws: WsClient | null;
@@ -20,7 +21,9 @@ interface Props {
 
 const BASE_AGENT_TYPES = [
   { id: 'claude-code', label: 'Claude Code', icon: '⚡' },
+  { id: 'claude-code-sdk', label: 'Claude Code SDK', icon: '⚡' },
   { id: 'codex', label: 'Codex', icon: '📦' },
+  { id: 'codex-sdk', label: 'Codex SDK', icon: '📦' },
   { id: 'opencode', label: 'OpenCode', icon: '🔆' },
   { id: 'gemini', label: 'Gemini CLI', icon: '♊' },
   { id: 'qwen', label: 'Qwen Code', icon: '千' },
@@ -43,6 +46,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const [scriptInterval, setScriptInterval] = useState('5');
   const [detectingShells, setDetectingShells] = useState(false);
   const [showDirBrowser, setShowDirBrowser] = useState(false);
+  const [thinking, setThinking] = useState<TransportEffortLevel>('high');
 
   // OpenClaw-specific state
   const [ocMode, setOcMode] = useState<OpenClawMode>('new');
@@ -108,6 +112,10 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     }
   }, [type, ocMode, ocSessionKey]);
 
+  useEffect(() => {
+    setThinking('high');
+  }, [type]);
+
   const handleStart = () => {
     const desc = description.trim() || undefined;
     if (type === 'script') {
@@ -121,8 +129,8 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     if (type === 'openclaw') {
       const extra =
         ocMode === 'bind'
-          ? { ocMode: 'bind', ocSessionId: ocSelectedSession, description: desc }
-          : { ocMode: 'new', ocSessionKey: ocSessionKey.trim(), description: desc };
+          ? { ocMode: 'bind', ocSessionId: ocSelectedSession, description: desc, thinking }
+          : { ocMode: 'new', ocSessionKey: ocSessionKey.trim(), description: desc, thinking };
       onStart('openclaw', undefined, cwd || undefined, label || undefined, extra);
       return;
     }
@@ -132,10 +140,21 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     }
     const extra: Record<string, unknown> = {};
     if (desc) extra.description = desc;
-    if (ccPreset && type === 'claude-code') extra.ccPreset = ccPreset;
-    if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
+    if (ccPreset && (type === 'claude-code' || type === 'claude-code-sdk')) extra.ccPreset = ccPreset;
+    if (ccInitPrompt.trim() && (type === 'claude-code' || type === 'claude-code-sdk')) extra.ccInitPrompt = ccInitPrompt.trim();
+    if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'qwen') extra.thinking = thinking;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
+
+  const thinkingLevels = type === 'claude-code-sdk'
+    ? CLAUDE_SDK_EFFORT_LEVELS
+    : type === 'codex-sdk'
+      ? CODEX_SDK_EFFORT_LEVELS
+      : type === 'qwen'
+        ? QWEN_EFFORT_LEVELS
+      : type === 'openclaw'
+        ? OPENCLAW_THINKING_LEVELS
+        : [];
 
   return (
     <div class="dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
@@ -156,7 +175,15 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                   class={`subsession-type-btn${type === at.id ? ' active' : ''}`}
                   onClick={() => setType(at.id)}
                 >
-                  <span>{at.icon}</span> {at.id === 'openclaw' || at.id === 'qwen' ? t(`session.agentType.${at.id}`) : at.label}
+                  <span>{at.icon}</span> {at.id === 'openclaw'
+                    ? t('session.agentType.openclaw')
+                    : at.id === 'qwen'
+                      ? t('session.agentType.qwen')
+                      : at.id === 'claude-code-sdk'
+                        ? t('session.agentType.claude_code_sdk')
+                        : at.id === 'codex-sdk'
+                          ? t('session.agentType.codex_sdk')
+                          : at.label}
                 </button>
               ))}
             </div>
@@ -391,6 +418,23 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                 </div>
               )}
             </>
+          )}
+
+          {/* Working directory */}
+          {thinkingLevels.length > 0 && (
+            <div>
+              <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.thinking')}</div>
+              <select
+                class="input"
+                value={thinking}
+                onChange={(e) => setThinking((e.target as HTMLSelectElement).value as TransportEffortLevel)}
+                style={{ width: '100%' }}
+              >
+                {thinkingLevels.map((level) => (
+                  <option key={level} value={level}>{level}</option>
+                ))}
+              </select>
+            </div>
           )}
 
           {/* Working directory */}

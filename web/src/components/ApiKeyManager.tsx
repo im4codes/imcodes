@@ -1,6 +1,6 @@
 import { useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { apiFetch } from '../api.js';
+import { apiFetch, getApiBaseUrl } from '../api.js';
 
 interface KeyInfo {
   id: string;
@@ -86,14 +86,18 @@ export function ApiKeyManager({ keys, onKeysChanged }: Props) {
   const [newLabel, setNewLabel] = useState('');
   const [newKey, setNewKey] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
-  const [copied, setCopied] = useState(false);
+  const [copiedTarget, setCopiedTarget] = useState<'key' | 'bind_url' | 'bind_command' | null>(null);
   const [revokeTarget, setRevokeTarget] = useState<RevokeTarget | null>(null);
 
   const [genError, setGenError] = useState<string | null>(null);
 
+  const bindUrl = newKey ? `${getApiBaseUrl()}/bind/${newKey}` : '';
+  const bindCommand = bindUrl ? `imcodes bind ${bindUrl}` : '';
+
   const handleGenerate = async () => {
     setGenerating(true);
     setGenError(null);
+    setCopiedTarget(null);
     try {
       const body = newLabel.trim() ? { label: newLabel.trim() } : {};
       const res = await apiFetch<{ id: string; apiKey: string }>('/api/auth/user/me/keys', {
@@ -123,12 +127,11 @@ export function ApiKeyManager({ keys, onKeysChanged }: Props) {
     }
   };
 
-  const handleCopy = () => {
-    if (newKey) {
-      navigator.clipboard.writeText(newKey);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    }
+  const handleCopy = (target: 'key' | 'bind_url' | 'bind_command', text: string) => {
+    if (!text) return;
+    navigator.clipboard.writeText(text);
+    setCopiedTarget(target);
+    setTimeout(() => setCopiedTarget((prev) => (prev === target ? null : prev)), 2000);
   };
 
   return (
@@ -143,30 +146,50 @@ export function ApiKeyManager({ keys, onKeysChanged }: Props) {
     <div style={{ marginTop: 32 }}>
       <h2 style={{ fontSize: 18, marginBottom: 16 }}>API Keys</h2>
 
-      {/* New key reveal */}
       {newKey && (
         <div style={{ background: '#1e293b', border: '1px solid #f59e0b', borderRadius: 8, padding: 16, marginBottom: 16 }}>
-          <div style={{ color: '#f59e0b', fontWeight: 600, marginBottom: 8 }}>Save this key — it will not be shown again</div>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            <code style={{ flex: 1, wordBreak: 'break-all', fontSize: 13, color: '#e2e8f0' }}>{newKey}</code>
-            <button class="btn btn-primary" style={{ whiteSpace: 'nowrap' }} onClick={handleCopy}>
-              {copied ? t('api_key.copied') : t('api_key.copy')}
-            </button>
+          <div style={{ color: '#f59e0b', fontWeight: 600, marginBottom: 8 }}>{t('api_key.save_once')}</div>
+          <div style={{ display: 'grid', gap: 10 }}>
+            <div>
+              <div style={{ color: '#94a3b8', fontSize: 12, marginBottom: 4 }}>{t('api_key.raw_key')}</div>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <code style={{ flex: 1, wordBreak: 'break-all', fontSize: 13, color: '#e2e8f0' }}>{newKey}</code>
+                <button class="btn btn-secondary" style={{ whiteSpace: 'nowrap' }} onClick={() => handleCopy('key', newKey)}>
+                  {copiedTarget === 'key' ? t('api_key.copied') : t('api_key.copy')}
+                </button>
+              </div>
+            </div>
+            <div>
+              <div style={{ color: '#94a3b8', fontSize: 12, marginBottom: 4 }}>{t('api_key.bind_url')}</div>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <code style={{ flex: 1, wordBreak: 'break-all', fontSize: 13, color: '#e2e8f0' }}>{bindUrl}</code>
+                <button class="btn btn-secondary" style={{ whiteSpace: 'nowrap' }} onClick={() => handleCopy('bind_url', bindUrl)}>
+                  {copiedTarget === 'bind_url' ? t('api_key.copied') : t('api_key.copy')}
+                </button>
+              </div>
+            </div>
+            <div>
+              <div style={{ color: '#94a3b8', fontSize: 12, marginBottom: 4 }}>{t('api_key.bind_command')}</div>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <code style={{ flex: 1, wordBreak: 'break-all', fontSize: 13, color: '#e2e8f0' }}>{bindCommand}</code>
+                <button class="btn btn-primary" style={{ whiteSpace: 'nowrap' }} onClick={() => handleCopy('bind_command', bindCommand)}>
+                  {copiedTarget === 'bind_command' ? t('api_key.copied') : t('api_key.copy_bind_command')}
+                </button>
+              </div>
+            </div>
           </div>
           <button class="btn btn-secondary" style={{ marginTop: 8, fontSize: 12 }} onClick={() => setNewKey(null)}>
-            Dismiss
+            {t('api_key.dismiss')}
           </button>
         </div>
       )}
 
-      {/* Generate error */}
       {genError && (
         <div style={{ color: '#f87171', marginBottom: 12, fontSize: 13, wordBreak: 'break-all' }}>
           [Error] {genError}
         </div>
       )}
 
-      {/* Generate new key */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
         <input
           type="text"
@@ -180,7 +203,6 @@ export function ApiKeyManager({ keys, onKeysChanged }: Props) {
         </button>
       </div>
 
-      {/* Key list */}
       {keys.length === 0 ? (
         <div style={{ color: '#64748b', padding: 16, textAlign: 'center' }}>No API keys yet.</div>
       ) : (

@@ -60,6 +60,7 @@ describe('sub-session metadata via subsession.created', () => {
       planLabel: 'Free',
       quotaLabel: '1,000/day',
       quotaUsageLabel: 'today 5/1000',
+      effort: 'medium',
     }));
 
     expect(captured).toHaveLength(1);
@@ -70,6 +71,7 @@ describe('sub-session metadata via subsession.created', () => {
     expect(s.planLabel).toBe('Free');
     expect(s.quotaLabel).toBe('1,000/day');
     expect(s.quotaUsageLabel).toBe('today 5/1000');
+    expect(s.effort).toBe('medium');
   });
 
   it('defaults metadata to null when not provided', async () => {
@@ -118,11 +120,13 @@ describe('sub-session metadata via subsession.sync', () => {
       modelDisplay: 'Qwen Turbo',
       planLabel: 'Paid',
       quotaUsageLabel: 'today 10/5000',
+      effort: 'high',
     }));
 
     expect(captured[0].modelDisplay).toBe('Qwen Turbo');
     expect(captured[0].planLabel).toBe('Paid');
     expect(captured[0].quotaUsageLabel).toBe('today 10/5000');
+    expect(captured[0].effort).toBe('high');
   });
 
   it('ignores sync for unknown id', async () => {
@@ -141,6 +145,35 @@ describe('sub-session metadata via subsession.sync', () => {
     const before = [...captured];
     act(() => send({ type: 'subsession.sync', id: 'unknown123', modelDisplay: 'nope' }));
     expect(captured).toEqual(before);
+  });
+
+
+  it('stores codex-sdk model, level, and quota metadata from sync', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'cxsdk1',
+      sessionName: 'deck_sub_cxsdk1',
+      sessionType: 'codex-sdk',
+      state: 'running',
+    }));
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'cxsdk1',
+      modelDisplay: 'gpt-5.4',
+      planLabel: 'Pro',
+      quotaLabel: '5h 11% 2h03m 4/6 14:40 · 7d 50% 1d04h 4/8 15:48',
+      effort: 'high',
+    }));
+
+    expect(captured[0].modelDisplay).toBe('gpt-5.4');
+    expect(captured[0].planLabel).toBe('Pro');
+    expect(captured[0].quotaLabel).toContain('5h 11%');
+    expect(captured[0].effort).toBe('high');
   });
 
   it('partial sync keeps existing values', async () => {

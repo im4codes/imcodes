@@ -42,8 +42,14 @@ vi.mock('react-i18next', () => {
     'file_browser.select': 'Select',
     'file_browser.browse': 'Browse',
     'file_browser.show_hidden': 'Hidden',
+    'file_browser.this_pc': 'This PC',
+    'file_browser.home': 'Home',
     'file_browser.timeout': 'Request timed out',
+    'file_browser.mkdir_failed': 'Failed to create folder',
     'common.cancel': 'Cancel',
+    'chat.new_folder': 'New folder',
+    'chat.new_folder_name': 'Folder name',
+    'chat.create': 'Create',
   };
   const t = (key: string, opts?: Record<string, unknown>) => {
     if (key === 'file_browser.insert') return `Insert ${opts?.count ?? 0}`;
@@ -66,6 +72,11 @@ function makeWsFactory() {
     lastSentIncludeFiles = includeFiles;
     return lastRequestId;
   });
+  const fsMkdir = vi.fn((path: string) => {
+    lastSentPath = path;
+    lastRequestId = 'mock-mkdir-id';
+    return lastRequestId;
+  });
 
   const ws: WsClient = {
     onMessage: (handler: (msg: ServerMessage) => void) => {
@@ -73,6 +84,7 @@ function makeWsFactory() {
       return () => { messageHandler = null; };
     },
     fsListDir,
+    fsMkdir,
     fsReadFile: vi.fn(() => 'mock-read-id'),
     fsGitStatus: vi.fn(() => 'mock-git-status-id'),
     fsGitDiff: vi.fn(() => 'mock-git-diff-id'),
@@ -101,7 +113,7 @@ function makeWsFactory() {
 
   const sendMsg = (msg: ServerMessage) => messageHandler?.(msg);
 
-  return { ws, fsListDir, respond, respondError, sendMsg, getLastPath: () => lastSentPath, getIncludeFiles: () => lastSentIncludeFiles };
+  return { ws, fsListDir, fsMkdir, respond, respondError, sendMsg, getLastPath: () => lastSentPath, getIncludeFiles: () => lastSentIncludeFiles };
 }
 
 describe('FileBrowser', () => {
@@ -192,6 +204,95 @@ describe('FileBrowser', () => {
     expect(getByText('documents')).toBeDefined();
   });
 
+  it('uses entry.path from a Windows drive root listing', async () => {
+    const { ws, respond } = makeWsFactory();
+    render(
+      <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath=":drives:" onConfirm={vi.fn()} onClose={vi.fn()} />,
+    );
+
+    act(() => respond([
+      { name: 'C:\\', path: 'C:\\', isDir: true },
+      { name: 'D:\\', path: 'D:\\', isDir: true },
+    ] as any, '__imcodes_windows_drives__'));
+
+    expect(await screen.findByText('C:\\')).toBeTruthy();
+    expect(await screen.findByText('D:\\')).toBeTruthy();
+  });
+
+  it('initialPath="~" requests home directory, NOT the drives sentinel', async () => {
+    const { ws, fsListDir, respond } = makeWsFactory();
+    render(
+      <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath="~" onConfirm={vi.fn()} onClose={vi.fn()} />,
+    );
+
+    // First call should ask for ~ (home), not :drives:
+    const calls = fsListDir.mock.calls.map((c) => c[0]);
+    expect(calls).toContain('~');
+    expect(calls).not.toContain(':drives:');
+
+    // Daemon resolves ~ to actual home path
+    act(() => respond([
+      { name: 'projects', isDir: true },
+      { name: 'Documents', isDir: true },
+    ], 'C:\\Users\\admin'));
+
+    expect(await screen.findByText('projects')).toBeTruthy();
+    expect(await screen.findByText('Documents')).toBeTruthy();
+  });
+
+  it('shows "This PC" drive switch button when current path looks like Windows', async () => {
+    const { ws, fsListDir, respond } = makeWsFactory();
+    const { container } = render(
+      <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath="~" onConfirm={vi.fn()} onClose={vi.fn()} />,
+    );
+
+    // Resolve home to a Windows-style path
+    act(() => respond([{ name: 'projects', isDir: true }], 'C:\\Users\\admin'));
+    await screen.findByText('projects');
+
+    // Drive switch button should be visible
+    const driveBtn = container.querySelector('button[title*="This PC"]');
+    expect(driveBtn).toBeTruthy();
+
+    // Clicking it requests the :drives: sentinel
+    fsListDir.mockClear();
+    act(() => { fireEvent.click(driveBtn as Element); });
+    expect(fsListDir.mock.calls.map((c) => c[0])).toContain(':drives:');
+  });
+
+  it('does NOT show drive switch button on Linux paths', async () => {
+    const { ws, respond } = makeWsFactory();
+    const { container } = render(
+      <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath="~" onConfirm={vi.fn()} onClose={vi.fn()} />,
+    );
+
+    act(() => respond([{ name: 'projects', isDir: true }], '/home/admin'));
+    await screen.findByText('projects');
+
+    const driveBtn = container.querySelector('button[title*="This PC"]');
+    expect(driveBtn).toBeNull();
+  });
+
+  it('drive button toggles to "Home" when at drives root', async () => {
+    const { ws, fsListDir, respond } = makeWsFactory();
+    const { container } = render(
+      <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath=":drives:" onConfirm={vi.fn()} onClose={vi.fn()} />,
+    );
+
+    act(() => respond([
+      { name: 'C:\\', path: 'C:\\', isDir: true },
+    ] as any, '__imcodes_windows_drives__'));
+    await screen.findByText('C:\\');
+
+    // Button should now offer to go Home
+    const homeBtn = container.querySelector('button[title="Home"]');
+    expect(homeBtn).toBeTruthy();
+
+    fsListDir.mockClear();
+    act(() => { fireEvent.click(homeBtn as Element); });
+    expect(fsListDir.mock.calls.map((c) => c[0])).toContain('~');
+  });
+
   it('shows error indicator on fs.ls_response with status error', async () => {
     const { ws, respondError } = makeWsFactory();
     const { getByTitle } = render(
@@ -226,6 +327,35 @@ describe('FileBrowser', () => {
     // Re-click the already-loaded node's parent (root breadcrumb area)
     // The key check: clicking the root node's expand arrow should not re-fetch
     expect(fsListDir.mock.calls.length).toBeGreaterThanOrEqual(callsBefore); // at minimum no regression
+  });
+
+  it('creates a new folder and refreshes the parent directory after fs.mkdir_response', async () => {
+    const { ws, respond, sendMsg, fsMkdir, fsListDir } = makeWsFactory();
+    const { getByTitle, getByPlaceholderText, getByText } = render(
+      <FileBrowser ws={ws} mode="dir-only" layout="modal" initialPath="/home/user" onConfirm={vi.fn()} onClose={vi.fn()} />,
+    );
+
+    await act(async () => {
+      respond([{ name: 'projects', isDir: true }], '/home/user');
+    });
+
+    await act(async () => {
+      fireEvent.click(getByTitle('New folder'));
+    });
+    await act(async () => {
+      fireEvent.input(getByPlaceholderText('Folder name'), { target: { value: 'newdir' } });
+    });
+    await act(async () => {
+      fireEvent.click(getByText('Create'));
+    });
+
+    expect(fsMkdir).toHaveBeenCalledWith('/home/user/newdir');
+
+    await act(async () => {
+      sendMsg({ type: 'fs.mkdir_response', requestId: 'mock-mkdir-id', path: '/home/user/newdir', resolvedPath: '/home/user/newdir', status: 'ok' } as any);
+    });
+
+    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', false, false);
   });
 
   // ── Selection ──────────────────────────────────────────────────────────
@@ -409,4 +539,3 @@ describe('FileBrowser', () => {
     expect(fsListDir.mock.calls.length).toBeGreaterThan(callsBefore);
   });
 });
-

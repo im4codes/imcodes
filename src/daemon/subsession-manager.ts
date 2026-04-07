@@ -13,7 +13,9 @@ import { timelineStore } from './timeline-store.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { upsertSession, getSession, removeSession } from '../store/session-store.js';
 import { existsSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { resolveStructuredSessionBootstrap } from '../agent/structured-session-bootstrap.js';
+import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 
 import logger from '../util/logger.js';
 import { getAgentVersion } from '../agent/agent-version.js';
@@ -32,6 +34,9 @@ export interface SubSessionRecord {
   runtimeType?: 'process' | 'transport' | null;
   providerId?: string | null;
   providerSessionId?: string | null;
+  requestedModel?: string | null;
+  activeModel?: string | null;
+  transportConfig?: Record<string, unknown> | null;
   parentSession?: string | null;
   /** CC env preset name (e.g. "MiniMax", "DeepSeek"). Resolves to env vars at launch. */
   ccPreset?: string | null;
@@ -39,6 +44,7 @@ export interface SubSessionRecord {
   ccInitPrompt?: string | null;
   /** Session description/persona — injected as background info on start and respawn. */
   description?: string | null;
+  effort?: TransportEffortLevel;
   fresh?: boolean;
   _fileSnapshot?: Set<string>;
   _onGeminiDiscovered?: (sessionId: string) => void;
@@ -72,6 +78,31 @@ export function normalizeShellBinForHost(shellBin?: string | null): string | und
 export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   const sessionName = subSessionName(sub.id);
   const agentType = sub.type as AgentType;
+
+  if (isTransportAgent(agentType)) {
+    if (await getTransportRuntime(sessionName)) return;
+    await launchTransportSession({
+      name: sessionName,
+      projectName: sessionName,
+      role: 'w1',
+      agentType,
+      projectDir: sub.cwd ?? process.cwd(),
+      label: sub.label ?? undefined,
+      description: sub.description ?? undefined,
+      requestedModel: sub.requestedModel ?? undefined,
+      transportConfig: sub.transportConfig ?? undefined,
+      bindExistingKey: sub.providerSessionId ?? undefined,
+      skipCreate: !!sub.providerSessionId,
+      ...(sub.providerSessionId ? { ccSessionId: sub.ccSessionId ?? undefined, codexSessionId: sub.codexSessionId ?? undefined, fresh: sub.fresh } : {}),
+      ...(!sub.providerSessionId && agentType === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
+      ...(!sub.providerSessionId && agentType === 'codex-sdk' ? { fresh: true } : {}),
+      ...(sub.effort ? { effort: sub.effort } : {}),
+      userCreated: true,
+      parentSession: sub.parentSession ?? undefined,
+    });
+    return;
+  }
+
   if (agentType === 'shell' || agentType === 'script') {
     const normalizedShellBin = normalizeShellBinForHost(sub.shellBin);
     if (sub.shellBin && !normalizedShellBin) {
@@ -188,6 +219,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     parentSession: sub.parentSession ?? undefined,
     ccPreset: sub.ccPreset ?? undefined,
     description: sub.description ?? undefined,
+    ...(sub.effort ? { effort: sub.effort } : {}),
     restarts: 0, restartTimestamps: [], createdAt: Date.now(), updatedAt: Date.now()
   });
 
@@ -260,18 +292,21 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
     if (isTransportAgent(sub.type)) {
       const existingRuntime = getTransportRuntime(sessionName);
       if (!existingRuntime) {
-        await launchTransportSession({
-          name: sessionName,
-          projectName: sessionName,
-          role: 'w1',
-          agentType: sub.type,
+      await launchTransportSession({
+        name: sessionName,
+        projectName: sessionName,
+        role: 'w1',
+        agentType: sub.type,
           projectDir: sub.cwd ?? process.cwd(),
-          description: sub.description ?? undefined,
-          label: sub.label ?? undefined,
-          bindExistingKey: sub.providerSessionId ?? undefined,
-          skipCreate: !!sub.providerSessionId,
-          parentSession: sub.parentSession ?? undefined,
-        }).catch((e) => logger.warn({ err: e, sessionName }, 'Failed to rebuild transport sub-session'));
+        description: sub.description ?? undefined,
+        label: sub.label ?? undefined,
+        bindExistingKey: sub.providerSessionId ?? undefined,
+        skipCreate: !!sub.providerSessionId,
+        parentSession: sub.parentSession ?? undefined,
+        requestedModel: sub.requestedModel ?? undefined,
+        effort: sub.effort ?? undefined,
+        transportConfig: sub.transportConfig ?? undefined,
+      }).catch((e) => logger.warn({ err: e, sessionName }, 'Failed to rebuild transport sub-session'));
       }
       continue;
     }
@@ -319,6 +354,16 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         geminiSessionId: effectiveGeminiSessionId ?? undefined,
         opencodeSessionId: effectiveOpenCodeSessionId ?? undefined,
         parentSession: sub.parentSession ?? stored?.parentSession,
+        requestedModel: sub.requestedModel ?? stored?.requestedModel,
+        activeModel: sub.activeModel ?? stored?.activeModel,
+        modelDisplay: sub.activeModel ?? stored?.activeModel ?? stored?.modelDisplay,
+        planLabel: stored?.planLabel,
+        permissionLabel: stored?.permissionLabel,
+        quotaLabel: stored?.quotaLabel,
+        quotaUsageLabel: stored?.quotaUsageLabel,
+        quotaMeta: stored?.quotaMeta,
+        effort: sub.effort ?? stored?.effort,
+        transportConfig: sub.transportConfig ?? stored?.transportConfig,
         // Preserve existing diagnostic fields instead of resetting
         restarts: stored?.restarts ?? 0,
         restartTimestamps: stored?.restartTimestamps ?? [],

@@ -94,6 +94,10 @@ export function useSubSessions(
       parentSession: s.parentSession,
       label: s.label,
       ccPresetId: s.ccPresetId,
+      requestedModel: s.requestedModel,
+      activeModel: s.activeModel,
+      effort: s.effort,
+      transportConfig: s.transportConfig,
     })));
   }, [connected, ws, subSessions]);
 
@@ -123,9 +127,14 @@ export function useSubSessions(
                 ...(m.cwd != null && { cwd: m.cwd }),
                 ...(m.label != null && { label: m.label }),
                 ...(m.modelDisplay != null && { modelDisplay: m.modelDisplay }),
+                ...(m.requestedModel !== undefined && { requestedModel: m.requestedModel }),
+                ...(m.activeModel !== undefined && { activeModel: m.activeModel }),
                 ...(m.planLabel != null && { planLabel: m.planLabel }),
                 ...(m.quotaLabel != null && { quotaLabel: m.quotaLabel }),
                 ...(m.quotaUsageLabel != null && { quotaUsageLabel: m.quotaUsageLabel }),
+                ...(m.quotaMeta !== undefined && { quotaMeta: m.quotaMeta }),
+                ...(m.effort != null && { effort: m.effort }),
+                ...(m.transportConfig !== undefined && { transportConfig: m.transportConfig }),
                 ...(m.qwenModel != null && { qwenModel: m.qwenModel }),
                 ...(m.qwenAuthType != null && { qwenAuthType: m.qwenAuthType }),
                 ...(m.qwenAvailableModels != null && { qwenAvailableModels: m.qwenAvailableModels }),
@@ -149,12 +158,17 @@ export function useSubSessions(
               updatedAt: now,
               state: (m.state || 'running') as SubSession['state'],
               qwenModel: m.qwenModel ?? null,
+              requestedModel: m.requestedModel ?? null,
+              activeModel: m.activeModel ?? m.modelDisplay ?? null,
               qwenAuthType: m.qwenAuthType ?? null,
               qwenAvailableModels: m.qwenAvailableModels ?? null,
               modelDisplay: m.modelDisplay ?? null,
               planLabel: m.planLabel ?? null,
               quotaLabel: m.quotaLabel ?? null,
               quotaUsageLabel: m.quotaUsageLabel ?? null,
+              quotaMeta: m.quotaMeta ?? null,
+              effort: m.effort ?? null,
+              transportConfig: m.transportConfig ?? null,
             }];
           });
         }
@@ -181,10 +195,15 @@ export function useSubSessions(
               ...(m.cwd !== undefined ? { cwd: m.cwd } : {}),
               ...(m.label !== undefined ? { label: m.label } : {}),
               ...(m.qwenModel !== undefined ? { qwenModel: m.qwenModel } : {}),
+              ...(m.requestedModel !== undefined ? { requestedModel: m.requestedModel } : {}),
+              ...(m.activeModel !== undefined ? { activeModel: m.activeModel } : {}),
               ...(m.modelDisplay !== undefined ? { modelDisplay: m.modelDisplay } : {}),
               ...(m.planLabel !== undefined ? { planLabel: m.planLabel } : {}),
               ...(m.quotaLabel !== undefined ? { quotaLabel: m.quotaLabel } : {}),
               ...(m.quotaUsageLabel !== undefined ? { quotaUsageLabel: m.quotaUsageLabel } : {}),
+              ...(m.quotaMeta !== undefined ? { quotaMeta: m.quotaMeta } : {}),
+              ...(m.effort !== undefined ? { effort: m.effort } : {}),
+              ...(m.transportConfig !== undefined ? { transportConfig: m.transportConfig } : {}),
             };
           }));
         }
@@ -245,13 +264,32 @@ export function useSubSessions(
       const ccSessionId = type === 'claude-code' ? crypto.randomUUID() : undefined;
       const description = extra?.description as string | undefined;
       const ccPresetId = extra?.ccPreset as string | undefined;
-      const res = await apiCreate(serverId, { type, shellBin, cwd, label: effectiveLabel, ccSessionId, parentSession: activeSession ?? null, description, ccPresetId });
+      const requestedModel = (extra?.requestedModel as string | undefined) ?? (extra?.model as string | undefined);
+      const transportConfig = extra?.transportConfig as Record<string, unknown> | undefined;
+      const res = await apiCreate(serverId, {
+        type,
+        shellBin,
+        cwd,
+        label: effectiveLabel,
+        ccSessionId,
+        parentSession: activeSession ?? null,
+        description,
+        ccPresetId,
+        requestedModel: requestedModel ?? null,
+        activeModel: requestedModel ?? null,
+        effort: (extra?.thinking as SubSession['effort'] | undefined) ?? null,
+        transportConfig: transportConfig ?? null,
+      });
       const sub: SubSession = {
         ...res.subSession,
         sessionName: res.sessionName,
         runtimeType: res.subSession.runtimeType ?? (type === 'openclaw' || type === 'qwen' ? 'transport' : 'process'),
         providerId: res.subSession.providerId ?? (type === 'openclaw' || type === 'qwen' ? type : null),
         state: 'starting',
+        requestedModel: res.subSession.requestedModel ?? requestedModel ?? null,
+        activeModel: res.subSession.activeModel ?? requestedModel ?? null,
+        effort: (extra?.thinking as SubSession['effort'] | undefined) ?? res.subSession.effort ?? null,
+        transportConfig: res.subSession.transportConfig ?? transportConfig ?? null,
       };
       setSubSessions((prev) => [...prev, sub]);
       // Ask daemon to start it — transport providers may need extra fields
@@ -264,7 +302,7 @@ export function useSubSessions(
           parentSession: activeSession,
           ...extra,
         });
-      } else if (extra?.ccPreset || extra?.ccInitPrompt) {
+      } else if (extra?.ccPreset || extra?.ccInitPrompt || extra?.thinking) {
         // CC with preset — send as raw message to include extra fields
         ws?.send({
           type: 'subsession.start',

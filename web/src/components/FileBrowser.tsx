@@ -20,6 +20,9 @@ const OfficePreview = lazy(() => import('./OfficePreview.js'));
 import { downloadAttachment } from '../api.js';
 
 const PREF_KEY = 'fb_prefer_editor';
+const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
+/** Sentinel path that asks the daemon to list Windows drive roots. */
+const WINDOWS_DRIVES_PATH = ':drives:';
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -258,6 +261,7 @@ export function FileBrowser({
   const pendingReadRef = useRef(new Map<string, string>()); // requestId → filePath
   const pendingGitStatusRef = useRef(new Map<string, string>()); // requestId → dirPath
   const pendingGitDiffRef = useRef(new Map<string, string>()); // requestId → filePath
+  const pendingMkdirRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
   const mountedRef = useRef(true);
 
   // History navigation
@@ -273,6 +277,7 @@ export function FileBrowser({
       pendingReadRef.current.clear();
       pendingGitStatusRef.current.clear();
       pendingGitDiffRef.current.clear();
+      pendingMkdirRef.current.clear();
       pendingChangesRef.current.clear();
       editorMsgHandlers.current.clear();
       if (pendingChangesTimerRef.current) clearTimeout(pendingChangesTimerRef.current);
@@ -321,7 +326,7 @@ export function FileBrowser({
         const children: FsNode[] = entries
           .filter((e) => showHidden || !e.hidden)
           .map((e) => ({
-            id: `${resolvedParent}${pathSep}${e.name}`,
+            id: e.path ?? `${resolvedParent}${pathSep}${e.name}`,
             name: e.name,
             isDir: e.isDir,
             hidden: e.hidden,
@@ -331,7 +336,12 @@ export function FileBrowser({
         loadedRef.current.add(nodeId);
         if (resolvedParent !== nodeId) loadedRef.current.add(resolvedParent);
 
-        setData((prev) => updateNode(prev, nodeId, { id: resolvedParent, name: resolvedParent.split(/[/\\]/).pop() || resolvedParent, children, isLoading: false }));
+        setData((prev) => updateNode(prev, nodeId, {
+          id: resolvedParent,
+          name: resolvedParent === WINDOWS_DRIVES_ROOT ? t('file_browser.this_pc') : resolvedParent.split(/[/\\]/).pop() || resolvedParent,
+          children,
+          isLoading: false,
+        }));
         // Keep the node expanded after its ID changes from alias (e.g. '~') to resolved path
         if (resolvedParent !== nodeId) {
           setExpandedPaths((prev) => {
@@ -342,7 +352,7 @@ export function FileBrowser({
             return next;
           });
         }
-        setCurrentLabel(resolvedParent);
+        setCurrentLabel(resolvedParent === WINDOWS_DRIVES_ROOT ? t('file_browser.this_pc') : resolvedParent);
         setError(null);
 
         // If highlightPath is under this dir, auto-expand
@@ -462,6 +472,23 @@ export function FileBrowser({
         }
         return;
       }
+
+      if (msg.type === 'fs.mkdir_response') {
+        const pending = pendingMkdirRef.current.get(msg.requestId);
+        if (!pending) return;
+        pendingMkdirRef.current.delete(msg.requestId);
+        if (!mountedRef.current) return;
+
+        if (msg.status === 'error') {
+          setError(msg.error ?? t('file_browser.mkdir_failed'));
+          return;
+        }
+
+        loadedRef.current.delete(pending.parentPath);
+        setError(null);
+        fetchDir(pending.parentPath);
+        return;
+      }
     });
   }, [ws, showHidden, highlightPath, t]);
 
@@ -515,6 +542,17 @@ export function FileBrowser({
   }, [ws, t]);
 
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
+
+  const requestMkdir = useCallback((parentPath: string, folderName: string) => {
+    const trimmed = folderName.trim();
+    if (!trimmed) return;
+    const sep = parentPath.includes('\\') ? '\\' : '/';
+    const fullPath = `${parentPath}${parentPath.endsWith(sep) ? '' : sep}${trimmed}`;
+    const requestId = ws.fsMkdir(fullPath);
+    pendingMkdirRef.current.set(requestId, { parentPath, targetPath: fullPath });
+    setNewFolderParent(null);
+    setNewFolderName('');
+  }, [ws]);
 
   // Navigate to a path and push to history
   const jumpTo = useCallback((newPath: string) => {
@@ -983,10 +1021,23 @@ export function FileBrowser({
     return [{ label, path: label }];
   }, [currentLabel]);
 
+  // Show drive picker / home button on Windows daemons.
+  // Detected by current path looking like a Windows path or label being the localized "This PC".
+  const thisPcLabel = t('file_browser.this_pc');
+  const looksLikeWindows = /^[A-Za-z]:[\\/]/.test(currentLabel) || currentLabel === thisPcLabel;
+  const isAtDrives = currentLabel === thisPcLabel;
+
   const breadcrumb = (
     <div class="fb-nav">
       <button class="fb-nav-btn" disabled={!canGoBack} onClick={goBack}>←</button>
       <button class="fb-nav-btn" onClick={goUp} title="Go up">⬆</button>
+      {looksLikeWindows && (
+        <button
+          class="fb-nav-btn"
+          onClick={() => navigateTo(isAtDrives ? '~' : WINDOWS_DRIVES_PATH)}
+          title={isAtDrives ? t('file_browser.home') : t('file_browser.this_pc')}
+        >{isAtDrives ? '🏠' : '💾'}</button>
+      )}
       <div class="fb-breadcrumb-segments">
         {breadcrumbSegments.map((seg, i) => {
           const isLast = i === breadcrumbSegments.length - 1;
@@ -1027,15 +1078,7 @@ export function FileBrowser({
         onInput={(e) => setNewFolderName((e.target as HTMLInputElement).value)}
         onKeyDown={(e) => {
           if (e.key === 'Enter' && newFolderName.trim()) {
-            const fullPath = `${newFolderParent}/${newFolderName.trim()}`;
-            ws.fsMkdir(fullPath);
-            // Refresh parent after a short delay
-            setTimeout(() => {
-              loadedRef.current.delete(newFolderParent!);
-              toggleExpand(newFolderParent!);
-              toggleExpand(newFolderParent!);
-            }, 300);
-            setNewFolderParent(null);
+            requestMkdir(newFolderParent!, newFolderName);
           }
           if (e.key === 'Escape') setNewFolderParent(null);
         }}
@@ -1046,15 +1089,7 @@ export function FileBrowser({
         style={{ padding: '4px 10px', fontSize: 12 }}
         disabled={!newFolderName.trim()}
         onClick={() => {
-          if (!newFolderName.trim()) return;
-          const fullPath = `${newFolderParent}/${newFolderName.trim()}`;
-          ws.fsMkdir(fullPath);
-          setTimeout(() => {
-            loadedRef.current.delete(newFolderParent!);
-            toggleExpand(newFolderParent!);
-            toggleExpand(newFolderParent!);
-          }, 300);
-          setNewFolderParent(null);
+          requestMkdir(newFolderParent!, newFolderName);
         }}
       >{t('chat.create')}</button>
       <button class="fb-close" onClick={() => setNewFolderParent(null)} style={{ fontSize: 12 }}>✕</button>
@@ -1142,6 +1177,7 @@ export function FileBrowser({
             <button class="fb-close" onClick={onClose}>✕</button>
           </div>
           {breadcrumb}
+          {newFolderDialog}
           <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}`}>
             {tree}
             {previewPane}

@@ -13,7 +13,7 @@ import { readProjectMemory, buildCodexMemoryEntry, appendAgentSendDocs } from '.
 import logger from '../util/logger.js';
 import { updateSessionState } from '../store/session-store.js';
 import { resolveContextWindow } from '../util/model-context.js';
-import { registerWatcherControl, unregisterWatcherControl, refreshSessionWatcher, type WatcherControl } from './watcher-controls.js';
+import { registerWatcherControl, unregisterWatcherControl, type WatcherControl } from './watcher-controls.js';
 
 // ── Codex SQLite helpers ────────────────────────────────────────────────────────
 
@@ -99,32 +99,52 @@ export async function readCwd(filePath: string): Promise<string | null> {
   }
 }
 
-async function findLatestRollout(dir: string, workDir: string, excludeClaimed = true): Promise<string | null> {
+async function findLatestRollout(
+  dir: string,
+  workDir: string,
+  excludeClaimed = true,
+  sessionName?: string,
+  requiredUuid?: string | null,
+): Promise<string | null> {
   let entries: string[];
   try { entries = await readdir(dir); } catch { return null; }
-  const rollouts = entries.filter((e) => e.startsWith('rollout-') && e.endsWith('.jsonl')).sort().reverse();
-  for (const name of rollouts) {
+
+  let latestPath: string | null = null;
+  let latestMtime = -1;
+
+  for (const name of entries) {
+    if (!name.startsWith('rollout-') || !name.endsWith('.jsonl')) continue;
     const fpath = join(dir, name);
     if (excludeClaimed) {
       const owner = claimedFiles.get(fpath);
       if (owner && owner !== 'UNKNOWN') continue;
     }
+    if (sessionName && isFileClaimedByOther(sessionName, fpath)) continue;
+    if (requiredUuid) {
+      const candidateUuid = extractUuidFromPath(fpath);
+      if (candidateUuid !== requiredUuid) continue;
+    }
     const cwd = await readCwd(fpath);
-    if (cwd && normalizePath(cwd) === normalizePath(workDir)) return fpath;
+    if (!cwd || normalizePath(cwd) !== normalizePath(workDir)) continue;
+    try {
+      const s = await stat(fpath);
+      if (s.mtimeMs > latestMtime) {
+        latestMtime = s.mtimeMs;
+        latestPath = fpath;
+      }
+    } catch {
+      continue;
+    }
   }
-  return null;
+  return latestPath;
 }
 
 async function findLatestMatchingRollout(sessionName: string, projectDir: string, currentUuid: string | null, currentPath: string | null): Promise<string | null> {
   let latestPath: string | null = null;
   let latestMtime = -1;
   for (const dir of recentSessionDirs()) {
-    const found = await findLatestRollout(dir, projectDir, false);
-    if (!found || found === currentPath || isFileClaimedByOther(sessionName, found)) continue;
-    if (currentUuid) {
-      const candidateUuid = extractUuidFromPath(found);
-      if (candidateUuid && candidateUuid !== currentUuid) continue;
-    }
+    const found = await findLatestRollout(dir, projectDir, false, sessionName, currentUuid);
+    if (!found || found === currentPath) continue;
     try {
       const s = await stat(found);
       if (s.mtimeMs > latestMtime) {
@@ -626,11 +646,18 @@ export async function retrackLatestRollout(sessionName: string): Promise<boolean
 
 async function finalizeIdleAfterRefresh(sessionName: string): Promise<void> {
   let refreshed = false;
+  let retracked = false;
   try {
-    refreshed = await refreshSessionWatcher(sessionName);
+    refreshed = await refreshTrackedSession(sessionName).catch(() => false);
+    if (sessionStates.get(sessionName) !== 'running') {
+      retracked = await retrackLatestRollout(sessionName).catch(() => false);
+      if (retracked && sessionStates.get(sessionName) !== 'running') {
+        refreshed = (await refreshTrackedSession(sessionName).catch(() => false)) || refreshed;
+      }
+    }
   } finally {
     flushFinalAnswer(sessionName);
-    if (refreshed && sessionStates.get(sessionName) === 'running') return;
+    if ((refreshed || retracked) && sessionStates.get(sessionName) === 'running') return;
     emitSessionState(sessionName, 'idle');
   }
 }

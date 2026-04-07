@@ -241,4 +241,48 @@ describe('OC streaming integration: provider → relay → emitter', () => {
     expect(finalTextIdx).toBeGreaterThanOrEqual(0);
     expect(idleIdx).toBeGreaterThan(finalTextIdx);
   });
+
+  it('tool stream emits transport tool.call + tool.result timeline events', () => {
+    const runId = 'int-run-tool';
+
+    emitAgentEvent({ runId, stream: 'lifecycle', data: { phase: 'start' }, key: 'test:tool' });
+    emitAgentEvent({
+      runId,
+      stream: 'tool',
+      key: 'test:tool',
+      data: {
+        phase: 'start',
+        name: 'bash',
+        toolCallId: 'tc-1',
+        args: { command: 'pwd' },
+      },
+    });
+    emitAgentEvent({
+      runId,
+      stream: 'tool',
+      key: 'test:tool',
+      data: {
+        phase: 'result',
+        name: 'bash',
+        toolCallId: 'tc-1',
+        result: { stdout: '/tmp/project\n' },
+        meta: { exitCode: 0 },
+      },
+    });
+
+    const toolEvents = emittedEvents.filter(
+      (e) => (e.type === 'tool.call' || e.type === 'tool.result') && e.sessionId === 'test___tool',
+    );
+
+    expect(toolEvents).toHaveLength(2);
+    expect(toolEvents[0].type).toBe('tool.call');
+    expect(toolEvents[0].payload.tool).toBe('bash');
+    expect(toolEvents[0].payload.input).toEqual({ command: 'pwd' });
+    expect(toolEvents[1].type).toBe('tool.result');
+    expect(toolEvents[1].payload.output).toBe(JSON.stringify({ stdout: '/tmp/project\n' }));
+    expect(toolEvents[1].payload.detail).toMatchObject({
+      kind: 'openclaw.tool',
+      meta: { exitCode: 0 },
+    });
+  });
 });

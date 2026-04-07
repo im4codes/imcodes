@@ -54,15 +54,29 @@ const DEFAULT_W = 620;
 const DEFAULT_H = 480;
 const MIN_W = 300;
 const MIN_H = 200;
+const DESKTOP_VISIBLE_MARGIN = 32;
+
+function clampDesktopGeom(geom: WindowGeometry): WindowGeometry {
+  const maxW = Math.max(MIN_W, window.innerWidth);
+  const maxH = Math.max(MIN_H, window.innerHeight);
+  const w = Math.min(Math.max(geom.w, MIN_W), maxW);
+  const h = Math.min(Math.max(geom.h, MIN_H), maxH);
+  const x = Math.min(Math.max(geom.x, DESKTOP_VISIBLE_MARGIN - w), window.innerWidth - DESKTOP_VISIBLE_MARGIN);
+  const y = Math.min(Math.max(geom.y, 0), window.innerHeight - DESKTOP_VISIBLE_MARGIN);
+  return { x, y, w, h };
+}
 
 function loadLocal(id: string): { geom: WindowGeometry; viewMode: ViewMode } {
   try {
     const raw = localStorage.getItem(LOCAL_KEY(id));
-    if (raw) return JSON.parse(raw) as { geom: WindowGeometry; viewMode: ViewMode };
+    if (raw) {
+      const parsed = JSON.parse(raw) as { geom: WindowGeometry; viewMode: ViewMode };
+      return { ...parsed, geom: clampDesktopGeom(parsed.geom) };
+    }
   } catch { /* ignore */ }
   const cx = Math.max(0, (window.innerWidth - DEFAULT_W) / 2);
   const cy = Math.max(0, (window.innerHeight - DEFAULT_H) / 2 - 80);
-  return { geom: { x: cx, y: cy, w: DEFAULT_W, h: DEFAULT_H }, viewMode: 'chat' };
+  return { geom: clampDesktopGeom({ x: cx, y: cy, w: DEFAULT_W, h: DEFAULT_H }), viewMode: 'chat' };
 }
 
 function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
@@ -145,12 +159,22 @@ export function SubSessionWindow({
     planLabel: sub.planLabel ?? undefined,
     quotaLabel: sub.quotaLabel ?? undefined,
     quotaUsageLabel: sub.quotaUsageLabel ?? undefined,
+    quotaMeta: sub.quotaMeta ?? undefined,
+    effort: sub.effort ?? undefined,
     runtimeType: sub.runtimeType ?? undefined,
   };
 
   useEffect(() => {
     saveLocal(sub.id, geom, viewMode);
   }, [sub.id, geom, viewMode]);
+
+  useEffect(() => {
+    if (isMobile) return;
+    const onResize = () => setGeom((g) => clampDesktopGeom(g));
+    window.addEventListener('resize', onResize);
+    requestAnimationFrame(onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, [isMobile]);
 
   // Scroll to bottom whenever switching to chat view;
   // force fit + full terminal refresh when switching to terminal view.
@@ -192,12 +216,10 @@ export function SubSessionWindow({
   // ── Dragging ──────────────────────────────────────────────────────────────
   const dragStart = useRef<{ mx: number; my: number; ox: number; oy: number } | null>(null);
 
-  const DRAG_MARGIN = 32; // px — minimum visible edge to keep in viewport
-
-  const clampPos = useCallback((x: number, y: number, w: number) => ({
-    x: Math.min(Math.max(x, DRAG_MARGIN - w), window.innerWidth - DRAG_MARGIN),
-    y: Math.min(Math.max(y, 0), window.innerHeight - DRAG_MARGIN),
-  }), []);
+  const clampPos = useCallback((x: number, y: number, w: number, h = geomRef.current.h) => {
+    const clamped = clampDesktopGeom({ x, y, w, h });
+    return { x: clamped.x, y: clamped.y, w: clamped.w, h: clamped.h };
+  }, []);
 
   const startDrag = useCallback((e: MouseEvent) => {
     if ((e.target as HTMLElement).closest('button, input, textarea, [contenteditable]')) return;
@@ -242,7 +264,7 @@ export function SubSessionWindow({
         if (dir.includes('s')) h = Math.max(MIN_H, startG.h + dy);
         if (dir.includes('w')) { w = Math.max(MIN_W, startG.w - dx); x = startG.x + (startG.w - w); }
         if (dir.includes('n')) { h = Math.max(MIN_H, startG.h - dy); y = startG.y + (startG.h - h); }
-        return { x, y, w, h };
+        return clampDesktopGeom({ x, y, w, h });
       });
     };
     const onUp = () => {
@@ -382,10 +404,12 @@ export function SubSessionWindow({
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sub.sessionName}
+          agentType={sessionInfo?.agentType}
           modelOverride={sessionInfo?.modelDisplay ?? (sessionInfo?.agentType === 'qwen' ? sessionInfo?.qwenModel : undefined)}
           planLabel={sessionInfo?.planLabel}
           quotaLabel={sessionInfo?.quotaLabel}
-          quotaUsageLabel={sessionInfo?.quotaUsageLabel}
+          quotaUsageLabel={(sessionInfo?.agentType === 'codex' || sessionInfo?.agentType === 'codex-sdk') ? undefined : sessionInfo?.quotaUsageLabel}
+          quotaMeta={sessionInfo?.quotaMeta}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}

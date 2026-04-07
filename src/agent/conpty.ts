@@ -324,7 +324,17 @@ export function conptySubscribe(name: string, callback: (data: string) => void):
 export function conptyResize(name: string, cols: number, rows: number): void {
   const session = sessions.get(name);
   if (!session) return;
-  session.pty.resize(cols, rows);
+  if (session.exited) return;  // pty already exited — resize would throw
+  try {
+    session.pty.resize(cols, rows);
+  } catch (err) {
+    // node-pty throws "Cannot resize a pty that has already exited" if the
+    // exit event hasn't propagated yet.  Swallow it instead of letting it
+    // become an uncaught exception that takes the daemon down.
+    logger.debug({ name, err: err instanceof Error ? err.message : String(err) }, 'conptyResize: ignored error on dead pty');
+    session.exited = true;
+    return;
+  }
   session.cols = cols;
   session.rows = rows;
 }

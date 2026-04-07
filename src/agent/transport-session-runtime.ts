@@ -3,7 +3,8 @@ import type { SessionRuntime } from './session-runtime.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
-import type { TransportProvider, ProviderError, SessionConfig } from './transport-provider.js';
+import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate } from './transport-provider.js';
+import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 
 /**
  * Transport session runtime — manages a single conversation with a remote provider.
@@ -31,6 +32,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _sending = false;
   private _description: string | undefined;
   private _agentId: string | undefined;
+  private _effort: TransportEffortLevel | undefined;
   private _unsubscribes: Array<() => void> = [];
   private _onStatusChange?: (status: AgentStatus) => void;
 
@@ -47,6 +49,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   /** Callback fired when pending messages are drained into a new turn.
    *  Allows command-handler to emit timeline events for the batched send. */
   private _onDrain?: (mergedMessage: string, count: number) => void;
+  private _onSessionInfoChange?: (info: SessionInfoUpdate) => void;
 
   constructor(
     private readonly provider: TransportProvider,
@@ -80,6 +83,10 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (canDrain && this._drainPending()) return;
         this.setStatus(error.code === 'CANCELLED' ? 'idle' : 'error');
       }),
+      ...(this.provider.onSessionInfo ? [this.provider.onSessionInfo((sid: string, info: SessionInfoUpdate) => {
+        if (sid !== this._providerSessionId) return;
+        this._onSessionInfoChange?.(info);
+      })] : []),
     );
   }
 
@@ -90,6 +97,8 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   /** Register a callback for when pending messages are drained into a new turn. */
   set onDrain(cb: (mergedMessage: string, count: number) => void) { this._onDrain = cb; }
+  /** Register a callback for provider session metadata updates. */
+  set onSessionInfoChange(cb: (info: SessionInfoUpdate) => void) { this._onSessionInfoChange = cb; }
 
   /** Set providerSessionId directly (restore from store without initialize). */
   setProviderSessionId(id: string): void { this._providerSessionId = id; }
@@ -98,6 +107,12 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._agentId = agentId;
     if (this._providerSessionId) {
       this.provider.setSessionAgentId?.(this._providerSessionId, agentId);
+    }
+  }
+  setEffort(effort: TransportEffortLevel): void {
+    this._effort = effort;
+    if (this._providerSessionId) {
+      this.provider.setSessionEffort?.(this._providerSessionId, effort);
     }
   }
 
@@ -110,6 +125,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._providerSessionId = await this.provider.createSession(config);
     this._description = config.description;
     this._agentId = config.agentId;
+    this._effort = config.effort;
   }
 
   /**

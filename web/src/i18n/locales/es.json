@@ -41,7 +41,12 @@
     "external_link_title": "Abrir enlace externo",
     "external_link_warning": "Este enlace fue generado por un agente de IA. Usted es responsable de los riesgos asociados con visitar sitios web externos.",
     "external_link_cancel": "Cancelar",
-    "external_link_open": "Abrir enlace"
+    "external_link_open": "Abrir enlace",
+    "tool_detail_toggle": "detalles",
+    "tool_detail_input": "entrada",
+    "tool_detail_output": "salida",
+    "tool_detail_meta": "meta",
+    "tool_detail_raw": "raw"
   },
   "session": {
     "restart": "↺ Reiniciar",
@@ -73,7 +78,11 @@
     "new_btn": "Nueva sesión",
     "agentType": {
       "openclaw": "OpenClaw",
-      "qwen": "Qwen Code"
+      "qwen": "Qwen Code",
+      "claude_code_sdk": "Claude Code SDK",
+      "codex_sdk": "Codex SDK",
+      "claude_code_cli": "Claude Code CLI",
+      "codex_cli": "Codex CLI"
     },
     "openclaw_not_connected": "no conectado",
     "openclaw_connect_hint": "El gateway de OpenClaw no está conectado. Ejecuta el siguiente comando en tu máquina daemon:",
@@ -103,7 +112,9 @@
     "qwen_tier_byo": "Propia clave",
     "qwen_source_title": "Origen de Qwen: {{tier}}",
     "qwen_model_title": "Origen de Qwen: {{tier}} · Modelo: {{model}}",
-    "p2p_tag": "P2P"
+    "p2p_tag": "P2P",
+    "thinking": "Nivel",
+    "thinking_title": "Nivel: {{value}}"
   },
   "server": {
     "upgrade_daemon": "↑ Actualizar Daemon",
@@ -147,6 +158,8 @@
     "insert": "Insertar {{count}}",
     "browse": "Explorar",
     "show_hidden": "Ocultos",
+    "this_pc": "Este equipo",
+    "home": "Inicio",
     "selected_count": "{{count}} seleccionados",
     "timeout": "Tiempo de espera agotado",
     "timeout_detail": "No se pudo leer el directorio. Puede ser causado por unidades de red lentas o no disponibles.",
@@ -154,6 +167,7 @@
     "preview_too_large": "Archivo demasiado grande para previsualizar (> 512 KB)",
     "preview_error": "Vista previa no disponible",
     "preview_binary": "Archivo binario — vista previa no disponible",
+    "mkdir_failed": "No se pudo crear la carpeta",
     "view_diff": "Diff",
     "view_source": "Fuente",
     "tab_files": "Archivos",
@@ -179,7 +193,14 @@
     "daemon_offline": "El daemon está desconectado — verifica que imcodes daemon esté en ejecución",
     "start": "Iniciar",
     "starting": "Iniciando...",
-    "timeout": "Tiempo de espera agotado para iniciar la sesión. Revisa los registros del daemon."
+    "timeout": "Tiempo de espera agotado para iniciar la sesión. Revisa los registros del daemon.",
+    "title": "Iniciar nueva sesión",
+    "project_name": "Nombre del proyecto",
+    "working_directory": "Directorio de trabajo",
+    "browse": "Examinar",
+    "agent_type": "Tipo de agente",
+    "agent_flavor_cli": "CLI: interfaz nativa para quienes prefieren la UI original. El modo chat no admite streaming.",
+    "agent_flavor_sdk": "SDK: admite streaming y usa una interfaz más simple."
   },
   "api_key": {
     "copy": "Copiar",
@@ -187,7 +208,13 @@
     "label_placeholder": "Etiqueta (opcional)",
     "generate": "Generar clave",
     "generating": "Generando...",
-    "revoke": "Revocar"
+    "revoke": "Revocar",
+    "save_once": "Guarda esta clave: no se mostrará otra vez",
+    "raw_key": "Clave API",
+    "bind_url": "URL de vinculación",
+    "bind_command": "Comando de vinculación",
+    "copy_bind_command": "Copiar comando",
+    "dismiss": "Cerrar"
   },
   "getting_started": {
     "step1_pending": "Paso 1: Genera una clave API",

@@ -1,3 +1,6 @@
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
@@ -16,8 +19,10 @@ import {
   PROVIDER_ERROR_CODES,
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
+import { DEFAULT_TRANSPORT_EFFORT, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import logger from '../../util/logger.js';
 import { inferContextWindow } from '../../util/model-context.js';
+import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 
 const execFileAsync = promisify(execFile);
 const QWEN_BIN = 'qwen';
@@ -27,6 +32,9 @@ interface QwenSessionState {
   started: boolean;
   description?: string;
   model?: string;
+  effort: TransportEffortLevel;
+  settingsDir?: string;
+  settingsPath?: string;
   /** Internal Qwen CLI conversation ID — decoupled from provider session ID so cancel can start fresh. */
   qwenConversationId: string;
   child: ChildProcess | null;
@@ -38,6 +46,13 @@ interface QwenSessionState {
   toolUseByIndex: Map<number, { id: string; name: string; input?: unknown; partialJson: string }>;
   toolUseById: Map<string, { id: string; name: string; input?: unknown; partialJson: string }>;
   emittedToolSignatures: Map<string, string>;
+}
+
+function toQwenReasoning(effort: TransportEffortLevel): false | { effort: 'low' | 'medium' | 'high' } {
+  if (effort === 'off') return false;
+  if (effort === 'high') return { effort: 'high' };
+  if (effort === 'low') return { effort: 'low' };
+  return { effort: 'medium' };
 }
 
 interface QwenStreamEvent {
@@ -160,6 +175,8 @@ export class QwenProvider implements TransportProvider {
     sessionRestore: true,
     multiTurn: true,
     attachments: false,
+    reasoningEffort: true,
+    supportedEffortLevels: QWEN_EFFORT_LEVELS,
   };
 
   private config: ProviderConfig | null = null;
@@ -170,9 +187,10 @@ export class QwenProvider implements TransportProvider {
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
 
   async connect(config: ProviderConfig): Promise<void> {
-    await execFileAsync(QWEN_BIN, ['--version']);
+    const resolved = resolveExecutableForSpawn(QWEN_BIN);
+    await execFileAsync(resolved.executable, [...resolved.prependArgs, '--version'], { windowsHide: true });
     this.config = config;
-    logger.info({ provider: this.id }, 'Qwen provider connected');
+    logger.info({ provider: this.id, resolved: resolved.executable }, 'Qwen provider connected');
   }
 
   async disconnect(): Promise<void> {
@@ -180,6 +198,7 @@ export class QwenProvider implements TransportProvider {
       if (state.child && !state.child.killed) {
         state.child.kill('SIGTERM');
       }
+      await this.cleanupSessionSettings(state);
       this.sessions.delete(sessionId);
     }
     this.config = null;
@@ -190,10 +209,13 @@ export class QwenProvider implements TransportProvider {
     const sessionId = config.bindExistingKey ?? config.sessionKey;
     const existing = this.sessions.get(sessionId);
     this.sessions.set(sessionId, {
-      cwd: config.cwd ?? existing?.cwd ?? process.cwd(),
+      cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       started: !!(config.bindExistingKey || config.skipCreate || existing?.started),
       description: config.description ?? existing?.description,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
+      effort: config.effort ?? existing?.effort ?? DEFAULT_TRANSPORT_EFFORT,
+      settingsDir: existing?.settingsDir,
+      settingsPath: existing?.settingsPath,
       qwenConversationId: existing?.qwenConversationId ?? sessionId,
       child: existing?.child ?? null,
       currentMessageId: existing?.currentMessageId ?? null,
@@ -213,6 +235,7 @@ export class QwenProvider implements TransportProvider {
     if (state?.child && !state.child.killed) {
       state.child.kill('SIGTERM');
     }
+    if (state) await this.cleanupSessionSettings(state);
     this.sessions.delete(sessionId);
   }
 
@@ -251,16 +274,26 @@ export class QwenProvider implements TransportProvider {
     this.sessions.set(sessionId, state);
   }
 
+  async setSessionEffort(sessionId: string, effort: TransportEffortLevel): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    state.effort = effort;
+    await this.ensureSettingsPath(state);
+  }
+
   async send(sessionId: string, message: string, _attachments?: unknown[], extraSystemPrompt?: string): Promise<void> {
     if (!this.config) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Qwen provider not connected', false);
     }
 
     const state: QwenSessionState = this.sessions.get(sessionId) ?? {
-      cwd: process.cwd(),
+      cwd: normalizeTransportCwd(process.cwd())!,
       started: true,
       description: undefined,
       model: undefined,
+      effort: DEFAULT_TRANSPORT_EFFORT,
+      settingsDir: undefined,
+      settingsPath: undefined,
       qwenConversationId: sessionId,
       child: null,
       currentMessageId: null,
@@ -304,14 +337,18 @@ export class QwenProvider implements TransportProvider {
       args.push('--session-id', state.qwenConversationId);
     }
 
-    const child = spawn(QWEN_BIN, args, {
+    const resolved = resolveExecutableForSpawn(QWEN_BIN);
+    const finalArgs = [...resolved.prependArgs, ...args];
+    const child = spawn(resolved.executable, finalArgs, {
       cwd: state.cwd,
       env: {
         ...process.env,
         ...((this.config.env as Record<string, string> | undefined) ?? {}),
+        QWEN_CODE_SYSTEM_SETTINGS_PATH: await this.ensureSettingsPath(state),
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: false,
+      windowsHide: true,
     });
     state.child = child;
     this.sessions.set(sessionId, state);
@@ -415,6 +452,12 @@ export class QwenProvider implements TransportProvider {
               name: toolName,
               status: 'running',
               input: toolInput,
+              detail: {
+                kind: 'tool_use',
+                summary: toolName,
+                input: toolInput,
+                raw: event.content_block,
+              },
             });
           }
           return;
@@ -445,6 +488,12 @@ export class QwenProvider implements TransportProvider {
             name: tool.name,
             status: 'running',
             ...(hasMeaningfulToolValue(tool.input) ? { input: tool.input } : {}),
+            detail: {
+              kind: 'tool_use',
+              summary: tool.name,
+              input: tool.input,
+              raw: tool,
+            },
           });
         }
         return;
@@ -459,6 +508,12 @@ export class QwenProvider implements TransportProvider {
                 name: block.name ?? 'tool',
                 status: 'running',
                 input: block.input,
+                detail: {
+                  kind: 'tool_use',
+                  summary: block.name ?? 'tool',
+                  input: block.input,
+                  raw: block,
+                },
               });
             }
           }
@@ -484,6 +539,12 @@ export class QwenProvider implements TransportProvider {
             name: tool?.name ?? 'tool',
             status: block.is_error ? 'error' : 'complete',
             ...(output ? { output } : {}),
+            detail: {
+              kind: 'tool_result',
+              summary: tool?.name ?? 'tool',
+              output,
+              raw: block,
+            },
           });
         }
         return;
@@ -538,6 +599,12 @@ export class QwenProvider implements TransportProvider {
       child.once('spawn', () => resolve());
       child.once('error', (err) => reject(this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, err.message, false)));
     });
+    // Persistent error listener so post-spawn errors don't escalate to
+    // uncaughtException and crash the daemon.
+    child.on('error', (err) => {
+      logger.error({ provider: this.id, err }, 'Qwen child process error');
+      emitError(err.message, err);
+    });
   }
 
   async restoreSession(sessionId: string): Promise<boolean> {
@@ -566,5 +633,40 @@ export class QwenProvider implements TransportProvider {
 
   private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {
     return { code, message, recoverable, details };
+  }
+
+  private async ensureSettingsPath(state: QwenSessionState): Promise<string> {
+    if (!state.settingsDir) {
+      state.settingsDir = await mkdtemp(path.join(os.tmpdir(), 'imcodes-qwen-thinking-'));
+      state.settingsPath = path.join(state.settingsDir, 'settings.json');
+    }
+    const next = {
+      model: {
+        generationConfig: {
+          reasoning: toQwenReasoning(state.effort),
+        },
+      },
+    };
+    let current = '';
+    if (state.settingsPath) {
+      try {
+        current = await readFile(state.settingsPath, 'utf8');
+      } catch {}
+      const serialized = JSON.stringify(next);
+      if (current.trim() !== serialized) {
+        await writeFile(state.settingsPath, serialized, 'utf8');
+      }
+    }
+    return state.settingsPath!;
+  }
+
+  private async cleanupSessionSettings(state: QwenSessionState): Promise<void> {
+    if (!state.settingsDir) return;
+    const dir = state.settingsDir;
+    state.settingsDir = undefined;
+    state.settingsPath = undefined;
+    try {
+      await rm(dir, { recursive: true, force: true });
+    } catch {}
   }
 }
