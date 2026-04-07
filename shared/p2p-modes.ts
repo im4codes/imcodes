@@ -198,11 +198,9 @@ export interface P2pComboPreset {
 
 export const COMBO_PRESETS: P2pComboPreset[] = [
   { key: 'brainstorm>discuss>plan',         pipeline: ['brainstorm', 'discuss', 'plan'] },
-  { key: 'brainstorm>discuss>discuss>plan', pipeline: ['brainstorm', 'discuss', 'discuss', 'plan'] },
   { key: 'audit>plan',                     pipeline: ['audit', 'plan'] },
   { key: 'review>plan',                    pipeline: ['review', 'plan'] },
   { key: 'audit>review>plan',              pipeline: ['audit', 'review', 'plan'] },
-  { key: 'brainstorm>plan',                pipeline: ['brainstorm', 'plan'] },
 ];
 
 /** Parse a mode string into a per-round pipeline. Single mode → single-element array. */

@@ -301,6 +301,12 @@ describe('getComboRoundCount', () => {
 });
 
 describe('COMBO_PRESETS', () => {
+  it('omits deprecated brainstorm presets from the default combo list', () => {
+    const presetKeys = COMBO_PRESETS.map((preset) => preset.key);
+    expect(presetKeys).not.toContain('brainstorm>discuss>discuss>plan');
+    expect(presetKeys).not.toContain('brainstorm>plan');
+  });
+
   it('all presets have valid mode keys in their pipeline', () => {
     for (const preset of COMBO_PRESETS) {
       for (const modeKey of preset.pipeline) {
