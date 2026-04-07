@@ -937,7 +937,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             <button
               class="shortcut-btn shortcut-btn-wide"
               title="Stop (/stop)"
-              disabled={disabled || activeSession?.state !== 'running'}
+              disabled={disabled || activeSession?.state === 'stopped'}
               onClick={() => {
                 if (!ws || !activeSession) return;
                 ws.sendSessionCommand('send', { sessionName: activeSession.name, text: '/stop' });

@@ -303,6 +303,30 @@ describe('SessionControls', () => {
     expect(ws.sendInput).not.toHaveBeenCalled();
   });
 
+  it('keeps transport Stop enabled even when session state is idle', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'codex-sdk-session',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          state: 'idle',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    const stopBtn = screen.getByRole('button', { name: /^stop$/i }) as HTMLButtonElement;
+    expect(stopBtn.disabled).toBe(false);
+    fireEvent.click(stopBtn);
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      sessionName: 'codex-sdk-session',
+      text: '/stop',
+    });
+  });
+
   it('pressing Shift+Enter does not submit', () => {
     const ws = makeWs();
     render(<SessionControls ws={ws as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
