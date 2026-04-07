@@ -1,6 +1,5 @@
 import path from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
-import { delimiter } from 'node:path';
 
 export function normalizeTransportCwd(cwd?: string): string | undefined {
   if (typeof cwd !== 'string' || !cwd.trim()) return undefined;
@@ -26,9 +25,14 @@ export function resolveBinaryOnWindows(name: string): string {
   if (process.platform !== 'win32') return name;
   // Already absolute and exists? Use as-is.
   if (path.isAbsolute(name) && existsSync(name)) return name;
-  const pathDirs = (process.env.PATH ?? '').split(delimiter).filter(Boolean);
+  // Windows path/ext delimiter is always ';'.  Hard-code it instead of
+  // importing `delimiter` from node:path because that constant is the host
+  // OS delimiter (':' on Linux), which breaks tests that fake
+  // `process.platform = 'win32'` on a posix CI runner.
+  const WIN_DELIMITER = ';';
+  const pathDirs = (process.env.PATH ?? '').split(WIN_DELIMITER).filter(Boolean);
   const pathExtRaw = process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD';
-  const exts = pathExtRaw.split(delimiter).filter(Boolean);
+  const exts = pathExtRaw.split(WIN_DELIMITER).filter(Boolean);
   const hasExt = exts.some((e) => name.toLowerCase().endsWith(e.toLowerCase()));
   // If the user already gave a known extension, try it directly.  Otherwise
   // try every PATHEXT (so we hit `.cmd` before the extensionless Unix shim),
