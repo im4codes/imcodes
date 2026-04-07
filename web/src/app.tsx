@@ -111,7 +111,7 @@ import { REPO_MSG } from '@shared/repo-types.js';
 import { shouldSubscribeTerminalRaw, type TerminalSubscribeViewMode } from './terminal-subscribe-mode.js';
 import { onWatchCommand } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
-import { isRunningTimelineEvent } from './timeline-running.js';
+import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timeline-running.js';
 
 // On web: if opened by the native app for passkey auth, render the bridge page.
 const nativeCallback = typeof window !== 'undefined'
@@ -1180,6 +1180,12 @@ export function App() {
               ? { ...s, state: 'running' as SessionInfo['state'] }
               : s,
           ));
+        }
+        if (isIdleSessionStateTimelineEvent(event)) {
+          flashIdleSession(event.sessionId);
+          if (!event.sessionId.startsWith('deck_sub_')) {
+            setIdleAlerts((prev) => new Set([...prev, event.sessionId]));
+          }
         }
         if (event.type === 'ask.question') {
           setPendingQuestion({
