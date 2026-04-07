@@ -360,4 +360,38 @@ describe('P2pConfigPanel', () => {
     const roundBtns = screen.getAllByRole('button').filter(b => b.textContent === '2');
     expect(roundBtns.length).toBeGreaterThan(0);
   });
+
+  it('manages shared custom combos from the combo tab', async () => {
+    getUserPrefMock.mockImplementation(async (key: string) => {
+      if (key === 'p2p_custom_combos') return JSON.stringify(['audit>discuss']);
+      return null;
+    });
+
+    renderPanel();
+    await flush();
+
+    fireEvent.click(screen.getByRole('button', { name: 'combo_label' }));
+    expect(screen.getByText('mode_audit→mode_discuss')).toBeDefined();
+
+    fireEvent.click(screen.getByText('+mode_brainstorm'));
+    fireEvent.click(screen.getByText('+mode_review'));
+    fireEvent.click(screen.getByText('✓'));
+
+    expect(saveUserPrefMock).toHaveBeenCalledWith('p2p_custom_combos', JSON.stringify(['audit>discuss', 'brainstorm>review']));
+  });
+
+  it('deletes custom combos from the combo tab', async () => {
+    getUserPrefMock.mockImplementation(async (key: string) => {
+      if (key === 'p2p_custom_combos') return JSON.stringify(['audit>discuss']);
+      return null;
+    });
+
+    renderPanel();
+    await flush();
+
+    fireEvent.click(screen.getByRole('button', { name: 'combo_label' }));
+    fireEvent.click(screen.getAllByText('×')[0]);
+
+    expect(saveUserPrefMock).toHaveBeenCalledWith('p2p_custom_combos', JSON.stringify([]));
+  });
 });
