@@ -61,7 +61,10 @@ vi.mock('node:child_process', async (importOriginal) => {
   return {
     ...actual,
     spawn,
-    execFile: vi.fn((_file: string, _args: string[], cb?: (err: Error | null, stdout: string, stderr: string) => void) => {
+    execFile: vi.fn((..._args: unknown[]) => {
+      const cb = (typeof _args[2] === 'function' ? _args[2] : _args[3]) as
+        | ((err: Error | null, stdout: string, stderr: string) => void)
+        | undefined;
       cb?.(null, 'ok\n', '');
       return {} as never;
     }),

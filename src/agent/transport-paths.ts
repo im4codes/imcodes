@@ -25,7 +25,7 @@ export function normalizeTransportCwd(cwd?: string): string | undefined {
 export function resolveBinaryOnWindows(name: string): string {
   if (process.platform !== 'win32') return name;
   // Already absolute and exists? Use as-is.
-  if (path.win32.isAbsolute(name) && existsSync(name)) return name;
+  if (path.isAbsolute(name) && existsSync(name)) return name;
   const pathDirs = (process.env.PATH ?? '').split(delimiter).filter(Boolean);
   const pathExtRaw = process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD';
   const exts = pathExtRaw.split(delimiter).filter(Boolean);
@@ -36,7 +36,9 @@ export function resolveBinaryOnWindows(name: string): string {
   const extsToTry = hasExt ? [''] : [...exts, ''];
   for (const dir of pathDirs) {
     for (const ext of extsToTry) {
-      const candidate = path.win32.join(dir, name + ext);
+      // Use path.join (native) — works on both Windows runtime and tests
+      // that fake `process.platform = 'win32'` on a posix host.
+      const candidate = path.join(dir, name + ext);
       if (existsSync(candidate)) return candidate;
     }
   }
@@ -80,8 +82,11 @@ export function resolveExecutableForSpawn(name: string): ResolvedExecutable {
     if (scriptPath) {
       return { executable: process.execPath, prependArgs: [scriptPath] };
     }
+    // Couldn't parse the shim — return as-is. Caller (e.g. codex-sdk) can
+    // still spawn it via shell:true as a fallback.
+    return { executable: resolved, prependArgs: [] };
   }
-  // Fallback: pass through. Caller may need shell:true.
+  // Fallback: pass through.
   return { executable: resolved, prependArgs: [] };
 }
 
@@ -97,8 +102,10 @@ export function parseNpmCmdShim(cmdPath: string): string | null {
   // npm shims contain a line like:
   //   "%_prog%"  "%dp0%\node_modules\@openai\codex\bin\codex.js" %*
   // We extract the "...js" path. The %dp0% expands to the directory of the .cmd.
-  const dp0 = path.win32.dirname(cmdPath);
+  const dp0 = path.dirname(cmdPath);
   const match = content.match(/"%dp0%[\\/]([^"]+\.(?:js|mjs|cjs))"/i);
   if (!match) return null;
-  return path.win32.normalize(path.win32.join(dp0, match[1]));
+  // Convert any windows-style separators in the captured path to native, then join.
+  const inner = match[1].split(/[\\/]/).join(path.sep);
+  return path.normalize(path.join(dp0, inner));
 }

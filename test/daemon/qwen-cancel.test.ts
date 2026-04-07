@@ -51,8 +51,11 @@ vi.mock('node:child_process', () => ({
     setTimeout(() => child.start(), 0);
     return child;
   }),
-  execFile: vi.fn((_cmd: string, _args: string[], cb: (err: null, stdout: string) => void) => {
-    cb(null, 'qwen-code version 1.0.0');
+  execFile: vi.fn((..._args: unknown[]) => {
+    const cb = (typeof _args[2] === 'function' ? _args[2] : _args[3]) as
+      | ((err: null, stdout: string) => void)
+      | undefined;
+    cb?.(null, 'qwen-code version 1.0.0');
   }),
 }));
 

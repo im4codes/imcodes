@@ -1,14 +1,20 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const childProcessMock = vi.hoisted(() => ({
-  execFile: vi.fn((_file: string, _args: string[], cb?: (err: Error | null, stdout: string, stderr: string) => void) => {
+  // Accept both (file, args, cb) and (file, args, opts, cb) signatures.
+  execFile: vi.fn((..._args: unknown[]) => {
+    const cb = (typeof _args[2] === 'function' ? _args[2] : _args[3]) as
+      | ((err: Error | null, stdout: string, stderr: string) => void)
+      | undefined;
     cb?.(null, 'ok\n', '');
     return {} as never;
   }),
+  spawn: vi.fn(() => ({} as never)),
 }));
 
 vi.mock('node:child_process', () => ({
   execFile: childProcessMock.execFile,
+  spawn: childProcessMock.spawn,
 }));
 
 const sdkMock = vi.hoisted(() => {

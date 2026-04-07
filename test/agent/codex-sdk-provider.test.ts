@@ -84,7 +84,11 @@ const childProcessMock = vi.hoisted(() => {
     return child;
   });
 
-  const execFile = vi.fn((_file: string, _args: string[], cb?: (err: Error | null, stdout: string, stderr: string) => void) => {
+  // Accept both (file, args, cb) and (file, args, opts, cb).
+  const execFile = vi.fn((..._args: unknown[]) => {
+    const cb = (typeof _args[2] === 'function' ? _args[2] : _args[3]) as
+      | ((err: Error | null, stdout: string, stderr: string) => void)
+      | undefined;
     cb?.(null, 'ok\n', '');
     return {} as never;
   });
