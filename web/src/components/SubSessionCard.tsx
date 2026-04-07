@@ -71,12 +71,14 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const isShell = sub.type === 'shell' || sub.type === 'script';
   const { events, refreshing } = isShell ? { events: [], refreshing: false } : useTimeline(sub.sessionName, ws, serverId);
   const termScrollRef = useRef<(() => void) | null>(null);
+  const chatScrollRef = useRef<(() => void) | null>(null);
   const cardInputRef = useRef<HTMLInputElement>(null);
   const previewRef = useRef<HTMLDivElement>(null);
   const agentTag = isShell ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${sub.label} · ${agentTag}` : agentTag;
   const icon = TYPE_ICON[sub.type] ?? '⚡';
   const badge = STATE_BADGE[sub.state];
+  const [showScrollBtn, setShowScrollBtn] = useState(false);
 
   // Build a SessionInfo for SessionControls compact mode
   const sessionInfo = useMemo<SessionInfo>(() => ({
@@ -89,6 +91,16 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     projectDir: sub.cwd ?? undefined,
   }), [sub.sessionName, sub.type, sub.state, sub.label, sub.cwd]);
 
+  const forceFollowLatest = useCallback(() => {
+    if (isShell) termScrollRef.current?.();
+    else chatScrollRef.current?.();
+    const el = previewRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+      setShowScrollBtn(false);
+    }
+  }, [isShell]);
+
   const handleCardSend = useCallback(() => {
     const text = cardInputRef.current?.value?.trim();
     if (!text || !ws || !connected) return;
@@ -96,20 +108,12 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
       ws.sendSessionCommand('send', { sessionName: sub.sessionName, text });
     } catch { /* ignore */ }
     cardInputRef.current!.value = '';
-    requestAnimationFrame(() => {
-      const el = previewRef.current;
-      if (el) {
-        el.scrollTop = el.scrollHeight;
-        setShowScrollBtn(false);
-      }
-    });
-  }, [ws, connected, sub.sessionName]);
+    requestAnimationFrame(() => { forceFollowLatest(); });
+  }, [ws, connected, sub.sessionName, forceFollowLatest]);
 
 
   const busy = useMemo(() => isVisuallyBusy(sub.state, !!getActiveThinkingTs(events)), [events, sub.state]);
-
   // Preview cards always follow the latest content.
-  const [showScrollBtn, setShowScrollBtn] = useState(false);
   useEffect(() => {
     const el = previewRef.current;
     if (!el) return;
@@ -122,19 +126,11 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     return () => el.removeEventListener('scroll', handleScroll);
   }, []);
   useEffect(() => {
-    const el = previewRef.current;
-    if (el) {
-      el.scrollTop = el.scrollHeight;
-      setShowScrollBtn(false);
-    }
-  }, [events.length, sub.state]);
+    requestAnimationFrame(() => { forceFollowLatest(); });
+  }, [events, sub.state, forceFollowLatest]);
   const scrollToBottom = useCallback(() => {
-    const el = previewRef.current;
-    if (el) {
-      el.scrollTop = el.scrollHeight;
-      setShowScrollBtn(false);
-    }
-  }, []);
+    forceFollowLatest();
+  }, [forceFollowLatest]);
 
   const lastUsage = useMemo(() => {
     for (let i = events.length - 1; i >= 0; i--) {
@@ -246,6 +242,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
               loading={false}
               refreshing={refreshing}
               sessionId={sub.sessionName}
+              onScrollBottomFn={(fn) => { chatScrollRef.current = fn; }}
               preview
             />
           )}

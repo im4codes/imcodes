@@ -3,7 +3,12 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
+import { useEffect } from 'preact/hooks';
 import { cleanup, render, waitFor } from '@testing-library/preact';
+
+const chatScrollBottomSpy = vi.fn();
+const terminalScrollBottomSpy = vi.fn();
+let timelineEvents = [{ type: 'assistant.text', payload: { text: 'hello' } }];
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -12,15 +17,25 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../../src/components/ChatView.js', () => ({
-  ChatView: () => <div style={{ height: '1200px' }}>chat</div>,
+  ChatView: ({ onScrollBottomFn }: any) => {
+    useEffect(() => {
+      onScrollBottomFn?.(chatScrollBottomSpy);
+    }, [onScrollBottomFn]);
+    return <div style={{ height: '1200px' }}>chat</div>;
+  },
 }));
 
 vi.mock('../../src/components/TerminalView.js', () => ({
-  TerminalView: () => null,
+  TerminalView: ({ onScrollBottomFn }: any) => {
+    useEffect(() => {
+      onScrollBottomFn?.(terminalScrollBottomSpy);
+    }, [onScrollBottomFn]);
+    return null;
+  },
 }));
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
-  useTimeline: () => ({ events: [{ type: 'assistant.text', payload: { text: 'hello' } }], refreshing: false }),
+  useTimeline: () => ({ events: timelineEvents, refreshing: false }),
 }));
 
 vi.mock('../../src/components/SessionControls.js', () => ({
@@ -51,6 +66,7 @@ function makeSubSession(overrides: Partial<SubSession> = {}): SubSession {
 describe('SubSessionCard', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    timelineEvents = [{ type: 'assistant.text', payload: { text: 'hello' } }];
   });
 
   afterEach(() => {
@@ -121,5 +137,70 @@ describe('SubSessionCard', () => {
 
     const card = container.querySelector('.subcard') as HTMLDivElement;
     expect(card.className).toContain('subcard-idle-flash');
+  });
+
+  it('forces chat preview to follow when timeline events update', async () => {
+    const view = render(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(chatScrollBottomSpy).toHaveBeenCalled();
+    });
+
+    chatScrollBottomSpy.mockClear();
+    timelineEvents = [
+      { type: 'assistant.text', payload: { text: 'hello' } },
+      { type: 'assistant.text', payload: { text: 'next' } },
+    ];
+
+    view.rerender(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(chatScrollBottomSpy).toHaveBeenCalled();
+    });
+  });
+
+  it('forces terminal preview to follow after sending from a shell card', async () => {
+    const ws = { sendSessionCommand: vi.fn() } as any;
+    const { container } = render(
+      <SubSessionCard
+        sub={makeSubSession({ type: 'shell', shellBin: '/bin/bash' })}
+        ws={ws}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    terminalScrollBottomSpy.mockClear();
+    const input = container.querySelector('.subcard-input') as HTMLInputElement;
+    input.value = 'echo hi';
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+
+    await waitFor(() => {
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', { sessionName: 'deck_sub_sub-card-1', text: 'echo hi' });
+      expect(terminalScrollBottomSpy).toHaveBeenCalled();
+    });
   });
 });
