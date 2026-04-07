@@ -767,10 +767,10 @@ function setupSignalHandlers(): void {
   const handler = () => shutdown(0);
   process.on('SIGTERM', handler);
   process.on('SIGINT', handler);
-  process.on('uncaughtException', (err) => {
-    logger.error({ err }, 'Uncaught exception');
-    shutdown(1);
-  });
+  // NOTE: uncaughtException / unhandledRejection are handled in src/index.ts
+  // with a "daemon stays alive" policy.  We must NOT register a shutdown
+  // handler here — that would override the keep-alive behavior and let any
+  // stray error take the daemon down.
 }
 
 export function getDaemonContext(): DaemonContext {

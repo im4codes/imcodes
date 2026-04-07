@@ -1,4 +1,31 @@
 #!/usr/bin/env node
+// ── GLOBAL ERROR HANDLERS — registered FIRST, before anything else ────────
+// The daemon must NEVER die from an unhandled error. node-pty in particular
+// throws synchronously from socket event handlers (e.g. resize on a dead pty)
+// which propagates as uncaughtException.  These handlers MUST be installed
+// before any module imports that might trigger such errors.
+process.on('uncaughtException', (err) => {
+  // Use console.error if logger isn't loaded yet, otherwise use the logger.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const log = require('./util/logger.js').default;
+    log.error({ err }, 'Uncaught exception — daemon stays alive');
+  } catch {
+    // eslint-disable-next-line no-console
+    console.error('Uncaught exception (logger not loaded):', err);
+  }
+});
+process.on('unhandledRejection', (err) => {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const log = require('./util/logger.js').default;
+    log.error({ err }, 'Unhandled rejection — daemon stays alive');
+  } catch {
+    // eslint-disable-next-line no-console
+    console.error('Unhandled rejection (logger not loaded):', err);
+  }
+});
+
 import { Command } from 'commander';
 // These modules are imported lazily to avoid eager tmux backend detection on Windows.
 // Commands like `bind` don't need tmux/conpty and shouldn't crash when node-pty is missing.
@@ -103,13 +130,7 @@ program
         throw err; // re-throw other startup errors
       }
       // Called by launchd/systemd plist/unit — run inline.
-      // Global error handlers: daemon must NEVER crash from unhandled errors.
-      process.on('uncaughtException', (err) => {
-        logger.error({ err }, 'Uncaught exception — daemon stays alive');
-      });
-      process.on('unhandledRejection', (err) => {
-        logger.error({ err }, 'Unhandled rejection — daemon stays alive');
-      });
+      // Global error handlers are registered at the top of this file.
       logger.info('Daemon running. Press Ctrl+C to stop.');
       await new Promise(() => {});
       return;
