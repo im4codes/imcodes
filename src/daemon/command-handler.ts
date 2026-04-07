@@ -36,7 +36,7 @@ import { getProvider } from '../agent/provider-registry.js';
 import { copyFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
-import { buildWindowsCleanupScript, buildWindowsUpgradeBatch } from '../util/windows-upgrade-script.js';
+import { buildWindowsCleanupScript, buildWindowsCleanupVbs, buildWindowsUpgradeBatch, buildWindowsUpgradeVbs } from '../util/windows-upgrade-script.js';
 import { UPGRADE_LOCK_FILE } from '../util/windows-launch-artifacts.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { sanitizeProjectName } from '../../shared/sanitize-project-name.js';
@@ -2145,15 +2145,18 @@ launchctl load -w "${plist}"`;
     const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
     const pkgSpec = targetVersion ? `imcodes@${targetVersion}` : 'imcodes@latest';
     const batchPath = join(scriptDir, 'upgrade.cmd');
+    const upgradeVbsPath = join(scriptDir, 'upgrade.vbs');
     const cleanupPath = join(scriptDir, 'cleanup.cmd');
+    const cleanupVbsPath = join(scriptDir, 'cleanup.vbs');
     const targetVer = targetVersion ?? 'latest';
-    const cleanupScript = buildWindowsCleanupScript(scriptDir);
-    writeFileSync(cleanupPath, cleanupScript);
+    writeFileSync(cleanupPath, buildWindowsCleanupScript(scriptDir));
+    writeFileSync(cleanupVbsPath, buildWindowsCleanupVbs(cleanupPath));
     const vbsLauncherPath = join(homedir(), '.imcodes', 'daemon-launcher.vbs');
     const batch = buildWindowsUpgradeBatch({
       logFile,
       scriptDir,
       cleanupPath,
+      cleanupVbsPath,
       npmCmd,
       pkgSpec,
       targetVer,
@@ -2162,10 +2165,12 @@ launchctl load -w "${plist}"`;
     });
 
     writeFileSync(batchPath, batch);
+    writeFileSync(upgradeVbsPath, buildWindowsUpgradeVbs(batchPath));
 
-    // Use absolute path — bare 'cmd.exe' fails in restricted daemon environments
-    const cmdExe = process.env.COMSPEC || `${process.env.SystemRoot || 'C:\\Windows'}\\system32\\cmd.exe`;
-    const child = spawn(cmdExe, ['/c', batchPath], {
+    // Launch via wscript on the wrapper VBS — this guarantees that ALL child
+    // processes spawned by the batch (wmic, find, tasklist, etc.) inherit a
+    // fully hidden parent and never flash console windows.
+    const child = spawn('wscript', [upgradeVbsPath], {
       detached: true,
       stdio: 'ignore',
       windowsHide: true,

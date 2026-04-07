@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { buildWindowsCleanupScript, buildWindowsUpgradeBatch } from '../../src/util/windows-upgrade-script.js';
+import { buildWindowsCleanupScript, buildWindowsCleanupVbs, buildWindowsUpgradeBatch } from '../../src/util/windows-upgrade-script.js';
 
 const INPUT = {
   logFile: 'C:\\Temp\\upgrade.log',
   scriptDir: 'C:\\Temp\\imcodes-upgrade-123',
   cleanupPath: 'C:\\Temp\\imcodes-upgrade-123\\cleanup.cmd',
+  cleanupVbsPath: 'C:\\Temp\\imcodes-upgrade-123\\cleanup.vbs',
   npmCmd: 'C:\\Program Files\\nodejs\\npm.cmd',
   pkgSpec: 'imcodes@1.2.3',
   targetVer: '1.2.3',
@@ -18,6 +19,16 @@ describe('buildWindowsCleanupScript', () => {
     expect(script).toContain('@echo off');
     expect(script).toContain('timeout /t 120 /nobreak >nul');
     expect(script).toContain('rmdir /s /q "C:\\Temp\\imcodes-upgrade-123"');
+  });
+});
+
+describe('buildWindowsCleanupVbs', () => {
+  it('generates a VBS that runs cleanup hidden (window style 0)', () => {
+    const vbs = buildWindowsCleanupVbs('C:\\Temp\\cleanup.cmd');
+    expect(vbs).toContain('CreateObject("WScript.Shell")');
+    expect(vbs).toContain('"C:\\Temp\\cleanup.cmd"');
+    // Window style 0 = hidden, no taskbar flash
+    expect(vbs).toContain(', 0, False');
   });
 });
 
@@ -120,12 +131,16 @@ describe('buildWindowsUpgradeBatch', () => {
 
   // ── No visible windows ──
 
-  it('uses minimized cleanup windows', () => {
-    const cleanupCalls = batch.match(/start.*cmd.*cleanup/g) ?? [];
-    for (const call of cleanupCalls) {
-      expect(call).toContain('/min');
-    }
-    expect(cleanupCalls.length).toBeGreaterThan(0);
+  it('uses hidden VBS for cleanup (no visible/minimized cmd window)', () => {
+    // No `start` command — that always creates a visible window
+    expect(batch).not.toContain('start ""');
+    // No `start /min` either — flashes briefly in taskbar
+    expect(batch).not.toContain('/min cmd /c');
+    // Cleanup must be invoked via wscript on the cleanup VBS
+    expect(batch).toContain(`wscript "${INPUT.cleanupVbsPath}"`);
+    // Should be invoked at least 5 times (4 abort paths + 1 success)
+    const wscriptCleanupCalls = batch.match(new RegExp(`wscript "${INPUT.cleanupVbsPath.replace(/\\/g, '\\\\')}"`, 'g')) ?? [];
+    expect(wscriptCleanupCalls.length).toBeGreaterThanOrEqual(5);
   });
 
   // ── Recovery guarantee: daemon is never left dead ──

@@ -2,6 +2,8 @@ export interface WindowsUpgradeScriptInput {
   logFile: string;
   scriptDir: string;
   cleanupPath: string;
+  /** VBS wrapper that runs the cleanup cmd hidden (no flashing window) */
+  cleanupVbsPath: string;
   npmCmd: string;
   pkgSpec: string;
   targetVer: string;
@@ -18,8 +20,20 @@ rmdir /s /q "${scriptDir}"\r
 `;
 }
 
+/** VBS wrapper that runs the cleanup cmd in a hidden window (no taskbar flash). */
+export function buildWindowsCleanupVbs(cleanupPath: string): string {
+  return `Set WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${cleanupPath}""", 0, False\r\n`;
+}
+
+/** VBS wrapper that runs the upgrade batch in a hidden window.
+ *  Without this, child processes spawned by the batch (wmic, find, tasklist)
+ *  may flash visible console windows on some Windows versions. */
+export function buildWindowsUpgradeVbs(batchPath: string): string {
+  return `Set WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${batchPath}""", 0, False\r\n`;
+}
+
 export function buildWindowsUpgradeBatch(input: WindowsUpgradeScriptInput): string {
-  const { logFile, cleanupPath, npmCmd, pkgSpec, targetVer, vbsLauncherPath, upgradeLockFile } = input;
+  const { logFile, cleanupVbsPath, npmCmd, pkgSpec, targetVer, vbsLauncherPath, upgradeLockFile } = input;
   return `@echo off\r
 setlocal EnableDelayedExpansion\r
 echo === imcodes upgrade started at %date% %time% === >> "${logFile}"\r
@@ -55,7 +69,7 @@ if %errorlevel% neq 0 (\r
   echo === upgrade aborted at %date% %time% === >> "${logFile}"\r
   del "${upgradeLockFile}" >nul 2>&1\r
   if exist "${vbsLauncherPath}" wscript "${vbsLauncherPath}"\r
-  start "" /min cmd /c "${cleanupPath}" >nul 2>&1\r
+  wscript "${cleanupVbsPath}" >nul 2>&1\r
   goto :done\r
 )\r
 \r
@@ -66,7 +80,7 @@ if not defined NPM_PREFIX (\r
   echo === upgrade aborted at %date% %time% === >> "${logFile}"\r
   del "${upgradeLockFile}" >nul 2>&1\r
   if exist "${vbsLauncherPath}" wscript "${vbsLauncherPath}"\r
-  start "" /min cmd /c "${cleanupPath}" >nul 2>&1\r
+  wscript "${cleanupVbsPath}" >nul 2>&1\r
   goto :done\r
 )\r
 \r
@@ -76,7 +90,7 @@ if not exist "%CLI_SHIM%" (\r
   echo === upgrade aborted at %date% %time% === >> "${logFile}"\r
   del "${upgradeLockFile}" >nul 2>&1\r
   if exist "${vbsLauncherPath}" wscript "${vbsLauncherPath}"\r
-  start "" /min cmd /c "${cleanupPath}" >nul 2>&1\r
+  wscript "${cleanupVbsPath}" >nul 2>&1\r
   goto :done\r
 )\r
 \r
@@ -88,7 +102,7 @@ if not "${targetVer}"=="latest" if /I not "%INSTALLED_VER%"=="${targetVer}" (\r
   echo === upgrade aborted at %date% %time% === >> "${logFile}"\r
   del "${upgradeLockFile}" >nul 2>&1\r
   if exist "${vbsLauncherPath}" wscript "${vbsLauncherPath}"\r
-  start "" /min cmd /c "${cleanupPath}" >nul 2>&1\r
+  wscript "${cleanupVbsPath}" >nul 2>&1\r
   goto :done\r
 )\r
 where imcodes >nul 2>&1\r
@@ -128,7 +142,7 @@ if exist "%PIDFILE%" (\r
 ) else (\r
   echo Health check FAILED: daemon.pid not found >> "${logFile}"\r
 )\r
-start "" /min cmd /c "${cleanupPath}" >nul 2>&1\r
+wscript "${cleanupVbsPath}" >nul 2>&1\r
 :done\r
 echo === upgrade done at %date% %time% === >> "${logFile}"\r
 `;
