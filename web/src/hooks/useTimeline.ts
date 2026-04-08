@@ -231,8 +231,10 @@ export function useTimeline(
         seqRef.current = last.seq;
         const stored = await db.getRecentEvents(cacheKey!, { limit: MAX_MEMORY_EVENTS });
         if (cancelled) return;
-        setCachedEvents(cacheKey!, stored);
-        setEvents(stored);
+        const existing = getCachedEvents(cacheKey!) ?? eventsRef.current;
+        const restored = mergeTimelineEvents(existing, stored, MAX_MEMORY_EVENTS);
+        setCachedEvents(cacheKey!, restored);
+        setEvents((prev) => (prev === restored ? prev : restored));
         setLoading(false);
         historyLoadedRef.current = cacheKeyRef.current;
         if (ws?.connected) {

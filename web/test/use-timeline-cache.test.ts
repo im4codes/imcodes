@@ -1,10 +1,11 @@
 /**
  * @vitest-environment jsdom
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, cleanup, act, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
 import type { ServerMessage, TimelineEvent, WsClient } from '../src/ws-client.js';
+import { TimelineDB } from '../src/timeline-db.js';
 import {
   __getTimelineCacheKeysForTests,
   __resetTimelineCacheForTests,
@@ -31,6 +32,10 @@ describe('useTimeline global cache bounds', () => {
   beforeEach(() => {
     __resetTimelineCacheForTests();
     cleanup();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it('evicts least recently used sessions when session-count cap is exceeded', () => {
@@ -189,6 +194,68 @@ describe('useTimeline global cache bounds', () => {
     });
 
     expect(screen.getByTestId('probe').textContent).toBe('live cached text');
+  });
+
+  it('does not let a late IndexedDB restore overwrite newer live timeline events', async () => {
+    const sessionName = `deck_transport_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    const stored = [{
+      eventId: `${sessionName}-stored-1`,
+      sessionId: sessionName,
+      ts: 1,
+      epoch: 5,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'stored history' },
+    }] satisfies TimelineEvent[];
+    let resolveRecentEvents: ((events: TimelineEvent[]) => void) | null = null;
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 1, epoch: 5 });
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockImplementation(
+      () => new Promise<TimelineEvent[]>((resolve) => {
+        resolveRecentEvents = resolve;
+      }),
+    );
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, null, serverId);
+      return h(
+        'div',
+        { 'data-testid': 'probe' },
+        events.map((event) => String(event.payload.text ?? '')).join('|'),
+      );
+    }
+
+    render(h(Probe, {}));
+
+    await act(async () => {
+      ingestTimelineEventForCache({
+        eventId: `${sessionName}-live-1`,
+        sessionId: sessionName,
+        ts: 2,
+        epoch: 5,
+        seq: 2,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'live transport send' },
+      }, serverId);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('live transport send');
+    });
+
+    await act(async () => {
+      resolveRecentEvents?.(stored);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('stored history|live transport send');
+    });
   });
 
   it('keeps timeline history isolated across servers for the same session name', async () => {
