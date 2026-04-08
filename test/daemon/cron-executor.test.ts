@@ -286,17 +286,18 @@ describe('executeCronJob', () => {
 
     await executeCronJob(msg, mockServerLink);
 
-    expect(startP2pRun).toHaveBeenCalledWith(
-      'deck_myapp_brain',
-      [
+    expect((startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0]).toHaveLength(1);
+    expect(startP2pRun).toHaveBeenCalledWith(expect.objectContaining({
+      initiatorSession: 'deck_myapp_brain',
+      targets: [
         { session: 'deck_myapp_w1', mode: 'audit' },
         { session: 'deck_myapp_w2', mode: 'audit' },
       ],
-      'code review',
-      [],
-      mockServerLink,
-      3,
-    );
+      userText: 'code review',
+      fileContents: [],
+      serverLink: mockServerLink,
+      rounds: 3,
+    }));
   });
 
   // 14. P2P with no valid participants — skips
@@ -362,14 +363,15 @@ describe('executeCronJob', () => {
 
     await executeCronJob(msg, mockServerLink);
 
-    expect(startP2pRun).toHaveBeenCalledWith(
-      'deck_myapp_brain',
-      [{ session: 'deck_myapp_w1', mode: 'review' }],
-      'quick sync',
-      [],
-      mockServerLink,
-      1,
-    );
+    expect((startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0]).toHaveLength(1);
+    expect(startP2pRun).toHaveBeenCalledWith(expect.objectContaining({
+      initiatorSession: 'deck_myapp_brain',
+      targets: [{ session: 'deck_myapp_w1', mode: 'review' }],
+      userText: 'quick sync',
+      fileContents: [],
+      serverLink: mockServerLink,
+      rounds: 1,
+    }));
   });
 
   it('logs warning for unknown action type', async () => {
@@ -453,14 +455,15 @@ describe('executeCronJob', () => {
 
     await executeCronJob(msg, mockServerLink);
 
-    expect(startP2pRun).toHaveBeenCalledWith(
-      'deck_myapp_brain',
-      [{ session: 'deck_sub_worker1', mode: 'review' }],
-      'architecture review',
-      [],
-      mockServerLink,
-      1,
-    );
+    expect((startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0]).toHaveLength(1);
+    expect(startP2pRun).toHaveBeenCalledWith(expect.objectContaining({
+      initiatorSession: 'deck_myapp_brain',
+      targets: [{ session: 'deck_sub_worker1', mode: 'review' }],
+      userText: 'architecture review',
+      fileContents: [],
+      serverLink: mockServerLink,
+      rounds: 1,
+    }));
   });
 
   it('sends command result with executionId when assistant output completes', async () => {

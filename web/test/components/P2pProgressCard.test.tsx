@@ -12,6 +12,7 @@ vi.mock('react-i18next', () => ({
 }));
 
 import { P2pProgressCard } from '../../src/components/P2pProgressCard.js';
+import { mapP2pRunToDiscussion } from '../../src/p2p-run-mapping.js';
 
 describe('P2pProgressCard', () => {
   beforeEach(() => {
@@ -229,5 +230,107 @@ describe('P2pProgressCard', () => {
     expect(hopSegments[1]?.className).toContain('is-active');
     expect(hopSegments[2]?.className).toContain('is-active');
     expect(hopSegments[3]?.className).toContain('is-active');
+  });
+
+  it('renders folded advanced retry history as logical rounds instead of execution steps', () => {
+    const discussion = mapP2pRunToDiscussion({
+      id: 'run_folded_render',
+      status: 'running',
+      mode_key: 'discuss',
+      advanced_p2p_enabled: true,
+      current_execution_step: 5,
+      current_round_id: 'implementation',
+      current_round_attempt: 3,
+      round_attempt_counts: {
+        discussion: 1,
+        openspec_propose: 1,
+        proposal_audit: 1,
+        implementation: 3,
+        implementation_audit: 2,
+      },
+      routing_history: [
+        { fromRoundId: 'implementation_audit', toRoundId: 'implementation', atStep: 3, atAttempt: 1, timestamp: 1, trigger: 'REWORK' },
+        { fromRoundId: 'implementation_audit', toRoundId: 'implementation', atStep: 4, atAttempt: 2, timestamp: 2, trigger: 'REWORK' },
+      ],
+      advanced_nodes: [
+        { id: 'discussion', title: 'Discussion', preset: 'discussion', status: 'done' },
+        { id: 'openspec_propose', title: 'OpenSpec Propose', preset: 'openspec_propose', status: 'done' },
+        { id: 'proposal_audit', title: 'Proposal Audit', preset: 'proposal_audit', status: 'done' },
+        { id: 'implementation', title: 'Implementation', preset: 'implementation', status: 'active' },
+        { id: 'implementation_audit', title: 'Implementation Audit', preset: 'implementation_audit', status: 'pending' },
+      ],
+      completed_hops_count: 7,
+      completed_round_hops_count: 1,
+      active_phase: 'hop',
+    });
+
+    const { container } = render(<P2pProgressCard discussion={discussion} />);
+
+    expect(screen.getAllByText('R4/5').length).toBeGreaterThan(0);
+    expect(screen.queryAllByText('implementation').length).toBeGreaterThan(0);
+    expect(container.querySelectorAll('.discussions-progress-segments-round .discussions-progress-segment')).toHaveLength(5);
+  });
+
+  it('falls back to legacy nodes and counters when advanced payload lacks advanced nodes', () => {
+    const discussion = mapP2pRunToDiscussion({
+      id: 'run_fallback_render',
+      status: 'running',
+      mode_key: 'audit',
+      advanced_p2p_enabled: true,
+      current_round: 2,
+      total_rounds: 4,
+      current_target_label: 'w2',
+      all_nodes: [
+        { label: 'brain', agentType: 'claude-code', status: 'done', phase: 'initial' },
+        { label: 'w2', agentType: 'codex', status: 'active', phase: 'hop' },
+      ],
+      total_hops: 4,
+      completed_hops_count: 2,
+      active_hop_number: 3,
+      active_round_hop_number: 3,
+      active_phase: 'hop',
+      advanced_nodes: [],
+    });
+
+    render(<P2pProgressCard discussion={discussion} />);
+
+    expect(screen.getAllByText('R2/4').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('H3/4').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('audit').length).toBeGreaterThan(0);
+    expect(screen.getByText('w2')).toBeTruthy();
+  });
+
+  it('keeps legacy rendering when advanced nodes are present but advanced mode is off', () => {
+    const discussion = mapP2pRunToDiscussion({
+      id: 'run_fallback_render_explicit_legacy',
+      status: 'running',
+      mode_key: 'audit',
+      advanced_p2p_enabled: false,
+      current_round: 2,
+      total_rounds: 4,
+      current_target_label: 'w2',
+      all_nodes: [
+        { label: 'brain', agentType: 'claude-code', status: 'done', phase: 'initial' },
+        { label: 'w2', agentType: 'codex', status: 'active', phase: 'hop' },
+      ],
+      total_hops: 4,
+      completed_hops_count: 2,
+      active_hop_number: 3,
+      active_round_hop_number: 3,
+      active_phase: 'hop',
+      advanced_nodes: [
+        { id: 'implementation', title: 'Implementation', preset: 'implementation', status: 'active' },
+        { id: 'implementation_audit', title: 'Implementation Audit', preset: 'implementation_audit', status: 'pending' },
+      ],
+      current_round_id: 'implementation',
+      current_execution_step: 5,
+    });
+
+    render(<P2pProgressCard discussion={discussion} />);
+
+    expect(screen.getAllByText('R2/4').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('H3/4').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('audit').length).toBeGreaterThan(0);
+    expect(screen.getByText('w2')).toBeTruthy();
   });
 });

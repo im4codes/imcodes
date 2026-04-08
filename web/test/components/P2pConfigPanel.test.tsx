@@ -21,6 +21,7 @@ vi.mock('../../src/api.js', () => ({
 
 import { P2pConfigPanel } from '../../src/components/P2pConfigPanel.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
+import { BUILT_IN_ADVANCED_PRESETS } from '@shared/p2p-advanced.js';
 
 const sessions = [
   { name: 'deck_proj_brain', agentType: 'claude-code-sdk', state: 'running' },
@@ -333,6 +334,55 @@ describe('P2pConfigPanel', () => {
     const parsed = JSON.parse(jsonArg);
     expect(parsed).toHaveProperty('sessions');
     expect(parsed).toHaveProperty('rounds');
+  });
+
+  it('saves advanced preset, run timeout, and reducer config from enabled sdk participants', async () => {
+    const onSave = vi.fn();
+    renderPanel({ onSave });
+    await flush();
+
+    const checkboxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
+    fireEvent.click(checkboxes[0]);
+    fireEvent.click(checkboxes[1]);
+
+    fireEvent.click(screen.getByRole('button', { name: /Advanced workflow/i }));
+    fireEvent.change(screen.getByLabelText('Advanced preset'), { target: { value: 'openspec' } });
+    fireEvent.input(screen.getByLabelText('Whole-run timeout'), { target: { value: '42' } });
+    fireEvent.change(screen.getByLabelText('Reducer mode'), { target: { value: 'reuse_existing_session' } });
+    fireEvent.change(screen.getByLabelText('Reducer participant'), { target: { value: 'deck_sub_abc' } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('settings_save'));
+    });
+    await flush();
+
+    const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
+    expect(cfg.advancedPresetKey).toBe('openspec');
+    expect(cfg.advancedRunTimeoutMinutes).toBe(42);
+    expect(cfg.contextReducer).toEqual({
+      mode: 'reuse_existing_session',
+      sessionName: 'deck_sub_abc',
+    });
+    expect(cfg.advancedRounds).toEqual(BUILT_IN_ADVANCED_PRESETS.openspec);
+  });
+
+  it('limits reducer source options to enabled sdk participants', async () => {
+    renderPanel();
+    await flush();
+
+    const checkboxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
+    fireEvent.click(checkboxes[0]);
+    fireEvent.click(checkboxes[1]);
+    fireEvent.click(screen.getByRole('button', { name: /Advanced workflow/i }));
+    fireEvent.change(screen.getByLabelText('Advanced preset'), { target: { value: 'openspec' } });
+    fireEvent.change(screen.getByLabelText('Reducer mode'), { target: { value: 'clone_sdk_session' } });
+
+    const templateSelect = screen.getByLabelText('Template participant') as HTMLSelectElement;
+    const optionValues = Array.from(templateSelect.options).map((option) => option.value);
+    expect(optionValues).toContain('deck_proj_brain');
+    expect(optionValues).toContain('deck_sub_abc');
+    expect(optionValues).not.toContain('deck_proj_w1');
+    expect(optionValues).not.toContain('deck_sub_cli');
   });
 
   it('calls onClose after save completes', async () => {

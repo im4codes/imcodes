@@ -30,6 +30,7 @@ import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget } from './p2p-orchestrator.js';
 import { getComboRoundCount, parseModePipeline, P2P_CONFIG_MODE, type P2pSessionConfig } from '../../shared/p2p-modes.js';
+import type { P2pAdvancedRound, P2pContextReducerConfig } from '../../shared/p2p-advanced.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
 import { executeCronJob } from './cron-executor.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
@@ -1061,6 +1062,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   let p2pExtraPrompt = (cmd as any).p2pExtraPrompt as string | undefined;
   const p2pLocale = (cmd as any).p2pLocale as string | undefined;
   const p2pHopTimeoutMs = (cmd as any).p2pHopTimeoutMs as number | undefined;
+  const p2pAdvancedPresetKey = (cmd as any).p2pAdvancedPresetKey as string | undefined;
+  const p2pAdvancedRounds = (cmd as any).p2pAdvancedRounds as P2pAdvancedRound[] | undefined;
+  const p2pAdvancedRunTimeoutMinutes = (cmd as any).p2pAdvancedRunTimeoutMinutes as number | undefined;
+  const p2pContextReducer = (cmd as any).p2pContextReducer as P2pContextReducerConfig | undefined;
   const p2pModeField = (cmd as any).p2pMode as string | undefined;
   const p2pAtTargets = (cmd as any).p2pAtTargets as Array<{ session: string; mode: string }> | undefined;
   const explicitTargets = directTargetSession
@@ -1200,7 +1205,21 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         const langInstr = `Use the user's selected i18n language (${langName}) for the discussion.`;
         p2pExtraPrompt = p2pExtraPrompt ? `${p2pExtraPrompt}\n${langInstr}` : langInstr;
       }
-      const run = await startP2pRun(sessionName, tokens.agents, tokens.cleanText, fileContents, serverLink, p2pRounds, p2pExtraPrompt, resolvedMode || undefined, p2pHopTimeoutMs);
+      const run = await startP2pRun({
+        initiatorSession: sessionName,
+        targets: tokens.agents,
+        userText: tokens.cleanText,
+        fileContents,
+        serverLink,
+        rounds: p2pRounds,
+        extraPrompt: p2pExtraPrompt,
+        modeOverride: resolvedMode || undefined,
+        hopTimeoutMs: p2pHopTimeoutMs,
+        advancedPresetKey: p2pAdvancedPresetKey,
+        advancedRounds: p2pAdvancedRounds,
+        advancedRunTimeoutMs: p2pAdvancedRunTimeoutMinutes != null ? p2pAdvancedRunTimeoutMinutes * 60_000 : undefined,
+        contextReducer: p2pContextReducer,
+      });
       const status = isLegacy ? 'accepted_legacy' : 'accepted';
       timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
       try {

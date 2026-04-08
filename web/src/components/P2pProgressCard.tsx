@@ -247,10 +247,12 @@ export const P2pProgressCard = memo(function P2pProgressCard({
         end: activeHopNumbers[activeHopNumbers.length - 1]!,
       };
     }
-    const start = Math.min(totalHopsPerRound, completedRoundHops + 1);
+    const start = typeof discussion.activeRoundHop === 'number' && discussion.activeRoundHop > 0
+      ? Math.min(totalHopsPerRound, discussion.activeRoundHop)
+      : Math.min(totalHopsPerRound, completedRoundHops + 1);
     const end = Math.min(totalHopsPerRound, completedRoundHops + activeHopCount);
     return { start, end };
-  }, [activeHopCount, activeHopNumbers, completedRoundHops, discussion.activePhase, totalHopsPerRound]);
+  }, [activeHopCount, activeHopNumbers, completedRoundHops, discussion.activePhase, discussion.activeRoundHop, totalHopsPerRound]);
   const hopText = useMemo(() => {
     if (discussion.totalHops == null || discussion.totalHops <= 0) return null;
     if (activeHopRange && activeHopCount > 1) {

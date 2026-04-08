@@ -1,4 +1,5 @@
 /** P2P Quick Discussion mode configuration. */
+import type { P2pAdvancedPresetKey, P2pAdvancedRound, P2pContextReducerConfig } from './p2p-advanced.js';
 
 /** The "config" meta-mode — each session uses its own saved default mode. */
 export const P2P_CONFIG_MODE = 'config' as const;
@@ -18,6 +19,14 @@ export interface P2pSavedConfig {
   extraPrompt?: string;
   /** Per-hop timeout in minutes. Default: 8. */
   hopTimeoutMinutes?: number;
+  /** Built-in advanced workflow preset key. */
+  advancedPresetKey?: P2pAdvancedPresetKey;
+  /** Advanced round overrides / full custom workflow definition. */
+  advancedRounds?: P2pAdvancedRound[];
+  /** Whole-run timeout for advanced workflows in minutes. */
+  advancedRunTimeoutMinutes?: number;
+  /** Optional context compression/helper config for advanced workflows. */
+  contextReducer?: P2pContextReducerConfig;
 }
 
 

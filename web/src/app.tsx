@@ -5,66 +5,8 @@ import {
   type FileBrowserPreviewState,
   type FileBrowserPreviewUpdate,
 } from './components/FileBrowser.js';
-import { mapP2pStatusToUiState, type P2pActivePhase, type P2pProgressNodeStatus } from '@shared/p2p-status.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
-
-function mapP2pRunToDiscussion(r: Record<string, any>) {
-  const rawSnapshot = r.progress_snapshot;
-  const snapshot = typeof rawSnapshot === 'string'
-    ? (() => { try { return JSON.parse(rawSnapshot) as Record<string, any>; } catch { return {}; } })()
-    : (rawSnapshot ?? {});
-  const source = { ...r, ...snapshot } as Record<string, any>;
-  const id = `p2p_${source.id}`;
-  const status = String(source.status ?? '');
-  const state = mapP2pStatusToUiState(status);
-  const mode = source.mode_key ?? 'discuss';
-  const currentRoundMode = source.current_round_mode ?? mode;
-  const initiatorLabel = source.initiator_label ?? 'brain';
-  const currentTarget = source.current_target_label ?? (source.current_target_session ? String(source.current_target_session).split('_').pop() : undefined);
-  const totalCount = source.total_count ?? 3;
-  const totalHops = source.total_hops ?? Math.max(0, totalCount - 2);
-  const nodes = Array.isArray(source.all_nodes) ? source.all_nodes.map((n: any) => ({
-    session: typeof n.session === 'string' ? n.session : undefined,
-    label: String(n.label ?? ''),
-    displayLabel: String(n.displayLabel ?? n.display_label ?? n.label ?? ''),
-    agentType: String(n.agentType ?? ''),
-    ccPreset: n.ccPreset ?? n.cc_preset ?? null,
-    mode: typeof n.mode === 'string' ? n.mode : undefined,
-    phase: typeof n.phase === 'string' ? n.phase as 'initial' | 'hop' | 'summary' : undefined,
-    status: String(n.status ?? 'pending') as P2pProgressNodeStatus,
-  })) : undefined;
-  const hopStates = Array.isArray(source.hop_states) ? source.hop_states.map((hop: any) => ({
-    hopIndex: Number(hop.hop_index ?? 0),
-    roundIndex: Number(hop.round_index ?? 0),
-    session: typeof hop.session === 'string' ? hop.session : undefined,
-    mode: typeof hop.mode === 'string' ? hop.mode : undefined,
-    status: String(hop.status ?? 'queued') as 'queued' | 'dispatched' | 'running' | 'completed' | 'timed_out' | 'failed' | 'cancelled',
-  })) : undefined;
-  return {
-    id,
-    topic: `P2P ${mode} · ${initiatorLabel}`,
-    state,
-    modeKey: currentRoundMode,
-    currentRound: source.current_round ?? 1,
-    maxRounds: source.total_rounds ?? 1,
-    completedHops: source.completed_hops_count ?? 0,
-    completedRoundHops: typeof source.completed_round_hops_count === 'number' ? source.completed_round_hops_count : undefined,
-    totalHops,
-    activeHop: source.active_hop_number ?? null,
-    activeRoundHop: source.active_round_hop_number ?? null,
-    activePhase: (typeof source.active_phase === 'string' ? source.active_phase : 'queued') as P2pActivePhase,
-    initiatorLabel,
-    currentSpeaker: currentTarget,
-    conclusion: state === 'done' ? (source.result_summary ?? undefined) : undefined,
-    error: state === 'failed' ? (source.error ?? undefined) : undefined,
-    filePath: undefined,
-    fileId: source.discussion_id ? String(source.discussion_id) : source.id,
-    startedAt: source.created_at ? new Date(source.created_at).getTime() : undefined,
-    hopStartedAt: typeof source.hop_started_at === 'number' ? source.hop_started_at : undefined,
-    nodes,
-    hopStates,
-  };
-}
+import { mapP2pRunToDiscussion } from './p2p-run-mapping.js';
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
 import { LanguageSwitcher } from './components/LanguageSwitcher.js';

@@ -264,7 +264,7 @@ describe('structured P2P routing via WS fields', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(startP2pRun).toHaveBeenCalledTimes(1);
-    const [_initiator, targets] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    const [{ targets }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(targets).toEqual([
       { session: 'deck_proj_w1', mode: 'brainstorm>discuss' },
     ]);
@@ -286,7 +286,7 @@ describe('structured P2P routing via WS fields', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(startP2pRun).toHaveBeenCalledTimes(1);
-    const [_initiator, targets] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    const [{ targets }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(targets).toEqual([
       { session: 'deck_proj_w1', mode: 'audit' },
       { session: 'deck_proj_w2', mode: 'review' },
@@ -306,7 +306,8 @@ describe('structured P2P routing via WS fields', () => {
     await new Promise((r) => setTimeout(r, 100));
 
     expect(startP2pRun).toHaveBeenCalledOnce();
-    const [_initiator, targets, cleanText] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect((startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0]).toHaveLength(1);
+    const [{ targets, userText: cleanText }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(targets.length).toBeGreaterThan(0);
     expect(targets.every((t: any) => t.mode === 'audit')).toBe(true);
     // Text should be clean — no @@tokens
@@ -326,7 +327,7 @@ describe('structured P2P routing via WS fields', () => {
     await new Promise((r) => setTimeout(r, 100));
 
     expect(startP2pRun).toHaveBeenCalledOnce();
-    const [_initiator, targets, cleanText] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    const [{ targets, userText: cleanText }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(targets).toEqual([
       { session: 'deck_proj_w1', mode: 'review' },
     ]);
@@ -348,8 +349,53 @@ describe('structured P2P routing via WS fields', () => {
     await new Promise((r) => setTimeout(r, 100));
 
     expect(startP2pRun).toHaveBeenCalledOnce();
-    const extraPrompt = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0][6];
+    expect((startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0]).toHaveLength(1);
+    const [{ extraPrompt }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(extraPrompt).toContain("Use the user's selected i18n language (Chinese (Simplified)) for the discussion.");
+  });
+
+  it('forwards advanced p2p options through the structured session.send path', async () => {
+    const advancedRounds = [
+      {
+        id: 'implementation',
+        title: 'Implementation',
+        preset: 'implementation',
+        executionMode: 'single_main',
+        permissionScope: 'implementation',
+      },
+    ];
+
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'run advanced p2p',
+      commandId: 'cmd-advanced-1',
+      p2pAtTargets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      p2pAdvancedPresetKey: 'openspec',
+      p2pAdvancedRounds: advancedRounds as any,
+      p2pAdvancedRunTimeoutMinutes: 45,
+      p2pContextReducer: {
+        mode: 'clone_sdk_session',
+        templateSession: 'deck_proj_brain',
+      },
+    }, mockServerLink as any);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(startP2pRun).toHaveBeenCalledOnce();
+    expect((startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0]).toHaveLength(1);
+    expect((startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]).toMatchObject({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'run advanced p2p',
+      advancedPresetKey: 'openspec',
+      advancedRounds,
+      advancedRunTimeoutMs: 45 * 60_000,
+      contextReducer: {
+        mode: 'clone_sdk_session',
+        templateSession: 'deck_proj_brain',
+      },
+    });
   });
 
   it('structured p2pAtTargets stays authoritative for single-target P2P runs', async () => {
@@ -364,7 +410,7 @@ describe('structured P2P routing via WS fields', () => {
     await new Promise((r) => setTimeout(r, 100));
 
     expect(startP2pRun).toHaveBeenCalledOnce();
-    const [_initiator, targets, cleanText] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    const [{ targets, userText: cleanText }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(targets).toEqual([
       { session: 'deck_proj_w1', mode: 'review' },
     ]);
@@ -387,7 +433,7 @@ describe('structured P2P routing via WS fields', () => {
     await new Promise((r) => setTimeout(r, 100));
 
     expect(startP2pRun).toHaveBeenCalledOnce();
-    const [_initiator, targets, cleanText] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    const [{ targets, userText: cleanText }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(targets).toEqual([
       { session: 'deck_proj_w2', mode: 'discuss' },
       { session: 'deck_proj_w1', mode: 'audit' },
@@ -407,7 +453,7 @@ describe('structured P2P routing via WS fields', () => {
     await new Promise((r) => setTimeout(r, 100));
 
     expect(startP2pRun).toHaveBeenCalledOnce();
-    const [_initiator, targets, cleanText] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    const [{ targets, userText: cleanText }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(targets.length).toBeGreaterThan(0);
     expect(targets.every((t: any) => t.mode === 'brainstorm')).toBe(true);
     expect(cleanText).toBe('brainstorm ideas');
@@ -440,7 +486,7 @@ describe('structured P2P routing via WS fields', () => {
     await new Promise((r) => setTimeout(r, 100));
 
     expect(startP2pRun).toHaveBeenCalledOnce();
-    const [_initiator, targets, cleanText] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    const [{ targets, userText: cleanText }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(targets).toEqual([
       { session: 'deck_proj_w1', mode: 'audit' },
     ]);
@@ -469,7 +515,7 @@ describe('structured P2P routing via WS fields', () => {
     await new Promise((r) => setTimeout(r, 100));
 
     expect(startP2pRun).toHaveBeenCalledOnce();
-    const [_initiator, targets] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    const [{ targets }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(targets.length).toBeGreaterThan(0);
     expect(targets.every((t: any) => t.mode === 'audit')).toBe(true);
   });
@@ -485,7 +531,7 @@ describe('structured P2P routing via WS fields', () => {
     await new Promise((r) => setTimeout(r, 100));
 
     expect(startP2pRun).toHaveBeenCalledOnce();
-    const call = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(call[5]).toBe(2);
+    const [{ rounds }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(rounds).toBe(2);
   });
 });
