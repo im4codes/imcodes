@@ -113,6 +113,7 @@ import { onWatchCommand } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
 import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timeline-running.js';
 import { ingestTimelineEventForCache } from './hooks/useTimeline.js';
+import { getMobileKeyboardState } from './mobile-keyboard.js';
 
 // On web: if opened by the native app for passkey auth, render the bridge page.
 const nativeCallback = typeof window !== 'undefined'
@@ -246,14 +247,18 @@ export function App() {
     const vv = window.visualViewport;
     if (!vv) return;
     let inputFocused = false;
+    let hadKeyboardOpen = false;
     let scrollTimer: ReturnType<typeof setTimeout> | undefined;
     const update = () => {
       document.documentElement.style.setProperty('--vvh', `${vv.height}px`);
       // Detect keyboard open: viewport shrink + optional input-focus fallback.
       // Chinese IME candidate bars can be ~40px, so use low threshold when input is focused.
       const shrink = window.innerHeight - vv.height;
-      const kbOpen = shrink > 40 || (inputFocused && shrink > 15);
+      const state = getMobileKeyboardState(inputFocused, shrink, hadKeyboardOpen);
+      hadKeyboardOpen = state.hadKeyboardOpen;
+      const { kbOpen, hideInputUi } = state;
       document.documentElement.classList.toggle('kb-open', kbOpen);
+      document.documentElement.classList.toggle('input-focused', hideInputUi);
       // Reset any scroll/offset caused by keyboard opening on mobile.
       // Always reset — iOS can have vv.offsetTop > 0 even when scrollY is 0.
       window.scrollTo(0, 0);
@@ -291,6 +296,7 @@ export function App() {
     };
     const onFocusOut = () => {
       inputFocused = false;
+      hadKeyboardOpen = false;
       document.documentElement.classList.remove('input-focused');
       clearTimeout(scrollTimer);
       update();
