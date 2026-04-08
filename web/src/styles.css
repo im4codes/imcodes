@@ -1259,6 +1259,14 @@ body {
   background: linear-gradient(180deg, rgba(10, 14, 26, 0.98), rgba(10, 14, 26, 0.94));
   border-bottom: 1px solid rgba(30, 41, 59, 0.9);
 }
+.discussions-nav-controls {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  min-width: 0;
+}
 .discussions-back-btn { background: none; border: none; color: #3b82f6; cursor: pointer; padding: 0; font-size: 14px; line-height: 1.2; text-align: left; }
 @media (min-width: 769px) { .discussions-back-btn { display: none; } }
 .discussions-follow-toggle {
@@ -1266,7 +1274,6 @@ body {
   align-items: center;
   gap: 8px;
   min-width: 0;
-  margin-right: auto;
   color: #cbd5e1;
   font-size: 13px;
   user-select: none;
@@ -1278,30 +1285,18 @@ body {
 .discussions-follow-toggle span {
   white-space: nowrap;
 }
-.discussions-scroll-dock {
-  position: absolute;
-  right: 16px;
-  bottom: 16px;
-  z-index: 4;
-  display: flex;
-  flex-direction: row;
-  align-items: flex-end;
-  gap: 10px;
-  pointer-events: none;
-}
 .discussions-scroll-arrows {
   display: flex;
-  flex-direction: column;
-  gap: 10px;
-  pointer-events: none;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
 }
 .discussions-scroll-btn-floating {
-  width: 38px;
-  height: 38px;
+  width: 34px;
+  height: 34px;
   border-radius: 999px;
-  background: rgba(15, 23, 42, 0.94);
-  box-shadow: 0 10px 28px rgba(2, 6, 23, 0.34);
-  pointer-events: auto;
+  background: rgba(15, 23, 42, 0.92);
+  box-shadow: 0 6px 18px rgba(2, 6, 23, 0.24);
 }
 .discussions-scroll-btn { background: none; border: 1px solid #334155; color: #94a3b8; cursor: pointer; border-radius: 4px; width: 28px; height: 28px; font-size: 14px; display: flex; align-items: center; justify-content: center; padding: 0; flex-shrink: 0; }
 .discussions-scroll-btn:active { background: #334155; color: #e2e8f0; }
@@ -1332,9 +1327,14 @@ body {
     position: absolute; inset: 0; z-index: 10; background: #0a0e1a;
     display: flex; flex-direction: column;
   }
+  .discussions-nav-row { align-items: flex-start; }
+  .discussions-nav-controls {
+    flex-wrap: wrap;
+    row-gap: 8px;
+    justify-content: flex-end;
+  }
   .discussions-follow-toggle span { white-space: normal; line-height: 1.2; }
-  .discussions-scroll-dock { right: 12px; bottom: 12px; }
-  .discussions-scroll-btn-floating { width: 42px; height: 42px; }
+  .discussions-scroll-btn-floating { width: 38px; height: 38px; }
 }
 
 /* AskQuestionDialog */

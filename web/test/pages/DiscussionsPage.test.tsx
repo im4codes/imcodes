@@ -213,7 +213,7 @@ describe('DiscussionsPage', () => {
     expect(screen.getByTestId('discussion-preview').textContent).toBe('Current preview content');
   });
 
-  it('renders copy control next to the floating arrows instead of inside the list', async () => {
+  it('renders copy and scroll controls in the top nav controls instead of inside the list', async () => {
     const { container } = render(<DiscussionsPage ws={ws} />);
 
     await act(async () => {
@@ -236,7 +236,7 @@ describe('DiscussionsPage', () => {
       } as ServerMessage);
     });
 
-    expect(container.querySelector('.discussions-scroll-dock .discussions-copy-btn')).toBeTruthy();
-    expect(container.querySelectorAll('.discussions-scroll-dock .discussions-scroll-btn-floating')).toHaveLength(3);
+    expect(container.querySelector('.discussions-nav-controls .discussions-copy-btn')).toBeTruthy();
+    expect(container.querySelectorAll('.discussions-nav-controls .discussions-scroll-btn-floating')).toHaveLength(3);
   });
 });
