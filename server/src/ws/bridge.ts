@@ -2158,6 +2158,8 @@ export class WsBridge {
 
     // Look up session metadata for human-readable push content
     // Check sessions table first, then sub_sessions for sub-session names
+    const activeMainSession = this.activeMainSessions.get(sessionName);
+
     let sessionRow = await db.queryOne<{ project_name: string; agent_type: string; label: string | null }>(
       'SELECT project_name, agent_type, label FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
       [this.serverId, sessionName],
@@ -2166,7 +2168,7 @@ export class WsBridge {
     let subType: string | undefined;
     if (!sessionRow) {
       // Try sub_sessions table: session name is deck_sub_{id}
-      const subMatch = sessionName.match(/^deck_sub_([a-zA-Z0-9]+)$/);
+      const subMatch = sessionName.match(/^deck_sub_(.+)$/);
       const subRow = subMatch ? await db.queryOne<{ type: string; label: string | null; parent_session: string }>(
         'SELECT type, label, parent_session FROM sub_sessions WHERE server_id = $1 AND id = $2 LIMIT 1',
         [this.serverId, subMatch[1]],
@@ -2175,23 +2177,26 @@ export class WsBridge {
         subType = subRow.type;
         // Look up parent session for context
         if (!daemonParentLabel && subRow.parent_session) {
+          const activeParent = this.activeMainSessions.get(subRow.parent_session);
           const parentRow = await db.queryOne<{ project_name: string; label: string | null }>(
             'SELECT project_name, label FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
             [this.serverId, subRow.parent_session],
           ).catch(() => null);
-          if (parentRow) {
-            sessionRow = { project_name: parentRow.project_name, agent_type: subRow.type, label: subRow.label };
-          }
+          sessionRow = {
+            project_name: activeParent?.project || parentRow?.project_name || subRow.parent_session,
+            agent_type: subRow.type,
+            label: subRow.label,
+          };
         }
       }
     }
 
     // Push title uses a stable 3-part shape: server · displayLabel · agentType.
     // sessionName is the final fallback only when no label/project-style name exists.
-    const label = daemonLabel || sessionRow?.label;
-    const agentType = subType || sessionRow?.agent_type || String(msg.agentType ?? '');
+    const label = daemonLabel || activeMainSession?.label || sessionRow?.label;
+    const agentType = subType || activeMainSession?.agentType || sessionRow?.agent_type || String(msg.agentType ?? '');
     const isSub = sessionName.startsWith('deck_sub_');
-    const mainDisplayName = sessionRow?.project_name || daemonParentLabel || sessionName;
+    const mainDisplayName = activeMainSession?.project || sessionRow?.project_name || daemonParentLabel || sessionName;
     const displayName = isSub
       ? (label || sessionName)
       : (label || mainDisplayName || sessionName);

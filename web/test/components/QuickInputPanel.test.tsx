@@ -80,4 +80,144 @@ describe('QuickInputPanel history scope', () => {
     expect(screen.getByText('session b newest')).toBeDefined();
     expect(screen.getByText('session b older')).toBeDefined();
   });
+
+  it('removes a custom phrase when its delete action is confirmed', () => {
+    const removePhrase = vi.fn();
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const { container } = render(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={vi.fn()}
+        agentType="claude-code"
+        sessionName="session-a"
+        data={{ history: [], sessionHistory: {}, commands: [], phrases: ['custom phrase'] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={removePhrase}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+      />,
+    );
+
+    const deleteButton = container.querySelector('.qp-pill-custom .qp-pill-del') as HTMLButtonElement | null;
+    expect(deleteButton).not.toBeNull();
+    fireEvent.click(deleteButton!);
+
+    expect(confirmSpy).toHaveBeenCalledWith('Delete?');
+    expect(removePhrase).toHaveBeenCalledWith('custom phrase');
+    confirmSpy.mockRestore();
+  });
+
+  it('removes a custom command when its delete action is confirmed', () => {
+    const removeCommand = vi.fn();
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const { container } = render(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={vi.fn()}
+        agentType="claude-code"
+        sessionName="session-a"
+        data={{ history: [], sessionHistory: {}, commands: ['/custom'], phrases: [] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={removeCommand}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+      />,
+    );
+
+    const deleteButton = container.querySelector('.qp-pill-custom .qp-pill-del') as HTMLButtonElement | null;
+    expect(deleteButton).not.toBeNull();
+    fireEvent.click(deleteButton!);
+
+    expect(confirmSpy).toHaveBeenCalledWith('Delete?');
+    expect(removeCommand).toHaveBeenCalledWith('/custom');
+    confirmSpy.mockRestore();
+  });
+
+  it('replaces a custom phrase when edited and committed', () => {
+    const addPhrase = vi.fn();
+    const removePhrase = vi.fn();
+    const { container } = render(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={vi.fn()}
+        agentType="claude-code"
+        sessionName="session-a"
+        data={{ history: [], sessionHistory: {}, commands: [], phrases: ['custom phrase'] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={addPhrase}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={removePhrase}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+      />,
+    );
+
+    const editButton = container.querySelector('.qp-pill-custom .qp-pill-edit') as HTMLButtonElement | null;
+    expect(editButton).not.toBeNull();
+    fireEvent.click(editButton!);
+
+    const input = container.querySelector('.qp-edit-input') as HTMLInputElement | null;
+    expect(input).not.toBeNull();
+    fireEvent.input(input!, { target: { value: 'updated phrase' } });
+    fireEvent.keyDown(input!, { key: 'Enter' });
+
+    expect(removePhrase).toHaveBeenCalledWith('custom phrase');
+    expect(addPhrase).toHaveBeenCalledWith('updated phrase');
+  });
+
+  it('replaces a custom command when edited and committed', () => {
+    const addCommand = vi.fn();
+    const removeCommand = vi.fn();
+    const { container } = render(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={vi.fn()}
+        agentType="claude-code"
+        sessionName="session-a"
+        data={{ history: [], sessionHistory: {}, commands: ['/custom'], phrases: [] }}
+        loaded
+        onAddCommand={addCommand}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={removeCommand}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+      />,
+    );
+
+    const editButton = container.querySelector('.qp-pill-custom .qp-pill-edit') as HTMLButtonElement | null;
+    expect(editButton).not.toBeNull();
+    fireEvent.click(editButton!);
+
+    const input = container.querySelector('.qp-edit-input') as HTMLInputElement | null;
+    expect(input).not.toBeNull();
+    fireEvent.input(input!, { target: { value: '/updated' } });
+    fireEvent.keyDown(input!, { key: 'Enter' });
+
+    expect(removeCommand).toHaveBeenCalledWith('/custom');
+    expect(addCommand).toHaveBeenCalledWith('/updated');
+  });
 });

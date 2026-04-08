@@ -1568,6 +1568,50 @@ describe('WsBridge', () => {
       expect(payload.title).not.toContain('deck_sub_ab12cd34');
     });
 
+    it('resolves hyphenated sub-session ids before falling back to internal session names', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle',
+        session: 'deck_sub_sub-123',
+        lastText: 'Done.',
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls[0][0];
+      expect(payload.title).toBe('my-server · worker-1 · codex');
+      expect(payload.title).not.toContain('deck_sub_sub-123');
+    });
+
+    it('prefers active session snapshot labels over internal main session names in push title', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session_list',
+        sessions: [{
+          name: 'bootmainxowfy6',
+          project: 'codedeck',
+          state: 'idle',
+          agentType: 'claude-code',
+          label: 'Boot Main',
+        }],
+      }));
+      await flushAsync();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle',
+        session: 'bootmainxowfy6',
+        lastText: 'Ready.',
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
+      expect(payload?.title).toBe('my-server · Boot Main · claude-code');
+      expect(payload?.title).not.toContain('bootmainxowfy6');
+    });
+
     it('uses lastText as push body for session.idle', async () => {
       const { dispatchPush } = await import('../src/routes/push.js');
       const { daemonWs } = await setupPushBridge();
