@@ -174,9 +174,15 @@ body {
 .menu-wrap { position: relative; }
 .menu-dropdown { position: absolute; bottom: calc(100% + 4px); right: 0; background: #1e293b; border: 1px solid #334155; border-radius: 6px; min-width: 200px; max-height: 60vh; overflow-y: auto; box-shadow: 0 4px 16px #00000060; z-index: 50; }
 .menu-dropdown-models { min-width: min(260px, calc(100vw - 24px)); max-width: min(320px, calc(100vw - 24px)); }
-.menu-dropdown-openspec { width: max-content; min-width: min(320px, calc(100vw - 24px)); max-width: calc(100vw - 24px); overscroll-behavior: contain; }
+.menu-dropdown-openspec { width: max-content; min-width: min(320px, calc(100vw - 24px)); max-width: calc(100vw - 24px); overscroll-behavior: contain; display: flex; flex-direction: column; }
 .menu-dropdown-openspec .menu-item,
 .menu-dropdown-openspec .p2p-menu-section-label { white-space: nowrap; }
+.openspec-dropdown-scroll { flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 2px; }
+.openspec-dropdown-footer { flex-shrink: 0; margin-top: 8px; padding: 8px 0 0; border-top: 1px solid rgba(148, 163, 184, 0.18); }
+.openspec-footer-action-wrap { width: 100%; }
+.openspec-section-label { margin-top: 0; }
+.openspec-section-meta { text-transform: none; letter-spacing: normal; margin-top: 4px; }
+.openspec-section-error { color: #fca5a5; }
 .openspec-change-row { display: flex; align-items: center; gap: 6px; }
 .openspec-change-header { display: contents; }
 .openspec-change-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }

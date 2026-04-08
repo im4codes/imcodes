@@ -1304,17 +1304,18 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             </button>
             {openSpecOpen && (
               <div class="menu-dropdown menu-dropdown-openspec" style={openSpecDropdownStyle}>
-                <div class="p2p-menu-section-label" style={{ marginTop: 0 }}>{t('openspec.changes')}</div>
+                <div class="openspec-dropdown-scroll">
+                <div class="p2p-menu-section-label openspec-section-label">{t('openspec.changes')}</div>
                 {openSpecLoading && (
-                  <div class="p2p-menu-section-label" style={{ textTransform: 'none', letterSpacing: 'normal', marginTop: 4 }}>{t('common.loading')}</div>
+                  <div class="p2p-menu-section-label openspec-section-meta">{t('common.loading')}</div>
                 )}
                 {!openSpecLoading && openSpecError && (
-                  <div class="p2p-menu-section-label" style={{ textTransform: 'none', letterSpacing: 'normal', color: '#fca5a5', marginTop: 4 }}>
+                  <div class="p2p-menu-section-label openspec-section-meta openspec-section-error">
                     {openSpecError}
                   </div>
                 )}
                 {!openSpecLoading && !openSpecError && openSpecChanges.length === 0 && (
-                  <div class="p2p-menu-section-label" style={{ textTransform: 'none', letterSpacing: 'normal', marginTop: 4 }}>{t('openspec.empty')}</div>
+                  <div class="p2p-menu-section-label openspec-section-meta">{t('openspec.empty')}</div>
                 )}
                 {!openSpecLoading && !openSpecError && openSpecChanges.map((changeName) => (
                   <div
@@ -1422,8 +1423,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     </div>
                   </div>
                 ))}
-                <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid rgba(148, 163, 184, 0.18)' }}>
-                  <div class="openspec-change-action-wrap" style={{ width: '100%' }}>
+                </div>
+                <div class="openspec-dropdown-footer">
+                  <div class="openspec-change-action-wrap openspec-footer-action-wrap">
                     <button
                       class="btn btn-secondary openspec-change-action-btn"
                       style={{ width: '100%', justifyContent: 'center' }}

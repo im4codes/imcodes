@@ -624,6 +624,29 @@ describe('SessionControls', () => {
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
   });
 
+  it('shows openspec propose even when there are no existing changes', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [],
+    });
+    await flushAsync();
+
+    expect(screen.getByRole('button', { name: 'propose_action' })).toBeDefined();
+  });
+
   it('limits openspec dropdown height to the visible space above the trigger', async () => {
     const rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function mockRect() {
       if ((this as HTMLElement).classList?.contains('shortcuts-model')) {

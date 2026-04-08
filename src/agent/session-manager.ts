@@ -884,11 +884,19 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'high' });
     }
     const mapped = (status === 'streaming' || status === 'thinking') ? 'running' : status;
-    timelineEmitter.emit(sessionName, 'session.state', { state: mapped }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(sessionName, 'session.state', {
+      state: mapped,
+      pendingCount: runtime.pendingCount,
+      pendingMessages: runtime.pendingMessages,
+    }, { source: 'daemon', confidence: 'high' });
   };
   runtime.onDrain = (merged, count) => {
     timelineEmitter.emit(sessionName, 'user.message', { text: merged, batchedCount: count, allowDuplicate: true });
-    timelineEmitter.emit(sessionName, 'session.state', { state: 'running' }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(sessionName, 'session.state', {
+      state: 'running',
+      pendingCount: runtime.pendingCount,
+      pendingMessages: runtime.pendingMessages,
+    }, { source: 'daemon', confidence: 'high' });
   };
 }
 

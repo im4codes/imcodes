@@ -1207,7 +1207,7 @@ export function App() {
             quotaUsageLabel: s.quotaUsageLabel,
             quotaMeta: s.quotaMeta ?? existing?.quotaMeta,
             effort: s.effort ?? existing?.effort,
-            transportPendingMessages: s.state === 'queued'
+            transportPendingMessages: (s.state === 'queued' || s.state === 'running')
               ? (existing?.transportPendingMessages ?? [])
               : [],
           };
@@ -1269,6 +1269,7 @@ export function App() {
         // Sync session state from live timeline events (running/idle)
         if (event.type === 'session.state' && !event.sessionId.startsWith('deck_sub_')) {
           const liveState = String(event.payload.state ?? '');
+          const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessages');
           if (liveState === 'queued') {
             const pendingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
             setSessions((prev) => prev.map((s) =>
@@ -1276,7 +1277,20 @@ export function App() {
                 ? { ...s, transportPendingMessages: pendingMessages }
                 : s,
             ));
-          } else if (liveState === 'running' || liveState === 'idle') {
+          } else if (liveState === 'running') {
+            const pendingMessages = hasPendingMessagesField
+              ? extractTransportPendingMessages(event.payload.pendingMessages)
+              : null;
+            setSessions((prev) => prev.map((s) =>
+              s.name === event.sessionId
+                ? {
+                    ...s,
+                    state: 'running' as SessionInfo['state'],
+                    transportPendingMessages: pendingMessages ?? (s.transportPendingMessages ?? []),
+                  }
+                : s,
+            ));
+          } else if (liveState === 'idle') {
             setSessions((prev) => prev.map((s) =>
               s.name === event.sessionId
                 ? { ...s, state: liveState as SessionInfo['state'], transportPendingMessages: [] }

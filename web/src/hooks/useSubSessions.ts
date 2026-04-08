@@ -235,6 +235,9 @@ export function useSubSessions(
       }
 
       if (!sessionName || !sessionName.startsWith('deck_sub_')) return;
+      const hasPendingMessagesField = msg.type === 'timeline.event'
+        && msg.event.type === 'session.state'
+        && Object.prototype.hasOwnProperty.call(msg.event.payload ?? {}, 'pendingMessages');
       if (state === 'queued') {
         const pendingMessages = msg.type === 'timeline.event' && msg.event.type === 'session.state'
           ? extractTransportPendingMessages(msg.event.payload.pendingMessages)
@@ -248,10 +251,27 @@ export function useSubSessions(
         });
         return;
       }
+      if (state === 'running' && hasPendingMessagesField) {
+        const pendingMessages = extractTransportPendingMessages(msg.event.payload.pendingMessages);
+        setSubSessions((prev) => {
+          const idx = prev.findIndex((s) => s.sessionName === sessionName);
+          if (idx === -1) return prev;
+          const next = [...prev];
+          next[idx] = { ...next[idx], state: 'running', transportPendingMessages: pendingMessages };
+          return next;
+        });
+        return;
+      }
       if (state !== 'idle' && state !== 'running' && state !== 'stopping' && state !== 'stopped' && state !== 'error') return;
       setSubSessions((prev) => {
         const idx = prev.findIndex((s) => s.sessionName === sessionName);
         if (idx === -1) return prev;
+        if (state === 'running') {
+          if (prev[idx].state === 'running') return prev;
+          const next = [...prev];
+          next[idx] = { ...next[idx], state: 'running' };
+          return next;
+        }
         if (prev[idx].state === state && (prev[idx].transportPendingMessages?.length ?? 0) === 0) return prev;
         const next = [...prev];
         next[idx] = { ...next[idx], state: state as SubSession['state'], transportPendingMessages: [] };
