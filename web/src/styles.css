@@ -137,7 +137,7 @@ body {
   border: 1px solid rgba(251, 191, 36, 0.35);
   border-radius: 10px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
-  pointer-events: none;
+  pointer-events: auto;
   z-index: 3;
 }
 .controls-queued-list {
@@ -154,6 +154,10 @@ body {
   color: #e2e8f0;
   white-space: pre-wrap;
   word-break: break-word;
+  max-height: calc(1.35em * 2 + 14px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
 }
 .attachment-badges { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 2px 2px; }
 .attachment-badge { display: inline-flex; align-items: center; gap: 4px; background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 2px 8px 2px 6px; font-size: 12px; color: #94a3b8; max-width: 200px; }
