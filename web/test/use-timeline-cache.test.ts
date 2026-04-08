@@ -89,6 +89,116 @@ describe('useTimeline global cache bounds', () => {
     expect(screen.getByTestId('window').textContent).toBe('3');
   });
 
+  it('keeps active session cache resident so a late stale instance cannot wipe history on the next event', async () => {
+    const sessionName = `deck_transport_live_${Date.now()}`;
+    const cacheKey = `srv:${sessionName}`;
+    let handlerA: ((msg: ServerMessage) => void) | null = null;
+    let handlerB: ((msg: ServerMessage) => void) | null = null;
+
+    const wsA: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handlerA = next;
+        return () => { handlerA = null; };
+      },
+      sendTimelineHistoryRequest: () => 'history-a',
+    } as unknown as WsClient;
+
+    const wsB: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handlerB = next;
+        return () => { handlerB = null; };
+      },
+      sendTimelineHistoryRequest: () => 'history-b',
+    } as unknown as WsClient;
+
+    function Probe({ name, ws }: { name: string; ws: WsClient }) {
+      const { events } = useTimeline(sessionName, ws, 'srv');
+      return h(
+        'div',
+        { 'data-testid': name },
+        events.map((event) => String(event.payload.text ?? '')).join('|'),
+      );
+    }
+
+    const view = render(h(Probe, { name: 'primary', ws: wsA }));
+
+    await act(async () => {
+      handlerA?.({
+        type: 'timeline.history',
+        sessionName,
+        requestId: 'history-a',
+        epoch: 1,
+        events: [
+          {
+            eventId: `${sessionName}-1`,
+            sessionId: sessionName,
+            ts: 1,
+            epoch: 1,
+            seq: 1,
+            source: 'daemon',
+            confidence: 'high',
+            type: 'user.message',
+            payload: { text: 'first' },
+          },
+          {
+            eventId: `${sessionName}-2`,
+            sessionId: sessionName,
+            ts: 2,
+            epoch: 1,
+            seq: 2,
+            source: 'daemon',
+            confidence: 'high',
+            type: 'assistant.text',
+            payload: { text: 'second' },
+          },
+        ],
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('primary').textContent).toBe('first|second');
+    });
+
+    for (let i = 0; i < 13; i++) {
+      __setTimelineCacheForTests(`srv:other-${i}`, makeEvents(`other-${i}`, 100));
+    }
+
+    expect(__getTimelineCacheKeysForTests()).toContain(cacheKey);
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockImplementation(() => new Promise(() => {}));
+
+    view.rerender(
+      h('div', null,
+        h(Probe, { name: 'primary', ws: wsA }),
+        h(Probe, { name: 'secondary', ws: wsB }),
+      ),
+    );
+
+    await act(async () => {
+      handlerB?.({
+        type: 'timeline.event',
+        event: {
+          eventId: `${sessionName}-3`,
+          sessionId: sessionName,
+          ts: 3,
+          epoch: 1,
+          seq: 3,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: 'third' },
+        },
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('primary').textContent).toBe('first|second|third');
+      expect(screen.getByTestId('secondary').textContent).toBe('first|second|third');
+    });
+  });
+
   it('uses the shared cache as the merge base when a late instance is locally stale', () => {
     const sessionName = `deck_transport_${Date.now()}`;
     const cacheKey = `srv:${sessionName}`;

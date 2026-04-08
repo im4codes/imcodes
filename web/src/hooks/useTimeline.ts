@@ -82,6 +82,7 @@ function pruneTimelineCache(): void {
   if (eventsCache.size <= MAX_CACHED_SESSIONS && totalEvents <= MAX_TOTAL_CACHED_EVENTS) return;
 
   const evictionOrder = [...eventsCache.keys()]
+    .filter((key) => (cacheListeners.get(key)?.size ?? 0) === 0)
     .map((key) => ({ key, at: eventsCacheAccess.get(key) ?? 0, size: eventsCache.get(key)?.length ?? 0 }))
     .sort((a, b) => a.at - b.at);
 
