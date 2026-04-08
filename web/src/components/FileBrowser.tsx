@@ -121,6 +121,8 @@ export interface FileBrowserProps {
   highlightPath?: string;
   /** When set, automatically open the file preview on mount (skips manual click) */
   autoPreviewPath?: string;
+  /** When autoPreviewPath is set, start in diff mode instead of source mode. */
+  autoPreviewPreferDiff?: boolean;
   /** Paths already inserted — shown with a badge to avoid duplicates */
   alreadyInserted?: string[];
   /** Hide the footer (select/confirm buttons) — for embedded panel views */
@@ -134,7 +136,7 @@ export interface FileBrowserProps {
   onConfirm: (paths: string[]) => void;
   onClose?: () => void;
   /** When set, file clicks open an external preview (e.g. floating window) instead of inline split */
-  onPreviewFile?: (path: string) => void;
+  onPreviewFile?: (request: { path: string; preferDiff?: boolean }) => void;
   /** Default panel tab — 'files' or 'changes'. Default: 'files' */
   defaultTab?: 'files' | 'changes';
 }
@@ -186,6 +188,7 @@ export function FileBrowser({
   initialPath,
   highlightPath,
   autoPreviewPath,
+  autoPreviewPreferDiff = false,
   alreadyInserted = [],
   hideFooter = false,
   changesRootPath,
@@ -526,7 +529,7 @@ export function FileBrowser({
   }, [ws, includeFiles, t]);
 
   const fetchPreview = useCallback((filePath: string, preferDiff = false) => {
-    if (onPreviewFile) { onPreviewFile(filePath); return; }
+    if (onPreviewFile) { onPreviewFile({ path: filePath, preferDiff }); return; }
     if (editDirtyRef.current) {
       if (!window.confirm(t('fileBrowser.unsavedChanges'))) return;
     }
@@ -614,8 +617,8 @@ export function FileBrowser({
 
   // Auto-preview file on open (e.g. when clicking a path link in chat)
   useEffect(() => {
-    if (autoPreviewPath) fetchPreview(autoPreviewPath);
-  }, [autoPreviewPath, fetchPreview]);
+    if (autoPreviewPath) fetchPreview(autoPreviewPath, autoPreviewPreferDiff);
+  }, [autoPreviewPath, autoPreviewPreferDiff, fetchPreview]);
 
   // Auto-refresh preview content every 5s when a file is being previewed (paused during editing)
   useEffect(() => {

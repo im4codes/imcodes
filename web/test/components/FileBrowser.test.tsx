@@ -554,6 +554,42 @@ describe('FileBrowser', () => {
     expect(document.querySelector('.fb-preview-content pre')).toBeNull();
   });
 
+  it('passes preferDiff to external previews opened from the Changes tab', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    const onPreviewFile = vi.fn();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        changesRootPath="/home/user"
+        onPreviewFile={onPreviewFile}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([], '/home/user'); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [{ path: '/home/user/foo.ts', code: 'M' }],
+      });
+    });
+
+    const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
+    await act(async () => { fireEvent.click(changesTab); });
+
+    const changeItem = document.querySelector('.fb-changes-item') as HTMLElement;
+    await act(async () => { fireEvent.click(changeItem); });
+
+    expect(onPreviewFile).toHaveBeenCalledWith({ path: '/home/user/foo.ts', preferDiff: true });
+  });
+
   // ── Expand ────────────────────────────────────────────────────────────
 
   it('fetches children when a collapsed directory expand arrow is clicked', async () => {

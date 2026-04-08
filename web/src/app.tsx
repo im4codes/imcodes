@@ -675,8 +675,8 @@ export function App() {
   const [showRepoPage, setShowRepoPage] = useState(false);
   const [repoFocusLatestAction, setRepoFocusLatestAction] = useState<{ token: number; failedJobName?: string; failedStepName?: string } | null>(null);
   const [pendingRepoToastSession, setPendingRepoToastSession] = useState<{ sessionName: string; focus: { token: number; failedJobName?: string; failedStepName?: string } } | null>(null);
-  /** File path for the floating file preview window (opened from pinned file browser) */
-  const [previewFilePath, setPreviewFilePath] = useState<string | null>(null);
+  /** Floating file preview request opened from pinned file browser. */
+  const [previewFileRequest, setPreviewFileRequest] = useState<{ path: string; preferDiff?: boolean } | null>(null);
   const [repoContexts, setRepoContexts] = useState<Map<string, any>>(new Map());
   const repoContextsRef = useRef(repoContexts);
   repoContextsRef.current = repoContexts;
@@ -1889,32 +1889,11 @@ export function App() {
 
   const handleStopProject = useCallback((project: string) => {
     if (!wsRef.current) return;
-    const parentNames = new Set(sessionsRef.current.filter((s) => s.project === project).map((s) => s.name));
-    const descendants = new Set<string>();
-
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const sub of subSessionsRef.current) {
-        if (!sub.parentSession) continue;
-        if (descendants.has(sub.id)) continue;
-        if (!parentNames.has(sub.parentSession)) continue;
-        descendants.add(sub.id);
-        parentNames.add(sub.sessionName);
-        changed = true;
-      }
-    }
-
-    for (const subId of descendants) {
-      closeSubSession(subId);
-    }
-
+    setSessions((prev) => prev.map((s) =>
+      s.project === project ? { ...s, state: 'stopping' as SessionInfo['state'] } : s,
+    ));
     wsRef.current.sendSessionCommand('stop', { project });
-    setSessions((prev) => prev.filter((s) => s.project !== project));
-    if (sessions.some((s) => s.project === project && s.name === activeSession)) {
-      setActiveSession(null);
-    }
-  }, [sessions, activeSession, setActiveSession, closeSubSession]);
+  }, []);
 
   const handleRestartProject = useCallback((project: string, fresh?: boolean) => {
     wsRef.current?.sendSessionCommand('restart', { project, ...(fresh ? { fresh: true } : {}) });
@@ -2267,7 +2246,7 @@ export function App() {
                 serverId: selectedServerId ?? '',
                 subSessions,
                 inputRefsMap,
-                onPreviewFile: (path) => setPreviewFilePath(path),
+                onPreviewFile: (request) => setPreviewFileRequest(request),
                 activeSession,
                 activeProjectDir: activeSessionInfo?.projectDir,
                 sessions,
@@ -2764,7 +2743,7 @@ export function App() {
                   serverId: selectedServerId ?? '',
                   subSessions,
                   inputRefsMap,
-                  onPreviewFile: (path) => { setPreviewFilePath(path); closeSidebar(); },
+                  onPreviewFile: (request) => { setPreviewFileRequest(request); closeSidebar(); },
                   activeSession,
                   activeProjectDir: activeSessionInfo?.projectDir,
                   sessions,
@@ -2877,25 +2856,24 @@ export function App() {
       )}
 
       {/* Floating file preview — one file at a time, opened from pinned file browser */}
-      {previewFilePath && wsRef.current && (
+      {previewFileRequest && wsRef.current && (
         <FloatingPanel
           id="file-preview"
-          title={previewFilePath.split(/[/\\]/).pop() ?? 'Preview'}
-          onClose={() => setPreviewFilePath(null)}
+          title={previewFileRequest.path.split(/[/\\]/).pop() ?? 'Preview'}
+          onClose={() => setPreviewFileRequest(null)}
           defaultW={700}
           defaultH={500}
         >
           <FileBrowser
-            key={previewFilePath}
+            key={`${previewFileRequest.path}:${previewFileRequest.preferDiff ? 'diff' : 'source'}`}
             ws={wsRef.current}
             serverId={selectedServerId ?? undefined}
             mode="file-single"
             layout="panel"
-            initialPath={previewFilePath.replace(/\/[^/]+$/, '') || '~'}
-            autoPreviewPath={previewFilePath}
+            initialPath={previewFileRequest.path.replace(/\/[^/]+$/, '') || '~'}
+            autoPreviewPath={previewFileRequest.path}
+            autoPreviewPreferDiff={!!previewFileRequest.preferDiff}
             hideFooter
-            changesRootPath={activeSessionInfo?.projectDir}
-            refreshTrigger={Date.now()}
             onConfirm={() => {}}
           />
         </FloatingPanel>
