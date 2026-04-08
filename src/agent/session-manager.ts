@@ -35,6 +35,7 @@ import { getQwenOAuthQuotaUsageLabel } from './provider-quota.js';
 import { getClaudeSdkRuntimeConfig } from './sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from './codex-runtime-config.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
+import { isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
 
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
@@ -752,6 +753,90 @@ export interface LaunchOpts {
   userCreated?: boolean;
 }
 
+export interface SessionRelaunchOverrides {
+  agentType?: AgentType;
+  projectDir?: string;
+  label?: string | null;
+  description?: string | null;
+  requestedModel?: string | null;
+  effort?: TransportEffortLevel | null;
+  transportConfig?: Record<string, unknown> | null;
+  ccPreset?: string | null;
+}
+
+export function getCompatibleSessionIds(
+  record: Pick<SessionRecord, 'ccSessionId' | 'codexSessionId' | 'geminiSessionId' | 'opencodeSessionId'>,
+  agentType: AgentType,
+): Pick<LaunchOpts, 'ccSessionId' | 'codexSessionId' | 'geminiSessionId' | 'opencodeSessionId'> {
+  return {
+    ...(isClaudeCodeFamily(agentType) && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
+    ...(isCodexFamily(agentType) && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
+    ...(agentType === 'gemini' && record.geminiSessionId ? { geminiSessionId: record.geminiSessionId } : {}),
+    ...(agentType === 'opencode' && record.opencodeSessionId ? { opencodeSessionId: record.opencodeSessionId } : {}),
+  };
+}
+
+function stopStructuredWatchers(sessionName: string): void {
+  stopWatching(sessionName);
+  stopCodexWatching(sessionName);
+  stopGeminiWatching(sessionName);
+  stopOpenCodeWatching(sessionName);
+}
+
+async function teardownSessionRuntime(record: SessionRecord): Promise<void> {
+  stopStructuredWatchers(record.name);
+  const transportRuntime = transportRuntimes.get(record.name);
+  if (transportRuntime) {
+    if (transportRuntime.providerSessionId) unregisterProviderRoute(transportRuntime.providerSessionId);
+    await transportRuntime.kill().catch(() => {});
+    transportRuntimes.delete(record.name);
+    return;
+  }
+  await killSession(record.name).catch(() => {});
+}
+
+export async function relaunchSessionWithSettings(
+  record: SessionRecord,
+  overrides: SessionRelaunchOverrides = {},
+): Promise<void> {
+  const targetAgentType = (overrides.agentType ?? record.agentType) as AgentType;
+  const targetProjectDir = overrides.projectDir ?? record.projectDir;
+  const targetLabel = overrides.label !== undefined ? overrides.label : (record.label ?? null);
+  const targetDescription = overrides.description !== undefined ? overrides.description : (record.description ?? null);
+  const targetRequestedModel = overrides.requestedModel !== undefined ? overrides.requestedModel : (record.requestedModel ?? null);
+  const targetEffort = overrides.effort !== undefined ? overrides.effort : (record.effort ?? null);
+  const targetTransportConfig = overrides.transportConfig !== undefined ? overrides.transportConfig : (record.transportConfig ?? null);
+  const targetCcPreset = overrides.ccPreset !== undefined ? overrides.ccPreset : (record.ccPreset ?? null);
+  const compatibleIds = getCompatibleSessionIds(record, targetAgentType);
+  const preserveTransportBinding = record.runtimeType === RUNTIME_TYPES.TRANSPORT
+    && record.agentType === targetAgentType
+    && typeof record.providerSessionId === 'string'
+    && record.providerSessionId.length > 0;
+
+  await teardownSessionRuntime(record);
+
+  await launchSession({
+    name: record.name,
+    projectName: record.projectName,
+    role: record.role,
+    agentType: targetAgentType,
+    projectDir: targetProjectDir,
+    label: targetLabel ?? undefined,
+    description: targetDescription ?? undefined,
+    requestedModel: targetRequestedModel ?? undefined,
+    effort: targetEffort ?? undefined,
+    transportConfig: targetTransportConfig ?? undefined,
+    ccPreset: targetAgentType === 'claude-code' ? (targetCcPreset ?? undefined) : undefined,
+    ...(preserveTransportBinding ? {
+      bindExistingKey: record.providerSessionId,
+      skipCreate: true,
+    } : {}),
+    ...compatibleIds,
+    ...(record.parentSession ? { parentSession: record.parentSession } : {}),
+    ...(record.userCreated ? { userCreated: true } : {}),
+  });
+}
+
 /** In-memory map of active transport session runtimes */
 const transportRuntimes = new Map<string, TransportSessionRuntime>();
 
@@ -1209,6 +1294,9 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ...(opencodeSessionId ? { opencodeSessionId } : {}),
       ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),
       ...(label ? { label } : {}),
+      ...(opts.description ? { description: opts.description } : {}),
+      ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
+      ...(opts.userCreated ? { userCreated: true } : {}),
       ...(familyDisplay ?? {}),
     };
     upsertSession(record);
@@ -1224,6 +1312,9 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
         ...(geminiSessionId ? { geminiSessionId } : {}),
         ...(opencodeSessionId ? { opencodeSessionId } : {}),
         ...(opts.qwenModel ? { qwenModel: opts.qwenModel } : {}),
+        ...(opts.description ? { description: opts.description } : {}),
+        ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
+        ...(opts.userCreated ? { userCreated: true } : {}),
         updatedAt: Date.now(),
       };
       upsertSession(merged);

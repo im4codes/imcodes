@@ -678,6 +678,7 @@ export async function patchSubSession(
   serverId: string,
   subId: string,
   body: {
+    type?: string | null;
     label?: string | null;
     closedAt?: number | null;
     description?: string | null;
@@ -698,7 +699,7 @@ export async function patchSubSession(
 export async function patchSession(
   serverId: string,
   sessionName: string,
-  body: { label?: string | null; description?: string | null; cwd?: string | null },
+  body: { label?: string | null; description?: string | null; cwd?: string | null; agentType?: string | null },
 ): Promise<void> {
   await apiFetch(`/api/server/${serverId}/sessions/${sessionName}`, {
     method: 'PATCH',

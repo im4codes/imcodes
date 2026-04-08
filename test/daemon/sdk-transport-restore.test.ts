@@ -111,15 +111,17 @@ vi.mock('../../src/daemon/timeline-emitter.js', () => ({
 
 vi.mock('../../src/agent/tmux.js', () => ({
   listSessions: vi.fn().mockResolvedValue([]),
-  newSession: vi.fn(), killSession: vi.fn(), sessionExists: vi.fn(), isPaneAlive: vi.fn(), respawnPane: vi.fn(),
-  sendKeys: vi.fn(), sendKey: vi.fn(), capturePane: vi.fn(), showBuffer: vi.fn(), getPaneId: vi.fn(), getPaneCwd: vi.fn(), getPaneStartCommand: vi.fn(), cleanupOrphanFifos: vi.fn(), BACKEND: 'tmux',
+  newSession: vi.fn().mockResolvedValue(undefined), killSession: vi.fn().mockResolvedValue(undefined), sessionExists: vi.fn(), isPaneAlive: vi.fn(), respawnPane: vi.fn(),
+  sendKeys: vi.fn(), sendKey: vi.fn(), capturePane: vi.fn(), showBuffer: vi.fn(), getPaneId: vi.fn().mockResolvedValue(undefined), getPaneCwd: vi.fn().mockResolvedValue('/tmp'), getPaneStartCommand: vi.fn().mockResolvedValue(''), cleanupOrphanFifos: vi.fn(), BACKEND: 'tmux',
 }));
-vi.mock('../../src/daemon/jsonl-watcher.js', () => ({ startWatching: vi.fn(), startWatchingFile: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findJsonlPathBySessionId: vi.fn() }));
-vi.mock('../../src/daemon/codex-watcher.js', () => ({ startWatching: vi.fn(), startWatchingSpecificFile: vi.fn(), startWatchingById: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findRolloutPathByUuid: vi.fn(async () => null) }));
-vi.mock('../../src/daemon/gemini-watcher.js', () => ({ startWatching: vi.fn(), startWatchingLatest: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));
-vi.mock('../../src/daemon/opencode-watcher.js', () => ({ startWatching: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));
+vi.mock('../../src/daemon/jsonl-watcher.js', () => ({ startWatching: vi.fn().mockResolvedValue(undefined), startWatchingFile: vi.fn().mockResolvedValue(undefined), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findJsonlPathBySessionId: vi.fn(() => '/tmp/mock.jsonl') }));
+vi.mock('../../src/daemon/codex-watcher.js', () => ({ startWatching: vi.fn().mockResolvedValue(undefined), startWatchingSpecificFile: vi.fn().mockResolvedValue(undefined), startWatchingById: vi.fn().mockResolvedValue(undefined), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findRolloutPathByUuid: vi.fn(async () => null) }));
+vi.mock('../../src/daemon/gemini-watcher.js', () => ({ startWatching: vi.fn().mockResolvedValue(undefined), startWatchingLatest: vi.fn().mockResolvedValue(undefined), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));
+vi.mock('../../src/daemon/opencode-watcher.js', () => ({ startWatching: vi.fn().mockResolvedValue(undefined), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));
 vi.mock('../../src/agent/structured-session-bootstrap.js', () => ({ resolveStructuredSessionBootstrap: vi.fn(async (x) => x) }));
 vi.mock('../../src/agent/qwen-runtime-config.js', () => ({ getQwenRuntimeConfig: vi.fn(async () => null) }));
+vi.mock('../../src/agent/sdk-runtime-config.js', () => ({ getClaudeSdkRuntimeConfig: vi.fn(async () => ({})) }));
+vi.mock('../../src/agent/codex-runtime-config.js', () => ({ getCodexRuntimeConfig: vi.fn(async () => ({})) }));
 vi.mock('../../src/agent/provider-display.js', () => ({ getQwenDisplayMetadata: vi.fn(() => ({})) }));
 vi.mock('../../src/agent/provider-quota.js', () => ({ getQwenOAuthQuotaUsageLabel: vi.fn(() => '') }));
 vi.mock('../../src/agent/agent-version.js', () => ({ getAgentVersion: vi.fn(async () => 'test') }));
@@ -129,7 +131,8 @@ vi.mock('../../src/repo/cache.js', () => ({ repoCache: { invalidate: vi.fn() } }
 vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })) }));
 
 import { connectProvider, disconnectAll } from '../../src/agent/provider-registry.js';
-import { getTransportRuntime, launchTransportSession, restoreTransportSessions, setSessionEventCallback } from '../../src/agent/session-manager.js';
+import { getTransportRuntime, launchTransportSession, relaunchSessionWithSettings, restoreTransportSessions, setSessionEventCallback } from '../../src/agent/session-manager.js';
+import { newSession } from '../../src/agent/tmux.js';
 
 const flush = async () => {
   for (let i = 0; i < 4; i++) await new Promise((resolve) => setTimeout(resolve, 0));
@@ -245,5 +248,93 @@ describe('sdk transport session restore', () => {
 
     expect(mocks.store.get('deck_sdk_new_brain')?.state).toBe('idle');
     expect(onSessionEvent).toHaveBeenCalledWith('started', 'deck_sdk_new_brain', 'idle');
+  });
+
+  it('preserves Claude resume id when switching from cli to sdk', async () => {
+    const name = 'deck_switch_ccsdk_brain';
+    const record = {
+      name,
+      projectName: 'switchccsdk',
+      role: 'brain',
+      agentType: 'claude-code',
+      projectDir: '/tmp/switch-ccsdk',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'process',
+      ccSessionId: 'cc-session-switch',
+    };
+    mocks.store.set(name, record);
+
+    await connectProvider('claude-code-sdk', {});
+    await relaunchSessionWithSettings(record as any, { agentType: 'claude-code-sdk' });
+
+    const runtime = getTransportRuntime(name);
+    expect(runtime).toBeDefined();
+    expect(mocks.store.get(name)?.agentType).toBe('claude-code-sdk');
+    expect(mocks.store.get(name)?.ccSessionId).toBe('cc-session-switch');
+
+    runtime!.send('What token did I ask you to remember?');
+    await flush();
+
+    expect(mocks.claudeRuns.at(-1)?.options.sessionId).toBe('cc-session-switch');
+  });
+
+  it('preserves Claude resume id when switching from sdk to cli', async () => {
+    const name = 'deck_switch_cccli_brain';
+    const record = {
+      name,
+      projectName: 'switchcccli',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/switch-cccli',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      providerSessionId: 'route-cc-switch',
+      ccSessionId: 'cc-session-switch',
+    };
+    mocks.store.set(name, record);
+
+    await connectProvider('claude-code-sdk', {});
+    await relaunchSessionWithSettings(record as any, { agentType: 'claude-code' });
+
+    expect(mocks.store.get(name)?.agentType).toBe('claude-code');
+    expect(mocks.store.get(name)?.ccSessionId).toBe('cc-session-switch');
+    expect(String(vi.mocked(newSession).mock.calls.at(-1)?.[1] ?? '')).toContain('cc-session-switch');
+  });
+
+  it('preserves Codex thread id when switching from sdk to cli', async () => {
+    const name = 'deck_switch_cxcli_brain';
+    const record = {
+      name,
+      projectName: 'switchcxcli',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/switch-cxcli',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-switch',
+      codexSessionId: 'codex-thread-switch',
+    };
+    mocks.store.set(name, record);
+
+    await connectProvider('codex-sdk', {});
+    await relaunchSessionWithSettings(record as any, { agentType: 'codex' });
+
+    expect(mocks.store.get(name)?.agentType).toBe('codex');
+    expect(mocks.store.get(name)?.codexSessionId).toBe('codex-thread-switch');
+    expect(String(vi.mocked(newSession).mock.calls.at(-1)?.[1] ?? '')).toContain('codex-thread-switch');
   });
 });

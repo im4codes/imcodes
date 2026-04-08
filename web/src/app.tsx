@@ -3139,6 +3139,7 @@ export function App() {
             if (settingsTarget.subId) {
               // Sub-session: update local state to reflect saved label/description/cwd
               updateSubLocal(settingsTarget.subId, {
+                type: fields.type !== undefined ? fields.type : undefined,
                 label: fields.label !== undefined ? (fields.label ?? null) : undefined,
                 description: fields.description !== undefined ? (fields.description ?? null) : undefined,
                 cwd: fields.cwd !== undefined ? (fields.cwd ?? null) : undefined,
@@ -3148,10 +3149,13 @@ export function App() {
               setSessions((prev) => prev.map((s) => {
                 if (s.name !== settingsTarget.sessionName) return s;
                 const updated = { ...s };
+                if (fields.type !== undefined) updated.agentType = fields.type;
                 if (fields.label !== undefined) updated.label = fields.label ?? null;
                 if (fields.description !== undefined) updated.description = fields.description ?? null;
+                if (fields.cwd !== undefined) updated.projectDir = fields.cwd ?? updated.projectDir;
                 return updated;
               }));
+              wsRef.current?.requestSessionList();
             }
           }}
         />

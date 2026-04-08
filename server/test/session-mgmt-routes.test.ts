@@ -4,6 +4,7 @@ import { Hono } from 'hono';
 const mockResolveServerRole = vi.fn<() => Promise<string>>().mockResolvedValue('owner');
 const mockUpsertDbSession = vi.fn();
 const mockUpdateSession = vi.fn();
+const sendToDaemonMock = vi.fn();
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: { set: (key: string, value: string) => void }, next: () => Promise<void>) => {
@@ -31,7 +32,7 @@ vi.mock('../src/security/crypto.js', () => ({
 vi.mock('../src/ws/bridge.js', () => ({
   WsBridge: {
     get: () => ({
-      sendToDaemon: vi.fn(),
+      sendToDaemon: sendToDaemonMock,
     }),
   },
 }));
@@ -127,5 +128,37 @@ describe('session-mgmt persistence routes', () => {
         transport_config: { provider: { mode: 'balanced' } },
       },
     );
+  });
+
+  it('PATCH /sessions/:name relays session.restart when agentType changes', async () => {
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        agentType: 'codex-sdk',
+        cwd: '/tmp/next',
+        description: 'next persona',
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateSession).toHaveBeenCalledWith(
+      {},
+      'srv-1',
+      'deck_proj_brain',
+      {
+        description: 'next persona',
+        project_dir: '/tmp/next',
+      },
+    );
+    expect(sendToDaemonMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toEqual({
+      type: 'session.restart',
+      sessionName: 'deck_proj_brain',
+      agentType: 'codex-sdk',
+      cwd: '/tmp/next',
+      description: 'next persona',
+    });
   });
 });

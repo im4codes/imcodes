@@ -9,6 +9,9 @@ import {
   reorderSubSessions,
 } from '../db/queries.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
+import { WsBridge } from '../ws/bridge.js';
+import logger from '../util/logger.js';
+import { isSessionAgentType } from '../../../shared/agent-types.js';
 
 export const subSessionRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -54,8 +57,7 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
   }
 
   if (!body.type) return c.json({ error: 'missing_fields' }, 400);
-  const validTypes = ['claude-code', 'claude-code-sdk', 'codex', 'codex-sdk', 'opencode', 'shell', 'gemini', 'openclaw', 'qwen', 'script'];
-  if (!validTypes.includes(body.type)) return c.json({ error: 'invalid_type' }, 400);
+  if (!isSessionAgentType(body.type)) return c.json({ error: 'invalid_type' }, 400);
 
   // Generate 8-char id
   const id = Array.from(crypto.getRandomValues(new Uint8Array(6)))
@@ -119,6 +121,7 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
   if (!existing) return c.json({ error: 'not_found' }, 404);
 
   let body: {
+    type?: string | null;
     label?: string | null;
     closedAt?: number | null;
     description?: string | null;
@@ -146,6 +149,11 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
     effort?: string | null;
     transport_config?: Record<string, unknown> | null;
   } = {};
+  if ('type' in body && body.type != null) {
+    if (typeof body.type !== 'string' || !isSessionAgentType(body.type)) {
+      return c.json({ error: 'invalid_agent_type' }, 400);
+    }
+  }
   if ('label' in body) fields.label = body.label ?? null;
   if ('closedAt' in body) fields.closed_at = body.closedAt ?? null;
   if ('description' in body) fields.description = body.description ?? null;
@@ -157,6 +165,26 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
   if ('transportConfig' in body) fields.transport_config = body.transportConfig ?? null;
 
   await updateSubSession(c.env.DB, subId, serverId, fields);
+
+  if (typeof body.type === 'string') {
+    try {
+      WsBridge.get(serverId).sendToDaemon(JSON.stringify({
+        type: 'subsession.restart',
+        sessionName: `deck_sub_${subId}`,
+        agentType: body.type,
+        ...(body.label !== undefined ? { label: body.label } : {}),
+        ...(body.description !== undefined ? { description: body.description } : {}),
+        ...(body.cwd !== undefined ? { cwd: body.cwd } : {}),
+        ...(body.requestedModel !== undefined ? { requestedModel: body.requestedModel } : {}),
+        ...(body.activeModel !== undefined ? { activeModel: body.activeModel } : {}),
+        ...(body.effort !== undefined ? { effort: body.effort } : {}),
+        ...(body.transportConfig !== undefined ? { transportConfig: body.transportConfig } : {}),
+      }));
+    } catch (err) {
+      logger.error({ serverId, subId, err }, 'WsBridge sub-session settings relay failed');
+      return c.json({ error: 'relay_failed' }, 502);
+    }
+  }
   return c.json({ ok: true });
 });
 

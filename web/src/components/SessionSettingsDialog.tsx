@@ -4,6 +4,7 @@
 import { useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { patchSession, patchSubSession } from '../api.js';
+import { SESSION_AGENT_TYPES, type SessionAgentType } from '@shared/agent-types.js';
 
 interface Props {
   serverId: string;
@@ -18,7 +19,7 @@ interface Props {
   type: string;
   parentSession?: string | null;
   onClose: () => void;
-  onSaved: (fields: { label?: string; description?: string; cwd?: string }) => void;
+  onSaved: (fields: { label?: string; description?: string; cwd?: string; type?: string }) => void;
 }
 
 export function SessionSettingsDialog({ serverId, sessionName, subSessionId, label: initLabel, description: initDesc, cwd: initCwd, type, parentSession, onClose, onSaved }: Props) {
@@ -26,26 +27,43 @@ export function SessionSettingsDialog({ serverId, sessionName, subSessionId, lab
   const [label, setLabel] = useState(initLabel);
   const [description, setDescription] = useState(initDesc);
   const [cwd, setCwd] = useState(initCwd);
+  const [agentType, setAgentType] = useState(type);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
 
-  const hasChanges = label !== initLabel || description !== initDesc || cwd !== initCwd;
+  const hasChanges = label !== initLabel || description !== initDesc || cwd !== initCwd || agentType !== type;
+
+  const renderTypeLabel = (value: string): string => {
+    switch (value) {
+      case 'claude-code-sdk': return t('session.agentType.claude_code_sdk');
+      case 'claude-code': return t('session.agentType.claude_code_cli');
+      case 'codex-sdk': return t('session.agentType.codex_sdk');
+      case 'codex': return t('session.agentType.codex_cli');
+      case 'qwen': return t('session.agentType.qwen');
+      case 'openclaw': return t('session.agentType.openclaw');
+      default: return value;
+    }
+  };
 
   const handleSave = async () => {
     setSaving(true);
     setError('');
     try {
-      const fields: { label?: string | null; description?: string | null; cwd?: string | null } = {};
+      const fields: { label?: string | null; description?: string | null; cwd?: string | null; agentType?: string | null; type?: string | null } = {};
       if (label !== initLabel) fields.label = label || null;
       if (description !== initDesc) fields.description = description || null;
       if (cwd !== initCwd) fields.cwd = cwd || null;
+      if (agentType !== type) {
+        if (subSessionId) fields.type = agentType;
+        else fields.agentType = agentType;
+      }
 
       if (subSessionId) {
         await patchSubSession(serverId, subSessionId, fields);
       } else {
         await patchSession(serverId, sessionName, fields);
       }
-      onSaved({ label: label || undefined, description: description || undefined, cwd: cwd || undefined });
+      onSaved({ label: label || undefined, description: description || undefined, cwd: cwd || undefined, type: agentType || undefined });
       onClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -63,10 +81,20 @@ export function SessionSettingsDialog({ serverId, sessionName, subSessionId, lab
         </div>
 
         <div class="dialog-body" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-          {/* Type (read-only) */}
+          {/* Type */}
           <div>
             <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>{t('session.type')}</div>
-            <div style={{ fontSize: 13, color: '#64748b' }}>{type}</div>
+            <select
+              class="input"
+              value={agentType}
+              onChange={(e) => setAgentType((e.target as HTMLSelectElement).value as SessionAgentType)}
+              style={{ width: '100%' }}
+              disabled={saving}
+            >
+              {SESSION_AGENT_TYPES.map((value) => (
+                <option key={value} value={value}>{renderTypeLabel(value)}</option>
+              ))}
+            </select>
           </div>
 
           {/* Parent session (read-only, sub-session only) */}

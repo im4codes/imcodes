@@ -2,7 +2,7 @@
  * Handle commands from the web UI and inbound chat messages via ServerLink.
  * Commands arrive as JSON objects with a `type` field.
  */
-import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, persistSessionRecord, type ProjectConfig } from '../agent/session-manager.js';
+import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, persistSessionRecord, relaunchSessionWithSettings, type ProjectConfig } from '../agent/session-manager.js';
 import { isTransportAgent } from '../agent/detect.js';
 import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand } from '../agent/tmux.js';
 import { listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
@@ -840,6 +840,33 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
 }
 
 async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const sessionName = cmd.sessionName as string | undefined;
+  if (sessionName) {
+    const record = getSession(sessionName);
+    if (!record) {
+      logger.warn({ sessionName }, 'session.restart: session not found in store');
+      return;
+    }
+    try {
+      await relaunchSessionWithSettings(record, {
+        agentType: (cmd.agentType as any) ?? undefined,
+        projectDir: ('cwd' in cmd ? (cmd.cwd as string | undefined) : undefined),
+        label: ('label' in cmd ? (cmd.label as string | null) : undefined),
+        description: ('description' in cmd ? (cmd.description as string | null) : undefined),
+        requestedModel: ('requestedModel' in cmd ? (cmd.requestedModel as string | null) : undefined),
+        effort: ('effort' in cmd ? (cmd.effort as any) : undefined),
+        transportConfig: ('transportConfig' in cmd ? (cmd.transportConfig as Record<string, unknown> | null) : undefined),
+      });
+      logger.info({ sessionName, agentType: cmd.agentType ?? record.agentType }, 'Session relaunched via settings');
+    } catch (err) {
+      logger.error({ sessionName, err }, 'session.restart(sessionName) failed');
+      const message = err instanceof Error ? err.message : String(err);
+      emitSessionInlineError(sessionName, message);
+      try { serverLink.send({ type: 'session.error', project: record.projectName, message }); } catch { /* ignore */ }
+    }
+    return;
+  }
+
   const project = cmd.project as string | undefined;
   const fresh = cmd.fresh === true;
   if (!project) {
@@ -1855,45 +1882,15 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
   const id = sName.replace(/^deck_sub_/, '');
   try {
     const effectiveRecord = (await recoverOpenCodeSessionRecord(record)) ?? record;
-    // Stop without notifying server (preserve PG record)
-    await stopSubSession(sName, null);
-    if (effectiveRecord.runtimeType === 'transport') {
-      await launchTransportSession({
-        name: sName,
-        projectName: sName,
-        role: 'w1',
-        agentType: effectiveRecord.agentType as any,
-        projectDir: effectiveRecord.projectDir || process.cwd(),
-        description: effectiveRecord.description ?? undefined,
-        label: effectiveRecord.label ?? undefined,
-        bindExistingKey: effectiveRecord.providerSessionId ?? undefined,
-        skipCreate: !!effectiveRecord.providerSessionId,
-        parentSession: effectiveRecord.parentSession ?? undefined,
-        requestedModel: effectiveRecord.requestedModel ?? undefined,
-        effort: effectiveRecord.effort ?? undefined,
-        transportConfig: effectiveRecord.transportConfig ?? undefined,
-        userCreated: effectiveRecord.userCreated,
-      });
-      try {
-        serverLink.send(await buildSubSessionSync(id));
-      } catch { /* not connected */ }
-      return;
-    }
-    // Recreate with same ID — pass existing session IDs so agents resume
-    // their conversation and ensureSessionFile skips if file already exists
-    await startSubSession({
-      id,
-      type: effectiveRecord.agentType,
-      cwd: effectiveRecord.projectDir || null,
-      parentSession: effectiveRecord.parentSession || null,
-      ccSessionId: effectiveRecord.ccSessionId ?? null,
-      codexSessionId: effectiveRecord.codexSessionId ?? null,
-      geminiSessionId: effectiveRecord.geminiSessionId ?? null,
-      opencodeSessionId: effectiveRecord.opencodeSessionId ?? null,
-      ccPreset: effectiveRecord.ccPreset ?? null,
-      description: effectiveRecord.description ?? null,
+    await relaunchSessionWithSettings(effectiveRecord, {
+      agentType: (cmd.agentType as any) ?? undefined,
+      projectDir: ('cwd' in cmd ? (cmd.cwd as string | undefined) : undefined),
+      label: ('label' in cmd ? (cmd.label as string | null) : undefined),
+      description: ('description' in cmd ? (cmd.description as string | null) : undefined),
+      requestedModel: ('requestedModel' in cmd ? (cmd.requestedModel as string | null) : undefined),
+      effort: ('effort' in cmd ? (cmd.effort as any) : undefined),
+      transportConfig: ('transportConfig' in cmd ? (cmd.transportConfig as Record<string, unknown> | null) : undefined),
     });
-    // Sync updated state to server
     try {
       serverLink.send(await buildSubSessionSync(id));
     } catch { /* not connected */ }
