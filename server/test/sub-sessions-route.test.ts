@@ -164,4 +164,26 @@ describe('sub-session routes', () => {
       cwd: '/tmp/next',
     });
   });
+
+  it('PATCH /sub-sessions/:id rejects browser-managed closedAt updates', async () => {
+    const { getSubSessionById } = await import('../src/db/queries.js');
+    vi.mocked(getSubSessionById).mockResolvedValue({
+      id: 'sub12345',
+      server_id: 'srv1',
+      type: 'codex',
+    } as any);
+
+    const res = await app.request('/api/server/srv1/sub-sessions/sub12345', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        closedAt: Date.now(),
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({ error: 'closed_at_managed_by_daemon' });
+    expect(updateSubSessionMock).not.toHaveBeenCalled();
+    expect(sendToDaemonMock).not.toHaveBeenCalled();
+  });
 });

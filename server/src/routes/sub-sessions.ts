@@ -154,8 +154,10 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
       return c.json({ error: 'invalid_agent_type' }, 400);
     }
   }
+  if ('closedAt' in body) {
+    return c.json({ error: 'closed_at_managed_by_daemon' }, 400);
+  }
   if ('label' in body) fields.label = body.label ?? null;
-  if ('closedAt' in body) fields.closed_at = body.closedAt ?? null;
   if ('description' in body) fields.description = body.description ?? null;
   if ('cwd' in body) fields.cwd = body.cwd ?? null;
   if ('ccPresetId' in body) fields.cc_preset_id = body.ccPresetId ?? null;

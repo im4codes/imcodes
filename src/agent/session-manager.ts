@@ -39,6 +39,7 @@ import { isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
 
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
+import { closeSingleSession, collectProjectCloseTargets, type CloseFailure, type CloseTreeResult } from './session-close.js';
 
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
 function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string): void {
@@ -184,50 +185,79 @@ export async function startProject(config: ProjectConfig): Promise<void> {
   }
 }
 
-/** Stop all sessions for a project and remove them from the store. */
-export async function stopProject(projectName: string): Promise<void> {
-  const allSessions = storeSessions();
-  const toStop = new Map<string, SessionRecord>();
+function buildCloseFailureMessage(record: SessionRecord, failure: CloseFailure): string {
+  const prefix = record.name.startsWith('deck_sub_') ? 'Sub-session' : 'Session';
+  return `${prefix} close failed during ${failure.stage}: ${failure.message}`;
+}
 
-  for (const session of allSessions) {
-    if (session.projectName === projectName) toStop.set(session.name, session);
-  }
-
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const session of allSessions) {
-      if (!session.name.startsWith('deck_sub_')) continue;
-      if (!session.parentSession) continue;
-      if (toStop.has(session.name)) continue;
-      if (!toStop.has(session.parentSession)) continue;
-      toStop.set(session.name, session);
-      changed = true;
-    }
-  }
-
+/** Stop all sessions for a project and remove them from the store on confirmed success. */
+export async function stopProject(
+  projectName: string,
+  serverLink?: { send(msg: object): void } | null,
+): Promise<CloseTreeResult> {
+  const targets = collectProjectCloseTargets(projectName, storeSessions());
   const invalidatedDirs = new Set<string>();
-  for (const s of toStop.values()) {
-    stopWatching(s.name);
-    stopCodexWatching(s.name);
-    stopGeminiWatching(s.name);
-    stopOpenCodeWatching(s.name);
-    const transportRuntime = transportRuntimes.get(s.name);
-    if (transportRuntime) {
-      if (transportRuntime.providerSessionId) unregisterProviderRoute(transportRuntime.providerSessionId);
-      await transportRuntime.kill().catch(() => {});
-      transportRuntimes.delete(s.name);
-    } else {
-      await killSession(s.name).catch(() => {});
-    }
-    removeSession(s.name);
-    emitSessionPersist(null, s.name);
-    emitSessionEvent('stopped', s.name, 'stopped');
-    if (s.projectDir && !invalidatedDirs.has(s.projectDir)) {
-      invalidatedDirs.add(s.projectDir);
-      repoCache.invalidate(s.projectDir);
-    }
+  const result: CloseTreeResult = { ok: true, closed: [], failed: [] };
+
+  for (const record of targets) {
+    const closeResult = await closeSingleSession(record, {
+      emitStopping: () => {
+        timelineEmitter.emit(record.name, 'session.state', { state: 'stopping' });
+      },
+      stopWatchers: () => {
+        stopStructuredWatchers(record.name);
+      },
+      stopTransportRuntime: async () => {
+        await stopTransportRuntimeSession(record.name);
+      },
+      killProcessRuntime: async () => {
+        await killSession(record.name);
+      },
+      verifyClosed: async () => {
+        if (record.runtimeType === RUNTIME_TYPES.TRANSPORT) {
+          if (transportRuntimes.has(record.name)) throw new Error('transport runtime still registered');
+          return;
+        }
+        if (await sessionExists(record.name)) throw new Error('session still exists after kill');
+      },
+      emitSuccess: async () => {
+        if (record.name.startsWith('deck_sub_')) {
+          timelineEmitter.emit(record.name, 'session.state', { state: 'stopped' });
+          return;
+        }
+        emitSessionEvent('stopped', record.name, 'stopped');
+      },
+      persistSuccess: async () => {
+        if (record.name.startsWith('deck_sub_')) {
+          const id = record.name.replace(/^deck_sub_/, '');
+          if (serverLink && id !== record.name) {
+            serverLink.send({ type: 'subsession.closed', id, sessionName: record.name });
+          }
+        }
+        removeSession(record.name);
+        emitSessionPersist(null, record.name);
+        if (record.projectDir && !invalidatedDirs.has(record.projectDir)) {
+          invalidatedDirs.add(record.projectDir);
+          repoCache.invalidate(record.projectDir);
+        }
+      },
+      emitFailure: async (_record, failure) => {
+        emitSessionEvent('error', record.name, buildCloseFailureMessage(record, failure));
+      },
+      persistFailure: async (_record, failure) => {
+        const next: SessionRecord = { ...record, state: 'error', updatedAt: Date.now() };
+        upsertSession(next);
+        emitSessionPersist(next, record.name);
+        logger.warn({ session: record.name, stage: failure.stage, message: failure.message }, 'Project shutdown failed');
+      },
+    });
+
+    result.closed.push(...closeResult.closed);
+    result.failed.push(...closeResult.failed);
   }
+
+  result.ok = result.failed.length === 0;
+  return result;
 }
 
 /** Kill tmux sessions and watchers for a project but keep store records (for restart). */
@@ -783,13 +813,19 @@ function stopStructuredWatchers(sessionName: string): void {
   stopOpenCodeWatching(sessionName);
 }
 
+export async function stopTransportRuntimeSession(sessionName: string): Promise<void> {
+  const transportRuntime = transportRuntimes.get(sessionName);
+  if (!transportRuntime) return;
+  if (transportRuntime.providerSessionId) unregisterProviderRoute(transportRuntime.providerSessionId);
+  await transportRuntime.kill();
+  transportRuntimes.delete(sessionName);
+}
+
 async function teardownSessionRuntime(record: SessionRecord): Promise<void> {
   stopStructuredWatchers(record.name);
   const transportRuntime = transportRuntimes.get(record.name);
   if (transportRuntime) {
-    if (transportRuntime.providerSessionId) unregisterProviderRoute(transportRuntime.providerSessionId);
-    await transportRuntime.kill().catch(() => {});
-    transportRuntimes.delete(record.name);
+    await stopTransportRuntimeSession(record.name).catch(() => {});
     return;
   }
   await killSession(record.name).catch(() => {});

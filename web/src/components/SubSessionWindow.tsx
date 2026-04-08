@@ -143,7 +143,16 @@ export function SubSessionWindow({
     project: sub.label ?? sub.type,
     role: 'w1',
     agentType: sub.type,
-    state: sub.state === 'running' ? 'running' : sub.state === 'stopped' ? 'stopped' : 'idle',
+    state:
+      sub.state === 'running'
+        ? 'running'
+        : sub.state === 'stopped'
+          ? 'stopped'
+          : sub.state === 'stopping'
+            ? 'stopping'
+            : sub.state === 'error'
+              ? 'error'
+              : 'idle',
     projectDir: sub.cwd ?? undefined,
     qwenModel: sub.qwenModel ?? undefined,
     qwenAuthType: sub.qwenAuthType ?? undefined,

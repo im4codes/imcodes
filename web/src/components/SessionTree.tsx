@@ -75,6 +75,7 @@ function StateDot({ state }: { state: string }) {
   let color: string;
   if (state === 'running') color = '#4ade80';
   else if (state === 'idle') color = '#64748b';
+  else if (state === 'stopping') color = '#f59e0b';
   else if (state === 'stopped' || state === 'error') color = '#ef4444';
   else color = '#64748b';
   return (

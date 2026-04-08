@@ -8,6 +8,8 @@ const {
   capturePaneMock, timelineReadMock,
   geminiStartWatchingMock, geminiIsWatchingMock,
   codexStartWatchingByIdMock, codexIsWatchingMock, codexIsFileClaimedMock,
+  jsonlStopWatchingMock, codexStopWatchingMock, geminiStopWatchingMock, opencodeStopWatchingMock,
+  killSessionMock, timelineEmitMock, emitSessionInlineErrorMock,
   removeSessionMock, resolveGeminiSessionIdMock, injectGeminiMemoryMock,
   launchTransportSessionMock, getTransportRuntimeMock,
   getAgentVersionMock,
@@ -27,6 +29,13 @@ const {
   codexStartWatchingByIdMock: vi.fn().mockResolvedValue(undefined),
   codexIsWatchingMock: vi.fn().mockReturnValue(false),
   codexIsFileClaimedMock: vi.fn().mockReturnValue(false),
+  jsonlStopWatchingMock: vi.fn(),
+  codexStopWatchingMock: vi.fn(),
+  geminiStopWatchingMock: vi.fn(),
+  opencodeStopWatchingMock: vi.fn(),
+  killSessionMock: vi.fn().mockResolvedValue(undefined),
+  timelineEmitMock: vi.fn(),
+  emitSessionInlineErrorMock: vi.fn(),
   removeSessionMock: vi.fn(),
   resolveGeminiSessionIdMock: vi.fn().mockResolvedValue('resolved-gemini-uuid'),
   injectGeminiMemoryMock: vi.fn().mockResolvedValue(undefined),
@@ -44,7 +53,7 @@ vi.mock('../../src/store/session-store.js', () => ({
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
   startWatchingFile: startWatchingFileMock,
   startWatching: startWatchingMock,
-  stopWatching: vi.fn(),
+  stopWatching: jsonlStopWatchingMock,
   isWatching: isWatchingMock,
   preClaimFile: vi.fn(),
   claudeProjectDir: (dir: string) => `/mock-claude-projects/${dir.replace(/\//g, '-')}`,
@@ -57,7 +66,7 @@ vi.mock('../../src/daemon/codex-watcher.js', () => ({
   startWatching: vi.fn().mockResolvedValue(undefined),
   startWatchingSpecificFile: vi.fn().mockResolvedValue(undefined),
   startWatchingById: codexStartWatchingByIdMock,
-  stopWatching: vi.fn(),
+  stopWatching: codexStopWatchingMock,
   isWatching: codexIsWatchingMock,
   isFileClaimedByOther: codexIsFileClaimedMock,
   findRolloutPathByUuid: vi.fn().mockResolvedValue(null),
@@ -66,16 +75,23 @@ vi.mock('../../src/daemon/codex-watcher.js', () => ({
 vi.mock('../../src/daemon/gemini-watcher.js', () => ({
   startWatching: geminiStartWatchingMock,
   startWatchingDiscovered: vi.fn().mockResolvedValue(undefined),
-  stopWatching: vi.fn(),
+  stopWatching: geminiStopWatchingMock,
   isWatching: geminiIsWatchingMock,
+}));
+
+vi.mock('../../src/daemon/opencode-watcher.js', () => ({
+  startWatching: vi.fn().mockResolvedValue(undefined),
+  stopWatching: opencodeStopWatchingMock,
+  isWatching: vi.fn().mockReturnValue(false),
 }));
 
 vi.mock('../../src/agent/tmux.js', () => ({
   newSession: newSessionMock,
-  killSession: vi.fn().mockResolvedValue(undefined),
+  killSession: killSessionMock,
   sessionExists: sessionExistsMock,
   capturePane: capturePaneMock,
   sendKey: vi.fn().mockResolvedValue(undefined),
+  getPanePids: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock('../../src/agent/session-manager.js', () => ({
@@ -102,7 +118,15 @@ vi.mock('../../src/daemon/timeline-store.js', () => ({
   timelineStore: { read: timelineReadMock, append: vi.fn() },
 }));
 
-import { subSessionName, detectShells, startSubSession, rebuildSubSessions, readSubSessionResponse, normalizeShellBinForHost } from '../../src/daemon/subsession-manager.js';
+vi.mock('../../src/daemon/timeline-emitter.js', () => ({
+  timelineEmitter: { emit: timelineEmitMock, on: vi.fn(() => () => {}), epoch: 0, replay: vi.fn(() => ({ events: [], truncated: false })) },
+}));
+
+vi.mock('../../src/daemon/session-error.js', () => ({
+  emitSessionInlineError: emitSessionInlineErrorMock,
+}));
+
+import { subSessionName, detectShells, startSubSession, stopSubSession, rebuildSubSessions, readSubSessionResponse, normalizeShellBinForHost } from '../../src/daemon/subsession-manager.js';
 import { upsertSession } from '../../src/store/session-store.js';
 import { startWatchingFile, startWatching } from '../../src/daemon/jsonl-watcher.js';
 
@@ -378,6 +402,111 @@ describe('SAFE_SESSION_NAME_RE — session name validation', () => {
     expect(re.test('../../../etc/passwd')).toBe(false);
     expect(re.test('deck_sub_a b c')).toBe(false);
     expect(re.test('')).toBe(false);
+  });
+});
+
+describe('stopSubSession()', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionExistsMock.mockResolvedValue(false);
+    getTransportRuntimeMock.mockReturnValue(null);
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_worker',
+      projectName: 'deck_sub_worker',
+      role: 'w1',
+      agentType: 'claude-code',
+      projectDir: '/proj',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+      parentSession: 'deck_proj_brain',
+    });
+  });
+
+  it('emits stopping before stopped and only announces subsession.closed after verified success', async () => {
+    const serverLink = { send: vi.fn() };
+
+    const result = await stopSubSession('deck_sub_worker', serverLink);
+
+    expect(result).toEqual({
+      ok: true,
+      closed: ['deck_sub_worker'],
+      failed: [],
+    });
+    expect(jsonlStopWatchingMock).toHaveBeenCalledWith('deck_sub_worker');
+    expect(codexStopWatchingMock).toHaveBeenCalledWith('deck_sub_worker');
+    expect(geminiStopWatchingMock).toHaveBeenCalledWith('deck_sub_worker');
+    expect(opencodeStopWatchingMock).toHaveBeenCalledWith('deck_sub_worker');
+    expect(killSessionMock).toHaveBeenCalledWith('deck_sub_worker');
+    expect(timelineEmitMock.mock.calls[0]).toEqual(['deck_sub_worker', 'session.state', { state: 'stopping' }]);
+    expect(timelineEmitMock).toHaveBeenCalledWith('deck_sub_worker', 'session.state', { state: 'stopped' });
+    expect(removeSessionMock).toHaveBeenCalledWith('deck_sub_worker');
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'subsession.closed',
+      id: 'worker',
+      sessionName: 'deck_sub_worker',
+    });
+  });
+
+  it('keeps authoritative state and emits error instead of stopped when close verification fails', async () => {
+    const serverLink = { send: vi.fn() };
+    sessionExistsMock.mockResolvedValue(true);
+
+    const result = await stopSubSession('deck_sub_worker', serverLink);
+
+    expect(result.ok).toBe(false);
+    expect(result.closed).toEqual([]);
+    expect(result.failed).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ sessionName: 'deck_sub_worker', stage: 'verify' }),
+      ]),
+    );
+    expect(timelineEmitMock.mock.calls[0]).toEqual(['deck_sub_worker', 'session.state', { state: 'stopping' }]);
+    expect(timelineEmitMock).toHaveBeenCalledWith(
+      'deck_sub_worker',
+      'session.state',
+      expect.objectContaining({ state: 'error' }),
+    );
+    expect(timelineEmitMock).not.toHaveBeenCalledWith('deck_sub_worker', 'session.state', { state: 'stopped' });
+    expect(emitSessionInlineErrorMock).toHaveBeenCalledWith(
+      'deck_sub_worker',
+      'Sub-session close failed during verify: session still exists after kill',
+    );
+    expect(removeSessionMock).not.toHaveBeenCalledWith('deck_sub_worker');
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_sub_worker',
+      state: 'error',
+    }));
+    expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'subsession.closed' }));
+  });
+
+  it('does not emit stopped or remove the sub-session when subsession.closed persistence fails', async () => {
+    const serverLink = {
+      send: vi.fn((msg: { type?: string }) => {
+        if (msg.type === 'subsession.closed') throw new Error('bridge offline');
+      }),
+    };
+
+    const result = await stopSubSession('deck_sub_worker', serverLink);
+
+    expect(result.ok).toBe(false);
+    expect(result.failed).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ sessionName: 'deck_sub_worker', stage: 'persist', message: 'bridge offline' }),
+      ]),
+    );
+    expect(removeSessionMock).not.toHaveBeenCalledWith('deck_sub_worker');
+    expect(timelineEmitMock).not.toHaveBeenCalledWith('deck_sub_worker', 'session.state', { state: 'stopped' });
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_sub_worker',
+      state: 'error',
+    }));
+    expect(emitSessionInlineErrorMock).toHaveBeenCalledWith(
+      'deck_sub_worker',
+      'Sub-session close failed during persist: bridge offline',
+    );
   });
 });
 

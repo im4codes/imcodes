@@ -16,10 +16,15 @@ vi.mock('react-i18next', () => ({
       if (key === 'openspec.changes') return 'changes';
       if (key === 'openspec.empty') return 'empty';
       if (key === 'openspec.audit_action') return 'audit_action';
+      if (key === 'openspec.audit_implementation_action') return 'audit_implementation_action';
+      if (key === 'openspec.audit_spec_action') return 'audit_spec_action';
       if (key === 'openspec.implement_action') return 'implement_action';
       if (key === 'openspec.achieve_action') return 'achieve_action';
-      if (key === 'openspec.audit_prompt') {
-        return `audit ${(opts?.reference as string) ?? ''}, improve ${(opts?.reference as string) ?? ''}`;
+      if (key === 'openspec.audit_implementation_prompt') {
+        return `audit implementation ${(opts?.reference as string) ?? ''}, fix code gaps`;
+      }
+      if (key === 'openspec.audit_spec_prompt') {
+        return `audit spec ${(opts?.reference as string) ?? ''}, fix spec gaps`;
       }
       if (key === 'openspec.implement_prompt') {
         return `delegate ${(opts?.reference as string) ?? ''}, split tasks and accept`;
@@ -458,7 +463,7 @@ describe('SessionControls', () => {
     expect(screen.getByRole('textbox').textContent).toBe('@openspec/changes/change-a');
   });
 
-  it('inserts an openspec audit prompt without sending immediately', async () => {
+  it('inserts an openspec implementation-audit prompt without sending immediately', async () => {
     const ws = makeWs();
     render(
       <SessionControls
@@ -481,8 +486,38 @@ describe('SessionControls', () => {
     await flushAsync();
 
     fireEvent.click(screen.getByRole('button', { name: 'audit_action' }));
+    fireEvent.click(screen.getByRole('button', { name: 'audit_implementation_action' }));
 
-    expect(screen.getByRole('textbox').textContent).toBe('audit @openspec/changes/change-a, improve @openspec/changes/change-a');
+    expect(screen.getByRole('textbox').textContent).toBe('audit implementation @openspec/changes/change-a, fix code gaps');
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it('inserts an openspec spec-audit prompt without sending immediately', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'audit_action' }));
+    fireEvent.click(screen.getByRole('button', { name: 'audit_spec_action' }));
+
+    expect(screen.getByRole('textbox').textContent).toBe('audit spec @openspec/changes/change-a, fix spec gaps');
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
   });
 

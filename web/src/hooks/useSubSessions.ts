@@ -15,7 +15,7 @@ import { isRunningTimelineEvent } from '../timeline-running.js';
 export interface SubSession extends SubSessionData {
   sessionName: string;
   /** runtime state from daemon */
-  state: 'running' | 'idle' | 'stopped' | 'starting' | 'unknown';
+  state: 'running' | 'idle' | 'stopped' | 'stopping' | 'error' | 'starting' | 'unknown';
 }
 
 function toSessionName(id: string): string {
@@ -230,7 +230,7 @@ export function useSubSessions(
       }
 
       if (!sessionName || !sessionName.startsWith('deck_sub_')) return;
-      if (state !== 'idle' && state !== 'running') return;
+      if (state !== 'idle' && state !== 'running' && state !== 'stopping' && state !== 'stopped' && state !== 'error') return;
       setSubSessions((prev) => {
         const idx = prev.findIndex((s) => s.sessionName === sessionName);
         if (idx === -1) return prev;
@@ -338,10 +338,10 @@ export function useSubSessions(
     if (!sub) return;
     // Stop the tmux session
     ws?.subSessionStop(sub.sessionName);
-    // Mark closed in PG
-    await patchSubSession(serverId, id, { closedAt: Date.now() }).catch(() => {});
-    // Remove from local state
-    setSubSessions((prev) => prev.filter((s) => s.id !== id));
+    // Keep the sub-session visible until daemon/server confirm successful close.
+    setSubSessions((prev) => prev.map((s) =>
+      s.id === id ? { ...s, state: 'stopping' } : s,
+    ));
   }, [serverId, ws, subSessions]);
 
   const restart = useCallback(async (id: string) => {

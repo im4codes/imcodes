@@ -529,7 +529,7 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       void handleStart(cmd, serverLink);
       break;
     case 'session.stop':
-      void handleStop(cmd);
+      void handleStop(cmd, serverLink);
       break;
     case 'session.restart':
       void handleRestart(cmd, serverLink);
@@ -908,19 +908,33 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
   }
 }
 
-async function handleStop(cmd: Record<string, unknown>): Promise<void> {
+async function handleStop(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const project = cmd.project as string | undefined;
   if (!project) {
     logger.warn('session.stop: missing project name');
     return;
   }
 
+  let result;
   try {
-    await stopProject(project);
-    logger.info({ project }, 'Session stopped via web');
+    result = await stopProject(project, serverLink);
   } catch (err) {
     logger.error({ project, err }, 'session.stop failed');
+    const message = err instanceof Error ? err.message : String(err);
+    try { serverLink.send({ type: 'session.error', project, message: `Shutdown failed: ${message}` }); } catch { /* ignore */ }
+    return;
   }
+
+  if (result.ok) {
+    logger.info({ project }, 'Session stopped via web');
+    return;
+  }
+
+  const message = result.failed
+    .map((failure) => `${failure.sessionName}:${failure.stage}`)
+    .join(', ');
+  logger.warn({ project, failed: result.failed }, 'session.stop completed with shutdown failures');
+  try { serverLink.send({ type: 'session.error', project, message: `Shutdown failed: ${message}` }); } catch { /* ignore */ }
 }
 
 /**
@@ -1865,7 +1879,12 @@ async function handleSubSessionStop(cmd: Record<string, unknown>, serverLink: Se
     logger.warn('subsession.stop: missing sessionName');
     return;
   }
-  await stopSubSession(sName, serverLink).catch((e: unknown) => logger.error({ err: e, sName }, 'subsession.stop failed'));
+  const result = await stopSubSession(sName, serverLink).catch((e: unknown) => {
+    logger.error({ err: e, sName }, 'subsession.stop failed');
+    return null;
+  });
+  if (!result || result.ok) return;
+  logger.warn({ sessionName: sName, failed: result.failed }, 'subsession.stop completed with shutdown failures');
 }
 
 async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {

@@ -2,11 +2,8 @@
  * Sub-session manager — creates/stops/rebuilds tmux sessions for sub-sessions.
  */
 
-import { newSession, killSession, sessionExists, getPanePids } from '../agent/tmux.js';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-const execFileAsync = promisify(execFile);
-import { getDriver, getTransportRuntime, launchTransportSession } from '../agent/session-manager.js';
+import { newSession, killSession, sessionExists } from '../agent/tmux.js';
+import { getDriver, getTransportRuntime, launchTransportSession, stopTransportRuntimeSession } from '../agent/session-manager.js';
 import type { AgentType } from '../agent/detect.js';
 import { isTransportAgent } from '../agent/detect.js';
 import { timelineStore } from './timeline-store.js';
@@ -19,6 +16,8 @@ import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 
 import logger from '../util/logger.js';
 import { getAgentVersion } from '../agent/agent-version.js';
+import { closeSingleSession, type CloseFailure, type CloseTreeResult } from '../agent/session-close.js';
+import { emitSessionInlineError } from './session-error.js';
 
 export interface SubSessionRecord {
   id: string;
@@ -243,43 +242,62 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   }
 }
 
-/** Validate that a session name matches the expected pattern to prevent injection. */
-const SAFE_SESSION_NAME_RE = /^deck_sub_[a-zA-Z0-9_-]+$/;
-
-/** Kill all processes running inside a session's panes before killing the session itself.
- *  This prevents orphan agent processes that hold session UUIDs after the session is gone.
- *  Uses the backend-aware getPanePids() export from tmux.ts. */
-async function killSessionProcesses(sessionName: string): Promise<void> {
-  if (!SAFE_SESSION_NAME_RE.test(sessionName)) {
-    logger.warn({ sessionName }, 'Rejected invalid session name in killSessionProcesses');
-    return;
-  }
-  try {
-    const pids = await getPanePids(sessionName);
-    for (const pid of pids) {
-      if (!/^\d+$/.test(pid)) continue; // only allow numeric PIDs
-      // Kill all children of the shell (the actual agent process), then the shell itself
-      await execFileAsync('pkill', ['-9', '-P', pid]).catch(() => {});
-      await execFileAsync('kill', ['-9', pid]).catch(() => {});
-    }
-  } catch { /* session may not exist or have no panes */ }
+function buildSubSessionCloseFailureMessage(failure: CloseFailure): string {
+  return `Sub-session close failed during ${failure.stage}: ${failure.message}`;
 }
 
-export async function stopSubSession(sessionName: string, serverLink?: { send(msg: object): void } | null): Promise<void> {
-  timelineEmitter.emit(sessionName, 'session.state', { state: 'stopped' });
-  await killSessionProcesses(sessionName);
-  await killSession(sessionName).catch(() => {});
-  (await import('./jsonl-watcher.js')).stopWatching(sessionName);
-  (await import('./codex-watcher.js')).stopWatching(sessionName);
-  (await import('./gemini-watcher.js')).stopWatching(sessionName);
-  (await import('./opencode-watcher.js')).stopWatching(sessionName);
-  removeSession(sessionName);
-
-  // Notify server so DB is updated (sub-session ID = session name without 'deck_sub_' prefix)
-  const id = sessionName.replace(/^deck_sub_/, '');
-  if (serverLink && id !== sessionName) {
-    try { serverLink.send({ type: 'subsession.closed', id, sessionName }); } catch { /* not connected */ }
+export async function stopSubSession(
+  sessionName: string,
+  serverLink?: { send(msg: object): void } | null,
+): Promise<CloseTreeResult> {
+  const record = getSession(sessionName);
+  if (!record) {
+    return { ok: true, closed: [], failed: [] };
   }
+
+  return closeSingleSession(record, {
+    emitStopping: () => {
+      timelineEmitter.emit(sessionName, 'session.state', { state: 'stopping' });
+    },
+    stopWatchers: async () => {
+      (await import('./jsonl-watcher.js')).stopWatching(sessionName);
+      (await import('./codex-watcher.js')).stopWatching(sessionName);
+      (await import('./gemini-watcher.js')).stopWatching(sessionName);
+      (await import('./opencode-watcher.js')).stopWatching(sessionName);
+    },
+    stopTransportRuntime: async () => {
+      await stopTransportRuntimeSession(sessionName);
+    },
+    killProcessRuntime: async () => {
+      await killSession(sessionName);
+    },
+    verifyClosed: async () => {
+      const runtime = getTransportRuntime(sessionName);
+      if (runtime) throw new Error('transport runtime still active');
+      if (record.runtimeType !== 'transport' && await sessionExists(sessionName)) {
+        throw new Error('session still exists after kill');
+      }
+    },
+    emitSuccess: async () => {
+      timelineEmitter.emit(sessionName, 'session.state', { state: 'stopped' });
+    },
+    persistSuccess: async () => {
+      const id = sessionName.replace(/^deck_sub_/, '');
+      if (serverLink && id !== sessionName) {
+        serverLink.send({ type: 'subsession.closed', id, sessionName });
+      }
+      removeSession(sessionName);
+    },
+    emitFailure: async (_record, failure) => {
+      const message = buildSubSessionCloseFailureMessage(failure);
+      emitSessionInlineError(sessionName, message);
+      timelineEmitter.emit(sessionName, 'session.state', { state: 'error', error: message });
+    },
+    persistFailure: async (_record, failure) => {
+      upsertSession({ ...record, state: 'error', updatedAt: Date.now() });
+      logger.warn({ sessionName, stage: failure.stage, message: failure.message }, 'Sub-session shutdown failed');
+    },
+  });
 }
 
 export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promise<void> {

@@ -1375,6 +1375,36 @@ describe('WsBridge', () => {
       expect(msg.sessionName).toBe('deck_sub_sub-456');
     });
 
+    it('subsession.closed does not broadcast removal when DB persistence fails', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      const failingDb = {
+        ...makeDb('valid-hash'),
+        execute: vi.fn().mockImplementation(async (sql: string) => {
+          if (sql.includes('UPDATE sub_sessions SET closed_at')) {
+            throw new Error('db write failed');
+          }
+          return { changes: 1 };
+        }),
+      } as unknown as import('../src/db/client.js').Database;
+      bridge.handleDaemonConnection(daemonWs as never, failingDb, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', failingDb);
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'subsession.closed',
+        id: 'sub-456',
+        sessionName: 'deck_sub_sub-456',
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings).toHaveLength(0);
+    });
+
     it('subsession.closed without id → no broadcast', async () => {
       const { daemonWs, browserWs } = await setupAuthBridge();
 
@@ -1386,6 +1416,46 @@ describe('WsBridge', () => {
       await flushAsync();
 
       expect(browserWs.sentStrings).toHaveLength(0);
+    });
+
+    it('subsession.closed clears only the matching descendant cache while preserving other sub-sessions', async () => {
+      const { bridge, daemonWs, browserWs } = await setupAuthBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          eventId: 'sub-a-1',
+          sessionId: 'deck_sub_alpha',
+          ts: 1,
+          type: 'assistant.text',
+          payload: { text: 'alpha text' },
+        },
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          eventId: 'sub-b-1',
+          sessionId: 'deck_sub_beta',
+          ts: 2,
+          type: 'assistant.text',
+          payload: { text: 'beta text' },
+        },
+      }));
+      await flushAsync();
+      expect(bridge.getRecentText('deck_sub_alpha')).toHaveLength(1);
+      expect(bridge.getRecentText('deck_sub_beta')).toHaveLength(1);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'subsession.closed',
+        id: 'alpha',
+        sessionName: 'deck_sub_alpha',
+      }));
+      await flushAsync();
+
+      expect(bridge.getRecentText('deck_sub_alpha')).toHaveLength(0);
+      expect(bridge.getRecentText('deck_sub_beta')).toHaveLength(1);
+      const msg = JSON.parse(browserWs.sentStrings.at(-1) ?? '{}');
+      expect(msg).toMatchObject({ type: 'subsession.removed', id: 'alpha', sessionName: 'deck_sub_alpha' });
     });
 
     it('p2p.conflict from daemon → broadcasts to all browsers', async () => {

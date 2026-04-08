@@ -316,4 +316,50 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
       state: 'idle',
     }));
   });
+
+  it('preserves error-state failed-close records for live sessions during restore', async () => {
+    storeMock.mockReturnValue([
+      {
+        name: 'deck_failedclose_brain',
+        projectName: 'failedclose',
+        role: 'brain',
+        agentType: 'shell',
+        projectDir: '/proj',
+        state: 'error',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: 1000,
+        updatedAt: 2000,
+      },
+      {
+        name: 'deck_sub_failedclose',
+        projectName: 'deck_sub_failedclose',
+        role: 'w1',
+        agentType: 'shell',
+        projectDir: '/proj',
+        state: 'error',
+        parentSession: 'deck_failedclose_brain',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: 1000,
+        updatedAt: 2000,
+      },
+    ]);
+    tmuxListMock.mockResolvedValue(['deck_failedclose_brain', 'deck_sub_failedclose']);
+
+    await restoreFromStore();
+
+    expect(updateSessionStateMock).not.toHaveBeenCalledWith('deck_failedclose_brain', 'idle');
+    expect(updateSessionStateMock).not.toHaveBeenCalledWith('deck_failedclose_brain', 'stopped');
+    expect(updateSessionStateMock).not.toHaveBeenCalledWith('deck_sub_failedclose', 'idle');
+    expect(updateSessionStateMock).not.toHaveBeenCalledWith('deck_sub_failedclose', 'stopped');
+    expect(upsertSessionMock).not.toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_failedclose_brain',
+      state: 'stopped',
+    }));
+    expect(upsertSessionMock).not.toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_sub_failedclose',
+      state: 'stopped',
+    }));
+  });
 });

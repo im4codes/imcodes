@@ -277,6 +277,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [openSpecChanges, setOpenSpecChanges] = useState<string[]>([]);
   const [openSpecLoading, setOpenSpecLoading] = useState(false);
   const [openSpecError, setOpenSpecError] = useState<string | null>(null);
+  const [openSpecAuditMenu, setOpenSpecAuditMenu] = useState<string | null>(null);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
   const [qwenModel, setQwenModel] = useState<QwenModelChoice | null>(loadQwenModel);
@@ -474,6 +475,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setOpenSpecChanges([]);
     setOpenSpecError(null);
     setOpenSpecLoading(false);
+    setOpenSpecAuditMenu(null);
     openSpecRequestIdRef.current = null;
   }, [activeSession?.projectDir]);
 
@@ -497,6 +499,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       }
       if (openSpecOpen && openSpecRef.current && !openSpecRef.current.contains(e.target as Node)) {
         setOpenSpecOpen(false);
+        setOpenSpecAuditMenu(null);
       }
     };
     document.addEventListener('mousedown', handleClick);
@@ -584,10 +587,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     openSpecRequestIdRef.current = ws.fsListDir(openSpecChangesPath, false, false);
   }, [openSpecChangesPath, ws]);
 
-  const insertOpenSpecPrompt = useCallback((kind: 'audit' | 'implement', reference: string) => {
-    const prompt = kind === 'audit'
-      ? t('openspec.audit_prompt', { reference })
-      : t('openspec.implement_prompt', { reference });
+  const insertOpenSpecPrompt = useCallback((kind: 'audit_implementation' | 'audit_spec' | 'implement', reference: string) => {
+    const prompt = kind === 'audit_implementation'
+      ? t('openspec.audit_implementation_prompt', { reference })
+      : kind === 'audit_spec'
+        ? t('openspec.audit_spec_prompt', { reference })
+        : t('openspec.implement_prompt', { reference });
     appendToInput([prompt]);
   }, [t]);
 
@@ -1293,18 +1298,45 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     >
                       {changeName}
                     </button>
-                    <button
-                      class="btn btn-secondary"
-                      style={{ padding: '4px 8px', fontSize: 11, whiteSpace: 'nowrap' }}
-                      onClick={() => {
-                        if (!openSpecChangesPath) return;
-                        const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
-                        insertOpenSpecPrompt('audit', reference);
-                        setOpenSpecOpen(false);
-                      }}
-                    >
-                      {t('openspec.audit_action')}
-                    </button>
+                    <div style={{ position: 'relative', flexShrink: 0 }}>
+                      <button
+                        class="btn btn-secondary"
+                        style={{ padding: '4px 8px', fontSize: 11, whiteSpace: 'nowrap' }}
+                        onClick={() => {
+                          setOpenSpecAuditMenu((current) => current === changeName ? null : changeName);
+                        }}
+                      >
+                        {t('openspec.audit_action')}
+                      </button>
+                      {openSpecAuditMenu === changeName && (
+                        <div class="menu-dropdown" style={{ right: 0, bottom: 'calc(100% + 6px)', minWidth: 180 }}>
+                          <button
+                            class="menu-item"
+                            onClick={() => {
+                              if (!openSpecChangesPath) return;
+                              const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                              insertOpenSpecPrompt('audit_implementation', reference);
+                              setOpenSpecAuditMenu(null);
+                              setOpenSpecOpen(false);
+                            }}
+                          >
+                            {t('openspec.audit_implementation_action')}
+                          </button>
+                          <button
+                            class="menu-item"
+                            onClick={() => {
+                              if (!openSpecChangesPath) return;
+                              const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                              insertOpenSpecPrompt('audit_spec', reference);
+                              setOpenSpecAuditMenu(null);
+                              setOpenSpecOpen(false);
+                            }}
+                          >
+                            {t('openspec.audit_spec_action')}
+                          </button>
+                        </div>
+                      )}
+                    </div>
                     <button
                       class="btn btn-secondary"
                       style={{ padding: '4px 8px', fontSize: 11, whiteSpace: 'nowrap' }}
@@ -1312,6 +1344,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                         if (!openSpecChangesPath) return;
                         const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
                         insertOpenSpecPrompt('implement', reference);
+                        setOpenSpecAuditMenu(null);
                         setOpenSpecOpen(false);
                       }}
                     >
@@ -1324,6 +1357,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                         if (!openSpecChangesPath) return;
                         const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
                         sendOpenSpecPrompt(t('openspec.achieve_prompt', { reference }));
+                        setOpenSpecAuditMenu(null);
                         setOpenSpecOpen(false);
                       }}
                     >

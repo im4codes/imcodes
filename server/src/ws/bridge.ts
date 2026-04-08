@@ -1054,10 +1054,15 @@ export class WsBridge {
     if (type === 'subsession.closed' && this.db) {
       const id = msg.id as string;
       if (id) {
-        this.recentTextBySession.delete(`deck_sub_${id}`);
         void this.db.execute('UPDATE sub_sessions SET closed_at = $1 WHERE id = $2 AND server_id = $3',
-          [Date.now(), id, this.serverId]).catch(() => {});
-        this.broadcastToBrowsers(JSON.stringify({ type: 'subsession.removed', id, sessionName: msg.sessionName }));
+          [Date.now(), id, this.serverId])
+          .then(() => {
+            this.recentTextBySession.delete(`deck_sub_${id}`);
+            this.broadcastToBrowsers(JSON.stringify({ type: 'subsession.removed', id, sessionName: msg.sessionName }));
+          })
+          .catch((err) => {
+            logger.error({ err, id, sessionName: msg.sessionName }, 'Failed to persist sub-session close from daemon');
+          });
       }
       return;
     }
