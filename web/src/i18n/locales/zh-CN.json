@@ -443,11 +443,14 @@
     "changes": "变更",
     "empty": "暂无 OpenSpec 变更",
     "audit_action": "审计",
+    "audit_implementation_action": "审计实现",
+    "audit_spec_action": "审计规范",
     "implement_action": "实现",
     "achieve_action": "完成",
-    "audit_prompt": "审计 {{reference}}，根据审计结果完善 {{reference}}。",
-    "implement_prompt": "安排子代理开始实施 {{reference}}，你负责拆分任务和验收。",
-    "achieve_prompt": "按 OpenSpec 工作流完成 {{reference}}。补齐剩余工作，并在准备就绪后归档该变更。"
+    "audit_implementation_prompt": "对 {{reference}} 执行严格的实现审计，逐项对照其 OpenSpec 产物。找出所有不一致、遗漏、回归风险、边界场景缺口和缺失测试；然后直接修复代码、测试以及必要的配套改动。不要停留在报告层面，必须把实现修到与规范完全一致。",
+    "audit_spec_prompt": "对 {{reference}} 执行严格的规范审计。强化范围定义、需求、验收标准、边界场景、失败模式、依赖关系与可测试性，消除歧义和内部不一致，把规范修到可直接落地实施的质量。不要只给审查意见，直接修规范。",
+    "implement_prompt": "强力推进 {{reference}} 的实施。把工作拆成明确子任务，给子代理分配清晰所有权，整合输出，逐项补齐与规范的差距，补充或更新测试，并对最终结果负责验收。你负责调度、技术决策、集成收口和最终质量把关。",
+    "achieve_prompt": "按完整 OpenSpec 工作流把 {{reference}} 推到完成。检查所有剩余任务和产物，完成必要的实现与规范工作，关闭未完成项，必要时同步受影响的主规范，并在满足完成条件后归档该变更。不要只汇报状态，直接把它做完。"
   },
   "upload": {
     "upload_file": "上传文件",

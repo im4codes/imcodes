@@ -443,11 +443,14 @@
     "changes": "Cambios",
     "empty": "No se encontraron cambios de OpenSpec",
     "audit_action": "Auditar",
+    "audit_implementation_action": "Auditar implementación",
+    "audit_spec_action": "Auditar especificación",
     "implement_action": "Implementar",
     "achieve_action": "Completar",
-    "audit_prompt": "Audita {{reference}}. En función de los hallazgos de la auditoría, completa {{reference}}.",
-    "implement_prompt": "Organiza subagentes para empezar a implementar {{reference}}. Tú te encargas de desglosar tareas y de la aceptación.",
-    "achieve_prompt": "Completa {{reference}} con el flujo de OpenSpec. Termina el trabajo pendiente y archiva el cambio si ya está listo."
+    "audit_implementation_prompt": "Realiza una auditoría estricta de la implementación de {{reference}} contra sus artefactos de OpenSpec. Identifica cada discrepancia, omisión, riesgo de regresión, hueco en casos límite y prueba faltante; después corrige el código, las pruebas y cualquier cambio de soporte necesario. No te detengas en un informe: deja la implementación totalmente alineada con la especificación.",
+    "audit_spec_prompt": "Realiza una auditoría estricta de la especificación de {{reference}}. Refuerza alcance, requisitos, criterios de aceptación, casos límite, modos de fallo, dependencias y capacidad de prueba; elimina ambigüedades e inconsistencias internas; y actualiza la especificación hasta que quede lista para implementar. No te limites a observaciones de revisión.",
+    "implement_prompt": "Impulsa con firmeza la implementación de {{reference}}. Divide el trabajo en subtareas concretas, asigna subagentes con propiedad clara, integra sus resultados, cierra las brechas respecto a la especificación, añade o actualiza pruebas y verifica el resultado final. Tú eres responsable de la orquestación, las decisiones técnicas y la aceptación final.",
+    "achieve_prompt": "Lleva {{reference}} hasta completarlo usando el flujo completo de OpenSpec. Revisa todas las tareas y artefactos pendientes, completa el trabajo necesario de implementación y especificación, cierra los huecos abiertos, sincroniza las especificaciones afectadas si hace falta y archiva el cambio cuando cumpla los criterios de finalización. No te quedes en el reporte de estado."
   },
   "upload": {
     "upload_file": "Subir archivo",
