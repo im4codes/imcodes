@@ -1285,11 +1285,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 {!openSpecLoading && !openSpecError && openSpecChanges.map((changeName) => (
                   <div
                     key={changeName}
-                    style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                    class="openspec-change-row"
                   >
                     <button
-                      class="menu-item"
-                      style={{ flex: 1, minWidth: 0 }}
+                      class="menu-item openspec-change-name"
                       onClick={() => {
                         if (!openSpecChangesPath) return;
                         appendToInput([toComposerReference(`${openSpecChangesPath}/${changeName}`)]);
@@ -1298,71 +1297,70 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     >
                       {changeName}
                     </button>
-                    <div style={{ position: 'relative', flexShrink: 0 }}>
+                    <div class="openspec-change-actions">
+                      <div class="openspec-change-action-wrap">
+                        <button
+                          class="btn btn-secondary openspec-change-action-btn"
+                          onClick={() => {
+                            setOpenSpecAuditMenu((current) => current === changeName ? null : changeName);
+                          }}
+                        >
+                          {t('openspec.audit_action')}
+                        </button>
+                        {openSpecAuditMenu === changeName && (
+                          <div class="menu-dropdown" style={{ right: 0, bottom: 'calc(100% + 6px)', minWidth: 180 }}>
+                            <button
+                              class="menu-item"
+                              onClick={() => {
+                                if (!openSpecChangesPath) return;
+                                const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                                insertOpenSpecPrompt('audit_implementation', reference);
+                                setOpenSpecAuditMenu(null);
+                                setOpenSpecOpen(false);
+                              }}
+                            >
+                              {t('openspec.audit_implementation_action')}
+                            </button>
+                            <button
+                              class="menu-item"
+                              onClick={() => {
+                                if (!openSpecChangesPath) return;
+                                const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                                insertOpenSpecPrompt('audit_spec', reference);
+                                setOpenSpecAuditMenu(null);
+                                setOpenSpecOpen(false);
+                              }}
+                            >
+                              {t('openspec.audit_spec_action')}
+                            </button>
+                          </div>
+                        )}
+                      </div>
                       <button
-                        class="btn btn-secondary"
-                        style={{ padding: '4px 8px', fontSize: 11, whiteSpace: 'nowrap' }}
+                        class="btn btn-secondary openspec-change-action-btn"
                         onClick={() => {
-                          setOpenSpecAuditMenu((current) => current === changeName ? null : changeName);
+                          if (!openSpecChangesPath) return;
+                          const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                          insertOpenSpecPrompt('implement', reference);
+                          setOpenSpecAuditMenu(null);
+                          setOpenSpecOpen(false);
                         }}
                       >
-                        {t('openspec.audit_action')}
+                        {t('openspec.implement_action')}
                       </button>
-                      {openSpecAuditMenu === changeName && (
-                        <div class="menu-dropdown" style={{ right: 0, bottom: 'calc(100% + 6px)', minWidth: 180 }}>
-                          <button
-                            class="menu-item"
-                            onClick={() => {
-                              if (!openSpecChangesPath) return;
-                              const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
-                              insertOpenSpecPrompt('audit_implementation', reference);
-                              setOpenSpecAuditMenu(null);
-                              setOpenSpecOpen(false);
-                            }}
-                          >
-                            {t('openspec.audit_implementation_action')}
-                          </button>
-                          <button
-                            class="menu-item"
-                            onClick={() => {
-                              if (!openSpecChangesPath) return;
-                              const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
-                              insertOpenSpecPrompt('audit_spec', reference);
-                              setOpenSpecAuditMenu(null);
-                              setOpenSpecOpen(false);
-                            }}
-                          >
-                            {t('openspec.audit_spec_action')}
-                          </button>
-                        </div>
-                      )}
+                      <button
+                        class="btn btn-secondary openspec-change-action-btn"
+                        onClick={() => {
+                          if (!openSpecChangesPath) return;
+                          const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                          sendOpenSpecPrompt(t('openspec.achieve_prompt', { reference }));
+                          setOpenSpecAuditMenu(null);
+                          setOpenSpecOpen(false);
+                        }}
+                      >
+                        {t('openspec.achieve_action')}
+                      </button>
                     </div>
-                    <button
-                      class="btn btn-secondary"
-                      style={{ padding: '4px 8px', fontSize: 11, whiteSpace: 'nowrap' }}
-                      onClick={() => {
-                        if (!openSpecChangesPath) return;
-                        const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
-                        insertOpenSpecPrompt('implement', reference);
-                        setOpenSpecAuditMenu(null);
-                        setOpenSpecOpen(false);
-                      }}
-                    >
-                      {t('openspec.implement_action')}
-                    </button>
-                    <button
-                      class="btn btn-secondary"
-                      style={{ padding: '4px 8px', fontSize: 11, whiteSpace: 'nowrap' }}
-                      onClick={() => {
-                        if (!openSpecChangesPath) return;
-                        const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
-                        sendOpenSpecPrompt(t('openspec.achieve_prompt', { reference }));
-                        setOpenSpecAuditMenu(null);
-                        setOpenSpecOpen(false);
-                      }}
-                    >
-                      {t('openspec.achieve_action')}
-                    </button>
                   </div>
                 ))}
               </div>
