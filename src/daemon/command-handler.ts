@@ -2712,6 +2712,203 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
   }
 }
 
+const GIT_STATUS_CACHE_TTL_MS = 5_000;
+const GIT_DIFF_CACHE_TTL_MS = 5_000;
+
+type GitStatusFile = { path: string; code: string; additions?: number; deletions?: number };
+
+interface RepoContext {
+  repoRoot: string;
+  gitDir: string;
+  repoSignature: string;
+}
+
+interface GitStatusSnapshot {
+  repoRoot: string;
+  repoSignature: string;
+  files: GitStatusFile[];
+}
+
+interface GitDiffSnapshot {
+  repoRoot: string;
+  repoSignature: string;
+  fileSignature: string;
+  diff: string;
+}
+
+const gitStatusCache = new Map<string, { expiresAt: number; value: GitStatusSnapshot }>();
+const gitStatusInflight = new Map<string, Promise<GitStatusSnapshot>>();
+const gitDiffCache = new Map<string, { expiresAt: number; value: GitDiffSnapshot }>();
+const gitDiffInflight = new Map<string, Promise<GitDiffSnapshot>>();
+
+function normalizeFsPath(value: string): string {
+  return nodePath.resolve(value);
+}
+
+function isPathInside(root: string, candidate: string): boolean {
+  const normalizedRoot = normalizeFsPath(root);
+  const normalizedCandidate = normalizeFsPath(candidate);
+  return normalizedCandidate === normalizedRoot || normalizedCandidate.startsWith(normalizedRoot + nodePath.sep);
+}
+
+async function safeStatSignature(targetPath: string): Promise<string> {
+  try {
+    const stats = await fsStat(targetPath);
+    return `${stats.mtimeMs}:${stats.size}`;
+  } catch {
+    return 'missing';
+  }
+}
+
+async function resolveGitDir(dotGitPath: string, repoRoot: string): Promise<string | null> {
+  try {
+    const stats = await fsStat(dotGitPath);
+    if (stats.isDirectory()) return dotGitPath;
+    if (!stats.isFile()) return null;
+    const raw = await fsReadFileRaw(dotGitPath, 'utf8');
+    const match = raw.match(/^gitdir:\s*(.+)\s*$/mi);
+    if (!match?.[1]) return null;
+    return nodePath.resolve(repoRoot, match[1].trim());
+  } catch {
+    return null;
+  }
+}
+
+async function findRepoRoot(startPath: string): Promise<{ repoRoot: string; gitDir: string } | null> {
+  let current = normalizeFsPath(startPath);
+  while (true) {
+    const dotGit = nodePath.join(current, '.git');
+    const gitDir = await resolveGitDir(dotGit, current);
+    if (gitDir) return { repoRoot: current, gitDir };
+    const parent = nodePath.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return null;
+}
+
+async function buildRepoSignature(gitDir: string): Promise<string> {
+  const indexSig = await safeStatSignature(nodePath.join(gitDir, 'index'));
+  const headPath = nodePath.join(gitDir, 'HEAD');
+  const headSig = await safeStatSignature(headPath);
+  let refSig = 'none';
+  try {
+    const headRaw = await fsReadFileRaw(headPath, 'utf8');
+    const match = headRaw.match(/^ref:\s*(.+)\s*$/m);
+    if (match?.[1]) {
+      refSig = await safeStatSignature(nodePath.join(gitDir, match[1].trim()));
+    }
+  } catch {
+    refSig = 'missing';
+  }
+  return `${indexSig}|${headSig}|${refSig}`;
+}
+
+async function resolveRepoContext(startPath: string): Promise<RepoContext | null> {
+  const repo = await findRepoRoot(startPath);
+  if (!repo) return null;
+  return {
+    repoRoot: repo.repoRoot,
+    gitDir: repo.gitDir,
+    repoSignature: await buildRepoSignature(repo.gitDir),
+  };
+}
+
+async function loadRepoGitStatusSnapshot(repoRoot: string, repoSignature: string): Promise<GitStatusSnapshot> {
+  const { stdout } = await execAsync('git status --porcelain -u', { cwd: repoRoot, timeout: 5000 });
+  const files: GitStatusFile[] = [];
+  for (const line of stdout.split('\n')) {
+    if (!line.trim()) continue;
+    const code = line.slice(0, 2).trim();
+    const filePath = line.slice(3).trim().replace(/^"(.*)"$/, '$1');
+    files.push({ path: nodePath.join(repoRoot, filePath), code });
+  }
+  return { repoRoot, repoSignature, files };
+}
+
+async function getRepoGitStatusSnapshot(startPath: string): Promise<GitStatusSnapshot | null> {
+  const context = await resolveRepoContext(startPath);
+  if (!context) return null;
+  const cached = gitStatusCache.get(context.repoRoot);
+  if (cached && cached.expiresAt > Date.now() && cached.value.repoSignature === context.repoSignature) {
+    return cached.value;
+  }
+  const inflight = gitStatusInflight.get(context.repoRoot);
+  if (inflight) return await inflight;
+  const promise = loadRepoGitStatusSnapshot(context.repoRoot, context.repoSignature)
+    .then((value) => {
+      gitStatusCache.set(context.repoRoot, { value, expiresAt: Date.now() + GIT_STATUS_CACHE_TTL_MS });
+      return value;
+    })
+    .finally(() => {
+      gitStatusInflight.delete(context.repoRoot);
+    });
+  gitStatusInflight.set(context.repoRoot, promise);
+  return await promise;
+}
+
+async function loadFileGitDiffSnapshot(realPath: string, repoRoot: string, repoSignature: string, fileSignature: string): Promise<GitDiffSnapshot> {
+  let diff = '';
+  try {
+    const { stdout } = await execAsync(`git diff HEAD -- ${JSON.stringify(realPath)}`, { cwd: repoRoot, timeout: 5000 });
+    diff = stdout;
+  } catch { /* ignore */ }
+  if (!diff) {
+    try {
+      const { stdout } = await execAsync(`git diff -- ${JSON.stringify(realPath)}`, { cwd: repoRoot, timeout: 5000 });
+      diff = stdout;
+    } catch { /* ignore */ }
+  }
+  return { repoRoot, repoSignature, fileSignature, diff };
+}
+
+async function getFileGitDiffSnapshot(realPath: string): Promise<GitDiffSnapshot | null> {
+  const context = await resolveRepoContext(nodePath.dirname(realPath));
+  if (!context) return null;
+  const fileSignature = await safeStatSignature(realPath);
+  const cached = gitDiffCache.get(realPath);
+  if (
+    cached
+    && cached.expiresAt > Date.now()
+    && cached.value.repoSignature === context.repoSignature
+    && cached.value.fileSignature === fileSignature
+  ) {
+    return cached.value;
+  }
+  const inflight = gitDiffInflight.get(realPath);
+  if (inflight) return await inflight;
+  const promise = loadFileGitDiffSnapshot(realPath, context.repoRoot, context.repoSignature, fileSignature)
+    .then((value) => {
+      gitDiffCache.set(realPath, { value, expiresAt: Date.now() + GIT_DIFF_CACHE_TTL_MS });
+      return value;
+    })
+    .finally(() => {
+      gitDiffInflight.delete(realPath);
+    });
+  gitDiffInflight.set(realPath, promise);
+  return await promise;
+}
+
+function filterRepoFilesForPath(files: GitStatusFile[], requestedPath: string): GitStatusFile[] {
+  return files.filter((file) => isPathInside(requestedPath, file.path));
+}
+
+function invalidateGitCachesForPath(targetPath: string): void {
+  const normalized = normalizeFsPath(targetPath);
+  gitDiffCache.delete(normalized);
+  gitDiffInflight.delete(normalized);
+  for (const key of gitStatusCache.keys()) {
+    if (isPathInside(key, normalized)) gitStatusCache.delete(key);
+  }
+}
+
+export function __resetFsGitCachesForTests(): void {
+  gitStatusCache.clear();
+  gitStatusInflight.clear();
+  gitDiffCache.clear();
+  gitDiffInflight.clear();
+}
+
 /** fs.git_status — return git modified file list for a directory */
 async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawPath = cmd.path as string | undefined;
@@ -2728,32 +2925,8 @@ async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: Serve
       try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
       return;
     }
-
-    const { stdout } = await execAsync('git status --porcelain -u', { cwd: real, timeout: 5000 });
-    const files: Array<{ path: string; code: string; additions?: number; deletions?: number }> = [];
-    for (const line of stdout.split('\n')) {
-      if (!line.trim()) continue;
-      const code = line.slice(0, 2).trim();
-      const filePath = line.slice(3).trim().replace(/^"(.*)"$/, '$1'); // unquote if needed
-      files.push({ path: nodePath.join(real, filePath), code });
-    }
-    // Enrich with +/- line stats from git diff --numstat (best-effort)
-    try {
-      const { stdout: numstat } = await execAsync('git diff --numstat HEAD 2>/dev/null || git diff --numstat', { cwd: real, timeout: 5000 });
-      const statsMap = new Map<string, { add: number; del: number }>();
-      for (const line of numstat.split('\n')) {
-        const m = line.match(/^(\d+|-)\t(\d+|-)\t(.+)$/);
-        if (m) {
-          const add = m[1] === '-' ? 0 : parseInt(m[1], 10);
-          const del = m[2] === '-' ? 0 : parseInt(m[2], 10);
-          statsMap.set(nodePath.join(real, m[3].trim()), { add, del });
-        }
-      }
-      for (const f of files) {
-        const s = statsMap.get(f.path);
-        if (s) { f.additions = s.add; f.deletions = s.del; }
-      }
-    } catch { /* ignore — stats are best-effort */ }
+    const snapshot = await getRepoGitStatusSnapshot(real);
+    const files = snapshot ? filterRepoFilesForPath(snapshot.files, real) : [];
     try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', files }); } catch { /* ignore */ }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -2779,20 +2952,8 @@ async function handleFsGitDiff(cmd: Record<string, unknown>, serverLink: ServerL
       try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
       return;
     }
-
-    const dir = nodePath.dirname(real);
-    // Try staged+unstaged diff vs HEAD; fall back to index diff; then untracked diff
-    let diff = '';
-    try {
-      const { stdout } = await execAsync(`git diff HEAD -- ${JSON.stringify(real)}`, { cwd: dir, timeout: 5000 });
-      diff = stdout;
-    } catch { /* ignore */ }
-    if (!diff) {
-      try {
-        const { stdout } = await execAsync(`git diff -- ${JSON.stringify(real)}`, { cwd: dir, timeout: 5000 });
-        diff = stdout;
-      } catch { /* ignore */ }
-    }
+    const snapshot = await getFileGitDiffSnapshot(real);
+    const diff = snapshot?.diff ?? '';
     // Untracked files: no diff (nothing meaningful to compare against)
     try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', diff }); } catch { /* ignore */ }
   } catch (err) {
@@ -2895,6 +3056,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       // Write the file
       await fsWriteFile(real, content, 'utf-8');
       const newStats = await fsStat(real);
+      invalidateGitCachesForPath(real);
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', mtime: newStats.mtimeMs }); } catch { /* ignore */ }
     } catch (err) {
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
@@ -2913,6 +3075,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       await fsWriteFile(resolved, content, 'utf-8');
       const newStats = await fsStat(resolved);
       const real = await fsRealpath(resolved);
+      invalidateGitCachesForPath(real);
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', mtime: newStats.mtimeMs }); } catch { /* ignore */ }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

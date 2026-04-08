@@ -199,6 +199,107 @@ function updateNode(nodes: FsNode[], targetId: string, patch: Partial<FsNode>): 
   });
 }
 
+type ChangeFile = { path: string; code: string; additions?: number; deletions?: number };
+type SharedChangesListener = (files: ChangeFile[]) => void;
+
+interface SharedChangesEntry {
+  repoPath: string;
+  files: ChangeFile[];
+  updatedAt: number;
+  inFlightRequestId: string | null;
+  queued: boolean;
+  listeners: Set<SharedChangesListener>;
+  ws: WsClient | null;
+}
+
+const SHARED_CHANGES_TTL_MS = 5_000;
+const sharedChangesByKey = new Map<string, SharedChangesEntry>();
+const sharedChangesRequestKey = new Map<string, string>();
+const wsIds = new WeakMap<WsClient, number>();
+let nextWsId = 1;
+
+export function __resetFileBrowserSharedChangesForTests(): void {
+  sharedChangesByKey.clear();
+  sharedChangesRequestKey.clear();
+  nextWsId = 1;
+}
+
+function getWsId(ws: WsClient): number {
+  let id = wsIds.get(ws);
+  if (!id) {
+    id = nextWsId++;
+    wsIds.set(ws, id);
+  }
+  return id;
+}
+
+function getSharedChangesKey(ws: WsClient, repoPath: string): string {
+  return `${getWsId(ws)}::${repoPath}`;
+}
+
+function getSharedChangesEntry(key: string): SharedChangesEntry {
+  let entry = sharedChangesByKey.get(key);
+  if (!entry) {
+    entry = { repoPath: '', files: [], updatedAt: 0, inFlightRequestId: null, queued: false, listeners: new Set(), ws: null };
+    sharedChangesByKey.set(key, entry);
+  }
+  return entry;
+}
+
+function subscribeSharedChanges(key: string, listener: SharedChangesListener): () => void {
+  const entry = getSharedChangesEntry(key);
+  entry.listeners.add(listener);
+  if (entry.updatedAt > 0) listener(entry.files);
+  return () => {
+    const current = sharedChangesByKey.get(key);
+    if (!current) return;
+    current.listeners.delete(listener);
+    if (current.listeners.size === 0 && !current.inFlightRequestId) {
+      sharedChangesByKey.delete(key);
+    }
+  };
+}
+
+function publishSharedChanges(key: string, files: ChangeFile[]): void {
+  const entry = getSharedChangesEntry(key);
+  entry.files = files;
+  entry.updatedAt = Date.now();
+  for (const listener of entry.listeners) listener(files);
+}
+
+function requestSharedChanges(key: string, ws: WsClient, repoPath: string, force = false): void {
+  const entry = getSharedChangesEntry(key);
+  entry.ws = ws;
+  entry.repoPath = repoPath;
+  const fresh = entry.updatedAt > 0 && (Date.now() - entry.updatedAt) < SHARED_CHANGES_TTL_MS;
+  if (!force && fresh) {
+    publishSharedChanges(key, entry.files);
+    return;
+  }
+  if (entry.inFlightRequestId) {
+    entry.queued = true;
+    return;
+  }
+  const requestId = ws.fsGitStatus(repoPath);
+  entry.inFlightRequestId = requestId;
+  sharedChangesRequestKey.set(requestId, key);
+}
+
+function settleSharedChangesRequest(requestId: string, files: ChangeFile[] | null): boolean {
+  const key = sharedChangesRequestKey.get(requestId);
+  if (!key) return false;
+  sharedChangesRequestKey.delete(requestId);
+  const entry = sharedChangesByKey.get(key);
+  if (!entry) return true;
+  entry.inFlightRequestId = null;
+  if (files) publishSharedChanges(key, files);
+  if (entry.queued && entry.ws) {
+    entry.queued = false;
+    requestSharedChanges(key, entry.ws, entry.repoPath, true);
+  }
+  return true;
+}
+
 
 export function FileBrowser({
   ws,
@@ -281,8 +382,7 @@ export function FileBrowser({
     setPanelViewRaw(v);
     try { localStorage.setItem('rcc_fb_tab', v); } catch { /* ignore */ }
   };
-  const [changesFiles, setChangesFiles] = useState<Array<{ path: string; code: string; additions?: number; deletions?: number }>>([]);
-  const pendingChangesRef = useRef(new Set<string>()); // all in-flight changesRootPath git status requestIds
+  const [changesFiles, setChangesFiles] = useState<ChangeFile[]>([]);
 
   const loadedRef = useRef(new Set<string>());
   const pendingRef = useRef(new Map<string, string>()); // requestId → nodeId
@@ -308,7 +408,6 @@ export function FileBrowser({
       pendingGitStatusRef.current.clear();
       pendingGitDiffRef.current.clear();
       pendingMkdirRef.current.clear();
-      pendingChangesRef.current.clear();
       editorMsgHandlers.current.clear();
       if (pendingChangesTimerRef.current) clearTimeout(pendingChangesTimerRef.current);
       for (const timer of timersRef.current.values()) clearTimeout(timer);
@@ -327,7 +426,6 @@ export function FileBrowser({
       if (msg.type === DAEMON_MSG.RECONNECTED || (msg.type === 'session.event' && (msg as any).event === 'connected')) {
         loadedRef.current.clear();
         pendingRef.current.clear();
-        pendingChangesRef.current.clear();
         // Re-fetch root and changes
         if (mountedRef.current) fetchDir(startPath);
         return;
@@ -452,18 +550,8 @@ export function FileBrowser({
       }
 
       if (msg.type === 'fs.git_status_response') {
-        // Check if this is a changesRootPath request
-        if (pendingChangesRef.current.has(msg.requestId)) {
-          pendingChangesRef.current.delete(msg.requestId);
-          if (!mountedRef.current) return;
-          if (msg.status === 'ok' && msg.files) {
-            setChangesFiles(msg.files as Array<{ path: string; code: string; additions?: number; deletions?: number }>);
-            setModifiedFiles((prev) => {
-              const next = new Map(prev);
-              for (const f of msg.files!) next.set(f.path, f.code);
-              return next;
-            });
-          }
+        const sharedFiles = msg.status === 'ok' ? ((msg.files as ChangeFile[] | undefined) ?? []) : [];
+        if (settleSharedChangesRequest(msg.requestId, sharedFiles)) {
           return;
         }
         const dirPath = pendingGitStatusRef.current.get(msg.requestId);
@@ -634,7 +722,6 @@ export function FileBrowser({
       // Clear stale state from previous ws instance
       loadedRef.current.clear();
       pendingRef.current.clear();
-      pendingChangesRef.current.clear();
       for (const timer of timersRef.current.values()) clearTimeout(timer);
       timersRef.current.clear();
       setData([{ id: startPath, name: startPath, isDir: true, children: [] }]);
@@ -642,6 +729,23 @@ export function FileBrowser({
     }
     fetchDir(startPath);
   }, [startPath, fetchDir]);
+
+  useEffect(() => {
+    if (!changesRootPath) return;
+    const cacheKey = getSharedChangesKey(ws, changesRootPath);
+    return subscribeSharedChanges(cacheKey, (files) => {
+      if (!mountedRef.current) return;
+      setChangesFiles(files);
+      setModifiedFiles((prev) => {
+        const next = new Map(prev);
+        for (const [k] of next) {
+          if (k.startsWith(changesRootPath + '/')) next.delete(k);
+        }
+        for (const file of files) next.set(file.path, file.code);
+        return next;
+      });
+    });
+  }, [changesRootPath, ws]);
 
   useEffect(() => {
     if (!initialPreview || initialPreview.status === 'idle') return;
@@ -719,24 +823,19 @@ export function FileBrowser({
 
   const refreshChanges = useCallback(() => {
     if (!changesRootPath) return;
+    const cacheKey = getSharedChangesKey(ws, changesRootPath);
     const now = Date.now();
     const elapsed = now - lastChangesRefreshRef.current;
     if (elapsed >= CHANGES_RATE_LIMIT_MS) {
       lastChangesRefreshRef.current = now;
-      try {
-        const requestId = ws.fsGitStatus(changesRootPath);
-        pendingChangesRef.current.add(requestId);
-      } catch { return; }
+      requestSharedChanges(cacheKey, ws, changesRootPath);
     } else {
       // Schedule for when rate limit clears
       if (pendingChangesTimerRef.current) clearTimeout(pendingChangesTimerRef.current);
       pendingChangesTimerRef.current = setTimeout(() => {
         if (!mountedRef.current) return;
         lastChangesRefreshRef.current = Date.now();
-        try {
-          const requestId = ws.fsGitStatus(changesRootPath);
-          pendingChangesRef.current.add(requestId);
-        } catch { /* ws disconnected */ }
+        requestSharedChanges(cacheKey, ws, changesRootPath, true);
       }, CHANGES_RATE_LIMIT_MS - elapsed);
     }
   }, [changesRootPath, ws]);
@@ -1016,8 +1115,7 @@ export function FileBrowser({
         <span class="fb-changes-title">{t('file_browser.changes_title', { count: changesFiles.length })}</span>
         {changesRootPath && (
           <button class="fb-changes-refresh" onClick={() => {
-            const requestId = ws.fsGitStatus(changesRootPath!);
-            pendingChangesRef.current.add(requestId);
+            requestSharedChanges(getSharedChangesKey(ws, changesRootPath!), ws, changesRootPath!, true);
           }} title="Refresh">↻</button>
         )}
       </div>

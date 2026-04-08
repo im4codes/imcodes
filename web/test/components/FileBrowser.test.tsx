@@ -25,7 +25,7 @@ vi.mock('../../src/components/file-editor-lazy.js', () => ({
   FileEditorContent: () => null,
 }));
 
-import { FileBrowser } from '../../src/components/FileBrowser.js';
+import { FileBrowser, __resetFileBrowserSharedChangesForTests } from '../../src/components/FileBrowser.js';
 import type { WsClient, ServerMessage } from '../../src/ws-client.js';
 
 // Cleanup DOM after each test
@@ -63,7 +63,7 @@ vi.mock('react-i18next', () => {
 // ── WsClient factory ──────────────────────────────────────────────────────
 
 function makeWsFactory() {
-  let messageHandler: ((msg: ServerMessage) => void) | null = null;
+  const messageHandlers = new Set<(msg: ServerMessage) => void>();
   let lastRequestId = 'mock-req-id';
   let lastSentPath = '';
   let lastSentIncludeFiles = false;
@@ -80,8 +80,8 @@ function makeWsFactory() {
 
   const ws: WsClient = {
     onMessage: (handler: (msg: ServerMessage) => void) => {
-      messageHandler = handler;
-      return () => { messageHandler = null; };
+      messageHandlers.add(handler);
+      return () => { messageHandlers.delete(handler); };
     },
     fsListDir,
     fsMkdir,
@@ -91,7 +91,7 @@ function makeWsFactory() {
   } as unknown as WsClient;
 
   const respond = (entries: Array<{ name: string; isDir: boolean; hidden?: boolean }>, resolvedPath?: string) => {
-    messageHandler?.({
+    for (const messageHandler of messageHandlers) messageHandler({
       type: 'fs.ls_response',
       requestId: lastRequestId,
       path: lastSentPath,
@@ -102,7 +102,7 @@ function makeWsFactory() {
   };
 
   const respondError = (error: string) => {
-    messageHandler?.({
+    for (const messageHandler of messageHandlers) messageHandler({
       type: 'fs.ls_response',
       requestId: lastRequestId,
       path: lastSentPath,
@@ -111,7 +111,9 @@ function makeWsFactory() {
     });
   };
 
-  const sendMsg = (msg: ServerMessage) => messageHandler?.(msg);
+  const sendMsg = (msg: ServerMessage) => {
+    for (const messageHandler of messageHandlers) messageHandler(msg);
+  };
 
   return { ws, fsListDir, fsMkdir, respond, respondError, sendMsg, getLastPath: () => lastSentPath, getIncludeFiles: () => lastSentIncludeFiles };
 }
@@ -119,6 +121,7 @@ function makeWsFactory() {
 describe('FileBrowser', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    __resetFileBrowserSharedChangesForTests();
   });
 
   // ── Layout ─────────────────────────────────────────────────────────────
@@ -500,6 +503,37 @@ describe('FileBrowser', () => {
     const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
     await act(async () => { fireEvent.click(changesTab); });
     expect(document.querySelector('.fb-changes-section')).not.toBeNull();
+  });
+
+  it('shares changes requests across file browsers on the same repo', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <div>
+        <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user/src"
+          changesRootPath="/home/user" onConfirm={vi.fn()} />
+        <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user/src"
+          changesRootPath="/home/user" onConfirm={vi.fn()} />
+      </div>,
+    );
+
+    await act(async () => { respond([], '/home/user/src'); });
+
+    const changeRequests = (ws.fsGitStatus as any).mock.calls.filter((call: any[]) => call[0] === '/home/user');
+    expect(changeRequests).toHaveLength(1);
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [{ path: '/home/user/bar.ts', code: 'M' }],
+      });
+    });
+
+    expect(document.querySelectorAll('.fb-panel-tab-badge')[0]?.textContent).toBe('1');
+    expect(document.querySelectorAll('.fb-panel-tab-badge')[1]?.textContent).toBe('1');
   });
 
   it('shows diff toggle button when diff is available', async () => {
