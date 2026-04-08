@@ -169,7 +169,7 @@ describe('handleWebCommand transport queue behavior', () => {
     handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'sent msg', commandId: 'cmd-sent' }, serverLink as any);
     await flushAsync();
 
-    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: 'sent msg' });
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: 'sent msg', allowDuplicate: true });
     expect(emitMock).not.toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
@@ -214,7 +214,7 @@ describe('handleWebCommand transport queue behavior', () => {
     await flushAsync();
 
     expect(transportSend).toHaveBeenCalledWith('after restart');
-    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: 'after restart' });
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: 'after restart', allowDuplicate: true });
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-after-restart', status: 'accepted' });
   });
 });
