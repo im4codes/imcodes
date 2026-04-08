@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { ClaudeCodeDriver } from '../../../src/agent/drivers/claude-code.js';
 import { CodexDriver } from '../../../src/agent/drivers/codex.js';
 import { OpenCodeDriver } from '../../../src/agent/drivers/opencode.js';
@@ -8,6 +8,10 @@ import { ShellDriver } from '../../../src/agent/drivers/shell.js';
 
 describe('ClaudeCodeDriver', () => {
   const driver = new ClaudeCodeDriver();
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
 
   it('type is claude-code', () => {
     expect(driver.type).toBe('claude-code');
@@ -61,6 +65,30 @@ describe('ClaudeCodeDriver', () => {
 
     const result = await driver.captureLastResponse(capturePane, sendKeys, showBuffer);
     expect(result).toContain('fallback line');
+  });
+
+  it('postLaunch confirms the summary resume chooser with Enter', async () => {
+    vi.useFakeTimers();
+    const capturePane = vi.fn()
+      .mockResolvedValueOnce([
+        '1. Resume from summary (recommended)',
+        '2. Resume full session as-is',
+        "3. Don't ask me again",
+        'Enter to confirm · Esc to cancel',
+      ])
+      .mockResolvedValueOnce(['❯']);
+    const sendKey = vi.fn().mockResolvedValue(undefined);
+
+    const done = driver.postLaunch!(capturePane, sendKey);
+    await vi.advanceTimersByTimeAsync(1_500);
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(700);
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1_500);
+    await done;
+
+    expect(sendKey).toHaveBeenCalledTimes(1);
+    expect(sendKey).toHaveBeenCalledWith('Enter');
   });
 });
 

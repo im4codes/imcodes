@@ -17,6 +17,9 @@ const STARTUP_PROMPTS: Array<{
   keys: string[]; // tmux key names to send in sequence
   label: string;
 }> = [
+  // "Resume from summary (recommended)" chooser shown on restart/resume.
+  // The default selection is already "Resume from summary", so Enter confirms it.
+  { pattern: /resume from summary|resume full session as-is|don't ask me again/i, keys: ['Enter'], label: 'resume-summary' },
   // "Security guide" / "Do you trust the files in this folder?" — select "Yes, I trust"
   // Newer CC versions use a numbered menu (1=Yes, 2=No); older use Enter for default.
   // Sending "1" then Enter covers both: numbered picks option 1, legacy confirms default.
