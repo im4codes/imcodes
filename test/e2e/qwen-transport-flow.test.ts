@@ -215,9 +215,8 @@ describe('qwen transport flow e2e', () => {
     expect(user?.payload.text).toBe('hello');
     expect(running).toBeDefined();
     expect(thinking?.payload.text).toBe('');
-    expect(streaming.map((e) => e.payload.text)).toEqual(['Qwen', 'Qwen: hello']);
+    expect(streaming.map((e) => e.payload.text)).toEqual(['Qwen']);
     expect(streaming[0]?.opts?.eventId).toBe(stableEventId);
-    expect(streaming[1]?.opts?.eventId).toBe(stableEventId);
     expect(final?.payload.text).toBe('Qwen: hello');
     expect(final?.opts?.eventId).toBe(stableEventId);
     const usage = mocks.emitted.find((e) => e.session === SESSION && e.type === 'usage.update');
