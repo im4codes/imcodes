@@ -109,6 +109,44 @@ describe('StartSubSessionDialog', () => {
     expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, { thinking: 'high' });
   });
 
+  it('shows CC preset controls and passes preset for claude-code-sdk sub-sessions', () => {
+    const onStart = vi.fn();
+    const ws = makeWs();
+    ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
+      handler({
+        type: 'cc.presets.list_response',
+        presets: [
+          { name: 'MiniMax', env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' } },
+        ],
+      });
+      return () => {};
+    });
+
+    render(
+      <StartSubSessionDialog
+        ws={ws as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('API Provider')).toBeDefined();
+    const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+      .find((select) => Array.from(select.options).some((option) => option.value === 'MiniMax'));
+    expect(presetSelect).toBeDefined();
+    fireEvent.change(presetSelect!, { target: { value: 'MiniMax' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('claude-code-sdk', undefined, '/tmp', undefined, {
+      ccPreset: 'MiniMax',
+      thinking: 'high',
+    });
+  });
+
   it('passes thinking level for qwen sub-sessions', () => {
     const onStart = vi.fn();
     render(

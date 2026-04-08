@@ -155,6 +155,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
       : type === 'openclaw'
         ? OPENCLAW_THINKING_LEVELS
         : [];
+  const supportsCcPreset = type === 'claude-code' || type === 'claude-code-sdk';
 
   return (
     <div class="dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
@@ -319,7 +320,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
           )}
 
           {/* CC env preset selector + editor */}
-          {type === 'claude-code' && (
+          {supportsCcPreset && (
             <>
               <div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
