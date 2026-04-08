@@ -820,12 +820,14 @@ export function FileBrowser({
       : t('file_browser.select');
 
   const alreadySet = new Set(alreadyInserted);
+  const usesExternalPreview = !!onPreviewFile;
   const hasPreview = mode !== 'dir-only' && preview.status !== 'idle';
+  const hasInlinePreview = hasPreview && !usesExternalPreview;
 
   const previewPath = preview.status !== 'idle' ? (preview as { path: string }).path : null;
 
   const tree = (
-    <div class={`fb-tree${hasPreview ? ' fb-tree-split' : ''}`}>
+    <div class={`fb-tree${hasInlinePreview ? ' fb-tree-split' : ''}`}>
       {data.map((root) => (
         <FsTreeNode
           key={root.id}
@@ -847,7 +849,7 @@ export function FileBrowser({
 
   const hasDiff = preview.status === 'ok' && !!preview.diff;
 
-  const previewPane = hasPreview ? (
+  const previewPane = hasInlinePreview ? (
     <div class="fb-preview">
       <div class="fb-preview-header">
         <button class="fb-preview-back" onClick={() => {
