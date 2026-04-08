@@ -129,6 +129,7 @@ registerPanelType('filebrowser', {
         initialPath={projectDir}
         changesRootPath={projectDir}
         hideFooter={false}
+        onPreviewStateChange={ctx.onPreviewStateChange}
         onPreviewFile={ctx.onPreviewFile}
         onConfirm={(paths) => {
           const inputEl = activeSession && ctx.inputRefsMap?.current

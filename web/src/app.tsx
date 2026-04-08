@@ -1,5 +1,10 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
-import { FileBrowser } from './components/FileBrowser.js';
+import {
+  FileBrowser,
+  type FileBrowserPreviewRequest,
+  type FileBrowserPreviewState,
+  type FileBrowserPreviewUpdate,
+} from './components/FileBrowser.js';
 import { mapP2pStatusToUiState, type P2pActivePhase, type P2pProgressNodeStatus } from '@shared/p2p-status.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 
@@ -709,7 +714,8 @@ export function App() {
   const [repoFocusLatestAction, setRepoFocusLatestAction] = useState<{ token: number; failedJobName?: string; failedStepName?: string } | null>(null);
   const [pendingRepoToastSession, setPendingRepoToastSession] = useState<{ sessionName: string; focus: { token: number; failedJobName?: string; failedStepName?: string } } | null>(null);
   /** Floating file preview request opened from pinned file browser. */
-  const [previewFileRequest, setPreviewFileRequest] = useState<{ path: string; preferDiff?: boolean } | null>(null);
+  const [previewFileRequest, setPreviewFileRequest] = useState<FileBrowserPreviewRequest | null>(null);
+  const [previewFileCache, setPreviewFileCache] = useState<Record<string, { preferDiff?: boolean; preview: FileBrowserPreviewState }>>({});
   const [repoContexts, setRepoContexts] = useState<Map<string, any>>(new Map());
   const repoContextsRef = useRef(repoContexts);
   repoContextsRef.current = repoContexts;
@@ -979,6 +985,38 @@ export function App() {
       panel.id === panelId ? { ...panel, props } : panel
     )));
   }, [setPinnedPanels]);
+
+  const handlePreviewFileRequest = useCallback((request: FileBrowserPreviewRequest) => {
+    const cached = previewFileCache[request.path];
+    setPreviewFileRequest({
+      ...request,
+      preview: request.preview ?? cached?.preview,
+      preferDiff: request.preferDiff ?? cached?.preferDiff,
+    });
+  }, [previewFileCache]);
+
+  const handlePreviewStateChange = useCallback((update: FileBrowserPreviewUpdate) => {
+    setPreviewFileCache((prev) => {
+      const existing = prev[update.path];
+      if (existing?.preview === update.preview && existing.preferDiff === update.preferDiff) return prev;
+      return {
+        ...prev,
+        [update.path]: {
+          preferDiff: update.preferDiff,
+          preview: update.preview,
+        },
+      };
+    });
+    setPreviewFileRequest((prev) => (
+      prev?.path === update.path
+        ? {
+            ...prev,
+            preferDiff: prev.preferDiff ?? update.preferDiff,
+            preview: update.preview,
+          }
+        : prev
+    ));
+  }, []);
 
   /** Generic unpin: remove from pinnedPanels + reopen the source floating window. */
   const unpinPanel = useCallback((panel: PinnedPanel) => {
@@ -2285,7 +2323,8 @@ export function App() {
                 serverId: selectedServerId ?? '',
                 subSessions,
                 inputRefsMap,
-                onPreviewFile: (request) => setPreviewFileRequest(request),
+                onPreviewFile: (request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: true }),
+                onPreviewStateChange: handlePreviewStateChange,
                 activeSession,
                 activeProjectDir: activeSessionInfo?.projectDir,
                 sessions,
@@ -2782,7 +2821,8 @@ export function App() {
                   serverId: selectedServerId ?? '',
                   subSessions,
                   inputRefsMap,
-                  onPreviewFile: (request) => { setPreviewFileRequest(request); closeSidebar(); },
+                  onPreviewFile: (request) => { handlePreviewFileRequest({ ...request, sourcePreviewLive: false }); closeSidebar(); },
+                  onPreviewStateChange: handlePreviewStateChange,
                   activeSession,
                   activeProjectDir: activeSessionInfo?.projectDir,
                   sessions,
@@ -2910,9 +2950,12 @@ export function App() {
             mode="file-single"
             layout="panel"
             initialPath={previewFileRequest.path.replace(/\/[^/]+$/, '') || '~'}
+            initialPreview={previewFileRequest.preview ?? previewFileCache[previewFileRequest.path]?.preview}
             autoPreviewPath={previewFileRequest.path}
             autoPreviewPreferDiff={!!previewFileRequest.preferDiff}
+            skipAutoPreviewIfLoading={!!previewFileRequest.sourcePreviewLive}
             hideFooter
+            onPreviewStateChange={handlePreviewStateChange}
             onConfirm={() => {}}
           />
         </FloatingPanel>

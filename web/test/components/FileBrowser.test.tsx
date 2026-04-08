@@ -587,7 +587,90 @@ describe('FileBrowser', () => {
     const changeItem = document.querySelector('.fb-changes-item') as HTMLElement;
     await act(async () => { fireEvent.click(changeItem); });
 
-    expect(onPreviewFile).toHaveBeenCalledWith({ path: '/home/user/foo.ts', preferDiff: true });
+    expect(onPreviewFile).toHaveBeenCalledWith({
+      path: '/home/user/foo.ts',
+      preferDiff: true,
+      preview: { status: 'loading', path: '/home/user/foo.ts' },
+    });
+  });
+
+  it('pushes loaded preview state updates for externally hosted change previews', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    const onPreviewFile = vi.fn();
+    const onPreviewStateChange = vi.fn();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        changesRootPath="/home/user"
+        onPreviewFile={onPreviewFile}
+        onPreviewStateChange={onPreviewStateChange}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([], '/home/user'); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [{ path: '/home/user/foo.ts', code: 'M' }],
+      });
+    });
+
+    const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
+    await act(async () => { fireEvent.click(changesTab); });
+
+    const changeItem = document.querySelector('.fb-changes-item') as HTMLElement;
+    await act(async () => { fireEvent.click(changeItem); });
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
+    expect(onPreviewFile).toHaveBeenLastCalledWith({
+      path: '/home/user/foo.ts',
+      preferDiff: true,
+      preview: { status: 'loading', path: '/home/user/foo.ts' },
+    });
+
+    await act(async () => {
+      sendMsg({ type: 'fs.read_response', requestId: 'mock-read-id', path: '/home/user/foo.ts', status: 'ok', content: 'const x = 1;' });
+      sendMsg({ type: 'fs.git_diff_response', requestId: 'mock-git-diff-id', path: '/home/user/foo.ts', status: 'ok', diff: '+const x = 1;' });
+    });
+
+    expect(onPreviewStateChange).toHaveBeenCalledWith(expect.objectContaining({
+      path: '/home/user/foo.ts',
+      preferDiff: true,
+      preview: expect.objectContaining({
+        status: 'ok',
+        path: '/home/user/foo.ts',
+        content: 'const x = 1;',
+      }),
+    }));
+  });
+
+  it('does not re-read when an external preview is hydrated with a live loading state', () => {
+    const { ws } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        initialPreview={{ status: 'loading', path: '/home/user/foo.ts' }}
+        autoPreviewPath="/home/user/foo.ts"
+        autoPreviewPreferDiff
+        skipAutoPreviewIfLoading
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(0);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(0);
   });
 
   // ── Expand ────────────────────────────────────────────────────────────

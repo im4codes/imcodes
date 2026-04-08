@@ -135,8 +135,14 @@ export interface FileBrowserProps {
   serverId?: string;
   onConfirm: (paths: string[]) => void;
   onClose?: () => void;
+  /** Seed external preview state so a new host can reuse an existing load. */
+  initialPreview?: FileBrowserPreviewState;
+  /** Keep an external preview host in sync with this FileBrowser's preview state. */
+  onPreviewStateChange?: (update: FileBrowserPreviewUpdate) => void;
+  /** Trust a hydrated loading preview instead of starting a second read immediately. */
+  skipAutoPreviewIfLoading?: boolean;
   /** When set, file clicks open an external preview (e.g. floating window) instead of inline split */
-  onPreviewFile?: (request: { path: string; preferDiff?: boolean }) => void;
+  onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
   /** Default panel tab — 'files' or 'changes'. Default: 'files' */
   defaultTab?: 'files' | 'changes';
 }
@@ -150,13 +156,26 @@ type FsNode = {
   isLoading?: boolean;
 };
 
-type PreviewState =
+export type FileBrowserPreviewState =
   | { status: 'idle' }
   | { status: 'loading'; path: string }
   | { status: 'ok'; path: string; content: string; diff?: string; diffHtml?: string; downloadId?: string }
   | { status: 'image'; path: string; dataUrl: string; downloadId?: string }
   | { status: 'office'; path: string; data: string; mimeType: string; downloadId?: string }
   | { status: 'error'; path: string; error: string; downloadId?: string };
+
+export interface FileBrowserPreviewRequest {
+  path: string;
+  preferDiff?: boolean;
+  preview?: FileBrowserPreviewState;
+  sourcePreviewLive?: boolean;
+}
+
+export interface FileBrowserPreviewUpdate {
+  path: string;
+  preferDiff?: boolean;
+  preview: FileBrowserPreviewState;
+}
 
 /** File extensions that can be previewed with office document libraries. */
 const OFFICE_EXTENSIONS: Record<string, string> = {
@@ -196,6 +215,9 @@ export function FileBrowser({
   serverId,
   onConfirm,
   onClose,
+  initialPreview,
+  onPreviewStateChange,
+  skipAutoPreviewIfLoading = false,
   onPreviewFile,
   defaultTab = 'files',
 }: FileBrowserProps) {
@@ -213,8 +235,11 @@ export function FileBrowser({
   const [currentLabel, setCurrentLabel] = useState(startPath);
   const [error, setError] = useState<string | null>(null);
   const [showHidden, setShowHidden] = useState(false);
-  const [preview, setPreview] = useState<PreviewState>({ status: 'idle' });
-  const [showDiff, setShowDiff] = useState(false);
+  const [preview, setPreview] = useState<FileBrowserPreviewState>(() => initialPreview ?? { status: 'idle' });
+  const [showDiff, setShowDiff] = useState(() => {
+    if (initialPreview?.status === 'ok' && initialPreview.diffHtml && autoPreviewPreferDiff) return true;
+    return false;
+  });
   const [lightbox, setLightbox] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
 
@@ -529,7 +554,6 @@ export function FileBrowser({
   }, [ws, includeFiles, t]);
 
   const fetchPreview = useCallback((filePath: string, preferDiff = false) => {
-    if (onPreviewFile) { onPreviewFile({ path: filePath, preferDiff }); return; }
     if (editDirtyRef.current) {
       if (!window.confirm(t('fileBrowser.unsavedChanges'))) return;
     }
@@ -537,13 +561,15 @@ export function FileBrowser({
     setEditContent('');
     setOriginalMtime(undefined);
     setIsEditing(() => { try { return localStorage.getItem(PREF_KEY) === '1'; } catch { return false; } });
-    setPreview({ status: 'loading', path: filePath });
+    const loadingPreview: FileBrowserPreviewState = { status: 'loading', path: filePath };
+    setPreview(loadingPreview);
     setShowDiff(preferDiff);
+    if (onPreviewFile) onPreviewFile({ path: filePath, preferDiff, preview: loadingPreview });
     const requestId = ws.fsReadFile(filePath);
     pendingReadRef.current.set(requestId, filePath);
     const diffId = ws.fsGitDiff(filePath);
     pendingGitDiffRef.current.set(diffId, filePath);
-  }, [ws, t]);
+  }, [ws, t, onPreviewFile]);
 
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
 
@@ -615,10 +641,34 @@ export function FileBrowser({
     fetchDir(startPath);
   }, [startPath, fetchDir]);
 
+  useEffect(() => {
+    if (!initialPreview || initialPreview.status === 'idle') return;
+    setPreview(initialPreview);
+  }, [initialPreview]);
+
+  useEffect(() => {
+    if (!onPreviewStateChange) return;
+    if (preview.status === 'idle') return;
+    onPreviewStateChange({
+      path: (preview as { path: string }).path,
+      preferDiff: showDiff,
+      preview,
+    });
+  }, [onPreviewStateChange, preview, showDiff]);
+
   // Auto-preview file on open (e.g. when clicking a path link in chat)
   useEffect(() => {
-    if (autoPreviewPath) fetchPreview(autoPreviewPath, autoPreviewPreferDiff);
-  }, [autoPreviewPath, autoPreviewPreferDiff, fetchPreview]);
+    if (!autoPreviewPath) return;
+    const currentPreviewPath = preview.status !== 'idle' ? (preview as { path: string }).path : null;
+    if (currentPreviewPath === autoPreviewPath && preview.status !== 'idle') {
+      setShowDiff(autoPreviewPreferDiff);
+      if (preview.status === 'loading' && initialPreview?.status === 'loading' && !skipAutoPreviewIfLoading) {
+        fetchPreview(autoPreviewPath, autoPreviewPreferDiff);
+      }
+      return;
+    }
+    fetchPreview(autoPreviewPath, autoPreviewPreferDiff);
+  }, [autoPreviewPath, autoPreviewPreferDiff, fetchPreview, initialPreview, preview, skipAutoPreviewIfLoading]);
 
   // Auto-refresh preview content every 5s when a file is being previewed (paused during editing)
   useEffect(() => {
