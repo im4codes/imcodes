@@ -1513,9 +1513,15 @@ describe('WsBridge', () => {
           if (sql.includes('FROM sessions') && params?.[1] === 'deck_cd_brain') {
             return { project_name: 'codedeck', agent_type: 'claude-code', label: null };
           }
+          if (sql.includes('FROM sessions') && params?.[1] === 'bootmainxowfy6') {
+            return { project_name: 'codedeck', agent_type: 'claude-code', label: 'Boot Main' };
+          }
           if (sql.includes('FROM sub_sessions')) {
             if (params?.[1] === 'unlabeled') {
               return { type: 'codex', label: null, parent_session: '' };
+            }
+            if (params?.[1] === 'needs-main-label') {
+              return { type: 'codex', label: null, parent_session: 'bootmainxowfy6' };
             }
             if (params?.[1] === 'nested') {
               return { type: 'shell', label: null, parent_session: 'deck_sub_parent' };
@@ -1621,7 +1627,7 @@ describe('WsBridge', () => {
       expect(payload?.title).not.toContain('bootmainxowfy6');
     });
 
-    it('uses daemon project fallback before internal main session names in push title', async () => {
+    it('prefers stored main-session labels before daemon project fallbacks in push title', async () => {
       const { dispatchPush } = await import('../src/routes/push.js');
       const { daemonWs } = await setupPushBridge();
 
@@ -1635,7 +1641,7 @@ describe('WsBridge', () => {
       await flushAsync();
 
       const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
-      expect(payload?.title).toBe('my-server · Readable Main · claude-code');
+      expect(payload?.title).toBe('my-server · Boot Main · claude-code');
       expect(payload?.title).not.toContain('bootmainxowfy6');
     });
 
@@ -1675,6 +1681,25 @@ describe('WsBridge', () => {
       expect(payload?.title).toBe('my-server · codedeck · shell');
       expect(payload?.title).not.toContain('deck_sub_nested');
       expect(payload?.title).not.toContain('deck_sub_parent');
+    });
+
+    it('prefers stored parent labels over opaque daemon parent/project names in push title', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle',
+        session: 'deck_sub_needs-main-label',
+        parentLabel: 'bootmainxowfy6',
+        project: 'bootmainxowfy6',
+        agentType: 'codex',
+        lastText: 'Ready.',
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
+      expect(payload?.title).toBe('my-server · Boot Main · codex');
+      expect(payload?.title).not.toContain('bootmainxowfy6');
     });
 
     it('uses lastText as push body for session.idle', async () => {

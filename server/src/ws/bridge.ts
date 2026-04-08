@@ -2183,8 +2183,6 @@ export class WsBridge {
           [
             active?.label,
             sessionRow?.label,
-            currentSessionName === sessionName ? daemonParentLabel : undefined,
-            currentSessionName === sessionName ? daemonProject : undefined,
             active?.project,
             sessionRow?.project_name,
           ],
@@ -2198,7 +2196,7 @@ export class WsBridge {
     }
 
     displayName = displayName
-      || pickReadableSessionDisplay([daemonParentLabel, daemonProject, activeMainSession?.label, activeMainSession?.project], sessionName)
+      || pickReadableSessionDisplay([activeMainSession?.label, activeMainSession?.project, daemonParentLabel, daemonProject], sessionName)
       || sessionName;
 
     return {

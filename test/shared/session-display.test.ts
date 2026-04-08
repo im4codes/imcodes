@@ -6,6 +6,7 @@ describe('session display helpers', () => {
     expect(isInternalSessionDisplayValue('deck_cd_brain')).toBe(true);
     expect(isInternalSessionDisplayValue('deck_sub_ab12cd34')).toBe(true);
     expect(isInternalSessionDisplayValue('bootmainxowfy6', 'bootmainxowfy6')).toBe(true);
+    expect(isInternalSessionDisplayValue('bootmainxowfy6')).toBe(true);
   });
 
   it('keeps human labels and project names readable', () => {
@@ -17,5 +18,6 @@ describe('session display helpers', () => {
   it('picks the first readable display candidate', () => {
     expect(pickReadableSessionDisplay(['deck_sub_ab12cd34', 'deck_cd_brain', 'Readable Main'])).toBe('Readable Main');
     expect(pickReadableSessionDisplay(['bootmainxowfy6', 'Boot Main'], 'bootmainxowfy6')).toBe('Boot Main');
+    expect(pickReadableSessionDisplay(['bootmainxowfy6', 'Boot Main'], 'deck_sub_ab12cd34')).toBe('Boot Main');
   });
 });
