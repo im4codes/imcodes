@@ -579,6 +579,83 @@ describe('SessionControls', () => {
     });
   });
 
+  it('limits openspec dropdown height to the visible space above the trigger', async () => {
+    const rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function mockRect() {
+      if ((this as HTMLElement).classList?.contains('shortcuts-model')) {
+        return {
+          x: 0, y: 0, top: 220, left: 0, right: 120, bottom: 252, width: 120, height: 32,
+          toJSON() { return {}; },
+        } as DOMRect;
+      }
+      return {
+        x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0,
+        toJSON() { return {}; },
+      } as DOMRect;
+    });
+
+    const innerWidth = window.innerWidth;
+    const innerHeight = window.innerHeight;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 800 });
+
+    try {
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+
+      const dropdown = document.querySelector('.menu-dropdown-openspec') as HTMLElement;
+      expect(dropdown.style.maxHeight).toBe('208px');
+    } finally {
+      rectSpy.mockRestore();
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: innerWidth });
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: innerHeight });
+    }
+  });
+
+  it('collapses openspec actions behind a disclosure toggle on mobile', async () => {
+    const innerWidth = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+
+    try {
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+      ws.emit({
+        type: 'fs.ls_response',
+        requestId: 'openspec-request',
+        status: 'ok',
+        resolvedPath: '/repo/openspec/changes',
+        entries: [
+          { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+        ],
+      });
+      await flushAsync();
+
+      expect(screen.queryByRole('button', { name: 'implement_action' })).toBeNull();
+
+      fireEvent.click(screen.getByRole('button', { name: 'expand change-a' }));
+
+      expect(screen.getByRole('button', { name: 'implement_action' })).toBeDefined();
+      expect(screen.getByRole('button', { name: 'collapse change-a' })).toBeDefined();
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: innerWidth });
+    }
+  });
+
   it('clears input after send', () => {
     const ws = makeWs();
     render(<SessionControls ws={ws as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);

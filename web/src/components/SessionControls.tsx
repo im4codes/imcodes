@@ -278,6 +278,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [openSpecLoading, setOpenSpecLoading] = useState(false);
   const [openSpecError, setOpenSpecError] = useState<string | null>(null);
   const [openSpecAuditMenu, setOpenSpecAuditMenu] = useState<string | null>(null);
+  const [openSpecExpandedChange, setOpenSpecExpandedChange] = useState<string | null>(null);
+  const [openSpecLayoutTick, setOpenSpecLayoutTick] = useState(0);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
   const [qwenModel, setQwenModel] = useState<QwenModelChoice | null>(loadQwenModel);
@@ -478,6 +480,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setOpenSpecError(null);
     setOpenSpecLoading(false);
     setOpenSpecAuditMenu(null);
+    setOpenSpecExpandedChange(null);
     openSpecRequestIdRef.current = null;
   }, [activeSession?.projectDir]);
 
@@ -599,9 +602,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [t]);
 
   const openSpecDropdownStyle = useMemo(() => {
-    if (!openSpecOpen || typeof window === 'undefined' || window.innerWidth > 640) return undefined;
+    if (!openSpecOpen || typeof window === 'undefined') return undefined;
     const rect = openSpecRef.current?.getBoundingClientRect();
     if (!rect) return undefined;
+    const availableHeight = Math.max(96, Math.floor(rect.top - 12));
+    if (window.innerWidth > 640) {
+      return {
+        maxHeight: `${availableHeight}px`,
+      } as const;
+    }
     return {
       position: 'fixed',
       left: 8,
@@ -609,8 +618,28 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       bottom: Math.max(window.innerHeight - rect.top + 4, 72),
       width: 'auto',
       maxWidth: 'none',
+      maxHeight: `${availableHeight}px`,
       zIndex: 10001,
     } as const;
+  }, [openSpecLayoutTick, openSpecOpen]);
+
+  const isOpenSpecMobile = useMemo(
+    () => typeof window !== 'undefined' && window.innerWidth <= 640,
+    [openSpecLayoutTick, openSpecOpen],
+  );
+
+  useEffect(() => {
+    if (!openSpecOpen || typeof window === 'undefined') return;
+    const refreshLayout = () => setOpenSpecLayoutTick((tick) => tick + 1);
+    const viewport = window.visualViewport;
+    window.addEventListener('resize', refreshLayout);
+    viewport?.addEventListener('resize', refreshLayout);
+    viewport?.addEventListener('scroll', refreshLayout);
+    return () => {
+      window.removeEventListener('resize', refreshLayout);
+      viewport?.removeEventListener('resize', refreshLayout);
+      viewport?.removeEventListener('scroll', refreshLayout);
+    };
   }, [openSpecOpen]);
 
   const activeSub = (subSessions ?? []).find((s) => s.sessionName === activeSession?.name);
@@ -1280,19 +1309,38 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                 {!openSpecLoading && !openSpecError && openSpecChanges.map((changeName) => (
                   <div
                     key={changeName}
-                    class="openspec-change-row"
+                    class={`openspec-change-row${isOpenSpecMobile ? ' openspec-change-row-mobile' : ''}${openSpecExpandedChange === changeName ? ' openspec-change-row-expanded' : ''}`}
                   >
-                    <button
-                      class="menu-item openspec-change-name"
-                      onClick={() => {
-                        if (!openSpecChangesPath) return;
-                        appendToInput([toComposerReference(`${openSpecChangesPath}/${changeName}`)]);
-                        setOpenSpecOpen(false);
-                      }}
+                    <div class="openspec-change-header">
+                      <button
+                        class="menu-item openspec-change-name"
+                        onClick={() => {
+                          if (!openSpecChangesPath) return;
+                          appendToInput([toComposerReference(`${openSpecChangesPath}/${changeName}`)]);
+                          setOpenSpecOpen(false);
+                        }}
+                      >
+                        {changeName}
+                      </button>
+                      {isOpenSpecMobile && (
+                        <button
+                          type="button"
+                          class="openspec-change-toggle"
+                          aria-label={openSpecExpandedChange === changeName ? `collapse ${changeName}` : `expand ${changeName}`}
+                          aria-expanded={openSpecExpandedChange === changeName}
+                          onClick={() => {
+                            setOpenSpecAuditMenu(null);
+                            setOpenSpecExpandedChange((current) => current === changeName ? null : changeName);
+                          }}
+                        >
+                          {openSpecExpandedChange === changeName ? '▾' : '▸'}
+                        </button>
+                      )}
+                    </div>
+                    <div
+                      class={`openspec-change-actions${!isOpenSpecMobile || openSpecExpandedChange === changeName ? ' openspec-change-actions-visible' : ''}`}
+                      hidden={isOpenSpecMobile && openSpecExpandedChange !== changeName}
                     >
-                      {changeName}
-                    </button>
-                    <div class="openspec-change-actions">
                       <div class="openspec-change-action-wrap">
                         <button
                           class="btn btn-secondary openspec-change-action-btn"
