@@ -734,12 +734,12 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       ? `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Final Summary`
       : `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Round ${run.currentRound}/${run.rounds} Summary`;
     const roundSummaryInstruction = isLastRound
-      ? `${summaryModeConfig?.summaryPrompt ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.'}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. Append only the new summary section.`
+      ? `${summaryModeConfig?.summaryPrompt ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.'}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.`
       : `Synthesize the key points, areas of agreement, and open questions from this round. Then assign specific focus areas or questions for each participant in the next round (round ${run.currentRound + 1}). Append to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`;
     const roundSummaryPrompt = buildHopPrompt(run, summaryModeConfig, {
       session: run.initiatorSession,
       sectionHeader: roundSummaryHeader,
-      instruction: `${roundSummaryInstruction}\nThe orchestrator has already appended each completed hop's evidence into the discussion file. Do not re-copy or restructure prior sections; append only your round-summary section.`,
+      instruction: `${roundSummaryInstruction}\nThe orchestrator has already appended each completed hop's evidence into the discussion file. If you write the final plan to another file, still append a short completion note under the new final-summary heading in the discussion file that records the chosen output file path.`,
       isInitial: false,
     }, rp);
     logger.info({ runId: run.id, round: run.currentRound, isLastRound, roundMode: roundModeKey }, isLastRound ? 'P2P: Final summary — initiator' : 'P2P: Round summary — initiator');
@@ -1071,12 +1071,17 @@ export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: Hop
   parts.push(`[P2P Discussion Task — run ${run.id}]`);
   parts.push(``);
   if (isFinalSummary) {
-    parts.push(`This is the FINAL round of a multi-agent discussion. Your discussion file is: ${filePath}`);
+    parts.push(`This is the FINAL round of a multi-agent discussion.`);
+    parts.push(`Discussion file: ${run.contextFilePath}`);
     parts.push(``);
     parts.push(`Steps:`);
-    parts.push(`1. Read the discussion file`);
-    parts.push(`2. Add a new heading "## ${opts.sectionHeader}" at the end and write your final synthesis`);
-    parts.push(`3. Base the synthesis on the collected hop evidence already appended into the discussion file for this round`);
+    parts.push(`1. Read the discussion file and use both the user's original request and the final discussion evidence as source context`);
+    parts.push(`2. Infer whether the user context specifies a concrete destination file for the final plan`);
+    parts.push(`3. If a concrete destination file is clear from the user context, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file under a new heading "## ${opts.sectionHeader}"`);
+    parts.push(`4. If you wrote the plan to another file, still append a short note under "## ${opts.sectionHeader}" in the discussion file that records the destination path and confirms the plan was written`);
+    parts.push(``);
+    parts.push(`Final summary instructions:`);
+    parts.push(opts.instruction);
     parts.push(``);
     parts.push(`User's original request: "${run.userText}"`);
   } else {

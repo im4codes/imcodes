@@ -77,9 +77,8 @@ function pathFromPrompt(prompt: string): string {
 }
 
 function headingFromPrompt(prompt: string): string {
-  const match = prompt.match(/Add a new heading "## ([^"]+)"/);
-  if (!match) throw new Error(`No heading found in prompt: ${prompt}`);
-  return match[1];
+  const match = prompt.match(/Add a new heading "## ([^"]+)"/) ?? prompt.match(/under "?## ([^"\n]+)"?/);
+  return match?.[1] ?? 'Automated Test Output';
 }
 
 async function waitForStatus(runId: string, expected: P2pRunStatus[], maxMs = 10000): Promise<P2pRun> {

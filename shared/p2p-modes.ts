@@ -125,22 +125,24 @@ export const BUILT_IN_MODES: P2pMode[] = [
   },
   {
     key: 'plan',
-    prompt: 'You are a technical architect. Design an implementation plan for the provided context. Break down the work into clear steps, identify dependencies and risks, define acceptance criteria, and suggest the optimal execution order. Be specific about files, interfaces, and data flow.',
+    prompt: 'You are a technical architect. Design an implementation plan for the provided context. Use the user request and the discussion evidence to produce a complete, detailed execution plan. Break down the work into clear steps, identify dependencies and risks, define concrete acceptance and validation criteria, and suggest the optimal execution order. Be specific about files, interfaces, data flow, and how the work will be verified.',
     callbackRequired: true,
     defaultTimeoutMs: 300_000,
     resultStyle: 'findings-first',
     maxOutputChars: 12_000,
     summaryPrompt:
-      'Write a complete **Implementation Plan** that synthesizes all discussion into an actionable blueprint. Structure it as:\n' +
-      '1. **Goal** — one-paragraph statement of what this plan achieves and why\n' +
-      '2. **Architecture Overview** — key components, data flow, and interfaces involved\n' +
-      '3. **Implementation Phases** — ordered list of phases, each with:\n' +
-      '   - Specific tasks with file paths and interface changes\n' +
-      '   - Dependencies (what must be done before this phase)\n' +
-      '   - Acceptance criteria (how to verify this phase is complete)\n' +
-      '4. **Risk Assessment** — identified risks with mitigation strategies\n' +
-      '5. **Open Questions** — unresolved decisions that need stakeholder input\n' +
-      'Be precise: name files, functions, types, and data structures. This plan should be directly executable by a developer.',
+      'Write a complete **Implementation Plan** that synthesizes the user request and all discussion evidence into an actionable blueprint. Structure it as:\n' +
+      '1. **Goal and Scope** — what must be delivered, what is in scope, and what is explicitly out of scope\n' +
+      '2. **Current Context** — the relevant existing behavior, constraints, and discussion conclusions that drive the plan\n' +
+      '3. **Architecture Overview** — key components, data flow, interfaces, and state transitions involved\n' +
+      '4. **Implementation Phases** — ordered list of phases, each with:\n' +
+      '   - Specific tasks with file paths, function/type/interface changes, and sequencing\n' +
+      '   - Dependencies and prerequisites\n' +
+      '   - Edge cases, failure handling, and rollout notes when relevant\n' +
+      '5. **Acceptance and Validation** — explicit acceptance criteria plus concrete verification steps and tests for each major behavior\n' +
+      '6. **Risk Assessment** — identified risks with mitigation strategies\n' +
+      '7. **Open Questions** — unresolved decisions that need stakeholder input\n' +
+      'Be precise: name files, functions, types, data structures, and test coverage. The final plan must be detailed enough for direct implementation and QA handoff.',
   },
   {
     key: 'brainstorm',
