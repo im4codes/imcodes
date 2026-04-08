@@ -811,6 +811,8 @@ interface CronFormProps {
   onCancel: () => void;
 }
 
+const CRON_COMMAND_INLINE_CHAR_LIMIT = 1500;
+
 function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDone, onCancel }: CronFormProps) {
   const { t } = useTranslation();
   const isEdit = !!job;
@@ -834,6 +836,8 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
   const [expiresAt, setExpiresAt] = useState(job?.expires_at ? new Date(job.expires_at).toISOString().slice(0, 16) : '');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const commandCharCount = Array.from(command).length;
+  const commandTooLong = actionType === 'command' && commandCharCount > CRON_COMMAND_INLINE_CHAR_LIMIT;
 
   // Target selection: role:xxx for main sessions, sub:xxx for sub-sessions
   const targetValue = targetSessionName ? `sub:${targetSessionName}` : `role:${targetRole}`;
@@ -857,6 +861,10 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
 
   const handleSubmit = async (e: Event) => {
     e.preventDefault();
+    if (commandTooLong) {
+      setError(`Command is too long (${commandCharCount}/${CRON_COMMAND_INLINE_CHAR_LIMIT}). Write the prompt to a file and reference it directly with @/path/to/file.`);
+      return;
+    }
     setSaving(true);
     setError(null);
 
@@ -962,10 +970,27 @@ function CronForm({ serverId, projectName, sessions, subSessions = [], job, onDo
             <textarea
               style={{ ...inputStyle, minHeight: '80px', resize: 'vertical', fontFamily: 'inherit' }}
               value={command}
-              onInput={e => setCommand((e.target as HTMLTextAreaElement).value)}
+              onInput={e => {
+                setCommand((e.target as HTMLTextAreaElement).value);
+                setError((prev) => prev?.startsWith('Command is too long') ? null : prev);
+              }}
               placeholder={t('cron.command_placeholder')}
               required
             />
+            <div
+              style={{
+                marginTop: '6px',
+                marginBottom: '10px',
+                fontSize: '11px',
+                lineHeight: 1.5,
+                color: commandTooLong ? '#fbbf24' : '#64748b',
+              }}
+            >
+              {commandCharCount}/{CRON_COMMAND_INLINE_CHAR_LIMIT}
+              {commandTooLong
+                ? ' · Too long for inline entry. Write it to a file and reference it with @/path/to/file.'
+                : ''}
+            </div>
           </>
         )}
 

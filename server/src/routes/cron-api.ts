@@ -47,7 +47,7 @@ const cronJobCreateSchema = z.object({
   serverId: z.string().min(1),
   projectName: z.string().min(1).max(64),
   targetRole: z.string().regex(rolePattern).default('brain'),
-  targetSessionName: z.string().regex(sessionNamePattern).optional(),
+  targetSessionName: z.string().regex(sessionNamePattern).nullable().optional(),
   action: cronActionSchema,
   timezone: z.string().min(1).max(64).optional(),
   expiresAt: z.number().nullable().optional(),
