@@ -18,7 +18,9 @@
     "connected": "接続済み",
     "disconnected": "切断済み",
     "reconnecting": "再接続中…",
-    "refresh": "更新"
+    "refresh": "更新",
+    "show": "表示",
+    "hide": "隠す"
   },
   "chat": {
     "loading": "チャットを読み込み中...",

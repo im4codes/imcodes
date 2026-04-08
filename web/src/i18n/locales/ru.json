@@ -18,7 +18,9 @@
     "connected": "Подключено",
     "disconnected": "Отключено",
     "reconnecting": "Переподключение…",
-    "refresh": "Обновить"
+    "refresh": "Обновить",
+    "show": "Показать",
+    "hide": "Скрыть"
   },
   "chat": {
     "loading": "Загрузка чата...",

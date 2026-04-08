@@ -18,7 +18,9 @@
     "connected": "已連線",
     "disconnected": "已斷線",
     "reconnecting": "重新連線中…",
-    "refresh": "重新整理"
+    "refresh": "重新整理",
+    "show": "顯示",
+    "hide": "隱藏"
   },
   "chat": {
     "loading": "載入對話中...",

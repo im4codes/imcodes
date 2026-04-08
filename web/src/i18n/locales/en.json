@@ -18,7 +18,9 @@
     "connected": "Connected",
     "disconnected": "Disconnected",
     "reconnecting": "Reconnecting…",
-    "refresh": "Refresh"
+    "refresh": "Refresh",
+    "show": "Show",
+    "hide": "Hide"
   },
   "chat": {
     "loading": "Loading chat...",

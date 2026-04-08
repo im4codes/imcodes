@@ -18,7 +18,9 @@
     "connected": "已连接",
     "disconnected": "已断开",
     "reconnecting": "重新连接中…",
-    "refresh": "刷新"
+    "refresh": "刷新",
+    "show": "显示",
+    "hide": "隐藏"
   },
   "chat": {
     "loading": "加载聊天记录中...",

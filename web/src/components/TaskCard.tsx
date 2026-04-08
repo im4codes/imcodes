@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'preact/hooks';
+import { useState } from 'preact/hooks';
 import type { AutoFixTaskStatus } from '../types';
+import { useNowTicker } from '../hooks/useNowTicker.js';
 
 interface TaskCardProps {
   task: AutoFixTaskStatus;
@@ -57,16 +58,10 @@ function formatElapsed(ms: number): string {
 }
 
 export function TaskCard({ task, priority, onAbort, onRetry }: TaskCardProps) {
-  const [now, setNow] = useState(Date.now());
   const [expanded, setExpanded] = useState(false);
 
   const isTerminal = task.state === 'done' || task.state === 'failed';
-
-  useEffect(() => {
-    if (isTerminal) return;
-    const interval = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(interval);
-  }, [isTerminal]);
+  const now = useNowTicker(!isTerminal);
 
   const elapsed = now - task.startedAt;
   const borderColor = STATE_BORDER_COLORS[task.state] ?? '#334155';

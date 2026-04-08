@@ -18,7 +18,9 @@
     "connected": "연결됨",
     "disconnected": "연결 끊김",
     "reconnecting": "재연결 중…",
-    "refresh": "새로고침"
+    "refresh": "새로고침",
+    "show": "표시",
+    "hide": "숨기기"
   },
   "chat": {
     "loading": "채팅 로딩 중...",

@@ -1,5 +1,6 @@
 import { useMemo, useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
+import { useNowTicker } from '../hooks/useNowTicker.js';
 
 export interface P2pProgressNode {
   label: string;
@@ -88,13 +89,7 @@ function formatElapsed(ms: number): string {
 
 /** Ticking timer that updates every second while `startMs` is defined and `active` is true. */
 function useElapsedTimer(startMs: number | undefined, active: boolean): string {
-  const [now, setNow] = useState(Date.now());
-  useEffect(() => {
-    if (!active || !startMs) return;
-    setNow(Date.now());
-    const id = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [active, startMs]);
+  const now = useNowTicker(active && !!startMs);
   if (!startMs) return '00:00';
   return formatElapsed(now - startMs);
 }

@@ -1770,6 +1770,64 @@ body {
 .repo-detail-error { color: #ef4444; padding: 12px 16px; font-size: 12px; display: flex; align-items: center; gap: 8px; }
 .repo-detail-retry { background: none; border: 1px solid #334155; color: #94a3b8; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 11px; }
 .repo-detail-retry:hover { background: #1e293b; }
+.repo-action-job {
+  position: relative;
+  overflow: hidden;
+}
+.repo-action-step {
+  position: relative;
+}
+.repo-action-step-test {
+  background: rgba(59,130,246,0.10);
+}
+.repo-action-job.repo-action-focus-a,
+.repo-action-job.repo-action-focus-b {
+  animation: repo-action-focus-job 1.85s ease-out 1;
+}
+.repo-action-step.repo-action-focus-a,
+.repo-action-step.repo-action-focus-b {
+  animation: repo-action-focus-step 1.85s ease-out 1;
+}
+@keyframes repo-action-focus-job {
+  0% {
+    border-color: rgba(148,163,184,0.18);
+    background: rgba(15,23,42,0.45);
+    box-shadow: 0 0 0 0 rgba(15,23,42,0);
+  }
+  18% {
+    border-color: color-mix(in srgb, var(--repo-action-focus-color, #60a5fa) 88%, white 12%);
+    background: color-mix(in srgb, var(--repo-action-focus-color, #60a5fa) 12%, rgba(15,23,42,0.72));
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--repo-action-focus-color, #60a5fa) 42%, transparent), 0 0 22px color-mix(in srgb, var(--repo-action-focus-color, #60a5fa) 28%, transparent);
+  }
+  55% {
+    border-color: color-mix(in srgb, var(--repo-action-focus-color, #60a5fa) 54%, rgba(148,163,184,0.18));
+    background: color-mix(in srgb, var(--repo-action-focus-color, #60a5fa) 7%, rgba(15,23,42,0.6));
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--repo-action-focus-color, #60a5fa) 18%, transparent), 0 0 10px color-mix(in srgb, var(--repo-action-focus-color, #60a5fa) 12%, transparent);
+  }
+  100% {
+    border-color: rgba(148,163,184,0.18);
+    background: rgba(15,23,42,0.45);
+    box-shadow: 0 0 0 0 rgba(15,23,42,0);
+  }
+}
+@keyframes repo-action-focus-step {
+  0% {
+    background: transparent;
+    box-shadow: 0 0 0 0 rgba(15,23,42,0);
+  }
+  18% {
+    background: color-mix(in srgb, var(--repo-action-focus-color, #f87171) 16%, rgba(15,23,42,0.12));
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--repo-action-focus-color, #f87171) 36%, transparent), 0 0 16px color-mix(in srgb, var(--repo-action-focus-color, #f87171) 18%, transparent);
+  }
+  55% {
+    background: color-mix(in srgb, var(--repo-action-focus-color, #f87171) 8%, rgba(15,23,42,0.08));
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--repo-action-focus-color, #f87171) 14%, transparent), 0 0 8px color-mix(in srgb, var(--repo-action-focus-color, #f87171) 10%, transparent);
+  }
+  100% {
+    background: transparent;
+    box-shadow: 0 0 0 0 rgba(15,23,42,0);
+  }
+}
 .repo-item-clickable { cursor: pointer; }
 .repo-item-clickable:hover { background: #1e293b; }
 

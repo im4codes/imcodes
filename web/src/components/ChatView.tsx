@@ -11,6 +11,7 @@ import type { TimelineEvent, WsClient } from '../ws-client.js';
 import { FileBrowser } from './FileBrowser.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
+import { useNowTicker } from '../hooks/useNowTicker.js';
 
 interface Props {
   events: TimelineEvent[];
@@ -1193,11 +1194,7 @@ const ChatEvent = memo(function ChatEvent({ event, nextTs, onPathClick, serverId
 
 function ActiveThinkingLabel({ startTs }: { startTs: number }) {
   const { t } = useTranslation();
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, []);
+  const now = useNowTicker(true);
   const sec = Math.max(0, Math.round((now - startTs) / 1000));
   return <>{t('chat.thinking_running', { sec })}</>;
 }

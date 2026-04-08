@@ -181,6 +181,7 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
   const actionJobRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const actionStepRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const [focusedActionTargetKey, setFocusedActionTargetKey] = useState<string | null>(null);
+  const [focusedActionTargetReplayClass, setFocusedActionTargetReplayClass] = useState<'repo-action-focus-a' | 'repo-action-focus-b'>('repo-action-focus-a');
   const contextRef = useRef<RepoContext | null>(null);
 
   useEffect(() => {
@@ -670,11 +671,12 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
     if (!targetEl) return;
 
     setFocusedActionTargetKey(targetKey);
-    window.setTimeout(() => {
-      targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    }, 80);
-    const clearId = window.setTimeout(() => setFocusedActionTargetKey((current) => current === targetKey ? null : current), 4000);
-    return () => window.clearTimeout(clearId);
+    setFocusedActionTargetReplayClass((current) => current === 'repo-action-focus-a' ? 'repo-action-focus-b' : 'repo-action-focus-a');
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      });
+    });
   }, [focusLatestAction, tabs.actions.fetched, tabs.actions.items, detailData]);
 
   // ── Actions ──────────────────────────────────────────────────────────────
@@ -1340,16 +1342,17 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
                   return (
                     <div
                       key={job.id}
+                      class={`repo-action-job${isJobFocused ? ` ${focusedActionTargetReplayClass}` : ''}`}
                       ref={(el) => {
                         if (el) actionJobRefs.current.set(jobFocusKey, el);
                         else actionJobRefs.current.delete(jobFocusKey);
                       }}
                       style={{
-                        border: isJobFocused ? `1px solid ${jobColor}` : '1px solid rgba(148,163,184,0.18)',
+                        border: '1px solid rgba(148,163,184,0.18)',
                         borderRadius: 8,
                         padding: '8px 10px',
-                        background: isJobFocused ? 'rgba(59,130,246,0.10)' : 'rgba(15,23,42,0.45)',
-                        boxShadow: isJobFocused ? '0 0 0 1px rgba(59,130,246,0.30), 0 0 18px rgba(59,130,246,0.18)' : 'none',
+                        background: 'rgba(15,23,42,0.45)',
+                        ['--repo-action-focus-color' as string]: jobColor,
                       }}
                     >
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
@@ -1378,6 +1381,7 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
                             return (
                               <div
                                 key={`${job.id}:${step.number}`}
+                                class={`repo-action-step${isTestStep ? ' repo-action-step-test' : ''}${isStepFocused ? ` ${focusedActionTargetReplayClass}` : ''}`}
                                 ref={(el) => {
                                   if (el) actionStepRefs.current.set(stepFocusKey, el);
                                   else actionStepRefs.current.delete(stepFocusKey);
@@ -1391,8 +1395,7 @@ export function RepoPage({ ws, projectDir, focusLatestAction, onCiEvent }: Props
                                   paddingBottom: 3,
                                   paddingRight: 8,
                                   borderRadius: 6,
-                                  background: isStepFocused ? 'rgba(239,68,68,0.16)' : isTestStep ? 'rgba(59,130,246,0.10)' : 'transparent',
-                                  boxShadow: isStepFocused ? '0 0 0 1px rgba(239,68,68,0.35), 0 0 14px rgba(239,68,68,0.18)' : 'none',
+                                  ['--repo-action-focus-color' as string]: stepColor,
                                 }}
                               >
                                 <span style={{ width: 6, height: 6, borderRadius: '50%', background: stepColor, flexShrink: 0, display: 'inline-block' }} />

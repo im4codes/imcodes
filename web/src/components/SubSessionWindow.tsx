@@ -20,6 +20,7 @@ import type { SubSession } from '../hooks/useSubSessions.js';
 import { extractLatestUsage } from '../usage-data.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
+import { useNowTicker } from '../hooks/useNowTicker.js';
 
 interface WindowGeometry { x: number; y: number; w: number; h: number }
 
@@ -111,13 +112,7 @@ export function SubSessionWindow({
   const addQuote = useCallback((text: string) => setQuotes((prev) => [...prev, text]), []);
   const removeQuote = useCallback((i: number) => setQuotes((prev) => prev.filter((_, j) => j !== i)), []);
 
-  const [thinkingNow, setThinkingNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!activeThinkingTs || !active) return;
-    setThinkingNow(Date.now());
-    const id = setInterval(() => setThinkingNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [!!activeThinkingTs, active]); // eslint-disable-line react-hooks/exhaustive-deps
+  const thinkingNow = useNowTicker(!!activeThinkingTs && active);
   const isShell = sub.type === 'shell' || sub.type === 'script';
   /** Transport-backed sessions have no tmux terminal — chat only */
   const isTransport = sub.runtimeType === 'transport';

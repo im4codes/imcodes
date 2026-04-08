@@ -19,6 +19,7 @@ import { formatLabel } from '../format-label.js';
 import type { WsClient } from '../ws-client.js';
 import type { SessionInfo, TerminalDiff } from '../types.js';
 import { extractLatestUsage } from '../usage-data.js';
+import { useNowTicker } from '../hooks/useNowTicker.js';
 
 type ViewMode = 'terminal' | 'chat';
 
@@ -141,14 +142,7 @@ export function SessionPane({
   const statusText = useMemo(() => getActiveStatusText(timelineEvents), [timelineEvents]);
   const shouldShowFooter = !!(lastUsage || activeThinkingTs || statusText || session.planLabel || session.quotaLabel || session.quotaUsageLabel);
 
-  // 1-second tick for thinking elapsed display (only while thinking)
-  const [thinkingNow, setThinkingNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!activeThinkingTs) return;
-    setThinkingNow(Date.now());
-    const id = setInterval(() => setThinkingNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [!!activeThinkingTs]); // eslint-disable-line react-hooks/exhaustive-deps
+  const thinkingNow = useNowTicker(!!activeThinkingTs);
 
   // Effective view mode: transport sessions are always chat
   const isTransportSession = session.runtimeType === 'transport';
