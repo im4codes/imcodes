@@ -2971,6 +2971,7 @@ export function App() {
             hideFooter
             onPreviewStateChange={handlePreviewStateChange}
             onConfirm={() => {}}
+            onClose={() => setPreviewFileRequest(null)}
           />
         </FloatingPanel>
       )}

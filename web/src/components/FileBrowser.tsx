@@ -292,6 +292,7 @@ export function FileBrowser({
   const pendingGitDiffRef = useRef(new Map<string, string>()); // requestId → filePath
   const pendingMkdirRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
   const mountedRef = useRef(true);
+  const dismissedAutoPreviewPathRef = useRef<string | null>(null);
 
   // History navigation
   const historyRef = useRef<string[]>([startPath]);
@@ -557,6 +558,7 @@ export function FileBrowser({
     if (editDirtyRef.current) {
       if (!window.confirm(t('fileBrowser.unsavedChanges'))) return;
     }
+    dismissedAutoPreviewPathRef.current = null;
     setEditDirty(false);
     setEditContent('');
     setOriginalMtime(undefined);
@@ -647,6 +649,16 @@ export function FileBrowser({
   }, [initialPreview]);
 
   useEffect(() => {
+    if (!autoPreviewPath) {
+      dismissedAutoPreviewPathRef.current = null;
+      return;
+    }
+    if (dismissedAutoPreviewPathRef.current && dismissedAutoPreviewPathRef.current !== autoPreviewPath) {
+      dismissedAutoPreviewPathRef.current = null;
+    }
+  }, [autoPreviewPath]);
+
+  useEffect(() => {
     if (!onPreviewStateChange) return;
     if (preview.status === 'idle') return;
     onPreviewStateChange({
@@ -659,6 +671,7 @@ export function FileBrowser({
   // Auto-preview file on open (e.g. when clicking a path link in chat)
   useEffect(() => {
     if (!autoPreviewPath) return;
+    if (dismissedAutoPreviewPathRef.current === autoPreviewPath && preview.status === 'idle') return;
     const currentPreviewPath = preview.status !== 'idle' ? (preview as { path: string }).path : null;
     if (currentPreviewPath === autoPreviewPath && preview.status !== 'idle') {
       setShowDiff(autoPreviewPreferDiff);
@@ -669,6 +682,17 @@ export function FileBrowser({
     }
     fetchPreview(autoPreviewPath, autoPreviewPreferDiff);
   }, [autoPreviewPath, autoPreviewPreferDiff, fetchPreview, initialPreview, preview, skipAutoPreviewIfLoading]);
+
+  const dismissPreview = useCallback(() => {
+    if (editDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
+    if (autoPreviewPath) dismissedAutoPreviewPathRef.current = autoPreviewPath;
+    setIsEditing(false);
+    setEditDirty(false);
+    setPreview({ status: 'idle' });
+    if (autoPreviewPath && onClose) {
+      onClose();
+    }
+  }, [autoPreviewPath, editDirty, onClose, t]);
 
   // Auto-refresh preview content every 5s when a file is being previewed (paused during editing)
   useEffect(() => {
@@ -827,10 +851,7 @@ export function FileBrowser({
     <div class="fb-preview">
       <div class="fb-preview-header">
         <button class="fb-preview-back" onClick={() => {
-          if (editDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
-          setIsEditing(false);
-          setEditDirty(false);
-          setPreview({ status: 'idle' });
+          dismissPreview();
         }}>←</button>
         <span class="fb-preview-name">{previewPath!.split(/[/\\]/).pop()}</span>
         {preview.status === 'ok' && !isEditing && (
@@ -896,10 +917,7 @@ export function FileBrowser({
           </button>
         )}
         <button class="fb-close" onClick={() => {
-          if (editDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
-          setIsEditing(false);
-          setEditDirty(false);
-          setPreview({ status: 'idle' });
+          dismissPreview();
         }}>✕</button>
       </div>
       {/* Conflict dialog rendered inside FileEditor */}

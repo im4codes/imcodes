@@ -673,6 +673,33 @@ describe('FileBrowser', () => {
     expect((ws.fsGitDiff as any).mock.calls).toHaveLength(0);
   });
 
+  it('does not immediately reopen an auto-preview after the preview close button is pressed', async () => {
+    const { ws } = makeWsFactory();
+    const onClose = vi.fn();
+    const { container } = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/foo.ts"
+        onClose={onClose}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
+
+    await act(async () => {
+      fireEvent.click(container.querySelector('.fb-close') as HTMLElement);
+    });
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
+  });
+
   // ── Expand ────────────────────────────────────────────────────────────
 
   it('fetches children when a collapsed directory expand arrow is clicked', async () => {
