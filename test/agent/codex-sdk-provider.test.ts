@@ -309,4 +309,28 @@ describe('CodexSdkProvider', () => {
     const turnStartReq = child.requests.find((req) => req.method === 'turn/start');
     expect(turnStartReq?.params?.effort).toBe('high');
   });
+
+  it('emits thinking status from reasoning items and clears it on streamed assistant text', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-status', cwd: '/tmp/project' });
+
+    const statuses: Array<{ status: string | null; label?: string | null }> = [];
+    provider.onStatus?.((_sid, status) => statuses.push(status));
+
+    await provider.send('route-status', 'hello');
+    const child = childProcessMock.children[0];
+    child.emits({
+      method: 'item/started',
+      params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'reason-1', type: 'reasoning', text: 'Planning next step' } },
+    });
+    child.emits({ method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'msg-1', delta: 'O' } });
+    child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    await flush();
+
+    expect(statuses).toEqual([
+      { status: 'thinking', label: 'Thinking...' },
+      { status: null, label: null },
+    ]);
+  });
 });

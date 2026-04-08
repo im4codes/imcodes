@@ -10,6 +10,7 @@ import type {
   ProviderCapabilities,
   ProviderConfig,
   ProviderError,
+  ProviderStatusUpdate,
   SessionConfig,
   ToolCallEvent,
 } from '../transport-provider.js';
@@ -46,6 +47,7 @@ interface QwenSessionState {
   toolUseByIndex: Map<number, { id: string; name: string; input?: unknown; partialJson: string }>;
   toolUseById: Map<string, { id: string; name: string; input?: unknown; partialJson: string }>;
   emittedToolSignatures: Map<string, string>;
+  lastStatusSignature: string | null;
 }
 
 function toQwenReasoning(effort: TransportEffortLevel): false | { effort: 'low' | 'medium' | 'high' } {
@@ -185,6 +187,7 @@ export class QwenProvider implements TransportProvider {
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
+  private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
 
   async connect(config: ProviderConfig): Promise<void> {
     const resolved = resolveExecutableForSpawn(QWEN_BIN);
@@ -226,6 +229,7 @@ export class QwenProvider implements TransportProvider {
       toolUseByIndex: existing?.toolUseByIndex ?? new Map(),
       toolUseById: existing?.toolUseById ?? new Map(),
       emittedToolSignatures: existing?.emittedToolSignatures ?? new Map(),
+      lastStatusSignature: existing?.lastStatusSignature ?? null,
     });
     return sessionId;
   }
@@ -267,6 +271,14 @@ export class QwenProvider implements TransportProvider {
     this.toolCallCallbacks.push(cb);
   }
 
+  onStatus(cb: (sessionId: string, status: ProviderStatusUpdate) => void): () => void {
+    this.statusCallbacks.push(cb);
+    return () => {
+      const idx = this.statusCallbacks.indexOf(cb);
+      if (idx >= 0) this.statusCallbacks.splice(idx, 1);
+    };
+  }
+
   setSessionAgentId(sessionId: string, agentId: string): void {
     const state = this.sessions.get(sessionId);
     if (!state) return;
@@ -304,6 +316,7 @@ export class QwenProvider implements TransportProvider {
       toolUseByIndex: new Map(),
       toolUseById: new Map(),
       emittedToolSignatures: new Map(),
+      lastStatusSignature: null,
     };
     if (state.child && !state.child.killed) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Qwen session is already busy', true);
@@ -317,6 +330,7 @@ export class QwenProvider implements TransportProvider {
     state.toolUseByIndex.clear();
     state.toolUseById.clear();
     state.emittedToolSignatures.clear();
+    state.lastStatusSignature = null;
 
     const args = [
       '-p', message,
@@ -424,11 +438,20 @@ export class QwenProvider implements TransportProvider {
         const event = payload.event;
         if (!event) return;
         if (event.type === 'message_start') {
+          this.clearStatus(sessionId, state);
           state.currentMessageId = event.message?.id ?? randomUUID();
           state.currentText = '';
           return;
         }
+        if (event.type === 'content_block_start' && event.content_block?.type === 'thinking') {
+          this.emitStatus(sessionId, state, {
+            status: 'thinking',
+            label: 'Thinking...',
+          });
+          return;
+        }
         if (event.type === 'content_block_start' && event.content_block?.type === 'tool_use') {
+          this.clearStatus(sessionId, state);
           const toolId = event.content_block.id ?? randomUUID();
           const toolName = event.content_block.name ?? 'tool';
           const toolInput = event.content_block.input;
@@ -463,6 +486,7 @@ export class QwenProvider implements TransportProvider {
           return;
         }
         if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta' && typeof event.delta.text === 'string') {
+          this.clearStatus(sessionId, state);
           state.currentMessageId ??= randomUUID();
           state.currentText += event.delta.text;
           this.deltaCallbacks.forEach((cb) => cb(sessionId, {
@@ -471,6 +495,13 @@ export class QwenProvider implements TransportProvider {
             delta: state.currentText,
             role: 'assistant',
           }));
+          return;
+        }
+        if (event.type === 'content_block_delta' && event.delta?.type === 'thinking_delta' && typeof event.delta.thinking === 'string') {
+          this.emitStatus(sessionId, state, {
+            status: 'thinking',
+            label: 'Thinking...',
+          });
           return;
         }
         if (event.type === 'content_block_delta' && event.delta?.type === 'input_json_delta' && typeof event.index === 'number') {
@@ -500,6 +531,14 @@ export class QwenProvider implements TransportProvider {
       }
 
       if (payload.type === 'assistant') {
+        if ((payload.message?.content ?? []).some((block) => block?.type === 'thinking')) {
+          this.emitStatus(sessionId, state, {
+            status: 'thinking',
+            label: 'Thinking...',
+          });
+        } else {
+          this.clearStatus(sessionId, state);
+        }
         for (const block of payload.message?.content ?? []) {
           if (block?.type === 'tool_use' && block.id) {
             if (hasMeaningfulToolValue(block.input)) {
@@ -530,6 +569,7 @@ export class QwenProvider implements TransportProvider {
       }
 
       if (payload.type === 'user') {
+        this.clearStatus(sessionId, state);
         for (const block of payload.message?.content ?? []) {
           if (block?.type !== 'tool_result' || !block.tool_use_id) continue;
           const output = stringifyToolResultContent(block.content);
@@ -551,6 +591,7 @@ export class QwenProvider implements TransportProvider {
       }
 
       if (payload.type === 'result') {
+        this.clearStatus(sessionId, state);
         if (payload.is_error) {
           emitError(payload.error?.message || stderrBuf || 'Qwen execution failed', payload);
           return;
@@ -633,6 +674,20 @@ export class QwenProvider implements TransportProvider {
 
   private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {
     return { code, message, recoverable, details };
+  }
+
+  private emitStatus(sessionId: string, state: QwenSessionState, status: ProviderStatusUpdate): void {
+    const signature = JSON.stringify({
+      status: status.status,
+      label: status.label ?? null,
+    });
+    if (state.lastStatusSignature === signature) return;
+    state.lastStatusSignature = signature;
+    for (const cb of this.statusCallbacks) cb(sessionId, status);
+  }
+
+  private clearStatus(sessionId: string, state: QwenSessionState): void {
+    this.emitStatus(sessionId, state, { status: null, label: null });
   }
 
   private async ensureSettingsPath(state: QwenSessionState): Promise<string> {

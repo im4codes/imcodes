@@ -48,12 +48,14 @@ type DeltaCb = (sessionId: string, delta: MessageDelta) => void;
 type CompleteCb = (sessionId: string, message: AgentMessage) => void;
 type ErrorCb = (sessionId: string, error: { code: string; message: string; recoverable: boolean }) => void;
 type ToolCb = (sessionId: string, tool: ToolCallEvent) => void;
+type StatusCb = (sessionId: string, status: { status: string | null; label?: string | null }) => void;
 
 function makeMockProvider() {
   let deltaCb: DeltaCb | undefined;
   let completeCb: CompleteCb | undefined;
   let errorCb: ErrorCb | undefined;
   let toolCb: ToolCb | undefined;
+  let statusCb: StatusCb | undefined;
 
   return {
     provider: {
@@ -61,11 +63,13 @@ function makeMockProvider() {
       onComplete: (cb: CompleteCb) => { completeCb = cb; return () => { completeCb = undefined; }; },
       onError: (cb: ErrorCb) => { errorCb = cb; return () => { errorCb = undefined; }; },
       onToolCall: (cb: ToolCb) => { toolCb = cb; },
+      onStatus: (cb: StatusCb) => { statusCb = cb; return () => { statusCb = undefined; }; },
     } as unknown as TransportProvider,
     fireDelta: (sid: string, delta: MessageDelta) => deltaCb?.(sid, delta),
     fireComplete: (sid: string, msg: AgentMessage) => completeCb?.(sid, msg),
     fireError: (sid: string, err: { code: string; message: string; recoverable: boolean }) => errorCb?.(sid, err),
     fireTool: (sid: string, tool: ToolCallEvent) => toolCb?.(sid, tool),
+    fireStatus: (sid: string, status: { status: string | null; label?: string | null }) => statusCb?.(sid, status),
   };
 }
 
@@ -639,6 +643,36 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(call![0]).toBe('sess-tool');
       expect(call![2]).toEqual({ output: 'done', detail: { kind: 'tool_result', output: 'done' } });
       expect(call![3].eventId).toBe('transport-tool:sess-tool:tool-1:result');
+    });
+  });
+
+  describe('onStatus', () => {
+    it('emits agent.status into the timeline for provider status updates', () => {
+      const { provider, fireStatus } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireStatus('sess-status', { status: 'compacting', label: 'Compacting conversation...' });
+
+      expect(emitMock).toHaveBeenCalledWith(
+        'sess-status',
+        'agent.status',
+        { status: 'compacting', label: 'Compacting conversation...' },
+        expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+      );
+    });
+
+    it('emits unlabeled status updates so the frontend can clear stale status text', () => {
+      const { provider, fireStatus } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireStatus('sess-status', { status: null, label: null });
+
+      expect(emitMock).toHaveBeenCalledWith(
+        'sess-status',
+        'agent.status',
+        { status: null, label: null },
+        expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+      );
     });
   });
 });

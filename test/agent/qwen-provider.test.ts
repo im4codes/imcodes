@@ -404,4 +404,28 @@ describe('QwenProvider', () => {
       },
     ]);
   });
+
+  it('emits thinking status from qwen thinking blocks and clears it on text output', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-thinking', cwd: '/tmp/project' });
+
+    const statuses: Array<{ status: string | null; label?: string | null }> = [];
+    provider.onStatus?.((_sid, status) => statuses.push(status));
+
+    await provider.send('sess-thinking', 'think');
+    const run = lastSpawn();
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-thinking' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'thinking' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'Analyzing...' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'Done' } } })}\n`);
+    run.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(statuses).toEqual([
+      { status: null, label: null },
+      { status: 'thinking', label: 'Thinking...' },
+      { status: null, label: null },
+    ]);
+  });
 });

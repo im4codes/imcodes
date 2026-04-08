@@ -10,6 +10,7 @@ import type {
   ProviderError,
   SessionConfig,
   SessionInfoUpdate,
+  ProviderStatusUpdate,
   ToolCallEvent,
 } from '../transport-provider.js';
 import {
@@ -46,6 +47,7 @@ interface ClaudeSdkSessionState {
   pendingError?: ProviderError;
   toolCalls: Map<number, ToolCallEvent & { partialInputJson?: string }>;
   emittedToolStates: Map<string, string>;
+  lastStatusSignature: string | null;
 }
 
 type ClaudeToolBlock = {
@@ -92,6 +94,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
   private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
+  private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
 
   async connect(config: ProviderConfig): Promise<void> {
     const binaryPath = this.resolveBinaryPath(config);
@@ -138,6 +141,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       pendingComplete: undefined,
       toolCalls: new Map(),
       emittedToolStates: new Map(),
+      lastStatusSignature: null,
     });
     this.emitSessionInfo(routeId, { resumeId, ...(config.effort ? { effort: config.effort } : {}) });
     return routeId;
@@ -184,6 +188,14 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     return () => {
       const idx = this.sessionInfoCallbacks.indexOf(cb);
       if (idx >= 0) this.sessionInfoCallbacks.splice(idx, 1);
+    };
+  }
+
+  onStatus(cb: (sessionId: string, status: ProviderStatusUpdate) => void): () => void {
+    this.statusCallbacks.push(cb);
+    return () => {
+      const idx = this.statusCallbacks.indexOf(cb);
+      if (idx >= 0) this.statusCallbacks.splice(idx, 1);
     };
   }
 
@@ -243,6 +255,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     state.pendingError = undefined;
     state.toolCalls.clear();
     state.emittedToolStates.clear();
+    state.lastStatusSignature = null;
 
     const resolvedBinary = this.resolveBinaryPath(this.config);
     const baseSystemPrompt = extraSystemPrompt ?? state.description;
@@ -346,6 +359,29 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       state.model = msg.model;
       state.started = true;
       this.emitSessionInfo(sessionId, { resumeId: msg.session_id, model: msg.model });
+      return;
+    }
+
+    if (msg.type === 'system' && msg.subtype === 'compact_boundary') {
+      this.emitStatus(sessionId, state, {
+        status: 'compacting',
+        label: 'Compacting conversation...',
+      });
+      return;
+    }
+
+    if (msg.type === 'system' && msg.subtype === 'status') {
+      if (msg.status === 'compacting') {
+        this.emitStatus(sessionId, state, {
+          status: 'compacting',
+          label: 'Compacting conversation...',
+        });
+      } else {
+        this.emitStatus(sessionId, state, {
+          status: msg.status,
+          label: null,
+        });
+      }
       return;
     }
 
@@ -523,6 +559,16 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
 
   private emitSessionInfo(sessionId: string, info: SessionInfoUpdate): void {
     for (const cb of this.sessionInfoCallbacks) cb(sessionId, info);
+  }
+
+  private emitStatus(sessionId: string, state: ClaudeSdkSessionState, status: ProviderStatusUpdate): void {
+    const signature = JSON.stringify({
+      status: status.status,
+      label: status.label ?? null,
+    });
+    if (state.lastStatusSignature === signature) return;
+    state.lastStatusSignature = signature;
+    for (const cb of this.statusCallbacks) cb(sessionId, status);
   }
 
   private emitError(sessionId: string, error: ProviderError): void {

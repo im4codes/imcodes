@@ -57,7 +57,10 @@ export function getActiveThinkingTs(events: Array<{ type: string; ts: number; pa
 export function getActiveStatusText(events: Array<{ type: string; payload?: Record<string, unknown> }>): string | null {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
-    if (e.type === 'agent.status' && e.payload?.label) return String(e.payload.label);
+    if (e.type === 'agent.status') {
+      if (e.payload?.label) return String(e.payload.label);
+      return null;
+    }
     if (e.type !== 'agent.status') break;
   }
   return null;

@@ -5,7 +5,7 @@
  * JSONL watchers), so ChatView renders them without any special handling.
  * Also cached to local JSONL for replay on reconnect/restart.
  */
-import type { TransportProvider, ProviderError } from '../agent/transport-provider.js';
+import type { TransportProvider, ProviderError, ProviderStatusUpdate } from '../agent/transport-provider.js';
 import type { MessageDelta, AgentMessage, ToolCallEvent } from '../../shared/agent-message.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { resolveSessionName } from '../agent/session-manager.js';
@@ -243,6 +243,19 @@ export function wireProviderToRelay(provider: TransportProvider): void {
           : {}),
       ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
     });
+  });
+
+  provider.onStatus?.((providerSid: string, status: ProviderStatusUpdate) => {
+    const sessionName = resolveSessionName(providerSid);
+    if (!sessionName) {
+      logger.debug({ providerSid }, 'transport-relay: unresolved route for status — dropped');
+      return;
+    }
+
+    timelineEmitter.emit(sessionName, 'agent.status', {
+      status: status.status,
+      ...(status.label !== undefined ? { label: status.label } : {}),
+    }, { source: 'daemon', confidence: 'high' });
   });
 }
 

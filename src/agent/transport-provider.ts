@@ -180,6 +180,14 @@ export interface SessionInfoUpdate {
   effort?: TransportEffortLevel;
 }
 
+/** Provider-reported transient execution status (e.g. compacting). */
+export interface ProviderStatusUpdate {
+  /** Machine-readable transient status. Null clears any previously active status. */
+  status: string | null;
+  /** Human-readable label shown in the footer/status line. Null clears the label. */
+  label?: string | null;
+}
+
 // ── TransportProvider interface ─────────────────────────────────────────────
 
 /**
@@ -285,6 +293,12 @@ export interface TransportProvider {
    * Used by SDK-backed providers that learn durable resume IDs after the first turn.
    */
   onSessionInfo?(cb: (sessionId: string, info: SessionInfoUpdate) => void): () => void;
+
+  /**
+   * Register a callback for transient provider status changes (e.g. compacting).
+   * Used by SDK-backed providers that can surface phases before a final response arrives.
+   */
+  onStatus?(cb: (sessionId: string, status: ProviderStatusUpdate) => void): () => void;
 
   /**
    * Register a callback for approval requests from the agent.

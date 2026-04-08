@@ -9,6 +9,7 @@ import type {
   ProviderError,
   SessionConfig,
   SessionInfoUpdate,
+  ProviderStatusUpdate,
   ToolCallEvent,
 } from '../transport-provider.js';
 import {
@@ -53,6 +54,7 @@ interface CodexSdkSessionState {
     cached_input_tokens: number;
     output_tokens: number;
   };
+  lastStatusSignature: string | null;
 }
 
 function toolFromItem(item: Record<string, any>, lifecycle: 'started' | 'completed'): ToolCallEvent | null {
@@ -173,6 +175,7 @@ export class CodexSdkProvider implements TransportProvider {
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
   private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
+  private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
   private child: ChildProcessWithoutNullStreams | null = null;
   private rl: ReadlineInterface | null = null;
   private nextRequestId = 1;
@@ -221,6 +224,7 @@ export class CodexSdkProvider implements TransportProvider {
       pendingComplete: undefined,
       cancelled: false,
       lastUsage: undefined,
+      lastStatusSignature: null,
     });
     if (config.resumeId || config.effort) this.emitSessionInfo(routeId, { ...(config.resumeId ? { resumeId: config.resumeId } : {}), ...(config.effort ? { effort: config.effort } : {}) });
     return routeId;
@@ -272,6 +276,14 @@ export class CodexSdkProvider implements TransportProvider {
     };
   }
 
+  onStatus(cb: (sessionId: string, status: ProviderStatusUpdate) => void): () => void {
+    this.statusCallbacks.push(cb);
+    return () => {
+      const idx = this.statusCallbacks.indexOf(cb);
+      if (idx >= 0) this.statusCallbacks.splice(idx, 1);
+    };
+  }
+
   setSessionAgentId(sessionId: string, agentId: string): void {
     const state = this.sessions.get(sessionId);
     if (!state) return;
@@ -302,6 +314,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.pendingComplete = undefined;
     state.cancelled = false;
     state.lastUsage = undefined;
+    state.lastStatusSignature = null;
     await this.startTurn(sessionId, state, message);
   }
 
@@ -470,6 +483,7 @@ export class CodexSdkProvider implements TransportProvider {
       const sessionId = this.threadToSession.get(params.threadId);
       const state = sessionId ? this.sessions.get(sessionId) : null;
       if (!sessionId || !state) return;
+      this.clearStatus(sessionId, state);
       state.currentMessageId = params.itemId;
       state.currentText += String(params.delta ?? '');
       const delta: MessageDelta = {
@@ -489,6 +503,16 @@ export class CodexSdkProvider implements TransportProvider {
 
       const item = params.item as Record<string, any> | undefined;
       if (!item) return;
+
+      if (item.type === 'reasoning') {
+        this.emitStatus(sessionId, state, {
+          status: 'thinking',
+          label: 'Thinking...',
+        });
+        return;
+      }
+
+      this.clearStatus(sessionId, state);
 
       const tool = toolFromItem(item, method === 'item/started' ? 'started' : 'completed');
       if (tool) {
@@ -522,16 +546,19 @@ export class CodexSdkProvider implements TransportProvider {
       const status = turn.status;
 
       if (status === 'failed') {
+        this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, turn.error?.message ?? 'Codex turn failed', false, turn.error));
         return;
       }
       if (status === 'interrupted') {
+        this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
         return;
       }
 
+      this.clearStatus(sessionId, state);
       state.pendingComplete = {
         id: state.currentMessageId ?? `${sessionId}:agent-message`,
         sessionId,
@@ -580,6 +607,20 @@ export class CodexSdkProvider implements TransportProvider {
 
   private emitSessionInfo(sessionId: string, info: SessionInfoUpdate): void {
     for (const cb of this.sessionInfoCallbacks) cb(sessionId, info);
+  }
+
+  private emitStatus(sessionId: string, state: CodexSdkSessionState, status: ProviderStatusUpdate): void {
+    const signature = JSON.stringify({
+      status: status.status,
+      label: status.label ?? null,
+    });
+    if (state.lastStatusSignature === signature) return;
+    state.lastStatusSignature = signature;
+    for (const cb of this.statusCallbacks) cb(sessionId, status);
+  }
+
+  private clearStatus(sessionId: string, state: CodexSdkSessionState): void {
+    this.emitStatus(sessionId, state, { status: null, label: null });
   }
 
   private emitError(sessionId: string, error: ProviderError): void {
