@@ -193,7 +193,7 @@ body {
 .controls-input:empty::before { content: attr(data-placeholder); color: #475569; pointer-events: none; }
 /* Menu dropdown */
 .menu-wrap { position: relative; }
-.menu-dropdown { position: absolute; bottom: calc(100% + 4px); right: 0; background: #1e293b; border: 1px solid #334155; border-radius: 6px; min-width: 200px; max-height: 60vh; overflow-y: auto; box-shadow: 0 4px 16px #00000060; z-index: 50; }
+.menu-dropdown { position: absolute; bottom: calc(100% + 4px); right: 0; background: #1e293b; border: 1px solid #334155; border-radius: 6px; min-width: 200px; max-width: calc(100vw - 16px); max-height: 60vh; overflow-y: auto; box-shadow: 0 4px 16px #00000060; z-index: 50; }
 .menu-dropdown-models { min-width: min(260px, calc(100vw - 24px)); max-width: min(320px, calc(100vw - 24px)); }
 .menu-dropdown-openspec { width: max-content; min-width: min(320px, calc(100vw - 24px)); max-width: calc(100vw - 24px); overscroll-behavior: contain; display: flex; flex-direction: column; }
 .menu-dropdown-openspec .menu-item,
@@ -226,6 +226,7 @@ body {
 .menu-item-active:hover { background: #2a1b4e !important; }
 .p2p-menu-section-label { font-size: 10px; color: #64748b; padding: 2px 12px; text-transform: uppercase; letter-spacing: 0.05em; }
 @media (max-width: 640px) {
+  .menu-dropdown { max-width: calc(100vw - 16px); }
   .menu-dropdown-openspec { max-height: min(60vh, calc(100vh - 148px)); }
   .openspec-change-row { flex-direction: column; align-items: stretch; gap: 4px; }
   .openspec-change-header { display: flex; align-items: center; gap: 6px; width: 100%; }
@@ -235,6 +236,7 @@ body {
   .openspec-change-actions-visible { display: grid; }
   .openspec-change-action-wrap { min-width: 0; }
   .openspec-change-action-btn { width: 100%; padding: 5px 6px; font-size: 10px; }
+  .openspec-submenu { max-height: min(45vh, calc(100vh - 120px)); }
   .menu-dropdown-p2p { right: 0; width: calc(100vw - 16px); min-width: calc(100vw - 16px); max-width: calc(100vw - 16px); }
   .menu-dropdown-p2p .menu-item,
   .menu-dropdown-p2p .menu-divider,

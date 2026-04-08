@@ -664,6 +664,38 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     [openSpecLayoutTick, openSpecOpen],
   );
 
+  const openSpecAuditDropdownStyle = isOpenSpecMobile
+    ? {
+        position: 'fixed',
+        left: 8,
+        right: 8,
+        bottom: 72,
+        minWidth: 0,
+        width: 'auto',
+        maxWidth: 'none',
+      } as const
+    : {
+        right: 0,
+        bottom: 'calc(100% + 6px)',
+        minWidth: 180,
+      } as const;
+
+  const openSpecProposeDropdownStyle = isOpenSpecMobile
+    ? {
+        position: 'fixed',
+        left: 8,
+        right: 8,
+        bottom: 72,
+        minWidth: 0,
+        width: 'auto',
+        maxWidth: 'none',
+      } as const
+    : {
+        right: 0,
+        bottom: 'calc(100% + 6px)',
+        minWidth: 220,
+      } as const;
+
   useEffect(() => {
     if (!openSpecOpen || typeof window === 'undefined') return;
     const refreshLayout = () => setOpenSpecLayoutTick((tick) => tick + 1);
@@ -795,6 +827,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     extra.p2pRounds = selection.rounds;
     if (selection.config.extraPrompt) extra.p2pExtraPrompt = selection.config.extraPrompt;
     if (selection.config.hopTimeoutMinutes != null) extra.p2pHopTimeoutMs = Math.min(selection.config.hopTimeoutMinutes * 60_000, 600_000);
+    if (mode === P2P_CONFIG_MODE) {
+      if (selection.config.advancedPresetKey) extra.p2pAdvancedPresetKey = selection.config.advancedPresetKey;
+      if (selection.config.advancedRounds) extra.p2pAdvancedRounds = selection.config.advancedRounds;
+      if (selection.config.advancedRunTimeoutMinutes != null) extra.p2pAdvancedRunTimeoutMinutes = selection.config.advancedRunTimeoutMinutes;
+      if (selection.config.contextReducer) extra.p2pContextReducer = selection.config.contextReducer;
+    }
   }, [p2pSavedConfig]);
 
   const buildSendPayload = useCallback((options?: string | BuildSendPayloadOptions): PendingSendPayload | null => {
@@ -836,6 +874,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           extra.p2pRounds = override?.rounds ?? cfg.rounds ?? 1;
           if (cfg.extraPrompt) extra.p2pExtraPrompt = cfg.extraPrompt;
           if (cfg.hopTimeoutMinutes != null) extra.p2pHopTimeoutMs = Math.min(cfg.hopTimeoutMinutes * 60_000, 600_000);
+          if (!override?.modeOverride || override.modeOverride === P2P_CONFIG_MODE) {
+            if (cfg.advancedPresetKey) extra.p2pAdvancedPresetKey = cfg.advancedPresetKey;
+            if (cfg.advancedRounds) extra.p2pAdvancedRounds = cfg.advancedRounds;
+            if (cfg.advancedRunTimeoutMinutes != null) extra.p2pAdvancedRunTimeoutMinutes = cfg.advancedRunTimeoutMinutes;
+            if (cfg.contextReducer) extra.p2pContextReducer = cfg.contextReducer;
+          }
         }
         // For non-config mode overrides (single or combo), send as p2pMode so the daemon uses it
         if (override?.modeOverride && override.modeOverride !== 'config') {
@@ -1407,7 +1451,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                           {t('openspec.audit_action')}
                         </button>
                         {openSpecAuditMenu === changeName && (
-                          <div class="menu-dropdown" style={{ right: 0, bottom: 'calc(100% + 6px)', minWidth: 180 }}>
+                          <div class="menu-dropdown openspec-submenu" style={openSpecAuditDropdownStyle}>
                             <button
                               class="menu-item"
                               onClick={() => {
@@ -1478,7 +1522,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                       {t('openspec.propose_action')}
                     </button>
                     {openSpecProposeMenuOpen && (
-                      <div class="menu-dropdown" style={{ right: 0, bottom: 'calc(100% + 6px)', minWidth: 220 }}>
+                      <div class="menu-dropdown openspec-submenu" style={openSpecProposeDropdownStyle}>
                         <button
                           class="menu-item"
                           onClick={() => {
