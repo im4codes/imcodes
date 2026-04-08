@@ -20,6 +20,9 @@ vi.mock('react-i18next', () => ({
       if (key === 'openspec.audit_spec_action') return 'audit_spec_action';
       if (key === 'openspec.implement_action') return 'implement_action';
       if (key === 'openspec.achieve_action') return 'achieve_action';
+      if (key === 'openspec.propose_action') return 'propose_action';
+      if (key === 'openspec.propose_from_discussion_action') return 'propose_from_discussion_action';
+      if (key === 'openspec.propose_from_description_action') return 'propose_from_description_action';
       if (key === 'openspec.audit_implementation_prompt') {
         return `audit implementation ${(opts?.reference as string) ?? ''}, fix code gaps`;
       }
@@ -31,6 +34,12 @@ vi.mock('react-i18next', () => ({
       }
       if (key === 'openspec.achieve_prompt') {
         return `complete ${(opts?.reference as string) ?? ''}, finish remaining work and archive if done`;
+      }
+      if (key === 'openspec.propose_from_discussion_prompt') {
+        return 'generate openspec proposal from recent discussion';
+      }
+      if (key === 'openspec.propose_from_description_prompt') {
+        return 'generate openspec proposal from description below';
       }
       const parts = key.split('.');
       return parts[parts.length - 1];
@@ -577,6 +586,42 @@ describe('SessionControls', () => {
       sessionName: 'my-session',
       text: 'complete @openspec/changes/change-a, finish remaining work and archive if done',
     });
+  });
+
+  it('inserts an openspec propose-from-discussion prompt without sending immediately', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'propose_action' }));
+    fireEvent.click(screen.getByRole('button', { name: 'propose_from_discussion_action' }));
+
+    expect(screen.getByRole('textbox').textContent).toBe('generate openspec proposal from recent discussion');
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it('inserts an openspec propose-from-description prompt without sending immediately', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'propose_action' }));
+    fireEvent.click(screen.getByRole('button', { name: 'propose_from_description_action' }));
+
+    expect(screen.getByRole('textbox').textContent).toBe('generate openspec proposal from description below');
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
   });
 
   it('limits openspec dropdown height to the visible space above the trigger', async () => {

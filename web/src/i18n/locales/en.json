@@ -447,10 +447,15 @@
     "audit_spec_action": "Audit Spec",
     "implement_action": "Implement",
     "achieve_action": "Achieve",
+    "propose_action": "Propose",
+    "propose_from_discussion_action": "From Recent Discussion",
+    "propose_from_description_action": "From Description Below",
     "audit_implementation_prompt": "Perform a strict implementation audit for {{reference}} against its OpenSpec artifacts. Identify every mismatch, omission, regression risk, edge-case gap, and missing test; then fix the code, tests, and any required supporting changes. Do not stop at a report. Deliver the implementation in full spec compliance.",
     "audit_spec_prompt": "Perform a strict specification audit for {{reference}}. Strengthen scope, requirements, acceptance criteria, edge cases, failure modes, dependencies, and testability; remove ambiguity and internal inconsistency; and update the spec until it is implementation-ready. Do not stop at review notes.",
     "implement_prompt": "Drive the implementation of {{reference}} aggressively. Break the work into concrete sub-tasks, dispatch sub-agents with clear ownership, integrate their output, resolve gaps against the spec, add or update tests, and verify the finished result. You own orchestration, technical decisions, and final acceptance.",
-    "achieve_prompt": "Take {{reference}} to done using the full OpenSpec workflow. Inspect all remaining tasks and artifacts, complete the required implementation and spec work, close outstanding gaps, sync affected specs if needed, and archive the change once it meets completion criteria. Do not stop at status reporting."
+    "achieve_prompt": "Take {{reference}} to done using the full OpenSpec workflow. Inspect all remaining tasks and artifacts, complete the required implementation and spec work, close outstanding gaps, sync affected specs if needed, and archive the change once it meets completion criteria. Do not stop at status reporting.",
+    "propose_from_discussion_prompt": "Generate an OpenSpec proposal from the recent discussion. Extract the goal, scope, key requirements, and acceptance criteria, and list unclear points as follow-ups. Start with a change proposal draft that is ready to land.",
+    "propose_from_description_prompt": "Generate an OpenSpec proposal from the description below. Organize the goal, scope, key requirements, and acceptance criteria, and list missing details as follow-ups. Start with a change proposal draft that is ready to land."
   },
   "upload": {
     "upload_file": "Upload file",

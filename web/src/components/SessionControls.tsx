@@ -278,6 +278,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [openSpecLoading, setOpenSpecLoading] = useState(false);
   const [openSpecError, setOpenSpecError] = useState<string | null>(null);
   const [openSpecAuditMenu, setOpenSpecAuditMenu] = useState<string | null>(null);
+  const [openSpecProposeMenuOpen, setOpenSpecProposeMenuOpen] = useState(false);
   const [openSpecExpandedChange, setOpenSpecExpandedChange] = useState<string | null>(null);
   const [openSpecLayoutTick, setOpenSpecLayoutTick] = useState(0);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
@@ -505,6 +506,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (openSpecOpen && openSpecRef.current && !openSpecRef.current.contains(e.target as Node)) {
         setOpenSpecOpen(false);
         setOpenSpecAuditMenu(null);
+        setOpenSpecProposeMenuOpen(false);
       }
     };
     document.addEventListener('mousedown', handleClick);
@@ -592,12 +594,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     openSpecRequestIdRef.current = ws.fsListDir(openSpecChangesPath, false, false);
   }, [openSpecChangesPath, ws]);
 
-  const insertOpenSpecPrompt = useCallback((kind: 'audit_implementation' | 'audit_spec' | 'implement', reference: string) => {
+  const insertOpenSpecPrompt = useCallback((kind: 'audit_implementation' | 'audit_spec' | 'implement' | 'propose_from_discussion' | 'propose_from_description', reference?: string) => {
     const prompt = kind === 'audit_implementation'
       ? t('openspec.audit_implementation_prompt', { reference })
       : kind === 'audit_spec'
         ? t('openspec.audit_spec_prompt', { reference })
-        : t('openspec.implement_prompt', { reference });
+        : kind === 'implement'
+          ? t('openspec.implement_prompt', { reference })
+          : kind === 'propose_from_discussion'
+            ? t('openspec.propose_from_discussion_prompt')
+            : t('openspec.propose_from_description_prompt');
     appendToInput([prompt]);
   }, [t]);
 
@@ -1282,6 +1288,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               onClick={() => {
                 setOpenSpecOpen((open) => {
                   const next = !open;
+                  if (!next) {
+                    setOpenSpecAuditMenu(null);
+                    setOpenSpecProposeMenuOpen(false);
+                  }
                   if (next) refreshOpenSpecChanges();
                   return next;
                 });
@@ -1317,6 +1327,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                         onClick={() => {
                           if (!openSpecChangesPath) return;
                           appendToInput([toComposerReference(`${openSpecChangesPath}/${changeName}`)]);
+                          setOpenSpecAuditMenu(null);
+                          setOpenSpecProposeMenuOpen(false);
                           setOpenSpecOpen(false);
                         }}
                       >
@@ -1330,6 +1342,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                           aria-expanded={openSpecExpandedChange === changeName}
                           onClick={() => {
                             setOpenSpecAuditMenu(null);
+                            setOpenSpecProposeMenuOpen(false);
                             setOpenSpecExpandedChange((current) => current === changeName ? null : changeName);
                           }}
                         >
@@ -1345,6 +1358,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                         <button
                           class="btn btn-secondary openspec-change-action-btn"
                           onClick={() => {
+                            setOpenSpecProposeMenuOpen(false);
                             setOpenSpecAuditMenu((current) => current === changeName ? null : changeName);
                           }}
                         >
@@ -1386,6 +1400,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                           const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
                           insertOpenSpecPrompt('implement', reference);
                           setOpenSpecAuditMenu(null);
+                          setOpenSpecProposeMenuOpen(false);
                           setOpenSpecOpen(false);
                         }}
                       >
@@ -1398,6 +1413,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                           const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
                           sendOpenSpecPrompt(t('openspec.achieve_prompt', { reference }));
                           setOpenSpecAuditMenu(null);
+                          setOpenSpecProposeMenuOpen(false);
                           setOpenSpecOpen(false);
                         }}
                       >
@@ -1406,6 +1422,46 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     </div>
                   </div>
                 ))}
+                <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid rgba(148, 163, 184, 0.18)' }}>
+                  <div class="openspec-change-action-wrap" style={{ width: '100%' }}>
+                    <button
+                      class="btn btn-secondary openspec-change-action-btn"
+                      style={{ width: '100%', justifyContent: 'center' }}
+                      onClick={() => {
+                        setOpenSpecAuditMenu(null);
+                        setOpenSpecProposeMenuOpen((open) => !open);
+                      }}
+                    >
+                      {t('openspec.propose_action')}
+                    </button>
+                    {openSpecProposeMenuOpen && (
+                      <div class="menu-dropdown" style={{ right: 0, bottom: 'calc(100% + 6px)', minWidth: 220 }}>
+                        <button
+                          class="menu-item"
+                          onClick={() => {
+                            insertOpenSpecPrompt('propose_from_discussion');
+                            setOpenSpecAuditMenu(null);
+                            setOpenSpecProposeMenuOpen(false);
+                            setOpenSpecOpen(false);
+                          }}
+                        >
+                          {t('openspec.propose_from_discussion_action')}
+                        </button>
+                        <button
+                          class="menu-item"
+                          onClick={() => {
+                            insertOpenSpecPrompt('propose_from_description');
+                            setOpenSpecAuditMenu(null);
+                            setOpenSpecProposeMenuOpen(false);
+                            setOpenSpecOpen(false);
+                          }}
+                        >
+                          {t('openspec.propose_from_description_action')}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
               </div>
             )}
           </div>
