@@ -117,6 +117,9 @@ export class WsClient {
   /** Per-session callbacks for raw PTY binary frames. Supports multiple subscribers per session. */
   private _terminalRawHandlers = new Map<string, Set<(data: Uint8Array) => void>>();
 
+  /** Desired terminal subscription mode per session. Replayed on browser reconnect. */
+  private terminalSubscriptions = new Map<string, boolean>();
+
   /** Per-session stream reset recovery state. */
   private resetState = new Map<string, {
     count: number;
@@ -198,11 +201,13 @@ export class WsClient {
   }
 
   subscribeTerminal(sessionName: string, raw: boolean): void {
+    this.terminalSubscriptions.set(sessionName, raw);
     if (!this._connected) return;
     this.send({ type: 'terminal.subscribe', session: sessionName, raw });
   }
 
   unsubscribeTerminal(sessionName: string): void {
+    this.terminalSubscriptions.delete(sessionName);
     if (!this._connected) return;
     this.send({ type: 'terminal.unsubscribe', session: sessionName });
   }
@@ -485,6 +490,13 @@ export class WsClient {
       this._connected = true;
       this.reconnectAttempt = 0;
       this.startHeartbeat();
+      for (const [session, raw] of this.terminalSubscriptions) {
+        try {
+          this.send({ type: 'terminal.subscribe', session, raw });
+        } catch {
+          break;
+        }
+      }
       this.dispatch({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
     });
 
