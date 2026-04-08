@@ -389,6 +389,48 @@ describe('sdk transport flow e2e', () => {
     });
   });
 
+  it('preserves cc presets when settings restart switches a main session to claude-code-sdk', async () => {
+    mocks.store.set('deck_settings_preset_brain', {
+      name: 'deck_settings_preset_brain',
+      projectName: 'settings_preset',
+      role: 'brain',
+      agentType: 'claude-code',
+      projectDir: '/tmp/settings-preset',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+      ccSessionId: 'cc-settings-preset',
+      ccPreset: 'MiniMax',
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({
+      type: 'session.restart',
+      sessionName: 'deck_settings_preset_brain',
+      agentType: 'claude-code-sdk',
+    }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => serverLink.send.mock.calls.some((call) => call[0]?.type === 'session_list'));
+
+    const switched = mocks.store.get('deck_settings_preset_brain');
+    expect(switched?.agentType).toBe('claude-code-sdk');
+    expect(switched?.ccPreset).toBe('MiniMax');
+
+    handleWebCommand({ type: 'session.send', session: 'deck_settings_preset_brain', text: 'hello', commandId: 'cmd-settings-preset' }, serverLink);
+    await flushAsync();
+
+    const claudeCall = mocks.claudeCalls.at(-1);
+    expect(claudeCall?.options.env).toMatchObject({
+      ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+      ANTHROPIC_API_KEY: expect.any(String),
+      ANTHROPIC_MODEL: 'MiniMax-M2.7',
+    });
+    expect(claudeCall?.options.model).toBe('MiniMax-M2.7');
+    expect(String(claudeCall?.options.appendSystemPrompt ?? '')).toContain('Authoritative runtime model: MiniMax-M2.7.');
+  });
+
   it('pushes a corrective session_list when settings restart fails', async () => {
     const tmuxNewSession = newSession as ReturnType<typeof vi.fn>;
     tmuxNewSession.mockRejectedValueOnce(new Error('tmux create failed'));
@@ -667,6 +709,103 @@ describe('sdk transport flow e2e', () => {
     expect(record?.runtimeType).toBe('transport');
     expect(record?.providerId).toBe('claude-code-sdk');
     expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'session.error' }));
+  });
+
+  it('persists and applies cc presets for claude-code-sdk main sessions', async () => {
+    const serverLink = { send: vi.fn() } as any;
+
+    handleWebCommand({
+      type: 'session.start',
+      project: 'ccsdk minimax',
+      dir: '/tmp/ccsdk-minimax-e2e',
+      agentType: 'claude-code-sdk',
+      ccPreset: 'MiniMax',
+    }, serverLink);
+    await flushAsync();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const sessionName = 'deck_ccsdk_minimax_brain';
+    const record = mocks.store.get(sessionName);
+    expect(record?.ccPreset).toBe('MiniMax');
+
+    handleWebCommand({ type: 'session.send', session: sessionName, text: 'hello', commandId: 'cmd-ccsdk-minimax' }, serverLink);
+    await flushAsync();
+
+    const claudeCall = mocks.claudeCalls.at(-1);
+    expect(claudeCall?.options.env).toMatchObject({
+      ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+      ANTHROPIC_API_KEY: expect.any(String),
+      ANTHROPIC_MODEL: 'MiniMax-M2.7',
+    });
+    expect(claudeCall?.options.model).toBe('MiniMax-M2.7');
+    expect(String(claudeCall?.options.appendSystemPrompt ?? '')).toContain('Authoritative runtime model: MiniMax-M2.7.');
+  });
+
+  it('persists and applies cc presets for claude-code-sdk sub-sessions', async () => {
+    const serverLink = { send: vi.fn() } as any;
+
+    handleWebCommand({
+      type: 'subsession.start',
+      id: 'ccsdk_minimax_sub',
+      sessionType: 'claude-code-sdk',
+      cwd: '/tmp/ccsdk-minimax-sub-e2e',
+      parentSession: 'deck_parent_brain',
+      ccPreset: 'MiniMax',
+    }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => serverLink.send.mock.calls.length > 0);
+
+    const sessionName = 'deck_sub_ccsdk_minimax_sub';
+    const record = mocks.store.get(sessionName);
+    expect(record?.ccPreset).toBe('MiniMax');
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'subsession.sync',
+      id: 'ccsdk_minimax_sub',
+      ccPresetId: 'MiniMax',
+    }));
+
+    handleWebCommand({ type: 'session.send', session: sessionName, text: 'hello', commandId: 'cmd-ccsdk-minimax-sub' }, serverLink);
+    await flushAsync();
+
+    const claudeCall = mocks.claudeCalls.at(-1);
+    expect(claudeCall?.options.env).toMatchObject({
+      ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+      ANTHROPIC_API_KEY: expect.any(String),
+      ANTHROPIC_MODEL: 'MiniMax-M2.7',
+    });
+    expect(claudeCall?.options.model).toBe('MiniMax-M2.7');
+    expect(String(claudeCall?.options.appendSystemPrompt ?? '')).toContain('Authoritative runtime model: MiniMax-M2.7.');
+  });
+
+  it('answers claude-code-sdk runtime identity questions from authoritative preset metadata', async () => {
+    const serverLink = { send: vi.fn() } as any;
+
+    handleWebCommand({
+      type: 'session.start',
+      project: 'ccsdk identity',
+      dir: '/tmp/ccsdk-identity-e2e',
+      agentType: 'claude-code-sdk',
+      ccPreset: 'MiniMax',
+    }, serverLink);
+    await flushAsync();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    mocks.claudeCalls.length = 0;
+    const sessionName = 'deck_ccsdk_identity_brain';
+    handleWebCommand({
+      type: 'session.send',
+      session: sessionName,
+      text: 'Reply with only the exact model or provider you are currently using.',
+      commandId: 'cmd-ccsdk-identity',
+    }, serverLink);
+    await flushAsync();
+
+    expect(mocks.claudeCalls).toEqual([]);
+    expect(mocks.emitted).toContainEqual(expect.objectContaining({
+      session: sessionName,
+      type: 'assistant.text',
+      payload: expect.objectContaining({ text: 'MiniMax-M2.7', streaming: false }),
+    }));
   });
 
   beforeEach(() => {

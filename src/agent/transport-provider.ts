@@ -114,6 +114,8 @@ export interface SessionConfig {
   label?: string;
   /** Persona/system prompt injection — used for session description/role. */
   description?: string;
+  /** Runtime/system prompt injection that should not be surfaced as user-facing description. */
+  systemPrompt?: string;
   /** Parent session key for sub-sessions. */
   parentSessionKey?: string;
   /** If binding to an already-existing remote session, use this key directly. */

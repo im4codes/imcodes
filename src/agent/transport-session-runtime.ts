@@ -31,6 +31,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _providerSessionId: string | null = null;
   private _sending = false;
   private _description: string | undefined;
+  private _systemPrompt: string | undefined;
   private _agentId: string | undefined;
   private _effort: TransportEffortLevel | undefined;
   private _unsubscribes: Array<() => void> = [];
@@ -103,6 +104,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   /** Set providerSessionId directly (restore from store without initialize). */
   setProviderSessionId(id: string): void { this._providerSessionId = id; }
   setDescription(desc: string): void { this._description = desc; }
+  setSystemPrompt(prompt: string): void { this._systemPrompt = prompt; }
   setAgentId(agentId: string): void {
     this._agentId = agentId;
     if (this._providerSessionId) {
@@ -126,6 +128,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   async initialize(config: SessionConfig): Promise<void> {
     this._providerSessionId = await this.provider.createSession(config);
     this._description = config.description;
+    this._systemPrompt = config.systemPrompt;
     this._agentId = config.agentId;
     this._effort = config.effort;
   }

@@ -55,6 +55,7 @@ describe('cc presets', () => {
     await expect(resolvePresetEnv('MiniMax')).resolves.toMatchObject({
       ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
       ANTHROPIC_AUTH_TOKEN: 'test-token',
+      ANTHROPIC_API_KEY: 'test-token',
       ANTHROPIC_MODEL: 'MiniMax-M2.7',
       ANTHROPIC_SMALL_FAST_MODEL: 'MiniMax-M2.7',
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'MiniMax-M2.7',

@@ -71,6 +71,11 @@ export async function resolvePresetEnv(presetName: string, ccSessionId?: string)
   const preset = await getPreset(presetName);
   if (!preset) return {};
   const env = { ...preset.env };
+  // Backward compatibility: older saved presets used ANTHROPIC_AUTH_TOKEN,
+  // while current Claude CLI/SDK auth reads ANTHROPIC_API_KEY in bare env mode.
+  if (env['ANTHROPIC_AUTH_TOKEN'] && !env['ANTHROPIC_API_KEY']) {
+    env['ANTHROPIC_API_KEY'] = env['ANTHROPIC_AUTH_TOKEN'];
+  }
   // Auto-fill model aliases from ANTHROPIC_MODEL
   if (env['ANTHROPIC_MODEL']) {
     for (const alias of MODEL_ALIASES) {
@@ -85,6 +90,30 @@ export async function resolvePresetEnv(presetName: string, ccSessionId?: string)
   }
   logger.debug({ preset: presetName, keys: Object.keys(env) }, 'Resolved CC preset env');
   return env;
+}
+
+export async function getPresetTransportOverrides(presetName: string): Promise<{
+  model?: string;
+  systemPrompt?: string;
+}> {
+  const preset = await getPreset(presetName);
+  if (!preset) return {};
+  const env = await resolvePresetEnv(presetName);
+  const configuredModel = env['ANTHROPIC_MODEL']?.trim() || undefined;
+  const configuredBaseUrl = env['ANTHROPIC_BASE_URL']?.trim() || undefined;
+  const runtimeFacts = [
+    `Authoritative runtime fact: this session is using the Claude Code preset "${preset.name}".`,
+    configuredBaseUrl ? `Authoritative provider endpoint: ${configuredBaseUrl}.` : undefined,
+    configuredModel ? `Authoritative runtime model: ${configuredModel}.` : undefined,
+    configuredModel ? `If the user asks which model you are using, answer exactly with "${configuredModel}".` : 'If the user asks which model or provider you are using, answer with the authoritative runtime facts above.',
+    configuredBaseUrl ? `If the user asks which provider or endpoint you are using, mention "${configuredBaseUrl}".` : undefined,
+    'These runtime facts override any generic Claude Code tool schema, enum, or default.',
+    'Do not answer with Sonnet, Opus, Haiku, or any inferred Claude default unless that exact value matches the authoritative runtime model above.',
+  ].filter(Boolean).join(' ');
+  return {
+    ...(configuredModel ? { model: configuredModel } : {}),
+    ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),
+  };
 }
 
 /** Default init message for non-Anthropic providers (no native web search). */

@@ -261,6 +261,29 @@ describe('ClaudeCodeSdkProvider', () => {
     });
   });
 
+  it('passes runtime-only system prompts without polluting description', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-system', model: 'claude-sonnet-4-6' },
+      { type: 'result', session_id: 'session-system', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-system',
+      cwd: '/tmp/project',
+      resumeId: 'session-system',
+      description: 'Visible description',
+      systemPrompt: 'Runtime note only',
+    });
+
+    await provider.send('route-system', 'hello');
+    await flush();
+
+    const run = sdkMock.runs.at(-1)!;
+    expect(run.options.appendSystemPrompt).toBe('Visible description\n\nRuntime note only');
+  });
+
   it('emits a fallback streaming delta from assistant text when the SDK does not send text_delta events', async () => {
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-fallback', model: 'claude-sonnet-4-6' },

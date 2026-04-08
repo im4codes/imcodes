@@ -31,6 +31,7 @@ interface ClaudeSdkSessionState {
   env?: Record<string, string>;
   model?: string;
   description?: string;
+  systemPrompt?: string;
   permissionMode: PermissionMode;
   effort?: TransportEffortLevel;
   started: boolean;
@@ -123,6 +124,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       env: config.env ?? existing?.env,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
       description: config.description ?? existing?.description,
+      systemPrompt: config.systemPrompt ?? existing?.systemPrompt,
       permissionMode: this.resolvePermissionMode(),
       effort: config.effort ?? existing?.effort,
       started: !!(config.resumeId && config.skipCreate),
@@ -243,6 +245,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     state.emittedToolStates.clear();
 
     const resolvedBinary = this.resolveBinaryPath(this.config);
+    const baseSystemPrompt = extraSystemPrompt ?? state.description;
     const options: Record<string, unknown> = {
       cwd: state.cwd,
       ...(state.env ? { env: { ...process.env, ...state.env } } : {}),
@@ -252,7 +255,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       ...(state.started ? { resume: state.resumeId } : { sessionId: state.resumeId }),
       ...(state.model ? { model: state.model } : {}),
       ...(state.effort ? { effort: state.effort } : {}),
-      ...(extraSystemPrompt ? { appendSystemPrompt: extraSystemPrompt } : {}),
+      ...(baseSystemPrompt ?? state.systemPrompt ? {
+        appendSystemPrompt: [baseSystemPrompt, state.systemPrompt].filter(Boolean).join('\n\n'),
+      } : {}),
     };
     // On Windows where claude resolved to a .cmd shim, override the SDK's
     // internal spawn so we can prepend `node script.js` and avoid spawn
