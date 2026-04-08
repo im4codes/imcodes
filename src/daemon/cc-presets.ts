@@ -53,9 +53,14 @@ export async function savePresets(presets: CcPreset[]): Promise<void> {
   await fs.writeFile(PRESETS_PATH, JSON.stringify(presets, null, 2), 'utf8');
 }
 
+function normalizePresetName(name: string): string {
+  return name.trim().toLowerCase();
+}
+
 export async function getPreset(name: string): Promise<CcPreset | undefined> {
   const presets = await loadPresets();
-  return presets.find((p) => p.name === name);
+  const normalized = normalizePresetName(name);
+  return presets.find((p) => normalizePresetName(p.name) === normalized);
 }
 
 /**
