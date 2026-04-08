@@ -131,9 +131,23 @@ vi.mock('../../src/api.js', () => ({
 
 import { SessionControls } from '../../src/components/SessionControls.js';
 import type { SessionInfo } from '../../src/types.js';
-import { BUILT_IN_ADVANCED_PRESETS } from '@shared/p2p-advanced.js';
 
 const flushAsync = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+const TEST_OPENSPEC_ADVANCED_ROUNDS = [
+  {
+    id: 'initial_audit',
+    mode: 'audit',
+    rounds: 1,
+    summaryMode: 'append',
+  },
+  {
+    id: 'implementation_plan',
+    mode: 'plan',
+    rounds: 1,
+    summaryMode: 'append',
+  },
+] as const;
 
 const makeWs = () => {
   const handlers = new Set<(msg: unknown) => void>();
@@ -294,7 +308,7 @@ describe('SessionControls', () => {
           },
           rounds: 3,
           advancedPresetKey: 'openspec',
-          advancedRounds: BUILT_IN_ADVANCED_PRESETS.openspec,
+          advancedRounds: TEST_OPENSPEC_ADVANCED_ROUNDS,
           advancedRunTimeoutMinutes: 45,
           contextReducer: {
             mode: 'clone_sdk_session',
@@ -335,7 +349,7 @@ describe('SessionControls', () => {
       },
       p2pRounds: 3,
       p2pAdvancedPresetKey: 'openspec',
-      p2pAdvancedRounds: BUILT_IN_ADVANCED_PRESETS.openspec,
+      p2pAdvancedRounds: TEST_OPENSPEC_ADVANCED_ROUNDS,
       p2pAdvancedRunTimeoutMinutes: 45,
       p2pContextReducer: {
         mode: 'clone_sdk_session',
