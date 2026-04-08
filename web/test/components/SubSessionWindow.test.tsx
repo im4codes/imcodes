@@ -142,9 +142,11 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
   beforeEach(() => {
     cleanup();
     vi.clearAllMocks();
+    vi.useFakeTimers();
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     cleanup();
   });
 
@@ -309,5 +311,90 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     );
 
     expect(second.container.querySelector('.idle-flash-layer--frame')).not.toBeNull();
+  });
+
+  it('does not replay the idle flash when the window is re-activated with the same token', async () => {
+    const sub = makeSubSession();
+    const view = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        idleFlashToken={4}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    view.rerender(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        idleFlashToken={5}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    expect(view.container.querySelector('.idle-flash-layer--frame')).not.toBeNull();
+
+    vi.advanceTimersByTime(2800);
+
+    await waitFor(() => {
+      expect(view.container.querySelector('.idle-flash-layer--frame')).toBeNull();
+    });
+
+    view.rerender(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={false}
+        idleFlashToken={5}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    view.rerender(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        idleFlashToken={5}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    expect(view.container.querySelector('.idle-flash-layer--frame')).toBeNull();
   });
 });
