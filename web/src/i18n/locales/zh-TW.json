@@ -444,8 +444,10 @@
     "empty": "目前沒有 OpenSpec 變更",
     "audit_action": "審計",
     "implement_action": "實作",
+    "achieve_action": "完成",
     "audit_prompt": "審計 {{reference}}，並根據審計結果完善 {{reference}}。",
-    "implement_prompt": "安排子代理開始實作 {{reference}}，你負責拆分任務與驗收。"
+    "implement_prompt": "安排子代理開始實作 {{reference}}，你負責拆分任務與驗收。",
+    "achieve_prompt": "依照 OpenSpec 工作流程完成 {{reference}}。補齊剩餘工作，並在準備就緒後封存此變更。"
   },
   "upload": {
     "upload_file": "上傳檔案",

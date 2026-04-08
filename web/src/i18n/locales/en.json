@@ -444,8 +444,10 @@
     "empty": "No OpenSpec changes found",
     "audit_action": "Audit",
     "implement_action": "Implement",
+    "achieve_action": "Achieve",
     "audit_prompt": "Audit {{reference}}. Based on the audit findings, complete {{reference}}.",
-    "implement_prompt": "Arrange sub-agents to start implementing {{reference}}. You are responsible for task breakdown and acceptance."
+    "implement_prompt": "Arrange sub-agents to start implementing {{reference}}. You are responsible for task breakdown and acceptance.",
+    "achieve_prompt": "Complete {{reference}} with the OpenSpec workflow. Finish any remaining work, then archive the change if it is ready."
   },
   "upload": {
     "upload_file": "Upload file",

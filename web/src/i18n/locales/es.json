@@ -444,8 +444,10 @@
     "empty": "No se encontraron cambios de OpenSpec",
     "audit_action": "Auditar",
     "implement_action": "Implementar",
+    "achieve_action": "Completar",
     "audit_prompt": "Audita {{reference}}. En función de los hallazgos de la auditoría, completa {{reference}}.",
-    "implement_prompt": "Organiza subagentes para empezar a implementar {{reference}}. Tú te encargas de desglosar tareas y de la aceptación."
+    "implement_prompt": "Organiza subagentes para empezar a implementar {{reference}}. Tú te encargas de desglosar tareas y de la aceptación.",
+    "achieve_prompt": "Completa {{reference}} con el flujo de OpenSpec. Termina el trabajo pendiente y archiva el cambio si ya está listo."
   },
   "upload": {
     "upload_file": "Subir archivo",

@@ -17,11 +17,15 @@ vi.mock('react-i18next', () => ({
       if (key === 'openspec.empty') return 'empty';
       if (key === 'openspec.audit_action') return 'audit_action';
       if (key === 'openspec.implement_action') return 'implement_action';
+      if (key === 'openspec.achieve_action') return 'achieve_action';
       if (key === 'openspec.audit_prompt') {
         return `audit ${(opts?.reference as string) ?? ''}, improve ${(opts?.reference as string) ?? ''}`;
       }
       if (key === 'openspec.implement_prompt') {
         return `delegate ${(opts?.reference as string) ?? ''}, split tasks and accept`;
+      }
+      if (key === 'openspec.achieve_prompt') {
+        return `complete ${(opts?.reference as string) ?? ''}, finish remaining work and archive if done`;
       }
       const parts = key.split('.');
       return parts[parts.length - 1];
@@ -508,6 +512,36 @@ describe('SessionControls', () => {
 
     expect(screen.getByRole('textbox').textContent).toBe('delegate @openspec/changes/change-a, split tasks and accept');
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it('sends an openspec achieve prompt directly', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'achieve_action' }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      sessionName: 'my-session',
+      text: 'complete @openspec/changes/change-a, finish remaining work and archive if done',
+    });
   });
 
   it('clears input after send', () => {

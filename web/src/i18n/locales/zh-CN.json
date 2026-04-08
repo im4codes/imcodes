@@ -444,8 +444,10 @@
     "empty": "暂无 OpenSpec 变更",
     "audit_action": "审计",
     "implement_action": "实现",
+    "achieve_action": "完成",
     "audit_prompt": "审计 {{reference}}，根据审计结果完善 {{reference}}。",
-    "implement_prompt": "安排子代理开始实施 {{reference}}，你负责拆分任务和验收。"
+    "implement_prompt": "安排子代理开始实施 {{reference}}，你负责拆分任务和验收。",
+    "achieve_prompt": "按 OpenSpec 工作流完成 {{reference}}。补齐剩余工作，并在准备就绪后归档该变更。"
   },
   "upload": {
     "upload_file": "上传文件",

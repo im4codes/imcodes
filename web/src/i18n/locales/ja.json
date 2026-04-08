@@ -444,8 +444,10 @@
     "empty": "OpenSpec の変更はありません",
     "audit_action": "監査",
     "implement_action": "実装",
+    "achieve_action": "完了",
     "audit_prompt": "{{reference}} を監査し、監査結果に基づいて {{reference}} を完成させてください。",
-    "implement_prompt": "サブエージェントに {{reference}} の実装を開始させてください。あなたはタスク分解と受け入れを担当してください。"
+    "implement_prompt": "サブエージェントに {{reference}} の実装を開始させてください。あなたはタスク分解と受け入れを担当してください。",
+    "achieve_prompt": "OpenSpec のワークフローで {{reference}} を完了してください。残りの作業を終え、準備が整っていれば変更をアーカイブしてください。"
   },
   "upload": {
     "upload_file": "ファイルをアップロード",

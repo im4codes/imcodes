@@ -32,6 +32,7 @@ const TYPE_ICON: Record<string, string> = {
 
 const STATE_BADGE: Record<string, string> = {
   starting: '…',
+  stopping: '…',
   unknown: '?',
   stopped: '■',
   idle: '●',
@@ -83,6 +84,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const icon = TYPE_ICON[sub.type] ?? '⚡';
   const badge = STATE_BADGE[sub.state];
   const [showScrollBtn, setShowScrollBtn] = useState(false);
+  const [quickPanelOpen, setQuickPanelOpen] = useState(false);
 
   // Build a SessionInfo for SessionControls compact mode
   const sessionInfo = useMemo<SessionInfo>(() => ({
@@ -116,7 +118,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   }, [ws, connected, sub.sessionName, forceFollowLatest]);
 
   const handleTransportStop = useCallback(() => {
-    if (!ws || !connected || sub.state === 'stopped') return;
+    if (!ws || !connected || sub.state === 'stopped' || sub.state === 'stopping') return;
     try {
       ws.sendSessionCommand('send', { sessionName: sub.sessionName, text: '/stop' });
     } catch { /* ignore */ }
@@ -200,7 +202,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
 
   return (
     <div
-      class={`subcard${isOpen ? ' subcard-open' : ''}${isFocused ? ' subcard-focused' : ''}${busy ? ' subcard-running-pulse' : ''}`}
+      class={`subcard${isOpen ? ' subcard-open' : ''}${isFocused ? ' subcard-focused' : ''}${busy ? ' subcard-running-pulse' : ''}${quickPanelOpen ? ' subcard-quick-open' : ''}`}
       style={{ width: effectiveW, height: cardH, minWidth: effectiveW, position: 'relative' }}
       onClick={() => { if (!draggingRef.current) onOpen(); }}
     >
@@ -273,7 +275,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
               type="button"
               title={t('session.stop')}
               aria-label={t('session.stop')}
-              disabled={!connected || sub.state === 'stopped'}
+              disabled={!connected || sub.state === 'stopped' || sub.state === 'stopping'}
               onClick={(e) => {
                 e.stopPropagation();
                 handleTransportStop();
@@ -295,6 +297,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
                 sessions={sessions}
                 subSessions={subSessions}
                 serverId={serverId}
+                onQuickOpenChange={setQuickPanelOpen}
               />
             ) : (
               <input

@@ -74,6 +74,8 @@ interface Props {
   onPendingPrefillApplied?: () => void;
   /** Compact mode for sub-session cards — only input, @, ⚡, 📎, send. */
   compact?: boolean;
+  /** Notifies parent when the quick input panel opens/closes. */
+  onQuickOpenChange?: (open: boolean) => void;
 }
 
 type MenuAction = 'restart' | 'new' | 'stop';
@@ -250,7 +252,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking: _activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking: _activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -456,6 +458,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     });
   }, []);
 
+  useEffect(() => {
+    onQuickOpenChange?.(quickOpen);
+    return () => onQuickOpenChange?.(false);
+  }, [onQuickOpenChange, quickOpen]);
+
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
   useEffect(() => {
@@ -583,6 +590,21 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       : t('openspec.implement_prompt', { reference });
     appendToInput([prompt]);
   }, [t]);
+
+  const openSpecDropdownStyle = useMemo(() => {
+    if (!openSpecOpen || typeof window === 'undefined' || window.innerWidth > 640) return undefined;
+    const rect = openSpecRef.current?.getBoundingClientRect();
+    if (!rect) return undefined;
+    return {
+      position: 'fixed',
+      left: 8,
+      right: 8,
+      bottom: Math.max(window.innerHeight - rect.top + 4, 72),
+      width: 'auto',
+      maxWidth: 'none',
+      zIndex: 10001,
+    } as const;
+  }, [openSpecOpen]);
 
   const activeSub = (subSessions ?? []).find((s) => s.sessionName === activeSession?.name);
   const rootSession = activeSub?.parentSession || activeSession?.name || '';
@@ -926,6 +948,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     finalizeSend(pending.payload, { clearComposer: pending.clearComposer });
   }, [finalizeSend, maybePersistComboSendSkip, pendingComboSendConfirm]);
 
+  const sendOpenSpecPrompt = useCallback((text: string) => {
+    finalizeSend({ text, extra: {} }, { clearComposer: false });
+  }, [finalizeSend]);
+
   // Voice overlay send handler — applies same P2P mode as text send
   const handleVoiceSend = useCallback((voiceText: string) => {
     requestSend(buildModeOnlySendPayload(voiceText));
@@ -1238,7 +1264,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               {t('openspec.title')}
             </button>
             {openSpecOpen && (
-              <div class="menu-dropdown">
+              <div class="menu-dropdown menu-dropdown-openspec" style={openSpecDropdownStyle}>
                 <div class="p2p-menu-section-label" style={{ marginTop: 0 }}>{t('openspec.changes')}</div>
                 {openSpecLoading && (
                   <div class="p2p-menu-section-label" style={{ textTransform: 'none', letterSpacing: 'normal', marginTop: 4 }}>{t('common.loading')}</div>
@@ -1290,6 +1316,18 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                       }}
                     >
                       {t('openspec.implement_action')}
+                    </button>
+                    <button
+                      class="btn btn-secondary"
+                      style={{ padding: '4px 8px', fontSize: 11, whiteSpace: 'nowrap' }}
+                      onClick={() => {
+                        if (!openSpecChangesPath) return;
+                        const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                        sendOpenSpecPrompt(t('openspec.achieve_prompt', { reference }));
+                        setOpenSpecOpen(false);
+                      }}
+                    >
+                      {t('openspec.achieve_action')}
                     </button>
                   </div>
                 ))}

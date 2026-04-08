@@ -444,8 +444,10 @@
     "empty": "OpenSpec 변경 사항이 없습니다",
     "audit_action": "감사",
     "implement_action": "구현",
+    "achieve_action": "완료",
     "audit_prompt": "{{reference}}를 감사하고, 감사 결과를 바탕으로 {{reference}}를 보완하세요.",
-    "implement_prompt": "하위 에이전트에게 {{reference}} 구현을 시작하도록 지시하세요. 당신은 작업 분해와 검수를 담당하세요."
+    "implement_prompt": "하위 에이전트에게 {{reference}} 구현을 시작하도록 지시하세요. 당신은 작업 분해와 검수를 담당하세요.",
+    "achieve_prompt": "OpenSpec 워크플로로 {{reference}}를 완료하세요. 남은 작업을 마무리하고 준비되면 변경을 보관하세요."
   },
   "upload": {
     "upload_file": "파일 업로드",
