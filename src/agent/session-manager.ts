@@ -1077,6 +1077,12 @@ export async function restoreTransportSessions(providerId: string): Promise<void
 export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate, parentSession } = opts;
   const existing = getSession(name);
+  const inheritedClaudeResumeId = opts.ccSessionId ?? (!opts.fresh ? existing?.ccSessionId : undefined);
+  const shouldResumeClaudeCliConversation = agentType === 'claude-code-sdk'
+    && existing?.agentType === 'claude-code'
+    && existing?.runtimeType !== RUNTIME_TYPES.TRANSPORT
+    && typeof inheritedClaudeResumeId === 'string'
+    && inheritedClaudeResumeId.length > 0;
 
   if (opts.fresh) {
     const existingRuntime = transportRuntimes.get(name);
@@ -1129,6 +1135,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     }
   } else if (agentType === 'claude-code-sdk') {
     transportResumeId = opts.ccSessionId ?? (!opts.fresh ? getSession(name)?.ccSessionId : undefined) ?? randomUUID();
+    // Switching from Claude CLI -> SDK must resume the inherited conversation.
+    // Re-creating with the same sessionId makes Claude reject the turn with
+    // "Session ID ... is already in use", which is what users were seeing.
+    if (shouldResumeClaudeCliConversation) {
+      effectiveSkipCreate = true;
+    }
     if (opts.ccPreset) {
       const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
       transportEnv = { ...(transportEnv ?? {}), ...(await resolvePresetEnv(opts.ccPreset, transportResumeId)) };

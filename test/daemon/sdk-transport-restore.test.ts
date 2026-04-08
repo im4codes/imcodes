@@ -250,7 +250,7 @@ describe('sdk transport session restore', () => {
     expect(onSessionEvent).toHaveBeenCalledWith('started', 'deck_sdk_new_brain', 'idle');
   });
 
-  it('preserves Claude resume id when switching from cli to sdk', async () => {
+  it('resumes Claude conversation when switching from cli to sdk', async () => {
     const name = 'deck_switch_ccsdk_brain';
     const record = {
       name,
@@ -279,7 +279,8 @@ describe('sdk transport session restore', () => {
     runtime!.send('What token did I ask you to remember?');
     await flush();
 
-    expect(mocks.claudeRuns.at(-1)?.options.sessionId).toBe('cc-session-switch');
+    expect(mocks.claudeRuns.at(-1)?.options.resume).toBe('cc-session-switch');
+    expect(mocks.claudeRuns.at(-1)?.options.sessionId).toBeUndefined();
   });
 
   it('preserves Claude resume id when switching from sdk to cli', async () => {
