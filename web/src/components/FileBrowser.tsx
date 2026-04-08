@@ -1177,6 +1177,8 @@ export function FileBrowser({
     </div>
   ) : null;
 
+  const showEmbeddedChangesSection = !!changesSection && !usesExternalPreview;
+
   if (layout === 'panel') {
     const tabs = changesRootPath ? (
       <div class="fb-panel-tabs">
@@ -1214,10 +1216,10 @@ export function FileBrowser({
           {tabs}
           {breadcrumb}
           {newFolderDialog}
-          <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}${changesRootPath && changesFiles.length > 0 ? ' fb-body-with-changes' : ''}`}>
+          <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}${showEmbeddedChangesSection ? ' fb-body-with-changes' : ''}`}>
             <div class={`fb-files-and-changes${hasPreview ? ' fb-tree-split' : ''}`} style={hasPreview && treeWidth ? { flex: 'none', width: treeWidth } : undefined}>
               {tree}
-              {changesSection}
+              {showEmbeddedChangesSection ? changesSection : null}
             </div>
             {hasPreview && (
               <div

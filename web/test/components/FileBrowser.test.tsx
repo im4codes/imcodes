@@ -695,6 +695,39 @@ describe('FileBrowser', () => {
     expect(document.querySelector('.fb-body-split')).toBeNull();
   });
 
+  it('hides the embedded changes section in files view when an external preview host is provided', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    localStorage.setItem('rcc_fb_tab', 'files');
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        changesRootPath="/home/user"
+        onPreviewFile={vi.fn()}
+        onConfirm={vi.fn()}
+        defaultTab="files"
+      />,
+    );
+
+    await act(async () => { respond([], '/home/user'); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [{ path: '/home/user/foo.ts', code: 'M' }],
+      });
+    });
+
+    expect(document.querySelector('.fb-panel-tabs')).not.toBeNull();
+    expect(document.querySelector('.fb-changes-section')).toBeNull();
+    expect(document.querySelector('.fb-body-with-changes')).toBeNull();
+  });
+
   it('does not re-read when an external preview is hydrated with a live loading state', () => {
     const { ws } = makeWsFactory();
     render(
