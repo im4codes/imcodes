@@ -84,8 +84,10 @@ Previsualiza tu servidor de desarrollo local desde cualquier dispositivo sin des
 ### Móvil, reloj y notificaciones
 Soporte completo para móvil, autenticación biométrica, notificaciones push, entrada interactiva para sesiones shell y respuestas rápidas desde Apple Watch.
 
-### Discusiones y auditoría multiagente
-Puedes ejecutar rondas rápidas de discusión donde varios agentes, incluso de distintos proveedores, revisan o auditan el mismo tema.
+### Auditoría cross-modelo y discusiones P2P
+La salida de un solo modelo no debería confiarse ciegamente. Las discusiones P2P permiten que múltiples agentes — de distintos proveedores y estilos de pensamiento — colaboren en el análisis del mismo código antes de escribir una sola línea. Cada ronda sigue un pipeline multifase personalizable, donde cada agente lee todas las contribuciones anteriores. Diferentes modelos detectan diferentes tipos de problemas. Esta revisión cruzada entre proveedores encuentra la mayoría de los problemas antes de la implementación, reduciendo drásticamente el retrabajo.
+
+Modos integrados: `audit` (pipeline estructurado audit → review → plan), `review`, `discuss` y `brainstorm` — o define tu propia secuencia de fases. Funciona con Claude Code, Codex, Gemini CLI y Qwen.
 
 ### Agentes transport con streaming
 Soporte nativo de streaming para agentes transport como OpenClaw y Qwen, sin scraping de terminal.
