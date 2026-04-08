@@ -6,8 +6,10 @@ import { render, screen, cleanup, act, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
 import type { ServerMessage, TimelineEvent, WsClient } from '../src/ws-client.js';
 import { TimelineDB } from '../src/timeline-db.js';
+import { mergeTimelineEvents } from '../../src/shared/timeline/merge.js';
 import {
   __getTimelineCacheKeysForTests,
+  __getSharedTimelineBaseForTests,
   __resetTimelineCacheForTests,
   __setTimelineCacheForTests,
   ingestTimelineEventForCache,
@@ -85,6 +87,53 @@ describe('useTimeline global cache bounds', () => {
 
     expect(screen.getByTestId('card').textContent).toBe('3');
     expect(screen.getByTestId('window').textContent).toBe('3');
+  });
+
+  it('uses the shared cache as the merge base when a late instance is locally stale', () => {
+    const sessionName = `deck_transport_${Date.now()}`;
+    const cacheKey = `srv:${sessionName}`;
+    const history = [
+      {
+        eventId: `${sessionName}-1`,
+        sessionId: sessionName,
+        ts: 1,
+        epoch: 1,
+        seq: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'user.message',
+        payload: { text: 'first' },
+      },
+      {
+        eventId: `${sessionName}-2`,
+        sessionId: sessionName,
+        ts: 2,
+        epoch: 1,
+        seq: 2,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: 'second' },
+      },
+    ] satisfies TimelineEvent[];
+
+    __setTimelineCacheForTests(cacheKey, history);
+
+    const base = __getSharedTimelineBaseForTests(cacheKey, []);
+    const next = mergeTimelineEvents(base, [{
+      eventId: `${sessionName}-3`,
+      sessionId: sessionName,
+      ts: 3,
+      epoch: 1,
+      seq: 3,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'third' },
+    }], 300);
+
+    expect(base).toEqual(history);
+    expect(next.map((event) => String(event.payload.text ?? ''))).toEqual(['first', 'second', 'third']);
   });
 
   it('restores history from IndexedDB using the server-scoped cache key after remount', async () => {
@@ -255,6 +304,67 @@ describe('useTimeline global cache bounds', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('probe').textContent).toBe('stored history|live transport send');
+    });
+  });
+
+  it('does not dedup confirmed user messages marked allowDuplicate', async () => {
+    const sessionName = `deck_transport_dup_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest: () => 'history-dup',
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, serverId);
+      return h(
+        'div',
+        { 'data-testid': 'probe-dup' },
+        events.filter((event) => event.type === 'user.message').map((event) => String(event.payload.text ?? '')).join('|'),
+      );
+    }
+
+    render(h(Probe, {}));
+
+    await act(async () => {
+      handler?.({
+        type: 'timeline.event',
+        event: {
+          eventId: `${sessionName}-u1`,
+          sessionId: sessionName,
+          ts: 1,
+          epoch: 1,
+          seq: 1,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'user.message',
+          payload: { text: 'retry', allowDuplicate: true },
+        },
+      } as ServerMessage);
+      handler?.({
+        type: 'timeline.event',
+        event: {
+          eventId: `${sessionName}-u2`,
+          sessionId: sessionName,
+          ts: 2,
+          epoch: 1,
+          seq: 2,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'user.message',
+          payload: { text: 'retry', allowDuplicate: true },
+        },
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('probe-dup').textContent).toBe('retry|retry');
     });
   });
 

@@ -70,6 +70,25 @@ describe('TimelineEmitter — seq counter', () => {
     expect(timelineStore.append).toHaveBeenCalledTimes(2);
   });
 
+  it('preserves repeated user messages when allowDuplicate is set', () => {
+    emitter.emit('session-a', 'user.message', { text: 'retry', allowDuplicate: true }, { ts: 10 });
+    emitter.emit('session-a', 'user.message', { text: 'retry', allowDuplicate: true }, { ts: 20 });
+
+    const { events } = emitter.replay('session-a', 0);
+    expect(events).toHaveLength(2);
+    expect(events[0]?.payload.text).toBe('retry');
+    expect(events[1]?.payload.text).toBe('retry');
+  });
+
+  it('still suppresses duplicate user messages without allowDuplicate', () => {
+    emitter.emit('session-a', 'user.message', { text: 'retry' }, { ts: 10 });
+    emitter.emit('session-a', 'user.message', { text: 'retry' }, { ts: 20 });
+
+    const { events } = emitter.replay('session-a', 0);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.payload.text).toBe('retry');
+  });
+
   it('does not let a stale streaming update overwrite a newer final event with the same eventId', () => {
     emitter.emit('session-a', 'assistant.text', { text: 'partial', streaming: true }, { eventId: 'transport:session-a:msg-1', ts: 10 });
     emitter.emit('session-a', 'assistant.text', { text: 'final', streaming: false }, { eventId: 'transport:session-a:msg-1', ts: 20 });

@@ -887,7 +887,7 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
     timelineEmitter.emit(sessionName, 'session.state', { state: mapped }, { source: 'daemon', confidence: 'high' });
   };
   runtime.onDrain = (merged, count) => {
-    timelineEmitter.emit(sessionName, 'user.message', { text: merged, batchedCount: count });
+    timelineEmitter.emit(sessionName, 'user.message', { text: merged, batchedCount: count, allowDuplicate: true });
     timelineEmitter.emit(sessionName, 'session.state', { state: 'running' }, { source: 'daemon', confidence: 'high' });
   };
 }

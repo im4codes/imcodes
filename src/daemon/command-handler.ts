@@ -1203,11 +1203,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // Transport sessions — route directly to the provider runtime, bypassing tmux.
   const transportRuntime = getTransportRuntime(sessionName);
   const record = (await import('../store/session-store.js')).getSession(sessionName);
+  const emitTransportUserMessage = (payloadText: string, extra?: Record<string, unknown>) => {
+    timelineEmitter.emit(sessionName, 'user.message', { text: payloadText, allowDuplicate: true, ...(extra ?? {}) });
+  };
   if (!transportRuntime && record?.runtimeType === 'transport') {
     // No runtime — provider not connected. Show error in chat.
     const errMsg = `Provider ${record.providerId ?? 'unknown'} not connected. Reconnecting...`;
     logger.warn({ sessionName, providerId: record.providerId }, 'session.send: transport session has no runtime');
-    timelineEmitter.emit(sessionName, 'user.message', { text });
+    emitTransportUserMessage(text);
     timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ ${errMsg}`, streaming: false }, { source: 'daemon', confidence: 'high' });
     timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
     const errStatus = 'error';
@@ -1219,7 +1222,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     const release = await getMutex(sessionName).acquire();
     try {
       if (text.trim() === '/stop') {
-        timelineEmitter.emit(sessionName, 'user.message', { text });
+        emitTransportUserMessage(text);
         await transportRuntime.cancel();
         // Mark session for fresh start so daemon restart doesn't resume the stuck conversation
         if (record?.agentType === 'qwen') {
@@ -1245,7 +1248,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             const authHint = qwenAuthType === 'qwen-oauth'
               ? ' (current tier only allows coder-model)'
               : '';
-            timelineEmitter.emit(sessionName, 'user.message', { text });
+            emitTransportUserMessage(text);
             timelineEmitter.emit(sessionName, 'assistant.text', {
               text: `⚠️ Unknown Qwen model: ${nextModel}${authHint}`,
               streaming: false,
@@ -1277,7 +1280,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           persistSessionRecord(nextRecord, sessionName);
           await handleGetSessions(serverLink);
           syncSubSessionIfNeeded(sessionName, serverLink);
-          timelineEmitter.emit(sessionName, 'user.message', { text });
+          emitTransportUserMessage(text);
           timelineEmitter.emit(sessionName, 'usage.update', {
             model: nextModel,
             contextWindow: resolveContextWindow(undefined, nextModel),
@@ -1294,7 +1297,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         const requestedModel = modelMatch[1];
         const selectedModel = normalizeClaudeCodeModelId(requestedModel);
         if (!selectedModel) {
-          timelineEmitter.emit(sessionName, 'user.message', { text });
+          emitTransportUserMessage(text);
           timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Claude model: ${requestedModel}`, streaming: false }, { source: 'daemon', confidence: 'high' });
           timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Claude model: ${requestedModel}` });
           try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unknown Claude model: ${requestedModel}` }); } catch {}
@@ -1314,7 +1317,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         persistSessionRecord(nextRecord, sessionName);
         await handleGetSessions(serverLink);
         syncSubSessionIfNeeded(sessionName, serverLink);
-        timelineEmitter.emit(sessionName, 'user.message', { text });
+        emitTransportUserMessage(text);
         timelineEmitter.emit(sessionName, 'usage.update', { model: selectedModel, contextWindow: resolveContextWindow(undefined, selectedModel) }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'assistant.text', { text: `Switched model to ${selectedModel}`, streaming: false }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
@@ -1324,7 +1327,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       if (record?.agentType === 'codex-sdk' && modelMatch) {
         const nextModel = modelMatch[1];
         if (!CODEX_MODEL_IDS.includes(nextModel as any)) {
-          timelineEmitter.emit(sessionName, 'user.message', { text });
+          emitTransportUserMessage(text);
           timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Codex model: ${nextModel}`, streaming: false }, { source: 'daemon', confidence: 'high' });
           timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Codex model: ${nextModel}` });
           try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: `Unknown Codex model: ${nextModel}` }); } catch {}
@@ -1346,7 +1349,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         persistSessionRecord(nextRecord, sessionName);
         await handleGetSessions(serverLink);
         syncSubSessionIfNeeded(sessionName, serverLink);
-        timelineEmitter.emit(sessionName, 'user.message', { text });
+        emitTransportUserMessage(text);
         timelineEmitter.emit(sessionName, 'usage.update', { model: nextModel, contextWindow: resolveContextWindow(undefined, nextModel) }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'assistant.text', { text: `Switched model to ${nextModel}`, streaming: false }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
@@ -1358,7 +1361,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         const allowed = getSupportedEffortLevels(record?.agentType);
         if (!isTransportEffortLevel(nextEffort) || !allowed.includes(nextEffort)) {
           const supported = allowed.join(', ');
-          timelineEmitter.emit(sessionName, 'user.message', { text });
+          emitTransportUserMessage(text);
           timelineEmitter.emit(sessionName, 'assistant.text', {
             text: `⚠️ Unsupported thinking level: ${nextEffort}. Supported: ${supported}`,
             streaming: false,
@@ -1377,7 +1380,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         persistSessionRecord(nextRecord, sessionName);
         await handleGetSessions(serverLink);
         syncSubSessionIfNeeded(sessionName, serverLink);
-        timelineEmitter.emit(sessionName, 'user.message', { text });
+        emitTransportUserMessage(text);
         timelineEmitter.emit(sessionName, 'assistant.text', {
           text: `Switched thinking level to ${nextEffort}`,
           streaming: false,
@@ -1394,7 +1397,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       // Status changes come from transport runtime's onStatusChange callback.
       const result = transportRuntime.send(text);
       if (result === 'sent') {
-        timelineEmitter.emit(sessionName, 'user.message', { text });
+        emitTransportUserMessage(text);
       }
       if (result === 'queued') {
         timelineEmitter.emit(sessionName, 'session.state', {

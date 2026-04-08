@@ -179,7 +179,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
 
 /** Emit user.message through timeline when user sends to a transport session. */
 export function emitTransportUserMessage(sessionId: string, text: string): void {
-  timelineEmitter.emit(sessionId, 'user.message', { text }, { source: 'daemon', confidence: 'high' });
+  timelineEmitter.emit(sessionId, 'user.message', { text, allowDuplicate: true }, { source: 'daemon', confidence: 'high' });
   void appendTransportEvent(sessionId, {
     type: 'user.message',
     sessionId,
