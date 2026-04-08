@@ -97,4 +97,43 @@ describe('SubSessionBar', () => {
     const runningCard = runningView.container.querySelector('.subsession-card') as HTMLButtonElement;
     expect(runningCard.className).toContain('subcard-running-pulse');
   });
+
+  it('shows idle flash on collapsed buttons only when the token increments after mount', () => {
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession({ state: 'idle' })]}
+        openIds={new Set()}
+        idleFlashTokens={new Map([['deck_sub_sub-1', 1]])}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(view.container.querySelector('.subcard-toolbar-btn') as HTMLButtonElement);
+    expect(view.container.querySelector('.idle-flash-layer--frame')).toBeNull();
+
+    view.rerender(
+      <SubSessionBar
+        subSessions={[makeSubSession({ state: 'idle' })]}
+        openIds={new Set()}
+        idleFlashTokens={new Map([['deck_sub_sub-1', 2]])}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(view.container.querySelector('.idle-flash-layer--frame')).not.toBeNull();
+  });
 });

@@ -247,4 +247,67 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       expect(ws.subscribeTerminal.mock.calls.at(-1)).toEqual([sub.sessionName, false]);
     });
   });
+
+  it('does not replay an existing idle flash token when the window remounts', async () => {
+    const sub = makeSubSession();
+    const first = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        idleFlashToken={4}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+    expect(first.container.querySelector('.idle-flash-layer--frame')).toBeNull();
+    first.unmount();
+
+    const second = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        idleFlashToken={4}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    expect(second.container.querySelector('.idle-flash-layer--frame')).toBeNull();
+
+    second.rerender(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        idleFlashToken={5}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    expect(second.container.querySelector('.idle-flash-layer--frame')).not.toBeNull();
+  });
 });

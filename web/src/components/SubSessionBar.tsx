@@ -15,6 +15,8 @@ import { resolveContextWindow } from '../model-context.js';
 import { shortModelLabel } from '../model-label.js';
 import { P2pProgressCard } from './P2pProgressCard.js';
 import type { P2pProgressDiscussion } from './P2pProgressCard.js';
+import { IdleFlashLayer } from './IdleFlashLayer.js';
+import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 
 interface DaemonStats {
   daemonVersion?: string | null;
@@ -32,6 +34,16 @@ type DiscussionSummary = P2pProgressDiscussion & {
   filePath?: string;
   fileId?: string;
 };
+
+interface CollapsedSubSessionButtonProps {
+  sub: SubSession;
+  isOpen: boolean;
+  idleFlashToken: number;
+  usage?: { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string };
+  inP2p: boolean;
+  onOpen: (id: string) => void;
+  t: (key: string, vars?: Record<string, unknown>) => string;
+}
 
 interface Props {
   subSessions: SubSession[];
@@ -102,6 +114,42 @@ function formatUptime(seconds: number): string {
   const d = Math.floor(seconds / 86400);
   const h = Math.floor((seconds % 86400) / 3600);
   return d > 0 ? `${d}d ${h}h` : `${h}h`;
+}
+
+function CollapsedSubSessionButton({ sub, isOpen, idleFlashToken, usage, inP2p, onOpen, t }: CollapsedSubSessionButtonProps) {
+  const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
+  const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
+  const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
+  const abbr = TYPE_ABBR[sub.type] ?? agentTag.slice(0, 2);
+  const model = usage ? shortModelLabel(usage.model) : null;
+  let ctxPct = 0;
+  if (usage) {
+    const ctx = resolveContextWindow(usage.contextWindow, usage.model);
+    ctxPct = Math.min(100, (usage.inputTokens + usage.cacheTokens) / ctx * 100);
+  }
+
+  return (
+    <button
+      key={sub.id}
+      data-sub-id={sub.id}
+      class={`subsession-card${isOpen ? ' open' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
+      onClick={() => onOpen(sub.id)}
+      title={label + (model ? ` · ${model}` : '') + (ctxPct > 0 ? ` · ctx ${ctxPct.toFixed(0)}%` : '')}
+    >
+      {activeIdleFlashToken ? <IdleFlashLayer key={`subbutton-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
+      <span class="subsession-card-icon">{abbr}</span>
+      <span class="subsession-card-label">{sub.label ? formatLabel(sub.label).slice(0, 12) : agentTag.slice(0, 6)}</span>
+      {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
+      {model && <span class="subsession-card-model">{model}</span>}
+      {sub.ccPresetId && <span class="subsession-card-custom-api" title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
+      {sub.state === 'starting' && <span class="subsession-card-badge">…</span>}
+      {ctxPct > 0 && (
+        <span class="subsession-card-ctx" style={{ width: '100%' }}>
+          <span class="subsession-card-ctx-fill" style={{ width: `${ctxPct}%` }} />
+        </span>
+      )}
+    </button>
+  );
 }
 
 export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, onClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId, quickData, sessions, allSubSessions, p2pSessionLabels }: Props) {
@@ -411,41 +459,18 @@ export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, o
       {/* Collapsed: compact buttons (all platforms) — long-press to reorder */}
       {collapsed && subSessions.length > 0 && (
         <div class="subsession-bar" style={{ borderTop: 'none' }} ref={collapsedBarRef}>
-          {orderedSessions.map((sub) => {
-            const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
-            const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
-            const abbr = TYPE_ABBR[sub.type] ?? agentTag.slice(0, 2);
-            const isOpen = openIds.has(sub.id);
-            const usage = subUsages?.get(`deck_sub_${sub.id}`);
-            const model = usage ? shortModelLabel(usage.model) : null;
-            // Compute ctx percentage for mini bar
-            let ctxPct = 0;
-            if (usage) {
-              const ctx = resolveContextWindow(usage.contextWindow, usage.model);
-              ctxPct = Math.min(100, (usage.inputTokens + usage.cacheTokens) / ctx * 100);
-            }
-            return (
-              <button
-                key={sub.id}
-                data-sub-id={sub.id}
-                class={`subsession-card${isOpen ? ' open' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
-                onClick={() => onOpen(sub.id)}
-                title={label + (model ? ` · ${model}` : '') + (ctxPct > 0 ? ` · ctx ${ctxPct.toFixed(0)}%` : '')}
-              >
-                <span class="subsession-card-icon">{abbr}</span>
-                <span class="subsession-card-label">{sub.label ? formatLabel(sub.label).slice(0, 12) : agentTag.slice(0, 6)}</span>
-                {p2pSessionLabels?.has(sub.sessionName) && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
-                {model && <span class="subsession-card-model">{model}</span>}
-                {sub.ccPresetId && <span class="subsession-card-custom-api" title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
-                {sub.state === 'starting' && <span class="subsession-card-badge">…</span>}
-                {ctxPct > 0 && (
-                  <span class="subsession-card-ctx" style={{ width: '100%' }}>
-                    <span class="subsession-card-ctx-fill" style={{ width: `${ctxPct}%` }} />
-                  </span>
-                )}
-              </button>
-            );
-          })}
+          {orderedSessions.map((sub) => (
+            <CollapsedSubSessionButton
+              key={sub.id}
+              sub={sub}
+              isOpen={openIds.has(sub.id)}
+              idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
+              usage={subUsages?.get(`deck_sub_${sub.id}`)}
+              inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
+              onOpen={onOpen}
+              t={t}
+            />
+          ))}
         </div>
       )}
 

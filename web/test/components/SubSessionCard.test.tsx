@@ -121,8 +121,8 @@ describe('SubSessionCard', () => {
     expect(container.querySelector('.idle-flash-layer--frame')).toBeNull();
   });
 
-  it('renders an idle-flash layer only when explicitly requested', () => {
-    const { container } = render(
+  it('renders an idle-flash layer only when the token increments after mount', () => {
+    const view = render(
       <SubSessionCard
         sub={makeSubSession({ state: 'idle' })}
         ws={null}
@@ -135,7 +135,53 @@ describe('SubSessionCard', () => {
       />,
     );
 
-    expect(container.querySelector('.idle-flash-layer--frame')).not.toBeNull();
+    expect(view.container.querySelector('.idle-flash-layer--frame')).toBeNull();
+
+    view.rerender(
+      <SubSessionCard
+        sub={makeSubSession({ state: 'idle' })}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        idleFlashToken={2}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(view.container.querySelector('.idle-flash-layer--frame')).not.toBeNull();
+  });
+
+  it('does not replay an old idle flash token after remount', () => {
+    const first = render(
+      <SubSessionCard
+        sub={makeSubSession({ state: 'idle' })}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        idleFlashToken={3}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    first.unmount();
+
+    const second = render(
+      <SubSessionCard
+        sub={makeSubSession({ state: 'idle' })}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        idleFlashToken={3}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(second.container.querySelector('.idle-flash-layer--frame')).toBeNull();
   });
 
   it('forces chat preview to follow when timeline events update', async () => {

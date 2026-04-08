@@ -17,6 +17,7 @@ import { getActiveThinkingTs, isVisuallyBusy } from '../thinking-utils.js';
 import { SessionControls } from './SessionControls.js';
 import type { SessionInfo } from '../types.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
+import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
@@ -69,6 +70,7 @@ function loadCardW(id: string, fallback: number): number {
 
 export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, inP2p }: Props) {
   const { t } = useTranslation();
+  const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const isShell = sub.type === 'shell' || sub.type === 'script';
   const isTransport = sub.runtimeType === 'transport';
   const { events, refreshing } = isShell ? { events: [], refreshing: false } : useTimeline(sub.sessionName, ws, serverId);
@@ -202,7 +204,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
       style={{ width: effectiveW, height: cardH, minWidth: effectiveW, position: 'relative' }}
       onClick={() => { if (!draggingRef.current) onOpen(); }}
     >
-      {idleFlashToken ? <IdleFlashLayer key={`subcard-idle-${idleFlashToken}`} variant="frame" /> : null}
+      {activeIdleFlashToken ? <IdleFlashLayer key={`subcard-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
       {/* Header */}
       <div class="subcard-header">
         <span class="subcard-icon">{icon}</span>

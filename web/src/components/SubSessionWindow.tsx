@@ -19,6 +19,7 @@ import type { TerminalDiff, SessionInfo } from '../types.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import { extractLatestUsage } from '../usage-data.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
+import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 
 interface WindowGeometry { x: number; y: number; w: number; h: number }
 
@@ -91,6 +92,7 @@ export function SubSessionWindow({
   sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, zIndex, onFocus, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, inP2p,
 }: Props) {
   const { t } = useTranslation();
+  const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const swipeBackRef = useSwipeBack(isMobile ? onMinimize : null);
 
@@ -336,7 +338,7 @@ export function SubSessionWindow({
 
   return (
     <div ref={swipeBackRef} class="subsession-window" style={style} onMouseDown={onFocus}>
-      {idleFlashToken ? <IdleFlashLayer key={`subwindow-idle-${idleFlashToken}`} variant="frame" /> : null}
+      {activeIdleFlashToken ? <IdleFlashLayer key={`subwindow-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
       {/* 8-direction resize handles (desktop only) */}
       {!isMobile && (['n','s','e','w','ne','nw','se','sw'] as ResizeDir[]).map((dir) => (
         <div key={dir} class={`resize-handle resize-${dir}`} onMouseDown={onResizeMouseDown(dir)} />

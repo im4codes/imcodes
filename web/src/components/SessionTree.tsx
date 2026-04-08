@@ -20,6 +20,7 @@ import type { SessionInfo } from '../types.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import { formatLabel } from '../format-label.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
+import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 
 // ── Agent badge config (matches SessionTabs.tsx AGENT_BADGE) ─────────────────
 const AGENT_BADGE: Record<string, { label: string; color: string }> = {
@@ -113,6 +114,7 @@ function SessionNode({
   label, agentType, state, isActive, isTransport, isSub, unread, idleFlashToken, inP2p, onClick,
 }: NodeProps) {
   const { t } = useTranslation();
+  const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const badge = isSub
     ? (SUB_TYPE_BADGE[agentType] ?? null)
     : (AGENT_BADGE[agentType] ?? null);
@@ -125,7 +127,7 @@ function SessionNode({
 
   return (
     <button class={classes} onClick={onClick} title={`${agentType} — ${state}`}>
-      {idleFlashToken ? <IdleFlashLayer key={`tree-idle-${idleFlashToken}`} variant="fill" /> : null}
+      {activeIdleFlashToken ? <IdleFlashLayer key={`tree-idle-${activeIdleFlashToken}`} variant="fill" /> : null}
       {/* Icon: only for sub-sessions (main sessions use the tree toggle arrow) */}
       {isSub && (
         <span class="session-tree-icon" aria-hidden="true">
