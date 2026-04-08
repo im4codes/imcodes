@@ -353,6 +353,79 @@ describe('sdk transport flow e2e', () => {
     }));
   });
 
+  it('pushes an updated session_list after settings restart switches a main session to claude-code-sdk', async () => {
+    mocks.store.set('deck_settings_switch_brain', {
+      name: 'deck_settings_switch_brain',
+      projectName: 'settings_switch',
+      role: 'brain',
+      agentType: 'claude-code',
+      projectDir: '/tmp/settings-switch',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+      ccSessionId: 'cc-settings-switch',
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({
+      type: 'session.restart',
+      sessionName: 'deck_settings_switch_brain',
+      agentType: 'claude-code-sdk',
+    }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => serverLink.send.mock.calls.some((call) => call[0]?.type === 'session_list'));
+
+    const sessionListPayload = serverLink.send.mock.calls
+      .map((call) => call[0])
+      .find((msg) => msg?.type === 'session_list');
+    const switched = sessionListPayload?.sessions?.find((session: any) => session.name === 'deck_settings_switch_brain');
+
+    expect(switched).toMatchObject({
+      name: 'deck_settings_switch_brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+    });
+  });
+
+  it('pushes a corrective session_list when settings restart fails', async () => {
+    const tmuxNewSession = newSession as ReturnType<typeof vi.fn>;
+    tmuxNewSession.mockRejectedValueOnce(new Error('tmux create failed'));
+    mocks.store.set('deck_settings_fail_brain', {
+      name: 'deck_settings_fail_brain',
+      projectName: 'settings_fail',
+      role: 'brain',
+      agentType: 'shell',
+      projectDir: '/tmp/settings-fail',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({
+      type: 'session.restart',
+      sessionName: 'deck_settings_fail_brain',
+      agentType: 'shell',
+    }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => serverLink.send.mock.calls.some((call) => call[0]?.type === 'session.error'));
+    await waitForCondition(() => serverLink.send.mock.calls.some((call) => call[0]?.type === 'session_list'));
+
+    const sessionListPayload = serverLink.send.mock.calls
+      .map((call) => call[0])
+      .find((msg) => msg?.type === 'session_list');
+    const session = sessionListPayload?.sessions?.find((entry: any) => entry.name === 'deck_settings_fail_brain');
+
+    expect(session).toMatchObject({
+      name: 'deck_settings_fail_brain',
+      agentType: 'shell',
+    });
+  });
+
   it('switches claude-code-sdk model through /model and updates display metadata', async () => {
     await launchSession({
       name: SESSION_CC,

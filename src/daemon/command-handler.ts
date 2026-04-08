@@ -213,6 +213,28 @@ function describeTransportSendError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+const pendingSessionRelaunches = new Map<string, Promise<void>>();
+
+function trackPendingSessionRelaunch(sessionName: string, pending: Promise<void>): Promise<void> {
+  pendingSessionRelaunches.set(sessionName, pending);
+  void pending.then(() => {
+    if (pendingSessionRelaunches.get(sessionName) === pending) pendingSessionRelaunches.delete(sessionName);
+  }, () => {
+    if (pendingSessionRelaunches.get(sessionName) === pending) pendingSessionRelaunches.delete(sessionName);
+  });
+  return pending;
+}
+
+async function waitForPendingSessionRelaunch(sessionName: string): Promise<void> {
+  const pending = pendingSessionRelaunches.get(sessionName);
+  if (!pending) return;
+  try {
+    await pending;
+  } catch {
+    // Restart path already emitted its own error and corrective session sync.
+  }
+}
+
 function refreshQwenQuotaUsageLabels(serverLink?: ServerLink): void {
   const usageLabel = getQwenOAuthQuotaUsageLabel();
   for (const session of listSessions()) {
@@ -848,21 +870,30 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
       return;
     }
     try {
-      await relaunchSessionWithSettings(record, {
-        agentType: (cmd.agentType as any) ?? undefined,
-        projectDir: ('cwd' in cmd ? (cmd.cwd as string | undefined) : undefined),
-        label: ('label' in cmd ? (cmd.label as string | null) : undefined),
-        description: ('description' in cmd ? (cmd.description as string | null) : undefined),
-        requestedModel: ('requestedModel' in cmd ? (cmd.requestedModel as string | null) : undefined),
-        effort: ('effort' in cmd ? (cmd.effort as any) : undefined),
-        transportConfig: ('transportConfig' in cmd ? (cmd.transportConfig as Record<string, unknown> | null) : undefined),
-      });
-      logger.info({ sessionName, agentType: cmd.agentType ?? record.agentType }, 'Session relaunched via settings');
-    } catch (err) {
-      logger.error({ sessionName, err }, 'session.restart(sessionName) failed');
-      const message = err instanceof Error ? err.message : String(err);
-      emitSessionInlineError(sessionName, message);
-      try { serverLink.send({ type: 'session.error', project: record.projectName, message }); } catch { /* ignore */ }
+      await trackPendingSessionRelaunch(sessionName, (async () => {
+        try {
+          await relaunchSessionWithSettings(record, {
+            agentType: (cmd.agentType as any) ?? undefined,
+            projectDir: ('cwd' in cmd ? (cmd.cwd as string | undefined) : undefined),
+            label: ('label' in cmd ? (cmd.label as string | null) : undefined),
+            description: ('description' in cmd ? (cmd.description as string | null) : undefined),
+            requestedModel: ('requestedModel' in cmd ? (cmd.requestedModel as string | null) : undefined),
+            effort: ('effort' in cmd ? (cmd.effort as any) : undefined),
+            transportConfig: ('transportConfig' in cmd ? (cmd.transportConfig as Record<string, unknown> | null) : undefined),
+          });
+          await handleGetSessions(serverLink);
+          logger.info({ sessionName, agentType: cmd.agentType ?? record.agentType }, 'Session relaunched via settings');
+        } catch (err) {
+          logger.error({ sessionName, err }, 'session.restart(sessionName) failed');
+          const message = err instanceof Error ? err.message : String(err);
+          emitSessionInlineError(sessionName, message);
+          try { serverLink.send({ type: 'session.error', project: record.projectName, message }); } catch { /* ignore */ }
+          await handleGetSessions(serverLink);
+          throw err;
+        }
+      })());
+    } catch {
+      // Failure already surfaced via session.error + corrective session_list.
     }
     return;
   }
@@ -987,6 +1018,8 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     logger.warn('session.send: missing sessionName or text');
     return;
   }
+
+  await waitForPendingSessionRelaunch(sessionName);
 
   // Fallback: legacy clients that don't send commandId get a server-generated one
   const isLegacy = !commandId;
@@ -1902,21 +1935,28 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
   }
   const id = sName.replace(/^deck_sub_/, '');
   try {
-    const effectiveRecord = (await recoverOpenCodeSessionRecord(record)) ?? record;
-    await relaunchSessionWithSettings(effectiveRecord, {
-      agentType: (cmd.agentType as any) ?? undefined,
-      projectDir: ('cwd' in cmd ? (cmd.cwd as string | undefined) : undefined),
-      label: ('label' in cmd ? (cmd.label as string | null) : undefined),
-      description: ('description' in cmd ? (cmd.description as string | null) : undefined),
-      requestedModel: ('requestedModel' in cmd ? (cmd.requestedModel as string | null) : undefined),
-      effort: ('effort' in cmd ? (cmd.effort as any) : undefined),
-      transportConfig: ('transportConfig' in cmd ? (cmd.transportConfig as Record<string, unknown> | null) : undefined),
-    });
-    try {
-      serverLink.send(await buildSubSessionSync(id));
-    } catch { /* not connected */ }
-  } catch (e: unknown) {
-    logger.error({ err: e, sessionName: sName }, 'subsession.restart failed');
+    await trackPendingSessionRelaunch(sName, (async () => {
+      try {
+        const effectiveRecord = (await recoverOpenCodeSessionRecord(record)) ?? record;
+        await relaunchSessionWithSettings(effectiveRecord, {
+          agentType: (cmd.agentType as any) ?? undefined,
+          projectDir: ('cwd' in cmd ? (cmd.cwd as string | undefined) : undefined),
+          label: ('label' in cmd ? (cmd.label as string | null) : undefined),
+          description: ('description' in cmd ? (cmd.description as string | null) : undefined),
+          requestedModel: ('requestedModel' in cmd ? (cmd.requestedModel as string | null) : undefined),
+          effort: ('effort' in cmd ? (cmd.effort as any) : undefined),
+          transportConfig: ('transportConfig' in cmd ? (cmd.transportConfig as Record<string, unknown> | null) : undefined),
+        });
+        try {
+          serverLink.send(await buildSubSessionSync(id));
+        } catch { /* not connected */ }
+      } catch (e: unknown) {
+        logger.error({ err: e, sessionName: sName }, 'subsession.restart failed');
+        throw e;
+      }
+    })());
+  } catch {
+    // Failure already logged; keep command handler alive for future sends.
   }
 }
 
