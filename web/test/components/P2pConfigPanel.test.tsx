@@ -132,6 +132,24 @@ describe('P2pConfigPanel', () => {
     expect(btn5).toBeDefined();
   });
 
+  it('defaults hop timeout to 8 minutes for new configs', async () => {
+    const onSave = vi.fn();
+    renderPanel({ onSave });
+    await flush();
+
+    const timeoutInput = screen.getByRole('spinbutton') as HTMLInputElement;
+    expect(timeoutInput.value).toBe('8');
+
+    const saveBtn = screen.getByText('settings_save');
+    await act(async () => {
+      fireEvent.click(saveBtn);
+    });
+    await flush();
+
+    const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
+    expect(cfg.hopTimeoutMinutes).toBe(8);
+  });
+
   it('calls onSave with correct config shape when save is clicked', async () => {
     const onSave = vi.fn();
     const onClose = vi.fn();

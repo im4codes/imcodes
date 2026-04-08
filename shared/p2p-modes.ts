@@ -16,7 +16,7 @@ export interface P2pSavedConfig {
   rounds: number;
   /** User-defined extra prompt appended to every participant's system prompt. */
   extraPrompt?: string;
-  /** Per-hop timeout in minutes. Default: 5. */
+  /** Per-hop timeout in minutes. Default: 8. */
   hopTimeoutMinutes?: number;
 }
 

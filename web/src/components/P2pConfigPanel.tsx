@@ -251,7 +251,7 @@ export function P2pConfigPanel({
   // Local config state: per-session enabled + mode
   const [sessionCfg, setSessionCfg] = useState<P2pSessionConfig>({});
   const [rounds, setRounds] = useState(3);
-  const [hopTimeoutMinutes, setHopTimeoutMinutes] = useState(5);
+  const [hopTimeoutMinutes, setHopTimeoutMinutes] = useState(8);
   const [extraPrompt, setExtraPrompt] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -269,7 +269,7 @@ export function P2pConfigPanel({
           const parsed: P2pSavedConfig = JSON.parse(raw);
           setSessionCfg(parsed.sessions ?? {});
           setRounds(parsed.rounds ?? 3);
-          setHopTimeoutMinutes(parsed.hopTimeoutMinutes ?? 5);
+          setHopTimeoutMinutes(parsed.hopTimeoutMinutes ?? 8);
           setExtraPrompt(parsed.extraPrompt ?? '');
         } catch { /* start fresh */ }
       }
