@@ -1514,6 +1514,9 @@ describe('WsBridge', () => {
             return { project_name: 'codedeck', agent_type: 'claude-code', label: null };
           }
           if (sql.includes('FROM sub_sessions')) {
+            if (params?.[1] === 'unlabeled') {
+              return { type: 'codex', label: null, parent_session: '' };
+            }
             return { type: 'codex', label: 'worker-1', parent_session: 'deck_cd_brain' };
           }
           return null;
@@ -1610,6 +1613,42 @@ describe('WsBridge', () => {
       const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
       expect(payload?.title).toBe('my-server · Boot Main · claude-code');
       expect(payload?.title).not.toContain('bootmainxowfy6');
+    });
+
+    it('uses daemon project fallback before internal main session names in push title', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle',
+        session: 'bootmainxowfy6',
+        project: 'Readable Main',
+        agentType: 'claude-code',
+        lastText: 'Ready.',
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
+      expect(payload?.title).toBe('my-server · Readable Main · claude-code');
+      expect(payload?.title).not.toContain('bootmainxowfy6');
+    });
+
+    it('uses parent/project fallback before internal sub-session names in push title', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle',
+        session: 'deck_sub_unlabeled',
+        project: 'Readable Main',
+        agentType: 'codex',
+        lastText: 'Ready.',
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
+      expect(payload?.title).toBe('my-server · Readable Main · codex');
+      expect(payload?.title).not.toContain('deck_sub_unlabeled');
     });
 
     it('uses lastText as push body for session.idle', async () => {

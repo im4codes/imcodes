@@ -2155,6 +2155,7 @@ export class WsBridge {
     // Prefer label/parentLabel from daemon message (has full context including sub-sessions)
     const daemonLabel = msg.label ? String(msg.label) : undefined;
     const daemonParentLabel = msg.parentLabel ? String(msg.parentLabel) : undefined;
+    const daemonProject = msg.project ? String(msg.project) : undefined;
 
     // Look up session metadata for human-readable push content
     // Check sessions table first, then sub_sessions for sub-session names
@@ -2196,9 +2197,9 @@ export class WsBridge {
     const label = daemonLabel || activeMainSession?.label || sessionRow?.label;
     const agentType = subType || activeMainSession?.agentType || sessionRow?.agent_type || String(msg.agentType ?? '');
     const isSub = sessionName.startsWith('deck_sub_');
-    const mainDisplayName = activeMainSession?.project || sessionRow?.project_name || daemonParentLabel || sessionName;
+    const mainDisplayName = daemonProject || daemonParentLabel || activeMainSession?.project || sessionRow?.project_name || sessionName;
     const displayName = isSub
-      ? (label || sessionName)
+      ? (label || daemonParentLabel || daemonProject || mainDisplayName || sessionName)
       : (label || mainDisplayName || sessionName);
     const titleParts = [server.name, displayName];
     if (agentType) titleParts.push(agentType);
