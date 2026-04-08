@@ -34,6 +34,7 @@ describe('mapP2pRunToDiscussion', () => {
   it('maps advanced payloads to logical rounds instead of raw execution steps', () => {
     const discussion = mapP2pRunToDiscussion({
       id: 'run_advanced',
+      discussion_id: 'disc_advanced',
       status: 'running',
       mode_key: 'discuss',
       advanced_p2p_enabled: true,
@@ -53,6 +54,7 @@ describe('mapP2pRunToDiscussion', () => {
 
     expect(discussion.currentRound).toBe(3);
     expect(discussion.maxRounds).toBe(3);
+    expect(discussion.fileId).toBe('disc_advanced');
     expect(discussion.totalHops).toBe(3);
     expect(discussion.currentSpeaker).toBe('implementation_audit');
     expect(discussion.modeKey).toBe('implementation_audit');
@@ -179,6 +181,22 @@ describe('mapP2pRunToDiscussion', () => {
     expect(discussion.currentSpeaker).toBe('w2');
     expect(discussion.modeKey).toBe('audit');
     expect(discussion.nodes?.map((node) => node.label)).toEqual(['brain', 'w2']);
+  });
+
+  it('preserves p2p discussion file id for homepage navigation', () => {
+    const discussion = mapP2pRunToDiscussion({
+      id: 'run_nav',
+      discussion_id: 'disc_nav',
+      status: 'running',
+      mode_key: 'audit',
+      current_round: 1,
+      total_rounds: 2,
+      total_hops: 1,
+      active_phase: 'hop',
+    });
+
+    expect(discussion.id).toBe('p2p_run_nav');
+    expect(discussion.fileId).toBe('disc_nav');
   });
 
   it('preserves timeout serialization for round and summary boundary failures', () => {
