@@ -87,6 +87,8 @@ type P2pMode = string; // 'solo' | single modes | combo pipelines like 'brainsto
 const MODEL_STORAGE_KEY = 'imcodes-model';
 const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const QWEN_MODEL_STORAGE_KEY = 'imcodes-qwen-model';
+const QUEUED_HINT_EXPANDED_STORAGE_KEY = 'imcodes-queued-hint-expanded';
+const QUEUED_HINT_EXPANDED_EVENT = 'imcodes:queued-hint-expanded';
 const P2P_COMBO_CONFIRM_SKIP_PREF_KEY = 'p2p_combo_direct_send_skip_confirm';
 const CODEX_MODELS: CodexModelChoice[] = [...CODEX_MODEL_IDS] as CodexModelChoice[];
 const P2P_BASE_MODES = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss', P2P_CONFIG_MODE] as const;
@@ -201,6 +203,13 @@ function loadQwenModel(): QwenModelChoice | null {
   return null;
 }
 
+function loadQueuedHintExpanded(): boolean {
+  try {
+    return localStorage.getItem(QUEUED_HINT_EXPANDED_STORAGE_KEY) !== '0';
+  } catch { /* ignore */ }
+  return true;
+}
+
 function normalizeP2pMode(mode: string): string | null {
   const normalized = mode.trim().toLowerCase();
   if ((P2P_BASE_MODES as readonly string[]).includes(normalized)) return normalized;
@@ -289,6 +298,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
   const [qwenModel, setQwenModel] = useState<QwenModelChoice | null>(loadQwenModel);
+  const [queuedHintExpanded, setQueuedHintExpanded] = useState(loadQueuedHintExpanded);
   const [confirm, setConfirm] = useState<MenuAction | null>(null);
   const [confirmLevel, setConfirmLevel] = useState(0); // 0=none, 1=first warning, 2=second warning (sub-session only)
   const [skipComboSendConfirm, setSkipComboSendConfirm] = useState(false);
@@ -306,6 +316,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const queuedTransportMessages = activeSession?.runtimeType === 'transport'
     ? (activeSession.transportPendingMessages ?? [])
     : [];
+  const queuedTransportLatestMessage = queuedTransportMessages[queuedTransportMessages.length - 1] ?? '';
   // Internal ref for contenteditable — also written to the external inputRef
   const divRef = useRef<HTMLDivElement>(null);
   // History navigation state
@@ -473,6 +484,20 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     onQuickOpenChange?.(quickOpen);
     return () => onQuickOpenChange?.(false);
   }, [onQuickOpenChange, quickOpen]);
+
+  useEffect(() => {
+    const syncQueuedHintExpanded = () => setQueuedHintExpanded(loadQueuedHintExpanded());
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key && event.key !== QUEUED_HINT_EXPANDED_STORAGE_KEY) return;
+      syncQueuedHintExpanded();
+    };
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener(QUEUED_HINT_EXPANDED_EVENT, syncQueuedHintExpanded);
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener(QUEUED_HINT_EXPANDED_EVENT, syncQueuedHintExpanded);
+    };
+  }, []);
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
@@ -1215,6 +1240,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     ws.sendSessionCommand('send', { sessionName: activeSession.name, text: `/thinking ${level}` });
     onAfterAction?.();
   };
+
+  const toggleQueuedHintExpanded = useCallback(() => {
+    setQueuedHintExpanded((current) => {
+      const next = !current;
+      try {
+        localStorage.setItem(QUEUED_HINT_EXPANDED_STORAGE_KEY, next ? '1' : '0');
+        window.dispatchEvent(new CustomEvent(QUEUED_HINT_EXPANDED_EVENT));
+      } catch { /* ignore */ }
+      return next;
+    });
+  }, []);
 
   const placeholder = !hasSession ? t('session.no_session') : !connected ? t('session.send_queued') : t('session.send_placeholder', { name: sessionDisplayName ?? activeSession?.label ?? activeSession?.project ?? 'session' });
 
@@ -2040,13 +2076,29 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       </div>
       {queuedTransportMessages.length > 0 && (
         <div class="controls-queued-hint" role="status" aria-live="polite">
-          <div>{t('session.transport_send_queued')}</div>
+          <div class="controls-queued-header">
+            <div>{t('session.transport_send_queued')}</div>
+            <button type="button" class="controls-queued-toggle" onClick={toggleQueuedHintExpanded}>
+              {queuedHintExpanded ? t('common.hide') : t('common.show')}
+            </button>
+          </div>
           <div class="controls-queued-list">
-            {queuedTransportMessages.map((message, index) => (
-              <div class="controls-queued-item" key={`${activeSession?.name ?? 'session'}:${index}:${message}`}>
-                {message}
-              </div>
-            ))}
+            {queuedHintExpanded ? (
+              queuedTransportMessages.map((message, index) => (
+                <div class="controls-queued-item" key={`${activeSession?.name ?? 'session'}:${index}:${message}`}>
+                  {message}
+                </div>
+              ))
+            ) : (
+              <>
+                <div class="controls-queued-summary">
+                  {t('session.transport_send_queued_collapsed', { count: queuedTransportMessages.length })}
+                </div>
+                <div class="controls-queued-item" key={`${activeSession?.name ?? 'session'}:latest:${queuedTransportLatestMessage}`}>
+                  {queuedTransportLatestMessage}
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}

@@ -41,6 +41,11 @@ vi.mock('react-i18next', () => ({
       if (key === 'openspec.propose_from_description_prompt') {
         return 'generate openspec proposal from description below';
       }
+      if (key === 'session.transport_send_queued_collapsed') {
+        return `${opts?.count ?? 0} queued · showing latest only`;
+      }
+      if (key === 'common.hide') return 'hide';
+      if (key === 'common.show') return 'show';
       const parts = key.split('.');
       return parts[parts.length - 1];
     },
@@ -851,6 +856,54 @@ describe('SessionControls', () => {
     expect(screen.getByText('transport_send_queued')).toBeDefined();
     expect(screen.getByText('queued send')).toBeDefined();
     expect(screen.getByText('second queued send')).toBeDefined();
+  });
+
+  it('can collapse queued transport messages to latest-only view', () => {
+    const runningSession = makeSession({
+      name: 'qwen-session',
+      agentType: 'qwen',
+      runtimeType: 'transport',
+      state: 'running',
+      transportPendingMessages: ['queued send', 'second queued send'],
+    });
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={runningSession}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'hide' }));
+
+    expect(screen.getByText('2 queued · showing latest only')).toBeDefined();
+    expect(screen.queryByText('queued send')).toBeNull();
+    expect(screen.getByText('second queued send')).toBeDefined();
+    expect(screen.getByRole('button', { name: 'show' })).toBeDefined();
+    expect(localStorage.getItem('imcodes-queued-hint-expanded')).toBe('0');
+  });
+
+  it('remembers collapsed queued transport messages globally', () => {
+    localStorage.setItem('imcodes-queued-hint-expanded', '0');
+    const runningSession = makeSession({
+      name: 'qwen-session',
+      agentType: 'qwen',
+      runtimeType: 'transport',
+      state: 'running',
+      transportPendingMessages: ['queued send', 'second queued send'],
+    });
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={runningSession}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getByText('2 queued · showing latest only')).toBeDefined();
+    expect(screen.queryByText('queued send')).toBeNull();
+    expect(screen.getByText('second queued send')).toBeDefined();
+    expect(screen.getByRole('button', { name: 'show' })).toBeDefined();
   });
 
   it('pressing Escape in a running transport input sends /stop command', () => {

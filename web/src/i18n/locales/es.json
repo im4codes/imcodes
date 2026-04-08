@@ -73,6 +73,7 @@
     "no_session": "Sin sesión",
     "send_queued": "Reconectando… (envío en cola)",
     "transport_send_queued": "En cola: se enviará cuando termine la respuesta actual",
+    "transport_send_queued_collapsed": "{{count}} en cola · mostrando solo el último",
     "send_placeholder": "Enviar a {{name}}…",
     "actions": "Acciones de sesión",
     "new_btn": "Nueva sesión",

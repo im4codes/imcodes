@@ -73,6 +73,7 @@
     "no_session": "セッションなし",
     "send_queued": "再接続中… (送信待ち)",
     "transport_send_queued": "キュー済み — 現在の応答が終わった後に送信します",
+    "transport_send_queued_collapsed": "{{count}} 件キュー中 · 最新のみ表示",
     "send_placeholder": "{{name}} へ送信…",
     "actions": "セッション操作",
     "new_btn": "新規セッション",

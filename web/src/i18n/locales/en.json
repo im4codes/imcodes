@@ -73,6 +73,7 @@
     "no_session": "No session",
     "send_queued": "Reconnecting… (send queued)",
     "transport_send_queued": "Queued — will send after the current reply finishes",
+    "transport_send_queued_collapsed": "{{count}} queued · showing latest only",
     "send_placeholder": "Send to {{name}}…",
     "actions": "Session actions",
     "new_btn": "New session",

@@ -73,6 +73,7 @@
     "no_session": "無 Session",
     "send_queued": "重新連線中… (訊息已排隊)",
     "transport_send_queued": "已加入佇列，當前回覆結束後傳送",
+    "transport_send_queued_collapsed": "共 {{count}} 則佇列訊息，僅顯示最後一則",
     "send_placeholder": "傳送給 {{name}}…",
     "actions": "Session 操作",
     "new_btn": "新建 Session",

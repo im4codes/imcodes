@@ -136,11 +136,32 @@ body {
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.22);
   pointer-events: auto;
 }
+.controls-queued-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.controls-queued-toggle {
+  border: none;
+  background: transparent;
+  color: #fcd34d;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0;
+  flex-shrink: 0;
+}
+.controls-queued-toggle:hover { color: #fde68a; }
 .controls-queued-list {
   margin-top: 8px;
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+.controls-queued-summary {
+  color: #cbd5e1;
+  font-size: 11px;
 }
 .controls-queued-item {
   padding: 7px 9px;
