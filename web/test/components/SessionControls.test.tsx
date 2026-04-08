@@ -237,12 +237,12 @@ describe('SessionControls', () => {
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'run combo';
     fireEvent.input(input);
-    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
     fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
 
     expect(screen.getByText('combo_send_confirm_title')).toBeDefined();
     expect(screen.getAllByRole('button', { name: /^send$/i }).length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByRole('button', { name: /mode_solo/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /^p2p$/i })).toBeDefined();
   });
 
   it('asks for confirmation before directly sending from a combo dropdown item', async () => {
@@ -253,7 +253,7 @@ describe('SessionControls', () => {
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'run combo';
     fireEvent.input(input);
-    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
     fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
 
     expect(screen.getByText('combo_send_confirm_title')).toBeDefined();
@@ -262,7 +262,7 @@ describe('SessionControls', () => {
     fireEvent.click(screen.getByRole('button', { name: /^cancel$/i }));
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: /^send$/i })).toBeDefined();
-    expect(screen.getByRole('button', { name: /mode_solo/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /^p2p$/i })).toBeDefined();
   });
 
   it('blocks combo sends that only contain routing markup and shows a warning', () => {
@@ -295,7 +295,7 @@ describe('SessionControls', () => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
     await flushAsync();
 
-    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
 
     expect(screen.getByText('combo_requires_participants_hint')).toBeDefined();
     const comboBtn = screen.getByRole('button', { name: /mode_audit→mode_plan/i }) as HTMLButtonElement;
@@ -307,9 +307,9 @@ describe('SessionControls', () => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
     await flushAsync();
 
-    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
 
-    expect(screen.getByText('mode_solo')).toBeDefined();
+    expect(screen.getByText('P2P')).toBeDefined();
     expect(screen.queryByText(/^mode_audit$/i)).toBeNull();
     expect(screen.queryByText(/^mode_review$/i)).toBeNull();
     expect(screen.queryByText(/^mode_plan$/i)).toBeNull();
@@ -342,7 +342,7 @@ describe('SessionControls', () => {
     fireEvent.click(screen.getByText('✓'));
     await flushAsync();
 
-    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
     expect(screen.getAllByText(/mode_brainstorm→mode_review/i).length).toBeGreaterThanOrEqual(1);
   });
 
@@ -354,7 +354,7 @@ describe('SessionControls', () => {
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'first combo';
     fireEvent.input(input);
-    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
     fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
 
     const dialog = screen.getByText('combo_send_confirm_title').closest('.dialog') as HTMLElement;
@@ -378,7 +378,7 @@ describe('SessionControls', () => {
 
     input.textContent = 'second combo';
     fireEvent.input(input);
-    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
     fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
 
     expect(screen.queryByText('combo_send_confirm_title')).toBeNull();
@@ -406,7 +406,7 @@ describe('SessionControls', () => {
     input.textContent = 'direct combo';
     fireEvent.input(input);
 
-    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
     fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
 
     const dialog = screen.getByText('combo_send_confirm_title').closest('.dialog') as HTMLElement;
@@ -431,7 +431,7 @@ describe('SessionControls', () => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
     await flushAsync();
 
-    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
 
     const menu = document.querySelector('.menu-dropdown-p2p') as HTMLElement;
     fireEvent.click(within(menu).getByRole('button', { name: 'settings_button' }));

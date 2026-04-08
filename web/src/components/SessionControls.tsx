@@ -93,6 +93,10 @@ const P2P_BASE_MODES = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discus
 const P2P_MODE_I18N: Record<string, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', plan: 'p2p.mode_plan', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
 const P2P_SINGLE_COLORS: Record<string, string> = { solo: '#dbe7f5', audit: '#f59e0b', review: '#3b82f6', plan: '#06b6d4', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
 
+function getP2pSoloDisplayLabel(): string {
+  return 'P2P';
+}
+
 function getP2pModeColor(mode: string): string {
   if (P2P_SINGLE_COLORS[mode]) return P2P_SINGLE_COLORS[mode];
   // Combo: use color of the last step (the deliverable)
@@ -104,6 +108,7 @@ function getP2pModeColor(mode: string): string {
 }
 
 function getP2pModeLabel(mode: string, t: (key: string) => string): string {
+  if (mode === 'solo') return getP2pSoloDisplayLabel();
   if (P2P_MODE_I18N[mode]) return t(P2P_MODE_I18N[mode]);
   // Combo: join translated names with →
   if (mode.includes(COMBO_SEPARATOR)) {
@@ -1582,10 +1587,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             data-onboarding="p2p-mode"
             onClick={() => setP2pOpen((o) => !o)}
             disabled={disabled}
-            title={p2pMode === 'solo' ? t('p2p.mode_solo') : `P2P: ${getP2pModeLabel(p2pMode, t)}`}
+            title={p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `P2P: ${getP2pModeLabel(p2pMode, t)}`}
             style={{ color: getP2pModeColor(p2pMode), fontSize: 10, fontWeight: p2pMode === 'solo' ? 600 : 700 }}
           >
-            {p2pMode === 'solo' ? t('p2p.mode_solo') : `P2P:${getP2pModeLabel(p2pMode, t)}`}
+            {p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `P2P:${getP2pModeLabel(p2pMode, t)}`}
           </button>
           <button
             class="shortcut-btn p2p-settings-btn"
