@@ -127,6 +127,13 @@ function getP2pMenuItemColor(mode: string, active: boolean): string {
   return getP2pModeColor(mode);
 }
 
+type OptionalP2pAdvancedConfig = {
+  advancedPresetKey?: unknown;
+  advancedRounds?: unknown;
+  advancedRunTimeoutMinutes?: unknown;
+  contextReducer?: unknown;
+};
+
 interface PendingAtTarget {
   session: string;
   mode: string;
@@ -165,6 +172,16 @@ type ManualP2pResolveResult = {
 };
 
 type P2pConfigTab = 'participants' | 'combos';
+
+function appendOptionalAdvancedP2pConfig(extra: Record<string, unknown>, config: P2pSavedConfig): void {
+  const advanced = config as P2pSavedConfig & OptionalP2pAdvancedConfig;
+  if (advanced.advancedPresetKey) extra.p2pAdvancedPresetKey = advanced.advancedPresetKey;
+  if (advanced.advancedRounds) extra.p2pAdvancedRounds = advanced.advancedRounds;
+  if (advanced.advancedRunTimeoutMinutes != null) {
+    extra.p2pAdvancedRunTimeoutMinutes = advanced.advancedRunTimeoutMinutes;
+  }
+  if (advanced.contextReducer) extra.p2pContextReducer = advanced.contextReducer;
+}
 
 // Enter moved after ↓ arrow
 const SHORTCUTS: Array<{ label: string; title: string; data: string; wide?: boolean }> = [
@@ -827,12 +844,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     extra.p2pRounds = selection.rounds;
     if (selection.config.extraPrompt) extra.p2pExtraPrompt = selection.config.extraPrompt;
     if (selection.config.hopTimeoutMinutes != null) extra.p2pHopTimeoutMs = Math.min(selection.config.hopTimeoutMinutes * 60_000, 600_000);
-    if (mode === P2P_CONFIG_MODE) {
-      if (selection.config.advancedPresetKey) extra.p2pAdvancedPresetKey = selection.config.advancedPresetKey;
-      if (selection.config.advancedRounds) extra.p2pAdvancedRounds = selection.config.advancedRounds;
-      if (selection.config.advancedRunTimeoutMinutes != null) extra.p2pAdvancedRunTimeoutMinutes = selection.config.advancedRunTimeoutMinutes;
-      if (selection.config.contextReducer) extra.p2pContextReducer = selection.config.contextReducer;
-    }
+    if (mode === P2P_CONFIG_MODE) appendOptionalAdvancedP2pConfig(extra, selection.config);
   }, [p2pSavedConfig]);
 
   const buildSendPayload = useCallback((options?: string | BuildSendPayloadOptions): PendingSendPayload | null => {
@@ -874,12 +886,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           extra.p2pRounds = override?.rounds ?? cfg.rounds ?? 1;
           if (cfg.extraPrompt) extra.p2pExtraPrompt = cfg.extraPrompt;
           if (cfg.hopTimeoutMinutes != null) extra.p2pHopTimeoutMs = Math.min(cfg.hopTimeoutMinutes * 60_000, 600_000);
-          if (!override?.modeOverride || override.modeOverride === P2P_CONFIG_MODE) {
-            if (cfg.advancedPresetKey) extra.p2pAdvancedPresetKey = cfg.advancedPresetKey;
-            if (cfg.advancedRounds) extra.p2pAdvancedRounds = cfg.advancedRounds;
-            if (cfg.advancedRunTimeoutMinutes != null) extra.p2pAdvancedRunTimeoutMinutes = cfg.advancedRunTimeoutMinutes;
-            if (cfg.contextReducer) extra.p2pContextReducer = cfg.contextReducer;
-          }
+          if (!override?.modeOverride || override.modeOverride === P2P_CONFIG_MODE) appendOptionalAdvancedP2pConfig(extra, cfg);
         }
         // For non-config mode overrides (single or combo), send as p2pMode so the daemon uses it
         if (override?.modeOverride && override.modeOverride !== 'config') {
