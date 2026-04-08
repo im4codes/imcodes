@@ -1915,8 +1915,6 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     }
     return;
   }
-
-  const ccPreset = cmd.ccPreset as string | null | undefined;
   const subCcInitPrompt = cmd.ccInitPrompt as string | null | undefined;
   const description = cmd.description as string | null | undefined;
 
