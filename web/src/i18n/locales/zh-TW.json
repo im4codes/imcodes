@@ -438,6 +438,15 @@
       "tip_history": "多 Agent 是共享檔案、歷史更完整的討論；一對一則是一次性討論。"
     }
   },
+  "openspec": {
+    "title": "OpenSpec",
+    "changes": "變更",
+    "empty": "目前沒有 OpenSpec 變更",
+    "audit_action": "審計",
+    "implement_action": "實作",
+    "audit_prompt": "審計 {{reference}}，並根據審計結果完善 {{reference}}。",
+    "implement_prompt": "安排子代理開始實作 {{reference}}，你負責拆分任務與驗收。"
+  },
   "upload": {
     "upload_file": "上傳檔案",
     "uploading": "上傳中...",

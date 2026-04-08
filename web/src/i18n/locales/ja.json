@@ -438,6 +438,15 @@
       "tip_history": "複数 Agent の議論はファイル共有があり、履歴もより完全に残ります。1 対 1 は単発の議論として扱われます。"
     }
   },
+  "openspec": {
+    "title": "OpenSpec",
+    "changes": "変更",
+    "empty": "OpenSpec の変更はありません",
+    "audit_action": "監査",
+    "implement_action": "実装",
+    "audit_prompt": "{{reference}} を監査し、監査結果に基づいて {{reference}} を完成させてください。",
+    "implement_prompt": "サブエージェントに {{reference}} の実装を開始させてください。あなたはタスク分解と受け入れを担当してください。"
+  },
   "upload": {
     "upload_file": "ファイルをアップロード",
     "uploading": "アップロード中...",

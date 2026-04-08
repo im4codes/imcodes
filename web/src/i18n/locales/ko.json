@@ -438,6 +438,15 @@
       "tip_history": "멀티 에이전트 토론은 파일을 공유하고 기록도 더 잘 남습니다. 1:1 토론은 일회성 토론으로 처리됩니다."
     }
   },
+  "openspec": {
+    "title": "OpenSpec",
+    "changes": "변경",
+    "empty": "OpenSpec 변경 사항이 없습니다",
+    "audit_action": "감사",
+    "implement_action": "구현",
+    "audit_prompt": "{{reference}}를 감사하고, 감사 결과를 바탕으로 {{reference}}를 보완하세요.",
+    "implement_prompt": "하위 에이전트에게 {{reference}} 구현을 시작하도록 지시하세요. 당신은 작업 분해와 검수를 담당하세요."
+  },
   "upload": {
     "upload_file": "파일 업로드",
     "uploading": "업로드 중...",

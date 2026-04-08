@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { RefObject } from 'preact';
-import type { WsClient } from '../ws-client.js';
+import type { WsClient, ServerMessage } from '../ws-client.js';
 import type { SessionInfo } from '../types.js';
 import { QuickInputPanel } from './QuickInputPanel.js';
 import { getNavigableHistory } from './QuickInputPanel.js';
@@ -155,6 +155,8 @@ type ManualP2pResolveResult = {
   cleanText: string;
 };
 
+type P2pConfigTab = 'participants' | 'combos';
+
 // Enter moved after ↓ arrow
 const SHORTCUTS: Array<{ label: string; title: string; data: string; wide?: boolean }> = [
   { label: 'Esc',  title: 'Escape',     data: '\x1b' },
@@ -267,7 +269,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [p2pExcludeSameType, setP2pExcludeSameType] = useState(true);
   const [p2pOpen, setP2pOpen] = useState(false);
   const [p2pConfigOpen, setP2pConfigOpen] = useState(false);
+  const [p2pConfigInitialTab, setP2pConfigInitialTab] = useState<P2pConfigTab>('participants');
   const [p2pSavedConfig, setP2pSavedConfig] = useState<P2pSavedConfig | null>(null);
+  const [openSpecOpen, setOpenSpecOpen] = useState(false);
+  const [openSpecChanges, setOpenSpecChanges] = useState<string[]>([]);
+  const [openSpecLoading, setOpenSpecLoading] = useState(false);
+  const [openSpecError, setOpenSpecError] = useState<string | null>(null);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
   const [qwenModel, setQwenModel] = useState<QwenModelChoice | null>(loadQwenModel);
@@ -281,6 +288,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const modelRef = useRef<HTMLDivElement>(null);
   const thinkingRef = useRef<HTMLDivElement>(null);
   const p2pRef = useRef<HTMLDivElement>(null);
+  const openSpecRef = useRef<HTMLDivElement>(null);
+  const openSpecRequestIdRef = useRef<string | null>(null);
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const showRunningSweep = !compact && isRunningSessionState(activeSession?.state);
@@ -453,10 +462,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setPendingComboSendConfirm(null);
     setRememberComboSendChoice(false);
   }, [activeSession?.name]);
+  useEffect(() => {
+    setOpenSpecOpen(false);
+    setOpenSpecChanges([]);
+    setOpenSpecError(null);
+    setOpenSpecLoading(false);
+    openSpecRequestIdRef.current = null;
+  }, [activeSession?.projectDir]);
 
   // Close menus when clicking outside
   useEffect(() => {
-    if (!menuOpen && !modelOpen && !p2pOpen && !thinkingOpen) return;
+    if (!menuOpen && !modelOpen && !p2pOpen && !thinkingOpen && !openSpecOpen) return;
     const handleClick = (e: MouseEvent) => {
       if (menuOpen && menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setMenuOpen(false);
@@ -472,10 +488,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (p2pOpen && p2pRef.current && !p2pRef.current.contains(e.target as Node)) {
         setP2pOpen(false);
       }
+      if (openSpecOpen && openSpecRef.current && !openSpecRef.current.contains(e.target as Node)) {
+        setOpenSpecOpen(false);
+      }
     };
     document.addEventListener('mousedown', handleClick);
     return () => document.removeEventListener('mousedown', handleClick);
-  }, [menuOpen, modelOpen, p2pOpen, thinkingOpen]);
+  }, [menuOpen, modelOpen, openSpecOpen, p2pOpen, thinkingOpen]);
 
   const getText = () => (divRef.current?.textContent ?? '').trim();
 
@@ -529,6 +548,42 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setHasText(true);
   };
 
+  const toComposerReference = useCallback((path: string) => {
+    const cwd = activeSession?.projectDir;
+    if (cwd) {
+      const unixPrefix = `${cwd}/`;
+      const winPrefix = `${cwd}\\`;
+      if (path.startsWith(unixPrefix)) return `@${path.slice(unixPrefix.length)}`;
+      if (path.startsWith(winPrefix)) return `@${path.slice(winPrefix.length).replace(/\\/g, '/')}`;
+    }
+    return `@${path.replace(/\\/g, '/')}`;
+  }, [activeSession?.projectDir]);
+
+  const openSpecChangesPath = useMemo(() => {
+    const cwd = activeSession?.projectDir;
+    if (!cwd) return null;
+    return `${cwd.replace(/[\\/]+$/, '')}/openspec/changes`;
+  }, [activeSession?.projectDir]);
+
+  const openP2pConfigPanel = useCallback((tab: P2pConfigTab = 'participants') => {
+    setP2pConfigInitialTab(tab);
+    setP2pConfigOpen(true);
+  }, []);
+
+  const refreshOpenSpecChanges = useCallback(() => {
+    if (!ws || !openSpecChangesPath) return;
+    setOpenSpecLoading(true);
+    setOpenSpecError(null);
+    openSpecRequestIdRef.current = ws.fsListDir(openSpecChangesPath, false, false);
+  }, [openSpecChangesPath, ws]);
+
+  const insertOpenSpecPrompt = useCallback((kind: 'audit' | 'implement', reference: string) => {
+    const prompt = kind === 'audit'
+      ? t('openspec.audit_prompt', { reference })
+      : t('openspec.implement_prompt', { reference });
+    appendToInput([prompt]);
+  }, [t]);
+
   const activeSub = (subSessions ?? []).find((s) => s.sessionName === activeSession?.name);
   const rootSession = activeSub?.parentSession || activeSession?.name || '';
   const hasConfiguredP2pParticipants = useMemo(() => {
@@ -558,6 +613,33 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       });
     });
   }, [p2pConfigKey]);
+
+  useEffect(() => {
+    if (!ws) return;
+    return ws.onMessage((msg: ServerMessage) => {
+      const requestId = openSpecRequestIdRef.current;
+      if (!requestId || msg.type !== 'fs.ls_response' || msg.requestId !== requestId) return;
+      openSpecRequestIdRef.current = null;
+      setOpenSpecLoading(false);
+      if (msg.status === 'error') {
+        const errorText = msg.error ?? 'Unable to scan OpenSpec changes';
+        if (/enoent|not found|no such file/i.test(errorText)) {
+          setOpenSpecChanges([]);
+          setOpenSpecError(null);
+          return;
+        }
+        setOpenSpecChanges([]);
+        setOpenSpecError(errorText);
+        return;
+      }
+      const changeNames = (msg.entries ?? [])
+        .filter((entry) => entry.isDir)
+        .map((entry) => entry.name)
+        .sort((a, b) => a.localeCompare(b));
+      setOpenSpecChanges(changeNames);
+      setOpenSpecError(null);
+    });
+  }, [ws]);
 
   useEffect(() => {
     if (!hasConfiguredP2pParticipants && isComboMode(p2pMode)) {
@@ -1138,6 +1220,83 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>
 
         {/* Model selector — outside overflow-x scroll area so dropdown isn't clipped */}
+        {openSpecChangesPath && (
+          <div class="shortcuts-model" ref={openSpecRef}>
+            <button
+              class="shortcut-btn"
+              onClick={() => {
+                setOpenSpecOpen((open) => {
+                  const next = !open;
+                  if (next) refreshOpenSpecChanges();
+                  return next;
+                });
+              }}
+              disabled={disabled}
+              title="OpenSpec changes"
+              style={{ color: '#f97316', fontSize: 10, fontWeight: 600 }}
+            >
+              {t('openspec.title')}
+            </button>
+            {openSpecOpen && (
+              <div class="menu-dropdown">
+                <div class="p2p-menu-section-label" style={{ marginTop: 0 }}>{t('openspec.changes')}</div>
+                {openSpecLoading && (
+                  <div class="p2p-menu-section-label" style={{ textTransform: 'none', letterSpacing: 'normal', marginTop: 4 }}>{t('common.loading')}</div>
+                )}
+                {!openSpecLoading && openSpecError && (
+                  <div class="p2p-menu-section-label" style={{ textTransform: 'none', letterSpacing: 'normal', color: '#fca5a5', marginTop: 4 }}>
+                    {openSpecError}
+                  </div>
+                )}
+                {!openSpecLoading && !openSpecError && openSpecChanges.length === 0 && (
+                  <div class="p2p-menu-section-label" style={{ textTransform: 'none', letterSpacing: 'normal', marginTop: 4 }}>{t('openspec.empty')}</div>
+                )}
+                {!openSpecLoading && !openSpecError && openSpecChanges.map((changeName) => (
+                  <div
+                    key={changeName}
+                    style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                  >
+                    <button
+                      class="menu-item"
+                      style={{ flex: 1, minWidth: 0 }}
+                      onClick={() => {
+                        if (!openSpecChangesPath) return;
+                        appendToInput([toComposerReference(`${openSpecChangesPath}/${changeName}`)]);
+                        setOpenSpecOpen(false);
+                      }}
+                    >
+                      {changeName}
+                    </button>
+                    <button
+                      class="btn btn-secondary"
+                      style={{ padding: '4px 8px', fontSize: 11, whiteSpace: 'nowrap' }}
+                      onClick={() => {
+                        if (!openSpecChangesPath) return;
+                        const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                        insertOpenSpecPrompt('audit', reference);
+                        setOpenSpecOpen(false);
+                      }}
+                    >
+                      {t('openspec.audit_action')}
+                    </button>
+                    <button
+                      class="btn btn-secondary"
+                      style={{ padding: '4px 8px', fontSize: 11, whiteSpace: 'nowrap' }}
+                      onClick={() => {
+                        if (!openSpecChangesPath) return;
+                        const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                        insertOpenSpecPrompt('implement', reference);
+                        setOpenSpecOpen(false);
+                      }}
+                    >
+                      {t('openspec.implement_action')}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
         {isClaudeCode && (
           <div class="shortcuts-model" ref={modelRef}>
             <button
@@ -1259,7 +1418,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           </button>
           <button
             class="shortcut-btn p2p-settings-btn"
-            onClick={() => { setP2pOpen(false); setP2pConfigOpen(true); }}
+            onClick={() => { setP2pOpen(false); openP2pConfigPanel('participants'); }}
             disabled={disabled}
             title={t('p2p.settings_title')}
             aria-label={t('p2p.settings_button')}
@@ -1302,6 +1461,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   ○ {getP2pModeLabel(key, t)}
                 </button>
               ))}
+              <div class="menu-divider" />
+              <button
+                class="menu-item"
+                onClick={() => {
+                  setP2pOpen(false);
+                  openP2pConfigPanel('combos');
+                }}
+              >
+                {t('p2p.settings_button')}
+              </button>
               {p2pMode !== 'solo' && (
                 <>
                   <div class="menu-divider" />
@@ -1628,7 +1797,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         {p2pMode === P2P_CONFIG_MODE && (
           <button
             class="btn btn-secondary"
-            onClick={() => setP2pConfigOpen(true)}
+            onClick={() => openP2pConfigPanel('participants')}
             disabled={disabled}
             title={t('p2p.settings_title')}
             style={{ padding: '6px 10px' }}
@@ -1732,6 +1901,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         sessions={(sessions ?? []).map(s => ({ name: s.name, agentType: s.agentType, state: s.state }))}
         subSessions={subSessions ?? []}
         activeSession={activeSession?.name}
+        initialTab={p2pConfigInitialTab}
         onClose={() => setP2pConfigOpen(false)}
         onSave={(cfg) => {
           setP2pSavedConfig(cfg);

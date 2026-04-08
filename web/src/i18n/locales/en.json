@@ -438,6 +438,15 @@
       "tip_history": "Multi-agent discussions share files and keep fuller history. One-to-one discussions are treated as one-off discussions."
     }
   },
+  "openspec": {
+    "title": "OpenSpec",
+    "changes": "Changes",
+    "empty": "No OpenSpec changes found",
+    "audit_action": "Audit",
+    "implement_action": "Implement",
+    "audit_prompt": "Audit {{reference}}. Based on the audit findings, complete {{reference}}.",
+    "implement_prompt": "Arrange sub-agents to start implementing {{reference}}. You are responsible for task breakdown and acceptance."
+  },
   "upload": {
     "upload_file": "Upload file",
     "uploading": "Uploading...",

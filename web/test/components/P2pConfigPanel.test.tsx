@@ -37,6 +37,7 @@ function renderPanel(overrides: {
   sessions?: typeof sessions;
   subSessions?: typeof subSessions;
   activeSession?: string;
+  initialTab?: 'participants' | 'combos';
   onClose?: () => void;
   onSave?: (cfg: P2pSavedConfig) => void;
 } = {}) {
@@ -44,6 +45,7 @@ function renderPanel(overrides: {
     sessions: overrides.sessions ?? sessions,
     subSessions: overrides.subSessions ?? subSessions,
     activeSession: overrides.activeSession ?? 'deck_proj_brain',
+    initialTab: overrides.initialTab,
     onClose: overrides.onClose ?? vi.fn(),
     onSave: overrides.onSave ?? vi.fn(),
   };
@@ -207,6 +209,14 @@ describe('P2pConfigPanel', () => {
     fireEvent.click(cancelBtn);
 
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it('can open directly on the combos tab', async () => {
+    renderPanel({ initialTab: 'combos' });
+    await flush();
+
+    expect(screen.getByText('+mode_brainstorm')).toBeDefined();
+    expect(screen.queryByText('brain')).toBeNull();
   });
 
   it('new sessions not in saved config default to disabled with audit mode', async () => {

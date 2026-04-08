@@ -438,6 +438,15 @@
       "tip_history": "Las discusiones multiagente comparten archivos y conservan mejor historial. Las discusiones uno a uno se tratan como puntuales."
     }
   },
+  "openspec": {
+    "title": "OpenSpec",
+    "changes": "Cambios",
+    "empty": "No se encontraron cambios de OpenSpec",
+    "audit_action": "Auditar",
+    "implement_action": "Implementar",
+    "audit_prompt": "Audita {{reference}}. En función de los hallazgos de la auditoría, completa {{reference}}.",
+    "implement_prompt": "Organiza subagentes para empezar a implementar {{reference}}. Tú te encargas de desglosar tareas y de la aceptación."
+  },
   "upload": {
     "upload_file": "Subir archivo",
     "uploading": "Subiendo...",

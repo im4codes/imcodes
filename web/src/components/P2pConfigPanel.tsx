@@ -28,6 +28,7 @@ interface Props {
   subSessions: SubSessionRow[];
   /** Active main session name — only show sessions scoped to this one by default */
   activeSession?: string | null;
+  initialTab?: 'participants' | 'combos';
   onClose: () => void;
   onSave: (config: P2pSavedConfig) => void;
 }
@@ -195,12 +196,23 @@ const btnPrimaryStyle: Record<string, string | number> = {
   cursor: 'pointer',
 };
 
-export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, onSave }: Props) {
+export function P2pConfigPanel({
+  sessions,
+  subSessions,
+  activeSession,
+  initialTab = 'participants',
+  onClose,
+  onSave,
+}: Props) {
   const { t } = useTranslation();
   const [agentFlavorFilter, setAgentFlavorFilter] = useState<AgentFlavorFilter>('sdk');
-  const [activeTab, setActiveTab] = useState<'participants' | 'combos'>('participants');
+  const [activeTab, setActiveTab] = useState<'participants' | 'combos'>(initialTab);
   const { customCombos, saveCustomCombos } = useP2pCustomCombos();
   const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' && window.innerWidth < 768);
+
+  useEffect(() => {
+    setActiveTab(initialTab);
+  }, [initialTab]);
 
   // Build combined eligible session list (exclude shell/script).
   // If activeSession is a sub-session, resolve its parent for scope filtering.

@@ -11,7 +11,18 @@ if (!HTMLElement.prototype.scrollIntoView) {
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string, _opts?: Record<string, unknown>) => {
+    t: (key: string, opts?: Record<string, unknown>) => {
+      if (key === 'openspec.title') return 'OpenSpec';
+      if (key === 'openspec.changes') return 'changes';
+      if (key === 'openspec.empty') return 'empty';
+      if (key === 'openspec.audit_action') return 'audit_action';
+      if (key === 'openspec.implement_action') return 'implement_action';
+      if (key === 'openspec.audit_prompt') {
+        return `audit ${(opts?.reference as string) ?? ''}, improve ${(opts?.reference as string) ?? ''}`;
+      }
+      if (key === 'openspec.implement_prompt') {
+        return `delegate ${(opts?.reference as string) ?? ''}, split tasks and accept`;
+      }
       const parts = key.split('.');
       return parts[parts.length - 1];
     },
@@ -54,13 +65,23 @@ import type { SessionInfo } from '../../src/types.js';
 
 const flushAsync = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-const makeWs = () => ({
-  sendSessionCommand: vi.fn(),
-  sendInput: vi.fn(),
-  connected: true,
-  subSessionSetModel: vi.fn(),
-  onMessage: vi.fn(() => () => {}),
-});
+const makeWs = () => {
+  const handlers = new Set<(msg: unknown) => void>();
+  return {
+    sendSessionCommand: vi.fn(),
+    sendInput: vi.fn(),
+    connected: true,
+    subSessionSetModel: vi.fn(),
+    fsListDir: vi.fn(() => 'openspec-request'),
+    onMessage: vi.fn((handler: (msg: unknown) => void) => {
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    }),
+    emit: (msg: unknown) => {
+      handlers.forEach((handler) => handler(msg));
+    },
+  };
+};
 
 const makeQuickData = () => ({
   data: { history: [], sessionHistory: {}, commands: [], phrases: [] },
@@ -108,6 +129,8 @@ describe('SessionControls', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    sessionStorage.clear();
+    localStorage.clear();
     getUserPrefMock.mockImplementation(async (key: unknown) => {
       if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
         const sessionKey = key.slice('p2p_session_config:'.length);
@@ -384,6 +407,107 @@ describe('SessionControls', () => {
       p2pRounds: 2,
       p2pLocale: 'en',
     });
+  });
+
+  it('opens combo settings from the bottom of the solo combo dropdown', async () => {
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: /mode_solo/i }));
+
+    const menu = document.querySelector('.menu-dropdown-p2p') as HTMLElement;
+    fireEvent.click(within(menu).getByRole('button', { name: 'settings_button' }));
+    await flushAsync();
+
+    expect(screen.getByText('+mode_brainstorm')).toBeDefined();
+  });
+
+  it('lists openspec changes and appends the selected reference to the input', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+
+    expect(ws.fsListDir).toHaveBeenCalledWith('/repo/openspec/changes', false, false);
+
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-b', path: '/repo/openspec/changes/change-b', isDir: true, hidden: false },
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+        { name: 'README.md', path: '/repo/openspec/changes/README.md', isDir: false, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'change-a' }));
+
+    expect(screen.getByRole('textbox').textContent).toBe('@openspec/changes/change-a');
+  });
+
+  it('inserts an openspec audit prompt without sending immediately', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'audit_action' }));
+
+    expect(screen.getByRole('textbox').textContent).toBe('audit @openspec/changes/change-a, improve @openspec/changes/change-a');
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it('inserts an openspec implement prompt without sending immediately', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'implement_action' }));
+
+    expect(screen.getByRole('textbox').textContent).toBe('delegate @openspec/changes/change-a, split tasks and accept');
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
   });
 
   it('clears input after send', () => {
