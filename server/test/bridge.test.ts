@@ -1702,6 +1702,37 @@ describe('WsBridge', () => {
       expect(payload?.title).not.toContain('bootmainxowfy6');
     });
 
+    it('uses cached sub-session labels for timeline idle pushes before explicit session.idle arrives', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'subsession.sync',
+        id: 'timeline-worker',
+        sessionType: 'codex',
+        label: 'Worker Timeline',
+        parentSession: 'deck_cd_brain',
+      }));
+      await flushAsync();
+      vi.mocked(dispatchPush).mockClear();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          sessionId: 'deck_sub_timeline-worker',
+          eventId: 'evt-1',
+          ts: Date.now(),
+          type: 'session.state',
+          payload: { state: 'idle' },
+        },
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
+      expect(payload?.title).toBe('my-server · Worker Timeline · codex');
+      expect(payload?.title).not.toContain('deck_sub_timeline-worker');
+    });
+
     it('uses lastText as push body for session.idle', async () => {
       const { dispatchPush } = await import('../src/routes/push.js');
       const { daemonWs } = await setupPushBridge();

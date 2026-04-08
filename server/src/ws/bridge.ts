@@ -139,6 +139,13 @@ export interface WatchActiveMainSessionRow {
   label?: string;
 }
 
+type WatchActiveSubSessionRow = {
+  name: string;
+  parentSession?: string;
+  agentType?: string;
+  label?: string;
+};
+
 type PendingPreviewRequest = {
   readable: ReadableStream<Uint8Array>;
   controller: ReadableStreamDefaultController<Uint8Array> | null;
@@ -279,6 +286,8 @@ export class WsBridge {
 
   /** Latest daemon-owned active main-session snapshot for watch list responses. */
   private activeMainSessions = new Map<string, WatchActiveMainSessionRow>();
+  /** Latest daemon-owned active sub-session snapshot for push title resolution. */
+  private activeSubSessions = new Map<string, WatchActiveSubSessionRow>();
   private hasActiveMainSessionSnapshot = false;
 
   /**
@@ -503,6 +512,7 @@ export class WsBridge {
         this.authenticated = false;
         this.recentTextBySession.clear();
         this.activeMainSessions.clear();
+        this.activeSubSessions.clear();
         this.hasActiveMainSessionSnapshot = false;
         this.rejectAllPendingFileTransfers('daemon_disconnected');
         this.rejectAllPendingHttpTimelineRequests('daemon_disconnected');
@@ -845,10 +855,10 @@ export class WsBridge {
       return;
     }
 
-    if (type === 'session_list') {
-      this.replaceActiveMainSessions(msg.sessions);
-      this.pruneMainSessionRecentText(msg.sessions);
-      this.broadcastToBrowsers(JSON.stringify({
+      if (type === 'session_list') {
+        this.replaceActiveMainSessions(msg.sessions);
+        this.pruneMainSessionRecentText(msg.sessions);
+        this.broadcastToBrowsers(JSON.stringify({
         ...msg,
         daemonVersion: typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion,
       }));
@@ -939,6 +949,13 @@ export class WsBridge {
 
     // ── Sub-session sync: daemon creates sub-sessions → persist to DB ────────
     if (type === 'subsession.sync' && this.db) {
+      const subSessionName = `deck_sub_${String(msg.id ?? '')}`;
+      if (subSessionName !== 'deck_sub_') {
+        const label = typeof msg.label === 'string' && msg.label.trim() ? msg.label.trim() : undefined;
+        const parentSession = typeof msg.parentSession === 'string' && msg.parentSession ? msg.parentSession : undefined;
+        const agentType = typeof msg.sessionType === 'string' && msg.sessionType ? msg.sessionType : undefined;
+        this.activeSubSessions.set(subSessionName, { name: subSessionName, label, parentSession, agentType });
+      }
       void createSubSession(
         this.db,
         msg.id as string,
@@ -1058,7 +1075,9 @@ export class WsBridge {
         void this.db.execute('UPDATE sub_sessions SET closed_at = $1 WHERE id = $2 AND server_id = $3',
           [Date.now(), id, this.serverId])
           .then(() => {
-            this.recentTextBySession.delete(`deck_sub_${id}`);
+            const sessionName = `deck_sub_${id}`;
+            this.recentTextBySession.delete(sessionName);
+            this.activeSubSessions.delete(sessionName);
             this.broadcastToBrowsers(JSON.stringify({ type: 'subsession.removed', id, sessionName: msg.sessionName }));
           })
           .catch((err) => {
@@ -2150,6 +2169,7 @@ export class WsBridge {
       visited.add(currentSessionName);
 
       const active = this.activeMainSessions.get(currentSessionName);
+      const activeSubSession = this.activeSubSessions.get(currentSessionName);
       let sessionRow = await db.queryOne<{ project_name: string; agent_type: string; label: string | null }>(
         'SELECT project_name, agent_type, label FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
         [this.serverId, currentSessionName],
@@ -2157,6 +2177,12 @@ export class WsBridge {
 
       let parentSession: string | undefined;
       let subType: string | undefined;
+      if (activeSubSession) {
+        subType = activeSubSession.agentType;
+        parentSession = activeSubSession.parentSession;
+        const activeSubDisplay = pickReadableSessionDisplay([activeSubSession.label], currentSessionName);
+        if (!displayName && activeSubDisplay) displayName = activeSubDisplay;
+      }
       if (!sessionRow && currentSessionName.startsWith('deck_sub_')) {
         const subRow: { type: string; label: string | null; parent_session: string | null } | null = await db
           .queryOne<{ type: string; label: string | null; parent_session: string | null }>(
