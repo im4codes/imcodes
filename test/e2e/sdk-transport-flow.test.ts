@@ -848,9 +848,8 @@ describe('sdk transport flow e2e', () => {
     const toolResult = mocks.emitted.find((e) => e.session === SESSION_CC && e.type === 'tool.result');
     const claudeCall = mocks.claudeCalls.at(-1);
 
-    expect(streaming.map((e) => e.payload.text)).toEqual(['Claude', 'Claude: hello']);
+    expect(streaming.map((e) => e.payload.text)).toEqual(['Claude']);
     expect(streaming[0]?.opts?.eventId).toBe(stableEventId);
-    expect(streaming[1]?.opts?.eventId).toBe(stableEventId);
     expect(final?.payload.text).toBe('Claude: hello');
     expect(final?.opts?.eventId).toBe(stableEventId);
     expect(usage?.payload.model).toBe('claude-sonnet-4-6');
@@ -887,9 +886,8 @@ describe('sdk transport flow e2e', () => {
     const toolResult = mocks.emitted.find((e) => e.session === SESSION_CX && e.type === 'tool.result');
     const ack = mocks.emitted.find((e) => e.session === SESSION_CX && e.type === 'command.ack');
 
-    expect(streaming.map((e) => e.payload.text)).toEqual(['Codex', 'Codex: hello']);
+    expect(streaming.map((e) => e.payload.text)).toEqual(['Codex']);
     expect(streaming[0]?.opts?.eventId).toBe(`transport:${SESSION_CX}:msg-codex-e2e`);
-    expect(streaming[1]?.opts?.eventId).toBe(`transport:${SESSION_CX}:msg-codex-e2e`);
     expect(final?.payload.text).toBe('Codex: hello');
     expect(final?.opts?.eventId).toBe(`transport:${SESSION_CX}:msg-codex-e2e`);
     expect(usage?.payload.inputTokens).toBe(7);
