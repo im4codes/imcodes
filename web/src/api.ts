@@ -577,6 +577,7 @@ export interface SubSessionData {
   quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null;
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null;
   transportConfig?: Record<string, unknown> | null;
+  transportPendingMessages?: string[] | null;
 }
 
 export async function listSubSessions(serverId: string): Promise<SubSessionData[]> {

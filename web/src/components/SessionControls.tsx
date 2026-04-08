@@ -281,7 +281,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
   const [qwenModel, setQwenModel] = useState<QwenModelChoice | null>(loadQwenModel);
-  const [queuedNoticeVisible, setQueuedNoticeVisible] = useState(false);
   const [confirm, setConfirm] = useState<MenuAction | null>(null);
   const [confirmLevel, setConfirmLevel] = useState(0); // 0=none, 1=first warning, 2=second warning (sub-session only)
   const [skipComboSendConfirm, setSkipComboSendConfirm] = useState(false);
@@ -296,6 +295,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const showRunningSweep = !compact && isRunningSessionState(activeSession?.state);
+  const queuedTransportMessages = activeSession?.runtimeType === 'transport'
+    ? (activeSession.transportPendingMessages ?? [])
+    : [];
   // Internal ref for contenteditable — also written to the external inputRef
   const divRef = useRef<HTMLDivElement>(null);
   // History navigation state
@@ -837,9 +839,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const finalizeSend = useCallback((payload: PendingSendPayload, options?: { clearComposer?: boolean }) => {
     if (!ws || !activeSession) return;
-    if (activeSession.runtimeType === 'transport' && activeSession.state === 'running') {
-      setQueuedNoticeVisible(true);
-    }
     quickData.recordHistory(payload.text, activeSession.name);
     try {
       ws.sendSessionCommand('send', { sessionName: activeSession.name, text: payload.text, ...payload.extra });
@@ -891,12 +890,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     }
     return null;
   }, [hasConfiguredP2pParticipants, t]);
-
-  useEffect(() => {
-    if (!activeSession || activeSession.runtimeType !== 'transport' || activeSession.state !== 'running') {
-      setQueuedNoticeVisible(false);
-    }
-  }, [activeSession?.name, activeSession?.runtimeType, activeSession?.state]);
 
   const requestSend = useCallback((payload: PendingSendPayload | null, options?: { clearComposer?: boolean }) => {
     if (!payload) return;
@@ -1934,9 +1927,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           )}
         </div>}
       </div>
-      {queuedNoticeVisible && (
+      {queuedTransportMessages.length > 0 && (
         <div class="controls-queued-hint" role="status" aria-live="polite">
-          {t('session.transport_send_queued')}
+          <div>{t('session.transport_send_queued')}</div>
+          <div class="controls-queued-list">
+            {queuedTransportMessages.map((message, index) => (
+              <div class="controls-queued-item" key={`${activeSession?.name ?? 'session'}:${index}:${message}`}>
+                {message}
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </div>

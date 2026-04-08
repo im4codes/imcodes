@@ -113,6 +113,7 @@ import { shouldSubscribeTerminalRaw, type TerminalSubscribeViewMode } from './te
 import { onWatchCommand } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
 import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timeline-running.js';
+import { extractTransportPendingMessages } from './transport-queue.js';
 import { ingestTimelineEventForCache } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 
@@ -1143,6 +1144,9 @@ export function App() {
             quotaUsageLabel: s.quotaUsageLabel,
             quotaMeta: s.quotaMeta ?? existing?.quotaMeta,
             effort: s.effort ?? existing?.effort,
+            transportPendingMessages: s.state === 'queued'
+              ? (existing?.transportPendingMessages ?? [])
+              : [],
           };
         }));
         setSessionsLoaded(true);
@@ -1202,9 +1206,18 @@ export function App() {
         // Sync session state from live timeline events (running/idle)
         if (event.type === 'session.state' && !event.sessionId.startsWith('deck_sub_')) {
           const liveState = String(event.payload.state ?? '');
-          if (liveState === 'running' || liveState === 'idle') {
+          if (liveState === 'queued') {
+            const pendingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
             setSessions((prev) => prev.map((s) =>
-              s.name === event.sessionId ? { ...s, state: liveState as SessionInfo['state'] } : s,
+              s.name === event.sessionId
+                ? { ...s, transportPendingMessages: pendingMessages }
+                : s,
+            ));
+          } else if (liveState === 'running' || liveState === 'idle') {
+            setSessions((prev) => prev.map((s) =>
+              s.name === event.sessionId
+                ? { ...s, state: liveState as SessionInfo['state'], transportPendingMessages: [] }
+                : s,
             ));
           }
         }
@@ -1276,7 +1289,7 @@ export function App() {
         }
         if (!sessionName.startsWith('deck_sub_')) {
           // Main session: update state + tab alert
-          setSessions((prev) => prev.map((s) => s.name === sessionName ? { ...s, state: 'idle' as SessionInfo['state'] } : s));
+          setSessions((prev) => prev.map((s) => s.name === sessionName ? { ...s, state: 'idle' as SessionInfo['state'], transportPendingMessages: [] } : s));
           // Always flash the tab — even if it's the active one
           setIdleAlerts((prev) => new Set([...prev, sessionName]));
         }

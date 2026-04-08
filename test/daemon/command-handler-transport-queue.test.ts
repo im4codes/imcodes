@@ -144,6 +144,7 @@ describe('handleWebCommand transport queue behavior', () => {
     getTransportRuntimeMock.mockReturnValue({
       send: vi.fn(() => 'queued'),
       pendingCount: 2,
+      pendingMessages: ['queued msg', 'queued msg 2'],
     });
 
     handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'queued msg', commandId: 'cmd-queued' }, serverLink as any);
@@ -153,7 +154,7 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
-      { state: 'queued', pendingCount: 2 },
+      { state: 'queued', pendingCount: 2, pendingMessages: ['queued msg', 'queued msg 2'] },
       expect.any(Object),
     );
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-queued', status: 'accepted' });

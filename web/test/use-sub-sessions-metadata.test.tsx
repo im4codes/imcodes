@@ -208,6 +208,42 @@ describe('sub-session metadata via subsession.sync', () => {
     expect(captured[0].planLabel).toBe('Free');
     expect(captured[0].quotaUsageLabel).toBe('today 20/1000');
   });
+
+  it('tracks queued transport messages from timeline session.state and clears them on running', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'q4',
+      sessionName: 'deck_sub_q4',
+      sessionType: 'qwen',
+      state: 'running',
+    }));
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_q4',
+        payload: { state: 'queued', pendingMessages: ['queued one', 'queued two'] },
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['queued one', 'queued two']);
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_q4',
+        payload: { state: 'running' },
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual([]);
+  });
 });
 
 describe('sub-session metadata integration', () => {

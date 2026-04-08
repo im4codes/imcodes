@@ -120,6 +120,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   get sending(): boolean { return this._sending; }
   /** Number of messages waiting in the queue. */
   get pendingCount(): number { return this._pendingMessages.length; }
+  /** Snapshot of queued messages waiting to be drained. */
+  get pendingMessages(): string[] { return [...this._pendingMessages]; }
 
   async initialize(config: SessionConfig): Promise<void> {
     this._providerSessionId = await this.provider.createSession(config);

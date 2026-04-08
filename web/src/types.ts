@@ -53,6 +53,7 @@ export interface SessionInfo {
   quotaUsageLabel?: string;
   quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null;
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel;
+  transportPendingMessages?: string[];
 }
 
 export interface ServerInfo {

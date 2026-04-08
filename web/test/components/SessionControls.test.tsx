@@ -688,33 +688,24 @@ describe('SessionControls', () => {
   });
 
 
-  it('shows a bottom queued notice when sending to a running transport session', () => {
-    const ws = makeWs();
+  it('shows queued transport messages at the bottom', () => {
     const runningSession = makeSession({
       name: 'qwen-session',
       agentType: 'qwen',
       runtimeType: 'transport',
       state: 'running',
+      transportPendingMessages: ['queued send', 'second queued send'],
     });
     render(
       <SessionControls
-        ws={ws as any}
+        ws={makeWs() as any}
         activeSession={runningSession}
         quickData={makeQuickData() as any}
       />,
     );
-
-    const input = screen.getByRole('textbox') as HTMLDivElement;
-    input.textContent = 'queued send';
-    fireEvent.input(input);
-    fireEvent.click(screen.getByRole('button', { name: /send/i }));
-
-    // Message is sent immediately — daemon handles queuing internally
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
-      sessionName: 'qwen-session',
-      text: 'queued send',
-    });
     expect(screen.getByText('transport_send_queued')).toBeDefined();
+    expect(screen.getByText('queued send')).toBeDefined();
+    expect(screen.getByText('second queued send')).toBeDefined();
   });
 
   it('pressing Escape in a running transport input sends /stop command', () => {

@@ -1397,7 +1397,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         timelineEmitter.emit(sessionName, 'user.message', { text });
       }
       if (result === 'queued') {
-        timelineEmitter.emit(sessionName, 'session.state', { state: 'queued', pendingCount: transportRuntime.pendingCount }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'session.state', {
+          state: 'queued',
+          pendingCount: transportRuntime.pendingCount,
+          pendingMessages: transportRuntime.pendingMessages,
+        }, { source: 'daemon', confidence: 'high' });
       }
       // Clear fresh-start flag — the new conversation is now active
       if (record?.qwenFreshOnResume) {
