@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 import { P2pProgressCard } from '../components/P2pProgressCard.js';
@@ -274,8 +274,14 @@ export function DiscussionsPage({ ws, initialSelectedId, liveDiscussions = [], o
   const formatTime = (ts: number) => new Date(ts).toLocaleString();
 
   // Find matching live discussion for progress display
-  const activeLive = liveDiscussions.filter((d) => d.state !== 'done' && d.state !== 'failed');
-  const selectedDiscussion = selected ? discussions.find((d) => d.id === selected) ?? null : null;
+  const activeLive = useMemo(
+    () => liveDiscussions.filter((d) => d.state !== 'done' && d.state !== 'failed'),
+    [liveDiscussions],
+  );
+  const selectedDiscussion = useMemo(
+    () => (selected ? discussions.find((d) => d.id === selected) ?? null : null),
+    [discussions, selected],
+  );
 
   return (
     <div class="discussions-page">

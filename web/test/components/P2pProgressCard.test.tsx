@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, cleanup, fireEvent } from '@testing-library/preact';
+import { render, screen, cleanup, fireEvent, act } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -15,12 +15,15 @@ import { P2pProgressCard } from '../../src/components/P2pProgressCard.js';
 
 describe('P2pProgressCard', () => {
   beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));
     HTMLElement.prototype.scrollIntoView = vi.fn();
   });
 
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
+    vi.useRealTimers();
   });
 
   it('shows round-local hop progress instead of global hop index', () => {
@@ -117,6 +120,8 @@ describe('P2pProgressCard', () => {
           activeHop: 1,
           activeRoundHop: 1,
           activePhase: 'hop',
+          startedAt: Date.now(),
+          hopStartedAt: Date.now(),
           nodes: [
             { label: 'brain', agentType: 'codex', status: 'active', phase: 'hop' },
           ],
@@ -126,6 +131,39 @@ describe('P2pProgressCard', () => {
 
     expect(container.querySelectorAll('.is-active').length).toBeGreaterThan(0);
     expect(container.querySelector('.p2p-timer-total')).toBeTruthy();
+  });
+
+  it('updates timer labels while keeping the running progress card active', () => {
+    render(
+      <P2pProgressCard
+        discussion={{
+          id: 'p2p_run_timers',
+          topic: 'P2P audit · brain',
+          state: 'running',
+          modeKey: 'audit',
+          currentRound: 1,
+          maxRounds: 2,
+          completedHops: 0,
+          totalHops: 2,
+          activeHop: 1,
+          activeRoundHop: 1,
+          activePhase: 'hop',
+          startedAt: Date.now(),
+          hopStartedAt: Date.now(),
+          nodes: [
+            { label: 'brain', agentType: 'codex', status: 'active', phase: 'hop' },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getAllByText('00:00').length).toBeGreaterThanOrEqual(2);
+
+    act(() => {
+      vi.advanceTimersByTime(2000);
+    });
+
+    expect(screen.getAllByText('00:02').length).toBeGreaterThan(0);
   });
 
   it('shows parallel hop ranges and highlights all active hop segments', () => {
