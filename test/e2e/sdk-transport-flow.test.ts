@@ -24,6 +24,39 @@ const mocks = vi.hoisted(() => {
   return { store, emitted, claudeCalls, codexCalls };
 });
 
+const PRESET_ENV = {
+  ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+  ANTHROPIC_AUTH_TOKEN: 'test-token',
+  ANTHROPIC_API_KEY: 'test-token',
+  ANTHROPIC_MODEL: 'MiniMax-M2.7',
+  ANTHROPIC_SMALL_FAST_MODEL: 'MiniMax-M2.7',
+  ANTHROPIC_DEFAULT_SONNET_MODEL: 'MiniMax-M2.7',
+  ANTHROPIC_DEFAULT_OPUS_MODEL: 'MiniMax-M2.7',
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: 'MiniMax-M2.7',
+  IMCODES_CONTEXT_WINDOW: '200000',
+};
+
+vi.mock('../../src/daemon/cc-presets.js', () => ({
+  getPreset: vi.fn(async (name: string) => (
+    name.trim().toLowerCase() === 'minimax'
+      ? { name: 'minimax', env: PRESET_ENV, contextWindow: 200000 }
+      : undefined
+  )),
+  resolvePresetEnv: vi.fn(async (name: string) => (
+    name.trim().toLowerCase() === 'minimax' ? { ...PRESET_ENV } : {}
+  )),
+  getPresetTransportOverrides: vi.fn(async (name: string) => (
+    name.trim().toLowerCase() === 'minimax'
+      ? {
+          model: 'MiniMax-M2.7',
+          systemPrompt: 'Authoritative runtime model: MiniMax-M2.7.',
+        }
+      : {}
+  )),
+  getPresetInitMessage: vi.fn(() => 'preset-init'),
+  invalidateCache: vi.fn(),
+}));
+
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
   const { EventEmitter } = await import('node:events');
