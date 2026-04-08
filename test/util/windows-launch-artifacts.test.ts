@@ -1,4 +1,11 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
+import {
+  UPGRADE_LOCK_FILE,
+  encodeCmdAsUtf8Bom,
+  encodeVbsAsUtf16,
+  writeVbsLauncher,
+  writeWatchdogCmd,
+} from '../../src/util/windows-launch-artifacts.js';
 
 // ── Mock fs so writeWatchdogCmd doesn't touch disk ─────────────────────────
 
@@ -47,7 +54,6 @@ describe('writeWatchdogCmd', () => {
   });
 
   it('generates watchdog with upgrade lock check', async () => {
-    const { writeWatchdogCmd, UPGRADE_LOCK_FILE } = await import('../../src/util/windows-launch-artifacts.js');
     const paths = {
       nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
       imcodesScript: 'C:\\Users\\X\\AppData\\Roaming\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
@@ -77,7 +83,6 @@ describe('writeWatchdogCmd', () => {
   });
 
   it('uses npm global shim instead of hard-coded node+script paths', async () => {
-    const { writeWatchdogCmd } = await import('../../src/util/windows-launch-artifacts.js');
     const paths = {
       nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
       imcodesScript: 'C:\\Users\\X\\AppData\\Roaming\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
@@ -99,7 +104,6 @@ describe('writeWatchdogCmd', () => {
     const { existsSync } = await import('fs');
     (existsSync as ReturnType<typeof vi.fn>).mockReturnValue(false);
 
-    const { writeWatchdogCmd } = await import('../../src/util/windows-launch-artifacts.js');
     const paths = {
       nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
       imcodesScript: 'C:\\dev\\imcodes\\dist\\src\\index.js',
@@ -117,7 +121,6 @@ describe('writeWatchdogCmd', () => {
   });
 
   it('watchdog is an infinite loop with 5s retry', async () => {
-    const { writeWatchdogCmd } = await import('../../src/util/windows-launch-artifacts.js');
     const paths = {
       nodeExe: 'node.exe',
       imcodesScript: 'C:\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
@@ -142,7 +145,6 @@ describe('writeVbsLauncher', () => {
   });
 
   it('runs watchdog CMD hidden (window style 0)', async () => {
-    const { writeVbsLauncher } = await import('../../src/util/windows-launch-artifacts.js');
     const paths = {
       nodeExe: '', imcodesScript: '', logPath: '',
       watchdogPath: 'C:\\Users\\X\\.imcodes\\daemon-watchdog.cmd',
@@ -159,7 +161,6 @@ describe('writeVbsLauncher', () => {
   });
 
   it('writes VBS as UTF-16 LE with BOM (required for non-ASCII paths)', async () => {
-    const { writeVbsLauncher } = await import('../../src/util/windows-launch-artifacts.js');
     const paths = {
       nodeExe: '', imcodesScript: '', logPath: '',
       watchdogPath: 'C:\\Users\\云科I\\.imcodes\\daemon-watchdog.cmd',
@@ -183,7 +184,6 @@ describe('writeVbsLauncher', () => {
   });
 
   it('uses On Error Resume Next so wscript never pops up an error dialog', async () => {
-    const { writeVbsLauncher } = await import('../../src/util/windows-launch-artifacts.js');
     const paths = {
       nodeExe: '', imcodesScript: '', logPath: '',
       watchdogPath: 'C:\\nonexistent\\path.cmd',
@@ -198,7 +198,6 @@ describe('writeVbsLauncher', () => {
 
 describe('encodeCmdAsUtf8Bom', () => {
   it('prepends UTF-8 BOM (EF BB BF)', async () => {
-    const { encodeCmdAsUtf8Bom } = await import('../../src/util/windows-launch-artifacts.js');
     const buf = encodeCmdAsUtf8Bom('@echo off\r\necho 云科\r\n');
     expect(buf[0]).toBe(0xEF);
     expect(buf[1]).toBe(0xBB);
@@ -211,7 +210,6 @@ describe('encodeCmdAsUtf8Bom', () => {
 
 describe('encodeVbsAsUtf16', () => {
   it('prepends UTF-16 LE BOM (FF FE)', async () => {
-    const { encodeVbsAsUtf16 } = await import('../../src/util/windows-launch-artifacts.js');
     const buf = encodeVbsAsUtf16('WScript.Echo "云科"');
     expect(buf[0]).toBe(0xFF);
     expect(buf[1]).toBe(0xFE);
@@ -227,7 +225,6 @@ describe('writeWatchdogCmd encoding', () => {
   });
 
   it('writes watchdog .cmd as UTF-8 with BOM (required for non-ASCII paths)', async () => {
-    const { writeWatchdogCmd } = await import('../../src/util/windows-launch-artifacts.js');
     const paths = {
       nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
       imcodesScript: 'C:\\Users\\云科I\\AppData\\Roaming\\npm\\node_modules\\imcodes\\dist\\src\\index.js',
@@ -254,7 +251,6 @@ describe('writeWatchdogCmd encoding', () => {
 
 describe('UPGRADE_LOCK_FILE', () => {
   it('is under .imcodes directory', async () => {
-    const { UPGRADE_LOCK_FILE } = await import('../../src/util/windows-launch-artifacts.js');
     expect(UPGRADE_LOCK_FILE).toContain('.imcodes');
     expect(UPGRADE_LOCK_FILE).toContain('upgrade.lock');
   });

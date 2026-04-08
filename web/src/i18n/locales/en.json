@@ -18,7 +18,9 @@
     "connected": "Connected",
     "disconnected": "Disconnected",
     "reconnecting": "Reconnecting…",
-    "refresh": "Refresh"
+    "refresh": "Refresh",
+    "show": "Show",
+    "hide": "Hide"
   },
   "chat": {
     "loading": "Loading chat...",
@@ -73,6 +75,7 @@
     "no_session": "No session",
     "send_queued": "Reconnecting… (send queued)",
     "transport_send_queued": "Queued — will send after the current reply finishes",
+    "transport_send_queued_collapsed": "{{count}} queued · showing latest only",
     "send_placeholder": "Send to {{name}}…",
     "actions": "Session actions",
     "new_btn": "New session",
@@ -176,7 +179,9 @@
     "no_changes": "No changes"
   },
   "toast": {
-    "finished": "finished"
+    "finished": "finished",
+    "upgrade_blocked_title": "Upgrade blocked",
+    "upgrade_blocked_p2p_active": "P2P is still running. Stop it before upgrading the daemon."
   },
   "discussion": {
     "role_critic": "Critic",
@@ -354,6 +359,9 @@
       "phase_queued": "Queued",
       "round_label": "Round",
       "hop_label": "Hop",
+      "auto_follow_latest": "Auto-follow latest",
+      "copy_path": "Copy path",
+      "copy_content": "Copy content",
       "scroll_top": "Scroll to top",
       "scroll_bottom": "Scroll to bottom"
     },
@@ -364,6 +372,10 @@
     "mode_brainstorm": "Brainstorm",
     "mode_discuss": "Discuss",
     "combo_label": "Combo",
+    "combo_presets": "Preset Combos",
+    "combo_custom": "My Combos",
+    "combo_custom_empty": "No custom combos yet.",
+    "combo_builder": "Add New Combo",
     "exclude_same_type": "Exclude same type",
     "picker": {
       "back": "Back",
@@ -389,11 +401,19 @@
       "discuss": "Discuss"
     },
     "mode_config": "Config",
+    "settings_button": "P2P Settings",
     "settings_title": "P2P Participant Settings",
     "cross_session": "Include sessions from other projects",
+    "settings_filter_sdk": "SDK",
+    "settings_filter_cli": "CLI",
     "settings_save": "Save",
     "settings_close": "Close",
     "confirm_cancel": "Sure to cancel?",
+    "combo_send_confirm_title": "Confirm combo send",
+    "combo_send_confirm_body": "This message will be sent directly with the combo flow {{mode}}. Continue?",
+    "combo_send_confirm_skip": "Don't ask again, send directly next time",
+    "combo_empty_message_warning": "Combo send requires a real message. Add some prompt text before sending.",
+    "combo_requires_participants_hint": "Choose P2P participants in Settings to enable combo modes.",
     "settings_enabled": "Participate",
     "settings_mode": "Mode",
     "settings_skip": "Skip",
@@ -420,6 +440,25 @@
       "send_anyway": "Send Anyway",
       "tip_history": "Multi-agent discussions share files and keep fuller history. One-to-one discussions are treated as one-off discussions."
     }
+  },
+  "openspec": {
+    "title": "OpenSpec",
+    "changes": "Changes",
+    "empty": "No OpenSpec changes found",
+    "audit_action": "Audit",
+    "audit_implementation_action": "Audit Implementation",
+    "audit_spec_action": "Audit Spec",
+    "implement_action": "Implement",
+    "achieve_action": "Achieve",
+    "propose_action": "Propose",
+    "propose_from_discussion_action": "From Recent Discussion",
+    "propose_from_description_action": "From Description Below",
+    "audit_implementation_prompt": "Perform a strict implementation audit for {{reference}} against its OpenSpec artifacts. Identify every mismatch, omission, regression risk, edge-case gap, and missing test; then fix the code, tests, and any required supporting changes. Do not stop at a report. Deliver the implementation in full spec compliance.",
+    "audit_spec_prompt": "Perform a strict specification audit for {{reference}}. Strengthen scope, requirements, acceptance criteria, edge cases, failure modes, dependencies, and testability; remove ambiguity and internal inconsistency; and update the spec until it is implementation-ready. Do not stop at review notes.",
+    "implement_prompt": "Drive the implementation of {{reference}} aggressively. Break the work into concrete sub-tasks, dispatch sub-agents with clear ownership, integrate their output, resolve gaps against the spec, add or update tests, and verify the finished result. You own orchestration, technical decisions, and final acceptance.",
+    "achieve_prompt": "Take {{reference}} to done using the full OpenSpec workflow. Inspect all remaining tasks and artifacts, complete the required implementation and spec work, close outstanding gaps, sync affected specs if needed, and archive the change once it meets completion criteria. Do not stop at status reporting.",
+    "propose_from_discussion_prompt": "Generate an OpenSpec proposal from the recent discussion. Extract the goal, scope, key requirements, and acceptance criteria, and list unclear points as follow-ups. Start with a change proposal draft that is ready to land.",
+    "propose_from_description_prompt": "Generate an OpenSpec proposal from the description below. Organize the goal, scope, key requirements, and acceptance criteria, and list missing details as follow-ups. Start with a change proposal draft that is ready to land."
   },
   "upload": {
     "upload_file": "Upload file",
@@ -580,6 +619,24 @@
     "expand_all": "Expand all",
     "collapse_all": "Collapse all",
     "drag_to_resize": "Drag to resize"
+  },
+  "subsessionBar": {
+    "show": "Show",
+    "hide": "Hide",
+    "layout_double": "Double row",
+    "layout_single": "Single row",
+    "card_size": "Card size",
+    "subs_count": "Subs ({{count}})",
+    "new_sub_session": "New sub-session",
+    "p2p_discussions": "P2P discussions",
+    "repository": "Repository",
+    "scheduled_tasks": "Scheduled Tasks",
+    "width_short": "W",
+    "height_short": "H",
+    "apply": "Apply",
+    "reset": "Reset",
+    "empty_prefix": "No sub-sessions — click",
+    "empty_suffix": "to add one"
   },
   "localWebPreview": {
     "title": "Local Web Preview",

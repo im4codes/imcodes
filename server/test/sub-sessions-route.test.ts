@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
 
 const createSubSessionMock = vi.fn();
+const updateSubSessionMock = vi.fn();
+const sendToDaemonMock = vi.fn();
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: any, next: any) => {
@@ -15,9 +17,17 @@ vi.mock('../src/db/queries.js', () => ({
   getSubSessionsByServer: vi.fn(),
   getSubSessionById: vi.fn(),
   createSubSession: (...args: unknown[]) => createSubSessionMock(...args),
-  updateSubSession: vi.fn(),
+  updateSubSession: (...args: unknown[]) => updateSubSessionMock(...args),
   deleteSubSession: vi.fn(),
   reorderSubSessions: vi.fn(),
+}));
+
+vi.mock('../src/ws/bridge.js', () => ({
+  WsBridge: {
+    get: () => ({
+      sendToDaemon: sendToDaemonMock,
+    }),
+  },
 }));
 
 import { subSessionRoutes } from '../src/routes/sub-sessions.js';
@@ -118,5 +128,62 @@ describe('sub-session routes', () => {
       null,
       null,
     );
+  });
+
+  it('PATCH /sub-sessions/:id relays subsession.restart when type changes', async () => {
+    const { getSubSessionById } = await import('../src/db/queries.js');
+    vi.mocked(getSubSessionById).mockResolvedValue({
+      id: 'sub12345',
+      server_id: 'srv1',
+      type: 'codex',
+    } as any);
+
+    const res = await app.request('/api/server/srv1/sub-sessions/sub12345', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'codex-sdk',
+        cwd: '/tmp/next',
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(updateSubSessionMock).toHaveBeenCalledWith(
+      {},
+      'sub12345',
+      'srv1',
+      {
+        cwd: '/tmp/next',
+      },
+    );
+    expect(sendToDaemonMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toEqual({
+      type: 'subsession.restart',
+      sessionName: 'deck_sub_sub12345',
+      agentType: 'codex-sdk',
+      cwd: '/tmp/next',
+    });
+  });
+
+  it('PATCH /sub-sessions/:id rejects browser-managed closedAt updates', async () => {
+    const { getSubSessionById } = await import('../src/db/queries.js');
+    vi.mocked(getSubSessionById).mockResolvedValue({
+      id: 'sub12345',
+      server_id: 'srv1',
+      type: 'codex',
+    } as any);
+
+    const res = await app.request('/api/server/srv1/sub-sessions/sub12345', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        closedAt: Date.now(),
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toEqual({ error: 'closed_at_managed_by_daemon' });
+    expect(updateSubSessionMock).not.toHaveBeenCalled();
+    expect(sendToDaemonMock).not.toHaveBeenCalled();
   });
 });

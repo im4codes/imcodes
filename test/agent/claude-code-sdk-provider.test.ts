@@ -152,6 +152,87 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(run.options.resume).toBeUndefined();
   });
 
+  it('uses resume mode when createSession marks an inherited session as existing', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-existing', model: 'claude-sonnet-4-6' },
+      { type: 'result', session_id: 'session-existing', subtype: 'success', is_error: false, result: 'ACK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-existing',
+      cwd: '/tmp/project',
+      resumeId: 'session-existing',
+      skipCreate: true,
+    });
+
+    await provider.send('route-existing', 'hello');
+    await flush();
+
+    const run = sdkMock.runs.at(-1)!;
+    expect(run.options.resume).toBe('session-existing');
+    expect(run.options.sessionId).toBeUndefined();
+  });
+
+  it('falls back to sessionId create when inherited resume id no longer exists', async () => {
+    const makeIterator = (messages: any[]) => {
+      async function* gen() {
+        for (const message of messages) yield message;
+      }
+      const iterator = gen() as AsyncGenerator<any, void> & { close(): void; interrupt(): Promise<void> };
+      iterator.close = () => {};
+      iterator.interrupt = async () => {};
+      return iterator;
+    };
+
+    sdkMock.query
+      .mockImplementationOnce(({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
+        sdkMock.runs.push({ prompt, options, closed: false, interrupted: false });
+        return makeIterator([
+          {
+            type: 'result',
+            session_id: 'session-missing',
+            subtype: 'error',
+            is_error: true,
+            errors: ['No conversation found with session ID: session-missing'],
+          },
+        ]);
+      })
+      .mockImplementationOnce(({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
+        sdkMock.runs.push({ prompt, options, closed: false, interrupted: false });
+        return makeIterator([
+          { type: 'system', subtype: 'init', session_id: 'session-missing', model: 'claude-sonnet-4-6' },
+          { type: 'result', session_id: 'session-missing', subtype: 'success', is_error: false, result: 'ACK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+        ]);
+      });
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-missing',
+      cwd: '/tmp/project',
+      resumeId: 'session-missing',
+      skipCreate: true,
+    });
+
+    const completed: string[] = [];
+    const errors: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+    provider.onError((_sid, err) => errors.push(err.message));
+
+    await provider.send('route-missing', 'hello');
+    await flush();
+
+    expect(sdkMock.runs).toHaveLength(2);
+    expect(sdkMock.runs[0]?.options.resume).toBe('session-missing');
+    expect(sdkMock.runs[0]?.options.sessionId).toBeUndefined();
+    expect(sdkMock.runs[1]?.options.sessionId).toBe('session-missing');
+    expect(sdkMock.runs[1]?.options.resume).toBeUndefined();
+    expect(completed).toEqual(['ACK']);
+    expect(errors).toEqual([]);
+  });
+
   it('passes session env through to the Claude SDK query options', async () => {
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-env', model: 'claude-sonnet-4-6' },

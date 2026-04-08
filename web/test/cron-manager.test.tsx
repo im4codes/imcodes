@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  */
 import { h } from 'preact';
-import { render, screen, cleanup } from '@testing-library/preact';
+import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/preact';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { CronManager } from '../src/pages/CronManager.js';
 import type { SessionInfo } from '../src/types.js';
@@ -162,5 +162,43 @@ describe('CronManager', () => {
     expect(await screen.findByText('Current job')).toBeDefined();
     expect(screen.queryByText('cron.read_only')).toBeNull();
     expect((screen.getByText('✎') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('blocks saving inline cron commands longer than 1500 chars and shows a file-reference hint', async () => {
+    apiFetch.mockResolvedValueOnce({ jobs: [] });
+
+    render(
+      <CronManager
+        serverId="srv-current"
+        projectName="cd"
+        sessions={sessions}
+        subSessions={subSessions}
+        onBack={vi.fn()}
+        servers={[{ id: 'srv-current', name: 'Current' }]}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(apiFetch).toHaveBeenCalledWith('/api/cron?serverId=srv-current&projectName=cd');
+    });
+
+    fireEvent.click(screen.getByTitle('cron.create'));
+
+    const nameInput = screen.getByPlaceholderText('cron.name_placeholder') as HTMLInputElement;
+    fireEvent.input(nameInput, { target: { value: 'Long prompt job' } });
+
+    const cronExprInput = screen.getByPlaceholderText('0 9 * * 1-5') as HTMLInputElement;
+    fireEvent.input(cronExprInput, { target: { value: '0 9 * * *' } });
+
+    const textarea = screen.getByPlaceholderText('cron.command_placeholder') as HTMLTextAreaElement;
+    const longCommand = '早上好主人！'.repeat(260);
+    fireEvent.input(textarea, { target: { value: longCommand } });
+
+    expect(screen.getByText('1560/1500 · Too long for inline entry. Write it to a file and reference it with @/path/to/file.')).toBeDefined();
+
+    fireEvent.click(screen.getByText('cron.save'));
+
+    expect(screen.getByText('Command is too long (1560/1500). Write the prompt to a file and reference it directly with @/path/to/file.')).toBeDefined();
+    expect(apiFetch).toHaveBeenCalledTimes(1);
   });
 });

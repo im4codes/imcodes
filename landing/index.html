@@ -304,7 +304,7 @@ footer {
     <div class="feat"><div class="feat-name" data-i18n="f_file_name">file browser & git</div><div class="feat-desc" data-i18n="f_file_desc">tree view, upload/download, +/- stats, floating preview</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_preview_name">local web preview</div><div class="feat-desc" data-i18n="f_preview_desc">preview localhost from any device via secure tunnel, supports HMR</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_mobile_name">mobile, watch & notifications</div><div class="feat-desc" data-i18n="f_mobile_desc">biometric auth, push notifications, shell keyboard input, watch quick replies</div></div>
-    <div class="feat"><div class="feat-name" data-i18n="f_discuss_name">multi-agent discussions</div><div class="feat-desc" data-i18n="f_discuss_desc">discuss, audit, review across providers with ring progress</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_discuss_name">cross-provider audit</div><div class="feat-desc" data-i18n="f_discuss_desc">multi-agent P2P discussions with customizable phases (audit, review, brainstorm…) — different models catch different issues before code is written, reducing rework</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_streaming_name">CLI + SDK agents</div><div class="feat-desc" data-i18n="f_streaming_desc">Claude Code and Codex work through both CLI and SDK integrations. OpenClaw and Qwen stream natively with real-time deltas, tool tracking, and session restore.</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_chat_name">terminal + chat</div><div class="feat-desc" data-i18n="f_chat_desc">raw CLI or structured view with parsed tool calls</div></div>
     <div class="feat"><div class="feat-name" data-i18n="f_sidebar_name">Discord-style sidebar</div><div class="feat-desc" data-i18n="f_sidebar_desc">server icons, session tree, unread badges, idle flash</div></div>
@@ -478,7 +478,7 @@ const I18N = {
     not_1: '不是另一个 AI IDE', not_2: '不只是聊天壳', not_3: '不只是远程终端客户端', not_4: '不是 Claude Code、Codex、Gemini CLI、OpenClaw 或 Qwen 的替代品', not_5: '它是围绕这些 agent 的消息/控制层',
     f_remote_name: '远程终端', f_remote_desc: '浏览器和手机访问，无需 SSH/VPN，实时 PTY 推流',
     f_chat_name: '终端 + 聊天', f_chat_desc: '原生 CLI 或结构化视图，解析工具调用',
-    f_discuss_name: '多代理讨论', f_discuss_desc: '跨供应商讨论、审计、审查',
+    f_discuss_name: '跨模型审计', f_discuss_desc: '多 Agent P2P 讨论，可自定义阶段（audit、review、brainstorm…）— 不同模型在写代码前交叉审查，大幅减少返工',
     f_multi_name: '多服务器', f_multi_desc: '一个面板管理所有机器上的代理',
     f_sub_name: '子会话', f_sub_desc: '随时启动并行代理',
     f_file_name: '文件浏览器', f_file_desc: '浏览、上传下载、Git 差异、浮动预览',
@@ -537,7 +537,7 @@ const I18N = {
     not_1: '不是另一個 AI IDE', not_2: '不只是聊天殼', not_3: '不只是遠端終端客戶端', not_4: '不是 Claude Code、Codex、Gemini CLI、OpenClaw 或 Qwen 的替代品', not_5: '它是圍繞這些 agent 的訊息/控制層',
     f_remote_name: '遠端終端機', f_remote_desc: '瀏覽器和手機存取，無需 SSH/VPN，即時 PTY 串流',
     f_chat_name: '終端機 + 聊天', f_chat_desc: '原生 CLI 或結構化檢視，解析工具呼叫',
-    f_discuss_name: '多代理討論', f_discuss_desc: '跨供應商討論、稽核、審查',
+    f_discuss_name: '跨模型稽核', f_discuss_desc: '多 Agent P2P 討論，可自訂階段（audit、review、brainstorm…）— 不同模型在寫程式前交叉審查，大幅減少返工',
     f_multi_name: '多伺服器', f_multi_desc: '一個面板管理所有機器上的代理',
     f_sub_name: '子會話', f_sub_desc: '隨時啟動並行代理',
     f_file_name: '檔案瀏覽器', f_file_desc: '瀏覽、上傳下載、Git 差異、浮動預覽',
@@ -595,7 +595,7 @@ const I18N = {
     not_1: '別の AI IDE ではありません', not_2: '単なるチャットラッパーではありません', not_3: '単なるリモートターミナルクライアントではありません', not_4: 'Claude Code、Codex、Gemini CLI、OpenClaw、Qwen の置き換えではありません', not_5: 'それらを取り巻くメッセージング／コントロール層です',
     f_remote_name: 'リモートターミナル', f_remote_desc: 'ブラウザ＆モバイル、SSH/VPN不要、リアルタイムPTYストリーミング',
     f_chat_name: 'ターミナル＋チャット', f_chat_desc: 'ネイティブCLIまたは構造化ビュー',
-    f_discuss_name: 'マルチエージェント議論', f_discuss_desc: 'プロバイダー間で議論・監査・レビュー',
+    f_discuss_name: 'クロスモデル監査', f_discuss_desc: 'カスタマイズ可能なフェーズ（audit、review、brainstorm…）のマルチエージェント P2P 議論 — 異なるモデルが実装前に交差レビューし、手戻りを大幅削減',
     f_multi_name: 'マルチサーバー', f_multi_desc: '複数マシンのエージェントを一元管理',
     f_sub_name: 'サブセッション', f_sub_desc: '並列エージェントを即座に起動',
     f_file_name: 'ファイルブラウザ', f_file_desc: '閲覧、アップロード/ダウンロード、Git差分、フローティングプレビュー',
@@ -654,7 +654,7 @@ const I18N = {
     not_1: '또 다른 AI IDE가 아닙니다', not_2: '단순한 채팅 래퍼가 아닙니다', not_3: '단순한 원격 터미널 클라이언트가 아닙니다', not_4: 'Claude Code, Codex, Gemini CLI, OpenClaw, Qwen의 대체품이 아닙니다', not_5: '그들을 둘러싼 메시징/컨트롤 레이어입니다',
     f_remote_name: '원격 터미널', f_remote_desc: '브라우저 & 모바일, SSH/VPN 불필요, 실시간 PTY 스트리밍',
     f_chat_name: '터미널 + 채팅', f_chat_desc: '네이티브 CLI 또는 구조화된 뷰',
-    f_discuss_name: '멀티 에이전트 토론', f_discuss_desc: '프로바이더 간 토론, 감사, 리뷰',
+    f_discuss_name: '크로스 모델 감사', f_discuss_desc: '커스터마이징 가능한 페이즈(audit, review, brainstorm…)의 멀티 에이전트 P2P 토론 — 서로 다른 모델이 코드 작성 전 교차 검토하여 재작업을 대폭 감소',
     f_multi_name: '멀티 서버', f_multi_desc: '하나의 대시보드에서 모든 머신의 에이전트 관리',
     f_sub_name: '서브 세션', f_sub_desc: '병렬 에이전트 즉시 생성',
     f_file_name: '파일 브라우저', f_file_desc: '탐색, 업로드/다운로드, Git 차이, 플로팅 미리보기',
@@ -713,7 +713,7 @@ const I18N = {
     not_1: 'No es otro AI IDE', not_2: 'No es solo un wrapper de chat', not_3: 'No es solo un cliente de terminal remota', not_4: 'No reemplaza a Claude Code, Codex, Gemini CLI, OpenClaw ni Qwen', not_5: 'Es la capa de mensajería/control alrededor de ellos',
     f_remote_name: 'terminal remota', f_remote_desc: 'navegador y móvil, sin SSH/VPN, streaming PTY en tiempo real',
     f_chat_name: 'terminal + chat', f_chat_desc: 'CLI nativo o vista estructurada con llamadas de herramientas',
-    f_discuss_name: 'discusiones multi-agente', f_discuss_desc: 'discutir, auditar, revisar entre proveedores',
+    f_discuss_name: 'auditoría cross-modelo', f_discuss_desc: 'discusiones P2P multi-agente con fases personalizables (audit, review, brainstorm…) — distintos modelos detectan distintos problemas antes de escribir código, reduciendo retrabajo',
     f_multi_name: 'multi-servidor', f_multi_desc: 'gestiona agentes en todas las máquinas desde un panel',
     f_sub_name: 'sub-sesiones', f_sub_desc: 'lanza agentes paralelos al instante',
     f_file_name: 'explorador de archivos', f_file_desc: 'explorar, subir/descargar, diffs de Git, vista previa flotante',
@@ -772,7 +772,7 @@ const I18N = {
     not_1: 'Это не ещё один AI IDE', not_2: 'Это не просто чат-обёртка', not_3: 'Это не просто клиент удалённого терминала', not_4: 'Это не замена Claude Code, Codex, Gemini CLI, OpenClaw или Qwen', not_5: 'Это слой сообщений/управления вокруг них',
     f_remote_name: 'удалённый терминал', f_remote_desc: 'браузер и мобильный, без SSH/VPN, PTY-стриминг в реальном времени',
     f_chat_name: 'терминал + чат', f_chat_desc: 'нативный CLI или структурированный вид',
-    f_discuss_name: 'мульти-агентные обсуждения', f_discuss_desc: 'обсуждение, аудит, ревью между провайдерами',
+    f_discuss_name: 'кросс-модельный аудит', f_discuss_desc: 'мульти-агентные P2P обсуждения с настраиваемыми фазами (audit, review, brainstorm…) — разные модели перекрёстно проверяют до написания кода, сокращая переделки',
     f_multi_name: 'мульти-сервер', f_multi_desc: 'управление агентами на всех машинах с одной панели',
     f_sub_name: 'под-сессии', f_sub_desc: 'мгновенный запуск параллельных агентов',
     f_file_name: 'файловый браузер', f_file_desc: 'просмотр, загрузка/скачивание, Git-диффы, плавающий превью',

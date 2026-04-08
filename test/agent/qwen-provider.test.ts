@@ -274,7 +274,7 @@ describe('QwenProvider', () => {
 
     // First send dispatches immediately
     runtime.send('first');
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    await waitForSpawnCount(1);
     const first = lastSpawn();
     first.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-queue-1' } } })}\n`);
     first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'assistant-queue-1', content: [{ type: 'text', text: 'Still running' }] } })}\n`);
@@ -305,7 +305,7 @@ describe('QwenProvider', () => {
     provider.onError((_sid, err) => errors.push(err.message));
 
     runtime.send('first');
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    await waitForSpawnCount(1);
     const first = lastSpawn();
     first.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-queue-close-1' } } })}\n`);
     first.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: 'done' })}\n`);

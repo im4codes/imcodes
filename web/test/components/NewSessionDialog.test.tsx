@@ -185,7 +185,7 @@ describe('NewSessionDialog', () => {
       type: 'session.event',
       event: 'started',
       session: 'deck_u6d4b_u8bd5_brain',
-      state: 'running',
+      state: 'idle',
     });
 
     expect(onSessionStarted).toHaveBeenCalledWith('deck_u6d4b_u8bd5_brain');
@@ -217,6 +217,35 @@ describe('NewSessionDialog', () => {
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
       agentType: 'codex-sdk',
+      thinking: 'high',
+    }));
+  });
+
+  it('shows CC preset controls and submits preset for claude-code-sdk', () => {
+    const ws = makeWs();
+    ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
+      handler({
+        type: 'cc.presets.list_response',
+        presets: [
+          { name: 'MiniMax', env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' } },
+        ],
+      });
+      return () => {};
+    });
+
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    expect(screen.getByText('API Provider')).toBeDefined();
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+
+    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    fireEvent.change(selects[2], { target: { value: 'MiniMax' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'claude-code-sdk',
+      ccPreset: 'MiniMax',
       thinking: 'high',
     }));
   });

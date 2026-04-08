@@ -7,6 +7,7 @@ import { WsBridge } from '../ws/bridge.js';
 import logger from '../util/logger.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
 import { getPodIdentity } from '../util/pod-identity.js';
+import { isSessionAgentType } from '../../../shared/agent-types.js';
 
 export const sessionMgmtRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -130,6 +131,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
     label?: string | null;
     description?: string | null;
     cwd?: string | null;
+    agentType?: string | null;
     requestedModel?: string | null;
     activeModel?: string | null;
     effort?: string | null;
@@ -150,6 +152,11 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
     effort?: string | null;
     transport_config?: Record<string, unknown> | null;
   } = {};
+  if ('agentType' in body && body.agentType != null) {
+    if (typeof body.agentType !== 'string' || !isSessionAgentType(body.agentType)) {
+      return c.json({ error: 'invalid_agent_type' }, 400);
+    }
+  }
   if ('label' in body) fields.label = body.label ?? null;
   if ('description' in body) fields.description = body.description ?? null;
   if ('cwd' in body) fields.project_dir = body.cwd ?? null;
@@ -159,6 +166,26 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
   if ('transportConfig' in body) fields.transport_config = body.transportConfig ?? null;
 
   await updateSession(c.env.DB, serverId, sessionName, fields);
+
+  if (typeof body.agentType === 'string') {
+    try {
+      WsBridge.get(serverId).sendToDaemon(JSON.stringify({
+        type: 'session.restart',
+        sessionName,
+        agentType: body.agentType,
+        ...(body.label !== undefined ? { label: body.label } : {}),
+        ...(body.description !== undefined ? { description: body.description } : {}),
+        ...(body.cwd !== undefined ? { cwd: body.cwd } : {}),
+        ...(body.requestedModel !== undefined ? { requestedModel: body.requestedModel } : {}),
+        ...(body.activeModel !== undefined ? { activeModel: body.activeModel } : {}),
+        ...(body.effort !== undefined ? { effort: body.effort } : {}),
+        ...(body.transportConfig !== undefined ? { transportConfig: body.transportConfig } : {}),
+      }));
+    } catch (err) {
+      logger.error({ serverId, sessionName, err }, 'WsBridge session settings relay failed');
+      return c.json({ error: 'relay_failed' }, 502);
+    }
+  }
   return c.json({ ok: true });
 });
 

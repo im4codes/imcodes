@@ -13,6 +13,7 @@ import { formatProviderQuotaLabel, type ProviderQuotaMeta } from '@shared/provid
 interface Props {
   usage: UsageData;
   sessionName: string;
+  sessionState?: string | null;
   agentType?: string | null;
   modelOverride?: string | null;
   planLabel?: string | null;
@@ -34,9 +35,10 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, now }: Props) {
+export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, now }: Props) {
   const { t } = useTranslation();
   const isCodexFamily = agentType === 'codex' || agentType === 'codex-sdk';
+  const showRunningStatus = sessionState === 'running' && !!(activeThinkingTs || statusText);
   const [quotaNow, setQuotaNow] = useState(() => Date.now());
 
   const displayModel = modelOverride ?? usage.model;
@@ -113,7 +115,7 @@ export function UsageFooter({ usage, sessionName, agentType, modelOverride, plan
         </div>
       )}
       <div class="session-usage-stats">
-        {(activeThinkingTs || statusText) && (
+        {showRunningStatus && (
           <span class="session-thinking-inline">
             <span class="chat-thinking-dots">···</span>
             {' '}{activeThinkingTs

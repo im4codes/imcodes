@@ -18,6 +18,9 @@ import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff, SessionInfo } from '../types.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import { extractLatestUsage } from '../usage-data.js';
+import { IdleFlashLayer } from './IdleFlashLayer.js';
+import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
+import { useNowTicker } from '../hooks/useNowTicker.js';
 
 interface WindowGeometry { x: number; y: number; w: number; h: number }
 
@@ -27,6 +30,7 @@ interface Props {
   connected: boolean;
   /** When false, timeline and terminal subscriptions are paused to save CPU. */
   active: boolean;
+  idleFlashToken?: number;
   onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void;
   onHistory: (sessionName: string, apply: (c: string) => void) => void;
   onMinimize: () => void;
@@ -86,9 +90,10 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, zIndex, onFocus, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, inP2p,
+  sub, ws, connected, active, idleFlashToken, onDiff, onHistory, onMinimize, onClose, onRestart, onRename, onSettings, zIndex, onFocus, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, inP2p,
 }: Props) {
   const { t } = useTranslation();
+  const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const swipeBackRef = useSwipeBack(isMobile ? onMinimize : null);
 
@@ -107,13 +112,7 @@ export function SubSessionWindow({
   const addQuote = useCallback((text: string) => setQuotes((prev) => [...prev, text]), []);
   const removeQuote = useCallback((i: number) => setQuotes((prev) => prev.filter((_, j) => j !== i)), []);
 
-  const [thinkingNow, setThinkingNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!activeThinkingTs || !active) return;
-    setThinkingNow(Date.now());
-    const id = setInterval(() => setThinkingNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [!!activeThinkingTs, active]); // eslint-disable-line react-hooks/exhaustive-deps
+  const thinkingNow = useNowTicker(!!activeThinkingTs && active);
   const isShell = sub.type === 'shell' || sub.type === 'script';
   /** Transport-backed sessions have no tmux terminal — chat only */
   const isTransport = sub.runtimeType === 'transport';
@@ -122,17 +121,6 @@ export function SubSessionWindow({
   const [viewMode, setViewMode] = useState<ViewMode>(isShell ? 'terminal' : isTransport ? 'chat' : initial.viewMode);
   // confirmClose removed — × now minimizes instead of terminating
 
-  // Flash red when sub-session transitions to idle
-  const [idleFlash, setIdleFlash] = useState(false);
-  const prevStateRef = useRef(sub.state);
-  useEffect(() => {
-    if (prevStateRef.current === 'running' && sub.state === 'idle') {
-      setIdleFlash(true);
-      const t = setTimeout(() => setIdleFlash(false), 3000);
-      return () => clearTimeout(t);
-    }
-    prevStateRef.current = sub.state;
-  }, [sub.state]);
   const inputRef = useRef<HTMLDivElement>(null);
   const termFitFnRef = useRef<(() => void) | null>(null);
   const geomRef = useRef(geom);
@@ -150,7 +138,16 @@ export function SubSessionWindow({
     project: sub.label ?? sub.type,
     role: 'w1',
     agentType: sub.type,
-    state: sub.state === 'running' ? 'running' : sub.state === 'stopped' ? 'stopped' : 'idle',
+    state:
+      sub.state === 'running'
+        ? 'running'
+        : sub.state === 'stopped'
+          ? 'stopped'
+          : sub.state === 'stopping'
+            ? 'stopping'
+            : sub.state === 'error'
+              ? 'error'
+              : 'idle',
     projectDir: sub.cwd ?? undefined,
     qwenModel: sub.qwenModel ?? undefined,
     qwenAuthType: sub.qwenAuthType ?? undefined,
@@ -162,6 +159,7 @@ export function SubSessionWindow({
     quotaMeta: sub.quotaMeta ?? undefined,
     effort: sub.effort ?? undefined,
     runtimeType: sub.runtimeType ?? undefined,
+    transportPendingMessages: sub.transportPendingMessages ?? undefined,
   };
 
   useEffect(() => {
@@ -344,7 +342,8 @@ export function SubSessionWindow({
     : { position: 'fixed', left: geom.x, top: geom.y, width: geom.w, height: geom.h, zIndex };
 
   return (
-    <div ref={swipeBackRef} class={`subsession-window${idleFlash ? ' subcard-idle-flash' : ''}`} style={style} onMouseDown={onFocus}>
+    <div ref={swipeBackRef} class="subsession-window" style={style} onMouseDown={onFocus}>
+      {activeIdleFlashToken ? <IdleFlashLayer key={`subwindow-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
       {/* 8-direction resize handles (desktop only) */}
       {!isMobile && (['n','s','e','w','ne','nw','se','sw'] as ResizeDir[]).map((dir) => (
         <div key={dir} class={`resize-handle resize-${dir}`} onMouseDown={onResizeMouseDown(dir)} />
@@ -404,6 +403,7 @@ export function SubSessionWindow({
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sub.sessionName}
+          sessionState={sessionInfo?.state}
           agentType={sessionInfo?.agentType}
           modelOverride={sessionInfo?.modelDisplay ?? (sessionInfo?.agentType === 'qwen' ? sessionInfo?.qwenModel : undefined)}
           planLabel={sessionInfo?.planLabel}

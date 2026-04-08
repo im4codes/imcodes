@@ -1,3 +1,4 @@
+import { DAEMON_MSG } from '@shared/daemon-events.js';
 /**
  * React hook for timeline event state management.
  * Loads from daemon file store on connect, caches in IndexedDB,
@@ -81,6 +82,7 @@ function pruneTimelineCache(): void {
   if (eventsCache.size <= MAX_CACHED_SESSIONS && totalEvents <= MAX_TOTAL_CACHED_EVENTS) return;
 
   const evictionOrder = [...eventsCache.keys()]
+    .filter((key) => (cacheListeners.get(key)?.size ?? 0) === 0)
     .map((key) => ({ key, at: eventsCacheAccess.get(key) ?? 0, size: eventsCache.get(key)?.length ?? 0 }))
     .sort((a, b) => a.at - b.at);
 
@@ -91,6 +93,41 @@ function pruneTimelineCache(): void {
       totalEvents -= entry.size;
     }
   }
+}
+
+function scopeCacheKey(serverId: string | null | undefined, sessionId: string): string {
+  return serverId ? `${serverId}:${sessionId}` : sessionId;
+}
+
+function scopeEventsForDb(cacheKey: string, events: TimelineEvent[]): TimelineEvent[] {
+  if (cacheKey === events[0]?.sessionId) return events;
+  return events.map((event) => ({ ...event, sessionId: cacheKey }));
+}
+
+function persistTimelineEvents(cacheKey: string, events: TimelineEvent[]): void {
+  if (events.length === 0) return;
+  sharedDb.putEvents(scopeEventsForDb(cacheKey, events)).catch(() => {});
+}
+
+function getSharedTimelineBase(
+  cacheKey: string | null | undefined,
+  localEvents: TimelineEvent[],
+  maxEvents = MAX_MEMORY_EVENTS,
+): TimelineEvent[] {
+  if (!cacheKey) return localEvents;
+  const shared = getCachedEvents(cacheKey);
+  if (!shared || shared === localEvents) return localEvents;
+  if (shared.length === 0) return localEvents;
+  if (localEvents.length === 0) return shared;
+  return mergeTimelineEvents(shared, localEvents, maxEvents);
+}
+
+export function __getSharedTimelineBaseForTests(
+  cacheKey: string | null | undefined,
+  localEvents: TimelineEvent[],
+  maxEvents = MAX_MEMORY_EVENTS,
+): TimelineEvent[] {
+  return getSharedTimelineBase(cacheKey, localEvents, maxEvents);
 }
 
 export function __resetTimelineCacheForTests(): void {
@@ -105,6 +142,14 @@ export function __getTimelineCacheKeysForTests(): string[] {
 
 export function __setTimelineCacheForTests(cacheKey: string, events: TimelineEvent[]): void {
   setCachedEvents(cacheKey, events);
+}
+
+export function ingestTimelineEventForCache(event: TimelineEvent, serverId?: string | null): void {
+  const cacheKey = scopeCacheKey(serverId, event.sessionId);
+  const existing = getCachedEvents(cacheKey) ?? [];
+  const merged = mergeTimelineEvents(existing, [event], MAX_MEMORY_EVENTS);
+  if (merged !== existing) setCachedEvents(cacheKey, merged);
+  persistTimelineEvents(cacheKey, [event]);
 }
 
 export interface UseTimelineResult {
@@ -129,7 +174,7 @@ export function useTimeline(
 ): UseTimelineResult {
   // IDB + memory cache key: scope by serverId to prevent cross-server pollution
   // when different servers share the same session name (e.g. deck_cd_brain).
-  const cacheKey = serverId && sessionId ? `${serverId}:${sessionId}` : sessionId;
+  const cacheKey = sessionId ? scopeCacheKey(serverId, sessionId) : sessionId;
   const cacheKeyRef = useRef(cacheKey);
   cacheKeyRef.current = cacheKey;
   const [events, setEvents] = useState<TimelineEvent[]>([]);
@@ -208,8 +253,10 @@ export function useTimeline(
         seqRef.current = last.seq;
         const stored = await db.getRecentEvents(cacheKey!, { limit: MAX_MEMORY_EVENTS });
         if (cancelled) return;
-        setCachedEvents(cacheKey!, stored);
-        setEvents(stored);
+        const existing = getSharedTimelineBase(cacheKey!, eventsRef.current, MAX_MEMORY_EVENTS);
+        const restored = mergeTimelineEvents(existing, stored, MAX_MEMORY_EVENTS);
+        setCachedEvents(cacheKey!, restored);
+        setEvents((prev) => (prev === restored ? prev : restored));
         setLoading(false);
         historyLoadedRef.current = cacheKeyRef.current;
         if (ws?.connected) {
@@ -248,7 +295,8 @@ export function useTimeline(
       payload: { text, pending: true },
     };
     setEvents((prev) => {
-      const result = [...prev, event];
+      const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
+      const result = [...base, event];
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
       return result;
     });
@@ -282,20 +330,21 @@ export function useTimeline(
   // New eventId → append to end.
   const appendEvent = useCallback((event: TimelineEvent) => {
     setEvents((prev) => {
+      const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
       // Fast path: check last few events for same-ID replacement
-      for (let i = prev.length - 1; i >= Math.max(0, prev.length - 10); i--) {
-        if (prev[i].eventId === event.eventId) {
+      for (let i = base.length - 1; i >= Math.max(0, base.length - 10); i--) {
+        if (base[i].eventId === event.eventId) {
           // Replace in place — enables typewriter effect for streaming events
-          const current = prev[i]!;
+          const current = base[i]!;
           const preferred = preferTimelineEvent(current, event);
-          if (preferred === current) return prev;
-          const updated = [...prev];
+          if (preferred === current) return base;
+          const updated = [...base];
           updated[i] = preferred;
           if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
           return updated;
         }
       }
-      const next = [...prev, event];
+      const next = [...base, event];
       const result = next.length > MAX_MEMORY_EVENTS
         ? next.slice(next.length - MAX_MEMORY_EVENTS)
         : next;
@@ -309,8 +358,9 @@ export function useTimeline(
    *  Uses two-pointer merge instead of concatenate + full sort. */
   const mergeEvents = useCallback((incoming: TimelineEvent[], maxEvents = MAX_MEMORY_EVENTS) => {
     setEvents((prev) => {
-      const result = mergeTimelineEvents(prev, incoming, maxEvents);
-      if (result === prev) return prev;
+      const base = getSharedTimelineBase(cacheKeyRef.current, prev, maxEvents);
+      const result = mergeTimelineEvents(base, incoming, maxEvents);
+      if (result === base) return base;
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
       return result;
     });
@@ -319,11 +369,8 @@ export function useTimeline(
   // IDB helper: scope events by cacheKey so cross-server sessions don't collide
   const idbPutEvents = useCallback((evts: TimelineEvent[]) => {
     const key = cacheKeyRef.current;
-    if (!key || key === evts[0]?.sessionId) {
-      sharedDb?.putEvents(evts).catch(() => {});
-    } else {
-      sharedDb?.putEvents(evts.map(e => ({ ...e, sessionId: key }))).catch(() => {});
-    }
+    if (!key) return;
+    persistTimelineEvents(key, evts);
   }, []);
 
   // Listen for WS messages
@@ -354,26 +401,29 @@ export function useTimeline(
         // against already-confirmed events (JSONL watcher re-emits same text ~2s later).
         if (event.type === 'user.message' && event.payload.text) {
           const text = String(event.payload.text).trim();
+          const allowDuplicate = event.payload.allowDuplicate === true;
           let skipAppend = false;
           setEvents((prev) => {
+            const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
             // Remove pending version of this message (optimistic UI cleanup)
-            const withoutPending = prev.filter(
+            const withoutPending = base.filter(
               (e) => !(e.type === 'user.message' && e.payload.pending && String(e.payload.text ?? '').trim() === text),
             );
-            if (withoutPending.length < prev.length) {
+            if (withoutPending.length < base.length) {
               if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, withoutPending);
               return withoutPending;
             }
             // No pending event — check for confirmed dedup (JSONL re-emit)
-            const isDup = prev.some(
+            const isDup = !allowDuplicate && base.some(
               (e) =>
                 e.type === 'user.message' &&
+                e.payload.allowDuplicate !== true &&
                 !e.payload.pending &&
                 Math.abs(e.ts - event.ts) < USER_MSG_DEDUP_WINDOW_MS &&
                 String(e.payload.text ?? '').trim() === text,
             );
             if (isDup) skipAppend = true;
-            return prev;
+            return base;
           });
           if (skipAppend) return;
         }
@@ -461,13 +511,14 @@ export function useTimeline(
       }
 
       // ── Reconnect: daemon restarted → epoch changed, replay is useless. Request only new events. ──
-      if (msg.type === 'daemon.reconnected') {
+      if (msg.type === DAEMON_MSG.RECONNECTED) {
         // Clear pending optimistic messages — they were sent to the old connection
         // and we can't guarantee they reached the agent. The history replay below
         // will bring back any messages that were actually processed.
         setEvents((prev) => {
-          const cleaned = prev.filter((e) => !(e.type === 'user.message' && e.payload.pending));
-          if (cleaned.length !== prev.length && cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, cleaned);
+          const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
+          const cleaned = base.filter((e) => !(e.type === 'user.message' && e.payload.pending));
+          if (cleaned.length !== base.length && cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, cleaned);
           return cleaned;
         });
         if (ws && sessionId) {

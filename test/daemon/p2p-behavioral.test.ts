@@ -20,6 +20,9 @@ function makeRun(overrides: Partial<P2pRun> = {}): P2pRun {
     totalTargets: 2,
     mode: 'audit',
     status: 'running',
+    runPhase: 'running',
+    summaryPhase: null,
+    activePhase: 'hop',
     contextFilePath: '/tmp/test-discussion.md',
     userText: 'review this code',
     timeoutMs: 300000,
@@ -34,6 +37,9 @@ function makeRun(overrides: Partial<P2pRun> = {}): P2pRun {
     currentRound: 1,
     allTargets: [],
     extraPrompt: '',
+    hopStartedAt: Date.now(),
+    hopStates: [],
+    activeTargetSessions: [],
     _cancelled: false,
     ...overrides,
   };
@@ -112,6 +118,27 @@ describe('buildHopPrompt — production function', () => {
     const roundIdx = prompt.indexOf('[Round 2/3');
     const extraIdx = prompt.indexOf('Additional instructions');
     expect(roundIdx).toBeLessThan(extraIdx);
+  });
+
+  it('includes plan final-summary instructions for model-side target inference', () => {
+    const mode = getP2pMode('plan');
+    const run = makeRun({
+      mode: 'plan',
+      userText: '根据讨论结果把完整方案写到 @docs/implementation-plan.md',
+    });
+    const prompt = buildHopPrompt(run, mode, {
+      session: 'deck_proj_brain',
+      sectionHeader: 'brain — Final Summary',
+      instruction: `${mode!.summaryPrompt}\nUse the discussion evidence as source material.`,
+      isInitial: false,
+    });
+
+    expect(prompt).toContain('Discussion file: /tmp/test-discussion.md');
+    expect(prompt).toContain('Final summary instructions:');
+    expect(prompt).toContain('Acceptance and Validation');
+    expect(prompt).toContain('Infer whether the user context specifies a concrete destination file for the final plan');
+    expect(prompt).toContain('If a concrete destination file is clear from the user context, write the complete plan there.');
+    expect(prompt).toContain('If you wrote the plan to another file, still append a short note under "## brain — Final Summary" in the discussion file');
   });
 });
 

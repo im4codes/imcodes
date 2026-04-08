@@ -1,3 +1,4 @@
+import { DAEMON_MSG } from '@shared/daemon-events.js';
 /**
  * FileBrowser — universal reusable file/directory browser.
  *
@@ -120,6 +121,8 @@ export interface FileBrowserProps {
   highlightPath?: string;
   /** When set, automatically open the file preview on mount (skips manual click) */
   autoPreviewPath?: string;
+  /** When autoPreviewPath is set, start in diff mode instead of source mode. */
+  autoPreviewPreferDiff?: boolean;
   /** Paths already inserted — shown with a badge to avoid duplicates */
   alreadyInserted?: string[];
   /** Hide the footer (select/confirm buttons) — for embedded panel views */
@@ -132,8 +135,14 @@ export interface FileBrowserProps {
   serverId?: string;
   onConfirm: (paths: string[]) => void;
   onClose?: () => void;
+  /** Seed external preview state so a new host can reuse an existing load. */
+  initialPreview?: FileBrowserPreviewState;
+  /** Keep an external preview host in sync with this FileBrowser's preview state. */
+  onPreviewStateChange?: (update: FileBrowserPreviewUpdate) => void;
+  /** Trust a hydrated loading preview instead of starting a second read immediately. */
+  skipAutoPreviewIfLoading?: boolean;
   /** When set, file clicks open an external preview (e.g. floating window) instead of inline split */
-  onPreviewFile?: (path: string) => void;
+  onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
   /** Default panel tab — 'files' or 'changes'. Default: 'files' */
   defaultTab?: 'files' | 'changes';
 }
@@ -147,13 +156,26 @@ type FsNode = {
   isLoading?: boolean;
 };
 
-type PreviewState =
+export type FileBrowserPreviewState =
   | { status: 'idle' }
   | { status: 'loading'; path: string }
   | { status: 'ok'; path: string; content: string; diff?: string; diffHtml?: string; downloadId?: string }
   | { status: 'image'; path: string; dataUrl: string; downloadId?: string }
   | { status: 'office'; path: string; data: string; mimeType: string; downloadId?: string }
   | { status: 'error'; path: string; error: string; downloadId?: string };
+
+export interface FileBrowserPreviewRequest {
+  path: string;
+  preferDiff?: boolean;
+  preview?: FileBrowserPreviewState;
+  sourcePreviewLive?: boolean;
+}
+
+export interface FileBrowserPreviewUpdate {
+  path: string;
+  preferDiff?: boolean;
+  preview: FileBrowserPreviewState;
+}
 
 /** File extensions that can be previewed with office document libraries. */
 const OFFICE_EXTENSIONS: Record<string, string> = {
@@ -185,6 +207,7 @@ export function FileBrowser({
   initialPath,
   highlightPath,
   autoPreviewPath,
+  autoPreviewPreferDiff = false,
   alreadyInserted = [],
   hideFooter = false,
   changesRootPath,
@@ -192,6 +215,9 @@ export function FileBrowser({
   serverId,
   onConfirm,
   onClose,
+  initialPreview,
+  onPreviewStateChange,
+  skipAutoPreviewIfLoading = false,
   onPreviewFile,
   defaultTab = 'files',
 }: FileBrowserProps) {
@@ -209,8 +235,11 @@ export function FileBrowser({
   const [currentLabel, setCurrentLabel] = useState(startPath);
   const [error, setError] = useState<string | null>(null);
   const [showHidden, setShowHidden] = useState(false);
-  const [preview, setPreview] = useState<PreviewState>({ status: 'idle' });
-  const [showDiff, setShowDiff] = useState(false);
+  const [preview, setPreview] = useState<FileBrowserPreviewState>(() => initialPreview ?? { status: 'idle' });
+  const [showDiff, setShowDiff] = useState(() => {
+    if (initialPreview?.status === 'ok' && initialPreview.diffHtml && autoPreviewPreferDiff) return true;
+    return false;
+  });
   const [lightbox, setLightbox] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
 
@@ -263,6 +292,7 @@ export function FileBrowser({
   const pendingGitDiffRef = useRef(new Map<string, string>()); // requestId → filePath
   const pendingMkdirRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
   const mountedRef = useRef(true);
+  const dismissedAutoPreviewPathRef = useRef<string | null>(null);
 
   // History navigation
   const historyRef = useRef<string[]>([startPath]);
@@ -294,7 +324,7 @@ export function FileBrowser({
       if (!mountedRef.current) return;
 
       // WS reconnected — clear loaded cache so directories re-fetch on next expand/navigate
-      if (msg.type === 'daemon.reconnected' || (msg.type === 'session.event' && (msg as any).event === 'connected')) {
+      if (msg.type === DAEMON_MSG.RECONNECTED || (msg.type === 'session.event' && (msg as any).event === 'connected')) {
         loadedRef.current.clear();
         pendingRef.current.clear();
         pendingChangesRef.current.clear();
@@ -524,22 +554,24 @@ export function FileBrowser({
     timersRef.current.set(requestId, timer);
   }, [ws, includeFiles, t]);
 
-  const fetchPreview = useCallback((filePath: string) => {
-    if (onPreviewFile) { onPreviewFile(filePath); return; }
+  const fetchPreview = useCallback((filePath: string, preferDiff = false) => {
     if (editDirtyRef.current) {
       if (!window.confirm(t('fileBrowser.unsavedChanges'))) return;
     }
+    dismissedAutoPreviewPathRef.current = null;
     setEditDirty(false);
     setEditContent('');
     setOriginalMtime(undefined);
     setIsEditing(() => { try { return localStorage.getItem(PREF_KEY) === '1'; } catch { return false; } });
-    setPreview({ status: 'loading', path: filePath });
-    setShowDiff(false);
+    const loadingPreview: FileBrowserPreviewState = { status: 'loading', path: filePath };
+    setPreview(loadingPreview);
+    setShowDiff(preferDiff);
+    if (onPreviewFile) onPreviewFile({ path: filePath, preferDiff, preview: loadingPreview });
     const requestId = ws.fsReadFile(filePath);
     pendingReadRef.current.set(requestId, filePath);
     const diffId = ws.fsGitDiff(filePath);
     pendingGitDiffRef.current.set(diffId, filePath);
-  }, [ws, t]);
+  }, [ws, t, onPreviewFile]);
 
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
 
@@ -611,10 +643,56 @@ export function FileBrowser({
     fetchDir(startPath);
   }, [startPath, fetchDir]);
 
+  useEffect(() => {
+    if (!initialPreview || initialPreview.status === 'idle') return;
+    setPreview(initialPreview);
+  }, [initialPreview]);
+
+  useEffect(() => {
+    if (!autoPreviewPath) {
+      dismissedAutoPreviewPathRef.current = null;
+      return;
+    }
+    if (dismissedAutoPreviewPathRef.current && dismissedAutoPreviewPathRef.current !== autoPreviewPath) {
+      dismissedAutoPreviewPathRef.current = null;
+    }
+  }, [autoPreviewPath]);
+
+  useEffect(() => {
+    if (!onPreviewStateChange) return;
+    if (preview.status === 'idle') return;
+    onPreviewStateChange({
+      path: (preview as { path: string }).path,
+      preferDiff: showDiff,
+      preview,
+    });
+  }, [onPreviewStateChange, preview, showDiff]);
+
   // Auto-preview file on open (e.g. when clicking a path link in chat)
   useEffect(() => {
-    if (autoPreviewPath) fetchPreview(autoPreviewPath);
-  }, [autoPreviewPath, fetchPreview]);
+    if (!autoPreviewPath) return;
+    if (dismissedAutoPreviewPathRef.current === autoPreviewPath && preview.status === 'idle') return;
+    const currentPreviewPath = preview.status !== 'idle' ? (preview as { path: string }).path : null;
+    if (currentPreviewPath === autoPreviewPath && preview.status !== 'idle') {
+      setShowDiff(autoPreviewPreferDiff);
+      if (preview.status === 'loading' && initialPreview?.status === 'loading' && !skipAutoPreviewIfLoading) {
+        fetchPreview(autoPreviewPath, autoPreviewPreferDiff);
+      }
+      return;
+    }
+    fetchPreview(autoPreviewPath, autoPreviewPreferDiff);
+  }, [autoPreviewPath, autoPreviewPreferDiff, fetchPreview, initialPreview, preview, skipAutoPreviewIfLoading]);
+
+  const dismissPreview = useCallback(() => {
+    if (editDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
+    if (autoPreviewPath) dismissedAutoPreviewPathRef.current = autoPreviewPath;
+    setIsEditing(false);
+    setEditDirty(false);
+    setPreview({ status: 'idle' });
+    if (autoPreviewPath && onClose) {
+      onClose();
+    }
+  }, [autoPreviewPath, editDirty, onClose, t]);
 
   // Auto-refresh preview content every 5s when a file is being previewed (paused during editing)
   useEffect(() => {
@@ -742,12 +820,14 @@ export function FileBrowser({
       : t('file_browser.select');
 
   const alreadySet = new Set(alreadyInserted);
+  const usesExternalPreview = !!onPreviewFile;
   const hasPreview = mode !== 'dir-only' && preview.status !== 'idle';
+  const hasInlinePreview = hasPreview && !usesExternalPreview;
 
   const previewPath = preview.status !== 'idle' ? (preview as { path: string }).path : null;
 
   const tree = (
-    <div class={`fb-tree${hasPreview ? ' fb-tree-split' : ''}`}>
+    <div class={`fb-tree${hasInlinePreview ? ' fb-tree-split' : ''}`}>
       {data.map((root) => (
         <FsTreeNode
           key={root.id}
@@ -769,14 +849,11 @@ export function FileBrowser({
 
   const hasDiff = preview.status === 'ok' && !!preview.diff;
 
-  const previewPane = hasPreview ? (
+  const previewPane = hasInlinePreview ? (
     <div class="fb-preview">
       <div class="fb-preview-header">
         <button class="fb-preview-back" onClick={() => {
-          if (editDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
-          setIsEditing(false);
-          setEditDirty(false);
-          setPreview({ status: 'idle' });
+          dismissPreview();
         }}>←</button>
         <span class="fb-preview-name">{previewPath!.split(/[/\\]/).pop()}</span>
         {preview.status === 'ok' && !isEditing && (
@@ -842,10 +919,7 @@ export function FileBrowser({
           </button>
         )}
         <button class="fb-close" onClick={() => {
-          if (editDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
-          setIsEditing(false);
-          setEditDirty(false);
-          setPreview({ status: 'idle' });
+          dismissPreview();
         }}>✕</button>
       </div>
       {/* Conflict dialog rendered inside FileEditor */}
@@ -958,7 +1032,7 @@ export function FileBrowser({
                 <div
                   key={f.path}
                   class={`fb-changes-item${previewPath === f.path ? ' active' : ''}`}
-                  onClick={() => fetchPreview(f.path)}
+                  onClick={() => fetchPreview(f.path, true)}
                   title={f.path}
                 >
                   <span class="fb-changes-item-badge">{f.code === '??' ? 'U' : f.code}</span>
@@ -1103,6 +1177,8 @@ export function FileBrowser({
     </div>
   ) : null;
 
+  const showEmbeddedChangesSection = !!changesSection && !usesExternalPreview;
+
   if (layout === 'panel') {
     const tabs = changesRootPath ? (
       <div class="fb-panel-tabs">
@@ -1140,10 +1216,10 @@ export function FileBrowser({
           {tabs}
           {breadcrumb}
           {newFolderDialog}
-          <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}${changesRootPath && changesFiles.length > 0 ? ' fb-body-with-changes' : ''}`}>
+          <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}${showEmbeddedChangesSection ? ' fb-body-with-changes' : ''}`}>
             <div class={`fb-files-and-changes${hasPreview ? ' fb-tree-split' : ''}`} style={hasPreview && treeWidth ? { flex: 'none', width: treeWidth } : undefined}>
               {tree}
-              {changesSection}
+              {showEmbeddedChangesSection ? changesSection : null}
             </div>
             {hasPreview && (
               <div

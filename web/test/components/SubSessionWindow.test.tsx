@@ -19,7 +19,7 @@ vi.mock('../../src/components/ChatView.js', () => ({
   ChatView: () => null,
 }));
 
-const sessionControlsSpy = vi.fn((props: any) => <div data-testid="session-controls" data-model={props.activeSession?.modelDisplay ?? ''} data-effort={props.activeSession?.effort ?? ''} data-quota={props.activeSession?.quotaLabel ?? ''} />);
+const sessionControlsSpy = vi.fn((props: any) => <div data-testid="session-controls" data-model={props.activeSession?.modelDisplay ?? ''} data-effort={props.activeSession?.effort ?? ''} data-quota={props.activeSession?.quotaLabel ?? ''} data-queued={(props.activeSession?.transportPendingMessages ?? []).join('|')} />);
 const usageFooterSpy = vi.fn((props: any) => <div data-testid="usage-footer" data-quota={props.quotaLabel ?? ''} />);
 
 vi.mock('../../src/components/SessionControls.js', () => ({
@@ -129,6 +129,36 @@ describe('SubSessionWindow metadata wiring', () => {
       expect(footer?.dataset.quota).toContain('5h 11%');
     });
   });
+
+  it('passes queued transport messages through to shared session controls for sub-sessions', async () => {
+    const sub = makeSubSession({
+      type: 'claude-code-sdk',
+      runtimeType: 'transport' as any,
+      transportPendingMessages: ['queued one', 'queued two'],
+    } as any);
+
+    render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const controls = document.querySelector('[data-testid="session-controls"]') as HTMLElement | null;
+      expect(controls?.dataset.queued).toBe('queued one|queued two');
+    });
+  });
 });
 
 describe('SubSessionWindow terminal subscription raw mode', () => {
@@ -142,9 +172,11 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
   beforeEach(() => {
     cleanup();
     vi.clearAllMocks();
+    vi.useFakeTimers();
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     cleanup();
   });
 
@@ -246,5 +278,153 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     await waitFor(() => {
       expect(ws.subscribeTerminal.mock.calls.at(-1)).toEqual([sub.sessionName, false]);
     });
+  });
+
+  it('does not replay an existing idle flash token when the window remounts', async () => {
+    const sub = makeSubSession();
+    const first = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        idleFlashToken={4}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+    expect(first.container.querySelector('.idle-flash-layer--frame')).toBeNull();
+    first.unmount();
+
+    const second = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        idleFlashToken={4}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    expect(second.container.querySelector('.idle-flash-layer--frame')).toBeNull();
+
+    second.rerender(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        idleFlashToken={5}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    expect(second.container.querySelector('.idle-flash-layer--frame')).not.toBeNull();
+  });
+
+  it('does not replay the idle flash when the window is re-activated with the same token', async () => {
+    const sub = makeSubSession();
+    const view = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        idleFlashToken={4}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    view.rerender(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        idleFlashToken={5}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    expect(view.container.querySelector('.idle-flash-layer--frame')).not.toBeNull();
+
+    vi.advanceTimersByTime(2800);
+
+    await waitFor(() => {
+      expect(view.container.querySelector('.idle-flash-layer--frame')).toBeNull();
+    });
+
+    view.rerender(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={false}
+        idleFlashToken={5}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    view.rerender(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        idleFlashToken={5}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    expect(view.container.querySelector('.idle-flash-layer--frame')).toBeNull();
   });
 });

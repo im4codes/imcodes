@@ -762,7 +762,18 @@ export async function startPipePaneStream(session: string, paneId: string): Prom
     //   well-tested libuv pipe path.
     fd = fs.openSync(fifoPath, fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
     const cat = spawn('cat', [fifoPath], { stdio: ['ignore', 'pipe', 'ignore'] });
-    stream = cat.stdout!;
+    const catReady = new Promise<void>((resolve, reject) => {
+      cat.once('spawn', () => resolve());
+      cat.once('error', (err) => reject(err));
+    });
+    cat.on('error', (err) => {
+      if (stream && !stream.destroyed) stream.destroy(err);
+    });
+    await catReady;
+    if (!cat.stdout) {
+      throw new Error('pipe-pane cat reader missing stdout pipe');
+    }
+    stream = cat.stdout;
     needsManualClose = true;
     catProc = cat;
 
@@ -804,7 +815,12 @@ export async function startPipePaneStream(session: string, paneId: string): Prom
   } catch (err) {
     // Rollback: destroy stream + close fd if needed, clean up files
     if (stream) { destroyPipeStream(stream, fd, needsManualClose, catProc); }
-    else if (fd >= 0) { try { fs.closeSync(fd); } catch { /* ignore */ } }
+    else {
+      if (catProc) {
+        try { catProc.kill('SIGTERM'); } catch { /* ignore */ }
+      }
+      if (fd >= 0) { try { fs.closeSync(fd); } catch { /* ignore */ } }
+    }
     await execFile('tmux', ['pipe-pane', '-t', paneId]).catch(() => {});
     await fsp.unlink(fifoPath).catch(() => {});
     await fsp.rmdir(dir).catch(() => {});

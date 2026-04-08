@@ -98,7 +98,7 @@ describe('TransportSessionRuntime', () => {
     expect(runtime.sending).toBe(false);
   });
 
-  it('cancel() delegates to provider.cancel and clears pending', () => {
+  it('cancel() delegates to provider.cancel and preserves pending', () => {
     runtime.send('first');
     runtime.send('queued1');
     runtime.send('queued2');
@@ -106,6 +106,19 @@ describe('TransportSessionRuntime', () => {
 
     runtime.cancel();
     expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
+    expect(runtime.pendingCount).toBe(2);
+  });
+
+  it('cancelled turns drain pending messages into the next turn', () => {
+    runtime.send('first');
+    runtime.send('queued1');
+    runtime.send('queued2');
+
+    runtime.cancel();
+    mock.fireError('sess-1', { code: 'CANCELLED', message: 'cancelled', recoverable: true });
+
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', 'queued1\n\nqueued2', undefined, undefined);
     expect(runtime.pendingCount).toBe(0);
   });
 

@@ -413,7 +413,38 @@ jobs:
           fi
           echo "npm_version=${NPM_VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
+      # Build the image into the local docker daemon first so we can smoke-test
+      # it BEFORE pushing. Without this step, an image whose Node process
+      # crashes on startup (e.g. ERR_MODULE_NOT_FOUND from a missing prod dep)
+      # would still get pushed and auto-deployed to production.
+      - name: Build (load to local docker for smoke test)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: server/Dockerfile
+          platforms: linux/amd64
+          tags: imcodes-smoke:test
+          build-args: |
+            BUILD_TIME=${{ steps.ts.outputs.value }}
+            OTA_VERSION=${{ steps.ota.outputs.version }}
+            APP_VERSION=${{ steps.version_meta.outputs.npm_version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          load: true
+          push: false
+
+      - name: Container startup smoke test
+        run: |
+          set -euo pipefail
+          # Override entrypoint to run an import-only check inside the actual
+          # production image. index.ts has an isMain guard so the import
+          # resolves all static deps (including all routes/* modules) without
+          # binding ports or hitting the database. Any ERR_MODULE_NOT_FOUND or
+          # other top-level eval failure surfaces here, before the image ships.
+          docker run --rm --entrypoint node imcodes-smoke:test \
+            -e "import('./dist/server/src/index.js').then(() => { console.log('OK: image loads cleanly'); process.exit(0); }).catch(e => { console.error('FAIL:', e.message); console.error(e.stack); process.exit(1); })"
+
+      - name: Build and push (cache hit — only pushes layers)
         uses: docker/build-push-action@v6
         with:
           context: .

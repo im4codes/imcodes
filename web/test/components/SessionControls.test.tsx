@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, fireEvent, cleanup } from '@testing-library/preact';
+import { render, screen, fireEvent, cleanup, within } from '@testing-library/preact';
 
 if (!HTMLElement.prototype.scrollIntoView) {
   HTMLElement.prototype.scrollIntoView = vi.fn();
@@ -11,7 +11,41 @@ if (!HTMLElement.prototype.scrollIntoView) {
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string, _opts?: Record<string, unknown>) => {
+    t: (key: string, opts?: Record<string, unknown>) => {
+      if (key === 'openspec.title') return 'OpenSpec';
+      if (key === 'openspec.changes') return 'changes';
+      if (key === 'openspec.empty') return 'empty';
+      if (key === 'openspec.audit_action') return 'audit_action';
+      if (key === 'openspec.audit_implementation_action') return 'audit_implementation_action';
+      if (key === 'openspec.audit_spec_action') return 'audit_spec_action';
+      if (key === 'openspec.implement_action') return 'implement_action';
+      if (key === 'openspec.achieve_action') return 'achieve_action';
+      if (key === 'openspec.propose_action') return 'propose_action';
+      if (key === 'openspec.propose_from_discussion_action') return 'propose_from_discussion_action';
+      if (key === 'openspec.propose_from_description_action') return 'propose_from_description_action';
+      if (key === 'openspec.audit_implementation_prompt') {
+        return `audit implementation ${(opts?.reference as string) ?? ''}, fix code gaps`;
+      }
+      if (key === 'openspec.audit_spec_prompt') {
+        return `audit spec ${(opts?.reference as string) ?? ''}, fix spec gaps`;
+      }
+      if (key === 'openspec.implement_prompt') {
+        return `delegate ${(opts?.reference as string) ?? ''}, split tasks and accept`;
+      }
+      if (key === 'openspec.achieve_prompt') {
+        return `complete ${(opts?.reference as string) ?? ''}, finish remaining work and archive if done`;
+      }
+      if (key === 'openspec.propose_from_discussion_prompt') {
+        return 'generate openspec proposal from recent discussion';
+      }
+      if (key === 'openspec.propose_from_description_prompt') {
+        return 'generate openspec proposal from description below';
+      }
+      if (key === 'session.transport_send_queued_collapsed') {
+        return `${opts?.count ?? 0} queued · showing latest only`;
+      }
+      if (key === 'common.hide') return 'hide';
+      if (key === 'common.show') return 'show';
       const parts = key.split('.');
       return parts[parts.length - 1];
     },
@@ -19,13 +53,25 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../../src/components/QuickInputPanel.js', () => ({
-  QuickInputPanel: () => null,
+  QuickInputPanel: ({ open, onSend }: { open: boolean; onSend: (text: string) => void }) => open ? (
+    <button onClick={() => onSend('quick combo message')}>quick-panel-send</button>
+  ) : null,
   EMPTY_QUICK_DATA: { history: [], sessionHistory: {}, commands: [], phrases: [] },
   getNavigableHistory: (data: { history: string[]; sessionHistory: Record<string, string[]> }, sessionName?: string) => {
     if (!sessionName) return data.history;
     const sessionHist = data.sessionHistory[sessionName] ?? [];
     return sessionHist.length > 0 ? sessionHist : data.history;
   },
+}));
+
+vi.mock('../../src/components/VoiceOverlay.js', () => ({
+  VoiceOverlay: ({ open, onSend }: { open: boolean; onSend: (text: string) => void }) => open ? (
+    <button onClick={() => onSend('voice combo message')}>voice-overlay-send</button>
+  ) : null,
+}));
+
+vi.mock('../../src/components/VoiceInput.js', () => ({
+  isAvailable: () => true,
 }));
 
 const uploadFileMock = vi.fn();
@@ -40,13 +86,25 @@ vi.mock('../../src/api.js', () => ({
 import { SessionControls } from '../../src/components/SessionControls.js';
 import type { SessionInfo } from '../../src/types.js';
 
-const makeWs = () => ({
-  sendSessionCommand: vi.fn(),
-  sendInput: vi.fn(),
-  connected: true,
-  subSessionSetModel: vi.fn(),
-  onMessage: vi.fn(() => () => {}),
-});
+const flushAsync = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+const makeWs = () => {
+  const handlers = new Set<(msg: unknown) => void>();
+  return {
+    sendSessionCommand: vi.fn(),
+    sendInput: vi.fn(),
+    connected: true,
+    subSessionSetModel: vi.fn(),
+    fsListDir: vi.fn(() => 'openspec-request'),
+    onMessage: vi.fn((handler: (msg: unknown) => void) => {
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    }),
+    emit: (msg: unknown) => {
+      handlers.forEach((handler) => handler(msg));
+    },
+  };
+};
 
 const makeQuickData = () => ({
   data: { history: [], sessionHistory: {}, commands: [], phrases: [] },
@@ -94,7 +152,20 @@ describe('SessionControls', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    getUserPrefMock.mockResolvedValue(null);
+    sessionStorage.clear();
+    localStorage.clear();
+    getUserPrefMock.mockImplementation(async (key: unknown) => {
+      if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
+        const sessionKey = key.slice('p2p_session_config:'.length);
+        return JSON.stringify({
+          sessions: {
+            [sessionKey]: { enabled: true, mode: 'audit' },
+          },
+          rounds: 3,
+        });
+      }
+      return null;
+    });
     saveUserPrefMock.mockResolvedValue(undefined);
   });
 
@@ -109,6 +180,29 @@ describe('SessionControls', () => {
     // The ⋯ menu button has title from t('session.actions') → 'actions'
     const menuBtn = screen.getByTitle('actions');
     expect(menuBtn).toBeDefined();
+  });
+
+  it('only shows the scan sweep while the session is running', () => {
+    const idleView = render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ state: 'idle' })}
+        activeThinking={true}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(idleView.container.querySelector('.controls-wrapper-running')).toBeNull();
+    idleView.unmount();
+
+    const runningView = render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ state: 'running' })}
+        activeThinking={false}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(runningView.container.querySelector('.controls-wrapper-running')).toBeTruthy();
   });
 
   it('send button is disabled when input is empty', () => {
@@ -139,6 +233,500 @@ describe('SessionControls', () => {
       sessionName: 'my-session',
       text: 'run tests',
     });
+  });
+
+  it('keeps the p2p button in solo mode after triggering a combo from the dropdown', async () => {
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
+    await flushAsync();
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'run combo';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+
+    expect(screen.getByText('combo_send_confirm_title')).toBeDefined();
+    expect(screen.getAllByRole('button', { name: /^send$/i }).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByRole('button', { name: /^p2p$/i })).toBeDefined();
+  });
+
+  it('asks for confirmation before directly sending from a combo dropdown item', async () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    await flushAsync();
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'run combo';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+
+    expect(screen.getByText('combo_send_confirm_title')).toBeDefined();
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: /^cancel$/i }));
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: /^send$/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /^p2p$/i })).toBeDefined();
+  });
+
+  it('blocks combo sends that only contain routing markup and shows a warning', () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = '@@all(audit>plan)';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /^send$/i }));
+
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+    expect(screen.queryByText('combo_send_confirm_title')).toBeNull();
+    expect(screen.getByText('combo_empty_message_warning')).toBeDefined();
+  });
+
+  it('disables combo modes when no participants are configured', async () => {
+    getUserPrefMock.mockImplementation(async (key: unknown) => {
+      if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
+        return JSON.stringify({
+          sessions: {
+            'my-session': { enabled: false, mode: 'audit' },
+          },
+          rounds: 3,
+        });
+      }
+      return null;
+    });
+
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+
+    expect(screen.getByText('combo_requires_participants_hint')).toBeDefined();
+    const comboBtn = screen.getByRole('button', { name: /mode_audit→mode_plan/i }) as HTMLButtonElement;
+    expect(comboBtn.disabled).toBe(true);
+    expect(comboBtn.title).toBe('combo_requires_participants_hint');
+  });
+
+  it('only shows solo plus combo items in the p2p dropdown', async () => {
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+
+    expect(screen.getByText('P2P')).toBeDefined();
+    expect(screen.queryByText(/^mode_audit$/i)).toBeNull();
+    expect(screen.queryByText(/^mode_review$/i)).toBeNull();
+    expect(screen.queryByText(/^mode_plan$/i)).toBeNull();
+    expect(screen.queryByText(/^mode_brainstorm$/i)).toBeNull();
+    expect(screen.queryByText(/^mode_discuss$/i)).toBeNull();
+    expect(screen.queryByText(/^mode_config$/i)).toBeNull();
+    expect(screen.getByText(/mode_audit→mode_plan/i)).toBeDefined();
+  });
+
+  it('updates the p2p dropdown when custom combos are created without a page refresh', async () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    await flushAsync();
+
+    const { P2pConfigPanel } = await import('../../src/components/P2pConfigPanel.js');
+    render(
+      <P2pConfigPanel
+        sessions={[{ name: 'my-session', agentType: 'claude-code', state: 'idle' }]}
+        subSessions={[]}
+        activeSession="my-session"
+        onClose={() => {}}
+        onSave={() => {}}
+      />,
+    );
+    await flushAsync();
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'combo_label' }).at(-1)!);
+    fireEvent.click(screen.getByText('+mode_brainstorm'));
+    fireEvent.click(screen.getByText('+mode_review'));
+    fireEvent.click(screen.getByText('✓'));
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    expect(screen.getAllByText(/mode_brainstorm→mode_review/i).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('remembers skipping combo confirmation across later dropdown combo sends', async () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    await flushAsync();
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'first combo';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+
+    const dialog = screen.getByText('combo_send_confirm_title').closest('.dialog') as HTMLElement;
+    fireEvent.click(within(dialog).getByRole('checkbox'));
+    fireEvent.click(within(dialog).getByRole('button', { name: /^send$/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      sessionName: 'my-session',
+      text: 'first combo',
+      p2pAtTargets: [
+        { session: '__all__', mode: 'config' },
+      ],
+      p2pMode: 'audit>plan',
+      p2pSessionConfig: {
+        'my-session': { enabled: true, mode: 'audit' },
+      },
+      p2pRounds: 2,
+      p2pLocale: 'en',
+    });
+    expect(saveUserPrefMock).toHaveBeenCalledWith('p2p_combo_direct_send_skip_confirm', true);
+
+    input.textContent = 'second combo';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+
+    expect(screen.queryByText('combo_send_confirm_title')).toBeNull();
+    expect(ws.sendSessionCommand).toHaveBeenLastCalledWith('send', {
+      sessionName: 'my-session',
+      text: 'second combo',
+      p2pAtTargets: [
+        { session: '__all__', mode: 'config' },
+      ],
+      p2pMode: 'audit>plan',
+      p2pSessionConfig: {
+        'my-session': { enabled: true, mode: 'audit' },
+      },
+      p2pRounds: 2,
+      p2pLocale: 'en',
+    });
+  });
+
+  it('clicking a combo dropdown item sends immediately once confirmation is accepted', async () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    await flushAsync();
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'direct combo';
+    fireEvent.input(input);
+
+    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+    fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
+
+    const dialog = screen.getByText('combo_send_confirm_title').closest('.dialog') as HTMLElement;
+    fireEvent.click(within(dialog).getByRole('button', { name: /^send$/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      sessionName: 'my-session',
+      text: 'direct combo',
+      p2pAtTargets: [
+        { session: '__all__', mode: 'config' },
+      ],
+      p2pMode: 'audit>plan',
+      p2pSessionConfig: {
+        'my-session': { enabled: true, mode: 'audit' },
+      },
+      p2pRounds: 2,
+      p2pLocale: 'en',
+    });
+  });
+
+  it('opens combo settings from the bottom of the solo combo dropdown', async () => {
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: /^p2p$/i }));
+
+    const menu = document.querySelector('.menu-dropdown-p2p') as HTMLElement;
+    fireEvent.click(within(menu).getByRole('button', { name: 'settings_button' }));
+    await flushAsync();
+
+    expect(screen.getByText('+mode_brainstorm')).toBeDefined();
+  });
+
+  it('lists openspec changes and appends the selected reference to the input', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+
+    expect(ws.fsListDir).toHaveBeenCalledWith('/repo/openspec/changes', false, false);
+
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-b', path: '/repo/openspec/changes/change-b', isDir: true, hidden: false },
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+        { name: 'README.md', path: '/repo/openspec/changes/README.md', isDir: false, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'change-a' }));
+
+    expect(screen.getByRole('textbox').textContent).toBe('@openspec/changes/change-a');
+  });
+
+  it('inserts an openspec implementation-audit prompt without sending immediately', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'audit_action' }));
+    fireEvent.click(screen.getByRole('button', { name: 'audit_implementation_action' }));
+
+    expect(screen.getByRole('textbox').textContent).toBe('audit implementation @openspec/changes/change-a, fix code gaps');
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it('inserts an openspec spec-audit prompt without sending immediately', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'audit_action' }));
+    fireEvent.click(screen.getByRole('button', { name: 'audit_spec_action' }));
+
+    expect(screen.getByRole('textbox').textContent).toBe('audit spec @openspec/changes/change-a, fix spec gaps');
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it('inserts an openspec implement prompt without sending immediately', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'implement_action' }));
+
+    expect(screen.getByRole('textbox').textContent).toBe('delegate @openspec/changes/change-a, split tasks and accept');
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it('sends an openspec achieve prompt directly', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'achieve_action' }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      sessionName: 'my-session',
+      text: 'complete @openspec/changes/change-a, finish remaining work and archive if done',
+    });
+  });
+
+  it('inserts an openspec propose-from-discussion prompt without sending immediately', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'propose_action' }));
+    fireEvent.click(screen.getByRole('button', { name: 'propose_from_discussion_action' }));
+
+    expect(screen.getByRole('textbox').textContent).toBe('generate openspec proposal from recent discussion');
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it('inserts an openspec propose-from-description prompt without sending immediately', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'propose_action' }));
+    fireEvent.click(screen.getByRole('button', { name: 'propose_from_description_action' }));
+
+    expect(screen.getByRole('textbox').textContent).toBe('generate openspec proposal from description below');
+    expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+  });
+
+  it('shows openspec propose even when there are no existing changes', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [],
+    });
+    await flushAsync();
+
+    expect(screen.getByRole('button', { name: 'propose_action' })).toBeDefined();
+  });
+
+  it('limits openspec dropdown height to the visible space above the trigger', async () => {
+    const rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function mockRect() {
+      if ((this as HTMLElement).classList?.contains('shortcuts-model')) {
+        return {
+          x: 0, y: 0, top: 220, left: 0, right: 120, bottom: 252, width: 120, height: 32,
+          toJSON() { return {}; },
+        } as DOMRect;
+      }
+      return {
+        x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0,
+        toJSON() { return {}; },
+      } as DOMRect;
+    });
+
+    const innerWidth = window.innerWidth;
+    const innerHeight = window.innerHeight;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 800 });
+
+    try {
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+
+      const dropdown = document.querySelector('.menu-dropdown-openspec') as HTMLElement;
+      expect(dropdown.style.maxHeight).toBe('208px');
+    } finally {
+      rectSpy.mockRestore();
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: innerWidth });
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: innerHeight });
+    }
+  });
+
+  it('collapses openspec actions behind a disclosure toggle on mobile', async () => {
+    const innerWidth = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+
+    try {
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+      ws.emit({
+        type: 'fs.ls_response',
+        requestId: 'openspec-request',
+        status: 'ok',
+        resolvedPath: '/repo/openspec/changes',
+        entries: [
+          { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+        ],
+      });
+      await flushAsync();
+
+      expect(screen.queryByRole('button', { name: 'implement_action' })).toBeNull();
+
+      fireEvent.click(screen.getByRole('button', { name: 'expand change-a' }));
+
+      expect(screen.getByRole('button', { name: 'implement_action' })).toBeDefined();
+      expect(screen.getByRole('button', { name: 'collapse change-a' })).toBeDefined();
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: innerWidth });
+    }
   });
 
   it('clears input after send', () => {
@@ -250,34 +838,72 @@ describe('SessionControls', () => {
   });
 
 
-  it('sends message to running transport session without blocking (queuing is daemon-side)', () => {
-    const ws = makeWs();
+  it('shows queued transport messages at the bottom', () => {
     const runningSession = makeSession({
       name: 'qwen-session',
       agentType: 'qwen',
       runtimeType: 'transport',
       state: 'running',
+      transportPendingMessages: ['queued send', 'second queued send'],
     });
     render(
       <SessionControls
-        ws={ws as any}
+        ws={makeWs() as any}
+        activeSession={runningSession}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    expect(screen.getByText('transport_send_queued')).toBeDefined();
+    expect(screen.getByText('queued send')).toBeDefined();
+    expect(screen.getByText('second queued send')).toBeDefined();
+  });
+
+  it('can collapse queued transport messages to latest-only view', () => {
+    const runningSession = makeSession({
+      name: 'qwen-session',
+      agentType: 'qwen',
+      runtimeType: 'transport',
+      state: 'running',
+      transportPendingMessages: ['queued send', 'second queued send'],
+    });
+    render(
+      <SessionControls
+        ws={makeWs() as any}
         activeSession={runningSession}
         quickData={makeQuickData() as any}
       />,
     );
 
-    const input = screen.getByRole('textbox') as HTMLDivElement;
-    input.textContent = 'queued send';
-    fireEvent.input(input);
-    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'hide' }));
 
-    // Message is sent immediately — daemon handles queuing internally
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
-      sessionName: 'qwen-session',
-      text: 'queued send',
+    expect(screen.getByText('2 queued · showing latest only')).toBeDefined();
+    expect(screen.queryByText('queued send')).toBeNull();
+    expect(screen.getByText('second queued send')).toBeDefined();
+    expect(screen.getByRole('button', { name: 'show' })).toBeDefined();
+    expect(localStorage.getItem('imcodes-queued-hint-expanded')).toBe('0');
+  });
+
+  it('remembers collapsed queued transport messages globally', () => {
+    localStorage.setItem('imcodes-queued-hint-expanded', '0');
+    const runningSession = makeSession({
+      name: 'qwen-session',
+      agentType: 'qwen',
+      runtimeType: 'transport',
+      state: 'running',
+      transportPendingMessages: ['queued send', 'second queued send'],
     });
-    // No frontend queued notice — transport runtime queues internally
-    expect(screen.queryByText('transport_send_queued')).toBeNull();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={runningSession}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getByText('2 queued · showing latest only')).toBeDefined();
+    expect(screen.queryByText('queued send')).toBeNull();
+    expect(screen.getByText('second queued send')).toBeDefined();
+    expect(screen.getByRole('button', { name: 'show' })).toBeDefined();
   });
 
   it('pressing Escape in a running transport input sends /stop command', () => {

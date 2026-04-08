@@ -67,6 +67,7 @@ export class TimelineEmitter {
     // Deduplicate user.message — skip if same session + same text within 5s
     if (type === 'user.message') {
       const text = String(payload.text ?? '');
+      const allowDuplicate = payload.allowDuplicate === true;
 
       // Resolve temp file references: replace instruction with actual file content
       const tempMatch = text.match(TEMP_FILE_RE);
@@ -79,10 +80,12 @@ export class TimelineEmitter {
 
       const key = sessionId;
       const resolvedText = String(payload.text ?? '');
-      const prev = this.recentUserMsg.get(key);
-      const now = Date.now();
-      if (prev && prev.text === resolvedText && now - prev.ts < 5_000) return null;
-      this.recentUserMsg.set(key, { text: resolvedText, ts: now });
+      if (!allowDuplicate) {
+        const prev = this.recentUserMsg.get(key);
+        const now = Date.now();
+        if (prev && prev.text === resolvedText && now - prev.ts < 5_000) return null;
+        this.recentUserMsg.set(key, { text: resolvedText, ts: now });
+      }
     }
 
     const seq = (this.seqMap.get(sessionId) ?? 0) + 1;

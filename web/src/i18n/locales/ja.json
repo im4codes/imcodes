@@ -18,7 +18,9 @@
     "connected": "接続済み",
     "disconnected": "切断済み",
     "reconnecting": "再接続中…",
-    "refresh": "更新"
+    "refresh": "更新",
+    "show": "表示",
+    "hide": "隠す"
   },
   "chat": {
     "loading": "チャットを読み込み中...",
@@ -73,6 +75,7 @@
     "no_session": "セッションなし",
     "send_queued": "再接続中… (送信待ち)",
     "transport_send_queued": "キュー済み — 現在の応答が終わった後に送信します",
+    "transport_send_queued_collapsed": "{{count}} 件キュー中 · 最新のみ表示",
     "send_placeholder": "{{name}} へ送信…",
     "actions": "セッション操作",
     "new_btn": "新規セッション",
@@ -176,7 +179,9 @@
     "no_changes": "変更なし"
   },
   "toast": {
-    "finished": "完了"
+    "finished": "完了",
+    "upgrade_blocked_title": "アップグレードはブロックされました",
+    "upgrade_blocked_p2p_active": "P2P がまだ実行中です。daemon をアップグレードする前に停止してください。"
   },
   "discussion": {
     "role_critic": "批評家",
@@ -354,6 +359,9 @@
       "phase_queued": "待機中",
       "round_label": "ラウンド",
       "hop_label": "ホップ",
+      "auto_follow_latest": "最新に自動追従",
+      "copy_path": "パスをコピー",
+      "copy_content": "内容をコピー",
       "scroll_top": "先頭へスクロール",
       "scroll_bottom": "末尾へスクロール"
     },
@@ -364,6 +372,10 @@
     "mode_brainstorm": "ブレスト",
     "mode_discuss": "ディスカッション",
     "combo_label": "コンボ",
+    "combo_presets": "プリセットコンボ",
+    "combo_custom": "マイコンボ",
+    "combo_custom_empty": "カスタムコンボはまだありません。",
+    "combo_builder": "新しいコンボを追加",
     "exclude_same_type": "同タイプを除外",
     "picker": {
       "back": "戻る",
@@ -389,11 +401,19 @@
       "discuss": "ディスカッション"
     },
     "mode_config": "設定",
+    "settings_button": "P2P設定",
     "settings_title": "P2P参加者設定",
     "cross_session": "他のプロジェクトのセッションを含める",
+    "settings_filter_sdk": "SDK",
+    "settings_filter_cli": "CLI",
     "settings_save": "保存",
     "settings_close": "閉じる",
     "confirm_cancel": "キャンセルしますか?",
+    "combo_send_confirm_title": "コンボ送信の確認",
+    "combo_send_confirm_body": "このメッセージはコンボフロー {{mode}} で直接送信されます。続行しますか？",
+    "combo_send_confirm_skip": "次回から確認せず直接送信する",
+    "combo_empty_message_warning": "コンボ送信には本文が必要です。実際の依頼内容を入力してから送信してください。",
+    "combo_requires_participants_hint": "コンボモードを有効にするには、先に P2P 設定で参加者を選んでください。",
     "settings_enabled": "参加",
     "settings_mode": "モード",
     "settings_skip": "スキップ",
@@ -420,6 +440,25 @@
       "send_anyway": "そのまま送信",
       "tip_history": "複数 Agent の議論はファイル共有があり、履歴もより完全に残ります。1 対 1 は単発の議論として扱われます。"
     }
+  },
+  "openspec": {
+    "title": "OpenSpec",
+    "changes": "変更",
+    "empty": "OpenSpec の変更はありません",
+    "audit_action": "監査",
+    "audit_implementation_action": "実装を監査",
+    "audit_spec_action": "仕様を監査",
+    "implement_action": "実装",
+    "achieve_action": "完了",
+    "propose_action": "提案",
+    "propose_from_discussion_action": "直近の議論から生成",
+    "propose_from_description_action": "下の説明から生成",
+    "audit_implementation_prompt": "{{reference}} について、OpenSpec の成果物に照らした厳格な実装監査を実施してください。不一致、抜け漏れ、回帰リスク、境界ケースの欠落、未整備のテストをすべて洗い出し、そのうえでコード、テスト、必要な関連修正まで直してください。レポートだけで終わらせず、実装を仕様完全準拠まで持っていってください。",
+    "audit_spec_prompt": "{{reference}} について、厳格な仕様監査を実施してください。スコープ、要件、受け入れ条件、境界ケース、失敗モード、依存関係、テスト容易性を強化し、曖昧さと内部矛盾を除去して、実装可能な品質まで仕様を更新してください。レビューコメントだけで終わらせないでください。",
+    "implement_prompt": "{{reference}} の実装を強力に前進させてください。作業を具体的なサブタスクに分解し、サブエージェントへ明確な責務で割り当て、成果を統合し、仕様との差分を解消し、テストを追加または更新し、最終結果を検証してください。あなたがオーケストレーション、技術判断、最終受け入れを担ってください。",
+    "achieve_prompt": "完全な OpenSpec ワークフローで {{reference}} を done まで持っていってください。残っているタスクと成果物をすべて確認し、必要な実装と仕様の作業を完了し、未解決事項を閉じ、必要なら影響するメイン仕様を同期し、完了条件を満たしたら変更をアーカイブしてください。進捗報告だけで止まらないでください。",
+    "propose_from_discussion_prompt": "直近の議論から OpenSpec proposal を生成してください。目的、スコープ、主要要件、受け入れ基準を整理し、不明点は確認事項として明示してください。まずはそのまま保存できる change proposal の草案を出してください。",
+    "propose_from_description_prompt": "下の説明から OpenSpec proposal を生成してください。目的、スコープ、主要要件、受け入れ基準を整理し、不足情報は確認事項として明示してください。まずはそのまま保存できる change proposal の草案を出してください。"
   },
   "upload": {
     "upload_file": "ファイルをアップロード",
@@ -580,6 +619,24 @@
     "expand_all": "すべて展開",
     "collapse_all": "すべて折りたたむ",
     "drag_to_resize": "ドラッグしてサイズ変更"
+  },
+  "subsessionBar": {
+    "show": "表示",
+    "hide": "非表示",
+    "layout_double": "2段表示",
+    "layout_single": "1段表示",
+    "card_size": "カードサイズ",
+    "subs_count": "Subs ({{count}})",
+    "new_sub_session": "新しいサブセッション",
+    "p2p_discussions": "P2P ディスカッション",
+    "repository": "リポジトリ",
+    "scheduled_tasks": "スケジュールされたタスク",
+    "width_short": "幅",
+    "height_short": "高",
+    "apply": "適用",
+    "reset": "リセット",
+    "empty_prefix": "サブセッションはまだありません。",
+    "empty_suffix": "をクリックして追加"
   },
   "localWebPreview": {
     "title": "ローカルWebプレビュー",

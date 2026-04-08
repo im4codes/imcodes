@@ -314,8 +314,16 @@ describe('readCwd', () => {
 // ── startWatching / stopWatching / isWatching ─────────────────────────────────
 
 describe('isWatching / stopWatching', () => {
+  const originalHome = process.env.HOME;
+
+  beforeEach(async () => {
+    process.env.HOME = await mkdtemp(join(tmpdir(), 'codex-watcher-home-'));
+  });
+
   afterEach(() => {
     stopWatching('session-x');
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
   });
 
   it('isWatching returns false before startWatching', () => {
@@ -323,7 +331,7 @@ describe('isWatching / stopWatching', () => {
   });
 
   it('isWatching returns true after startWatching', async () => {
-    // Use a workDir that won't match any real file so watcher just idles
+    // Use an isolated HOME so the watcher does not scan the developer's real Codex history.
     await startWatching('session-x', '/tmp/__nonexistent_codex_dir__');
     expect(isWatching('session-x')).toBe(true);
   });

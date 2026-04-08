@@ -120,6 +120,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   get sending(): boolean { return this._sending; }
   /** Number of messages waiting in the queue. */
   get pendingCount(): number { return this._pendingMessages.length; }
+  /** Snapshot of queued messages waiting to be drained. */
+  get pendingMessages(): string[] { return [...this._pendingMessages]; }
 
   async initialize(config: SessionConfig): Promise<void> {
     this._providerSessionId = await this.provider.createSession(config);
@@ -155,8 +157,6 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
-    // Clear pending — user cancelled, they don't want queued messages either
-    this._pendingMessages = [];
     if (!this.provider.cancel) return;
     await this.provider.cancel(this._providerSessionId);
   }

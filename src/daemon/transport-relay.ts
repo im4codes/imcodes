@@ -179,7 +179,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
 
 /** Emit user.message through timeline when user sends to a transport session. */
 export function emitTransportUserMessage(sessionId: string, text: string): void {
-  timelineEmitter.emit(sessionId, 'user.message', { text }, { source: 'daemon', confidence: 'high' });
+  timelineEmitter.emit(sessionId, 'user.message', { text, allowDuplicate: true }, { source: 'daemon', confidence: 'high' });
   void appendTransportEvent(sessionId, {
     type: 'user.message',
     sessionId,
@@ -209,7 +209,7 @@ export function broadcastProviderStatus(providerId: string, connected: boolean):
 /** Fetch remote sessions from a provider and broadcast to browsers + sync to server DB. */
 async function pushProviderSessions(providerId: string): Promise<void> {
   try {
-    const { listProviderSessions } = await import('./command-handler.js');
+    const { listProviderSessions } = await import('./provider-sessions.js');
     const sessions = await listProviderSessions(providerId);
     if (!sendToServer) return;
     // Send via sync_sessions — bridge handles this: caches, persists to DB, broadcasts to browsers

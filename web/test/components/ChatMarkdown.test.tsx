@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { render } from '@testing-library/preact';
+import { describe, it, expect, vi } from 'vitest';
+import { fireEvent, render } from '@testing-library/preact';
 import { ChatMarkdown } from '../../src/components/ChatMarkdown';
 
 describe('ChatMarkdown', () => {
@@ -29,6 +29,54 @@ describe('ChatMarkdown', () => {
     expect(links[0].textContent).toBe('~/.openclaw-ppt/projects/digital-town/output/digital-town.pdf');
     // Should also have inline-code styling
     expect(links[0].classList.contains('chat-inline-code')).toBe(true);
+  });
+
+  it('renders a download button for plain file paths and calls onDownload', () => {
+    const onDownload = vi.fn();
+    const { container } = render(
+      <ChatMarkdown
+        text="Open ./README.md"
+        onPathClick={() => {}}
+        onDownload={onDownload}
+      />
+    );
+
+    const button = container.querySelector('.chat-dl-btn') as HTMLButtonElement | null;
+    expect(button).not.toBeNull();
+    fireEvent.click(button!);
+    expect(onDownload).toHaveBeenCalledWith('./README.md');
+  });
+
+  it('renders a download button for backtick file paths and calls onDownload', () => {
+    const onDownload = vi.fn();
+    const { container } = render(
+      <ChatMarkdown
+        text="生成完毕：`./dist/report.pdf`"
+        onPathClick={() => {}}
+        onDownload={onDownload}
+      />
+    );
+
+    const button = container.querySelector('.chat-dl-btn') as HTMLButtonElement | null;
+    expect(button).not.toBeNull();
+    fireEvent.click(button!);
+    expect(onDownload).toHaveBeenCalledWith('./dist/report.pdf');
+  });
+
+  it('renders a download button for local markdown links with file extensions', () => {
+    const onDownload = vi.fn();
+    const { container } = render(
+      <ChatMarkdown
+        text="[report](./dist/report.pdf)"
+        onPathClick={() => {}}
+        onDownload={onDownload}
+      />
+    );
+
+    const button = container.querySelector('.chat-dl-btn') as HTMLButtonElement | null;
+    expect(button).not.toBeNull();
+    fireEvent.click(button!);
+    expect(onDownload).toHaveBeenCalledWith('./dist/report.pdf');
   });
 
   it('does not detect paths inside URLs', () => {

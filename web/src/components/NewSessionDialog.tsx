@@ -191,7 +191,8 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
         ? QWEN_EFFORT_LEVELS
       : agentType === 'openclaw'
         ? OPENCLAW_THINKING_LEVELS
-        : [];
+      : [];
+  const supportsCcPreset = agentType === 'claude-code' || agentType === 'claude-code-sdk';
 
   useEffect(() => {
     setThinking('high');
@@ -304,7 +305,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
         )}
 
         {/* CC env preset selector + editor */}
-        {agentType === 'claude-code' && (
+        {supportsCcPreset && (
           <>
             <div class="form-group">
               <label style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>

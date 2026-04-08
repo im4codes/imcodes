@@ -92,6 +92,10 @@ pushRoutes.post('/relay', async (c) => {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const unregistered = err instanceof PushError && err.unregistered;
+    logger.warn(
+      { err, platform: body.platform, token: body.token.slice(0, 10) + '...', unregistered },
+      'Push relay failed',
+    );
     return c.json({ error: msg, unregistered }, unregistered ? 410 : 502);
   }
 });
@@ -145,7 +149,9 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
       [payload.userId],
     );
     if (rows.length > 0) badgeCount = rows[0].badge_count;
-  } catch { /* fallback to 1 */ }
+  } catch (err) {
+    logger.warn({ err, userId: payload.userId }, 'Failed to increment badge_count — falling back to 1');
+  }
   payload.badge = badgeCount;
 
   const hasApns = !!(env.APNS_KEY && env.APNS_KEY_ID && env.APNS_TEAM_ID);

@@ -217,6 +217,30 @@ describe('Cron API routes', () => {
       expect(body.action).toEqual({ type: 'command', command: '/status' });
     });
 
+    it('accepts a null targetSessionName for main-session cron jobs', async () => {
+      const res = await app.request('/api/cron', jsonReq('POST', '/api/cron', {
+        ...validCommandBody,
+        targetSessionName: null,
+      }));
+      expect(res.status).toBe(201);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body.targetSessionName).toBeNull();
+    });
+
+    it('accepts long command prompts well beyond 1500 characters', async () => {
+      const longCommand = '早上好主人！'.repeat(260);
+      expect(longCommand.length).toBeGreaterThan(1500);
+
+      const res = await app.request('/api/cron', jsonReq('POST', '/api/cron', {
+        ...validCommandBody,
+        targetSessionName: null,
+        action: { type: 'command', command: longCommand },
+      }));
+      expect(res.status).toBe(201);
+      const body = await res.json() as Record<string, any>;
+      expect(body.action).toEqual({ type: 'command', command: longCommand });
+    });
+
     it('command action missing `command` field returns 400', async () => {
       const res = await app.request('/api/cron', jsonReq('POST', '/api/cron', {
         ...validCommandBody,

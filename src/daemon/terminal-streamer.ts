@@ -17,6 +17,7 @@
 
 import type { Readable } from 'stream';
 import { BACKEND, capturePaneVisible, capturePaneHistory, getPaneId, getPaneSize, sessionExists, startPipePaneStream, stopPipePaneStream } from '../agent/tmux.js';
+import { isTransportAgent } from '../agent/detect.js';
 import { getSession, upsertSession } from '../store/session-store.js';
 import { processRawPtyData, resetParser } from './terminal-parser.js';
 import { isWatching } from './jsonl-watcher.js';
@@ -24,12 +25,19 @@ import { isWatching as isCodexWatching } from './codex-watcher.js';
 import { isWatching as isGeminiWatching } from './gemini-watcher.js';
 import logger from '../util/logger.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { emitSessionInlineError } from './session-error.js';
 import type { TerminalDiff, TerminalHistory } from '../shared/transport/terminal.js';
 
 const IDLE_THRESHOLD_MS = 5_000; // 5s without raw bytes → idle (Stop hook fires immediately; this is fallback)
 const MAX_RAW_BUFFER = 256 * 1024; // 256KB per-subscriber snapshot-pending buffer
 const REBIND_DELAYS_MS = [1000, 2000, 4000, 8000, 16000, 30000];
 const MAX_REBIND_ATTEMPTS = 5;
+
+function shouldSuppressPaneIdInlineError(sessionName: string): boolean {
+  const session = getSession(sessionName);
+  return session?.runtimeType === 'transport'
+    || (typeof session?.agentType === 'string' && isTransportAgent(session.agentType));
+}
 
 export type { TerminalDiff, TerminalHistory } from '../shared/transport/terminal.js';
 
@@ -293,6 +301,9 @@ export class TerminalStreamer {
       }
       if (!paneId) {
         logger.error({ sessionName }, 'Cannot start pipe-pane: paneId not available — restart session to fix');
+        if (!shouldSuppressPaneIdInlineError(sessionName)) {
+          this.emitSessionStreamError(sessionName, 'Terminal stream unavailable: pane id not available. Restart the session to fix.');
+        }
         // Do not remove subscribers: they can still receive on-demand snapshots
         return;
       }
@@ -481,12 +492,17 @@ export class TerminalStreamer {
   private errorAllSubscribers(sessionName: string, err: Error): void {
     const subs = this.subscribers.get(sessionName);
     if (!subs) return;
+    this.emitSessionStreamError(sessionName, err.message);
     for (const [sub] of subs) {
       try { sub.onError?.(err); } catch { /* ignore */ }
     }
     this.subscribers.delete(sessionName);
     void this.stopPipe(sessionName);
     this.clearIdleTimer(sessionName);
+  }
+
+  private emitSessionStreamError(sessionName: string, message: string): void {
+    emitSessionInlineError(sessionName, message);
   }
 
   // ── Idle detection ──────────────────────────────────────────────────────────

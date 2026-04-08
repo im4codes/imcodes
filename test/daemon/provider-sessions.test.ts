@@ -3,8 +3,13 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
+import { setTransportRelaySend, broadcastProviderStatus } from '../../src/daemon/transport-relay.js';
 
 describe('provider session listing', () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
   it('TRANSPORT_MSG has LIST_SESSIONS and SESSIONS_RESPONSE constants', () => {
     expect(TRANSPORT_MSG.LIST_SESSIONS).toBe('provider.list_sessions');
     expect(TRANSPORT_MSG.SESSIONS_RESPONSE).toBe('provider.sessions_response');
@@ -15,7 +20,7 @@ describe('provider session listing', () => {
     vi.doMock('../../src/agent/provider-registry.js', () => ({
       getProvider: () => undefined,
     }));
-    const { listProviderSessions } = await import('../../src/daemon/command-handler.js');
+    const { listProviderSessions } = await import('../../src/daemon/provider-sessions.js');
     const sessions = await listProviderSessions('openclaw');
     expect(sessions).toEqual([]);
     vi.doUnmock('../../src/agent/provider-registry.js');
@@ -27,7 +32,7 @@ describe('provider session listing', () => {
         capabilities: { sessionRestore: false },
       }),
     }));
-    const mod = await import('../../src/daemon/command-handler.js');
+    const mod = await import('../../src/daemon/provider-sessions.js');
     // Re-import to pick up new mock
     const sessions = await mod.listProviderSessions('openclaw');
     expect(sessions).toEqual([]);
@@ -36,15 +41,6 @@ describe('provider session listing', () => {
 });
 
 describe('broadcastProviderStatus auto-push', () => {
-  let setTransportRelaySend: typeof import('../../src/daemon/transport-relay.js')['setTransportRelaySend'];
-  let broadcastProviderStatus: typeof import('../../src/daemon/transport-relay.js')['broadcastProviderStatus'];
-
-  beforeEach(async () => {
-    const mod = await import('../../src/daemon/transport-relay.js');
-    setTransportRelaySend = mod.setTransportRelaySend;
-    broadcastProviderStatus = mod.broadcastProviderStatus;
-  });
-
   it('sends provider.status message to server', () => {
     const sent: Record<string, unknown>[] = [];
     setTransportRelaySend((msg) => sent.push(msg));

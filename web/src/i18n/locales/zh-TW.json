@@ -18,7 +18,9 @@
     "connected": "已連線",
     "disconnected": "已斷線",
     "reconnecting": "重新連線中…",
-    "refresh": "重新整理"
+    "refresh": "重新整理",
+    "show": "顯示",
+    "hide": "隱藏"
   },
   "chat": {
     "loading": "載入對話中...",
@@ -73,6 +75,7 @@
     "no_session": "無 Session",
     "send_queued": "重新連線中… (訊息已排隊)",
     "transport_send_queued": "已加入佇列，當前回覆結束後傳送",
+    "transport_send_queued_collapsed": "共 {{count}} 則佇列訊息，僅顯示最後一則",
     "send_placeholder": "傳送給 {{name}}…",
     "actions": "Session 操作",
     "new_btn": "新建 Session",
@@ -176,7 +179,9 @@
     "no_changes": "無變更"
   },
   "toast": {
-    "finished": "完成"
+    "finished": "已完成",
+    "upgrade_blocked_title": "升級已阻止",
+    "upgrade_blocked_p2p_active": "P2P 仍在執行中。請先停止，再升級 daemon。"
   },
   "discussion": {
     "role_critic": "評論者",
@@ -354,6 +359,9 @@
       "phase_queued": "排隊中",
       "round_label": "輪次",
       "hop_label": "跳轉",
+      "auto_follow_latest": "自動跟隨最新",
+      "copy_path": "複製路徑",
+      "copy_content": "複製內容",
       "scroll_top": "捲動到頂部",
       "scroll_bottom": "捲動到底部"
     },
@@ -364,6 +372,10 @@
     "mode_brainstorm": "腦力激盪",
     "mode_discuss": "討論",
     "combo_label": "組合流程",
+    "combo_presets": "預設組合",
+    "combo_custom": "我的組合",
+    "combo_custom_empty": "還沒有自訂組合。",
+    "combo_builder": "新增組合",
     "exclude_same_type": "排除同類型",
     "picker": {
       "back": "返回",
@@ -389,11 +401,19 @@
       "discuss": "討論"
     },
     "mode_config": "配置",
+    "settings_button": "P2P設定",
     "settings_title": "P2P 參與者設定",
     "cross_session": "包含其他專案的工作階段",
+    "settings_filter_sdk": "SDK",
+    "settings_filter_cli": "CLI",
     "settings_save": "儲存",
     "settings_close": "關閉",
     "confirm_cancel": "確定取消?",
+    "combo_send_confirm_title": "確認組合流程傳送",
+    "combo_send_confirm_body": "這則訊息將直接依組合流程 {{mode}} 傳送。是否繼續？",
+    "combo_send_confirm_skip": "下次不再提示，直接傳送",
+    "combo_empty_message_warning": "組合流程傳送必須帶正文。請先補上實際問題或指令再傳送。",
+    "combo_requires_participants_hint": "請先到 P2P 設定裡選擇參與者，再啟用組合流程。",
     "settings_enabled": "參與",
     "settings_mode": "模式",
     "settings_skip": "跳過",
@@ -420,6 +440,25 @@
       "send_anyway": "仍然傳送",
       "tip_history": "多 Agent 是共享檔案、歷史更完整的討論；一對一則是一次性討論。"
     }
+  },
+  "openspec": {
+    "title": "OpenSpec",
+    "changes": "變更",
+    "empty": "目前沒有 OpenSpec 變更",
+    "audit_action": "審計",
+    "audit_implementation_action": "審計實作",
+    "audit_spec_action": "審計規格",
+    "implement_action": "實作",
+    "achieve_action": "完成",
+    "propose_action": "Propose",
+    "propose_from_discussion_action": "根據最近討論生成",
+    "propose_from_description_action": "根據下面的描述生成",
+    "audit_implementation_prompt": "對 {{reference}} 執行嚴格的實作審計，逐項對照其 OpenSpec 產物。找出所有不一致、遺漏、回歸風險、邊界情境缺口與缺失測試；然後直接修復程式碼、測試以及必要的配套改動。不要停留在報告層面，必須把實作修到與規格完全一致。",
+    "audit_spec_prompt": "對 {{reference}} 執行嚴格的規格審計。強化範圍定義、需求、驗收標準、邊界情境、失敗模式、依賴關係與可測試性，消除歧義與內部不一致，把規格修到可直接落地實作的品質。不要只給審查意見，直接修規格。",
+    "implement_prompt": "強力推進 {{reference}} 的實作。把工作拆成明確子任務，給子代理分配清楚所有權，整合輸出，逐項補齊與規格的差距，補充或更新測試，並對最終結果負責驗收。你負責調度、技術決策、整合收口與最終品質把關。",
+    "achieve_prompt": "依照完整 OpenSpec 工作流程把 {{reference}} 推到完成。檢查所有剩餘任務與產物，完成必要的實作與規格工作，關閉未完成項，必要時同步受影響的主規格，並在符合完成條件後封存此變更。不要只回報狀態，直接把它做完。",
+    "propose_from_discussion_prompt": "根據最近的討論生成一個 OpenSpec proposal。提煉目標、範圍、關鍵需求和驗收標準；不明確的部分明確列為待確認項。先給出可直接落庫的 change proposal 草稿。",
+    "propose_from_description_prompt": "根據下面的描述生成一個 OpenSpec proposal。整理目標、範圍、關鍵需求和驗收標準；缺失資訊明確列為待確認項。先給出可直接落庫的 change proposal 草稿。"
   },
   "upload": {
     "upload_file": "上傳檔案",
@@ -580,6 +619,24 @@
     "expand_all": "全部展開",
     "collapse_all": "全部折疊",
     "drag_to_resize": "拖動調整寬度"
+  },
+  "subsessionBar": {
+    "show": "顯示",
+    "hide": "隱藏",
+    "layout_double": "雙行",
+    "layout_single": "單行",
+    "card_size": "卡片尺寸",
+    "subs_count": "Subs（{{count}}）",
+    "new_sub_session": "新增子會話",
+    "p2p_discussions": "P2P 討論",
+    "repository": "儲存庫",
+    "scheduled_tasks": "排程任務",
+    "width_short": "寬",
+    "height_short": "高",
+    "apply": "套用",
+    "reset": "重設",
+    "empty_prefix": "目前沒有子會話，點擊",
+    "empty_suffix": "新增一個"
   },
   "localWebPreview": {
     "title": "本機網頁預覽",

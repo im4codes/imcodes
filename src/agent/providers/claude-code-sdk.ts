@@ -42,6 +42,7 @@ interface ClaudeSdkSessionState {
   cancelled: boolean;
   finalMetadata?: Record<string, unknown>;
   pendingComplete?: AgentMessage;
+  pendingError?: ProviderError;
   toolCalls: Map<number, ToolCallEvent & { partialInputJson?: string }>;
   emittedToolStates: Map<string, string>;
 }
@@ -209,12 +210,35 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Claude SDK session is already busy', true);
     }
 
+    await this.startQuery(sessionId, state, message, extraSystemPrompt, true);
+  }
+
+  async cancel(sessionId: string): Promise<void> {
+    const state = this.sessions.get(sessionId);
+    if (!state?.currentQuery) return;
+    state.cancelled = true;
+    try {
+      await state.currentQuery.interrupt();
+    } catch {}
+    try {
+      state.currentQuery.close();
+    } catch {}
+  }
+
+  private async startQuery(
+    sessionId: string,
+    state: ClaudeSdkSessionState,
+    message: string,
+    extraSystemPrompt: string | undefined,
+    allowResumeFallback: boolean,
+  ): Promise<void> {
     state.currentText = '';
     state.currentMessageId = null;
     state.completed = false;
     state.cancelled = false;
     state.finalMetadata = undefined;
     state.pendingComplete = undefined;
+    state.pendingError = undefined;
     state.toolCalls.clear();
     state.emittedToolStates.clear();
 
@@ -257,26 +281,24 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
 
     const q = query({ prompt: message, options: options as any });
     state.currentQuery = q;
-    void this.consumeQuery(sessionId, state, q);
+    void this.consumeQuery(sessionId, state, q, message, extraSystemPrompt, allowResumeFallback);
   }
 
-  async cancel(sessionId: string): Promise<void> {
-    const state = this.sessions.get(sessionId);
-    if (!state?.currentQuery) return;
-    state.cancelled = true;
-    try {
-      await state.currentQuery.interrupt();
-    } catch {}
-    try {
-      state.currentQuery.close();
-    } catch {}
-  }
-
-  private async consumeQuery(sessionId: string, state: ClaudeSdkSessionState, q: ReturnType<typeof query>): Promise<void> {
+  private async consumeQuery(
+    sessionId: string,
+    state: ClaudeSdkSessionState,
+    q: ReturnType<typeof query>,
+    message: string,
+    extraSystemPrompt: string | undefined,
+    allowResumeFallback: boolean,
+  ): Promise<void> {
     let pendingError: ProviderError | null = null;
     try {
       for await (const msg of q) {
         this.handleMessage(sessionId, state, msg);
+      }
+      if (!pendingError && state.pendingError) {
+        pendingError = state.pendingError;
       }
       if (!state.completed && state.cancelled) {
         pendingError = this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Claude turn cancelled', true);
@@ -289,8 +311,15 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       state.currentQuery = null;
       const pendingComplete = state.pendingComplete;
       state.pendingComplete = undefined;
+      state.pendingError = undefined;
       state.currentMessageId = null;
       state.currentText = '';
+      if (!pendingComplete && pendingError && allowResumeFallback && state.started && this.isMissingResumeError(pendingError.message)) {
+        state.started = false;
+        logger.info({ provider: this.id, sessionId, resumeId: state.resumeId }, 'Claude SDK resume failed; retrying with sessionId');
+        await this.startQuery(sessionId, state, message, extraSystemPrompt, false);
+        return;
+      }
       if (pendingComplete) {
         for (const cb of this.completeCallbacks) cb(sessionId, pendingComplete);
       } else if (pendingError) {
@@ -437,7 +466,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     if (msg.type === 'result') {
       if (msg.is_error) {
         const details = Array.isArray((msg as any).errors) ? (msg as any).errors.join('; ') : 'Claude execution failed';
-        this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, details, false, msg));
+        state.pendingError = this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, details, false, msg);
         return;
       }
       state.started = true;
@@ -547,6 +576,10 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       return this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, message, true, err);
     }
     return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, message, false, err);
+  }
+
+  private isMissingResumeError(message: string): boolean {
+    return /no conversation found|session .* not found|unknown session|invalid session/i.test(message);
   }
 
   private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {

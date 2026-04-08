@@ -80,8 +80,10 @@ SSH、VPN、ポート開放なしで、任意のブラウザから agent session
 ### モバイル、Watch、通知
 生体認証、push 通知、shell session の入力、Apple Watch での素早い確認と返信に対応します。
 
-### マルチエージェント議論と監査
-複数の agent による discuss / audit / review / brainstorm ラウンドを実行できます。
+### クロスモデル監査と P2P ディスカッション
+単一モデルの出力を盲信すべきではありません。P2P ディスカッションでは、異なるプロバイダーや思考スタイルを持つ複数の agent が、コードを書く前に同じコードベースで協調分析を行います。各ラウンドはカスタマイズ可能なマルチフェーズパイプラインに従い、各 agent は前の貢献をすべて読んだ上で出力します。異なるモデルは異なる種類の問題を発見します。このクロスプロバイダー相互審査により、実装前に大部分の問題を発見し、手戻りを大幅に削減できます。
+
+組み込みモードは `audit`（構造化された audit → review → plan パイプライン）、`review`、`discuss`、`brainstorm` で、独自のフェーズ構成も定義可能。Claude Code、Codex、Gemini CLI、Qwen で動作します。
 
 ### Streaming Transport Agents
 OpenClaw や Qwen のような transport 型 agent に対して、terminal scraping ではなくネイティブなストリーミングを提供します。

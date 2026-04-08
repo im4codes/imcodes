@@ -18,7 +18,9 @@
     "connected": "연결됨",
     "disconnected": "연결 끊김",
     "reconnecting": "재연결 중…",
-    "refresh": "새로고침"
+    "refresh": "새로고침",
+    "show": "표시",
+    "hide": "숨기기"
   },
   "chat": {
     "loading": "채팅 로딩 중...",
@@ -73,6 +75,7 @@
     "no_session": "세션 없음",
     "send_queued": "재연결 중… (전송 대기 중)",
     "transport_send_queued": "대기열에 추가됨 — 현재 응답이 끝나면 전송됩니다",
+    "transport_send_queued_collapsed": "{{count}}개 대기 중 · 마지막 메시지만 표시",
     "send_placeholder": "{{name}}에게 전송…",
     "actions": "세션 작업",
     "new_btn": "새 세션",
@@ -176,7 +179,9 @@
     "no_changes": "변경 없음"
   },
   "toast": {
-    "finished": "완료"
+    "finished": "완료됨",
+    "upgrade_blocked_title": "업그레이드 차단됨",
+    "upgrade_blocked_p2p_active": "P2P가 아직 실행 중입니다. daemon을 업그레이드하기 전에 먼저 중지하세요."
   },
   "discussion": {
     "role_critic": "비평가",
@@ -354,6 +359,9 @@
       "phase_queued": "대기열",
       "round_label": "라운드",
       "hop_label": "홉",
+      "auto_follow_latest": "최신 내용 자동 따라가기",
+      "copy_path": "경로 복사",
+      "copy_content": "내용 복사",
       "scroll_top": "맨 위로 스크롤",
       "scroll_bottom": "맨 아래로 스크롤"
     },
@@ -364,6 +372,10 @@
     "mode_brainstorm": "브레인스토밍",
     "mode_discuss": "토론",
     "combo_label": "콤보",
+    "combo_presets": "기본 콤보",
+    "combo_custom": "내 콤보",
+    "combo_custom_empty": "아직 사용자 콤보가 없습니다.",
+    "combo_builder": "새 콤보 추가",
     "exclude_same_type": "같은 유형 제외",
     "picker": {
       "back": "뒤로",
@@ -389,11 +401,19 @@
       "discuss": "토론"
     },
     "mode_config": "설정",
+    "settings_button": "P2P 설정",
     "settings_title": "P2P 참가자 설정",
     "cross_session": "다른 프로젝트의 세션 포함",
+    "settings_filter_sdk": "SDK",
+    "settings_filter_cli": "CLI",
     "settings_save": "저장",
     "settings_close": "닫기",
     "confirm_cancel": "취소하시겠습니까?",
+    "combo_send_confirm_title": "콤보 전송 확인",
+    "combo_send_confirm_body": "이 메시지는 콤보 흐름 {{mode}} 으로 바로 전송됩니다. 계속할까요?",
+    "combo_send_confirm_skip": "다음부터 묻지 않고 바로 전송",
+    "combo_empty_message_warning": "콤보 전송에는 실제 메시지 본문이 필요합니다. 내용을 입력한 뒤 전송하세요.",
+    "combo_requires_participants_hint": "콤보 모드를 쓰려면 먼저 P2P 설정에서 참여자를 선택하세요.",
     "settings_enabled": "참여",
     "settings_mode": "모드",
     "settings_skip": "건너뛰기",
@@ -420,6 +440,25 @@
       "send_anyway": "그대로 보내기",
       "tip_history": "멀티 에이전트 토론은 파일을 공유하고 기록도 더 잘 남습니다. 1:1 토론은 일회성 토론으로 처리됩니다."
     }
+  },
+  "openspec": {
+    "title": "OpenSpec",
+    "changes": "변경",
+    "empty": "OpenSpec 변경 사항이 없습니다",
+    "audit_action": "감사",
+    "audit_implementation_action": "구현 감사",
+    "audit_spec_action": "명세 감사",
+    "implement_action": "구현",
+    "achieve_action": "완료",
+    "propose_action": "제안",
+    "propose_from_discussion_action": "최근 논의에서 생성",
+    "propose_from_description_action": "아래 설명에서 생성",
+    "audit_implementation_prompt": "{{reference}}에 대해 OpenSpec 산출물을 기준으로 엄격한 구현 감사를 수행하세요. 모든 불일치, 누락, 회귀 위험, 경계 사례 공백, 누락된 테스트를 찾아낸 뒤 코드, 테스트, 필요한 보조 변경까지 직접 수정하세요. 보고서로 끝내지 말고 구현을 명세와 완전히 일치시키세요.",
+    "audit_spec_prompt": "{{reference}}에 대해 엄격한 명세 감사를 수행하세요. 범위, 요구사항, 승인 기준, 경계 사례, 실패 모드, 의존성, 테스트 가능성을 강화하고, 모호함과 내부 불일치를 제거해 바로 구현 가능한 수준까지 명세를 개선하세요. 검토 의견만 남기지 말고 명세 자체를 고치세요.",
+    "implement_prompt": "{{reference}} 구현을 강하게 밀어붙이세요. 작업을 구체적 하위 작업으로 분해하고, 하위 에이전트에 명확한 소유권을 배정하고, 결과를 통합하고, 명세 대비 부족분을 메우고, 테스트를 추가 또는 갱신하고, 최종 결과를 검증하세요. 당신이 오케스트레이션, 기술 판단, 최종 검수를 책임지세요.",
+    "achieve_prompt": "전체 OpenSpec 워크플로로 {{reference}}를 완료 상태까지 밀어붙이세요. 남은 작업과 산출물을 모두 점검하고, 필요한 구현과 명세 작업을 끝내고, 미해결 항목을 닫고, 필요하면 영향받는 메인 명세를 동기화한 뒤, 완료 기준을 충족하면 변경을 보관하세요. 상태 보고에서 멈추지 마세요.",
+    "propose_from_discussion_prompt": "최근 논의를 바탕으로 OpenSpec proposal을 생성하세요. 목표, 범위, 핵심 요구사항, 승인 기준을 정리하고, 불명확한 부분은 확인 필요 항목으로 남기세요. 먼저 바로 저장할 수 있는 change proposal 초안을 작성하세요.",
+    "propose_from_description_prompt": "아래 설명을 바탕으로 OpenSpec proposal을 생성하세요. 목표, 범위, 핵심 요구사항, 승인 기준을 정리하고, 빠진 정보는 확인 필요 항목으로 남기세요. 먼저 바로 저장할 수 있는 change proposal 초안을 작성하세요."
   },
   "upload": {
     "upload_file": "파일 업로드",
@@ -580,6 +619,24 @@
     "expand_all": "모두 펼치기",
     "collapse_all": "모두 접기",
     "drag_to_resize": "드래그하여 크기 조절"
+  },
+  "subsessionBar": {
+    "show": "표시",
+    "hide": "숨기기",
+    "layout_double": "2줄",
+    "layout_single": "1줄",
+    "card_size": "카드 크기",
+    "subs_count": "Subs ({{count}})",
+    "new_sub_session": "새 하위 세션",
+    "p2p_discussions": "P2P 토론",
+    "repository": "저장소",
+    "scheduled_tasks": "예약 작업",
+    "width_short": "너비",
+    "height_short": "높이",
+    "apply": "적용",
+    "reset": "재설정",
+    "empty_prefix": "하위 세션이 없습니다. ",
+    "empty_suffix": "를 눌러 추가하세요"
   },
   "localWebPreview": {
     "title": "로컬 웹 미리보기",

@@ -7,14 +7,15 @@
  * main session's JSONL file and emitting its events under the sub-session name.
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── All mocks hoisted so factories can reference them ─────────────────────────
 
 const {
   storeMock, tmuxListMock, startWatchingMock, startWatchingFileMock,
-  isWatchingMock, restartSessionMock, getPaneStartCommandMock, upsertSessionMock, discoverLatestOpenCodeSessionIdMock,
-  opencodeStartWatchingMock, opencodeIsWatchingMock,
+  isWatchingMock, restartSessionMock, getPaneStartCommandMock, upsertSessionMock, updateSessionStateMock,
+  discoverLatestOpenCodeSessionIdMock, opencodeStartWatchingMock, opencodeIsWatchingMock,
+  newSessionMock, timelineEmitMock,
 } = vi.hoisted(() => ({
   storeMock: vi.fn(),
   tmuxListMock: vi.fn().mockResolvedValue(['deck_Cd_brain', 'deck_sub_5907196l']),
@@ -24,20 +25,26 @@ const {
   restartSessionMock: vi.fn().mockResolvedValue(undefined),
   getPaneStartCommandMock: vi.fn().mockResolvedValue('claude --dangerously-skip-permissions'),
   upsertSessionMock: vi.fn(),
+  updateSessionStateMock: vi.fn(),
   discoverLatestOpenCodeSessionIdMock: vi.fn().mockResolvedValue(undefined),
   opencodeStartWatchingMock: vi.fn().mockResolvedValue(undefined),
   opencodeIsWatchingMock: vi.fn().mockReturnValue(false),
+  newSessionMock: vi.fn().mockResolvedValue(undefined),
+  timelineEmitMock: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
   listSessions: storeMock,   // session-manager imports `listSessions as storeSessions`
   upsertSession: upsertSessionMock,
+  updateSessionState: updateSessionStateMock,
   getSession: vi.fn(() => null),
+  removeSession: vi.fn(),
 }));
 
 vi.mock('../../src/agent/tmux.js', () => ({
+  BACKEND: 'tmux',
   listSessions: tmuxListMock,
-  newSession: vi.fn().mockResolvedValue(undefined),
+  newSession: newSessionMock,
   killSession: vi.fn().mockResolvedValue(undefined),
   sessionExists: vi.fn().mockResolvedValue(true),
   isPaneAlive: vi.fn().mockResolvedValue(true),
@@ -77,6 +84,7 @@ vi.mock('../../src/daemon/codex-watcher.js', () => ({
 
 vi.mock('../../src/agent/detect.js', () => ({
   detectStatus: vi.fn(() => 'idle'),
+  isTransportAgent: vi.fn(() => false),
 }));
 
 vi.mock('../../src/daemon/opencode-history.js', () => ({
@@ -90,7 +98,7 @@ vi.mock('../../src/daemon/opencode-watcher.js', () => ({
 }));
 
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
-  timelineEmitter: { emit: vi.fn(), on: vi.fn(() => () => {}), epoch: 0, replay: vi.fn(() => ({ events: [], truncated: false })) },
+  timelineEmitter: { emit: timelineEmitMock, on: vi.fn(() => () => {}), epoch: 0, replay: vi.fn(() => ({ events: [], truncated: false })) },
 }));
 
 vi.mock('../../src/daemon/timeline-store.js', () => ({
@@ -101,12 +109,24 @@ vi.mock('../../src/agent/brain-dispatcher.js', () => ({
   BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })),
 }));
 
-import { restoreFromStore } from '../../src/agent/session-manager.js';
+import { restoreFromStore, restartSession, respawnSession, setSessionEventCallback } from '../../src/agent/session-manager.js';
 import { startWatching, startWatchingFile } from '../../src/daemon/jsonl-watcher.js';
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('restoreFromStore — sub-session JSONL watcher regression', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setSessionEventCallback(() => {});
+    tmuxListMock.mockResolvedValue(['deck_Cd_brain', 'deck_sub_5907196l']);
+    isWatchingMock.mockReturnValue(false);
+    getPaneStartCommandMock.mockResolvedValue('claude --dangerously-skip-permissions');
+    discoverLatestOpenCodeSessionIdMock.mockResolvedValue(undefined);
+    opencodeStartWatchingMock.mockResolvedValue(undefined);
+    opencodeIsWatchingMock.mockReturnValue(false);
+    newSessionMock.mockResolvedValue(undefined);
+  });
+
   it('does NOT call startWatching for deck_sub_* sessions (prevents JSONL file stealing)', async () => {
     storeMock.mockReturnValue([
       // Main brain session — has ccSessionId
@@ -194,6 +214,152 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
     expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
       name: 'deck_sub_5907196l',
       opencodeSessionId: 'oc-sub-sqlite-789',
+    }));
+  });
+
+  it('emits a session-scoped error when restartSession hits loop protection', async () => {
+    const now = Date.now();
+    const result = await restartSession({
+      name: 'deck_loop_brain',
+      projectName: 'loop',
+      role: 'brain',
+      agentType: 'shell',
+      projectDir: '/proj',
+      state: 'running',
+      restarts: 3,
+      restartTimestamps: [now - 60_000, now - 120_000, now - 180_000],
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    expect(result).toBe(false);
+    expect(updateSessionStateMock).toHaveBeenCalledWith('deck_loop_brain', 'error');
+    expect(timelineEmitMock).toHaveBeenCalledWith(
+      'deck_loop_brain',
+      'assistant.text',
+      expect.objectContaining({
+        text: '⚠️ Error: Restart loop detected: more than 3 restarts within 5 minutes',
+        streaming: false,
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it('emits a session-scoped error when respawnSession hits loop protection', async () => {
+    const now = Date.now();
+    const result = await respawnSession({
+      name: 'deck_loop_w1',
+      projectName: 'loop',
+      role: 'w1',
+      agentType: 'shell',
+      projectDir: '/proj',
+      state: 'running',
+      restarts: 3,
+      restartTimestamps: [now - 60_000, now - 120_000, now - 180_000],
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    expect(result).toBe(false);
+    expect(updateSessionStateMock).toHaveBeenCalledWith('deck_loop_w1', 'error');
+    expect(timelineEmitMock).toHaveBeenCalledWith(
+      'deck_loop_w1',
+      'assistant.text',
+      expect.objectContaining({
+        text: '⚠️ Error: Restart loop detected: more than 3 restarts within 5 minutes',
+        streaming: false,
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it('persists idle before restarting a missing session', async () => {
+    const now = Date.now();
+
+    await restartSession({
+      name: 'deck_restart_brain',
+      projectName: 'restart',
+      role: 'brain',
+      agentType: 'shell',
+      projectDir: '/proj',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_restart_brain',
+      state: 'idle',
+    }));
+  });
+
+  it('persists idle before respawning a dead pane', async () => {
+    const now = Date.now();
+
+    await respawnSession({
+      name: 'deck_respawn_w1',
+      projectName: 'respawn',
+      role: 'w1',
+      agentType: 'shell',
+      projectDir: '/proj',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_respawn_w1',
+      state: 'idle',
+    }));
+  });
+
+  it('preserves error-state failed-close records for live sessions during restore', async () => {
+    storeMock.mockReturnValue([
+      {
+        name: 'deck_failedclose_brain',
+        projectName: 'failedclose',
+        role: 'brain',
+        agentType: 'shell',
+        projectDir: '/proj',
+        state: 'error',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: 1000,
+        updatedAt: 2000,
+      },
+      {
+        name: 'deck_sub_failedclose',
+        projectName: 'deck_sub_failedclose',
+        role: 'w1',
+        agentType: 'shell',
+        projectDir: '/proj',
+        state: 'error',
+        parentSession: 'deck_failedclose_brain',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: 1000,
+        updatedAt: 2000,
+      },
+    ]);
+    tmuxListMock.mockResolvedValue(['deck_failedclose_brain', 'deck_sub_failedclose']);
+
+    await restoreFromStore();
+
+    expect(updateSessionStateMock).not.toHaveBeenCalledWith('deck_failedclose_brain', 'idle');
+    expect(updateSessionStateMock).not.toHaveBeenCalledWith('deck_failedclose_brain', 'stopped');
+    expect(updateSessionStateMock).not.toHaveBeenCalledWith('deck_sub_failedclose', 'idle');
+    expect(updateSessionStateMock).not.toHaveBeenCalledWith('deck_sub_failedclose', 'stopped');
+    expect(upsertSessionMock).not.toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_failedclose_brain',
+      state: 'stopped',
+    }));
+    expect(upsertSessionMock).not.toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_sub_failedclose',
+      state: 'stopped',
     }));
   });
 });

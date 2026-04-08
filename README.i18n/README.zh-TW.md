@@ -88,9 +88,11 @@ Claude Code 和 Codex 現在都支援兩種接入方式：CLI 和 SDK。
 
 完整支持移动端，包含生物识别认证和推送通知。Shell 会话在手機上也支持交互式键盘输入（类似 SSH）。子会话預覽卡始终显示最新消息。Toast 通知可直接跳转到对应会话。Apple Watch 支持会话快速檢視、未读计数和快速回复。
 
-### 多 Agent 討論與審計
+### 跨模型稽核與 P2P 討論
 
-单模型输出不应被盲目信任。你可以快速发起多轮讨论，让多个 agent——甚至跨 provider——围绕同一主题进行 review、audit 或 brainstorming。每个 agent 会读取前面的内容，再追加自己的分析。支持 `discuss`、`audit`、`review`、`brainstorm` 模式。侧边栏中的环形进度条会显示 round / hop 完成情况。支持 Claude Code、Codex、Gemini CLI，也兼容带 sandbox 的 agent。
+單一模型的輸出不應被盲目信任。P2P 討論讓多個 agent——跨不同 provider 和思維風格——在寫程式之前就對同一代碼庫進行協作分析。每輪遵循可自訂的多階段流程，每個 agent 讀取所有前序貢獻並在此基礎上輸出。不同模型捕獲不同類別的問題：一個發現競態條件，另一個指出遺漏的 migration，第三個質疑 API 設計。這種跨 provider 交叉審查能在實現前發現絕大部分問題，大幅減少返工。
+
+內建模式包括 `audit`（結構化 audit → review → plan 流水線）、`review`、`discuss` 和 `brainstorm`，也可以自訂階段序列。側邊欄中的環形進度條會顯示 round / hop 完成情況。支持 Claude Code、Codex、Gemini CLI 和 Qwen，也相容帶 sandbox 的 agent。透過 `@@all(config)` 或 UI 配置參與者、輪次、模式和 P2P 設定。
 
 ### 串流 Transport Agents
 

@@ -164,7 +164,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
             projectDir: mainSessionProjectDir(group.agentName),
             bindExistingKey: group.mainSession.key, skipCreate: true, skipStore: true,
           });
-          upsertSession({ ...mainRecord!, state: 'running', label: mainLabel, updatedAt: Date.now() });
+          upsertSession({ ...mainRecord!, state: 'idle', label: mainLabel, updatedAt: Date.now() });
           logger.info({ session: mName, ocKey: group.mainSession.key }, 'oc-sync: reconnected main session runtime');
         } catch (err) {
           registerProviderRoute(group.mainSession.key, mName);
@@ -217,7 +217,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
               parentSession: mName,
             });
             const newLabel = preferredOpenClawLabel(storeEntry.label, ch.displayName, ch.key);
-            upsertSession({ ...storeEntry, state: 'running', parentSession: mName, label: newLabel, updatedAt: Date.now() });
+            upsertSession({ ...storeEntry, state: 'idle', parentSession: mName, label: newLabel, updatedAt: Date.now() });
             // Update server DB label (may have been stored with sanitized key before displayName fix)
             const subId = storeEntry.name.replace('deck_sub_', '');
             try {
@@ -253,7 +253,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
             const reconnLabel = preferredOpenClawLabel(existingInStore.label, ch.displayName, ch.key);
             upsertSession({
               ...existingInStore,
-              state: 'running',
+              state: 'idle',
               parentSession: mName,
               label: reconnLabel,
               updatedAt: Date.now(),

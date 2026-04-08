@@ -476,20 +476,24 @@ export async function startWatching(sessionName: string, workDir: string, model?
   watchers.set(sessionName, state);
   const control = watcherControl(sessionName);
   registerWatcherControl(sessionName, control);
-
-  for (const dir of recentSessionDirs()) {
-    const found = await findLatestRollout(dir, workDir);
-    if (found) {
-      const s = await stat(found);
+  startPoll(sessionName, state);
+  void watchDir(sessionName, state, state.workDir || codexSessionDir(new Date()));
+  void (async () => {
+    for (const dir of recentSessionDirs()) {
+      if (state.stopped) return;
+      const found = await findLatestRollout(dir, workDir);
+      if (!found || state.stopped) continue;
+      const s = await stat(found).catch(() => null);
+      if (!s || state.stopped) continue;
       state.activeFile = found;
       state.fileOffset = s.size;
       claimedFiles.set(found, sessionName);
       await emitRecentHistory(sessionName, found, model);
-      break;
+      return;
     }
-  }
-  startPoll(sessionName, state);
-  void watchDir(sessionName, state, state.workDir || codexSessionDir(new Date()));
+  })().catch((err) => {
+    logger.debug({ err, sessionName, workDir }, 'codex-watcher: initial rollout scan failed');
+  });
   return control;
 }
 

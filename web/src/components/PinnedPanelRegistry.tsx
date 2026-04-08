@@ -15,6 +15,7 @@ import type { TFunction } from 'i18next';
 import type { WsClient } from '../ws-client.js';
 import type { PinnedPanel } from '../app.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
+import type { FileBrowserPreviewRequest, FileBrowserPreviewUpdate } from './FileBrowser.js';
 
 export interface PanelRenderContext {
   ws: WsClient | null;
@@ -27,7 +28,9 @@ export interface PanelRenderContext {
   /** For repo/file browser CI events */
   onCiEvent?: (run: { name: string; status: string; conclusion?: string | null }) => void;
   /** Open a file preview in a large floating window (used by pinned file browser) */
-  onPreviewFile?: (path: string) => void;
+  onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
+  /** Sync preview state from a source FileBrowser into the floating preview host/cache. */
+  onPreviewStateChange?: (update: FileBrowserPreviewUpdate) => void;
   /** Current active session name — for file browser to follow tab switches */
   activeSession?: string | null;
   /** Current active session's project directory — follows tab switches */

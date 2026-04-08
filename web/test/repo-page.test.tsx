@@ -9,6 +9,10 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, act, cleanup } from '@testing-library/preact';
 
+if (!HTMLElement.prototype.scrollIntoView) {
+  HTMLElement.prototype.scrollIntoView = vi.fn();
+}
+
 // jsdom localStorage may be a plain object without methods — ensure a working stub
 const localStorageStore: Record<string, string> = {};
 Object.defineProperty(globalThis, 'localStorage', {
@@ -408,6 +412,69 @@ describe('RepoPage', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('applies CSS focus animation classes to the targeted failed action step', async () => {
+    const { ws, respondDetect, respondTab, respondActionDetail } = makeWs();
+    const { container, rerender } = render(
+      <RepoPage
+        ws={ws}
+        projectDir={PROJECT_DIR}
+        onBack={vi.fn()}
+        focusLatestAction={{ token: 1, failedJobName: 'test', failedStepName: 'unit tests' }}
+      />,
+    );
+
+    await act(async () => {
+      respondDetect({ provider: 'github', owner: 'acme', repo: 'widgets' });
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Actions'));
+    });
+
+    await act(async () => {
+      respondTab('repo.actions_response', PROJECT_DIR, [
+        { id: 101, name: 'CI', status: 'failure', conclusion: 'failure', updatedAt: Date.now() },
+      ]);
+    });
+
+    await act(async () => {
+      respondActionDetail(PROJECT_DIR, {
+        runId: 101,
+        jobs: [
+          {
+            id: 'job-1',
+            name: 'test',
+            status: 'failure',
+            conclusion: 'failure',
+            steps: [
+              { number: 1, name: 'install', status: 'completed', conclusion: 'success' },
+              { number: 2, name: 'unit tests', status: 'failure', conclusion: 'failure' },
+            ],
+          },
+        ],
+      });
+    });
+
+    const focusedStep = Array.from(container.querySelectorAll('.repo-action-step')).find((el) => el.textContent?.includes('unit tests'));
+    expect(focusedStep?.className).toMatch(/repo-action-focus-[ab]/);
+
+    rerender(
+      <RepoPage
+        ws={ws}
+        projectDir={PROJECT_DIR}
+        onBack={vi.fn()}
+        focusLatestAction={{ token: 2, failedJobName: 'test', failedStepName: 'unit tests' }}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const replayedStep = Array.from(container.querySelectorAll('.repo-action-step')).find((el) => el.textContent?.includes('unit tests'));
+    expect(replayedStep?.className).toMatch(/repo-action-focus-[ab]/);
   });
 
   // 5. Empty state

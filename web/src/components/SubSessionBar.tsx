@@ -15,6 +15,8 @@ import { resolveContextWindow } from '../model-context.js';
 import { shortModelLabel } from '../model-label.js';
 import { P2pProgressCard } from './P2pProgressCard.js';
 import type { P2pProgressDiscussion } from './P2pProgressCard.js';
+import { IdleFlashLayer } from './IdleFlashLayer.js';
+import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 
 interface DaemonStats {
   daemonVersion?: string | null;
@@ -33,9 +35,20 @@ type DiscussionSummary = P2pProgressDiscussion & {
   fileId?: string;
 };
 
+interface CollapsedSubSessionButtonProps {
+  sub: SubSession;
+  isOpen: boolean;
+  idleFlashToken: number;
+  usage?: { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string };
+  inP2p: boolean;
+  onOpen: (id: string) => void;
+  t: (key: string, vars?: Record<string, unknown>) => string;
+}
+
 interface Props {
   subSessions: SubSession[];
   openIds: Set<string>;
+  idleFlashTokens?: Map<string, number>;
   onOpen: (id: string) => void;
   onClose: (id: string) => void;
   onRestart: (id: string) => void;
@@ -103,7 +116,43 @@ function formatUptime(seconds: number): string {
   return d > 0 ? `${d}d ${h}h` : `${h}h`;
 }
 
-export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId, quickData, sessions, allSubSessions, p2pSessionLabels }: Props) {
+function CollapsedSubSessionButton({ sub, isOpen, idleFlashToken, usage, inP2p, onOpen, t }: CollapsedSubSessionButtonProps) {
+  const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
+  const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
+  const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
+  const abbr = TYPE_ABBR[sub.type] ?? agentTag.slice(0, 2);
+  const model = usage ? shortModelLabel(usage.model) : null;
+  let ctxPct = 0;
+  if (usage) {
+    const ctx = resolveContextWindow(usage.contextWindow, usage.model);
+    ctxPct = Math.min(100, (usage.inputTokens + usage.cacheTokens) / ctx * 100);
+  }
+
+  return (
+    <button
+      key={sub.id}
+      data-sub-id={sub.id}
+      class={`subsession-card${isOpen ? ' open' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
+      onClick={() => onOpen(sub.id)}
+      title={label + (model ? ` · ${model}` : '') + (ctxPct > 0 ? ` · ctx ${ctxPct.toFixed(0)}%` : '')}
+    >
+      {activeIdleFlashToken ? <IdleFlashLayer key={`subbutton-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
+      <span class="subsession-card-icon">{abbr}</span>
+      <span class="subsession-card-label">{sub.label ? formatLabel(sub.label).slice(0, 12) : agentTag.slice(0, 6)}</span>
+      {inP2p && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
+      {model && <span class="subsession-card-model">{model}</span>}
+      {sub.ccPresetId && <span class="subsession-card-custom-api" title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
+      {sub.state === 'starting' && <span class="subsession-card-badge">…</span>}
+      {ctxPct > 0 && (
+        <span class="subsession-card-ctx" style={{ width: '100%' }}>
+          <span class="subsession-card-ctx-fill" style={{ width: `${ctxPct}%` }} />
+        </span>
+      )}
+    </button>
+  );
+}
+
+export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, onClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId, quickData, sessions, allSubSessions, p2pSessionLabels }: Props) {
   const { t } = useTranslation();
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
   const [collapsed, setCollapsed] = useState(isMobile);
@@ -260,22 +309,22 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
     <div class="subcard-bar">
       {/* Toolbar */}
       <div class="subcard-toolbar">
-        <button class="subcard-toolbar-btn" onClick={() => setCollapsed(!collapsed)} title={collapsed ? 'Show' : 'Hide'}>
+        <button class="subcard-toolbar-btn" onClick={() => setCollapsed(!collapsed)} title={collapsed ? t('subsessionBar.show') : t('subsessionBar.hide')}>
           {collapsed ? '▲' : '▼'}
         </button>
         {!collapsed && (
           <>
-            <button class="subcard-toolbar-btn" onClick={toggleLayout} title={layout === 'single' ? 'Double row' : 'Single row'}>
+            <button class="subcard-toolbar-btn" onClick={toggleLayout} title={layout === 'single' ? t('subsessionBar.layout_double') : t('subsessionBar.layout_single')}>
               {layout === 'single' ? '⊞' : '☰'}
             </button>
             <button
               class={`subcard-toolbar-btn${showSizePanel ? ' subcard-toolbar-btn-active' : ''}`}
               onClick={() => { setShowSizePanel(!showSizePanel); setDraftW(String(cardSize.w)); setDraftH(String(cardSize.h)); }}
-              title="Card size"
+              title={t('subsessionBar.card_size')}
             >
               ⚙
             </button>
-            <span class="subcard-toolbar-label">Subs ({subSessions.length})</span>
+            <span class="subcard-toolbar-label">{t('subsessionBar.subs_count', { count: subSessions.length })}</span>
             {/* Desktop: full stats in expanded toolbar */}
             {stats && (
               <span class="daemon-stats-inline" title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}`}>
@@ -324,9 +373,9 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
             </span>
           );
         })()}
-        <button class="subcard-toolbar-add" data-onboarding="new-sub-session" onClick={onNew} title="New sub-session">+</button>
+        <button class="subcard-toolbar-add" data-onboarding="new-sub-session" onClick={onNew} title={t('subsessionBar.new_sub_session')}>+</button>
         {onViewDiscussions && (
-          <button class="subcard-toolbar-btn" data-onboarding="discussion-history" onClick={onViewDiscussions} title="P2P discussions" style={{ marginLeft: 4, fontSize: 11 }}>
+          <button class="subcard-toolbar-btn" data-onboarding="discussion-history" onClick={onViewDiscussions} title={t('subsessionBar.p2p_discussions')} style={{ marginLeft: 4, fontSize: 11 }}>
             📋
           </button>
         )}
@@ -335,7 +384,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
             class="subcard-toolbar-btn"
             data-onboarding="repo-page"
             onClick={() => onViewRepo()}
-            title="Repository"
+            title={t('subsessionBar.repository')}
             style={{
               marginLeft: 4,
               fontSize: 11,
@@ -345,7 +394,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
           </button>
         )}
         {onViewCron && (
-          <button class="subcard-toolbar-btn" data-onboarding="cron-manager" onClick={onViewCron} title="Scheduled Tasks" style={{ marginLeft: 4, fontSize: 11 }}>
+          <button class="subcard-toolbar-btn" data-onboarding="cron-manager" onClick={onViewCron} title={t('subsessionBar.scheduled_tasks')} style={{ marginLeft: 4, fontSize: 11 }}>
             ⏰
           </button>
         )}
@@ -354,9 +403,9 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
       {/* Size settings panel */}
       {!collapsed && showSizePanel && (
         <div class="subcard-size-panel">
-          <span class="subcard-size-label">Card size</span>
+          <span class="subcard-size-label">{t('subsessionBar.card_size')}</span>
           <label class="subcard-size-field">
-            W
+            {t('subsessionBar.width_short')}
             <input
               type="number"
               class="subcard-size-input"
@@ -367,7 +416,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
             />
           </label>
           <label class="subcard-size-field">
-            H
+            {t('subsessionBar.height_short')}
             <input
               type="number"
               class="subcard-size-input"
@@ -377,15 +426,15 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
               onKeyDown={(e) => e.key === 'Enter' && applySize()}
             />
           </label>
-          <button class="subcard-toolbar-btn" onClick={applySize}>Apply</button>
-          <button class="subcard-toolbar-btn" onClick={resetSize}>Reset</button>
+          <button class="subcard-toolbar-btn" onClick={applySize}>{t('subsessionBar.apply')}</button>
+          <button class="subcard-toolbar-btn" onClick={resetSize}>{t('subsessionBar.reset')}</button>
         </div>
       )}
 
       {/* Empty state: no sub-sessions and expanded */}
       {!collapsed && subSessions.length === 0 && discussions.length === 0 && (
         <div class="subcard-empty-state">
-          No sub-sessions — click <strong>+</strong> to add one
+          {t('subsessionBar.empty_prefix')} <strong>+</strong> {t('subsessionBar.empty_suffix')}
         </div>
       )}
 
@@ -410,41 +459,18 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
       {/* Collapsed: compact buttons (all platforms) — long-press to reorder */}
       {collapsed && subSessions.length > 0 && (
         <div class="subsession-bar" style={{ borderTop: 'none' }} ref={collapsedBarRef}>
-          {orderedSessions.map((sub) => {
-            const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
-            const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
-            const abbr = TYPE_ABBR[sub.type] ?? agentTag.slice(0, 2);
-            const isOpen = openIds.has(sub.id);
-            const usage = subUsages?.get(`deck_sub_${sub.id}`);
-            const model = usage ? shortModelLabel(usage.model) : null;
-            // Compute ctx percentage for mini bar
-            let ctxPct = 0;
-            if (usage) {
-              const ctx = resolveContextWindow(usage.contextWindow, usage.model);
-              ctxPct = Math.min(100, (usage.inputTokens + usage.cacheTokens) / ctx * 100);
-            }
-            return (
-              <button
-                key={sub.id}
-                data-sub-id={sub.id}
-                class={`subsession-card${isOpen ? ' open' : ''} mobile${isVisuallyBusy(sub.state, false) ? ' subcard-running-pulse' : ''}`}
-                onClick={() => onOpen(sub.id)}
-                title={label + (model ? ` · ${model}` : '') + (ctxPct > 0 ? ` · ctx ${ctxPct.toFixed(0)}%` : '')}
-              >
-                <span class="subsession-card-icon">{abbr}</span>
-                <span class="subsession-card-label">{sub.label ? formatLabel(sub.label).slice(0, 12) : agentTag.slice(0, 6)}</span>
-                {p2pSessionLabels?.has(sub.sessionName) && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
-                {model && <span class="subsession-card-model">{model}</span>}
-                {sub.ccPresetId && <span class="subsession-card-custom-api" title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
-                {sub.state === 'starting' && <span class="subsession-card-badge">…</span>}
-                {ctxPct > 0 && (
-                  <span class="subsession-card-ctx" style={{ width: '100%' }}>
-                    <span class="subsession-card-ctx-fill" style={{ width: `${ctxPct}%` }} />
-                  </span>
-                )}
-              </button>
-            );
-          })}
+          {orderedSessions.map((sub) => (
+            <CollapsedSubSessionButton
+              key={sub.id}
+              sub={sub}
+              isOpen={openIds.has(sub.id)}
+              idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
+              usage={subUsages?.get(`deck_sub_${sub.id}`)}
+              inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
+              onOpen={onOpen}
+              t={t}
+            />
+          ))}
         </div>
       )}
 
@@ -493,6 +519,7 @@ export function SubSessionBar({ subSessions, openIds, onOpen, onClose, onRestart
                 connected={connected}
                 isOpen={openIds.has(sub.id)}
                 isFocused={focusedSubId === sub.id}
+                idleFlashToken={idleFlashTokens?.get(sub.sessionName) ?? 0}
                 onOpen={() => onOpen(sub.id)}
                 onClose={() => onClose(sub.id)}
                 onRestart={() => onRestart(sub.id)}

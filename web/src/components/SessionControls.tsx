@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { RefObject } from 'preact';
-import type { WsClient } from '../ws-client.js';
+import type { WsClient, ServerMessage } from '../ws-client.js';
 import type { SessionInfo } from '../types.js';
 import { QuickInputPanel } from './QuickInputPanel.js';
 import { getNavigableHistory } from './QuickInputPanel.js';
@@ -12,9 +12,15 @@ import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
 import { P2pConfigPanel } from './P2pConfigPanel.js';
+import { useP2pCustomCombos } from './p2p-combos.js';
 import { uploadFile, getUserPref, saveUserPref } from '../api.js';
-import { isVisuallyBusy } from '../thinking-utils.js';
-import { P2P_CONFIG_MODE, COMBO_PRESETS, COMBO_SEPARATOR } from '@shared/p2p-modes.js';
+import { isRunningSessionState } from '../thinking-utils.js';
+import {
+  buildP2pConfigSelection,
+  P2P_CONFIG_MODE,
+  COMBO_SEPARATOR,
+  isComboMode,
+} from '@shared/p2p-modes.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
@@ -47,7 +53,7 @@ interface Props {
   onSubRestart?: () => void;
   onSubNew?: () => void;
   onSubStop?: () => void;
-  /** When true, show the scan-sweep animation even if session state is not 'running'. */
+  /** Legacy prop retained for callers that still pass thinking state for labels/timers. */
   activeThinking?: boolean;
   /** Mobile: open full-screen file browser overlay. */
   mobileFileBrowserOpen?: boolean;
@@ -68,6 +74,8 @@ interface Props {
   onPendingPrefillApplied?: () => void;
   /** Compact mode for sub-session cards — only input, @, ⚡, 📎, send. */
   compact?: boolean;
+  /** Notifies parent when the quick input panel opens/closes. */
+  onQuickOpenChange?: (open: boolean) => void;
 }
 
 type MenuAction = 'restart' | 'new' | 'stop';
@@ -79,11 +87,17 @@ type P2pMode = string; // 'solo' | single modes | combo pipelines like 'brainsto
 const MODEL_STORAGE_KEY = 'imcodes-model';
 const CODEX_MODEL_STORAGE_KEY = 'imcodes-codex-model';
 const QWEN_MODEL_STORAGE_KEY = 'imcodes-qwen-model';
+const QUEUED_HINT_EXPANDED_STORAGE_KEY = 'imcodes-queued-hint-expanded';
+const QUEUED_HINT_EXPANDED_EVENT = 'imcodes:queued-hint-expanded';
+const P2P_COMBO_CONFIRM_SKIP_PREF_KEY = 'p2p_combo_direct_send_skip_confirm';
 const CODEX_MODELS: CodexModelChoice[] = [...CODEX_MODEL_IDS] as CodexModelChoice[];
-const SINGLE_P2P_MODES: string[] = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss'];
-const P2P_MODES: string[] = [...SINGLE_P2P_MODES, ...COMBO_PRESETS.map((c) => c.key), P2P_CONFIG_MODE];
+const P2P_BASE_MODES = ['solo', 'audit', 'review', 'plan', 'brainstorm', 'discuss', P2P_CONFIG_MODE] as const;
 const P2P_MODE_I18N: Record<string, string> = { solo: 'p2p.mode_solo', audit: 'p2p.mode_audit', review: 'p2p.mode_review', plan: 'p2p.mode_plan', brainstorm: 'p2p.mode_brainstorm', discuss: 'p2p.mode_discuss', [P2P_CONFIG_MODE]: 'p2p.mode_config' };
-const P2P_SINGLE_COLORS: Record<string, string> = { solo: '#6b7280', audit: '#f59e0b', review: '#3b82f6', plan: '#06b6d4', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
+const P2P_SINGLE_COLORS: Record<string, string> = { solo: '#dbe7f5', audit: '#f59e0b', review: '#3b82f6', plan: '#06b6d4', brainstorm: '#a78bfa', discuss: '#22c55e', [P2P_CONFIG_MODE]: '#94a3b8' };
+
+function getP2pSoloDisplayLabel(): string {
+  return 'P2P';
+}
 
 function getP2pModeColor(mode: string): string {
   if (P2P_SINGLE_COLORS[mode]) return P2P_SINGLE_COLORS[mode];
@@ -96,6 +110,7 @@ function getP2pModeColor(mode: string): string {
 }
 
 function getP2pModeLabel(mode: string, t: (key: string) => string): string {
+  if (mode === 'solo') return getP2pSoloDisplayLabel();
   if (P2P_MODE_I18N[mode]) return t(P2P_MODE_I18N[mode]);
   // Combo: join translated names with →
   if (mode.includes(COMBO_SEPARATOR)) {
@@ -105,6 +120,11 @@ function getP2pModeLabel(mode: string, t: (key: string) => string): string {
     }).join('→');
   }
   return mode;
+}
+
+function getP2pMenuItemColor(mode: string, active: boolean): string {
+  if (mode === 'solo') return active ? '#f8fafc' : '#dbe7f5';
+  return getP2pModeColor(mode);
 }
 
 interface PendingAtTarget {
@@ -118,6 +138,22 @@ interface PendingSendPayload {
   extra: Record<string, unknown>;
 }
 
+interface BuildSendPayloadOptions {
+  modeOverride?: string;
+  syntheticAtTargets?: PendingAtTarget[];
+  syntheticConfigOverride?: {
+    config: P2pSavedConfig;
+    rounds: number;
+    modeOverride: string;
+  } | null;
+}
+
+interface PendingComboSendConfirmation {
+  payload: PendingSendPayload;
+  modeLabel: string;
+  clearComposer: boolean;
+}
+
 type ManualP2pTargetCandidate = {
   session: string;
   aliases: string[];
@@ -127,6 +163,8 @@ type ManualP2pResolveResult = {
   orderedTargets: Array<{ session: string; mode: string }>;
   cleanText: string;
 };
+
+type P2pConfigTab = 'participants' | 'combos';
 
 // Enter moved after ↓ arrow
 const SHORTCUTS: Array<{ label: string; title: string; data: string; wide?: boolean }> = [
@@ -165,9 +203,17 @@ function loadQwenModel(): QwenModelChoice | null {
   return null;
 }
 
+function loadQueuedHintExpanded(): boolean {
+  try {
+    return localStorage.getItem(QUEUED_HINT_EXPANDED_STORAGE_KEY) !== '0';
+  } catch { /* ignore */ }
+  return true;
+}
+
 function normalizeP2pMode(mode: string): string | null {
   const normalized = mode.trim().toLowerCase();
-  return P2P_MODES.includes(normalized as P2pMode) ? normalized : null;
+  if ((P2P_BASE_MODES as readonly string[]).includes(normalized)) return normalized;
+  return isComboMode(normalized) ? normalized : null;
 }
 
 function buildManualP2pCandidates(
@@ -220,7 +266,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking: _activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -238,21 +284,39 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [p2pMode, setP2pMode] = useState<P2pMode>('solo');
   const [p2pExcludeSameType, setP2pExcludeSameType] = useState(true);
   const [p2pOpen, setP2pOpen] = useState(false);
-  const [customCombos, setCustomCombos] = useState<string[]>([]);
   const [p2pConfigOpen, setP2pConfigOpen] = useState(false);
+  const [p2pConfigInitialTab, setP2pConfigInitialTab] = useState<P2pConfigTab>('participants');
   const [p2pSavedConfig, setP2pSavedConfig] = useState<P2pSavedConfig | null>(null);
+  const [openSpecOpen, setOpenSpecOpen] = useState(false);
+  const [openSpecChanges, setOpenSpecChanges] = useState<string[]>([]);
+  const [openSpecLoading, setOpenSpecLoading] = useState(false);
+  const [openSpecError, setOpenSpecError] = useState<string | null>(null);
+  const [openSpecAuditMenu, setOpenSpecAuditMenu] = useState<string | null>(null);
+  const [openSpecProposeMenuOpen, setOpenSpecProposeMenuOpen] = useState(false);
+  const [openSpecExpandedChange, setOpenSpecExpandedChange] = useState<string | null>(null);
+  const [openSpecLayoutTick, setOpenSpecLayoutTick] = useState(0);
   const [model, setModel] = useState<ModelChoice | null>(loadModel);
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
   const [qwenModel, setQwenModel] = useState<QwenModelChoice | null>(loadQwenModel);
-  const [queuedNoticeVisible, setQueuedNoticeVisible] = useState(false);
+  const [queuedHintExpanded, setQueuedHintExpanded] = useState(loadQueuedHintExpanded);
   const [confirm, setConfirm] = useState<MenuAction | null>(null);
   const [confirmLevel, setConfirmLevel] = useState(0); // 0=none, 1=first warning, 2=second warning (sub-session only)
+  const [skipComboSendConfirm, setSkipComboSendConfirm] = useState(false);
+  const [pendingComboSendConfirm, setPendingComboSendConfirm] = useState<PendingComboSendConfirmation | null>(null);
+  const [rememberComboSendChoice, setRememberComboSendChoice] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef<HTMLDivElement>(null);
   const thinkingRef = useRef<HTMLDivElement>(null);
   const p2pRef = useRef<HTMLDivElement>(null);
+  const openSpecRef = useRef<HTMLDivElement>(null);
+  const openSpecRequestIdRef = useRef<string | null>(null);
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showRunningSweep = !compact && isRunningSessionState(activeSession?.state);
+  const queuedTransportMessages = activeSession?.runtimeType === 'transport'
+    ? (activeSession.transportPendingMessages ?? [])
+    : [];
+  const queuedTransportLatestMessage = queuedTransportMessages[queuedTransportMessages.length - 1] ?? '';
   // Internal ref for contenteditable — also written to the external inputRef
   const divRef = useRef<HTMLDivElement>(null);
   // History navigation state
@@ -263,7 +327,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [sendWarning, setSendWarning] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<Array<{ path: string; name: string }>>([]);
+  const sendWarningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Keep external inputRef in sync so parent can call .focus()
   useEffect(() => {
@@ -287,6 +353,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     onPendingPrefillApplied?.();
   }, [pendingPrefillText, onPendingPrefillApplied]);
 
+  const clearSendWarning = useCallback(() => {
+    if (sendWarningTimerRef.current) {
+      clearTimeout(sendWarningTimerRef.current);
+      sendWarningTimerRef.current = null;
+    }
+    setSendWarning(null);
+  }, []);
+
+  const showSendWarning = useCallback((message: string) => {
+    if (sendWarningTimerRef.current) clearTimeout(sendWarningTimerRef.current);
+    setSendWarning(message);
+    sendWarningTimerRef.current = setTimeout(() => {
+      sendWarningTimerRef.current = null;
+      setSendWarning(null);
+    }, 5000);
+  }, []);
+
   // Persist input draft across unmount/remount (sub-session minimize/restore)
   const draftKey = activeSession ? `rcc_draft_${activeSession.name}` : null;
   useEffect(() => {
@@ -301,6 +384,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (draftKey) sessionStorage.setItem(draftKey, text);
     };
   }, [draftKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => () => {
+    if (sendWarningTimerRef.current) clearTimeout(sendWarningTimerRef.current);
+  }, []);
 
   // Auto-sync model selector with detected model from terminal/ctx
   // Detection is the real-time truth — always override the selector
@@ -379,24 +466,58 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       description: known.find((model) => model.id === id)?.description ?? getKnownQwenModelDescription(id),
     }));
   }, [activeSession?.qwenAuthType, activeSession?.qwenAvailableModels, detectedModel, qwenModel, qwenTier]);
+  const { allCombos } = useP2pCustomCombos();
+  const comboMenuItems = useMemo(
+    () => [...allCombos.presets.map((combo) => combo.key), ...allCombos.custom],
+    [allCombos],
+  );
 
   // P2P config loading moved after rootSession declaration below
 
-  // Load custom combos from server
   useEffect(() => {
-    void getUserPref('p2p_custom_combos').then((raw) => {
-      if (raw && typeof raw === 'string') {
-        try { setCustomCombos(JSON.parse(raw)); } catch { /* ignore */ }
-      }
+    void getUserPref(P2P_COMBO_CONFIRM_SKIP_PREF_KEY).then((raw) => {
+      if (raw === true || raw === 'true') setSkipComboSendConfirm(true);
     });
+  }, []);
+
+  useEffect(() => {
+    onQuickOpenChange?.(quickOpen);
+    return () => onQuickOpenChange?.(false);
+  }, [onQuickOpenChange, quickOpen]);
+
+  useEffect(() => {
+    const syncQueuedHintExpanded = () => setQueuedHintExpanded(loadQueuedHintExpanded());
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key && event.key !== QUEUED_HINT_EXPANDED_STORAGE_KEY) return;
+      syncQueuedHintExpanded();
+    };
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener(QUEUED_HINT_EXPANDED_EVENT, syncQueuedHintExpanded);
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener(QUEUED_HINT_EXPANDED_EVENT, syncQueuedHintExpanded);
+    };
   }, []);
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
+  useEffect(() => {
+    setPendingComboSendConfirm(null);
+    setRememberComboSendChoice(false);
+  }, [activeSession?.name]);
+  useEffect(() => {
+    setOpenSpecOpen(false);
+    setOpenSpecChanges([]);
+    setOpenSpecError(null);
+    setOpenSpecLoading(false);
+    setOpenSpecAuditMenu(null);
+    setOpenSpecExpandedChange(null);
+    openSpecRequestIdRef.current = null;
+  }, [activeSession?.projectDir]);
 
   // Close menus when clicking outside
   useEffect(() => {
-    if (!menuOpen && !modelOpen && !p2pOpen && !thinkingOpen) return;
+    if (!menuOpen && !modelOpen && !p2pOpen && !thinkingOpen && !openSpecOpen) return;
     const handleClick = (e: MouseEvent) => {
       if (menuOpen && menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setMenuOpen(false);
@@ -412,10 +533,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (p2pOpen && p2pRef.current && !p2pRef.current.contains(e.target as Node)) {
         setP2pOpen(false);
       }
+      if (openSpecOpen && openSpecRef.current && !openSpecRef.current.contains(e.target as Node)) {
+        setOpenSpecOpen(false);
+        setOpenSpecAuditMenu(null);
+        setOpenSpecProposeMenuOpen(false);
+      }
     };
     document.addEventListener('mousedown', handleClick);
     return () => document.removeEventListener('mousedown', handleClick);
-  }, [menuOpen, modelOpen, p2pOpen, thinkingOpen]);
+  }, [menuOpen, modelOpen, openSpecOpen, p2pOpen, thinkingOpen]);
 
   const getText = () => (divRef.current?.textContent ?? '').trim();
 
@@ -469,8 +595,95 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setHasText(true);
   };
 
+  const toComposerReference = useCallback((path: string) => {
+    const cwd = activeSession?.projectDir;
+    if (cwd) {
+      const unixPrefix = `${cwd}/`;
+      const winPrefix = `${cwd}\\`;
+      if (path.startsWith(unixPrefix)) return `@${path.slice(unixPrefix.length)}`;
+      if (path.startsWith(winPrefix)) return `@${path.slice(winPrefix.length).replace(/\\/g, '/')}`;
+    }
+    return `@${path.replace(/\\/g, '/')}`;
+  }, [activeSession?.projectDir]);
+
+  const openSpecChangesPath = useMemo(() => {
+    const cwd = activeSession?.projectDir;
+    if (!cwd) return null;
+    return `${cwd.replace(/[\\/]+$/, '')}/openspec/changes`;
+  }, [activeSession?.projectDir]);
+
+  const openP2pConfigPanel = useCallback((tab: P2pConfigTab = 'participants') => {
+    setP2pConfigInitialTab(tab);
+    setP2pConfigOpen(true);
+  }, []);
+
+  const refreshOpenSpecChanges = useCallback(() => {
+    if (!ws || !openSpecChangesPath) return;
+    setOpenSpecLoading(true);
+    setOpenSpecError(null);
+    openSpecRequestIdRef.current = ws.fsListDir(openSpecChangesPath, false, false);
+  }, [openSpecChangesPath, ws]);
+
+  const insertOpenSpecPrompt = useCallback((kind: 'audit_implementation' | 'audit_spec' | 'implement' | 'propose_from_discussion' | 'propose_from_description', reference?: string) => {
+    const prompt = kind === 'audit_implementation'
+      ? t('openspec.audit_implementation_prompt', { reference })
+      : kind === 'audit_spec'
+        ? t('openspec.audit_spec_prompt', { reference })
+        : kind === 'implement'
+          ? t('openspec.implement_prompt', { reference })
+          : kind === 'propose_from_discussion'
+            ? t('openspec.propose_from_discussion_prompt')
+            : t('openspec.propose_from_description_prompt');
+    appendToInput([prompt]);
+  }, [t]);
+
+  const openSpecDropdownStyle = useMemo(() => {
+    if (!openSpecOpen || typeof window === 'undefined') return undefined;
+    const rect = openSpecRef.current?.getBoundingClientRect();
+    if (!rect) return undefined;
+    const availableHeight = Math.max(96, Math.floor(rect.top - 12));
+    if (window.innerWidth > 640) {
+      return {
+        maxHeight: `${availableHeight}px`,
+      } as const;
+    }
+    return {
+      position: 'fixed',
+      left: 8,
+      right: 8,
+      bottom: Math.max(window.innerHeight - rect.top + 4, 72),
+      width: 'auto',
+      maxWidth: 'none',
+      maxHeight: `${availableHeight}px`,
+      zIndex: 10001,
+    } as const;
+  }, [openSpecLayoutTick, openSpecOpen]);
+
+  const isOpenSpecMobile = useMemo(
+    () => typeof window !== 'undefined' && window.innerWidth <= 640,
+    [openSpecLayoutTick, openSpecOpen],
+  );
+
+  useEffect(() => {
+    if (!openSpecOpen || typeof window === 'undefined') return;
+    const refreshLayout = () => setOpenSpecLayoutTick((tick) => tick + 1);
+    const viewport = window.visualViewport;
+    window.addEventListener('resize', refreshLayout);
+    viewport?.addEventListener('resize', refreshLayout);
+    viewport?.addEventListener('scroll', refreshLayout);
+    return () => {
+      window.removeEventListener('resize', refreshLayout);
+      viewport?.removeEventListener('resize', refreshLayout);
+      viewport?.removeEventListener('scroll', refreshLayout);
+    };
+  }, [openSpecOpen]);
+
   const activeSub = (subSessions ?? []).find((s) => s.sessionName === activeSession?.name);
   const rootSession = activeSub?.parentSession || activeSession?.name || '';
+  const hasConfiguredP2pParticipants = useMemo(() => {
+    if (!p2pSavedConfig?.sessions) return false;
+    return Object.values(p2pSavedConfig.sessions).some((entry) => entry?.enabled && entry.mode !== 'skip');
+  }, [p2pSavedConfig]);
 
   // P2P config is per main-session (sub-sessions follow parent), stored on server for cross-device sync
   const p2pConfigKey = rootSession ? `p2p_session_config:${rootSession}` : null;
@@ -494,6 +707,39 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       });
     });
   }, [p2pConfigKey]);
+
+  useEffect(() => {
+    if (!ws) return;
+    return ws.onMessage((msg: ServerMessage) => {
+      const requestId = openSpecRequestIdRef.current;
+      if (!requestId || msg.type !== 'fs.ls_response' || msg.requestId !== requestId) return;
+      openSpecRequestIdRef.current = null;
+      setOpenSpecLoading(false);
+      if (msg.status === 'error') {
+        const errorText = msg.error ?? 'Unable to scan OpenSpec changes';
+        if (/enoent|not found|no such file/i.test(errorText)) {
+          setOpenSpecChanges([]);
+          setOpenSpecError(null);
+          return;
+        }
+        setOpenSpecChanges([]);
+        setOpenSpecError(errorText);
+        return;
+      }
+      const changeNames = (msg.entries ?? [])
+        .filter((entry) => entry.isDir)
+        .map((entry) => entry.name)
+        .sort((a, b) => a.localeCompare(b));
+      setOpenSpecChanges(changeNames);
+      setOpenSpecError(null);
+    });
+  }, [ws]);
+
+  useEffect(() => {
+    if (!hasConfiguredP2pParticipants && isComboMode(p2pMode)) {
+      setP2pMode('solo');
+    }
+  }, [hasConfiguredP2pParticipants, p2pMode]);
 
   /** Build a short display label for the input box — prefer sub-session label over raw ID. */
   const buildAgentLabel = (session: string, mode: string) => {
@@ -542,13 +788,36 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return { orderedTargets, cleanText };
   };
 
-  const buildSendPayload = useCallback((): PendingSendPayload | null => {
+  const applySavedP2pConfigSelection = useCallback((extra: Record<string, unknown>, mode: string) => {
+    if (!p2pSavedConfig || (mode !== P2P_CONFIG_MODE && !isComboMode(mode))) return;
+    const selection = buildP2pConfigSelection(p2pSavedConfig, mode);
+    extra.p2pSessionConfig = selection.config.sessions;
+    extra.p2pRounds = selection.rounds;
+    if (selection.config.extraPrompt) extra.p2pExtraPrompt = selection.config.extraPrompt;
+    if (selection.config.hopTimeoutMinutes != null) extra.p2pHopTimeoutMs = Math.min(selection.config.hopTimeoutMinutes * 60_000, 600_000);
+  }, [p2pSavedConfig]);
+
+  const buildSendPayload = useCallback((options?: string | BuildSendPayloadOptions): PendingSendPayload | null => {
+    const normalizedOptions: BuildSendPayloadOptions =
+      typeof options === 'string' ? { modeOverride: options } : (options ?? {});
     let text = getText();
-    if ((!text && attachments.length === 0) || !ws || !activeSession) return null;
+    if (normalizedOptions.syntheticAtTargets && normalizedOptions.syntheticAtTargets.length > 0) {
+      const syntheticPrefix = normalizedOptions.syntheticAtTargets.map((target) => target.label).join(' ');
+      text = text ? `${syntheticPrefix} ${text}` : syntheticPrefix;
+    }
+    const effectiveMode = normalizedOptions.modeOverride ?? p2pMode;
+    const syntheticModeOverride = normalizedOptions.syntheticConfigOverride?.modeOverride;
+    const allowEmptyCombo = (
+      (!!normalizedOptions.modeOverride && isComboMode(normalizedOptions.modeOverride)) ||
+      (!!syntheticModeOverride && isComboMode(syntheticModeOverride))
+    );
+    if (((!text && attachments.length === 0) && !allowEmptyCombo) || !ws || !activeSession) return null;
 
     // Build P2P routing as structured WS fields — keep text clean for display.
     const extra: Record<string, unknown> = {};
-    const pendingTargets = [...pendingAtTargetsRef.current];
+    const pendingTargets = normalizedOptions.syntheticAtTargets
+      ? [...normalizedOptions.syntheticAtTargets]
+      : [...pendingAtTargetsRef.current];
 
     if (pendingTargets.length > 0) {
       // @ picker was used — derive routing from the visible textbox order, then strip matched labels.
@@ -560,7 +829,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       // Attach config data when any target uses config mode
       const hasConfigTarget = orderedTargets.some(t => t.mode === 'config');
       if (extra.p2pAtTargets && hasConfigTarget) {
-        const override = pendingConfigOverrideRef.current;
+        const override = normalizedOptions.syntheticConfigOverride ?? pendingConfigOverrideRef.current;
         const cfg = override?.config ?? p2pSavedConfig;
         if (cfg) {
           extra.p2pSessionConfig = cfg.sessions;
@@ -578,20 +847,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (manual.orderedTargets.length > 0) {
         text = manual.cleanText;
         extra.p2pAtTargets = manual.orderedTargets;
-      } else if (p2pMode !== 'solo' && !text.includes('@@')) {
+      } else if (effectiveMode !== 'solo' && !text.includes('@@')) {
         // Dropdown P2P mode — daemon handles expansion
-        if (p2pMode === P2P_CONFIG_MODE) {
+        if (effectiveMode === P2P_CONFIG_MODE) {
           extra.p2pMode = 'config';
         } else {
-          extra.p2pMode = p2pMode;
+          extra.p2pMode = effectiveMode;
           if (p2pExcludeSameType) extra.p2pExcludeSameType = true;
         }
-        if (p2pMode === P2P_CONFIG_MODE && p2pSavedConfig) {
-          extra.p2pSessionConfig = p2pSavedConfig.sessions;
-          extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
-          if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
-          if (p2pSavedConfig.hopTimeoutMinutes != null) extra.p2pHopTimeoutMs = Math.min(p2pSavedConfig.hopTimeoutMinutes * 60_000, 600_000);
-        }
+        applySavedP2pConfigSelection(extra, effectiveMode);
       }
     }
 
@@ -611,65 +875,152 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       text = text ? `${refs} ${text}` : refs;
     }
     return { text, extra };
-  }, [attachments, activeSession, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, sessions, subSessions, ws]);
+  }, [activeSession, applySavedP2pConfigSelection, attachments, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, sessions, subSessions, ws]);
 
-  const finalizeSend = useCallback((payload: PendingSendPayload) => {
+  const buildModeOnlySendPayload = useCallback((rawText: string, modeOverride?: string): PendingSendPayload | null => {
+    const text = rawText.trim();
+    const effectiveMode = modeOverride ?? p2pMode;
+    const allowEmptyCombo = !!modeOverride && isComboMode(modeOverride);
+    if ((!text && !allowEmptyCombo) || !ws || !activeSession) return null;
+
+    const extra: Record<string, unknown> = {};
+    const manual = extractManualP2pTargets(text, buildManualP2pCandidates(sessions, subSessions));
+    let cleanText = manual.cleanText;
+
+    if (manual.orderedTargets.length > 0) {
+      extra.p2pAtTargets = manual.orderedTargets;
+    } else if (effectiveMode !== 'solo' && !text.includes('@@')) {
+      extra.p2pMode = effectiveMode === P2P_CONFIG_MODE ? 'config' : effectiveMode;
+      if (p2pExcludeSameType && effectiveMode !== P2P_CONFIG_MODE) extra.p2pExcludeSameType = true;
+      applySavedP2pConfigSelection(extra, effectiveMode);
+    }
+
+    if (extra.p2pAtTargets || extra.p2pMode) {
+      extra.p2pLocale = i18n?.language ?? 'en';
+    }
+
+    return { text: cleanText, extra };
+  }, [activeSession, applySavedP2pConfigSelection, i18n?.language, p2pExcludeSameType, p2pMode, p2pSavedConfig, sessions, subSessions, ws]);
+
+  const finalizeSend = useCallback((payload: PendingSendPayload, options?: { clearComposer?: boolean }) => {
     if (!ws || !activeSession) return;
-    // Transport sessions queue messages internally — no frontend notice needed
     quickData.recordHistory(payload.text, activeSession.name);
     try {
       ws.sendSessionCommand('send', { sessionName: activeSession.name, text: payload.text, ...payload.extra });
     } catch {
       return;
     }
-    pendingAtTargetsRef.current = [];
-    pendingConfigOverrideRef.current = null;
     onSend?.(activeSession.name, payload.text);
-    if (divRef.current) divRef.current.textContent = '';
-    setHasText(false);
-    setAttachments([]);
-    // Clear quotes after send
-    if (quotes && quotes.length > 0) {
-      for (let i = quotes.length - 1; i >= 0; i--) onRemoveQuote?.(i);
+    if (options?.clearComposer) {
+      pendingAtTargetsRef.current = [];
+      pendingConfigOverrideRef.current = null;
+      if (divRef.current) divRef.current.textContent = '';
+      setHasText(false);
+      setAttachments([]);
+      if (quotes && quotes.length > 0) {
+        for (let i = quotes.length - 1; i >= 0; i--) onRemoveQuote?.(i);
+      }
+      atSelectionLockRef.current = false;
+      atSelectionSnapshotRef.current = '';
+      histIdxRef.current = -1;
+      draftRef.current = '';
+      if (draftKey) sessionStorage.removeItem(draftKey);
     }
-    atSelectionLockRef.current = false;
-    atSelectionSnapshotRef.current = '';
-    histIdxRef.current = -1;
-    draftRef.current = '';
-    if (draftKey) sessionStorage.removeItem(draftKey);
   }, [activeSession, draftKey, onRemoveQuote, onSend, quickData, quotes, ws]);
 
-  useEffect(() => {
-    if (!activeSession || activeSession.runtimeType !== 'transport' || activeSession.state !== 'running') {
-      setQueuedNoticeVisible(false);
+  const maybePersistComboSendSkip = useCallback(() => {
+    if (!rememberComboSendChoice) return;
+    setSkipComboSendConfirm(true);
+    void saveUserPref(P2P_COMBO_CONFIRM_SKIP_PREF_KEY, true).catch(() => {});
+  }, [rememberComboSendChoice]);
+
+  const getSendValidationError = useCallback((payload: PendingSendPayload): string | null => {
+    const text = payload.text.trim();
+    const routedModes: string[] = [];
+    const directMode = payload.extra.p2pMode;
+    if (typeof directMode === 'string') routedModes.push(directMode);
+    const atTargets = payload.extra.p2pAtTargets;
+    if (Array.isArray(atTargets)) {
+      for (const target of atTargets) {
+        if (target && typeof target === 'object' && 'mode' in target && typeof target.mode === 'string') {
+          routedModes.push(target.mode);
+        }
+      }
     }
-  }, [activeSession?.name, activeSession?.runtimeType, activeSession?.state]);
+    if (!text && routedModes.some((mode) => isComboMode(mode))) {
+      return t('p2p.combo_empty_message_warning');
+    }
+    if (!hasConfiguredP2pParticipants && routedModes.some((mode) => isComboMode(mode))) {
+      return t('p2p.combo_requires_participants_hint');
+    }
+    return null;
+  }, [hasConfiguredP2pParticipants, t]);
+
+  const requestSend = useCallback((payload: PendingSendPayload | null, options?: { clearComposer?: boolean }) => {
+    if (!payload) return;
+    const validationError = getSendValidationError(payload);
+    if (validationError) {
+      showSendWarning(validationError);
+      return;
+    }
+    clearSendWarning();
+    const comboMode = typeof payload.extra.p2pMode === 'string' ? payload.extra.p2pMode : null;
+    if (comboMode && isComboMode(comboMode) && !skipComboSendConfirm) {
+      setRememberComboSendChoice(false);
+      setPendingComboSendConfirm({
+        payload,
+        modeLabel: getP2pModeLabel(comboMode, t),
+        clearComposer: !!options?.clearComposer,
+      });
+      return;
+    }
+    finalizeSend(payload, options);
+  }, [clearSendWarning, finalizeSend, getSendValidationError, showSendWarning, skipComboSendConfirm, t]);
 
   const handleSend = useCallback(() => {
-    const payload = buildSendPayload();
-    if (!payload) return;
-    finalizeSend(payload);
-  }, [buildSendPayload, finalizeSend]);
+    requestSend(buildSendPayload(), { clearComposer: true });
+  }, [buildSendPayload, requestSend]);
+
+  const handleDirectComboSelect = useCallback((mode: string) => {
+    setP2pOpen(false);
+    const selection = p2pSavedConfig ? buildP2pConfigSelection(p2pSavedConfig, mode) : null;
+    const payloadOptions: BuildSendPayloadOptions = selection
+      ? {
+          modeOverride: mode,
+          syntheticAtTargets: [{
+            session: '__all__',
+            mode: 'config',
+            label: selection.rounds > 1 ? `@@all(${selection.modeOverride} ×${selection.rounds})` : `@@all(${selection.modeOverride})`,
+          }],
+          syntheticConfigOverride: selection,
+        }
+      : { modeOverride: mode };
+    requestSend(buildSendPayload(payloadOptions), { clearComposer: true });
+  }, [buildSendPayload, p2pSavedConfig, requestSend]);
+
+  const handleComboSendCancel = useCallback(() => {
+    maybePersistComboSendSkip();
+    setPendingComboSendConfirm(null);
+    setRememberComboSendChoice(false);
+  }, [maybePersistComboSendSkip]);
+
+  const handleComboSendConfirm = useCallback(() => {
+    const pending = pendingComboSendConfirm;
+    if (!pending) return;
+    maybePersistComboSendSkip();
+    setPendingComboSendConfirm(null);
+    setRememberComboSendChoice(false);
+    finalizeSend(pending.payload, { clearComposer: pending.clearComposer });
+  }, [finalizeSend, maybePersistComboSendSkip, pendingComboSendConfirm]);
+
+  const sendOpenSpecPrompt = useCallback((text: string) => {
+    finalizeSend({ text, extra: {} }, { clearComposer: false });
+  }, [finalizeSend]);
 
   // Voice overlay send handler — applies same P2P mode as text send
   const handleVoiceSend = useCallback((voiceText: string) => {
-    if (!ws || !activeSession) return;
-    const extra: Record<string, unknown> = {};
-    if (p2pMode !== 'solo') {
-      extra.p2pMode = p2pMode === P2P_CONFIG_MODE ? 'config' : p2pMode;
-      if (p2pExcludeSameType && p2pMode !== P2P_CONFIG_MODE) extra.p2pExcludeSameType = true;
-    }
-    if (p2pMode === P2P_CONFIG_MODE && p2pSavedConfig) {
-      extra.p2pSessionConfig = p2pSavedConfig.sessions;
-      extra.p2pRounds = p2pSavedConfig.rounds ?? 1;
-      if (p2pSavedConfig.extraPrompt) extra.p2pExtraPrompt = p2pSavedConfig.extraPrompt;
-    }
-    quickData.recordHistory(voiceText, activeSession.name);
-    try {
-      ws.sendSessionCommand('send', { sessionName: activeSession.name, text: voiceText, ...extra });
-    } catch { return; }
-    onSend?.(activeSession.name, voiceText);
-  }, [ws, activeSession, quickData, onSend, p2pMode, p2pExcludeSameType, p2pSavedConfig]);
+    requestSend(buildModeOnlySendPayload(voiceText));
+  }, [buildModeOnlySendPayload, requestSend]);
 
   const handleKeyDown = (e: KeyboardEvent) => {
     if (e.key === 'Escape' && activeSession?.runtimeType === 'transport' && activeSession.state === 'running') {
@@ -890,6 +1241,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     onAfterAction?.();
   };
 
+  const toggleQueuedHintExpanded = useCallback(() => {
+    setQueuedHintExpanded((current) => {
+      const next = !current;
+      try {
+        localStorage.setItem(QUEUED_HINT_EXPANDED_STORAGE_KEY, next ? '1' : '0');
+        window.dispatchEvent(new CustomEvent(QUEUED_HINT_EXPANDED_EVENT));
+      } catch { /* ignore */ }
+      return next;
+    });
+  }, []);
+
   const placeholder = !hasSession ? t('session.no_session') : !connected ? t('session.send_queued') : t('session.send_placeholder', { name: sessionDisplayName ?? activeSession?.label ?? activeSession?.project ?? 'session' });
 
   return (
@@ -920,7 +1282,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         />
       </div>
     )}
-    <div class={`controls-wrapper${!compact && isVisuallyBusy(activeSession?.state, !!activeThinking) ? ' controls-wrapper-running' : ''}`}>
+    <div class={`controls-wrapper${showRunningSweep ? ' controls-wrapper-running' : ''}`}>
       {/* Shortcut row — hidden in chat mode and compact mode */}
       {!hideShortcuts && !compact && <div class="shortcuts-row">
         <div class="shortcuts">
@@ -960,6 +1322,193 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         </div>
 
         {/* Model selector — outside overflow-x scroll area so dropdown isn't clipped */}
+        {openSpecChangesPath && (
+          <div class="shortcuts-model" ref={openSpecRef}>
+            <button
+              class="shortcut-btn"
+              onClick={() => {
+                setOpenSpecOpen((open) => {
+                  const next = !open;
+                  if (!next) {
+                    setOpenSpecAuditMenu(null);
+                    setOpenSpecProposeMenuOpen(false);
+                  }
+                  if (next) refreshOpenSpecChanges();
+                  return next;
+                });
+              }}
+              disabled={disabled}
+              title="OpenSpec changes"
+              style={{ color: '#f97316', fontSize: 10, fontWeight: 600 }}
+            >
+              {t('openspec.title')}
+            </button>
+            {openSpecOpen && (
+              <div class="menu-dropdown menu-dropdown-openspec" style={openSpecDropdownStyle}>
+                <div class="openspec-dropdown-scroll">
+                <div class="p2p-menu-section-label openspec-section-label">{t('openspec.changes')}</div>
+                {openSpecLoading && (
+                  <div class="p2p-menu-section-label openspec-section-meta">{t('common.loading')}</div>
+                )}
+                {!openSpecLoading && openSpecError && (
+                  <div class="p2p-menu-section-label openspec-section-meta openspec-section-error">
+                    {openSpecError}
+                  </div>
+                )}
+                {!openSpecLoading && !openSpecError && openSpecChanges.length === 0 && (
+                  <div class="p2p-menu-section-label openspec-section-meta">{t('openspec.empty')}</div>
+                )}
+                {!openSpecLoading && !openSpecError && openSpecChanges.map((changeName) => (
+                  <div
+                    key={changeName}
+                    class={`openspec-change-row${isOpenSpecMobile ? ' openspec-change-row-mobile' : ''}${openSpecExpandedChange === changeName ? ' openspec-change-row-expanded' : ''}`}
+                  >
+                    <div class="openspec-change-header">
+                      <button
+                        class="menu-item openspec-change-name"
+                        onClick={() => {
+                          if (!openSpecChangesPath) return;
+                          appendToInput([toComposerReference(`${openSpecChangesPath}/${changeName}`)]);
+                          setOpenSpecAuditMenu(null);
+                          setOpenSpecProposeMenuOpen(false);
+                          setOpenSpecOpen(false);
+                        }}
+                      >
+                        {changeName}
+                      </button>
+                      {isOpenSpecMobile && (
+                        <button
+                          type="button"
+                          class="openspec-change-toggle"
+                          aria-label={openSpecExpandedChange === changeName ? `collapse ${changeName}` : `expand ${changeName}`}
+                          aria-expanded={openSpecExpandedChange === changeName}
+                          onClick={() => {
+                            setOpenSpecAuditMenu(null);
+                            setOpenSpecProposeMenuOpen(false);
+                            setOpenSpecExpandedChange((current) => current === changeName ? null : changeName);
+                          }}
+                        >
+                          {openSpecExpandedChange === changeName ? '▾' : '▸'}
+                        </button>
+                      )}
+                    </div>
+                    <div
+                      class={`openspec-change-actions${!isOpenSpecMobile || openSpecExpandedChange === changeName ? ' openspec-change-actions-visible' : ''}`}
+                      hidden={isOpenSpecMobile && openSpecExpandedChange !== changeName}
+                    >
+                      <div class="openspec-change-action-wrap">
+                        <button
+                          class="btn btn-secondary openspec-change-action-btn"
+                          onClick={() => {
+                            setOpenSpecProposeMenuOpen(false);
+                            setOpenSpecAuditMenu((current) => current === changeName ? null : changeName);
+                          }}
+                        >
+                          {t('openspec.audit_action')}
+                        </button>
+                        {openSpecAuditMenu === changeName && (
+                          <div class="menu-dropdown" style={{ right: 0, bottom: 'calc(100% + 6px)', minWidth: 180 }}>
+                            <button
+                              class="menu-item"
+                              onClick={() => {
+                                if (!openSpecChangesPath) return;
+                                const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                                insertOpenSpecPrompt('audit_implementation', reference);
+                                setOpenSpecAuditMenu(null);
+                                setOpenSpecOpen(false);
+                              }}
+                            >
+                              {t('openspec.audit_implementation_action')}
+                            </button>
+                            <button
+                              class="menu-item"
+                              onClick={() => {
+                                if (!openSpecChangesPath) return;
+                                const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                                insertOpenSpecPrompt('audit_spec', reference);
+                                setOpenSpecAuditMenu(null);
+                                setOpenSpecOpen(false);
+                              }}
+                            >
+                              {t('openspec.audit_spec_action')}
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                      <button
+                        class="btn btn-secondary openspec-change-action-btn"
+                        onClick={() => {
+                          if (!openSpecChangesPath) return;
+                          const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                          insertOpenSpecPrompt('implement', reference);
+                          setOpenSpecAuditMenu(null);
+                          setOpenSpecProposeMenuOpen(false);
+                          setOpenSpecOpen(false);
+                        }}
+                      >
+                        {t('openspec.implement_action')}
+                      </button>
+                      <button
+                        class="btn btn-secondary openspec-change-action-btn"
+                        onClick={() => {
+                          if (!openSpecChangesPath) return;
+                          const reference = toComposerReference(`${openSpecChangesPath}/${changeName}`);
+                          sendOpenSpecPrompt(t('openspec.achieve_prompt', { reference }));
+                          setOpenSpecAuditMenu(null);
+                          setOpenSpecProposeMenuOpen(false);
+                          setOpenSpecOpen(false);
+                        }}
+                      >
+                        {t('openspec.achieve_action')}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                </div>
+                <div class="openspec-dropdown-footer">
+                  <div class="openspec-change-action-wrap openspec-footer-action-wrap">
+                    <button
+                      class="btn btn-secondary openspec-change-action-btn"
+                      style={{ width: '100%', justifyContent: 'center' }}
+                      onClick={() => {
+                        setOpenSpecAuditMenu(null);
+                        setOpenSpecProposeMenuOpen((open) => !open);
+                      }}
+                    >
+                      {t('openspec.propose_action')}
+                    </button>
+                    {openSpecProposeMenuOpen && (
+                      <div class="menu-dropdown" style={{ right: 0, bottom: 'calc(100% + 6px)', minWidth: 220 }}>
+                        <button
+                          class="menu-item"
+                          onClick={() => {
+                            insertOpenSpecPrompt('propose_from_discussion');
+                            setOpenSpecAuditMenu(null);
+                            setOpenSpecProposeMenuOpen(false);
+                            setOpenSpecOpen(false);
+                          }}
+                        >
+                          {t('openspec.propose_from_discussion_action')}
+                        </button>
+                        <button
+                          class="menu-item"
+                          onClick={() => {
+                            insertOpenSpecPrompt('propose_from_description');
+                            setOpenSpecAuditMenu(null);
+                            setOpenSpecProposeMenuOpen(false);
+                            setOpenSpecOpen(false);
+                          }}
+                        >
+                          {t('openspec.propose_from_description_action')}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
         {isClaudeCode && (
           <div class="shortcuts-model" ref={modelRef}>
             <button
@@ -1070,79 +1619,71 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         {/* P2P mode selector — hidden for shell/script sessions */}
         {!isShellLike && <div class="shortcuts-model" ref={p2pRef}>
           <button
-            class="shortcut-btn"
+            class={`shortcut-btn p2p-mode-btn${p2pMode === 'solo' ? ' p2p-mode-btn-solo' : ''}`}
             data-onboarding="p2p-mode"
             onClick={() => setP2pOpen((o) => !o)}
             disabled={disabled}
-            title={p2pMode === 'solo' ? t('p2p.mode_solo') : `P2P: ${getP2pModeLabel(p2pMode, t)}`}
-            style={{ color: getP2pModeColor(p2pMode), fontSize: 10, fontWeight: p2pMode !== 'solo' ? 600 : 400 }}
+            title={p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `P2P: ${getP2pModeLabel(p2pMode, t)}`}
+            style={{ color: getP2pModeColor(p2pMode), fontSize: 10, fontWeight: p2pMode === 'solo' ? 600 : 700 }}
           >
-            {p2pMode === 'solo' ? t('p2p.mode_solo') : `P2P:${getP2pModeLabel(p2pMode, t)}`}
+            {p2pMode === 'solo' ? getP2pModeLabel('solo', t) : `P2P:${getP2pModeLabel(p2pMode, t)}`}
           </button>
-          {/* Gear button for P2P config panel — always visible */}
           <button
-            class="shortcut-btn"
-            onClick={() => { setP2pOpen(false); setP2pConfigOpen(true); }}
+            class="shortcut-btn p2p-settings-btn"
+            onClick={() => { setP2pOpen(false); openP2pConfigPanel('participants'); }}
             disabled={disabled}
             title={t('p2p.settings_title')}
-            style={{ fontSize: 12, color: '#94a3b8', paddingLeft: 2, paddingRight: 2 }}
+            aria-label={t('p2p.settings_button')}
           >
-            ⚙
+            <span class="p2p-settings-icon" aria-hidden="true">⚙</span>
+            <span class="p2p-settings-label">{t('p2p.settings_button')}</span>
           </button>
           {p2pOpen && (
-            <div class="menu-dropdown">
-              {/* Single modes */}
-              {SINGLE_P2P_MODES.map((m) => (
-                <button
-                  key={m}
-                  class={`menu-item ${p2pMode === m ? 'menu-item-active' : ''}`}
-                  onClick={() => {
-                    setP2pMode(m);
-                    if (m === 'solo') setP2pExcludeSameType(false);
-                    setP2pOpen(false);
-                  }}
-                  style={{ color: getP2pModeColor(m) }}
-                >
-                  {p2pMode === m ? '● ' : '○ '}{getP2pModeLabel(m, t)}
-                </button>
-              ))}
-              {/* Combo presets */}
+            <div class="menu-dropdown menu-dropdown-p2p">
+              <button
+                class={`menu-item ${p2pMode === 'solo' ? 'menu-item-active' : ''}`}
+                onClick={() => {
+                  setP2pMode('solo');
+                  setP2pExcludeSameType(false);
+                  setP2pOpen(false);
+                }}
+                style={{ color: getP2pMenuItemColor('solo', p2pMode === 'solo'), fontWeight: p2pMode === 'solo' ? 700 : 600 }}
+              >
+                {p2pMode === 'solo' ? '● ' : '○ '}{getP2pModeLabel('solo', t)}
+              </button>
               <div class="menu-divider" />
-              <div style={{ fontSize: 10, color: '#64748b', padding: '2px 12px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{t('p2p.combo_label')}</div>
-              {COMBO_PRESETS.map((c) => (
-                <button
-                  key={c.key}
-                  class={`menu-item ${p2pMode === c.key ? 'menu-item-active' : ''}`}
-                  onClick={() => { setP2pMode(c.key); setP2pOpen(false); }}
-                  style={{ color: getP2pModeColor(c.key), fontSize: 12 }}
-                >
-                  {p2pMode === c.key ? '● ' : '○ '}{getP2pModeLabel(c.key, t)}
-                </button>
-              ))}
-              {customCombos.filter((k) => !COMBO_PRESETS.some((p) => p.key === k)).map((key) => (
+              <div class="p2p-menu-section-label">{t('p2p.combo_label')}</div>
+              {!hasConfiguredP2pParticipants && (
+                <div class="p2p-menu-section-label" style={{ textTransform: 'none', letterSpacing: 'normal', color: '#fbbf24', marginTop: 4 }}>
+                  {t('p2p.combo_requires_participants_hint')}
+                </div>
+              )}
+              {comboMenuItems.map((key) => (
                 <button
                   key={key}
-                  class={`menu-item ${p2pMode === key ? 'menu-item-active' : ''}`}
-                  onClick={() => { setP2pMode(key); setP2pOpen(false); }}
-                  style={{ color: getP2pModeColor(key), fontSize: 12 }}
+                  class="menu-item"
+                  onClick={() => {
+                    if (!hasConfiguredP2pParticipants) return;
+                    handleDirectComboSelect(key);
+                  }}
+                  disabled={!hasConfiguredP2pParticipants}
+                  title={!hasConfiguredP2pParticipants ? t('p2p.combo_requires_participants_hint') : undefined}
+                  style={{ color: getP2pModeColor(key), fontSize: 12, opacity: hasConfiguredP2pParticipants ? 1 : 0.45, cursor: hasConfiguredP2pParticipants ? 'pointer' : 'not-allowed' }}
                 >
-                  {p2pMode === key ? '● ' : '○ '}{getP2pModeLabel(key, t)}
+                  ○ {getP2pModeLabel(key, t)}
                 </button>
               ))}
-              {/* Config mode */}
               <div class="menu-divider" />
               <button
-                class={`menu-item ${p2pMode === P2P_CONFIG_MODE ? 'menu-item-active' : ''}`}
+                class="menu-item"
                 onClick={() => {
-                  setP2pMode(P2P_CONFIG_MODE);
                   setP2pOpen(false);
-                  if (!p2pSavedConfig) setP2pConfigOpen(true);
+                  openP2pConfigPanel('combos');
                 }}
-                style={{ color: getP2pModeColor(P2P_CONFIG_MODE) }}
               >
-                {p2pMode === P2P_CONFIG_MODE ? '● ' : '○ '}{getP2pModeLabel(P2P_CONFIG_MODE, t)} ⚙
+                {t('p2p.settings_button')}
               </button>
-              {p2pMode !== 'solo' && p2pMode !== P2P_CONFIG_MODE && (
+              {p2pMode !== 'solo' && (
                 <>
                   <div class="menu-divider" />
                   <button
@@ -1173,6 +1714,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       {uploadError && (
         <div style={{ padding: '4px 12px', fontSize: 12, color: '#ef4444', background: 'rgba(239,68,68,0.1)', borderRadius: 4, margin: '0 8px 4px' }}>
           {uploadError}
+        </div>
+      )}
+
+      {sendWarning && (
+        <div style={{ padding: '4px 12px', fontSize: 12, color: '#fbbf24', background: 'rgba(251,191,36,0.12)', borderRadius: 4, margin: '0 8px 4px', border: '1px solid rgba(251,191,36,0.25)' }}>
+          {sendWarning}
         </div>
       )}
 
@@ -1226,9 +1773,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             onClose={() => setQuickOpen(false)}
             onSelect={fillInput}
             onSend={(text: string) => {
-              if (!ws || !activeSession) return;
-              quickData.recordHistory(text, activeSession.name);
-              ws.sendSessionCommand('send', { sessionName: activeSession.name, text });
+              requestSend(buildModeOnlySendPayload(text));
             }}
             agentType={activeSession?.agentType ?? 'claude-code'}
             sessionName={activeSession?.name ?? ''}
@@ -1372,6 +1917,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           onInput={() => {
             const currentText = divRef.current?.textContent ?? '';
             setHasText(!!currentText.trim());
+            if (sendWarning) clearSendWarning();
             if (atSelectionLockRef.current && currentText !== atSelectionSnapshotRef.current) {
               atSelectionLockRef.current = false;
               atSelectionSnapshotRef.current = currentText;
@@ -1456,15 +2002,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           class="btn btn-primary"
           onClick={handleSend}
           disabled={inputDisabled || (!hasText && attachments.length === 0) || !connected}
-          style={p2pMode !== 'solo' ? { background: getP2pModeColor(p2pMode), borderColor: getP2pModeColor(p2pMode) } : undefined}
         >
-          {p2pMode !== 'solo' ? getP2pModeLabel(p2pMode, t) : t('common.send')}
+          {t('common.send')}
         </button>
         {/* Config mode: show gear to open settings panel inline with send row */}
         {p2pMode === P2P_CONFIG_MODE && (
           <button
             class="btn btn-secondary"
-            onClick={() => setP2pConfigOpen(true)}
+            onClick={() => openP2pConfigPanel('participants')}
             disabled={disabled}
             title={t('p2p.settings_title')}
             style={{ padding: '6px 10px' }}
@@ -1529,18 +2074,69 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           )}
         </div>}
       </div>
-      {queuedNoticeVisible && (
+      {queuedTransportMessages.length > 0 && (
         <div class="controls-queued-hint" role="status" aria-live="polite">
-          {t('session.transport_send_queued')}
+          <div class="controls-queued-header">
+            <div>{t('session.transport_send_queued')}</div>
+            <button type="button" class="controls-queued-toggle" onClick={toggleQueuedHintExpanded}>
+              {queuedHintExpanded ? t('common.hide') : t('common.show')}
+            </button>
+          </div>
+          <div class="controls-queued-list">
+            {queuedHintExpanded ? (
+              queuedTransportMessages.map((message, index) => (
+                <div class="controls-queued-item" key={`${activeSession?.name ?? 'session'}:${index}:${message}`}>
+                  {message}
+                </div>
+              ))
+            ) : (
+              <>
+                <div class="controls-queued-summary">
+                  {t('session.transport_send_queued_collapsed', { count: queuedTransportMessages.length })}
+                </div>
+                <div class="controls-queued-item" key={`${activeSession?.name ?? 'session'}:latest:${queuedTransportLatestMessage}`}>
+                  {queuedTransportLatestMessage}
+                </div>
+              </>
+            )}
+          </div>
         </div>
       )}
     </div>
+    {pendingComboSendConfirm && (
+      <div class="dialog-overlay">
+        <div class="dialog" style={{ maxWidth: 420 }}>
+          <div class="dialog-header">
+            <h2>{t('p2p.combo_send_confirm_title')}</h2>
+            <button class="dialog-close" onClick={handleComboSendCancel} aria-label={t('common.close')}>×</button>
+          </div>
+          <div class="dialog-body" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <div style={{ color: '#cbd5e1', fontSize: 13, lineHeight: 1.5 }}>
+              {t('p2p.combo_send_confirm_body', { mode: pendingComboSendConfirm.modeLabel })}
+            </div>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, color: '#94a3b8', fontSize: 13 }}>
+              <input
+                type="checkbox"
+                checked={rememberComboSendChoice}
+                onChange={(e) => setRememberComboSendChoice((e.target as HTMLInputElement).checked)}
+              />
+              {t('p2p.combo_send_confirm_skip')}
+            </label>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button class="btn btn-secondary" onClick={handleComboSendCancel}>{t('common.cancel')}</button>
+              <button class="btn btn-primary" onClick={handleComboSendConfirm}>{t('common.send')}</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    )}
     <VoiceOverlay open={voiceOpen} onClose={() => setVoiceOpen(false)} onSend={handleVoiceSend} initialText={divRef.current?.textContent ?? ''} />
     {p2pConfigOpen && (
       <P2pConfigPanel
         sessions={(sessions ?? []).map(s => ({ name: s.name, agentType: s.agentType, state: s.state }))}
         subSessions={subSessions ?? []}
         activeSession={activeSession?.name}
+        initialTab={p2pConfigInitialTab}
         onClose={() => setP2pConfigOpen(false)}
         onSave={(cfg) => {
           setP2pSavedConfig(cfg);

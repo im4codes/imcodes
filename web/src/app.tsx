@@ -1,6 +1,12 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
-import { FileBrowser } from './components/FileBrowser.js';
+import {
+  FileBrowser,
+  type FileBrowserPreviewRequest,
+  type FileBrowserPreviewState,
+  type FileBrowserPreviewUpdate,
+} from './components/FileBrowser.js';
 import { mapP2pStatusToUiState, type P2pActivePhase, type P2pProgressNodeStatus } from '@shared/p2p-status.js';
+import { DAEMON_MSG } from '@shared/daemon-events.js';
 
 function mapP2pRunToDiscussion(r: Record<string, any>) {
   const rawSnapshot = r.progress_snapshot;
@@ -27,6 +33,13 @@ function mapP2pRunToDiscussion(r: Record<string, any>) {
     phase: typeof n.phase === 'string' ? n.phase as 'initial' | 'hop' | 'summary' : undefined,
     status: String(n.status ?? 'pending') as P2pProgressNodeStatus,
   })) : undefined;
+  const hopStates = Array.isArray(source.hop_states) ? source.hop_states.map((hop: any) => ({
+    hopIndex: Number(hop.hop_index ?? 0),
+    roundIndex: Number(hop.round_index ?? 0),
+    session: typeof hop.session === 'string' ? hop.session : undefined,
+    mode: typeof hop.mode === 'string' ? hop.mode : undefined,
+    status: String(hop.status ?? 'queued') as 'queued' | 'dispatched' | 'running' | 'completed' | 'timed_out' | 'failed' | 'cancelled',
+  })) : undefined;
   return {
     id,
     topic: `P2P ${mode} · ${initiatorLabel}`,
@@ -35,6 +48,7 @@ function mapP2pRunToDiscussion(r: Record<string, any>) {
     currentRound: source.current_round ?? 1,
     maxRounds: source.total_rounds ?? 1,
     completedHops: source.completed_hops_count ?? 0,
+    completedRoundHops: typeof source.completed_round_hops_count === 'number' ? source.completed_round_hops_count : undefined,
     totalHops,
     activeHop: source.active_hop_number ?? null,
     activeRoundHop: source.active_round_hop_number ?? null,
@@ -48,6 +62,7 @@ function mapP2pRunToDiscussion(r: Record<string, any>) {
     startedAt: source.created_at ? new Date(source.created_at).getTime() : undefined,
     hopStartedAt: typeof source.hop_started_at === 'number' ? source.hop_started_at : undefined,
     nodes,
+    hopStates,
   };
 }
 import { useTranslation } from 'react-i18next';
@@ -84,6 +99,7 @@ import type { PanelRenderContext } from './components/PinnedPanelRegistry.js';
 import './components/pinnedPanelTypes.js'; // register all panel types
 import { LOCAL_WEB_PREVIEW_PANEL_TYPE } from './components/pinnedPanelTypes.js';
 import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
+import { getSessionRuntimeType } from '@shared/agent-types.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
 import { useSubSessions } from './hooks/useSubSessions.js';
 import { useProviderStatus } from './hooks/useProviderStatus.js';
@@ -101,6 +117,11 @@ import { REPO_MSG } from '@shared/repo-types.js';
 import { shouldSubscribeTerminalRaw, type TerminalSubscribeViewMode } from './terminal-subscribe-mode.js';
 import { onWatchCommand } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
+import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timeline-running.js';
+import { extractTransportPendingMessages } from './transport-queue.js';
+import { ingestTimelineEventForCache } from './hooks/useTimeline.js';
+import { getMobileKeyboardState } from './mobile-keyboard.js';
+import { pickReadableSessionDisplay } from '@shared/session-display.js';
 
 // On web: if opened by the native app for passkey auth, render the bridge page.
 const nativeCallback = typeof window !== 'undefined'
@@ -108,6 +129,30 @@ const nativeCallback = typeof window !== 'undefined'
   : null;
 
 type ViewMode = TerminalSubscribeViewMode;
+
+function buildSessionToastLabel(
+  sessionName: string,
+  options: {
+    label?: string | null;
+    parentLabel?: string | null;
+    project?: string | null;
+    agentType?: string | null;
+  },
+): string {
+  const label = pickReadableSessionDisplay([options.label], sessionName);
+  const parentLabel = pickReadableSessionDisplay([options.parentLabel], sessionName);
+  const project = pickReadableSessionDisplay([options.project], sessionName);
+  const agentType = options.agentType?.trim() || undefined;
+  const typeSuffix = agentType ? `(${agentType})` : '';
+
+  if (sessionName.startsWith('deck_sub_')) {
+    const name = label || parentLabel || project || agentType || sessionName.replace(/^deck_sub_/, '');
+    return `${name}${label ? typeSuffix : ''}${parentLabel && name !== parentLabel ? `@${parentLabel}` : ''}`;
+  }
+
+  const name = label || project || sessionName;
+  return `${name}${typeSuffix}`;
+}
 
 /** A panel pinned to the sidebar. Uses sessionName as stable identity. */
 export interface PinnedPanel {
@@ -234,14 +279,18 @@ export function App() {
     const vv = window.visualViewport;
     if (!vv) return;
     let inputFocused = false;
+    let hadKeyboardOpen = false;
     let scrollTimer: ReturnType<typeof setTimeout> | undefined;
     const update = () => {
       document.documentElement.style.setProperty('--vvh', `${vv.height}px`);
       // Detect keyboard open: viewport shrink + optional input-focus fallback.
       // Chinese IME candidate bars can be ~40px, so use low threshold when input is focused.
       const shrink = window.innerHeight - vv.height;
-      const kbOpen = shrink > 40 || (inputFocused && shrink > 15);
+      const state = getMobileKeyboardState(inputFocused, shrink, hadKeyboardOpen);
+      hadKeyboardOpen = state.hadKeyboardOpen;
+      const { kbOpen, hideInputUi } = state;
       document.documentElement.classList.toggle('kb-open', kbOpen);
+      document.documentElement.classList.toggle('input-focused', hideInputUi);
       // Reset any scroll/offset caused by keyboard opening on mobile.
       // Always reset — iOS can have vv.offsetTop > 0 even when scrollY is 0.
       window.scrollTo(0, 0);
@@ -279,6 +328,7 @@ export function App() {
     };
     const onFocusOut = () => {
       inputFocused = false;
+      hadKeyboardOpen = false;
       document.documentElement.classList.remove('input-focused');
       clearTimeout(scrollTimer);
       update();
@@ -566,6 +616,7 @@ export function App() {
   const stoppedNavTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [idleAlerts, setIdleAlerts] = useState<Set<string>>(new Set());
+  const [idleFlashTokens, setIdleFlashTokens] = useState<Map<string, number>>(() => new Map());
   const [toasts, setToasts] = useState<Array<{ id: number; sessionName: string; project: string; kind: 'idle' | 'notification'; title?: string; message?: string; openRepoLatest?: boolean; failedJobName?: string; failedStepName?: string }>>([]);
   const [detectedModels, setDetectedModels] = useState<Map<string, string>>(new Map());
   const [subUsages, setSubUsages] = useState<Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; model?: string }>>(new Map());
@@ -607,6 +658,13 @@ export function App() {
     }
     return maxId;
   }, [subZIndexes, openSubIds]);
+  const flashIdleSession = useCallback((sessionName: string) => {
+    setIdleFlashTokens((prev) => {
+      const next = new Map(prev);
+      next.set(sessionName, (next.get(sessionName) ?? 0) + 1);
+      return next;
+    });
+  }, []);
   const focusedSubIdRef = useRef(focusedSubId);
   focusedSubIdRef.current = focusedSubId;
 
@@ -655,8 +713,9 @@ export function App() {
   const [showRepoPage, setShowRepoPage] = useState(false);
   const [repoFocusLatestAction, setRepoFocusLatestAction] = useState<{ token: number; failedJobName?: string; failedStepName?: string } | null>(null);
   const [pendingRepoToastSession, setPendingRepoToastSession] = useState<{ sessionName: string; focus: { token: number; failedJobName?: string; failedStepName?: string } } | null>(null);
-  /** File path for the floating file preview window (opened from pinned file browser) */
-  const [previewFilePath, setPreviewFilePath] = useState<string | null>(null);
+  /** Floating file preview request opened from pinned file browser. */
+  const [previewFileRequest, setPreviewFileRequest] = useState<FileBrowserPreviewRequest | null>(null);
+  const [previewFileCache, setPreviewFileCache] = useState<Record<string, { preferDiff?: boolean; preview: FileBrowserPreviewState }>>({});
   const [repoContexts, setRepoContexts] = useState<Map<string, any>>(new Map());
   const repoContextsRef = useRef(repoContexts);
   repoContextsRef.current = repoContexts;
@@ -703,6 +762,7 @@ export function App() {
     currentRound: number;
     maxRounds: number;
     completedHops: number;
+    completedRoundHops?: number;
     totalHops: number;
     activeHop?: number | null;
     activeRoundHop?: number | null;
@@ -719,6 +779,13 @@ export function App() {
       mode?: string;
       phase?: 'initial' | 'hop' | 'summary';
       status: 'done' | 'active' | 'pending' | 'skipped';
+    }>;
+    hopStates?: Array<{
+      hopIndex: number;
+      roundIndex: number;
+      session?: string;
+      mode?: string;
+      status: 'queued' | 'dispatched' | 'running' | 'completed' | 'timed_out' | 'failed' | 'cancelled';
     }>;
     /** Discussion file ID for navigation (P2P runs use discussion_id, not run id) */
     fileId?: string;
@@ -860,6 +927,25 @@ export function App() {
   const subSessionsRef = useRef(subSessions);
   subSessionsRef.current = subSessions;
 
+  useEffect(() => {
+    const liveSessionNames = new Set<string>([
+      ...sessions.map((session) => session.name),
+      ...subSessions.map((sub) => sub.sessionName),
+    ]);
+    setIdleFlashTokens((prev) => {
+      let changed = false;
+      const next = new Map<string, number>();
+      for (const [sessionName, token] of prev) {
+        if (liveSessionNames.has(sessionName)) {
+          next.set(sessionName, token);
+          continue;
+        }
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [sessions, subSessions]);
+
   // When sub-sessions load from API (after session_list already fired), sync them to Watch projection
   useEffect(() => {
     if (subSessions.length === 0 || !selectedServerId) return;
@@ -899,6 +985,38 @@ export function App() {
       panel.id === panelId ? { ...panel, props } : panel
     )));
   }, [setPinnedPanels]);
+
+  const handlePreviewFileRequest = useCallback((request: FileBrowserPreviewRequest) => {
+    const cached = previewFileCache[request.path];
+    setPreviewFileRequest({
+      ...request,
+      preview: request.preview ?? cached?.preview,
+      preferDiff: request.preferDiff ?? cached?.preferDiff,
+    });
+  }, [previewFileCache]);
+
+  const handlePreviewStateChange = useCallback((update: FileBrowserPreviewUpdate) => {
+    setPreviewFileCache((prev) => {
+      const existing = prev[update.path];
+      if (existing?.preview === update.preview && existing.preferDiff === update.preferDiff) return prev;
+      return {
+        ...prev,
+        [update.path]: {
+          preferDiff: update.preferDiff,
+          preview: update.preview,
+        },
+      };
+    });
+    setPreviewFileRequest((prev) => (
+      prev?.path === update.path
+        ? {
+            ...prev,
+            preferDiff: prev.preferDiff ?? update.preferDiff,
+            preview: update.preview,
+          }
+        : prev
+    ));
+  }, []);
 
   /** Generic unpin: remove from pinnedPanels + reopen the source floating window. */
   const unpinPanel = useCallback((panel: PinnedPanel) => {
@@ -1089,6 +1207,9 @@ export function App() {
             quotaUsageLabel: s.quotaUsageLabel,
             quotaMeta: s.quotaMeta ?? existing?.quotaMeta,
             effort: s.effort ?? existing?.effort,
+            transportPendingMessages: (s.state === 'queued' || s.state === 'running')
+              ? (existing?.transportPendingMessages ?? [])
+              : [],
           };
         }));
         setSessionsLoaded(true);
@@ -1123,7 +1244,21 @@ export function App() {
       // Detect model from JSONL usage.update events (authoritative, overrides terminal scan)
       if (msg.type === 'timeline.event') {
         const event = msg.event;
+        ingestTimelineEventForCache(event, selectedServerId);
         watchProjectionStore.handleTimelineEvent(event);
+        if (isRunningTimelineEvent(event) && !event.sessionId.startsWith('deck_sub_')) {
+          setSessions((prev) => prev.map((s) =>
+            s.name === event.sessionId && s.state !== 'running'
+              ? { ...s, state: 'running' as SessionInfo['state'] }
+              : s,
+          ));
+        }
+        if (isIdleSessionStateTimelineEvent(event)) {
+          flashIdleSession(event.sessionId);
+          if (!event.sessionId.startsWith('deck_sub_')) {
+            setIdleAlerts((prev) => new Set([...prev, event.sessionId]));
+          }
+        }
         if (event.type === 'ask.question') {
           setPendingQuestion({
             sessionName: event.sessionId,
@@ -1134,9 +1269,32 @@ export function App() {
         // Sync session state from live timeline events (running/idle)
         if (event.type === 'session.state' && !event.sessionId.startsWith('deck_sub_')) {
           const liveState = String(event.payload.state ?? '');
-          if (liveState === 'running' || liveState === 'idle') {
+          const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessages');
+          if (liveState === 'queued') {
+            const pendingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
             setSessions((prev) => prev.map((s) =>
-              s.name === event.sessionId ? { ...s, state: liveState as SessionInfo['state'] } : s,
+              s.name === event.sessionId
+                ? { ...s, transportPendingMessages: pendingMessages }
+                : s,
+            ));
+          } else if (liveState === 'running') {
+            const pendingMessages = hasPendingMessagesField
+              ? extractTransportPendingMessages(event.payload.pendingMessages)
+              : null;
+            setSessions((prev) => prev.map((s) =>
+              s.name === event.sessionId
+                ? {
+                    ...s,
+                    state: 'running' as SessionInfo['state'],
+                    transportPendingMessages: pendingMessages ?? (s.transportPendingMessages ?? []),
+                  }
+                : s,
+            ));
+          } else if (liveState === 'idle') {
+            setSessions((prev) => prev.map((s) =>
+              s.name === event.sessionId
+                ? { ...s, state: liveState as SessionInfo['state'], transportPendingMessages: [] }
+                : s,
             ));
           }
         }
@@ -1197,21 +1355,19 @@ export function App() {
         const parentLabel = msg.parentLabel as string | undefined;
         const agentType = (msg.agentType as string | undefined) || localSub?.type || undefined;
         const rawProject = (msg.project as string) || sessionName;
-        let displayProject: string;
-        const typeSuffix = agentType ? `(${agentType})` : '';
-        if (sessionName.startsWith('deck_sub_')) {
-          const name = label || agentType || sessionName.replace(/^deck_sub_/, '');
-          displayProject = `${name}${label ? typeSuffix : ''}${parentLabel ? `@${parentLabel}` : ''}`;
-        } else {
-          const name = label || rawProject;
-          displayProject = `${name}${typeSuffix}`;
-        }
+        const displayProject = buildSessionToastLabel(sessionName, {
+          label,
+          parentLabel,
+          project: rawProject,
+          agentType,
+        });
         if (!sessionName.startsWith('deck_sub_')) {
           // Main session: update state + tab alert
-          setSessions((prev) => prev.map((s) => s.name === sessionName ? { ...s, state: 'idle' as SessionInfo['state'] } : s));
+          setSessions((prev) => prev.map((s) => s.name === sessionName ? { ...s, state: 'idle' as SessionInfo['state'], transportPendingMessages: [] } : s));
           // Always flash the tab — even if it's the active one
           setIdleAlerts((prev) => new Set([...prev, sessionName]));
         }
+        flashIdleSession(sessionName);
         // Always show a toast (main + sub sessions)
         const id = Date.now();
         setToasts((prev) => [...prev, { id, sessionName, project: displayProject, kind: 'idle' }]);
@@ -1234,15 +1390,12 @@ export function App() {
         const parentLabel = msg.parentLabel as string | undefined;
         const agentType = (msg.agentType as string | undefined) || localSub?.type || undefined;
         const rawProject = msg.project || sessionName;
-        const typeSuffix = agentType ? `(${agentType})` : '';
-        let displayProject: string;
-        if (sessionName.startsWith('deck_sub_')) {
-          const name = label || agentType || sessionName.replace(/^deck_sub_/, '');
-          displayProject = `${name}${label ? typeSuffix : ''}${parentLabel ? `@${parentLabel}` : ''}`;
-        } else {
-          const name = label || rawProject;
-          displayProject = `${name}${typeSuffix}`;
-        }
+        const displayProject = buildSessionToastLabel(sessionName, {
+          label,
+          parentLabel,
+          project: rawProject,
+          agentType,
+        });
         const id = Date.now();
         setToasts((prev) => [...prev, { id, sessionName, project: displayProject, kind: 'notification', title: msg.title, message: msg.message }]);
         setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 8000);
@@ -1330,6 +1483,9 @@ export function App() {
           }, 120_000);
         }
       }
+      if (msg.type === 'p2p.cancel_response' && msg.ok && msg.runId) {
+        setDiscussions((prev) => prev.filter((d) => d.id !== `p2p_${msg.runId}`));
+      }
       if (msg.type === 'p2p.status_response') {
         const runs = Array.isArray(msg.runs)
           ? msg.runs
@@ -1341,7 +1497,6 @@ export function App() {
         setDiscussions((prev) => {
           const retained = prev.filter((d) => {
             if (!d.id.startsWith('p2p_')) return true;
-            if (d.state === 'done' || d.state === 'failed') return true;
             return activeIds.has(d.id);
           });
           const merged = [...retained];
@@ -1388,7 +1543,19 @@ export function App() {
           }
         }
       }
-      if (msg.type === 'daemon.disconnected') {
+      if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED) {
+        const id = Date.now() + Math.random();
+        setToasts((prev) => [...prev, {
+          id,
+          sessionName: '',
+          project: '',
+          kind: 'notification',
+          title: trans('toast.upgrade_blocked_title'),
+          message: trans('toast.upgrade_blocked_p2p_active'),
+        }]);
+        setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
+      }
+      if (msg.type === DAEMON_MSG.DISCONNECTED) {
         // Daemon went offline — keep existing session data visible, just update status
         setDaemonOnline(false);
         watchProjectionStore.setSnapshotStatus('stale');
@@ -1409,7 +1576,7 @@ export function App() {
         // Auto-dismiss after 10 seconds
         setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 10_000);
       }
-      if (msg.type === 'daemon.reconnected') {
+      if (msg.type === DAEMON_MSG.RECONNECTED) {
         setDaemonOnline(true);
         // Daemon process (re)started — all its subscriptions are gone.
         // Re-subscribe active targets first, then stagger the rest to avoid a herd.
@@ -1813,32 +1980,11 @@ export function App() {
 
   const handleStopProject = useCallback((project: string) => {
     if (!wsRef.current) return;
-    const parentNames = new Set(sessionsRef.current.filter((s) => s.project === project).map((s) => s.name));
-    const descendants = new Set<string>();
-
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const sub of subSessionsRef.current) {
-        if (!sub.parentSession) continue;
-        if (descendants.has(sub.id)) continue;
-        if (!parentNames.has(sub.parentSession)) continue;
-        descendants.add(sub.id);
-        parentNames.add(sub.sessionName);
-        changed = true;
-      }
-    }
-
-    for (const subId of descendants) {
-      closeSubSession(subId);
-    }
-
+    setSessions((prev) => prev.map((s) =>
+      s.project === project ? { ...s, state: 'stopping' as SessionInfo['state'] } : s,
+    ));
     wsRef.current.sendSessionCommand('stop', { project });
-    setSessions((prev) => prev.filter((s) => s.project !== project));
-    if (sessions.some((s) => s.project === project && s.name === activeSession)) {
-      setActiveSession(null);
-    }
-  }, [sessions, activeSession, setActiveSession, closeSubSession]);
+  }, []);
 
   const handleRestartProject = useCallback((project: string, fresh?: boolean) => {
     wsRef.current?.sendSessionCommand('restart', { project, ...(fresh ? { fresh: true } : {}) });
@@ -2150,6 +2296,7 @@ export function App() {
               subSessions={subSessions}
               activeSession={activeSession}
               unreadCounts={unreadCounts}
+              idleFlashTokens={idleFlashTokens}
               p2pSessionLabels={p2pSessionLabels}
               onSelectSession={(name) => {
                 setActiveSession(name);
@@ -2190,7 +2337,8 @@ export function App() {
                 serverId: selectedServerId ?? '',
                 subSessions,
                 inputRefsMap,
-                onPreviewFile: (path) => setPreviewFilePath(path),
+                onPreviewFile: (request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: true }),
+                onPreviewStateChange: handlePreviewStateChange,
                 activeSession,
                 activeProjectDir: activeSessionInfo?.projectDir,
                 sessions,
@@ -2551,6 +2699,7 @@ export function App() {
               <SubSessionBar
                 subSessions={visibleSubSessions}
                 openIds={openSubIds}
+                idleFlashTokens={idleFlashTokens}
                 onOpen={toggleSubSession}
                 onClose={closeSubSession}
                 onRestart={restartSubSession}
@@ -2645,6 +2794,7 @@ export function App() {
                 subSessions={subSessions}
                 activeSession={activeSession}
                 unreadCounts={unreadCounts}
+                idleFlashTokens={idleFlashTokens}
                 p2pSessionLabels={p2pSessionLabels}
                 onSelectSession={(name) => {
                   setActiveSession(name);
@@ -2685,7 +2835,8 @@ export function App() {
                   serverId: selectedServerId ?? '',
                   subSessions,
                   inputRefsMap,
-                  onPreviewFile: (path) => { setPreviewFilePath(path); closeSidebar(); },
+                  onPreviewFile: (request) => { handlePreviewFileRequest({ ...request, sourcePreviewLive: false }); closeSidebar(); },
+                  onPreviewStateChange: handlePreviewStateChange,
                   activeSession,
                   activeProjectDir: activeSessionInfo?.projectDir,
                   sessions,
@@ -2798,26 +2949,29 @@ export function App() {
       )}
 
       {/* Floating file preview — one file at a time, opened from pinned file browser */}
-      {previewFilePath && wsRef.current && (
+      {previewFileRequest && wsRef.current && (
         <FloatingPanel
           id="file-preview"
-          title={previewFilePath.split(/[/\\]/).pop() ?? 'Preview'}
-          onClose={() => setPreviewFilePath(null)}
+          title={previewFileRequest.path.split(/[/\\]/).pop() ?? 'Preview'}
+          onClose={() => setPreviewFileRequest(null)}
           defaultW={700}
           defaultH={500}
         >
           <FileBrowser
-            key={previewFilePath}
+            key={`${previewFileRequest.path}:${previewFileRequest.preferDiff ? 'diff' : 'source'}`}
             ws={wsRef.current}
             serverId={selectedServerId ?? undefined}
             mode="file-single"
             layout="panel"
-            initialPath={previewFilePath.replace(/\/[^/]+$/, '') || '~'}
-            autoPreviewPath={previewFilePath}
+            initialPath={previewFileRequest.path.replace(/\/[^/]+$/, '') || '~'}
+            initialPreview={previewFileRequest.preview ?? previewFileCache[previewFileRequest.path]?.preview}
+            autoPreviewPath={previewFileRequest.path}
+            autoPreviewPreferDiff={!!previewFileRequest.preferDiff}
+            skipAutoPreviewIfLoading={!!previewFileRequest.sourcePreviewLive}
             hideFooter
-            changesRootPath={activeSessionInfo?.projectDir}
-            refreshTrigger={Date.now()}
+            onPreviewStateChange={handlePreviewStateChange}
             onConfirm={() => {}}
+            onClose={() => setPreviewFileRequest(null)}
           />
         </FloatingPanel>
       )}
@@ -2951,6 +3105,7 @@ export function App() {
               ws={wsRef.current}
               connected={connected}
               active={isOpen}
+              idleFlashToken={idleFlashTokens.get(sub.sessionName) ?? 0}
               onDiff={registerDiffApplyer}
               onHistory={registerHistoryApplyer}
               onMinimize={() => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; })}
@@ -3059,6 +3214,8 @@ export function App() {
             if (settingsTarget.subId) {
               // Sub-session: update local state to reflect saved label/description/cwd
               updateSubLocal(settingsTarget.subId, {
+                type: fields.type !== undefined ? fields.type : undefined,
+                runtimeType: fields.type !== undefined ? getSessionRuntimeType(fields.type) : undefined,
                 label: fields.label !== undefined ? (fields.label ?? null) : undefined,
                 description: fields.description !== undefined ? (fields.description ?? null) : undefined,
                 cwd: fields.cwd !== undefined ? (fields.cwd ?? null) : undefined,
@@ -3068,8 +3225,13 @@ export function App() {
               setSessions((prev) => prev.map((s) => {
                 if (s.name !== settingsTarget.sessionName) return s;
                 const updated = { ...s };
+                if (fields.type !== undefined) {
+                  updated.agentType = fields.type;
+                  updated.runtimeType = getSessionRuntimeType(fields.type);
+                }
                 if (fields.label !== undefined) updated.label = fields.label ?? null;
                 if (fields.description !== undefined) updated.description = fields.description ?? null;
+                if (fields.cwd !== undefined) updated.projectDir = fields.cwd ?? updated.projectDir;
                 return updated;
               }));
             }

@@ -17,6 +17,7 @@ import type { Database } from '../db/client.js';
 import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
 import { sha256Hex } from '../security/crypto.js';
+import { DAEMON_MSG } from '../../../shared/daemon-events.js';
 import { REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import {
@@ -38,6 +39,7 @@ import {
 import { LocalWebPreviewRegistry } from '../preview/registry.js';
 import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions } from '../db/queries.js';
 import logger from '../util/logger.js';
+import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
 
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
@@ -136,6 +138,13 @@ export interface WatchActiveMainSessionRow {
   agentType: string;
   label?: string;
 }
+
+type WatchActiveSubSessionRow = {
+  name: string;
+  parentSession?: string;
+  agentType?: string;
+  label?: string;
+};
 
 type PendingPreviewRequest = {
   readable: ReadableStream<Uint8Array>;
@@ -277,6 +286,8 @@ export class WsBridge {
 
   /** Latest daemon-owned active main-session snapshot for watch list responses. */
   private activeMainSessions = new Map<string, WatchActiveMainSessionRow>();
+  /** Latest daemon-owned active sub-session snapshot for push title resolution. */
+  private activeSubSessions = new Map<string, WatchActiveSubSessionRow>();
   private hasActiveMainSessionSnapshot = false;
 
   /**
@@ -437,7 +448,7 @@ export class WsBridge {
         }
         this.queue = [];
 
-        this.broadcastToBrowsers(JSON.stringify({ type: 'daemon.reconnected' }));
+        this.broadcastToBrowsers(JSON.stringify({ type: DAEMON_MSG.RECONNECTED }));
 
         // Re-subscribe daemon to all sessions that still have active browser subscribers
         for (const [sessionName, refs] of this.daemonSessionRefs) {
@@ -501,6 +512,7 @@ export class WsBridge {
         this.authenticated = false;
         this.recentTextBySession.clear();
         this.activeMainSessions.clear();
+        this.activeSubSessions.clear();
         this.hasActiveMainSessionSnapshot = false;
         this.rejectAllPendingFileTransfers('daemon_disconnected');
         this.rejectAllPendingHttpTimelineRequests('daemon_disconnected');
@@ -512,7 +524,7 @@ export class WsBridge {
           this.broadcastToBrowsers(JSON.stringify({ type: TRANSPORT_MSG.PROVIDER_STATUS, providerId, connected: false }));
         }
         this.providerStatus.clear();
-        this.broadcastToBrowsers(JSON.stringify({ type: 'daemon.disconnected' }));
+        this.broadcastToBrowsers(JSON.stringify({ type: DAEMON_MSG.DISCONNECTED }));
         void clearProviderStatus(db, this.serverId).catch(() => {});
         updateServerStatus(db, this.serverId, 'offline').catch((err) =>
           logger.error({ err }, 'Failed to mark server offline'),
@@ -843,10 +855,10 @@ export class WsBridge {
       return;
     }
 
-    if (type === 'session_list') {
-      this.replaceActiveMainSessions(msg.sessions);
-      this.pruneMainSessionRecentText(msg.sessions);
-      this.broadcastToBrowsers(JSON.stringify({
+      if (type === 'session_list') {
+        this.replaceActiveMainSessions(msg.sessions);
+        this.pruneMainSessionRecentText(msg.sessions);
+        this.broadcastToBrowsers(JSON.stringify({
         ...msg,
         daemonVersion: typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion,
       }));
@@ -937,6 +949,13 @@ export class WsBridge {
 
     // ── Sub-session sync: daemon creates sub-sessions → persist to DB ────────
     if (type === 'subsession.sync' && this.db) {
+      const subSessionName = `deck_sub_${String(msg.id ?? '')}`;
+      if (subSessionName !== 'deck_sub_') {
+        const label = typeof msg.label === 'string' && msg.label.trim() ? msg.label.trim() : undefined;
+        const parentSession = typeof msg.parentSession === 'string' && msg.parentSession ? msg.parentSession : undefined;
+        const agentType = typeof msg.sessionType === 'string' && msg.sessionType ? msg.sessionType : undefined;
+        this.activeSubSessions.set(subSessionName, { name: subSessionName, label, parentSession, agentType });
+      }
       void createSubSession(
         this.db,
         msg.id as string,
@@ -983,7 +1002,7 @@ export class WsBridge {
           quotaLabel: msg.quotaLabel || null,
           quotaUsageLabel: msg.quotaUsageLabel || null,
           quotaMeta: msg.quotaMeta || null,
-          state: 'running',
+          state: (msg.state as string) || 'idle',
         }));
       }).catch((e) => logger.error({ err: e, id: msg.id }, 'Failed to sync sub-session to DB'));
       return;
@@ -1053,10 +1072,17 @@ export class WsBridge {
     if (type === 'subsession.closed' && this.db) {
       const id = msg.id as string;
       if (id) {
-        this.recentTextBySession.delete(`deck_sub_${id}`);
         void this.db.execute('UPDATE sub_sessions SET closed_at = $1 WHERE id = $2 AND server_id = $3',
-          [Date.now(), id, this.serverId]).catch(() => {});
-        this.broadcastToBrowsers(JSON.stringify({ type: 'subsession.removed', id, sessionName: msg.sessionName }));
+          [Date.now(), id, this.serverId])
+          .then(() => {
+            const sessionName = `deck_sub_${id}`;
+            this.recentTextBySession.delete(sessionName);
+            this.activeSubSessions.delete(sessionName);
+            this.broadcastToBrowsers(JSON.stringify({ type: 'subsession.removed', id, sessionName: msg.sessionName }));
+          })
+          .catch((err) => {
+            logger.error({ err, id, sessionName: msg.sessionName }, 'Failed to persist sub-session close from daemon');
+          });
       }
       return;
     }
@@ -2123,6 +2149,88 @@ export class WsBridge {
   private lastPushAt = new Map<string, number>();
   private static readonly PUSH_DEDUP_MS = 10_000;
 
+  private async resolveReadablePushDisplay(
+    db: Database,
+    sessionName: string,
+    daemonLabel: string | undefined,
+    daemonParentLabel: string | undefined,
+    daemonProject: string | undefined,
+  ): Promise<{
+    displayName: string;
+    agentType?: string;
+  }> {
+    const visited = new Set<string>();
+    const activeMainSession = this.activeMainSessions.get(sessionName);
+    let effectiveAgentType = pickReadableSessionDisplay([activeMainSession?.agentType], sessionName);
+    let currentSessionName: string | undefined = sessionName;
+    let displayName = pickReadableSessionDisplay([daemonLabel], sessionName);
+
+    while (currentSessionName && !visited.has(currentSessionName)) {
+      visited.add(currentSessionName);
+
+      const active = this.activeMainSessions.get(currentSessionName);
+      const activeSubSession = this.activeSubSessions.get(currentSessionName);
+      let sessionRow = await db.queryOne<{ project_name: string; agent_type: string; label: string | null }>(
+        'SELECT project_name, agent_type, label FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
+        [this.serverId, currentSessionName],
+      ).catch(() => null);
+
+      let parentSession: string | undefined;
+      let subType: string | undefined;
+      if (activeSubSession) {
+        subType = activeSubSession.agentType;
+        parentSession = activeSubSession.parentSession;
+        const activeSubDisplay = pickReadableSessionDisplay([activeSubSession.label], currentSessionName);
+        if (!displayName && activeSubDisplay) displayName = activeSubDisplay;
+      }
+      if (!sessionRow && currentSessionName.startsWith('deck_sub_')) {
+        const subRow: { type: string; label: string | null; parent_session: string | null } | null = await db
+          .queryOne<{ type: string; label: string | null; parent_session: string | null }>(
+            'SELECT type, label, parent_session FROM sub_sessions WHERE server_id = $1 AND id = $2 LIMIT 1',
+            [this.serverId, currentSessionName.replace(/^deck_sub_/, '')],
+          )
+          .catch(() => null);
+        if (subRow) {
+          subType = subRow.type;
+          parentSession = subRow.parent_session ?? undefined;
+          const subDisplay = pickReadableSessionDisplay([subRow.label], currentSessionName);
+          if (!displayName && subDisplay) displayName = subDisplay;
+        }
+      }
+
+      effectiveAgentType = effectiveAgentType
+        || subType
+        || active?.agentType
+        || sessionRow?.agent_type
+        || undefined;
+
+      if (!displayName) {
+        const candidate = pickReadableSessionDisplay(
+          [
+            active?.label,
+            sessionRow?.label,
+            active?.project,
+            sessionRow?.project_name,
+          ],
+          currentSessionName,
+        );
+        if (candidate) displayName = candidate;
+      }
+
+      if (displayName) break;
+      currentSessionName = parentSession;
+    }
+
+    displayName = displayName
+      || pickReadableSessionDisplay([activeMainSession?.label, activeMainSession?.project, daemonParentLabel, daemonProject], sessionName)
+      || sessionName;
+
+    return {
+      displayName,
+      ...(effectiveAgentType ? { agentType: effectiveAgentType } : {}),
+    };
+  }
+
   private async dispatchEventPush(db: Database, env: Env, msg: Record<string, unknown>): Promise<void> {
     // Always send APNs push — iOS handles foreground display via UNUserNotificationCenterDelegate.
     // Badge count must increment regardless of app state.
@@ -2137,83 +2245,42 @@ export class WsBridge {
     const server = await db.queryOne<{ user_id: string; name: string }>('SELECT user_id, name FROM servers WHERE id = $1', [this.serverId]);
     if (!server) return;
 
-    const { dispatchPush } = await import('../routes/push.js').catch(() => ({ dispatchPush: null }));
+    const { dispatchPush } = await import('../routes/push.js').catch((err) => {
+      logger.error({ err }, 'Failed to import push module — push notifications disabled');
+      return { dispatchPush: null };
+    });
     if (!dispatchPush) return;
 
     const sessionName = String(msg.session ?? msg.sessionId ?? '');
     const eventType = String(msg.type ?? '');
-
-    // Prefer label/parentLabel from daemon message (has full context including sub-sessions)
     const daemonLabel = msg.label ? String(msg.label) : undefined;
     const daemonParentLabel = msg.parentLabel ? String(msg.parentLabel) : undefined;
-
-    // Look up session metadata for human-readable push content
-    // Check sessions table first, then sub_sessions for sub-session names
-    let sessionRow = await db.queryOne<{ project_name: string; agent_type: string; label: string | null }>(
-      'SELECT project_name, agent_type, label FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
-      [this.serverId, sessionName],
-    ).catch(() => null);
-
-    let subType: string | undefined;
-    if (!sessionRow) {
-      // Try sub_sessions table: session name is deck_sub_{id}
-      const subMatch = sessionName.match(/^deck_sub_([a-zA-Z0-9]+)$/);
-      const subRow = subMatch ? await db.queryOne<{ type: string; label: string | null; parent_session: string }>(
-        'SELECT type, label, parent_session FROM sub_sessions WHERE server_id = $1 AND id = $2 LIMIT 1',
-        [this.serverId, subMatch[1]],
-      ).catch(() => null) : null;
-      if (subRow) {
-        subType = subRow.type;
-        // Look up parent session for context
-        if (!daemonParentLabel && subRow.parent_session) {
-          const parentRow = await db.queryOne<{ project_name: string; label: string | null }>(
-            'SELECT project_name, label FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
-            [this.serverId, subRow.parent_session],
-          ).catch(() => null);
-          if (parentRow) {
-            sessionRow = { project_name: parentRow.project_name, agent_type: subRow.type, label: subRow.label };
-          }
-        }
-      }
-    }
-
-    // Build display name: label(type)@mainSession — fallback label to sub-session ID
-    const label = daemonLabel || sessionRow?.label;
-    const agentType = subType || sessionRow?.agent_type || String(msg.agentType ?? '');
-    const parentContext = daemonParentLabel || sessionRow?.project_name;
-    const isSub = sessionName.startsWith('deck_sub_');
-
-    let displayName: string;
-    const typeSuffix = agentType ? `(${agentType})` : '';
-    if (isSub) {
-      // Prefer label, fallback to agentType, last resort raw ID
-      const name = label || agentType || sessionName.replace(/^deck_sub_/, '');
-      displayName = `${name}${label ? typeSuffix : ''}${parentContext ? `@${parentContext}` : ''}`;
-    } else {
-      const name = label || parentContext || sessionName;
-      displayName = `${name}${typeSuffix}`;
-    }
-    const agentLabel = '';
+    const daemonProject = msg.project ? String(msg.project) : undefined;
+    const resolved = await this.resolveReadablePushDisplay(db, sessionName, daemonLabel, daemonParentLabel, daemonProject);
+    const displayName = resolved.displayName;
+    const agentType = resolved.agentType || String(msg.agentType ?? '');
+    const titleParts = [server.name, displayName];
+    if (agentType) titleParts.push(agentType);
     const lastText = String(msg.lastText ?? msg.message ?? '').slice(0, 200);
 
     let title: string;
     let body: string;
     switch (eventType) {
       case 'session.idle':
-        title = `${server.name} · ${displayName}${agentLabel}`;
+        title = titleParts.join(' · ');
         body = lastText || 'Task complete — ready for input';
         break;
       case 'session.notification': {
-        title = `${server.name} · ${displayName}`;
+        title = titleParts.join(' · ');
         body = String(msg.message ?? 'Notification');
         break;
       }
       case 'session.error':
-        title = `${server.name} · ${displayName}`;
+        title = titleParts.join(' · ');
         body = `Error: ${String(msg.error ?? 'unknown')}`;
         break;
       case 'ask.question':
-        title = `${server.name} · ${displayName}${agentLabel}`;
+        title = titleParts.join(' · ');
         body = lastText || 'Waiting for your answer';
         break;
       default:

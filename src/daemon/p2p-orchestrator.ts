@@ -106,14 +106,12 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
   const currentRoundCompletedHopCount = run.hopStates.filter(
     (hop) => hop.round_index === run.currentRound && hop.status === 'completed',
   ).length;
-  const currentHop = run.activeTargetSessions[0] ?? run.currentTargetSession;
-  const currentHopState = currentHop
-    ? run.hopStates.find((hop) =>
-      hop.session === currentHop &&
-      hop.round_index === run.currentRound &&
-      (hop.status === 'running' || hop.status === 'dispatched'),
-    ) ?? null
-    : null;
+  const activeHopStates = run.hopStates.filter((hop) =>
+    hop.round_index === run.currentRound &&
+    (hop.status === 'running' || hop.status === 'dispatched'),
+  );
+  const currentHopState = activeHopStates[0] ?? null;
+  const currentHop = currentHopState?.session ?? run.activeTargetSessions[0] ?? run.currentTargetSession;
   const hopCounts = countHopStates(run.hopStates);
 
   return {
@@ -244,17 +242,18 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
         const status = hop.status === 'completed' ? 'done' : 'skipped';
         nodes.push({ session: t.session, ...info, status });
       }
-      if (currentHopState) {
+      const activeSessions = new Set(activeHopStates.map((hop) => hop.session));
+      for (const activeHop of activeHopStates) {
         const curMode = combo ? resolveMode(run.currentRound) : (
-          run.allTargets.find((t) => t.session === currentHopState.session)?.mode
-          ?? run.remainingTargets.find((t) => t.session === currentHopState.session)?.mode
+          run.allTargets.find((t) => t.session === activeHop.session)?.mode
+          ?? run.remainingTargets.find((t) => t.session === activeHop.session)?.mode
           ?? run.mode
         );
-        const info = getInfo(currentHopState.session, curMode, 'hop');
-        nodes.push({ session: currentHopState.session, ...info, status: 'active' });
+        const info = getInfo(activeHop.session, curMode, 'hop');
+        nodes.push({ session: activeHop.session, ...info, status: 'active' });
       }
       for (const t of run.remainingTargets) {
-        if (t.session === currentHop) continue;
+        if (activeSessions.has(t.session)) continue;
         const pendingMode = combo ? resolveMode(run.currentRound) : t.mode;
         const info = getInfo(t.session, pendingMode, 'hop');
         nodes.push({ session: t.session, ...info, status: 'pending' });
@@ -473,7 +472,8 @@ export async function cancelP2pRun(runId: string, serverLink: ServerLink | null)
     return true;
   }
 
-  return false;
+  activeRuns.delete(runId);
+  return true;
 }
 
 // ── Resume after daemon restart ───────────────────────────────────────────
@@ -734,12 +734,12 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       ? `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Final Summary`
       : `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Round ${run.currentRound}/${run.rounds} Summary`;
     const roundSummaryInstruction = isLastRound
-      ? `${summaryModeConfig?.summaryPrompt ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.'}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. Append only the new summary section.`
+      ? `${summaryModeConfig?.summaryPrompt ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.'}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.`
       : `Synthesize the key points, areas of agreement, and open questions from this round. Then assign specific focus areas or questions for each participant in the next round (round ${run.currentRound + 1}). Append to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`;
     const roundSummaryPrompt = buildHopPrompt(run, summaryModeConfig, {
       session: run.initiatorSession,
       sectionHeader: roundSummaryHeader,
-      instruction: `${roundSummaryInstruction}\nThe orchestrator has already appended each completed hop's evidence into the discussion file. Do not re-copy or restructure prior sections; append only your round-summary section.`,
+      instruction: `${roundSummaryInstruction}\nThe orchestrator has already appended each completed hop's evidence into the discussion file. If you write the final plan to another file, still append a short completion note under the new final-summary heading in the discussion file that records the chosen output file path.`,
       isInitial: false,
     }, rp);
     logger.info({ runId: run.id, round: run.currentRound, isLastRound, roundMode: roundModeKey }, isLastRound ? 'P2P: Final summary — initiator' : 'P2P: Round summary — initiator');
@@ -1071,12 +1071,17 @@ export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: Hop
   parts.push(`[P2P Discussion Task — run ${run.id}]`);
   parts.push(``);
   if (isFinalSummary) {
-    parts.push(`This is the FINAL round of a multi-agent discussion. Your discussion file is: ${filePath}`);
+    parts.push(`This is the FINAL round of a multi-agent discussion.`);
+    parts.push(`Discussion file: ${run.contextFilePath}`);
     parts.push(``);
     parts.push(`Steps:`);
-    parts.push(`1. Read the discussion file`);
-    parts.push(`2. Add a new heading "## ${opts.sectionHeader}" at the end and write your final synthesis`);
-    parts.push(`3. Base the synthesis on the collected hop evidence already appended into the discussion file for this round`);
+    parts.push(`1. Read the discussion file and use both the user's original request and the final discussion evidence as source context`);
+    parts.push(`2. Infer whether the user context specifies a concrete destination file for the final plan`);
+    parts.push(`3. If a concrete destination file is clear from the user context, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file under a new heading "## ${opts.sectionHeader}"`);
+    parts.push(`4. If you wrote the plan to another file, still append a short note under "## ${opts.sectionHeader}" in the discussion file that records the destination path and confirms the plan was written`);
+    parts.push(``);
+    parts.push(`Final summary instructions:`);
+    parts.push(opts.instruction);
     parts.push(``);
     parts.push(`User's original request: "${run.userText}"`);
   } else {
@@ -1124,6 +1129,9 @@ function transition(run: P2pRun, status: P2pRunStatus, serverLink: ServerLink | 
   } else if (status === 'failed' || status === 'timed_out') {
     run.runPhase = 'failed';
   }
+  if (P2P_TERMINAL_RUN_STATUSES.has(status)) {
+    run.completedAt = run.completedAt ?? new Date().toISOString();
+  }
   run.updatedAt = new Date().toISOString();
   logger.info({ runId: run.id, status }, 'P2P run state transition');
   pushState(run, serverLink);
@@ -1131,6 +1139,7 @@ function transition(run: P2pRun, status: P2pRunStatus, serverLink: ServerLink | 
 
 function failRun(run: P2pRun, errorType: string, message: string, serverLink: ServerLink | null): void {
   run.error = `${errorType}: ${message}`;
+  run.completedAt = run.completedAt ?? new Date().toISOString();
   run.updatedAt = new Date().toISOString();
   const status: P2pRunStatus = errorType === 'timed_out' ? 'timed_out' : 'failed';
   run.status = status;

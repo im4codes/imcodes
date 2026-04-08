@@ -3,7 +3,7 @@
  *
  * 1. Sub-sessions: single-click stop (no multi-step confirmation)
  * 2. Main sessions: 3-level confirmation (warn → danger → dialog)
- * 3. Main session stop cascades to close all child sub-sessions
+ * 3. Main session stop is browser-thin and sends only session.stop
  */
 import { describe, it, expect, vi } from 'vitest';
 
@@ -160,69 +160,39 @@ describe('confirmation levels', () => {
   });
 });
 
-// ── main session stop cascades to close all sub-sessions ────────────────────
+// ── main session stop is browser-thin ────────────────────────────────────────
 
-describe('main session stop cascades to sub-sessions', () => {
+describe('main session stop sends only session.stop', () => {
   /**
-   * Mirrors handleStopProject from app.tsx:
-   * 1. Find all sub-sessions whose parentSession matches the main session
-   * 2. Close each one
-   * 3. Send session.stop for the main project
+   * Mirrors the shutdown-main behavior in handleStopProject from app.tsx.
+   * Browser marks the project stopping locally, but sends only session.stop and
+   * leaves descendant shutdown to the daemon.
    */
   function simulateStopProject(
     project: string,
-    subSessions: Array<{ id: string; parentSession: string | null; sessionName: string }>,
-    opts: { ws: ReturnType<typeof makeWsStub>; closeSubSession: (id: string) => void },
+    opts: { ws: ReturnType<typeof makeWsStub> },
   ) {
-    const mainSessionName = `deck_${project}_brain`;
-    for (const sub of subSessions) {
-      if (sub.parentSession === mainSessionName) {
-        opts.closeSubSession(sub.id);
-      }
-    }
     opts.ws.sendSessionCommand('stop', { project });
   }
 
-  it('closes all sub-sessions belonging to the project', () => {
+  it('does not close descendant sub-sessions from the browser', () => {
     const ws = makeWsStub();
-    const closeSubSession = vi.fn();
-    const subs = [
-      { id: 'sub1', parentSession: 'deck_myapp_brain', sessionName: 'deck_sub_sub1' },
-      { id: 'sub2', parentSession: 'deck_myapp_brain', sessionName: 'deck_sub_sub2' },
-      { id: 'sub3', parentSession: 'deck_other_brain', sessionName: 'deck_sub_sub3' },
-    ];
-
-    simulateStopProject('myapp', subs, { ws, closeSubSession });
-
-    expect(closeSubSession).toHaveBeenCalledTimes(2);
-    expect(closeSubSession).toHaveBeenCalledWith('sub1');
-    expect(closeSubSession).toHaveBeenCalledWith('sub2');
-    // sub3 belongs to a different project — not closed
-    expect(closeSubSession).not.toHaveBeenCalledWith('sub3');
+    simulateStopProject('myapp', { ws });
+    expect(ws.subSessionStop).not.toHaveBeenCalled();
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('stop', { project: 'myapp' });
   });
 
   it('sends stop even when there are no sub-sessions', () => {
     const ws = makeWsStub();
-    const closeSubSession = vi.fn();
-
-    simulateStopProject('myapp', [], { ws, closeSubSession });
-
-    expect(closeSubSession).not.toHaveBeenCalled();
+    simulateStopProject('myapp', { ws });
+    expect(ws.subSessionStop).not.toHaveBeenCalled();
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('stop', { project: 'myapp' });
   });
 
-  it('does not close sub-sessions with null parentSession', () => {
+  it('does not depend on descendant parent links in the browser', () => {
     const ws = makeWsStub();
-    const closeSubSession = vi.fn();
-    const subs = [
-      { id: 'sub1', parentSession: null, sessionName: 'deck_sub_sub1' },
-      { id: 'sub2', parentSession: 'deck_myapp_brain', sessionName: 'deck_sub_sub2' },
-    ];
-
-    simulateStopProject('myapp', subs, { ws, closeSubSession });
-
-    expect(closeSubSession).toHaveBeenCalledTimes(1);
-    expect(closeSubSession).toHaveBeenCalledWith('sub2');
+    simulateStopProject('myapp', { ws });
+    expect(ws.subSessionStop).not.toHaveBeenCalled();
+    expect(ws.sendSessionCommand).toHaveBeenCalledTimes(1);
   });
 });

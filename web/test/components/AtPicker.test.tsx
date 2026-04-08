@@ -1,9 +1,9 @@
 /**
  * @vitest-environment jsdom
  */
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, fireEvent, cleanup } from '@testing-library/preact';
+import { render, screen, fireEvent, cleanup, act } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -13,11 +13,32 @@ vi.mock('react-i18next', () => ({
 
 import { AtPicker } from '../../src/components/AtPicker.js';
 
+const getUserPrefMock = vi.fn();
+const saveUserPrefMock = vi.fn();
+
+vi.mock('../../src/api.js', () => ({
+  getUserPref: (...args: unknown[]) => getUserPrefMock(...args),
+  saveUserPref: (...args: unknown[]) => saveUserPrefMock(...args),
+}));
+
 if (!HTMLElement.prototype.scrollIntoView) {
   HTMLElement.prototype.scrollIntoView = vi.fn();
 }
 
+async function flush() {
+  for (let i = 0; i < 5; i++) {
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  }
+}
+
 describe('AtPicker', () => {
+  beforeEach(() => {
+    getUserPrefMock.mockResolvedValue(null);
+    saveUserPrefMock.mockResolvedValue(undefined);
+  });
+
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
@@ -343,6 +364,50 @@ describe('AtPicker', () => {
     const [cfg, rounds, modeOverride] = onSelectAllConfig.mock.calls[0];
     expect(rounds).toBe(2);
     expect(modeOverride).toBe('audit');
+    expect(cfg.sessions['deck_sub_w1'].mode).toBe('audit');
+    expect(cfg.sessions['deck_sub_w2'].mode).toBe('audit');
+  });
+
+  it('reuses the shared combo manager to select saved custom combos', async () => {
+    getUserPrefMock.mockResolvedValue(JSON.stringify(['audit>discuss']));
+    const wsClient = { connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) };
+    const onSelectAllConfig = vi.fn();
+
+    render(
+      <AtPicker
+        query=""
+        sessions={[
+          { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle', parentSession: null, isSelf: true },
+          { name: 'deck_sub_w1', agentType: 'codex', state: 'idle', parentSession: 'deck_proj_brain', label: 'Cron' },
+          { name: 'deck_sub_w2', agentType: 'claude-code', state: 'idle', parentSession: 'deck_proj_brain', label: 'mm0' },
+        ]}
+        rootSession="deck_proj_brain"
+        wsClient={wsClient as any}
+        projectDir="/tmp/proj"
+        onSelectFile={vi.fn()}
+        onSelectAgent={vi.fn()}
+        onSelectAllConfig={onSelectAllConfig}
+        p2pConfig={{
+          sessions: {
+            'deck_sub_w1': { enabled: true, mode: 'review' },
+            'deck_sub_w2': { enabled: true, mode: 'review' },
+          },
+          rounds: 1,
+        }}
+        onClose={vi.fn()}
+        visible
+      />,
+    );
+
+    await flush();
+    fireEvent.click(screen.getByText('agents'));
+    fireEvent.click(screen.getByText((_, el) => el?.tagName === 'SPAN' && (el.textContent?.includes('all_plus') ?? false)));
+    fireEvent.click(screen.getByText('mode_audit→mode_discuss'));
+
+    expect(onSelectAllConfig).toHaveBeenCalledTimes(1);
+    const [cfg, rounds, modeOverride] = onSelectAllConfig.mock.calls[0];
+    expect(rounds).toBe(2);
+    expect(modeOverride).toBe('audit>discuss');
     expect(cfg.sessions['deck_sub_w1'].mode).toBe('audit');
     expect(cfg.sessions['deck_sub_w2'].mode).toBe('audit');
   });

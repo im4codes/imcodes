@@ -68,19 +68,19 @@ function renderToken(
     case 'heading': {
       const t = token as Tokens.Heading;
       const Tag = `h${t.depth}` as keyof h.JSX.IntrinsicElements;
-      return <Tag key={key} class="chat-heading">{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink)}</Tag>;
+      return <Tag key={key} class="chat-heading">{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink, onDownload)}</Tag>;
     }
 
     case 'paragraph': {
       const t = token as Tokens.Paragraph;
-      return <p key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink)}</p>;
+      return <p key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink, onDownload)}</p>;
     }
 
     case 'text': {
       const t = token as Tokens.Text;
       // Text tokens may have sub-tokens (e.g. from inline parsing)
       if ('tokens' in t && t.tokens && t.tokens.length > 0) {
-        return <span key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink)}</span>;
+        return <span key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink, onDownload)}</span>;
       }
       // Plain text — apply path/URL detection IF NOT already inside a link
       if (inLink) return <span key={key}>{t.raw}</span>;
@@ -89,17 +89,17 @@ function renderToken(
 
     case 'strong': {
       const t = token as Tokens.Strong;
-      return <strong key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink)}</strong>;
+      return <strong key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink, onDownload)}</strong>;
     }
 
     case 'em': {
       const t = token as Tokens.Em;
-      return <em key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink)}</em>;
+      return <em key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink, onDownload)}</em>;
     }
 
     case 'del': {
       const t = token as Tokens.Del;
-      return <del key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink)}</del>;
+      return <del key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink, onDownload)}</del>;
     }
 
     case 'codespan': {
@@ -129,13 +129,26 @@ function renderToken(
       const t = token as Tokens.Link;
       if (isLocalPath(t.href)) {
         return (
-          <span
-            key={key}
-            class="chat-path-link"
-            onClick={() => onPathClick?.(t.href)}
-            title={t.href}
-          >
-            {renderInlineTokens(t.tokens, onPathClick, onUrlClick, true)}
+          <span key={key}>
+            <span
+              class="chat-path-link"
+              onClick={() => onPathClick?.(t.href)}
+              title={t.href}
+            >
+              {renderInlineTokens(t.tokens, onPathClick, onUrlClick, true, onDownload)}
+            </span>
+            {onDownload && hasFileExtension(t.href) && (
+              <button
+                class="chat-dl-btn"
+                title="Download"
+                onClick={(e: Event) => {
+                  e.stopPropagation();
+                  onDownload(t.href);
+                }}
+              >
+                ⬇
+              </button>
+            )}
           </span>
         );
       }
@@ -150,7 +163,7 @@ function renderToken(
             onUrlClick?.(t.href);
           }}
         >
-          {renderInlineTokens(t.tokens, onPathClick, onUrlClick, true)}
+          {renderInlineTokens(t.tokens, onPathClick, onUrlClick, true, onDownload)}
         </a>
       );
     }
@@ -168,7 +181,7 @@ function renderToken(
             <tr>
               {t.header.map((cell, ci) => (
                 <th key={ci} style={cell.align ? { textAlign: cell.align } : undefined}>
-                  {renderInlineTokens(cell.tokens, onPathClick, onUrlClick)}
+                  {renderInlineTokens(cell.tokens, onPathClick, onUrlClick, false, onDownload)}
                 </th>
               ))}
             </tr>
@@ -178,7 +191,7 @@ function renderToken(
               <tr key={ri}>
                 {row.map((cell, ci) => (
                   <td key={ci} style={cell.align ? { textAlign: cell.align } : undefined}>
-                    {renderInlineTokens(cell.tokens, onPathClick, onUrlClick)}
+                    {renderInlineTokens(cell.tokens, onPathClick, onUrlClick, false, onDownload)}
                   </td>
                 ))}
               </tr>
@@ -196,7 +209,7 @@ function renderToken(
           {t.items.map((item, li) => (
             <li key={li}>
               {item.task && <input type="checkbox" checked={item.checked} disabled style={{ marginRight: 4 }} />}
-              {renderTokens(item.tokens, onPathClick, onUrlClick)}
+              {renderTokens(item.tokens, onPathClick, onUrlClick, false, onDownload)}
             </li>
           ))}
         </Tag>
@@ -205,7 +218,7 @@ function renderToken(
 
     case 'blockquote': {
       const t = token as Tokens.Blockquote;
-      return <blockquote key={key} class="chat-blockquote">{renderTokens(t.tokens, onPathClick, onUrlClick)}</blockquote>;
+      return <blockquote key={key} class="chat-blockquote">{renderTokens(t.tokens, onPathClick, onUrlClick, false, onDownload)}</blockquote>;
     }
 
     case 'hr':

@@ -7,6 +7,7 @@
 import { render, cleanup, waitFor, act } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { useSubSessions, type SubSession } from '../src/hooks/useSubSessions.js';
+import { listSubSessions, patchSubSession } from '../src/api.js';
 
 vi.mock('../src/api.js', () => ({
   listSubSessions: vi.fn().mockResolvedValue([]),
@@ -35,6 +36,15 @@ let captured: SubSession[] = [];
 function Harness({ ws, connected }: { ws: any; connected: boolean }) {
   const { subSessions } = useSubSessions('srv1', ws, connected, null);
   captured = subSessions;
+  return null;
+}
+
+let closeSubSessionHook: ((id: string) => Promise<void>) | null = null;
+
+function CloseHarness({ ws, connected }: { ws: any; connected: boolean }) {
+  const { subSessions, close } = useSubSessions('srv1', ws, connected, null);
+  captured = subSessions;
+  closeSubSessionHook = close;
   return null;
 }
 
@@ -84,11 +94,11 @@ describe('sub-session metadata via subsession.created', () => {
       id: 'cc1',
       sessionName: 'deck_sub_cc1',
       sessionType: 'claude-code',
-      state: 'running',
     }));
 
     expect(captured).toHaveLength(1);
     const s = captured[0];
+    expect(s.state).toBe('idle');
     expect(s.modelDisplay).toBeNull();
     expect(s.planLabel).toBeNull();
     expect(s.quotaLabel).toBeNull();
@@ -198,6 +208,53 @@ describe('sub-session metadata via subsession.sync', () => {
     expect(captured[0].planLabel).toBe('Free');
     expect(captured[0].quotaUsageLabel).toBe('today 20/1000');
   });
+
+  it('preserves queued transport messages until running explicitly reports an empty queue', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'q4',
+      sessionName: 'deck_sub_q4',
+      sessionType: 'qwen',
+      state: 'running',
+    }));
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_q4',
+        payload: { state: 'queued', pendingMessages: ['queued one', 'queued two'] },
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['queued one', 'queued two']);
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_q4',
+        payload: { state: 'running' },
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['queued one', 'queued two']);
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_q4',
+        payload: { state: 'running', pendingMessages: [] },
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual([]);
+  });
 });
 
 describe('sub-session metadata integration', () => {
@@ -266,6 +323,166 @@ describe('sub-session metadata integration', () => {
     expect(captured).toHaveLength(1);
 
     act(() => send({ type: 'subsession.removed', id: 'rm1', sessionName: 'deck_sub_rm1' }));
+    expect(captured).toHaveLength(0);
+  });
+});
+
+describe('sub-session realtime state sync', () => {
+  afterEach(() => { cleanup(); vi.clearAllMocks(); captured = []; });
+
+  it('marks a sub-session running on assistant/tool timeline events and idle on session.idle', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'run1',
+      sessionName: 'deck_sub_run1',
+      sessionType: 'codex-sdk',
+      state: 'idle',
+    }));
+    expect(captured[0]?.state).toBe('idle');
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        eventId: 'e1',
+        sessionId: 'deck_sub_run1',
+        ts: 100,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: 'working' },
+      },
+    }));
+    expect(captured[0]?.state).toBe('running');
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        eventId: 'e2',
+        sessionId: 'deck_sub_run1',
+        ts: 101,
+        seq: 2,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'tool.call',
+        payload: { tool: 'read_file' },
+      },
+    }));
+    expect(captured[0]?.state).toBe('running');
+
+    act(() => send({
+      type: 'session.idle',
+      session: 'deck_sub_run1',
+    }));
+    expect(captured[0]?.state).toBe('idle');
+  });
+
+  it('tracks stopping and error states from timeline events', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'run2',
+      sessionName: 'deck_sub_run2',
+      sessionType: 'codex',
+      state: 'running',
+    }));
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        eventId: 'e3',
+        sessionId: 'deck_sub_run2',
+        ts: 200,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'session.state',
+        payload: { state: 'stopping' },
+      },
+    }));
+    expect(captured[0]?.state).toBe('stopping');
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        eventId: 'e4',
+        sessionId: 'deck_sub_run2',
+        ts: 201,
+        seq: 2,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'session.state',
+        payload: { state: 'error' },
+      },
+    }));
+    expect(captured[0]?.state).toBe('error');
+  });
+});
+
+describe('sub-session close behavior', () => {
+  afterEach(() => { cleanup(); vi.clearAllMocks(); captured = []; closeSubSessionHook = null; });
+
+  it('marks a sub-session stopping locally and waits for daemon/server confirmation before removal', async () => {
+    vi.mocked(listSubSessions).mockResolvedValueOnce([
+      {
+        id: 'stop1',
+        serverId: 'srv1',
+        type: 'codex',
+        runtimeType: 'process',
+        providerId: null,
+        providerSessionId: null,
+        shellBin: null,
+        cwd: '/tmp/proj',
+        ccSessionId: null,
+        geminiSessionId: null,
+        parentSession: 'deck_app_brain',
+        label: 'Worker',
+        description: null,
+        ccPresetId: null,
+        requestedModel: null,
+        activeModel: null,
+        qwenModel: null,
+        qwenAuthType: null,
+        qwenAvailableModels: null,
+        modelDisplay: null,
+        planLabel: null,
+        quotaLabel: null,
+        quotaUsageLabel: null,
+        quotaMeta: null,
+        effort: null,
+        transportConfig: null,
+        closedAt: null,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ]);
+
+    const { ws, send } = createMockWs();
+    (ws as any).subSessionStop = vi.fn();
+    render(<CloseHarness ws={ws} connected={true} />);
+    await waitFor(() => expect(captured).toHaveLength(1));
+
+    await act(async () => {
+      await closeSubSessionHook?.('stop1');
+    });
+
+    expect((ws as any).subSessionStop).toHaveBeenCalledWith('deck_sub_stop1');
+    expect(vi.mocked(patchSubSession)).not.toHaveBeenCalled();
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.state).toBe('stopping');
+
+    act(() => send({ type: 'subsession.removed', id: 'stop1', sessionName: 'deck_sub_stop1' }));
     expect(captured).toHaveLength(0);
   });
 });

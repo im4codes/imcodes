@@ -20,10 +20,10 @@ interface Props {
 }
 
 const BASE_AGENT_TYPES = [
-  { id: 'claude-code', label: 'Claude Code', icon: '⚡' },
   { id: 'claude-code-sdk', label: 'Claude Code SDK', icon: '⚡' },
-  { id: 'codex', label: 'Codex', icon: '📦' },
+  { id: 'claude-code', label: 'Claude Code', icon: '⚡' },
   { id: 'codex-sdk', label: 'Codex SDK', icon: '📦' },
+  { id: 'codex', label: 'Codex', icon: '📦' },
   { id: 'opencode', label: 'OpenCode', icon: '🔆' },
   { id: 'gemini', label: 'Gemini CLI', icon: '♊' },
   { id: 'qwen', label: 'Qwen Code', icon: '千' },
@@ -37,7 +37,7 @@ type OpenClawMode = 'new' | 'bind';
 
 export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _isProviderConnected, getRemoteSessions, refreshSessions, onStart, onClose }: Props) {
   const { t } = useTranslation();
-  const [type, setType] = useState('claude-code');
+  const [type, setType] = useState('claude-code-sdk');
   const [shells, setShells] = useState<string[]>([]);
   const [shellBin, setShellBin] = useState<string>('/bin/bash');
   const [cwd, setCwd] = useState(defaultCwd ?? '');
@@ -155,6 +155,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
       : type === 'openclaw'
         ? OPENCLAW_THINKING_LEVELS
         : [];
+  const supportsCcPreset = type === 'claude-code' || type === 'claude-code-sdk';
 
   return (
     <div class="dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
@@ -319,7 +320,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
           )}
 
           {/* CC env preset selector + editor */}
-          {type === 'claude-code' && (
+          {supportsCcPreset && (
             <>
               <div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>

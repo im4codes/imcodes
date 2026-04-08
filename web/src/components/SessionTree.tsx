@@ -9,16 +9,18 @@
  * of the default terminal icon.
  *
  * Task 2.4: Unread badge shown next to session name when count > 0.
- * Task 2.5: Idle flash applied for ~3s on running→idle transition.
+ * Task 2.5: Idle flash applied for new realtime session.idle events.
  * Task 2.6: Main click → onSelectSession; sub-session click → onSelectSubSession.
  */
 
-import { useRef, useState, useEffect, useMemo } from 'preact/hooks';
+import { useState } from 'preact/hooks';
 import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { SessionInfo } from '../types.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import { formatLabel } from '../format-label.js';
+import { IdleFlashLayer } from './IdleFlashLayer.js';
+import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';
 
 // ── Agent badge config (matches SessionTabs.tsx AGENT_BADGE) ─────────────────
 const AGENT_BADGE: Record<string, { label: string; color: string }> = {
@@ -44,15 +46,14 @@ const SUB_TYPE_BADGE: Record<string, { label: string; color: string }> = {
   'script':      { label: 'sc', color: '#64748b' },
 };
 
-// How long to apply the idle-flash class (ms). 6 × 0.5s = 3s.
-const IDLE_FLASH_DURATION_MS = 3000;
-
 interface Props {
   sessions: SessionInfo[];
   subSessions: SubSession[];
   activeSession: string | null;
   /** Map<sessionName, unreadCount> — supplied by useUnreadCounts */
   unreadCounts: Map<string, number>;
+  /** Per-session idle flash replay token. */
+  idleFlashTokens?: Map<string, number>;
   /** Set of sub-session labels participating in active P2P discussions. */
   p2pSessionLabels?: Set<string>;
   onSelectSession: (sessionName: string) => void;
@@ -74,6 +75,7 @@ function StateDot({ state }: { state: string }) {
   let color: string;
   if (state === 'running') color = '#4ade80';
   else if (state === 'idle') color = '#64748b';
+  else if (state === 'stopping') color = '#f59e0b';
   else if (state === 'stopped' || state === 'error') color = '#ef4444';
   else color = '#64748b';
   return (
@@ -104,15 +106,16 @@ interface NodeProps {
   isTransport?: boolean;
   isSub?: boolean;
   unread: number;
-  idleFlash: boolean;
+  idleFlashToken: number;
   inP2p?: boolean;
   onClick: () => void;
 }
 
 function SessionNode({
-  label, agentType, state, isActive, isTransport, isSub, unread, idleFlash, inP2p, onClick,
+  label, agentType, state, isActive, isTransport, isSub, unread, idleFlashToken, inP2p, onClick,
 }: NodeProps) {
   const { t } = useTranslation();
+  const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const badge = isSub
     ? (SUB_TYPE_BADGE[agentType] ?? null)
     : (AGENT_BADGE[agentType] ?? null);
@@ -121,11 +124,11 @@ function SessionNode({
     'session-tree-node',
     isSub ? 'session-tree-node--sub' : 'session-tree-node--main',
     isActive ? 'session-tree-node--active' : '',
-    idleFlash ? 'sidebar-idle-flash' : '',
   ].filter(Boolean).join(' ');
 
   return (
     <button class={classes} onClick={onClick} title={`${agentType} — ${state}`}>
+      {activeIdleFlashToken ? <IdleFlashLayer key={`tree-idle-${activeIdleFlashToken}`} variant="fill" /> : null}
       {/* Icon: only for sub-sessions (main sessions use the tree toggle arrow) */}
       {isSub && (
         <span class="session-tree-icon" aria-hidden="true">
@@ -161,46 +164,6 @@ function SessionNode({
   );
 }
 
-// ── useIdleFlash: detect running→idle transition, return flashing set ────────
-function useIdleFlash(items: Array<{ name: string; state: string }>): Set<string> {
-  const [flashing, setFlashing] = useState<Set<string>>(new Set());
-  const prevStates = useRef<Map<string, string>>(new Map());
-
-  useEffect(() => {
-    const prev = prevStates.current;
-    const toFlash: string[] = [];
-
-    for (const item of items) {
-      const prevState = prev.get(item.name);
-      if (prevState === 'running' && item.state === 'idle') {
-        toFlash.push(item.name);
-      }
-      prev.set(item.name, item.state);
-    }
-
-    if (toFlash.length === 0) return;
-
-    setFlashing((s) => {
-      const next = new Set(s);
-      toFlash.forEach((n) => next.add(n));
-      return next;
-    });
-
-    const timer = setTimeout(() => {
-      setFlashing((s) => {
-        const next = new Set(s);
-        toFlash.forEach((n) => next.delete(n));
-        return next;
-      });
-    }, IDLE_FLASH_DURATION_MS);
-
-    return () => clearTimeout(timer);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [items]);
-
-  return flashing;
-}
-
 // ── Collapse state persistence ────────────────────────────────────────────────
 const LS_COLLAPSED_KEY = 'rcc_tree_collapsed';
 function loadCollapsed(): Set<string> {
@@ -216,6 +179,7 @@ function SessionTreeInner({
   subSessions,
   activeSession,
   unreadCounts,
+  idleFlashTokens,
   p2pSessionLabels,
   onSelectSession,
   onSelectSubSession,
@@ -246,17 +210,6 @@ function SessionTreeInner({
   };
 
   const allCollapsed = sessions.length > 0 && sessions.every(s => collapsed.has(s.name));
-
-  // Memoize the flat item list used for idle-flash detection to avoid
-  // creating a new array reference on every render cycle.
-  const allItems = useMemo(
-    () => [
-      ...sessions.map((s) => ({ name: s.name, state: s.state })),
-      ...subSessions.map((s) => ({ name: s.sessionName, state: s.state })),
-    ],
-    [sessions, subSessions],
-  );
-  const flashingSet = useIdleFlash(allItems);
 
   if (sessions.length === 0) {
     return (
@@ -292,7 +245,7 @@ function SessionTreeInner({
         const isActive = session.name === activeSession;
         const isTransport = session.runtimeType === 'transport';
         const unread = unreadCounts.get(session.name) ?? 0;
-        const idleFlash = flashingSet.has(session.name);
+        const idleFlashToken = idleFlashTokens?.get(session.name) ?? 0;
 
         // Sub-sessions belonging to this main session
         const children = subSessions.filter(
@@ -321,7 +274,7 @@ function SessionTreeInner({
                 isTransport={isTransport}
                 isSub={false}
                 unread={unread}
-                idleFlash={idleFlash}
+                idleFlashToken={idleFlashToken}
                 inP2p={!!p2pSessionLabels?.has(session.name)}
                 onClick={() => onSelectSession(session.name)}
               />
@@ -338,7 +291,7 @@ function SessionTreeInner({
             {!isCollapsed && children.map((sub) => {
               const subLabel = sub.label ? formatLabel(sub.label) : sub.type;
               const subUnread = unreadCounts.get(sub.sessionName) ?? 0;
-              const subIdleFlash = flashingSet.has(sub.sessionName);
+              const subIdleFlashToken = idleFlashTokens?.get(sub.sessionName) ?? 0;
               return (
                 <SessionNode
                   key={sub.id}
@@ -349,7 +302,7 @@ function SessionTreeInner({
                   isTransport={false}
                   isSub={true}
                   unread={subUnread}
-                  idleFlash={subIdleFlash}
+                  idleFlashToken={subIdleFlashToken}
                   inP2p={!!p2pSessionLabels?.has(sub.sessionName)}
                   onClick={() => onSelectSubSession(sub)}
                 />

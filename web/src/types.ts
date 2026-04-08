@@ -34,7 +34,7 @@ export interface SessionInfo {
   role: 'brain' | `w${number}`;
   agentType: string;
   agentVersion?: string;
-  state: 'running' | 'idle' | 'stopped' | 'error' | 'unknown';
+  state: 'running' | 'idle' | 'stopped' | 'stopping' | 'error' | 'unknown';
   label?: string | null;
   projectDir?: string;
   description?: string | null;
@@ -53,6 +53,7 @@ export interface SessionInfo {
   quotaUsageLabel?: string;
   quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null;
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel;
+  transportPendingMessages?: string[];
 }
 
 export interface ServerInfo {

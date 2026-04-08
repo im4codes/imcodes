@@ -77,9 +77,8 @@ function pathFromPrompt(prompt: string): string {
 }
 
 function headingFromPrompt(prompt: string): string {
-  const match = prompt.match(/Add a new heading "## ([^"]+)"/);
-  if (!match) throw new Error(`No heading found in prompt: ${prompt}`);
-  return match[1];
+  const match = prompt.match(/Add a new heading "## ([^"]+)"/) ?? prompt.match(/under "?## ([^"\n]+)"?/);
+  return match?.[1] ?? 'Automated Test Output';
 }
 
 async function waitForStatus(runId: string, expected: P2pRunStatus[], maxMs = 10000): Promise<P2pRun> {
@@ -330,6 +329,39 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(done.summaryPhase).toBe('completed');
   });
 
+  it('completes the discussion when a single hop times out', async () => {
+    detectStatusAsyncMock.mockImplementation(async (session: string) => (
+      session === 'deck_proj_w1' ? 'running' : 'idle'
+    ));
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      if (session === 'deck_proj_w1') return;
+      const filePath = pathFromPrompt(prompt);
+      const heading = headingFromPrompt(prompt);
+      await appendFile(filePath, `\n## ${heading}\n\nBRAIN-${session}\n`, 'utf8');
+      setTimeout(() => notifySessionIdle(session), 20);
+    });
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'single hop timeout should not fail the run',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      120,
+    );
+
+    const done = await waitForStatus(run.id, ['completed']);
+    expect(done.status).toBe('completed');
+    expect(done.hopStates).toHaveLength(1);
+    expect(done.hopStates[0].status).toBe('timed_out');
+    expect(done.summaryPhase).toBe('completed');
+    const content = await readFile(done.contextFilePath, 'utf8');
+    expect(content).toContain('BRAIN-deck_proj_brain');
+  });
+
   it('preserves completed evidence and still summarizes on partial hop failure', async () => {
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
       const filePath = pathFromPrompt(prompt);
@@ -451,6 +483,35 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(sendKeyMock).toHaveBeenCalled();
   });
 
+  it('treats cancel on a terminal run as close and removes it from memory', async () => {
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      if (session === 'deck_proj_w1') return;
+      const filePath = pathFromPrompt(prompt);
+      const heading = headingFromPrompt(prompt);
+      await appendFile(filePath, `\n## ${heading}\n\nBRAIN-${session}\n`, 'utf8');
+      setTimeout(() => notifySessionIdle(session), 20);
+    });
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'close failed/timed-out p2p',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      120,
+    );
+
+    await waitForStatus(run.id, ['completed']);
+    expect(getP2pRun(run.id)?.status).toBe('completed');
+
+    const closed = await cancelP2pRun(run.id, serverLinkMock as any);
+    expect(closed).toBe(true);
+    expect(getP2pRun(run.id)).toBeUndefined();
+  });
+
   it('emits additive hop/run payload fields without breaking legacy fields', async () => {
     const run = await startP2pRun(
       'deck_proj_brain',
@@ -471,5 +532,89 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(payload.run_phase).toBe('completed');
     expect(payload.summary_phase).toBe('completed');
     expect(payload.hop_counts?.completed).toBeGreaterThanOrEqual(1);
+  });
+
+  it('projects all active hops into all_nodes for parallel round progress', () => {
+    const run: P2pRun = {
+      id: 'run_parallel',
+      discussionId: 'disc_parallel',
+      mainSession: 'deck_proj_brain',
+      initiatorSession: 'deck_proj_brain',
+      currentTargetSession: 'deck_proj_w1',
+      finalReturnSession: 'deck_proj_brain',
+      remainingTargets: [
+        { session: 'deck_proj_w1', mode: 'audit' },
+        { session: 'deck_proj_w2', mode: 'review' },
+      ],
+      totalTargets: 2,
+      mode: 'discuss',
+      status: 'running',
+      runPhase: 'round_execution',
+      summaryPhase: null,
+      activePhase: 'hop',
+      contextFilePath: '/tmp/run_parallel.md',
+      userText: 'parallel progress',
+      timeoutMs: 120000,
+      resultSummary: null,
+      completedHops: [],
+      skippedHops: [],
+      error: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      completedAt: null,
+      rounds: 1,
+      currentRound: 1,
+      allTargets: [
+        { session: 'deck_proj_w1', mode: 'audit' },
+        { session: 'deck_proj_w2', mode: 'review' },
+      ],
+      extraPrompt: '',
+      hopStartedAt: Date.now(),
+      hopStates: [
+        {
+          hop_index: 1,
+          round_index: 1,
+          session: 'deck_proj_w1',
+          mode: 'audit',
+          status: 'running',
+          started_at: Date.now(),
+          completed_at: null,
+          error: null,
+          output_path: null,
+          section_header: 'W1',
+          artifact_path: '/tmp/run_parallel.round1.hop1.md',
+          working_path: null,
+          baseline_size: 0,
+          baseline_content: '',
+        },
+        {
+          hop_index: 2,
+          round_index: 1,
+          session: 'deck_proj_w2',
+          mode: 'review',
+          status: 'dispatched',
+          started_at: Date.now(),
+          completed_at: null,
+          error: null,
+          output_path: null,
+          section_header: 'W2',
+          artifact_path: '/tmp/run_parallel.round1.hop2.md',
+          working_path: null,
+          baseline_size: 0,
+          baseline_content: '',
+        },
+      ],
+      activeTargetSessions: ['deck_proj_w1', 'deck_proj_w2'],
+      _cancelled: false,
+    };
+
+    const payload = serializeP2pRun(run);
+    const activeNodes = payload.all_nodes?.filter((node) => node.phase === 'hop' && node.status === 'active') ?? [];
+    const pendingNodes = payload.all_nodes?.filter((node) => node.phase === 'hop' && node.status === 'pending') ?? [];
+
+    expect(activeNodes.map((node) => node.session)).toEqual(['deck_proj_w1', 'deck_proj_w2']);
+    expect(pendingNodes).toHaveLength(0);
+    expect(payload.current_target_session).toBe('deck_proj_w1');
+    expect(payload.active_hop_number).toBe(1);
   });
 });

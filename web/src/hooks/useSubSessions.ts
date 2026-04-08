@@ -10,11 +10,14 @@ import {
   type SubSessionData,
 } from '../api.js';
 import type { WsClient } from '../ws-client.js';
+import { isRunningTimelineEvent } from '../timeline-running.js';
+import { extractTransportPendingMessages } from '../transport-queue.js';
 
 export interface SubSession extends SubSessionData {
   sessionName: string;
   /** runtime state from daemon */
-  state: 'running' | 'idle' | 'stopped' | 'starting' | 'unknown';
+  state: 'running' | 'idle' | 'stopped' | 'stopping' | 'error' | 'starting' | 'unknown';
+  transportPendingMessages?: string[] | null;
 }
 
 function toSessionName(id: string): string {
@@ -135,6 +138,7 @@ export function useSubSessions(
                 ...(m.quotaMeta !== undefined && { quotaMeta: m.quotaMeta }),
                 ...(m.effort != null && { effort: m.effort }),
                 ...(m.transportConfig !== undefined && { transportConfig: m.transportConfig }),
+                ...(m.transportPendingMessages !== undefined && { transportPendingMessages: extractTransportPendingMessages(m.transportPendingMessages) }),
                 ...(m.qwenModel != null && { qwenModel: m.qwenModel }),
                 ...(m.qwenAuthType != null && { qwenAuthType: m.qwenAuthType }),
                 ...(m.qwenAvailableModels != null && { qwenAvailableModels: m.qwenAvailableModels }),
@@ -156,7 +160,7 @@ export function useSubSessions(
               parentSession: m.parentSession || null,
               createdAt: now,
               updatedAt: now,
-              state: (m.state || 'running') as SubSession['state'],
+              state: (m.state || 'idle') as SubSession['state'],
               qwenModel: m.qwenModel ?? null,
               requestedModel: m.requestedModel ?? null,
               activeModel: m.activeModel ?? m.modelDisplay ?? null,
@@ -169,6 +173,7 @@ export function useSubSessions(
               quotaMeta: m.quotaMeta ?? null,
               effort: m.effort ?? null,
               transportConfig: m.transportConfig ?? null,
+              transportPendingMessages: extractTransportPendingMessages(m.transportPendingMessages),
             }];
           });
         }
@@ -204,6 +209,7 @@ export function useSubSessions(
               ...(m.quotaMeta !== undefined ? { quotaMeta: m.quotaMeta } : {}),
               ...(m.effort !== undefined ? { effort: m.effort } : {}),
               ...(m.transportConfig !== undefined ? { transportConfig: m.transportConfig } : {}),
+              ...(m.transportPendingMessages !== undefined ? { transportPendingMessages: extractTransportPendingMessages(m.transportPendingMessages) } : {}),
             };
           }));
         }
@@ -212,9 +218,15 @@ export function useSubSessions(
 
       if (msg.type === 'timeline.event') {
         const ev = msg.event;
-        if (ev.type !== 'session.state') return;
-        state = String(ev.payload.state ?? '');
-        sessionName = ev.sessionId;
+        if (ev.type === 'session.state') {
+          state = String(ev.payload.state ?? '');
+          sessionName = ev.sessionId;
+        } else if (isRunningTimelineEvent(ev)) {
+          state = 'running';
+          sessionName = ev.sessionId;
+        } else {
+          return;
+        }
       } else if (msg.type === 'session.idle') {
         state = 'idle';
         sessionName = msg.session as string | undefined;
@@ -223,13 +235,46 @@ export function useSubSessions(
       }
 
       if (!sessionName || !sessionName.startsWith('deck_sub_')) return;
-      if (state !== 'idle' && state !== 'running') return;
+      const hasPendingMessagesField = msg.type === 'timeline.event'
+        && msg.event.type === 'session.state'
+        && Object.prototype.hasOwnProperty.call(msg.event.payload ?? {}, 'pendingMessages');
+      if (state === 'queued') {
+        const pendingMessages = msg.type === 'timeline.event' && msg.event.type === 'session.state'
+          ? extractTransportPendingMessages(msg.event.payload.pendingMessages)
+          : [];
+        setSubSessions((prev) => {
+          const idx = prev.findIndex((s) => s.sessionName === sessionName);
+          if (idx === -1) return prev;
+          const next = [...prev];
+          next[idx] = { ...next[idx], transportPendingMessages: pendingMessages };
+          return next;
+        });
+        return;
+      }
+      if (state === 'running' && hasPendingMessagesField) {
+        const pendingMessages = extractTransportPendingMessages(msg.event.payload.pendingMessages);
+        setSubSessions((prev) => {
+          const idx = prev.findIndex((s) => s.sessionName === sessionName);
+          if (idx === -1) return prev;
+          const next = [...prev];
+          next[idx] = { ...next[idx], state: 'running', transportPendingMessages: pendingMessages };
+          return next;
+        });
+        return;
+      }
+      if (state !== 'idle' && state !== 'running' && state !== 'stopping' && state !== 'stopped' && state !== 'error') return;
       setSubSessions((prev) => {
         const idx = prev.findIndex((s) => s.sessionName === sessionName);
         if (idx === -1) return prev;
-        if (prev[idx].state === state) return prev;
+        if (state === 'running') {
+          if (prev[idx].state === 'running') return prev;
+          const next = [...prev];
+          next[idx] = { ...next[idx], state: 'running' };
+          return next;
+        }
+        if (prev[idx].state === state && (prev[idx].transportPendingMessages?.length ?? 0) === 0) return prev;
         const next = [...prev];
-        next[idx] = { ...next[idx], state: state as SubSession['state'] };
+        next[idx] = { ...next[idx], state: state as SubSession['state'], transportPendingMessages: [] };
         return next;
       });
     });
@@ -331,10 +376,10 @@ export function useSubSessions(
     if (!sub) return;
     // Stop the tmux session
     ws?.subSessionStop(sub.sessionName);
-    // Mark closed in PG
-    await patchSubSession(serverId, id, { closedAt: Date.now() }).catch(() => {});
-    // Remove from local state
-    setSubSessions((prev) => prev.filter((s) => s.id !== id));
+    // Keep the sub-session visible until daemon/server confirm successful close.
+    setSubSessions((prev) => prev.map((s) =>
+      s.id === id ? { ...s, state: 'stopping' } : s,
+    ));
   }, [serverId, ws, subSessions]);
 
   const restart = useCallback(async (id: string) => {
@@ -361,7 +406,7 @@ export function useSubSessions(
   }, [serverId, ws]);
 
   /** Update local state for a sub-session (does NOT write to DB — caller handles that). */
-  const updateLocal = useCallback((id: string, fields: Partial<Pick<SubSession, 'label' | 'description' | 'cwd'>>) => {
+  const updateLocal = useCallback((id: string, fields: Partial<Pick<SubSession, 'type' | 'runtimeType' | 'label' | 'description' | 'cwd'>>) => {
     setSubSessions((prev) => prev.map((s) =>
       s.id === id ? { ...s, ...fields } : s,
     ));

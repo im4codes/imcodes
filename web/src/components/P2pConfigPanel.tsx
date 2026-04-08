@@ -5,6 +5,8 @@
 import { useState, useEffect } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { getUserPref, saveUserPref } from '../api.js';
+import { P2pComboManager } from './P2pComboManager.js';
+import { useP2pCustomCombos } from './p2p-combos.js';
 import type { P2pSavedConfig, P2pSessionConfig } from '@shared/p2p-modes.js';
 
 interface SessionRow {
@@ -26,6 +28,7 @@ interface Props {
   subSessions: SubSessionRow[];
   /** Active main session name — only show sessions scoped to this one by default */
   activeSession?: string | null;
+  initialTab?: 'participants' | 'combos';
   onClose: () => void;
   onSave: (config: P2pSavedConfig) => void;
 }
@@ -33,30 +36,12 @@ interface Props {
 const EXCLUDED_TYPES = new Set(['shell', 'script']);
 const SESSION_MODES = ['audit', 'review', 'plan', 'brainstorm', 'discuss', 'skip'] as const;
 const ROUND_OPTIONS = [1, 2, 3, 5] as const;
+type AgentFlavorFilter = 'sdk' | 'cli';
 
-const overlayStyle: Record<string, string | number> = {
-  position: 'fixed',
-  inset: 0,
-  background: 'rgba(0,0,0,0.6)',
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'center',
-  zIndex: 9999,
-  padding: 16,
-};
-
-const panelStyle: Record<string, string | number> = {
-  background: '#1e293b',
-  border: '1px solid #334155',
-  borderRadius: 10,
-  width: '100%',
-  maxWidth: 520,
-  maxHeight: '90vh',
-  display: 'flex',
-  flexDirection: 'column',
-  boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
-  overflow: 'hidden',
-};
+function getAgentFlavor(agentType: string): AgentFlavorFilter {
+  if (agentType === 'claude-code' || agentType === 'codex' || agentType === 'gemini' || agentType === 'opencode') return 'cli';
+  return 'sdk';
+}
 
 const headerStyle: Record<string, string | number> = {
   display: 'flex',
@@ -89,15 +74,34 @@ const bodyStyle: Record<string, string | number> = {
   padding: '12px 20px',
 };
 
+const tabsStyle: Record<string, string | number> = {
+  display: 'flex',
+  gap: 8,
+  padding: '0 20px 12px',
+  borderBottom: '1px solid #334155',
+};
+
+const tabStyle = (active: boolean): Record<string, string | number> => ({
+  padding: '6px 12px',
+  borderRadius: 999,
+  border: `1px solid ${active ? '#3b82f6' : '#475569'}`,
+  background: active ? '#1d4ed840' : '#0f172a',
+  color: active ? '#bfdbfe' : '#94a3b8',
+  fontSize: 12,
+  fontWeight: active ? 600 : 500,
+  cursor: 'pointer',
+});
+
 const rowStyle: Record<string, string | number> = {
-  display: 'inline-flex',
+  display: 'grid',
+  gridTemplateColumns: '18px minmax(0, 1fr) minmax(110px, auto)',
   alignItems: 'center',
-  gap: 4,
-  padding: '4px 8px',
+  gap: 8,
+  padding: '10px 12px',
   borderRadius: 6,
   background: '#0f172a',
   border: '1px solid #334155',
-  whiteSpace: 'nowrap',
+  minWidth: 0,
 };
 
 const checkboxStyle: Record<string, string | number> = {
@@ -137,6 +141,19 @@ const sectionLabelStyle: Record<string, string | number> = {
   letterSpacing: '0.05em',
   marginTop: 14,
   marginBottom: 6,
+};
+
+const agentGridStyle = (mobile: boolean): Record<string, string | number> => ({
+  display: 'grid',
+  gridTemplateColumns: mobile ? '1fr' : 'repeat(2, minmax(0, 1fr))',
+  gap: 10,
+});
+
+const sectionCardStyle: Record<string, string | number> = {
+  background: '#111827',
+  border: '1px solid #334155',
+  borderRadius: 10,
+  padding: 14,
 };
 
 const roundsBtnStyle = (active: boolean): Record<string, string | number> => ({
@@ -179,9 +196,23 @@ const btnPrimaryStyle: Record<string, string | number> = {
   cursor: 'pointer',
 };
 
-export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, onSave }: Props) {
+export function P2pConfigPanel({
+  sessions,
+  subSessions,
+  activeSession,
+  initialTab = 'participants',
+  onClose,
+  onSave,
+}: Props) {
   const { t } = useTranslation();
-  const [crossSession, setCrossSession] = useState(false);
+  const [agentFlavorFilter, setAgentFlavorFilter] = useState<AgentFlavorFilter>('sdk');
+  const [activeTab, setActiveTab] = useState<'participants' | 'combos'>(initialTab);
+  const { customCombos, saveCustomCombos } = useP2pCustomCombos();
+  const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' && window.innerWidth < 768);
+
+  useEffect(() => {
+    setActiveTab(initialTab);
+  }, [initialTab]);
 
   // Build combined eligible session list (exclude shell/script).
   // If activeSession is a sub-session, resolve its parent for scope filtering.
@@ -194,33 +225,33 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
     return activeSession;
   })();
 
-  const eligible: Array<{ key: string; shortName: string; agentType: string }> = [];
+  const allEligible: Array<{ key: string; shortName: string; agentType: string; flavor: AgentFlavorFilter }> = [];
   const seen = new Set<string>();
 
   for (const s of sessions) {
     if (EXCLUDED_TYPES.has(s.agentType)) continue;
-    // When not cross-session, only show the scoped main session
-    if (!crossSession && scopeSession && s.name !== scopeSession) continue;
+    if (scopeSession && s.name !== scopeSession) continue;
     if (seen.has(s.name)) continue;
     seen.add(s.name);
     const shortName = s.name.split('_').pop() || s.name;
-    eligible.push({ key: s.name, shortName, agentType: s.agentType });
+    allEligible.push({ key: s.name, shortName, agentType: s.agentType, flavor: getAgentFlavor(s.agentType) });
   }
 
   for (const s of subSessions) {
     if (EXCLUDED_TYPES.has(s.type)) continue;
-    // When not cross-session, only show sub-sessions under the scoped main session
-    if (!crossSession && scopeSession && s.parentSession && s.parentSession !== scopeSession) continue;
+    if (scopeSession && s.parentSession && s.parentSession !== scopeSession) continue;
     if (seen.has(s.sessionName)) continue;
     seen.add(s.sessionName);
     const shortName = s.label || s.sessionName;
-    eligible.push({ key: s.sessionName, shortName, agentType: s.type });
+    allEligible.push({ key: s.sessionName, shortName, agentType: s.type, flavor: getAgentFlavor(s.type) });
   }
+
+  const visibleEligible = allEligible.filter((entry) => entry.flavor === agentFlavorFilter);
 
   // Local config state: per-session enabled + mode
   const [sessionCfg, setSessionCfg] = useState<P2pSessionConfig>({});
   const [rounds, setRounds] = useState(3);
-  const [hopTimeoutMinutes, setHopTimeoutMinutes] = useState(5);
+  const [hopTimeoutMinutes, setHopTimeoutMinutes] = useState(8);
   const [extraPrompt, setExtraPrompt] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -238,7 +269,7 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
           const parsed: P2pSavedConfig = JSON.parse(raw);
           setSessionCfg(parsed.sessions ?? {});
           setRounds(parsed.rounds ?? 3);
-          setHopTimeoutMinutes(parsed.hopTimeoutMinutes ?? 5);
+          setHopTimeoutMinutes(parsed.hopTimeoutMinutes ?? 8);
           setExtraPrompt(parsed.extraPrompt ?? '');
         } catch { /* start fresh */ }
       }
@@ -255,6 +286,14 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
       });
     });
   }, [configKey]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const handleResize = () => setIsMobile(window.innerWidth < 768);
+    handleResize();
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
 
   const toggleEnabled = (key: string) => {
     setSessionCfg((prev) => {
@@ -275,7 +314,7 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
     // Only keep entries for currently eligible sessions — drop stale entries
     // from old/closed sessions or other daemons to prevent config rot.
     const merged: P2pSessionConfig = {};
-    for (const e of eligible) {
+    for (const e of allEligible) {
       merged[e.key] = sessionCfg[e.key] ?? { enabled: false, mode: 'audit' };
     }
     const cfg: P2pSavedConfig = { sessions: merged, rounds, hopTimeoutMinutes, extraPrompt: extraPrompt.trim() || undefined };
@@ -288,6 +327,29 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
   };
 
   const getEntry = (key: string) => sessionCfg[key] ?? { enabled: false, mode: 'audit' };
+  const overlayStyle: Record<string, string | number> = {
+    position: 'fixed',
+    inset: 0,
+    background: 'rgba(0,0,0,0.6)',
+    display: 'flex',
+    alignItems: isMobile ? 'flex-start' : 'center',
+    justifyContent: 'center',
+    zIndex: 9999,
+    padding: isMobile ? 'calc(env(safe-area-inset-top, 0px) + 12px) 0 0' : 16,
+  };
+  const panelStyle: Record<string, string | number> = {
+    background: '#1e293b',
+    border: '1px solid #334155',
+    borderRadius: isMobile ? 0 : 10,
+    width: isMobile ? '100vw' : 'min(780px, calc(100vw - 32px))',
+    maxWidth: isMobile ? '100vw' : 780,
+    height: isMobile ? 'calc(100vh - env(safe-area-inset-top, 0px) - 12px)' : 'auto',
+    maxHeight: isMobile ? 'calc(100vh - env(safe-area-inset-top, 0px) - 12px)' : '90vh',
+    display: 'flex',
+    flexDirection: 'column',
+    boxShadow: isMobile ? 'none' : '0 8px 32px rgba(0,0,0,0.5)',
+    overflow: 'hidden',
+  };
 
   return (
     <div style={overlayStyle} onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
@@ -297,130 +359,164 @@ export function P2pConfigPanel({ sessions, subSessions, activeSession, onClose, 
           <h2 style={titleStyle}>{t('p2p.settings_title')}</h2>
           <button style={closeBtnStyle} onClick={onClose}>✕</button>
         </div>
+        <div style={tabsStyle}>
+          <button type="button" style={tabStyle(activeTab === 'participants')} onClick={() => setActiveTab('participants')}>
+            {t('p2p.picker.agents')}
+          </button>
+          <button type="button" style={tabStyle(activeTab === 'combos')} onClick={() => setActiveTab('combos')}>
+            {t('p2p.combo_label')}
+          </button>
+        </div>
 
         {/* Body */}
         <div style={bodyStyle}>
           {loading ? (
             <div style={{ textAlign: 'center', padding: 24, color: '#64748b', fontSize: 13 }}>…</div>
           ) : (
-            <>
-              {/* Cross-session toggle */}
-              <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: '#94a3b8', cursor: 'pointer', marginBottom: 4 }}>
-                <input
-                  type="checkbox"
-                  style={checkboxStyle}
-                  checked={crossSession}
-                  onChange={() => setCrossSession((v) => !v)}
-                />
-                {t('p2p.cross_session')}
-              </label>
-
-              {/* Session rows — horizontal wrap */}
-              <div style={sectionLabelStyle}>{t('p2p.picker.agents')}</div>
-              {eligible.length === 0 && (
-                <div style={{ color: '#64748b', fontSize: 13, padding: '8px 0' }}>
-                  {t('p2p.picker.no_agents_available')}
-                </div>
-              )}
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-              {eligible.map((e) => {
-                const entry = getEntry(e.key);
-                return (
-                  <div key={e.key} style={{ ...rowStyle, opacity: entry.enabled ? 1 : 0.5 }}>
-                    <input
-                      type="checkbox"
-                      style={checkboxStyle}
-                      checked={entry.enabled}
-                      onChange={() => toggleEnabled(e.key)}
-                    />
-                    <span style={{ fontSize: 12, color: '#e2e8f0' }}>{e.shortName}</span>
-                    <span style={{ ...badgeStyle, fontSize: 9 }}>{e.agentType}</span>
-                    <select
-                      style={{ ...selectStyle, fontSize: 11, padding: '1px 4px' }}
-                      value={entry.mode}
-                      disabled={!entry.enabled}
-                      onChange={(ev) => setMode(e.key, (ev.target as HTMLSelectElement).value)}
-                    >
-                      {SESSION_MODES.map((m) => (
-                        <option key={m} value={m}>
-                          {m === 'skip' ? t('p2p.settings_skip') : t(`p2p.mode.${m}`, m.charAt(0).toUpperCase() + m.slice(1))}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                );
-              })}
-              </div>
-
-              {/* Rounds */}
-              <div style={sectionLabelStyle}>{t('p2p.settings_rounds')}</div>
-              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                {ROUND_OPTIONS.map((r) => (
+            activeTab === 'participants' ? (
+              <>
+                <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
                   <button
-                    key={r}
                     type="button"
-                    style={roundsBtnStyle(rounds === r)}
-                    onClick={() => setRounds(r)}
+                    style={tabStyle(agentFlavorFilter === 'sdk')}
+                    onClick={() => setAgentFlavorFilter('sdk')}
                   >
-                    {r}
+                    {t('p2p.settings_filter_sdk', 'SDK')}
                   </button>
-                ))}
-              </div>
-              <div style={{ fontSize: 11, color: '#64748b', marginTop: 6 }}>
-                {t('p2p.settings_rounds_hint')}
-              </div>
+                  <button
+                    type="button"
+                    style={tabStyle(agentFlavorFilter === 'cli')}
+                    onClick={() => setAgentFlavorFilter('cli')}
+                  >
+                    {t('p2p.settings_filter_cli', 'CLI')}
+                  </button>
+                </div>
 
-              {/* Hop timeout */}
-              <div style={sectionLabelStyle}>{t('p2p.settings_hop_timeout', 'Hop Timeout')}</div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <input
-                  type="number"
-                  min={1}
-                  max={10}
-                  value={hopTimeoutMinutes}
-                  onInput={(e) => {
-                    const v = parseInt((e.target as HTMLInputElement).value, 10);
-                    if (v >= 1 && v <= 10) setHopTimeoutMinutes(v);
-                  }}
-                  style={{
-                    width: 64,
-                    background: '#0f172a',
-                    border: '1px solid #334155',
-                    borderRadius: 5,
-                    color: '#e2e8f0',
-                    fontSize: 13,
-                    padding: '4px 8px',
-                    textAlign: 'center',
-                    outline: 'none',
-                  }}
-                />
-                <span style={{ fontSize: 12, color: '#94a3b8' }}>{t('p2p.settings_hop_timeout_unit', 'minutes per hop')}</span>
-              </div>
-              <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
-                {t('p2p.settings_hop_timeout_hint', 'How long to wait for each agent to respond. Increase for complex tasks.')}
-              </div>
+                <div style={sectionCardStyle}>
+                  <div style={{ ...sectionLabelStyle, marginTop: 0 }}>{t('p2p.picker.agents')}</div>
+                  {visibleEligible.length === 0 && (
+                    <div style={{ color: '#64748b', fontSize: 13, padding: '8px 0' }}>
+                      {t('p2p.picker.no_agents_available')}
+                    </div>
+                  )}
+                  <div style={agentGridStyle(isMobile)}>
+                  {visibleEligible.map((e) => {
+                    const entry = getEntry(e.key);
+                    return (
+                      <div key={e.key} style={{ ...rowStyle, opacity: entry.enabled ? 1 : 0.6 }}>
+                        <input
+                          type="checkbox"
+                          style={checkboxStyle}
+                          checked={entry.enabled}
+                          onChange={() => toggleEnabled(e.key)}
+                        />
+                        <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                          <span style={{ fontSize: 13, color: '#e2e8f0', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis' }}>{e.shortName}</span>
+                          <span style={{ ...badgeStyle, width: 'fit-content', fontSize: 10 }}>{e.agentType}</span>
+                        </div>
+                        <select
+                          style={{ ...selectStyle, width: '100%', minWidth: 110, fontSize: 12, padding: '5px 8px' }}
+                          value={entry.mode}
+                          disabled={!entry.enabled}
+                          onChange={(ev) => setMode(e.key, (ev.target as HTMLSelectElement).value)}
+                        >
+                          {SESSION_MODES.map((m) => (
+                            <option key={m} value={m}>
+                              {m === 'skip' ? t('p2p.settings_skip') : t(`p2p.mode.${m}`, m.charAt(0).toUpperCase() + m.slice(1))}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    );
+                  })}
+                  </div>
+                </div>
 
-              {/* Extra prompt */}
-              <div style={{ ...sectionLabelStyle, marginTop: 12 }}>{t('p2p.settings_extra_prompt')}</div>
-              <textarea
-                value={extraPrompt}
-                onInput={(e) => setExtraPrompt((e.target as HTMLTextAreaElement).value)}
-                placeholder={t('p2p.settings_extra_prompt_hint')}
-                rows={2}
-                style={{
-                  width: '100%',
-                  background: '#0f172a',
-                  border: '1px solid #334155',
-                  borderRadius: 6,
-                  color: '#e2e8f0',
-                  fontFamily: 'inherit',
-                  fontSize: 13,
-                  padding: '6px 8px',
-                  resize: 'vertical',
-                  outline: 'none',
-                }}
-              />
-            </>
+                <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : 'repeat(2, minmax(0, 1fr))', gap: 12, marginTop: 12 }}>
+                  <div style={sectionCardStyle}>
+                    <div style={{ ...sectionLabelStyle, marginTop: 0 }}>{t('p2p.settings_rounds')}</div>
+                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                      {ROUND_OPTIONS.map((r) => (
+                        <button
+                          key={r}
+                          type="button"
+                          style={roundsBtnStyle(rounds === r)}
+                          onClick={() => setRounds(r)}
+                        >
+                          {r}
+                        </button>
+                      ))}
+                    </div>
+                    <div style={{ fontSize: 11, color: '#64748b', marginTop: 6 }}>
+                      {t('p2p.settings_rounds_hint')}
+                    </div>
+                  </div>
+
+                  <div style={sectionCardStyle}>
+                    <div style={{ ...sectionLabelStyle, marginTop: 0 }}>{t('p2p.settings_hop_timeout', 'Hop Timeout')}</div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <input
+                        type="number"
+                        min={1}
+                        max={10}
+                        value={hopTimeoutMinutes}
+                        onInput={(e) => {
+                          const v = parseInt((e.target as HTMLInputElement).value, 10);
+                          if (v >= 1 && v <= 10) setHopTimeoutMinutes(v);
+                        }}
+                        style={{
+                          width: 72,
+                          background: '#0f172a',
+                          border: '1px solid #334155',
+                          borderRadius: 5,
+                          color: '#e2e8f0',
+                          fontSize: 13,
+                          padding: '6px 8px',
+                          textAlign: 'center',
+                          outline: 'none',
+                        }}
+                      />
+                      <span style={{ fontSize: 12, color: '#94a3b8' }}>{t('p2p.settings_hop_timeout_unit', 'minutes per hop')}</span>
+                    </div>
+                    <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>
+                      {t('p2p.settings_hop_timeout_hint', 'How long to wait for each agent to respond. Increase for complex tasks.')}
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{ ...sectionCardStyle, marginTop: 12 }}>
+                  <div style={{ ...sectionLabelStyle, marginTop: 0 }}>{t('p2p.settings_extra_prompt')}</div>
+                  <textarea
+                    value={extraPrompt}
+                    onInput={(e) => setExtraPrompt((e.target as HTMLTextAreaElement).value)}
+                    placeholder={t('p2p.settings_extra_prompt_hint')}
+                    rows={3}
+                    style={{
+                      width: '100%',
+                      background: '#0f172a',
+                      border: '1px solid #334155',
+                      borderRadius: 6,
+                      color: '#e2e8f0',
+                      fontFamily: 'inherit',
+                      fontSize: 13,
+                      padding: '8px 10px',
+                      resize: 'vertical',
+                      outline: 'none',
+                    }}
+                  />
+                </div>
+              </>
+            ) : (
+              <>
+                <div style={sectionCardStyle}>
+                  <div style={{ ...sectionLabelStyle, marginTop: 0 }}>{t('p2p.combo_label')}</div>
+                  <P2pComboManager
+                    customCombos={customCombos}
+                    onCustomCombosChange={saveCustomCombos}
+                  />
+                </div>
+              </>
+            )
           )}
         </div>
 

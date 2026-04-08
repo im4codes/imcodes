@@ -11,6 +11,7 @@ import type { TimelineEvent, WsClient } from '../ws-client.js';
 import { FileBrowser } from './FileBrowser.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
+import { useNowTicker } from '../hooks/useNowTicker.js';
 
 interface Props {
   events: TimelineEvent[];
@@ -329,6 +330,12 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
 
   const autoScrollRef = useRef(true);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
+  const lastScrollTopRef = useRef(0);
+  const suppressLoadOlderUntilRef = useRef(0);
+
+  const suppressLoadOlder = useCallback((durationMs = 1200) => {
+    suppressLoadOlderUntilRef.current = Date.now() + durationMs;
+  }, []);
 
   // Track tool.call events to trigger file panel refresh
   const [filePanelRefreshTrigger, setFilePanelRefreshTrigger] = useState(0);
@@ -397,7 +404,9 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
     const el = scrollRef.current;
     if (!el) return;
     autoScrollRef.current = true;
+    suppressLoadOlder();
     el.scrollTop = el.scrollHeight;
+    lastScrollTopRef.current = el.scrollTop;
   };
 
   // On session change, reset scroll position to bottom
@@ -411,21 +420,34 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
   }, [sessionId]);
 
   // On mobile: when keyboard opens, viewport shrinks and scrollTop can reset to 0.
-  // Save scrollTop on focusin, restore it when visualViewport height decreases (keyboard appeared).
+  // Save the relative bottom offset on focusin, then restore against the new layout
+  // when visualViewport height decreases (keyboard appeared). Using absolute scrollTop
+  // is brittle on iOS and can replay a stale 0 value, snapping the chat to the top.
   useEffect(() => {
     const vv = window.visualViewport;
     if (!vv) return;
-    let savedScrollTop = 0;
+    let savedBottomOffset = 0;
+    let savedWasNearBottom = true;
     let prevHeight = vv.height;
     const onFocusIn = () => {
-      savedScrollTop = scrollRef.current?.scrollTop ?? 0;
+      const el = scrollRef.current;
+      if (!el) return;
+      savedBottomOffset = Math.max(0, el.scrollHeight - el.scrollTop - el.clientHeight);
+      savedWasNearBottom = savedBottomOffset < 150;
+      suppressLoadOlder();
     };
     const onResize = () => {
       const el = scrollRef.current;
       if (!el) return;
-      if (vv.height < prevHeight) {
-        // Keyboard appeared — restore scroll position
-        el.scrollTop = savedScrollTop;
+      if (vv.height !== prevHeight) {
+        suppressLoadOlder();
+        if (savedWasNearBottom || autoScrollRef.current) {
+          requestAnimationFrame(() => scrollToBottom());
+        } else if (vv.height < prevHeight) {
+          const targetTop = Math.max(0, el.scrollHeight - el.clientHeight - savedBottomOffset);
+          el.scrollTop = targetTop;
+          lastScrollTopRef.current = el.scrollTop;
+        }
       }
       prevHeight = vv.height;
     };
@@ -474,6 +496,13 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
     }
   }, [lastVisibleTs]);
 
+  // Any visible content update should force-follow to the latest message.
+  // Skip while prepending older history so anchor restoration can preserve position.
+  useLayoutEffect(() => {
+    if (loadingOlder || scrollAnchorRef.current) return;
+    scrollToBottom();
+  }, [preview, viewItems, loading, loadingOlder]);
+
   // Restore scroll position after Load Older prepends events
   useLayoutEffect(() => {
     const anchor = scrollAnchorRef.current;
@@ -485,14 +514,14 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
     scrollAnchorRef.current = null;
   }, [events]);
 
-  // Subsequent auto-scroll (new messages while at bottom) — use rAF for smooth updates.
+  // Fallback for timestamp-based message additions. The layout effect above handles
+  // streaming edits and other view changes that do not advance timestamps.
   useEffect(() => {
     const changed = lastVisibleTs !== prevVisibleTsRef.current;
     prevVisibleTsRef.current = lastVisibleTs;
     if (!changed && !preview) return;
     requestAnimationFrame(() => {
-      if (preview) { scrollToBottom(); return; }
-      if (autoScrollRef.current) scrollToBottom();
+      scrollToBottom();
     });
   }, [lastVisibleTs, preview]);
 
@@ -508,17 +537,31 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
   const handleScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
+    const scrollTop = el.scrollTop;
+    const scrollHeight = el.scrollHeight;
+    const clientHeight = el.clientHeight;
+    const wasAutoFollowing = autoScrollRef.current;
+    const transientTopJump = wasAutoFollowing
+      && scrollTop < 100
+      && lastScrollTopRef.current > 100
+      && Date.now() < suppressLoadOlderUntilRef.current;
+    if (transientTopJump) {
+      setShowScrollBtn(false);
+      requestAnimationFrame(() => scrollToBottom());
+      return;
+    }
     // Use generous threshold — 150px from bottom still counts as "at bottom"
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 150;
+    const atBottom = scrollHeight - scrollTop - clientHeight < 150;
     autoScrollRef.current = atBottom;
     setShowScrollBtn(!atBottom);
     if (!atBottom) lastScrollActivityRef.current = Date.now();
+    lastScrollTopRef.current = scrollTop;
     // Auto-trigger load older when scrolled near top
-    if (el.scrollTop < 100 && onLoadOlder && hasOlderHistory && !loadingOlder && !loading) {
+    if (scrollTop < 100 && onLoadOlder && hasOlderHistory && !loadingOlder && !loading) {
       const now = Date.now();
       if (now - lastLoadOlderAtRef.current >= LOAD_OLDER_COOLDOWN_MS) {
         lastLoadOlderAtRef.current = now;
-        scrollAnchorRef.current = { scrollHeight: el.scrollHeight };
+        scrollAnchorRef.current = { scrollHeight };
         onLoadOlder();
       }
     }
@@ -1151,11 +1194,7 @@ const ChatEvent = memo(function ChatEvent({ event, nextTs, onPathClick, serverId
 
 function ActiveThinkingLabel({ startTs }: { startTs: number }) {
   const { t } = useTranslation();
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, []);
+  const now = useNowTicker(true);
   const sec = Math.max(0, Math.round((now - startTs) / 1000));
   return <>{t('chat.thinking_running', { sec })}</>;
 }

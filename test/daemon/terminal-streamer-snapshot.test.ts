@@ -18,7 +18,8 @@ vi.mock('../../src/store/session-store.js', () => ({
   upsertSession: vi.fn(),
 }));
 
-import { capturePaneVisible, capturePaneHistory, getPaneSize, startPipePaneStream } from '../../src/agent/tmux.js';
+import { capturePaneVisible, capturePaneHistory, getPaneId, getPaneSize, startPipePaneStream, sessionExists } from '../../src/agent/tmux.js';
+import { getSession } from '../../src/store/session-store.js';
 import { TerminalStreamer } from '../../src/daemon/terminal-streamer.js';
 import { TimelineEmitter } from '../../src/daemon/timeline-emitter.js';
 
@@ -28,8 +29,11 @@ import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 
 const mockCapture = capturePaneVisible as ReturnType<typeof vi.fn>;
 const mockHistory = capturePaneHistory as ReturnType<typeof vi.fn>;
+const mockGetPaneId = getPaneId as ReturnType<typeof vi.fn>;
 const mockSize = getPaneSize as ReturnType<typeof vi.fn>;
 const mockStartPipe = startPipePaneStream as ReturnType<typeof vi.fn>;
+const mockSessionExists = sessionExists as ReturnType<typeof vi.fn>;
+const mockGetSession = getSession as ReturnType<typeof vi.fn>;
 
 /** Flush all pending timers + microtasks so the capture loop runs. */
 const flush = () => vi.advanceTimersByTimeAsync(200);
@@ -45,6 +49,9 @@ describe('TerminalStreamer — snapshot behavior', () => {
     mockSize.mockResolvedValue({ cols: 80, rows: 4 });
     mockCapture.mockResolvedValue('line0\nline1\nline2\nline3');
     mockHistory.mockResolvedValue('');
+    mockGetPaneId.mockResolvedValue('%1');
+    mockSessionExists.mockResolvedValue(true);
+    mockGetSession.mockReturnValue({ paneId: '%1' });
 
     // Mock startPipePaneStream to return a no-op stream (never emits data)
     const noopStream = { on: vi.fn(), destroy: vi.fn() };
@@ -165,5 +172,52 @@ describe('TerminalStreamer — snapshot behavior', () => {
     await flush();
     // No new diffs after unsubscribe
     expect(received.length).toBe(countAfterFirst);
+  });
+
+  it('emits a session-scoped error after pipe-pane rebind retries are exhausted', async () => {
+    const session = 'broken-stream-session';
+    mockStartPipe.mockRejectedValue(new Error('cat spawn failed'));
+
+    streamer.subscribe({
+      sessionName: session,
+      send: () => {},
+      onError: () => {},
+    });
+
+    await flush();
+    await vi.advanceTimersByTimeAsync(61_000);
+
+    expect(emitSpy).toHaveBeenCalledWith(
+      session,
+      'assistant.text',
+      expect.objectContaining({
+        text: '⚠️ Error: Terminal stream unavailable after max retries',
+        streaming: false,
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it('suppresses pane-id inline errors for transport sessions', async () => {
+    const session = 'deck_sub_qwen';
+    mockGetSession.mockReturnValue({ agentType: 'qwen', runtimeType: 'transport' });
+    mockGetPaneId.mockResolvedValue(undefined);
+
+    streamer.subscribe({
+      sessionName: session,
+      send: () => {},
+      onError: () => {},
+    });
+
+    await flush();
+
+    expect(emitSpy).not.toHaveBeenCalledWith(
+      session,
+      'assistant.text',
+      expect.objectContaining({
+        text: '⚠️ Error: Terminal stream unavailable: pane id not available. Restart the session to fix.',
+      }),
+      expect.any(Object),
+    );
   });
 });

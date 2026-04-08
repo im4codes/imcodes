@@ -52,7 +52,6 @@ Node.js process that manages AI agent sessions via tmux. Entry point: `src/index
   - `session-manager.ts` manages all sessions, auto-restart with loop prevention. `provider-registry.ts` manages transport provider lifecycle.
 - **Transport relay** (`src/daemon/transport-relay.ts`): Converts transport provider callbacks (`onDelta`, `onComplete`, `onError`) to unified timeline events (`assistant.text`, `session.state`, `tool.call`).
 - **Routing** (`src/router/`): `message-router.ts` routes inbound messages to the correct session. `command-parser.ts` handles `/bind`, `/status`, `/send`, etc.
-- **Brain dispatcher** (`src/agent/brain-dispatcher.ts`): Parses `@w1`, `@status`, `@reply` commands from the brain session's output, dispatching to workers.
 - **Server link** (`src/daemon/server-link.ts`): WebSocket client connecting to the server at `/api/server/:id/ws`. Sends `{ type: 'auth', serverId, token }` on open. Credentials stored in `~/.imcodes/server.json` after `imcodes bind`.
 - **Session store** (`src/store/session-store.ts`): JSON file at `~/.imcodes/sessions.json`, debounced writes.
 

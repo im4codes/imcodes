@@ -18,7 +18,9 @@
     "connected": "Conectado",
     "disconnected": "Desconectado",
     "reconnecting": "Reconectando…",
-    "refresh": "Actualizar"
+    "refresh": "Actualizar",
+    "show": "Mostrar",
+    "hide": "Ocultar"
   },
   "chat": {
     "loading": "Cargando chat...",
@@ -73,6 +75,7 @@
     "no_session": "Sin sesión",
     "send_queued": "Reconectando… (envío en cola)",
     "transport_send_queued": "En cola: se enviará cuando termine la respuesta actual",
+    "transport_send_queued_collapsed": "{{count}} en cola · mostrando solo el último",
     "send_placeholder": "Enviar a {{name}}…",
     "actions": "Acciones de sesión",
     "new_btn": "Nueva sesión",
@@ -176,7 +179,9 @@
     "no_changes": "Sin cambios"
   },
   "toast": {
-    "finished": "completado"
+    "finished": "terminó",
+    "upgrade_blocked_title": "Actualización bloqueada",
+    "upgrade_blocked_p2p_active": "P2P sigue en ejecución. Deténlo antes de actualizar el daemon."
   },
   "discussion": {
     "role_critic": "Crítico",
@@ -354,6 +359,9 @@
       "phase_queued": "En cola",
       "round_label": "Ronda",
       "hop_label": "Salto",
+      "auto_follow_latest": "Seguir lo último automáticamente",
+      "copy_path": "Copiar ruta",
+      "copy_content": "Copiar contenido",
       "scroll_top": "Ir arriba",
       "scroll_bottom": "Ir abajo"
     },
@@ -364,6 +372,10 @@
     "mode_brainstorm": "Lluvia de ideas",
     "mode_discuss": "Discusión",
     "combo_label": "Combo",
+    "combo_presets": "Combos predefinidos",
+    "combo_custom": "Mis combos",
+    "combo_custom_empty": "Aun no hay combos personalizados.",
+    "combo_builder": "Agregar nuevo combo",
     "exclude_same_type": "Excluir mismo tipo",
     "picker": {
       "back": "Atrás",
@@ -389,11 +401,19 @@
       "discuss": "Discusión"
     },
     "mode_config": "Config",
+    "settings_button": "Ajustes P2P",
     "settings_title": "Ajustes de participantes P2P",
     "cross_session": "Incluir sesiones de otros proyectos",
+    "settings_filter_sdk": "SDK",
+    "settings_filter_cli": "CLI",
     "settings_save": "Guardar",
     "settings_close": "Cerrar",
     "confirm_cancel": "¿Seguro que desea cancelar?",
+    "combo_send_confirm_title": "Confirmar envío combinado",
+    "combo_send_confirm_body": "Este mensaje se enviará directamente con el flujo combinado {{mode}}. ¿Continuar?",
+    "combo_send_confirm_skip": "No volver a preguntar, enviar directamente la próxima vez",
+    "combo_empty_message_warning": "El envío combinado requiere un mensaje real. Agrega texto antes de enviarlo.",
+    "combo_requires_participants_hint": "Elige participantes de P2P en Configuración para habilitar los modos combinados.",
     "settings_enabled": "Participar",
     "settings_mode": "Modo",
     "settings_skip": "Omitir",
@@ -420,6 +440,25 @@
       "send_anyway": "Enviar de todos modos",
       "tip_history": "Las discusiones multiagente comparten archivos y conservan mejor historial. Las discusiones uno a uno se tratan como puntuales."
     }
+  },
+  "openspec": {
+    "title": "OpenSpec",
+    "changes": "Cambios",
+    "empty": "No se encontraron cambios de OpenSpec",
+    "audit_action": "Auditar",
+    "audit_implementation_action": "Auditar implementación",
+    "audit_spec_action": "Auditar especificación",
+    "implement_action": "Implementar",
+    "achieve_action": "Completar",
+    "propose_action": "Proponer",
+    "propose_from_discussion_action": "Desde la discusión reciente",
+    "propose_from_description_action": "Desde la descripción de abajo",
+    "audit_implementation_prompt": "Realiza una auditoría estricta de la implementación de {{reference}} contra sus artefactos de OpenSpec. Identifica cada discrepancia, omisión, riesgo de regresión, hueco en casos límite y prueba faltante; después corrige el código, las pruebas y cualquier cambio de soporte necesario. No te detengas en un informe: deja la implementación totalmente alineada con la especificación.",
+    "audit_spec_prompt": "Realiza una auditoría estricta de la especificación de {{reference}}. Refuerza alcance, requisitos, criterios de aceptación, casos límite, modos de fallo, dependencias y capacidad de prueba; elimina ambigüedades e inconsistencias internas; y actualiza la especificación hasta que quede lista para implementar. No te limites a observaciones de revisión.",
+    "implement_prompt": "Impulsa con firmeza la implementación de {{reference}}. Divide el trabajo en subtareas concretas, asigna subagentes con propiedad clara, integra sus resultados, cierra las brechas respecto a la especificación, añade o actualiza pruebas y verifica el resultado final. Tú eres responsable de la orquestación, las decisiones técnicas y la aceptación final.",
+    "achieve_prompt": "Lleva {{reference}} hasta completarlo usando el flujo completo de OpenSpec. Revisa todas las tareas y artefactos pendientes, completa el trabajo necesario de implementación y especificación, cierra los huecos abiertos, sincroniza las especificaciones afectadas si hace falta y archiva el cambio cuando cumpla los criterios de finalización. No te quedes en el reporte de estado.",
+    "propose_from_discussion_prompt": "Genera una propuesta de OpenSpec a partir de la discusión reciente. Extrae el objetivo, el alcance, los requisitos clave y los criterios de aceptación, y deja los puntos poco claros como pendientes. Empieza con un borrador de change proposal listo para guardar.",
+    "propose_from_description_prompt": "Genera una propuesta de OpenSpec a partir de la descripción de abajo. Organiza el objetivo, el alcance, los requisitos clave y los criterios de aceptación, y deja los detalles faltantes como pendientes. Empieza con un borrador de change proposal listo para guardar."
   },
   "upload": {
     "upload_file": "Subir archivo",
@@ -580,6 +619,24 @@
     "expand_all": "Expandir todo",
     "collapse_all": "Contraer todo",
     "drag_to_resize": "Arrastra para cambiar el tamaño"
+  },
+  "subsessionBar": {
+    "show": "Mostrar",
+    "hide": "Ocultar",
+    "layout_double": "Doble fila",
+    "layout_single": "Fila única",
+    "card_size": "Tamaño de tarjeta",
+    "subs_count": "Subs ({{count}})",
+    "new_sub_session": "Nueva sub-sesión",
+    "p2p_discussions": "Discusiones P2P",
+    "repository": "Repositorio",
+    "scheduled_tasks": "Tareas programadas",
+    "width_short": "A",
+    "height_short": "H",
+    "apply": "Aplicar",
+    "reset": "Restablecer",
+    "empty_prefix": "No hay sub-sesiones; haz clic en",
+    "empty_suffix": "para agregar una"
   },
   "localWebPreview": {
     "title": "Vista previa web local",

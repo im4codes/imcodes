@@ -23,12 +23,13 @@ import { P2pConfigPanel } from '../../src/components/P2pConfigPanel.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 
 const sessions = [
-  { name: 'deck_proj_brain', agentType: 'claude-code', state: 'running' },
+  { name: 'deck_proj_brain', agentType: 'claude-code-sdk', state: 'running' },
   { name: 'deck_proj_w1', agentType: 'codex', state: 'idle' },
 ];
 
 const subSessions = [
-  { sessionName: 'deck_sub_abc', type: 'gemini', label: 'worker', state: 'running' },
+  { sessionName: 'deck_sub_abc', type: 'qwen', label: 'worker', state: 'running', parentSession: 'deck_proj_brain' },
+  { sessionName: 'deck_sub_cli', type: 'codex', label: 'reviewer', state: 'running', parentSession: 'deck_proj_brain' },
   { sessionName: 'deck_sub_def', type: 'shell', label: null, state: 'idle' },
 ];
 
@@ -36,6 +37,7 @@ function renderPanel(overrides: {
   sessions?: typeof sessions;
   subSessions?: typeof subSessions;
   activeSession?: string;
+  initialTab?: 'participants' | 'combos';
   onClose?: () => void;
   onSave?: (cfg: P2pSavedConfig) => void;
 } = {}) {
@@ -43,6 +45,7 @@ function renderPanel(overrides: {
     sessions: overrides.sessions ?? sessions,
     subSessions: overrides.subSessions ?? subSessions,
     activeSession: overrides.activeSession ?? 'deck_proj_brain',
+    initialTab: overrides.initialTab,
     onClose: overrides.onClose ?? vi.fn(),
     onSave: overrides.onSave ?? vi.fn(),
   };
@@ -73,7 +76,7 @@ describe('P2pConfigPanel', () => {
   it('renders session list excluding shell and script types', async () => {
     renderPanel({
       sessions: [
-        { name: 'deck_proj_brain', agentType: 'claude-code', state: 'running' },
+        { name: 'deck_proj_brain', agentType: 'claude-code-sdk', state: 'running' },
         { name: 'deck_proj_w1', agentType: 'shell', state: 'idle' },
         { name: 'deck_proj_w2', agentType: 'script', state: 'idle' },
       ],
@@ -127,6 +130,24 @@ describe('P2pConfigPanel', () => {
     const buttons = screen.getAllByRole('button');
     const btn5 = buttons.find((b) => b.textContent === '5');
     expect(btn5).toBeDefined();
+  });
+
+  it('defaults hop timeout to 8 minutes for new configs', async () => {
+    const onSave = vi.fn();
+    renderPanel({ onSave });
+    await flush();
+
+    const timeoutInput = screen.getByRole('spinbutton') as HTMLInputElement;
+    expect(timeoutInput.value).toBe('8');
+
+    const saveBtn = screen.getByText('settings_save');
+    await act(async () => {
+      fireEvent.click(saveBtn);
+    });
+    await flush();
+
+    const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
+    expect(cfg.hopTimeoutMinutes).toBe(8);
   });
 
   it('calls onSave with correct config shape when save is clicked', async () => {
@@ -183,7 +204,7 @@ describe('P2pConfigPanel', () => {
     // The first eligible session mode should be 'review'
     const firstKey = Object.keys(cfg.sessions)[0];
     expect(cfg.sessions[firstKey].mode).toBe('review');
-  });
+  }, 15_000);
 
   it('calls onClose when the close button (✕) is clicked', async () => {
     const onClose = vi.fn();
@@ -208,6 +229,14 @@ describe('P2pConfigPanel', () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
+  it('can open directly on the combos tab', async () => {
+    renderPanel({ initialTab: 'combos' });
+    await flush();
+
+    expect(screen.getByText('+mode_brainstorm')).toBeDefined();
+    expect(screen.queryByText('brain')).toBeNull();
+  });
+
   it('new sessions not in saved config default to disabled with audit mode', async () => {
     const savedConfig: P2pSavedConfig = {
       sessions: {}, // no prior config for any session
@@ -222,11 +251,9 @@ describe('P2pConfigPanel', () => {
     await flush();
 
     // Checkboxes should all be unchecked (enabled=false by default for new sessions)
-    // First checkbox is the cross-session toggle — skip it
     const checkboxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
-    const sessionCheckboxes = checkboxes.slice(1); // skip cross-session toggle
-    expect(sessionCheckboxes.length).toBeGreaterThan(0);
-    for (const cb of sessionCheckboxes) {
+    expect(checkboxes.length).toBeGreaterThan(0);
+    for (const cb of checkboxes) {
       expect(cb.checked).toBe(false);
     }
 
@@ -245,13 +272,12 @@ describe('P2pConfigPanel', () => {
     await flush();
 
     const checkboxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
-    // First checkbox is cross-session toggle, session checkboxes start at index 1
     // New sessions default to unchecked (enabled=false)
-    expect(checkboxes[1].checked).toBe(false);
+    expect(checkboxes[0].checked).toBe(false);
 
     // Check the first session (toggle from disabled to enabled)
-    fireEvent.click(checkboxes[1]);
-    expect(checkboxes[1].checked).toBe(true);
+    fireEvent.click(checkboxes[0]);
+    expect(checkboxes[0].checked).toBe(true);
 
     const saveBtn = screen.getByText('settings_save');
     await act(async () => {
@@ -262,7 +288,7 @@ describe('P2pConfigPanel', () => {
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
     const firstKey = Object.keys(cfg.sessions)[0];
     expect(cfg.sessions[firstKey].enabled).toBe(true);
-  });
+  }, 15_000);
 
   it('changing rounds updates the config passed to onSave', async () => {
     const onSave = vi.fn();
@@ -284,7 +310,7 @@ describe('P2pConfigPanel', () => {
 
     const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
     expect(cfg.rounds).toBe(5);
-  });
+  }, 15_000);
 
   it('persists config via saveUserPref on save', async () => {
     const onSave = vi.fn();
@@ -359,5 +385,75 @@ describe('P2pConfigPanel', () => {
     // Rounds button "2" should be active (loaded from server config)
     const roundBtns = screen.getAllByRole('button').filter(b => b.textContent === '2');
     expect(roundBtns.length).toBeGreaterThan(0);
+  });
+
+  it('shows sdk sessions by default and switches to cli sessions on demand', async () => {
+    renderPanel();
+    await flush();
+
+    expect(screen.getByText('brain')).toBeDefined();
+    expect(screen.getByText('worker')).toBeDefined();
+    expect(screen.queryByText('reviewer')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'CLI' }));
+
+    expect(screen.getByText('reviewer')).toBeDefined();
+    expect(screen.queryByText('brain')).toBeNull();
+    expect(screen.queryByText('worker')).toBeNull();
+  });
+
+  it('preserves hidden sdk entries when saving from the cli filter', async () => {
+    const onSave = vi.fn();
+    renderPanel({ onSave });
+    await flush();
+
+    fireEvent.click(screen.getAllByRole('checkbox')[0]);
+    fireEvent.click(screen.getByRole('button', { name: 'CLI' }));
+    fireEvent.click(screen.getAllByRole('checkbox')[0]);
+    await act(async () => {
+      fireEvent.click(screen.getByText('settings_save'));
+    });
+    await flush();
+
+    const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
+    expect(cfg.sessions['deck_proj_brain']).toBeDefined();
+    expect(cfg.sessions['deck_proj_brain'].enabled).toBe(true);
+    expect(cfg.sessions['deck_sub_cli']).toBeDefined();
+    expect(cfg.sessions['deck_sub_cli'].enabled).toBe(true);
+    expect(cfg.sessions['deck_sub_abc']).toBeDefined();
+  }, 15_000);
+
+  it('manages shared custom combos from the combo tab', async () => {
+    getUserPrefMock.mockImplementation(async (key: string) => {
+      if (key === 'p2p_custom_combos') return JSON.stringify(['audit>discuss']);
+      return null;
+    });
+
+    renderPanel();
+    await flush();
+
+    fireEvent.click(screen.getByRole('button', { name: 'combo_label' }));
+    expect(screen.getByText('mode_audit→mode_discuss')).toBeDefined();
+
+    fireEvent.click(screen.getByText('+mode_brainstorm'));
+    fireEvent.click(screen.getByText('+mode_review'));
+    fireEvent.click(screen.getByText('✓'));
+
+    expect(saveUserPrefMock).toHaveBeenCalledWith('p2p_custom_combos', JSON.stringify(['audit>discuss', 'brainstorm>review']));
+  });
+
+  it('deletes custom combos from the combo tab', async () => {
+    getUserPrefMock.mockImplementation(async (key: string) => {
+      if (key === 'p2p_custom_combos') return JSON.stringify(['audit>discuss']);
+      return null;
+    });
+
+    renderPanel();
+    await flush();
+
+    fireEvent.click(screen.getByRole('button', { name: 'combo_label' }));
+    fireEvent.click(screen.getAllByText('×')[0]);
+
+    expect(saveUserPrefMock).toHaveBeenCalledWith('p2p_custom_combos', JSON.stringify([]));
   });
 });

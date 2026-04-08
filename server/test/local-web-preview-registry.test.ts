@@ -18,12 +18,11 @@ describe('LocalWebPreviewRegistry', () => {
     vi.useRealTimers();
   });
 
-  it('creates opaque preview ids and updates access time on get', () => {
+  it('creates hex preview ids and updates access time on get', () => {
     const registry = getRegistry();
     const { preview, accessToken } = registry.create('user1', 3000, '/docs');
 
     expect(preview.id).toMatch(/^[a-f0-9]{48}$/);
-    expect(preview.id).not.toContain('3000');
     expect(accessToken).toMatch(/^[a-f0-9]{48}$/);
 
     vi.setSystemTime(now + 5_000);

@@ -23,6 +23,7 @@ import {
 } from '../store/session-store.js';
 import logger from '../util/logger.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
+import { emitSessionInlineError } from '../daemon/session-error.js';
 import { startWatching, startWatchingFile, stopWatching, isWatching, findJsonlPathBySessionId } from '../daemon/jsonl-watcher.js';
 import { startWatching as startCodexWatching, startWatchingSpecificFile as startCodexWatchingFile, startWatchingById as startCodexWatchingById, stopWatching as stopCodexWatching, isWatching as isCodexWatching, findRolloutPathByUuid } from '../daemon/codex-watcher.js';
 import { startWatching as startGeminiWatching, startWatchingLatest as startGeminiWatchingLatest, stopWatching as stopGeminiWatching, isWatching as isGeminiWatching } from '../daemon/gemini-watcher.js';
@@ -34,9 +35,11 @@ import { getQwenOAuthQuotaUsageLabel } from './provider-quota.js';
 import { getClaudeSdkRuntimeConfig } from './sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from './codex-runtime-config.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
+import { isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
 
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
+import { closeSingleSession, collectProjectCloseTargets, type CloseFailure, type CloseTreeResult } from './session-close.js';
 
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
 function startCCWatcher(sessionName: string, projectDir: string, ccSessionId?: string): void {
@@ -112,6 +115,11 @@ export function setSessionEventCallback(cb: SessionEventCallback): void {
 
 function emitSessionEvent(event: 'started' | 'stopped' | 'error', session: string, state: string): void {
   try { _onSessionEvent?.(event, session, state); } catch { /* ignore */ }
+  if (event === 'error') {
+    emitSessionInlineError(session, state);
+    timelineEmitter.emit(session, 'session.state', { state: event, error: state });
+    return;
+  }
   timelineEmitter.emit(session, 'session.state', { state: event });
 }
 
@@ -177,50 +185,79 @@ export async function startProject(config: ProjectConfig): Promise<void> {
   }
 }
 
-/** Stop all sessions for a project and remove them from the store. */
-export async function stopProject(projectName: string): Promise<void> {
-  const allSessions = storeSessions();
-  const toStop = new Map<string, SessionRecord>();
+function buildCloseFailureMessage(record: SessionRecord, failure: CloseFailure): string {
+  const prefix = record.name.startsWith('deck_sub_') ? 'Sub-session' : 'Session';
+  return `${prefix} close failed during ${failure.stage}: ${failure.message}`;
+}
 
-  for (const session of allSessions) {
-    if (session.projectName === projectName) toStop.set(session.name, session);
-  }
-
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const session of allSessions) {
-      if (!session.name.startsWith('deck_sub_')) continue;
-      if (!session.parentSession) continue;
-      if (toStop.has(session.name)) continue;
-      if (!toStop.has(session.parentSession)) continue;
-      toStop.set(session.name, session);
-      changed = true;
-    }
-  }
-
+/** Stop all sessions for a project and remove them from the store on confirmed success. */
+export async function stopProject(
+  projectName: string,
+  serverLink?: { send(msg: object): void } | null,
+): Promise<CloseTreeResult> {
+  const targets = collectProjectCloseTargets(projectName, storeSessions());
   const invalidatedDirs = new Set<string>();
-  for (const s of toStop.values()) {
-    stopWatching(s.name);
-    stopCodexWatching(s.name);
-    stopGeminiWatching(s.name);
-    stopOpenCodeWatching(s.name);
-    const transportRuntime = transportRuntimes.get(s.name);
-    if (transportRuntime) {
-      if (transportRuntime.providerSessionId) unregisterProviderRoute(transportRuntime.providerSessionId);
-      await transportRuntime.kill().catch(() => {});
-      transportRuntimes.delete(s.name);
-    } else {
-      await killSession(s.name).catch(() => {});
-    }
-    removeSession(s.name);
-    emitSessionPersist(null, s.name);
-    emitSessionEvent('stopped', s.name, 'stopped');
-    if (s.projectDir && !invalidatedDirs.has(s.projectDir)) {
-      invalidatedDirs.add(s.projectDir);
-      repoCache.invalidate(s.projectDir);
-    }
+  const result: CloseTreeResult = { ok: true, closed: [], failed: [] };
+
+  for (const record of targets) {
+    const closeResult = await closeSingleSession(record, {
+      emitStopping: () => {
+        timelineEmitter.emit(record.name, 'session.state', { state: 'stopping' });
+      },
+      stopWatchers: () => {
+        stopStructuredWatchers(record.name);
+      },
+      stopTransportRuntime: async () => {
+        await stopTransportRuntimeSession(record.name);
+      },
+      killProcessRuntime: async () => {
+        await killSession(record.name);
+      },
+      verifyClosed: async () => {
+        if (record.runtimeType === RUNTIME_TYPES.TRANSPORT) {
+          if (transportRuntimes.has(record.name)) throw new Error('transport runtime still registered');
+          return;
+        }
+        if (await sessionExists(record.name)) throw new Error('session still exists after kill');
+      },
+      emitSuccess: async () => {
+        if (record.name.startsWith('deck_sub_')) {
+          timelineEmitter.emit(record.name, 'session.state', { state: 'stopped' });
+          return;
+        }
+        emitSessionEvent('stopped', record.name, 'stopped');
+      },
+      persistSuccess: async () => {
+        if (record.name.startsWith('deck_sub_')) {
+          const id = record.name.replace(/^deck_sub_/, '');
+          if (serverLink && id !== record.name) {
+            serverLink.send({ type: 'subsession.closed', id, sessionName: record.name });
+          }
+        }
+        removeSession(record.name);
+        emitSessionPersist(null, record.name);
+        if (record.projectDir && !invalidatedDirs.has(record.projectDir)) {
+          invalidatedDirs.add(record.projectDir);
+          repoCache.invalidate(record.projectDir);
+        }
+      },
+      emitFailure: async (_record, failure) => {
+        emitSessionEvent('error', record.name, buildCloseFailureMessage(record, failure));
+      },
+      persistFailure: async (_record, failure) => {
+        const next: SessionRecord = { ...record, state: 'error', updatedAt: Date.now() };
+        upsertSession(next);
+        emitSessionPersist(next, record.name);
+        logger.warn({ session: record.name, stage: failure.stage, message: failure.message }, 'Project shutdown failed');
+      },
+    });
+
+    result.closed.push(...closeResult.closed);
+    result.failed.push(...closeResult.failed);
   }
+
+  result.ok = result.failed.length === 0;
+  return result;
 }
 
 /** Kill tmux sessions and watchers for a project but keep store records (for restart). */
@@ -413,6 +450,7 @@ export async function restoreFromStore(): Promise<void> {
       try { await restartSession(hydrated); } catch (err) {
         logger.error({ err, session: hydrated.name }, 'Failed to restart session on restore — skipping (tmux may be unavailable)');
         updateSessionState(hydrated.name, 'error');
+        emitSessionEvent('error', hydrated.name, err instanceof Error ? err.message : String(err));
       }
     } else if (isLiveSession && !paneAlive) {
       // Session exists (remain-on-exit) but process is dead — respawn instead of creating a new session
@@ -420,6 +458,7 @@ export async function restoreFromStore(): Promise<void> {
       try { await respawnSession(hydrated); } catch (err) {
         logger.error({ err, session: hydrated.name }, 'Failed to respawn session on restore — skipping');
         updateSessionState(hydrated.name, 'error');
+        emitSessionEvent('error', hydrated.name, err instanceof Error ? err.message : String(err));
       }
     } else if (hydrated.agentType === 'claude-code' && hydrated.projectDir && !isWatching(hydrated.name)) {
       if (hydrated.ccSessionId) {
@@ -513,7 +552,7 @@ export async function restoreFromStore(): Promise<void> {
       agentType,
       agentVersion: await getAgentVersion(agentType),
       projectDir,
-      state: 'running',
+      state: 'idle',
       restarts: 0,
       restartTimestamps: [],
       createdAt: Date.now(),
@@ -525,7 +564,7 @@ export async function restoreFromStore(): Promise<void> {
 
     upsertSession(record);
     emitSessionPersist(record, name);
-    emitSessionEvent('started', name, 'running');
+    emitSessionEvent('started', name, 'idle');
     if (agentType === 'claude-code' && projectDir) {
       startStructuredWatcher(name, agentType, projectDir, { ccSessionId });
     } else if (agentType === 'opencode' && projectDir) {
@@ -553,9 +592,10 @@ export async function restartSession(record: SessionRecord): Promise<boolean> {
   const recentRestarts = record.restartTimestamps.filter((t) => t > windowStart);
 
   if (recentRestarts.length >= MAX_RESTARTS) {
+    const message = `Restart loop detected: more than ${MAX_RESTARTS} restarts within 5 minutes`;
     logger.error({ session: record.name }, 'Restart loop detected — marking as error');
     updateSessionState(record.name, 'error');
-    emitSessionEvent('error', record.name, 'error');
+    emitSessionEvent('error', record.name, message);
     return false;
   }
 
@@ -571,7 +611,7 @@ export async function restartSession(record: SessionRecord): Promise<boolean> {
     ...effectiveRecord,
     restarts: record.restarts + 1,
     restartTimestamps: [...recentRestarts, now],
-    state: 'running',
+    state: 'idle',
     updatedAt: now,
   };
   upsertSession(updated);
@@ -608,9 +648,10 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
   const recentRestarts = record.restartTimestamps.filter((t) => t > windowStart);
 
   if (recentRestarts.length >= MAX_RESTARTS) {
+    const message = `Restart loop detected: more than ${MAX_RESTARTS} restarts within 5 minutes`;
     logger.error({ session: record.name }, 'Restart loop detected — marking as error');
     updateSessionState(record.name, 'error');
-    emitSessionEvent('error', record.name, 'error');
+    emitSessionEvent('error', record.name, message);
     return false;
   }
 
@@ -662,7 +703,7 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     ...effectiveRecord,
     restarts: record.restarts + 1,
     restartTimestamps: [...recentRestarts, now],
-    state: 'running',
+    state: 'idle',
     updatedAt: now,
   };
   upsertSession(updated);
@@ -742,6 +783,96 @@ export interface LaunchOpts {
   userCreated?: boolean;
 }
 
+export interface SessionRelaunchOverrides {
+  agentType?: AgentType;
+  projectDir?: string;
+  label?: string | null;
+  description?: string | null;
+  requestedModel?: string | null;
+  effort?: TransportEffortLevel | null;
+  transportConfig?: Record<string, unknown> | null;
+  ccPreset?: string | null;
+}
+
+export function getCompatibleSessionIds(
+  record: Pick<SessionRecord, 'ccSessionId' | 'codexSessionId' | 'geminiSessionId' | 'opencodeSessionId'>,
+  agentType: AgentType,
+): Pick<LaunchOpts, 'ccSessionId' | 'codexSessionId' | 'geminiSessionId' | 'opencodeSessionId'> {
+  return {
+    ...(isClaudeCodeFamily(agentType) && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
+    ...(isCodexFamily(agentType) && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),
+    ...(agentType === 'gemini' && record.geminiSessionId ? { geminiSessionId: record.geminiSessionId } : {}),
+    ...(agentType === 'opencode' && record.opencodeSessionId ? { opencodeSessionId: record.opencodeSessionId } : {}),
+  };
+}
+
+function stopStructuredWatchers(sessionName: string): void {
+  stopWatching(sessionName);
+  stopCodexWatching(sessionName);
+  stopGeminiWatching(sessionName);
+  stopOpenCodeWatching(sessionName);
+}
+
+export async function stopTransportRuntimeSession(sessionName: string): Promise<void> {
+  const transportRuntime = transportRuntimes.get(sessionName);
+  if (!transportRuntime) return;
+  if (transportRuntime.providerSessionId) unregisterProviderRoute(transportRuntime.providerSessionId);
+  await transportRuntime.kill();
+  transportRuntimes.delete(sessionName);
+}
+
+async function teardownSessionRuntime(record: SessionRecord): Promise<void> {
+  stopStructuredWatchers(record.name);
+  const transportRuntime = transportRuntimes.get(record.name);
+  if (transportRuntime) {
+    await stopTransportRuntimeSession(record.name).catch(() => {});
+    return;
+  }
+  await killSession(record.name).catch(() => {});
+}
+
+export async function relaunchSessionWithSettings(
+  record: SessionRecord,
+  overrides: SessionRelaunchOverrides = {},
+): Promise<void> {
+  const targetAgentType = (overrides.agentType ?? record.agentType) as AgentType;
+  const targetProjectDir = overrides.projectDir ?? record.projectDir;
+  const targetLabel = overrides.label !== undefined ? overrides.label : (record.label ?? null);
+  const targetDescription = overrides.description !== undefined ? overrides.description : (record.description ?? null);
+  const targetRequestedModel = overrides.requestedModel !== undefined ? overrides.requestedModel : (record.requestedModel ?? null);
+  const targetEffort = overrides.effort !== undefined ? overrides.effort : (record.effort ?? null);
+  const targetTransportConfig = overrides.transportConfig !== undefined ? overrides.transportConfig : (record.transportConfig ?? null);
+  const targetCcPreset = overrides.ccPreset !== undefined ? overrides.ccPreset : (record.ccPreset ?? null);
+  const compatibleIds = getCompatibleSessionIds(record, targetAgentType);
+  const preserveTransportBinding = record.runtimeType === RUNTIME_TYPES.TRANSPORT
+    && record.agentType === targetAgentType
+    && typeof record.providerSessionId === 'string'
+    && record.providerSessionId.length > 0;
+
+  await teardownSessionRuntime(record);
+
+  await launchSession({
+    name: record.name,
+    projectName: record.projectName,
+    role: record.role,
+    agentType: targetAgentType,
+    projectDir: targetProjectDir,
+    label: targetLabel ?? undefined,
+    description: targetDescription ?? undefined,
+    requestedModel: targetRequestedModel ?? undefined,
+    effort: targetEffort ?? undefined,
+    transportConfig: targetTransportConfig ?? undefined,
+    ccPreset: targetAgentType === 'claude-code' ? (targetCcPreset ?? undefined) : undefined,
+    ...(preserveTransportBinding ? {
+      bindExistingKey: record.providerSessionId,
+      skipCreate: true,
+    } : {}),
+    ...compatibleIds,
+    ...(record.parentSession ? { parentSession: record.parentSession } : {}),
+    ...(record.userCreated ? { userCreated: true } : {}),
+  });
+}
+
 /** In-memory map of active transport session runtimes */
 const transportRuntimes = new Map<string, TransportSessionRuntime>();
 
@@ -753,11 +884,19 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'high' });
     }
     const mapped = (status === 'streaming' || status === 'thinking') ? 'running' : status;
-    timelineEmitter.emit(sessionName, 'session.state', { state: mapped }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(sessionName, 'session.state', {
+      state: mapped,
+      pendingCount: runtime.pendingCount,
+      pendingMessages: runtime.pendingMessages,
+    }, { source: 'daemon', confidence: 'high' });
   };
   runtime.onDrain = (merged, count) => {
-    timelineEmitter.emit(sessionName, 'user.message', { text: merged, batchedCount: count });
-    timelineEmitter.emit(sessionName, 'session.state', { state: 'running' }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(sessionName, 'user.message', { text: merged, batchedCount: count, allowDuplicate: true });
+    timelineEmitter.emit(sessionName, 'session.state', {
+      state: 'running',
+      pendingCount: runtime.pendingCount,
+      pendingMessages: runtime.pendingMessages,
+    }, { source: 'daemon', confidence: 'high' });
   };
 }
 
@@ -918,7 +1057,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       registerProviderRoute(actualProviderSid, s.name);
       upsertSession({
         ...s,
-        state: 'running',
+        state: 'idle',
         updatedAt: Date.now(),
         ...(freshAfterCancel ? { providerSessionId: actualProviderSid, qwenFreshOnResume: undefined } : {}),
         requestedModel: effectiveQwenModel ?? s.requestedModel,
@@ -946,6 +1085,12 @@ export async function restoreTransportSessions(providerId: string): Promise<void
 export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate, parentSession } = opts;
   const existing = getSession(name);
+  const inheritedClaudeResumeId = opts.ccSessionId ?? (!opts.fresh ? existing?.ccSessionId : undefined);
+  const shouldResumeClaudeCliConversation = agentType === 'claude-code-sdk'
+    && existing?.agentType === 'claude-code'
+    && existing?.runtimeType !== RUNTIME_TYPES.TRANSPORT
+    && typeof inheritedClaudeResumeId === 'string'
+    && inheritedClaudeResumeId.length > 0;
 
   if (opts.fresh) {
     const existingRuntime = transportRuntimes.get(name);
@@ -998,6 +1143,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     }
   } else if (agentType === 'claude-code-sdk') {
     transportResumeId = opts.ccSessionId ?? (!opts.fresh ? getSession(name)?.ccSessionId : undefined) ?? randomUUID();
+    // Switching from Claude CLI -> SDK must resume the inherited conversation.
+    // Re-creating with the same sessionId makes Claude reject the turn with
+    // "Session ID ... is already in use", which is what users were seeing.
+    if (shouldResumeClaudeCliConversation) {
+      effectiveSkipCreate = true;
+    }
     if (opts.ccPreset) {
       const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
       transportEnv = { ...(transportEnv ?? {}), ...(await resolvePresetEnv(opts.ccPreset, transportResumeId)) };
@@ -1036,7 +1187,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
         role,
         agentType,
         projectDir,
-        state: 'running',
+        state: 'idle',
         restarts: 0,
         restartTimestamps: [],
         createdAt: Date.now(),
@@ -1071,7 +1222,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
       emitSessionPersist(record, name);
     }
 
-    emitSessionEvent('started', name, 'running');
+    emitSessionEvent('started', name, 'idle');
     logger.info({ session: name, agentType, providerId: provider.id }, 'Launched transport session');
   } catch (err) {
     // Rollback runtime + route on persistence failure
@@ -1187,7 +1338,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       agentType,
       agentVersion,
       projectDir,
-      state: 'running',
+      state: 'idle',
       restarts: existing?.restarts ?? 0,
       restartTimestamps: existing?.restartTimestamps ?? [],
       createdAt: existing?.createdAt ?? Date.now(),
@@ -1199,6 +1350,9 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ...(opencodeSessionId ? { opencodeSessionId } : {}),
       ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),
       ...(label ? { label } : {}),
+      ...(opts.description ? { description: opts.description } : {}),
+      ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
+      ...(opts.userCreated ? { userCreated: true } : {}),
       ...(familyDisplay ?? {}),
     };
     upsertSession(record);
@@ -1214,6 +1368,9 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
         ...(geminiSessionId ? { geminiSessionId } : {}),
         ...(opencodeSessionId ? { opencodeSessionId } : {}),
         ...(opts.qwenModel ? { qwenModel: opts.qwenModel } : {}),
+        ...(opts.description ? { description: opts.description } : {}),
+        ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
+        ...(opts.userCreated ? { userCreated: true } : {}),
         updatedAt: Date.now(),
       };
       upsertSession(merged);
@@ -1221,7 +1378,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     }
   }
 
-  emitSessionEvent('started', name, 'running');
+  emitSessionEvent('started', name, 'idle');
 
   // Start structured-event watchers for supported agent types
   startStructuredWatcher(name, agentType, projectDir, { ccSessionId, codexSessionId, geminiSessionId, opencodeSessionId });

@@ -21,7 +21,14 @@ describe('model context inference', () => {
     expect(inferContextWindow('gpt-4.1-mini')).toBe(1_000_000);
   });
 
+  it('maps claude opus family to 1M context', () => {
+    expect(inferContextWindow('opus[1M]')).toBe(1_000_000);
+    expect(inferContextWindow('claude-opus-4-1')).toBe(1_000_000);
+    expect(inferContextWindow('claude-opus-4-6')).toBe(1_000_000);
+  });
+
   it('prefers model mapping over stale explicit fallback values', () => {
     expect(resolveContextWindow(400_000, 'gpt-5.4')).toBe(1_000_000);
+    expect(resolveContextWindow(200_000, 'claude-opus-4-1')).toBe(1_000_000);
   });
 });

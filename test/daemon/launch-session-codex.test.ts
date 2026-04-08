@@ -70,16 +70,20 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
   }),
 }));
 
-import { launchSession } from '../../src/agent/session-manager.js';
+import { launchSession, setSessionEventCallback } from '../../src/agent/session-manager.js';
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('launchSession — Codex ID handling', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    setSessionEventCallback(() => {});
   });
 
   it('assigns an explicit codexSessionId before first launch and persists it', async () => {
+    const onSessionEvent = vi.fn();
+    setSessionEventCallback(onSessionEvent);
+
     await launchSession({
       name: 'deck_codex_brain',
       projectName: 'test',
@@ -97,5 +101,7 @@ describe('launchSession — Codex ID handling', () => {
     const upsertCalls = mocks.upsertSession.mock.calls;
     const lastRecord = upsertCalls[upsertCalls.length - 1][0];
     expect(lastRecord.codexSessionId).toBe('new-codex-uuid');
+    expect(lastRecord.state).toBe('idle');
+    expect(onSessionEvent).toHaveBeenCalledWith('started', 'deck_codex_brain', 'idle');
   });
 });

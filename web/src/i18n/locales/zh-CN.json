@@ -18,7 +18,9 @@
     "connected": "已连接",
     "disconnected": "已断开",
     "reconnecting": "重新连接中…",
-    "refresh": "刷新"
+    "refresh": "刷新",
+    "show": "显示",
+    "hide": "隐藏"
   },
   "chat": {
     "loading": "加载聊天记录中...",
@@ -73,6 +75,7 @@
     "no_session": "无会话",
     "send_queued": "重连中… (消息已排队)",
     "transport_send_queued": "已加入队列，当前回复结束后发送",
+    "transport_send_queued_collapsed": "共 {{count}} 条队列消息，仅显示最后一条",
     "send_placeholder": "发送到 {{name}}…",
     "actions": "会话操作",
     "new_btn": "新建会话",
@@ -176,7 +179,9 @@
     "no_changes": "无变更"
   },
   "toast": {
-    "finished": "完成了"
+    "finished": "完成了",
+    "upgrade_blocked_title": "升级已阻止",
+    "upgrade_blocked_p2p_active": "P2P 仍在运行。请先停止，再升级 daemon。"
   },
   "discussion": {
     "role_critic": "批判者",
@@ -354,6 +359,9 @@
       "phase_queued": "排队中",
       "round_label": "轮次",
       "hop_label": "跳转",
+      "auto_follow_latest": "自动跟随最新",
+      "copy_path": "复制路径",
+      "copy_content": "复制内容",
       "scroll_top": "滚动到顶部",
       "scroll_bottom": "滚动到底部"
     },
@@ -364,6 +372,10 @@
     "mode_brainstorm": "头脑风暴",
     "mode_discuss": "讨论",
     "combo_label": "组合流程",
+    "combo_presets": "预设组合",
+    "combo_custom": "我的组合",
+    "combo_custom_empty": "还没有自定义组合。",
+    "combo_builder": "添加新组合",
     "exclude_same_type": "排除同类型",
     "picker": {
       "back": "返回",
@@ -389,11 +401,19 @@
       "discuss": "讨论"
     },
     "mode_config": "配置",
+    "settings_button": "P2P设置",
     "settings_title": "P2P 参与者设置",
     "cross_session": "包含其他项目的会话",
+    "settings_filter_sdk": "SDK",
+    "settings_filter_cli": "CLI",
     "settings_save": "保存",
     "settings_close": "关闭",
     "confirm_cancel": "确定取消?",
+    "combo_send_confirm_title": "确认组合流程发送",
+    "combo_send_confirm_body": "这条消息将直接按组合流程 {{mode}} 发送。是否继续？",
+    "combo_send_confirm_skip": "下次不再提示，直接发送",
+    "combo_empty_message_warning": "组合流程发送必须带正文。先补充实际问题或指令再发送。",
+    "combo_requires_participants_hint": "请先到 P2P 设置里选择参与者，再启用组合流程。",
     "settings_enabled": "参与",
     "settings_mode": "模式",
     "settings_skip": "跳过",
@@ -420,6 +440,25 @@
       "send_anyway": "仍然发送",
       "tip_history": "多 Agent 是共享文件、历史更完整的讨论；一对一则是一次性讨论。"
     }
+  },
+  "openspec": {
+    "title": "OpenSpec",
+    "changes": "变更",
+    "empty": "暂无 OpenSpec 变更",
+    "audit_action": "审计",
+    "audit_implementation_action": "审计实现",
+    "audit_spec_action": "审计规范",
+    "implement_action": "实现",
+    "achieve_action": "完成",
+    "propose_action": "Propose",
+    "propose_from_discussion_action": "根据最近讨论生成",
+    "propose_from_description_action": "根据下面的描述生成",
+    "audit_implementation_prompt": "对 {{reference}} 执行严格的实现审计，逐项对照其 OpenSpec 产物。找出所有不一致、遗漏、回归风险、边界场景缺口和缺失测试；然后直接修复代码、测试以及必要的配套改动。不要停留在报告层面，必须把实现修到与规范完全一致。",
+    "audit_spec_prompt": "对 {{reference}} 执行严格的规范审计。强化范围定义、需求、验收标准、边界场景、失败模式、依赖关系与可测试性，消除歧义和内部不一致，把规范修到可直接落地实施的质量。不要只给审查意见，直接修规范。",
+    "implement_prompt": "强力推进 {{reference}} 的实施。把工作拆成明确子任务，给子代理分配清晰所有权，整合输出，逐项补齐与规范的差距，补充或更新测试，并对最终结果负责验收。你负责调度、技术决策、集成收口和最终质量把关。",
+    "achieve_prompt": "按完整 OpenSpec 工作流把 {{reference}} 推到完成。检查所有剩余任务和产物，完成必要的实现与规范工作，关闭未完成项，必要时同步受影响的主规范，并在满足完成条件后归档该变更。不要只汇报状态，直接把它做完。",
+    "propose_from_discussion_prompt": "根据最近的讨论生成一个 OpenSpec proposal。提炼目标、范围、关键需求和验收标准；不明确的部分明确列为待确认项。先给出可直接落库的 change proposal 草稿。",
+    "propose_from_description_prompt": "根据下面的描述生成一个 OpenSpec proposal。整理目标、范围、关键需求和验收标准；缺失信息明确列为待确认项。先给出可直接落库的 change proposal 草稿。"
   },
   "upload": {
     "upload_file": "上传文件",
@@ -580,6 +619,24 @@
     "expand_all": "全部展开",
     "collapse_all": "全部折叠",
     "drag_to_resize": "拖动调整宽度"
+  },
+  "subsessionBar": {
+    "show": "显示",
+    "hide": "隐藏",
+    "layout_double": "双行",
+    "layout_single": "单行",
+    "card_size": "卡片尺寸",
+    "subs_count": "Subs（{{count}}）",
+    "new_sub_session": "新建子会话",
+    "p2p_discussions": "P2P 讨论",
+    "repository": "仓库",
+    "scheduled_tasks": "定时任务",
+    "width_short": "宽",
+    "height_short": "高",
+    "apply": "应用",
+    "reset": "重置",
+    "empty_prefix": "还没有子会话，点击",
+    "empty_suffix": "添加一个"
   },
   "localWebPreview": {
     "title": "本地网页预览",

@@ -38,12 +38,17 @@ interface NativePasswordSetupState {
  * ASWebAuthenticationSession should detect at least one of these.
  */
 function navigateToCallback(url: string) {
+  if (typeof window === 'undefined') return;
   // Method 1: direct assignment
   window.location.href = url;
   // Method 2: replace (in case href doesn't work)
-  setTimeout(() => { try { window.location.replace(url); } catch { /* ignore */ } }, 200);
+  setTimeout(() => {
+    if (typeof window === 'undefined') return;
+    try { window.location.replace(url); } catch { /* ignore */ }
+  }, 200);
   // Method 3: anchor click
   setTimeout(() => {
+    if (typeof document === 'undefined') return;
     const a = document.createElement('a');
     a.href = url;
     a.style.display = 'none';
@@ -51,7 +56,10 @@ function navigateToCallback(url: string) {
     a.click();
   }, 400);
   // Method 4: open
-  setTimeout(() => { try { window.open(url, '_self'); } catch { /* ignore */ } }, 600);
+  setTimeout(() => {
+    if (typeof window === 'undefined') return;
+    try { window.open(url, '_self'); } catch { /* ignore */ }
+  }, 600);
 }
 
 export function NativeAuthBridge({ callbackUrl }: Props) {

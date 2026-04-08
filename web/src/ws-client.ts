@@ -6,6 +6,7 @@ import type { TerminalDiff } from './types.js';
 import { apiFetch, ApiError } from './api.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { REPO_MSG } from '@shared/repo-types.js';
+import { DAEMON_MSG } from '@shared/daemon-events.js';
 import type {
   FsLsResponse,
   FsReadResponse,
@@ -26,8 +27,9 @@ export type ServerMessage =
   | { type: 'session.idle'; session: string; project: string; agentType: string; label?: string; parentLabel?: string }
   | { type: 'session.notification'; session: string; project: string; title: string; message: string; agentType?: string; label?: string; parentLabel?: string }
   | { type: 'session.tool'; session: string; tool: string | null }
-  | { type: 'daemon.reconnected' }
-  | { type: 'daemon.disconnected' }
+  | { type: typeof DAEMON_MSG.RECONNECTED }
+  | { type: typeof DAEMON_MSG.DISCONNECTED }
+  | { type: typeof DAEMON_MSG.UPGRADE_BLOCKED; reason: 'p2p_active'; activeRunIds?: string[] }
   | { type: 'daemon.error'; kind: 'uncaughtException' | 'unhandledRejection' | 'warning'; message: string; stack?: string; ts: number }
   | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; project: string; role: string; agentType: string; agentVersion?: string; state: string; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel }> }
   | { type: 'outbound'; platform: string; channelId: string; content: string }
@@ -57,8 +59,8 @@ export type ServerMessage =
   | { type: 'p2p.run_started'; runId: string; session: string }
   | { type: 'p2p.cancel_response'; runId: string; ok: boolean }
   | { type: 'p2p.status_response'; runId?: string; run?: any; runs?: any[] }
-  | { type: 'p2p.list_discussions_response'; discussions: Array<{ id: string; fileName: string; preview: string; mtime: number }> }
-  | { type: 'p2p.read_discussion_response'; id?: string; content?: string; error?: string }
+  | { type: 'p2p.list_discussions_response'; discussions: Array<{ id: string; fileName: string; path?: string; preview: string; mtime: number }> }
+  | { type: 'p2p.read_discussion_response'; id?: string; requestId?: string; content?: string; error?: string }
   | { type: 'cc.presets.list_response'; presets: Array<{ name: string; env: Record<string, string>; contextWindow?: number }> }
   | { type: 'cc.presets.save_response'; ok: boolean }
   | FsGitDiffResponse
@@ -114,6 +116,9 @@ export class WsClient {
 
   /** Per-session callbacks for raw PTY binary frames. Supports multiple subscribers per session. */
   private _terminalRawHandlers = new Map<string, Set<(data: Uint8Array) => void>>();
+
+  /** Desired terminal subscription mode per session. Replayed on browser reconnect. */
+  private terminalSubscriptions = new Map<string, boolean>();
 
   /** Per-session stream reset recovery state. */
   private resetState = new Map<string, {
@@ -196,11 +201,13 @@ export class WsClient {
   }
 
   subscribeTerminal(sessionName: string, raw: boolean): void {
+    this.terminalSubscriptions.set(sessionName, raw);
     if (!this._connected) return;
     this.send({ type: 'terminal.subscribe', session: sessionName, raw });
   }
 
   unsubscribeTerminal(sessionName: string): void {
+    this.terminalSubscriptions.delete(sessionName);
     if (!this._connected) return;
     this.send({ type: 'terminal.unsubscribe', session: sessionName });
   }
@@ -483,6 +490,13 @@ export class WsClient {
       this._connected = true;
       this.reconnectAttempt = 0;
       this.startHeartbeat();
+      for (const [session, raw] of this.terminalSubscriptions) {
+        try {
+          this.send({ type: 'terminal.subscribe', session, raw });
+        } catch {
+          break;
+        }
+      }
       this.dispatch({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
     });
 

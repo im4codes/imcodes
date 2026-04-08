@@ -1354,7 +1354,7 @@ describe('WsBridge', () => {
       expect(msg.activeModel).toBe('sonnet');
       expect(msg.effort).toBe('high');
       expect(msg.transportConfig).toEqual({ provider: { mode: 'safe' } });
-      expect(msg.state).toBe('running');
+      expect(msg.state).toBe('idle');
     });
 
     it('subsession.closed from daemon → updates DB + broadcasts subsession.removed to browsers', async () => {
@@ -1375,6 +1375,36 @@ describe('WsBridge', () => {
       expect(msg.sessionName).toBe('deck_sub_sub-456');
     });
 
+    it('subsession.closed does not broadcast removal when DB persistence fails', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      const failingDb = {
+        ...makeDb('valid-hash'),
+        execute: vi.fn().mockImplementation(async (sql: string) => {
+          if (sql.includes('UPDATE sub_sessions SET closed_at')) {
+            throw new Error('db write failed');
+          }
+          return { changes: 1 };
+        }),
+      } as unknown as import('../src/db/client.js').Database;
+      bridge.handleDaemonConnection(daemonWs as never, failingDb, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', failingDb);
+      browserWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'subsession.closed',
+        id: 'sub-456',
+        sessionName: 'deck_sub_sub-456',
+      }));
+      await flushAsync();
+
+      expect(browserWs.sentStrings).toHaveLength(0);
+    });
+
     it('subsession.closed without id → no broadcast', async () => {
       const { daemonWs, browserWs } = await setupAuthBridge();
 
@@ -1386,6 +1416,46 @@ describe('WsBridge', () => {
       await flushAsync();
 
       expect(browserWs.sentStrings).toHaveLength(0);
+    });
+
+    it('subsession.closed clears only the matching descendant cache while preserving other sub-sessions', async () => {
+      const { bridge, daemonWs, browserWs } = await setupAuthBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          eventId: 'sub-a-1',
+          sessionId: 'deck_sub_alpha',
+          ts: 1,
+          type: 'assistant.text',
+          payload: { text: 'alpha text' },
+        },
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          eventId: 'sub-b-1',
+          sessionId: 'deck_sub_beta',
+          ts: 2,
+          type: 'assistant.text',
+          payload: { text: 'beta text' },
+        },
+      }));
+      await flushAsync();
+      expect(bridge.getRecentText('deck_sub_alpha')).toHaveLength(1);
+      expect(bridge.getRecentText('deck_sub_beta')).toHaveLength(1);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'subsession.closed',
+        id: 'alpha',
+        sessionName: 'deck_sub_alpha',
+      }));
+      await flushAsync();
+
+      expect(bridge.getRecentText('deck_sub_alpha')).toHaveLength(0);
+      expect(bridge.getRecentText('deck_sub_beta')).toHaveLength(1);
+      const msg = JSON.parse(browserWs.sentStrings.at(-1) ?? '{}');
+      expect(msg).toMatchObject({ type: 'subsession.removed', id: 'alpha', sessionName: 'deck_sub_alpha' });
     });
 
     it('p2p.conflict from daemon → broadcasts to all browsers', async () => {
@@ -1438,10 +1508,30 @@ describe('WsBridge', () => {
   describe('push notifications', () => {
     function makePushDb(tokenHash: string) {
       return {
-        queryOne: async (sql: string) => {
+        queryOne: async (sql: string, params?: unknown[]) => {
           if (sql.includes('FROM servers')) return { token_hash: tokenHash, user_id: 'user-1', name: 'my-server' };
-          if (sql.includes('FROM sessions')) return { project_name: 'codedeck', agent_type: 'claude-code', label: null };
-          return { token_hash: tokenHash };
+          if (sql.includes('FROM sessions') && params?.[1] === 'deck_cd_brain') {
+            return { project_name: 'codedeck', agent_type: 'claude-code', label: null };
+          }
+          if (sql.includes('FROM sessions') && params?.[1] === 'bootmainxowfy6') {
+            return { project_name: 'codedeck', agent_type: 'claude-code', label: 'Boot Main' };
+          }
+          if (sql.includes('FROM sub_sessions')) {
+            if (params?.[1] === 'unlabeled') {
+              return { type: 'codex', label: null, parent_session: '' };
+            }
+            if (params?.[1] === 'needs-main-label') {
+              return { type: 'codex', label: null, parent_session: 'bootmainxowfy6' };
+            }
+            if (params?.[1] === 'nested') {
+              return { type: 'shell', label: null, parent_session: 'deck_sub_parent' };
+            }
+            if (params?.[1] === 'parent') {
+              return { type: 'codex', label: null, parent_session: 'deck_cd_brain' };
+            }
+            return { type: 'codex', label: 'worker-1', parent_session: 'deck_cd_brain' };
+          }
+          return null;
         },
         query: async () => [],
         execute: async () => ({ changes: 1 }),
@@ -1473,10 +1563,174 @@ describe('WsBridge', () => {
       expect(dispatchPush).toHaveBeenCalled();
       const call = vi.mocked(dispatchPush).mock.calls[0];
       const payload = call[0];
-      expect(payload.title).toContain('my-server');
-      expect(payload.title).toContain('codedeck');
-      expect(payload.title).toContain('claude-code');
+      expect(payload.title).toBe('my-server · codedeck · claude-code');
       expect(payload.body).toContain('Done implementing');
+    });
+
+    it('prefers sub-session label over session name in push title', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle',
+        session: 'deck_sub_ab12cd34',
+        lastText: 'Stopped early.',
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls[0][0];
+      expect(payload.title).toBe('my-server · worker-1 · codex');
+      expect(payload.title).not.toContain('deck_sub_ab12cd34');
+    });
+
+    it('resolves hyphenated sub-session ids before falling back to internal session names', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle',
+        session: 'deck_sub_sub-123',
+        lastText: 'Done.',
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls[0][0];
+      expect(payload.title).toBe('my-server · worker-1 · codex');
+      expect(payload.title).not.toContain('deck_sub_sub-123');
+    });
+
+    it('prefers active session snapshot labels over internal main session names in push title', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session_list',
+        sessions: [{
+          name: 'bootmainxowfy6',
+          project: 'codedeck',
+          state: 'idle',
+          agentType: 'claude-code',
+          label: 'Boot Main',
+        }],
+      }));
+      await flushAsync();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle',
+        session: 'bootmainxowfy6',
+        lastText: 'Ready.',
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
+      expect(payload?.title).toBe('my-server · Boot Main · claude-code');
+      expect(payload?.title).not.toContain('bootmainxowfy6');
+    });
+
+    it('prefers stored main-session labels before daemon project fallbacks in push title', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle',
+        session: 'bootmainxowfy6',
+        project: 'Readable Main',
+        agentType: 'claude-code',
+        lastText: 'Ready.',
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
+      expect(payload?.title).toBe('my-server · Boot Main · claude-code');
+      expect(payload?.title).not.toContain('bootmainxowfy6');
+    });
+
+    it('uses parent/project fallback before internal sub-session names in push title', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle',
+        session: 'deck_sub_unlabeled',
+        project: 'Readable Main',
+        agentType: 'codex',
+        lastText: 'Ready.',
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
+      expect(payload?.title).toBe('my-server · Readable Main · codex');
+      expect(payload?.title).not.toContain('deck_sub_unlabeled');
+    });
+
+    it('walks nested sub-session parents until it finds a readable main-session title', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle',
+        session: 'deck_sub_nested',
+        project: 'deck_sub_nested',
+        parentLabel: 'deck_sub_parent',
+        agentType: 'shell',
+        lastText: 'Ready.',
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
+      expect(payload?.title).toBe('my-server · codedeck · shell');
+      expect(payload?.title).not.toContain('deck_sub_nested');
+      expect(payload?.title).not.toContain('deck_sub_parent');
+    });
+
+    it('prefers stored parent labels over opaque daemon parent/project names in push title', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle',
+        session: 'deck_sub_needs-main-label',
+        parentLabel: 'bootmainxowfy6',
+        project: 'bootmainxowfy6',
+        agentType: 'codex',
+        lastText: 'Ready.',
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
+      expect(payload?.title).toBe('my-server · Boot Main · codex');
+      expect(payload?.title).not.toContain('bootmainxowfy6');
+    });
+
+    it('uses cached sub-session labels for timeline idle pushes before explicit session.idle arrives', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'subsession.sync',
+        id: 'timeline-worker',
+        sessionType: 'codex',
+        label: 'Worker Timeline',
+        parentSession: 'deck_cd_brain',
+      }));
+      await flushAsync();
+      vi.mocked(dispatchPush).mockClear();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          sessionId: 'deck_sub_timeline-worker',
+          eventId: 'evt-1',
+          ts: Date.now(),
+          type: 'session.state',
+          payload: { state: 'idle' },
+        },
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
+      expect(payload?.title).toBe('my-server · Worker Timeline · codex');
+      expect(payload?.title).not.toContain('deck_sub_timeline-worker');
     });
 
     it('uses lastText as push body for session.idle', async () => {

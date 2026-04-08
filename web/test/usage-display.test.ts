@@ -29,6 +29,12 @@ describe('usage display behavior', () => {
     expect(view.pctStr).toBe('50');
   });
 
+  it('uses 1M context for claude opus even when explicit context is stale', () => {
+    const view = usageSummary(210_000, 105_000, 200_000, 'claude-opus-4-1');
+    expect(view.ctx).toBe(1_000_000);
+    expect(view.pctStr).toBe('32');
+  });
+
   it('keeps model labels consistent across GPT-5.4 variants', () => {
     expect(usageSummary(1, 1, undefined, 'gpt-5.4').label).toBe('gpt-5.4');
     expect(usageSummary(1, 1, undefined, 'gpt-5.4-mini').label).toBe('gpt-5.4-mini');

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { WsClient } from '../src/ws-client.js';
+import { DAEMON_MSG } from '@shared/daemon-events.js';
 import type { MessageHandler } from '../src/ws-client.js';
 
 // Mock WebSocket implementation
@@ -214,6 +215,44 @@ describe('WsClient', () => {
       client.disconnect();
     });
 
+    it('replays remembered terminal subscriptions immediately after reconnect', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const firstWs = lastWs!;
+
+      client.subscribeTerminal('chat-session', false);
+      client.subscribeTerminal('terminal-session', true);
+      firstWs.send.mockClear();
+
+      firstWs.emit('close');
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const secondWs = lastWs!;
+      expect(secondWs).not.toBe(firstWs);
+
+      secondWs.emit('open');
+
+      expect(secondWs.send).toHaveBeenCalledTimes(3);
+      expect(JSON.parse(secondWs.send.mock.calls[0][0] as string)).toEqual({ type: 'ping' });
+      expect(JSON.parse(secondWs.send.mock.calls[1][0] as string)).toEqual({
+        type: 'terminal.subscribe',
+        session: 'chat-session',
+        raw: false,
+      });
+      expect(JSON.parse(secondWs.send.mock.calls[2][0] as string)).toEqual({
+        type: 'terminal.subscribe',
+        session: 'terminal-session',
+        raw: true,
+      });
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
     it('retries terminal.stream_reset with raw=true', async () => {
       const client = await connectClient();
       vi.useFakeTimers();
@@ -259,8 +298,8 @@ describe('WsClient', () => {
       client.onMessage(handler);
       handler.mockClear();
 
-      lastWs!.emit('message', { data: JSON.stringify({ type: 'daemon.disconnected' }) });
-      expect(handler).toHaveBeenCalledWith({ type: 'daemon.disconnected' });
+      lastWs!.emit('message', { data: JSON.stringify({ type: DAEMON_MSG.DISCONNECTED }) });
+      expect(handler).toHaveBeenCalledWith({ type: DAEMON_MSG.DISCONNECTED });
       client.disconnect();
     });
 
@@ -270,16 +309,27 @@ describe('WsClient', () => {
       client.onMessage(handler);
       handler.mockClear();
 
-      lastWs!.emit('message', { data: JSON.stringify({ type: 'daemon.reconnected' }) });
-      expect(handler).toHaveBeenCalledWith({ type: 'daemon.reconnected' });
+      lastWs!.emit('message', { data: JSON.stringify({ type: DAEMON_MSG.RECONNECTED }) });
+      expect(handler).toHaveBeenCalledWith({ type: DAEMON_MSG.RECONNECTED });
       client.disconnect();
     });
 
     it('stays connected (browser WS alive) even when daemon.disconnected arrives', async () => {
       const client = await connectClient();
-      lastWs!.emit('message', { data: JSON.stringify({ type: 'daemon.disconnected' }) });
+      lastWs!.emit('message', { data: JSON.stringify({ type: DAEMON_MSG.DISCONNECTED }) });
       // The browser WebSocket should still be connected
       expect(client.connected).toBe(true);
+      client.disconnect();
+    });
+
+    it('dispatches daemon.upgrade_blocked to handlers', async () => {
+      const client = await connectClient();
+      const handler = vi.fn();
+      client.onMessage(handler);
+      handler.mockClear();
+
+      lastWs!.emit('message', { data: JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'p2p_active', activeRunIds: ['run_1'] }) });
+      expect(handler).toHaveBeenCalledWith({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'p2p_active', activeRunIds: ['run_1'] });
       client.disconnect();
     });
   });
