@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  */
 import { h } from 'preact';
-import { render, waitFor, cleanup } from '@testing-library/preact';
+import { render, waitFor, cleanup, fireEvent } from '@testing-library/preact';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { ChatView } from '../../src/components/ChatView.js';
 
@@ -208,5 +208,100 @@ describe('ChatView', () => {
     emitVisualViewport('resize');
 
     expect(scrollTopValue).toBe(1000);
+  });
+
+  it('keeps the chat pinned to bottom when the mobile keyboard closes', async () => {
+    const initialEvents = [
+      {
+        eventId: 'evt-1',
+        type: 'assistant.text',
+        ts: 1000,
+        payload: { text: 'hello' },
+      },
+    ] as any;
+
+    const { container } = render(
+      <ChatView
+        events={initialEvents}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    let scrollTopValue = 0;
+    let scrollHeightValue = 1200;
+    let clientHeightValue = 200;
+    Object.defineProperty(scrollEl, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (value) => { scrollTopValue = value; },
+    });
+    Object.defineProperty(scrollEl, 'scrollHeight', {
+      configurable: true,
+      get: () => scrollHeightValue,
+    });
+    Object.defineProperty(scrollEl, 'clientHeight', {
+      configurable: true,
+      get: () => clientHeightValue,
+    });
+
+    await waitFor(() => {
+      expect(scrollTopValue).toBe(1200);
+    });
+
+    document.dispatchEvent(new FocusEvent('focusin'));
+
+    scrollTopValue = 0;
+    scrollHeightValue = 1600;
+    visualViewportMock.height = 900;
+    emitVisualViewport('resize');
+
+    await waitFor(() => {
+      expect(scrollTopValue).toBe(1600);
+    });
+  });
+
+  it('ignores transient top jumps while auto-follow is active instead of loading older history', async () => {
+    const onLoadOlder = vi.fn();
+    const initialEvents = [
+      {
+        eventId: 'evt-1',
+        type: 'assistant.text',
+        ts: 1000,
+        payload: { text: 'hello' },
+      },
+    ] as any;
+
+    const { container } = render(
+      <ChatView
+        events={initialEvents}
+        loading={false}
+        sessionId="deck_main_brain"
+        onLoadOlder={onLoadOlder}
+      />,
+    );
+
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    let scrollTopValue = 0;
+    Object.defineProperty(scrollEl, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (value) => { scrollTopValue = value; },
+    });
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1200 });
+    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 200 });
+
+    await waitFor(() => {
+      expect(scrollTopValue).toBe(1200);
+    });
+
+    scrollTopValue = 0;
+    fireEvent.scroll(scrollEl);
+
+    await waitFor(() => {
+      expect(scrollTopValue).toBe(1200);
+    });
+    expect(onLoadOlder).not.toHaveBeenCalled();
   });
 });

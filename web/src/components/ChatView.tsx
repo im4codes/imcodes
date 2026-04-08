@@ -329,6 +329,12 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
 
   const autoScrollRef = useRef(true);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
+  const lastScrollTopRef = useRef(0);
+  const suppressLoadOlderUntilRef = useRef(0);
+
+  const suppressLoadOlder = useCallback((durationMs = 1200) => {
+    suppressLoadOlderUntilRef.current = Date.now() + durationMs;
+  }, []);
 
   // Track tool.call events to trigger file panel refresh
   const [filePanelRefreshTrigger, setFilePanelRefreshTrigger] = useState(0);
@@ -397,7 +403,9 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
     const el = scrollRef.current;
     if (!el) return;
     autoScrollRef.current = true;
+    suppressLoadOlder();
     el.scrollTop = el.scrollHeight;
+    lastScrollTopRef.current = el.scrollTop;
   };
 
   // On session change, reset scroll position to bottom
@@ -425,16 +433,19 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
       if (!el) return;
       savedBottomOffset = Math.max(0, el.scrollHeight - el.scrollTop - el.clientHeight);
       savedWasNearBottom = savedBottomOffset < 150;
+      suppressLoadOlder();
     };
     const onResize = () => {
       const el = scrollRef.current;
       if (!el) return;
-      if (vv.height < prevHeight) {
+      if (vv.height !== prevHeight) {
+        suppressLoadOlder();
         if (savedWasNearBottom || autoScrollRef.current) {
-          scrollToBottom();
-        } else {
+          requestAnimationFrame(() => scrollToBottom());
+        } else if (vv.height < prevHeight) {
           const targetTop = Math.max(0, el.scrollHeight - el.clientHeight - savedBottomOffset);
           el.scrollTop = targetTop;
+          lastScrollTopRef.current = el.scrollTop;
         }
       }
       prevHeight = vv.height;
@@ -525,17 +536,31 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
   const handleScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
+    const scrollTop = el.scrollTop;
+    const scrollHeight = el.scrollHeight;
+    const clientHeight = el.clientHeight;
+    const wasAutoFollowing = autoScrollRef.current;
+    const transientTopJump = wasAutoFollowing
+      && scrollTop < 100
+      && lastScrollTopRef.current > 100
+      && Date.now() < suppressLoadOlderUntilRef.current;
+    if (transientTopJump) {
+      setShowScrollBtn(false);
+      requestAnimationFrame(() => scrollToBottom());
+      return;
+    }
     // Use generous threshold — 150px from bottom still counts as "at bottom"
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 150;
+    const atBottom = scrollHeight - scrollTop - clientHeight < 150;
     autoScrollRef.current = atBottom;
     setShowScrollBtn(!atBottom);
     if (!atBottom) lastScrollActivityRef.current = Date.now();
+    lastScrollTopRef.current = scrollTop;
     // Auto-trigger load older when scrolled near top
-    if (el.scrollTop < 100 && onLoadOlder && hasOlderHistory && !loadingOlder && !loading) {
+    if (scrollTop < 100 && onLoadOlder && hasOlderHistory && !loadingOlder && !loading) {
       const now = Date.now();
       if (now - lastLoadOlderAtRef.current >= LOAD_OLDER_COOLDOWN_MS) {
         lastLoadOlderAtRef.current = now;
-        scrollAnchorRef.current = { scrollHeight: el.scrollHeight };
+        scrollAnchorRef.current = { scrollHeight };
         onLoadOlder();
       }
     }
