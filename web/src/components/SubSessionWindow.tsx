@@ -164,6 +164,7 @@ export function SubSessionWindow({
     quotaMeta: sub.quotaMeta ?? undefined,
     effort: sub.effort ?? undefined,
     runtimeType: sub.runtimeType ?? undefined,
+    transportPendingMessages: sub.transportPendingMessages ?? undefined,
   };
 
   useEffect(() => {

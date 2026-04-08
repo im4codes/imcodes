@@ -38,8 +38,10 @@ vi.mock('../../src/hooks/useTimeline.js', () => ({
   useTimeline: () => ({ events: timelineEvents, refreshing: false }),
 }));
 
+const sessionControlsSpy = vi.fn((props: any) => <div data-testid="session-controls" data-queued={(props.activeSession?.transportPendingMessages ?? []).join('|')} />);
+
 vi.mock('../../src/components/SessionControls.js', () => ({
-  SessionControls: () => null,
+  SessionControls: (props: any) => sessionControlsSpy(props),
 }));
 
 import { SubSessionCard } from '../../src/components/SubSessionCard.js';
@@ -293,6 +295,26 @@ describe('SubSessionCard', () => {
 
     await waitFor(() => {
       expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', { sessionName: 'deck_sub_sub-card-1', text: '/stop' });
+    });
+  });
+
+  it('passes queued transport messages through to shared session controls in compact mode', async () => {
+    render(
+      <SubSessionCard
+        sub={makeSubSession({ runtimeType: 'transport', transportPendingMessages: ['queued send'] } as any)}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        quickData={{} as any}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const controls = document.querySelector('[data-testid="session-controls"]') as HTMLElement | null;
+      expect(controls?.dataset.queued).toBe('queued send');
     });
   });
 });

@@ -19,7 +19,7 @@ vi.mock('../../src/components/ChatView.js', () => ({
   ChatView: () => null,
 }));
 
-const sessionControlsSpy = vi.fn((props: any) => <div data-testid="session-controls" data-model={props.activeSession?.modelDisplay ?? ''} data-effort={props.activeSession?.effort ?? ''} data-quota={props.activeSession?.quotaLabel ?? ''} />);
+const sessionControlsSpy = vi.fn((props: any) => <div data-testid="session-controls" data-model={props.activeSession?.modelDisplay ?? ''} data-effort={props.activeSession?.effort ?? ''} data-quota={props.activeSession?.quotaLabel ?? ''} data-queued={(props.activeSession?.transportPendingMessages ?? []).join('|')} />);
 const usageFooterSpy = vi.fn((props: any) => <div data-testid="usage-footer" data-quota={props.quotaLabel ?? ''} />);
 
 vi.mock('../../src/components/SessionControls.js', () => ({
@@ -127,6 +127,36 @@ describe('SubSessionWindow metadata wiring', () => {
       expect(controls?.dataset.effort).toBe('high');
       expect(controls?.dataset.quota).toContain('5h 11%');
       expect(footer?.dataset.quota).toContain('5h 11%');
+    });
+  });
+
+  it('passes queued transport messages through to shared session controls for sub-sessions', async () => {
+    const sub = makeSubSession({
+      type: 'claude-code-sdk',
+      runtimeType: 'transport' as any,
+      transportPendingMessages: ['queued one', 'queued two'],
+    } as any);
+
+    render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const controls = document.querySelector('[data-testid="session-controls"]') as HTMLElement | null;
+      expect(controls?.dataset.queued).toBe('queued one|queued two');
     });
   });
 });
