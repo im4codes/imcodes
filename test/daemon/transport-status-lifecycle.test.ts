@@ -200,18 +200,18 @@ describe('batched queuing', () => {
     expect(runtime.getStatus()).toBe('thinking');
   });
 
-  it('on cancel, pending messages are cleared (not drained)', () => {
+  it('on cancel, pending messages are drained into the next turn', () => {
     runtime.send('first');
-    runtime.send('will-be-dropped');
-    runtime.send('also-dropped');
+    runtime.send('still-queued');
+    runtime.send('send-after-stop');
 
     runtime.cancel();
     mock.fireCancelled('sess-1');
 
-    // Cancel clears pending → no drain, no second send
-    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', 'still-queued\n\nsend-after-stop', undefined, undefined);
     expect(runtime.pendingCount).toBe(0);
-    expect(runtime.getStatus()).toBe('idle');
+    expect(runtime.getStatus()).toBe('thinking');
   });
 
   it('multiple turns with queuing: correct history order', () => {

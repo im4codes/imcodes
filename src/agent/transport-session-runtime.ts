@@ -155,8 +155,6 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
-    // Clear pending — user cancelled, they don't want queued messages either
-    this._pendingMessages = [];
     if (!this.provider.cancel) return;
     await this.provider.cancel(this._providerSessionId);
   }

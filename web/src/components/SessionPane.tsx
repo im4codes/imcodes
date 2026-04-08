@@ -270,7 +270,9 @@ export function SessionPane({
           inputRef={inputRef}
           onAfterAction={onAfterAction}
           onSend={(_name, text) => {
-            addOptimisticUserMessage(text);
+            if (session.runtimeType !== 'transport') {
+              addOptimisticUserMessage(text);
+            }
             scrollToBottom();
           }}
           onStopProject={onStopProject}

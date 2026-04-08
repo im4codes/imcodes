@@ -837,7 +837,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const finalizeSend = useCallback((payload: PendingSendPayload, options?: { clearComposer?: boolean }) => {
     if (!ws || !activeSession) return;
-    // Transport sessions queue messages internally — no frontend notice needed
+    if (activeSession.runtimeType === 'transport' && activeSession.state === 'running') {
+      setQueuedNoticeVisible(true);
+    }
     quickData.recordHistory(payload.text, activeSession.name);
     try {
       ws.sendSessionCommand('send', { sessionName: activeSession.name, text: payload.text, ...payload.extra });

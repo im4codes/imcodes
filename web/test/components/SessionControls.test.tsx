@@ -688,7 +688,7 @@ describe('SessionControls', () => {
   });
 
 
-  it('sends message to running transport session without blocking (queuing is daemon-side)', () => {
+  it('shows a bottom queued notice when sending to a running transport session', () => {
     const ws = makeWs();
     const runningSession = makeSession({
       name: 'qwen-session',
@@ -714,8 +714,7 @@ describe('SessionControls', () => {
       sessionName: 'qwen-session',
       text: 'queued send',
     });
-    // No frontend queued notice — transport runtime queues internally
-    expect(screen.queryByText('transport_send_queued')).toBeNull();
+    expect(screen.getByText('transport_send_queued')).toBeDefined();
   });
 
   it('pressing Escape in a running transport input sends /stop command', () => {

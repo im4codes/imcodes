@@ -1353,7 +1353,6 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted', session: sessionName }); } catch {}
         return;
       }
-      timelineEmitter.emit(sessionName, 'user.message', { text });
       if (record?.agentType === 'qwen' && record.qwenAuthType === 'qwen-oauth') {
         recordQwenOAuthRequest();
         refreshQwenQuotaUsageLabels(serverLink);
@@ -1361,6 +1360,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       // send() is synchronous: dispatches immediately if idle, queues if busy.
       // Status changes come from transport runtime's onStatusChange callback.
       const result = transportRuntime.send(text);
+      if (result === 'sent') {
+        timelineEmitter.emit(sessionName, 'user.message', { text });
+      }
       if (result === 'queued') {
         timelineEmitter.emit(sessionName, 'session.state', { state: 'queued', pendingCount: transportRuntime.pendingCount }, { source: 'daemon', confidence: 'high' });
       }
