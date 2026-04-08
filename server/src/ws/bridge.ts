@@ -39,6 +39,7 @@ import {
 import { LocalWebPreviewRegistry } from '../preview/registry.js';
 import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions } from '../db/queries.js';
 import logger from '../util/logger.js';
+import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
 
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
@@ -2129,6 +2130,83 @@ export class WsBridge {
   private lastPushAt = new Map<string, number>();
   private static readonly PUSH_DEDUP_MS = 10_000;
 
+  private async resolveReadablePushDisplay(
+    db: Database,
+    sessionName: string,
+    daemonLabel: string | undefined,
+    daemonParentLabel: string | undefined,
+    daemonProject: string | undefined,
+  ): Promise<{
+    displayName: string;
+    agentType?: string;
+  }> {
+    const visited = new Set<string>();
+    const activeMainSession = this.activeMainSessions.get(sessionName);
+    let effectiveAgentType = pickReadableSessionDisplay([activeMainSession?.agentType], sessionName);
+    let currentSessionName: string | undefined = sessionName;
+    let displayName = pickReadableSessionDisplay([daemonLabel], sessionName);
+
+    while (currentSessionName && !visited.has(currentSessionName)) {
+      visited.add(currentSessionName);
+
+      const active = this.activeMainSessions.get(currentSessionName);
+      let sessionRow = await db.queryOne<{ project_name: string; agent_type: string; label: string | null }>(
+        'SELECT project_name, agent_type, label FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
+        [this.serverId, currentSessionName],
+      ).catch(() => null);
+
+      let parentSession: string | undefined;
+      let subType: string | undefined;
+      if (!sessionRow && currentSessionName.startsWith('deck_sub_')) {
+        const subRow: { type: string; label: string | null; parent_session: string | null } | null = await db
+          .queryOne<{ type: string; label: string | null; parent_session: string | null }>(
+            'SELECT type, label, parent_session FROM sub_sessions WHERE server_id = $1 AND id = $2 LIMIT 1',
+            [this.serverId, currentSessionName.replace(/^deck_sub_/, '')],
+          )
+          .catch(() => null);
+        if (subRow) {
+          subType = subRow.type;
+          parentSession = subRow.parent_session ?? undefined;
+          const subDisplay = pickReadableSessionDisplay([subRow.label], currentSessionName);
+          if (!displayName && subDisplay) displayName = subDisplay;
+        }
+      }
+
+      effectiveAgentType = effectiveAgentType
+        || subType
+        || active?.agentType
+        || sessionRow?.agent_type
+        || undefined;
+
+      if (!displayName) {
+        const candidate = pickReadableSessionDisplay(
+          [
+            active?.label,
+            sessionRow?.label,
+            currentSessionName === sessionName ? daemonParentLabel : undefined,
+            currentSessionName === sessionName ? daemonProject : undefined,
+            active?.project,
+            sessionRow?.project_name,
+          ],
+          currentSessionName,
+        );
+        if (candidate) displayName = candidate;
+      }
+
+      if (displayName) break;
+      currentSessionName = parentSession;
+    }
+
+    displayName = displayName
+      || pickReadableSessionDisplay([daemonParentLabel, daemonProject, activeMainSession?.label, activeMainSession?.project], sessionName)
+      || sessionName;
+
+    return {
+      displayName,
+      ...(effectiveAgentType ? { agentType: effectiveAgentType } : {}),
+    };
+  }
+
   private async dispatchEventPush(db: Database, env: Env, msg: Record<string, unknown>): Promise<void> {
     // Always send APNs push — iOS handles foreground display via UNUserNotificationCenterDelegate.
     // Badge count must increment regardless of app state.
@@ -2151,56 +2229,12 @@ export class WsBridge {
 
     const sessionName = String(msg.session ?? msg.sessionId ?? '');
     const eventType = String(msg.type ?? '');
-
-    // Prefer label/parentLabel from daemon message (has full context including sub-sessions)
     const daemonLabel = msg.label ? String(msg.label) : undefined;
     const daemonParentLabel = msg.parentLabel ? String(msg.parentLabel) : undefined;
     const daemonProject = msg.project ? String(msg.project) : undefined;
-
-    // Look up session metadata for human-readable push content
-    // Check sessions table first, then sub_sessions for sub-session names
-    const activeMainSession = this.activeMainSessions.get(sessionName);
-
-    let sessionRow = await db.queryOne<{ project_name: string; agent_type: string; label: string | null }>(
-      'SELECT project_name, agent_type, label FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
-      [this.serverId, sessionName],
-    ).catch(() => null);
-
-    let subType: string | undefined;
-    if (!sessionRow) {
-      // Try sub_sessions table: session name is deck_sub_{id}
-      const subMatch = sessionName.match(/^deck_sub_(.+)$/);
-      const subRow = subMatch ? await db.queryOne<{ type: string; label: string | null; parent_session: string }>(
-        'SELECT type, label, parent_session FROM sub_sessions WHERE server_id = $1 AND id = $2 LIMIT 1',
-        [this.serverId, subMatch[1]],
-      ).catch(() => null) : null;
-      if (subRow) {
-        subType = subRow.type;
-        // Look up parent session for context
-        if (!daemonParentLabel && subRow.parent_session) {
-          const activeParent = this.activeMainSessions.get(subRow.parent_session);
-          const parentRow = await db.queryOne<{ project_name: string; label: string | null }>(
-            'SELECT project_name, label FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
-            [this.serverId, subRow.parent_session],
-          ).catch(() => null);
-          sessionRow = {
-            project_name: activeParent?.project || parentRow?.project_name || subRow.parent_session,
-            agent_type: subRow.type,
-            label: subRow.label,
-          };
-        }
-      }
-    }
-
-    // Push title uses a stable 3-part shape: server · displayLabel · agentType.
-    // sessionName is the final fallback only when no label/project-style name exists.
-    const label = daemonLabel || activeMainSession?.label || sessionRow?.label;
-    const agentType = subType || activeMainSession?.agentType || sessionRow?.agent_type || String(msg.agentType ?? '');
-    const isSub = sessionName.startsWith('deck_sub_');
-    const mainDisplayName = daemonProject || daemonParentLabel || activeMainSession?.project || sessionRow?.project_name || sessionName;
-    const displayName = isSub
-      ? (label || daemonParentLabel || daemonProject || mainDisplayName || sessionName)
-      : (label || mainDisplayName || sessionName);
+    const resolved = await this.resolveReadablePushDisplay(db, sessionName, daemonLabel, daemonParentLabel, daemonProject);
+    const displayName = resolved.displayName;
+    const agentType = resolved.agentType || String(msg.agentType ?? '');
     const titleParts = [server.name, displayName];
     if (agentType) titleParts.push(agentType);
     const lastText = String(msg.lastText ?? msg.message ?? '').slice(0, 200);

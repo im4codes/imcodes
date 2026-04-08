@@ -116,6 +116,7 @@ import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timel
 import { extractTransportPendingMessages } from './transport-queue.js';
 import { ingestTimelineEventForCache } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
+import { pickReadableSessionDisplay } from '@shared/session-display.js';
 
 // On web: if opened by the native app for passkey auth, render the bridge page.
 const nativeCallback = typeof window !== 'undefined'
@@ -123,6 +124,30 @@ const nativeCallback = typeof window !== 'undefined'
   : null;
 
 type ViewMode = TerminalSubscribeViewMode;
+
+function buildSessionToastLabel(
+  sessionName: string,
+  options: {
+    label?: string | null;
+    parentLabel?: string | null;
+    project?: string | null;
+    agentType?: string | null;
+  },
+): string {
+  const label = pickReadableSessionDisplay([options.label], sessionName);
+  const parentLabel = pickReadableSessionDisplay([options.parentLabel], sessionName);
+  const project = pickReadableSessionDisplay([options.project], sessionName);
+  const agentType = options.agentType?.trim() || undefined;
+  const typeSuffix = agentType ? `(${agentType})` : '';
+
+  if (sessionName.startsWith('deck_sub_')) {
+    const name = label || parentLabel || project || agentType || sessionName.replace(/^deck_sub_/, '');
+    return `${name}${label ? typeSuffix : ''}${parentLabel && name !== parentLabel ? `@${parentLabel}` : ''}`;
+  }
+
+  const name = label || project || sessionName;
+  return `${name}${typeSuffix}`;
+}
 
 /** A panel pinned to the sidebar. Uses sessionName as stable identity. */
 export interface PinnedPanel {
@@ -1278,15 +1303,12 @@ export function App() {
         const parentLabel = msg.parentLabel as string | undefined;
         const agentType = (msg.agentType as string | undefined) || localSub?.type || undefined;
         const rawProject = (msg.project as string) || sessionName;
-        let displayProject: string;
-        const typeSuffix = agentType ? `(${agentType})` : '';
-        if (sessionName.startsWith('deck_sub_')) {
-          const name = label || agentType || sessionName.replace(/^deck_sub_/, '');
-          displayProject = `${name}${label ? typeSuffix : ''}${parentLabel ? `@${parentLabel}` : ''}`;
-        } else {
-          const name = label || rawProject;
-          displayProject = `${name}${typeSuffix}`;
-        }
+        const displayProject = buildSessionToastLabel(sessionName, {
+          label,
+          parentLabel,
+          project: rawProject,
+          agentType,
+        });
         if (!sessionName.startsWith('deck_sub_')) {
           // Main session: update state + tab alert
           setSessions((prev) => prev.map((s) => s.name === sessionName ? { ...s, state: 'idle' as SessionInfo['state'], transportPendingMessages: [] } : s));
@@ -1316,15 +1338,12 @@ export function App() {
         const parentLabel = msg.parentLabel as string | undefined;
         const agentType = (msg.agentType as string | undefined) || localSub?.type || undefined;
         const rawProject = msg.project || sessionName;
-        const typeSuffix = agentType ? `(${agentType})` : '';
-        let displayProject: string;
-        if (sessionName.startsWith('deck_sub_')) {
-          const name = label || agentType || sessionName.replace(/^deck_sub_/, '');
-          displayProject = `${name}${label ? typeSuffix : ''}${parentLabel ? `@${parentLabel}` : ''}`;
-        } else {
-          const name = label || rawProject;
-          displayProject = `${name}${typeSuffix}`;
-        }
+        const displayProject = buildSessionToastLabel(sessionName, {
+          label,
+          parentLabel,
+          project: rawProject,
+          agentType,
+        });
         const id = Date.now();
         setToasts((prev) => [...prev, { id, sessionName, project: displayProject, kind: 'notification', title: msg.title, message: msg.message }]);
         setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 8000);

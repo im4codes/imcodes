@@ -26,6 +26,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
+import { pickReadableSessionDisplay } from '../../shared/session-display.js';
 
 /** Get the last assistant.text from a session's timeline (for push notification context). */
 function getLastAssistantText(sessionName: string): string | undefined {
@@ -39,6 +40,42 @@ function getLastAssistantText(sessionName: string): string | undefined {
     }
   } catch { /* ignore */ }
   return undefined;
+}
+
+function resolvePushDisplayContext(sessionName: string, sessions: SessionRecord[]): {
+  project: string;
+  label?: string;
+  parentLabel?: string;
+} {
+  const byName = new Map(sessions.map((session) => [session.name, session] as const));
+  const session = byName.get(sessionName);
+  const label = pickReadableSessionDisplay([session?.label], sessionName);
+  const visited = new Set<string>();
+  let cursor = session;
+  let parentLabel: string | undefined;
+
+  while (cursor?.parentSession && !visited.has(cursor.parentSession)) {
+    visited.add(cursor.parentSession);
+    const parent = byName.get(cursor.parentSession);
+    if (!parent) break;
+    const readable = pickReadableSessionDisplay([parent.label, parent.projectName], parent.name);
+    if (readable) {
+      parentLabel = readable;
+      break;
+    }
+    cursor = parent;
+  }
+
+  const project = pickReadableSessionDisplay(
+    [label, parentLabel, session?.projectName],
+    sessionName,
+  ) ?? session?.projectName ?? sessionName;
+
+  return {
+    project,
+    ...(label ? { label } : {}),
+    ...(parentLabel ? { parentLabel } : {}),
+  };
 }
 
 export interface DaemonContext {
@@ -580,21 +617,35 @@ export async function startup(): Promise<DaemonContext> {
   const hookResult = await startHookServer((payload) => {
     if (!serverLink) return;
     try {
-      const record = listSessions().find((s) => s.name === payload.session);
-      const projectName = record?.projectName ?? payload.session;
-      // Build human-readable display label: prefer label, then project name, then session ID
-      const sessionLabel = record?.label || undefined;
-      const parentRecord = record?.parentSession ? listSessions().find((s) => s.name === record.parentSession) : undefined;
-      const parentLabel = parentRecord?.label || parentRecord?.projectName || undefined;
+      const sessions = listSessions();
+      const record = sessions.find((s) => s.name === payload.session);
+      const display = resolvePushDisplayContext(payload.session, sessions);
       if (payload.event === 'idle') {
         // Shell/script sessions are always "idle" — skip to avoid noise
         if (record?.agentType === 'shell' || record?.agentType === 'script') return;
         // notifySessionIdle is handled by the unified timeline listener below
         // Include last assistant text for push notification context
         const lastText = getLastAssistantText(payload.session);
-        serverLink.send({ type: 'session.idle', session: payload.session, project: projectName, agentType: payload.agentType, ...(lastText ? { lastText } : {}), ...(sessionLabel ? { label: sessionLabel } : {}), ...(parentLabel ? { parentLabel } : {}) });
+        serverLink.send({
+          type: 'session.idle',
+          session: payload.session,
+          project: display.project,
+          agentType: payload.agentType,
+          ...(lastText ? { lastText } : {}),
+          ...(display.label ? { label: display.label } : {}),
+          ...(display.parentLabel ? { parentLabel: display.parentLabel } : {}),
+        });
       } else if (payload.event === 'notification') {
-        serverLink.send({ type: 'session.notification', session: payload.session, project: projectName, agentType: record?.agentType ?? '', title: payload.title, message: payload.message, ...(sessionLabel ? { label: sessionLabel } : {}), ...(parentLabel ? { parentLabel } : {}) });
+        serverLink.send({
+          type: 'session.notification',
+          session: payload.session,
+          project: display.project,
+          agentType: record?.agentType ?? '',
+          title: payload.title,
+          message: payload.message,
+          ...(display.label ? { label: display.label } : {}),
+          ...(display.parentLabel ? { parentLabel: display.parentLabel } : {}),
+        });
       } else if (payload.event === 'tool_start') {
         serverLink.send({ type: 'session.tool', session: payload.session, tool: payload.tool });
       } else if (payload.event === 'tool_end') {

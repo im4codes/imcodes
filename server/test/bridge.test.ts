@@ -1517,6 +1517,12 @@ describe('WsBridge', () => {
             if (params?.[1] === 'unlabeled') {
               return { type: 'codex', label: null, parent_session: '' };
             }
+            if (params?.[1] === 'nested') {
+              return { type: 'shell', label: null, parent_session: 'deck_sub_parent' };
+            }
+            if (params?.[1] === 'parent') {
+              return { type: 'codex', label: null, parent_session: 'deck_cd_brain' };
+            }
             return { type: 'codex', label: 'worker-1', parent_session: 'deck_cd_brain' };
           }
           return null;
@@ -1649,6 +1655,26 @@ describe('WsBridge', () => {
       const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
       expect(payload?.title).toBe('my-server · Readable Main · codex');
       expect(payload?.title).not.toContain('deck_sub_unlabeled');
+    });
+
+    it('walks nested sub-session parents until it finds a readable main-session title', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { daemonWs } = await setupPushBridge();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session.idle',
+        session: 'deck_sub_nested',
+        project: 'deck_sub_nested',
+        parentLabel: 'deck_sub_parent',
+        agentType: 'shell',
+        lastText: 'Ready.',
+      }));
+      await flushAsync();
+
+      const payload = vi.mocked(dispatchPush).mock.calls.at(-1)?.[0];
+      expect(payload?.title).toBe('my-server · codedeck · shell');
+      expect(payload?.title).not.toContain('deck_sub_nested');
+      expect(payload?.title).not.toContain('deck_sub_parent');
     });
 
     it('uses lastText as push body for session.idle', async () => {
