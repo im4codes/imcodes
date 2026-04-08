@@ -3,8 +3,25 @@
  */
 import { h } from 'preact';
 import { render, waitFor, cleanup } from '@testing-library/preact';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { ChatView } from '../../src/components/ChatView.js';
+
+type ViewportListener = () => void;
+const visualViewportListeners = new Map<string, Set<ViewportListener>>();
+const visualViewportMock = {
+  height: 800,
+  addEventListener: vi.fn((type: string, listener: ViewportListener) => {
+    if (!visualViewportListeners.has(type)) visualViewportListeners.set(type, new Set());
+    visualViewportListeners.get(type)!.add(listener);
+  }),
+  removeEventListener: vi.fn((type: string, listener: ViewportListener) => {
+    visualViewportListeners.get(type)?.delete(listener);
+  }),
+};
+
+function emitVisualViewport(type: string) {
+  for (const listener of visualViewportListeners.get(type) ?? []) listener();
+}
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -25,8 +42,18 @@ vi.mock('../../src/components/FloatingPanel.js', () => ({
 }));
 
 describe('ChatView', () => {
+  const originalVisualViewport = window.visualViewport;
+
+  (window as Window & { visualViewport?: typeof visualViewportMock }).visualViewport = visualViewportMock as any;
+
   afterEach(() => {
     cleanup();
+    visualViewportMock.height = 800;
+    visualViewportListeners.clear();
+  });
+
+  afterAll(() => {
+    (window as Window & { visualViewport?: typeof visualViewportMock }).visualViewport = originalVisualViewport as any;
   });
 
   it('keeps preview mode pinned to the bottom during streaming updates with the same timestamp', async () => {
@@ -129,5 +156,57 @@ describe('ChatView', () => {
     await waitFor(() => {
       expect(scrollEl.scrollTop).toBe(1800);
     });
+  });
+
+  it('restores mobile keyboard scroll position from bottom offset instead of snapping to top', async () => {
+    const initialEvents = [
+      {
+        eventId: 'evt-1',
+        type: 'assistant.text',
+        ts: 1000,
+        payload: { text: 'hello' },
+      },
+    ] as any;
+
+    const { container } = render(
+      <ChatView
+        events={initialEvents}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    let scrollTopValue = 0;
+    let scrollHeightValue = 1200;
+    let clientHeightValue = 200;
+    Object.defineProperty(scrollEl, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (value) => { scrollTopValue = value; },
+    });
+    Object.defineProperty(scrollEl, 'scrollHeight', {
+      configurable: true,
+      get: () => scrollHeightValue,
+    });
+    Object.defineProperty(scrollEl, 'clientHeight', {
+      configurable: true,
+      get: () => clientHeightValue,
+    });
+
+    await waitFor(() => {
+      expect(scrollTopValue).toBe(1200);
+    });
+
+    scrollTopValue = 600;
+    scrollEl.dispatchEvent(new Event('scroll'));
+    document.dispatchEvent(new FocusEvent('focusin'));
+
+    scrollTopValue = 0;
+    scrollHeightValue = 1600;
+    visualViewportMock.height = 620;
+    emitVisualViewport('resize');
+
+    expect(scrollTopValue).toBe(1000);
   });
 });
