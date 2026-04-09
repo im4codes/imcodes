@@ -155,8 +155,8 @@ function CollapsedSubSessionButton({ sub, isOpen, idleFlashToken, usage, inP2p, 
 export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, onClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId, quickData, sessions, allSubSessions, p2pSessionLabels }: Props) {
   const { t } = useTranslation();
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
-  const [collapsed, setCollapsed] = useState(isMobile);
-  const [p2pHidden, setP2pHidden] = useState(false);
+  const [collapsed, setCollapsed] = useState(() => load('rcc_subcard_collapsed', isMobile));
+  const [p2pHidden, setP2pHidden] = useState(() => load('rcc_subcard_p2p_hidden', false));
   const [showSizePanel, setShowSizePanel] = useState(false);
   const [cardSize, setCardSize] = useState<CardSize>(() => load('rcc_subcard_size', DEFAULT_SIZE));
   const [draftW, setDraftW] = useState(String(cardSize.w));
@@ -194,6 +194,14 @@ export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, o
   orderedSessionsRef.current = orderedSessions;
   const dragOrderRef = useRef(dragOrder);
   dragOrderRef.current = dragOrder;
+
+  useEffect(() => {
+    save('rcc_subcard_collapsed', collapsed);
+  }, [collapsed]);
+
+  useEffect(() => {
+    save('rcc_subcard_p2p_hidden', p2pHidden);
+  }, [p2pHidden]);
 
   // Touch-based reorder for collapsed bar — must use addEventListener({ passive: false })
   // so touchmove can preventDefault (passive listeners can't).

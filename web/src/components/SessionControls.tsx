@@ -589,8 +589,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     }
     const root = divRef.current;
     if (!root) return;
-    const clientHeight = root.clientHeight || 32;
-    setMobileComposerMultiline(root.scrollHeight > clientHeight + 4);
+    const computed = window.getComputedStyle(root);
+    const lineHeight = Number.parseFloat(computed.lineHeight || '') || 20;
+    const verticalPadding = (Number.parseFloat(computed.paddingTop || '') || 0)
+      + (Number.parseFloat(computed.paddingBottom || '') || 0);
+    const multilineThreshold = (lineHeight * 2) + verticalPadding + 4;
+    setMobileComposerMultiline(root.scrollHeight > multilineThreshold);
   }, []);
 
   const fillInput = (text: string) => {
@@ -1849,6 +1853,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       <div class={`controls${isMobileLayout && mobileComposerMultiline ? ' controls-mobile-multiline' : ''}`}>
         {/* Quick input trigger — left of input */}
         <div class="qp-trigger-wrap" ref={quickWrapRef}>
+          {isMobileLayout && (mobileComposerMultiline || mobileComposerExpanded) && (
+            <button
+              class="btn btn-input-expand btn-input-expand-floating"
+              onClick={() => {
+                setMobileComposerExpanded((prev) => !prev);
+                setTimeout(() => divRef.current?.focus(), 0);
+              }}
+              title={mobileComposerExpanded ? 'collapse composer' : 'expand composer'}
+              aria-label={mobileComposerExpanded ? 'collapse composer' : 'expand composer'}
+            >
+              {mobileComposerExpanded ? '✕' : '⤢'}
+            </button>
+          )}
           <button
             class="qp-trigger"
             title={t('quick_input.title')}
@@ -1992,22 +2009,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         */}
         {mobileComposerExpanded && <div class="controls-composer-backdrop" onClick={() => setMobileComposerExpanded(false)} />}
         <div class={`controls-composer${showEmbeddedVoiceButton ? ' controls-composer-with-voice' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}`}>
-          {isMobileLayout && (
-            <button
-              class="btn btn-input-expand"
-              onClick={() => {
-                setMobileComposerExpanded((prev) => !prev);
-                setTimeout(() => divRef.current?.focus(), 0);
-              }}
-              title={mobileComposerExpanded ? 'collapse composer' : 'expand composer'}
-              aria-label={mobileComposerExpanded ? 'collapse composer' : 'expand composer'}
-            >
-              {mobileComposerExpanded ? '✕' : '⤢'}
-            </button>
-          )}
           <div
             ref={divRef}
-            class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${isMobileLayout ? ' controls-input-with-leading' : ''}${showEmbeddedVoiceButton ? ' controls-input-with-trailing' : ''}`}
+            class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${showEmbeddedVoiceButton ? ' controls-input-with-trailing' : ''}`}
             data-onboarding="chat-input"
             contenteditable={inputDisabled ? 'false' : 'true'}
             role="textbox"

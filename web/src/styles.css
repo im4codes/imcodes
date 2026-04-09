@@ -131,14 +131,8 @@ body {
   background: rgba(2, 6, 23, 0.72);
   z-index: 4090;
 }
-.controls-input-with-leading { padding-left: 42px; }
 .controls-input-with-trailing { padding-right: 42px; }
 .btn-input-expand {
-  position: absolute;
-  left: 8px;
-  top: 50%;
-  transform: translateY(-50%);
-  z-index: 1;
   width: 28px;
   height: 28px;
   padding: 0;
@@ -154,6 +148,12 @@ body {
 .btn-input-expand:active {
   background: #334155;
   color: #f8fafc;
+}
+.btn-input-expand-floating {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 6px);
+  z-index: 2;
 }
 .btn-voice-embedded {
   position: absolute;
@@ -283,10 +283,6 @@ body {
     max-height: none;
     border-radius: 12px;
   }
-  .controls-composer-mobile-expanded .btn-input-expand {
-    top: 10px;
-    transform: none;
-  }
   .btn-voice-embedded {
     right: 6px;
     width: 30px;
@@ -304,6 +300,13 @@ body {
     top: 10px;
     right: 10px;
     transform: none;
+  }
+  .controls-wrapper-mobile-expanded .btn-input-expand-floating {
+    position: fixed;
+    left: 18px;
+    top: calc(var(--sat, 0px) + 18px);
+    bottom: auto;
+    z-index: 4101;
   }
   .btn-voice-embedded:hover,
   .btn-voice-embedded:active {

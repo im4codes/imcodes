@@ -288,7 +288,7 @@ afterEach(() => {
     });
   });
 
-  it('bottom-aligns side buttons on mobile once the composer grows past one line', () => {
+  it('bottom-aligns side buttons on mobile once the composer grows past two lines', () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
     const { container } = render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
     const input = screen.getByRole('textbox') as HTMLDivElement;
@@ -299,10 +299,22 @@ afterEach(() => {
     expect(container.querySelector('.controls-mobile-multiline')).toBeTruthy();
   });
 
-  it('expands the mobile composer into a full-screen editor', () => {
+  it('does not show the mobile expand button until the composer exceeds two lines', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
+    expect(screen.queryByRole('button', { name: 'expand composer' })).toBeNull();
+  });
+
+  it('places the mobile expand button above the quick trigger and expands the composer', () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
     const { container } = render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
-    fireEvent.click(screen.getByRole('button', { name: 'expand composer' }));
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    Object.defineProperty(input, 'clientHeight', { configurable: true, value: 32 });
+    Object.defineProperty(input, 'scrollHeight', { configurable: true, value: 84 });
+    fireEvent.input(input);
+    const expandButton = screen.getByRole('button', { name: 'expand composer' });
+    expect(expandButton.className).toContain('btn-input-expand-floating');
+    fireEvent.click(expandButton);
     expect(container.querySelector('.controls-composer-mobile-expanded')).toBeTruthy();
     expect(container.querySelector('.controls-composer-backdrop')).toBeTruthy();
   });
