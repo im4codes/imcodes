@@ -977,7 +977,7 @@ describe('transport session metadata persistence', () => {
   it('upsertDbSession with transport fields roundtrip', async () => {
     await upsertDbSession(
       db, 'tmd-sid-1', serverId, 'deck_transport_brain', 'tproj', 'brain', 'claude-code', '/home/dev',
-      'running', null, 'transport', 'openclaw', 'oc-key-123', 'test persona',
+      'running', null, null, 'transport', 'openclaw', 'oc-key-123', 'test persona',
     );
     const sessions = await getDbSessionsByServer(db, serverId);
     const s = sessions.find(s => s.name === 'deck_transport_brain');
@@ -992,7 +992,7 @@ describe('transport session metadata persistence', () => {
     // Upsert same session with a new state — transport fields should survive
     await upsertDbSession(
       db, 'tmd-sid-1', serverId, 'deck_transport_brain', 'tproj', 'brain', 'claude-code', '/home/dev',
-      'idle', null, 'transport', 'openclaw', 'oc-key-123', 'test persona', 'sonnet', 'sonnet', 'high', { provider: { mode: 'safe' } },
+      'idle', null, null, 'transport', 'openclaw', 'oc-key-123', 'test persona', 'sonnet', 'sonnet', 'high', { provider: { mode: 'safe' } },
     );
     const sessions = await getDbSessionsByServer(db, serverId);
     const s = sessions.find(s => s.name === 'deck_transport_brain');
