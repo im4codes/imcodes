@@ -839,7 +839,8 @@ program
 
 program
   .command('repair-watchdog')
-  .description('Regenerate Windows daemon watchdog files with current paths')
+  .alias('r')
+  .description('Regenerate Windows daemon watchdog files with current paths (alias: r)')
   .action(async () => {
     if (process.platform !== 'win32') {
       console.log('This command is only needed on Windows.');
