@@ -64,7 +64,11 @@ import { extractTransportPendingMessages } from './transport-queue.js';
 import { ingestTimelineEventForCache } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
-import { getSelectedServerName } from './server-selection.js';
+import {
+  getSelectedServerName,
+  shouldResetSelectedServer,
+  shouldShowInitialConnectingGate,
+} from './server-selection.js';
 
 // On web: if opened by the native app for passkey auth, render the bridge page.
 const nativeCallback = typeof window !== 'undefined'
@@ -145,6 +149,8 @@ export function App() {
   const [splashDone, setSplashDone] = useState(false);
 
   const [servers, setServers] = useState<ServerInfo[]>([]);
+  const [serversLoaded, setServersLoaded] = useState(false);
+  const [serversSynced, setServersSynced] = useState(false);
   const [selectedServerId, setSelectedServerId] = useState<string | null>(
     () => localStorage.getItem('rcc_server'),
   );
@@ -174,6 +180,8 @@ export function App() {
 
   useEffect(() => {
     if (!auth) {
+      setServersLoaded(false);
+      setServersSynced(false);
       watchProjectionStore.setApiKey(null);
       watchProjectionStore.setSnapshotStatus('switching');
       watchProjectionStore.setServers([]);
@@ -219,6 +227,18 @@ export function App() {
     }
     localStorage.removeItem('rcc_server_name');
   }, [resolvedSelectedServerName, selectedServerId, selectedServerName, servers.length]);
+
+  useEffect(() => {
+    if (!serversSynced) return;
+    if (!shouldResetSelectedServer(selectedServerId, servers, serversLoaded)) return;
+    setSelectedServerId(null);
+    setSelectedServerName(null);
+    setSessionsLoaded(true);
+    setConnecting(false);
+    localStorage.removeItem('rcc_server');
+    localStorage.removeItem('rcc_server_name');
+    localStorage.removeItem('rcc_session');
+  }, [selectedServerId, servers, serversLoaded]);
 
   useEffect(() => {
     let cleanup = () => {};
@@ -504,10 +524,20 @@ export function App() {
     try {
       const data = await apiFetch<{ servers: ServerInfo[] }>('/api/server');
       setServers(data.servers);
-    } catch { /* ignore */ }
+      setServersSynced(true);
+    } catch {
+      // Preserve the last known list on refresh failures. The request is still
+      // considered resolved so the UI can escape the initial connecting gate.
+    } finally {
+      setServersLoaded(true);
+    }
   }, [auth]);
 
-  useEffect(() => { loadServers(); }, [loadServers]);
+  useEffect(() => {
+    setServersLoaded(false);
+    setServersSynced(false);
+    void loadServers();
+  }, [loadServers]);
 
   // Periodically refresh server list so lastHeartbeatAt stays current
   useEffect(() => {
@@ -2207,16 +2237,24 @@ export function App() {
   // Show full-screen connecting indicator while waiting for initial WS + session data.
   // After 8s, show escape buttons so the user is never stuck.
   const [connectTimeout, setConnectTimeout] = useState(false);
+  const showInitialConnectingGate = shouldShowInitialConnectingGate(
+    Boolean(auth),
+    selectedServerId,
+    connected,
+    sessionsLoaded,
+    serversLoaded,
+  );
+
   useEffect(() => {
-    if (auth && selectedServerId && !connected && servers.length === 0) {
+    if (showInitialConnectingGate) {
       const t = setTimeout(() => setConnectTimeout(true), 5000);
       return () => { clearTimeout(t); setConnectTimeout(false); };
     }
     setConnectTimeout(false);
     return undefined;
-  }, [auth, selectedServerId, connected, servers.length]);
+  }, [showInitialConnectingGate]);
 
-  if (auth && selectedServerId && !sessionsLoaded && !connected && servers.length === 0) {
+  if (showInitialConnectingGate) {
     return (
       <div style={{ position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0a0e1a', flexDirection: 'column', gap: 16 }}>
         <div class="spinner" style={{ width: 32, height: 32 }} />
