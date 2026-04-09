@@ -77,6 +77,7 @@
     "transport_send_queued": "Queued — will send after the current reply finishes",
     "transport_send_queued_collapsed": "{{count}} queued · showing latest only",
     "send_placeholder": "Send to {{name}}…",
+    "send_placeholder_desktop_upload": "{{placeholder}} Supports fast multi-file paste upload",
     "actions": "Session actions",
     "new_btn": "New session",
     "agentType": {

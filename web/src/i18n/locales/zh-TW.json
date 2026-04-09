@@ -77,6 +77,7 @@
     "transport_send_queued": "已加入佇列，當前回覆結束後傳送",
     "transport_send_queued_collapsed": "共 {{count}} 則佇列訊息，僅顯示最後一則",
     "send_placeholder": "傳送給 {{name}}…",
+    "send_placeholder_desktop_upload": "{{placeholder}} 支援多檔案貼上快速上傳",
     "actions": "Session 操作",
     "new_btn": "新建 Session",
     "agentType": {

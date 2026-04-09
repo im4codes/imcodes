@@ -1303,7 +1303,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     });
   }, []);
 
-  const placeholder = !hasSession ? t('session.no_session') : !connected ? t('session.send_queued') : t('session.send_placeholder', { name: sessionDisplayName ?? activeSession?.label ?? activeSession?.project ?? 'session' });
+  const isMobilePlaceholder = typeof window !== 'undefined' && window.innerWidth <= 640;
+  const basePlaceholder = !hasSession
+    ? t('session.no_session')
+    : !connected
+      ? t('session.send_queued')
+      : t('session.send_placeholder', { name: sessionDisplayName ?? activeSession?.label ?? activeSession?.project ?? 'session' });
+  const placeholder = !hasSession || !connected || isMobilePlaceholder
+    ? basePlaceholder
+    : t('session.send_placeholder_desktop_upload', { placeholder: basePlaceholder });
 
   return (
     <>

@@ -77,6 +77,7 @@
     "transport_send_queued": "En cola: se enviará cuando termine la respuesta actual",
     "transport_send_queued_collapsed": "{{count}} en cola · mostrando solo el último",
     "send_placeholder": "Enviar a {{name}}…",
+    "send_placeholder_desktop_upload": "{{placeholder}} Admite carga rápida pegando varios archivos",
     "actions": "Acciones de sesión",
     "new_btn": "Nueva sesión",
     "agentType": {

@@ -77,6 +77,7 @@
     "transport_send_queued": "キュー済み — 現在の応答が終わった後に送信します",
     "transport_send_queued_collapsed": "{{count}} 件キュー中 · 最新のみ表示",
     "send_placeholder": "{{name}} へ送信…",
+    "send_placeholder_desktop_upload": "{{placeholder}} 複数ファイルの貼り付けによる高速アップロードに対応",
     "actions": "セッション操作",
     "new_btn": "新規セッション",
     "agentType": {

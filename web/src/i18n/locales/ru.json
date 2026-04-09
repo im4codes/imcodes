@@ -77,6 +77,7 @@
     "transport_send_queued": "Поставлено в очередь — будет отправлено после текущего ответа",
     "transport_send_queued_collapsed": "В очереди: {{count}} · показано только последнее",
     "send_placeholder": "Отправить в {{name}}…",
+    "send_placeholder_desktop_upload": "{{placeholder}} Поддерживается быстрая загрузка вставкой нескольких файлов",
     "actions": "Действия с сессией",
     "new_btn": "Новая сессия",
     "agentType": {

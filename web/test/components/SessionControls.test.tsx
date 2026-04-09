@@ -6,6 +6,8 @@ import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, within } from '@testing-library/preact';
 import { useState } from 'preact/hooks';
 
+const DEFAULT_INNER_WIDTH = 1280;
+
 if (!HTMLElement.prototype.scrollIntoView) {
   HTMLElement.prototype.scrollIntoView = vi.fn();
 }
@@ -44,6 +46,12 @@ vi.mock('react-i18next', () => ({
       }
       if (key === 'session.transport_send_queued_collapsed') {
         return `${opts?.count ?? 0} queued · showing latest only`;
+      }
+      if (key === 'session.send_placeholder') {
+        return `Send to ${String(opts?.name ?? 'session')}…`;
+      }
+      if (key === 'session.send_placeholder_desktop_upload') {
+        return `${String(opts?.placeholder ?? '')} Supports fast multi-file paste upload`;
       }
       if (key === 'common.hide') return 'hide';
       if (key === 'common.show') return 'show';
@@ -207,9 +215,10 @@ const subSession = (name: string, label: string): SessionInfo =>
   });
 
 describe('SessionControls', () => {
-  afterEach(() => {
-    cleanup();
-  });
+afterEach(() => {
+  cleanup();
+  Object.defineProperty(window, 'innerWidth', { configurable: true, value: DEFAULT_INNER_WIDTH });
+});
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -234,6 +243,18 @@ describe('SessionControls', () => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
     expect(screen.getByRole('textbox')).toBeDefined();
     expect(screen.getByRole('button', { name: /send/i })).toBeDefined();
+  });
+
+  it('shows the desktop upload hint in the placeholder on desktop', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: DEFAULT_INNER_WIDTH });
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project… Supports fast multi-file paste upload');
+  });
+
+  it('keeps the placeholder short on mobile', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project…');
   });
 
   it('renders menu button (⋯)', () => {
