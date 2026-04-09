@@ -352,7 +352,7 @@ let IDLE_POLL_MS = 3_000;
 let GRACE_PERIOD_DEFAULT_MS = 180_000; // 3 min — complex analysis (subagent research + write) takes time
 let MIN_PROCESSING_MS = 30_000; // Don't trust idle detection until 30s after dispatch
 let FILE_SETTLE_CYCLES = 3; // File must stop growing for 3 poll cycles (9s) to be "settled"
-let ROUND_HOP_CLEANUP_DELAY_MS = 30_000;
+let ROUND_HOP_CLEANUP_DELAY_MS = 0;
 
 /** Override poll interval for tests. */
 export function _setIdlePollMs(ms: number): void { IDLE_POLL_MS = ms; }
@@ -821,6 +821,10 @@ async function cleanupRoundHopArtifacts(roundHops: P2pHopRuntime[]): Promise<voi
 
 function scheduleRoundHopArtifactCleanup(roundHops: P2pHopRuntime[]): void {
   if (roundHops.length === 0) return;
+  if (ROUND_HOP_CLEANUP_DELAY_MS <= 0) {
+    void cleanupRoundHopArtifacts(roundHops);
+    return;
+  }
   setTimeout(() => { void cleanupRoundHopArtifacts(roundHops); }, ROUND_HOP_CLEANUP_DELAY_MS);
 }
 

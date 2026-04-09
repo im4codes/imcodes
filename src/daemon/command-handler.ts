@@ -2072,7 +2072,15 @@ async function handleP2pListDiscussions(_cmd: Record<string, unknown>, serverLin
     const dir = imcSubDir(projectDir, 'discussions');
     try {
       const entries = await fsReaddir(dir);
-      const files = entries.filter(e => e.endsWith('.md'));
+      const files = entries.filter((entry) => {
+        if (!entry.endsWith('.md')) return false;
+        // Keep only canonical discussion documents in the history list.
+        // Intermediate hop artifacts and reducer snapshots are implementation
+        // details and should not crowd out the main discussion file.
+        if (/\.round\d+\.hop\d+\.md$/i.test(entry)) return false;
+        if (/\.reducer\.\d+\.md$/i.test(entry)) return false;
+        return true;
+      });
       for (const f of files) {
         try {
           const fullPath = nodePath.join(dir, f);

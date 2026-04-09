@@ -120,7 +120,7 @@ beforeEach(async () => {
   _setGracePeriodMs(80);
   _setMinProcessingMs(0);
   _setFileSettleCycles(1);
-  _setRoundHopCleanupDelayMs(30_000);
+  _setRoundHopCleanupDelayMs(0);
 
   tempProjectDir = join(tmpdir(), `p2p-par-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
   await mkdir(tempProjectDir, { recursive: true });
@@ -155,7 +155,7 @@ afterEach(async () => {
   _setGracePeriodMs(180000);
   _setMinProcessingMs(30000);
   _setFileSettleCycles(3);
-  _setRoundHopCleanupDelayMs(30_000);
+  _setRoundHopCleanupDelayMs(0);
   await rm(tempProjectDir, { recursive: true, force: true }).catch(() => {});
 });
 
@@ -173,6 +173,19 @@ describe('P2P orchestrator — parallel rounds', () => {
     const done = await waitForStatus(run.id, ['completed']);
     expect(done.hopStates).toHaveLength(1);
     expect(done.hopStates[0].artifact_path).toContain(`${done.id}.round1.hop1.md`);
+  });
+
+  it('removes legacy round hop artifacts after merging them into the main discussion file', async () => {
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'legacy artifact cleanup',
+      [],
+      serverLinkMock as any,
+    );
+
+    const done = await waitForStatus(run.id, ['completed']);
+    await waitForNoRoundHopArtifacts(tempProjectDir, done.id);
   });
 
   it('keeps legacy single-mode runs on the legacy payload path without advanced fields', async () => {
@@ -498,8 +511,7 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(hop).toBeDefined();
     expect(hop?.working_path).toContain(join(tempProjectDir, 'other'));
     expect(hop?.artifact_path).toContain(tempProjectDir);
-    const artifact = await readFile(hop!.artifact_path, 'utf8');
-    expect(artifact).toContain('CROSS-PROJECT-deck_proj_w2');
+    await expect(access(hop!.artifact_path)).rejects.toBeTruthy();
     const main = await readFile(done.contextFilePath, 'utf8');
     expect(main).toContain('CROSS-PROJECT-deck_proj_w2');
   });
