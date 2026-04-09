@@ -3,6 +3,14 @@ export interface SelectableServerInfo {
   name: string;
 }
 
+export function hasSelectedServer(
+  selectedServerId: string | null,
+  servers: readonly SelectableServerInfo[],
+): boolean {
+  if (!selectedServerId) return false;
+  return servers.some((server) => server.id === selectedServerId);
+}
+
 export function getSelectedServerName(
   selectedServerId: string | null,
   servers: readonly SelectableServerInfo[],
@@ -11,4 +19,23 @@ export function getSelectedServerName(
   if (!selectedServerId) return null;
   if (servers.length === 0) return fallbackName;
   return servers.find((server) => server.id === selectedServerId)?.name ?? null;
+}
+
+export function shouldResetSelectedServer(
+  selectedServerId: string | null,
+  servers: readonly SelectableServerInfo[],
+  serversLoaded: boolean,
+): boolean {
+  if (!selectedServerId || !serversLoaded) return false;
+  return !hasSelectedServer(selectedServerId, servers);
+}
+
+export function shouldShowInitialConnectingGate(
+  authReady: boolean,
+  selectedServerId: string | null,
+  connected: boolean,
+  sessionsLoaded: boolean,
+  serversLoaded: boolean,
+): boolean {
+  return Boolean(authReady && selectedServerId && !sessionsLoaded && !connected && !serversLoaded);
 }
