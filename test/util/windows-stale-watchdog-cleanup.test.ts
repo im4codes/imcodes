@@ -113,18 +113,22 @@ describe('stale watchdog cleanup (Windows-only end-to-end)', () => {
       expect(spawned, `fake watchdog PID ${fakePid} did not appear`).toBe(true);
 
       // Run killAllStaleWatchdogs() in a child process so vitest mocks don't
-      // touch the real fs/child_process modules.
+      // touch the real fs/child_process modules.  Also print diagnostics so
+      // CI failures are easy to debug.
       const moduleUrl = pathToFileURL(join(repoRoot, 'dist/src/util/windows-daemon.js')).href;
       const driverSource = `
         import { killAllStaleWatchdogs } from ${JSON.stringify(moduleUrl)};
+        console.error('[driver] before kill, fakePid=${fakePid}');
         killAllStaleWatchdogs();
+        console.error('[driver] after kill');
       `;
       const result = runInChildProcess(driverSource);
-      expect(result.status, `driver failed: ${result.stderr}`).toBe(0);
+      expect(result.status, `driver failed: status=${result.status} stdout=${result.stdout} stderr=${result.stderr}`).toBe(0);
 
-      // Wait up to 5s for taskkill chain to complete.
-      const dead = await waitFor(() => !pidAlive(fakePid!), 5000);
-      expect(dead, `fake watchdog PID ${fakePid} should be killed`).toBe(true);
+      // Wait up to 15s for the PowerShell+taskkill chain to complete.
+      // PowerShell startup alone is 1-3s on CI runners, so 5s is too tight.
+      const dead = await waitFor(() => !pidAlive(fakePid!), 15000);
+      expect(dead, `fake watchdog PID ${fakePid} should be killed.\nDriver stdout: ${result.stdout}\nDriver stderr: ${result.stderr}`).toBe(true);
     } finally {
       // Best-effort cleanup if the test failed
       if (fakePid && pidAlive(fakePid)) {
@@ -132,7 +136,7 @@ describe('stale watchdog cleanup (Windows-only end-to-end)', () => {
       }
       try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
     }
-  }, 30_000);
+  }, 60_000);
 
   it.skipIf(!isWindows)('regenerateAllArtifacts() in windows-launch-artifacts.ts also kills stale watchdogs', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'imcodes-stale-2-'));
@@ -162,14 +166,16 @@ describe('stale watchdog cleanup (Windows-only end-to-end)', () => {
         // user's home dir.  Instead reproduce its kill logic via the dedicated
         // helper that the daemon module exports for restart use.
         const { killAllStaleWatchdogs } = await import(${JSON.stringify(pathToFileURL(join(repoRoot, 'dist/src/util/windows-daemon.js')).href)});
+        console.error('[driver] before kill, fakePid=${fakePid}');
         killAllStaleWatchdogs();
+        console.error('[driver] after kill');
         await writeWatchdogCmd(${JSON.stringify(stagingPaths)});
         await writeVbsLauncher(${JSON.stringify(stagingPaths)});
       `;
       const result = runInChildProcess(driverSource);
-      expect(result.status, `driver failed: ${result.stderr}`).toBe(0);
+      expect(result.status, `driver failed: status=${result.status} stdout=${result.stdout} stderr=${result.stderr}`).toBe(0);
 
-      const dead = await waitFor(() => !pidAlive(fakePid!), 5000);
+      const dead = await waitFor(() => !pidAlive(fakePid!), 15000);
       expect(dead, `fake watchdog PID ${fakePid} should be killed`).toBe(true);
     } finally {
       if (fakePid && pidAlive(fakePid)) {
@@ -177,7 +183,7 @@ describe('stale watchdog cleanup (Windows-only end-to-end)', () => {
       }
       try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
     }
-  }, 30_000);
+  }, 60_000);
 
   it.skipIf(!isWindows)('killAllStaleWatchdogs() is a no-op when no watchdogs are running', async () => {
     // Make sure we don't accidentally kill unrelated cmd.exe processes.
@@ -218,5 +224,5 @@ describe('stale watchdog cleanup (Windows-only end-to-end)', () => {
       }
       try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
     }
-  }, 30_000);
+  }, 60_000);
 });
