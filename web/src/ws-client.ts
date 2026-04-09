@@ -357,9 +357,9 @@ export class WsClient {
   }
 
   /** Request git status for a directory. Returns requestId. */
-  fsGitStatus(path: string): string {
+  fsGitStatus(path: string, opts?: { includeStats?: boolean }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'fs.git_status', path, requestId });
+    this.send({ type: 'fs.git_status', path, requestId, ...(opts?.includeStats ? { includeStats: true } : {}) });
     return requestId;
   }
 

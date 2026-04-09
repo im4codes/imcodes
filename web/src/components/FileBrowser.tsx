@@ -301,7 +301,7 @@ function requestSharedChanges(key: string, ws: WsClient, repoPath: string, force
     entry.queued = true;
     return;
   }
-  const requestId = ws.fsGitStatus(repoPath);
+  const requestId = ws.fsGitStatus(repoPath, { includeStats: true });
   entry.inFlightRequestId = requestId;
   sharedChangesRequestKey.set(requestId, key);
 }
@@ -842,6 +842,8 @@ export function FileBrowser({
   const lastChangesRefreshRef = useRef(0);
   const pendingChangesTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const changesVisible = !!changesRootPath && (panelView === 'changes' || !onPreviewFile);
+
   const refreshChanges = useCallback(() => {
     if (!changesRootPath) return;
     const cacheKey = getSharedChangesKey(ws, changesRootPath);
@@ -863,24 +865,25 @@ export function FileBrowser({
 
   // Initial fetch on mount
   useEffect(() => {
-    if (!changesRootPath) return;
+    if (!changesVisible) return;
     refreshChanges();
-  }, [changesRootPath, ws]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [changesVisible, changesRootPath, ws]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 30s polling
   useEffect(() => {
-    if (!changesRootPath) return;
+    if (!changesVisible) return;
     const id = setInterval(() => {
       if (mountedRef.current) refreshChanges();
     }, 30_000);
     return () => clearInterval(id);
-  }, [changesRootPath, refreshChanges]);
+  }, [changesVisible, refreshChanges]);
 
   // External refresh trigger (e.g. from tool.call events in ChatView)
   useEffect(() => {
+    if (!changesVisible) return;
     if (refreshTrigger === undefined || refreshTrigger === 0) return;
     refreshChanges();
-  }, [refreshTrigger, refreshChanges]);
+  }, [changesVisible, refreshTrigger, refreshChanges]);
 
   // Reload tree when showHidden changes
   useEffect(() => {

@@ -502,6 +502,41 @@ describe('FileBrowser', () => {
     expect(document.querySelector('.fb-node-git-badge')).not.toBeNull();
   });
 
+  it('requests stats only for shared changes queries, not tree git badges', () => {
+    const { ws } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        onConfirm={vi.fn()}
+        changesRootPath="/home/user"
+        defaultTab="changes"
+      />,
+    );
+
+    expect(ws.fsGitStatus).toHaveBeenCalledWith('~');
+    expect(ws.fsGitStatus).toHaveBeenCalledWith('/home/user', { includeStats: true });
+  });
+
+  it('does not refresh shared changes while pinned files tab hides the changes panel', () => {
+    const { ws } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        onConfirm={vi.fn()}
+        changesRootPath="/home/user"
+        onPreviewFile={vi.fn()}
+        defaultTab="files"
+      />,
+    );
+
+    expect(ws.fsGitStatus).toHaveBeenCalledTimes(1);
+    expect(ws.fsGitStatus).toHaveBeenCalledWith('~');
+  });
+
   it('shows panel tabs when changesRootPath is provided', async () => {
     const { ws, respond } = makeWsFactory();
     render(

@@ -3051,6 +3051,7 @@ export function __resetFsGitCachesForTests(): void {
 async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawPath = cmd.path as string | undefined;
   const requestId = cmd.requestId as string | undefined;
+  const includeStats = cmd.includeStats === true;
   if (!rawPath || !requestId) return;
 
   const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
@@ -3065,7 +3066,7 @@ async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: Serve
     }
     const [snapshot, numstat] = await Promise.all([
       getRepoGitStatusSnapshot(real),
-      getRepoGitNumstatSnapshot(real),
+      includeStats ? getRepoGitNumstatSnapshot(real) : Promise.resolve(null),
     ]);
     const files = snapshot ? filterRepoFilesForPath(snapshot.files, real).map((file) => {
       const stats = numstat?.stats.get(file.path);
