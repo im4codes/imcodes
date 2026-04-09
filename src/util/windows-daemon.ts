@@ -1,7 +1,7 @@
 import { execSync, spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { resolve } from 'node:path';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 
 const WINDOWS_DAEMON_TASK = 'imcodes-daemon';
 
@@ -52,23 +52,44 @@ export function killAllStaleWatchdogs(): void {
 }
 
 /** Enumerate cmd.exe processes whose command line references daemon-watchdog.
- *  Tries PowerShell first (universal), falls back to wmic (legacy Windows). */
+ *  Tries PowerShell via a temp .ps1 file (works on every Windows since 7),
+ *  then falls back to wmic for legacy Windows where PowerShell is missing.
+ *
+ *  CRITICAL: PowerShell command must be in a .ps1 FILE, not passed via
+ *  `-Command "..."`.  When the script contains nested double quotes
+ *  (e.g. inside a Filter clause), cmd.exe→powershell command-line parsing
+ *  closes the outer quote prematurely and the script becomes truncated.
+ *  This was the root cause of the CI failure. */
 function findStaleWatchdogPids(): number[] {
   const pids = new Set<number>();
   // ── PowerShell path (works on every Windows since 7) ────────────────────
+  let scriptDir: string | null = null;
   try {
-    const ps = 'Get-CimInstance Win32_Process -Filter "Name=\'cmd.exe\'" | Where-Object { $_.CommandLine -like \'*daemon-watchdog*\' } | Select-Object -ExpandProperty ProcessId';
-    const out = execSync(`powershell -NoProfile -NonInteractive -Command "${ps}"`, {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      windowsHide: true,
-    });
+    scriptDir = mkdtempSync(join(tmpdir(), 'imcodes-watchdog-query-'));
+    const scriptPath = join(scriptDir, 'find-stale.ps1');
+    // Use single quotes around 'cmd.exe' inside the filter to avoid escaping
+    // headaches.  Format-Wide -Property ProcessId so each PID is on its own
+    // line for easy parsing.
+    writeFileSync(
+      scriptPath,
+      "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | " +
+        "Where-Object { $_.CommandLine -like '*daemon-watchdog*' } | " +
+        "ForEach-Object { $_.ProcessId }\r\n",
+    );
+    const out = execSync(
+      `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`,
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
+    );
     for (const line of out.split(/\r?\n/)) {
       const pid = parseInt(line.trim(), 10);
       if (Number.isFinite(pid) && pid > 0) pids.add(pid);
     }
-    if (pids.size > 0) return [...pids];
-  } catch { /* fall through to wmic */ }
+  } catch { /* fall through to wmic */ } finally {
+    if (scriptDir) {
+      try { rmSync(scriptDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  }
+  if (pids.size > 0) return [...pids];
   // ── Legacy wmic path ────────────────────────────────────────────────────
   try {
     const out = execSync(

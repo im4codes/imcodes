@@ -73,7 +73,12 @@ rem This catches both the healthy case and the crash-loop case.\r
 echo Killing all daemon-watchdog cmd.exe processes... >> "%LOG_FILE%"\r
 rem Try PowerShell first (works on Windows 11 / Server 2025 where wmic is\r
 rem deprecated/removed), fall back to wmic for legacy Windows installs.\r
-for /f "usebackq delims=" %%w in (\`powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter \\"Name='cmd.exe'\\" ^| Where-Object { $_.CommandLine -like '*daemon-watchdog*' } ^| Select-Object -ExpandProperty ProcessId" 2^>nul\`) do (\r
+rem CRITICAL: write the PowerShell script to a .ps1 file rather than passing\r
+rem it via -Command "..." — nested double quotes inside a -Command argument\r
+rem get truncated by cmd.exe→powershell command-line parsing.\r
+set "PS_SCRIPT=%SCRIPT_DIR%\\find-stale-watchdog.ps1"\r
+> "%PS_SCRIPT%" echo Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" ^| Where-Object { $_.CommandLine -like '*daemon-watchdog*' } ^| ForEach-Object { $_.ProcessId }\r
+for /f "usebackq delims=" %%w in (\`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%PS_SCRIPT%" 2^>nul\`) do (\r
   set "STALE_WD=%%w"\r
   set "STALE_WD=!STALE_WD: =!"\r
   if defined STALE_WD if not "!STALE_WD!"=="" (\r

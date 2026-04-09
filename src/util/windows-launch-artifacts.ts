@@ -1,9 +1,9 @@
 import { writeFile, mkdir, stat, truncate } from 'fs/promises';
-import { existsSync } from 'fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { execSync } from 'child_process';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { homedir } from 'os';
+import { homedir, tmpdir } from 'os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -170,19 +170,33 @@ export async function regenerateAllArtifacts(): Promise<void> {
 function killAllStaleWatchdogsBeforeRegen(): void {
   if (process.platform !== 'win32') return;
   // PowerShell first (works on every Windows including ones where wmic is gone)
+  // CRITICAL: use a temp .ps1 file, NOT `-Command "..."` — nested double
+  // quotes inside the script body get truncated by cmd.exe→powershell
+  // command-line parsing.  See windows-daemon.ts findStaleWatchdogPids.
   let pids: number[] = [];
+  let scriptDir: string | null = null;
   try {
-    const ps = 'Get-CimInstance Win32_Process -Filter "Name=\'cmd.exe\'" | Where-Object { $_.CommandLine -like \'*daemon-watchdog*\' } | Select-Object -ExpandProperty ProcessId';
-    const out = execSync(`powershell -NoProfile -NonInteractive -Command "${ps}"`, {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      windowsHide: true,
-    });
+    scriptDir = mkdtempSync(join(tmpdir(), 'imcodes-watchdog-regen-'));
+    const scriptPath = join(scriptDir, 'find-stale.ps1');
+    writeFileSync(
+      scriptPath,
+      "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | " +
+        "Where-Object { $_.CommandLine -like '*daemon-watchdog*' } | " +
+        "ForEach-Object { $_.ProcessId }\r\n",
+    );
+    const out = execSync(
+      `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`,
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
+    );
     for (const line of out.split(/\r?\n/)) {
       const pid = parseInt(line.trim(), 10);
       if (Number.isFinite(pid) && pid > 0) pids.push(pid);
     }
-  } catch { /* fall through */ }
+  } catch { /* fall through */ } finally {
+    if (scriptDir) {
+      try { rmSync(scriptDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  }
   if (pids.length === 0) {
     try {
       const out = execSync(
