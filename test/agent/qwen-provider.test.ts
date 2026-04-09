@@ -230,6 +230,51 @@ describe('QwenProvider', () => {
     expect(second.args).not.toContain('--session-id');
   });
 
+  it('falls back to a fresh session when --resume points to a missing qwen conversation id', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-resume-fallback',
+      cwd: '/tmp/project',
+    });
+
+    const completed: string[] = [];
+    const resumeIds: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(String(msg.content)));
+    provider.onSessionInfo?.((_sid, info) => {
+      if (typeof info.resumeId === 'string') resumeIds.push(info.resumeId);
+    });
+
+    await provider.send('sess-resume-fallback', 'hello');
+    const first = lastSpawn();
+    first.child.stdout.write(`${JSON.stringify({ type: 'system', subtype: 'session_start', session_id: 'sess-resume-fallback' })}\n`);
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-1', content: [{ type: 'text', text: 'Hello' }] } })}\n`);
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    await provider.send('sess-resume-fallback', 'again');
+    const second = childProcessMock.spawned[1];
+    expect(second?.args).toContain('--resume');
+    second?.child.stderr.write('No saved session found with ID sess-resume-fallback\n');
+    second?.child.emit('close', 1, null);
+    await waitForSpawnCount(3);
+
+    const third = childProcessMock.spawned[2];
+    expect(third?.args).toContain('--session-id');
+    expect(third?.args).not.toContain('--resume');
+    const sessionIdIndex = third?.args.indexOf('--session-id') ?? -1;
+    expect(sessionIdIndex).toBeGreaterThanOrEqual(0);
+    expect(third?.args[sessionIdIndex + 1]).not.toBe('sess-resume-fallback');
+    expect(resumeIds).toContain(third?.args[sessionIdIndex + 1]);
+
+    third?.child.stdout.write(`${JSON.stringify({ type: 'system', subtype: 'session_start', session_id: third?.args[sessionIdIndex + 1] })}\n`);
+    third?.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-2', content: [{ type: 'text', text: 'Recovered' }] } })}\n`);
+    third?.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(completed).toContain('Recovered');
+  });
+
   it('normalizes Windows cwd before spawning qwen', async () => {
     const origPlatform = process.platform;
     Object.defineProperty(process, 'platform', { value: 'win32' });

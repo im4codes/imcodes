@@ -18,6 +18,7 @@ import {
   CONNECTION_MODES,
   SESSION_OWNERSHIP,
   PROVIDER_ERROR_CODES,
+  type SessionInfoUpdate,
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import { DEFAULT_TRANSPORT_EFFORT, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
@@ -189,6 +190,7 @@ export class QwenProvider implements TransportProvider {
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
+  private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
 
   async connect(config: ProviderConfig): Promise<void> {
     const resolved = resolveExecutableForSpawn(QWEN_BIN);
@@ -281,6 +283,14 @@ export class QwenProvider implements TransportProvider {
     };
   }
 
+  onSessionInfo(cb: (sessionId: string, info: SessionInfoUpdate) => void): () => void {
+    this.sessionInfoCallbacks.push(cb);
+    return () => {
+      const idx = this.sessionInfoCallbacks.indexOf(cb);
+      if (idx >= 0) this.sessionInfoCallbacks.splice(idx, 1);
+    };
+  }
+
   setSessionAgentId(sessionId: string, agentId: string): void {
     const state = this.sessions.get(sessionId);
     if (!state) return;
@@ -295,7 +305,13 @@ export class QwenProvider implements TransportProvider {
     await this.ensureSettingsPath(state);
   }
 
-  async send(sessionId: string, message: string, _attachments?: unknown[], extraSystemPrompt?: string): Promise<void> {
+  async send(
+    sessionId: string,
+    message: string,
+    _attachments?: unknown[],
+    extraSystemPrompt?: string,
+    allowResumeFallback = true,
+  ): Promise<void> {
     if (!this.config) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Qwen provider not connected', false);
     }
@@ -635,6 +651,18 @@ export class QwenProvider implements TransportProvider {
         }
       }
       if (!completed && !sawError && code !== 0) {
+        if (allowResumeFallback && state.started && /No saved session found with ID/i.test(stderrBuf)) {
+          state.started = false;
+          state.qwenConversationId = randomUUID();
+          this.emitSessionInfo(sessionId, { resumeId: state.qwenConversationId });
+          void this.send(sessionId, message, _attachments, extraSystemPrompt, false).catch((err) => {
+            const providerError = typeof err === 'object' && err && 'code' in err
+              ? err as ProviderError
+              : this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, String(err), false, err);
+            emitError(providerError.message, providerError.details ?? providerError);
+          });
+          return;
+        }
         emitError(stderrBuf.trim() || `Qwen exited with code ${code ?? 'null'}${signal ? ` (${signal})` : ''}`);
       }
     });
@@ -687,6 +715,10 @@ export class QwenProvider implements TransportProvider {
     if (state.lastStatusSignature === signature) return;
     state.lastStatusSignature = signature;
     for (const cb of this.statusCallbacks) cb(sessionId, status);
+  }
+
+  private emitSessionInfo(sessionId: string, info: SessionInfoUpdate): void {
+    for (const cb of this.sessionInfoCallbacks) cb(sessionId, info);
   }
 
   private clearStatus(sessionId: string, state: QwenSessionState): void {

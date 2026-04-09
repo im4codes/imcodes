@@ -918,6 +918,12 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
         next.codexSessionId = info.resumeId;
         changed = true;
       }
+      if (agentType === 'qwen' && next.providerSessionId !== info.resumeId) {
+        if (next.providerSessionId) unregisterProviderRoute(next.providerSessionId);
+        next.providerSessionId = info.resumeId;
+        registerProviderRoute(info.resumeId, sessionName);
+        changed = true;
+      }
     }
 
     if (typeof info.model === 'string' && info.model) {
