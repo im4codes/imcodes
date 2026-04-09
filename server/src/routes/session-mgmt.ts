@@ -116,6 +116,15 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/label', async (c) => {
 
   const label = typeof body.label === 'string' && body.label.trim() ? body.label.trim() : null;
   await updateSessionLabel(c.env.DB, serverId, sessionName, label);
+  try {
+    WsBridge.get(serverId).sendToDaemon(JSON.stringify({
+      type: 'session.relabel',
+      sessionName,
+      label,
+    }));
+  } catch (err) {
+    logger.warn({ serverId, sessionName, err }, 'WsBridge session relabel relay failed');
+  }
   return c.json({ ok: true });
 });
 
@@ -186,6 +195,18 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
       return c.json({ error: 'relay_failed' }, 502);
     }
   }
+  if (body.agentType == null && body.label !== undefined) {
+    try {
+      WsBridge.get(serverId).sendToDaemon(JSON.stringify({
+        type: 'session.relabel',
+        sessionName,
+        label: body.label ?? null,
+      }));
+    } catch (err) {
+      logger.error({ serverId, sessionName, err }, 'WsBridge session relabel relay failed');
+      return c.json({ error: 'relay_failed' }, 502);
+    }
+  }
   return c.json({ ok: true });
 });
 
@@ -208,6 +229,15 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/rename', async (c) => {
   if (!newName) return c.json({ error: 'name_required' }, 400);
 
   await updateProjectName(c.env.DB, serverId, sessionName, newName);
+  try {
+    WsBridge.get(serverId).sendToDaemon(JSON.stringify({
+      type: 'session.rename',
+      sessionName,
+      projectName: newName,
+    }));
+  } catch (err) {
+    logger.warn({ serverId, sessionName, err }, 'WsBridge session rename relay failed');
+  }
   return c.json({ ok: true });
 });
 

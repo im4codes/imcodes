@@ -30,6 +30,7 @@ import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
 const execFileAsync = promisify(execFileCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget } from './p2p-orchestrator.js';
+import { buildSessionList } from './session-list.js';
 import { getComboRoundCount, parseModePipeline, P2P_CONFIG_MODE, type P2pSessionConfig } from '../../shared/p2p-modes.js';
 import type { P2pAdvancedRound, P2pContextReducerConfig } from '../../shared/p2p-advanced.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
@@ -203,7 +204,6 @@ import { resolveContextWindow } from '../util/model-context.js';
 import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
 import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from '../agent/provider-display.js';
-import { buildSessionList } from './session-list.js';
 import { getQwenOAuthQuotaUsageLabel, recordQwenOAuthRequest } from '../agent/provider-quota.js';
 import { listProviderSessions as listProviderSessionsImpl } from './provider-sessions.js';
 
@@ -611,12 +611,63 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       break;
     case 'subsession.rename': {
       const sName = cmd.sessionName as string | undefined;
-      const label = cmd.label as string | undefined;
+      const label = cmd.label === null
+        ? null
+        : (typeof cmd.label === 'string' ? cmd.label : undefined);
       if (sName && label !== undefined) {
         const record = getSession(sName);
         if (record) {
-          upsertSession({ ...record, label, updatedAt: Date.now() });
+          const nextLabel = label ?? undefined;
+          upsertSession({ ...record, label: nextLabel, updatedAt: Date.now() });
           logger.info({ sessionName: sName, label }, 'subsession.rename: label updated');
+          const id = sName.replace(/^deck_sub_/, '');
+          void buildSubSessionSync(id, { label: nextLabel }).then((payload) => {
+            try {
+              serverLink.send(payload);
+            } catch {
+              // not connected
+            }
+          });
+        }
+      }
+      break;
+    }
+    case 'session.rename': {
+      const sessionName = cmd.sessionName as string | undefined;
+      const projectName = typeof cmd.projectName === 'string' ? cmd.projectName.trim() : '';
+      if (sessionName && projectName) {
+        const record = getSession(sessionName);
+        if (record) {
+          upsertSession({ ...record, projectName, updatedAt: Date.now() });
+          logger.info({ sessionName, projectName }, 'session.rename: project name updated');
+          void buildSessionList().then((sessions) => {
+            try {
+              serverLink.send({ type: 'session_list', daemonVersion: serverLink.daemonVersion, sessions });
+            } catch {
+              // not connected
+            }
+          });
+        }
+      }
+      break;
+    }
+    case 'session.relabel': {
+      const sessionName = cmd.sessionName as string | undefined;
+      const label = cmd.label === null
+        ? null
+        : (typeof cmd.label === 'string' ? cmd.label : undefined);
+      if (sessionName && label !== undefined) {
+        const record = getSession(sessionName);
+        if (record) {
+          upsertSession({ ...record, label: label ?? undefined, updatedAt: Date.now() });
+          logger.info({ sessionName, label }, 'session.relabel: label updated');
+          void buildSessionList().then((sessions) => {
+            try {
+              serverLink.send({ type: 'session_list', daemonVersion: serverLink.daemonVersion, sessions });
+            } catch {
+              // not connected
+            }
+          });
         }
       }
       break;
