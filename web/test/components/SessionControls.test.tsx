@@ -1497,24 +1497,26 @@ afterEach(() => {
 
   // ── File upload tests ─────────────────────────────────────────────────────
 
-  it('shows upload button when serverId is provided', () => {
+  it('shows upload button in compact card composer when serverId is provided', () => {
     render(
       <SessionControls
         ws={makeWs() as any}
         activeSession={makeSession()}
         quickData={makeQuickData() as any}
         serverId="srv-1"
+        compact
       />,
     );
     expect(screen.getByTitle('upload_file')).toBeDefined();
   });
 
-  it('does not show upload button when serverId is missing', () => {
+  it('does not show upload button in regular chat composer even when serverId exists', () => {
     render(
       <SessionControls
         ws={makeWs() as any}
         activeSession={makeSession()}
         quickData={makeQuickData() as any}
+        serverId="srv-1"
       />,
     );
     expect(screen.queryByTitle('upload_file')).toBeNull();
