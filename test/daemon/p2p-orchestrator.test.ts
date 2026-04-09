@@ -482,6 +482,38 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(payload.summary_phase).toBe('completed');
   });
 
+  it('does not fail the whole run when the initiator goes idle without writing', async () => {
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      const filePath = pathFromPrompt(prompt);
+      const heading = headingFromPrompt(prompt);
+      if (session === 'deck_proj_brain') {
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
+      }
+      await appendFile(filePath, `\n## ${heading}\n\nSUCCESS-${session}\n`, 'utf8');
+      setTimeout(() => notifySessionIdle(session), 20);
+    });
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'initiator idle without file change should not fail run',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      120,
+    );
+
+    const done = await waitForStatus(run.id, ['completed']);
+    expect(done.status).toBe('completed');
+    expect(done.skippedHops).toContain('deck_proj_brain');
+    expect(done.hopStates.some((hop) => hop.session === 'deck_proj_w1' && hop.status === 'completed')).toBe(true);
+    const content = await readFile(done.contextFilePath, 'utf8');
+    expect(content).toContain('SUCCESS-deck_proj_w1');
+  });
+
   it('uses isolated cross-project hop copies and copies completed artifacts back to the main project hop file', async () => {
     await mkdir(join(tempProjectDir, 'other'), { recursive: true });
     getSessionMock.mockImplementation((name: string) => {

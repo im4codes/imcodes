@@ -881,7 +881,7 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
         isInitial: true,
       }, rp);
       const initialOk = await dispatchHop(run, run.initiatorSession, initialPrompt, serverLink, { sectionHeader: initialHeader, required: true });
-      if (!initialOk) return;
+      if (!initialOk && (run._cancelled || isTerminal(run.status))) return;
       if (run._cancelled || isTerminal(run.status)) return;
     }
 
@@ -951,8 +951,8 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
         sectionHeader: roundSummaryHeader,
         required: true,
       });
-      if (!summaryOk) return;
-      run.summaryPhase = 'completed';
+      if (!summaryOk && (run._cancelled || isTerminal(run.status))) return;
+      run.summaryPhase = summaryOk ? 'completed' : 'failed';
       if (run._cancelled || isTerminal(run.status)) return;
     } finally {
       scheduleRoundHopArtifactCleanup(roundHops);
@@ -1350,8 +1350,8 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
         sectionHeader,
         required: true,
       });
-      if (!ok) return;
-      authoritativeSegment = await readAppendedContent(run.contextFilePath, baselineBuffer.length);
+      if (!ok && (run._cancelled || isTerminal(run.status))) return;
+      authoritativeSegment = ok ? await readAppendedContent(run.contextFilePath, baselineBuffer.length) : '';
     } else {
       const targets = [...run.allTargets];
       const roundHops = await createRoundHopStates(run, targets, round.modeKey);
@@ -1383,9 +1383,9 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
             sectionHeader,
             required: true,
           });
-          if (!ok) return;
-          authoritativeSegment = await readAppendedContent(run.contextFilePath, baselineBuffer.length);
-          run.summaryPhase = 'completed';
+          if (!ok && (run._cancelled || isTerminal(run.status))) return;
+          authoritativeSegment = ok ? await readAppendedContent(run.contextFilePath, baselineBuffer.length) : '';
+          run.summaryPhase = ok ? 'completed' : 'failed';
         }
       } finally {
         scheduleRoundHopArtifactCleanup(roundHops);
@@ -1456,8 +1456,8 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
     sectionHeader: `${discussionParticipantNameWithMode(run.initiatorSession, finalRound?.modeKey ?? run.mode)} — Final Summary`,
     required: true,
   });
-  if (!summaryOk) return;
-  run.summaryPhase = 'completed';
+  if (!summaryOk && (run._cancelled || isTerminal(run.status))) return;
+  run.summaryPhase = summaryOk ? 'completed' : 'failed';
 
   let fullContent = '';
   try {
@@ -1718,8 +1718,7 @@ async function dispatchHop(
           logger.warn({ runId: run.id, session }, 'P2P: agent idle without file change after retry');
           idleWaiter.cancel();
           await finishHop('failed', 'idle_without_file_change');
-          if (required) failRun(run, 'dispatch_failed', 'idle_without_file_change', serverLink);
-          else pushState(run, serverLink);
+          pushState(run, serverLink);
           return false;
         }
       }
