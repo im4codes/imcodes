@@ -113,12 +113,19 @@ describe('stale watchdog cleanup (Windows-only end-to-end)', () => {
       expect(spawned, `fake watchdog PID ${fakePid} did not appear`).toBe(true);
 
       // Run killAllStaleWatchdogs() in a child process so vitest mocks don't
-      // touch the real fs/child_process modules.  Also print diagnostics so
-      // CI failures are easy to debug.
+      // touch the real fs/child_process modules.  Also dump what PowerShell
+      // sees so CI failures expose the actual CommandLine values.
       const moduleUrl = pathToFileURL(join(repoRoot, 'dist/src/util/windows-daemon.js')).href;
       const driverSource = `
         import { killAllStaleWatchdogs } from ${JSON.stringify(moduleUrl)};
+        import { execSync } from 'child_process';
         console.error('[driver] before kill, fakePid=${fakePid}');
+        // Diagnostic: show every cmd.exe and its CommandLine so we can see
+        // why the filter may not be matching on this Windows runner.
+        try {
+          const all = execSync('powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter \\\\"Name=\\'cmd.exe\\'\\\\" | Select-Object ProcessId, CommandLine | Format-List"', { encoding: 'utf8' });
+          console.error('[driver] all cmd.exe processes:\\n' + all);
+        } catch (e) { console.error('[driver] diag failed:', String(e)); }
         killAllStaleWatchdogs();
         console.error('[driver] after kill');
       `;
