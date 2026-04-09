@@ -700,8 +700,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     const availableHeight = Math.max(96, Math.floor(rect.top - 12));
     if (window.innerWidth > 640) {
       return {
+        position: 'fixed',
+        right: Math.max(window.innerWidth - rect.right, 8),
+        bottom: Math.max(window.innerHeight - rect.top + 4, 8),
         maxHeight: `${availableHeight}px`,
-        zIndex: 10001,
+        zIndex: 2147483646,
       } as const;
     }
     return {
@@ -712,7 +715,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       width: 'auto',
       maxWidth: 'none',
       maxHeight: `${availableHeight}px`,
-      zIndex: 10001,
+      zIndex: 2147483646,
     } as const;
   }, [openSpecLayoutTick, openSpecOpen]);
 
@@ -730,13 +733,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         minWidth: 0,
         width: 'auto',
         maxWidth: 'none',
-        zIndex: 10002,
+        zIndex: 2147483647,
       } as const
     : {
         right: 0,
         bottom: 'calc(100% + 6px)',
         minWidth: 180,
-        zIndex: 10002,
+        zIndex: 2147483647,
       } as const;
 
   const openSpecProposeDropdownStyle = isOpenSpecMobile
@@ -748,13 +751,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         minWidth: 0,
         width: 'auto',
         maxWidth: 'none',
-        zIndex: 10002,
+        zIndex: 2147483647,
       } as const
     : {
         right: 0,
         bottom: 'calc(100% + 6px)',
         minWidth: 220,
-        zIndex: 10002,
+        zIndex: 2147483647,
       } as const;
 
   useEffect(() => {

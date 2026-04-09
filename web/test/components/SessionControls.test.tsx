@@ -926,6 +926,8 @@ afterEach(() => {
       fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
 
       const dropdown = document.querySelector('.menu-dropdown-openspec') as HTMLElement;
+      expect(dropdown.style.position).toBe('fixed');
+      expect(dropdown.style.bottom).toBe('584px');
       expect(dropdown.style.maxHeight).toBe('208px');
     } finally {
       rectSpy.mockRestore();
@@ -958,13 +960,14 @@ afterEach(() => {
 
     const dropdown = document.querySelector('.menu-dropdown-openspec') as HTMLElement;
     expect(dropdown).toBeTruthy();
-    expect(dropdown.style.zIndex).toBe('10001');
+    expect(dropdown.style.position).toBe('fixed');
+    expect(dropdown.style.zIndex).toBe('2147483646');
 
     fireEvent.click(screen.getByRole('button', { name: 'audit_action' }));
 
     const submenu = document.querySelector('.openspec-submenu') as HTMLElement;
     expect(submenu).toBeTruthy();
-    expect(submenu.style.zIndex).toBe('10002');
+    expect(submenu.style.zIndex).toBe('2147483647');
   });
 
   it('collapses openspec actions behind a disclosure toggle on mobile', async () => {
