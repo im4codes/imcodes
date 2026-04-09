@@ -38,7 +38,12 @@ vi.mock('../../src/hooks/useTimeline.js', () => ({
   useTimeline: () => ({ events: timelineEvents, refreshing: false }),
 }));
 
-const sessionControlsSpy = vi.fn((props: any) => <div data-testid="session-controls" data-queued={(props.activeSession?.transportPendingMessages ?? []).join('|')} />);
+const sessionControlsSpy = vi.fn((props: any) => (
+  <div data-testid="session-controls" data-queued={(props.activeSession?.transportPendingMessages ?? []).join('|')}>
+    <button type="button" data-testid="session-controls-open-overlay" onClick={() => props.onOverlayOpenChange?.(true)}>open overlay</button>
+    <button type="button" data-testid="session-controls-close-overlay" onClick={() => props.onOverlayOpenChange?.(false)}>close overlay</button>
+  </div>
+));
 
 vi.mock('../../src/components/SessionControls.js', () => ({
   SessionControls: (props: any) => sessionControlsSpy(props),
@@ -316,5 +321,29 @@ describe('SubSessionCard', () => {
       const controls = document.querySelector('[data-testid="session-controls"]') as HTMLElement | null;
       expect(controls?.dataset.queued).toBe('queued send');
     });
+  });
+
+  it('raises the whole card above neighbors while a compact dropdown is open', async () => {
+    const { container, getByTestId } = render(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        quickData={{ data: [], recordHistory: vi.fn() } as any}
+      />,
+    );
+
+    const card = container.querySelector('.subcard') as HTMLDivElement;
+    expect(card.className).not.toContain('subcard-overlay-open');
+
+    fireEvent.click(getByTestId('session-controls-open-overlay'));
+    expect(card.className).toContain('subcard-overlay-open');
+
+    fireEvent.click(getByTestId('session-controls-close-overlay'));
+    expect(card.className).not.toContain('subcard-overlay-open');
   });
 });

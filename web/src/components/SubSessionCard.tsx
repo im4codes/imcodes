@@ -85,6 +85,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const badge = STATE_BADGE[sub.state];
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const [quickPanelOpen, setQuickPanelOpen] = useState(false);
+  const [overlayOpen, setOverlayOpen] = useState(false);
 
   // Build a SessionInfo for SessionControls compact mode
   const sessionInfo = useMemo<SessionInfo>(() => ({
@@ -204,7 +205,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
 
   return (
     <div
-      class={`subcard${isOpen ? ' subcard-open' : ''}${isFocused ? ' subcard-focused' : ''}${busy ? ' subcard-running-pulse' : ''}${quickPanelOpen ? ' subcard-quick-open' : ''}`}
+      class={`subcard${isOpen ? ' subcard-open' : ''}${isFocused ? ' subcard-focused' : ''}${busy ? ' subcard-running-pulse' : ''}${quickPanelOpen ? ' subcard-quick-open' : ''}${overlayOpen ? ' subcard-overlay-open' : ''}`}
       style={{ width: effectiveW, height: cardH, minWidth: effectiveW, position: 'relative' }}
       onClick={() => { if (!draggingRef.current) onOpen(); }}
     >
@@ -300,6 +301,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
                 subSessions={subSessions}
                 serverId={serverId}
                 onQuickOpenChange={setQuickPanelOpen}
+                onOverlayOpenChange={setOverlayOpen}
               />
             ) : (
               <input

@@ -76,6 +76,8 @@ interface Props {
   compact?: boolean;
   /** Notifies parent when the quick input panel opens/closes. */
   onQuickOpenChange?: (open: boolean) => void;
+  /** Notifies parent when any floating overlay/dropdown is open. */
+  onOverlayOpenChange?: (open: boolean) => void;
 }
 
 type MenuAction = 'restart' | 'new' | 'stop';
@@ -283,7 +285,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking: _activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking: _activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -503,6 +505,24 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     onQuickOpenChange?.(quickOpen);
     return () => onQuickOpenChange?.(false);
   }, [onQuickOpenChange, quickOpen]);
+
+  const overlayOpen = quickOpen
+    || menuOpen
+    || modelOpen
+    || thinkingOpen
+    || atPickerOpen
+    || p2pOpen
+    || p2pConfigOpen
+    || openSpecOpen
+    || openSpecAuditMenu !== null
+    || openSpecProposeMenuOpen
+    || voiceOpen
+    || !!mobileFileBrowserOpen;
+
+  useEffect(() => {
+    onOverlayOpenChange?.(overlayOpen);
+    return () => onOverlayOpenChange?.(false);
+  }, [mobileFileBrowserOpen, onOverlayOpenChange, overlayOpen]);
 
   useEffect(() => {
     const syncQueuedHintExpanded = () => setQueuedHintExpanded(loadQueuedHintExpanded());
@@ -1326,6 +1346,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const isMobileLayout = typeof window !== 'undefined' && window.innerWidth <= 640;
   const showEmbeddedVoiceButton = isMobileLayout && VoiceInput.isAvailable() && !hasText;
+  const showCompactMetaControls = !!(openSpecChangesPath || isClaudeCode || isCodex || isQwen || supportsThinking || !isShellLike);
   const basePlaceholder = !hasSession
     ? t('session.no_session')
     : !connected
@@ -1375,9 +1396,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       </div>
     )}
     <div class={`controls-wrapper${showRunningSweep ? ' controls-wrapper-running' : ''}${mobileComposerExpanded ? ' controls-wrapper-mobile-expanded' : ''}`}>
-      {/* Shortcut row — hidden in chat mode and compact mode */}
-      {!hideShortcuts && !compact && <div class="shortcuts-row">
-        <div class="shortcuts">
+      {/* Header control row — compact mode keeps meta controls but still hides terminal shortcuts */}
+      {!hideShortcuts && (!compact || showCompactMetaControls) && <div class="shortcuts-row">
+        {!compact && <div class="shortcuts">
           {/* Quick input trigger — shown here (before Esc) when shell terminal hides input row */}
           {isShellLike && (
             <button
@@ -1411,7 +1432,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               {s.label}
             </button>
           ))}
-        </div>
+        </div>}
 
         {/* Model selector — outside overflow-x scroll area so dropdown isn't clipped */}
         {openSpecChangesPath && (

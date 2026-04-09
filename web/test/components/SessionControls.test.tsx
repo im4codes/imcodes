@@ -245,6 +245,41 @@ afterEach(() => {
     expect(screen.getByRole('button', { name: /send/i })).toBeDefined();
   });
 
+  it('keeps openspec through p2p settings controls visible in compact card mode', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ projectDir: '/tmp/project' })}
+        quickData={makeQuickData() as any}
+        compact
+      />,
+    );
+    expect(screen.getByText('OpenSpec')).toBeDefined();
+    expect(screen.getByText('P2P')).toBeDefined();
+    expect(screen.getByLabelText('settings_button')).toBeDefined();
+    expect(document.querySelector('.shortcuts')).toBeNull();
+  });
+
+  it('reports card overlay state when compact dropdowns open', () => {
+    const onOverlayOpenChange = vi.fn();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ projectDir: '/tmp/project' })}
+        quickData={makeQuickData() as any}
+        compact
+        onOverlayOpenChange={onOverlayOpenChange}
+      />,
+    );
+
+    fireEvent.click(screen.getByText('OpenSpec'));
+    expect(onOverlayOpenChange).toHaveBeenLastCalledWith(true);
+    expect(document.querySelector('.menu-dropdown-openspec')).toBeTruthy();
+
+    fireEvent.mouseDown(document.body);
+    expect(onOverlayOpenChange).toHaveBeenLastCalledWith(false);
+  });
+
   it('shows the desktop upload hint in the placeholder on desktop', () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: DEFAULT_INNER_WIDTH });
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);

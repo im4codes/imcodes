@@ -746,6 +746,7 @@ body {
 .subcard:hover { border-color: #475569; box-shadow: 0 2px 12px rgba(0,0,0,0.4); }
 .subcard-open { border-color: #334d6b; }
 .subcard-quick-open { z-index: 300; }
+.subcard-overlay-open { z-index: 300; }
 @keyframes subcard-sci-fi { 0% { border-color: #334155; box-shadow: 0 0 4px #00e5ff22; } 40% { border-color: #00e5ff; box-shadow: 0 0 12px #00e5ff88, 0 0 24px #00e5ff33; } 70% { border-color: #818cf8; box-shadow: 0 0 12px #818cf888, 0 0 24px #818cf833; } 100% { border-color: #334155; box-shadow: 0 0 4px #00e5ff22; } }
 .subcard-running-pulse { animation: subcard-sci-fi 3.6s ease-in-out infinite; }
 @keyframes subcard-focus-glow { 0%, 100% { box-shadow: 0 0 8px #60a5faaa, 0 0 20px #3b82f644; } 50% { box-shadow: 0 0 16px #60a5facc, 0 0 32px #3b82f666; } }
