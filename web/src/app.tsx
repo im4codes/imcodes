@@ -546,15 +546,16 @@ export function App() {
     return () => clearInterval(id);
   }, [auth, loadServers]);
 
-  // Rename = update project_name in D1 + local sessions state
-  const handleRenameSession = useCallback(async (sessionName: string, newProjectName: string) => {
-    if (!selectedServerId || !newProjectName) return;
-    // Optimistic update
-    setSessions((prev) => prev.map((s) => s.name === sessionName ? { ...s, project: newProjectName } : s));
+  // Rename = update main-session label in D1 + local sessions state
+  const handleRenameSession = useCallback(async (sessionName: string, nextLabel: string | null) => {
+    if (!selectedServerId) return;
+    setSessions((prev) => prev.map((s) => (
+      s.name === sessionName ? { ...s, label: nextLabel } : s
+    )));
     try {
-      await apiFetch(`/api/server/${selectedServerId}/sessions/${encodeURIComponent(sessionName)}/rename`, {
+      await apiFetch(`/api/server/${selectedServerId}/sessions/${encodeURIComponent(sessionName)}/label`, {
         method: 'PATCH',
-        body: JSON.stringify({ name: newProjectName }),
+        body: JSON.stringify({ label: nextLabel }),
       });
     } catch { /* best-effort */ }
   }, [selectedServerId]);

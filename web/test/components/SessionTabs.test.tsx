@@ -11,6 +11,14 @@ vi.mock('react-i18next', () => ({
   }),
 }));
 
+const getUserPrefMock = vi.fn().mockResolvedValue(null);
+const saveUserPrefMock = vi.fn().mockResolvedValue(undefined);
+
+vi.mock('../../src/api.js', () => ({
+  getUserPref: (...args: unknown[]) => getUserPrefMock(...args),
+  saveUserPref: (...args: unknown[]) => saveUserPrefMock(...args),
+}));
+
 import { SessionTabs } from '../../src/components/SessionTabs.js';
 import type { SessionInfo } from '../../src/types.js';
 
@@ -33,6 +41,8 @@ const defaultProps = {
 
 describe('SessionTabs', () => {
   beforeEach(() => {
+    getUserPrefMock.mockResolvedValue(null);
+    saveUserPrefMock.mockResolvedValue(undefined);
     // Ensure localStorage is available (jsdom may provide a broken stub)
     if (typeof globalThis.localStorage === 'undefined' || typeof globalThis.localStorage.setItem !== 'function') {
       const store: Record<string, string> = {};
@@ -163,5 +173,69 @@ describe('SessionTabs', () => {
     fireEvent.click(stopBtn());
     expect(onStopProject).toHaveBeenCalledOnce();
     expect(onStopProject).toHaveBeenCalledWith('proj-1');
+  });
+
+  it('uses the current label as the rename input value and commits a label update', () => {
+    const onRenameSession = vi.fn();
+    const sessions: SessionInfo[] = [{
+      name: 'deck_proj_brain',
+      project: 'my-project',
+      role: 'brain',
+      agentType: 'brain',
+      state: 'idle',
+      label: 'Main Label',
+    }];
+
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession="deck_proj_brain"
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        renameRequest="deck_proj_brain"
+        onRenameHandled={vi.fn()}
+        onRenameSession={onRenameSession}
+        {...defaultProps}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLInputElement;
+    expect(input.value).toBe('Main Label');
+
+    fireEvent.input(input, { target: { value: 'Readable Main' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    expect(onRenameSession).toHaveBeenCalledWith('deck_proj_brain', 'Readable Main');
+  });
+
+  it('allows clearing the label so the session falls back to the project name', () => {
+    const onRenameSession = vi.fn();
+    const sessions: SessionInfo[] = [{
+      name: 'deck_proj_brain',
+      project: 'my-project',
+      role: 'brain',
+      agentType: 'brain',
+      state: 'idle',
+      label: 'Main Label',
+    }];
+
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession="deck_proj_brain"
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        renameRequest="deck_proj_brain"
+        onRenameHandled={vi.fn()}
+        onRenameSession={onRenameSession}
+        {...defaultProps}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLInputElement;
+    fireEvent.input(input, { target: { value: '' } });
+    fireEvent.blur(input);
+
+    expect(onRenameSession).toHaveBeenCalledWith('deck_proj_brain', null);
   });
 });

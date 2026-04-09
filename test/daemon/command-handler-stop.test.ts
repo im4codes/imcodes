@@ -265,6 +265,53 @@ describe('handleWebCommand shutdown failure paths', () => {
     });
   });
 
+  it('clears the main-session label and pushes a refreshed session_list on session.relabel', async () => {
+    const { getSession, upsertSession } = await import('../../src/store/session-store.js');
+    vi.mocked(getSession).mockReturnValue({
+      name: 'deck_proj_brain',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'codex',
+      state: 'idle',
+      label: 'Main Label',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+      projectDir: '/tmp/proj',
+    } as any);
+    buildSessionListMock.mockResolvedValueOnce([
+      {
+        name: 'deck_proj_brain',
+        project: 'proj',
+        role: 'brain',
+        agentType: 'codex',
+        state: 'idle',
+      },
+    ]);
+
+    handleWebCommand({ type: 'session.relabel', sessionName: 'deck_proj_brain', label: null }, serverLink as any);
+    await flushAsync();
+
+    expect(upsertSession).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_proj_brain',
+      label: undefined,
+    }));
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'session_list',
+      daemonVersion: '0.1.0',
+      sessions: [
+        {
+          name: 'deck_proj_brain',
+          project: 'proj',
+          role: 'brain',
+          agentType: 'codex',
+          state: 'idle',
+        },
+      ],
+    });
+  });
+
   it('updates the sub-session label and emits subsession.sync on subsession.rename', async () => {
     const { getSession, upsertSession } = await import('../../src/store/session-store.js');
     vi.mocked(getSession).mockReturnValue({

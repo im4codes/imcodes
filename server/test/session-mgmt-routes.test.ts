@@ -198,4 +198,22 @@ describe('session-mgmt persistence routes', () => {
       label: 'Main Label',
     });
   });
+
+  it('PATCH /sessions/:name/label allows clearing the label and still relays session.relabel', async () => {
+    const { updateSessionLabel } = await import('../src/db/queries.js');
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain/label', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: '' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(updateSessionLabel).toHaveBeenCalledWith({}, 'srv-1', 'deck_proj_brain', null);
+    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toEqual({
+      type: 'session.relabel',
+      sessionName: 'deck_proj_brain',
+      label: null,
+    });
+  });
 });
