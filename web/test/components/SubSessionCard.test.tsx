@@ -346,4 +346,24 @@ describe('SubSessionCard', () => {
     fireEvent.click(getByTestId('session-controls-close-overlay'));
     expect(card.className).not.toContain('subcard-overlay-open');
   });
+
+  it('keeps compact meta controls available inside the card composer', () => {
+    render(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        quickData={{ data: [], recordHistory: vi.fn() } as any}
+      />,
+    );
+
+    expect(sessionControlsSpy).toHaveBeenCalled();
+    const props = sessionControlsSpy.mock.calls.at(-1)?.[0];
+    expect(props.compact).toBe(true);
+    expect(props.hideShortcuts).toBeUndefined();
+  });
 });

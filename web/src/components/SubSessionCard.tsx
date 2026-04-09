@@ -294,7 +294,6 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
                 activeSession={sessionInfo}
                 quickData={quickData}
                 compact
-                hideShortcuts
                 onSubStop={onClose}
                 onSubRestart={onRestart}
                 sessions={sessions}
