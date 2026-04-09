@@ -824,6 +824,38 @@ describe('FileBrowser', () => {
     expect(onPreviewFile).toHaveBeenCalled();
     expect(document.querySelector('.fb-preview')).toBeNull();
     expect(document.querySelector('.fb-body-split')).toBeNull();
+    expect(document.querySelector('.fb-tree-split')).toBeNull();
+    expect(document.querySelector('.fb-resize-handle')).toBeNull();
+  });
+
+  it('does not change the source panel layout when opening external previews from the files list', async () => {
+    const { ws, respond } = makeWsFactory();
+    const onPreviewFile = vi.fn();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        onPreviewFile={onPreviewFile}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+
+    const fileEntry = await screen.findByText('foo.ts');
+    await act(async () => { fireEvent.click(fileEntry); });
+
+    expect(onPreviewFile).toHaveBeenCalledWith({
+      path: '/home/user/foo.ts',
+      preferDiff: false,
+      preview: { status: 'loading', path: '/home/user/foo.ts' },
+    });
+    expect(document.querySelector('.fb-preview')).toBeNull();
+    expect(document.querySelector('.fb-body-split')).toBeNull();
+    expect(document.querySelector('.fb-tree-split')).toBeNull();
+    expect(document.querySelector('.fb-resize-handle')).toBeNull();
   });
 
   it('hides the embedded changes section in files view when an external preview host is provided', async () => {

@@ -667,6 +667,10 @@ export function FileBrowser({
     if (editDirtyRef.current) {
       if (!window.confirm(t('fileBrowser.unsavedChanges'))) return;
     }
+    if (onPreviewFile) {
+      onPreviewFile({ path: filePath, preferDiff, preview: { status: 'loading', path: filePath } });
+      return;
+    }
     dismissedAutoPreviewPathRef.current = null;
     setEditDirty(false);
     setEditContent('');
@@ -675,10 +679,6 @@ export function FileBrowser({
     const loadingPreview: FileBrowserPreviewState = { status: 'loading', path: filePath };
     setPreview(loadingPreview);
     setShowDiff(preferDiff);
-    if (onPreviewFile) {
-      onPreviewFile({ path: filePath, preferDiff, preview: loadingPreview });
-      return;
-    }
     const requestId = ws.fsReadFile(filePath);
     pendingReadRef.current.set(requestId, filePath);
     const diffId = ws.fsGitDiff(filePath);
@@ -948,8 +948,8 @@ export function FileBrowser({
 
   const alreadySet = new Set(alreadyInserted);
   const usesExternalPreview = !!onPreviewFile;
-  const hasPreview = mode !== 'dir-only' && preview.status !== 'idle';
-  const hasInlinePreview = hasPreview && !usesExternalPreview;
+  const hasInlinePreview = mode !== 'dir-only' && preview.status !== 'idle' && !usesExternalPreview;
+  const hasPreview = hasInlinePreview;
 
   const previewPath = preview.status !== 'idle' ? (preview as { path: string }).path : null;
 
