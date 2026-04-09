@@ -701,6 +701,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     if (window.innerWidth > 640) {
       return {
         maxHeight: `${availableHeight}px`,
+        zIndex: 10001,
       } as const;
     }
     return {
@@ -729,11 +730,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         minWidth: 0,
         width: 'auto',
         maxWidth: 'none',
+        zIndex: 10002,
       } as const
     : {
         right: 0,
         bottom: 'calc(100% + 6px)',
         minWidth: 180,
+        zIndex: 10002,
       } as const;
 
   const openSpecProposeDropdownStyle = isOpenSpecMobile
@@ -745,11 +748,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         minWidth: 0,
         width: 'auto',
         maxWidth: 'none',
+        zIndex: 10002,
       } as const
     : {
         right: 0,
         bottom: 'calc(100% + 6px)',
         minWidth: 220,
+        zIndex: 10002,
       } as const;
 
   useEffect(() => {

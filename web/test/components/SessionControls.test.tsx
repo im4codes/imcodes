@@ -934,6 +934,39 @@ afterEach(() => {
     }
   });
 
+  it('raises openspec dropdowns above surrounding cards on desktop', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    const dropdown = document.querySelector('.menu-dropdown-openspec') as HTMLElement;
+    expect(dropdown).toBeTruthy();
+    expect(dropdown.style.zIndex).toBe('10001');
+
+    fireEvent.click(screen.getByRole('button', { name: 'audit_action' }));
+
+    const submenu = document.querySelector('.openspec-submenu') as HTMLElement;
+    expect(submenu).toBeTruthy();
+    expect(submenu.style.zIndex).toBe('10002');
+  });
+
   it('collapses openspec actions behind a disclosure toggle on mobile', async () => {
     const innerWidth = window.innerWidth;
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
