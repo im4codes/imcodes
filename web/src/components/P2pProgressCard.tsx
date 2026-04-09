@@ -200,8 +200,8 @@ export const P2pProgressCard = memo(function P2pProgressCard({
 }: Props) {
   const { t } = useTranslation();
   const nodes = discussion.nodes ?? [];
-  const isRunning = discussion.state === 'running';
   const isTerminal = discussion.state === 'done' || discussion.state === 'failed';
+  const isRunning = !isTerminal;
   const isActive = !isTerminal;
   const showActionButton = discussion.state === 'failed' || isActive;
   const totalHopsPerRound = discussion.totalHops ?? 0;

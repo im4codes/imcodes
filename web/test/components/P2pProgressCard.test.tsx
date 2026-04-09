@@ -158,7 +158,40 @@ describe('P2pProgressCard', () => {
       />,
     );
 
-    expect(screen.getAllByText('00:00').length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText('00:00').length).toBeGreaterThan(0);
+
+    act(() => {
+      vi.advanceTimersByTime(2000);
+    });
+
+    expect(screen.getAllByText('00:02').length).toBeGreaterThan(0);
+  });
+
+  it('keeps timers ticking during setup state before the run reaches running', () => {
+    render(
+      <P2pProgressCard
+        discussion={{
+          id: 'p2p_run_setup_timers',
+          topic: 'P2P audit · brain',
+          state: 'setup',
+          modeKey: 'audit',
+          currentRound: 1,
+          maxRounds: 2,
+          completedHops: 0,
+          totalHops: 2,
+          activeHop: 1,
+          activeRoundHop: 1,
+          activePhase: 'initial',
+          startedAt: Date.now(),
+          hopStartedAt: Date.now(),
+          nodes: [
+            { label: 'brain', agentType: 'codex', status: 'active', phase: 'initial' },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getAllByText('00:00').length).toBeGreaterThan(0);
 
     act(() => {
       vi.advanceTimersByTime(2000);
