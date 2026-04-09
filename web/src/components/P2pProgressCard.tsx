@@ -88,11 +88,9 @@ function formatElapsed(ms: number): string {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
 }
 
-function resolveTimerAnchor(startMs: number | undefined, fallbackStart: number, now: number): number {
+function resolveTimerAnchor(startMs: number | undefined, fallbackStart: number): number {
   if (typeof startMs !== 'number' || !Number.isFinite(startMs)) return fallbackStart;
-  // Remote daemon clock skew can place server timestamps slightly or significantly in the future.
-  // In that case, anchor locally so the timer still advances instead of sticking at 00:00.
-  return startMs > now ? fallbackStart : startMs;
+  return startMs;
 }
 
 function DiscussionActionButton({ active, compact, onAction }: ActionButtonProps) {
@@ -171,7 +169,7 @@ const ElapsedTimer = memo(function ElapsedTimer({
     }
   }, [timerKey]);
   const now = useNowTicker(active);
-  const anchor = resolveTimerAnchor(startMs, fallbackStart, now);
+  const anchor = resolveTimerAnchor(startMs, fallbackStart);
   if (!active) return null;
   const elapsed = formatElapsed(now - anchor);
   return <span class={className}>{elapsed}</span>;
@@ -197,7 +195,7 @@ const HopElapsedTimer = memo(function HopElapsedTimer({
     }
   }, [hopKey]);
   const now = useNowTicker(active);
-  const anchor = resolveTimerAnchor(startMs, fallbackStart, now);
+  const anchor = resolveTimerAnchor(startMs, fallbackStart);
   const elapsed = formatElapsed(now - anchor);
   if (!active) return null;
   return <span class={className}>{elapsed}</span>;

@@ -1,6 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi, afterEach } from 'vitest';
 
 import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate } from '../src/p2p-run-mapping.js';
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe('mapP2pRunToDiscussion', () => {
   it('keeps legacy payloads on legacy nodes and legacy counters', () => {
@@ -264,6 +268,26 @@ describe('mapP2pRunToDiscussion', () => {
     expect(stringStamped.hopStartedAt).toBe(startedAt);
     expect(numericStamped.startedAt).toBe(startedAt);
     expect(numericStamped.hopStartedAt).toBe(hopStartedAt);
+  });
+
+  it('adjusts persisted timer anchors when server timestamps are ahead of the browser clock', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-04-09T00:00:00.000Z'));
+
+    const discussion = mapP2pRunToDiscussion({
+      id: 'run_clock_skew',
+      status: 'running',
+      mode_key: 'audit',
+      current_round: 1,
+      total_rounds: 1,
+      total_hops: 1,
+      created_at: '2026-04-09T00:00:10.000Z',
+      hop_started_at: '2026-04-09T00:00:40.000Z',
+      updated_at: '2026-04-09T00:01:00.000Z',
+    });
+
+    expect(discussion.startedAt).toBe(Date.parse('2026-04-08T23:59:10.000Z'));
+    expect(discussion.hopStartedAt).toBe(Date.parse('2026-04-08T23:59:40.000Z'));
   });
 
   it('preserves existing timer anchors when later run updates omit them', () => {

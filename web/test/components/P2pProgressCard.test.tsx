@@ -14,6 +14,12 @@ vi.mock('react-i18next', () => ({
 import { P2pProgressCard } from '../../src/components/P2pProgressCard.js';
 import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate } from '../../src/p2p-run-mapping.js';
 
+function parseMmSs(value: string | null | undefined): number {
+  if (!value) return 0;
+  const [mins, secs] = value.split(':').map((part) => Number(part));
+  return ((mins ?? 0) * 60) + (secs ?? 0);
+}
+
 describe('P2pProgressCard', () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -200,40 +206,6 @@ describe('P2pProgressCard', () => {
     expect(screen.getAllByText('00:02').length).toBeGreaterThan(0);
   });
 
-  it('keeps timers moving even when server timestamps are in the future', () => {
-    const futureStart = Date.now() + 60_000;
-    render(
-      <P2pProgressCard
-        discussion={{
-          id: 'p2p_run_future_clock',
-          topic: 'P2P audit · brain',
-          state: 'running',
-          modeKey: 'audit',
-          currentRound: 1,
-          maxRounds: 2,
-          completedHops: 0,
-          totalHops: 2,
-          activeHop: 1,
-          activeRoundHop: 1,
-          activePhase: 'hop',
-          startedAt: futureStart,
-          hopStartedAt: futureStart,
-          nodes: [
-            { label: 'brain', agentType: 'codex', status: 'active', phase: 'hop' },
-          ],
-        }}
-      />,
-    );
-
-    expect(screen.getAllByText('00:00').length).toBeGreaterThan(0);
-
-    act(() => {
-      vi.advanceTimersByTime(2000);
-    });
-
-    expect(screen.getAllByText('00:02').length).toBeGreaterThan(0);
-  });
-
   it('does not lose timer anchors when a later discussion update omits timestamp fields', () => {
     const startedAt = Date.now();
     const hopStartedAt = startedAt;
@@ -281,6 +253,64 @@ describe('P2pProgressCard', () => {
 
     expect(screen.queryAllByText('00:00').length).toBe(0);
     expect(screen.getAllByText('00:04').length).toBeGreaterThan(0);
+  });
+
+  it('keeps the persisted elapsed timer across remounts instead of restarting from local mount time', () => {
+    const initial = mapP2pRunToDiscussion({
+      id: 'p2p_run_reopen_clock',
+      status: 'running',
+      mode_key: 'audit',
+      current_round: 1,
+      total_rounds: 2,
+      completed_hops_count: 0,
+      total_hops: 2,
+      active_hop_number: 1,
+      active_round_hop_number: 1,
+      active_phase: 'hop',
+      created_at: '2026-04-08T00:00:10.000Z',
+      hop_started_at: '2026-04-08T00:00:30.000Z',
+      updated_at: '2026-04-08T00:01:00.000Z',
+      all_nodes: [
+        { label: 'brain', agentType: 'claude-code', status: 'done', phase: 'initial' },
+        { label: 'w1', agentType: 'codex', status: 'active', phase: 'hop' },
+      ],
+    });
+
+    const first = render(<P2pProgressCard discussion={initial} />);
+    const firstTimer = first.container.querySelector('.p2p-timer-total')?.textContent;
+    expect(firstTimer).toBeTruthy();
+    expect(firstTimer).not.toBe('00:00');
+    first.unmount();
+
+    act(() => {
+      vi.advanceTimersByTime(5000);
+    });
+
+    const reopened = mapP2pRunToDiscussion({
+      id: 'p2p_run_reopen_clock',
+      status: 'running',
+      mode_key: 'audit',
+      current_round: 1,
+      total_rounds: 2,
+      completed_hops_count: 0,
+      total_hops: 2,
+      active_hop_number: 1,
+      active_round_hop_number: 1,
+      active_phase: 'hop',
+      created_at: '2026-04-08T00:00:10.000Z',
+      hop_started_at: '2026-04-08T00:00:30.000Z',
+      updated_at: '2026-04-08T00:01:05.000Z',
+      all_nodes: [
+        { label: 'brain', agentType: 'claude-code', status: 'done', phase: 'initial' },
+        { label: 'w1', agentType: 'codex', status: 'active', phase: 'hop' },
+      ],
+    });
+    render(<P2pProgressCard discussion={reopened} />);
+
+    const reopenedTimer = document.querySelector('.p2p-timer-total')?.textContent;
+    expect(reopenedTimer).toBeTruthy();
+    expect(reopenedTimer).not.toBe('00:00');
+    expect(parseMmSs(reopenedTimer)).toBeGreaterThan(10);
   });
 
   it('shows parallel hop ranges and highlights all active hop segments', () => {

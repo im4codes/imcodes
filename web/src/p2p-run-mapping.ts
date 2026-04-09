@@ -9,6 +9,19 @@ function parseTimestamp(value: unknown): number | undefined {
   return undefined;
 }
 
+function normalizeTimerAnchor(startValue: unknown, updatedValue: unknown, receivedAt: number): number | undefined {
+  const start = parseTimestamp(startValue);
+  if (start === undefined) return undefined;
+
+  const updated = parseTimestamp(updatedValue);
+  if (updated === undefined || updated <= receivedAt || updated < start) return start;
+
+  // When the daemon/server clock is ahead of the browser clock, anchor the
+  // timer using the persisted server delta instead of resetting to local "now"
+  // on every remount.
+  return start - (updated - receivedAt);
+}
+
 function parseSnapshot(rawSnapshot: unknown): Record<string, any> {
   if (typeof rawSnapshot === 'string') {
     try {
@@ -49,6 +62,7 @@ function mapAdvancedNodes(source: Record<string, any>) {
 export function mapP2pRunToDiscussion(r: Record<string, any>) {
   const snapshot = parseSnapshot(r.progress_snapshot);
   const source = { ...r, ...snapshot } as Record<string, any>;
+  const receivedAt = Date.now();
   const advancedEnabled = source.advanced_p2p_enabled === true;
   const id = `p2p_${source.id}`;
   const status = String(source.status ?? '');
@@ -112,8 +126,16 @@ export function mapP2pRunToDiscussion(r: Record<string, any>) {
     error: state === 'failed' ? (source.error ?? source.terminal_reason ?? '') : '',
     nodes: useAdvancedNodes ? advancedNodes : legacyNodes,
     hopStates,
-    startedAt: parseTimestamp(source.created_at),
-    hopStartedAt: parseTimestamp(source.hop_started_at),
+    startedAt: normalizeTimerAnchor(
+      source.created_at ?? source.startedAt,
+      source.updated_at ?? source.updatedAt,
+      receivedAt,
+    ),
+    hopStartedAt: normalizeTimerAnchor(
+      source.hop_started_at ?? source.hopStartedAt,
+      source.updated_at ?? source.updatedAt,
+      receivedAt,
+    ),
   };
 }
 
