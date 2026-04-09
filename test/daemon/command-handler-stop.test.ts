@@ -1,10 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const { stopProjectMock, stopSubSessionMock, loggerErrorMock, loggerWarnMock } = vi.hoisted(() => ({
+const { stopProjectMock, stopSubSessionMock, loggerErrorMock, loggerWarnMock, buildSessionListMock } = vi.hoisted(() => ({
   stopProjectMock: vi.fn(),
   stopSubSessionMock: vi.fn().mockResolvedValue({ ok: true, closed: ['deck_sub_worker'], failed: [] }),
   loggerErrorMock: vi.fn(),
   loggerWarnMock: vi.fn(),
+  buildSessionListMock: vi.fn(async () => []),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -78,6 +79,10 @@ vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
   getP2pRun: vi.fn(() => undefined),
   listP2pRuns: vi.fn(() => []),
   serializeP2pRun: vi.fn(),
+}));
+
+vi.mock('../../src/daemon/session-list.js', () => ({
+  buildSessionList: buildSessionListMock,
 }));
 
 vi.mock('../../src/daemon/repo-handler.js', () => ({
@@ -163,5 +168,132 @@ describe('handleWebCommand shutdown failure paths', () => {
       project: 'proj',
       message: 'Shutdown failed: backend unavailable',
     });
+  });
+
+  it('updates the main-session project name and pushes a refreshed session_list on session.rename', async () => {
+    const { getSession, upsertSession } = await import('../../src/store/session-store.js');
+    vi.mocked(getSession).mockReturnValue({
+      name: 'deck_proj_brain',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'codex',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+      projectDir: '/tmp/proj',
+    } as any);
+    buildSessionListMock.mockResolvedValueOnce([
+      {
+        name: 'deck_proj_brain',
+        project: 'new-proj',
+        role: 'brain',
+        agentType: 'codex',
+        state: 'idle',
+      },
+    ]);
+
+    handleWebCommand({ type: 'session.rename', sessionName: 'deck_proj_brain', projectName: 'new-proj' }, serverLink as any);
+    await flushAsync();
+
+    expect(upsertSession).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_proj_brain',
+      projectName: 'new-proj',
+    }));
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'session_list',
+      daemonVersion: '0.1.0',
+      sessions: [
+        {
+          name: 'deck_proj_brain',
+          project: 'new-proj',
+          role: 'brain',
+          agentType: 'codex',
+          state: 'idle',
+        },
+      ],
+    });
+  });
+
+  it('updates the main-session label and pushes a refreshed session_list on session.relabel', async () => {
+    const { getSession, upsertSession } = await import('../../src/store/session-store.js');
+    vi.mocked(getSession).mockReturnValue({
+      name: 'deck_proj_brain',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'codex',
+      state: 'idle',
+      label: null,
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+      projectDir: '/tmp/proj',
+    } as any);
+    buildSessionListMock.mockResolvedValueOnce([
+      {
+        name: 'deck_proj_brain',
+        project: 'proj',
+        role: 'brain',
+        agentType: 'codex',
+        state: 'idle',
+        label: 'Main Label',
+      },
+    ]);
+
+    handleWebCommand({ type: 'session.relabel', sessionName: 'deck_proj_brain', label: 'Main Label' }, serverLink as any);
+    await flushAsync();
+
+    expect(upsertSession).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_proj_brain',
+      label: 'Main Label',
+    }));
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'session_list',
+      daemonVersion: '0.1.0',
+      sessions: [
+        {
+          name: 'deck_proj_brain',
+          project: 'proj',
+          role: 'brain',
+          agentType: 'codex',
+          state: 'idle',
+          label: 'Main Label',
+        },
+      ],
+    });
+  });
+
+  it('updates the sub-session label and emits subsession.sync on subsession.rename', async () => {
+    const { getSession, upsertSession } = await import('../../src/store/session-store.js');
+    vi.mocked(getSession).mockReturnValue({
+      name: 'deck_sub_worker',
+      projectName: 'proj',
+      role: 'w1',
+      agentType: 'codex',
+      state: 'idle',
+      label: 'old',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+      projectDir: '/tmp/proj',
+      runtimeType: 'process',
+      parentSession: 'deck_proj_brain',
+    } as any);
+
+    handleWebCommand({ type: 'subsession.rename', sessionName: 'deck_sub_worker', label: 'Worker Label' }, serverLink as any);
+    await flushAsync();
+
+    expect(upsertSession).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_sub_worker',
+      label: 'Worker Label',
+    }));
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'subsession.sync',
+      id: 'worker',
+      label: 'Worker Label',
+    }));
   });
 });

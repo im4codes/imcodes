@@ -520,7 +520,7 @@ export function App() {
   const handleRenameSession = useCallback(async (sessionName: string, newProjectName: string) => {
     if (!selectedServerId || !newProjectName) return;
     // Optimistic update
-    setSessions((prev) => prev.map((s) => s.name === sessionName ? { ...s, project: newProjectName, label: newProjectName } : s));
+    setSessions((prev) => prev.map((s) => s.name === sessionName ? { ...s, project: newProjectName } : s));
     try {
       await apiFetch(`/api/server/${selectedServerId}/sessions/${encodeURIComponent(sessionName)}/rename`, {
         method: 'PATCH',

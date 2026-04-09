@@ -400,10 +400,7 @@ export function useSubSessions(
     setSubSessions((prev) => prev.map((s) =>
       s.id === id ? { ...s, label } : s,
     ));
-    // Sync label to daemon session store
-    const sessionName = `deck_sub_${id}`;
-    ws?.subSessionRename(sessionName, label);
-  }, [serverId, ws]);
+  }, [serverId]);
 
   /** Update local state for a sub-session (does NOT write to DB — caller handles that). */
   const updateLocal = useCallback((id: string, fields: Partial<Pick<SubSession, 'type' | 'runtimeType' | 'label' | 'description' | 'cwd'>>) => {

@@ -186,4 +186,36 @@ describe('sub-session routes', () => {
     expect(updateSubSessionMock).not.toHaveBeenCalled();
     expect(sendToDaemonMock).not.toHaveBeenCalled();
   });
+
+  it('PATCH /sub-sessions/:id relays subsession.rename when only the label changes', async () => {
+    const { getSubSessionById } = await import('../src/db/queries.js');
+    vi.mocked(getSubSessionById).mockResolvedValue({
+      id: 'sub12345',
+      server_id: 'srv1',
+      type: 'codex',
+    } as any);
+
+    const res = await app.request('/api/server/srv1/sub-sessions/sub12345', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        label: 'Worker Label',
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(updateSubSessionMock).toHaveBeenCalledWith(
+      {},
+      'sub12345',
+      'srv1',
+      {
+        label: 'Worker Label',
+      },
+    );
+    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toEqual({
+      type: 'subsession.rename',
+      sessionName: 'deck_sub_sub12345',
+      label: 'Worker Label',
+    });
+  });
 });

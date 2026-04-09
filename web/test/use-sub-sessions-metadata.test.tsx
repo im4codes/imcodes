@@ -12,7 +12,7 @@ import { listSubSessions, patchSubSession } from '../src/api.js';
 vi.mock('../src/api.js', () => ({
   listSubSessions: vi.fn().mockResolvedValue([]),
   createSubSession: vi.fn(),
-  patchSubSession: vi.fn(),
+  patchSubSession: vi.fn().mockResolvedValue(undefined),
 }));
 
 type MsgHandler = (msg: any) => void;
@@ -40,11 +40,19 @@ function Harness({ ws, connected }: { ws: any; connected: boolean }) {
 }
 
 let closeSubSessionHook: ((id: string) => Promise<void>) | null = null;
+let renameSubSessionHook: ((id: string, label: string) => Promise<void>) | null = null;
 
 function CloseHarness({ ws, connected }: { ws: any; connected: boolean }) {
   const { subSessions, close } = useSubSessions('srv1', ws, connected, null);
   captured = subSessions;
   closeSubSessionHook = close;
+  return null;
+}
+
+function RenameHarness({ ws, connected }: { ws: any; connected: boolean }) {
+  const { subSessions, rename } = useSubSessions('srv1', ws, connected, null);
+  captured = subSessions;
+  renameSubSessionHook = rename;
   return null;
 }
 
@@ -484,5 +492,58 @@ describe('sub-session close behavior', () => {
 
     act(() => send({ type: 'subsession.removed', id: 'stop1', sessionName: 'deck_sub_stop1' }));
     expect(captured).toHaveLength(0);
+  });
+});
+
+describe('sub-session rename behavior', () => {
+  afterEach(() => { cleanup(); vi.clearAllMocks(); captured = []; renameSubSessionHook = null; });
+
+  it('persists label changes through the API and updates local state without direct ws rename commands', async () => {
+    vi.mocked(listSubSessions).mockResolvedValueOnce([
+      {
+        id: 'rename1',
+        serverId: 'srv1',
+        type: 'codex',
+        runtimeType: 'process',
+        providerId: null,
+        providerSessionId: null,
+        shellBin: null,
+        cwd: '/tmp/proj',
+        ccSessionId: null,
+        geminiSessionId: null,
+        parentSession: 'deck_app_brain',
+        label: 'Old Label',
+        description: null,
+        ccPresetId: null,
+        requestedModel: null,
+        activeModel: null,
+        qwenModel: null,
+        qwenAuthType: null,
+        qwenAvailableModels: null,
+        modelDisplay: null,
+        planLabel: null,
+        quotaLabel: null,
+        quotaUsageLabel: null,
+        quotaMeta: null,
+        effort: null,
+        transportConfig: null,
+        closedAt: null,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ]);
+
+    const { ws } = createMockWs();
+    (ws as any).subSessionRename = vi.fn();
+    render(<RenameHarness ws={ws} connected={true} />);
+    await waitFor(() => expect(captured).toHaveLength(1));
+
+    await act(async () => {
+      await renameSubSessionHook?.('rename1', 'New Label');
+    });
+
+    expect(vi.mocked(patchSubSession)).toHaveBeenCalledWith('srv1', 'rename1', { label: 'New Label' });
+    expect(captured[0]?.label).toBe('New Label');
+    expect((ws as any).subSessionRename).not.toHaveBeenCalled();
   });
 });

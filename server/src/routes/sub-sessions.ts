@@ -187,6 +187,18 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
       return c.json({ error: 'relay_failed' }, 502);
     }
   }
+  if (body.type == null && body.label !== undefined) {
+    try {
+      WsBridge.get(serverId).sendToDaemon(JSON.stringify({
+        type: 'subsession.rename',
+        sessionName: `deck_sub_${subId}`,
+        label: body.label ?? null,
+      }));
+    } catch (err) {
+      logger.error({ serverId, subId, err }, 'WsBridge sub-session rename relay failed');
+      return c.json({ error: 'relay_failed' }, 502);
+    }
+  }
   return c.json({ ok: true });
 });
 
