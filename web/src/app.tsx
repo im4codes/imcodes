@@ -64,6 +64,7 @@ import { extractTransportPendingMessages } from './transport-queue.js';
 import { ingestTimelineEventForCache } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
+import { updateMainSessionLabel } from './session-label-api.js';
 import {
   getSelectedServerName,
   shouldResetSelectedServer,
@@ -546,20 +547,6 @@ export function App() {
     return () => clearInterval(id);
   }, [auth, loadServers]);
 
-  // Rename = update main-session label in D1 + local sessions state
-  const handleRenameSession = useCallback(async (sessionName: string, nextLabel: string | null) => {
-    if (!selectedServerId) return;
-    setSessions((prev) => prev.map((s) => (
-      s.name === sessionName ? { ...s, label: nextLabel } : s
-    )));
-    try {
-      await apiFetch(`/api/server/${selectedServerId}/sessions/${encodeURIComponent(sessionName)}/label`, {
-        method: 'PATCH',
-        body: JSON.stringify({ label: nextLabel }),
-      });
-    } catch { /* best-effort */ }
-  }, [selectedServerId]);
-
   // Fetch sessions from DB immediately when auth + server are available
   useEffect(() => {
     if (!auth || !selectedServerId) return;
@@ -628,6 +615,22 @@ export function App() {
   const quickData = useQuickData();
   const lastImcodesActivityRef = useRef(Date.now());
   const resubscribeTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+
+  // Rename = update main-session label in D1 + local sessions state
+  const handleRenameSession = useCallback(async (sessionName: string, nextLabel: string | null) => {
+    if (!selectedServerId) return;
+    const previousLabel = sessions.find((s) => s.name === sessionName)?.label ?? null;
+    setSessions((prev) => prev.map((s) => (
+      s.name === sessionName ? { ...s, label: nextLabel } : s
+    )));
+    try {
+      await updateMainSessionLabel(selectedServerId, sessionName, nextLabel);
+    } catch {
+      setSessions((prev) => prev.map((s) => (
+        s.name === sessionName ? { ...s, label: previousLabel } : s
+      )));
+    }
+  }, [selectedServerId, sessions]);
 
   // IDs of currently-open (non-minimized) sub-session windows
   const [openSubIds, setOpenSubIds] = useState<Set<string>>(new Set());
