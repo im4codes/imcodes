@@ -51,7 +51,7 @@ import { WsClient } from './ws-client.js';
 import { configure as configureApi, apiFetch, onAuthExpired, getUserPref, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { getAuthKey, clearAuthKey } from './biometric-auth.js';
-import { initPushNotifications } from './push-notifications.js';
+import { initPushNotifications, resetPushBadge } from './push-notifications.js';
 import { ServerSetupPage } from './pages/ServerSetupPage.js';
 import { NativeAuthBridge } from './pages/NativeAuthBridge.js';
 import type { SessionInfo, TerminalDiff } from './types.js';
@@ -349,6 +349,21 @@ export function App() {
     getAuthKey().then((key) => {
       if (key) initPushNotifications(key, auth.baseUrl).catch(console.warn);
     });
+  }, [auth]);
+
+  // Native: clear server-side push badge whenever the app becomes visible with
+  // a valid auth context. AppDelegate also tries via JS bridge, but that can
+  // fire before the web bundle is ready, leaving badge_count stale.
+  useEffect(() => {
+    if (!auth || !isNative()) return;
+    void resetPushBadge();
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void resetPushBadge();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, [auth]);
 
   // When session expires mid-session (refresh failed), clear auth and show login.

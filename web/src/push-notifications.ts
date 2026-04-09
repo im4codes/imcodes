@@ -6,13 +6,31 @@
 const isNative = (): boolean => typeof (globalThis as any).Capacitor?.isNativePlatform === 'function' && (globalThis as any).Capacitor.isNativePlatform();
 
 let pushSupported = false;
+let resetBadgePromise: Promise<void> | null = null;
+let lastBadgeResetAt = 0;
 
 // Expose badge-reset to native layer (AppDelegate calls via evaluateJavaScript on app foreground).
 // Uses apiFetch which prepends baseUrl and includes Bearer token — relative URLs fail in Capacitor.
 import { apiFetch } from './api.js';
 (window as any).__imcodesResetBadge = () => {
-  apiFetch('/api/push/badge-reset', { method: 'POST' }).catch(() => {});
+  void resetPushBadge(true);
 };
+
+export async function resetPushBadge(force = false): Promise<void> {
+  if (!isNative()) return;
+  const now = Date.now();
+  if (!force && now - lastBadgeResetAt < 3_000) return;
+  if (resetBadgePromise) return resetBadgePromise;
+  resetBadgePromise = apiFetch('/api/push/badge-reset', { method: 'POST' })
+    .then(() => {
+      lastBadgeResetAt = Date.now();
+    })
+    .catch(() => {})
+    .finally(() => {
+      resetBadgePromise = null;
+    });
+  return resetBadgePromise;
+}
 
 export async function initPushNotifications(
   apiKey: string,
