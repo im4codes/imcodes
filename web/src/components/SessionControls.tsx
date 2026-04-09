@@ -347,8 +347,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [sendWarning, setSendWarning] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<Array<{ path: string; name: string }>>([]);
   const sendWarningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const supportsFileAttachments = !!compact;
-  const effectiveAttachments = supportsFileAttachments ? attachments : [];
 
   // Keep external inputRef in sync so parent can call .focus()
   useEffect(() => {
@@ -407,15 +405,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   useEffect(() => () => {
     if (sendWarningTimerRef.current) clearTimeout(sendWarningTimerRef.current);
   }, []);
-
-  useEffect(() => {
-    if (!supportsFileAttachments && attachments.length > 0) {
-      setAttachments([]);
-      setUploading(false);
-      setUploadProgress(0);
-      setUploadError(null);
-    }
-  }, [attachments.length, supportsFileAttachments]);
 
   // Auto-sync model selector with detected model from terminal/ctx
   // Detection is the real-time truth — always override the selector
@@ -872,7 +861,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       (!!normalizedOptions.modeOverride && isComboMode(normalizedOptions.modeOverride)) ||
       (!!syntheticModeOverride && isComboMode(syntheticModeOverride))
     );
-    if (((!text && effectiveAttachments.length === 0) && !allowEmptyCombo) || !ws || !activeSession) return null;
+    if (((!text && attachments.length === 0) && !allowEmptyCombo) || !ws || !activeSession) return null;
 
     // Build P2P routing as structured WS fields — keep text clean for display.
     const extra: Record<string, unknown> = {};
@@ -932,12 +921,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       text = text ? `${quoteBlock}\n\n${text}` : quoteBlock;
     }
     // Prepend attachment references
-    if (effectiveAttachments.length > 0) {
-      const refs = effectiveAttachments.map((a) => `@${a.path}`).join(' ');
+    if (attachments.length > 0) {
+      const refs = attachments.map((a) => `@${a.path}`).join(' ');
       text = text ? `${refs} ${text}` : refs;
     }
     return { text, extra };
-  }, [activeSession, applySavedP2pConfigSelection, effectiveAttachments, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, sessions, subSessions, ws]);
+  }, [activeSession, applySavedP2pConfigSelection, attachments, i18n?.language, onRemoveQuote, p2pExcludeSameType, p2pMode, p2pSavedConfig, quotes, sessions, subSessions, ws]);
 
   const buildModeOnlySendPayload = useCallback((rawText: string, modeOverride?: string): PendingSendPayload | null => {
     const text = rawText.trim();
@@ -1167,7 +1156,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     const ce = e as ClipboardEvent;
     const files = ce.clipboardData?.files;
     if (files && files.length > 0) {
-      if (!supportsFileAttachments) return;
       e.preventDefault();
       void handleFileUpload(files);
       return;
@@ -1179,7 +1167,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   };
 
   const handleFileUpload = useCallback(async (files: FileList | null) => {
-    if (!supportsFileAttachments || !files || files.length === 0 || !serverId) return;
+    if (!files || files.length === 0 || !serverId) return;
     setUploading(true);
     setUploadProgress(0);
     setUploadError(null);
@@ -1203,7 +1191,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       }
     }
     setUploading(false);
-  }, [serverId, supportsFileAttachments, t]);
+  }, [serverId, t]);
 
   const handleShortcut = (data: string) => {
     if (!ws || !activeSession) return;
@@ -1324,7 +1312,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       : t('session.send_placeholder', { name: sessionDisplayName ?? activeSession?.label ?? activeSession?.project ?? 'session' });
   const placeholder = !hasSession || !connected || isMobileLayout
     ? basePlaceholder
-    : t('session.send_placeholder_desktop_upload', { placeholder: basePlaceholder });
+    : compact
+      ? basePlaceholder
+      : t('session.send_placeholder_desktop_upload', { placeholder: basePlaceholder });
 
   return (
     <>
@@ -1773,7 +1763,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       </div>}
 
       {/* Upload progress bar */}
-      {supportsFileAttachments && uploading && (
+      {uploading && (
         <div style={{ margin: '0 8px 4px', height: 18, display: 'flex', alignItems: 'center', gap: 8 }}>
           <div style={{ flex: 1, height: 4, background: 'rgba(255,255,255,0.1)', borderRadius: 2, overflow: 'hidden' }}>
             <div style={{ width: `${uploadProgress}%`, height: '100%', background: '#3b82f6', borderRadius: 2, transition: 'width 0.2s ease' }} />
@@ -1783,7 +1773,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       )}
 
       {/* Upload error banner */}
-      {supportsFileAttachments && uploadError && (
+      {uploadError && (
         <div style={{ padding: '4px 12px', fontSize: 12, color: '#ef4444', background: 'rgba(239,68,68,0.1)', borderRadius: 4, margin: '0 8px 4px' }}>
           {uploadError}
         </div>
@@ -1796,7 +1786,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       )}
 
       {/* Attachment badges — above input row */}
-      {supportsFileAttachments && attachments.length > 0 && (
+      {attachments.length > 0 && (
         <div class="attachment-badges">
           {attachments.map((a, i) => (
             <span key={a.path} class="attachment-badge" title={a.path}>
@@ -2051,7 +2041,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             </button>
           )}
         </div>
-        {supportsFileAttachments && serverId && (
+        {serverId && (
           <>
             <input
               ref={fileInputRef}
@@ -2088,7 +2078,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           <button
             class="btn btn-primary"
             onClick={handleSend}
-            disabled={inputDisabled || (!hasText && effectiveAttachments.length === 0) || !connected}
+            disabled={inputDisabled || (!hasText && attachments.length === 0) || !connected}
           >
             {t('common.send')}
           </button>

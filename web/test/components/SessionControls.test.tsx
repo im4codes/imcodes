@@ -1510,7 +1510,7 @@ afterEach(() => {
     expect(screen.getByTitle('upload_file')).toBeDefined();
   });
 
-  it('does not show upload button in regular chat composer even when serverId exists', () => {
+  it('shows upload button in regular chat composer when serverId is provided', () => {
     render(
       <SessionControls
         ws={makeWs() as any}
@@ -1519,7 +1519,19 @@ afterEach(() => {
         serverId="srv-1"
       />,
     );
-    expect(screen.queryByTitle('upload_file')).toBeNull();
+    expect(screen.getByTitle('upload_file')).toBeDefined();
+  });
+
+  it('does not show desktop paste-upload hint in compact card composer', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession()}
+        quickData={makeQuickData() as any}
+        compact
+      />,
+    );
+    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project…');
   });
 
   // TODO: fix — file upload mock doesn't trigger state update in jsdom
