@@ -35,42 +35,66 @@ export function resolveLaunchPaths(): LaunchPaths {
 }
 
 /** Write the daemon-watchdog.cmd that loops and restarts the daemon.
- *  Uses the npm global shim (`imcodes.cmd`) instead of hard-coding
- *  node.exe + script paths — this way the watchdog always launches
- *  whatever version is currently installed, even after npm upgrades. */
+ *
+ *  IMPORTANT: this file is parsed by cmd.exe.  Two non-obvious rules:
+ *
+ *  1. cmd.exe does NOT understand a UTF-8 BOM at the start of a .cmd file.
+ *     The BOM bytes (EF BB BF) are treated as part of the first command,
+ *     so `[BOM]@echo off` becomes the unknown command "[BOM]@echo".
+ *     => never write a BOM here.
+ *
+ *  2. To support non-ASCII paths (e.g. usernames with Chinese characters)
+ *     we never hard-code absolute paths.  Instead we use environment-variable
+ *     expansion (%USERPROFILE%, %APPDATA%) which cmd.exe resolves at runtime
+ *     using the OS's native wide-character API — no encoding round-trip.
+ *
+ *  3. Uses the npm global shim (`imcodes.cmd`) by default so the watchdog
+ *     always launches whatever version is currently installed, even after
+ *     npm upgrades.  Falls back to direct node+script for dev installs
+ *     where the shim isn't on %APPDATA%\npm. */
 export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
   await mkdir(dirname(paths.watchdogPath), { recursive: true });
-  // Resolve the npm global shim path (e.g. C:\Users\X\AppData\Roaming\npm\imcodes.cmd)
+  // Detect whether the npm global shim exists.  When yes, the watchdog can
+  // use the parameter-free env-var path; when no (e.g. tests, dev installs)
+  // we fall back to a direct node+script invocation with absolute paths.
   const npmGlobalBin = dirname(paths.imcodesScript).replace(/[/\\]node_modules[/\\]imcodes[/\\]dist[/\\]src$/i, '');
   const shimPath = join(npmGlobalBin, 'imcodes.cmd');
-  // Prefer the shim if it exists; fall back to direct node+script for dev setups
-  const launchCmd = existsSync(shimPath)
-    ? `"${shimPath}" start --foreground`
-    : `"${paths.nodeExe}" "${paths.imcodesScript}" start --foreground`;
-  const lockFile = UPGRADE_LOCK_FILE.replace(/\//g, '\\');
+  const useShim = existsSync(shimPath);
+
+  // Build the launch line.  Either form gets prefixed with `call ` so cmd.exe
+  // returns to the loop after the daemon exits (without `call`, control would
+  // hand off to the .cmd shim and never come back).
+  const launchCmd = useShim
+    ? `call "%APPDATA%\\npm\\imcodes.cmd" start --foreground`
+    : `call "${paths.nodeExe}" "${paths.imcodesScript}" start --foreground`;
+
   const watchdog = [
     '@echo off',
     'chcp 65001 >nul 2>&1',
     ':loop',
-    `if exist "${lockFile}" (`,
-    `  echo Upgrade in progress, waiting... >> "${paths.logPath}"`,
+    'if exist "%USERPROFILE%\\.imcodes\\upgrade.lock" (',
+    '  echo Upgrade in progress, waiting... >> "%USERPROFILE%\\.imcodes\\watchdog.log"',
     '  timeout /t 5 /nobreak >nul',
     '  goto loop',
     ')',
-    `${launchCmd} >> "${paths.logPath}" 2>&1`,
+    `${launchCmd} >> "%USERPROFILE%\\.imcodes\\watchdog.log" 2>&1`,
     'timeout /t 5 /nobreak >nul',
     'goto loop',
     '',
   ].join('\r\n');
-  // Write as UTF-8 + BOM so cmd.exe parses non-ASCII paths correctly
-  // (e.g. usernames with Chinese characters).  Without the BOM cmd.exe
-  // reads the file using the system codepage and mangles UTF-8 bytes.
-  await writeFile(paths.watchdogPath, encodeCmdAsUtf8Bom(watchdog));
+
+  // CRITICAL: write as plain UTF-8 with NO BOM. cmd.exe does not understand
+  // BOMs in batch files — the BOM bytes get prepended to the first command
+  // and cmd reports "[BOM]@echo is not a recognized command".
+  await writeFile(paths.watchdogPath, watchdog, 'utf8');
 }
 
-/** Encode a .cmd file as UTF-8 with BOM so cmd.exe handles non-ASCII paths. */
+/** @deprecated cmd.exe does not understand UTF-8 BOMs in batch files; the BOM
+ *  bytes break the very first command of the script.  Kept here only so
+ *  upgrade scripts that already imported it continue to compile — they should
+ *  switch to plain `writeFile(..., 'utf8')` instead. */
 export function encodeCmdAsUtf8Bom(content: string): Buffer {
-  return Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), Buffer.from(content, 'utf8')]);
+  return Buffer.from(content, 'utf8');
 }
 
 /** Write the daemon-launcher.vbs that starts the watchdog CMD hidden.
@@ -122,11 +146,42 @@ export async function rotateWatchdogLog(paths: LaunchPaths): Promise<void> {
   }
 }
 
-/** Regenerate all Windows daemon launch artifacts with current paths. */
+/** Regenerate all Windows daemon launch artifacts with current paths.
+ *
+ *  Tree-kills any existing daemon-watchdog cmd.exe processes BEFORE writing
+ *  the new files.  This is critical when the user is recovering from a
+ *  crash-loop caused by an OLD watchdog file with a UTF-8 BOM (cmd.exe
+ *  parses [BOM]@echo as the unknown command "[BOM]@echo" forever).
+ *  Without the kill, the old watchdog still has the bad file mapped and
+ *  will overwrite our PID file with stale data.
+ *
+ *  Process matching is by command-line pattern via wmic, which is
+ *  language-independent — works on en-US, zh-CN, ja-JP and any other Windows
+ *  locale. */
 export async function regenerateAllArtifacts(): Promise<void> {
+  killAllStaleWatchdogsBeforeRegen();
   const paths = resolveLaunchPaths();
   await writeWatchdogCmd(paths);
   await writeVbsLauncher(paths);
   updateSchtasks(paths);
   await rotateWatchdogLog(paths);
+}
+
+function killAllStaleWatchdogsBeforeRegen(): void {
+  if (process.platform !== 'win32') return;
+  try {
+    const out = execSync(
+      'wmic process where "Name=\'cmd.exe\' and CommandLine like \'%daemon-watchdog%\'" get ProcessId /format:list',
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+    const pids = out
+      .split(/\r?\n/)
+      .map((line) => line.match(/^ProcessId=(\d+)/))
+      .filter((m): m is RegExpMatchArray => m !== null)
+      .map((m) => parseInt(m[1], 10))
+      .filter((pid) => Number.isFinite(pid) && pid > 0);
+    for (const pid of pids) {
+      try { execSync(`taskkill /f /t /pid ${pid}`, { stdio: 'ignore' }); } catch { /* already dead */ }
+    }
+  } catch { /* wmic missing or no matches */ }
 }

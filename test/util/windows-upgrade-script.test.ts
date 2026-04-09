@@ -38,8 +38,8 @@ describe('buildWindowsCleanupVbs', () => {
   });
 
   it('handles non-ASCII paths in the cleanup target', () => {
-    const vbs = buildWindowsCleanupVbs('C:\\Users\\云科I\\Temp\\cleanup.cmd');
-    expect(vbs).toContain('云科I');
+    const vbs = buildWindowsCleanupVbs('C:\\Users\\测试用户A\\Temp\\cleanup.cmd');
+    expect(vbs).toContain('测试用户A');
   });
 });
 
@@ -100,20 +100,28 @@ describe('buildWindowsUpgradeBatch', () => {
 
   // ── Daemon + old watchdog kill ──
 
-  it('kills old watchdog tree before npm install', () => {
-    const killTreeIdx = batch.indexOf('taskkill /f /t /pid !WD_PID!');
+  it('finds and tree-kills ALL daemon-watchdog cmd.exe processes by command-line pattern', () => {
+    // REGRESSION GUARD — when an old watchdog is in a crash-loop because the
+    // OLD watchdog.cmd had a UTF-8 BOM (cmd.exe parses [BOM]@echo as the
+    // unknown command "[BOM]@echo"), there is no daemon.pid to walk back
+    // from. The upgrade script must enumerate watchdogs by their cmd line.
+    // Note: in batch source, % must be doubled to escape, so the pattern
+    // appears as %%daemon-watchdog%%.
+    expect(batch).toContain("CommandLine like '%%daemon-watchdog%%'");
+    expect(batch).toContain('taskkill /f /t /pid !STALE_WD!');
+    // Must run BEFORE npm install
+    const killByPatternIdx = batch.indexOf('taskkill /f /t /pid !STALE_WD!');
     const installIdx = batch.indexOf(`call "${INPUT.npmCmd}" install`);
-    expect(killTreeIdx).toBeGreaterThan(-1);
-    expect(killTreeIdx).toBeLessThan(installIdx);
+    expect(killByPatternIdx).toBeGreaterThan(-1);
+    expect(killByPatternIdx).toBeLessThan(installIdx);
   });
 
-  it('kills daemon directly as belt-and-suspenders', () => {
+  it('kills daemon directly via PIDFILE as belt-and-suspenders', () => {
     expect(batch).toContain('taskkill /f /pid !OLD_PID!');
   });
 
-  it('finds watchdog parent via wmic', () => {
+  it('uses wmic to enumerate watchdog processes', () => {
     expect(batch).toContain('wmic process where');
-    expect(batch).toContain('ParentProcessId');
   });
 
   // ── npm install ──
@@ -205,12 +213,12 @@ describe('buildWindowsUpgradeBatch', () => {
   it('avoids embedding non-ASCII user paths directly in the batch body', () => {
     const nonAscii = buildWindowsUpgradeBatch({
       ...INPUT,
-      logFile: 'C:\\Users\\云科1\\AppData\\Local\\Temp\\imcodes-upgrade-123\\upgrade.log',
-      cleanupVbsPath: 'C:\\Users\\云科1\\AppData\\Local\\Temp\\imcodes-upgrade-123\\cleanup.vbs',
-      vbsLauncherPath: 'C:\\Users\\云科1\\.imcodes\\daemon-launcher.vbs',
-      upgradeLockFile: 'C:\\Users\\云科1\\.imcodes\\upgrade.lock',
+      logFile: 'C:\\Users\\测试用户B\\AppData\\Local\\Temp\\imcodes-upgrade-123\\upgrade.log',
+      cleanupVbsPath: 'C:\\Users\\测试用户B\\AppData\\Local\\Temp\\imcodes-upgrade-123\\cleanup.vbs',
+      vbsLauncherPath: 'C:\\Users\\测试用户B\\.imcodes\\daemon-launcher.vbs',
+      upgradeLockFile: 'C:\\Users\\测试用户B\\.imcodes\\upgrade.lock',
     });
-    expect(nonAscii).not.toContain('云科1');
+    expect(nonAscii).not.toContain('测试用户B');
     expect(nonAscii).toContain('%USERPROFILE%\\.imcodes\\daemon-launcher.vbs');
     expect(nonAscii).toContain('%SCRIPT_DIR%\\cleanup.vbs');
   });

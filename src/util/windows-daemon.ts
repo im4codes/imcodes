@@ -29,6 +29,38 @@ function sleepMs(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+/** Tree-kill every cmd.exe process whose command line references
+ *  daemon-watchdog.  Works on any locale because the wmic query and
+ *  taskkill commands are language-independent.
+ *
+ *  Why this exists:
+ *    - Old daemon installs (pre-fix) wrote watchdog.cmd with a UTF-8 BOM.
+ *    - cmd.exe parses [BOM]@echo as the unknown command "[BOM]@echo" and
+ *      crash-loops forever printing the same error.
+ *    - Restart/upgrade must KILL these zombies before laying down new
+ *      files; otherwise the old watchdog re-spawns on the next loop tick
+ *      and overwrites the daemon PID with a stale one.
+ *
+ *  This function is best-effort: it logs nothing and swallows all errors. */
+export function killAllStaleWatchdogs(): void {
+  if (process.platform !== 'win32') return;
+  try {
+    const out = execSync(
+      'wmic process where "Name=\'cmd.exe\' and CommandLine like \'%daemon-watchdog%\'" get ProcessId /format:list',
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+    const pids = out
+      .split(/\r?\n/)
+      .map((line) => line.match(/^ProcessId=(\d+)/))
+      .filter((m): m is RegExpMatchArray => m !== null)
+      .map((m) => parseInt(m[1], 10))
+      .filter((pid) => Number.isFinite(pid) && pid > 0);
+    for (const pid of pids) {
+      try { execSync(`taskkill /f /t /pid ${pid}`, { stdio: 'ignore' }); } catch { /* already dead */ }
+    }
+  } catch { /* wmic missing or no matches */ }
+}
+
 // ── Launcher methods (all hidden — no visible windows) ──────────────────────
 
 function tryStartVbsLauncher(): boolean {
@@ -84,6 +116,12 @@ export function restartWindowsDaemon(currentPid?: number): boolean {
     // restart it automatically (within ~5 seconds).
     try { execSync(`taskkill /f /pid ${previousPid}`, { stdio: 'ignore' }); } catch { /* not running */ }
   }
+  // CRITICAL: also tree-kill any stale daemon-watchdog cmd.exe processes by
+  // command-line pattern.  This handles the upgrade-from-bad-watchdog case
+  // where an OLD watchdog with a UTF-8 BOM is in a crash-loop printing
+  // "is not a recognized command" forever.  Without this kill, the new
+  // watchdog we spawn below will race with the old one.
+  killAllStaleWatchdogs();
 
   // If no watchdog is running (e.g. first start after bind), launch one.
   // Priority: VBS (always hidden) > scheduled task > startup shortcut.
