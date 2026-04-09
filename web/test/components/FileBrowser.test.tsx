@@ -519,7 +519,7 @@ describe('FileBrowser', () => {
     expect(ws.fsGitStatus).toHaveBeenCalledWith('/home/user', { includeStats: true });
   });
 
-  it('does not refresh shared changes while pinned files tab hides the changes panel', () => {
+  it('does not refresh shared changes while files tab hides the changes panel', () => {
     const { ws } = makeWsFactory();
     render(
       <FileBrowser
@@ -535,6 +535,36 @@ describe('FileBrowser', () => {
 
     expect(ws.fsGitStatus).toHaveBeenCalledTimes(1);
     expect(ws.fsGitStatus).toHaveBeenCalledWith('~');
+  });
+
+  it('does not render an embedded changes section in files view', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        changesRootPath="/home/user"
+        onConfirm={vi.fn()}
+        defaultTab="files"
+      />,
+    );
+
+    await act(async () => { respond([], '/home/user'); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [{ path: '/home/user/foo.ts', code: 'M' }],
+      });
+    });
+
+    expect(document.querySelector('.fb-changes-section')).toBeNull();
+    expect(document.querySelector('.fb-body-with-changes')).toBeNull();
   });
 
   it('shows panel tabs when changesRootPath is provided', async () => {
@@ -554,7 +584,9 @@ describe('FileBrowser', () => {
         changesRootPath="/home/user" onConfirm={vi.fn()} />,
     );
     await act(async () => { respond([], '/home/user'); });
-    // Simulate git changes response
+    // Click Changes tab (in .fb-panel-tabs)
+    const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
+    await act(async () => { fireEvent.click(changesTab); });
     await act(async () => {
       sendMsg({
         type: 'fs.git_status_response',
@@ -565,9 +597,6 @@ describe('FileBrowser', () => {
         files: [{ path: '/home/user/bar.ts', code: 'M' }],
       });
     });
-    // Click Changes tab (in .fb-panel-tabs)
-    const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
-    await act(async () => { fireEvent.click(changesTab); });
     expect(document.querySelector('.fb-changes-section')).not.toBeNull();
   });
 
@@ -578,6 +607,8 @@ describe('FileBrowser', () => {
         changesRootPath="/home/user" onConfirm={vi.fn()} />,
     );
     await act(async () => { respond([], '/home/user'); });
+    const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
+    await act(async () => { fireEvent.click(changesTab); });
     await act(async () => {
       sendMsg({
         type: 'fs.git_status_response',
@@ -588,8 +619,6 @@ describe('FileBrowser', () => {
         files: [{ path: '/home/user/bar.ts', code: 'M', additions: 7, deletions: 2 }],
       } as any);
     });
-    const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
-    await act(async () => { fireEvent.click(changesTab); });
     expect(document.querySelector('.fb-changes-item-stats')?.textContent).toContain('+7');
     expect(document.querySelector('.fb-changes-item-stats')?.textContent).toContain('-2');
   });

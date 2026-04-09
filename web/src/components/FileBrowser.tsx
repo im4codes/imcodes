@@ -842,7 +842,7 @@ export function FileBrowser({
   const lastChangesRefreshRef = useRef(0);
   const pendingChangesTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const changesVisible = !!changesRootPath && (panelView === 'changes' || !onPreviewFile);
+  const changesVisible = !!changesRootPath && panelView === 'changes';
 
   const refreshChanges = useCallback(() => {
     if (!changesRootPath) return;
@@ -1299,8 +1299,6 @@ export function FileBrowser({
     </div>
   ) : null;
 
-  const showEmbeddedChangesSection = !!changesSection && !usesExternalPreview;
-
   if (layout === 'panel') {
     const tabs = changesRootPath ? (
       <div class="fb-panel-tabs">
@@ -1338,10 +1336,9 @@ export function FileBrowser({
           {tabs}
           {breadcrumb}
           {newFolderDialog}
-          <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}${showEmbeddedChangesSection ? ' fb-body-with-changes' : ''}`}>
+          <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}`}>
             <div class={`fb-files-and-changes${hasPreview ? ' fb-tree-split' : ''}`} style={hasPreview && treeWidth ? { flex: 'none', width: treeWidth } : undefined}>
               {tree}
-              {showEmbeddedChangesSection ? changesSection : null}
             </div>
             {hasPreview && (
               <div
