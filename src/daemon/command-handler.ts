@@ -3053,7 +3053,6 @@ async function loadRepoGitNumstatSnapshot(repoRoot: string, repoSignature: strin
     const deletions = deletionsRaw === '-' ? undefined : parseInt(deletionsRaw, 10);
     let logicalPath = pathRaw;
     if (pathRaw === '') {
-      const _renamedFrom = records[idx + 1];
       const renamedTo = records[idx + 2];
       if (!renamedTo) continue;
       logicalPath = renamedTo;

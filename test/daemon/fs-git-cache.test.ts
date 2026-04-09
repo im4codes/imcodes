@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import path from 'node:path';
+import { homedir } from 'node:os';
 import * as fsp from 'node:fs/promises';
 import * as childProcess from 'node:child_process';
 
@@ -475,8 +476,8 @@ describe('fs git cache handlers', () => {
   });
 
   it('preserves forbidden-path behavior for git status and git diff', async () => {
-    const sshRoot = '/home/k/.ssh';
-    const forbiddenFile = '/home/k/.ssh/config';
+    const sshRoot = path.join(homedir(), '.ssh');
+    const forbiddenFile = path.join(sshRoot, 'config');
     mockRealpath.mockImplementation(async (target) => String(target));
     mockStat.mockResolvedValue(makeStats('file', 10, 10));
 
