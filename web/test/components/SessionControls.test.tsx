@@ -257,6 +257,37 @@ afterEach(() => {
     expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project…');
   });
 
+  it('hides the send button on mobile and shows the embedded voice button when empty', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    expect(screen.queryByRole('button', { name: /send/i })).toBeNull();
+    expect(document.querySelector('.btn-voice-embedded')).toBeTruthy();
+    expect(screen.getByTitle('voice_input')).toBeDefined();
+  });
+
+  it('hides the embedded voice button after typing on mobile', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'hello';
+    fireEvent.input(input);
+    expect(document.querySelector('.btn-voice-embedded')).toBeNull();
+  });
+
+  it('sends on Enter on mobile without a send button', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'run tests';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      sessionName: 'my-session',
+      text: 'run tests',
+    });
+  });
+
   it('renders menu button (⋯)', () => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
     // The ⋯ menu button has title from t('session.actions') → 'actions'

@@ -1303,13 +1303,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     });
   }, []);
 
-  const isMobilePlaceholder = typeof window !== 'undefined' && window.innerWidth <= 640;
+  const isMobileLayout = typeof window !== 'undefined' && window.innerWidth <= 640;
+  const showEmbeddedVoiceButton = isMobileLayout && VoiceInput.isAvailable() && !hasText;
   const basePlaceholder = !hasSession
     ? t('session.no_session')
     : !connected
       ? t('session.send_queued')
       : t('session.send_placeholder', { name: sessionDisplayName ?? activeSession?.label ?? activeSession?.project ?? 'session' });
-  const placeholder = !hasSession || !connected || isMobilePlaceholder
+  const placeholder = !hasSession || !connected || isMobileLayout
     ? basePlaceholder
     : t('session.send_placeholder_desktop_upload', { placeholder: basePlaceholder });
 
@@ -1961,69 +1962,83 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           contenteditable div — iOS does NOT show the password/keychain autofill bar
           for contenteditable elements, unlike <input> or <textarea>.
         */}
-        <div
-          ref={divRef}
-          class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}`}
-          data-onboarding="chat-input"
-          contenteditable={inputDisabled ? 'false' : 'true'}
-          role="textbox"
-          aria-multiline="true"
-          aria-label="Message input"
-          data-placeholder={placeholder}
-          spellcheck={false}
-          style={p2pMode !== 'solo' ? { borderColor: getP2pModeColor(p2pMode), boxShadow: `0 0 0 1px ${getP2pModeColor(p2pMode)}40` } : undefined}
-          onFocus={handleFocus}
-          onInput={() => {
-            const currentText = divRef.current?.textContent ?? '';
-            setHasText(!!currentText.trim());
-            if (sendWarning) clearSendWarning();
-            if (atSelectionLockRef.current && currentText !== atSelectionSnapshotRef.current) {
-              atSelectionLockRef.current = false;
-              atSelectionSnapshotRef.current = currentText;
-            }
-            // Detect @/@@: use end of text (contentEditable anchorOffset is unreliable)
-            const text = currentText;
+        <div class={`controls-composer${showEmbeddedVoiceButton ? ' controls-composer-with-voice' : ''}`}>
+          <div
+            ref={divRef}
+            class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${showEmbeddedVoiceButton ? ' controls-input-with-trailing' : ''}`}
+            data-onboarding="chat-input"
+            contenteditable={inputDisabled ? 'false' : 'true'}
+            role="textbox"
+            aria-multiline="true"
+            aria-label="Message input"
+            data-placeholder={placeholder}
+            spellcheck={false}
+            enterkeyhint={isMobileLayout ? 'send' : undefined}
+            style={p2pMode !== 'solo' ? { borderColor: getP2pModeColor(p2pMode), boxShadow: `0 0 0 1px ${getP2pModeColor(p2pMode)}40` } : undefined}
+            onFocus={handleFocus}
+            onInput={() => {
+              const currentText = divRef.current?.textContent ?? '';
+              setHasText(!!currentText.trim());
+              if (sendWarning) clearSendWarning();
+              if (atSelectionLockRef.current && currentText !== atSelectionSnapshotRef.current) {
+                atSelectionLockRef.current = false;
+                atSelectionSnapshotRef.current = currentText;
+              }
+              // Detect @/@@: use end of text (contentEditable anchorOffset is unreliable)
+              const text = currentText;
 
-            // @@ → jump straight to agents picker
-            const doubleAt = text.match(/@@([^\s]*)$/);
-            if (doubleAt) {
-              setAtPickerOpen(true);
-              setAtPickerStage('agents');
-              setAtQuery(doubleAt[1]);
-            } else {
-              // Single @ → choose stage (files + agents menu)
-              const singleAt = text.match(/@([^\s@]*)$/);
-              if (singleAt) {
-                const query = singleAt[1];
-                if (!atPickerOpen) {
-                  if (query.length === 0) {
-                    setAtPickerOpen(true);
-                    setAtPickerStage('choose');
-                    setAtQuery('');
+              // @@ → jump straight to agents picker
+              const doubleAt = text.match(/@@([^\s]*)$/);
+              if (doubleAt) {
+                setAtPickerOpen(true);
+                setAtPickerStage('agents');
+                setAtQuery(doubleAt[1]);
+              } else {
+                // Single @ → choose stage (files + agents menu)
+                const singleAt = text.match(/@([^\s@]*)$/);
+                if (singleAt) {
+                  const query = singleAt[1];
+                  if (!atPickerOpen) {
+                    if (query.length === 0) {
+                      setAtPickerOpen(true);
+                      setAtPickerStage('choose');
+                      setAtQuery('');
+                    } else {
+                      setAtPickerOpen(false);
+                    }
+                  } else if (atPickerStage === 'choose') {
+                    if (query.length === 0) {
+                      setAtPickerOpen(true);
+                      setAtQuery('');
+                    } else {
+                      setAtPickerOpen(false);
+                    }
                   } else {
-                    setAtPickerOpen(false);
-                  }
-                } else if (atPickerStage === 'choose') {
-                  if (query.length === 0) {
                     setAtPickerOpen(true);
-                    setAtQuery('');
-                  } else {
-                    setAtPickerOpen(false);
+                    setAtQuery(query);
                   }
                 } else {
-                  setAtPickerOpen(true);
-                  setAtQuery(query);
+                  setAtPickerOpen(false);
+                  setAtPickerStage('choose');
+                  setAtQuery('');
                 }
-              } else {
-                setAtPickerOpen(false);
-                setAtPickerStage('choose');
-                setAtQuery('');
               }
-            }
-          }}
-          onKeyDown={handleKeyDown}
-          onPaste={handlePaste}
-        />
+            }}
+            onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
+          />
+          {showEmbeddedVoiceButton && (
+            <button
+              class="btn btn-voice btn-voice-embedded"
+              onClick={() => setVoiceOpen(true)}
+              disabled={inputDisabled}
+              title={t('voice.voice_input')}
+              aria-label={t('voice.voice_input')}
+            >
+              🎙
+            </button>
+          )}
+        </div>
         {serverId && (
           <>
             <input
@@ -2047,7 +2062,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             </button>
           </>
         )}
-        {VoiceInput.isAvailable() && (
+        {!isMobileLayout && VoiceInput.isAvailable() && (
           <button
             class="btn btn-voice"
             onClick={() => setVoiceOpen(true)}
@@ -2057,13 +2072,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             🎙
           </button>
         )}
-        <button
-          class="btn btn-primary"
-          onClick={handleSend}
-          disabled={inputDisabled || (!hasText && attachments.length === 0) || !connected}
-        >
-          {t('common.send')}
-        </button>
+        {!isMobileLayout && (
+          <button
+            class="btn btn-primary"
+            onClick={handleSend}
+            disabled={inputDisabled || (!hasText && attachments.length === 0) || !connected}
+          >
+            {t('common.send')}
+          </button>
+        )}
         {/* Config mode: show gear to open settings panel inline with send row */}
         {p2pMode === P2P_CONFIG_MODE && (
           <button

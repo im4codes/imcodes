@@ -124,6 +124,15 @@ body {
 .p2p-settings-icon { font-size: 12px; line-height: 1; }
 .p2p-settings-label { font-size: 11px; font-weight: 600; letter-spacing: 0.01em; }
 .controls { padding: 6px 8px; display: flex; gap: 6px; align-items: center; }
+.controls-composer { position: relative; flex: 1; min-width: 0; display: flex; align-items: stretch; }
+.controls-input-with-trailing { padding-right: 42px; }
+.btn-voice-embedded {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 1;
+}
 .controls-queued-hint {
   margin: 0 8px 8px;
   padding: 8px 10px;
@@ -226,6 +235,26 @@ body {
 .menu-item-active:hover { background: #2a1b4e !important; }
 .p2p-menu-section-label { font-size: 10px; color: #64748b; padding: 2px 12px; text-transform: uppercase; letter-spacing: 0.05em; }
 @media (max-width: 640px) {
+  .controls { align-items: flex-end; }
+  .controls-composer { min-height: 32px; }
+  .btn-voice-embedded {
+    right: 6px;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 999px;
+    background: rgba(30, 41, 59, 0.9);
+    border: 1px solid #475569;
+    color: #cbd5e1;
+  }
+  .btn-voice-embedded:hover,
+  .btn-voice-embedded:active {
+    background: #334155;
+    color: #f8fafc;
+  }
   .menu-dropdown { max-width: calc(100vw - 16px); }
   .menu-dropdown-openspec { max-height: min(60vh, calc(100vh - 148px)); }
   .openspec-change-row { flex-direction: column; align-items: stretch; gap: 4px; }
