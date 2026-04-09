@@ -10,6 +10,7 @@ import type {
   ProviderError,
   SessionConfig,
   SessionInfoUpdate,
+  ProviderStatusUpdate,
   ToolCallEvent,
 } from '../transport-provider.js';
 import {
@@ -30,7 +31,9 @@ interface ClaudeSdkSessionState {
   cwd: string;
   env?: Record<string, string>;
   model?: string;
+  settings?: string | Record<string, unknown>;
   description?: string;
+  systemPrompt?: string;
   permissionMode: PermissionMode;
   effort?: TransportEffortLevel;
   started: boolean;
@@ -45,6 +48,7 @@ interface ClaudeSdkSessionState {
   pendingError?: ProviderError;
   toolCalls: Map<number, ToolCallEvent & { partialInputJson?: string }>;
   emittedToolStates: Map<string, string>;
+  lastStatusSignature: string | null;
 }
 
 type ClaudeToolBlock = {
@@ -91,6 +95,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
   private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
+  private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
 
   async connect(config: ProviderConfig): Promise<void> {
     const binaryPath = this.resolveBinaryPath(config);
@@ -122,7 +127,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       env: config.env ?? existing?.env,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
+      settings: config.settings ?? existing?.settings,
       description: config.description ?? existing?.description,
+      systemPrompt: config.systemPrompt ?? existing?.systemPrompt,
       permissionMode: this.resolvePermissionMode(),
       effort: config.effort ?? existing?.effort,
       started: !!(config.resumeId && config.skipCreate),
@@ -136,6 +143,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       pendingComplete: undefined,
       toolCalls: new Map(),
       emittedToolStates: new Map(),
+      lastStatusSignature: null,
     });
     this.emitSessionInfo(routeId, { resumeId, ...(config.effort ? { effort: config.effort } : {}) });
     return routeId;
@@ -182,6 +190,14 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     return () => {
       const idx = this.sessionInfoCallbacks.indexOf(cb);
       if (idx >= 0) this.sessionInfoCallbacks.splice(idx, 1);
+    };
+  }
+
+  onStatus(cb: (sessionId: string, status: ProviderStatusUpdate) => void): () => void {
+    this.statusCallbacks.push(cb);
+    return () => {
+      const idx = this.statusCallbacks.indexOf(cb);
+      if (idx >= 0) this.statusCallbacks.splice(idx, 1);
     };
   }
 
@@ -241,8 +257,10 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     state.pendingError = undefined;
     state.toolCalls.clear();
     state.emittedToolStates.clear();
+    state.lastStatusSignature = null;
 
     const resolvedBinary = this.resolveBinaryPath(this.config);
+    const baseSystemPrompt = extraSystemPrompt ?? state.description;
     const options: Record<string, unknown> = {
       cwd: state.cwd,
       ...(state.env ? { env: { ...process.env, ...state.env } } : {}),
@@ -251,8 +269,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       includePartialMessages: true,
       ...(state.started ? { resume: state.resumeId } : { sessionId: state.resumeId }),
       ...(state.model ? { model: state.model } : {}),
+      ...(state.settings ? { settings: state.settings } : {}),
       ...(state.effort ? { effort: state.effort } : {}),
-      ...(extraSystemPrompt ? { appendSystemPrompt: extraSystemPrompt } : {}),
+      ...(baseSystemPrompt ?? state.systemPrompt ? {
+        appendSystemPrompt: [baseSystemPrompt, state.systemPrompt].filter(Boolean).join('\n\n'),
+      } : {}),
     };
     // On Windows where claude resolved to a .cmd shim, override the SDK's
     // internal spawn so we can prepend `node script.js` and avoid spawn
@@ -341,6 +362,29 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       state.model = msg.model;
       state.started = true;
       this.emitSessionInfo(sessionId, { resumeId: msg.session_id, model: msg.model });
+      return;
+    }
+
+    if (msg.type === 'system' && msg.subtype === 'compact_boundary') {
+      this.emitStatus(sessionId, state, {
+        status: 'compacting',
+        label: 'Compacting conversation...',
+      });
+      return;
+    }
+
+    if (msg.type === 'system' && msg.subtype === 'status') {
+      if (msg.status === 'compacting') {
+        this.emitStatus(sessionId, state, {
+          status: 'compacting',
+          label: 'Compacting conversation...',
+        });
+      } else {
+        this.emitStatus(sessionId, state, {
+          status: msg.status,
+          label: null,
+        });
+      }
       return;
     }
 
@@ -518,6 +562,16 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
 
   private emitSessionInfo(sessionId: string, info: SessionInfoUpdate): void {
     for (const cb of this.sessionInfoCallbacks) cb(sessionId, info);
+  }
+
+  private emitStatus(sessionId: string, state: ClaudeSdkSessionState, status: ProviderStatusUpdate): void {
+    const signature = JSON.stringify({
+      status: status.status,
+      label: status.label ?? null,
+    });
+    if (state.lastStatusSignature === signature) return;
+    state.lastStatusSignature = signature;
+    for (const cb of this.statusCallbacks) cb(sessionId, status);
   }
 
   private emitError(sessionId: string, error: ProviderError): void {

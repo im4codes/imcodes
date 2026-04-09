@@ -162,7 +162,14 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
     }
 
     logger.info({ jobId, jobName, initiator: name, targets: targets.length, mode }, 'Cron: starting P2P discussion');
-    const run = await startP2pRun(name, targets, topic, [], serverLink, rounds ?? 1);
+    const run = await startP2pRun({
+      initiatorSession: name,
+      targets,
+      userText: topic,
+      fileContents: [],
+      serverLink,
+      rounds: rounds ?? 1,
+    });
     // Link cron execution to P2P discussion so frontend can navigate
     try {
       serverLink.send({ type: 'cron.p2p_linked', jobId, discussionId: run.discussionId, runId: run.id });

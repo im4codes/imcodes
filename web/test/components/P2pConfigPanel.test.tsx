@@ -335,6 +335,52 @@ describe('P2pConfigPanel', () => {
     expect(parsed).toHaveProperty('rounds');
   });
 
+  it('hides the advanced workflow section while the openspec flow is being reworked', async () => {
+    renderPanel();
+    await flush();
+
+    expect(screen.queryByRole('button', { name: /Advanced workflow/i })).toBeNull();
+    expect(screen.queryByLabelText('Advanced preset')).toBeNull();
+  });
+
+  it('preserves hidden advanced workflow config when saving', async () => {
+    const savedConfig: P2pSavedConfig = {
+      sessions: { 'deck_sub_abc': { enabled: true, mode: 'review' } },
+      rounds: 2,
+      advancedPresetKey: 'openspec',
+      advancedRunTimeoutMinutes: 42,
+      contextReducer: {
+        mode: 'reuse_existing_session',
+        sessionName: 'deck_sub_abc',
+      },
+      advancedRounds: [
+        {
+          id: 'discussion',
+          title: 'Discussion',
+          preset: 'discussion',
+          executionMode: 'single_main',
+          timeoutMinutes: 5,
+        },
+      ],
+    };
+    getUserPrefMock.mockResolvedValue(JSON.stringify(savedConfig));
+    const onSave = vi.fn();
+
+    renderPanel({ onSave });
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('settings_save'));
+    });
+    await flush();
+
+    const cfg: P2pSavedConfig = onSave.mock.calls[0][0];
+    expect(cfg.advancedPresetKey).toBe('openspec');
+    expect(cfg.advancedRunTimeoutMinutes).toBe(42);
+    expect(cfg.contextReducer).toEqual(savedConfig.contextReducer);
+    expect(cfg.advancedRounds).toEqual(savedConfig.advancedRounds);
+  });
+
   it('calls onClose after save completes', async () => {
     const onClose = vi.fn();
 

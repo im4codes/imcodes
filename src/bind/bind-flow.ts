@@ -200,6 +200,15 @@ async function ensureServiceInstalled(): Promise<void> {
   } else if (process.platform === 'win32') {
     await installWindowsStartup();
     console.log('\nDaemon installed as a startup shortcut — starts automatically on login.');
+    // Immediately start the daemon (don't wait for next login).  Use the
+    // single reusable ensureDaemonRunning() that handles all edge cases:
+    // orphan daemons holding the named pipe, crash-loop watchdogs, etc.
+    const { ensureDaemonRunning } = await import('../util/windows-daemon.js');
+    if (ensureDaemonRunning(process.pid)) {
+      console.log('Daemon started.');
+    } else {
+      console.log('Note: Daemon will start on next login.');
+    }
   } else {
     console.log('\nRun "imcodes start" to start the daemon.');
   }

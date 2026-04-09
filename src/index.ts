@@ -708,7 +708,7 @@ program
 program
   .command('restart')
   .description('Restart the imcodes daemon service')
-  .action(() => {
+  .action(async () => {
     ensureServiceForeground();
     const platform = process.platform;
     if (platform === 'darwin') {
@@ -729,11 +729,15 @@ program
         process.exit(1);
       }
     } else if (platform === 'win32') {
-      if (!restartWindowsDaemon(process.pid)) {
+      // Use the single reusable ensureDaemonRunning() that handles all
+      // edge cases: orphan daemons holding the named pipe, crash-loop
+      // watchdogs from the BOM bug, missing PID files, etc.
+      const { ensureDaemonRunning } = await import('./util/windows-daemon.js');
+      if (!ensureDaemonRunning(process.pid)) {
         console.error('Watchdog not found. Run "imcodes bind" first.');
         process.exit(1);
       }
-      console.log('Daemon will restart in ~5 seconds (via watchdog).');
+      console.log('Daemon restarted (orphans cleared, fresh watchdog launched).');
     } else {
       console.error(`Unsupported platform: ${platform}`); process.exit(1);
     }
@@ -839,7 +843,8 @@ program
 
 program
   .command('repair-watchdog')
-  .description('Regenerate Windows daemon watchdog files with current paths')
+  .alias('r')
+  .description('Regenerate Windows daemon watchdog files and (re)start the watchdog (alias: r)')
   .action(async () => {
     if (process.platform !== 'win32') {
       console.log('This command is only needed on Windows.');
@@ -847,7 +852,14 @@ program
     }
     const { regenerateAllArtifacts } = await import('./util/windows-launch-artifacts.js');
     await regenerateAllArtifacts();
-    console.log('Watchdog files regenerated with current Node.js and imcodes paths.');
+    // Use the single reusable ensureDaemonRunning() that handles every
+    // edge case (orphan daemons, crash-loop watchdogs, stale PID files).
+    const { ensureDaemonRunning } = await import('./util/windows-daemon.js');
+    if (ensureDaemonRunning(process.pid)) {
+      console.log('Watchdog files regenerated and daemon restarted.');
+    } else {
+      console.log('Watchdog files regenerated. Daemon will start on next login (Startup shortcut).');
+    }
   });
 
 program.parseAsync(process.argv).catch((err: unknown) => {

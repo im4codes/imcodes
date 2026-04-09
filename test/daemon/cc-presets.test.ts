@@ -55,12 +55,43 @@ describe('cc presets', () => {
     await expect(resolvePresetEnv('MiniMax')).resolves.toMatchObject({
       ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
       ANTHROPIC_AUTH_TOKEN: 'test-token',
+      ANTHROPIC_API_KEY: 'test-token',
       ANTHROPIC_MODEL: 'MiniMax-M2.7',
       ANTHROPIC_SMALL_FAST_MODEL: 'MiniMax-M2.7',
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'MiniMax-M2.7',
       ANTHROPIC_DEFAULT_OPUS_MODEL: 'MiniMax-M2.7',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'MiniMax-M2.7',
       IMCODES_CONTEXT_WINDOW: '200000',
+    });
+  });
+
+  it('builds qwen transport config for anthropic-compatible presets', async () => {
+    const { getQwenPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
+
+    await expect(getQwenPresetTransportConfig('MiniMax')).resolves.toEqual({
+      env: {
+        ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+        ANTHROPIC_API_KEY: 'test-token',
+        ANTHROPIC_MODEL: 'MiniMax-M2.7',
+      },
+      model: 'MiniMax-M2.7',
+      settings: {
+        security: { auth: { selectedType: 'anthropic' } },
+        model: { name: 'MiniMax-M2.7' },
+        modelProviders: {
+          anthropic: [
+            {
+              id: 'MiniMax-M2.7',
+              name: 'minimax',
+              envKey: 'ANTHROPIC_API_KEY',
+              baseUrl: 'https://api.minimax.io/anthropic',
+              generationConfig: {
+                contextWindowSize: 200000,
+              },
+            },
+          ],
+        },
+      },
     });
   });
 });

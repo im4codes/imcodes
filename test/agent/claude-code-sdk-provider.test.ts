@@ -261,6 +261,29 @@ describe('ClaudeCodeSdkProvider', () => {
     });
   });
 
+  it('passes runtime-only system prompts without polluting description', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-system', model: 'claude-sonnet-4-6' },
+      { type: 'result', session_id: 'session-system', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-system',
+      cwd: '/tmp/project',
+      resumeId: 'session-system',
+      description: 'Visible description',
+      systemPrompt: 'Runtime note only',
+    });
+
+    await provider.send('route-system', 'hello');
+    await flush();
+
+    const run = sdkMock.runs.at(-1)!;
+    expect(run.options.appendSystemPrompt).toBe('Visible description\n\nRuntime note only');
+  });
+
   it('emits a fallback streaming delta from assistant text when the SDK does not send text_delta events', async () => {
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-fallback', model: 'claude-sonnet-4-6' },
@@ -387,6 +410,52 @@ describe('ClaudeCodeSdkProvider', () => {
 
     const run = sdkMock.runs.at(-1)!;
     expect(run.options.effort).toBe('high');
+  });
+
+  it('emits compacting status updates from Claude SDK system status messages', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-status', model: 'claude-sonnet-4-6' },
+      { type: 'system', subtype: 'status', session_id: 'session-status', status: 'compacting' },
+      { type: 'system', subtype: 'status', session_id: 'session-status', status: null },
+      { type: 'result', session_id: 'session-status', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-status', cwd: '/tmp/project', resumeId: 'session-status' });
+
+    const statuses: Array<{ status: string | null; label?: string | null }> = [];
+    provider.onStatus?.((_sid, status) => statuses.push(status));
+
+    await provider.send('route-status', 'hello');
+    await flush();
+
+    expect(statuses).toEqual([
+      { status: 'compacting', label: 'Compacting conversation...' },
+      { status: null, label: null },
+    ]);
+  });
+
+  it('emits compacting status from compact boundary system messages', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-boundary', model: 'claude-sonnet-4-6' },
+      { type: 'system', subtype: 'compact_boundary', session_id: 'session-boundary' },
+      { type: 'result', session_id: 'session-boundary', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-boundary', cwd: '/tmp/project', resumeId: 'session-boundary' });
+
+    const statuses: Array<{ status: string | null; label?: string | null }> = [];
+    provider.onStatus?.((_sid, status) => statuses.push(status));
+
+    await provider.send('route-boundary', 'hello');
+    await flush();
+
+    expect(statuses).toEqual([
+      { status: 'compacting', label: 'Compacting conversation...' },
+    ]);
   });
 });
 

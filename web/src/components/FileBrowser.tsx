@@ -177,6 +177,27 @@ export interface FileBrowserPreviewUpdate {
   preview: FileBrowserPreviewState;
 }
 
+export function mergePreviewState(
+  current: FileBrowserPreviewState,
+  incoming: FileBrowserPreviewState,
+): FileBrowserPreviewState {
+  if (current.status === 'idle') return incoming;
+  const currentPath = 'path' in current ? current.path : null;
+  const incomingPath = 'path' in incoming ? incoming.path : null;
+  if (!currentPath || !incomingPath || currentPath !== incomingPath) return incoming;
+  if (incoming.status === 'loading') return current;
+  if (current.status === 'ok' && incoming.status === 'ok') {
+    return {
+      ...current,
+      ...incoming,
+      diff: incoming.diff ?? current.diff,
+      diffHtml: incoming.diffHtml ?? current.diffHtml,
+      downloadId: incoming.downloadId ?? current.downloadId,
+    };
+  }
+  return incoming;
+}
+
 /** File extensions that can be previewed with office document libraries. */
 const OFFICE_EXTENSIONS: Record<string, string> = {
   '.pdf': 'application/pdf',
@@ -197,6 +218,108 @@ function updateNode(nodes: FsNode[], targetId: string, patch: Partial<FsNode>): 
     if (n.children?.length) return { ...n, children: updateNode(n.children, targetId, patch) };
     return n;
   });
+}
+
+type ChangeFile = { path: string; code: string; additions?: number; deletions?: number };
+type SharedChangesListener = (files: ChangeFile[]) => void;
+type PendingPreviewRequest = { path: string; cycleId: number };
+
+interface SharedChangesEntry {
+  repoPath: string;
+  files: ChangeFile[];
+  updatedAt: number;
+  inFlightRequestId: string | null;
+  queued: boolean;
+  listeners: Set<SharedChangesListener>;
+  ws: WsClient | null;
+}
+
+const SHARED_CHANGES_TTL_MS = 5_000;
+const sharedChangesByKey = new Map<string, SharedChangesEntry>();
+const sharedChangesRequestKey = new Map<string, string>();
+const wsIds = new WeakMap<WsClient, number>();
+let nextWsId = 1;
+
+export function __resetFileBrowserSharedChangesForTests(): void {
+  sharedChangesByKey.clear();
+  sharedChangesRequestKey.clear();
+  nextWsId = 1;
+}
+
+function getWsId(ws: WsClient): number {
+  let id = wsIds.get(ws);
+  if (!id) {
+    id = nextWsId++;
+    wsIds.set(ws, id);
+  }
+  return id;
+}
+
+function getSharedChangesKey(ws: WsClient, repoPath: string): string {
+  return `${getWsId(ws)}::${repoPath}`;
+}
+
+function getSharedChangesEntry(key: string): SharedChangesEntry {
+  let entry = sharedChangesByKey.get(key);
+  if (!entry) {
+    entry = { repoPath: '', files: [], updatedAt: 0, inFlightRequestId: null, queued: false, listeners: new Set(), ws: null };
+    sharedChangesByKey.set(key, entry);
+  }
+  return entry;
+}
+
+function subscribeSharedChanges(key: string, listener: SharedChangesListener): () => void {
+  const entry = getSharedChangesEntry(key);
+  entry.listeners.add(listener);
+  if (entry.updatedAt > 0) listener(entry.files);
+  return () => {
+    const current = sharedChangesByKey.get(key);
+    if (!current) return;
+    current.listeners.delete(listener);
+    if (current.listeners.size === 0 && !current.inFlightRequestId) {
+      sharedChangesByKey.delete(key);
+    }
+  };
+}
+
+function publishSharedChanges(key: string, files: ChangeFile[]): void {
+  const entry = getSharedChangesEntry(key);
+  entry.files = files;
+  entry.updatedAt = Date.now();
+  for (const listener of entry.listeners) listener(files);
+}
+
+function requestSharedChanges(key: string, ws: WsClient, repoPath: string, force = false): void {
+  const entry = getSharedChangesEntry(key);
+  entry.ws = ws;
+  entry.repoPath = repoPath;
+  const fresh = entry.updatedAt > 0 && (Date.now() - entry.updatedAt) < SHARED_CHANGES_TTL_MS;
+  if (!force && fresh) {
+    publishSharedChanges(key, entry.files);
+    return;
+  }
+  if (entry.inFlightRequestId) {
+    entry.queued = true;
+    return;
+  }
+  const requestId = ws.fsGitStatus(repoPath, { includeStats: true });
+  entry.inFlightRequestId = requestId;
+  sharedChangesRequestKey.set(requestId, key);
+}
+
+function settleSharedChangesRequest(requestId: string, files: ChangeFile[] | null): boolean {
+  const key = sharedChangesRequestKey.get(requestId);
+  if (!key) return false;
+  sharedChangesRequestKey.delete(requestId);
+  const entry = sharedChangesByKey.get(key);
+  if (!entry) return true;
+  entry.inFlightRequestId = null;
+  if (files) publishSharedChanges(key, files);
+  if (entry.queued && entry.ws) {
+    entry.queued = false;
+    requestSharedChanges(key, entry.ws, entry.repoPath, true);
+  }
+  return true;
 }
 
 
@@ -281,18 +404,19 @@ export function FileBrowser({
     setPanelViewRaw(v);
     try { localStorage.setItem('rcc_fb_tab', v); } catch { /* ignore */ }
   };
-  const [changesFiles, setChangesFiles] = useState<Array<{ path: string; code: string; additions?: number; deletions?: number }>>([]);
-  const pendingChangesRef = useRef(new Set<string>()); // all in-flight changesRootPath git status requestIds
+  const [changesFiles, setChangesFiles] = useState<ChangeFile[]>([]);
 
   const loadedRef = useRef(new Set<string>());
   const pendingRef = useRef(new Map<string, string>()); // requestId → nodeId
   const timersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
-  const pendingReadRef = useRef(new Map<string, string>()); // requestId → filePath
+  const pendingReadRef = useRef(new Map<string, PendingPreviewRequest>());
   const pendingGitStatusRef = useRef(new Map<string, string>()); // requestId → dirPath
-  const pendingGitDiffRef = useRef(new Map<string, string>()); // requestId → filePath
+  const pendingGitDiffRef = useRef(new Map<string, PendingPreviewRequest>());
   const pendingMkdirRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
   const mountedRef = useRef(true);
   const dismissedAutoPreviewPathRef = useRef<string | null>(null);
+  const nextPreviewCycleIdRef = useRef(1);
+  const activePreviewCycleRef = useRef<PendingPreviewRequest | null>(null);
 
   // History navigation
   const historyRef = useRef<string[]>([startPath]);
@@ -308,13 +432,61 @@ export function FileBrowser({
       pendingGitStatusRef.current.clear();
       pendingGitDiffRef.current.clear();
       pendingMkdirRef.current.clear();
-      pendingChangesRef.current.clear();
       editorMsgHandlers.current.clear();
       if (pendingChangesTimerRef.current) clearTimeout(pendingChangesTimerRef.current);
       for (const timer of timersRef.current.values()) clearTimeout(timer);
       timersRef.current.clear();
     };
   }, []);
+
+  const getActivePreviewCycle = useCallback((path?: string): PendingPreviewRequest | null => {
+    const active = activePreviewCycleRef.current;
+    if (!active) return null;
+    if (path && active.path !== path) return null;
+    return active;
+  }, []);
+
+  const hasPendingPreviewWork = useCallback((kind: 'read' | 'diff', path: string, cycleId?: number): boolean => {
+    const active = cycleId !== undefined ? { path, cycleId } : getActivePreviewCycle(path);
+    if (!active) return false;
+    const pending = kind === 'read' ? pendingReadRef.current : pendingGitDiffRef.current;
+    for (const request of pending.values()) {
+      if (request.path === active.path && request.cycleId === active.cycleId) return true;
+    }
+    return false;
+  }, [getActivePreviewCycle]);
+
+  const fetchDir = useCallback((nodePath: string) => {
+    if (loadedRef.current.has(nodePath)) return;
+    const inFlight = [...pendingRef.current.values()].includes(nodePath);
+    if (inFlight) return;
+
+    setData((prev) => updateNode(prev, nodePath, { isLoading: true }));
+    let requestId: string;
+    try {
+      requestId = ws.fsListDir(nodePath, includeFiles, !!serverId);
+    } catch {
+      setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
+      return;
+    }
+    pendingRef.current.set(requestId, nodePath);
+    // Tree/subtree refreshes only need lightweight status without includeStats.
+    try {
+      const gitId = ws.fsGitStatus(nodePath);
+      pendingGitStatusRef.current.set(gitId, nodePath);
+    } catch { /* ws disconnected — skip git status */ }
+
+    const timer = setTimeout(() => {
+      if (!mountedRef.current) return;
+      if (pendingRef.current.has(requestId)) {
+        pendingRef.current.delete(requestId);
+        timersRef.current.delete(requestId);
+        setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
+        setError(t('file_browser.timeout_detail', { defaultValue: t('file_browser.timeout') }));
+      }
+    }, REQUEST_TIMEOUT_MS);
+    timersRef.current.set(requestId, timer);
+  }, [includeFiles, serverId, t, ws]);
 
   // Listen for fs.ls_response and fs.read_response
   // IMPORTANT: Every setState call is guarded by mountedRef to prevent crashes
@@ -327,7 +499,9 @@ export function FileBrowser({
       if (msg.type === DAEMON_MSG.RECONNECTED || (msg.type === 'session.event' && (msg as any).event === 'connected')) {
         loadedRef.current.clear();
         pendingRef.current.clear();
-        pendingChangesRef.current.clear();
+        pendingReadRef.current.clear();
+        pendingGitDiffRef.current.clear();
+        activePreviewCycleRef.current = null;
         // Re-fetch root and changes
         if (mountedRef.current) fetchDir(startPath);
         return;
@@ -395,9 +569,12 @@ export function FileBrowser({
       }
 
       if (msg.type === 'fs.read_response') {
-        const filePath = pendingReadRef.current.get(msg.requestId);
-        if (!filePath) return;
+        const pending = pendingReadRef.current.get(msg.requestId);
+        if (!pending) return;
         pendingReadRef.current.delete(msg.requestId);
+        const active = getActivePreviewCycle();
+        if (!active || active.path !== pending.path || active.cycleId !== pending.cycleId) return;
+        const filePath = pending.path;
 
         if (!mountedRef.current) return;
 
@@ -452,18 +629,8 @@ export function FileBrowser({
       }
 
       if (msg.type === 'fs.git_status_response') {
-        // Check if this is a changesRootPath request
-        if (pendingChangesRef.current.has(msg.requestId)) {
-          pendingChangesRef.current.delete(msg.requestId);
-          if (!mountedRef.current) return;
-          if (msg.status === 'ok' && msg.files) {
-            setChangesFiles(msg.files as Array<{ path: string; code: string; additions?: number; deletions?: number }>);
-            setModifiedFiles((prev) => {
-              const next = new Map(prev);
-              for (const f of msg.files!) next.set(f.path, f.code);
-              return next;
-            });
-          }
+        const sharedFiles = msg.status === 'ok' ? ((msg.files as ChangeFile[] | undefined) ?? []) : [];
+        if (settleSharedChangesRequest(msg.requestId, sharedFiles)) {
           return;
         }
         const dirPath = pendingGitStatusRef.current.get(msg.requestId);
@@ -486,9 +653,12 @@ export function FileBrowser({
       }
 
       if (msg.type === 'fs.git_diff_response') {
-        const filePath = pendingGitDiffRef.current.get(msg.requestId);
-        if (!filePath) return;
+        const pending = pendingGitDiffRef.current.get(msg.requestId);
+        if (!pending) return;
         pendingGitDiffRef.current.delete(msg.requestId);
+        const active = getActivePreviewCycle();
+        if (!active || active.path !== pending.path || active.cycleId !== pending.cycleId) return;
+        const filePath = pending.path;
         if (!mountedRef.current) return;
         if (msg.status === 'ok') {
           const diff = msg.diff ?? '';
@@ -520,58 +690,38 @@ export function FileBrowser({
         return;
       }
     });
-  }, [ws, showHidden, highlightPath, t]);
-
-  const fetchDir = useCallback((nodePath: string) => {
-    if (loadedRef.current.has(nodePath)) return;
-    const inFlight = [...pendingRef.current.values()].includes(nodePath);
-    if (inFlight) return;
-
-    setData((prev) => updateNode(prev, nodePath, { isLoading: true }));
-    let requestId: string;
-    try {
-      requestId = ws.fsListDir(nodePath, includeFiles, !!serverId);
-    } catch {
-      setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
-      return;
-    }
-    pendingRef.current.set(requestId, nodePath);
-    // Fetch git status for this directory
-    try {
-      const gitId = ws.fsGitStatus(nodePath);
-      pendingGitStatusRef.current.set(gitId, nodePath);
-    } catch { /* ws disconnected — skip git status */ }
-
-    const timer = setTimeout(() => {
-      if (!mountedRef.current) return;
-      if (pendingRef.current.has(requestId)) {
-        pendingRef.current.delete(requestId);
-        timersRef.current.delete(requestId);
-        setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
-        setError(t('file_browser.timeout_detail', { defaultValue: t('file_browser.timeout') }));
-      }
-    }, REQUEST_TIMEOUT_MS);
-    timersRef.current.set(requestId, timer);
-  }, [ws, includeFiles, t]);
+  }, [fetchDir, getActivePreviewCycle, startPath, showHidden, highlightPath, t, ws]);
 
   const fetchPreview = useCallback((filePath: string, preferDiff = false) => {
     if (editDirtyRef.current) {
       if (!window.confirm(t('fileBrowser.unsavedChanges'))) return;
+    }
+    if (onPreviewFile) {
+      onPreviewFile({ path: filePath, preferDiff, preview: { status: 'loading', path: filePath } });
+      return;
     }
     dismissedAutoPreviewPathRef.current = null;
     setEditDirty(false);
     setEditContent('');
     setOriginalMtime(undefined);
     setIsEditing(() => { try { return localStorage.getItem(PREF_KEY) === '1'; } catch { return false; } });
+    const active = getActivePreviewCycle(filePath);
+    const cycleId = active && (hasPendingPreviewWork('read', filePath, active.cycleId) || hasPendingPreviewWork('diff', filePath, active.cycleId))
+      ? active.cycleId
+      : nextPreviewCycleIdRef.current++;
+    activePreviewCycleRef.current = { path: filePath, cycleId };
     const loadingPreview: FileBrowserPreviewState = { status: 'loading', path: filePath };
     setPreview(loadingPreview);
     setShowDiff(preferDiff);
-    if (onPreviewFile) onPreviewFile({ path: filePath, preferDiff, preview: loadingPreview });
-    const requestId = ws.fsReadFile(filePath);
-    pendingReadRef.current.set(requestId, filePath);
-    const diffId = ws.fsGitDiff(filePath);
-    pendingGitDiffRef.current.set(diffId, filePath);
-  }, [ws, t, onPreviewFile]);
+    if (!hasPendingPreviewWork('read', filePath, cycleId)) {
+      const requestId = ws.fsReadFile(filePath);
+      pendingReadRef.current.set(requestId, { path: filePath, cycleId });
+    }
+    if (!hasPendingPreviewWork('diff', filePath, cycleId)) {
+      const diffId = ws.fsGitDiff(filePath);
+      pendingGitDiffRef.current.set(diffId, { path: filePath, cycleId });
+    }
+  }, [getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, t, ws]);
 
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
 
@@ -634,7 +784,9 @@ export function FileBrowser({
       // Clear stale state from previous ws instance
       loadedRef.current.clear();
       pendingRef.current.clear();
-      pendingChangesRef.current.clear();
+      pendingReadRef.current.clear();
+      pendingGitDiffRef.current.clear();
+      activePreviewCycleRef.current = null;
       for (const timer of timersRef.current.values()) clearTimeout(timer);
       timersRef.current.clear();
       setData([{ id: startPath, name: startPath, isDir: true, children: [] }]);
@@ -644,8 +796,25 @@ export function FileBrowser({
   }, [startPath, fetchDir]);
 
   useEffect(() => {
+    if (!changesRootPath) return;
+    const cacheKey = getSharedChangesKey(ws, changesRootPath);
+    return subscribeSharedChanges(cacheKey, (files) => {
+      if (!mountedRef.current) return;
+      setChangesFiles(files);
+      setModifiedFiles((prev) => {
+        const next = new Map(prev);
+        for (const [k] of next) {
+          if (k.startsWith(changesRootPath + '/')) next.delete(k);
+        }
+        for (const file of files) next.set(file.path, file.code);
+        return next;
+      });
+    });
+  }, [changesRootPath, ws]);
+
+  useEffect(() => {
     if (!initialPreview || initialPreview.status === 'idle') return;
-    setPreview(initialPreview);
+    setPreview((prev) => mergePreviewState(prev, initialPreview));
   }, [initialPreview]);
 
   useEffect(() => {
@@ -676,16 +845,18 @@ export function FileBrowser({
     if (currentPreviewPath === autoPreviewPath && preview.status !== 'idle') {
       setShowDiff(autoPreviewPreferDiff);
       if (preview.status === 'loading' && initialPreview?.status === 'loading' && !skipAutoPreviewIfLoading) {
-        fetchPreview(autoPreviewPath, autoPreviewPreferDiff);
+        const hasPendingRead = hasPendingPreviewWork('read', autoPreviewPath);
+        if (!hasPendingRead) fetchPreview(autoPreviewPath, autoPreviewPreferDiff);
       }
       return;
     }
     fetchPreview(autoPreviewPath, autoPreviewPreferDiff);
-  }, [autoPreviewPath, autoPreviewPreferDiff, fetchPreview, initialPreview, preview, skipAutoPreviewIfLoading]);
+  }, [autoPreviewPath, autoPreviewPreferDiff, fetchPreview, hasPendingPreviewWork, initialPreview, preview, skipAutoPreviewIfLoading]);
 
   const dismissPreview = useCallback(() => {
     if (editDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
     if (autoPreviewPath) dismissedAutoPreviewPathRef.current = autoPreviewPath;
+    activePreviewCycleRef.current = null;
     setIsEditing(false);
     setEditDirty(false);
     setPreview({ status: 'idle' });
@@ -703,10 +874,12 @@ export function FileBrowser({
     const timer = setInterval(() => {
       if (!mountedRef.current) return;
       try {
+        const cycleId = nextPreviewCycleIdRef.current++;
+        activePreviewCycleRef.current = { path, cycleId };
         const reqId = ws.fsReadFile(path);
-        pendingReadRef.current.set(reqId, path);
+        pendingReadRef.current.set(reqId, { path, cycleId });
         const diffId = ws.fsGitDiff(path);
-        pendingGitDiffRef.current.set(diffId, path);
+        pendingGitDiffRef.current.set(diffId, { path, cycleId });
       } catch { /* ws disconnected */ }
     }, 5000);
     return () => clearInterval(timer);
@@ -717,50 +890,48 @@ export function FileBrowser({
   const lastChangesRefreshRef = useRef(0);
   const pendingChangesTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const changesVisible = !!changesRootPath && panelView === 'changes';
+
   const refreshChanges = useCallback(() => {
     if (!changesRootPath) return;
+    const cacheKey = getSharedChangesKey(ws, changesRootPath);
     const now = Date.now();
     const elapsed = now - lastChangesRefreshRef.current;
     if (elapsed >= CHANGES_RATE_LIMIT_MS) {
       lastChangesRefreshRef.current = now;
-      try {
-        const requestId = ws.fsGitStatus(changesRootPath);
-        pendingChangesRef.current.add(requestId);
-      } catch { return; }
+      requestSharedChanges(cacheKey, ws, changesRootPath);
     } else {
       // Schedule for when rate limit clears
       if (pendingChangesTimerRef.current) clearTimeout(pendingChangesTimerRef.current);
       pendingChangesTimerRef.current = setTimeout(() => {
         if (!mountedRef.current) return;
         lastChangesRefreshRef.current = Date.now();
-        try {
-          const requestId = ws.fsGitStatus(changesRootPath);
-          pendingChangesRef.current.add(requestId);
-        } catch { /* ws disconnected */ }
+        requestSharedChanges(cacheKey, ws, changesRootPath, true);
       }, CHANGES_RATE_LIMIT_MS - elapsed);
     }
   }, [changesRootPath, ws]);
 
   // Initial fetch on mount
   useEffect(() => {
-    if (!changesRootPath) return;
+    if (!changesVisible) return;
     refreshChanges();
-  }, [changesRootPath, ws]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [changesVisible, changesRootPath, ws]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 30s polling
   useEffect(() => {
-    if (!changesRootPath) return;
+    if (!changesVisible) return;
     const id = setInterval(() => {
       if (mountedRef.current) refreshChanges();
     }, 30_000);
     return () => clearInterval(id);
-  }, [changesRootPath, refreshChanges]);
+  }, [changesVisible, refreshChanges]);
 
   // External refresh trigger (e.g. from tool.call events in ChatView)
   useEffect(() => {
+    if (!changesVisible) return;
     if (refreshTrigger === undefined || refreshTrigger === 0) return;
     refreshChanges();
-  }, [refreshTrigger, refreshChanges]);
+  }, [changesVisible, refreshTrigger, refreshChanges]);
 
   // Reload tree when showHidden changes
   useEffect(() => {
@@ -821,8 +992,8 @@ export function FileBrowser({
 
   const alreadySet = new Set(alreadyInserted);
   const usesExternalPreview = !!onPreviewFile;
-  const hasPreview = mode !== 'dir-only' && preview.status !== 'idle';
-  const hasInlinePreview = hasPreview && !usesExternalPreview;
+  const hasInlinePreview = mode !== 'dir-only' && preview.status !== 'idle' && !usesExternalPreview;
+  const hasPreview = hasInlinePreview;
 
   const previewPath = preview.status !== 'idle' ? (preview as { path: string }).path : null;
 
@@ -1016,8 +1187,7 @@ export function FileBrowser({
         <span class="fb-changes-title">{t('file_browser.changes_title', { count: changesFiles.length })}</span>
         {changesRootPath && (
           <button class="fb-changes-refresh" onClick={() => {
-            const requestId = ws.fsGitStatus(changesRootPath!);
-            pendingChangesRef.current.add(requestId);
+            requestSharedChanges(getSharedChangesKey(ws, changesRootPath!), ws, changesRootPath!, true);
           }} title="Refresh">↻</button>
         )}
       </div>
@@ -1177,8 +1347,6 @@ export function FileBrowser({
     </div>
   ) : null;
 
-  const showEmbeddedChangesSection = !!changesSection && !usesExternalPreview;
-
   if (layout === 'panel') {
     const tabs = changesRootPath ? (
       <div class="fb-panel-tabs">
@@ -1216,10 +1384,9 @@ export function FileBrowser({
           {tabs}
           {breadcrumb}
           {newFolderDialog}
-          <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}${showEmbeddedChangesSection ? ' fb-body-with-changes' : ''}`}>
+          <div class={`fb-body${hasPreview ? ' fb-body-split' : ''}`}>
             <div class={`fb-files-and-changes${hasPreview ? ' fb-tree-split' : ''}`} style={hasPreview && treeWidth ? { flex: 'none', width: treeWidth } : undefined}>
               {tree}
-              {showEmbeddedChangesSection ? changesSection : null}
             </div>
             {hasPreview && (
               <div

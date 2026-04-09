@@ -6,6 +6,8 @@ import { render, waitFor, cleanup, fireEvent } from '@testing-library/preact';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { ChatView } from '../../src/components/ChatView.js';
 
+const chatMarkdownRenderSpy = vi.hoisted(() => vi.fn());
+
 type ViewportListener = () => void;
 const visualViewportListeners = new Map<string, Set<ViewportListener>>();
 const visualViewportMock = {
@@ -30,7 +32,10 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../../src/components/ChatMarkdown.js', () => ({
-  ChatMarkdown: ({ text }: { text: string }) => <div>{text}</div>,
+  ChatMarkdown: ({ text }: { text: string }) => {
+    chatMarkdownRenderSpy(text);
+    return <div>{text}</div>;
+  },
 }));
 
 vi.mock('../../src/components/FileBrowser.js', () => ({
@@ -48,6 +53,7 @@ describe('ChatView', () => {
 
   afterEach(() => {
     cleanup();
+    chatMarkdownRenderSpy.mockClear();
     visualViewportMock.height = 800;
     visualViewportListeners.clear();
   });
@@ -156,6 +162,48 @@ describe('ChatView', () => {
     await waitFor(() => {
       expect(scrollEl.scrollTop).toBe(1800);
     });
+  });
+
+  it('does not rerender an unchanged assistant block when the parent chat rerenders', async () => {
+    const { rerender } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-1',
+            type: 'assistant.text',
+            ts: 1000,
+            payload: { text: 'stable block' },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(chatMarkdownRenderSpy.mock.calls.filter(([text]) => text === 'stable block')).toHaveLength(1);
+
+    rerender(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-1',
+            type: 'assistant.text',
+            ts: 1000,
+            payload: { text: 'stable block' },
+          },
+          {
+            eventId: 'evt-2',
+            type: 'user.message',
+            ts: 1001,
+            payload: { text: 'new user message' },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(chatMarkdownRenderSpy.mock.calls.filter(([text]) => text === 'stable block')).toHaveLength(1);
   });
 
   it('restores mobile keyboard scroll position from bottom offset instead of snapping to top', async () => {

@@ -55,6 +55,14 @@ interface ViewItem {
   lastTs?: number;
 }
 
+interface AssistantBlockProps {
+  text: string;
+  ts: number;
+  onPathClick?: (p: string) => void;
+  onUrlClick?: (url: string) => void;
+  onDownload?: (path: string) => void;
+}
+
 const TOOL_INPUT_SUMMARY_KEYS = [
   'query',
   'command',
@@ -397,6 +405,33 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
   }, [sessionId]);
+
+  const handlePathClick = useCallback((path: string) => {
+    setFileBrowserPath(path.replace(/^`+|`+$/g, ''));
+  }, []);
+
+  const handleUrlClick = useCallback((url: string) => {
+    setPendingUrl(url);
+  }, []);
+
+  const handleDownload = useCallback((path: string) => {
+    if (!serverId || !ws) return;
+    const reqId = ws.fsReadFile(path);
+    const unsub = ws.onMessage((msg) => {
+      if (msg.type !== 'fs.read_response' || msg.requestId !== reqId) return;
+      unsub();
+      if (msg.downloadId) {
+        import('../api.js').then(({ downloadAttachment }) => {
+          downloadAttachment(serverId, msg.downloadId as string).catch(() => {});
+        });
+      }
+    });
+    setTimeout(unsub, 30_000);
+  }, [serverId, ws]);
+
+  const pathClickHandler = ws && !preview ? handlePathClick : undefined;
+  const urlClickHandler = !preview ? handleUrlClick : undefined;
+  const downloadHandler = serverId && ws ? handleDownload : undefined;
 
   const viewItems = useMemo(() => buildViewItems(events), [events]);
 
@@ -763,31 +798,19 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
           {!loading && viewItems.map((item, idx) => {
             const nextItem = viewItems[idx + 1];
             const nextTs = nextItem?.ts ?? nextItem?.event?.ts;
-            const onPathClick = ws && !preview ? (p: string) => setFileBrowserPath(p.replace(/^`+|`+$/g, '')) : undefined;
-            const onUrlClick = !preview ? (url: string) => setPendingUrl(url) : undefined;
-            const onDownload = serverId && ws ? (p: string) => {
-              const reqId = ws.fsReadFile(p);
-              const unsub = ws.onMessage((msg) => {
-                if (msg.type !== 'fs.read_response' || msg.requestId !== reqId) return;
-                unsub();
-                if (msg.downloadId) {
-                  import('../api.js').then(({ downloadAttachment }) => {
-                    downloadAttachment(serverId!, msg.downloadId as string).catch(() => {});
-                  });
-                }
-              });
-              // Auto-cleanup after 30s
-              setTimeout(unsub, 30_000);
-            } : undefined;
             return item.type === 'assistant-block' ? (
-              <div key={item.key} class="chat-event chat-assistant">
-                <ChatMarkdown text={item.text!} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} />
-                <ChatTime ts={item.lastTs ?? item.ts ?? 0} />
-              </div>
+              <AssistantBlock
+                key={item.key}
+                text={item.text!}
+                ts={item.lastTs ?? item.ts ?? 0}
+                onPathClick={pathClickHandler}
+                onUrlClick={urlClickHandler}
+                onDownload={downloadHandler}
+              />
             ) : item.type === 'tool-group' ? (
-              <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={onPathClick} />
+              <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} />
             ) : (
-              <ChatEvent key={item.key} event={item.event!} nextTs={nextTs} onPathClick={onPathClick} serverId={serverId} />
+              <ChatEvent key={item.key} event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} serverId={serverId} />
             );
           })}
           {!loading && <div ref={bottomRef} />}
@@ -1021,6 +1044,21 @@ function ToolCallGroup({ events, onPathClick }: { events: TimelineEvent[]; onPat
 }
 
 // ToolInputFold removed — replaced by unified ToolBlockFold (CSS max-height based)
+
+const AssistantBlock = memo(function AssistantBlock({
+  text,
+  ts,
+  onPathClick,
+  onUrlClick,
+  onDownload,
+}: AssistantBlockProps) {
+  return (
+    <div class="chat-event chat-assistant">
+      <ChatMarkdown text={text} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} />
+      <ChatTime ts={ts} />
+    </div>
+  );
+});
 
 function AttachmentDownloadButton({ att, serverId, onPathClick }: { att: { id: string; originalName?: string; size?: number; daemonPath?: string }; serverId: string; onPathClick?: (p: string) => void }) {
   const { t } = useTranslation();

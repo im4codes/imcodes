@@ -15,6 +15,8 @@ export interface FsEntry {
 export interface GitStatusEntry {
   path: string;
   code: string;
+  additions?: number;
+  deletions?: number;
 }
 
 interface FsBaseResponse {

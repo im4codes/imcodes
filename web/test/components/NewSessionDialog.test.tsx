@@ -221,7 +221,7 @@ describe('NewSessionDialog', () => {
     }));
   });
 
-  it('shows CC preset controls and submits preset for claude-code-sdk', () => {
+  it('does not show CC preset controls for claude-code-sdk', () => {
     const ws = makeWs();
     ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
       handler({
@@ -235,16 +235,36 @@ describe('NewSessionDialog', () => {
 
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
+    expect(screen.queryByText('API Provider')).toBeNull();
+  });
+
+  it('shows CC preset controls and submits preset for qwen', () => {
+    const ws = makeWs();
+    ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
+      handler({
+        type: 'cc.presets.list_response',
+        presets: [
+          { name: 'MiniMax', env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' } },
+        ],
+      });
+      return () => {};
+    });
+
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.change(screen.getAllByRole('combobox')[0], { target: { value: 'qwen' } });
     expect(screen.getByText('API Provider')).toBeDefined();
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
 
-    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-    fireEvent.change(selects[2], { target: { value: 'MiniMax' } });
+    const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+      .find((select) => Array.from(select.options).some((option) => option.value === 'MiniMax'));
+    expect(presetSelect).toBeDefined();
+    fireEvent.change(presetSelect!, { target: { value: 'MiniMax' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
-      agentType: 'claude-code-sdk',
+      agentType: 'qwen',
       ccPreset: 'MiniMax',
       thinking: 'high',
     }));

@@ -2,12 +2,19 @@
  * P2pConfigPanel — modal settings panel for P2P config mode.
  * Lets the user configure per-session participation and modes, plus round count.
  */
-import { useState, useEffect } from 'preact/hooks';
+import { useState, useEffect, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { getUserPref, saveUserPref } from '../api.js';
 import { P2pComboManager } from './P2pComboManager.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
 import type { P2pSavedConfig, P2pSessionConfig } from '@shared/p2p-modes.js';
+import { BUILT_IN_ADVANCED_PRESETS } from '@shared/p2p-advanced.js';
+import type {
+  P2pAdvancedPresetKey,
+  P2pAdvancedRound,
+  P2pContextReducerConfig,
+  P2pContextReducerMode,
+} from '@shared/p2p-advanced.js';
 
 interface SessionRow {
   name: string;
@@ -156,6 +163,25 @@ const sectionCardStyle: Record<string, string | number> = {
   padding: 14,
 };
 
+const fieldLabelStyle: Record<string, string | number> = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 6,
+  fontSize: 12,
+  color: '#cbd5e1',
+};
+
+const fieldInputStyle: Record<string, string | number> = {
+  width: '100%',
+  background: '#0f172a',
+  border: '1px solid #334155',
+  borderRadius: 6,
+  color: '#e2e8f0',
+  fontSize: 13,
+  padding: '7px 9px',
+  outline: 'none',
+};
+
 const roundsBtnStyle = (active: boolean): Record<string, string | number> => ({
   padding: '4px 12px',
   borderRadius: 6,
@@ -253,8 +279,24 @@ export function P2pConfigPanel({
   const [rounds, setRounds] = useState(3);
   const [hopTimeoutMinutes, setHopTimeoutMinutes] = useState(8);
   const [extraPrompt, setExtraPrompt] = useState('');
+  const [advancedExpanded, setAdvancedExpanded] = useState(false);
+  const [advancedPresetKey, setAdvancedPresetKey] = useState<P2pAdvancedPresetKey | ''>('');
+  const [advancedRounds, setAdvancedRounds] = useState<P2pAdvancedRound[] | undefined>(undefined);
+  const [advancedRunTimeoutMinutes, setAdvancedRunTimeoutMinutes] = useState(30);
+  const [contextReducerMode, setContextReducerMode] = useState<P2pContextReducerMode | ''>('');
+  const [contextReducerSession, setContextReducerSession] = useState('');
+  const [contextReducerTemplate, setContextReducerTemplate] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const showAdvancedWorkflowSettings = false;
+
+  const enabledSdkParticipants = useMemo(
+    () => allEligible.filter((entry) => entry.flavor === 'sdk').filter((entry) => {
+      const cfg = sessionCfg[entry.key];
+      return !!cfg?.enabled && cfg.mode !== 'skip';
+    }),
+    [allEligible, sessionCfg],
+  );
 
   // Config key uses the main session (sub-sessions follow parent config)
   const configKey = scopeSession ? `p2p_session_config:${scopeSession}` : null;
@@ -271,6 +313,13 @@ export function P2pConfigPanel({
           setRounds(parsed.rounds ?? 3);
           setHopTimeoutMinutes(parsed.hopTimeoutMinutes ?? 8);
           setExtraPrompt(parsed.extraPrompt ?? '');
+          setAdvancedPresetKey(parsed.advancedPresetKey ?? '');
+          setAdvancedRounds(parsed.advancedRounds);
+          setAdvancedRunTimeoutMinutes(parsed.advancedRunTimeoutMinutes ?? 30);
+          setContextReducerMode(parsed.contextReducer?.mode ?? '');
+          setContextReducerSession(parsed.contextReducer?.sessionName ?? '');
+          setContextReducerTemplate(parsed.contextReducer?.templateSession ?? '');
+          setAdvancedExpanded(Boolean(parsed.advancedPresetKey || parsed.contextReducer || parsed.advancedRunTimeoutMinutes != null));
         } catch { /* start fresh */ }
       }
       setLoading(false);
@@ -286,6 +335,21 @@ export function P2pConfigPanel({
       });
     });
   }, [configKey]);
+
+  useEffect(() => {
+    if (contextReducerMode === 'reuse_existing_session') {
+      const stillEligible = enabledSdkParticipants.some((entry) => entry.key === contextReducerSession);
+      if (!stillEligible) setContextReducerSession(enabledSdkParticipants[0]?.key ?? '');
+      return;
+    }
+    if (contextReducerMode === 'clone_sdk_session') {
+      const stillEligible = enabledSdkParticipants.some((entry) => entry.key === contextReducerTemplate);
+      if (!stillEligible) setContextReducerTemplate(enabledSdkParticipants[0]?.key ?? '');
+      return;
+    }
+    setContextReducerSession('');
+    setContextReducerTemplate('');
+  }, [contextReducerMode, contextReducerSession, contextReducerTemplate, enabledSdkParticipants]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -317,7 +381,25 @@ export function P2pConfigPanel({
     for (const e of allEligible) {
       merged[e.key] = sessionCfg[e.key] ?? { enabled: false, mode: 'audit' };
     }
-    const cfg: P2pSavedConfig = { sessions: merged, rounds, hopTimeoutMinutes, extraPrompt: extraPrompt.trim() || undefined };
+    let contextReducer: P2pContextReducerConfig | undefined;
+    if (advancedPresetKey && contextReducerMode === 'reuse_existing_session' && contextReducerSession) {
+      contextReducer = { mode: 'reuse_existing_session', sessionName: contextReducerSession };
+    } else if (advancedPresetKey && contextReducerMode === 'clone_sdk_session' && contextReducerTemplate) {
+      contextReducer = { mode: 'clone_sdk_session', templateSession: contextReducerTemplate };
+    }
+    const resolvedAdvancedRounds = advancedPresetKey
+      ? (advancedRounds ? JSON.parse(JSON.stringify(advancedRounds)) as P2pAdvancedRound[] : JSON.parse(JSON.stringify(BUILT_IN_ADVANCED_PRESETS[advancedPresetKey])) as P2pAdvancedRound[])
+      : undefined;
+    const cfg: P2pSavedConfig = {
+      sessions: merged,
+      rounds,
+      hopTimeoutMinutes,
+      extraPrompt: extraPrompt.trim() || undefined,
+      advancedPresetKey: advancedPresetKey || undefined,
+      advancedRounds: resolvedAdvancedRounds,
+      advancedRunTimeoutMinutes: advancedPresetKey ? advancedRunTimeoutMinutes : undefined,
+      contextReducer,
+    };
     try {
       if (configKey) await saveUserPref(configKey, JSON.stringify(cfg));
       onSave(cfg);
@@ -327,6 +409,26 @@ export function P2pConfigPanel({
   };
 
   const getEntry = (key: string) => sessionCfg[key] ?? { enabled: false, mode: 'audit' };
+  const handleAdvancedPresetChange = (value: string) => {
+    const nextPreset = value as P2pAdvancedPresetKey | '';
+    setAdvancedPresetKey(nextPreset);
+    if (!nextPreset) {
+      setAdvancedRounds(undefined);
+      setContextReducerMode('');
+      setContextReducerSession('');
+      setContextReducerTemplate('');
+      return;
+    }
+    setAdvancedRounds((prev) => prev ?? (JSON.parse(JSON.stringify(BUILT_IN_ADVANCED_PRESETS[nextPreset])) as P2pAdvancedRound[]));
+    setAdvancedRunTimeoutMinutes((prev) => (prev > 0 ? prev : 30));
+  };
+
+  const updateAdvancedRound = (roundId: string, updater: (round: P2pAdvancedRound) => P2pAdvancedRound) => {
+    setAdvancedRounds((prev) => {
+      if (!prev) return prev;
+      return prev.map((round) => (round.id === roundId ? updater(round) : round));
+    });
+  };
   const overlayStyle: Record<string, string | number> = {
     position: 'fixed',
     inset: 0,
@@ -505,6 +607,317 @@ export function P2pConfigPanel({
                     }}
                   />
                 </div>
+
+                {showAdvancedWorkflowSettings && <div style={{ ...sectionCardStyle, marginTop: 12 }}>
+                  <button
+                    type="button"
+                    onClick={() => setAdvancedExpanded((value) => !value)}
+                    style={{
+                      width: '100%',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      background: 'none',
+                      border: 'none',
+                      color: '#e2e8f0',
+                      fontSize: 13,
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                      padding: 0,
+                    }}
+                    aria-expanded={advancedExpanded}
+                  >
+                    <span>{t('p2p.settings_advanced_title', 'Advanced workflow')}</span>
+                    <span>{advancedExpanded ? '▾' : '▸'}</span>
+                  </button>
+                  {advancedExpanded && (
+                    <div style={{ display: 'grid', gap: 12, marginTop: 12 }}>
+                      <label style={fieldLabelStyle}>
+                        <span>{t('p2p.settings_advanced_preset', 'Advanced preset')}</span>
+                        <select
+                          value={advancedPresetKey}
+                          onChange={(event) => handleAdvancedPresetChange((event.target as HTMLSelectElement).value)}
+                          style={fieldInputStyle}
+                          aria-label={t('p2p.settings_advanced_preset', 'Advanced preset')}
+                        >
+                          <option value="">{t('common.off', 'Off')}</option>
+                          <option value="openspec">OpenSpec</option>
+                        </select>
+                      </label>
+
+                      {advancedPresetKey && (
+                        <>
+                          <label style={fieldLabelStyle}>
+                            <span>{t('p2p.settings_advanced_run_timeout', 'Whole-run timeout')}</span>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                              <input
+                                type="number"
+                                min={1}
+                                max={240}
+                                value={advancedRunTimeoutMinutes}
+                                onInput={(event) => {
+                                  const next = parseInt((event.target as HTMLInputElement).value, 10);
+                                  if (Number.isFinite(next) && next >= 1 && next <= 240) setAdvancedRunTimeoutMinutes(next);
+                                }}
+                                style={{ ...fieldInputStyle, width: 88, textAlign: 'center' }}
+                                aria-label={t('p2p.settings_advanced_run_timeout', 'Whole-run timeout')}
+                              />
+                              <span style={{ fontSize: 12, color: '#94a3b8' }}>{t('p2p.settings_advanced_run_timeout_unit', 'minutes total')}</span>
+                            </div>
+                          </label>
+
+                          <label style={fieldLabelStyle}>
+                            <span>{t('p2p.settings_context_reducer_mode', 'Reducer mode')}</span>
+                            <select
+                              value={contextReducerMode}
+                              onChange={(event) => setContextReducerMode((event.target as HTMLSelectElement).value as P2pContextReducerMode | '')}
+                              style={fieldInputStyle}
+                              aria-label={t('p2p.settings_context_reducer_mode', 'Reducer mode')}
+                            >
+                              <option value="">{t('common.none', 'None')}</option>
+                              <option value="reuse_existing_session">{t('p2p.settings_context_reducer_reuse', 'Reuse existing SDK participant')}</option>
+                              <option value="clone_sdk_session">{t('p2p.settings_context_reducer_clone', 'Clone SDK session template')}</option>
+                            </select>
+                          </label>
+
+                          {contextReducerMode === 'reuse_existing_session' && (
+                            <label style={fieldLabelStyle}>
+                              <span>{t('p2p.settings_context_reducer_session', 'Reducer participant')}</span>
+                              <select
+                                value={contextReducerSession}
+                                onChange={(event) => setContextReducerSession((event.target as HTMLSelectElement).value)}
+                                style={fieldInputStyle}
+                                aria-label={t('p2p.settings_context_reducer_session', 'Reducer participant')}
+                              >
+                                <option value="">{enabledSdkParticipants.length > 0 ? t('common.select', 'Select') : t('p2p.picker.no_agents_available')}</option>
+                                {enabledSdkParticipants.map((entry) => (
+                                  <option key={entry.key} value={entry.key}>{entry.shortName}</option>
+                                ))}
+                              </select>
+                            </label>
+                          )}
+
+                          {contextReducerMode === 'clone_sdk_session' && (
+                            <label style={fieldLabelStyle}>
+                              <span>{t('p2p.settings_context_reducer_template', 'Template participant')}</span>
+                              <select
+                                value={contextReducerTemplate}
+                                onChange={(event) => setContextReducerTemplate((event.target as HTMLSelectElement).value)}
+                                style={fieldInputStyle}
+                                aria-label={t('p2p.settings_context_reducer_template', 'Template participant')}
+                              >
+                                <option value="">{enabledSdkParticipants.length > 0 ? t('common.select', 'Select') : t('p2p.picker.no_agents_available')}</option>
+                                {enabledSdkParticipants.map((entry) => (
+                                  <option key={entry.key} value={entry.key}>{entry.shortName}</option>
+                                ))}
+                              </select>
+                            </label>
+                          )}
+
+                          {advancedRounds && advancedRounds.length > 0 && (
+                            <div style={{ display: 'grid', gap: 10 }}>
+                              <div style={{ ...sectionLabelStyle, marginTop: 4, marginBottom: 0 }}>
+                                {t('p2p.settings_advanced_rounds', 'Advanced rounds')}
+                              </div>
+                              {advancedRounds.map((round) => (
+                                <div
+                                  key={round.id}
+                                  style={{
+                                    display: 'grid',
+                                    gap: 10,
+                                    background: '#0b1220',
+                                    border: '1px solid #334155',
+                                    borderRadius: 8,
+                                    padding: 12,
+                                  }}
+                                >
+                                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+                                    <div style={{ minWidth: 0 }}>
+                                      <div style={{ fontSize: 13, fontWeight: 600, color: '#e2e8f0' }}>{round.title}</div>
+                                      <div style={{ fontSize: 11, color: '#64748b' }}>{round.id} · {round.preset}</div>
+                                    </div>
+                                    <select
+                                      value={round.executionMode}
+                                      onChange={(event) => updateAdvancedRound(round.id, (current) => ({
+                                        ...current,
+                                        executionMode: (event.target as HTMLSelectElement).value as P2pAdvancedRound['executionMode'],
+                                      }))}
+                                      style={{ ...fieldInputStyle, width: 180 }}
+                                      aria-label={`${round.id}-execution-mode`}
+                                    >
+                                      <option value="single_main">{t('p2p.settings_single_main', 'Single main')}</option>
+                                      <option value="multi_dispatch">{t('p2p.settings_multi_dispatch', 'Multi-dispatch')}</option>
+                                    </select>
+                                  </div>
+
+                                  <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : 'repeat(2, minmax(0, 1fr))', gap: 10 }}>
+                                    <label style={fieldLabelStyle}>
+                                      <span>{t('p2p.settings_round_timeout', 'Round timeout')}</span>
+                                      <input
+                                        type="number"
+                                        min={1}
+                                        max={60}
+                                        value={round.timeoutMinutes ?? 5}
+                                        onInput={(event) => {
+                                          const next = parseInt((event.target as HTMLInputElement).value, 10);
+                                          if (Number.isFinite(next) && next >= 1 && next <= 60) {
+                                            updateAdvancedRound(round.id, (current) => ({ ...current, timeoutMinutes: next }));
+                                          }
+                                        }}
+                                        style={fieldInputStyle}
+                                        aria-label={`${round.id}-timeout`}
+                                      />
+                                    </label>
+                                    <label style={fieldLabelStyle}>
+                                      <span>{t('p2p.settings_verdict_policy', 'Verdict policy')}</span>
+                                      <select
+                                        value={round.verdictPolicy ?? 'none'}
+                                        onChange={(event) => updateAdvancedRound(round.id, (current) => ({
+                                          ...current,
+                                          verdictPolicy: (event.target as HTMLSelectElement).value as NonNullable<P2pAdvancedRound['verdictPolicy']>,
+                                          jumpRule: (event.target as HTMLSelectElement).value === 'none'
+                                            ? undefined
+                                            : current.jumpRule ?? {
+                                              targetRoundId: advancedRounds.find((candidate) => candidate.id !== current.id)?.id ?? '',
+                                              marker: 'REWORK',
+                                              minTriggers: 0,
+                                              maxTriggers: 2,
+                                            },
+                                        }))}
+                                        style={fieldInputStyle}
+                                        aria-label={`${round.id}-verdict-policy`}
+                                      >
+                                        <option value="none">{t('common.none', 'None')}</option>
+                                        <option value="smart_gate">{t('p2p.settings_smart_gate', 'Smart gate')}</option>
+                                        <option value="forced_rework">{t('p2p.settings_forced_rework', 'Forced rework')}</option>
+                                      </select>
+                                    </label>
+                                  </div>
+
+                                  {(round.verdictPolicy === 'smart_gate' || round.verdictPolicy === 'forced_rework' || round.jumpRule) && (
+                                    <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : 'repeat(4, minmax(0, 1fr))', gap: 10 }}>
+                                      <label style={fieldLabelStyle}>
+                                        <span>{t('p2p.settings_jump_target', 'Jump target')}</span>
+                                        <select
+                                          value={round.jumpRule?.targetRoundId ?? ''}
+                                          onChange={(event) => updateAdvancedRound(round.id, (current) => ({
+                                            ...current,
+                                            jumpRule: {
+                                              targetRoundId: (event.target as HTMLSelectElement).value,
+                                              marker: current.jumpRule?.marker ?? 'REWORK',
+                                              minTriggers: current.jumpRule?.minTriggers ?? 0,
+                                              maxTriggers: current.jumpRule?.maxTriggers ?? 2,
+                                            },
+                                          }))}
+                                          style={fieldInputStyle}
+                                          aria-label={`${round.id}-jump-target`}
+                                        >
+                                          <option value="">{t('common.none', 'None')}</option>
+                                          {advancedRounds
+                                            .filter((candidate) => candidate.id !== round.id)
+                                            .map((candidate) => (
+                                              <option key={candidate.id} value={candidate.id}>{candidate.title}</option>
+                                            ))}
+                                        </select>
+                                      </label>
+                                      <label style={fieldLabelStyle}>
+                                        <span>{t('p2p.settings_jump_marker', 'Jump marker')}</span>
+                                        <select
+                                          value={round.jumpRule?.marker ?? 'REWORK'}
+                                          onChange={(event) => updateAdvancedRound(round.id, (current) => ({
+                                            ...current,
+                                            jumpRule: current.jumpRule ? {
+                                              ...current.jumpRule,
+                                              marker: (event.target as HTMLSelectElement).value as 'PASS' | 'REWORK',
+                                            } : undefined,
+                                          }))}
+                                          style={fieldInputStyle}
+                                          aria-label={`${round.id}-jump-marker`}
+                                        >
+                                          <option value="REWORK">REWORK</option>
+                                          <option value="PASS">PASS</option>
+                                        </select>
+                                      </label>
+                                      <label style={fieldLabelStyle}>
+                                        <span>{t('p2p.settings_min_triggers', 'Min triggers')}</span>
+                                        <input
+                                          type="number"
+                                          min={0}
+                                          max={10}
+                                          value={round.jumpRule?.minTriggers ?? 0}
+                                          onInput={(event) => updateAdvancedRound(round.id, (current) => ({
+                                            ...current,
+                                            jumpRule: current.jumpRule ? {
+                                              ...current.jumpRule,
+                                              minTriggers: parseInt((event.target as HTMLInputElement).value, 10) || 0,
+                                            } : undefined,
+                                          }))}
+                                          style={fieldInputStyle}
+                                          aria-label={`${round.id}-min-triggers`}
+                                        />
+                                      </label>
+                                      <label style={fieldLabelStyle}>
+                                        <span>{t('p2p.settings_max_triggers', 'Max triggers')}</span>
+                                        <input
+                                          type="number"
+                                          min={1}
+                                          max={10}
+                                          value={round.jumpRule?.maxTriggers ?? 2}
+                                          onInput={(event) => updateAdvancedRound(round.id, (current) => ({
+                                            ...current,
+                                            jumpRule: current.jumpRule ? {
+                                              ...current.jumpRule,
+                                              maxTriggers: parseInt((event.target as HTMLInputElement).value, 10) || 1,
+                                            } : undefined,
+                                          }))}
+                                          style={fieldInputStyle}
+                                          aria-label={`${round.id}-max-triggers`}
+                                        />
+                                      </label>
+                                    </div>
+                                  )}
+
+                                  {(round.permissionScope === 'artifact_generation' || (round.artifactOutputs?.length ?? 0) > 0) && (
+                                    <label style={fieldLabelStyle}>
+                                      <span>{t('p2p.settings_artifact_outputs', 'Artifact outputs')}</span>
+                                      <input
+                                        type="text"
+                                        value={(round.artifactOutputs ?? []).join(', ')}
+                                        onInput={(event) => updateAdvancedRound(round.id, (current) => ({
+                                          ...current,
+                                          artifactOutputs: (event.target as HTMLInputElement).value
+                                            .split(',')
+                                            .map((entry) => entry.trim())
+                                            .filter(Boolean),
+                                        }))}
+                                        style={fieldInputStyle}
+                                        aria-label={`${round.id}-artifact-outputs`}
+                                      />
+                                    </label>
+                                  )}
+
+                                  <label style={fieldLabelStyle}>
+                                    <span>{t('p2p.settings_prompt_append', 'Prompt append')}</span>
+                                    <textarea
+                                      value={round.promptAppend ?? ''}
+                                      onInput={(event) => updateAdvancedRound(round.id, (current) => ({
+                                        ...current,
+                                        promptAppend: (event.target as HTMLTextAreaElement).value,
+                                      }))}
+                                      rows={2}
+                                      style={{ ...fieldInputStyle, resize: 'vertical' }}
+                                      aria-label={`${round.id}-prompt-append`}
+                                    />
+                                  </label>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>}
               </>
             ) : (
               <>

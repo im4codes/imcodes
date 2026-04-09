@@ -19,7 +19,12 @@ vi.mock('../../src/components/SubSessionCard.js', () => ({
 }));
 
 vi.mock('../../src/components/P2pProgressCard.js', () => ({
-  P2pProgressCard: () => null,
+  P2pProgressCard: ({ hidden, onToggleHide }: { hidden?: boolean; onToggleHide?: () => void }) => (
+    <div>
+      <span data-testid="p2p-hidden-state">{hidden ? 'hidden' : 'visible'}</span>
+      {onToggleHide && <button onClick={onToggleHide}>toggle-p2p-hide</button>}
+    </div>
+  ),
 }));
 
 vi.mock('../../src/api.js', () => ({
@@ -93,7 +98,9 @@ describe('SubSessionBar', () => {
       />,
     );
 
-    fireEvent.click(runningView.container.querySelector('.subcard-toolbar-btn') as HTMLButtonElement);
+    if (!runningView.container.querySelector('.subsession-bar')) {
+      fireEvent.click(runningView.container.querySelector('.subcard-toolbar-btn') as HTMLButtonElement);
+    }
     const runningCard = runningView.container.querySelector('.subsession-card') as HTMLButtonElement;
     expect(runningCard.className).toContain('subcard-running-pulse');
   });
@@ -136,4 +143,63 @@ describe('SubSessionBar', () => {
 
     expect(view.container.querySelector('.idle-flash-layer--frame')).not.toBeNull();
   });
+
+  it('registers a non-passive touchmove guard for the horizontal cards strip', () => {
+    const addSpy = vi.spyOn(HTMLDivElement.prototype, 'addEventListener');
+
+    render(
+      <SubSessionBar
+        subSessions={[makeSubSession({ state: 'idle' })]}
+        openIds={new Set()}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(addSpy.mock.calls.some(([type, , options]) => type === 'touchmove' && typeof options === 'object' && (options as AddEventListenerOptions).passive === false)).toBe(true);
+  });
+
+  it('persists the collapsed toolbar state locally', () => {
+    const first = render(
+      <SubSessionBar
+        subSessions={[makeSubSession({ state: 'idle' })]}
+        openIds={new Set()}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(first.container.querySelector('.subcard-toolbar-btn') as HTMLButtonElement);
+    first.unmount();
+
+    const second = render(
+      <SubSessionBar
+        subSessions={[makeSubSession({ state: 'idle' })]}
+        openIds={new Set()}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(second.container.querySelector('.subsession-bar')).not.toBeNull();
+  });
+
 });

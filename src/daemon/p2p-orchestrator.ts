@@ -13,8 +13,17 @@ import { randomUUID } from 'node:crypto';
 import { sendKeysDelayedEnter } from '../agent/tmux.js';
 import { detectStatusAsync } from '../agent/detect.js';
 import { getSession } from '../store/session-store.js';
-import { getTransportRuntime } from '../agent/session-manager.js';
+import { getTransportRuntime, launchTransportSession, stopTransportRuntimeSession } from '../agent/session-manager.js';
 import { P2P_BASELINE_PROMPT, getP2pMode, getModeForRound, isComboMode, parseModePipeline, roundPrompt, type P2pMode } from '../../shared/p2p-modes.js';
+import {
+  resolveP2pRoundPlan,
+  type P2pAdvancedRound,
+  type P2pContextReducerConfig,
+  type P2pHelperDiagnostic,
+  type P2pParticipantSnapshotEntry,
+  type P2pResolvedPlan,
+  type P2pResolvedRound,
+} from '../../shared/p2p-advanced.js';
 import { formatP2pParticipantIdentity, shortP2pSessionName } from '../../shared/p2p-participant.js';
 import {
   P2P_TERMINAL_HOP_STATUSES,
@@ -41,6 +50,22 @@ export interface P2pTarget {
   mode: string;    // mode key e.g. 'audit'
 }
 
+export interface StartP2pRunOptions {
+  initiatorSession: string;
+  targets: P2pTarget[];
+  userText: string;
+  fileContents: Array<{ path: string; content: string }>;
+  serverLink: ServerLink | null;
+  rounds?: number;
+  extraPrompt?: string;
+  modeOverride?: string;
+  hopTimeoutMs?: number;
+  advancedPresetKey?: string;
+  advancedRounds?: P2pAdvancedRound[];
+  advancedRunTimeoutMs?: number;
+  contextReducer?: P2pContextReducerConfig;
+}
+
 interface P2pHopRuntime extends P2pHopProgress {
   section_header: string;
   artifact_path: string;
@@ -56,6 +81,7 @@ export interface P2pRun {
   initiatorSession: string;
   currentTargetSession: string | null;
   finalReturnSession: string;
+  /** Compatibility-only projection for legacy consumers; advanced runs drain this per execution round. */
   remainingTargets: P2pTarget[];
   /** Total number of hop targets (excluding initiator phases). Fixed at creation time. */
   totalTargets: number;
@@ -69,9 +95,9 @@ export interface P2pRun {
   userText: string;
   timeoutMs: number;
   resultSummary: string | null;
-  /** Sessions whose hops completed successfully. */
+  /** Compatibility-only projection for legacy consumers; advanced loop retries may repeat sessions here. */
   completedHops: P2pTarget[];
-  /** Sessions whose hops were skipped (timeout, sendKeys failure, idle without file change). */
+  /** Compatibility-only projection for legacy consumers; advanced loop retries may repeat sessions here. */
   skippedHops: string[];
   error: string | null;
   createdAt: string;
@@ -90,6 +116,26 @@ export interface P2pRun {
   /** Parallel hop runtime state across all rounds. */
   hopStates: P2pHopRuntime[];
   activeTargetSessions: string[];
+  advancedP2pEnabled: boolean;
+  resolvedRounds?: P2pResolvedRound[];
+  helperEligibleSnapshot: P2pParticipantSnapshotEntry[];
+  contextReducer?: P2pContextReducerConfig;
+  advancedRunTimeoutMs?: number;
+  deadlineAt?: number | null;
+  currentRoundId?: string | null;
+  currentExecutionStep: number;
+  currentRoundAttempt: number;
+  roundAttemptCounts: Record<string, number>;
+  roundJumpCounts: Record<string, number>;
+  routingHistory: Array<{
+    fromRoundId?: string | null;
+    toRoundId?: string | null;
+    trigger?: string | null;
+    atStep: number;
+    atAttempt?: number | null;
+    timestamp: number;
+  }>;
+  helperDiagnostics: P2pHelperDiagnostic[];
   /** Internal: set to true when cancel requested */
   _cancelled: boolean;
 }
@@ -113,6 +159,13 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
   const currentHopState = activeHopStates[0] ?? null;
   const currentHop = currentHopState?.session ?? run.activeTargetSessions[0] ?? run.currentTargetSession;
   const hopCounts = countHopStates(run.hopStates);
+  const routingHistory = Array.isArray(run.routingHistory) ? run.routingHistory : [];
+  const latestStepByRoundId = routingHistory.reduce<Record<string, number>>((acc, entry) => {
+    if (typeof entry.toRoundId === 'string' && typeof entry.atStep === 'number') {
+      acc[entry.toRoundId] = entry.atStep;
+    }
+    return acc;
+  }, {});
 
   return {
     id: run.id,
@@ -187,6 +240,30 @@ export function serializeP2pRun(run: P2pRun): P2pRunUpdatePayload {
     terminal_reason: run.status === 'completed' || run.status === 'timed_out' || run.status === 'failed' || run.status === 'cancelled'
       ? run.status
       : null,
+    advanced_p2p_enabled: run.advancedP2pEnabled || undefined,
+    current_round_id: run.currentRoundId ?? null,
+    current_execution_step: run.currentExecutionStep || null,
+    current_round_attempt: run.currentRoundAttempt || null,
+    round_attempt_counts: run.advancedP2pEnabled ? { ...run.roundAttemptCounts } : undefined,
+    round_jump_counts: run.advancedP2pEnabled ? { ...run.roundJumpCounts } : undefined,
+    routing_history: run.advancedP2pEnabled ? [...routingHistory] : undefined,
+    helper_diagnostics: run.advancedP2pEnabled && run.helperDiagnostics.length > 0 ? [...run.helperDiagnostics] : undefined,
+    advanced_nodes: run.advancedP2pEnabled && run.resolvedRounds
+      ? run.resolvedRounds.map((round) => ({
+        id: round.id,
+        title: round.title,
+        preset: round.preset,
+        status: (() => {
+          if (run.currentRoundId === round.id) {
+            return P2P_TERMINAL_RUN_STATUSES.has(run.status) ? (run.status === 'completed' ? 'done' : 'skipped') : 'active';
+          }
+          if ((run.roundAttemptCounts[round.id] ?? 0) > 0) return 'done';
+          return 'pending';
+        })(),
+        attempt: run.roundAttemptCounts[round.id] ?? 0,
+        step: latestStepByRoundId[round.id],
+      }))
+      : undefined,
     // Full node list for segmented progress display — compatibility projection
     all_nodes: (() => {
       type NodeInfo = {
@@ -275,6 +352,7 @@ let IDLE_POLL_MS = 3_000;
 let GRACE_PERIOD_DEFAULT_MS = 180_000; // 3 min — complex analysis (subagent research + write) takes time
 let MIN_PROCESSING_MS = 30_000; // Don't trust idle detection until 30s after dispatch
 let FILE_SETTLE_CYCLES = 3; // File must stop growing for 3 poll cycles (9s) to be "settled"
+let ROUND_HOP_CLEANUP_DELAY_MS = 0;
 
 /** Override poll interval for tests. */
 export function _setIdlePollMs(ms: number): void { IDLE_POLL_MS = ms; }
@@ -284,6 +362,8 @@ export function _setGracePeriodMs(ms: number): void { GRACE_PERIOD_DEFAULT_MS = 
 export function _setMinProcessingMs(ms: number): void { MIN_PROCESSING_MS = ms; }
 /** Override file settle cycles for tests. */
 export function _setFileSettleCycles(n: number): void { FILE_SETTLE_CYCLES = n; }
+/** Override round hop artifact cleanup delay for tests. */
+export function _setRoundHopCleanupDelayMs(ms: number): void { ROUND_HOP_CLEANUP_DELAY_MS = ms; }
 
 // ── Idle event registry (callback-driven, no polling) ─────────────────────
 
@@ -344,19 +424,103 @@ function waitForIdleEvent(session: string, timeoutMs: number): IdleWaiterHandle 
 
 // ── Start a P2P run ───────────────────────────────────────────────────────
 
-export async function startP2pRun(
-  initiatorSession: string,
-  targets: P2pTarget[],
-  userText: string,
-  fileContents: Array<{ path: string; content: string }>,
-  serverLink: ServerLink | null,
-  rounds?: number,
-  extraPrompt?: string,
-  /** Explicit mode override — used for combo pipelines (e.g. "brainstorm>discuss>plan"). */
-  modeOverride?: string,
-  /** Custom per-hop timeout in ms. Overrides mode default (300s). */
-  hopTimeoutMs?: number,
+function buildHelperEligibleSnapshot(initiatorSession: string, targets: P2pTarget[]): P2pParticipantSnapshotEntry[] {
+  const seen = new Set<string>();
+  const names = [initiatorSession, ...targets.map((target) => target.session)];
+  const snapshot: P2pParticipantSnapshotEntry[] = [];
+  for (const sessionName of names) {
+    if (seen.has(sessionName)) continue;
+    seen.add(sessionName);
+    const record = getSession(sessionName);
+    snapshot.push({
+      sessionName,
+      agentType: record?.agentType ?? 'unknown',
+      parentSession: record?.parentSession ?? null,
+    });
+  }
+  return snapshot;
+}
+
+function normalizeStartP2pRunArgs(
+  args: [
+    StartP2pRunOptions
+  ] | [
+    string,
+    P2pTarget[],
+    string,
+    Array<{ path: string; content: string }>,
+    ServerLink | null,
+    number | undefined,
+    string | undefined,
+    string | undefined,
+    number | undefined,
+  ],
+): StartP2pRunOptions {
+  if (args.length === 1 && typeof args[0] === 'object' && args[0] !== null && 'initiatorSession' in args[0]) {
+    return args[0] as StartP2pRunOptions;
+  }
+  const [
+    initiatorSession,
+    targets,
+    userText,
+    fileContents,
+    serverLink,
+    rounds,
+    extraPrompt,
+    modeOverride,
+    hopTimeoutMs,
+  ] = args as [
+    string,
+    P2pTarget[],
+    string,
+    Array<{ path: string; content: string }>,
+    ServerLink | null,
+    number | undefined,
+    string | undefined,
+    string | undefined,
+    number | undefined,
+  ];
+  return {
+    initiatorSession,
+    targets,
+    userText,
+    fileContents,
+    serverLink,
+    rounds,
+    extraPrompt,
+    modeOverride,
+    hopTimeoutMs,
+  };
+}
+
+export async function startP2pRun(...args:
+  [StartP2pRunOptions] | [
+    string,
+    P2pTarget[],
+    string,
+    Array<{ path: string; content: string }>,
+    ServerLink | null,
+    number | undefined,
+    string | undefined,
+    string | undefined,
+    number | undefined,
+  ]
 ): Promise<P2pRun> {
+  const {
+    initiatorSession,
+    targets,
+    userText,
+    fileContents,
+    serverLink,
+    rounds,
+    extraPrompt,
+    modeOverride,
+    hopTimeoutMs,
+    advancedPresetKey,
+    advancedRounds,
+    advancedRunTimeoutMs,
+    contextReducer,
+  } = normalizeStartP2pRunArgs(args);
   // Validate same domain
   const mainSession = extractMainSession(initiatorSession);
   for (const t of targets) {
@@ -365,6 +529,17 @@ export async function startP2pRun(
     }
   }
 
+  const helperEligibleSnapshot = buildHelperEligibleSnapshot(initiatorSession, targets);
+  const resolvedPlan: P2pResolvedPlan = resolveP2pRoundPlan({
+    modeOverride: modeOverride ?? targets[0]?.mode ?? 'discuss',
+    roundsOverride: rounds,
+    hopTimeoutMinutes: hopTimeoutMs != null ? Math.ceil(hopTimeoutMs / 60_000) : undefined,
+    advancedPresetKey,
+    advancedRounds,
+    advancedRunTimeoutMinutes: advancedRunTimeoutMs != null ? Math.ceil(advancedRunTimeoutMs / 60_000) : undefined,
+    contextReducer,
+    participants: helperEligibleSnapshot,
+  });
   const mode = modeOverride ?? targets[0]?.mode ?? 'discuss';
   const modeConfig = getP2pMode(isComboMode(mode) ? parseModePipeline(mode)[0] : mode);
   const runId = randomUUID().slice(0, 12);
@@ -394,7 +569,9 @@ export async function startP2pRun(
   await writeFile(contextFilePath, seed, 'utf8');
 
   const P2P_MAX_ROUNDS = 6;
-  const totalRounds = Math.min(P2P_MAX_ROUNDS, Math.max(1, rounds ?? 1));
+  const totalRounds = resolvedPlan.advanced
+    ? resolvedPlan.rounds.length
+    : Math.min(P2P_MAX_ROUNDS, Math.max(1, rounds ?? 1));
   const run: P2pRun = {
     id: runId,
     discussionId,
@@ -426,6 +603,23 @@ export async function startP2pRun(
     hopStartedAt: Date.now(),
     hopStates: [],
     activeTargetSessions: [],
+    advancedP2pEnabled: resolvedPlan.advanced,
+    resolvedRounds: resolvedPlan.advanced ? resolvedPlan.rounds : undefined,
+    helperEligibleSnapshot: resolvedPlan.helperEligibleSnapshot ?? helperEligibleSnapshot,
+    contextReducer: resolvedPlan.contextReducer,
+    advancedRunTimeoutMs: resolvedPlan.advanced && resolvedPlan.overallRunTimeoutMinutes != null
+      ? resolvedPlan.overallRunTimeoutMinutes * 60_000
+      : undefined,
+    deadlineAt: resolvedPlan.advanced && resolvedPlan.overallRunTimeoutMinutes != null
+      ? Date.now() + (resolvedPlan.overallRunTimeoutMinutes * 60_000)
+      : null,
+    currentRoundId: resolvedPlan.advanced ? (resolvedPlan.rounds[0]?.id ?? null) : null,
+    currentExecutionStep: 0,
+    currentRoundAttempt: 1,
+    roundAttemptCounts: {},
+    roundJumpCounts: {},
+    routingHistory: [],
+    helperDiagnostics: [],
     _cancelled: false,
   };
 
@@ -625,6 +819,15 @@ async function cleanupRoundHopArtifacts(roundHops: P2pHopRuntime[]): Promise<voi
   }));
 }
 
+function scheduleRoundHopArtifactCleanup(roundHops: P2pHopRuntime[]): void {
+  if (roundHops.length === 0) return;
+  if (ROUND_HOP_CLEANUP_DELAY_MS <= 0) {
+    void cleanupRoundHopArtifacts(roundHops);
+    return;
+  }
+  setTimeout(() => { void cleanupRoundHopArtifacts(roundHops); }, ROUND_HOP_CLEANUP_DELAY_MS);
+}
+
 function updateHopStatus(run: P2pRun, hop: P2pHopRuntime | null | undefined, status: P2pHopStatus, error: string | null = null): void {
   if (!hop) return;
   hop.status = status;
@@ -639,6 +842,10 @@ function updateHopStatus(run: P2pRun, hop: P2pHopRuntime | null | undefined, sta
 }
 
 async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, serverLink: ServerLink | null): Promise<void> {
+  if (run.advancedP2pEnabled && run.resolvedRounds?.length) {
+    await executeAdvancedChain(run, serverLink);
+    return;
+  }
   const totalHops = run.allTargets.length;
 
   // ── Multi-round loop ──
@@ -674,83 +881,82 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
         isInitial: true,
       }, rp);
       const initialOk = await dispatchHop(run, run.initiatorSession, initialPrompt, serverLink, { sectionHeader: initialHeader, required: true });
-      if (!initialOk) return;
+      if (!initialOk && (run._cancelled || isTerminal(run.status))) return;
       if (run._cancelled || isTerminal(run.status)) return;
     }
 
     // ── Phase 2: Sub-session hops ──
     run.activePhase = 'hop';
     const roundHops = await createRoundHopStates(run, targets, roundModeKey);
-    run.activeTargetSessions = roundHops.map((hop) => hop.session);
-    const hopResults = await Promise.allSettled(targets.map(async (target, i) => {
-      if (run._cancelled) return false;
-      const hop = roundHops[i];
-      const hopMode = combo ? roundModeKey : target.mode;
-      const hopLabel = `${discussionParticipantName(target.session)} — ${capitalize(hopMode)} (hop ${i + 1}/${totalHops}${roundLabel})`;
-      hop.section_header = hopLabel;
-      const hopModeConfig = combo ? roundModeConfig : (getP2pMode(target.mode) ?? modeConfig);
-      const hopPrompt = buildHopPrompt(run, hopModeConfig, {
-        session: target.session,
-        sectionHeader: hopLabel,
-        instruction: `Read the discussion file and provide your ${hopMode} analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`,
+    try {
+      run.activeTargetSessions = roundHops.map((hop) => hop.session);
+      const hopResults = await Promise.allSettled(targets.map(async (target, i) => {
+        if (run._cancelled) return false;
+        const hop = roundHops[i];
+        const hopMode = combo ? roundModeKey : target.mode;
+        const hopLabel = `${discussionParticipantName(target.session)} — ${capitalize(hopMode)} (hop ${i + 1}/${totalHops}${roundLabel})`;
+        hop.section_header = hopLabel;
+        const hopModeConfig = combo ? roundModeConfig : (getP2pMode(target.mode) ?? modeConfig);
+        const hopPrompt = buildHopPrompt(run, hopModeConfig, {
+          session: target.session,
+          sectionHeader: hopLabel,
+          instruction: `Read the discussion file and provide your ${hopMode} analysis. Append your output to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`,
+          isInitial: false,
+          filePath: hop.artifact_path,
+        }, rp);
+        logger.info({ runId: run.id, target: target.session, mode: hopMode, hop: i + 1, totalHops, round: run.currentRound }, 'P2P: Phase 2 — dispatching hop');
+        return dispatchHop(run, target.session, hopPrompt, serverLink, {
+          sectionHeader: hopLabel,
+          hop,
+          filePath: hop.artifact_path,
+        });
+      }));
+      run.activeTargetSessions = [];
+      run.currentTargetSession = null;
+      if (run._cancelled || isTerminal(run.status)) return;
+      logger.info({
+        runId: run.id,
+        round: run.currentRound,
+        settled: hopResults.length,
+        completed: roundHops.filter((hop) => hop.status === 'completed').length,
+      }, 'P2P: Phase 2 — round barrier settled');
+      await appendRoundEvidence(run, roundHops);
+      if (run._cancelled || isTerminal(run.status)) return;
+
+      run.remainingTargets = [];
+
+      // ── Round summary: Initiator synthesizes this round ──
+      if (run._cancelled) return;
+      run.runPhase = 'summarizing';
+      run.summaryPhase = 'running';
+      run.activePhase = 'summary';
+      const isLastRound = run.currentRound === run.rounds;
+      const summaryModeConfig = isLastRound && combo
+        ? getModeForRound(run.mode, run.rounds) // last pipeline mode for final summary
+        : roundModeConfig;
+      const roundSummaryHeader = isLastRound
+        ? `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Final Summary`
+        : `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Round ${run.currentRound}/${run.rounds} Summary`;
+      const roundSummaryInstruction = isLastRound
+        ? `${summaryModeConfig?.summaryPrompt ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.'}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.`
+        : `Synthesize the key points, areas of agreement, and open questions from this round. Then assign specific focus areas or questions for each participant in the next round (round ${run.currentRound + 1}). Append to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`;
+      const roundSummaryPrompt = buildHopPrompt(run, summaryModeConfig, {
+        session: run.initiatorSession,
+        sectionHeader: roundSummaryHeader,
+        instruction: `${roundSummaryInstruction}\nThe orchestrator has already appended each completed hop's evidence into the discussion file. If you write the final plan to another file, still append a short completion note under the new final-summary heading in the discussion file that records the chosen output file path.`,
         isInitial: false,
-        filePath: hop.artifact_path,
       }, rp);
-      logger.info({ runId: run.id, target: target.session, mode: hopMode, hop: i + 1, totalHops, round: run.currentRound }, 'P2P: Phase 2 — dispatching hop');
-      return dispatchHop(run, target.session, hopPrompt, serverLink, {
-        sectionHeader: hopLabel,
-        hop,
-        filePath: hop.artifact_path,
+      logger.info({ runId: run.id, round: run.currentRound, isLastRound, roundMode: roundModeKey }, isLastRound ? 'P2P: Final summary — initiator' : 'P2P: Round summary — initiator');
+      const summaryOk = await dispatchHop(run, run.initiatorSession, roundSummaryPrompt, serverLink, {
+        sectionHeader: roundSummaryHeader,
+        required: true,
       });
-    }));
-    run.activeTargetSessions = [];
-    run.currentTargetSession = null;
-    if (run._cancelled || isTerminal(run.status)) return;
-    logger.info({
-      runId: run.id,
-      round: run.currentRound,
-      settled: hopResults.length,
-      completed: roundHops.filter((hop) => hop.status === 'completed').length,
-    }, 'P2P: Phase 2 — round barrier settled');
-    await appendRoundEvidence(run, roundHops);
-    if (run._cancelled || isTerminal(run.status)) return;
-
-    if (run.currentRound === run.rounds) {
-      run.remainingTargets = [];
-    } else {
-      run.remainingTargets = [];
+      if (!summaryOk && (run._cancelled || isTerminal(run.status))) return;
+      run.summaryPhase = summaryOk ? 'completed' : 'failed';
+      if (run._cancelled || isTerminal(run.status)) return;
+    } finally {
+      scheduleRoundHopArtifactCleanup(roundHops);
     }
-
-    // ── Round summary: Initiator synthesizes this round ──
-    if (run._cancelled) return;
-    run.runPhase = 'summarizing';
-    run.summaryPhase = 'running';
-    run.activePhase = 'summary';
-    const isLastRound = run.currentRound === run.rounds;
-    const summaryModeConfig = isLastRound && combo
-      ? getModeForRound(run.mode, run.rounds) // last pipeline mode for final summary
-      : roundModeConfig;
-    const roundSummaryHeader = isLastRound
-      ? `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Final Summary`
-      : `${discussionParticipantNameWithMode(run.initiatorSession, roundModeKey)} — Round ${run.currentRound}/${run.rounds} Summary`;
-    const roundSummaryInstruction = isLastRound
-      ? `${summaryModeConfig?.summaryPrompt ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.'}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.`
-      : `Synthesize the key points, areas of agreement, and open questions from this round. Then assign specific focus areas or questions for each participant in the next round (round ${run.currentRound + 1}). Append to the file.\nIMPORTANT: This is ANALYSIS ONLY. Do NOT implement fixes, do NOT edit code files, do NOT run commands. Only write your analysis into this discussion file.`;
-    const roundSummaryPrompt = buildHopPrompt(run, summaryModeConfig, {
-      session: run.initiatorSession,
-      sectionHeader: roundSummaryHeader,
-      instruction: `${roundSummaryInstruction}\nThe orchestrator has already appended each completed hop's evidence into the discussion file. If you write the final plan to another file, still append a short completion note under the new final-summary heading in the discussion file that records the chosen output file path.`,
-      isInitial: false,
-    }, rp);
-    logger.info({ runId: run.id, round: run.currentRound, isLastRound, roundMode: roundModeKey }, isLastRound ? 'P2P: Final summary — initiator' : 'P2P: Round summary — initiator');
-    const summaryOk = await dispatchHop(run, run.initiatorSession, roundSummaryPrompt, serverLink, {
-      sectionHeader: roundSummaryHeader,
-      required: true,
-    });
-    if (!summaryOk) return;
-    run.summaryPhase = 'completed';
-    setTimeout(() => { void cleanupRoundHopArtifacts(roundHops); }, 30_000);
-    if (run._cancelled || isTerminal(run.status)) return;
   }
   if (run._cancelled || isTerminal(run.status)) return;
 
@@ -780,6 +986,487 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
   setTimeout(() => {
     activeRuns.delete(run.id);
   }, 60_000);
+}
+
+function addHelperDiagnostic(run: P2pRun, diagnostic: Omit<P2pHelperDiagnostic, 'timestamp'>): void {
+  run.helperDiagnostics.push({ ...diagnostic, timestamp: Date.now() });
+}
+
+function parseVerdictFromContent(content: string): 'PASS' | 'REWORK' | null {
+  const matches = [...content.matchAll(/<!--\s*P2P_VERDICT:\s*(PASS|REWORK)\s*-->/g)];
+  const verdict = matches.at(-1)?.[1];
+  return verdict === 'PASS' || verdict === 'REWORK' ? verdict : null;
+}
+
+function helperFallbackCandidates(run: P2pRun, exclude: string[]): string[] {
+  const excluded = new Set(exclude);
+  return run.helperEligibleSnapshot
+    .filter((entry) => entry.sessionName !== run.initiatorSession)
+    .filter((entry) => !!entry.parentSession || entry.sessionName.startsWith('deck_sub_'))
+    .filter((entry) => !excluded.has(entry.sessionName))
+    .map((entry) => entry.sessionName);
+}
+
+function ensureRunDeadline(run: P2pRun, serverLink: ServerLink | null): boolean {
+  if (!run.advancedRunTimeoutMs || !run.deadlineAt) return true;
+  if (Date.now() <= run.deadlineAt) return true;
+  failRun(run, 'timed_out', 'advanced_run_timeout', serverLink);
+  return false;
+}
+
+async function launchClonedHelperSession(run: P2pRun, templateSession: string): Promise<string> {
+  const template = getSession(templateSession);
+  if (!template || !template.runtimeType || template.runtimeType !== 'transport') {
+    throw new Error(`Helper template is not an eligible SDK transport session: ${templateSession}`);
+  }
+  const helperName = `deck_p2p_helper_${run.id}_${run.currentExecutionStep}_${randomUUID().slice(0, 6)}`;
+  await launchTransportSession({
+    name: helperName,
+    projectName: template.projectName,
+    role: 'w1',
+    agentType: template.agentType as any,
+    projectDir: template.projectDir,
+    skipStore: true,
+    fresh: true,
+    requestedModel: template.requestedModel ?? template.activeModel ?? undefined,
+    transportConfig: template.transportConfig ?? undefined,
+    description: `P2P helper for ${run.id}`,
+    label: helperName,
+    effort: template.effort,
+    ...(template.ccPreset ? { ccPreset: template.ccPreset } : {}),
+  });
+  return helperName;
+}
+
+async function teardownHelperSession(run: P2pRun, sessionName: string): Promise<void> {
+  try {
+    await stopTransportRuntimeSession(sessionName);
+  } catch (err) {
+    addHelperDiagnostic(run, {
+      code: 'P2P_HELPER_CLEANUP_FAILED',
+      attempt: run.currentRoundAttempt,
+      sourceSession: sessionName,
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+async function cleanupReducerSummaryFile(
+  run: P2pRun,
+  summaryPath: string,
+  sourceSession?: string | null,
+  templateSession?: string | null,
+  fallbackSession?: string | null,
+): Promise<void> {
+  try {
+    await unlink(summaryPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') return;
+    addHelperDiagnostic(run, {
+      code: 'P2P_HELPER_CLEANUP_FAILED',
+      attempt: run.currentRoundAttempt,
+      sourceSession: sourceSession ?? null,
+      templateSession: templateSession ?? null,
+      fallbackSession: fallbackSession ?? null,
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+async function reduceAdvancedContext(
+  run: P2pRun,
+  round: P2pResolvedRound,
+  serverLink: ServerLink | null,
+): Promise<string | null> {
+  if (!run.contextReducer) return null;
+  const info = await stat(run.contextFilePath).catch(() => null);
+  if (!info || info.size < 32_000) return null;
+
+  const summaryPath = join(dirname(run.contextFilePath), `${run.id}.reducer.${run.currentExecutionStep}.md`);
+  const sectionHeader = `P2P Helper Summary — ${round.title} (step ${run.currentExecutionStep})`;
+  const reducerPrompt = [
+    `[P2P Helper Task — ${run.id}]`,
+    `Read the discussion file at ${run.contextFilePath}.`,
+    `Produce a compact context reduction for the next round.`,
+    `Focus on: latest implementation attempt, latest audit findings, declared artifact targets, and only the most relevant unresolved issues.`,
+    `Write the result to ${summaryPath}.`,
+    `Add a new heading "## ${sectionHeader}" and put the reduced context under it.`,
+    `Do not change workflow verdicts, do not route, and do not edit any code files.`,
+    `Start immediately.`,
+  ].join('\n');
+
+  const readReducedSummary = async () => {
+    const content = await readFile(summaryPath, 'utf8').catch(() => '');
+    const section = extractHeadingSection(content, sectionHeader) ?? content;
+    return section.trim() ? section.trim() : null;
+  };
+
+  const attemptWithSession = async (sessionName: string, codeOnFailure: P2pHelperDiagnostic['code'], templateSession?: string | null) => {
+    const ok = await dispatchHop(run, sessionName, reducerPrompt, serverLink, {
+      sectionHeader,
+      filePath: summaryPath,
+      required: false,
+    });
+    if (!ok) {
+      addHelperDiagnostic(run, {
+        code: codeOnFailure,
+        attempt: run.currentRoundAttempt,
+        sourceSession: sessionName,
+        templateSession: templateSession ?? null,
+      });
+      return null;
+    }
+    return readReducedSummary();
+  };
+
+  await writeFile(summaryPath, '# Helper Summary\n\n', 'utf8');
+  try {
+    if (run.contextReducer.mode === 'reuse_existing_session' && run.contextReducer.sessionName) {
+      const primaryResult = await attemptWithSession(
+        run.contextReducer.sessionName,
+        'P2P_HELPER_PRIMARY_FAILED',
+        run.contextReducer.sessionName,
+      );
+      if (primaryResult) return primaryResult;
+    } else if (run.contextReducer.mode === 'clone_sdk_session' && run.contextReducer.templateSession) {
+      let helperName: string | null = null;
+      try {
+        helperName = await launchClonedHelperSession(run, run.contextReducer.templateSession);
+        const primaryResult = await attemptWithSession(
+          helperName,
+          'P2P_HELPER_PRIMARY_FAILED',
+          run.contextReducer.templateSession,
+        );
+        if (primaryResult) return primaryResult;
+      } catch (err) {
+        addHelperDiagnostic(run, {
+          code: 'P2P_HELPER_PRIMARY_FAILED',
+          attempt: run.currentRoundAttempt,
+          templateSession: run.contextReducer.templateSession,
+          message: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        if (helperName) await teardownHelperSession(run, helperName);
+      }
+    }
+
+    const fallbackSession = helperFallbackCandidates(run, [
+      run.contextReducer.sessionName ?? '',
+      run.contextReducer.templateSession ?? '',
+    ])[0];
+    if (!fallbackSession) {
+      addHelperDiagnostic(run, {
+        code: 'P2P_COMPRESSION_SKIPPED_NO_FALLBACK',
+        attempt: run.currentRoundAttempt,
+        templateSession: run.contextReducer.templateSession ?? null,
+        sourceSession: run.contextReducer.sessionName ?? null,
+      });
+      return null;
+    }
+    const fallbackResult = await attemptWithSession(fallbackSession, 'P2P_HELPER_FALLBACK_FAILED', fallbackSession);
+    if (fallbackResult) return fallbackResult;
+    failRun(run, 'failed', `helper_fallback_failed:${fallbackSession}`, serverLink);
+    return null;
+  } finally {
+    await cleanupReducerSummaryFile(
+      run,
+      summaryPath,
+      run.contextReducer.sessionName ?? null,
+      run.contextReducer.templateSession ?? null,
+    );
+  }
+}
+
+async function captureArtifactBaseline(run: P2pRun, round: P2pResolvedRound): Promise<Map<string, string | null>> {
+  const baseline = new Map<string, string | null>();
+  const record = getSession(run.initiatorSession);
+  const projectDir = record?.projectDir ?? process.cwd();
+  if (round.artifactConvention === 'openspec_convention') {
+    const target = join(projectDir, 'openspec', 'changes');
+    try {
+      const entries = await readdir(target);
+      baseline.set(target, entries.join('\n'));
+    } catch {
+      baseline.set(target, null);
+    }
+    return baseline;
+  }
+  for (const output of round.artifactOutputs) {
+    const absPath = join(projectDir, output);
+    try {
+      baseline.set(absPath, await readFile(absPath, 'utf8'));
+    } catch {
+      baseline.set(absPath, null);
+    }
+  }
+  return baseline;
+}
+
+async function validateArtifactOutputsForRound(run: P2pRun, round: P2pResolvedRound, baseline: Map<string, string | null>): Promise<void> {
+  if (round.artifactConvention === 'none') return;
+  if (round.artifactConvention === 'openspec_convention') {
+    const target = [...baseline.keys()][0];
+    const before = baseline.get(target) ?? null;
+    try {
+      const afterEntries = (await readdir(target)).join('\n');
+      if (afterEntries === before) throw new Error('openspec_convention artifacts were not observably updated');
+      return;
+    } catch (err) {
+      throw new Error(err instanceof Error ? err.message : String(err));
+    }
+  }
+  for (const [absPath, before] of baseline.entries()) {
+    let after: string | null = null;
+    try { after = await readFile(absPath, 'utf8'); } catch { after = null; }
+    if (after == null) throw new Error(`Expected artifact missing after round: ${absPath}`);
+    if (after === before) throw new Error(`Expected artifact not observably updated: ${absPath}`);
+  }
+}
+
+async function readAppendedContent(filePath: string, baselineSize: number): Promise<string> {
+  const buffer = await readFile(filePath);
+  return buffer.subarray(Math.min(buffer.length, baselineSize)).toString('utf8');
+}
+
+function buildAdvancedRoundPrefix(run: P2pRun, round: P2pResolvedRound): string {
+  return `[Advanced Round ${run.currentExecutionStep} — ${round.title} — Attempt ${run.currentRoundAttempt}]`;
+}
+
+function buildAdvancedPromptCommon(
+  run: P2pRun,
+  round: P2pResolvedRound,
+  targetSession: string,
+  filePath: string,
+  sectionHeader: string,
+  reducerSummary: string | null,
+  instruction: string,
+): string {
+  const parts: string[] = [];
+  parts.push(buildAdvancedRoundPrefix(run, round));
+  parts.push('');
+  parts.push(P2P_BASELINE_PROMPT);
+  if (round.presetPrompt) parts.push(round.presetPrompt);
+  parts.push('');
+  parts.push(`[P2P Advanced Task — run ${run.id}]`);
+  parts.push(`Discussion file: ${filePath}`);
+  parts.push(`Your identity for this round is "${discussionParticipantName(targetSession)}".`);
+  parts.push(`Round id: ${round.id}`);
+  parts.push(`Permission scope: ${round.permissionScope}`);
+  if (round.artifactConvention === 'openspec_convention') {
+    parts.push('Required artifact contract: write OpenSpec artifacts under repository OpenSpec conventions inside openspec/changes/.');
+  } else if (round.artifactOutputs.length > 0) {
+    parts.push(`Required artifact outputs: ${round.artifactOutputs.join(', ')}`);
+  }
+  if (reducerSummary) {
+    parts.push('');
+    parts.push('Reduced context for this attempt:');
+    parts.push(reducerSummary);
+  }
+  if (round.promptAppend) {
+    parts.push('');
+    parts.push(`Additional round instructions: ${round.promptAppend}`);
+  }
+  parts.push('');
+  parts.push(instruction);
+  parts.push(`Add a new heading "## ${sectionHeader}" at the end of the discussion file and write your result below it.`);
+  parts.push('Do not ask for confirmation. Start immediately.');
+  if (run.extraPrompt) {
+    parts.push('');
+    parts.push(`Additional instructions: ${run.extraPrompt}`);
+  }
+  return parts.join('\n');
+}
+
+function buildAdvancedHopPrompt(
+  run: P2pRun,
+  round: P2pResolvedRound,
+  target: P2pTarget,
+  filePath: string,
+  sectionHeader: string,
+  reducerSummary: string | null,
+): string {
+  const instruction = round.permissionScope === 'analysis_only'
+    ? 'Read the discussion file and provide analysis only. Do not edit code or other files.'
+    : round.permissionScope === 'artifact_generation'
+      ? 'Read the discussion file and produce the required artifacts. You may write only the round outputs and the discussion note for this round.'
+      : 'Read the discussion file and perform the implementation work required by this round. You may edit code and tests as needed, then append a concise execution note to the discussion file.';
+  return buildAdvancedPromptCommon(run, round, target.session, filePath, sectionHeader, reducerSummary, instruction);
+}
+
+function buildAdvancedSynthesisPrompt(
+  run: P2pRun,
+  round: P2pResolvedRound,
+  sectionHeader: string,
+  reducerSummary: string | null,
+): string {
+  const instruction = round.summaryPrompt
+    ?? 'Synthesize the evidence appended in this round into one authoritative summary.';
+  return buildAdvancedPromptCommon(
+    run,
+    round,
+    run.initiatorSession,
+    run.contextFilePath,
+    sectionHeader,
+    reducerSummary,
+    instruction,
+  );
+}
+
+async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null): Promise<void> {
+  const rounds = run.resolvedRounds ?? [];
+  let roundIndex = 0;
+  while (roundIndex < rounds.length) {
+    if (run._cancelled || isTerminal(run.status)) return;
+    if (!ensureRunDeadline(run, serverLink)) return;
+    const round = rounds[roundIndex];
+    run.timeoutMs = round.timeoutMs;
+    run.currentRound = roundIndex + 1;
+    run.currentRoundId = round.id;
+    run.currentExecutionStep += 1;
+    run.roundAttemptCounts[round.id] = (run.roundAttemptCounts[round.id] ?? 0) + 1;
+    run.currentRoundAttempt = run.roundAttemptCounts[round.id];
+    run.runPhase = 'round_execution';
+    run.summaryPhase = null;
+    run.activePhase = round.dispatchStyle === 'initiator_only' ? 'initial' : 'hop';
+    pushState(run, serverLink);
+
+    const artifactBaseline = await captureArtifactBaseline(run, round);
+    const reducerSummary = await reduceAdvancedContext(run, round, serverLink);
+    if (run._cancelled || isTerminal(run.status)) return;
+
+    let authoritativeSegment = '';
+    if (round.dispatchStyle === 'initiator_only') {
+      const sectionHeader = `${discussionParticipantName(run.initiatorSession)} — ${round.title} (attempt ${run.currentRoundAttempt})`;
+      const baselineBuffer = await readFile(run.contextFilePath).catch(() => Buffer.from(''));
+      const prompt = buildAdvancedHopPrompt(
+        run,
+        round,
+        { session: run.initiatorSession, mode: round.modeKey },
+        run.contextFilePath,
+        sectionHeader,
+        reducerSummary,
+      );
+      const ok = await dispatchHop(run, run.initiatorSession, prompt, serverLink, {
+        sectionHeader,
+        required: true,
+      });
+      if (!ok && (run._cancelled || isTerminal(run.status))) return;
+      authoritativeSegment = ok ? await readAppendedContent(run.contextFilePath, baselineBuffer.length) : '';
+    } else {
+      const targets = [...run.allTargets];
+      const roundHops = await createRoundHopStates(run, targets, round.modeKey);
+      try {
+        run.activeTargetSessions = roundHops.map((hop) => hop.session);
+        await Promise.allSettled(targets.map(async (target, index) => {
+          const hop = roundHops[index];
+          const sectionHeader = `${discussionParticipantName(target.session)} — ${round.title} (hop ${index + 1}/${targets.length}, attempt ${run.currentRoundAttempt})`;
+          hop.section_header = sectionHeader;
+          const prompt = buildAdvancedHopPrompt(run, round, target, hop.artifact_path, sectionHeader, reducerSummary);
+          return dispatchHop(run, target.session, prompt, serverLink, {
+            sectionHeader,
+            hop,
+            filePath: hop.artifact_path,
+          });
+        }));
+        run.activeTargetSessions = [];
+        run.currentTargetSession = null;
+        if (run._cancelled || isTerminal(run.status)) return;
+        await appendRoundEvidence(run, roundHops);
+        if (round.synthesisStyle === 'initiator_summary') {
+          run.runPhase = 'summarizing';
+          run.summaryPhase = 'running';
+          run.activePhase = 'summary';
+          const sectionHeader = `${discussionParticipantName(run.initiatorSession)} — ${round.title} Synthesis (attempt ${run.currentRoundAttempt})`;
+          const baselineBuffer = await readFile(run.contextFilePath).catch(() => Buffer.from(''));
+          const prompt = buildAdvancedSynthesisPrompt(run, round, sectionHeader, reducerSummary);
+          const ok = await dispatchHop(run, run.initiatorSession, prompt, serverLink, {
+            sectionHeader,
+            required: true,
+          });
+          if (!ok && (run._cancelled || isTerminal(run.status))) return;
+          authoritativeSegment = ok ? await readAppendedContent(run.contextFilePath, baselineBuffer.length) : '';
+          run.summaryPhase = ok ? 'completed' : 'failed';
+        }
+      } finally {
+        scheduleRoundHopArtifactCleanup(roundHops);
+      }
+    }
+
+    await validateArtifactOutputsForRound(run, round, artifactBaseline).catch((err) => {
+      failRun(run, 'failed', err instanceof Error ? err.message : String(err), serverLink);
+    });
+    if (run._cancelled || isTerminal(run.status)) return;
+
+    const verdict = round.requiresVerdict ? parseVerdictFromContent(authoritativeSegment) : null;
+    const effectiveVerdict = round.requiresVerdict
+      ? (verdict ?? (() => {
+        addHelperDiagnostic(run, {
+          code: 'P2P_VERDICT_MISSING',
+          attempt: run.currentRoundAttempt,
+          sourceSession: run.initiatorSession,
+          message: `Missing verdict marker for round ${round.id}`,
+        });
+        return 'REWORK' as const;
+      })())
+      : null;
+
+    const jump = round.allowRouting && round.jumpRule
+      ? (() => {
+        const jumpCount = run.roundJumpCounts[round.id] ?? 0;
+        const belowMax = jumpCount < round.jumpRule!.maxTriggers;
+        if (!belowMax) return null;
+        if (round.verdictPolicy === 'forced_rework') {
+          if (jumpCount < round.jumpRule.minTriggers) return round.jumpRule.targetRoundId;
+          return effectiveVerdict === (round.jumpRule.marker ?? 'REWORK') ? round.jumpRule.targetRoundId : null;
+        }
+        return effectiveVerdict === (round.jumpRule.marker ?? 'REWORK') ? round.jumpRule.targetRoundId : null;
+      })()
+      : null;
+
+    if (jump) {
+      run.roundJumpCounts[round.id] = (run.roundJumpCounts[round.id] ?? 0) + 1;
+      run.routingHistory.push({
+        fromRoundId: round.id,
+        toRoundId: jump,
+        trigger: effectiveVerdict,
+        atStep: run.currentExecutionStep,
+        atAttempt: run.currentRoundAttempt,
+        timestamp: Date.now(),
+      });
+      roundIndex = rounds.findIndex((entry) => entry.id === jump);
+      continue;
+    }
+
+    roundIndex += 1;
+  }
+
+  if (!ensureRunDeadline(run, serverLink) || run._cancelled || isTerminal(run.status)) return;
+  run.runPhase = 'summarizing';
+  run.summaryPhase = 'running';
+  run.activePhase = 'summary';
+  const finalRound = rounds[Math.max(rounds.length - 1, 0)];
+  run.timeoutMs = finalRound?.timeoutMs ?? run.timeoutMs;
+  const finalPrompt = buildHopPrompt(run, getP2pMode(finalRound?.modeKey ?? run.mode), {
+    session: run.initiatorSession,
+    sectionHeader: `${discussionParticipantNameWithMode(run.initiatorSession, finalRound?.modeKey ?? run.mode)} — Final Summary`,
+    instruction: `${getP2pMode(finalRound?.modeKey ?? run.mode)?.summaryPrompt ?? 'Synthesize a final summary that captures the consensus, key decisions, and any remaining disagreements across all rounds.'}\nBefore writing the summary, use the hop evidence already appended into the discussion file for this round. If the user context clearly specifies a destination file for the final plan, write the complete plan there. Otherwise, write the complete plan at the end of the discussion file.`,
+    isInitial: false,
+  });
+  const summaryOk = await dispatchHop(run, run.initiatorSession, finalPrompt, serverLink, {
+    sectionHeader: `${discussionParticipantNameWithMode(run.initiatorSession, finalRound?.modeKey ?? run.mode)} — Final Summary`,
+    required: true,
+  });
+  if (!summaryOk && (run._cancelled || isTerminal(run.status))) return;
+  run.summaryPhase = summaryOk ? 'completed' : 'failed';
+
+  let fullContent = '';
+  try {
+    fullContent = await readFile(run.contextFilePath, 'utf8');
+    run.resultSummary = fullContent.slice(-2000);
+  } catch { /* ignore */ }
+  run.completedAt = new Date().toISOString();
+  transition(run, 'completed', serverLink);
+  setTimeout(() => { activeRuns.delete(run.id); }, 60_000);
 }
 
 // ── Single hop dispatch + wait ────────────────────────────────────────────
@@ -852,6 +1539,15 @@ async function dispatchHop(
     }
   };
 
+  const abortForOverallTimeout = async () => {
+    if (hop) {
+      await finishHop('timed_out', 'advanced_run_timeout');
+    } else {
+      run.currentTargetSession = null;
+      run.activeTargetSessions = run.activeTargetSessions.filter((item) => item !== session);
+    }
+  };
+
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     if (run._cancelled) {
       await finishHop('cancelled');
@@ -898,6 +1594,11 @@ async function dispatchHop(
     let headingFoundAt = 0;
 
     while (Date.now() < deadline) {
+      if (!ensureRunDeadline(run, serverLink)) {
+        idleWaiter.cancel();
+        await abortForOverallTimeout();
+        return false;
+      }
       if (Date.now() >= hardDeadline) {
         logger.warn({ runId: run.id, session }, 'P2P: hard deadline reached, force-skipping hop');
         break;
@@ -908,6 +1609,11 @@ async function dispatchHop(
         return false;
       }
       await sleep(IDLE_POLL_MS);
+      if (!ensureRunDeadline(run, serverLink)) {
+        idleWaiter.cancel();
+        await abortForOverallTimeout();
+        return false;
+      }
       if (Date.now() >= hardDeadline) {
         logger.warn({ runId: run.id, session }, 'P2P: hard deadline reached, force-skipping hop');
         break;
@@ -1012,8 +1718,7 @@ async function dispatchHop(
           logger.warn({ runId: run.id, session }, 'P2P: agent idle without file change after retry');
           idleWaiter.cancel();
           await finishHop('failed', 'idle_without_file_change');
-          if (required) failRun(run, 'dispatch_failed', 'idle_without_file_change', serverLink);
-          else pushState(run, serverLink);
+          pushState(run, serverLink);
           return false;
         }
       }
@@ -1126,11 +1831,16 @@ function transition(run: P2pRun, status: P2pRunStatus, serverLink: ServerLink | 
     run.summaryPhase = 'completed';
   } else if (status === 'cancelled') {
     run.runPhase = 'cancelled';
-  } else if (status === 'failed' || status === 'timed_out') {
+  } else if (status === 'failed') {
     run.runPhase = 'failed';
   }
   if (P2P_TERMINAL_RUN_STATUSES.has(status)) {
     run.completedAt = run.completedAt ?? new Date().toISOString();
+    if (run.advancedP2pEnabled) {
+      void cleanupRoundHopArtifacts(run.hopStates);
+    } else {
+      scheduleRoundHopArtifactCleanup(run.hopStates);
+    }
   }
   run.updatedAt = new Date().toISOString();
   logger.info({ runId: run.id, status }, 'P2P run state transition');
@@ -1143,8 +1853,17 @@ function failRun(run: P2pRun, errorType: string, message: string, serverLink: Se
   run.updatedAt = new Date().toISOString();
   const status: P2pRunStatus = errorType === 'timed_out' ? 'timed_out' : 'failed';
   run.status = status;
-  run.runPhase = 'failed';
-  if (run.activePhase === 'summary') run.summaryPhase = 'failed';
+  if (status === 'failed') {
+    run.runPhase = 'failed';
+  }
+  if (run.activePhase === 'summary') {
+    run.summaryPhase = 'failed';
+  }
+  if (run.advancedP2pEnabled) {
+    void cleanupRoundHopArtifacts(run.hopStates);
+  } else {
+    scheduleRoundHopArtifactCleanup(run.hopStates);
+  }
   logger.warn({ runId: run.id, errorType, message }, 'P2P run failed');
   pushState(run, serverLink);
 }

@@ -48,12 +48,14 @@ type DeltaCb = (sessionId: string, delta: MessageDelta) => void;
 type CompleteCb = (sessionId: string, message: AgentMessage) => void;
 type ErrorCb = (sessionId: string, error: { code: string; message: string; recoverable: boolean }) => void;
 type ToolCb = (sessionId: string, tool: ToolCallEvent) => void;
+type StatusCb = (sessionId: string, status: { status: string | null; label?: string | null }) => void;
 
 function makeMockProvider() {
   let deltaCb: DeltaCb | undefined;
   let completeCb: CompleteCb | undefined;
   let errorCb: ErrorCb | undefined;
   let toolCb: ToolCb | undefined;
+  let statusCb: StatusCb | undefined;
 
   return {
     provider: {
@@ -61,11 +63,13 @@ function makeMockProvider() {
       onComplete: (cb: CompleteCb) => { completeCb = cb; return () => { completeCb = undefined; }; },
       onError: (cb: ErrorCb) => { errorCb = cb; return () => { errorCb = undefined; }; },
       onToolCall: (cb: ToolCb) => { toolCb = cb; },
+      onStatus: (cb: StatusCb) => { statusCb = cb; return () => { statusCb = undefined; }; },
     } as unknown as TransportProvider,
     fireDelta: (sid: string, delta: MessageDelta) => deltaCb?.(sid, delta),
     fireComplete: (sid: string, msg: AgentMessage) => completeCb?.(sid, msg),
     fireError: (sid: string, err: { code: string; message: string; recoverable: boolean }) => errorCb?.(sid, err),
     fireTool: (sid: string, tool: ToolCallEvent) => toolCb?.(sid, tool),
+    fireStatus: (sid: string, status: { status: string | null; label?: string | null }) => statusCb?.(sid, status),
   };
 }
 
@@ -140,33 +144,74 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(opts.eventId).toBe('transport:sess-a:msg-abc');
     });
 
-    it('multiple deltas pass through directly (provider handles accumulation)', () => {
+    it('throttles streaming updates to at most one emit every 80ms and keeps the latest text', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));
+
       const { provider, fireDelta } = makeMockProvider();
       wireProviderToRelay(provider);
 
-      fireDelta('sess-a', makeDelta({ messageId: 'msg-1', delta: 'foo ' }));
-      fireDelta('sess-a', makeDelta({ messageId: 'msg-1', delta: 'bar ' }));
-      fireDelta('sess-a', makeDelta({ messageId: 'msg-1', delta: 'baz' }));
+      fireDelta('sess-a', makeDelta({ messageId: 'msg-throttle', delta: 'a' }));
+      fireDelta('sess-a', makeDelta({ messageId: 'msg-throttle', delta: 'ab' }));
+      fireDelta('sess-a', makeDelta({ messageId: 'msg-throttle', delta: 'abc' }));
 
-      expect(emitMock).toHaveBeenCalledTimes(3);
+      expect(emitMock).toHaveBeenCalledTimes(1);
+      expect(emitMock.mock.calls[0][2].text).toBe('a');
 
-      // Each delta is passed through directly — provider already accumulated
-      expect(emitMock.mock.calls[0][2].text).toBe('foo ');
-      expect(emitMock.mock.calls[1][2].text).toBe('bar ');
-      expect(emitMock.mock.calls[2][2].text).toBe('baz');
+      vi.advanceTimersByTime(79);
+      expect(emitMock).toHaveBeenCalledTimes(1);
+
+      vi.advanceTimersByTime(1);
+      expect(emitMock).toHaveBeenCalledTimes(2);
+      expect(emitMock.mock.calls[1][2].text).toBe('abc');
+
+      vi.useRealTimers();
     });
 
-    it('uses the same stable eventId across multiple deltas for the same message', () => {
+    it('does not let a new message flush an old throttled delta later', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));
+
       const { provider, fireDelta } = makeMockProvider();
       wireProviderToRelay(provider);
 
-      fireDelta('sess-a', makeDelta({ messageId: 'msg-stable', delta: 'a' }));
-      fireDelta('sess-a', makeDelta({ messageId: 'msg-stable', delta: 'b' }));
+      fireDelta('sess-a', makeDelta({ messageId: 'msg-old', delta: 'old-a' }));
+      fireDelta('sess-a', makeDelta({ messageId: 'msg-old', delta: 'old-ab' }));
+      fireDelta('sess-a', makeDelta({ messageId: 'msg-new', delta: 'new-a' }));
 
-      const id1 = emitMock.mock.calls[0][3].eventId;
-      const id2 = emitMock.mock.calls[1][3].eventId;
-      expect(id1).toBe('transport:sess-a:msg-stable');
-      expect(id2).toBe('transport:sess-a:msg-stable');
+      expect(emitMock.mock.calls.filter(c => c[1] === 'assistant.text')).toHaveLength(2);
+      expect(emitMock.mock.calls[0][2].text).toBe('old-a');
+      expect(emitMock.mock.calls[1][2].text).toBe('new-a');
+
+      vi.advanceTimersByTime(500);
+      const textCalls = emitMock.mock.calls.filter(c => c[1] === 'assistant.text');
+      expect(textCalls).toHaveLength(2);
+      expect(textCalls.map(c => c[2].text)).not.toContain('old-ab');
+
+      vi.useRealTimers();
+    });
+
+    it('throttles independently per session', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));
+
+      const { provider, fireDelta } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireDelta('sess-a', makeDelta({ messageId: 'msg-a', delta: 'A1' }));
+      fireDelta('sess-a', makeDelta({ messageId: 'msg-a', delta: 'A2' }));
+      fireDelta('sess-b', makeDelta({ messageId: 'msg-b', delta: 'B1' }));
+      fireDelta('sess-b', makeDelta({ messageId: 'msg-b', delta: 'B2' }));
+
+      expect(emitMock.mock.calls.filter(c => c[1] === 'assistant.text')).toHaveLength(2);
+      vi.advanceTimersByTime(80);
+
+      const textCalls = emitMock.mock.calls.filter(c => c[1] === 'assistant.text');
+      expect(textCalls).toHaveLength(4);
+      expect(textCalls.filter(c => c[0] === 'sess-a').map(c => c[2].text)).toEqual(['A1', 'A2']);
+      expect(textCalls.filter(c => c[0] === 'sess-b').map(c => c[2].text)).toEqual(['B1', 'B2']);
+
+      vi.useRealTimers();
     });
 
     it('does NOT cache to JSONL via appendTransportEvent', () => {
@@ -284,6 +329,52 @@ describe('transport-relay (timeline-emitter based)', () => {
       const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
       expect(textCall![3].eventId).toBe(deltaEventId);
       expect(textCall![3].eventId).toBe('transport:sess-1:msg-4');
+    });
+
+    it('emits final completion immediately even when a throttled delta is pending', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));
+
+      const { provider, fireDelta, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireDelta('sess-1', makeDelta({ messageId: 'msg-final', delta: 'a' }));
+      fireDelta('sess-1', makeDelta({ messageId: 'msg-final', delta: 'ab' }));
+      emitMock.mockClear();
+
+      fireComplete('sess-1', makeMessage({ id: 'msg-final', content: 'final answer' }));
+
+      const textCalls = emitMock.mock.calls.filter(c => c[1] === 'assistant.text');
+      expect(textCalls).toHaveLength(1);
+      expect(textCalls[0][2].text).toBe('final answer');
+      expect(textCalls[0][2].streaming).toBe(false);
+
+      vi.advanceTimersByTime(500);
+      expect(emitMock.mock.calls.filter(c => c[1] === 'assistant.text')).toHaveLength(1);
+
+      vi.useRealTimers();
+    });
+
+    it('completion still emits immediately when another session has a pending throttled delta', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));
+
+      const { provider, fireDelta, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireDelta('sess-a', makeDelta({ messageId: 'msg-a', delta: 'A1' }));
+      fireDelta('sess-a', makeDelta({ messageId: 'msg-a', delta: 'A2' }));
+      emitMock.mockClear();
+
+      fireComplete('sess-b', makeMessage({ id: 'msg-b', sessionId: 'sess-b', content: 'done-b' }));
+
+      const textCalls = emitMock.mock.calls.filter(c => c[1] === 'assistant.text');
+      expect(textCalls).toHaveLength(1);
+      expect(textCalls[0][0]).toBe('sess-b');
+      expect(textCalls[0][2].text).toBe('done-b');
+      expect(textCalls[0][2].streaming).toBe(false);
+
+      vi.useRealTimers();
     });
 
     it('caches to JSONL via appendTransportEvent with type assistant.text', async () => {
@@ -416,6 +507,30 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(textCall?.[2]?.streaming).toBe(false);
       expect(textCall?.[2]?.text).toBe('partial answer\n\n⚠️ Error: boom');
     });
+
+    it('emits error immediately even when a throttled delta is pending and suppresses the delayed flush', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));
+
+      const { provider, fireDelta, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireDelta('sess-err', makeDelta({ messageId: 'msg-err-2', delta: 'partial' }));
+      fireDelta('sess-err', makeDelta({ messageId: 'msg-err-2', delta: 'partial+' }));
+      emitMock.mockClear();
+
+      fireError('sess-err', { code: 'PROVIDER_ERROR', message: 'boom-now', recoverable: true });
+
+      const textCalls = emitMock.mock.calls.filter(c => c[1] === 'assistant.text');
+      expect(textCalls).toHaveLength(1);
+      expect(textCalls[0][2].text).toBe('partial+\n\n⚠️ Error: boom-now');
+      expect(textCalls[0][2].streaming).toBe(false);
+
+      vi.advanceTimersByTime(500);
+      expect(emitMock.mock.calls.filter(c => c[1] === 'assistant.text')).toHaveLength(1);
+
+      vi.useRealTimers();
+    });
   });
 
   // ── emitTransportUserMessage ─────────────────────────────────────────────
@@ -528,6 +643,36 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(call![0]).toBe('sess-tool');
       expect(call![2]).toEqual({ output: 'done', detail: { kind: 'tool_result', output: 'done' } });
       expect(call![3].eventId).toBe('transport-tool:sess-tool:tool-1:result');
+    });
+  });
+
+  describe('onStatus', () => {
+    it('emits agent.status into the timeline for provider status updates', () => {
+      const { provider, fireStatus } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireStatus('sess-status', { status: 'compacting', label: 'Compacting conversation...' });
+
+      expect(emitMock).toHaveBeenCalledWith(
+        'sess-status',
+        'agent.status',
+        { status: 'compacting', label: 'Compacting conversation...' },
+        expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+      );
+    });
+
+    it('emits unlabeled status updates so the frontend can clear stale status text', () => {
+      const { provider, fireStatus } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      fireStatus('sess-status', { status: null, label: null });
+
+      expect(emitMock).toHaveBeenCalledWith(
+        'sess-status',
+        'agent.status',
+        { status: null, label: null },
+        expect.objectContaining({ source: 'daemon', confidence: 'high' }),
+      );
     });
   });
 });

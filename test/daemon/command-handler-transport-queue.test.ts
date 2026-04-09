@@ -178,6 +178,31 @@ describe('handleWebCommand transport queue behavior', () => {
     );
   });
 
+  it('does not short-circuit transport identity questions in the daemon', async () => {
+    const transportSend = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      send: transportSend,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '你在用什么模型',
+      commandId: 'cmd-identity',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(transportSend).toHaveBeenCalledWith('你在用什么模型');
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: '你在用什么模型', allowDuplicate: true });
+    expect(emitMock).not.toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'assistant.text',
+      expect.objectContaining({ text: expect.any(String), streaming: false }),
+      expect.anything(),
+    );
+  });
+
   it('waits for an in-flight settings restart before sending the first transport message', async () => {
     let restartResolved = false;
     let resolveRestart: (() => void) | null = null;

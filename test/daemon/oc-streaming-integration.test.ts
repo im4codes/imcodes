@@ -74,6 +74,10 @@ function emitAgentEvent(payload: Record<string, unknown>): void {
   lastWs().emit('message', JSON.stringify({ type: 'event', event: 'agent', payload }));
 }
 
+function advanceStreamWindow(): void {
+  vi.advanceTimersByTime(250);
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 describe('OC streaming integration: provider → relay → emitter', () => {
@@ -105,9 +109,13 @@ describe('OC streaming integration: provider → relay → emitter', () => {
 
     emitAgentEvent({ runId, stream: 'lifecycle', data: { phase: 'start' }, key: 'test:sess' });
     emitAgentEvent({ runId, stream: 'assistant', data: { delta: '你' }, key: 'test:sess' });
+    advanceStreamWindow();
     emitAgentEvent({ runId, stream: 'assistant', data: { delta: '好' }, key: 'test:sess' });
+    advanceStreamWindow();
     emitAgentEvent({ runId, stream: 'assistant', data: { delta: '世' }, key: 'test:sess' });
+    advanceStreamWindow();
     emitAgentEvent({ runId, stream: 'assistant', data: { delta: '界' }, key: 'test:sess' });
+    advanceStreamWindow();
 
     // Filter to assistant.text events for the sanitized session
     const textEvents = emittedEvents.filter(
@@ -135,7 +143,9 @@ describe('OC streaming integration: provider → relay → emitter', () => {
 
     emitAgentEvent({ runId, stream: 'lifecycle', data: { phase: 'start' }, key: 'test:s2' });
     emitAgentEvent({ runId, stream: 'assistant', data: { delta: 'Hello ' }, key: 'test:s2' });
+    advanceStreamWindow();
     emitAgentEvent({ runId, stream: 'assistant', data: { delta: 'World' }, key: 'test:s2' });
+    advanceStreamWindow();
     emitAgentEvent({ runId, stream: 'lifecycle', data: { phase: 'end' }, key: 'test:s2' });
 
     const textEvents = emittedEvents.filter(
@@ -161,7 +171,9 @@ describe('OC streaming integration: provider → relay → emitter', () => {
 
     // OC sends text=delta (both incremental, text field NOT cumulative)
     emitAgentEvent({ runId, stream: 'assistant', data: { text: '收到', delta: '收到' }, key: 'test:nc' });
+    advanceStreamWindow();
     emitAgentEvent({ runId, stream: 'assistant', data: { text: '主人', delta: '主人' }, key: 'test:nc' });
+    advanceStreamWindow();
 
     const textEvents = emittedEvents.filter(
       (e) => e.type === 'assistant.text' && e.sessionId === 'test___nc',
@@ -203,8 +215,11 @@ describe('OC streaming integration: provider → relay → emitter', () => {
 
     emitAgentEvent({ runId, stream: 'lifecycle', data: { phase: 'start' }, key: 'test:dd' });
     emitAgentEvent({ runId, stream: 'assistant', data: { delta: 'A' }, key: 'test:dd' });
+    advanceStreamWindow();
     emitAgentEvent({ runId, stream: 'assistant', data: { delta: 'B' }, key: 'test:dd' });
+    advanceStreamWindow();
     emitAgentEvent({ runId, stream: 'assistant', data: { delta: 'C' }, key: 'test:dd' });
+    advanceStreamWindow();
     emitAgentEvent({ runId, stream: 'lifecycle', data: { phase: 'end' }, key: 'test:dd' });
 
     const textEvents = emittedEvents.filter(

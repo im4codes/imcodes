@@ -25,11 +25,13 @@ import logger from '../util/logger.js';
 import { homedir } from 'os';
 import { readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, stat as fsStat, writeFile as fsWriteFile } from 'node:fs/promises';
 import * as nodePath from 'node:path';
-import { exec as execCb } from 'node:child_process';
+import { exec as execCb, execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
+const execFileAsync = promisify(execFileCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget } from './p2p-orchestrator.js';
 import { getComboRoundCount, parseModePipeline, P2P_CONFIG_MODE, type P2pSessionConfig } from '../../shared/p2p-modes.js';
+import type { P2pAdvancedRound, P2pContextReducerConfig } from '../../shared/p2p-advanced.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
 import { executeCronJob } from './cron-executor.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
@@ -1042,6 +1044,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   let p2pExtraPrompt = (cmd as any).p2pExtraPrompt as string | undefined;
   const p2pLocale = (cmd as any).p2pLocale as string | undefined;
   const p2pHopTimeoutMs = (cmd as any).p2pHopTimeoutMs as number | undefined;
+  const p2pAdvancedPresetKey = (cmd as any).p2pAdvancedPresetKey as string | undefined;
+  const p2pAdvancedRounds = (cmd as any).p2pAdvancedRounds as P2pAdvancedRound[] | undefined;
+  const p2pAdvancedRunTimeoutMinutes = (cmd as any).p2pAdvancedRunTimeoutMinutes as number | undefined;
+  const p2pContextReducer = (cmd as any).p2pContextReducer as P2pContextReducerConfig | undefined;
   const p2pModeField = (cmd as any).p2pMode as string | undefined;
   const p2pAtTargets = (cmd as any).p2pAtTargets as Array<{ session: string; mode: string }> | undefined;
   const explicitTargets = directTargetSession
@@ -1181,7 +1187,21 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         const langInstr = `Use the user's selected i18n language (${langName}) for the discussion.`;
         p2pExtraPrompt = p2pExtraPrompt ? `${p2pExtraPrompt}\n${langInstr}` : langInstr;
       }
-      const run = await startP2pRun(sessionName, tokens.agents, tokens.cleanText, fileContents, serverLink, p2pRounds, p2pExtraPrompt, resolvedMode || undefined, p2pHopTimeoutMs);
+      const run = await startP2pRun({
+        initiatorSession: sessionName,
+        targets: tokens.agents,
+        userText: tokens.cleanText,
+        fileContents,
+        serverLink,
+        rounds: p2pRounds,
+        extraPrompt: p2pExtraPrompt,
+        modeOverride: resolvedMode || undefined,
+        hopTimeoutMs: p2pHopTimeoutMs,
+        advancedPresetKey: p2pAdvancedPresetKey,
+        advancedRounds: p2pAdvancedRounds,
+        advancedRunTimeoutMs: p2pAdvancedRunTimeoutMinutes != null ? p2pAdvancedRunTimeoutMinutes * 60_000 : undefined,
+        contextReducer: p2pContextReducer,
+      });
       const status = isLegacy ? 'accepted_legacy' : 'accepted';
       timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
       try {
@@ -1838,6 +1858,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
   const shellBin = cmd.shellBin as string | null | undefined;
   const ccSessionId = cmd.ccSessionId as string | null | undefined;
   const parentSession = cmd.parentSession as string | null | undefined;
+  const ccPreset = cmd.ccPreset as string | null | undefined;
   const requestedEffort: unknown = cmd.thinking ?? cmd.effort;
   const effort = isTransportEffortLevel(requestedEffort)
     ? requestedEffort
@@ -1866,6 +1887,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
         requestedModel: (cmd.requestedModel as string | undefined) ?? (cmd.model as string | undefined),
         transportConfig: (cmd.transportConfig as Record<string, unknown> | undefined) ?? undefined,
         bindExistingKey,
+        ...(ccPreset ? { ccPreset } : {}),
         ...(type === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
         ...(type === 'codex-sdk' ? { fresh: true } : {}),
         ...(effort ? { effort } : {}),
@@ -1881,8 +1903,6 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     }
     return;
   }
-
-  const ccPreset = cmd.ccPreset as string | null | undefined;
   const subCcInitPrompt = cmd.ccInitPrompt as string | null | undefined;
   const description = cmd.description as string | null | undefined;
 
@@ -2053,7 +2073,15 @@ async function handleP2pListDiscussions(_cmd: Record<string, unknown>, serverLin
     const dir = imcSubDir(projectDir, 'discussions');
     try {
       const entries = await fsReaddir(dir);
-      const files = entries.filter(e => e.endsWith('.md'));
+      const files = entries.filter((entry) => {
+        if (!entry.endsWith('.md')) return false;
+        // Keep only canonical discussion documents in the history list.
+        // Intermediate hop artifacts and reducer snapshots are implementation
+        // details and should not crowd out the main discussion file.
+        if (/\.round\d+\.hop\d+\.md$/i.test(entry)) return false;
+        if (/\.reducer\.\d+\.md$/i.test(entry)) return false;
+        return true;
+      });
       for (const f of files) {
         try {
           const fullPath = nodePath.join(dir, f);
@@ -2602,6 +2630,89 @@ async function handleFsListInner(resolved: string, rawPath: string, requestId: s
 
 const FS_READ_SIZE_LIMIT = 512 * 1024; // 512 KB
 
+interface FsReadSnapshot {
+  path: string;
+  fileSignature: string;
+  status: 'ok' | 'error';
+  content?: string;
+  encoding?: 'base64';
+  mimeType?: string;
+  error?: string;
+  previewReason?: 'too_large' | 'binary' | 'unknown_type';
+}
+
+const fsReadCache = new Map<string, { expiresAt: number; value: FsReadSnapshot }>();
+const fsReadInflight = new Map<string, Promise<FsReadSnapshot>>();
+const fsReadGenerations = new Map<string, number>();
+const FS_READ_CACHE_TTL_MS = 5_000;
+const REPO_CONTEXT_CACHE_TTL_MS = 5_000;
+
+async function loadFsReadSnapshot(realPath: string, fileSignature: string): Promise<FsReadSnapshot> {
+  const ext = nodePath.extname(realPath).toLowerCase().slice(1);
+  const IMAGE_MIME: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', ico: 'image/x-icon', bmp: 'image/bmp', svg: 'image/svg+xml' };
+  const OFFICE_MIME: Record<string, string> = {
+    pdf: 'application/pdf',
+    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  };
+  const mimeType = IMAGE_MIME[ext] ?? OFFICE_MIME[ext];
+
+  if (mimeType) {
+    const buf = await fsReadFileRaw(realPath);
+    return {
+      path: realPath,
+      fileSignature,
+      status: 'ok',
+      content: buf.toString('base64'),
+      encoding: 'base64',
+      mimeType,
+    };
+  }
+
+  const content = await fsReadFileRaw(realPath, 'utf-8');
+  const sample = content.slice(0, 8192);
+  if (sample.includes('\0')) {
+    return {
+      path: realPath,
+      fileSignature,
+      status: 'error',
+      error: 'binary_file',
+      previewReason: 'binary',
+    };
+  }
+
+  return {
+    path: realPath,
+    fileSignature,
+    status: 'ok',
+    content,
+  };
+}
+
+async function getFsReadSnapshot(realPath: string, fileSignature: string): Promise<FsReadSnapshot> {
+  const cached = fsReadCache.get(realPath);
+  if (cached && cached.expiresAt > Date.now() && cached.value.fileSignature === fileSignature) {
+    return cached.value;
+  }
+  const generation = getResourceGeneration(fsReadGenerations, realPath);
+  const inflightKey = `${realPath}::${fileSignature}::${generation}`;
+  const inflight = fsReadInflight.get(inflightKey);
+  if (inflight) return await inflight;
+  const promise = loadFsReadSnapshot(realPath, fileSignature)
+    .then(async (value) => {
+      const currentSignature = await safeStatSignature(realPath);
+      if (getResourceGeneration(fsReadGenerations, realPath) === generation && currentSignature === value.fileSignature) {
+        fsReadCache.set(realPath, { value, expiresAt: Date.now() + FS_READ_CACHE_TTL_MS });
+      }
+      return value;
+    })
+    .finally(() => {
+      fsReadInflight.delete(inflightKey);
+    });
+  fsReadInflight.set(inflightKey, promise);
+  return await promise;
+}
+
 async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawPath = cmd.path as string | undefined;
   const requestId = cmd.requestId as string | undefined;
@@ -2619,6 +2730,7 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
     }
 
     const stats = await fsStat(real);
+    const fileSignature = `${stats.mtimeMs}:${stats.size}`;
 
     // Image files: send as base64 with a higher size limit (5 MB)
     const ext = nodePath.extname(real).toLowerCase().slice(1);
@@ -2642,29 +2754,477 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
     }
 
     const mtime = stats.mtimeMs;
-    if (mimeType) {
-      const buf = await fsReadFileRaw(real);
-      const content = buf.toString('base64');
-      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', content, encoding: 'base64', mimeType, downloadId: handle.id, mtime }); } catch { /* ignore */ }
-    } else {
-      const content = await fsReadFileRaw(real, 'utf-8');
-      // Check for binary content
-      const sample = content.slice(0, 8192);
-      if (sample.includes('\0')) {
-        try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'binary_file', previewReason: 'binary', downloadId: handle.id }); } catch { /* ignore */ }
-        return;
-      }
-      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', content, downloadId: handle.id, mtime }); } catch { /* ignore */ }
+    const snapshot = await getFsReadSnapshot(real, fileSignature);
+    if (snapshot.status === 'error') {
+      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: snapshot.error, previewReason: snapshot.previewReason, downloadId: handle.id }); } catch { /* ignore */ }
+      return;
     }
+    try {
+      serverLink.send({
+        type: 'fs.read_response',
+        requestId,
+        path: rawPath,
+        resolvedPath: real,
+        status: 'ok',
+        content: snapshot.content,
+        ...(snapshot.encoding ? { encoding: snapshot.encoding } : {}),
+        ...(snapshot.mimeType ? { mimeType: snapshot.mimeType } : {}),
+        downloadId: handle.id,
+        mtime,
+      });
+    } catch { /* ignore */ }
   } catch (err) {
     try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
   }
+}
+
+const GIT_STATUS_CACHE_TTL_MS = 5_000;
+const GIT_DIFF_CACHE_TTL_MS = 5_000;
+
+type GitStatusFile = { path: string; code: string; additions?: number; deletions?: number };
+
+interface RepoContext {
+  repoRoot: string;
+  gitDir: string;
+  repoSignature: string;
+}
+
+interface RepoContextBase {
+  repoRoot: string;
+  gitDir: string;
+}
+
+interface RepoSignatureState {
+  repoSignature: string;
+  indexSig: string;
+  headSig: string;
+  refPath: string | null;
+  refSig: string;
+}
+
+interface GitStatusSnapshot {
+  repoRoot: string;
+  repoSignature: string;
+  files: GitStatusFile[];
+}
+
+interface GitNumstatSnapshot {
+  repoRoot: string;
+  repoSignature: string;
+  stats: Map<string, { additions?: number; deletions?: number }>;
+}
+
+interface GitDiffSnapshot {
+  logicalPath: string;
+  repoRoot: string;
+  repoSignature: string;
+  fileSignature: string;
+  diff: string;
+}
+
+const repoContextCache = new Map<string, { expiresAt: number; value: RepoContextBase | null }>();
+const repoSignatureCache = new Map<string, RepoSignatureState>();
+const gitStatusCache = new Map<string, { expiresAt: number; value: GitStatusSnapshot }>();
+const gitStatusInflight = new Map<string, Promise<GitStatusSnapshot>>();
+const gitNumstatCache = new Map<string, { expiresAt: number; value: GitNumstatSnapshot }>();
+const gitNumstatInflight = new Map<string, Promise<GitNumstatSnapshot>>();
+const gitDiffCache = new Map<string, { expiresAt: number; value: GitDiffSnapshot }>();
+const gitDiffInflight = new Map<string, Promise<GitDiffSnapshot>>();
+const gitRepoGenerations = new Map<string, number>();
+const gitDiffGenerations = new Map<string, number>();
+
+function normalizeFsPath(value: string): string {
+  return nodePath.resolve(value);
+}
+
+function getResourceGeneration(map: Map<string, number>, key: string): number {
+  return map.get(key) ?? 0;
+}
+
+function bumpResourceGeneration(map: Map<string, number>, key: string): void {
+  map.set(key, getResourceGeneration(map, key) + 1);
+}
+
+function isPathInside(root: string, candidate: string): boolean {
+  const normalizedRoot = normalizeFsPath(root);
+  const normalizedCandidate = normalizeFsPath(candidate);
+  return normalizedCandidate === normalizedRoot || normalizedCandidate.startsWith(normalizedRoot + nodePath.sep);
+}
+
+async function safeStatSignature(targetPath: string): Promise<string> {
+  try {
+    const stats = await fsStat(targetPath);
+    return `${stats.mtimeMs}:${stats.size}`;
+  } catch {
+    return 'missing';
+  }
+}
+
+async function resolveGitDir(dotGitPath: string, repoRoot: string): Promise<string | null> {
+  try {
+    const stats = await fsStat(dotGitPath);
+    if (stats.isDirectory()) return dotGitPath;
+    if (!stats.isFile()) return null;
+    const raw = await fsReadFileRaw(dotGitPath, 'utf8');
+    const match = raw.match(/^gitdir:\s*(.+)\s*$/mi);
+    if (!match?.[1]) return null;
+    return nodePath.resolve(repoRoot, match[1].trim());
+  } catch {
+    return null;
+  }
+}
+
+async function findRepoContextBase(startPath: string): Promise<RepoContextBase | null> {
+  let current = normalizeFsPath(startPath);
+  const traversed: string[] = [];
+  const now = Date.now();
+  while (true) {
+    const cached = repoContextCache.get(current);
+    if (cached && cached.expiresAt > now) {
+      for (const traversedPath of traversed) {
+        repoContextCache.set(traversedPath, { expiresAt: now + REPO_CONTEXT_CACHE_TTL_MS, value: cached.value });
+      }
+      return cached.value;
+    }
+    traversed.push(current);
+    const dotGit = nodePath.join(current, '.git');
+    const gitDir = await resolveGitDir(dotGit, current);
+    if (gitDir) {
+      const value = { repoRoot: current, gitDir };
+      for (const traversedPath of traversed) {
+        repoContextCache.set(traversedPath, { expiresAt: Date.now() + REPO_CONTEXT_CACHE_TTL_MS, value });
+      }
+      return value;
+    }
+    const parent = nodePath.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  for (const traversedPath of traversed) {
+    repoContextCache.set(traversedPath, { expiresAt: Date.now() + REPO_CONTEXT_CACHE_TTL_MS, value: null });
+  }
+  return null;
+}
+
+async function buildRepoSignatureState(gitDir: string, indexSig?: string, headSig?: string): Promise<RepoSignatureState> {
+  const resolvedIndexSig = indexSig ?? await safeStatSignature(nodePath.join(gitDir, 'index'));
+  const headPath = nodePath.join(gitDir, 'HEAD');
+  const resolvedHeadSig = headSig ?? await safeStatSignature(headPath);
+  let refPath: string | null = null;
+  let refSig = 'none';
+  try {
+    const headRaw = await fsReadFileRaw(headPath, 'utf8');
+    const match = headRaw.match(/^ref:\s*(.+)\s*$/m);
+    if (match?.[1]) {
+      refPath = match[1].trim();
+      refSig = await safeStatSignature(nodePath.join(gitDir, refPath));
+    }
+  } catch {
+    refSig = 'missing';
+  }
+  return {
+    repoSignature: `${resolvedIndexSig}|${resolvedHeadSig}|${refSig}`,
+    indexSig: resolvedIndexSig,
+    headSig: resolvedHeadSig,
+    refPath,
+    refSig,
+  };
+}
+
+async function getRepoSignature(repoRoot: string, gitDir: string): Promise<string> {
+  const indexSig = await safeStatSignature(nodePath.join(gitDir, 'index'));
+  const headPath = nodePath.join(gitDir, 'HEAD');
+  const headSig = await safeStatSignature(headPath);
+  const cached = repoSignatureCache.get(repoRoot);
+  if (cached && cached.indexSig === indexSig && cached.headSig === headSig) {
+    if (!cached.refPath || await safeStatSignature(nodePath.join(gitDir, cached.refPath)) === cached.refSig) {
+      return cached.repoSignature;
+    }
+  }
+  const next = await buildRepoSignatureState(gitDir, indexSig, headSig);
+  repoSignatureCache.set(repoRoot, next);
+  return next.repoSignature;
+}
+
+async function resolveRepoContext(startPath: string): Promise<RepoContext | null> {
+  const repo = await findRepoContextBase(startPath);
+  if (!repo) return null;
+  return {
+    repoRoot: repo.repoRoot,
+    gitDir: repo.gitDir,
+    repoSignature: await getRepoSignature(repo.repoRoot, repo.gitDir),
+  };
+}
+
+function decodeGitPath(rawPath: string): string {
+  return rawPath.replace(/\\([\\\"abfnrtv])/g, (_match, escaped: string) => {
+    switch (escaped) {
+      case 'a': return '\u0007';
+      case 'b': return '\b';
+      case 'f': return '\f';
+      case 'n': return '\n';
+      case 'r': return '\r';
+      case 't': return '\t';
+      case 'v': return '\v';
+      case '\\': return '\\';
+      case '"': return '"';
+      default: return escaped;
+    }
+  }).replace(/\\([0-7]{1,3})/g, (_match, octal: string) => String.fromCharCode(parseInt(octal, 8)));
+}
+
+function parseZRecords(stdout: string): string[] {
+  return stdout.split('\0').filter((entry) => entry.length > 0);
+}
+
+function normalizeRepoRelativePath(repoRoot: string, relativePath: string): string {
+  return nodePath.join(repoRoot, decodeGitPath(relativePath));
+}
+
+async function loadRepoGitStatusSnapshot(repoRoot: string, repoSignature: string): Promise<GitStatusSnapshot> {
+  const { stdout } = await execAsync('git status --porcelain=v1 -z -u', { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
+  const files: GitStatusFile[] = [];
+  const records = parseZRecords(stdout);
+  for (let idx = 0; idx < records.length; idx++) {
+    const record = records[idx];
+    const code = record.slice(0, 2).trim();
+    const firstPath = record.slice(3);
+    let logicalPath = firstPath;
+    if (code.startsWith('R') || code.startsWith('C')) {
+      const renamedTo = records[idx + 1];
+      if (renamedTo) {
+        logicalPath = renamedTo;
+        idx += 1;
+      }
+    }
+    files.push({ path: normalizeRepoRelativePath(repoRoot, logicalPath), code });
+  }
+  return { repoRoot, repoSignature, files };
+}
+
+async function getRepoGitStatusSnapshot(startPath: string): Promise<GitStatusSnapshot | null> {
+  const context = await resolveRepoContext(startPath);
+  if (!context) return null;
+  const cached = gitStatusCache.get(context.repoRoot);
+  if (cached && cached.expiresAt > Date.now() && cached.value.repoSignature === context.repoSignature) {
+    return cached.value;
+  }
+  const generation = getResourceGeneration(gitRepoGenerations, context.repoRoot);
+  const inflightKey = `${context.repoRoot}::${context.repoSignature}::${generation}`;
+  const inflight = gitStatusInflight.get(inflightKey);
+  if (inflight) return await inflight;
+  const promise = loadRepoGitStatusSnapshot(context.repoRoot, context.repoSignature)
+    .then(async (value) => {
+      const currentSignature = await getRepoSignature(context.repoRoot, context.gitDir);
+      if (getResourceGeneration(gitRepoGenerations, context.repoRoot) === generation && currentSignature === value.repoSignature) {
+        gitStatusCache.set(context.repoRoot, { value, expiresAt: Date.now() + GIT_STATUS_CACHE_TTL_MS });
+      }
+      return value;
+    })
+    .finally(() => {
+      gitStatusInflight.delete(inflightKey);
+    });
+  gitStatusInflight.set(inflightKey, promise);
+  return await promise;
+}
+
+async function loadRepoGitNumstatSnapshot(repoRoot: string, repoSignature: string): Promise<GitNumstatSnapshot> {
+  let stdout = '';
+  try {
+    ({ stdout } = await execAsync('git diff --numstat -z HEAD', { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }));
+  } catch {
+    try {
+      ({ stdout } = await execAsync('git diff --numstat -z', { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }));
+    } catch {
+      stdout = '';
+    }
+  }
+  const stats = new Map<string, { additions?: number; deletions?: number }>();
+  const records = parseZRecords(stdout);
+  for (let idx = 0; idx < records.length; idx++) {
+    const header = records[idx];
+    const firstTab = header.indexOf('\t');
+    const secondTab = firstTab >= 0 ? header.indexOf('\t', firstTab + 1) : -1;
+    if (firstTab < 0 || secondTab < 0) continue;
+    const additionsRaw = header.slice(0, firstTab);
+    const deletionsRaw = header.slice(firstTab + 1, secondTab);
+    const pathRaw = header.slice(secondTab + 1);
+    const additions = additionsRaw === '-' ? undefined : parseInt(additionsRaw, 10);
+    const deletions = deletionsRaw === '-' ? undefined : parseInt(deletionsRaw, 10);
+    let logicalPath = pathRaw;
+    if (pathRaw === '') {
+      const renamedTo = records[idx + 2];
+      if (!renamedTo) continue;
+      logicalPath = renamedTo;
+      idx += 2;
+    }
+    stats.set(normalizeRepoRelativePath(repoRoot, logicalPath), { additions, deletions });
+  }
+  return { repoRoot, repoSignature, stats };
+}
+
+async function getRepoGitNumstatSnapshot(startPath: string): Promise<GitNumstatSnapshot | null> {
+  const context = await resolveRepoContext(startPath);
+  if (!context) return null;
+  const cached = gitNumstatCache.get(context.repoRoot);
+  if (cached && cached.expiresAt > Date.now() && cached.value.repoSignature === context.repoSignature) {
+    return cached.value;
+  }
+  const generation = getResourceGeneration(gitRepoGenerations, context.repoRoot);
+  const inflightKey = `${context.repoRoot}::${context.repoSignature}::${generation}`;
+  const inflight = gitNumstatInflight.get(inflightKey);
+  if (inflight) return await inflight;
+  const promise = loadRepoGitNumstatSnapshot(context.repoRoot, context.repoSignature)
+    .then(async (value) => {
+      const currentSignature = await getRepoSignature(context.repoRoot, context.gitDir);
+      if (getResourceGeneration(gitRepoGenerations, context.repoRoot) === generation && currentSignature === value.repoSignature) {
+        gitNumstatCache.set(context.repoRoot, { value, expiresAt: Date.now() + GIT_STATUS_CACHE_TTL_MS });
+      }
+      return value;
+    })
+    .finally(() => {
+      gitNumstatInflight.delete(inflightKey);
+    });
+  gitNumstatInflight.set(inflightKey, promise);
+  return await promise;
+}
+
+async function loadFileGitDiffSnapshot(logicalPath: string, repoRoot: string, repoSignature: string, fileSignature: string): Promise<GitDiffSnapshot> {
+  let diff = '';
+  const repoRelativePath = nodePath.relative(repoRoot, logicalPath).split(nodePath.sep).join('/');
+  try {
+    const { stdout } = await execFileAsync('git', ['diff', 'HEAD', '--', repoRelativePath], { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
+    diff = stdout;
+  } catch { /* ignore */ }
+  if (!diff) {
+    try {
+      const { stdout } = await execFileAsync('git', ['diff', '--', repoRelativePath], { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
+      diff = stdout;
+    } catch { /* ignore */ }
+  }
+  return { logicalPath, repoRoot, repoSignature, fileSignature, diff };
+}
+
+async function getFileGitDiffSnapshot(logicalPath: string): Promise<GitDiffSnapshot | null> {
+  const context = await resolveRepoContext(nodePath.dirname(logicalPath));
+  if (!context) return null;
+  const fileSignature = await safeStatSignature(logicalPath);
+  const cached = gitDiffCache.get(logicalPath);
+  if (
+    cached
+    && cached.expiresAt > Date.now()
+    && cached.value.repoSignature === context.repoSignature
+    && cached.value.fileSignature === fileSignature
+  ) {
+    return cached.value;
+  }
+  const generation = getResourceGeneration(gitDiffGenerations, logicalPath);
+  const inflightKey = `${logicalPath}::${context.repoSignature}::${fileSignature}::${generation}`;
+  const inflight = gitDiffInflight.get(inflightKey);
+  if (inflight) return await inflight;
+  const promise = loadFileGitDiffSnapshot(logicalPath, context.repoRoot, context.repoSignature, fileSignature)
+    .then(async (value) => {
+      const currentContext = await resolveRepoContext(nodePath.dirname(logicalPath));
+      const currentFileSignature = await safeStatSignature(logicalPath);
+      if (
+        getResourceGeneration(gitDiffGenerations, logicalPath) === generation
+        && currentContext
+        && currentContext.repoSignature === value.repoSignature
+        && currentFileSignature === value.fileSignature
+      ) {
+        gitDiffCache.set(logicalPath, { value, expiresAt: Date.now() + GIT_DIFF_CACHE_TTL_MS });
+      }
+      return value;
+    })
+    .finally(() => {
+      gitDiffInflight.delete(inflightKey);
+    });
+  gitDiffInflight.set(inflightKey, promise);
+  return await promise;
+}
+
+function collectAffectedRepoRoots(targetPath: string): Set<string> {
+  const affected = new Set<string>();
+  for (const key of gitStatusCache.keys()) {
+    if (isPathInside(key, targetPath)) affected.add(key);
+  }
+  for (const key of gitNumstatCache.keys()) {
+    if (isPathInside(key, targetPath)) affected.add(key);
+  }
+  for (const key of gitStatusInflight.keys()) {
+    const repoRoot = key.split('::')[0] ?? '';
+    if (repoRoot && isPathInside(repoRoot, targetPath)) affected.add(repoRoot);
+  }
+  for (const key of gitNumstatInflight.keys()) {
+    const repoRoot = key.split('::')[0] ?? '';
+    if (repoRoot && isPathInside(repoRoot, targetPath)) affected.add(repoRoot);
+  }
+  for (const entry of repoContextCache.values()) {
+    const repoRoot = entry.value?.repoRoot;
+    if (repoRoot && isPathInside(repoRoot, targetPath)) affected.add(repoRoot);
+  }
+  return affected;
+}
+
+function invalidateGitCachesForPath(targetPath: string): void {
+  const normalized = normalizeFsPath(targetPath);
+  bumpResourceGeneration(fsReadGenerations, normalized);
+  bumpResourceGeneration(gitDiffGenerations, normalized);
+  for (const repoRoot of collectAffectedRepoRoots(normalized)) {
+    bumpResourceGeneration(gitRepoGenerations, repoRoot);
+  }
+  fsReadCache.delete(normalized);
+  gitDiffCache.delete(normalized);
+  for (const key of fsReadInflight.keys()) {
+    if (key.startsWith(`${normalized}::`)) fsReadInflight.delete(key);
+  }
+  for (const key of gitDiffInflight.keys()) {
+    if (key.startsWith(`${normalized}::`)) gitDiffInflight.delete(key);
+  }
+  for (const key of gitStatusCache.keys()) {
+    if (isPathInside(key, normalized)) gitStatusCache.delete(key);
+    if (isPathInside(key, normalized)) repoSignatureCache.delete(key);
+  }
+  for (const key of repoContextCache.keys()) {
+    if (isPathInside(key, normalized)) repoContextCache.delete(key);
+  }
+  for (const key of gitNumstatCache.keys()) {
+    if (isPathInside(key, normalized)) gitNumstatCache.delete(key);
+    if (isPathInside(key, normalized)) repoSignatureCache.delete(key);
+  }
+  for (const key of gitStatusInflight.keys()) {
+    if (isPathInside(key.split('::')[0] ?? '', normalized)) gitStatusInflight.delete(key);
+  }
+  for (const key of gitNumstatInflight.keys()) {
+    if (isPathInside(key.split('::')[0] ?? '', normalized)) gitNumstatInflight.delete(key);
+  }
+}
+
+export function __resetFsGitCachesForTests(): void {
+  fsReadCache.clear();
+  fsReadInflight.clear();
+  fsReadGenerations.clear();
+  repoContextCache.clear();
+  repoSignatureCache.clear();
+  gitStatusCache.clear();
+  gitStatusInflight.clear();
+  gitNumstatCache.clear();
+  gitNumstatInflight.clear();
+  gitDiffCache.clear();
+  gitDiffInflight.clear();
+  gitRepoGenerations.clear();
+  gitDiffGenerations.clear();
+}
+
+function filterRepoFilesForPath(files: GitStatusFile[], requestedPath: string): GitStatusFile[] {
+  return files.filter((file) => isPathInside(requestedPath, file.path));
 }
 
 /** fs.git_status — return git modified file list for a directory */
 async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawPath = cmd.path as string | undefined;
   const requestId = cmd.requestId as string | undefined;
+  const includeStats = cmd.includeStats === true;
   if (!rawPath || !requestId) return;
 
   const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
@@ -2677,32 +3237,14 @@ async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: Serve
       try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
       return;
     }
-
-    const { stdout } = await execAsync('git status --porcelain -u', { cwd: real, timeout: 5000 });
-    const files: Array<{ path: string; code: string; additions?: number; deletions?: number }> = [];
-    for (const line of stdout.split('\n')) {
-      if (!line.trim()) continue;
-      const code = line.slice(0, 2).trim();
-      const filePath = line.slice(3).trim().replace(/^"(.*)"$/, '$1'); // unquote if needed
-      files.push({ path: nodePath.join(real, filePath), code });
-    }
-    // Enrich with +/- line stats from git diff --numstat (best-effort)
-    try {
-      const { stdout: numstat } = await execAsync('git diff --numstat HEAD 2>/dev/null || git diff --numstat', { cwd: real, timeout: 5000 });
-      const statsMap = new Map<string, { add: number; del: number }>();
-      for (const line of numstat.split('\n')) {
-        const m = line.match(/^(\d+|-)\t(\d+|-)\t(.+)$/);
-        if (m) {
-          const add = m[1] === '-' ? 0 : parseInt(m[1], 10);
-          const del = m[2] === '-' ? 0 : parseInt(m[2], 10);
-          statsMap.set(nodePath.join(real, m[3].trim()), { add, del });
-        }
-      }
-      for (const f of files) {
-        const s = statsMap.get(f.path);
-        if (s) { f.additions = s.add; f.deletions = s.del; }
-      }
-    } catch { /* ignore — stats are best-effort */ }
+    const [snapshot, numstat] = await Promise.all([
+      getRepoGitStatusSnapshot(real),
+      includeStats ? getRepoGitNumstatSnapshot(real) : Promise.resolve(null),
+    ]);
+    const files = snapshot ? filterRepoFilesForPath(snapshot.files, real).map((file) => {
+      const stats = numstat?.stats.get(file.path);
+      return stats ? { ...file, ...stats } : file;
+    }) : [];
     try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', files }); } catch { /* ignore */ }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -2722,28 +3264,26 @@ async function handleFsGitDiff(cmd: Record<string, unknown>, serverLink: ServerL
   const resolved = nodePath.resolve(expanded);
 
   try {
-    const real = await fsRealpath(resolved);
-    const allowed = isPathAllowed(real);
+    let allowedProbe = resolved;
+    while (true) {
+      try {
+        allowedProbe = await fsRealpath(allowedProbe);
+        break;
+      } catch {
+        const parent = nodePath.dirname(allowedProbe);
+        if (parent === allowedProbe) throw new Error(`ENOENT: no such file or directory, realpath '${resolved}'`);
+        allowedProbe = parent;
+      }
+    }
+    const allowed = isPathAllowed(allowedProbe);
     if (!allowed) {
       try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
       return;
     }
-
-    const dir = nodePath.dirname(real);
-    // Try staged+unstaged diff vs HEAD; fall back to index diff; then untracked diff
-    let diff = '';
-    try {
-      const { stdout } = await execAsync(`git diff HEAD -- ${JSON.stringify(real)}`, { cwd: dir, timeout: 5000 });
-      diff = stdout;
-    } catch { /* ignore */ }
-    if (!diff) {
-      try {
-        const { stdout } = await execAsync(`git diff -- ${JSON.stringify(real)}`, { cwd: dir, timeout: 5000 });
-        diff = stdout;
-      } catch { /* ignore */ }
-    }
+    const snapshot = await getFileGitDiffSnapshot(resolved);
+    const diff = snapshot?.diff ?? '';
     // Untracked files: no diff (nothing meaningful to compare against)
-    try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', diff }); } catch { /* ignore */ }
+    try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, resolvedPath: resolved, status: 'ok', diff }); } catch { /* ignore */ }
   } catch (err) {
     try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
   }
@@ -2844,6 +3384,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       // Write the file
       await fsWriteFile(real, content, 'utf-8');
       const newStats = await fsStat(real);
+      invalidateGitCachesForPath(real);
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', mtime: newStats.mtimeMs }); } catch { /* ignore */ }
     } catch (err) {
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
@@ -2862,6 +3403,7 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
       await fsWriteFile(resolved, content, 'utf-8');
       const newStats = await fsStat(resolved);
       const real = await fsRealpath(resolved);
+      invalidateGitCachesForPath(real);
       try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', mtime: newStats.mtimeMs }); } catch { /* ignore */ }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

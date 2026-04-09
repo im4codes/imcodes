@@ -25,11 +25,14 @@ vi.mock('../../src/components/file-editor-lazy.js', () => ({
   FileEditorContent: () => null,
 }));
 
-import { FileBrowser } from '../../src/components/FileBrowser.js';
+import { FileBrowser, __resetFileBrowserSharedChangesForTests, mergePreviewState } from '../../src/components/FileBrowser.js';
 import type { WsClient, ServerMessage } from '../../src/ws-client.js';
 
-// Cleanup DOM after each test
-afterEach(cleanup);
+// Cleanup DOM/timers after each test
+afterEach(() => {
+  vi.useRealTimers();
+  cleanup();
+});
 
 // ── i18n stub ─────────────────────────────────────────────────────────────
 vi.mock('react-i18next', () => {
@@ -63,7 +66,7 @@ vi.mock('react-i18next', () => {
 // ── WsClient factory ──────────────────────────────────────────────────────
 
 function makeWsFactory() {
-  let messageHandler: ((msg: ServerMessage) => void) | null = null;
+  const messageHandlers = new Set<(msg: ServerMessage) => void>();
   let lastRequestId = 'mock-req-id';
   let lastSentPath = '';
   let lastSentIncludeFiles = false;
@@ -80,8 +83,8 @@ function makeWsFactory() {
 
   const ws: WsClient = {
     onMessage: (handler: (msg: ServerMessage) => void) => {
-      messageHandler = handler;
-      return () => { messageHandler = null; };
+      messageHandlers.add(handler);
+      return () => { messageHandlers.delete(handler); };
     },
     fsListDir,
     fsMkdir,
@@ -91,7 +94,7 @@ function makeWsFactory() {
   } as unknown as WsClient;
 
   const respond = (entries: Array<{ name: string; isDir: boolean; hidden?: boolean }>, resolvedPath?: string) => {
-    messageHandler?.({
+    for (const messageHandler of messageHandlers) messageHandler({
       type: 'fs.ls_response',
       requestId: lastRequestId,
       path: lastSentPath,
@@ -102,7 +105,7 @@ function makeWsFactory() {
   };
 
   const respondError = (error: string) => {
-    messageHandler?.({
+    for (const messageHandler of messageHandlers) messageHandler({
       type: 'fs.ls_response',
       requestId: lastRequestId,
       path: lastSentPath,
@@ -111,7 +114,9 @@ function makeWsFactory() {
     });
   };
 
-  const sendMsg = (msg: ServerMessage) => messageHandler?.(msg);
+  const sendMsg = (msg: ServerMessage) => {
+    for (const messageHandler of messageHandlers) messageHandler(msg);
+  };
 
   return { ws, fsListDir, fsMkdir, respond, respondError, sendMsg, getLastPath: () => lastSentPath, getIncludeFiles: () => lastSentIncludeFiles };
 }
@@ -119,6 +124,38 @@ function makeWsFactory() {
 describe('FileBrowser', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    __resetFileBrowserSharedChangesForTests();
+  });
+
+  it('does not regress an existing preview back to loading for the same file', () => {
+    const merged = mergePreviewState(
+      { status: 'ok', path: '/home/user/foo.ts', content: 'const x = 1;', diff: '+const x = 1;', diffHtml: '<div>diff</div>' },
+      { status: 'loading', path: '/home/user/foo.ts' },
+    );
+
+    expect(merged).toEqual({
+      status: 'ok',
+      path: '/home/user/foo.ts',
+      content: 'const x = 1;',
+      diff: '+const x = 1;',
+      diffHtml: '<div>diff</div>',
+    });
+  });
+
+  it('merges richer ok preview state for the same file without dropping existing diff data', () => {
+    const merged = mergePreviewState(
+      { status: 'ok', path: '/home/user/foo.ts', content: 'const x = 1;', diff: '+const x = 1;', diffHtml: '<div>diff</div>' },
+      { status: 'ok', path: '/home/user/foo.ts', content: 'const x = 2;' },
+    );
+
+    expect(merged).toEqual({
+      status: 'ok',
+      path: '/home/user/foo.ts',
+      content: 'const x = 2;',
+      diff: '+const x = 1;',
+      diffHtml: '<div>diff</div>',
+      downloadId: undefined,
+    });
   });
 
   // ── Layout ─────────────────────────────────────────────────────────────
@@ -468,6 +505,96 @@ describe('FileBrowser', () => {
     expect(document.querySelector('.fb-node-git-badge')).not.toBeNull();
   });
 
+  it('requests stats only for shared changes queries, not tree git badges', () => {
+    const { ws } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        onConfirm={vi.fn()}
+        changesRootPath="/home/user"
+        defaultTab="changes"
+      />,
+    );
+
+    expect(ws.fsGitStatus).toHaveBeenCalledWith('~');
+    expect(ws.fsGitStatus).toHaveBeenCalledWith('/home/user', { includeStats: true });
+  });
+
+  it('keeps subtree git status requests lightweight when expanding directories', async () => {
+    const { ws, respond } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      respond([{ name: 'projects', isDir: true }], '/home/user');
+    });
+
+    const dirEntry = await screen.findByText('projects');
+    await act(async () => { fireEvent.click(dirEntry); });
+
+    expect((ws.fsGitStatus as any).mock.calls).toEqual([
+      ['/home/user'],
+      ['/home/user/projects'],
+    ]);
+  });
+
+  it('does not refresh shared changes while files tab hides the changes panel', () => {
+    const { ws } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        onConfirm={vi.fn()}
+        changesRootPath="/home/user"
+        onPreviewFile={vi.fn()}
+        defaultTab="files"
+      />,
+    );
+
+    expect(ws.fsGitStatus).toHaveBeenCalledTimes(1);
+    expect(ws.fsGitStatus).toHaveBeenCalledWith('~');
+  });
+
+  it('does not render an embedded changes section in files view', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        changesRootPath="/home/user"
+        onConfirm={vi.fn()}
+        defaultTab="files"
+      />,
+    );
+
+    await act(async () => { respond([], '/home/user'); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [{ path: '/home/user/foo.ts', code: 'M' }],
+      });
+    });
+
+    expect(document.querySelector('.fb-changes-section')).toBeNull();
+    expect(document.querySelector('.fb-body-with-changes')).toBeNull();
+  });
+
   it('shows panel tabs when changesRootPath is provided', async () => {
     const { ws, respond } = makeWsFactory();
     render(
@@ -485,7 +612,9 @@ describe('FileBrowser', () => {
         changesRootPath="/home/user" onConfirm={vi.fn()} />,
     );
     await act(async () => { respond([], '/home/user'); });
-    // Simulate git changes response
+    // Click Changes tab (in .fb-panel-tabs)
+    const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
+    await act(async () => { fireEvent.click(changesTab); });
     await act(async () => {
       sendMsg({
         type: 'fs.git_status_response',
@@ -496,10 +625,84 @@ describe('FileBrowser', () => {
         files: [{ path: '/home/user/bar.ts', code: 'M' }],
       });
     });
-    // Click Changes tab (in .fb-panel-tabs)
+    expect(document.querySelector('.fb-changes-section')).not.toBeNull();
+  });
+
+  it('keeps the Changes list usable when stats are unavailable', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user"
+        changesRootPath="/home/user" onConfirm={vi.fn()} />,
+    );
+    await act(async () => { respond([], '/home/user'); });
     const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
     await act(async () => { fireEvent.click(changesTab); });
-    expect(document.querySelector('.fb-changes-section')).not.toBeNull();
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [{ path: '/home/user/bar.ts', code: 'M' }],
+      });
+    });
+    expect(document.querySelector('.fb-changes-item')).not.toBeNull();
+    expect(document.querySelector('.fb-changes-item-stats')).toBeNull();
+  });
+
+  it('shows + and - stats in the changes list when provided by git status', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user"
+        changesRootPath="/home/user" onConfirm={vi.fn()} />,
+    );
+    await act(async () => { respond([], '/home/user'); });
+    const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
+    await act(async () => { fireEvent.click(changesTab); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [{ path: '/home/user/bar.ts', code: 'M', additions: 7, deletions: 2 }],
+      } as any);
+    });
+    expect(document.querySelector('.fb-changes-item-stats')?.textContent).toContain('+7');
+    expect(document.querySelector('.fb-changes-item-stats')?.textContent).toContain('-2');
+  });
+
+  it('shares changes requests across file browsers on the same repo', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <div>
+        <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user/src"
+          changesRootPath="/home/user" onConfirm={vi.fn()} />
+        <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user/src"
+          changesRootPath="/home/user" onConfirm={vi.fn()} />
+      </div>,
+    );
+
+    await act(async () => { respond([], '/home/user/src'); });
+
+    const changeRequests = (ws.fsGitStatus as any).mock.calls.filter((call: any[]) => call[0] === '/home/user');
+    expect(changeRequests).toHaveLength(1);
+
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [{ path: '/home/user/bar.ts', code: 'M' }],
+      });
+    });
+
+    expect(document.querySelectorAll('.fb-panel-tab-badge')[0]?.textContent).toBe('1');
+    expect(document.querySelectorAll('.fb-panel-tab-badge')[1]?.textContent).toBe('1');
   });
 
   it('shows diff toggle button when diff is available', async () => {
@@ -594,10 +797,9 @@ describe('FileBrowser', () => {
     });
   });
 
-  it('pushes loaded preview state updates for externally hosted change previews', async () => {
+  it('does not start local preview fetches when using an external preview host', async () => {
     const { ws, respond, sendMsg } = makeWsFactory();
     const onPreviewFile = vi.fn();
-    const onPreviewStateChange = vi.fn();
     render(
       <FileBrowser
         ws={ws}
@@ -606,7 +808,6 @@ describe('FileBrowser', () => {
         initialPath="/home/user"
         changesRootPath="/home/user"
         onPreviewFile={onPreviewFile}
-        onPreviewStateChange={onPreviewStateChange}
         onConfirm={vi.fn()}
       />,
     );
@@ -629,28 +830,13 @@ describe('FileBrowser', () => {
     const changeItem = document.querySelector('.fb-changes-item') as HTMLElement;
     await act(async () => { fireEvent.click(changeItem); });
 
-    expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
-    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(0);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(0);
     expect(onPreviewFile).toHaveBeenLastCalledWith({
       path: '/home/user/foo.ts',
       preferDiff: true,
       preview: { status: 'loading', path: '/home/user/foo.ts' },
     });
-
-    await act(async () => {
-      sendMsg({ type: 'fs.read_response', requestId: 'mock-read-id', path: '/home/user/foo.ts', status: 'ok', content: 'const x = 1;' });
-      sendMsg({ type: 'fs.git_diff_response', requestId: 'mock-git-diff-id', path: '/home/user/foo.ts', status: 'ok', diff: '+const x = 1;' });
-    });
-
-    expect(onPreviewStateChange).toHaveBeenCalledWith(expect.objectContaining({
-      path: '/home/user/foo.ts',
-      preferDiff: true,
-      preview: expect.objectContaining({
-        status: 'ok',
-        path: '/home/user/foo.ts',
-        content: 'const x = 1;',
-      }),
-    }));
   });
 
   it('does not render an inline preview when an external preview host is provided', async () => {
@@ -685,14 +871,42 @@ describe('FileBrowser', () => {
 
     const changeItem = document.querySelector('.fb-changes-item') as HTMLElement;
     await act(async () => { fireEvent.click(changeItem); });
-    await act(async () => {
-      sendMsg({ type: 'fs.read_response', requestId: 'mock-read-id', path: '/home/user/foo.ts', status: 'ok', content: 'const x = 1;' });
-      sendMsg({ type: 'fs.git_diff_response', requestId: 'mock-git-diff-id', path: '/home/user/foo.ts', status: 'ok', diff: '+const x = 1;' });
-    });
 
     expect(onPreviewFile).toHaveBeenCalled();
     expect(document.querySelector('.fb-preview')).toBeNull();
     expect(document.querySelector('.fb-body-split')).toBeNull();
+    expect(document.querySelector('.fb-tree-split')).toBeNull();
+    expect(document.querySelector('.fb-resize-handle')).toBeNull();
+  });
+
+  it('does not change the source panel layout when opening external previews from the files list', async () => {
+    const { ws, respond } = makeWsFactory();
+    const onPreviewFile = vi.fn();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        onPreviewFile={onPreviewFile}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+
+    const fileEntry = await screen.findByText('foo.ts');
+    await act(async () => { fireEvent.click(fileEntry); });
+
+    expect(onPreviewFile).toHaveBeenCalledWith({
+      path: '/home/user/foo.ts',
+      preferDiff: false,
+      preview: { status: 'loading', path: '/home/user/foo.ts' },
+    });
+    expect(document.querySelector('.fb-preview')).toBeNull();
+    expect(document.querySelector('.fb-body-split')).toBeNull();
+    expect(document.querySelector('.fb-tree-split')).toBeNull();
+    expect(document.querySelector('.fb-resize-handle')).toBeNull();
   });
 
   it('hides the embedded changes section in files view when an external preview host is provided', async () => {
@@ -746,6 +960,252 @@ describe('FileBrowser', () => {
 
     expect((ws.fsReadFile as any).mock.calls).toHaveLength(0);
     expect((ws.fsGitDiff as any).mock.calls).toHaveLength(0);
+  });
+
+  it('fetches preview data when a floating preview is hydrated with a loading state', () => {
+    const { ws } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        initialPreview={{ status: 'loading', path: '/home/user/foo.ts' }}
+        autoPreviewPath="/home/user/foo.ts"
+        autoPreviewPreferDiff
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
+    expect((ws.fsReadFile as any).mock.calls[0]?.[0]).toBe('/home/user/foo.ts');
+    expect((ws.fsGitDiff as any).mock.calls[0]?.[0]).toBe('/home/user/foo.ts');
+  });
+
+  it('dispatches at most one current read/diff cycle per visible target', async () => {
+    const { ws, respond } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      respond([{ name: 'foo.ts', isDir: false }], '/home/user');
+    });
+
+    const fileEntry = await screen.findByText('foo.ts');
+    await act(async () => { fireEvent.click(fileEntry); });
+    await act(async () => { fireEvent.click(fileEntry); });
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
+    expect((ws.fsReadFile as any).mock.calls[0]?.[0]).toBe('/home/user/foo.ts');
+    expect((ws.fsGitDiff as any).mock.calls[0]?.[0]).toBe('/home/user/foo.ts');
+  });
+
+  it('does not let stale pending preview work delay a new auto-preview target', () => {
+    const { ws } = makeWsFactory();
+    (ws.fsReadFile as any)
+      .mockImplementationOnce(() => 'read-foo')
+      .mockImplementationOnce(() => 'read-bar');
+    (ws.fsGitDiff as any)
+      .mockImplementationOnce(() => 'diff-foo')
+      .mockImplementationOnce(() => 'diff-bar');
+
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/foo.ts"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    view.rerender(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/bar.ts"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect((ws.fsReadFile as any).mock.calls.map((call: any[]) => call[0])).toEqual([
+      '/home/user/foo.ts',
+      '/home/user/bar.ts',
+    ]);
+    expect((ws.fsGitDiff as any).mock.calls.map((call: any[]) => call[0])).toEqual([
+      '/home/user/foo.ts',
+      '/home/user/bar.ts',
+    ]);
+  });
+
+  it('clears stale preview-cycle ownership when the ws instance changes', () => {
+    const first = makeWsFactory();
+    (first.ws.fsReadFile as any).mockImplementationOnce(() => 'read-first');
+    (first.ws.fsGitDiff as any).mockImplementationOnce(() => 'diff-first');
+
+    const view = render(
+      <FileBrowser
+        ws={first.ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        initialPreview={{ status: 'loading', path: '/home/user/foo.ts' }}
+        autoPreviewPath="/home/user/foo.ts"
+        autoPreviewPreferDiff
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect((first.ws.fsReadFile as any).mock.calls).toHaveLength(1);
+    expect((first.ws.fsGitDiff as any).mock.calls).toHaveLength(1);
+
+    const second = makeWsFactory();
+    (second.ws.fsReadFile as any).mockImplementationOnce(() => 'read-second');
+    (second.ws.fsGitDiff as any).mockImplementationOnce(() => 'diff-second');
+
+    view.rerender(
+      <FileBrowser
+        ws={second.ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        initialPreview={{ status: 'loading', path: '/home/user/foo.ts' }}
+        autoPreviewPath="/home/user/foo.ts"
+        autoPreviewPreferDiff
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect((second.ws.fsReadFile as any).mock.calls).toHaveLength(1);
+    expect((second.ws.fsGitDiff as any).mock.calls).toHaveLength(1);
+    expect((second.ws.fsReadFile as any).mock.calls[0]?.[0]).toBe('/home/user/foo.ts');
+    expect((second.ws.fsGitDiff as any).mock.calls[0]?.[0]).toBe('/home/user/foo.ts');
+  });
+
+  it('ignores stale preview responses after switching to a new target', async () => {
+    const { ws, sendMsg } = makeWsFactory();
+    const onPreviewStateChange = vi.fn();
+    (ws.fsReadFile as any)
+      .mockImplementationOnce(() => 'read-foo')
+      .mockImplementationOnce(() => 'read-bar');
+    (ws.fsGitDiff as any)
+      .mockImplementationOnce(() => 'diff-foo')
+      .mockImplementationOnce(() => 'diff-bar');
+
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/foo.ts"
+        onPreviewStateChange={onPreviewStateChange}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    view.rerender(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/bar.ts"
+        onPreviewStateChange={onPreviewStateChange}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      sendMsg({ type: 'fs.read_response', requestId: 'read-foo', path: '/home/user/foo.ts', status: 'ok', content: 'old foo' });
+      sendMsg({ type: 'fs.git_diff_response', requestId: 'diff-foo', path: '/home/user/foo.ts', status: 'ok', diff: '+old foo' });
+    });
+
+    expect(onPreviewStateChange.mock.calls.at(-1)?.[0]).toMatchObject({
+      path: '/home/user/bar.ts',
+      preview: { status: 'loading', path: '/home/user/bar.ts' },
+    });
+
+    await act(async () => {
+      sendMsg({ type: 'fs.read_response', requestId: 'read-bar', path: '/home/user/bar.ts', status: 'ok', content: 'new bar' });
+      sendMsg({ type: 'fs.git_diff_response', requestId: 'diff-bar', path: '/home/user/bar.ts', status: 'ok', diff: '+new bar' });
+    });
+
+    expect(onPreviewStateChange.mock.calls.at(-1)?.[0]).toMatchObject({
+      path: '/home/user/bar.ts',
+      preview: { status: 'ok', path: '/home/user/bar.ts', content: 'new bar', diff: '+new bar' },
+    });
+  });
+
+  it('polls only for an active inline preview', async () => {
+    vi.useFakeTimers();
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/foo.ts"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+    await act(async () => {
+      sendMsg({ type: 'fs.read_response', requestId: 'mock-read-id', path: '/home/user/foo.ts', status: 'ok', content: 'const x = 1;' });
+      sendMsg({ type: 'fs.git_diff_response', requestId: 'mock-git-diff-id', path: '/home/user/foo.ts', status: 'ok', diff: '+const x = 1;' });
+    });
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
+
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+    });
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(2);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(2);
+    vi.useRealTimers();
+  });
+
+  it('does not poll local preview state for source instances that delegate to external previews', async () => {
+    vi.useFakeTimers();
+    const { ws } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        onPreviewFile={vi.fn()}
+        initialPreview={{ status: 'ok', path: '/home/user/foo.ts', content: 'const x = 1;' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(0);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(0);
+
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+    });
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(0);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(0);
+    vi.useRealTimers();
   });
 
   it('does not immediately reopen an auto-preview after the preview close button is pressed', async () => {

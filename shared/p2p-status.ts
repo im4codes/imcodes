@@ -5,6 +5,7 @@
  * server/web consumers, and expose richer parallel-hop progress through
  * additive fields.
  */
+import type { P2pHelperDiagnostic } from './p2p-advanced.js';
 
 export const P2P_RUN_STATUS_VALUES = [
   'queued',
@@ -175,6 +176,29 @@ export interface P2pRunUpdatePayload {
   hop_counts?: P2pHopCounts;
   completed_round_hops_count?: number;
   terminal_reason?: 'completed' | 'timed_out' | 'failed' | 'cancelled' | null;
+  advanced_p2p_enabled?: boolean;
+  current_round_id?: string | null;
+  current_execution_step?: number | null;
+  current_round_attempt?: number | null;
+  round_attempt_counts?: Record<string, number>;
+  round_jump_counts?: Record<string, number>;
+  routing_history?: Array<{
+    fromRoundId?: string | null;
+    toRoundId?: string | null;
+    trigger?: string | null;
+    atStep: number;
+    atAttempt?: number | null;
+    timestamp: number;
+  }>;
+  helper_diagnostics?: P2pHelperDiagnostic[];
+  advanced_nodes?: Array<{
+    id: string;
+    title: string;
+    preset?: string;
+    status: P2pProgressNodeStatus;
+    attempt?: number;
+    step?: number;
+  }>;
   [key: string]: unknown;
 }
 

@@ -5,66 +5,8 @@ import {
   type FileBrowserPreviewState,
   type FileBrowserPreviewUpdate,
 } from './components/FileBrowser.js';
-import { mapP2pStatusToUiState, type P2pActivePhase, type P2pProgressNodeStatus } from '@shared/p2p-status.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
-
-function mapP2pRunToDiscussion(r: Record<string, any>) {
-  const rawSnapshot = r.progress_snapshot;
-  const snapshot = typeof rawSnapshot === 'string'
-    ? (() => { try { return JSON.parse(rawSnapshot) as Record<string, any>; } catch { return {}; } })()
-    : (rawSnapshot ?? {});
-  const source = { ...r, ...snapshot } as Record<string, any>;
-  const id = `p2p_${source.id}`;
-  const status = String(source.status ?? '');
-  const state = mapP2pStatusToUiState(status);
-  const mode = source.mode_key ?? 'discuss';
-  const currentRoundMode = source.current_round_mode ?? mode;
-  const initiatorLabel = source.initiator_label ?? 'brain';
-  const currentTarget = source.current_target_label ?? (source.current_target_session ? String(source.current_target_session).split('_').pop() : undefined);
-  const totalCount = source.total_count ?? 3;
-  const totalHops = source.total_hops ?? Math.max(0, totalCount - 2);
-  const nodes = Array.isArray(source.all_nodes) ? source.all_nodes.map((n: any) => ({
-    session: typeof n.session === 'string' ? n.session : undefined,
-    label: String(n.label ?? ''),
-    displayLabel: String(n.displayLabel ?? n.display_label ?? n.label ?? ''),
-    agentType: String(n.agentType ?? ''),
-    ccPreset: n.ccPreset ?? n.cc_preset ?? null,
-    mode: typeof n.mode === 'string' ? n.mode : undefined,
-    phase: typeof n.phase === 'string' ? n.phase as 'initial' | 'hop' | 'summary' : undefined,
-    status: String(n.status ?? 'pending') as P2pProgressNodeStatus,
-  })) : undefined;
-  const hopStates = Array.isArray(source.hop_states) ? source.hop_states.map((hop: any) => ({
-    hopIndex: Number(hop.hop_index ?? 0),
-    roundIndex: Number(hop.round_index ?? 0),
-    session: typeof hop.session === 'string' ? hop.session : undefined,
-    mode: typeof hop.mode === 'string' ? hop.mode : undefined,
-    status: String(hop.status ?? 'queued') as 'queued' | 'dispatched' | 'running' | 'completed' | 'timed_out' | 'failed' | 'cancelled',
-  })) : undefined;
-  return {
-    id,
-    topic: `P2P ${mode} · ${initiatorLabel}`,
-    state,
-    modeKey: currentRoundMode,
-    currentRound: source.current_round ?? 1,
-    maxRounds: source.total_rounds ?? 1,
-    completedHops: source.completed_hops_count ?? 0,
-    completedRoundHops: typeof source.completed_round_hops_count === 'number' ? source.completed_round_hops_count : undefined,
-    totalHops,
-    activeHop: source.active_hop_number ?? null,
-    activeRoundHop: source.active_round_hop_number ?? null,
-    activePhase: (typeof source.active_phase === 'string' ? source.active_phase : 'queued') as P2pActivePhase,
-    initiatorLabel,
-    currentSpeaker: currentTarget,
-    conclusion: state === 'done' ? (source.result_summary ?? undefined) : undefined,
-    error: state === 'failed' ? (source.error ?? undefined) : undefined,
-    filePath: undefined,
-    fileId: source.discussion_id ? String(source.discussion_id) : source.id,
-    startedAt: source.created_at ? new Date(source.created_at).getTime() : undefined,
-    hopStartedAt: typeof source.hop_started_at === 'number' ? source.hop_started_at : undefined,
-    nodes,
-    hopStates,
-  };
-}
+import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate } from './p2p-run-mapping.js';
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
 import { LanguageSwitcher } from './components/LanguageSwitcher.js';
@@ -109,7 +51,7 @@ import { WsClient } from './ws-client.js';
 import { configure as configureApi, apiFetch, onAuthExpired, getUserPref, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { getAuthKey, clearAuthKey } from './biometric-auth.js';
-import { initPushNotifications } from './push-notifications.js';
+import { initPushNotifications, resetPushBadge } from './push-notifications.js';
 import { ServerSetupPage } from './pages/ServerSetupPage.js';
 import { NativeAuthBridge } from './pages/NativeAuthBridge.js';
 import type { SessionInfo, TerminalDiff } from './types.js';
@@ -122,6 +64,7 @@ import { extractTransportPendingMessages } from './transport-queue.js';
 import { ingestTimelineEventForCache } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
+import { getSelectedServerName } from './server-selection.js';
 
 // On web: if opened by the native app for passkey auth, render the bridge page.
 const nativeCallback = typeof window !== 'undefined'
@@ -252,6 +195,30 @@ export function App() {
     if (!selectedServerId) return;
     watchProjectionStore.beginServerSwitch(selectedServerId);
   }, [selectedServerId]);
+
+  useEffect(() => {
+    if (selectedServerId) {
+      localStorage.setItem('rcc_server', selectedServerId);
+      return;
+    }
+    localStorage.removeItem('rcc_server');
+  }, [selectedServerId]);
+
+  const resolvedSelectedServerName = useMemo(
+    () => getSelectedServerName(selectedServerId, servers, selectedServerName),
+    [selectedServerId, selectedServerName, servers],
+  );
+
+  useEffect(() => {
+    if (!selectedServerId || servers.length === 0) return;
+    if (resolvedSelectedServerName === selectedServerName) return;
+    setSelectedServerName(resolvedSelectedServerName);
+    if (resolvedSelectedServerName) {
+      localStorage.setItem('rcc_server_name', resolvedSelectedServerName);
+      return;
+    }
+    localStorage.removeItem('rcc_server_name');
+  }, [resolvedSelectedServerName, selectedServerId, selectedServerName, servers.length]);
 
   useEffect(() => {
     let cleanup = () => {};
@@ -409,6 +376,21 @@ export function App() {
     });
   }, [auth]);
 
+  // Native: clear server-side push badge whenever the app becomes visible with
+  // a valid auth context. AppDelegate also tries via JS bridge, but that can
+  // fire before the web bundle is ready, leaving badge_count stale.
+  useEffect(() => {
+    if (!auth || !isNative()) return;
+    void resetPushBadge();
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void resetPushBadge();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [auth]);
+
   // When session expires mid-session (refresh failed), clear auth and show login.
   // Registered once so any apiFetch 401 after refresh failure lands here.
   useEffect(() => {
@@ -522,16 +504,8 @@ export function App() {
     try {
       const data = await apiFetch<{ servers: ServerInfo[] }>('/api/server');
       setServers(data.servers);
-      // Populate selected server name if missing
-      if (selectedServerId) {
-        const found = data.servers.find((s) => s.id === selectedServerId);
-        if (found && !selectedServerName) {
-          localStorage.setItem('rcc_server_name', found.name);
-          setSelectedServerName(found.name);
-        }
-      }
     } catch { /* ignore */ }
-  }, [auth, selectedServerId, selectedServerName]);
+  }, [auth]);
 
   useEffect(() => { loadServers(); }, [loadServers]);
 
@@ -1158,8 +1132,7 @@ export function App() {
         }
       }
       if (msg.type === 'session_list') {
-        const watchServerName = servers.find((server) => server.id === selectedServerId)?.name
-          ?? selectedServerName
+        const watchServerName = resolvedSelectedServerName
           ?? selectedServerId;
         // Build sub-session inputs from app state (daemon filters them from session_list)
         // Use ref to avoid stale closure — subSessions state may not be in useEffect deps
@@ -1472,7 +1445,7 @@ export function App() {
         setDiscussions((prev) => {
           const existing = prev.find((d) => d.id === entry.id);
           return existing
-            ? prev.map((d) => d.id === entry.id ? { ...d, ...entry } : d)
+            ? prev.map((d) => d.id === entry.id ? mergeP2pDiscussionUpdate(d, entry) : d)
             : [...prev, entry];
         });
 
@@ -1502,7 +1475,7 @@ export function App() {
           const merged = [...retained];
           for (const entry of mapped) {
             const idx = merged.findIndex((d) => d.id === entry.id);
-            if (idx >= 0) merged[idx] = { ...merged[idx], ...entry };
+            if (idx >= 0) merged[idx] = mergeP2pDiscussionUpdate(merged[idx], entry);
             else merged.push(entry);
           }
           return merged;
@@ -2337,7 +2310,7 @@ export function App() {
                 serverId: selectedServerId ?? '',
                 subSessions,
                 inputRefsMap,
-                onPreviewFile: (request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: true }),
+                onPreviewFile: (request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false }),
                 onPreviewStateChange: handlePreviewStateChange,
                 activeSession,
                 activeProjectDir: activeSessionInfo?.projectDir,
@@ -2465,7 +2438,7 @@ export function App() {
                   class="mobile-server-btn"
                   onClick={() => setShowMobileServerMenu((o) => !o)}
                 >
-                  {selectedServerName ?? 'Server'} ▾
+                  {resolvedSelectedServerName ?? 'Server'} ▾
                 </button>
                 {showMobileServerMenu && (
                   <>

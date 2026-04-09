@@ -140,8 +140,8 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     }
     const extra: Record<string, unknown> = {};
     if (desc) extra.description = desc;
-    if (ccPreset && (type === 'claude-code' || type === 'claude-code-sdk')) extra.ccPreset = ccPreset;
-    if (ccInitPrompt.trim() && (type === 'claude-code' || type === 'claude-code-sdk')) extra.ccInitPrompt = ccInitPrompt.trim();
+    if (ccPreset && (type === 'claude-code' || type === 'qwen')) extra.ccPreset = ccPreset;
+    if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
     if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'qwen') extra.thinking = thinking;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
@@ -155,7 +155,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
       : type === 'openclaw'
         ? OPENCLAW_THINKING_LEVELS
         : [];
-  const supportsCcPreset = type === 'claude-code' || type === 'claude-code-sdk';
+  const supportsCcPreset = type === 'claude-code' || type === 'qwen';
 
   return (
     <div class="dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>

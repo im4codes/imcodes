@@ -4,6 +4,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, within } from '@testing-library/preact';
+import { useState } from 'preact/hooks';
+
+const DEFAULT_INNER_WIDTH = 1280;
 
 if (!HTMLElement.prototype.scrollIntoView) {
   HTMLElement.prototype.scrollIntoView = vi.fn();
@@ -44,6 +47,12 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.transport_send_queued_collapsed') {
         return `${opts?.count ?? 0} queued · showing latest only`;
       }
+      if (key === 'session.send_placeholder') {
+        return `Send to ${String(opts?.name ?? 'session')}…`;
+      }
+      if (key === 'session.send_placeholder_desktop_upload') {
+        return `${String(opts?.placeholder ?? '')} Supports fast multi-file paste upload`;
+      }
       if (key === 'common.hide') return 'hide';
       if (key === 'common.show') return 'show';
       const parts = key.split('.');
@@ -74,6 +83,51 @@ vi.mock('../../src/components/VoiceInput.js', () => ({
   isAvailable: () => true,
 }));
 
+vi.mock('../../src/components/AtPicker.js', () => ({
+  AtPicker: ({ visible, onSelectAllConfig, onSelectAgent, p2pConfig, sessions, rootSession }: {
+    visible: boolean;
+    onSelectAllConfig?: (config: unknown, rounds: number, modeOverride: string) => void;
+    onSelectAgent?: (session: string, mode: string) => void;
+    p2pConfig?: { rounds?: number } | null;
+    sessions?: Array<{ name: string; label?: string | null; parentSession?: string | null; isSelf?: boolean }>;
+    rootSession?: string | null;
+  }) => {
+    const [stage, setStage] = useState<'root' | 'agents' | { session: string }>('root');
+    if (!visible) return null;
+    const visibleAgents = (sessions ?? []).filter((entry) => {
+      const sameRoot = (entry.parentSession ?? entry.name) === rootSession || entry.name === rootSession;
+      return sameRoot;
+    });
+    if (stage === 'root') {
+      return (
+        <div>
+          <button onClick={() => onSelectAllConfig?.(p2pConfig, p2pConfig?.rounds ?? 1, 'config')}>mock-select-all-config</button>
+          <button>files</button>
+          <button onClick={() => setStage('agents')}>agents</button>
+        </div>
+      );
+    }
+    if (stage === 'agents') {
+      return (
+        <div>
+          {visibleAgents.map((entry) => (
+            <button key={entry.name} onClick={() => setStage({ session: entry.name })}>
+              {entry.label ?? entry.name}
+            </button>
+          ))}
+        </div>
+      );
+    }
+    return (
+      <div>
+        {['audit', 'discuss', 'review', 'plan', 'brainstorm'].map((mode) => (
+          <button key={mode} onClick={() => onSelectAgent?.(stage.session, mode)}>{mode}</button>
+        ))}
+      </div>
+    );
+  },
+}));
+
 const uploadFileMock = vi.fn();
 const getUserPrefMock = vi.fn().mockResolvedValue(null);
 const saveUserPrefMock = vi.fn().mockResolvedValue(undefined);
@@ -87,6 +141,21 @@ import { SessionControls } from '../../src/components/SessionControls.js';
 import type { SessionInfo } from '../../src/types.js';
 
 const flushAsync = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+const TEST_OPENSPEC_ADVANCED_ROUNDS = [
+  {
+    id: 'initial_audit',
+    mode: 'audit',
+    rounds: 1,
+    summaryMode: 'append',
+  },
+  {
+    id: 'implementation_plan',
+    mode: 'plan',
+    rounds: 1,
+    summaryMode: 'append',
+  },
+] as const;
 
 const makeWs = () => {
   const handlers = new Set<(msg: unknown) => void>();
@@ -146,9 +215,10 @@ const subSession = (name: string, label: string): SessionInfo =>
   });
 
 describe('SessionControls', () => {
-  afterEach(() => {
-    cleanup();
-  });
+afterEach(() => {
+  cleanup();
+  Object.defineProperty(window, 'innerWidth', { configurable: true, value: DEFAULT_INNER_WIDTH });
+});
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -173,6 +243,115 @@ describe('SessionControls', () => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
     expect(screen.getByRole('textbox')).toBeDefined();
     expect(screen.getByRole('button', { name: /send/i })).toBeDefined();
+  });
+
+  it('keeps openspec through p2p settings controls visible in compact card mode', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ projectDir: '/tmp/project' })}
+        quickData={makeQuickData() as any}
+        compact
+      />,
+    );
+    expect(screen.getByText('OpenSpec')).toBeDefined();
+    expect(screen.getByText('P2P')).toBeDefined();
+    expect(screen.getByLabelText('settings_button')).toBeDefined();
+    expect(document.querySelector('.shortcuts')).toBeNull();
+  });
+
+  it('reports card overlay state when compact dropdowns open', () => {
+    const onOverlayOpenChange = vi.fn();
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ projectDir: '/tmp/project' })}
+        quickData={makeQuickData() as any}
+        compact
+        onOverlayOpenChange={onOverlayOpenChange}
+      />,
+    );
+
+    fireEvent.click(screen.getByText('OpenSpec'));
+    expect(onOverlayOpenChange).toHaveBeenLastCalledWith(true);
+    expect(document.querySelector('.menu-dropdown-openspec')).toBeTruthy();
+
+    fireEvent.mouseDown(document.body);
+    expect(onOverlayOpenChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it('shows the desktop upload hint in the placeholder on desktop', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: DEFAULT_INNER_WIDTH });
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project… Supports fast multi-file paste upload');
+  });
+
+  it('keeps the placeholder short on mobile', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project…');
+  });
+
+  it('hides the send button on mobile and shows the embedded voice button when empty', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    expect(screen.queryByRole('button', { name: /send/i })).toBeNull();
+    expect(document.querySelector('.btn-voice-embedded')).toBeTruthy();
+    expect(screen.getByTitle('voice_input')).toBeDefined();
+  });
+
+  it('hides the embedded voice button after typing on mobile', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'hello';
+    fireEvent.input(input);
+    expect(document.querySelector('.btn-voice-embedded')).toBeNull();
+  });
+
+  it('sends on Enter on mobile without a send button', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'run tests';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      sessionName: 'my-session',
+      text: 'run tests',
+    });
+  });
+
+  it('bottom-aligns side buttons on mobile once the composer grows past two lines', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    const { container } = render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    Object.defineProperty(input, 'clientHeight', { configurable: true, value: 32 });
+    Object.defineProperty(input, 'scrollHeight', { configurable: true, value: 84 });
+    input.textContent = 'hello world';
+    fireEvent.input(input);
+    expect(container.querySelector('.controls-mobile-multiline')).toBeTruthy();
+  });
+
+  it('does not show the mobile expand button until the composer exceeds two lines', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
+    expect(screen.queryByRole('button', { name: 'expand composer' })).toBeNull();
+  });
+
+  it('places the mobile expand button above the quick trigger and expands the composer', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    const { container } = render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    Object.defineProperty(input, 'clientHeight', { configurable: true, value: 32 });
+    Object.defineProperty(input, 'scrollHeight', { configurable: true, value: 84 });
+    fireEvent.input(input);
+    const expandButton = screen.getByRole('button', { name: 'expand composer' });
+    expect(expandButton.className).toContain('btn-input-expand-floating');
+    fireEvent.click(expandButton);
+    expect(container.querySelector('.controls-composer-mobile-expanded')).toBeTruthy();
+    expect(container.querySelector('.controls-composer-backdrop')).toBeTruthy();
   });
 
   it('renders menu button (⋯)', () => {
@@ -232,6 +411,69 @@ describe('SessionControls', () => {
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
       sessionName: 'my-session',
       text: 'run tests',
+    });
+  });
+
+  it('sends advanced p2p config fields when config mode is used', async () => {
+    const ws = makeWs();
+    getUserPrefMock.mockImplementation(async (key: unknown) => {
+      if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
+        const sessionKey = key.slice('p2p_session_config:'.length);
+        return JSON.stringify({
+          sessions: {
+            [sessionKey]: { enabled: true, mode: 'audit' },
+            'deck_sub_abc': { enabled: true, mode: 'review' },
+          },
+          rounds: 3,
+          advancedPresetKey: 'openspec',
+          advancedRounds: TEST_OPENSPEC_ADVANCED_ROUNDS,
+          advancedRunTimeoutMinutes: 45,
+          contextReducer: {
+            mode: 'clone_sdk_session',
+            templateSession: sessionKey,
+          },
+        });
+      }
+      return null;
+    });
+
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    await flushAsync();
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = '@';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByText('mock-select-all-config'));
+
+    input.textContent = `${input.textContent} ship it`;
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /^send$/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      sessionName: 'my-session',
+      text: 'ship it',
+      p2pAtTargets: [
+        { session: '__all__', mode: 'config' },
+      ],
+      p2pSessionConfig: {
+        'my-session': { enabled: true, mode: 'audit' },
+        'deck_sub_abc': { enabled: true, mode: 'review' },
+      },
+      p2pRounds: 3,
+      p2pAdvancedPresetKey: 'openspec',
+      p2pAdvancedRounds: TEST_OPENSPEC_ADVANCED_ROUNDS,
+      p2pAdvancedRunTimeoutMinutes: 45,
+      p2pContextReducer: {
+        mode: 'clone_sdk_session',
+        templateSession: 'my-session',
+      },
+      p2pLocale: 'en',
     });
   });
 
@@ -684,12 +926,48 @@ describe('SessionControls', () => {
       fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
 
       const dropdown = document.querySelector('.menu-dropdown-openspec') as HTMLElement;
+      expect(dropdown.style.position).toBe('fixed');
+      expect(dropdown.style.bottom).toBe('584px');
       expect(dropdown.style.maxHeight).toBe('208px');
     } finally {
       rectSpy.mockRestore();
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: innerWidth });
       Object.defineProperty(window, 'innerHeight', { configurable: true, value: innerHeight });
     }
+  });
+
+  it('raises openspec dropdowns above surrounding cards on desktop', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    const dropdown = document.querySelector('.menu-dropdown-openspec') as HTMLElement;
+    expect(dropdown).toBeTruthy();
+    expect(dropdown.style.position).toBe('fixed');
+    expect(dropdown.style.zIndex).toBe('2147483646');
+
+    fireEvent.click(screen.getByRole('button', { name: 'audit_action' }));
+
+    const submenu = document.querySelector('.openspec-submenu') as HTMLElement;
+    expect(submenu).toBeTruthy();
+    expect(submenu.style.zIndex).toBe('2147483647');
   });
 
   it('collapses openspec actions behind a disclosure toggle on mobile', async () => {
@@ -724,6 +1002,81 @@ describe('SessionControls', () => {
 
       expect(screen.getByRole('button', { name: 'implement_action' })).toBeDefined();
       expect(screen.getByRole('button', { name: 'collapse change-a' })).toBeDefined();
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: innerWidth });
+    }
+  });
+
+  it('keeps the openspec audit submenu inside the mobile viewport', async () => {
+    const innerWidth = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+
+    try {
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+      ws.emit({
+        type: 'fs.ls_response',
+        requestId: 'openspec-request',
+        status: 'ok',
+        resolvedPath: '/repo/openspec/changes',
+        entries: [
+          { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+        ],
+      });
+      await flushAsync();
+
+      fireEvent.click(screen.getByRole('button', { name: 'expand change-a' }));
+      fireEvent.click(screen.getByRole('button', { name: 'audit_action' }));
+
+      const submenu = document.querySelector('.openspec-submenu') as HTMLElement;
+      expect(submenu).toBeTruthy();
+      expect(submenu.style.position).toBe('fixed');
+      expect(submenu.style.left).toBe('8px');
+      expect(submenu.style.right).toBe('8px');
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: innerWidth });
+    }
+  });
+
+  it('keeps the openspec propose submenu inside the mobile viewport', async () => {
+    const innerWidth = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+
+    try {
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+      ws.emit({
+        type: 'fs.ls_response',
+        requestId: 'openspec-request',
+        status: 'ok',
+        resolvedPath: '/repo/openspec/changes',
+        entries: [],
+      });
+      await flushAsync();
+
+      fireEvent.click(screen.getByRole('button', { name: 'propose_action' }));
+
+      const submenu = document.querySelector('.openspec-submenu') as HTMLElement;
+      expect(submenu).toBeTruthy();
+      expect(submenu.style.position).toBe('fixed');
+      expect(submenu.style.left).toBe('8px');
+      expect(submenu.style.right).toBe('8px');
     } finally {
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: innerWidth });
     }
@@ -1246,7 +1599,20 @@ describe('SessionControls', () => {
 
   // ── File upload tests ─────────────────────────────────────────────────────
 
-  it('shows upload button when serverId is provided', () => {
+  it('shows upload button in compact card composer when serverId is provided', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession()}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+        compact
+      />,
+    );
+    expect(screen.getByTitle('upload_file')).toBeDefined();
+  });
+
+  it('shows upload button in regular chat composer when serverId is provided', () => {
     render(
       <SessionControls
         ws={makeWs() as any}
@@ -1258,15 +1624,16 @@ describe('SessionControls', () => {
     expect(screen.getByTitle('upload_file')).toBeDefined();
   });
 
-  it('does not show upload button when serverId is missing', () => {
+  it('does not show desktop paste-upload hint in compact card composer', () => {
     render(
       <SessionControls
         ws={makeWs() as any}
         activeSession={makeSession()}
         quickData={makeQuickData() as any}
+        compact
       />,
     );
-    expect(screen.queryByTitle('upload_file')).toBeNull();
+    expect(document.querySelector('.controls-input')?.getAttribute('data-placeholder')).toBe('Send to my-project…');
   });
 
   // TODO: fix — file upload mock doesn't trigger state update in jsdom

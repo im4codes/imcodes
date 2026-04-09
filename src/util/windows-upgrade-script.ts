@@ -60,23 +60,62 @@ echo upgrade > "%UPGRADE_LOCK%"\r
 echo Upgrade lock created >> "%LOG_FILE%"\r
 \r
 rem ── Kill daemon + old watchdog so npm can overwrite files cleanly ─────\r
-rem Old watchdog versions don't know about the lock file, so we must kill\r
-rem them.  After npm install, repair-watchdog generates a new watchdog\r
-rem that respects the lock.\r
+rem Three failure modes we must handle:\r
+rem   1. Healthy daemon — kill PIDFILE and parent watchdog tree\r
+rem   2. Daemon crashed but watchdog still spamming an error in a tight\r
+rem      loop because the OLD watchdog.cmd had a UTF-8 BOM and/or no\r
+rem      'call' prefix (cmd.exe quoted-command parse rule).  In this case\r
+rem      there is NO daemon.pid but the watchdog cmd.exe processes are\r
+rem      still running.  We must find them by command-line pattern.\r
+rem   3. Multiple watchdog instances (race after past upgrades)\r
+rem Tree-kill EVERY cmd.exe whose command line references daemon-watchdog.\r
+rem This catches both the healthy case and the crash-loop case.\r
+echo Killing all daemon-watchdog cmd.exe processes... >> "%LOG_FILE%"\r
+rem Try PowerShell first (works on Windows 11 / Server 2025 where wmic is\r
+rem deprecated/removed), fall back to wmic for legacy Windows installs.\r
+rem CRITICAL: write the PowerShell script to a .ps1 file rather than passing\r
+rem it via -Command "..." — nested double quotes inside a -Command argument\r
+rem get truncated by cmd.exe→powershell command-line parsing.\r
+set "PS_SCRIPT=%SCRIPT_DIR%\\find-stale-watchdog.ps1"\r
+> "%PS_SCRIPT%" echo Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" ^| Where-Object { $_.CommandLine -like '*daemon-watchdog*' } ^| ForEach-Object { $_.ProcessId }\r
+for /f "usebackq delims=" %%w in (\`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%PS_SCRIPT%" 2^>nul\`) do (\r
+  set "STALE_WD=%%w"\r
+  set "STALE_WD=!STALE_WD: =!"\r
+  if defined STALE_WD if not "!STALE_WD!"=="" (\r
+    echo   tree-killing watchdog PID !STALE_WD! ^(via powershell^) >> "%LOG_FILE%"\r
+    taskkill /f /t /pid !STALE_WD! >nul 2>&1\r
+  )\r
+)\r
+rem Fallback for systems where powershell returns nothing (or is unavailable).\r
+for /f "tokens=2 delims==" %%w in ('wmic process where "Name='cmd.exe' and CommandLine like '%%daemon-watchdog%%'" get ProcessId /format:list 2^>nul ^| find "="') do (\r
+  set "STALE_WD=%%w"\r
+  set "STALE_WD=!STALE_WD: =!"\r
+  if defined STALE_WD if not "!STALE_WD!"=="" (\r
+    echo   tree-killing watchdog PID !STALE_WD! ^(via wmic^) >> "%LOG_FILE%"\r
+    taskkill /f /t /pid !STALE_WD! >nul 2>&1\r
+  )\r
+)\r
+rem Also kill the daemon directly if PIDFILE has a fresh value.\r
 set "PIDFILE=%USERPROFILE%\\.imcodes\\daemon.pid"\r
 if exist "%PIDFILE%" (\r
   set /p OLD_PID=<"%PIDFILE%"\r
-  echo Stopping daemon PID !OLD_PID! and old watchdog... >> "%LOG_FILE%"\r
-  rem Find watchdog (parent of daemon) and tree-kill it\r
-  for /f "tokens=2 delims==" %%a in ('wmic process where "ProcessId=!OLD_PID!" get ParentProcessId /format:list 2^>nul ^| find "="') do (\r
-    set "WD_PID=%%a"\r
+  if defined OLD_PID if not "!OLD_PID!"=="" (\r
+    echo Stopping daemon PID !OLD_PID!... >> "%LOG_FILE%"\r
+    taskkill /f /pid !OLD_PID! >nul 2>&1\r
   )\r
-  if defined WD_PID (\r
-    taskkill /f /t /pid !WD_PID! >nul 2>&1\r
-  )\r
-  taskkill /f /pid !OLD_PID! >nul 2>&1\r
-  timeout /t 2 /nobreak >nul\r
 )\r
+rem Belt-and-suspenders: if the watchdog file itself has a BOM (the bug we\r
+rem just fixed), the new repair-watchdog step below will overwrite it with\r
+rem clean bytes.  Until then, prevent the freshly-killed watchdog from being\r
+rem respawned by anyone (e.g. a scheduled task) by leaving the lock in place.\r
+timeout /t 2 /nobreak >nul\r
+\r
+if defined NODE_OPTIONS (\r
+  set "NODE_OPTIONS=%NODE_OPTIONS% --max-old-space-size=16384"\r
+) else (\r
+  set "NODE_OPTIONS=--max-old-space-size=16384"\r
+)\r
+echo Using NODE_OPTIONS=%NODE_OPTIONS% >> "%LOG_FILE%"\r
 \r
 echo Installing ${pkgSpec}... >> "%LOG_FILE%"\r
 call "${npmCmd}" install -g ${pkgSpec} >> "%LOG_FILE%" 2>&1\r

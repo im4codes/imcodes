@@ -76,6 +76,8 @@ interface Props {
   compact?: boolean;
   /** Notifies parent when the quick input panel opens/closes. */
   onQuickOpenChange?: (open: boolean) => void;
+  /** Notifies parent when any floating overlay/dropdown is open. */
+  onOverlayOpenChange?: (open: boolean) => void;
 }
 
 type MenuAction = 'restart' | 'new' | 'stop';
@@ -127,6 +129,13 @@ function getP2pMenuItemColor(mode: string, active: boolean): string {
   return getP2pModeColor(mode);
 }
 
+type OptionalP2pAdvancedConfig = {
+  advancedPresetKey?: unknown;
+  advancedRounds?: unknown;
+  advancedRunTimeoutMinutes?: unknown;
+  contextReducer?: unknown;
+};
+
 interface PendingAtTarget {
   session: string;
   mode: string;
@@ -165,6 +174,16 @@ type ManualP2pResolveResult = {
 };
 
 type P2pConfigTab = 'participants' | 'combos';
+
+function appendOptionalAdvancedP2pConfig(extra: Record<string, unknown>, config: P2pSavedConfig): void {
+  const advanced = config as P2pSavedConfig & OptionalP2pAdvancedConfig;
+  if (advanced.advancedPresetKey) extra.p2pAdvancedPresetKey = advanced.advancedPresetKey;
+  if (advanced.advancedRounds) extra.p2pAdvancedRounds = advanced.advancedRounds;
+  if (advanced.advancedRunTimeoutMinutes != null) {
+    extra.p2pAdvancedRunTimeoutMinutes = advanced.advancedRunTimeoutMinutes;
+  }
+  if (advanced.contextReducer) extra.p2pContextReducer = advanced.contextReducer;
+}
 
 // Enter moved after ↓ arrow
 const SHORTCUTS: Array<{ label: string; title: string; data: string; wide?: boolean }> = [
@@ -266,7 +285,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking: _activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange }: Props) {
+export function SessionControls({ ws, activeSession, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking: _activeThinking, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, onQuickOpenChange, onOverlayOpenChange }: Props) {
   const { t, i18n } = useTranslation();
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
@@ -299,6 +318,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
   const [qwenModel, setQwenModel] = useState<QwenModelChoice | null>(loadQwenModel);
   const [queuedHintExpanded, setQueuedHintExpanded] = useState(loadQueuedHintExpanded);
+  const [mobileComposerMultiline, setMobileComposerMultiline] = useState(false);
+  const [mobileComposerExpanded, setMobileComposerExpanded] = useState(false);
   const [confirm, setConfirm] = useState<MenuAction | null>(null);
   const [confirmLevel, setConfirmLevel] = useState(0); // 0=none, 1=first warning, 2=second warning (sub-session only)
   const [skipComboSendConfirm, setSkipComboSendConfirm] = useState(false);
@@ -485,6 +506,24 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return () => onQuickOpenChange?.(false);
   }, [onQuickOpenChange, quickOpen]);
 
+  const overlayOpen = quickOpen
+    || menuOpen
+    || modelOpen
+    || thinkingOpen
+    || atPickerOpen
+    || p2pOpen
+    || p2pConfigOpen
+    || openSpecOpen
+    || openSpecAuditMenu !== null
+    || openSpecProposeMenuOpen
+    || voiceOpen
+    || !!mobileFileBrowserOpen;
+
+  useEffect(() => {
+    onOverlayOpenChange?.(overlayOpen);
+    return () => onOverlayOpenChange?.(false);
+  }, [mobileFileBrowserOpen, onOverlayOpenChange, overlayOpen]);
+
   useEffect(() => {
     const syncQueuedHintExpanded = () => setQueuedHintExpanded(loadQueuedHintExpanded());
     const handleStorage = (event: StorageEvent) => {
@@ -563,6 +602,21 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return !text.includes('\n');
   };
 
+  const syncMobileComposerMetrics = useCallback(() => {
+    if (typeof window === 'undefined' || window.innerWidth > 640) {
+      setMobileComposerMultiline(false);
+      return;
+    }
+    const root = divRef.current;
+    if (!root) return;
+    const computed = window.getComputedStyle(root);
+    const lineHeight = Number.parseFloat(computed.lineHeight || '') || 20;
+    const verticalPadding = (Number.parseFloat(computed.paddingTop || '') || 0)
+      + (Number.parseFloat(computed.paddingBottom || '') || 0);
+    const multilineThreshold = (lineHeight * 2) + verticalPadding + 4;
+    setMobileComposerMultiline(root.scrollHeight > multilineThreshold);
+  }, []);
+
   const fillInput = (text: string) => {
     if (divRef.current) {
       divRef.current.textContent = text;
@@ -576,6 +630,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       divRef.current.focus();
     }
     setHasText(!!text.trim());
+    syncMobileComposerMetrics();
   };
 
   const appendToInput = (paths: string[]) => {
@@ -593,6 +648,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       divRef.current.focus();
     }
     setHasText(true);
+    syncMobileComposerMetrics();
   };
 
   const toComposerReference = useCallback((path: string) => {
@@ -644,7 +700,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     const availableHeight = Math.max(96, Math.floor(rect.top - 12));
     if (window.innerWidth > 640) {
       return {
+        position: 'fixed',
+        right: Math.max(window.innerWidth - rect.right, 8),
+        bottom: Math.max(window.innerHeight - rect.top + 4, 8),
         maxHeight: `${availableHeight}px`,
+        zIndex: 2147483646,
       } as const;
     }
     return {
@@ -655,7 +715,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       width: 'auto',
       maxWidth: 'none',
       maxHeight: `${availableHeight}px`,
-      zIndex: 10001,
+      zIndex: 2147483646,
     } as const;
   }, [openSpecLayoutTick, openSpecOpen]);
 
@@ -663,6 +723,42 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     () => typeof window !== 'undefined' && window.innerWidth <= 640,
     [openSpecLayoutTick, openSpecOpen],
   );
+
+  const openSpecAuditDropdownStyle = isOpenSpecMobile
+    ? {
+        position: 'fixed',
+        left: 8,
+        right: 8,
+        bottom: 72,
+        minWidth: 0,
+        width: 'auto',
+        maxWidth: 'none',
+        zIndex: 2147483647,
+      } as const
+    : {
+        right: 0,
+        bottom: 'calc(100% + 6px)',
+        minWidth: 180,
+        zIndex: 2147483647,
+      } as const;
+
+  const openSpecProposeDropdownStyle = isOpenSpecMobile
+    ? {
+        position: 'fixed',
+        left: 8,
+        right: 8,
+        bottom: 72,
+        minWidth: 0,
+        width: 'auto',
+        maxWidth: 'none',
+        zIndex: 2147483647,
+      } as const
+    : {
+        right: 0,
+        bottom: 'calc(100% + 6px)',
+        minWidth: 220,
+        zIndex: 2147483647,
+      } as const;
 
   useEffect(() => {
     if (!openSpecOpen || typeof window === 'undefined') return;
@@ -795,6 +891,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     extra.p2pRounds = selection.rounds;
     if (selection.config.extraPrompt) extra.p2pExtraPrompt = selection.config.extraPrompt;
     if (selection.config.hopTimeoutMinutes != null) extra.p2pHopTimeoutMs = Math.min(selection.config.hopTimeoutMinutes * 60_000, 600_000);
+    if (mode === P2P_CONFIG_MODE) appendOptionalAdvancedP2pConfig(extra, selection.config);
   }, [p2pSavedConfig]);
 
   const buildSendPayload = useCallback((options?: string | BuildSendPayloadOptions): PendingSendPayload | null => {
@@ -836,6 +933,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           extra.p2pRounds = override?.rounds ?? cfg.rounds ?? 1;
           if (cfg.extraPrompt) extra.p2pExtraPrompt = cfg.extraPrompt;
           if (cfg.hopTimeoutMinutes != null) extra.p2pHopTimeoutMs = Math.min(cfg.hopTimeoutMinutes * 60_000, 600_000);
+          if (!override?.modeOverride || override.modeOverride === P2P_CONFIG_MODE) appendOptionalAdvancedP2pConfig(extra, cfg);
         }
         // For non-config mode overrides (single or combo), send as p2pMode so the daemon uses it
         if (override?.modeOverride && override.modeOverride !== 'config') {
@@ -916,6 +1014,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       pendingConfigOverrideRef.current = null;
       if (divRef.current) divRef.current.textContent = '';
       setHasText(false);
+      setMobileComposerExpanded(false);
+      setMobileComposerMultiline(false);
       setAttachments([]);
       if (quotes && quotes.length > 0) {
         for (let i = quotes.length - 1; i >= 0; i--) onRemoveQuote?.(i);
@@ -1252,7 +1352,28 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     });
   }, []);
 
-  const placeholder = !hasSession ? t('session.no_session') : !connected ? t('session.send_queued') : t('session.send_placeholder', { name: sessionDisplayName ?? activeSession?.label ?? activeSession?.project ?? 'session' });
+  const isMobileLayout = typeof window !== 'undefined' && window.innerWidth <= 640;
+  const showEmbeddedVoiceButton = isMobileLayout && VoiceInput.isAvailable() && !hasText;
+  const showCompactMetaControls = !!(openSpecChangesPath || isClaudeCode || isCodex || isQwen || supportsThinking || !isShellLike);
+  const basePlaceholder = !hasSession
+    ? t('session.no_session')
+    : !connected
+      ? t('session.send_queued')
+      : t('session.send_placeholder', { name: sessionDisplayName ?? activeSession?.label ?? activeSession?.project ?? 'session' });
+  const placeholder = !hasSession || !connected || isMobileLayout
+    ? basePlaceholder
+    : compact
+      ? basePlaceholder
+      : t('session.send_placeholder_desktop_upload', { placeholder: basePlaceholder });
+
+  useEffect(() => {
+    if (!isMobileLayout) {
+      setMobileComposerExpanded(false);
+      setMobileComposerMultiline(false);
+      return;
+    }
+    syncMobileComposerMetrics();
+  }, [hasText, isMobileLayout, syncMobileComposerMetrics]);
 
   return (
     <>
@@ -1282,10 +1403,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         />
       </div>
     )}
-    <div class={`controls-wrapper${showRunningSweep ? ' controls-wrapper-running' : ''}`}>
-      {/* Shortcut row — hidden in chat mode and compact mode */}
-      {!hideShortcuts && !compact && <div class="shortcuts-row">
-        <div class="shortcuts">
+    <div class={`controls-wrapper${showRunningSweep ? ' controls-wrapper-running' : ''}${mobileComposerExpanded ? ' controls-wrapper-mobile-expanded' : ''}`}>
+      {/* Header control row — compact mode keeps meta controls but still hides terminal shortcuts */}
+      {!hideShortcuts && (!compact || showCompactMetaControls) && <div class="shortcuts-row">
+        {!compact && <div class="shortcuts">
           {/* Quick input trigger — shown here (before Esc) when shell terminal hides input row */}
           {isShellLike && (
             <button
@@ -1319,7 +1440,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               {s.label}
             </button>
           ))}
-        </div>
+        </div>}
 
         {/* Model selector — outside overflow-x scroll area so dropdown isn't clipped */}
         {openSpecChangesPath && (
@@ -1407,7 +1528,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                           {t('openspec.audit_action')}
                         </button>
                         {openSpecAuditMenu === changeName && (
-                          <div class="menu-dropdown" style={{ right: 0, bottom: 'calc(100% + 6px)', minWidth: 180 }}>
+                          <div class="menu-dropdown openspec-submenu" style={openSpecAuditDropdownStyle}>
                             <button
                               class="menu-item"
                               onClick={() => {
@@ -1478,7 +1599,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                       {t('openspec.propose_action')}
                     </button>
                     {openSpecProposeMenuOpen && (
-                      <div class="menu-dropdown" style={{ right: 0, bottom: 'calc(100% + 6px)', minWidth: 220 }}>
+                      <div class="menu-dropdown openspec-submenu" style={openSpecProposeDropdownStyle}>
                         <button
                           class="menu-item"
                           onClick={() => {
@@ -1758,9 +1879,22 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       )}
 
       {/* Main input row */}
-      <div class="controls">
+      <div class={`controls${isMobileLayout && mobileComposerMultiline ? ' controls-mobile-multiline' : ''}`}>
         {/* Quick input trigger — left of input */}
         <div class="qp-trigger-wrap" ref={quickWrapRef}>
+          {isMobileLayout && (mobileComposerMultiline || mobileComposerExpanded) && (
+            <button
+              class="btn btn-input-expand btn-input-expand-floating"
+              onClick={() => {
+                setMobileComposerExpanded((prev) => !prev);
+                setTimeout(() => divRef.current?.focus(), 0);
+              }}
+              title={mobileComposerExpanded ? 'collapse composer' : 'expand composer'}
+              aria-label={mobileComposerExpanded ? 'collapse composer' : 'expand composer'}
+            >
+              {mobileComposerExpanded ? '✕' : '⤢'}
+            </button>
+          )}
           <button
             class="qp-trigger"
             title={t('quick_input.title')}
@@ -1902,69 +2036,85 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           contenteditable div — iOS does NOT show the password/keychain autofill bar
           for contenteditable elements, unlike <input> or <textarea>.
         */}
-        <div
-          ref={divRef}
-          class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}`}
-          data-onboarding="chat-input"
-          contenteditable={inputDisabled ? 'false' : 'true'}
-          role="textbox"
-          aria-multiline="true"
-          aria-label="Message input"
-          data-placeholder={placeholder}
-          spellcheck={false}
-          style={p2pMode !== 'solo' ? { borderColor: getP2pModeColor(p2pMode), boxShadow: `0 0 0 1px ${getP2pModeColor(p2pMode)}40` } : undefined}
-          onFocus={handleFocus}
-          onInput={() => {
-            const currentText = divRef.current?.textContent ?? '';
-            setHasText(!!currentText.trim());
-            if (sendWarning) clearSendWarning();
-            if (atSelectionLockRef.current && currentText !== atSelectionSnapshotRef.current) {
-              atSelectionLockRef.current = false;
-              atSelectionSnapshotRef.current = currentText;
-            }
-            // Detect @/@@: use end of text (contentEditable anchorOffset is unreliable)
-            const text = currentText;
+        {mobileComposerExpanded && <div class="controls-composer-backdrop" onClick={() => setMobileComposerExpanded(false)} />}
+        <div class={`controls-composer${showEmbeddedVoiceButton ? ' controls-composer-with-voice' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}`}>
+          <div
+            ref={divRef}
+            class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${showEmbeddedVoiceButton ? ' controls-input-with-trailing' : ''}`}
+            data-onboarding="chat-input"
+            contenteditable={inputDisabled ? 'false' : 'true'}
+            role="textbox"
+            aria-multiline="true"
+            aria-label="Message input"
+            data-placeholder={placeholder}
+            spellcheck={false}
+            enterkeyhint={isMobileLayout ? 'send' : undefined}
+            style={p2pMode !== 'solo' ? { borderColor: getP2pModeColor(p2pMode), boxShadow: `0 0 0 1px ${getP2pModeColor(p2pMode)}40` } : undefined}
+            onFocus={handleFocus}
+            onInput={() => {
+              const currentText = divRef.current?.textContent ?? '';
+              setHasText(!!currentText.trim());
+              syncMobileComposerMetrics();
+              if (sendWarning) clearSendWarning();
+              if (atSelectionLockRef.current && currentText !== atSelectionSnapshotRef.current) {
+                atSelectionLockRef.current = false;
+                atSelectionSnapshotRef.current = currentText;
+              }
+              // Detect @/@@: use end of text (contentEditable anchorOffset is unreliable)
+              const text = currentText;
 
-            // @@ → jump straight to agents picker
-            const doubleAt = text.match(/@@([^\s]*)$/);
-            if (doubleAt) {
-              setAtPickerOpen(true);
-              setAtPickerStage('agents');
-              setAtQuery(doubleAt[1]);
-            } else {
-              // Single @ → choose stage (files + agents menu)
-              const singleAt = text.match(/@([^\s@]*)$/);
-              if (singleAt) {
-                const query = singleAt[1];
-                if (!atPickerOpen) {
-                  if (query.length === 0) {
-                    setAtPickerOpen(true);
-                    setAtPickerStage('choose');
-                    setAtQuery('');
+              // @@ → jump straight to agents picker
+              const doubleAt = text.match(/@@([^\s]*)$/);
+              if (doubleAt) {
+                setAtPickerOpen(true);
+                setAtPickerStage('agents');
+                setAtQuery(doubleAt[1]);
+              } else {
+                // Single @ → choose stage (files + agents menu)
+                const singleAt = text.match(/@([^\s@]*)$/);
+                if (singleAt) {
+                  const query = singleAt[1];
+                  if (!atPickerOpen) {
+                    if (query.length === 0) {
+                      setAtPickerOpen(true);
+                      setAtPickerStage('choose');
+                      setAtQuery('');
+                    } else {
+                      setAtPickerOpen(false);
+                    }
+                  } else if (atPickerStage === 'choose') {
+                    if (query.length === 0) {
+                      setAtPickerOpen(true);
+                      setAtQuery('');
+                    } else {
+                      setAtPickerOpen(false);
+                    }
                   } else {
-                    setAtPickerOpen(false);
-                  }
-                } else if (atPickerStage === 'choose') {
-                  if (query.length === 0) {
                     setAtPickerOpen(true);
-                    setAtQuery('');
-                  } else {
-                    setAtPickerOpen(false);
+                    setAtQuery(query);
                   }
                 } else {
-                  setAtPickerOpen(true);
-                  setAtQuery(query);
+                  setAtPickerOpen(false);
+                  setAtPickerStage('choose');
+                  setAtQuery('');
                 }
-              } else {
-                setAtPickerOpen(false);
-                setAtPickerStage('choose');
-                setAtQuery('');
               }
-            }
-          }}
-          onKeyDown={handleKeyDown}
-          onPaste={handlePaste}
-        />
+            }}
+            onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
+          />
+          {showEmbeddedVoiceButton && (
+            <button
+              class="btn btn-voice btn-voice-embedded"
+              onClick={() => setVoiceOpen(true)}
+              disabled={inputDisabled}
+              title={t('voice.voice_input')}
+              aria-label={t('voice.voice_input')}
+            >
+              🎙
+            </button>
+          )}
+        </div>
         {serverId && (
           <>
             <input
@@ -1988,7 +2138,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             </button>
           </>
         )}
-        {VoiceInput.isAvailable() && (
+        {!isMobileLayout && VoiceInput.isAvailable() && (
           <button
             class="btn btn-voice"
             onClick={() => setVoiceOpen(true)}
@@ -1998,13 +2148,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             🎙
           </button>
         )}
-        <button
-          class="btn btn-primary"
-          onClick={handleSend}
-          disabled={inputDisabled || (!hasText && attachments.length === 0) || !connected}
-        >
-          {t('common.send')}
-        </button>
+        {!isMobileLayout && (
+          <button
+            class="btn btn-primary"
+            onClick={handleSend}
+            disabled={inputDisabled || (!hasText && attachments.length === 0) || !connected}
+          >
+            {t('common.send')}
+          </button>
+        )}
         {/* Config mode: show gear to open settings panel inline with send row */}
         {p2pMode === P2P_CONFIG_MODE && (
           <button

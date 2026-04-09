@@ -71,6 +71,11 @@ export async function resolvePresetEnv(presetName: string, ccSessionId?: string)
   const preset = await getPreset(presetName);
   if (!preset) return {};
   const env = { ...preset.env };
+  // Backward compatibility: older saved presets used ANTHROPIC_AUTH_TOKEN,
+  // while current Claude CLI/SDK auth reads ANTHROPIC_API_KEY in bare env mode.
+  if (env['ANTHROPIC_AUTH_TOKEN'] && !env['ANTHROPIC_API_KEY']) {
+    env['ANTHROPIC_API_KEY'] = env['ANTHROPIC_AUTH_TOKEN'];
+  }
   // Auto-fill model aliases from ANTHROPIC_MODEL
   if (env['ANTHROPIC_MODEL']) {
     for (const alias of MODEL_ALIASES) {
@@ -85,6 +90,87 @@ export async function resolvePresetEnv(presetName: string, ccSessionId?: string)
   }
   logger.debug({ preset: presetName, keys: Object.keys(env) }, 'Resolved CC preset env');
   return env;
+}
+
+export async function getPresetTransportOverrides(presetName: string): Promise<{
+  model?: string;
+  systemPrompt?: string;
+}> {
+  const preset = await getPreset(presetName);
+  if (!preset) return {};
+  const env = await resolvePresetEnv(presetName);
+  const configuredModel = env['ANTHROPIC_MODEL']?.trim() || undefined;
+  const configuredBaseUrl = env['ANTHROPIC_BASE_URL']?.trim() || undefined;
+  const runtimeFacts = [
+    `Authoritative runtime fact: this session is using the Claude Code preset "${preset.name}".`,
+    configuredBaseUrl ? `Authoritative provider endpoint: ${configuredBaseUrl}.` : undefined,
+    configuredModel ? `Authoritative runtime model: ${configuredModel}.` : undefined,
+    configuredModel ? `If the user asks which model you are using, answer exactly with "${configuredModel}".` : 'If the user asks which model or provider you are using, answer with the authoritative runtime facts above.',
+    configuredBaseUrl ? `If the user asks which provider or endpoint you are using, mention "${configuredBaseUrl}".` : undefined,
+    'These runtime facts override any generic Claude Code tool schema, enum, or default.',
+    'Do not answer with Sonnet, Opus, Haiku, or any inferred Claude default unless that exact value matches the authoritative runtime model above.',
+  ].filter(Boolean).join(' ');
+  return {
+    ...(configuredModel ? { model: configuredModel } : {}),
+    ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),
+  };
+}
+
+export async function getQwenPresetTransportConfig(presetName: string): Promise<{
+  env: Record<string, string>;
+  settings?: Record<string, unknown>;
+  model?: string;
+}> {
+  const preset = await getPreset(presetName);
+  if (!preset) return { env: {} };
+
+  const resolvedEnv = await resolvePresetEnv(presetName);
+  const model = resolvedEnv['ANTHROPIC_MODEL']?.trim() || undefined;
+  const baseUrl = resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || undefined;
+  const apiKey = resolvedEnv['ANTHROPIC_API_KEY']?.trim()
+    || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()
+    || undefined;
+
+  const env: Record<string, string> = {};
+  if (baseUrl) env['ANTHROPIC_BASE_URL'] = baseUrl;
+  if (apiKey) env['ANTHROPIC_API_KEY'] = apiKey;
+  if (model) env['ANTHROPIC_MODEL'] = model;
+
+  const settings: Record<string, unknown> | undefined = (baseUrl && apiKey && model)
+    ? {
+        security: {
+          auth: {
+            selectedType: 'anthropic',
+          },
+        },
+        model: {
+          name: model,
+        },
+        modelProviders: {
+          anthropic: [
+            {
+              id: model,
+              name: preset.name,
+              envKey: 'ANTHROPIC_API_KEY',
+              baseUrl,
+              ...(preset.contextWindow
+                ? {
+                    generationConfig: {
+                      contextWindowSize: preset.contextWindow,
+                    },
+                  }
+                : {}),
+            },
+          ],
+        },
+      }
+    : undefined;
+
+  return {
+    env,
+    ...(settings ? { settings } : {}),
+    ...(model ? { model } : {}),
+  };
 }
 
 /** Default init message for non-Anthropic providers (no native web search). */

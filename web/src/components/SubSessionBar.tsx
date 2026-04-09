@@ -155,8 +155,8 @@ function CollapsedSubSessionButton({ sub, isOpen, idleFlashToken, usage, inP2p, 
 export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, onClose, onRestart, onNew, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, discussions = [], onStopDiscussion, ws, connected, onDiff, onHistory, serverId, subUsages, focusedSubId, quickData, sessions, allSubSessions, p2pSessionLabels }: Props) {
   const { t } = useTranslation();
   const [layout, setLayout] = useState<Layout>(() => load('rcc_subcard_layout', 'single'));
-  const [collapsed, setCollapsed] = useState(isMobile);
-  const [p2pHidden, setP2pHidden] = useState(false);
+  const [collapsed, setCollapsed] = useState(() => load('rcc_subcard_collapsed', isMobile));
+  const [p2pHidden, setP2pHidden] = useState(() => load('rcc_subcard_p2p_hidden', false));
   const [showSizePanel, setShowSizePanel] = useState(false);
   const [cardSize, setCardSize] = useState<CardSize>(() => load('rcc_subcard_size', DEFAULT_SIZE));
   const [draftW, setDraftW] = useState(String(cardSize.w));
@@ -170,6 +170,7 @@ export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, o
   // Touch-drag state for collapsed bar (persists across re-renders)
   const touchDragRef = useRef<{ id: string | null; active: boolean; timer: ReturnType<typeof setTimeout> | null }>({ id: null, active: false, timer: null });
   const collapsedBarRef = useRef<HTMLDivElement | null>(null);
+  const expandedScrollRef = useRef<HTMLDivElement | null>(null);
 
   // Reset drag order only when session membership changes (add/remove),
   // NOT on state updates (idle/running) which just change the array reference.
@@ -193,6 +194,14 @@ export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, o
   orderedSessionsRef.current = orderedSessions;
   const dragOrderRef = useRef(dragOrder);
   dragOrderRef.current = dragOrder;
+
+  useEffect(() => {
+    save('rcc_subcard_collapsed', collapsed);
+  }, [collapsed]);
+
+  useEffect(() => {
+    save('rcc_subcard_p2p_hidden', p2pHidden);
+  }, [p2pHidden]);
 
   // Touch-based reorder for collapsed bar — must use addEventListener({ passive: false })
   // so touchmove can preventDefault (passive listeners can't).
@@ -270,6 +279,53 @@ export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, o
       el.removeEventListener('contextmenu', onContext);
     };
   }, [collapsed, syncOrderToServer]);
+
+  useEffect(() => {
+    const installHorizontalEdgeGuard = (el: HTMLDivElement | null) => {
+      if (!el) return () => {};
+      let startX = 0;
+      let startY = 0;
+
+      const onTouchStart = (e: TouchEvent) => {
+        const touch = e.touches[0];
+        if (!touch) return;
+        startX = touch.clientX;
+        startY = touch.clientY;
+      };
+
+      const onTouchMove = (e: TouchEvent) => {
+        const touch = e.touches[0];
+        if (!touch) return;
+        const dx = touch.clientX - startX;
+        const dy = touch.clientY - startY;
+        if (Math.abs(dx) < 6 || Math.abs(dx) <= Math.abs(dy)) return;
+        const maxScrollLeft = Math.max(0, el.scrollWidth - el.clientWidth);
+        if (maxScrollLeft <= 0) {
+          e.preventDefault();
+          return;
+        }
+        const atStart = el.scrollLeft <= 0;
+        const atEnd = el.scrollLeft >= maxScrollLeft - 1;
+        if ((atStart && dx > 0) || (atEnd && dx < 0)) {
+          e.preventDefault();
+        }
+      };
+
+      el.addEventListener('touchstart', onTouchStart, { passive: true });
+      el.addEventListener('touchmove', onTouchMove, { passive: false });
+      return () => {
+        el.removeEventListener('touchstart', onTouchStart);
+        el.removeEventListener('touchmove', onTouchMove);
+      };
+    };
+
+    const cleanupCollapsed = installHorizontalEdgeGuard(collapsedBarRef.current);
+    const cleanupExpanded = installHorizontalEdgeGuard(expandedScrollRef.current);
+    return () => {
+      cleanupCollapsed();
+      cleanupExpanded();
+    };
+  }, [collapsed, layout, orderedSessions.length]);
 
   useEffect(() => {
     if (!ws) return;
@@ -477,6 +533,7 @@ export function SubSessionBar({ subSessions, openIds, idleFlashTokens, onOpen, o
       {/* Expanded: preview cards (all platforms) */}
       {!collapsed && orderedSessions.length > 0 && (
         <div
+          ref={expandedScrollRef}
           class={`subcard-scroll ${layout === 'double' ? 'subcard-double' : 'subcard-single'}`}
           style={layout === 'double' ? { gridAutoColumns: 'max-content' } : undefined}
         >

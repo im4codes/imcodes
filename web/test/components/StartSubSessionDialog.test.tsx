@@ -109,7 +109,7 @@ describe('StartSubSessionDialog', () => {
     expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, { thinking: 'high' });
   });
 
-  it('shows CC preset controls and passes preset for claude-code-sdk sub-sessions', () => {
+  it('does not show CC preset controls for claude-code-sdk sub-sessions', () => {
     const onStart = vi.fn();
     const ws = makeWs();
     ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
@@ -134,6 +134,35 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
+    expect(screen.queryByText('API Provider')).toBeNull();
+  });
+
+  it('shows CC preset controls and passes preset for qwen sub-sessions', () => {
+    const onStart = vi.fn();
+    const ws = makeWs();
+    ws.onMessage.mockImplementation((handler: (msg: unknown) => void) => {
+      handler({
+        type: 'cc.presets.list_response',
+        presets: [
+          { name: 'MiniMax', env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' } },
+        ],
+      });
+      return () => {};
+    });
+
+    render(
+      <StartSubSessionDialog
+        ws={ws as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
     expect(screen.getByText('API Provider')).toBeDefined();
     const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
       .find((select) => Array.from(select.options).some((option) => option.value === 'MiniMax'));
@@ -141,7 +170,7 @@ describe('StartSubSessionDialog', () => {
     fireEvent.change(presetSelect!, { target: { value: 'MiniMax' } });
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
-    expect(onStart).toHaveBeenCalledWith('claude-code-sdk', undefined, '/tmp', undefined, {
+    expect(onStart).toHaveBeenCalledWith('qwen', undefined, '/tmp', undefined, {
       ccPreset: 'MiniMax',
       thinking: 'high',
     });

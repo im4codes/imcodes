@@ -114,6 +114,10 @@ export interface SessionConfig {
   label?: string;
   /** Persona/system prompt injection — used for session description/role. */
   description?: string;
+  /** Runtime/system prompt injection that should not be surfaced as user-facing description. */
+  systemPrompt?: string;
+  /** Provider-specific SDK/CLI settings object or settings file path. */
+  settings?: string | Record<string, unknown>;
   /** Parent session key for sub-sessions. */
   parentSessionKey?: string;
   /** If binding to an already-existing remote session, use this key directly. */
@@ -176,6 +180,14 @@ export interface SessionInfoUpdate {
   quotaUsageLabel?: string;
   /** Current reasoning/thinking effort, if known. */
   effort?: TransportEffortLevel;
+}
+
+/** Provider-reported transient execution status (e.g. compacting). */
+export interface ProviderStatusUpdate {
+  /** Machine-readable transient status. Null clears any previously active status. */
+  status: string | null;
+  /** Human-readable label shown in the footer/status line. Null clears the label. */
+  label?: string | null;
 }
 
 // ── TransportProvider interface ─────────────────────────────────────────────
@@ -283,6 +295,12 @@ export interface TransportProvider {
    * Used by SDK-backed providers that learn durable resume IDs after the first turn.
    */
   onSessionInfo?(cb: (sessionId: string, info: SessionInfoUpdate) => void): () => void;
+
+  /**
+   * Register a callback for transient provider status changes (e.g. compacting).
+   * Used by SDK-backed providers that can surface phases before a final response arrives.
+   */
+  onStatus?(cb: (sessionId: string, status: ProviderStatusUpdate) => void): () => void;
 
   /**
    * Register a callback for approval requests from the agent.

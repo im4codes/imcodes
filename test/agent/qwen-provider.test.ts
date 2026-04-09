@@ -139,6 +139,51 @@ describe('QwenProvider', () => {
     });
   });
 
+  it('merges provided qwen settings with reasoning settings', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-preset',
+      cwd: '/tmp/project',
+      effort: 'high',
+      agentId: 'MiniMax-M2.7',
+      settings: {
+        security: { auth: { selectedType: 'anthropic' } },
+        model: { name: 'MiniMax-M2.7' },
+        modelProviders: {
+          anthropic: [
+            {
+              id: 'MiniMax-M2.7',
+              envKey: 'ANTHROPIC_API_KEY',
+              baseUrl: 'https://api.minimax.io/anthropic',
+            },
+          ],
+        },
+      },
+    });
+
+    await provider.send('sess-preset', 'hello');
+    const first = lastSpawn();
+    const settingsPath = first.env?.QWEN_CODE_SYSTEM_SETTINGS_PATH;
+    expect(typeof settingsPath).toBe('string');
+    expect(JSON.parse(await readFile(String(settingsPath), 'utf8'))).toEqual({
+      security: { auth: { selectedType: 'anthropic' } },
+      model: {
+        name: 'MiniMax-M2.7',
+        generationConfig: { reasoning: { effort: 'high' } },
+      },
+      modelProviders: {
+        anthropic: [
+          {
+            id: 'MiniMax-M2.7',
+            envKey: 'ANTHROPIC_API_KEY',
+            baseUrl: 'https://api.minimax.io/anthropic',
+          },
+        ],
+      },
+    });
+  });
+
   it('uses --session-id on first send, streams cumulative deltas, then resumes with --resume', async () => {
     const provider = new QwenProvider();
     await provider.connect({});
@@ -183,6 +228,51 @@ describe('QwenProvider', () => {
     expect(second.args).toContain('--resume');
     expect(second.args).toContain('sess-1');
     expect(second.args).not.toContain('--session-id');
+  });
+
+  it('falls back to a fresh session when --resume points to a missing qwen conversation id', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-resume-fallback',
+      cwd: '/tmp/project',
+    });
+
+    const completed: string[] = [];
+    const resumeIds: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(String(msg.content)));
+    provider.onSessionInfo?.((_sid, info) => {
+      if (typeof info.resumeId === 'string') resumeIds.push(info.resumeId);
+    });
+
+    await provider.send('sess-resume-fallback', 'hello');
+    const first = lastSpawn();
+    first.child.stdout.write(`${JSON.stringify({ type: 'system', subtype: 'session_start', session_id: 'sess-resume-fallback' })}\n`);
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-1', content: [{ type: 'text', text: 'Hello' }] } })}\n`);
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    await provider.send('sess-resume-fallback', 'again');
+    const second = childProcessMock.spawned[1];
+    expect(second?.args).toContain('--resume');
+    second?.child.stderr.write('No saved session found with ID sess-resume-fallback\n');
+    second?.child.emit('close', 1, null);
+    await waitForSpawnCount(3);
+
+    const third = childProcessMock.spawned[2];
+    expect(third?.args).toContain('--session-id');
+    expect(third?.args).not.toContain('--resume');
+    const sessionIdIndex = third?.args.indexOf('--session-id') ?? -1;
+    expect(sessionIdIndex).toBeGreaterThanOrEqual(0);
+    expect(third?.args[sessionIdIndex + 1]).not.toBe('sess-resume-fallback');
+    expect(resumeIds).toContain(third?.args[sessionIdIndex + 1]);
+
+    third?.child.stdout.write(`${JSON.stringify({ type: 'system', subtype: 'session_start', session_id: third?.args[sessionIdIndex + 1] })}\n`);
+    third?.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-2', content: [{ type: 'text', text: 'Recovered' }] } })}\n`);
+    third?.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(completed).toContain('Recovered');
   });
 
   it('normalizes Windows cwd before spawning qwen', async () => {
@@ -402,6 +492,30 @@ describe('QwenProvider', () => {
           raw: { type: 'tool_result', tool_use_id: 'tool-1', content: 'ok', is_error: false },
         },
       },
+    ]);
+  });
+
+  it('emits thinking status from qwen thinking blocks and clears it on text output', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-thinking', cwd: '/tmp/project' });
+
+    const statuses: Array<{ status: string | null; label?: string | null }> = [];
+    provider.onStatus?.((_sid, status) => statuses.push(status));
+
+    await provider.send('sess-thinking', 'think');
+    const run = lastSpawn();
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-thinking' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'thinking' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'Analyzing...' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'Done' } } })}\n`);
+    run.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(statuses).toEqual([
+      { status: null, label: null },
+      { status: 'thinking', label: 'Thinking...' },
+      { status: null, label: null },
     ]);
   });
 });

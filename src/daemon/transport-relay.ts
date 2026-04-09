@@ -5,7 +5,7 @@
  * JSONL watchers), so ChatView renders them without any special handling.
  * Also cached to local JSONL for replay on reconnect/restart.
  */
-import type { TransportProvider, ProviderError } from '../agent/transport-provider.js';
+import type { TransportProvider, ProviderError, ProviderStatusUpdate } from '../agent/transport-provider.js';
 import type { MessageDelta, AgentMessage, ToolCallEvent } from '../../shared/agent-message.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { resolveSessionName } from '../agent/session-manager.js';
@@ -16,6 +16,72 @@ import { resolveContextWindow } from '../util/model-context.js';
 
 let sendToServer: ((msg: Record<string, unknown>) => void) | null = null;
 const inFlightMessages = new Map<string, { messageId: string; eventId: string; text: string }>();
+const pendingStreamUpdates = new Map<string, {
+  sessionName: string;
+  eventId: string;
+  lastEmitAt: number;
+  pendingText: string | null;
+  timer: ReturnType<typeof setTimeout> | null;
+}>();
+const STREAM_UPDATE_INTERVAL_MS = 80;
+
+function emitStreamingAssistantText(sessionName: string, eventId: string, text: string): void {
+  timelineEmitter.emit(sessionName, 'assistant.text', {
+    text,
+    streaming: true,
+  }, { source: 'daemon', confidence: 'high', eventId });
+}
+
+function clearPendingStreamUpdate(eventId: string): void {
+  const pending = pendingStreamUpdates.get(eventId);
+  if (!pending) return;
+  if (pending.timer) clearTimeout(pending.timer);
+  pendingStreamUpdates.delete(eventId);
+}
+
+function flushPendingStreamUpdate(eventId: string): void {
+  const pending = pendingStreamUpdates.get(eventId);
+  if (!pending || pending.pendingText == null) return;
+  pending.timer = null;
+  pending.lastEmitAt = Date.now();
+  const nextText = pending.pendingText;
+  pending.pendingText = null;
+  emitStreamingAssistantText(pending.sessionName, pending.eventId, nextText);
+}
+
+function emitThrottledStreamingAssistantText(sessionName: string, eventId: string, text: string): void {
+  const now = Date.now();
+  let pending = pendingStreamUpdates.get(eventId);
+  if (!pending) {
+    pending = {
+      sessionName,
+      eventId,
+      lastEmitAt: 0,
+      pendingText: null,
+      timer: null,
+    };
+    pendingStreamUpdates.set(eventId, pending);
+  } else {
+    pending.sessionName = sessionName;
+  }
+
+  if (pending.lastEmitAt === 0 || now - pending.lastEmitAt >= STREAM_UPDATE_INTERVAL_MS) {
+    if (pending.timer) {
+      clearTimeout(pending.timer);
+      pending.timer = null;
+    }
+    pending.pendingText = null;
+    pending.lastEmitAt = now;
+    emitStreamingAssistantText(sessionName, eventId, text);
+    return;
+  }
+
+  pending.pendingText = text;
+  if (pending.timer) return;
+  pending.timer = setTimeout(() => {
+    flushPendingStreamUpdate(eventId);
+  }, STREAM_UPDATE_INTERVAL_MS - (now - pending.lastEmitAt));
+}
 
 /** Set the send function (called once during server-link setup) */
 export function setTransportRelaySend(fn: (msg: Record<string, unknown>) => void): void {
@@ -34,16 +100,17 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     // Use delta.delta as the display text directly — the provider's internal
     // accumulator handles cumulative vs incremental differences.
     const stableEventId = `transport:${sessionName}:${delta.messageId}`;
+    const previous = inFlightMessages.get(sessionName);
+    if (previous && previous.messageId !== delta.messageId) {
+      clearPendingStreamUpdate(previous.eventId);
+    }
     inFlightMessages.set(sessionName, {
       messageId: delta.messageId,
       eventId: stableEventId,
       text: delta.delta,
     });
 
-    timelineEmitter.emit(sessionName, 'assistant.text', {
-      text: delta.delta,
-      streaming: true,
-    }, { source: 'daemon', confidence: 'high', eventId: stableEventId });
+    emitThrottledStreamingAssistantText(sessionName, stableEventId, delta.delta);
   });
 
   provider.onComplete((providerSid: string, message: AgentMessage) => {
@@ -60,6 +127,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       ? tracked.eventId
       : `transport:${sessionName}:${message.id}`;
     inFlightMessages.delete(sessionName);
+    clearPendingStreamUpdate(stableEventId);
     timelineEmitter.emit(sessionName, 'assistant.text', {
       text: finalText,
       streaming: false,
@@ -102,6 +170,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
 
     const tracked = inFlightMessages.get(sessionName);
     inFlightMessages.delete(sessionName);
+    if (tracked) clearPendingStreamUpdate(tracked.eventId);
     const errorText = tracked?.text
       ? `${tracked.text}\n\n⚠️ Error: ${error.message}`
       : `⚠️ Error: ${error.message}`;
@@ -174,6 +243,19 @@ export function wireProviderToRelay(provider: TransportProvider): void {
           : {}),
       ...(tool.detail !== undefined ? { detail: tool.detail } : {}),
     });
+  });
+
+  provider.onStatus?.((providerSid: string, status: ProviderStatusUpdate) => {
+    const sessionName = resolveSessionName(providerSid);
+    if (!sessionName) {
+      logger.debug({ providerSid }, 'transport-relay: unresolved route for status — dropped');
+      return;
+    }
+
+    timelineEmitter.emit(sessionName, 'agent.status', {
+      status: status.status,
+      ...(status.label !== undefined ? { label: status.label } : {}),
+    }, { source: 'daemon', confidence: 'high' });
   });
 }
 
