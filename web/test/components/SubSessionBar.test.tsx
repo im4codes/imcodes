@@ -136,4 +136,25 @@ describe('SubSessionBar', () => {
 
     expect(view.container.querySelector('.idle-flash-layer--frame')).not.toBeNull();
   });
+
+  it('registers a non-passive touchmove guard for the horizontal cards strip', () => {
+    const addSpy = vi.spyOn(HTMLDivElement.prototype, 'addEventListener');
+
+    render(
+      <SubSessionBar
+        subSessions={[makeSubSession({ state: 'idle' })]}
+        openIds={new Set()}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(addSpy.mock.calls.some(([type, , options]) => type === 'touchmove' && typeof options === 'object' && (options as AddEventListenerOptions).passive === false)).toBe(true);
+  });
 });
