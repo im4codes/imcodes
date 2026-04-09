@@ -64,6 +64,7 @@ import { extractTransportPendingMessages } from './transport-queue.js';
 import { ingestTimelineEventForCache } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
+import { getSelectedServerName } from './server-selection.js';
 
 // On web: if opened by the native app for passkey auth, render the bridge page.
 const nativeCallback = typeof window !== 'undefined'
@@ -194,6 +195,30 @@ export function App() {
     if (!selectedServerId) return;
     watchProjectionStore.beginServerSwitch(selectedServerId);
   }, [selectedServerId]);
+
+  useEffect(() => {
+    if (selectedServerId) {
+      localStorage.setItem('rcc_server', selectedServerId);
+      return;
+    }
+    localStorage.removeItem('rcc_server');
+  }, [selectedServerId]);
+
+  const resolvedSelectedServerName = useMemo(
+    () => getSelectedServerName(selectedServerId, servers, selectedServerName),
+    [selectedServerId, selectedServerName, servers],
+  );
+
+  useEffect(() => {
+    if (!selectedServerId || servers.length === 0) return;
+    if (resolvedSelectedServerName === selectedServerName) return;
+    setSelectedServerName(resolvedSelectedServerName);
+    if (resolvedSelectedServerName) {
+      localStorage.setItem('rcc_server_name', resolvedSelectedServerName);
+      return;
+    }
+    localStorage.removeItem('rcc_server_name');
+  }, [resolvedSelectedServerName, selectedServerId, selectedServerName, servers.length]);
 
   useEffect(() => {
     let cleanup = () => {};
@@ -479,16 +504,8 @@ export function App() {
     try {
       const data = await apiFetch<{ servers: ServerInfo[] }>('/api/server');
       setServers(data.servers);
-      // Populate selected server name if missing
-      if (selectedServerId) {
-        const found = data.servers.find((s) => s.id === selectedServerId);
-        if (found && !selectedServerName) {
-          localStorage.setItem('rcc_server_name', found.name);
-          setSelectedServerName(found.name);
-        }
-      }
     } catch { /* ignore */ }
-  }, [auth, selectedServerId, selectedServerName]);
+  }, [auth]);
 
   useEffect(() => { loadServers(); }, [loadServers]);
 
@@ -1115,8 +1132,7 @@ export function App() {
         }
       }
       if (msg.type === 'session_list') {
-        const watchServerName = servers.find((server) => server.id === selectedServerId)?.name
-          ?? selectedServerName
+        const watchServerName = resolvedSelectedServerName
           ?? selectedServerId;
         // Build sub-session inputs from app state (daemon filters them from session_list)
         // Use ref to avoid stale closure — subSessions state may not be in useEffect deps
@@ -2422,7 +2438,7 @@ export function App() {
                   class="mobile-server-btn"
                   onClick={() => setShowMobileServerMenu((o) => !o)}
                 >
-                  {selectedServerName ?? 'Server'} ▾
+                  {resolvedSelectedServerName ?? 'Server'} ▾
                 </button>
                 {showMobileServerMenu && (
                   <>
