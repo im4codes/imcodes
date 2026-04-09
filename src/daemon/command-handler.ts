@@ -25,9 +25,10 @@ import logger from '../util/logger.js';
 import { homedir } from 'os';
 import { readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, stat as fsStat, writeFile as fsWriteFile } from 'node:fs/promises';
 import * as nodePath from 'node:path';
-import { exec as execCb } from 'node:child_process';
+import { exec as execCb, execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
+const execFileAsync = promisify(execFileCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget } from './p2p-orchestrator.js';
 import { getComboRoundCount, parseModePipeline, P2P_CONFIG_MODE, type P2pSessionConfig } from '../../shared/p2p-modes.js';
 import type { P2pAdvancedRound, P2pContextReducerConfig } from '../../shared/p2p-advanced.js';
@@ -2630,6 +2631,7 @@ async function handleFsListInner(resolved: string, rawPath: string, requestId: s
 const FS_READ_SIZE_LIMIT = 512 * 1024; // 512 KB
 
 interface FsReadSnapshot {
+  path: string;
   fileSignature: string;
   status: 'ok' | 'error';
   content?: string;
@@ -2641,7 +2643,9 @@ interface FsReadSnapshot {
 
 const fsReadCache = new Map<string, { expiresAt: number; value: FsReadSnapshot }>();
 const fsReadInflight = new Map<string, Promise<FsReadSnapshot>>();
+const fsReadGenerations = new Map<string, number>();
 const FS_READ_CACHE_TTL_MS = 5_000;
+const REPO_CONTEXT_CACHE_TTL_MS = 5_000;
 
 async function loadFsReadSnapshot(realPath: string, fileSignature: string): Promise<FsReadSnapshot> {
   const ext = nodePath.extname(realPath).toLowerCase().slice(1);
@@ -2656,6 +2660,7 @@ async function loadFsReadSnapshot(realPath: string, fileSignature: string): Prom
   if (mimeType) {
     const buf = await fsReadFileRaw(realPath);
     return {
+      path: realPath,
       fileSignature,
       status: 'ok',
       content: buf.toString('base64'),
@@ -2668,6 +2673,7 @@ async function loadFsReadSnapshot(realPath: string, fileSignature: string): Prom
   const sample = content.slice(0, 8192);
   if (sample.includes('\0')) {
     return {
+      path: realPath,
       fileSignature,
       status: 'error',
       error: 'binary_file',
@@ -2676,6 +2682,7 @@ async function loadFsReadSnapshot(realPath: string, fileSignature: string): Prom
   }
 
   return {
+    path: realPath,
     fileSignature,
     status: 'ok',
     content,
@@ -2687,17 +2694,22 @@ async function getFsReadSnapshot(realPath: string, fileSignature: string): Promi
   if (cached && cached.expiresAt > Date.now() && cached.value.fileSignature === fileSignature) {
     return cached.value;
   }
-  const inflight = fsReadInflight.get(realPath);
+  const generation = getResourceGeneration(fsReadGenerations, realPath);
+  const inflightKey = `${realPath}::${fileSignature}::${generation}`;
+  const inflight = fsReadInflight.get(inflightKey);
   if (inflight) return await inflight;
   const promise = loadFsReadSnapshot(realPath, fileSignature)
-    .then((value) => {
-      fsReadCache.set(realPath, { value, expiresAt: Date.now() + FS_READ_CACHE_TTL_MS });
+    .then(async (value) => {
+      const currentSignature = await safeStatSignature(realPath);
+      if (getResourceGeneration(fsReadGenerations, realPath) === generation && currentSignature === value.fileSignature) {
+        fsReadCache.set(realPath, { value, expiresAt: Date.now() + FS_READ_CACHE_TTL_MS });
+      }
       return value;
     })
     .finally(() => {
-      fsReadInflight.delete(realPath);
+      fsReadInflight.delete(inflightKey);
     });
-  fsReadInflight.set(realPath, promise);
+  fsReadInflight.set(inflightKey, promise);
   return await promise;
 }
 
@@ -2777,6 +2789,19 @@ interface RepoContext {
   repoSignature: string;
 }
 
+interface RepoContextBase {
+  repoRoot: string;
+  gitDir: string;
+}
+
+interface RepoSignatureState {
+  repoSignature: string;
+  indexSig: string;
+  headSig: string;
+  refPath: string | null;
+  refSig: string;
+}
+
 interface GitStatusSnapshot {
   repoRoot: string;
   repoSignature: string;
@@ -2790,21 +2815,34 @@ interface GitNumstatSnapshot {
 }
 
 interface GitDiffSnapshot {
+  logicalPath: string;
   repoRoot: string;
   repoSignature: string;
   fileSignature: string;
   diff: string;
 }
 
+const repoContextCache = new Map<string, { expiresAt: number; value: RepoContextBase | null }>();
+const repoSignatureCache = new Map<string, RepoSignatureState>();
 const gitStatusCache = new Map<string, { expiresAt: number; value: GitStatusSnapshot }>();
 const gitStatusInflight = new Map<string, Promise<GitStatusSnapshot>>();
 const gitNumstatCache = new Map<string, { expiresAt: number; value: GitNumstatSnapshot }>();
 const gitNumstatInflight = new Map<string, Promise<GitNumstatSnapshot>>();
 const gitDiffCache = new Map<string, { expiresAt: number; value: GitDiffSnapshot }>();
 const gitDiffInflight = new Map<string, Promise<GitDiffSnapshot>>();
+const gitRepoGenerations = new Map<string, number>();
+const gitDiffGenerations = new Map<string, number>();
 
 function normalizeFsPath(value: string): string {
   return nodePath.resolve(value);
+}
+
+function getResourceGeneration(map: Map<string, number>, key: string): number {
+  return map.get(key) ?? 0;
+}
+
+function bumpResourceGeneration(map: Map<string, number>, key: string): void {
+  map.set(key, getResourceGeneration(map, key) + 1);
 }
 
 function isPathInside(root: string, candidate: string): boolean {
@@ -2836,54 +2874,130 @@ async function resolveGitDir(dotGitPath: string, repoRoot: string): Promise<stri
   }
 }
 
-async function findRepoRoot(startPath: string): Promise<{ repoRoot: string; gitDir: string } | null> {
+async function findRepoContextBase(startPath: string): Promise<RepoContextBase | null> {
   let current = normalizeFsPath(startPath);
+  const traversed: string[] = [];
+  const now = Date.now();
   while (true) {
+    const cached = repoContextCache.get(current);
+    if (cached && cached.expiresAt > now) {
+      for (const traversedPath of traversed) {
+        repoContextCache.set(traversedPath, { expiresAt: now + REPO_CONTEXT_CACHE_TTL_MS, value: cached.value });
+      }
+      return cached.value;
+    }
+    traversed.push(current);
     const dotGit = nodePath.join(current, '.git');
     const gitDir = await resolveGitDir(dotGit, current);
-    if (gitDir) return { repoRoot: current, gitDir };
+    if (gitDir) {
+      const value = { repoRoot: current, gitDir };
+      for (const traversedPath of traversed) {
+        repoContextCache.set(traversedPath, { expiresAt: Date.now() + REPO_CONTEXT_CACHE_TTL_MS, value });
+      }
+      return value;
+    }
     const parent = nodePath.dirname(current);
     if (parent === current) break;
     current = parent;
   }
+  for (const traversedPath of traversed) {
+    repoContextCache.set(traversedPath, { expiresAt: Date.now() + REPO_CONTEXT_CACHE_TTL_MS, value: null });
+  }
   return null;
 }
 
-async function buildRepoSignature(gitDir: string): Promise<string> {
-  const indexSig = await safeStatSignature(nodePath.join(gitDir, 'index'));
+async function buildRepoSignatureState(gitDir: string, indexSig?: string, headSig?: string): Promise<RepoSignatureState> {
+  const resolvedIndexSig = indexSig ?? await safeStatSignature(nodePath.join(gitDir, 'index'));
   const headPath = nodePath.join(gitDir, 'HEAD');
-  const headSig = await safeStatSignature(headPath);
+  const resolvedHeadSig = headSig ?? await safeStatSignature(headPath);
+  let refPath: string | null = null;
   let refSig = 'none';
   try {
     const headRaw = await fsReadFileRaw(headPath, 'utf8');
     const match = headRaw.match(/^ref:\s*(.+)\s*$/m);
     if (match?.[1]) {
-      refSig = await safeStatSignature(nodePath.join(gitDir, match[1].trim()));
+      refPath = match[1].trim();
+      refSig = await safeStatSignature(nodePath.join(gitDir, refPath));
     }
   } catch {
     refSig = 'missing';
   }
-  return `${indexSig}|${headSig}|${refSig}`;
+  return {
+    repoSignature: `${resolvedIndexSig}|${resolvedHeadSig}|${refSig}`,
+    indexSig: resolvedIndexSig,
+    headSig: resolvedHeadSig,
+    refPath,
+    refSig,
+  };
+}
+
+async function getRepoSignature(repoRoot: string, gitDir: string): Promise<string> {
+  const indexSig = await safeStatSignature(nodePath.join(gitDir, 'index'));
+  const headPath = nodePath.join(gitDir, 'HEAD');
+  const headSig = await safeStatSignature(headPath);
+  const cached = repoSignatureCache.get(repoRoot);
+  if (cached && cached.indexSig === indexSig && cached.headSig === headSig) {
+    if (!cached.refPath || await safeStatSignature(nodePath.join(gitDir, cached.refPath)) === cached.refSig) {
+      return cached.repoSignature;
+    }
+  }
+  const next = await buildRepoSignatureState(gitDir, indexSig, headSig);
+  repoSignatureCache.set(repoRoot, next);
+  return next.repoSignature;
 }
 
 async function resolveRepoContext(startPath: string): Promise<RepoContext | null> {
-  const repo = await findRepoRoot(startPath);
+  const repo = await findRepoContextBase(startPath);
   if (!repo) return null;
   return {
     repoRoot: repo.repoRoot,
     gitDir: repo.gitDir,
-    repoSignature: await buildRepoSignature(repo.gitDir),
+    repoSignature: await getRepoSignature(repo.repoRoot, repo.gitDir),
   };
 }
 
+function decodeGitPath(rawPath: string): string {
+  return rawPath.replace(/\\([\\\"abfnrtv])/g, (_match, escaped: string) => {
+    switch (escaped) {
+      case 'a': return '\u0007';
+      case 'b': return '\b';
+      case 'f': return '\f';
+      case 'n': return '\n';
+      case 'r': return '\r';
+      case 't': return '\t';
+      case 'v': return '\v';
+      case '\\': return '\\';
+      case '"': return '"';
+      default: return escaped;
+    }
+  }).replace(/\\([0-7]{1,3})/g, (_match, octal: string) => String.fromCharCode(parseInt(octal, 8)));
+}
+
+function parseZRecords(stdout: string): string[] {
+  return stdout.split('\0').filter((entry) => entry.length > 0);
+}
+
+function normalizeRepoRelativePath(repoRoot: string, relativePath: string): string {
+  return nodePath.join(repoRoot, decodeGitPath(relativePath));
+}
+
 async function loadRepoGitStatusSnapshot(repoRoot: string, repoSignature: string): Promise<GitStatusSnapshot> {
-  const { stdout } = await execAsync('git status --porcelain -u', { cwd: repoRoot, timeout: 5000 });
+  const { stdout } = await execAsync('git status --porcelain=v1 -z -u', { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
   const files: GitStatusFile[] = [];
-  for (const line of stdout.split('\n')) {
-    if (!line.trim()) continue;
-    const code = line.slice(0, 2).trim();
-    const filePath = line.slice(3).trim().replace(/^"(.*)"$/, '$1');
-    files.push({ path: nodePath.join(repoRoot, filePath), code });
+  const records = parseZRecords(stdout);
+  for (let idx = 0; idx < records.length; idx++) {
+    const record = records[idx];
+    const code = record.slice(0, 2).trim();
+    const firstPath = record.slice(3);
+    let logicalPath = firstPath;
+    if (code.startsWith('R') || code.startsWith('C')) {
+      const renamedTo = records[idx + 1];
+      if (renamedTo) {
+        logicalPath = renamedTo;
+        idx += 1;
+      }
+    }
+    files.push({ path: normalizeRepoRelativePath(repoRoot, logicalPath), code });
   }
   return { repoRoot, repoSignature, files };
 }
@@ -2895,38 +3009,57 @@ async function getRepoGitStatusSnapshot(startPath: string): Promise<GitStatusSna
   if (cached && cached.expiresAt > Date.now() && cached.value.repoSignature === context.repoSignature) {
     return cached.value;
   }
-  const inflight = gitStatusInflight.get(context.repoRoot);
+  const generation = getResourceGeneration(gitRepoGenerations, context.repoRoot);
+  const inflightKey = `${context.repoRoot}::${context.repoSignature}::${generation}`;
+  const inflight = gitStatusInflight.get(inflightKey);
   if (inflight) return await inflight;
   const promise = loadRepoGitStatusSnapshot(context.repoRoot, context.repoSignature)
-    .then((value) => {
-      gitStatusCache.set(context.repoRoot, { value, expiresAt: Date.now() + GIT_STATUS_CACHE_TTL_MS });
+    .then(async (value) => {
+      const currentSignature = await getRepoSignature(context.repoRoot, context.gitDir);
+      if (getResourceGeneration(gitRepoGenerations, context.repoRoot) === generation && currentSignature === value.repoSignature) {
+        gitStatusCache.set(context.repoRoot, { value, expiresAt: Date.now() + GIT_STATUS_CACHE_TTL_MS });
+      }
       return value;
     })
     .finally(() => {
-      gitStatusInflight.delete(context.repoRoot);
+      gitStatusInflight.delete(inflightKey);
     });
-  gitStatusInflight.set(context.repoRoot, promise);
+  gitStatusInflight.set(inflightKey, promise);
   return await promise;
 }
 
 async function loadRepoGitNumstatSnapshot(repoRoot: string, repoSignature: string): Promise<GitNumstatSnapshot> {
   let stdout = '';
   try {
-    ({ stdout } = await execAsync('git diff --numstat HEAD', { cwd: repoRoot, timeout: 5000 }));
+    ({ stdout } = await execAsync('git diff --numstat -z HEAD', { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }));
   } catch {
     try {
-      ({ stdout } = await execAsync('git diff --numstat', { cwd: repoRoot, timeout: 5000 }));
+      ({ stdout } = await execAsync('git diff --numstat -z', { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }));
     } catch {
       stdout = '';
     }
   }
   const stats = new Map<string, { additions?: number; deletions?: number }>();
-  for (const line of stdout.split('\n')) {
-    const match = line.match(/^(\d+|-)\t(\d+|-)\t(.+)$/);
-    if (!match) continue;
-    const additions = match[1] === '-' ? undefined : parseInt(match[1], 10);
-    const deletions = match[2] === '-' ? undefined : parseInt(match[2], 10);
-    stats.set(nodePath.join(repoRoot, match[3].trim()), { additions, deletions });
+  const records = parseZRecords(stdout);
+  for (let idx = 0; idx < records.length; idx++) {
+    const header = records[idx];
+    const firstTab = header.indexOf('\t');
+    const secondTab = firstTab >= 0 ? header.indexOf('\t', firstTab + 1) : -1;
+    if (firstTab < 0 || secondTab < 0) continue;
+    const additionsRaw = header.slice(0, firstTab);
+    const deletionsRaw = header.slice(firstTab + 1, secondTab);
+    const pathRaw = header.slice(secondTab + 1);
+    const additions = additionsRaw === '-' ? undefined : parseInt(additionsRaw, 10);
+    const deletions = deletionsRaw === '-' ? undefined : parseInt(deletionsRaw, 10);
+    let logicalPath = pathRaw;
+    if (pathRaw === '') {
+      const _renamedFrom = records[idx + 1];
+      const renamedTo = records[idx + 2];
+      if (!renamedTo) continue;
+      logicalPath = renamedTo;
+      idx += 2;
+    }
+    stats.set(normalizeRepoRelativePath(repoRoot, logicalPath), { additions, deletions });
   }
   return { repoRoot, repoSignature, stats };
 }
@@ -2938,40 +3071,46 @@ async function getRepoGitNumstatSnapshot(startPath: string): Promise<GitNumstatS
   if (cached && cached.expiresAt > Date.now() && cached.value.repoSignature === context.repoSignature) {
     return cached.value;
   }
-  const inflight = gitNumstatInflight.get(context.repoRoot);
+  const generation = getResourceGeneration(gitRepoGenerations, context.repoRoot);
+  const inflightKey = `${context.repoRoot}::${context.repoSignature}::${generation}`;
+  const inflight = gitNumstatInflight.get(inflightKey);
   if (inflight) return await inflight;
   const promise = loadRepoGitNumstatSnapshot(context.repoRoot, context.repoSignature)
-    .then((value) => {
-      gitNumstatCache.set(context.repoRoot, { value, expiresAt: Date.now() + GIT_STATUS_CACHE_TTL_MS });
+    .then(async (value) => {
+      const currentSignature = await getRepoSignature(context.repoRoot, context.gitDir);
+      if (getResourceGeneration(gitRepoGenerations, context.repoRoot) === generation && currentSignature === value.repoSignature) {
+        gitNumstatCache.set(context.repoRoot, { value, expiresAt: Date.now() + GIT_STATUS_CACHE_TTL_MS });
+      }
       return value;
     })
     .finally(() => {
-      gitNumstatInflight.delete(context.repoRoot);
+      gitNumstatInflight.delete(inflightKey);
     });
-  gitNumstatInflight.set(context.repoRoot, promise);
+  gitNumstatInflight.set(inflightKey, promise);
   return await promise;
 }
 
-async function loadFileGitDiffSnapshot(realPath: string, repoRoot: string, repoSignature: string, fileSignature: string): Promise<GitDiffSnapshot> {
+async function loadFileGitDiffSnapshot(logicalPath: string, repoRoot: string, repoSignature: string, fileSignature: string): Promise<GitDiffSnapshot> {
   let diff = '';
+  const repoRelativePath = nodePath.relative(repoRoot, logicalPath).split(nodePath.sep).join('/');
   try {
-    const { stdout } = await execAsync(`git diff HEAD -- ${JSON.stringify(realPath)}`, { cwd: repoRoot, timeout: 5000 });
+    const { stdout } = await execFileAsync('git', ['diff', 'HEAD', '--', repoRelativePath], { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
     diff = stdout;
   } catch { /* ignore */ }
   if (!diff) {
     try {
-      const { stdout } = await execAsync(`git diff -- ${JSON.stringify(realPath)}`, { cwd: repoRoot, timeout: 5000 });
+      const { stdout } = await execFileAsync('git', ['diff', '--', repoRelativePath], { cwd: repoRoot, timeout: 5000, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
       diff = stdout;
     } catch { /* ignore */ }
   }
-  return { repoRoot, repoSignature, fileSignature, diff };
+  return { logicalPath, repoRoot, repoSignature, fileSignature, diff };
 }
 
-async function getFileGitDiffSnapshot(realPath: string): Promise<GitDiffSnapshot | null> {
-  const context = await resolveRepoContext(nodePath.dirname(realPath));
+async function getFileGitDiffSnapshot(logicalPath: string): Promise<GitDiffSnapshot | null> {
+  const context = await resolveRepoContext(nodePath.dirname(logicalPath));
   if (!context) return null;
-  const fileSignature = await safeStatSignature(realPath);
-  const cached = gitDiffCache.get(realPath);
+  const fileSignature = await safeStatSignature(logicalPath);
+  const cached = gitDiffCache.get(logicalPath);
   if (
     cached
     && cached.expiresAt > Date.now()
@@ -2980,47 +3119,106 @@ async function getFileGitDiffSnapshot(realPath: string): Promise<GitDiffSnapshot
   ) {
     return cached.value;
   }
-  const inflight = gitDiffInflight.get(realPath);
+  const generation = getResourceGeneration(gitDiffGenerations, logicalPath);
+  const inflightKey = `${logicalPath}::${context.repoSignature}::${fileSignature}::${generation}`;
+  const inflight = gitDiffInflight.get(inflightKey);
   if (inflight) return await inflight;
-  const promise = loadFileGitDiffSnapshot(realPath, context.repoRoot, context.repoSignature, fileSignature)
-    .then((value) => {
-      gitDiffCache.set(realPath, { value, expiresAt: Date.now() + GIT_DIFF_CACHE_TTL_MS });
+  const promise = loadFileGitDiffSnapshot(logicalPath, context.repoRoot, context.repoSignature, fileSignature)
+    .then(async (value) => {
+      const currentContext = await resolveRepoContext(nodePath.dirname(logicalPath));
+      const currentFileSignature = await safeStatSignature(logicalPath);
+      if (
+        getResourceGeneration(gitDiffGenerations, logicalPath) === generation
+        && currentContext
+        && currentContext.repoSignature === value.repoSignature
+        && currentFileSignature === value.fileSignature
+      ) {
+        gitDiffCache.set(logicalPath, { value, expiresAt: Date.now() + GIT_DIFF_CACHE_TTL_MS });
+      }
       return value;
     })
     .finally(() => {
-      gitDiffInflight.delete(realPath);
+      gitDiffInflight.delete(inflightKey);
     });
-  gitDiffInflight.set(realPath, promise);
+  gitDiffInflight.set(inflightKey, promise);
   return await promise;
 }
 
-function filterRepoFilesForPath(files: GitStatusFile[], requestedPath: string): GitStatusFile[] {
-  return files.filter((file) => isPathInside(requestedPath, file.path));
+function collectAffectedRepoRoots(targetPath: string): Set<string> {
+  const affected = new Set<string>();
+  for (const key of gitStatusCache.keys()) {
+    if (isPathInside(key, targetPath)) affected.add(key);
+  }
+  for (const key of gitNumstatCache.keys()) {
+    if (isPathInside(key, targetPath)) affected.add(key);
+  }
+  for (const key of gitStatusInflight.keys()) {
+    const repoRoot = key.split('::')[0] ?? '';
+    if (repoRoot && isPathInside(repoRoot, targetPath)) affected.add(repoRoot);
+  }
+  for (const key of gitNumstatInflight.keys()) {
+    const repoRoot = key.split('::')[0] ?? '';
+    if (repoRoot && isPathInside(repoRoot, targetPath)) affected.add(repoRoot);
+  }
+  for (const entry of repoContextCache.values()) {
+    const repoRoot = entry.value?.repoRoot;
+    if (repoRoot && isPathInside(repoRoot, targetPath)) affected.add(repoRoot);
+  }
+  return affected;
 }
 
 function invalidateGitCachesForPath(targetPath: string): void {
   const normalized = normalizeFsPath(targetPath);
+  bumpResourceGeneration(fsReadGenerations, normalized);
+  bumpResourceGeneration(gitDiffGenerations, normalized);
+  for (const repoRoot of collectAffectedRepoRoots(normalized)) {
+    bumpResourceGeneration(gitRepoGenerations, repoRoot);
+  }
   fsReadCache.delete(normalized);
-  fsReadInflight.delete(normalized);
   gitDiffCache.delete(normalized);
-  gitDiffInflight.delete(normalized);
+  for (const key of fsReadInflight.keys()) {
+    if (key.startsWith(`${normalized}::`)) fsReadInflight.delete(key);
+  }
+  for (const key of gitDiffInflight.keys()) {
+    if (key.startsWith(`${normalized}::`)) gitDiffInflight.delete(key);
+  }
   for (const key of gitStatusCache.keys()) {
     if (isPathInside(key, normalized)) gitStatusCache.delete(key);
+    if (isPathInside(key, normalized)) repoSignatureCache.delete(key);
+  }
+  for (const key of repoContextCache.keys()) {
+    if (isPathInside(key, normalized)) repoContextCache.delete(key);
   }
   for (const key of gitNumstatCache.keys()) {
     if (isPathInside(key, normalized)) gitNumstatCache.delete(key);
+    if (isPathInside(key, normalized)) repoSignatureCache.delete(key);
+  }
+  for (const key of gitStatusInflight.keys()) {
+    if (isPathInside(key.split('::')[0] ?? '', normalized)) gitStatusInflight.delete(key);
+  }
+  for (const key of gitNumstatInflight.keys()) {
+    if (isPathInside(key.split('::')[0] ?? '', normalized)) gitNumstatInflight.delete(key);
   }
 }
 
 export function __resetFsGitCachesForTests(): void {
   fsReadCache.clear();
   fsReadInflight.clear();
+  fsReadGenerations.clear();
+  repoContextCache.clear();
+  repoSignatureCache.clear();
   gitStatusCache.clear();
   gitStatusInflight.clear();
   gitNumstatCache.clear();
   gitNumstatInflight.clear();
   gitDiffCache.clear();
   gitDiffInflight.clear();
+  gitRepoGenerations.clear();
+  gitDiffGenerations.clear();
+}
+
+function filterRepoFilesForPath(files: GitStatusFile[], requestedPath: string): GitStatusFile[] {
+  return files.filter((file) => isPathInside(requestedPath, file.path));
 }
 
 /** fs.git_status — return git modified file list for a directory */
@@ -3067,16 +3265,26 @@ async function handleFsGitDiff(cmd: Record<string, unknown>, serverLink: ServerL
   const resolved = nodePath.resolve(expanded);
 
   try {
-    const real = await fsRealpath(resolved);
-    const allowed = isPathAllowed(real);
+    let allowedProbe = resolved;
+    while (true) {
+      try {
+        allowedProbe = await fsRealpath(allowedProbe);
+        break;
+      } catch {
+        const parent = nodePath.dirname(allowedProbe);
+        if (parent === allowedProbe) throw new Error(`ENOENT: no such file or directory, realpath '${resolved}'`);
+        allowedProbe = parent;
+      }
+    }
+    const allowed = isPathAllowed(allowedProbe);
     if (!allowed) {
       try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
       return;
     }
-    const snapshot = await getFileGitDiffSnapshot(real);
+    const snapshot = await getFileGitDiffSnapshot(resolved);
     const diff = snapshot?.diff ?? '';
     // Untracked files: no diff (nothing meaningful to compare against)
-    try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', diff }); } catch { /* ignore */ }
+    try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, resolvedPath: resolved, status: 'ok', diff }); } catch { /* ignore */ }
   } catch (err) {
     try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
   }

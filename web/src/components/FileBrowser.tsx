@@ -222,6 +222,7 @@ function updateNode(nodes: FsNode[], targetId: string, patch: Partial<FsNode>): 
 
 type ChangeFile = { path: string; code: string; additions?: number; deletions?: number };
 type SharedChangesListener = (files: ChangeFile[]) => void;
+type PendingPreviewRequest = { path: string; cycleId: number };
 
 interface SharedChangesEntry {
   repoPath: string;
@@ -408,12 +409,14 @@ export function FileBrowser({
   const loadedRef = useRef(new Set<string>());
   const pendingRef = useRef(new Map<string, string>()); // requestId → nodeId
   const timersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
-  const pendingReadRef = useRef(new Map<string, string>()); // requestId → filePath
+  const pendingReadRef = useRef(new Map<string, PendingPreviewRequest>());
   const pendingGitStatusRef = useRef(new Map<string, string>()); // requestId → dirPath
-  const pendingGitDiffRef = useRef(new Map<string, string>()); // requestId → filePath
+  const pendingGitDiffRef = useRef(new Map<string, PendingPreviewRequest>());
   const pendingMkdirRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
   const mountedRef = useRef(true);
   const dismissedAutoPreviewPathRef = useRef<string | null>(null);
+  const nextPreviewCycleIdRef = useRef(1);
+  const activePreviewCycleRef = useRef<PendingPreviewRequest | null>(null);
 
   // History navigation
   const historyRef = useRef<string[]>([startPath]);
@@ -436,6 +439,55 @@ export function FileBrowser({
     };
   }, []);
 
+  const getActivePreviewCycle = useCallback((path?: string): PendingPreviewRequest | null => {
+    const active = activePreviewCycleRef.current;
+    if (!active) return null;
+    if (path && active.path !== path) return null;
+    return active;
+  }, []);
+
+  const hasPendingPreviewWork = useCallback((kind: 'read' | 'diff', path: string, cycleId?: number): boolean => {
+    const active = cycleId !== undefined ? { path, cycleId } : getActivePreviewCycle(path);
+    if (!active) return false;
+    const pending = kind === 'read' ? pendingReadRef.current : pendingGitDiffRef.current;
+    for (const request of pending.values()) {
+      if (request.path === active.path && request.cycleId === active.cycleId) return true;
+    }
+    return false;
+  }, [getActivePreviewCycle]);
+
+  const fetchDir = useCallback((nodePath: string) => {
+    if (loadedRef.current.has(nodePath)) return;
+    const inFlight = [...pendingRef.current.values()].includes(nodePath);
+    if (inFlight) return;
+
+    setData((prev) => updateNode(prev, nodePath, { isLoading: true }));
+    let requestId: string;
+    try {
+      requestId = ws.fsListDir(nodePath, includeFiles, !!serverId);
+    } catch {
+      setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
+      return;
+    }
+    pendingRef.current.set(requestId, nodePath);
+    // Tree/subtree refreshes only need lightweight status without includeStats.
+    try {
+      const gitId = ws.fsGitStatus(nodePath);
+      pendingGitStatusRef.current.set(gitId, nodePath);
+    } catch { /* ws disconnected — skip git status */ }
+
+    const timer = setTimeout(() => {
+      if (!mountedRef.current) return;
+      if (pendingRef.current.has(requestId)) {
+        pendingRef.current.delete(requestId);
+        timersRef.current.delete(requestId);
+        setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
+        setError(t('file_browser.timeout_detail', { defaultValue: t('file_browser.timeout') }));
+      }
+    }, REQUEST_TIMEOUT_MS);
+    timersRef.current.set(requestId, timer);
+  }, [includeFiles, serverId, t, ws]);
+
   // Listen for fs.ls_response and fs.read_response
   // IMPORTANT: Every setState call is guarded by mountedRef to prevent crashes
   // when responses arrive after component unmount (race condition with FloatingPanel close).
@@ -447,6 +499,9 @@ export function FileBrowser({
       if (msg.type === DAEMON_MSG.RECONNECTED || (msg.type === 'session.event' && (msg as any).event === 'connected')) {
         loadedRef.current.clear();
         pendingRef.current.clear();
+        pendingReadRef.current.clear();
+        pendingGitDiffRef.current.clear();
+        activePreviewCycleRef.current = null;
         // Re-fetch root and changes
         if (mountedRef.current) fetchDir(startPath);
         return;
@@ -514,9 +569,12 @@ export function FileBrowser({
       }
 
       if (msg.type === 'fs.read_response') {
-        const filePath = pendingReadRef.current.get(msg.requestId);
-        if (!filePath) return;
+        const pending = pendingReadRef.current.get(msg.requestId);
+        if (!pending) return;
         pendingReadRef.current.delete(msg.requestId);
+        const active = getActivePreviewCycle();
+        if (!active || active.path !== pending.path || active.cycleId !== pending.cycleId) return;
+        const filePath = pending.path;
 
         if (!mountedRef.current) return;
 
@@ -595,9 +653,12 @@ export function FileBrowser({
       }
 
       if (msg.type === 'fs.git_diff_response') {
-        const filePath = pendingGitDiffRef.current.get(msg.requestId);
-        if (!filePath) return;
+        const pending = pendingGitDiffRef.current.get(msg.requestId);
+        if (!pending) return;
         pendingGitDiffRef.current.delete(msg.requestId);
+        const active = getActivePreviewCycle();
+        if (!active || active.path !== pending.path || active.cycleId !== pending.cycleId) return;
+        const filePath = pending.path;
         if (!mountedRef.current) return;
         if (msg.status === 'ok') {
           const diff = msg.diff ?? '';
@@ -629,39 +690,7 @@ export function FileBrowser({
         return;
       }
     });
-  }, [ws, showHidden, highlightPath, t]);
-
-  const fetchDir = useCallback((nodePath: string) => {
-    if (loadedRef.current.has(nodePath)) return;
-    const inFlight = [...pendingRef.current.values()].includes(nodePath);
-    if (inFlight) return;
-
-    setData((prev) => updateNode(prev, nodePath, { isLoading: true }));
-    let requestId: string;
-    try {
-      requestId = ws.fsListDir(nodePath, includeFiles, !!serverId);
-    } catch {
-      setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
-      return;
-    }
-    pendingRef.current.set(requestId, nodePath);
-    // Fetch git status for this directory
-    try {
-      const gitId = ws.fsGitStatus(nodePath);
-      pendingGitStatusRef.current.set(gitId, nodePath);
-    } catch { /* ws disconnected — skip git status */ }
-
-    const timer = setTimeout(() => {
-      if (!mountedRef.current) return;
-      if (pendingRef.current.has(requestId)) {
-        pendingRef.current.delete(requestId);
-        timersRef.current.delete(requestId);
-        setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
-        setError(t('file_browser.timeout_detail', { defaultValue: t('file_browser.timeout') }));
-      }
-    }, REQUEST_TIMEOUT_MS);
-    timersRef.current.set(requestId, timer);
-  }, [ws, includeFiles, t]);
+  }, [fetchDir, getActivePreviewCycle, startPath, showHidden, highlightPath, t, ws]);
 
   const fetchPreview = useCallback((filePath: string, preferDiff = false) => {
     if (editDirtyRef.current) {
@@ -676,14 +705,23 @@ export function FileBrowser({
     setEditContent('');
     setOriginalMtime(undefined);
     setIsEditing(() => { try { return localStorage.getItem(PREF_KEY) === '1'; } catch { return false; } });
+    const active = getActivePreviewCycle(filePath);
+    const cycleId = active && (hasPendingPreviewWork('read', filePath, active.cycleId) || hasPendingPreviewWork('diff', filePath, active.cycleId))
+      ? active.cycleId
+      : nextPreviewCycleIdRef.current++;
+    activePreviewCycleRef.current = { path: filePath, cycleId };
     const loadingPreview: FileBrowserPreviewState = { status: 'loading', path: filePath };
     setPreview(loadingPreview);
     setShowDiff(preferDiff);
-    const requestId = ws.fsReadFile(filePath);
-    pendingReadRef.current.set(requestId, filePath);
-    const diffId = ws.fsGitDiff(filePath);
-    pendingGitDiffRef.current.set(diffId, filePath);
-  }, [ws, t, onPreviewFile]);
+    if (!hasPendingPreviewWork('read', filePath, cycleId)) {
+      const requestId = ws.fsReadFile(filePath);
+      pendingReadRef.current.set(requestId, { path: filePath, cycleId });
+    }
+    if (!hasPendingPreviewWork('diff', filePath, cycleId)) {
+      const diffId = ws.fsGitDiff(filePath);
+      pendingGitDiffRef.current.set(diffId, { path: filePath, cycleId });
+    }
+  }, [getActivePreviewCycle, hasPendingPreviewWork, onPreviewFile, t, ws]);
 
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([startPath]));
 
@@ -746,6 +784,9 @@ export function FileBrowser({
       // Clear stale state from previous ws instance
       loadedRef.current.clear();
       pendingRef.current.clear();
+      pendingReadRef.current.clear();
+      pendingGitDiffRef.current.clear();
+      activePreviewCycleRef.current = null;
       for (const timer of timersRef.current.values()) clearTimeout(timer);
       timersRef.current.clear();
       setData([{ id: startPath, name: startPath, isDir: true, children: [] }]);
@@ -804,17 +845,18 @@ export function FileBrowser({
     if (currentPreviewPath === autoPreviewPath && preview.status !== 'idle') {
       setShowDiff(autoPreviewPreferDiff);
       if (preview.status === 'loading' && initialPreview?.status === 'loading' && !skipAutoPreviewIfLoading) {
-        const hasPendingRead = [...pendingReadRef.current.values()].includes(autoPreviewPath);
+        const hasPendingRead = hasPendingPreviewWork('read', autoPreviewPath);
         if (!hasPendingRead) fetchPreview(autoPreviewPath, autoPreviewPreferDiff);
       }
       return;
     }
     fetchPreview(autoPreviewPath, autoPreviewPreferDiff);
-  }, [autoPreviewPath, autoPreviewPreferDiff, fetchPreview, initialPreview, preview, skipAutoPreviewIfLoading]);
+  }, [autoPreviewPath, autoPreviewPreferDiff, fetchPreview, hasPendingPreviewWork, initialPreview, preview, skipAutoPreviewIfLoading]);
 
   const dismissPreview = useCallback(() => {
     if (editDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
     if (autoPreviewPath) dismissedAutoPreviewPathRef.current = autoPreviewPath;
+    activePreviewCycleRef.current = null;
     setIsEditing(false);
     setEditDirty(false);
     setPreview({ status: 'idle' });
@@ -832,10 +874,12 @@ export function FileBrowser({
     const timer = setInterval(() => {
       if (!mountedRef.current) return;
       try {
+        const cycleId = nextPreviewCycleIdRef.current++;
+        activePreviewCycleRef.current = { path, cycleId };
         const reqId = ws.fsReadFile(path);
-        pendingReadRef.current.set(reqId, path);
+        pendingReadRef.current.set(reqId, { path, cycleId });
         const diffId = ws.fsGitDiff(path);
-        pendingGitDiffRef.current.set(diffId, path);
+        pendingGitDiffRef.current.set(diffId, { path, cycleId });
       } catch { /* ws disconnected */ }
     }, 5000);
     return () => clearInterval(timer);

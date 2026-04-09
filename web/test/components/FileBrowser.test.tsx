@@ -28,8 +28,11 @@ vi.mock('../../src/components/file-editor-lazy.js', () => ({
 import { FileBrowser, __resetFileBrowserSharedChangesForTests, mergePreviewState } from '../../src/components/FileBrowser.js';
 import type { WsClient, ServerMessage } from '../../src/ws-client.js';
 
-// Cleanup DOM after each test
-afterEach(cleanup);
+// Cleanup DOM/timers after each test
+afterEach(() => {
+  vi.useRealTimers();
+  cleanup();
+});
 
 // ── i18n stub ─────────────────────────────────────────────────────────────
 vi.mock('react-i18next', () => {
@@ -519,6 +522,31 @@ describe('FileBrowser', () => {
     expect(ws.fsGitStatus).toHaveBeenCalledWith('/home/user', { includeStats: true });
   });
 
+  it('keeps subtree git status requests lightweight when expanding directories', async () => {
+    const { ws, respond } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      respond([{ name: 'projects', isDir: true }], '/home/user');
+    });
+
+    const dirEntry = await screen.findByText('projects');
+    await act(async () => { fireEvent.click(dirEntry); });
+
+    expect((ws.fsGitStatus as any).mock.calls).toEqual([
+      ['/home/user'],
+      ['/home/user/projects'],
+    ]);
+  });
+
   it('does not refresh shared changes while files tab hides the changes panel', () => {
     const { ws } = makeWsFactory();
     render(
@@ -598,6 +626,29 @@ describe('FileBrowser', () => {
       });
     });
     expect(document.querySelector('.fb-changes-section')).not.toBeNull();
+  });
+
+  it('keeps the Changes list usable when stats are unavailable', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user"
+        changesRootPath="/home/user" onConfirm={vi.fn()} />,
+    );
+    await act(async () => { respond([], '/home/user'); });
+    const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
+    await act(async () => { fireEvent.click(changesTab); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [{ path: '/home/user/bar.ts', code: 'M' }],
+      });
+    });
+    expect(document.querySelector('.fb-changes-item')).not.toBeNull();
+    expect(document.querySelector('.fb-changes-item-stats')).toBeNull();
   });
 
   it('shows + and - stats in the changes list when provided by git status', async () => {
@@ -930,6 +981,231 @@ describe('FileBrowser', () => {
     expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
     expect((ws.fsReadFile as any).mock.calls[0]?.[0]).toBe('/home/user/foo.ts');
     expect((ws.fsGitDiff as any).mock.calls[0]?.[0]).toBe('/home/user/foo.ts');
+  });
+
+  it('dispatches at most one current read/diff cycle per visible target', async () => {
+    const { ws, respond } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      respond([{ name: 'foo.ts', isDir: false }], '/home/user');
+    });
+
+    const fileEntry = await screen.findByText('foo.ts');
+    await act(async () => { fireEvent.click(fileEntry); });
+    await act(async () => { fireEvent.click(fileEntry); });
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
+    expect((ws.fsReadFile as any).mock.calls[0]?.[0]).toBe('/home/user/foo.ts');
+    expect((ws.fsGitDiff as any).mock.calls[0]?.[0]).toBe('/home/user/foo.ts');
+  });
+
+  it('does not let stale pending preview work delay a new auto-preview target', () => {
+    const { ws } = makeWsFactory();
+    (ws.fsReadFile as any)
+      .mockImplementationOnce(() => 'read-foo')
+      .mockImplementationOnce(() => 'read-bar');
+    (ws.fsGitDiff as any)
+      .mockImplementationOnce(() => 'diff-foo')
+      .mockImplementationOnce(() => 'diff-bar');
+
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/foo.ts"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    view.rerender(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/bar.ts"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect((ws.fsReadFile as any).mock.calls.map((call: any[]) => call[0])).toEqual([
+      '/home/user/foo.ts',
+      '/home/user/bar.ts',
+    ]);
+    expect((ws.fsGitDiff as any).mock.calls.map((call: any[]) => call[0])).toEqual([
+      '/home/user/foo.ts',
+      '/home/user/bar.ts',
+    ]);
+  });
+
+  it('clears stale preview-cycle ownership when the ws instance changes', () => {
+    const first = makeWsFactory();
+    (first.ws.fsReadFile as any).mockImplementationOnce(() => 'read-first');
+    (first.ws.fsGitDiff as any).mockImplementationOnce(() => 'diff-first');
+
+    const view = render(
+      <FileBrowser
+        ws={first.ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        initialPreview={{ status: 'loading', path: '/home/user/foo.ts' }}
+        autoPreviewPath="/home/user/foo.ts"
+        autoPreviewPreferDiff
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect((first.ws.fsReadFile as any).mock.calls).toHaveLength(1);
+    expect((first.ws.fsGitDiff as any).mock.calls).toHaveLength(1);
+
+    const second = makeWsFactory();
+    (second.ws.fsReadFile as any).mockImplementationOnce(() => 'read-second');
+    (second.ws.fsGitDiff as any).mockImplementationOnce(() => 'diff-second');
+
+    view.rerender(
+      <FileBrowser
+        ws={second.ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        initialPreview={{ status: 'loading', path: '/home/user/foo.ts' }}
+        autoPreviewPath="/home/user/foo.ts"
+        autoPreviewPreferDiff
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect((second.ws.fsReadFile as any).mock.calls).toHaveLength(1);
+    expect((second.ws.fsGitDiff as any).mock.calls).toHaveLength(1);
+    expect((second.ws.fsReadFile as any).mock.calls[0]?.[0]).toBe('/home/user/foo.ts');
+    expect((second.ws.fsGitDiff as any).mock.calls[0]?.[0]).toBe('/home/user/foo.ts');
+  });
+
+  it('ignores stale preview responses after switching to a new target', async () => {
+    const { ws, sendMsg } = makeWsFactory();
+    const onPreviewStateChange = vi.fn();
+    (ws.fsReadFile as any)
+      .mockImplementationOnce(() => 'read-foo')
+      .mockImplementationOnce(() => 'read-bar');
+    (ws.fsGitDiff as any)
+      .mockImplementationOnce(() => 'diff-foo')
+      .mockImplementationOnce(() => 'diff-bar');
+
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/foo.ts"
+        onPreviewStateChange={onPreviewStateChange}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    view.rerender(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/bar.ts"
+        onPreviewStateChange={onPreviewStateChange}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      sendMsg({ type: 'fs.read_response', requestId: 'read-foo', path: '/home/user/foo.ts', status: 'ok', content: 'old foo' });
+      sendMsg({ type: 'fs.git_diff_response', requestId: 'diff-foo', path: '/home/user/foo.ts', status: 'ok', diff: '+old foo' });
+    });
+
+    expect(onPreviewStateChange.mock.calls.at(-1)?.[0]).toMatchObject({
+      path: '/home/user/bar.ts',
+      preview: { status: 'loading', path: '/home/user/bar.ts' },
+    });
+
+    await act(async () => {
+      sendMsg({ type: 'fs.read_response', requestId: 'read-bar', path: '/home/user/bar.ts', status: 'ok', content: 'new bar' });
+      sendMsg({ type: 'fs.git_diff_response', requestId: 'diff-bar', path: '/home/user/bar.ts', status: 'ok', diff: '+new bar' });
+    });
+
+    expect(onPreviewStateChange.mock.calls.at(-1)?.[0]).toMatchObject({
+      path: '/home/user/bar.ts',
+      preview: { status: 'ok', path: '/home/user/bar.ts', content: 'new bar', diff: '+new bar' },
+    });
+  });
+
+  it('polls only for an active inline preview', async () => {
+    vi.useFakeTimers();
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/foo.ts"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'foo.ts', isDir: false }], '/home/user'); });
+    await act(async () => {
+      sendMsg({ type: 'fs.read_response', requestId: 'mock-read-id', path: '/home/user/foo.ts', status: 'ok', content: 'const x = 1;' });
+      sendMsg({ type: 'fs.git_diff_response', requestId: 'mock-git-diff-id', path: '/home/user/foo.ts', status: 'ok', diff: '+const x = 1;' });
+    });
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
+
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+    });
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(2);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(2);
+    vi.useRealTimers();
+  });
+
+  it('does not poll local preview state for source instances that delegate to external previews', async () => {
+    vi.useFakeTimers();
+    const { ws } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        onPreviewFile={vi.fn()}
+        initialPreview={{ status: 'ok', path: '/home/user/foo.ts', content: 'const x = 1;' }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(0);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(0);
+
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+    });
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(0);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(0);
+    vi.useRealTimers();
   });
 
   it('does not immediately reopen an auto-preview after the preview close button is pressed', async () => {
