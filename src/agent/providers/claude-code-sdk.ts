@@ -31,6 +31,7 @@ interface ClaudeSdkSessionState {
   cwd: string;
   env?: Record<string, string>;
   model?: string;
+  settings?: string | Record<string, unknown>;
   description?: string;
   systemPrompt?: string;
   permissionMode: PermissionMode;
@@ -126,6 +127,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       env: config.env ?? existing?.env,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
+      settings: config.settings ?? existing?.settings,
       description: config.description ?? existing?.description,
       systemPrompt: config.systemPrompt ?? existing?.systemPrompt,
       permissionMode: this.resolvePermissionMode(),
@@ -267,6 +269,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       includePartialMessages: true,
       ...(state.started ? { resume: state.resumeId } : { sessionId: state.resumeId }),
       ...(state.model ? { model: state.model } : {}),
+      ...(state.settings ? { settings: state.settings } : {}),
       ...(state.effort ? { effort: state.effort } : {}),
       ...(baseSystemPrompt ?? state.systemPrompt ? {
         appendSystemPrompt: [baseSystemPrompt, state.systemPrompt].filter(Boolean).join('\n\n'),

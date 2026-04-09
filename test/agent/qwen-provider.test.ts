@@ -139,6 +139,51 @@ describe('QwenProvider', () => {
     });
   });
 
+  it('merges provided qwen settings with reasoning settings', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-preset',
+      cwd: '/tmp/project',
+      effort: 'high',
+      agentId: 'MiniMax-M2.7',
+      settings: {
+        security: { auth: { selectedType: 'anthropic' } },
+        model: { name: 'MiniMax-M2.7' },
+        modelProviders: {
+          anthropic: [
+            {
+              id: 'MiniMax-M2.7',
+              envKey: 'ANTHROPIC_API_KEY',
+              baseUrl: 'https://api.minimax.io/anthropic',
+            },
+          ],
+        },
+      },
+    });
+
+    await provider.send('sess-preset', 'hello');
+    const first = lastSpawn();
+    const settingsPath = first.env?.QWEN_CODE_SYSTEM_SETTINGS_PATH;
+    expect(typeof settingsPath).toBe('string');
+    expect(JSON.parse(await readFile(String(settingsPath), 'utf8'))).toEqual({
+      security: { auth: { selectedType: 'anthropic' } },
+      model: {
+        name: 'MiniMax-M2.7',
+        generationConfig: { reasoning: { effort: 'high' } },
+      },
+      modelProviders: {
+        anthropic: [
+          {
+            id: 'MiniMax-M2.7',
+            envKey: 'ANTHROPIC_API_KEY',
+            baseUrl: 'https://api.minimax.io/anthropic',
+          },
+        ],
+      },
+    });
+  });
+
   it('uses --session-id on first send, streams cumulative deltas, then resumes with --resume', async () => {
     const provider = new QwenProvider();
     await provider.connect({});

@@ -137,25 +137,6 @@ function getDefaultThinkingLevel(agentType: string | undefined): TransportEffort
   return supportsEffort(agentType) ? DEFAULT_TRANSPORT_EFFORT : undefined;
 }
 
-function isTransportIdentityQuestion(text: string): boolean {
-  const trimmed = text.trim();
-  if (!trimmed || trimmed.length > 200) return false;
-  return /(?:what|which|exact|current).*(?:model|provider|endpoint)|(?:model|provider|endpoint).*(?:using|use|current)|你.*(?:什么|哪个).*(?:模型|provider|服务商|端点)|当前.*(?:模型|provider|服务商|端点)|你在用什么模型/i.test(trimmed);
-}
-
-async function resolveTransportIdentityAnswer(record: SessionRecord): Promise<string | null> {
-  let model = record.activeModel ?? record.requestedModel ?? record.modelDisplay ?? undefined;
-  let provider = record.providerId ?? undefined;
-  if (record.ccPreset && record.agentType === 'claude-code-sdk') {
-    const { getPresetTransportOverrides, resolvePresetEnv } = await import('./cc-presets.js');
-    const presetOverrides = await getPresetTransportOverrides(record.ccPreset);
-    const presetEnv = await resolvePresetEnv(record.ccPreset, record.ccSessionId);
-    model = model ?? presetOverrides.model;
-    provider = presetEnv['ANTHROPIC_BASE_URL']?.trim() || provider;
-  }
-  return model ?? provider ?? null;
-}
-
 async function syncSubSessionIfNeeded(sessionName: string, serverLink: ServerLink): Promise<void> {
   if (!sessionName.startsWith('deck_sub_')) return;
   const subId = sessionName.slice('deck_sub_'.length);
@@ -1272,19 +1253,6 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           serverLink.send({ type: 'command.ack', commandId: effectiveId, status: stopStatus, session: sessionName });
         } catch { /* */ }
         return;
-      }
-      if (record && isTransportIdentityQuestion(text)) {
-        const identityAnswer = await resolveTransportIdentityAnswer(record);
-        if (identityAnswer) {
-          emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'assistant.text', { text: identityAnswer, streaming: false }, { source: 'daemon', confidence: 'high' });
-          const infoStatus = isLegacy ? 'accepted_legacy' : 'accepted';
-          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: infoStatus });
-          try {
-            serverLink.send({ type: 'command.ack', commandId: effectiveId, status: infoStatus, session: sessionName });
-          } catch { /* */ }
-          return;
-        }
       }
       const modelMatch = text.trim().match(/^\/model\s+(\S+)(?:\s+.*)?$/);
       const effortMatch = text.trim().match(/^\/(?:thinking|effort)\s+(\S+)\s*$/);

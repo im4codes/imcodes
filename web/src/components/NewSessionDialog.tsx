@@ -167,10 +167,12 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
           : { ocMode: 'new', ocSessionKey: ocSessionKey.trim(), ocDescription: ocDescription.trim() };
       ws.sendSessionCommand('start', { project: project.trim(), dir: dir.trim(), agentType, ...extra, thinking });
     } else {
+      const extra: Record<string, unknown> = {};
+      if (ccPreset && (agentType === 'claude-code' || agentType === 'qwen')) extra.ccPreset = ccPreset;
+      if (ccInitPrompt.trim() && agentType === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
       ws.sendSessionCommand('start', {
         project: project.trim(), dir: dir.trim(), agentType,
-        ...(ccPreset ? { ccPreset } : {}),
-        ...(ccInitPrompt.trim() ? { ccInitPrompt: ccInitPrompt.trim() } : {}),
+        ...extra,
         ...((agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'qwen') ? { thinking } : {}),
       });
     }
@@ -192,7 +194,7 @@ export function NewSessionDialog({ ws, onClose, onSessionStarted, isProviderConn
       : agentType === 'openclaw'
         ? OPENCLAW_THINKING_LEVELS
       : [];
-  const supportsCcPreset = agentType === 'claude-code' || agentType === 'claude-code-sdk';
+  const supportsCcPreset = agentType === 'claude-code' || agentType === 'qwen';
 
   useEffect(() => {
     setThinking('high');

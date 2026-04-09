@@ -862,7 +862,7 @@ export async function relaunchSessionWithSettings(
     requestedModel: targetRequestedModel ?? undefined,
     effort: targetEffort ?? undefined,
     transportConfig: targetTransportConfig ?? undefined,
-    ccPreset: (targetAgentType === 'claude-code' || targetAgentType === 'claude-code-sdk')
+    ccPreset: (targetAgentType === 'claude-code' || targetAgentType === 'claude-code-sdk' || targetAgentType === 'qwen')
       ? (targetCcPreset ?? undefined)
       : undefined,
     ...(preserveTransportBinding ? {
@@ -1014,7 +1014,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
     try {
       const provider = getProvider(s.providerId);
       if (!provider) continue;
-      const availableQwenModels = s.providerId === 'qwen'
+      let availableQwenModels = s.providerId === 'qwen'
         ? (s.qwenAvailableModels?.length ? s.qwenAvailableModels : (qwenRuntime?.availableModels ?? []))
         : [];
       const requestedTransportModel = s.requestedModel ?? s.qwenModel;
@@ -1036,6 +1036,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
           : undefined;
       let extraEnv: Record<string, string> | undefined;
       let systemPrompt: string | undefined;
+      let transportSettings: string | Record<string, unknown> | undefined;
       let effectiveRequestedModel = effectiveQwenModel;
       if (s.providerId === 'claude-code-sdk' && s.ccPreset) {
         const { resolvePresetEnv, getPresetTransportOverrides } = await import('../daemon/cc-presets.js');
@@ -1043,6 +1044,16 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         const presetOverrides = await getPresetTransportOverrides(s.ccPreset);
         if (!effectiveRequestedModel && presetOverrides.model) effectiveRequestedModel = presetOverrides.model;
         systemPrompt = presetOverrides.systemPrompt;
+      } else if (s.providerId === 'qwen' && s.ccPreset) {
+        const { getQwenPresetTransportConfig } = await import('../daemon/cc-presets.js');
+        const presetConfig = await getQwenPresetTransportConfig(s.ccPreset);
+        extraEnv = { ...(extraEnv ?? {}), ...presetConfig.env };
+        if (!effectiveRequestedModel && presetConfig.model) effectiveRequestedModel = presetConfig.model;
+        transportSettings = presetConfig.settings;
+        if (presetConfig.model) {
+          const nextModels = new Set([...(availableQwenModels ?? []), presetConfig.model]);
+          availableQwenModels = [...nextModels];
+        }
       }
       await runtime.initialize({
         sessionKey: effectiveSessionKey,
@@ -1053,6 +1064,7 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         label: s.label ?? s.name,
         description: s.description,
         ...(systemPrompt ? { systemPrompt } : {}),
+        ...(transportSettings ? { settings: transportSettings } : {}),
         agentId: effectiveRequestedModel,
         resumeId,
         effort: s.effort,
@@ -1128,6 +1140,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   let availableQwenModels: string[] | undefined;
   let sdkDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel'> | undefined;
   let transportSystemPrompt: string | undefined;
+  let transportSettings: string | Record<string, unknown> | undefined;
   const storedRequestedModel = !opts.fresh ? existing?.requestedModel : undefined;
   let requestedTransportModel = opts.requestedModel ?? storedRequestedModel ?? (agentType === 'qwen' ? (opts.qwenModel ?? existing?.qwenModel) : undefined);
   const effectiveTransportConfig = opts.transportConfig ?? existing?.transportConfig ?? {};
@@ -1138,6 +1151,17 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     qwenAuthType = qwenRuntime?.authType;
     qwenAuthLimit = qwenRuntime?.authLimit;
     availableQwenModels = qwenRuntime?.availableModels ?? [];
+    if (opts.ccPreset) {
+      const { getQwenPresetTransportConfig } = await import('../daemon/cc-presets.js');
+      const presetConfig = await getQwenPresetTransportConfig(opts.ccPreset);
+      transportEnv = { ...(transportEnv ?? {}), ...presetConfig.env };
+      if (!requestedTransportModel && presetConfig.model) requestedTransportModel = presetConfig.model;
+      if (presetConfig.settings) transportSettings = presetConfig.settings;
+      if (presetConfig.model) {
+        const nextModels = new Set([...(availableQwenModels ?? []), presetConfig.model]);
+        availableQwenModels = [...nextModels];
+      }
+    }
     if (!requestedTransportModel || (availableQwenModels.length > 0 && !availableQwenModels.includes(requestedTransportModel))) {
       requestedTransportModel = availableQwenModels[0] ?? requestedTransportModel;
     }
@@ -1166,6 +1190,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
       if (!requestedTransportModel && presetOverrides.model) requestedTransportModel = presetOverrides.model;
       transportSystemPrompt = presetOverrides.systemPrompt;
     }
+    if (requestedTransportModel) {
+      transportSettings = {
+        model: requestedTransportModel,
+        availableModels: [requestedTransportModel],
+      };
+    }
     sdkDisplay = await getClaudeSdkRuntimeConfig().catch(() => ({}));
   } else if (agentType === 'codex-sdk') {
     transportResumeId = opts.codexSessionId ?? (!opts.fresh ? getSession(name)?.codexSessionId : undefined);
@@ -1181,6 +1211,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     label: label || name,
     description,
     ...(transportSystemPrompt ? { systemPrompt: transportSystemPrompt } : {}),
+    ...(transportSettings ? { settings: transportSettings } : {}),
     agentId: requestedTransportModel,
     bindExistingKey: effectiveBindExistingKey,
     skipCreate: effectiveSkipCreate,

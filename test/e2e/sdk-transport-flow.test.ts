@@ -758,6 +758,7 @@ describe('sdk transport flow e2e', () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     const sessionName = 'deck_ccsdk_minimax_brain';
+    await waitForCondition(() => !!mocks.store.get(sessionName));
     const record = mocks.store.get(sessionName);
     expect(record?.ccPreset).toBe('MiniMax');
 
@@ -808,37 +809,6 @@ describe('sdk transport flow e2e', () => {
     });
     expect(claudeCall?.options.model).toBe('MiniMax-M2.7');
     expect(String(claudeCall?.options.appendSystemPrompt ?? '')).toContain('Authoritative runtime model: MiniMax-M2.7.');
-  });
-
-  it('answers claude-code-sdk runtime identity questions from authoritative preset metadata', async () => {
-    const serverLink = { send: vi.fn() } as any;
-
-    handleWebCommand({
-      type: 'session.start',
-      project: 'ccsdk identity',
-      dir: '/tmp/ccsdk-identity-e2e',
-      agentType: 'claude-code-sdk',
-      ccPreset: 'MiniMax',
-    }, serverLink);
-    await flushAsync();
-    await new Promise((resolve) => setTimeout(resolve, 50));
-
-    mocks.claudeCalls.length = 0;
-    const sessionName = 'deck_ccsdk_identity_brain';
-    handleWebCommand({
-      type: 'session.send',
-      session: sessionName,
-      text: 'Reply with only the exact model or provider you are currently using.',
-      commandId: 'cmd-ccsdk-identity',
-    }, serverLink);
-    await flushAsync();
-
-    expect(mocks.claudeCalls).toEqual([]);
-    expect(mocks.emitted).toContainEqual(expect.objectContaining({
-      session: sessionName,
-      type: 'assistant.text',
-      payload: expect.objectContaining({ text: 'MiniMax-M2.7', streaming: false }),
-    }));
   });
 
   beforeEach(() => {

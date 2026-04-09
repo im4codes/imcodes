@@ -34,6 +34,7 @@ interface QwenSessionState {
   description?: string;
   model?: string;
   effort: TransportEffortLevel;
+  settings?: string | Record<string, unknown>;
   settingsDir?: string;
   settingsPath?: string;
   /** Internal Qwen CLI conversation ID — decoupled from provider session ID so cancel can start fresh. */
@@ -217,6 +218,7 @@ export class QwenProvider implements TransportProvider {
       description: config.description ?? existing?.description,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
       effort: config.effort ?? existing?.effort ?? DEFAULT_TRANSPORT_EFFORT,
+      settings: config.settings ?? existing?.settings,
       settingsDir: existing?.settingsDir,
       settingsPath: existing?.settingsPath,
       qwenConversationId: existing?.qwenConversationId ?? sessionId,
@@ -304,6 +306,7 @@ export class QwenProvider implements TransportProvider {
       description: undefined,
       model: undefined,
       effort: DEFAULT_TRANSPORT_EFFORT,
+      settings: undefined,
       settingsDir: undefined,
       settingsPath: undefined,
       qwenConversationId: sessionId,
@@ -695,12 +698,26 @@ export class QwenProvider implements TransportProvider {
       state.settingsDir = await mkdtemp(path.join(os.tmpdir(), 'imcodes-qwen-thinking-'));
       state.settingsPath = path.join(state.settingsDir, 'settings.json');
     }
-    const next = {
-      model: {
-        generationConfig: {
-          reasoning: toQwenReasoning(state.effort),
-        },
+    const base = typeof state.settings === 'string'
+      ? {}
+      : (state.settings && typeof state.settings === 'object' ? state.settings : {});
+    const nextModel = {
+      ...(base.model && typeof base.model === 'object' ? base.model as Record<string, unknown> : {}),
+      generationConfig: {
+        ...(
+          base.model
+          && typeof base.model === 'object'
+          && (base.model as Record<string, unknown>).generationConfig
+          && typeof (base.model as Record<string, unknown>).generationConfig === 'object'
+            ? (base.model as Record<string, unknown>).generationConfig as Record<string, unknown>
+            : {}
+        ),
+        reasoning: toQwenReasoning(state.effort),
       },
+    };
+    const next = {
+      ...base,
+      model: nextModel,
     };
     let current = '';
     if (state.settingsPath) {

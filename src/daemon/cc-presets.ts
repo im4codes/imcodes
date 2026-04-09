@@ -116,6 +116,63 @@ export async function getPresetTransportOverrides(presetName: string): Promise<{
   };
 }
 
+export async function getQwenPresetTransportConfig(presetName: string): Promise<{
+  env: Record<string, string>;
+  settings?: Record<string, unknown>;
+  model?: string;
+}> {
+  const preset = await getPreset(presetName);
+  if (!preset) return { env: {} };
+
+  const resolvedEnv = await resolvePresetEnv(presetName);
+  const model = resolvedEnv['ANTHROPIC_MODEL']?.trim() || undefined;
+  const baseUrl = resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || undefined;
+  const apiKey = resolvedEnv['ANTHROPIC_API_KEY']?.trim()
+    || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()
+    || undefined;
+
+  const env: Record<string, string> = {};
+  if (baseUrl) env['ANTHROPIC_BASE_URL'] = baseUrl;
+  if (apiKey) env['ANTHROPIC_API_KEY'] = apiKey;
+  if (model) env['ANTHROPIC_MODEL'] = model;
+
+  const settings: Record<string, unknown> | undefined = (baseUrl && apiKey && model)
+    ? {
+        security: {
+          auth: {
+            selectedType: 'anthropic',
+          },
+        },
+        model: {
+          name: model,
+        },
+        modelProviders: {
+          anthropic: [
+            {
+              id: model,
+              name: preset.name,
+              envKey: 'ANTHROPIC_API_KEY',
+              baseUrl,
+              ...(preset.contextWindow
+                ? {
+                    generationConfig: {
+                      contextWindowSize: preset.contextWindow,
+                    },
+                  }
+                : {}),
+            },
+          ],
+        },
+      }
+    : undefined;
+
+  return {
+    env,
+    ...(settings ? { settings } : {}),
+    ...(model ? { model } : {}),
+  };
+}
+
 /** Default init message for non-Anthropic providers (no native web search). */
 const DEFAULT_INIT_MESSAGE = 'For web searches, use: curl -s "https://html.duckduckgo.com/html/?q=QUERY" | head -200. Replace QUERY with URL-encoded search terms.';
 

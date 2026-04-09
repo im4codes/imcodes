@@ -64,4 +64,34 @@ describe('cc presets', () => {
       IMCODES_CONTEXT_WINDOW: '200000',
     });
   });
+
+  it('builds qwen transport config for anthropic-compatible presets', async () => {
+    const { getQwenPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
+
+    await expect(getQwenPresetTransportConfig('MiniMax')).resolves.toEqual({
+      env: {
+        ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+        ANTHROPIC_API_KEY: 'test-token',
+        ANTHROPIC_MODEL: 'MiniMax-M2.7',
+      },
+      model: 'MiniMax-M2.7',
+      settings: {
+        security: { auth: { selectedType: 'anthropic' } },
+        model: { name: 'MiniMax-M2.7' },
+        modelProviders: {
+          anthropic: [
+            {
+              id: 'MiniMax-M2.7',
+              name: 'minimax',
+              envKey: 'ANTHROPIC_API_KEY',
+              baseUrl: 'https://api.minimax.io/anthropic',
+              generationConfig: {
+                contextWindowSize: 200000,
+              },
+            },
+          ],
+        },
+      },
+    });
+  });
 });
