@@ -4,7 +4,7 @@
 
 **Слой мессенджера для агентов.**
 
-IM.codes — специализированный мессенджер для AI coding agents. Он позволяет держать долгие agent‑сессии под рукой с телефона или из веба: терминал, файлы, Git, просмотр localhost, уведомления и multi‑agent workflows. Поддерживаются Claude Code, Codex, Gemini CLI, OpenClaw и Qwen.
+IM.codes — специализированный мессенджер для AI coding agents. Он позволяет держать долгие agent‑сессии под рукой с iPhone, iPad, Apple Watch, телефона или из веба: терминал, файлы, Git, просмотр localhost, уведомления и multi‑agent workflows. Поддерживаются Claude Code, Codex, Gemini CLI, OpenClaw и Qwen.
 
 > Это перевод. **Каноническая версия — английский README (`../README.md`).** Если есть расхождения, ориентируйтесь на английский вариант.
 

@@ -4,7 +4,7 @@
 
 **AI エージェントのための IM。**
 
-IM.codes は AI コーディングエージェント向けの専用メッセンジャーです。モバイルや Web から長時間動作する agent session にアクセスし、ターミナル、ファイル閲覧、Git 変更、localhost プレビュー、通知、マルチエージェント連携を扱えます。Claude Code、Codex、Gemini CLI、OpenClaw、Qwen に対応します。
+IM.codes は AI コーディングエージェント向けの専用メッセンジャーです。iPhone、iPad、Apple Watch、モバイルや Web から長時間動作する agent session にアクセスし、ターミナル、ファイル閲覧、Git 変更、localhost プレビュー、通知、マルチエージェント連携を扱えます。Claude Code、Codex、Gemini CLI、OpenClaw、Qwen に対応します。
 
 > これは翻訳版です。**正式な内容は英語版 README（`../README.md`）です。** 差異がある場合は英語版を優先してください。
 
