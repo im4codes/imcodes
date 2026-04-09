@@ -675,7 +675,10 @@ export function FileBrowser({
     const loadingPreview: FileBrowserPreviewState = { status: 'loading', path: filePath };
     setPreview(loadingPreview);
     setShowDiff(preferDiff);
-    if (onPreviewFile) onPreviewFile({ path: filePath, preferDiff, preview: loadingPreview });
+    if (onPreviewFile) {
+      onPreviewFile({ path: filePath, preferDiff, preview: loadingPreview });
+      return;
+    }
     const requestId = ws.fsReadFile(filePath);
     pendingReadRef.current.set(requestId, filePath);
     const diffId = ws.fsGitDiff(filePath);
@@ -801,7 +804,8 @@ export function FileBrowser({
     if (currentPreviewPath === autoPreviewPath && preview.status !== 'idle') {
       setShowDiff(autoPreviewPreferDiff);
       if (preview.status === 'loading' && initialPreview?.status === 'loading' && !skipAutoPreviewIfLoading) {
-        fetchPreview(autoPreviewPath, autoPreviewPreferDiff);
+        const hasPendingRead = [...pendingReadRef.current.values()].includes(autoPreviewPath);
+        if (!hasPendingRead) fetchPreview(autoPreviewPath, autoPreviewPreferDiff);
       }
       return;
     }

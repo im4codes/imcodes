@@ -746,10 +746,9 @@ describe('FileBrowser', () => {
     });
   });
 
-  it('pushes loaded preview state updates for externally hosted change previews', async () => {
+  it('does not start local preview fetches when using an external preview host', async () => {
     const { ws, respond, sendMsg } = makeWsFactory();
     const onPreviewFile = vi.fn();
-    const onPreviewStateChange = vi.fn();
     render(
       <FileBrowser
         ws={ws}
@@ -758,7 +757,6 @@ describe('FileBrowser', () => {
         initialPath="/home/user"
         changesRootPath="/home/user"
         onPreviewFile={onPreviewFile}
-        onPreviewStateChange={onPreviewStateChange}
         onConfirm={vi.fn()}
       />,
     );
@@ -781,28 +779,13 @@ describe('FileBrowser', () => {
     const changeItem = document.querySelector('.fb-changes-item') as HTMLElement;
     await act(async () => { fireEvent.click(changeItem); });
 
-    expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
-    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(0);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(0);
     expect(onPreviewFile).toHaveBeenLastCalledWith({
       path: '/home/user/foo.ts',
       preferDiff: true,
       preview: { status: 'loading', path: '/home/user/foo.ts' },
     });
-
-    await act(async () => {
-      sendMsg({ type: 'fs.read_response', requestId: 'mock-read-id', path: '/home/user/foo.ts', status: 'ok', content: 'const x = 1;' });
-      sendMsg({ type: 'fs.git_diff_response', requestId: 'mock-git-diff-id', path: '/home/user/foo.ts', status: 'ok', diff: '+const x = 1;' });
-    });
-
-    expect(onPreviewStateChange).toHaveBeenCalledWith(expect.objectContaining({
-      path: '/home/user/foo.ts',
-      preferDiff: true,
-      preview: expect.objectContaining({
-        status: 'ok',
-        path: '/home/user/foo.ts',
-        content: 'const x = 1;',
-      }),
-    }));
   });
 
   it('does not render an inline preview when an external preview host is provided', async () => {
@@ -837,10 +820,6 @@ describe('FileBrowser', () => {
 
     const changeItem = document.querySelector('.fb-changes-item') as HTMLElement;
     await act(async () => { fireEvent.click(changeItem); });
-    await act(async () => {
-      sendMsg({ type: 'fs.read_response', requestId: 'mock-read-id', path: '/home/user/foo.ts', status: 'ok', content: 'const x = 1;' });
-      sendMsg({ type: 'fs.git_diff_response', requestId: 'mock-git-diff-id', path: '/home/user/foo.ts', status: 'ok', diff: '+const x = 1;' });
-    });
 
     expect(onPreviewFile).toHaveBeenCalled();
     expect(document.querySelector('.fb-preview')).toBeNull();
@@ -898,6 +877,27 @@ describe('FileBrowser', () => {
 
     expect((ws.fsReadFile as any).mock.calls).toHaveLength(0);
     expect((ws.fsGitDiff as any).mock.calls).toHaveLength(0);
+  });
+
+  it('fetches preview data when a floating preview is hydrated with a loading state', () => {
+    const { ws } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        initialPreview={{ status: 'loading', path: '/home/user/foo.ts' }}
+        autoPreviewPath="/home/user/foo.ts"
+        autoPreviewPreferDiff
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect((ws.fsReadFile as any).mock.calls).toHaveLength(1);
+    expect((ws.fsGitDiff as any).mock.calls).toHaveLength(1);
+    expect((ws.fsReadFile as any).mock.calls[0]?.[0]).toBe('/home/user/foo.ts');
+    expect((ws.fsGitDiff as any).mock.calls[0]?.[0]).toBe('/home/user/foo.ts');
   });
 
   it('does not immediately reopen an auto-preview after the preview close button is pressed', async () => {

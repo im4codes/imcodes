@@ -2279,7 +2279,7 @@ export function App() {
                 serverId: selectedServerId ?? '',
                 subSessions,
                 inputRefsMap,
-                onPreviewFile: (request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: true }),
+                onPreviewFile: (request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false }),
                 onPreviewStateChange: handlePreviewStateChange,
                 activeSession,
                 activeProjectDir: activeSessionInfo?.projectDir,
