@@ -71,11 +71,22 @@ rem   3. Multiple watchdog instances (race after past upgrades)\r
 rem Tree-kill EVERY cmd.exe whose command line references daemon-watchdog.\r
 rem This catches both the healthy case and the crash-loop case.\r
 echo Killing all daemon-watchdog cmd.exe processes... >> "%LOG_FILE%"\r
+rem Try PowerShell first (works on Windows 11 / Server 2025 where wmic is\r
+rem deprecated/removed), fall back to wmic for legacy Windows installs.\r
+for /f "usebackq delims=" %%w in (\`powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter \\"Name='cmd.exe'\\" ^| Where-Object { $_.CommandLine -like '*daemon-watchdog*' } ^| Select-Object -ExpandProperty ProcessId" 2^>nul\`) do (\r
+  set "STALE_WD=%%w"\r
+  set "STALE_WD=!STALE_WD: =!"\r
+  if defined STALE_WD if not "!STALE_WD!"=="" (\r
+    echo   tree-killing watchdog PID !STALE_WD! ^(via powershell^) >> "%LOG_FILE%"\r
+    taskkill /f /t /pid !STALE_WD! >nul 2>&1\r
+  )\r
+)\r
+rem Fallback for systems where powershell returns nothing (or is unavailable).\r
 for /f "tokens=2 delims==" %%w in ('wmic process where "Name='cmd.exe' and CommandLine like '%%daemon-watchdog%%'" get ProcessId /format:list 2^>nul ^| find "="') do (\r
   set "STALE_WD=%%w"\r
   set "STALE_WD=!STALE_WD: =!"\r
   if defined STALE_WD if not "!STALE_WD!"=="" (\r
-    echo   tree-killing watchdog PID !STALE_WD! >> "%LOG_FILE%"\r
+    echo   tree-killing watchdog PID !STALE_WD! ^(via wmic^) >> "%LOG_FILE%"\r
     taskkill /f /t /pid !STALE_WD! >nul 2>&1\r
   )\r
 )\r

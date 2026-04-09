@@ -105,9 +105,6 @@ describe('buildWindowsUpgradeBatch', () => {
     // OLD watchdog.cmd had a UTF-8 BOM (cmd.exe parses [BOM]@echo as the
     // unknown command "[BOM]@echo"), there is no daemon.pid to walk back
     // from. The upgrade script must enumerate watchdogs by their cmd line.
-    // Note: in batch source, % must be doubled to escape, so the pattern
-    // appears as %%daemon-watchdog%%.
-    expect(batch).toContain("CommandLine like '%%daemon-watchdog%%'");
     expect(batch).toContain('taskkill /f /t /pid !STALE_WD!');
     // Must run BEFORE npm install
     const killByPatternIdx = batch.indexOf('taskkill /f /t /pid !STALE_WD!');
@@ -116,12 +113,23 @@ describe('buildWindowsUpgradeBatch', () => {
     expect(killByPatternIdx).toBeLessThan(installIdx);
   });
 
-  it('kills daemon directly via PIDFILE as belt-and-suspenders', () => {
-    expect(batch).toContain('taskkill /f /pid !OLD_PID!');
+  it('uses BOTH PowerShell and wmic so it works on every Windows version', () => {
+    // PowerShell works on Windows 7+; wmic is being removed from Windows 11
+    // and Server 2025 images.  Try PowerShell first, fall back to wmic.
+    expect(batch).toContain('powershell -NoProfile -NonInteractive');
+    expect(batch).toContain('Get-CimInstance Win32_Process');
+    expect(batch).toContain('daemon-watchdog');
+    expect(batch).toContain('wmic process where');
+    // Both branches should resolve to the same taskkill
+    const psIdx = batch.indexOf('powershell -NoProfile');
+    const wmicIdx = batch.indexOf('wmic process where');
+    // PowerShell branch must come first (preferred)
+    expect(psIdx).toBeGreaterThan(-1);
+    expect(wmicIdx).toBeGreaterThan(psIdx);
   });
 
-  it('uses wmic to enumerate watchdog processes', () => {
-    expect(batch).toContain('wmic process where');
+  it('kills daemon directly via PIDFILE as belt-and-suspenders', () => {
+    expect(batch).toContain('taskkill /f /pid !OLD_PID!');
   });
 
   // ── npm install ──

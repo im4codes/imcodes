@@ -48,14 +48,21 @@ async function waitFor(pred: () => boolean, timeoutMs: number, intervalMs = 100)
   return pred();
 }
 
-/** Use wmic to check whether a PID is still alive. */
+/** Check whether a PID is still alive.
+ *
+ *  Uses `tasklist` (available on every Windows Server / Windows 10/11)
+ *  rather than `wmic` because `wmic` is deprecated and not always installed
+ *  on newer GitHub Actions Windows runner images. */
 function pidAlive(pid: number): boolean {
   if (!isWindows) return false;
-  const result = spawnSync('wmic', ['process', 'where', `ProcessId=${pid}`, 'get', 'ProcessId'], {
+  const result = spawnSync('tasklist', ['/fi', `PID eq ${pid}`, '/fo', 'csv', '/nh'], {
     encoding: 'utf8',
     windowsHide: true,
   });
-  return (result.stdout ?? '').includes(String(pid));
+  // tasklist with /nh /fo csv outputs `"name.exe","PID",...`
+  // When no process matches, stdout is empty or contains "INFO:".
+  const stdout = result.stdout ?? '';
+  return stdout.includes(`"${pid}"`);
 }
 
 /** Spawn a fake daemon-watchdog cmd.exe process that just loops printing. */

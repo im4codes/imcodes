@@ -30,8 +30,9 @@ function sleepMs(ms: number): void {
 }
 
 /** Tree-kill every cmd.exe process whose command line references
- *  daemon-watchdog.  Works on any locale because the wmic query and
- *  taskkill commands are language-independent.
+ *  daemon-watchdog.  Works on any Windows locale and any Windows version
+ *  (Windows 10/11, Server 2016/2019/2022/2025) — newer Windows Server
+ *  images have deprecated `wmic`, so we use PowerShell's CIM cmdlets.
  *
  *  Why this exists:
  *    - Old daemon installs (pre-fix) wrote watchdog.cmd with a UTF-8 BOM.
@@ -44,21 +45,45 @@ function sleepMs(ms: number): void {
  *  This function is best-effort: it logs nothing and swallows all errors. */
 export function killAllStaleWatchdogs(): void {
   if (process.platform !== 'win32') return;
+  const pids = findStaleWatchdogPids();
+  for (const pid of pids) {
+    try { execSync(`taskkill /f /t /pid ${pid}`, { stdio: 'ignore' }); } catch { /* already dead */ }
+  }
+}
+
+/** Enumerate cmd.exe processes whose command line references daemon-watchdog.
+ *  Tries PowerShell first (universal), falls back to wmic (legacy Windows). */
+function findStaleWatchdogPids(): number[] {
+  const pids = new Set<number>();
+  // ── PowerShell path (works on every Windows since 7) ────────────────────
+  try {
+    const ps = 'Get-CimInstance Win32_Process -Filter "Name=\'cmd.exe\'" | Where-Object { $_.CommandLine -like \'*daemon-watchdog*\' } | Select-Object -ExpandProperty ProcessId';
+    const out = execSync(`powershell -NoProfile -NonInteractive -Command "${ps}"`, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    });
+    for (const line of out.split(/\r?\n/)) {
+      const pid = parseInt(line.trim(), 10);
+      if (Number.isFinite(pid) && pid > 0) pids.add(pid);
+    }
+    if (pids.size > 0) return [...pids];
+  } catch { /* fall through to wmic */ }
+  // ── Legacy wmic path ────────────────────────────────────────────────────
   try {
     const out = execSync(
       'wmic process where "Name=\'cmd.exe\' and CommandLine like \'%daemon-watchdog%\'" get ProcessId /format:list',
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
     );
-    const pids = out
-      .split(/\r?\n/)
-      .map((line) => line.match(/^ProcessId=(\d+)/))
-      .filter((m): m is RegExpMatchArray => m !== null)
-      .map((m) => parseInt(m[1], 10))
-      .filter((pid) => Number.isFinite(pid) && pid > 0);
-    for (const pid of pids) {
-      try { execSync(`taskkill /f /t /pid ${pid}`, { stdio: 'ignore' }); } catch { /* already dead */ }
+    for (const line of out.split(/\r?\n/)) {
+      const m = line.match(/^ProcessId=(\d+)/);
+      if (m) {
+        const pid = parseInt(m[1], 10);
+        if (Number.isFinite(pid) && pid > 0) pids.add(pid);
+      }
     }
-  } catch { /* wmic missing or no matches */ }
+  } catch { /* both methods failed */ }
+  return [...pids];
 }
 
 // ── Launcher methods (all hidden — no visible windows) ──────────────────────

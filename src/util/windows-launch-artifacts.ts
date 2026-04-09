@@ -169,19 +169,35 @@ export async function regenerateAllArtifacts(): Promise<void> {
 
 function killAllStaleWatchdogsBeforeRegen(): void {
   if (process.platform !== 'win32') return;
+  // PowerShell first (works on every Windows including ones where wmic is gone)
+  let pids: number[] = [];
   try {
-    const out = execSync(
-      'wmic process where "Name=\'cmd.exe\' and CommandLine like \'%daemon-watchdog%\'" get ProcessId /format:list',
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
-    );
-    const pids = out
-      .split(/\r?\n/)
-      .map((line) => line.match(/^ProcessId=(\d+)/))
-      .filter((m): m is RegExpMatchArray => m !== null)
-      .map((m) => parseInt(m[1], 10))
-      .filter((pid) => Number.isFinite(pid) && pid > 0);
-    for (const pid of pids) {
-      try { execSync(`taskkill /f /t /pid ${pid}`, { stdio: 'ignore' }); } catch { /* already dead */ }
+    const ps = 'Get-CimInstance Win32_Process -Filter "Name=\'cmd.exe\'" | Where-Object { $_.CommandLine -like \'*daemon-watchdog*\' } | Select-Object -ExpandProperty ProcessId';
+    const out = execSync(`powershell -NoProfile -NonInteractive -Command "${ps}"`, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    });
+    for (const line of out.split(/\r?\n/)) {
+      const pid = parseInt(line.trim(), 10);
+      if (Number.isFinite(pid) && pid > 0) pids.push(pid);
     }
-  } catch { /* wmic missing or no matches */ }
+  } catch { /* fall through */ }
+  if (pids.length === 0) {
+    try {
+      const out = execSync(
+        'wmic process where "Name=\'cmd.exe\' and CommandLine like \'%daemon-watchdog%\'" get ProcessId /format:list',
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
+      );
+      pids = out
+        .split(/\r?\n/)
+        .map((line) => line.match(/^ProcessId=(\d+)/))
+        .filter((m): m is RegExpMatchArray => m !== null)
+        .map((m) => parseInt(m[1], 10))
+        .filter((pid) => Number.isFinite(pid) && pid > 0);
+    } catch { /* both methods failed */ }
+  }
+  for (const pid of pids) {
+    try { execSync(`taskkill /f /t /pid ${pid}`, { stdio: 'ignore' }); } catch { /* already dead */ }
+  }
 }
