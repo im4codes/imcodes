@@ -23,7 +23,7 @@ const pendingStreamUpdates = new Map<string, {
   pendingText: string | null;
   timer: ReturnType<typeof setTimeout> | null;
 }>();
-const STREAM_UPDATE_INTERVAL_MS = 200;
+const STREAM_UPDATE_INTERVAL_MS = 80;
 
 function emitStreamingAssistantText(sessionName: string, eventId: string, text: string): void {
   timelineEmitter.emit(sessionName, 'assistant.text', {
