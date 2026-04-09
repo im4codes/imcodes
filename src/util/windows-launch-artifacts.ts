@@ -127,7 +127,7 @@ export function updateSchtasks(paths: LaunchPaths): boolean {
       'schtasks', '/Change',
       '/TN', TASK_NAME,
       '/TR', `wscript "${paths.vbsPath}"`,
-    ].join(' '), { stdio: 'ignore' });
+    ].join(' '), { stdio: 'ignore', windowsHide: true });
     return true;
   } catch {
     return false;
@@ -212,6 +212,6 @@ function killAllStaleWatchdogsBeforeRegen(): void {
     } catch { /* both methods failed */ }
   }
   for (const pid of pids) {
-    try { execSync(`taskkill /f /t /pid ${pid}`, { stdio: 'ignore' }); } catch { /* already dead */ }
+    try { execSync(`taskkill /f /t /pid ${pid}`, { stdio: 'ignore', windowsHide: true }); } catch { /* already dead */ }
   }
 }

@@ -232,4 +232,94 @@ describe('stale watchdog cleanup (Windows-only end-to-end)', () => {
       try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
     }
   }, 60_000);
+
+  // ── killOrphanDaemonProcesses() — guards bind/restart/repair/upgrade ────
+  // Verifies the helper that handles the "orphan daemon holding the named
+  // pipe" edge case.  Spawns a real node.exe at a path that matches the
+  // production filter (`*node_modules\imcodes\dist*`) — this is the EXACT
+  // path layout npm produces for the global imcodes install.
+  //
+  // CRITICAL: the production filter must be SPECIFIC.  An earlier loose
+  // `*imcodes*` filter killed the test runner itself (because the repo
+  // working directory is C:\Users\<user>\imcodes-src — which contains
+  // "imcodes").  This test verifies the precise filter targeting.
+
+  it.skipIf(!isWindows)('killOrphanDaemonProcesses() kills a node.exe at the production daemon path', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-orphan-1-'));
+    let pid: number | null = null;
+    try {
+      // Build the EXACT path layout production uses:
+      //   <tmp>/node_modules/imcodes/dist/src/index.js
+      const fakeDir = join(dir, 'node_modules', 'imcodes', 'dist', 'src');
+      const { mkdirSync } = await import('node:fs');
+      mkdirSync(fakeDir, { recursive: true });
+      const fakePath = join(fakeDir, 'index.js');
+      writeFileSync(fakePath, 'setInterval(() => {}, 60_000);');
+
+      const child = spawn(process.execPath, [fakePath], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      child.unref();
+      pid = child.pid!;
+      const spawned = await waitFor(() => pidAlive(pid!), 5000);
+      expect(spawned, `fake orphan PID ${pid} did not appear`).toBe(true);
+
+      // Run killOrphanDaemonProcesses() in a child node so vitest doesn't
+      // pollute the production module.
+      const moduleUrl = pathToFileURL(join(repoRoot, 'dist/src/util/windows-daemon.js')).href;
+      const driverSource =
+        `import { killOrphanDaemonProcesses } from ${JSON.stringify(moduleUrl)};\n` +
+        `const k = killOrphanDaemonProcesses();\n` +
+        `console.error('[driver] killed=' + k);\n`;
+      const result = runInChildProcess(driverSource);
+      expect(result.status, `driver: ${result.stderr}`).toBe(0);
+
+      // PowerShell startup is slow on CI runners → 15s grace
+      const dead = await waitFor(() => !pidAlive(pid!), 15_000);
+      expect(dead, `fake orphan ${pid} should be killed.\nDriver: ${result.stderr}`).toBe(true);
+    } finally {
+      if (pid && pidAlive(pid)) {
+        spawnSync('taskkill', ['/f', '/pid', String(pid)], { windowsHide: true });
+      }
+      try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  }, 60_000);
+
+  it.skipIf(!isWindows)('killOrphanDaemonProcesses() does NOT kill an unrelated node.exe (precise filter)', async () => {
+    // Spawn a node.exe whose path does NOT match the production filter
+    // even though it's in a tmp dir.  Production filter is
+    // `*node_modules\imcodes\dist*` — must NOT match "unrelated.js".
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-orphan-2-'));
+    let benignPid: number | null = null;
+    try {
+      const benignPath = join(dir, 'unrelated-script.js');
+      writeFileSync(benignPath, 'setInterval(() => {}, 60_000);');
+      const child = spawn(process.execPath, [benignPath], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      child.unref();
+      benignPid = child.pid!;
+      const spawned = await waitFor(() => pidAlive(benignPid!), 5000);
+      expect(spawned).toBe(true);
+
+      const moduleUrl = pathToFileURL(join(repoRoot, 'dist/src/util/windows-daemon.js')).href;
+      const driverSource =
+        `import { killOrphanDaemonProcesses } from ${JSON.stringify(moduleUrl)};\n` +
+        `killOrphanDaemonProcesses();\n`;
+      runInChildProcess(driverSource);
+
+      await new Promise((r) => setTimeout(r, 3000));
+      expect(pidAlive(benignPid!), `unrelated node.exe ${benignPid} must NOT be killed`).toBe(true);
+    } finally {
+      if (benignPid && pidAlive(benignPid)) {
+        spawnSync('taskkill', ['/f', '/pid', String(benignPid)], { windowsHide: true });
+      }
+      try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  }, 60_000);
+
 });
