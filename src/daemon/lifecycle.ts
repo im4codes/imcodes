@@ -27,7 +27,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { pickReadableSessionDisplay } from '../../shared/session-display.js';
-import { mergeWorkerSessionSnapshot } from './session-bootstrap.js';
+import { buildWorkerSessionPersistBody, mergeWorkerSessionSnapshot } from './session-bootstrap.js';
 
 /** Get the last assistant.text from a session's timeline (for push notification context). */
 function getLastAssistantText(sessionName: string): string | undefined {
@@ -103,25 +103,11 @@ async function persistSessionToWorker(
   record: import('../store/session-store.js').SessionRecord,
 ): Promise<void> {
   try {
+    const payload = buildWorkerSessionPersistBody(record);
     const res = await fetch(`${workerUrl}/api/server/${serverId}/sessions/${encodeURIComponent(name)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, 'X-Server-Id': serverId },
-      body: JSON.stringify({
-        projectName: record.projectName,
-        projectRole: record.role,
-        agentType: record.agentType,
-        agentVersion: record.agentVersion,
-        projectDir: record.projectDir,
-        state: record.state,
-        runtimeType: record.runtimeType ?? null,
-        providerId: record.providerId ?? null,
-        providerSessionId: record.providerSessionId ?? null,
-        description: record.description ?? null,
-        requestedModel: record.requestedModel ?? null,
-        activeModel: record.activeModel ?? record.modelDisplay ?? null,
-        effort: record.effort ?? null,
-        transportConfig: record.transportConfig ?? null,
-      }),
+      body: JSON.stringify(payload),
     });
     if (!res.ok) logger.warn({ status: res.status, name }, 'persistSessionToWorker: non-ok response');
   } catch (e) {
@@ -186,7 +172,7 @@ async function syncSessionsFromWorker(workerUrl: string, serverId: string, token
       return;
     }
 
-    const data = await sessionRes.json() as { sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; project_dir: string; state: string; requested_model?: string | null; active_model?: string | null; effort?: SessionRecord['effort'] | null; transport_config?: Record<string, unknown> | string | null }> };
+    const data = await sessionRes.json() as { sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; project_dir: string; state: string; label?: string | null; requested_model?: string | null; active_model?: string | null; effort?: SessionRecord['effort'] | null; transport_config?: Record<string, unknown> | string | null }> };
     const subData = await subRes.json() as { subSessions: Array<{ id: string }> };
     const remoteSessionNames = new Set(
       data.sessions

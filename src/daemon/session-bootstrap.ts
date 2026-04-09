@@ -14,6 +14,44 @@ export interface WorkerSessionSnapshot {
   transport_config?: Record<string, unknown> | string | null;
 }
 
+export interface WorkerSessionPersistBody {
+  projectName: string;
+  projectRole: string;
+  agentType: string;
+  agentVersion: string | null;
+  projectDir: string;
+  state: string;
+  label: string | null;
+  runtimeType: string | null;
+  providerId: string | null;
+  providerSessionId: string | null;
+  description: string | null;
+  requestedModel: string | null;
+  activeModel: string | null;
+  effort: SessionRecord['effort'] | null;
+  transportConfig: Record<string, unknown> | null;
+}
+
+export function buildWorkerSessionPersistBody(record: SessionRecord): WorkerSessionPersistBody {
+  return {
+    projectName: record.projectName,
+    projectRole: record.role,
+    agentType: record.agentType,
+    agentVersion: record.agentVersion ?? null,
+    projectDir: record.projectDir,
+    state: record.state,
+    label: record.label ?? null,
+    runtimeType: record.runtimeType ?? null,
+    providerId: record.providerId ?? null,
+    providerSessionId: record.providerSessionId ?? null,
+    description: record.description ?? null,
+    requestedModel: record.requestedModel ?? null,
+    activeModel: record.activeModel ?? record.modelDisplay ?? null,
+    effort: record.effort ?? null,
+    transportConfig: record.transportConfig ?? null,
+  };
+}
+
 export function mergeWorkerSessionSnapshot(
   existing: SessionRecord | undefined,
   snapshot: WorkerSessionSnapshot,

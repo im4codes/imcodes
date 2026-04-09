@@ -474,6 +474,15 @@ describe('sessions', () => {
     expect(s?.state).toBe('idle');
   });
 
+  it('upsertDbSession preserves an existing label when a later sync omits it', async () => {
+    await upsertDbSession(db, 'sid-keep-label', serverId, 'deck_proj_brain', 'myproj', 'brain', 'claude-code', '/home/dev', 'idle', 'Readable Main');
+    await upsertDbSession(db, 'sid-1', serverId, 'deck_proj_brain', 'myproj', 'brain', 'claude-code', '/home/dev', 'running');
+    const sessions = await getDbSessionsByServer(db, serverId);
+    const s = sessions.find((session) => session.name === 'deck_proj_brain');
+    expect(s?.label).toBe('Readable Main');
+    expect(s?.state).toBe('running');
+  });
+
   it('updateSessionLabel sets label', async () => {
     await updateSessionLabel(db, serverId, 'deck_proj_brain', 'My Project');
     const sessions = await getDbSessionsByServer(db, serverId);

@@ -1,6 +1,36 @@
 import { describe, expect, it } from 'vitest';
 
-import { mergeWorkerSessionSnapshot } from '../../src/daemon/session-bootstrap.js';
+import { buildWorkerSessionPersistBody, mergeWorkerSessionSnapshot } from '../../src/daemon/session-bootstrap.js';
+
+describe('buildWorkerSessionPersistBody', () => {
+  it('serializes the current label so later daemon syncs do not wipe it', () => {
+    const payload = buildWorkerSessionPersistBody({
+      name: 'deck_proj_brain',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'codex',
+      projectDir: '/tmp/proj',
+      state: 'idle',
+      label: 'Readable Main',
+      description: 'persona',
+      requestedModel: 'gpt-5',
+      activeModel: 'gpt-5',
+      modelDisplay: 'GPT-5',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    } as any);
+
+    expect(payload).toEqual(expect.objectContaining({
+      projectName: 'proj',
+      projectRole: 'brain',
+      label: 'Readable Main',
+      requestedModel: 'gpt-5',
+      activeModel: 'gpt-5',
+    }));
+  });
+});
 
 describe('mergeWorkerSessionSnapshot', () => {
   it('hydrates the persisted main-session label from the worker snapshot', () => {
