@@ -1,5 +1,14 @@
 import { mapP2pStatusToUiState, type P2pActivePhase, type P2pProgressNodeStatus } from '@shared/p2p-status.js';
 
+function parseTimestamp(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value);
+    if (!Number.isNaN(parsed)) return parsed;
+  }
+  return undefined;
+}
+
 function parseSnapshot(rawSnapshot: unknown): Record<string, any> {
   if (typeof rawSnapshot === 'string') {
     try {
@@ -103,7 +112,17 @@ export function mapP2pRunToDiscussion(r: Record<string, any>) {
     error: state === 'failed' ? (source.error ?? source.terminal_reason ?? '') : '',
     nodes: useAdvancedNodes ? advancedNodes : legacyNodes,
     hopStates,
-    startedAt: typeof source.created_at === 'string' ? Date.parse(source.created_at) : undefined,
-    hopStartedAt: typeof source.hop_started_at === 'number' ? source.hop_started_at : undefined,
+    startedAt: parseTimestamp(source.created_at),
+    hopStartedAt: parseTimestamp(source.hop_started_at),
+  };
+}
+
+export function mergeP2pDiscussionUpdate<T extends { startedAt?: number; hopStartedAt?: number }>(existing: T | undefined, incoming: T): T {
+  if (!existing) return incoming;
+  return {
+    ...existing,
+    ...incoming,
+    startedAt: incoming.startedAt ?? existing.startedAt,
+    hopStartedAt: incoming.hopStartedAt ?? existing.hopStartedAt,
   };
 }

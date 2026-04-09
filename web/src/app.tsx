@@ -6,7 +6,7 @@ import {
   type FileBrowserPreviewUpdate,
 } from './components/FileBrowser.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
-import { mapP2pRunToDiscussion } from './p2p-run-mapping.js';
+import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate } from './p2p-run-mapping.js';
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
 import { LanguageSwitcher } from './components/LanguageSwitcher.js';
@@ -1429,7 +1429,7 @@ export function App() {
         setDiscussions((prev) => {
           const existing = prev.find((d) => d.id === entry.id);
           return existing
-            ? prev.map((d) => d.id === entry.id ? { ...d, ...entry } : d)
+            ? prev.map((d) => d.id === entry.id ? mergeP2pDiscussionUpdate(d, entry) : d)
             : [...prev, entry];
         });
 
@@ -1459,7 +1459,7 @@ export function App() {
           const merged = [...retained];
           for (const entry of mapped) {
             const idx = merged.findIndex((d) => d.id === entry.id);
-            if (idx >= 0) merged[idx] = { ...merged[idx], ...entry };
+            if (idx >= 0) merged[idx] = mergeP2pDiscussionUpdate(merged[idx], entry);
             else merged.push(entry);
           }
           return merged;

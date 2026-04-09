@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { mapP2pRunToDiscussion } from '../src/p2p-run-mapping.js';
+import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate } from '../src/p2p-run-mapping.js';
 
 describe('mapP2pRunToDiscussion', () => {
   it('keeps legacy payloads on legacy nodes and legacy counters', () => {
@@ -233,5 +233,69 @@ describe('mapP2pRunToDiscussion', () => {
     expect(summaryTimeout.error).toContain('advanced_run_timeout');
     expect(roundTimeout.state).toBe('failed');
     expect(roundTimeout.error).toContain('timed_out');
+  });
+
+  it('maps timer timestamps from both string and numeric payload fields', () => {
+    const startedAt = 1_775_692_800_000;
+    const hopStartedAt = startedAt + 5_000;
+    const stringStamped = mapP2pRunToDiscussion({
+      id: 'run_string_time',
+      status: 'running',
+      mode_key: 'audit',
+      current_round: 1,
+      total_rounds: 1,
+      total_hops: 1,
+      created_at: '2026-04-09T00:00:00.000Z',
+      hop_started_at: startedAt,
+    });
+
+    const numericStamped = mapP2pRunToDiscussion({
+      id: 'run_numeric_time',
+      status: 'running',
+      mode_key: 'audit',
+      current_round: 1,
+      total_rounds: 1,
+      total_hops: 1,
+      created_at: startedAt,
+      hop_started_at: '2026-04-09T00:00:05.000Z',
+    });
+
+    expect(stringStamped.startedAt).toBe(startedAt);
+    expect(stringStamped.hopStartedAt).toBe(startedAt);
+    expect(numericStamped.startedAt).toBe(startedAt);
+    expect(numericStamped.hopStartedAt).toBe(hopStartedAt);
+  });
+
+  it('preserves existing timer anchors when later run updates omit them', () => {
+    const existing = {
+      id: 'p2p_run_anchor',
+      topic: 'P2P audit · brain',
+      state: 'setup',
+      currentRound: 0,
+      maxRounds: 2,
+      completedHops: 0,
+      totalHops: 2,
+      startedAt: 1_744_156_800_000,
+      hopStartedAt: 1_744_156_801_000,
+    };
+
+    const incoming = {
+      id: 'p2p_run_anchor',
+      topic: 'P2P audit · brain',
+      state: 'running',
+      currentRound: 1,
+      maxRounds: 2,
+      completedHops: 0,
+      totalHops: 2,
+      startedAt: undefined,
+      hopStartedAt: undefined,
+    };
+
+    const merged = mergeP2pDiscussionUpdate(existing, incoming);
+
+    expect(merged.startedAt).toBe(existing.startedAt);
+    expect(merged.hopStartedAt).toBe(existing.hopStartedAt);
+    expect(merged.state).toBe('running');
+    expect(merged.currentRound).toBe(1);
   });
 });

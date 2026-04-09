@@ -12,7 +12,7 @@ vi.mock('react-i18next', () => ({
 }));
 
 import { P2pProgressCard } from '../../src/components/P2pProgressCard.js';
-import { mapP2pRunToDiscussion } from '../../src/p2p-run-mapping.js';
+import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate } from '../../src/p2p-run-mapping.js';
 
 describe('P2pProgressCard', () => {
   beforeEach(() => {
@@ -198,6 +198,55 @@ describe('P2pProgressCard', () => {
     });
 
     expect(screen.getAllByText('00:02').length).toBeGreaterThan(0);
+  });
+
+  it('does not lose timer anchors when a later discussion update omits timestamp fields', () => {
+    const startedAt = Date.now();
+    const hopStartedAt = startedAt;
+    const initial = mapP2pRunToDiscussion({
+      id: 'p2p_run_partial_update',
+      status: 'running',
+      mode_key: 'audit',
+      current_round: 1,
+      total_rounds: 2,
+      completed_hops_count: 0,
+      total_hops: 2,
+      active_hop_number: 1,
+      active_round_hop_number: 1,
+      active_phase: 'hop',
+      created_at: startedAt,
+      hop_started_at: hopStartedAt,
+      all_nodes: [
+        { label: 'brain', agentType: 'claude-code', status: 'done', phase: 'initial' },
+        { label: 'w1', agentType: 'codex', status: 'active', phase: 'hop' },
+      ],
+    });
+
+    const view = render(<P2pProgressCard discussion={initial} />);
+
+    act(() => {
+      vi.advanceTimersByTime(2000);
+    });
+
+    expect(screen.getAllByText('00:02').length).toBeGreaterThan(0);
+
+    const partialUpdate = mergeP2pDiscussionUpdate(initial, {
+      ...initial,
+      completedHops: 1,
+      activeHop: 2,
+      activeRoundHop: 2,
+      startedAt: undefined,
+      hopStartedAt: undefined,
+    });
+
+    view.rerender(<P2pProgressCard discussion={partialUpdate} />);
+
+    act(() => {
+      vi.advanceTimersByTime(2000);
+    });
+
+    expect(screen.queryAllByText('00:00').length).toBe(0);
+    expect(screen.getAllByText('00:04').length).toBeGreaterThan(0);
   });
 
   it('shows parallel hop ranges and highlights all active hop segments', () => {
