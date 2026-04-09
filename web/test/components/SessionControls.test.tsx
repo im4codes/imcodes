@@ -288,6 +288,25 @@ afterEach(() => {
     });
   });
 
+  it('bottom-aligns side buttons on mobile once the composer grows past one line', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    const { container } = render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    Object.defineProperty(input, 'clientHeight', { configurable: true, value: 32 });
+    Object.defineProperty(input, 'scrollHeight', { configurable: true, value: 84 });
+    input.textContent = 'hello world';
+    fireEvent.input(input);
+    expect(container.querySelector('.controls-mobile-multiline')).toBeTruthy();
+  });
+
+  it('expands the mobile composer into a full-screen editor', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    const { container } = render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
+    fireEvent.click(screen.getByRole('button', { name: 'expand composer' }));
+    expect(container.querySelector('.controls-composer-mobile-expanded')).toBeTruthy();
+    expect(container.querySelector('.controls-composer-backdrop')).toBeTruthy();
+  });
+
   it('renders menu button (⋯)', () => {
     render(<SessionControls ws={makeWs() as any} activeSession={makeSession()} quickData={makeQuickData() as any} />);
     // The ⋯ menu button has title from t('session.actions') → 'actions'

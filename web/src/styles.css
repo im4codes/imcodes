@@ -125,7 +125,36 @@ body {
 .p2p-settings-label { font-size: 11px; font-weight: 600; letter-spacing: 0.01em; }
 .controls { padding: 6px 8px; display: flex; gap: 6px; align-items: center; }
 .controls-composer { position: relative; flex: 1; min-width: 0; display: flex; align-items: stretch; }
+.controls-composer-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(2, 6, 23, 0.72);
+  z-index: 4090;
+}
+.controls-input-with-leading { padding-left: 42px; }
 .controls-input-with-trailing { padding-right: 42px; }
+.btn-input-expand {
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 1;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: rgba(30, 41, 59, 0.9);
+  border: 1px solid #475569;
+  color: #cbd5e1;
+}
+.btn-input-expand:hover,
+.btn-input-expand:active {
+  background: #334155;
+  color: #f8fafc;
+}
 .btn-voice-embedded {
   position: absolute;
   right: 8px;
@@ -235,8 +264,29 @@ body {
 .menu-item-active:hover { background: #2a1b4e !important; }
 .p2p-menu-section-label { font-size: 10px; color: #64748b; padding: 2px 12px; text-transform: uppercase; letter-spacing: 0.05em; }
 @media (max-width: 640px) {
-  .controls { align-items: flex-end; }
+  .controls { align-items: center; }
+  .controls-mobile-multiline { align-items: flex-end; }
   .controls-composer { min-height: 32px; }
+  .controls-composer-mobile-expanded {
+    position: fixed;
+    inset: calc(var(--sat, 0px) + 8px) 8px 8px;
+    z-index: 4100;
+    background: #0f172a;
+    border: 1px solid #334155;
+    border-radius: 16px;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+    padding: 44px 10px 10px;
+  }
+  .controls-composer-mobile-expanded .controls-input {
+    height: 100%;
+    min-height: 100%;
+    max-height: none;
+    border-radius: 12px;
+  }
+  .controls-composer-mobile-expanded .btn-input-expand {
+    top: 10px;
+    transform: none;
+  }
   .btn-voice-embedded {
     right: 6px;
     width: 30px;
@@ -249,6 +299,11 @@ body {
     background: rgba(30, 41, 59, 0.9);
     border: 1px solid #475569;
     color: #cbd5e1;
+  }
+  .controls-composer-mobile-expanded .btn-voice-embedded {
+    top: 10px;
+    right: 10px;
+    transform: none;
   }
   .btn-voice-embedded:hover,
   .btn-voice-embedded:active {

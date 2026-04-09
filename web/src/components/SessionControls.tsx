@@ -316,6 +316,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
   const [qwenModel, setQwenModel] = useState<QwenModelChoice | null>(loadQwenModel);
   const [queuedHintExpanded, setQueuedHintExpanded] = useState(loadQueuedHintExpanded);
+  const [mobileComposerMultiline, setMobileComposerMultiline] = useState(false);
+  const [mobileComposerExpanded, setMobileComposerExpanded] = useState(false);
   const [confirm, setConfirm] = useState<MenuAction | null>(null);
   const [confirmLevel, setConfirmLevel] = useState(0); // 0=none, 1=first warning, 2=second warning (sub-session only)
   const [skipComboSendConfirm, setSkipComboSendConfirm] = useState(false);
@@ -580,6 +582,17 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return !text.includes('\n');
   };
 
+  const syncMobileComposerMetrics = useCallback(() => {
+    if (typeof window === 'undefined' || window.innerWidth > 640) {
+      setMobileComposerMultiline(false);
+      return;
+    }
+    const root = divRef.current;
+    if (!root) return;
+    const clientHeight = root.clientHeight || 32;
+    setMobileComposerMultiline(root.scrollHeight > clientHeight + 4);
+  }, []);
+
   const fillInput = (text: string) => {
     if (divRef.current) {
       divRef.current.textContent = text;
@@ -593,6 +606,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       divRef.current.focus();
     }
     setHasText(!!text.trim());
+    syncMobileComposerMetrics();
   };
 
   const appendToInput = (paths: string[]) => {
@@ -610,6 +624,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       divRef.current.focus();
     }
     setHasText(true);
+    syncMobileComposerMetrics();
   };
 
   const toComposerReference = useCallback((path: string) => {
@@ -967,6 +982,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       pendingConfigOverrideRef.current = null;
       if (divRef.current) divRef.current.textContent = '';
       setHasText(false);
+      setMobileComposerExpanded(false);
+      setMobileComposerMultiline(false);
       setAttachments([]);
       if (quotes && quotes.length > 0) {
         for (let i = quotes.length - 1; i >= 0; i--) onRemoveQuote?.(i);
@@ -1316,6 +1333,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       ? basePlaceholder
       : t('session.send_placeholder_desktop_upload', { placeholder: basePlaceholder });
 
+  useEffect(() => {
+    if (!isMobileLayout) {
+      setMobileComposerExpanded(false);
+      setMobileComposerMultiline(false);
+      return;
+    }
+    syncMobileComposerMetrics();
+  }, [hasText, isMobileLayout, syncMobileComposerMetrics]);
+
   return (
     <>
     {mobileFileBrowserOpen && ws && activeSession && (
@@ -1344,7 +1370,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         />
       </div>
     )}
-    <div class={`controls-wrapper${showRunningSweep ? ' controls-wrapper-running' : ''}`}>
+    <div class={`controls-wrapper${showRunningSweep ? ' controls-wrapper-running' : ''}${mobileComposerExpanded ? ' controls-wrapper-mobile-expanded' : ''}`}>
       {/* Shortcut row — hidden in chat mode and compact mode */}
       {!hideShortcuts && !compact && <div class="shortcuts-row">
         <div class="shortcuts">
@@ -1820,7 +1846,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       )}
 
       {/* Main input row */}
-      <div class="controls">
+      <div class={`controls${isMobileLayout && mobileComposerMultiline ? ' controls-mobile-multiline' : ''}`}>
         {/* Quick input trigger — left of input */}
         <div class="qp-trigger-wrap" ref={quickWrapRef}>
           <button
@@ -1964,10 +1990,24 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           contenteditable div — iOS does NOT show the password/keychain autofill bar
           for contenteditable elements, unlike <input> or <textarea>.
         */}
-        <div class={`controls-composer${showEmbeddedVoiceButton ? ' controls-composer-with-voice' : ''}`}>
+        {mobileComposerExpanded && <div class="controls-composer-backdrop" onClick={() => setMobileComposerExpanded(false)} />}
+        <div class={`controls-composer${showEmbeddedVoiceButton ? ' controls-composer-with-voice' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}`}>
+          {isMobileLayout && (
+            <button
+              class="btn btn-input-expand"
+              onClick={() => {
+                setMobileComposerExpanded((prev) => !prev);
+                setTimeout(() => divRef.current?.focus(), 0);
+              }}
+              title={mobileComposerExpanded ? 'collapse composer' : 'expand composer'}
+              aria-label={mobileComposerExpanded ? 'collapse composer' : 'expand composer'}
+            >
+              {mobileComposerExpanded ? '✕' : '⤢'}
+            </button>
+          )}
           <div
             ref={divRef}
-            class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${showEmbeddedVoiceButton ? ' controls-input-with-trailing' : ''}`}
+            class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${isMobileLayout ? ' controls-input-with-leading' : ''}${showEmbeddedVoiceButton ? ' controls-input-with-trailing' : ''}`}
             data-onboarding="chat-input"
             contenteditable={inputDisabled ? 'false' : 'true'}
             role="textbox"
@@ -1981,6 +2021,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             onInput={() => {
               const currentText = divRef.current?.textContent ?? '';
               setHasText(!!currentText.trim());
+              syncMobileComposerMetrics();
               if (sendWarning) clearSendWarning();
               if (atSelectionLockRef.current && currentText !== atSelectionSnapshotRef.current) {
                 atSelectionLockRef.current = false;
