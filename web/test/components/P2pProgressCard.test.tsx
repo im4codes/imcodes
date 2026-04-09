@@ -200,6 +200,40 @@ describe('P2pProgressCard', () => {
     expect(screen.getAllByText('00:02').length).toBeGreaterThan(0);
   });
 
+  it('keeps timers moving even when server timestamps are in the future', () => {
+    const futureStart = Date.now() + 60_000;
+    render(
+      <P2pProgressCard
+        discussion={{
+          id: 'p2p_run_future_clock',
+          topic: 'P2P audit · brain',
+          state: 'running',
+          modeKey: 'audit',
+          currentRound: 1,
+          maxRounds: 2,
+          completedHops: 0,
+          totalHops: 2,
+          activeHop: 1,
+          activeRoundHop: 1,
+          activePhase: 'hop',
+          startedAt: futureStart,
+          hopStartedAt: futureStart,
+          nodes: [
+            { label: 'brain', agentType: 'codex', status: 'active', phase: 'hop' },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getAllByText('00:00').length).toBeGreaterThan(0);
+
+    act(() => {
+      vi.advanceTimersByTime(2000);
+    });
+
+    expect(screen.getAllByText('00:02').length).toBeGreaterThan(0);
+  });
+
   it('does not lose timer anchors when a later discussion update omits timestamp fields', () => {
     const startedAt = Date.now();
     const hopStartedAt = startedAt;

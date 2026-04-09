@@ -288,6 +288,7 @@ export function P2pConfigPanel({
   const [contextReducerTemplate, setContextReducerTemplate] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const showAdvancedWorkflowSettings = false;
 
   const enabledSdkParticipants = useMemo(
     () => allEligible.filter((entry) => entry.flavor === 'sdk').filter((entry) => {
@@ -607,7 +608,7 @@ export function P2pConfigPanel({
                   />
                 </div>
 
-                <div style={{ ...sectionCardStyle, marginTop: 12 }}>
+                {showAdvancedWorkflowSettings && <div style={{ ...sectionCardStyle, marginTop: 12 }}>
                   <button
                     type="button"
                     onClick={() => setAdvancedExpanded((value) => !value)}
@@ -916,7 +917,7 @@ export function P2pConfigPanel({
                       )}
                     </div>
                   )}
-                </div>
+                </div>}
               </>
             ) : (
               <>

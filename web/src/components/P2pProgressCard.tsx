@@ -88,11 +88,11 @@ function formatElapsed(ms: number): string {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
 }
 
-/** Ticking timer that updates every second while `startMs` is defined and `active` is true. */
-function useElapsedTimer(startMs: number | undefined, active: boolean): string {
-  const now = useNowTicker(active && !!startMs);
-  if (!startMs) return '00:00';
-  return formatElapsed(now - startMs);
+function resolveTimerAnchor(startMs: number | undefined, fallbackStart: number, now: number): number {
+  if (typeof startMs !== 'number' || !Number.isFinite(startMs)) return fallbackStart;
+  // Remote daemon clock skew can place server timestamps slightly or significantly in the future.
+  // In that case, anchor locally so the timer still advances instead of sticking at 00:00.
+  return startMs > now ? fallbackStart : startMs;
 }
 
 function DiscussionActionButton({ active, compact, onAction }: ActionButtonProps) {
@@ -152,16 +152,28 @@ function DiscussionActionButton({ active, compact, onAction }: ActionButtonProps
 }
 
 const ElapsedTimer = memo(function ElapsedTimer({
+  timerKey,
   startMs,
   active,
   className,
 }: {
+  timerKey: string | null;
   startMs?: number;
   active: boolean;
   className: string;
 }) {
-  const elapsed = useElapsedTimer(startMs, active);
-  if (!active || !startMs) return null;
+  const [fallbackStart, setFallbackStart] = useState(Date.now());
+  const prevKey = useRef(timerKey);
+  useEffect(() => {
+    if (timerKey !== prevKey.current) {
+      prevKey.current = timerKey;
+      setFallbackStart(Date.now());
+    }
+  }, [timerKey]);
+  const now = useNowTicker(active);
+  const anchor = resolveTimerAnchor(startMs, fallbackStart, now);
+  if (!active) return null;
+  const elapsed = formatElapsed(now - anchor);
   return <span class={className}>{elapsed}</span>;
 });
 
@@ -184,7 +196,9 @@ const HopElapsedTimer = memo(function HopElapsedTimer({
       setFallbackStart(Date.now());
     }
   }, [hopKey]);
-  const elapsed = useElapsedTimer(startMs ?? fallbackStart, active);
+  const now = useNowTicker(active);
+  const anchor = resolveTimerAnchor(startMs, fallbackStart, now);
+  const elapsed = formatElapsed(now - anchor);
   if (!active) return null;
   return <span class={className}>{elapsed}</span>;
 });
@@ -274,6 +288,7 @@ export const P2pProgressCard = memo(function P2pProgressCard({
   ), [discussion.activePhase, t]);
 
   const hopKey = isRunning ? `${discussion.currentRound}:${discussion.activeHop}:${discussion.activePhase}` : null;
+  const runKey = isRunning ? discussion.id : null;
 
   // ── Mobile ultra-compact: single-line summary ──────────────────────────
   if (mobile) {
@@ -288,7 +303,7 @@ export const P2pProgressCard = memo(function P2pProgressCard({
           <span class="discussions-progress-kicker">P2P</span>
           <span class="discussions-progress-badge">{roundText}</span>
           {hopText && <span class="discussions-progress-badge">{hopText}</span>}
-          <ElapsedTimer startMs={discussion.startedAt} active={isRunning} className="p2p-timer p2p-timer-compact" />
+          <ElapsedTimer timerKey={runKey} startMs={discussion.startedAt} active={isRunning} className="p2p-timer p2p-timer-compact" />
           {phaseLabel && <span class="discussions-progress-badge discussions-progress-badge-phase">{phaseLabel}</span>}
           {!hidden && activeNode && (
             <span class={`discussions-progress-node ${progressStatusClassName(activeNode.status, isRunning)}`} style={{ margin: 0 }}>
@@ -380,7 +395,7 @@ export const P2pProgressCard = memo(function P2pProgressCard({
           <div class="discussions-progress-kicker">P2P</div>
           <div class="discussions-progress-title">{discussion.topic || t('p2p.discussions.untitled')}</div>
         </div>
-        <ElapsedTimer startMs={discussion.startedAt} active={isRunning} className="p2p-timer p2p-timer-total" />
+        <ElapsedTimer timerKey={runKey} startMs={discussion.startedAt} active={isRunning} className="p2p-timer p2p-timer-total" />
         {showActionButton && onStopDiscussion && (
           <DiscussionActionButton
             active={isActive}
