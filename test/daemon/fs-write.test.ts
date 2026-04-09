@@ -30,7 +30,7 @@ const mockStat = vi.mocked(fsp.stat);
 const mockReadFile = vi.mocked(fsp.readFile);
 const mockWriteFile = vi.mocked(fsp.writeFile);
 
-import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import { handleWebCommand, __resetFsGitCachesForTests } from '../../src/daemon/command-handler.js';
 
 /** Flush the microtask + macrotask queue so async handlers complete. */
 const flushAsync = () => new Promise<void>((r) => setTimeout(r, 0));
@@ -40,6 +40,7 @@ describe('fs.write handler', () => {
     vi.clearAllMocks();
     sent.length = 0;
     mockServerLink.send.mockImplementation((msg: unknown) => { sent.push(msg); });
+    __resetFsGitCachesForTests();
   });
 
   afterEach(() => {
@@ -214,6 +215,7 @@ describe('fs.write mtime conflict detection', () => {
     vi.clearAllMocks();
     sent.length = 0;
     mockServerLink.send.mockImplementation((msg: unknown) => { sent.push(msg); });
+    __resetFsGitCachesForTests();
   });
 
   it('passes when expectedMtime matches disk mtime', async () => {
@@ -294,6 +296,7 @@ describe('fs.read handler — mtime field', () => {
     vi.clearAllMocks();
     sent.length = 0;
     mockServerLink.send.mockImplementation((msg: unknown) => { sent.push(msg); });
+    __resetFsGitCachesForTests();
   });
 
   it('includes mtime in successful text read response', async () => {
@@ -313,5 +316,66 @@ describe('fs.read handler — mtime field', () => {
       status: 'ok',
       mtime,
     });
+  });
+
+  it('reuses cached text content when file signature is unchanged', async () => {
+    const filePath = path.join(homedir(), 'cached-read.txt');
+    const mtime = 1700000000000;
+    mockRealpath.mockResolvedValue(filePath as unknown as string);
+    mockStat.mockResolvedValue({ size: 100, mtimeMs: mtime } as fsp.Stats);
+    mockReadFile.mockResolvedValue('hello cache' as unknown as Buffer);
+
+    handleWebCommand({ type: 'fs.read', path: filePath, requestId: 'req-read-1' }, mockServerLink as any);
+    await flushAsync();
+    handleWebCommand({ type: 'fs.read', path: filePath, requestId: 'req-read-2' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockReadFile).toHaveBeenCalledTimes(1);
+    expect((sent[1] as any).content).toBe('hello cache');
+  });
+
+  it('single-flights concurrent reads for the same file', async () => {
+    const filePath = path.join(homedir(), 'inflight-read.txt');
+    const mtime = 1700000000000;
+    let release: ((value: string) => void) | null = null;
+    mockRealpath.mockResolvedValue(filePath as unknown as string);
+    mockStat.mockResolvedValue({ size: 100, mtimeMs: mtime } as fsp.Stats);
+    mockReadFile.mockImplementation(() => new Promise((resolve) => { release = resolve as (value: string) => void; }) as any);
+
+    handleWebCommand({ type: 'fs.read', path: filePath, requestId: 'req-inflight-1' }, mockServerLink as any);
+    handleWebCommand({ type: 'fs.read', path: filePath, requestId: 'req-inflight-2' }, mockServerLink as any);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(mockReadFile).toHaveBeenCalledTimes(1);
+
+    release?.('shared content');
+    await flushAsync();
+
+    expect(sent).toHaveLength(2);
+    expect((sent[0] as any).content).toBe('shared content');
+    expect((sent[1] as any).content).toBe('shared content');
+  });
+
+  it('invalidates cached reads after fs.write succeeds', async () => {
+    const filePath = path.join(homedir(), 'cache-invalidated.txt');
+    mockRealpath.mockResolvedValue(filePath as unknown as string);
+    mockStat
+      .mockResolvedValueOnce({ size: 100, mtimeMs: 1000 } as fsp.Stats)
+      .mockResolvedValueOnce({ size: 100, mtimeMs: 1000 } as fsp.Stats)
+      .mockResolvedValueOnce({ mtimeMs: 2000 } as fsp.Stats)
+      .mockResolvedValueOnce({ size: 120, mtimeMs: 3000 } as fsp.Stats);
+    mockReadFile
+      .mockResolvedValueOnce('before write' as unknown as Buffer)
+      .mockResolvedValueOnce('after write' as unknown as Buffer);
+    mockWriteFile.mockResolvedValue(undefined);
+
+    handleWebCommand({ type: 'fs.read', path: filePath, requestId: 'req-pre-write' }, mockServerLink as any);
+    await flushAsync();
+    handleWebCommand({ type: 'fs.write', path: filePath, content: 'updated', requestId: 'req-write-ok' }, mockServerLink as any);
+    await flushAsync();
+    handleWebCommand({ type: 'fs.read', path: filePath, requestId: 'req-post-write' }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockReadFile).toHaveBeenCalledTimes(2);
+    expect((sent.find((msg: any) => msg.requestId === 'req-post-write') as any)?.content).toBe('after write');
   });
 });

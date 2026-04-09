@@ -92,7 +92,7 @@ describe('fs git cache handlers', () => {
     __resetFsGitCachesForTests();
   });
 
-  it('single-flights repo status requests and does not run numstat', async () => {
+  it('single-flights repo status requests and reuses cached numstat data', async () => {
     const repoRoot = '/home/k/project';
     setupRepoMocks(repoRoot);
     mockExec.mockImplementation((command: any, options: any, callback: any) => {
@@ -103,6 +103,10 @@ describe('fs git cache handlers', () => {
         callback(null, 'M  src/a.ts\n?? new.txt\n', '');
         return {} as any;
       }
+      if (command === 'git diff --numstat HEAD') {
+        callback(null, '3\t1\tsrc/a.ts\n5\t0\tnew.txt\n', '');
+        return {} as any;
+      }
       callback(new Error(`unexpected command: ${String(command)}`), '', '');
       return {} as any;
     });
@@ -111,13 +115,13 @@ describe('fs git cache handlers', () => {
     handleWebCommand({ type: 'fs.git_status', path: repoRoot, requestId: 'req-2' }, mockServerLink as any);
     await flushAsync();
 
-    expect(mockExec).toHaveBeenCalledTimes(1);
+    expect(mockExec).toHaveBeenCalledTimes(2);
     expect(mockExec.mock.calls[0]?.[0]).toBe('git status --porcelain -u');
-    expect(mockExec.mock.calls.some((call) => String(call[0]).includes('numstat'))).toBe(false);
+    expect(mockExec.mock.calls[1]?.[0]).toBe('git diff --numstat HEAD');
     expect(sent).toHaveLength(2);
     expect((sent[0] as any).files).toEqual([
-      { path: '/home/k/project/src/a.ts', code: 'M' },
-      { path: '/home/k/project/new.txt', code: '??' },
+      { path: '/home/k/project/src/a.ts', code: 'M', additions: 3, deletions: 1 },
+      { path: '/home/k/project/new.txt', code: '??', additions: 5, deletions: 0 },
     ]);
     expect((sent[1] as any).files).toEqual((sent[0] as any).files);
   });
@@ -161,13 +165,17 @@ describe('fs git cache handlers', () => {
         callback(null, 'M  foo.ts\n', '');
         return {} as any;
       }
+      if (command === 'git diff --numstat HEAD') {
+        callback(null, '1\t0\tfoo.ts\n', '');
+        return {} as any;
+      }
       callback(null, '', '');
       return {} as any;
     });
 
     handleWebCommand({ type: 'fs.git_status', path: repoRoot, requestId: 'status-1' }, mockServerLink as any);
     await flushAsync();
-    expect(mockExec).toHaveBeenCalledTimes(1);
+    expect(mockExec).toHaveBeenCalledTimes(2);
 
     mockStat.mockImplementation(async (target) => {
       const normalized = String(target);
@@ -186,7 +194,7 @@ describe('fs git cache handlers', () => {
     handleWebCommand({ type: 'fs.git_status', path: repoRoot, requestId: 'status-2' }, mockServerLink as any);
     await flushAsync();
 
-    expect(mockExec).toHaveBeenCalledTimes(2);
+    expect(mockExec).toHaveBeenCalledTimes(4);
     expect((sent.find((msg: any) => msg.requestId === 'write-1') as any)?.status).toBe('ok');
   });
 });

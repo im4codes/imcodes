@@ -177,6 +177,27 @@ export interface FileBrowserPreviewUpdate {
   preview: FileBrowserPreviewState;
 }
 
+export function mergePreviewState(
+  current: FileBrowserPreviewState,
+  incoming: FileBrowserPreviewState,
+): FileBrowserPreviewState {
+  if (current.status === 'idle') return incoming;
+  const currentPath = 'path' in current ? current.path : null;
+  const incomingPath = 'path' in incoming ? incoming.path : null;
+  if (!currentPath || !incomingPath || currentPath !== incomingPath) return incoming;
+  if (incoming.status === 'loading') return current;
+  if (current.status === 'ok' && incoming.status === 'ok') {
+    return {
+      ...current,
+      ...incoming,
+      diff: incoming.diff ?? current.diff,
+      diffHtml: incoming.diffHtml ?? current.diffHtml,
+      downloadId: incoming.downloadId ?? current.downloadId,
+    };
+  }
+  return incoming;
+}
+
 /** File extensions that can be previewed with office document libraries. */
 const OFFICE_EXTENSIONS: Record<string, string> = {
   '.pdf': 'application/pdf',
@@ -749,7 +770,7 @@ export function FileBrowser({
 
   useEffect(() => {
     if (!initialPreview || initialPreview.status === 'idle') return;
-    setPreview(initialPreview);
+    setPreview((prev) => mergePreviewState(prev, initialPreview));
   }, [initialPreview]);
 
   useEffect(() => {

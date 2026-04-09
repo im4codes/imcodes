@@ -2653,6 +2653,78 @@ async function handleFsListInner(resolved: string, rawPath: string, requestId: s
 
 const FS_READ_SIZE_LIMIT = 512 * 1024; // 512 KB
 
+interface FsReadSnapshot {
+  fileSignature: string;
+  status: 'ok' | 'error';
+  content?: string;
+  encoding?: 'base64';
+  mimeType?: string;
+  error?: string;
+  previewReason?: 'too_large' | 'binary' | 'unknown_type';
+}
+
+const fsReadCache = new Map<string, { expiresAt: number; value: FsReadSnapshot }>();
+const fsReadInflight = new Map<string, Promise<FsReadSnapshot>>();
+const FS_READ_CACHE_TTL_MS = 5_000;
+
+async function loadFsReadSnapshot(realPath: string, fileSignature: string): Promise<FsReadSnapshot> {
+  const ext = nodePath.extname(realPath).toLowerCase().slice(1);
+  const IMAGE_MIME: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', ico: 'image/x-icon', bmp: 'image/bmp', svg: 'image/svg+xml' };
+  const OFFICE_MIME: Record<string, string> = {
+    pdf: 'application/pdf',
+    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  };
+  const mimeType = IMAGE_MIME[ext] ?? OFFICE_MIME[ext];
+
+  if (mimeType) {
+    const buf = await fsReadFileRaw(realPath);
+    return {
+      fileSignature,
+      status: 'ok',
+      content: buf.toString('base64'),
+      encoding: 'base64',
+      mimeType,
+    };
+  }
+
+  const content = await fsReadFileRaw(realPath, 'utf-8');
+  const sample = content.slice(0, 8192);
+  if (sample.includes('\0')) {
+    return {
+      fileSignature,
+      status: 'error',
+      error: 'binary_file',
+      previewReason: 'binary',
+    };
+  }
+
+  return {
+    fileSignature,
+    status: 'ok',
+    content,
+  };
+}
+
+async function getFsReadSnapshot(realPath: string, fileSignature: string): Promise<FsReadSnapshot> {
+  const cached = fsReadCache.get(realPath);
+  if (cached && cached.expiresAt > Date.now() && cached.value.fileSignature === fileSignature) {
+    return cached.value;
+  }
+  const inflight = fsReadInflight.get(realPath);
+  if (inflight) return await inflight;
+  const promise = loadFsReadSnapshot(realPath, fileSignature)
+    .then((value) => {
+      fsReadCache.set(realPath, { value, expiresAt: Date.now() + FS_READ_CACHE_TTL_MS });
+      return value;
+    })
+    .finally(() => {
+      fsReadInflight.delete(realPath);
+    });
+  fsReadInflight.set(realPath, promise);
+  return await promise;
+}
+
 async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawPath = cmd.path as string | undefined;
   const requestId = cmd.requestId as string | undefined;
@@ -2670,6 +2742,7 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
     }
 
     const stats = await fsStat(real);
+    const fileSignature = `${stats.mtimeMs}:${stats.size}`;
 
     // Image files: send as base64 with a higher size limit (5 MB)
     const ext = nodePath.extname(real).toLowerCase().slice(1);
@@ -2693,20 +2766,25 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
     }
 
     const mtime = stats.mtimeMs;
-    if (mimeType) {
-      const buf = await fsReadFileRaw(real);
-      const content = buf.toString('base64');
-      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', content, encoding: 'base64', mimeType, downloadId: handle.id, mtime }); } catch { /* ignore */ }
-    } else {
-      const content = await fsReadFileRaw(real, 'utf-8');
-      // Check for binary content
-      const sample = content.slice(0, 8192);
-      if (sample.includes('\0')) {
-        try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: 'binary_file', previewReason: 'binary', downloadId: handle.id }); } catch { /* ignore */ }
-        return;
-      }
-      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', content, downloadId: handle.id, mtime }); } catch { /* ignore */ }
+    const snapshot = await getFsReadSnapshot(real, fileSignature);
+    if (snapshot.status === 'error') {
+      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, resolvedPath: real, status: 'error', error: snapshot.error, previewReason: snapshot.previewReason, downloadId: handle.id }); } catch { /* ignore */ }
+      return;
     }
+    try {
+      serverLink.send({
+        type: 'fs.read_response',
+        requestId,
+        path: rawPath,
+        resolvedPath: real,
+        status: 'ok',
+        content: snapshot.content,
+        ...(snapshot.encoding ? { encoding: snapshot.encoding } : {}),
+        ...(snapshot.mimeType ? { mimeType: snapshot.mimeType } : {}),
+        downloadId: handle.id,
+        mtime,
+      });
+    } catch { /* ignore */ }
   } catch (err) {
     try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: err instanceof Error ? err.message : String(err) }); } catch { /* ignore */ }
   }
@@ -2729,6 +2807,12 @@ interface GitStatusSnapshot {
   files: GitStatusFile[];
 }
 
+interface GitNumstatSnapshot {
+  repoRoot: string;
+  repoSignature: string;
+  stats: Map<string, { additions?: number; deletions?: number }>;
+}
+
 interface GitDiffSnapshot {
   repoRoot: string;
   repoSignature: string;
@@ -2738,6 +2822,8 @@ interface GitDiffSnapshot {
 
 const gitStatusCache = new Map<string, { expiresAt: number; value: GitStatusSnapshot }>();
 const gitStatusInflight = new Map<string, Promise<GitStatusSnapshot>>();
+const gitNumstatCache = new Map<string, { expiresAt: number; value: GitNumstatSnapshot }>();
+const gitNumstatInflight = new Map<string, Promise<GitNumstatSnapshot>>();
 const gitDiffCache = new Map<string, { expiresAt: number; value: GitDiffSnapshot }>();
 const gitDiffInflight = new Map<string, Promise<GitDiffSnapshot>>();
 
@@ -2847,6 +2933,49 @@ async function getRepoGitStatusSnapshot(startPath: string): Promise<GitStatusSna
   return await promise;
 }
 
+async function loadRepoGitNumstatSnapshot(repoRoot: string, repoSignature: string): Promise<GitNumstatSnapshot> {
+  let stdout = '';
+  try {
+    ({ stdout } = await execAsync('git diff --numstat HEAD', { cwd: repoRoot, timeout: 5000 }));
+  } catch {
+    try {
+      ({ stdout } = await execAsync('git diff --numstat', { cwd: repoRoot, timeout: 5000 }));
+    } catch {
+      stdout = '';
+    }
+  }
+  const stats = new Map<string, { additions?: number; deletions?: number }>();
+  for (const line of stdout.split('\n')) {
+    const match = line.match(/^(\d+|-)\t(\d+|-)\t(.+)$/);
+    if (!match) continue;
+    const additions = match[1] === '-' ? undefined : parseInt(match[1], 10);
+    const deletions = match[2] === '-' ? undefined : parseInt(match[2], 10);
+    stats.set(nodePath.join(repoRoot, match[3].trim()), { additions, deletions });
+  }
+  return { repoRoot, repoSignature, stats };
+}
+
+async function getRepoGitNumstatSnapshot(startPath: string): Promise<GitNumstatSnapshot | null> {
+  const context = await resolveRepoContext(startPath);
+  if (!context) return null;
+  const cached = gitNumstatCache.get(context.repoRoot);
+  if (cached && cached.expiresAt > Date.now() && cached.value.repoSignature === context.repoSignature) {
+    return cached.value;
+  }
+  const inflight = gitNumstatInflight.get(context.repoRoot);
+  if (inflight) return await inflight;
+  const promise = loadRepoGitNumstatSnapshot(context.repoRoot, context.repoSignature)
+    .then((value) => {
+      gitNumstatCache.set(context.repoRoot, { value, expiresAt: Date.now() + GIT_STATUS_CACHE_TTL_MS });
+      return value;
+    })
+    .finally(() => {
+      gitNumstatInflight.delete(context.repoRoot);
+    });
+  gitNumstatInflight.set(context.repoRoot, promise);
+  return await promise;
+}
+
 async function loadFileGitDiffSnapshot(realPath: string, repoRoot: string, repoSignature: string, fileSignature: string): Promise<GitDiffSnapshot> {
   let diff = '';
   try {
@@ -2895,16 +3024,25 @@ function filterRepoFilesForPath(files: GitStatusFile[], requestedPath: string): 
 
 function invalidateGitCachesForPath(targetPath: string): void {
   const normalized = normalizeFsPath(targetPath);
+  fsReadCache.delete(normalized);
+  fsReadInflight.delete(normalized);
   gitDiffCache.delete(normalized);
   gitDiffInflight.delete(normalized);
   for (const key of gitStatusCache.keys()) {
     if (isPathInside(key, normalized)) gitStatusCache.delete(key);
   }
+  for (const key of gitNumstatCache.keys()) {
+    if (isPathInside(key, normalized)) gitNumstatCache.delete(key);
+  }
 }
 
 export function __resetFsGitCachesForTests(): void {
+  fsReadCache.clear();
+  fsReadInflight.clear();
   gitStatusCache.clear();
   gitStatusInflight.clear();
+  gitNumstatCache.clear();
+  gitNumstatInflight.clear();
   gitDiffCache.clear();
   gitDiffInflight.clear();
 }
@@ -2925,8 +3063,14 @@ async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: Serve
       try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', error: 'forbidden_path' }); } catch { /* ignore */ }
       return;
     }
-    const snapshot = await getRepoGitStatusSnapshot(real);
-    const files = snapshot ? filterRepoFilesForPath(snapshot.files, real) : [];
+    const [snapshot, numstat] = await Promise.all([
+      getRepoGitStatusSnapshot(real),
+      getRepoGitNumstatSnapshot(real),
+    ]);
+    const files = snapshot ? filterRepoFilesForPath(snapshot.files, real).map((file) => {
+      const stats = numstat?.stats.get(file.path);
+      return stats ? { ...file, ...stats } : file;
+    }) : [];
     try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, resolvedPath: real, status: 'ok', files }); } catch { /* ignore */ }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

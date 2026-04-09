@@ -25,7 +25,7 @@ vi.mock('../../src/components/file-editor-lazy.js', () => ({
   FileEditorContent: () => null,
 }));
 
-import { FileBrowser, __resetFileBrowserSharedChangesForTests } from '../../src/components/FileBrowser.js';
+import { FileBrowser, __resetFileBrowserSharedChangesForTests, mergePreviewState } from '../../src/components/FileBrowser.js';
 import type { WsClient, ServerMessage } from '../../src/ws-client.js';
 
 // Cleanup DOM after each test
@@ -122,6 +122,37 @@ describe('FileBrowser', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     __resetFileBrowserSharedChangesForTests();
+  });
+
+  it('does not regress an existing preview back to loading for the same file', () => {
+    const merged = mergePreviewState(
+      { status: 'ok', path: '/home/user/foo.ts', content: 'const x = 1;', diff: '+const x = 1;', diffHtml: '<div>diff</div>' },
+      { status: 'loading', path: '/home/user/foo.ts' },
+    );
+
+    expect(merged).toEqual({
+      status: 'ok',
+      path: '/home/user/foo.ts',
+      content: 'const x = 1;',
+      diff: '+const x = 1;',
+      diffHtml: '<div>diff</div>',
+    });
+  });
+
+  it('merges richer ok preview state for the same file without dropping existing diff data', () => {
+    const merged = mergePreviewState(
+      { status: 'ok', path: '/home/user/foo.ts', content: 'const x = 1;', diff: '+const x = 1;', diffHtml: '<div>diff</div>' },
+      { status: 'ok', path: '/home/user/foo.ts', content: 'const x = 2;' },
+    );
+
+    expect(merged).toEqual({
+      status: 'ok',
+      path: '/home/user/foo.ts',
+      content: 'const x = 2;',
+      diff: '+const x = 1;',
+      diffHtml: '<div>diff</div>',
+      downloadId: undefined,
+    });
   });
 
   // ── Layout ─────────────────────────────────────────────────────────────
@@ -503,6 +534,29 @@ describe('FileBrowser', () => {
     const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
     await act(async () => { fireEvent.click(changesTab); });
     expect(document.querySelector('.fb-changes-section')).not.toBeNull();
+  });
+
+  it('shows + and - stats in the changes list when provided by git status', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser ws={ws} mode="file-single" layout="panel" initialPath="/home/user"
+        changesRootPath="/home/user" onConfirm={vi.fn()} />,
+    );
+    await act(async () => { respond([], '/home/user'); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [{ path: '/home/user/bar.ts', code: 'M', additions: 7, deletions: 2 }],
+      } as any);
+    });
+    const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
+    await act(async () => { fireEvent.click(changesTab); });
+    expect(document.querySelector('.fb-changes-item-stats')?.textContent).toContain('+7');
+    expect(document.querySelector('.fb-changes-item-stats')?.textContent).toContain('-2');
   });
 
   it('shares changes requests across file browsers on the same repo', async () => {

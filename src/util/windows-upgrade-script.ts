@@ -78,6 +78,13 @@ if exist "%PIDFILE%" (\r
   timeout /t 2 /nobreak >nul\r
 )\r
 \r
+if defined NODE_OPTIONS (\r
+  set "NODE_OPTIONS=%NODE_OPTIONS% --max-old-space-size=16384"\r
+) else (\r
+  set "NODE_OPTIONS=--max-old-space-size=16384"\r
+)\r
+echo Using NODE_OPTIONS=%NODE_OPTIONS% >> "%LOG_FILE%"\r
+\r
 echo Installing ${pkgSpec}... >> "%LOG_FILE%"\r
 call "${npmCmd}" install -g ${pkgSpec} >> "%LOG_FILE%" 2>&1\r
 if %errorlevel% neq 0 (\r

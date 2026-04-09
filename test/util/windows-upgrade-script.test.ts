@@ -118,6 +118,17 @@ describe('buildWindowsUpgradeBatch', () => {
 
   // ── npm install ──
 
+  it('raises NODE_OPTIONS heap limit before npm install while preserving existing flags', () => {
+    const nodeOptionsIdx = batch.indexOf('set "NODE_OPTIONS=%NODE_OPTIONS% --max-old-space-size=16384"');
+    const fallbackIdx = batch.indexOf('set "NODE_OPTIONS=--max-old-space-size=16384"');
+    const installIdx = batch.indexOf(`call "${INPUT.npmCmd}" install -g ${INPUT.pkgSpec}`);
+    expect(nodeOptionsIdx).toBeGreaterThan(-1);
+    expect(fallbackIdx).toBeGreaterThan(-1);
+    expect(nodeOptionsIdx).toBeLessThan(installIdx);
+    expect(fallbackIdx).toBeLessThan(installIdx);
+    expect(batch).toContain('echo Using NODE_OPTIONS=%NODE_OPTIONS% >> "%LOG_FILE%"');
+  });
+
   it('installs with quoted npm path', () => {
     expect(batch).toContain(`call "${INPUT.npmCmd}" install -g ${INPUT.pkgSpec}`);
   });
