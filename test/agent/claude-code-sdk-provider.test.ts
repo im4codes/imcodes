@@ -113,6 +113,63 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(sessionInfo.some((info) => info.model === 'claude-sonnet-4-6')).toBe(true);
   });
 
+  it('uses the last assistant usage for completion metadata instead of cumulative result usage', async () => {
+    sdkMock.setNextMessages([
+      {
+        type: 'assistant',
+        session_id: 'session-usage',
+        message: {
+          content: [{ type: 'text', text: 'Hello' }],
+          usage: {
+            input_tokens: 120,
+            cache_creation_input_tokens: 30,
+            cache_read_input_tokens: 20,
+            output_tokens: 10,
+          },
+        },
+      },
+      {
+        type: 'result',
+        session_id: 'session-usage',
+        subtype: 'success',
+        is_error: false,
+        result: 'Hello',
+        usage: {
+          input_tokens: 999,
+          cache_creation_input_tokens: 400,
+          cache_read_input_tokens: 300,
+          output_tokens: 50,
+        },
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-usage', cwd: '/tmp/project', resumeId: 'session-usage' });
+
+    const completed: AgentMessage[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg));
+
+    await provider.send('route-usage', 'hello');
+    await flush();
+
+    expect(completed).toHaveLength(1);
+    expect(completed[0]?.metadata).toMatchObject({
+      usage: {
+        input_tokens: 120,
+        cache_creation_input_tokens: 30,
+        cache_read_input_tokens: 20,
+        output_tokens: 10,
+      },
+      totalUsage: {
+        input_tokens: 999,
+        cache_creation_input_tokens: 400,
+        cache_read_input_tokens: 300,
+        output_tokens: 50,
+      },
+    });
+  });
+
   it('emits cancelled on cancel()', async () => {
     sdkMock.setWaitForClose(true);
 

@@ -44,11 +44,19 @@ interface ClaudeSdkSessionState {
   completed: boolean;
   cancelled: boolean;
   finalMetadata?: Record<string, unknown>;
+  lastAssistantUsage?: ClaudeUsageSnapshot;
   pendingComplete?: AgentMessage;
   pendingError?: ProviderError;
   toolCalls: Map<number, ToolCallEvent & { partialInputJson?: string }>;
   emittedToolStates: Map<string, string>;
   lastStatusSignature: string | null;
+}
+
+interface ClaudeUsageSnapshot {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
 }
 
 type ClaudeToolBlock = {
@@ -140,6 +148,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       completed: false,
       cancelled: false,
       finalMetadata: existing?.finalMetadata,
+      lastAssistantUsage: existing?.lastAssistantUsage,
       pendingComplete: undefined,
       toolCalls: new Map(),
       emittedToolStates: new Map(),
@@ -253,6 +262,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     state.completed = false;
     state.cancelled = false;
     state.finalMetadata = undefined;
+    state.lastAssistantUsage = undefined;
     state.pendingComplete = undefined;
     state.pendingError = undefined;
     state.toolCalls.clear();
@@ -446,6 +456,15 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     }
 
     if (msg.type === 'assistant') {
+      const assistantUsage = msg.message?.usage as ClaudeUsageSnapshot | undefined;
+      if (assistantUsage && typeof assistantUsage === 'object') {
+        state.lastAssistantUsage = {
+          ...(typeof assistantUsage.input_tokens === 'number' ? { input_tokens: assistantUsage.input_tokens } : {}),
+          ...(typeof assistantUsage.output_tokens === 'number' ? { output_tokens: assistantUsage.output_tokens } : {}),
+          ...(typeof assistantUsage.cache_read_input_tokens === 'number' ? { cache_read_input_tokens: assistantUsage.cache_read_input_tokens } : {}),
+          ...(typeof assistantUsage.cache_creation_input_tokens === 'number' ? { cache_creation_input_tokens: assistantUsage.cache_creation_input_tokens } : {}),
+        };
+      }
       const text = collectAssistantText(msg);
       if (Array.isArray(msg.message.content)) {
         for (const block of msg.message.content) {
@@ -527,7 +546,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
         status: 'complete',
         metadata: {
           ...(state.model ? { model: state.model } : {}),
-          usage: msg.usage,
+          usage: state.lastAssistantUsage ?? msg.usage,
+          ...(state.lastAssistantUsage && state.lastAssistantUsage !== msg.usage ? { totalUsage: msg.usage } : {}),
           resultSubtype: msg.subtype,
           resumeId: state.resumeId,
         },
