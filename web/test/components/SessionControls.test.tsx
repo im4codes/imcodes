@@ -175,6 +175,20 @@ const makeWs = () => {
   };
 };
 
+function expectSendPayload(ws: ReturnType<typeof makeWs>, payload: Record<string, unknown>): void {
+  expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
+    ...payload,
+    commandId: expect.any(String),
+  }));
+}
+
+function expectLastSendPayload(ws: ReturnType<typeof makeWs>, payload: Record<string, unknown>): void {
+  expect(ws.sendSessionCommand).toHaveBeenLastCalledWith('send', expect.objectContaining({
+    ...payload,
+    commandId: expect.any(String),
+  }));
+}
+
 const makeQuickData = () => ({
   data: { history: [], sessionHistory: {}, commands: [], phrases: [] },
   loaded: true,
@@ -317,7 +331,7 @@ afterEach(() => {
     input.textContent = 'run tests';
     fireEvent.input(input);
     fireEvent.keyDown(input, { key: 'Enter' });
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+    expectSendPayload(ws, {
       sessionName: 'my-session',
       text: 'run tests',
     });
@@ -408,10 +422,31 @@ afterEach(() => {
     fireEvent.input(input);
     fireEvent.click(screen.getByRole('button', { name: /send/i }));
     expect(ws.sendSessionCommand).toHaveBeenCalledOnce();
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+    expectSendPayload(ws, {
       sessionName: 'my-session',
       text: 'run tests',
     });
+  });
+
+  it('generates a distinct commandId for each send', () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+
+    input.textContent = 'first';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    input.textContent = 'second';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledTimes(2);
+    const firstPayload = ws.sendSessionCommand.mock.calls[0]?.[1] as { commandId?: string };
+    const secondPayload = ws.sendSessionCommand.mock.calls[1]?.[1] as { commandId?: string };
+    expect(firstPayload.commandId).toEqual(expect.any(String));
+    expect(secondPayload.commandId).toEqual(expect.any(String));
+    expect(firstPayload.commandId).not.toBe(secondPayload.commandId);
   });
 
   it('sends advanced p2p config fields when config mode is used', async () => {
@@ -455,7 +490,7 @@ afterEach(() => {
     fireEvent.input(input);
     fireEvent.click(screen.getByRole('button', { name: /^send$/i }));
 
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+    expectSendPayload(ws, {
       sessionName: 'my-session',
       text: 'ship it',
       p2pAtTargets: [
@@ -608,7 +643,7 @@ afterEach(() => {
     fireEvent.click(within(dialog).getByRole('checkbox'));
     fireEvent.click(within(dialog).getByRole('button', { name: /^send$/i }));
 
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+    expectSendPayload(ws, {
       sessionName: 'my-session',
       text: 'first combo',
       p2pAtTargets: [
@@ -629,7 +664,7 @@ afterEach(() => {
     fireEvent.click(screen.getByText(/mode_audit→mode_plan/i));
 
     expect(screen.queryByText('combo_send_confirm_title')).toBeNull();
-    expect(ws.sendSessionCommand).toHaveBeenLastCalledWith('send', {
+    expectLastSendPayload(ws, {
       sessionName: 'my-session',
       text: 'second combo',
       p2pAtTargets: [
@@ -659,7 +694,7 @@ afterEach(() => {
     const dialog = screen.getByText('combo_send_confirm_title').closest('.dialog') as HTMLElement;
     fireEvent.click(within(dialog).getByRole('button', { name: /^send$/i }));
 
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+    expectSendPayload(ws, {
       sessionName: 'my-session',
       text: 'direct combo',
       p2pAtTargets: [
@@ -829,7 +864,7 @@ afterEach(() => {
 
     fireEvent.click(screen.getByRole('button', { name: 'achieve_action' }));
 
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+    expectSendPayload(ws, {
       sessionName: 'my-session',
       text: 'complete @openspec/changes/change-a, update proposal design specs tasks and archive if done',
     });
@@ -1146,7 +1181,7 @@ afterEach(() => {
     input.textContent = 'enter message';
     fireEvent.input(input);
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+    expectSendPayload(ws, {
       sessionName: 'my-session',
       text: 'enter message',
     });
@@ -1184,7 +1219,7 @@ afterEach(() => {
 
     fireEvent.click(screen.getByRole('button', { name: /^medium$/i }));
     fireEvent.click(screen.getByRole('button', { name: /high/i }));
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+    expectSendPayload(ws, {
       sessionName: 'qwen-session',
       text: '/thinking high',
     });
@@ -1278,7 +1313,7 @@ afterEach(() => {
     fireEvent.keyDown(input, { key: 'Escape' });
 
     // Transport sessions send /stop instead of raw escape byte
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', { sessionName: 'qwen-session', text: '/stop' });
+    expectSendPayload(ws, { sessionName: 'qwen-session', text: '/stop' });
     expect(ws.sendInput).not.toHaveBeenCalled();
   });
 
@@ -1300,7 +1335,7 @@ afterEach(() => {
     const stopBtn = screen.getByRole('button', { name: /^stop$/i }) as HTMLButtonElement;
     expect(stopBtn.disabled).toBe(false);
     fireEvent.click(stopBtn);
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+    expectSendPayload(ws, {
       sessionName: 'codex-sdk-session',
       text: '/stop',
     });
@@ -1708,7 +1743,7 @@ afterEach(() => {
       fireEvent.input(input);
       // Send
       fireEvent.click(screen.getByRole('button', { name: /send/i }));
-      expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+      expectSendPayload(ws, {
         sessionName: 'my-session',
         text: '@/tmp/data.csv analyze this',
       });
@@ -1897,7 +1932,7 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: /^medium$/i }));
     fireEvent.click(screen.getByRole('button', { name: /high/i }));
 
-    expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
+    expectSendPayload(ws, {
       sessionName: 'codex-sdk-session',
       text: '/thinking high',
     });
