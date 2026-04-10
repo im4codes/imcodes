@@ -26,6 +26,17 @@ function hasFileExtension(path: string): boolean {
   return /\.\w{1,10}$/.test(basename);
 }
 
+function isLikelyDomainPath(value: string): boolean {
+  return /^(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/|$)/i.test(value);
+}
+
+function trimDetectedUrl(url: string): string {
+  const hardStop = url.search(/[（【《「『，。；：！？⬇]/u);
+  let next = hardStop >= 0 ? url.slice(0, hardStop) : url;
+  while (next.length > 1 && /[.,;:!?)}\]>）】》」』，。；：！？⬇]$/u.test(next)) next = next.slice(0, -1);
+  return next;
+}
+
 // ── Token rendering ─────────────────────────────────────────────────────────
 
 function isLocalPath(href: string): boolean {
@@ -156,18 +167,21 @@ function renderToken(
           </span>
         );
       }
+      const sanitizedHref = trimDetectedUrl(t.href);
+      const inlineText = typeof (t as { text?: unknown }).text === 'string' ? String((t as { text?: unknown }).text) : '';
+      const isAutoLinkLike = !inlineText || inlineText === t.href;
       return (
         <a
           key={key}
           class="chat-external-link"
-          href={t.href}
-          title={t.href}
+          href={sanitizedHref}
+          title={sanitizedHref}
           onClick={(e: Event) => {
             e.preventDefault();
-            onUrlClick?.(t.href);
+            onUrlClick?.(sanitizedHref);
           }}
         >
-          {renderInlineTokens(t.tokens, onPathClick, onUrlClick, true, onDownload)}
+          {isAutoLinkLike ? sanitizedHref : renderInlineTokens(t.tokens, onPathClick, onUrlClick, true, onDownload)}
         </a>
       );
     }
@@ -253,7 +267,7 @@ function renderToken(
 
 // ── URL/Path detection (inline within text tokens) ──────────────────────────
 
-const URL_REGEX_INLINE = /https?:\/\/[^\s<>"\])}]+/g;
+const URL_REGEX_INLINE = /https?:\/\/[^\s<>"\])}）】》」』，。；：！？（【《「『]+/g;
 const PATH_REGEX_INLINE = /(\\\\[\w.$ -]+\\[\w.$ \\-]+|[A-Za-z]:\\(?:[\w.$ -]+\\)*[\w.$ -]+|\.{1,2}\/[\w\p{L}.\-~/]+|\/[\w\p{L}.\-~][\w\p{L}.\-~/]*|(?<![:/\w\p{L}])[a-zA-Z_~][\w\p{L}.\-~]*(?:\/[\w\p{L}.\-~]+)+)/gu;
 
 function splitPathsAndUrlsInternal(
@@ -274,8 +288,7 @@ function splitPathsAndUrlsInternal(
 
   while ((m = URL_REGEX_INLINE.exec(text)) !== null) {
     if (m.index > last) chunks.push({ type: 'text', value: text.slice(last, m.index), start: last });
-    let url = m[0];
-    while (url.length > 1 && /[.,;:!?)}\]>]$/.test(url)) url = url.slice(0, -1);
+    let url = trimDetectedUrl(m[0]);
     chunks.push({ type: 'url', value: url, start: m.index });
     last = m.index + url.length;
     URL_REGEX_INLINE.lastIndex = last;
@@ -302,6 +315,7 @@ function splitPathsAndUrlsInternal(
       while ((pm = PATH_REGEX_INLINE.exec(chunk.value)) !== null) {
         const path = pm[1];
         if (path.length < 3) continue;
+        if (isLikelyDomainPath(path)) continue;
         if (pm.index > pathLast) parts.push(<span key={`t${chunk.start + pathLast}`}>{chunk.value.slice(pathLast, pm.index)}</span>);
         parts.push(
           <span key={`p${chunk.start + pm.index}`}>

@@ -188,6 +188,28 @@ describe('ChatView tool payload formatting', () => {
     });
   });
 
+  it('keeps adjacent Chinese-punctuated URLs as external links instead of file paths', () => {
+    const events = [
+      makeEvent({
+        type: 'assistant.text',
+        payload: {
+          text: 'https://blog.csdn.net/2502_91125447/article/details/146912737（CSDN博客 - PCDN市场深水区）https://m.c114.com.cn/w16-1296322.html⬇（C114 - PCDN即将成为历史）',
+          streaming: false,
+        },
+      }),
+    ];
+
+    const { container } = render(<ChatView events={events} loading={false} />);
+
+    const externalLinks = Array.from(container.querySelectorAll('.chat-external-link')) as HTMLAnchorElement[];
+    expect(externalLinks.map((el) => el.textContent)).toEqual([
+      'https://blog.csdn.net/2502_91125447/article/details/146912737',
+      'https://m.c114.com.cn/w16-1296322.html',
+    ]);
+    expect(container.querySelector('.chat-path-link')).toBeNull();
+    expect(container.querySelector('.chat-dl-btn')).toBeNull();
+  });
+
   it('renders OpenClaw transport tool rows for realistic sessions_send payloads', () => {
     const events = [
       makeEvent({
