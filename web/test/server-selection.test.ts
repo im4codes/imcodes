@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   getSelectedServerName,
+  hasResolvedActiveSession,
   hasSelectedServer,
   shouldResetSelectedServer,
   shouldShowInitialConnectingGate,
@@ -60,14 +61,27 @@ describe('shouldResetSelectedServer', () => {
 });
 
 describe('shouldShowInitialConnectingGate', () => {
-  it('shows the gate only while the server list is still loading', () => {
-    expect(shouldShowInitialConnectingGate(true, 'srv-1', false, false, false)).toBe(true);
-    expect(shouldShowInitialConnectingGate(true, 'srv-1', false, false, true)).toBe(false);
+  it('keeps the gate visible until websocket or session data resolves', () => {
+    expect(shouldShowInitialConnectingGate(true, 'srv-1', false, false)).toBe(true);
+    expect(shouldShowInitialConnectingGate(true, 'srv-1', true, false)).toBe(false);
+    expect(shouldShowInitialConnectingGate(true, 'srv-1', false, true)).toBe(false);
   });
 
   it('does not show the gate without a selected server or after a connection is established', () => {
-    expect(shouldShowInitialConnectingGate(true, null, false, false, false)).toBe(false);
-    expect(shouldShowInitialConnectingGate(true, 'srv-1', true, false, false)).toBe(false);
-    expect(shouldShowInitialConnectingGate(true, 'srv-1', false, true, false)).toBe(false);
+    expect(shouldShowInitialConnectingGate(true, null, false, false)).toBe(false);
+    expect(shouldShowInitialConnectingGate(false, 'srv-1', false, false)).toBe(false);
+  });
+});
+
+describe('hasResolvedActiveSession', () => {
+  it('returns false for a stale active session restored before the session list arrives', () => {
+    expect(hasResolvedActiveSession('deck_proj_brain', [])).toBe(false);
+  });
+
+  it('returns true once the active session exists in the current session list', () => {
+    expect(hasResolvedActiveSession('deck_proj_brain', [
+      { name: 'deck_proj_brain' },
+      { name: 'deck_proj_w1' },
+    ])).toBe(true);
   });
 });

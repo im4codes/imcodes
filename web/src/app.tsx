@@ -67,6 +67,7 @@ import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { updateMainSessionLabel } from './session-label-api.js';
 import {
   getSelectedServerName,
+  hasResolvedActiveSession,
   shouldResetSelectedServer,
   shouldShowInitialConnectingGate,
 } from './server-selection.js';
@@ -2246,8 +2247,8 @@ export function App() {
     selectedServerId,
     connected,
     sessionsLoaded,
-    serversLoaded,
   );
+  const resolvedActiveSessionExists = hasResolvedActiveSession(activeSession, sessions);
 
   useEffect(() => {
     if (showInitialConnectingGate) {
@@ -2559,7 +2560,7 @@ export function App() {
             />
 
             {/* Desktop local preview shortcut — available even before a session is active */}
-            {!isMobile && selectedServerId && !activeSession && (
+            {!isMobile && selectedServerId && !resolvedActiveSessionExists && (
               <div class="desktop-view-toggle">
                 <button
                   class="view-toggle"
@@ -2573,7 +2574,7 @@ export function App() {
             )}
 
             {/* Desktop view mode toggle — mobile uses the one in mobile-server-bar */}
-            {!isMobile && activeSession && (
+            {!isMobile && resolvedActiveSessionExists && (
               <div class="desktop-view-toggle">
                 <button class="view-toggle" title={trans('picker.files')} onClick={() => setShowDesktopFileBrowser(o => !o)} style={{ position: 'relative' }}>
                   📁
@@ -2634,13 +2635,13 @@ export function App() {
               </ErrorBoundary>
             ))}
 
-            {!activeSession && !sessionsLoaded && (
+            {!resolvedActiveSessionExists && !sessionsLoaded && (
               <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#475569', flexDirection: 'column', gap: 12 }}>
                 <div class="spinner" />
                 <div>{connected ? 'Waiting for daemon...' : 'Connecting...'}</div>
               </div>
             )}
-            {!activeSession && sessionsLoaded && (
+            {!resolvedActiveSessionExists && sessionsLoaded && (
               <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#475569', flexDirection: 'column', gap: 12 }}>
                 <div style={{ fontSize: 32 }}>⌨</div>
                 <div>Select a session or start a new one</div>

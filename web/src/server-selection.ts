@@ -3,6 +3,10 @@ export interface SelectableServerInfo {
   name: string;
 }
 
+export interface NamedSessionInfo {
+  name: string;
+}
+
 export function hasSelectedServer(
   selectedServerId: string | null,
   servers: readonly SelectableServerInfo[],
@@ -35,7 +39,14 @@ export function shouldShowInitialConnectingGate(
   selectedServerId: string | null,
   connected: boolean,
   sessionsLoaded: boolean,
-  serversLoaded: boolean,
 ): boolean {
-  return Boolean(authReady && selectedServerId && !sessionsLoaded && !connected && !serversLoaded);
+  return Boolean(authReady && selectedServerId && !sessionsLoaded && !connected);
+}
+
+export function hasResolvedActiveSession(
+  activeSession: string | null,
+  sessions: readonly NamedSessionInfo[],
+): boolean {
+  if (!activeSession) return false;
+  return sessions.some((session) => session.name === activeSession);
 }
