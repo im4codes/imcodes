@@ -63,6 +63,11 @@ interface AssistantBlockProps {
   onDownload?: (path: string) => void;
 }
 
+function hasFileExtension(path: string): boolean {
+  const basename = path.split(/[/\\]/).pop() ?? '';
+  return /\.\w{1,10}$/.test(basename);
+}
+
 const TOOL_INPUT_SUMMARY_KEYS = [
   'query',
   'command',
@@ -808,9 +813,9 @@ export function ChatView({ events, loading, refreshing: _refreshing, loadingOlde
                 onDownload={downloadHandler}
               />
             ) : item.type === 'tool-group' ? (
-              <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} />
+              <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onDownload={downloadHandler} serverId={serverId} />
             ) : (
-              <ChatEvent key={item.key} event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} serverId={serverId} />
+              <ChatEvent key={item.key} event={item.event!} nextTs={nextTs} onPathClick={pathClickHandler} onDownload={downloadHandler} serverId={serverId} />
             );
           })}
           {!loading && <div ref={bottomRef} />}
@@ -1012,7 +1017,17 @@ function ToolBlockFold({ children }: { children: preact.ComponentChildren }) {
 }
 
 /** Collapsible group of consecutive tool events. Shows first and last, folds middle. */
-function ToolCallGroup({ events, onPathClick }: { events: TimelineEvent[]; onPathClick?: (p: string) => void }) {
+function ToolCallGroup({
+  events,
+  onPathClick,
+  onDownload,
+  serverId,
+}: {
+  events: TimelineEvent[];
+  onPathClick?: (p: string) => void;
+  onDownload?: (path: string) => void;
+  serverId?: string;
+}) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const first = events[0];
@@ -1021,18 +1036,18 @@ function ToolCallGroup({ events, onPathClick }: { events: TimelineEvent[]; onPat
 
   return (
     <div class="chat-tool-group">
-      <ChatEvent event={first} onPathClick={onPathClick} />
+      <ChatEvent event={first} onPathClick={onPathClick} onDownload={onDownload} serverId={serverId} />
       <div class="chat-tool-group-indent">
         {middle.length > 0 && (
           expanded ? (
-            middle.map((ev) => <ChatEvent key={ev.eventId} event={ev} onPathClick={onPathClick} />)
+            middle.map((ev) => <ChatEvent key={ev.eventId} event={ev} onPathClick={onPathClick} onDownload={onDownload} serverId={serverId} />)
           ) : (
             <button class="chat-tool-fold-btn" onClick={() => setExpanded(true)}>
               {t('chat.tool_group_more', { count: middle.length })}
             </button>
           )
         )}
-        {last && <ChatEvent event={last} onPathClick={onPathClick} />}
+        {last && <ChatEvent event={last} onPathClick={onPathClick} onDownload={onDownload} serverId={serverId} />}
         {expanded && middle.length > 0 && (
           <button class="chat-tool-fold-btn" onClick={() => setExpanded(false)}>
             {t('chat.tool_group_collapse')}
@@ -1110,7 +1125,19 @@ function AttachmentDownloadButton({ att, serverId, onPathClick }: { att: { id: s
   );
 }
 
-const ChatEvent = memo(function ChatEvent({ event, nextTs, onPathClick, serverId }: { event: TimelineEvent; nextTs?: number; onPathClick?: (p: string) => void; serverId?: string }) {
+const ChatEvent = memo(function ChatEvent({
+  event,
+  nextTs,
+  onPathClick,
+  onDownload,
+  serverId,
+}: {
+  event: TimelineEvent;
+  nextTs?: number;
+  onPathClick?: (p: string) => void;
+  onDownload?: (path: string) => void;
+  serverId?: string;
+}) {
   const { t } = useTranslation();
   switch (event.type) {
     case 'user.message': {
@@ -1127,7 +1154,7 @@ const ChatEvent = memo(function ChatEvent({ event, nextTs, onPathClick, serverId
           {attachments && serverId && attachments.map((att) => (
             <AttachmentDownloadButton key={att.id} att={att} serverId={serverId} onPathClick={onPathClick} />
           ))}
-          {userText && <div class="chat-bubble-content">{splitPathsAndUrls(userText, onPathClick)}</div>}
+          {userText && <div class="chat-bubble-content">{splitPathsAndUrls(userText, onPathClick, undefined, onDownload)}</div>}
           {!event.payload.pending && <ChatTime ts={event.ts} />}
         </div>
       );
@@ -1143,11 +1170,11 @@ const ChatEvent = memo(function ChatEvent({ event, nextTs, onPathClick, serverId
           <div class="chat-event chat-tool">
             <span class="chat-tool-icon">{'>'}</span>
             <span class="chat-tool-name">{String(event.payload.tool ?? 'tool')}</span>
-            {toolInput && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInput, onPathClick)}</span>}
+            {toolInput && <span class="chat-tool-input">{' '}{splitPathsAndUrls(toolInput, onPathClick, undefined, onDownload)}</span>}
           </div>
           {toolOutput && (
             <div class="chat-event chat-tool chat-tool-result-preview">
-              <span class="chat-tool-output">{splitPathsAndUrls(toolOutput, onPathClick)}</span>
+              <span class="chat-tool-output">{splitPathsAndUrls(toolOutput, onPathClick, undefined, onDownload)}</span>
             </div>
           )}
           {(callDetail || resultDetail) && (
@@ -1173,9 +1200,9 @@ const ChatEvent = memo(function ChatEvent({ event, nextTs, onPathClick, serverId
           <div class="chat-event chat-tool">
             <span class="chat-tool-icon">{'<'}</span>
             {error ? (
-              <span class="chat-tool-error">{`error: ${String(error)}`}</span>
-            ) : output ? (
-              <span class="chat-tool-output">{splitPathsAndUrls(output, onPathClick)}</span>
+            <span class="chat-tool-error">{`error: ${String(error)}`}</span>
+          ) : output ? (
+              <span class="chat-tool-output">{splitPathsAndUrls(output, onPathClick, undefined, onDownload)}</span>
             ) : (
               <span class="chat-tool-output">done</span>
             )}
@@ -1296,15 +1323,16 @@ const ChatTime = memo(function ChatTime({ ts }: { ts: number }) {
 const URL_REGEX = /https?:\/\/[^\s<>"\])}]+/g;
 
 // Matches absolute paths (/foo/bar) and relative paths (docs/file.md, src/components/Foo.tsx).
-const PATH_REGEX = /(\.{1,2}\/[\w\p{L}.\-~/]+|\/[\w\p{L}.\-~][\w\p{L}.\-~/]*|(?<![:/\w\p{L}])[a-zA-Z_~][\w\p{L}.\-~]*(?:\/[\w\p{L}.\-~]+)+)/gu;
+const PATH_REGEX = /(\\\\[\w.$ -]+\\[\w.$ \\-]+|[A-Za-z]:\\(?:[\w.$ -]+\\)*[\w.$ -]+|\.{1,2}\/[\w\p{L}.\-~/]+|\/[\w\p{L}.\-~][\w\p{L}.\-~/]*|(?<![:/\w\p{L}])[a-zA-Z_~][\w\p{L}.\-~]*(?:\/[\w\p{L}.\-~]+)+)/gu;
 
 /** Split a plain-text segment into URL tokens, path tokens, and plain text. */
 function splitPathsAndUrls(
   text: string,
   onPathClick?: (p: string) => void,
   onUrlClick?: (url: string) => void,
+  onDownload?: (path: string) => void,
 ): h.JSX.Element[] {
-  if (!onPathClick && !onUrlClick) return [<span>{text}</span>];
+  if (!onPathClick && !onUrlClick && !onDownload) return [<span>{text}</span>];
 
   // Step 1: Split by URLs first (URLs take priority over path detection)
   const parts: preact.JSX.Element[] = [];
@@ -1353,13 +1381,26 @@ function splitPathsAndUrls(
         if (path.length < 3) continue;
         if (pm.index > pathLast) parts.push(<span key={`t${chunk.start + pathLast}`}>{chunk.value.slice(pathLast, pm.index)}</span>);
         parts.push(
-          <span
-            key={`p${chunk.start + pm.index}`}
-            class="chat-path-link"
-            onClick={() => onPathClick(path)}
-            title={path}
-          >
-            {path}
+          <span key={`p${chunk.start + pm.index}`}>
+            <span
+              class="chat-path-link"
+              onClick={() => onPathClick(path)}
+              title={path}
+            >
+              {path}
+            </span>
+            {onDownload && hasFileExtension(path) && (
+              <button
+                class="chat-dl-btn"
+                title="Download"
+                onClick={(e: Event) => {
+                  e.stopPropagation();
+                  onDownload(path);
+                }}
+              >
+                ⬇
+              </button>
+            )}
           </span>,
         );
         pathLast = pm.index + pm[0].length;

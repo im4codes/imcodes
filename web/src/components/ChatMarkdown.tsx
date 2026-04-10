@@ -22,7 +22,7 @@ interface Props {
 
 /** Returns true if the path has a file extension (not a directory). */
 function hasFileExtension(path: string): boolean {
-  const basename = path.split('/').pop() ?? '';
+  const basename = path.split(/[/\\]/).pop() ?? '';
   return /\.\w{1,10}$/.test(basename);
 }
 
@@ -73,6 +73,10 @@ function renderToken(
 
     case 'paragraph': {
       const t = token as Tokens.Paragraph;
+      const plainEscapedParagraph = !inLink && Array.isArray(t.tokens) && t.tokens.every((child) => child.type === 'text' || child.type === 'escape');
+      if (plainEscapedParagraph) {
+        return <p key={key}>{splitPathsAndUrlsInternal(t.raw, onPathClick, onUrlClick, onDownload)}</p>;
+      }
       return <p key={key}>{renderInlineTokens(t.tokens, onPathClick, onUrlClick, inLink, onDownload)}</p>;
     }
 
@@ -250,7 +254,7 @@ function renderToken(
 // ── URL/Path detection (inline within text tokens) ──────────────────────────
 
 const URL_REGEX_INLINE = /https?:\/\/[^\s<>"\])}]+/g;
-const PATH_REGEX_INLINE = /(\.{1,2}\/[\w\p{L}.\-~/]+|\/[\w\p{L}.\-~][\w\p{L}.\-~/]*|(?<![:/\w\p{L}])[a-zA-Z_~][\w\p{L}.\-~]*(?:\/[\w\p{L}.\-~]+)+)/gu;
+const PATH_REGEX_INLINE = /(\\\\[\w.$ -]+\\[\w.$ \\-]+|[A-Za-z]:\\(?:[\w.$ -]+\\)*[\w.$ -]+|\.{1,2}\/[\w\p{L}.\-~/]+|\/[\w\p{L}.\-~][\w\p{L}.\-~/]*|(?<![:/\w\p{L}])[a-zA-Z_~][\w\p{L}.\-~]*(?:\/[\w\p{L}.\-~]+)+)/gu;
 
 function splitPathsAndUrlsInternal(
   text: string,
