@@ -27,22 +27,22 @@ vi.mock('react-i18next', () => ({
       if (key === 'openspec.propose_from_discussion_action') return 'propose_from_discussion_action';
       if (key === 'openspec.propose_from_description_action') return 'propose_from_description_action';
       if (key === 'openspec.audit_implementation_prompt') {
-        return `audit implementation ${(opts?.reference as string) ?? ''}, fix code gaps`;
+        return `audit implementation ${(opts?.reference as string) ?? ''}, fix code gaps and update openspec files`;
       }
       if (key === 'openspec.audit_spec_prompt') {
-        return `audit spec ${(opts?.reference as string) ?? ''}, fix spec gaps`;
+        return `audit spec ${(opts?.reference as string) ?? ''}, update proposal design specs and tasks`;
       }
       if (key === 'openspec.implement_prompt') {
-        return `delegate ${(opts?.reference as string) ?? ''}, split tasks and accept`;
+        return `implement ${(opts?.reference as string) ?? ''}, keep openspec artifacts aligned while coding`;
       }
       if (key === 'openspec.achieve_prompt') {
-        return `complete ${(opts?.reference as string) ?? ''}, finish remaining work and archive if done`;
+        return `complete ${(opts?.reference as string) ?? ''}, update proposal design specs tasks and archive if done`;
       }
       if (key === 'openspec.propose_from_discussion_prompt') {
-        return 'generate openspec proposal from recent discussion';
+        return 'generate openspec change from recent discussion and write proposal design specs tasks';
       }
       if (key === 'openspec.propose_from_description_prompt') {
-        return 'generate openspec proposal from description below';
+        return 'generate openspec change from description below and write proposal design specs tasks';
       }
       if (key === 'session.transport_send_queued_collapsed') {
         return `${opts?.count ?? 0} queued · showing latest only`;
@@ -744,7 +744,7 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: 'audit_action' }));
     fireEvent.click(screen.getByRole('button', { name: 'audit_implementation_action' }));
 
-    expect(screen.getByRole('textbox').textContent).toBe('audit implementation @openspec/changes/change-a, fix code gaps');
+    expect(screen.getByRole('textbox').textContent).toBe('audit implementation @openspec/changes/change-a, fix code gaps and update openspec files');
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
   });
 
@@ -773,7 +773,7 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: 'audit_action' }));
     fireEvent.click(screen.getByRole('button', { name: 'audit_spec_action' }));
 
-    expect(screen.getByRole('textbox').textContent).toBe('audit spec @openspec/changes/change-a, fix spec gaps');
+    expect(screen.getByRole('textbox').textContent).toBe('audit spec @openspec/changes/change-a, update proposal design specs and tasks');
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
   });
 
@@ -801,7 +801,7 @@ afterEach(() => {
 
     fireEvent.click(screen.getByRole('button', { name: 'implement_action' }));
 
-    expect(screen.getByRole('textbox').textContent).toBe('delegate @openspec/changes/change-a, split tasks and accept');
+    expect(screen.getByRole('textbox').textContent).toBe('implement @openspec/changes/change-a, keep openspec artifacts aligned while coding');
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
   });
 
@@ -831,7 +831,7 @@ afterEach(() => {
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', {
       sessionName: 'my-session',
-      text: 'complete @openspec/changes/change-a, finish remaining work and archive if done',
+      text: 'complete @openspec/changes/change-a, update proposal design specs tasks and archive if done',
     });
   });
 
@@ -849,7 +849,7 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: 'propose_action' }));
     fireEvent.click(screen.getByRole('button', { name: 'propose_from_discussion_action' }));
 
-    expect(screen.getByRole('textbox').textContent).toBe('generate openspec proposal from recent discussion');
+    expect(screen.getByRole('textbox').textContent).toBe('generate openspec change from recent discussion and write proposal design specs tasks');
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
   });
 
@@ -867,7 +867,7 @@ afterEach(() => {
     fireEvent.click(screen.getByRole('button', { name: 'propose_action' }));
     fireEvent.click(screen.getByRole('button', { name: 'propose_from_description_action' }));
 
-    expect(screen.getByRole('textbox').textContent).toBe('generate openspec proposal from description below');
+    expect(screen.getByRole('textbox').textContent).toBe('generate openspec change from description below and write proposal design specs tasks');
     expect(ws.sendSessionCommand).not.toHaveBeenCalled();
   });
 

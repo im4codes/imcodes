@@ -476,12 +476,12 @@
     "propose_action": "Propose",
     "propose_from_discussion_action": "根据最近讨论生成",
     "propose_from_description_action": "根据下面的描述生成",
-    "audit_implementation_prompt": "对 {{reference}} 执行严格的实现审计，逐项对照其 OpenSpec 产物。找出所有不一致、遗漏、回归风险、边界场景缺口和缺失测试；然后直接修复代码、测试以及必要的配套改动。不要停留在报告层面，必须把实现修到与规范完全一致。",
-    "audit_spec_prompt": "对 {{reference}} 执行严格的规范审计。强化范围定义、需求、验收标准、边界场景、失败模式、依赖关系与可测试性，消除歧义和内部不一致，把规范修到可直接落地实施的质量。不要只给审查意见，直接修规范。",
-    "implement_prompt": "强力推进 {{reference}} 的实施。把工作拆成明确子任务，给子代理分配清晰所有权，整合输出，逐项补齐与规范的差距，补充或更新测试，并对最终结果负责验收。你负责调度、技术决策、集成收口和最终质量把关。",
-    "achieve_prompt": "按完整 OpenSpec 工作流把 {{reference}} 推到完成。检查所有剩余任务和产物，完成必要的实现与规范工作，关闭未完成项，必要时同步受影响的主规范，并在满足完成条件后归档该变更。不要只汇报状态，直接把它做完。",
-    "propose_from_discussion_prompt": "根据最近的讨论生成一个 OpenSpec proposal。提炼目标、范围、关键需求和验收标准；不明确的部分明确列为待确认项。先给出可直接落库的 change proposal 草稿。",
-    "propose_from_description_prompt": "根据下面的描述生成一个 OpenSpec proposal。整理目标、范围、关键需求和验收标准；缺失信息明确列为待确认项。先给出可直接落库的 change proposal 草稿。"
+    "audit_implementation_prompt": "对 {{reference}} 执行严格的实现审计，逐项对照其 OpenSpec 产物。找出所有不一致、遗漏、回归风险、边界场景缺口和缺失测试；然后直接修复代码、测试以及必要的配套改动。如果实现推进过程中需要同步变更规范产物，也要在同一次任务里直接更新 {{reference}} 下的 OpenSpec 文件。不要停留在报告层面，必须把实现修到与规范完全一致。",
+    "audit_spec_prompt": "对 {{reference}} 执行严格的规范审计。强化范围定义、需求、验收标准、边界场景、失败模式、依赖关系与可测试性，消除歧义和内部不一致；然后直接更新 {{reference}} 下的 proposal、design、specs、tasks，直到规范达到可直接落地实施的质量。不要只给审查意见。",
+    "implement_prompt": "强力推进 {{reference}} 的实施。把工作拆成明确子任务，给子代理分配清晰所有权，整合输出，逐项补齐与规范的差距，补充或更新测试，并对最终结果负责验收。实施过程中要同步维护 {{reference}} 下的 OpenSpec 产物，不要把规范更新留成后续备注。你负责调度、技术决策、集成收口和最终质量把关。",
+    "achieve_prompt": "按完整 OpenSpec 工作流把 {{reference}} 推到完成。检查所有剩余任务和产物，完成必要的实现与规范工作，按需直接更新 {{reference}} 下的 proposal、design、specs、tasks，关闭未完成项，必要时同步受影响的主规范，并在满足完成条件后归档该变更。不要只汇报状态，直接把它做完。",
+    "propose_from_discussion_prompt": "根据最近的讨论生成一个 OpenSpec 变更。提炼目标、范围、关键需求和验收标准；不明确的部分明确列为待确认项；并直接把 proposal、design、specs、tasks 写到 openspec/changes/ 下，而不是只停留在草稿说明。",
+    "propose_from_description_prompt": "根据下面的描述生成一个 OpenSpec 变更。整理目标、范围、关键需求和验收标准；缺失信息明确列为待确认项；并直接把 proposal、design、specs、tasks 写到 openspec/changes/ 下，而不是只停留在草稿说明。"
   },
   "upload": {
     "upload_file": "上传文件",
