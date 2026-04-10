@@ -144,6 +144,25 @@ export function App() {
       return null;
     }
   });
+  const clearAuthState = useCallback(async (reason?: string) => {
+    console.warn('[auth] clearing auth state', reason ?? '');
+    clearApiKey();
+    try { await clearAuthKey(); } catch { /* ignore */ }
+    try {
+      const { Preferences } = await import('@capacitor/preferences');
+      await Preferences.remove({ key: 'deck_api_key_id' });
+    } catch { /* ignore */ }
+    localStorage.removeItem('rcc_auth');
+    localStorage.removeItem('rcc_server');
+    localStorage.removeItem('rcc_server_name');
+    localStorage.removeItem('rcc_session');
+    setAuth(null);
+    setServers([]);
+    setServersLoaded(false);
+    setServersSynced(false);
+    setSelectedServerId(null);
+    setSelectedServerName(null);
+  }, []);
 
   // Native: server URL state and readiness flag
   const [nativeServerUrl, setNativeServerUrl] = useState<string | null>(null);
@@ -417,11 +436,9 @@ export function App() {
   // Registered once so any apiFetch 401 after refresh failure lands here.
   useEffect(() => {
     onAuthExpired((reason?: string) => {
-      console.warn('[auth] onAuthExpired fired — clearing auth state, reason:', reason);
-      localStorage.removeItem('rcc_auth');
-      setAuth(null);
+      void clearAuthState(reason ?? 'expired');
     });
-  }, []);
+  }, [clearAuthState]);
 
 
   // Verify session via /api/auth/user/me on mount (cookie-based auth)
@@ -442,9 +459,7 @@ export function App() {
     }).catch((err) => {
       console.warn(`[auth] /me FAILED:`, err instanceof ApiError ? `${err.status}: ${err.body}` : err);
       if (err instanceof ApiError && err.status === 401) {
-        console.warn('[auth] /me 401 — clearing auth (login required)');
-        localStorage.removeItem('rcc_auth');
-        setAuth(null);
+        void clearAuthState('mount_verify_401');
       }
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -470,6 +485,26 @@ export function App() {
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);
   }, [auth]);
+
+  useEffect(() => {
+    if (!auth) return;
+    const verifyAuthStillValid = async (reason: string) => {
+      try {
+        await fetchMe();
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 401) {
+          await clearAuthState(reason);
+        }
+      }
+    };
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        void verifyAuthStillValid('visibility_verify_401');
+      }
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [auth, clearAuthState]);
 
   const handleRenameServer = useCallback(async (server: ServerInfo) => {
     const newName = prompt('Rename server:', server.name);
@@ -540,6 +575,17 @@ export function App() {
     setServersSynced(false);
     void loadServers();
   }, [loadServers]);
+
+  useEffect(() => {
+    if (!auth || !selectedServerId || !serversLoaded) return;
+    const selectedServer = servers.find((server) => server.id === selectedServerId);
+    if (!selectedServer || isServerOnline(selectedServer)) return;
+    void fetchMe().catch(async (err) => {
+      if (err instanceof ApiError && err.status === 401) {
+        await clearAuthState('server_offline_verify_401');
+      }
+    });
+  }, [auth, clearAuthState, selectedServerId, servers, serversLoaded]);
 
   // Periodically refresh server list so lastHeartbeatAt stays current
   useEffect(() => {
