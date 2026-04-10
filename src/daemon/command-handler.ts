@@ -58,6 +58,8 @@ import {
   type TransportEffortLevel,
 } from '../../shared/effort-levels.js';
 
+const MAX_P2P_FILE_PULL_COUNT = 20;
+
 /**
  * Build a unified subsession.sync payload from the session store record.
  * Ensures all fields (including Qwen metadata) are always sent — no more
@@ -1213,7 +1215,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       const fileContents: Array<{ path: string; content: string }> = [];
       const record = getSession(sessionName);
       const projectDir = record?.projectDir ?? '';
-      for (const fp of tokens.files) {
+      for (const fp of tokens.files.slice(0, MAX_P2P_FILE_PULL_COUNT)) {
         try {
           const absPath = nodePath.isAbsolute(fp) ? fp : nodePath.join(projectDir, fp);
           // Check for binary content (null bytes anywhere in the capped content)

@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // ── Hoisted mocks ─────────────────────────────────────────────────────────────
 
@@ -533,5 +536,34 @@ describe('structured P2P routing via WS fields', () => {
     expect(startP2pRun).toHaveBeenCalledOnce();
     const [{ rounds }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(rounds).toBe(2);
+  });
+
+  it('limits pulled file contents to the first 20 referenced files', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'p2p-file-limit-'));
+    try {
+      const filePaths: string[] = [];
+      for (let i = 0; i < 25; i++) {
+        const filePath = join(dir, `file-${i}.ts`);
+        await writeFile(filePath, `export const value${i} = ${i};\n`, 'utf8');
+        filePaths.push(filePath);
+      }
+
+      handleWebCommand({
+        type: 'session.send',
+        sessionName: 'deck_proj_brain',
+        text: `${filePaths.map((fp) => `@${fp}`).join(' ')} review these files`,
+        commandId: 'cmd-file-limit',
+        p2pAtTargets: [{ session: 'deck_proj_w1', mode: 'review' }],
+      }, mockServerLink as any);
+
+      await new Promise((r) => setTimeout(r, 100));
+
+      expect(startP2pRun).toHaveBeenCalledOnce();
+      const [{ fileContents }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+      expect(fileContents).toHaveLength(20);
+      expect(fileContents.map((f: { path: string }) => f.path)).toEqual(filePaths.slice(0, 20));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
