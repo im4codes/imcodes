@@ -847,6 +847,9 @@ export async function relaunchSessionWithSettings(
   const compatibleIds = getCompatibleSessionIds(record, targetAgentType);
   const preserveTransportBinding = record.runtimeType === RUNTIME_TYPES.TRANSPORT
     && record.agentType === targetAgentType
+    // Qwen uses providerSessionId as its real resume key, so explicit restart must
+    // preserve it. Claude/Codex SDKs keep their provider continuity in ccSessionId /
+    // codexSessionId and therefore use a fresh local route key on relaunch.
     && targetAgentType !== 'claude-code-sdk'
     && targetAgentType !== 'codex-sdk'
     && typeof record.providerSessionId === 'string'
