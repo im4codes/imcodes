@@ -287,6 +287,25 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-after-restart', status: 'accepted' });
   });
 
+  it('deduplicates concurrent session.restart requests for the same transport session', async () => {
+    let resolveRestart: (() => void) | null = null;
+    relaunchSessionWithSettingsMock.mockImplementation(
+      () => new Promise<void>((resolve) => {
+        resolveRestart = resolve;
+      }),
+    );
+
+    handleWebCommand({ type: 'session.restart', sessionName: 'deck_transport_brain', agentType: 'claude-code-sdk' }, serverLink as any);
+    handleWebCommand({ type: 'session.restart', sessionName: 'deck_transport_brain', agentType: 'claude-code-sdk' }, serverLink as any);
+
+    await flushAsync();
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(1);
+
+    resolveRestart?.();
+    await flushAsync();
+    await flushAsync();
+  });
+
   it('skips terminal subscribe and snapshot requests for transport sessions', async () => {
     handleWebCommand({ type: 'terminal.subscribe', session: 'deck_transport_brain' }, serverLink as any);
     handleWebCommand({ type: 'terminal.snapshot_request', sessionName: 'deck_transport_brain' }, serverLink as any);

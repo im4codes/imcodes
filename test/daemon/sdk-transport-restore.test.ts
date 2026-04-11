@@ -326,6 +326,45 @@ describe('sdk transport session restore', () => {
     expect(mocks.claudeRuns.at(-1)?.options.sessionId).toBeUndefined();
   });
 
+  it('relaunches claude-code-sdk with a fresh provider route key while preserving the Claude resume id', async () => {
+    const name = 'deck_restart_ccsdk_brain';
+    const record = {
+      name,
+      projectName: 'restartccsdk',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/restart-ccsdk',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      providerSessionId: 'route-cc-old',
+      ccSessionId: 'cc-session-restart',
+    };
+    mocks.store.set(name, record);
+
+    await connectProvider('claude-code-sdk', {});
+    await relaunchSessionWithSettings(record as any, { agentType: 'claude-code-sdk' });
+
+    const next = mocks.store.get(name);
+    expect(next?.agentType).toBe('claude-code-sdk');
+    expect(next?.ccSessionId).toBe('cc-session-restart');
+    expect(next?.providerSessionId).toBeTruthy();
+    expect(next?.providerSessionId).not.toBe('route-cc-old');
+
+    const runtime = getTransportRuntime(name);
+    expect(runtime?.providerSessionId).toBe(next?.providerSessionId);
+
+    runtime!.send('What token did I ask you to remember?');
+    await flush();
+
+    expect(mocks.claudeRuns.at(-1)?.options.resume).toBe('cc-session-restart');
+    expect(mocks.claudeRuns.at(-1)?.options.sessionId).toBeUndefined();
+  });
+
   it('preserves Claude resume id when switching from sdk to cli', async () => {
     const name = 'deck_switch_cccli_brain';
     const record = {

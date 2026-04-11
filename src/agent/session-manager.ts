@@ -847,6 +847,8 @@ export async function relaunchSessionWithSettings(
   const compatibleIds = getCompatibleSessionIds(record, targetAgentType);
   const preserveTransportBinding = record.runtimeType === RUNTIME_TYPES.TRANSPORT
     && record.agentType === targetAgentType
+    && targetAgentType !== 'claude-code-sdk'
+    && targetAgentType !== 'codex-sdk'
     && typeof record.providerSessionId === 'string'
     && record.providerSessionId.length > 0;
 
@@ -1035,7 +1037,8 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       wireTransportSessionInfo(runtime, s.name, s.agentType);
       // After cancel, qwenFreshOnResume is set — don't resume the stuck conversation.
       const freshAfterCancel = !!(s.qwenFreshOnResume && s.providerId === 'qwen');
-      const effectiveSessionKey = freshAfterCancel ? randomUUID() : s.providerSessionId;
+      const needsEphemeralRouteKey = s.providerId === 'claude-code-sdk' || s.providerId === 'codex-sdk';
+      const effectiveSessionKey = freshAfterCancel || needsEphemeralRouteKey ? randomUUID() : s.providerSessionId;
       const resumeId = s.providerId === 'claude-code-sdk'
         ? s.ccSessionId
         : s.providerId === 'codex-sdk'
@@ -1087,7 +1090,9 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         ...s,
         state: 'idle',
         updatedAt: Date.now(),
-        ...(freshAfterCancel ? { providerSessionId: actualProviderSid, qwenFreshOnResume: undefined } : {}),
+        ...((freshAfterCancel || s.providerSessionId !== actualProviderSid)
+          ? { providerSessionId: actualProviderSid, ...(freshAfterCancel ? { qwenFreshOnResume: undefined } : {}) }
+          : {}),
         requestedModel: effectiveRequestedModel ?? s.requestedModel,
         activeModel: effectiveRequestedModel ?? s.activeModel ?? s.modelDisplay,
         modelDisplay: effectiveRequestedModel ?? s.modelDisplay,
@@ -1183,7 +1188,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
       effectiveSkipCreate = false;
     }
   } else if (agentType === 'claude-code-sdk') {
+    effectiveSessionKey = randomUUID();
+    effectiveBindExistingKey = undefined;
     transportResumeId = opts.ccSessionId ?? (!opts.fresh ? getSession(name)?.ccSessionId : undefined) ?? randomUUID();
+    if (!opts.fresh && transportResumeId) {
+      effectiveSkipCreate = true;
+    }
     // Switching from Claude CLI -> SDK must resume the inherited conversation.
     // Re-creating with the same sessionId makes Claude reject the turn with
     // "Session ID ... is already in use", which is what users were seeing.
@@ -1205,7 +1215,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     }
     sdkDisplay = await getClaudeSdkRuntimeConfig().catch(() => ({}));
   } else if (agentType === 'codex-sdk') {
+    effectiveSessionKey = randomUUID();
+    effectiveBindExistingKey = undefined;
     transportResumeId = opts.codexSessionId ?? (!opts.fresh ? getSession(name)?.codexSessionId : undefined);
+    if (!opts.fresh && transportResumeId) {
+      effectiveSkipCreate = true;
+    }
     sdkDisplay = await getCodexRuntimeConfig().catch(() => ({}));
   }
 

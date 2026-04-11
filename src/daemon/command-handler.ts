@@ -229,6 +229,12 @@ function trackPendingSessionRelaunch(sessionName: string, pending: Promise<void>
   return pending;
 }
 
+function runExclusiveSessionRelaunch(sessionName: string, factory: () => Promise<void>): Promise<void> {
+  const pending = pendingSessionRelaunches.get(sessionName);
+  if (pending) return pending;
+  return trackPendingSessionRelaunch(sessionName, factory());
+}
+
 async function waitForPendingSessionRelaunch(sessionName: string): Promise<void> {
   const pending = pendingSessionRelaunches.get(sessionName);
   if (!pending) return;
@@ -925,7 +931,7 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
       return;
     }
     try {
-      await trackPendingSessionRelaunch(sessionName, (async () => {
+      await runExclusiveSessionRelaunch(sessionName, async () => {
         try {
           await relaunchSessionWithSettings(record, {
             agentType: (cmd.agentType as any) ?? undefined,
@@ -946,7 +952,7 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
           await handleGetSessions(serverLink);
           throw err;
         }
-      })());
+      });
     } catch {
       // Failure already surfaced via session.error + corrective session_list.
     }
@@ -2040,7 +2046,7 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
   }
   const id = sName.replace(/^deck_sub_/, '');
   try {
-    await trackPendingSessionRelaunch(sName, (async () => {
+    await runExclusiveSessionRelaunch(sName, async () => {
       try {
         const effectiveRecord = (await recoverOpenCodeSessionRecord(record)) ?? record;
         await relaunchSessionWithSettings(effectiveRecord, {
@@ -2059,7 +2065,7 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
         logger.error({ err: e, sessionName: sName }, 'subsession.restart failed');
         throw e;
       }
-    })());
+    });
   } catch {
     // Failure already logged; keep command handler alive for future sends.
   }
