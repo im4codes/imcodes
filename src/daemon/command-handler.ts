@@ -1309,10 +1309,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     return;
   }
   if (transportRuntime) {
-    const release = await getMutex(sessionName).acquire();
-    try {
-      if (text.trim() === '/stop') {
-        emitTransportUserMessage(text);
+    if (text.trim() === '/stop') {
+      emitTransportUserMessage(text);
+      try {
         await transportRuntime.cancel();
         // Mark session for fresh start so daemon restart doesn't resume the stuck conversation
         if (record?.agentType === 'qwen') {
@@ -1323,8 +1322,17 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         try {
           serverLink.send({ type: 'command.ack', commandId: effectiveId, status: stopStatus, session: sessionName });
         } catch { /* */ }
-        return;
+      } catch (err) {
+        const errMsg = describeTransportSendError(err);
+        logger.error({ sessionName, err }, 'session.stop (transport) failed');
+        timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Stop failed: ${errMsg}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
+        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch { /* */ }
       }
+      return;
+    }
+    const release = await getMutex(sessionName).acquire();
+    try {
       const modelMatch = text.trim().match(/^\/model\s+(\S+)(?:\s+.*)?$/);
       const effortMatch = text.trim().match(/^\/(?:thinking|effort)\s+(\S+)\s*$/);
       if (record?.agentType === 'qwen' && modelMatch) {

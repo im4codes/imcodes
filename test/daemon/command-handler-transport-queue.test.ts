@@ -168,6 +168,30 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-queued', status: 'accepted' });
   });
 
+  it('dispatches /stop immediately for transport sessions without emitting queued state', async () => {
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      cancel,
+      send: vi.fn(() => 'queued'),
+      pendingCount: 3,
+      pendingMessages: ['a', 'b', 'c'],
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/stop', commandId: 'cmd-stop' }, serverLink as any);
+    await flushAsync();
+
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: '/stop', allowDuplicate: true });
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-stop', status: 'accepted' });
+    expect(emitMock).not.toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      expect.objectContaining({ state: 'queued' }),
+      expect.anything(),
+    );
+  });
+
   it('emits a user.message immediately for dispatched transport sends', async () => {
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'route-transport',
