@@ -95,6 +95,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const modelLabel = shortModelLabel(displayModel);
   const inlineQuotaText = displayQuotaLabel;
+  const liveStatusMode = sessionState === 'running' ? 'running' : sessionState === 'idle' ? 'idle' : null;
   const liveStatusText = useMemo(() => {
     if (sessionState === 'running') {
       if (statusText) return statusText;
@@ -116,12 +117,6 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
         </div>
       )}
-      {showLiveStatus && liveStatusText && (
-        <div class="session-live-status">
-          {sessionState === 'running' && <span class="chat-thinking-dots">···</span>}
-          <span>{liveStatusText}</span>
-        </div>
-      )}
       {codexQuotaLines.length > 0 && (
         <div class="session-usage-codex-quota">
           {codexQuotaLines.map((line) => (
@@ -130,6 +125,14 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
         </div>
       )}
       <div class="session-usage-stats">
+        {showLiveStatus && liveStatusText && liveStatusMode && (
+          <span class={`session-live-status-inline ${liveStatusMode}`} title={liveStatusText} aria-label={liveStatusText}>
+            <span class="session-live-status-emoji robot">🤖</span>
+            {liveStatusMode === 'running'
+              ? <span class="session-live-status-emoji gear">⚙️</span>
+              : <span class="session-live-status-emoji sleep">💤</span>}
+          </span>
+        )}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
           {modelLabel && <span class="session-usage-model">{modelLabel}</span>}
           {total > 0 && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}

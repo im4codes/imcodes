@@ -34,7 +34,7 @@ afterEach(() => {
 });
 
 describe('UsageFooter', () => {
-  it('renders live status below the ctx bar and only animates while running', () => {
+  it('renders emoji live status inline with footer stats and only animates while running', () => {
     const { container, rerender } = render(
       <UsageFooter
         usage={{
@@ -49,8 +49,12 @@ describe('UsageFooter', () => {
       />,
     );
 
-    expect(container.querySelector('.session-live-status')?.textContent).toContain('Agent idle');
+    const idleStatus = container.querySelector('.session-live-status-inline') as HTMLSpanElement | null;
+    expect(idleStatus?.textContent).toContain('🤖');
+    expect(idleStatus?.textContent).toContain('💤');
+    expect(idleStatus?.getAttribute('aria-label')).toContain('Agent idle');
     expect(container.querySelector('.chat-thinking-dots')).toBeNull();
+    expect(container.querySelector('.session-live-status-inline.idle .session-live-status-emoji.sleep')).toBeTruthy();
 
     rerender(
       <UsageFooter
@@ -66,12 +70,16 @@ describe('UsageFooter', () => {
       />,
     );
 
-    expect(container.querySelector('.session-live-status')?.textContent).toContain('thinking');
-    expect(container.querySelector('.chat-thinking-dots')).toBeTruthy();
+    const runningStatus = container.querySelector('.session-live-status-inline') as HTMLSpanElement | null;
+    expect(runningStatus?.textContent).toContain('🤖');
+    expect(runningStatus?.textContent).toContain('⚙️');
+    expect(runningStatus?.getAttribute('aria-label')).toContain('thinking');
+    expect(container.querySelector('.session-live-status-inline.running')).toBeTruthy();
+    expect(container.querySelector('.session-live-status-inline.running .session-live-status-emoji.gear')).toBeTruthy();
   });
 
   it('prefers explicit running status text in the live status row', () => {
-    render(
+    const { container } = render(
       <UsageFooter
         usage={{
           inputTokens: 0,
@@ -85,7 +93,7 @@ describe('UsageFooter', () => {
       />,
     );
 
-    expect(screen.getByText('Reading file...')).toBeDefined();
+    expect((container.querySelector('.session-live-status-inline') as HTMLSpanElement | null)?.getAttribute('aria-label')).toBe('Reading file...');
   });
 
   it('renders explicit quota label inline in the ctx footer', () => {
