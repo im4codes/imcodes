@@ -36,6 +36,7 @@ import { getClaudeSdkRuntimeConfig } from './sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from './codex-runtime-config.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
+import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
@@ -958,6 +959,11 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
       changed = true;
     }
 
+    if (info.quotaMeta !== undefined && !providerQuotaMetaEquals(next.quotaMeta, info.quotaMeta)) {
+      next.quotaMeta = info.quotaMeta;
+      changed = true;
+    }
+
     if (typeof info.effort === 'string' && next.effort !== info.effort) {
       next.effort = info.effort;
       changed = true;
@@ -1153,7 +1159,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   let qwenAuthType: SessionRecord['qwenAuthType'] | undefined;
   let qwenAuthLimit: SessionRecord['qwenAuthLimit'] | undefined;
   let availableQwenModels: string[] | undefined;
-  let sdkDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel'> | undefined;
+  let sdkDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'> | undefined;
   let transportSystemPrompt: string | undefined;
   let transportSettings: string | Record<string, unknown> | undefined;
   const storedRequestedModel = !opts.fresh ? existing?.requestedModel : undefined;
@@ -1393,7 +1399,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     }
   }
 
-  let familyDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel'> | undefined;
+  let familyDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'> | undefined;
   if (agentType === 'codex') {
     familyDisplay = await getCodexRuntimeConfig().catch(() => ({}));
   } else if (agentType === 'claude-code' && !opts.ccPreset) {

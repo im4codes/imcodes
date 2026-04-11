@@ -12,6 +12,7 @@
 
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
+import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 
 // Re-export shared types used by consumers of this module so they can import from one place.
 export type { AgentMessage, MessageDelta, ToolCallEvent };
@@ -178,6 +179,8 @@ export interface SessionInfoUpdate {
   quotaLabel?: string;
   /** Human-readable quota progress / reset label, if known. */
   quotaUsageLabel?: string;
+  /** Structured quota metadata for recomputing display labels. */
+  quotaMeta?: ProviderQuotaMeta;
   /** Current reasoning/thinking effort, if known. */
   effort?: TransportEffortLevel;
 }

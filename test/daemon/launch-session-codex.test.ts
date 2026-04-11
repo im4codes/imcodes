@@ -67,6 +67,10 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
   getCodexRuntimeConfig: vi.fn().mockResolvedValue({
     planLabel: 'Pro',
     quotaLabel: '5h 11% 2h03m 4/5 13:00 · 7d 50% 1d04h 4/7 14:00',
+    quotaMeta: {
+      primary: { usedPercent: 11, windowDurationMins: 300, resetsAt: 1_700_000_000 },
+      secondary: { usedPercent: 50, windowDurationMins: 10080, resetsAt: 1_700_100_000 },
+    },
   }),
 }));
 
@@ -102,6 +106,10 @@ describe('launchSession — Codex ID handling', () => {
     const lastRecord = upsertCalls[upsertCalls.length - 1][0];
     expect(lastRecord.codexSessionId).toBe('new-codex-uuid');
     expect(lastRecord.state).toBe('idle');
+    expect(lastRecord.quotaMeta).toEqual({
+      primary: { usedPercent: 11, windowDurationMins: 300, resetsAt: 1_700_000_000 },
+      secondary: { usedPercent: 50, windowDurationMins: 10080, resetsAt: 1_700_100_000 },
+    });
     expect(onSessionEvent).toHaveBeenCalledWith('started', 'deck_codex_brain', 'idle');
   });
 });

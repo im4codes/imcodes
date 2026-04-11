@@ -149,6 +149,7 @@ export function SessionPane({
     || session.planLabel
     || session.quotaLabel
     || session.quotaUsageLabel
+    || session.quotaMeta
   );
 
   const thinkingNow = useNowTicker(!!activeThinkingTs);
