@@ -60,7 +60,7 @@ import { shouldSubscribeTerminalRaw, type TerminalSubscribeViewMode } from './te
 import { onWatchCommand } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
 import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timeline-running.js';
-import { extractTransportPendingMessages } from './transport-queue.js';
+import { extractTransportPendingMessages, mergeTransportPendingMessagesForRunningState } from './transport-queue.js';
 import { ingestTimelineEventForCache } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
@@ -1332,15 +1332,16 @@ export function App() {
                 : s,
             ));
           } else if (liveState === 'running') {
-            const pendingMessages = hasPendingMessagesField
-              ? extractTransportPendingMessages(event.payload.pendingMessages)
-              : null;
             setSessions((prev) => prev.map((s) =>
               s.name === event.sessionId
                 ? {
                     ...s,
                     state: 'running' as SessionInfo['state'],
-                    transportPendingMessages: pendingMessages ?? (s.transportPendingMessages ?? []),
+                    transportPendingMessages: mergeTransportPendingMessagesForRunningState(
+                      s.transportPendingMessages,
+                      event.payload.pendingMessages,
+                      hasPendingMessagesField,
+                    ),
                   }
                 : s,
             ));

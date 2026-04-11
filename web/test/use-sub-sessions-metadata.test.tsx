@@ -217,7 +217,7 @@ describe('sub-session metadata via subsession.sync', () => {
     expect(captured[0].quotaUsageLabel).toBe('today 20/1000');
   });
 
-  it('preserves queued transport messages until running explicitly reports an empty queue', async () => {
+  it('preserves queued transport messages while the drained send is still running and clears on idle', async () => {
     const { ws, send } = createMockWs();
     render(<Harness ws={ws} connected={true} />);
     await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
@@ -258,6 +258,17 @@ describe('sub-session metadata via subsession.sync', () => {
         type: 'session.state',
         sessionId: 'deck_sub_q4',
         payload: { state: 'running', pendingMessages: [] },
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['queued one', 'queued two']);
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_q4',
+        payload: { state: 'idle' },
       },
     }));
 
