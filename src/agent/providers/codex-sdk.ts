@@ -23,6 +23,7 @@ import { CODEX_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../sha
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 
 const CODEX_BIN = 'codex';
+const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
 
 type JsonRpcResponse = {
   id?: number;
@@ -49,6 +50,7 @@ interface CodexSdkSessionState {
   currentText: string;
   pendingComplete?: AgentMessage;
   cancelled: boolean;
+  cancelTimer: ReturnType<typeof setTimeout> | null;
   lastUsage?: {
     input_tokens: number;
     cached_input_tokens: number;
@@ -223,6 +225,7 @@ export class CodexSdkProvider implements TransportProvider {
       currentText: '',
       pendingComplete: undefined,
       cancelled: false,
+      cancelTimer: null,
       lastUsage: undefined,
       lastStatusSignature: null,
     });
@@ -233,6 +236,7 @@ export class CodexSdkProvider implements TransportProvider {
   async endSession(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state) return;
+    this.clearCancelTimer(state);
     if (state.threadId && state.loaded) {
       await this.request('thread/unsubscribe', { threadId: state.threadId }).catch(() => {});
       this.threadToSession.delete(state.threadId);
@@ -313,6 +317,7 @@ export class CodexSdkProvider implements TransportProvider {
     state.currentMessageId = null;
     state.pendingComplete = undefined;
     state.cancelled = false;
+    this.clearCancelTimer(state);
     state.lastUsage = undefined;
     state.lastStatusSignature = null;
     await this.startTurn(sessionId, state, message);
@@ -322,10 +327,21 @@ export class CodexSdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (!state?.threadId || !state.runningTurnId) return;
     state.cancelled = true;
+    const turnId = state.runningTurnId;
     await this.request('turn/interrupt', {
       threadId: state.threadId,
-      turnId: state.runningTurnId,
+      turnId,
     }).catch(() => {});
+    this.clearCancelTimer(state);
+    state.cancelTimer = setTimeout(() => {
+      if (!this.sessions.has(sessionId)) return;
+      if (state.runningTurnId !== turnId) return;
+      this.clearStatus(sessionId, state);
+      state.runningTurnId = undefined;
+      state.pendingComplete = undefined;
+      this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
+    }, CANCEL_INTERRUPT_TIMEOUT_MS);
+    state.cancelTimer.unref?.();
   }
 
   private async startAppServer(binaryPath: string): Promise<void> {
@@ -546,18 +562,25 @@ export class CodexSdkProvider implements TransportProvider {
       const status = turn.status;
 
       if (status === 'failed') {
+        this.clearCancelTimer(state);
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, turn.error?.message ?? 'Codex turn failed', false, turn.error));
         return;
       }
       if (status === 'interrupted') {
+        this.clearCancelTimer(state);
+        if (!state.runningTurnId && state.cancelled) {
+          state.cancelled = false;
+          return;
+        }
         this.clearStatus(sessionId, state);
         state.runningTurnId = undefined;
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
         return;
       }
 
+      this.clearCancelTimer(state);
       this.clearStatus(sessionId, state);
       state.pendingComplete = {
         id: state.currentMessageId ?? `${sessionId}:agent-message`,
@@ -644,5 +667,11 @@ export class CodexSdkProvider implements TransportProvider {
 
   private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {
     return { code, message, recoverable, ...(details !== undefined ? { details } : {}) };
+  }
+
+  private clearCancelTimer(state: CodexSdkSessionState): void {
+    if (!state.cancelTimer) return;
+    clearTimeout(state.cancelTimer);
+    state.cancelTimer = null;
   }
 }
