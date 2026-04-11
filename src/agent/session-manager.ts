@@ -816,9 +816,10 @@ function stopStructuredWatchers(sessionName: string): void {
 export async function stopTransportRuntimeSession(sessionName: string): Promise<void> {
   const transportRuntime = transportRuntimes.get(sessionName);
   if (!transportRuntime) return;
-  if (transportRuntime.providerSessionId) unregisterProviderRoute(transportRuntime.providerSessionId);
-  await transportRuntime.kill();
+  const providerSid = transportRuntime.providerSessionId;
   transportRuntimes.delete(sessionName);
+  if (providerSid) unregisterProviderRoute(providerSid);
+  await transportRuntime.kill();
 }
 
 async function teardownSessionRuntime(record: SessionRecord): Promise<void> {
@@ -1123,13 +1124,13 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     const existingRuntime = transportRuntimes.get(name);
     if (existingRuntime) {
       const oldProviderSid = existingRuntime.providerSessionId;
+      transportRuntimes.delete(name);
+      if (oldProviderSid) unregisterProviderRoute(oldProviderSid);
       try {
         await existingRuntime.kill();
       } catch (err) {
         logger.warn({ err, session: name }, 'Failed to kill existing transport runtime before fresh launch');
       }
-      transportRuntimes.delete(name);
-      if (oldProviderSid) unregisterProviderRoute(oldProviderSid);
     }
   }
 

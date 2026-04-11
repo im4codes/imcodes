@@ -2,7 +2,7 @@
  * Handle commands from the web UI and inbound chat messages via ServerLink.
  * Commands arrive as JSON objects with a `type` field.
  */
-import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, persistSessionRecord, relaunchSessionWithSettings, type ProjectConfig } from '../agent/session-manager.js';
+import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, persistSessionRecord, relaunchSessionWithSettings, stopTransportRuntimeSession, type ProjectConfig } from '../agent/session-manager.js';
 import { isTransportAgent } from '../agent/detect.js';
 import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand } from '../agent/tmux.js';
 import { listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
@@ -1291,6 +1291,17 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: errStatus, session: sessionName, error: errMsg }); } catch { /* not connected */ }
     return;
   }
+  if (transportRuntime && !transportRuntime.providerSessionId) {
+    await stopTransportRuntimeSession(sessionName).catch(() => {});
+    const errMsg = `Provider ${record?.providerId ?? 'unknown'} restarting. Please resend in a moment.`;
+    logger.warn({ sessionName, providerId: record?.providerId }, 'session.send: transport runtime missing provider session id');
+    emitTransportUserMessage(text);
+    timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ ${errMsg}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
+    try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch {}
+    return;
+  }
   if (transportRuntime) {
     const release = await getMutex(sessionName).acquire();
     try {
@@ -1605,6 +1616,8 @@ async function handleResize(cmd: Record<string, unknown>): Promise<void> {
   const cols = cmd.cols as number | undefined;
   const rows = cmd.rows as number | undefined;
   if (!sessionName || !cols || !rows) return;
+  const record = getSession(sessionName);
+  if (record?.runtimeType === 'transport') return;
   try {
     // Subtract 1 col so tmux is always slightly narrower than the browser terminal.
     // xterm fitAddon rounds down but container width may have sub-character remainder,
@@ -1631,6 +1644,16 @@ const RAW_BATCH_MAX_BYTES = 32 * 1024;   // flush immediately at 32KB
 function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): void {
   const session = cmd.session as string | undefined;
   if (!session) return;
+  const record = getSession(session);
+  if (record?.runtimeType === 'transport') {
+    const existing = activeSubscriptions.get(session);
+    if (existing) {
+      existing.unsubscribe();
+      activeSubscriptions.delete(session);
+    }
+    logger.debug({ session }, 'Terminal subscribe skipped for transport session');
+    return;
+  }
 
   // The bridge may include a `raw` flag on terminal.subscribe for its own forwarding-mode
   // bookkeeping, but daemon-side terminal streaming remains transport-stable in this phase:
@@ -1699,6 +1722,8 @@ function handleUnsubscribe(cmd: Record<string, unknown>): void {
 function handleSnapshotRequest(cmd: Record<string, unknown>): void {
   const sessionName = cmd.sessionName as string | undefined;
   if (!sessionName) return;
+  const record = getSession(sessionName);
+  if (record?.runtimeType === 'transport') return;
   terminalStreamer.requestSnapshot(sessionName);
   logger.debug({ sessionName }, 'Snapshot requested via web');
 }
