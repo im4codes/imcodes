@@ -206,6 +206,58 @@ describe('ChatView', () => {
     expect(chatMarkdownRenderSpy.mock.calls.filter(([text]) => text === 'stable block')).toHaveLength(1);
   });
 
+  it('does not render running or idle session states as chat rows', () => {
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-running',
+            type: 'session.state',
+            ts: 1000,
+            payload: { state: 'running' },
+          },
+          {
+            eventId: 'evt-idle',
+            type: 'session.state',
+            ts: 1001,
+            payload: { state: 'idle' },
+          },
+          {
+            eventId: 'evt-msg',
+            type: 'assistant.text',
+            ts: 1002,
+            payload: { text: 'real message' },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.textContent).not.toContain('Agent working...');
+    expect(container.textContent).not.toContain('Agent idle');
+    expect(container.textContent).toContain('real message');
+  });
+
+  it('still renders non-live session state entries such as stopped', () => {
+    const { container } = render(
+      <ChatView
+        events={[
+          {
+            eventId: 'evt-stopped',
+            type: 'session.state',
+            ts: 1000,
+            payload: { state: 'stopped' },
+          },
+        ] as any}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.textContent).toContain('Session stopped');
+  });
+
   it('restores mobile keyboard scroll position from bottom offset instead of snapping to top', async () => {
     const initialEvents = [
       {

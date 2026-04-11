@@ -15,6 +15,7 @@ import { useTranslation } from 'react-i18next';
 import { UsageFooter } from './UsageFooter.js';
 import { extractLatestUsage } from '../usage-data.js';
 import { getActiveThinkingTs, getActiveStatusText } from '../thinking-utils.js';
+import { useNowTicker } from '../hooks/useNowTicker.js';
 import type { PinnedPanel } from '../app.js';
 import type { PanelRenderContext } from './PinnedPanelRegistry.js';
 
@@ -37,6 +38,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   const lastUsage = useMemo(() => extractLatestUsage(events), [events]);
   const activeThinkingTs = useMemo(() => getActiveThinkingTs(events), [events]);
   const statusText = useMemo(() => getActiveStatusText(events), [events]);
+  const thinkingNow = useNowTicker(!!activeThinkingTs);
 
   if (!liveSub) {
     return <div class="sidebar-pinned-unavailable">{t('sidebar.session_unavailable')}</div>;
@@ -68,7 +70,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           onQuote={ctx.onQuote}
         />
       )}
-      {(lastUsage || activeThinkingTs || statusText || liveSub.planLabel || liveSub.quotaLabel || liveSub.quotaUsageLabel) && (
+      {(lastUsage || activeThinkingTs || statusText || liveSub.state === 'running' || liveSub.state === 'idle' || liveSub.planLabel || liveSub.quotaLabel || liveSub.quotaUsageLabel) && (
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sessionName}
@@ -82,6 +84,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           showCost={false}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}
+          now={thinkingNow}
         />
       )}
       {(compactQuotaText || liveSub.planLabel) && (

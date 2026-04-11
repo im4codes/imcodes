@@ -34,7 +34,7 @@ afterEach(() => {
 });
 
 describe('UsageFooter', () => {
-  it('only shows the animated thinking dots while the session is running', () => {
+  it('renders live status below the ctx bar and only animates while running', () => {
     const { container, rerender } = render(
       <UsageFooter
         usage={{
@@ -49,6 +49,7 @@ describe('UsageFooter', () => {
       />,
     );
 
+    expect(container.querySelector('.session-live-status')?.textContent).toContain('Agent idle');
     expect(container.querySelector('.chat-thinking-dots')).toBeNull();
 
     rerender(
@@ -65,7 +66,26 @@ describe('UsageFooter', () => {
       />,
     );
 
+    expect(container.querySelector('.session-live-status')?.textContent).toContain('thinking');
     expect(container.querySelector('.chat-thinking-dots')).toBeTruthy();
+  });
+
+  it('prefers explicit running status text in the live status row', () => {
+    render(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        sessionState="running"
+        statusText="Reading file..."
+      />,
+    );
+
+    expect(screen.getByText('Reading file...')).toBeDefined();
   });
 
   it('renders explicit quota label inline in the ctx footer', () => {

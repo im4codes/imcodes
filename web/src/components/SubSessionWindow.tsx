@@ -399,7 +399,7 @@ export function SubSessionWindow({
       </div>
 
       {/* Usage footer — shared component */}
-      {(lastUsage || activeThinkingTs || statusText || sessionInfo?.planLabel || sessionInfo?.quotaLabel || sessionInfo?.quotaUsageLabel) && (
+      {(lastUsage || activeThinkingTs || statusText || sessionInfo?.state === 'running' || sessionInfo?.state === 'idle' || sessionInfo?.planLabel || sessionInfo?.quotaLabel || sessionInfo?.quotaUsageLabel) && (
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sub.sessionName}

@@ -38,7 +38,7 @@ const fmt = (n: number) =>
 export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, now }: Props) {
   const { t } = useTranslation();
   const isCodexFamily = agentType === 'codex' || agentType === 'codex-sdk';
-  const showRunningStatus = sessionState === 'running' && !!(activeThinkingTs || statusText);
+  const showLiveStatus = sessionState === 'running' || sessionState === 'idle';
   const [quotaNow, setQuotaNow] = useState(() => Date.now());
 
   const displayModel = modelOverride ?? usage.model;
@@ -95,6 +95,15 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const modelLabel = shortModelLabel(displayModel);
   const inlineQuotaText = displayQuotaLabel;
+  const liveStatusText = useMemo(() => {
+    if (sessionState === 'running') {
+      if (statusText) return statusText;
+      if (activeThinkingTs) return t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) });
+      return 'Agent working...';
+    }
+    if (sessionState === 'idle') return 'Agent idle — waiting for input';
+    return null;
+  }, [activeThinkingTs, now, sessionState, statusText, t]);
   const codexQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk')
     ? (displayQuotaLabel ?? '').split(' · ').filter(Boolean)
     : [];
@@ -107,6 +116,12 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           <div class="session-ctx-input" style={{ width: `${newPct}%`, left: `${cachePct}%` }} />
         </div>
       )}
+      {showLiveStatus && liveStatusText && (
+        <div class="session-live-status">
+          {sessionState === 'running' && <span class="chat-thinking-dots">···</span>}
+          <span>{liveStatusText}</span>
+        </div>
+      )}
       {codexQuotaLines.length > 0 && (
         <div class="session-usage-codex-quota">
           {codexQuotaLines.map((line) => (
@@ -115,14 +130,6 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
         </div>
       )}
       <div class="session-usage-stats">
-        {showRunningStatus && (
-          <span class="session-thinking-inline">
-            <span class="chat-thinking-dots">···</span>
-            {' '}{activeThinkingTs
-              ? t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) })
-              : statusText}
-          </span>
-        )}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
           {modelLabel && <span class="session-usage-model">{modelLabel}</span>}
           {total > 0 && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}

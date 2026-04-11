@@ -140,7 +140,16 @@ export function SessionPane({
 
   const activeThinkingTs = useMemo(() => getActiveThinkingTs(timelineEvents), [timelineEvents]);
   const statusText = useMemo(() => getActiveStatusText(timelineEvents), [timelineEvents]);
-  const shouldShowFooter = !!(lastUsage || activeThinkingTs || statusText || session.planLabel || session.quotaLabel || session.quotaUsageLabel);
+  const shouldShowFooter = !!(
+    lastUsage
+    || activeThinkingTs
+    || statusText
+    || session.state === 'running'
+    || session.state === 'idle'
+    || session.planLabel
+    || session.quotaLabel
+    || session.quotaUsageLabel
+  );
 
   const thinkingNow = useNowTicker(!!activeThinkingTs);
 
