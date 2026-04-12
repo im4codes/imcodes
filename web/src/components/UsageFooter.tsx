@@ -95,7 +95,9 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const modelLabel = shortModelLabel(displayModel);
   const inlineQuotaText = displayQuotaLabel;
-  const liveStatusMode = sessionState === 'running' ? 'running' : sessionState === 'idle' ? 'idle' : null;
+  const liveStatusMode = sessionState === 'running'
+    ? (statusText ? 'tool' : activeThinkingTs ? 'thinking' : 'running')
+    : sessionState === 'idle' ? 'idle' : null;
   const liveStatusText = useMemo(() => {
     if (sessionState === 'running') {
       if (statusText) return statusText;
@@ -105,6 +107,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     if (sessionState === 'idle') return 'Agent idle — waiting for input';
     return null;
   }, [activeThinkingTs, now, sessionState, statusText, t]);
+  const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool';
   const codexQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk')
     ? (displayQuotaLabel ?? '').split(' · ').filter(Boolean)
     : [];
@@ -128,9 +131,11 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
         {showLiveStatus && liveStatusText && liveStatusMode && (
           <span class={`session-live-status-inline ${liveStatusMode}`} title={liveStatusText} aria-label={liveStatusText}>
             <span class="session-live-status-emoji robot">🤖</span>
-            {liveStatusMode === 'running'
-              ? <span class="session-live-status-emoji gear">⚙️</span>
-              : <span class="session-live-status-emoji sleep">💤</span>}
+            {liveStatusMode === 'running' && <span class="session-live-status-emoji gear">⚙️</span>}
+            {liveStatusMode === 'thinking' && <span class="session-live-status-emoji thought">💭</span>}
+            {liveStatusMode === 'tool' && <span class="session-live-status-emoji tool">🔍</span>}
+            {liveStatusMode === 'idle' && <span class="session-live-status-emoji sleep">💤</span>}
+            {showInlineStatusText && <span class="session-live-status-text">{liveStatusText}</span>}
           </span>
         )}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
