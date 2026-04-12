@@ -4,7 +4,7 @@
  */
 import { useState, useRef, useCallback, useEffect, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { getActiveThinkingTs, getActiveStatusText } from '../thinking-utils.js';
+import { getActiveThinkingTs, getActiveStatusText, hasActiveToolCall } from '../thinking-utils.js';
 import { recordCost } from '../cost-tracker.js';
 import { formatLabel } from '../format-label.js';
 import { TerminalView } from './TerminalView.js';
@@ -107,6 +107,7 @@ export function SubSessionWindow({
 
   // Extract active agent status (e.g. "Reading file...")
   const statusText = useMemo(() => getActiveStatusText(events), [events]);
+  const activeToolCall = useMemo(() => hasActiveToolCall(events), [events]);
 
   const [quotes, setQuotes] = useState<string[]>([]);
   const addQuote = useCallback((text: string) => setQuotes((prev) => [...prev, text]), []);
@@ -413,6 +414,7 @@ export function SubSessionWindow({
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}
+          activeToolCall={activeToolCall}
           now={thinkingNow}
         />
       )}

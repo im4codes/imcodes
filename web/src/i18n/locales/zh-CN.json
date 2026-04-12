@@ -182,7 +182,8 @@
   "toast": {
     "finished": "完成了",
     "upgrade_blocked_title": "升级已阻止",
-    "upgrade_blocked_p2p_active": "P2P 仍在运行。请先停止，再升级 daemon。"
+    "upgrade_blocked_p2p_active": "P2P 仍在运行。请先停止，再升级 daemon。",
+    "upgrade_blocked_transport_busy": "还有 transport session 正在 turn 中。等它回到 idle 再升级 daemon。"
   },
   "discussion": {
     "role_critic": "批判者",

@@ -332,6 +332,17 @@ describe('WsClient', () => {
       expect(handler).toHaveBeenCalledWith({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'p2p_active', activeRunIds: ['run_1'] });
       client.disconnect();
     });
+
+    it('dispatches daemon.upgrade_blocked transport_busy to handlers', async () => {
+      const client = await connectClient();
+      const handler = vi.fn();
+      client.onMessage(handler);
+      handler.mockClear();
+
+      lastWs!.emit('message', { data: JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'transport_busy', activeSessionNames: ['deck_proj_brain'] }) });
+      expect(handler).toHaveBeenCalledWith({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'transport_busy', activeSessionNames: ['deck_proj_brain'] });
+      client.disconnect();
+    });
   });
 
   // ── fsListDir ─────────────────────────────────────────────────────────

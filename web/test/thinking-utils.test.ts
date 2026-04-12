@@ -1,19 +1,31 @@
 import { describe, expect, it } from 'vitest';
 
-import { getActiveStatusText } from '../src/thinking-utils.js';
+import { hasActiveToolCall } from '../src/thinking-utils.js';
 
-describe('getActiveStatusText', () => {
-  it('returns the latest trailing status label', () => {
-    expect(getActiveStatusText([
-      { type: 'assistant.text', payload: { text: 'done' } },
-      { type: 'agent.status', payload: { status: 'compacting', label: 'Compacting conversation...' } },
-    ])).toBe('Compacting conversation...');
+describe('hasActiveToolCall', () => {
+  it('does not treat trailing agent.status during thinking as a tool call', () => {
+    expect(hasActiveToolCall([
+      { type: 'assistant.thinking', ts: 1 },
+      { type: 'agent.status', payload: { label: 'thinking 4s' } },
+      { type: 'session.state', payload: { state: 'running' } },
+    ] as any)).toBe(false);
   });
 
-  it('treats an unlabeled trailing status as an explicit clear', () => {
-    expect(getActiveStatusText([
-      { type: 'agent.status', payload: { status: 'compacting', label: 'Compacting conversation...' } },
-      { type: 'agent.status', payload: { status: null, label: null } },
-    ])).toBeNull();
+  it('treats a trailing tool.call as active', () => {
+    expect(hasActiveToolCall([
+      { type: 'assistant.thinking', ts: 1 },
+      { type: 'tool.call', payload: { tool: 'Read' } },
+      { type: 'agent.status', payload: { label: 'Reading file...' } },
+      { type: 'session.state', payload: { state: 'running' } },
+    ] as any)).toBe(true);
+  });
+
+  it('does not treat a completed tool.result as an active tool call', () => {
+    expect(hasActiveToolCall([
+      { type: 'tool.call', payload: { tool: 'Read' } },
+      { type: 'tool.result', payload: { ok: true } },
+      { type: 'agent.status', payload: { label: 'thinking 1s' } },
+      { type: 'session.state', payload: { state: 'running' } },
+    ] as any)).toBe(false);
   });
 });

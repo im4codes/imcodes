@@ -182,7 +182,8 @@
   "toast": {
     "finished": "finished",
     "upgrade_blocked_title": "Upgrade blocked",
-    "upgrade_blocked_p2p_active": "P2P is still running. Stop it before upgrading the daemon."
+    "upgrade_blocked_p2p_active": "P2P is still running. Stop it before upgrading the daemon.",
+    "upgrade_blocked_transport_busy": "A transport session is still in a turn. Wait until it goes idle before upgrading the daemon."
   },
   "discussion": {
     "role_critic": "Critic",

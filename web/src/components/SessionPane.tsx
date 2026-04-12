@@ -12,7 +12,7 @@ import { ChatView } from './ChatView.js';
 import { SessionControls } from './SessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
 import { useTimeline } from '../hooks/useTimeline.js';
-import { getActiveThinkingTs, getActiveStatusText } from '../thinking-utils.js';
+import { getActiveThinkingTs, getActiveStatusText, hasActiveToolCall } from '../thinking-utils.js';
 import { recordCost } from '../cost-tracker.js';
 import type { UseQuickDataResult } from './QuickInputPanel.js';
 import { formatLabel } from '../format-label.js';
@@ -140,6 +140,7 @@ export function SessionPane({
 
   const activeThinkingTs = useMemo(() => getActiveThinkingTs(timelineEvents), [timelineEvents]);
   const statusText = useMemo(() => getActiveStatusText(timelineEvents), [timelineEvents]);
+  const activeToolCall = useMemo(() => hasActiveToolCall(timelineEvents), [timelineEvents]);
   const shouldShowFooter = !!(
     lastUsage
     || activeThinkingTs
@@ -262,6 +263,7 @@ export function SessionPane({
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}
+          activeToolCall={activeToolCall}
           now={thinkingNow}
         />
       )}

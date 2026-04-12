@@ -110,6 +110,7 @@ describe('UsageFooter', () => {
         sessionName="deck_test_brain"
         sessionState="running"
         statusText="Reading file..."
+        activeToolCall={true}
       />,
     );
 

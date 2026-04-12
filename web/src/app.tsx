@@ -1599,6 +1599,9 @@ export function App() {
         }
       }
       if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED) {
+        const message = msg.reason === 'transport_busy'
+          ? trans('toast.upgrade_blocked_transport_busy')
+          : trans('toast.upgrade_blocked_p2p_active');
         const id = Date.now() + Math.random();
         setToasts((prev) => [...prev, {
           id,
@@ -1606,7 +1609,7 @@ export function App() {
           project: '',
           kind: 'notification',
           title: trans('toast.upgrade_blocked_title'),
-          message: trans('toast.upgrade_blocked_p2p_active'),
+          message,
         }]);
         setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
       }

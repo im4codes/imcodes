@@ -26,6 +26,8 @@ interface Props {
   activeThinkingTs?: number | null;
   /** Status text from agent (e.g. "Reading file..."). */
   statusText?: string | null;
+  /** Whether the current live tail is an active tool call. */
+  activeToolCall?: boolean;
   /** Current timestamp for thinking timer (updated every second). */
   now?: number;
 }
@@ -35,7 +37,7 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, now }: Props) {
+export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, now }: Props) {
   const { t } = useTranslation();
   const isCodexFamily = agentType === 'codex' || agentType === 'codex-sdk';
   const showLiveStatus = sessionState === 'running' || sessionState === 'idle';
@@ -96,17 +98,17 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const modelLabel = shortModelLabel(displayModel);
   const inlineQuotaText = displayQuotaLabel;
   const liveStatusMode = sessionState === 'running'
-    ? (statusText ? 'tool' : activeThinkingTs ? 'thinking' : 'running')
+    ? (activeToolCall ? 'tool' : activeThinkingTs ? 'thinking' : 'running')
     : sessionState === 'idle' ? 'idle' : null;
   const liveStatusText = useMemo(() => {
     if (sessionState === 'running') {
-      if (statusText) return statusText;
+      if (activeToolCall) return statusText || 'Tool running...';
       if (activeThinkingTs) return t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) });
       return 'Agent working...';
     }
     if (sessionState === 'idle') return 'Agent idle — waiting for input';
     return null;
-  }, [activeThinkingTs, now, sessionState, statusText, t]);
+  }, [activeThinkingTs, activeToolCall, now, sessionState, statusText, t]);
   const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool';
   const codexQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk')
     ? (displayQuotaLabel ?? '').split(' · ').filter(Boolean)

@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const { stopProjectMock, stopSubSessionMock, loggerErrorMock, loggerWarnMock, buildSessionListMock } = vi.hoisted(() => ({
+const { stopProjectMock, stopSubSessionMock, loggerErrorMock, loggerWarnMock, buildSessionListMock, getTransportRuntimeMock } = vi.hoisted(() => ({
   stopProjectMock: vi.fn(),
   stopSubSessionMock: vi.fn().mockResolvedValue({ ok: true, closed: ['deck_sub_worker'], failed: [] }),
   loggerErrorMock: vi.fn(),
   loggerWarnMock: vi.fn(),
   buildSessionListMock: vi.fn(async () => []),
+  getTransportRuntimeMock: vi.fn(() => undefined),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -19,7 +20,7 @@ vi.mock('../../src/agent/session-manager.js', () => ({
   startProject: vi.fn(),
   stopProject: stopProjectMock,
   teardownProject: vi.fn(),
-  getTransportRuntime: vi.fn(() => undefined),
+  getTransportRuntime: getTransportRuntimeMock,
   launchTransportSession: vi.fn(),
   isProviderSessionBound: vi.fn(() => false),
   persistSessionRecord: vi.fn(),
@@ -167,6 +168,31 @@ describe('handleWebCommand shutdown failure paths', () => {
       type: 'session.error',
       project: 'proj',
       message: 'Shutdown failed: backend unavailable',
+    });
+  });
+
+  it('blocks daemon.upgrade when a transport session still has an active turn', async () => {
+    const { listSessions } = await import('../../src/store/session-store.js');
+    vi.mocked(listSessions).mockReturnValue([
+      {
+        name: 'deck_proj_brain',
+        runtimeType: 'transport',
+        state: 'running',
+      } as any,
+    ]);
+    getTransportRuntimeMock.mockReturnValue({
+      getStatus: () => 'thinking',
+      sending: true,
+      pendingCount: 0,
+    } as any);
+
+    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'daemon.upgrade_blocked',
+      reason: 'transport_busy',
+      activeSessionNames: ['deck_proj_brain'],
     });
   });
 

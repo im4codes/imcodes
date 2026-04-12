@@ -2360,6 +2360,23 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
     return;
   }
 
+  const activeTransportSessions = getActiveTransportSessionsBlockingDaemonUpgrade();
+  if (activeTransportSessions.length > 0) {
+    logger.warn({
+      targetVersion,
+      activeSessionNames: activeTransportSessions.map((session) => session.name),
+      activeSessionStates: activeTransportSessions.map((session) => session.state),
+    }, 'daemon.upgrade: blocked because transport sessions have active turns');
+    try {
+      serverLink?.send({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: 'transport_busy',
+        activeSessionNames: activeTransportSessions.map((session) => session.name),
+      });
+    } catch { /* ignore */ }
+    return;
+  }
+
   const { spawn } = await import('child_process');
   const { writeFileSync, mkdtempSync, existsSync } = await import('fs');
   const { join, dirname } = await import('path');
@@ -2564,6 +2581,15 @@ export function getActiveP2pRunsBlockingDaemonUpgrade(runs = listP2pRuns()) {
   return runs.filter((run) => !P2P_TERMINAL_RUN_STATUSES.has(run.status));
 }
 
+export function getActiveTransportSessionsBlockingDaemonUpgrade(sessions = listSessions()) {
+  return sessions.filter((session) => {
+    if (session.runtimeType !== 'transport') return false;
+    const runtime = getTransportRuntime(session.name);
+    if (!runtime) return false;
+    return runtime.getStatus() !== 'idle' || runtime.sending || runtime.pendingCount > 0;
+  });
+}
+
 async function handleFileSearch(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const query = (cmd.query as string ?? '').trim();
   const projectDir = cmd.projectDir as string | undefined;
@@ -2602,6 +2628,7 @@ async function handleFileSearch(cmd: Record<string, unknown>, serverLink: Server
       const fzf = new Fzf(allPaths, {
         fuzzy: allPaths.length > 20000 ? 'v1' : 'v2',
         forward: false,
+        casing: 'case-insensitive',
         tiebreakers: [fileSearchByBasenamePrefix, fileSearchByMatchPosFromEnd, fileSearchByLengthAsc],
       });
       const results = fzf.find(query);
