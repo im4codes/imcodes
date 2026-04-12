@@ -30,6 +30,7 @@ vi.mock('../../src/hooks/useTimeline.js', () => ({
 vi.mock('../../src/thinking-utils.js', () => ({
   getActiveThinkingTs: () => null,
   getActiveStatusText: () => null,
+  hasActiveToolCall: () => false,
 }));
 vi.mock('../../src/cost-tracker.js', () => ({ recordCost: vi.fn() }));
 vi.mock('../../src/format-label.js', () => ({ formatLabel: (x: string) => x }));
