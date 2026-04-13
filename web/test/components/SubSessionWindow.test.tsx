@@ -20,7 +20,8 @@ vi.mock('../../src/components/ChatView.js', () => ({
 }));
 
 const sessionControlsSpy = vi.fn((props: any) => <div data-testid="session-controls" data-model={props.activeSession?.modelDisplay ?? ''} data-effort={props.activeSession?.effort ?? ''} data-quota={props.activeSession?.quotaLabel ?? ''} data-queued={(props.activeSession?.transportPendingMessages ?? []).join('|')} />);
-const usageFooterSpy = vi.fn((props: any) => <div data-testid="usage-footer" data-quota={props.quotaLabel ?? ''} />);
+const usageFooterSpy = vi.fn((props: any) => <div data-testid="usage-footer" data-quota={props.quotaLabel ?? ''} data-state={props.sessionState ?? ''} />);
+let timelineEventsMock: any[] = [];
 
 vi.mock('../../src/components/SessionControls.js', () => ({
   SessionControls: (props: any) => sessionControlsSpy(props),
@@ -32,7 +33,7 @@ vi.mock('../../src/components/UsageFooter.js', () => ({
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
   useTimeline: () => ({
-    events: [],
+    events: timelineEventsMock,
     refreshing: false,
   }),
 }));
@@ -90,6 +91,7 @@ describe('SubSessionWindow metadata wiring', () => {
   beforeEach(() => {
     cleanup();
     vi.clearAllMocks();
+    timelineEventsMock = [];
   });
 
   it('passes model, level, and quota metadata through for transport sub-sessions', async () => {
@@ -157,6 +159,41 @@ describe('SubSessionWindow metadata wiring', () => {
     await waitFor(() => {
       const controls = document.querySelector('[data-testid="session-controls"]') as HTMLElement | null;
       expect(controls?.dataset.queued).toBe('queued one|queued two');
+    });
+  });
+
+  it('prefers timeline tail running state over stale outer idle state for footer status', async () => {
+    timelineEventsMock = [
+      { type: 'session.state', payload: { state: 'running' } },
+      { type: 'tool.result', payload: { ok: true } },
+    ];
+
+    const sub = makeSubSession({
+      type: 'codex-sdk',
+      runtimeType: 'transport' as any,
+      state: 'idle',
+    } as any);
+
+    render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const footer = document.querySelector('[data-testid="usage-footer"]') as HTMLElement | null;
+      expect(footer?.dataset.state).toBe('running');
     });
   });
 });

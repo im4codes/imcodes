@@ -14,7 +14,7 @@ import { useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { UsageFooter } from './UsageFooter.js';
 import { extractLatestUsage } from '../usage-data.js';
-import { getActiveThinkingTs, getActiveStatusText, hasActiveToolCall } from '../thinking-utils.js';
+import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiveToolCall } from '../thinking-utils.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import type { PinnedPanel } from '../app.js';
 import type { PanelRenderContext } from './PinnedPanelRegistry.js';
@@ -39,6 +39,10 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   const activeThinkingTs = useMemo(() => getActiveThinkingTs(events), [events]);
   const statusText = useMemo(() => getActiveStatusText(events), [events]);
   const activeToolCall = useMemo(() => hasActiveToolCall(events), [events]);
+  const liveSessionState = useMemo(
+    () => getTailSessionState(events) ?? liveSub?.state ?? null,
+    [events, liveSub?.state],
+  );
   const thinkingNow = useNowTicker(!!activeThinkingTs);
 
   if (!liveSub) {
@@ -62,18 +66,18 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           loading={false}
           refreshing={refreshing}
           sessionId={sessionName}
-          sessionState={liveSub.state}
+          sessionState={liveSessionState ?? undefined}
           ws={ctx.ws}
           workdir={liveSub.cwd ?? null}
           serverId={ctx.serverId}
           onQuote={ctx.onQuote}
         />
       )}
-      {(lastUsage || activeThinkingTs || statusText || liveSub.state === 'running' || liveSub.state === 'idle' || liveSub.planLabel || liveSub.quotaLabel || liveSub.quotaUsageLabel || liveSub.quotaMeta) && (
+      {(lastUsage || activeThinkingTs || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || liveSub.planLabel || liveSub.quotaLabel || liveSub.quotaUsageLabel || liveSub.quotaMeta) && (
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sessionName}
-          sessionState={liveSub.state}
+          sessionState={liveSessionState}
           agentType={liveSub.type}
           modelOverride={modelDisplay ?? undefined}
           planLabel={liveSub.planLabel}

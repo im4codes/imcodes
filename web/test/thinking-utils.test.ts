@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { hasActiveToolCall } from '../src/thinking-utils.js';
+import { getTailSessionState, hasActiveToolCall } from '../src/thinking-utils.js';
 
 describe('hasActiveToolCall', () => {
   it('does not treat trailing agent.status during thinking as a tool call', () => {
@@ -27,5 +27,22 @@ describe('hasActiveToolCall', () => {
       { type: 'agent.status', payload: { label: 'thinking 1s' } },
       { type: 'session.state', payload: { state: 'running' } },
     ] as any)).toBe(false);
+  });
+});
+
+describe('getTailSessionState', () => {
+  it('returns the latest authoritative session state from the timeline tail', () => {
+    expect(getTailSessionState([
+      { type: 'session.state', payload: { state: 'idle' } },
+      { type: 'tool.result', payload: { ok: true } },
+      { type: 'session.state', payload: { state: 'running' } },
+    ] as any)).toBe('running');
+  });
+
+  it('returns null when no session.state event exists', () => {
+    expect(getTailSessionState([
+      { type: 'assistant.thinking', ts: 1 },
+      { type: 'tool.call', payload: { tool: 'Read' } },
+    ] as any)).toBe(null);
   });
 });

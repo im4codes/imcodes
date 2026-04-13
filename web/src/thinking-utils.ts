@@ -85,6 +85,23 @@ export function hasActiveToolCall(events: Array<{ type: string; payload?: Record
   return false;
 }
 
+/**
+ * Read the most recent authoritative session.state from the timeline tail.
+ * This is more reliable than outer session store state for footer rendering,
+ * because timeline updates can arrive before higher-level session snapshots settle.
+ */
+export function getTailSessionState(
+  events: Array<{ type: string; payload?: Record<string, unknown> }>,
+): string | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.type !== 'session.state') continue;
+    const state = e.payload?.state;
+    return typeof state === 'string' && state ? state : null;
+  }
+  return null;
+}
+
 export function isRunningSessionState(sessionState: string | undefined): boolean {
   return sessionState === 'running';
 }

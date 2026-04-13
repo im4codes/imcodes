@@ -12,7 +12,7 @@ import { ChatView } from './ChatView.js';
 import { SessionControls } from './SessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
 import { useTimeline } from '../hooks/useTimeline.js';
-import { getActiveThinkingTs, getActiveStatusText, hasActiveToolCall } from '../thinking-utils.js';
+import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiveToolCall } from '../thinking-utils.js';
 import { recordCost } from '../cost-tracker.js';
 import type { UseQuickDataResult } from './QuickInputPanel.js';
 import { formatLabel } from '../format-label.js';
@@ -141,12 +141,16 @@ export function SessionPane({
   const activeThinkingTs = useMemo(() => getActiveThinkingTs(timelineEvents), [timelineEvents]);
   const statusText = useMemo(() => getActiveStatusText(timelineEvents), [timelineEvents]);
   const activeToolCall = useMemo(() => hasActiveToolCall(timelineEvents), [timelineEvents]);
+  const liveSessionState = useMemo(
+    () => getTailSessionState(timelineEvents) ?? session.state ?? null,
+    [timelineEvents, session.state],
+  );
   const shouldShowFooter = !!(
     lastUsage
     || activeThinkingTs
     || statusText
-    || session.state === 'running'
-    || session.state === 'idle'
+    || liveSessionState === 'running'
+    || liveSessionState === 'idle'
     || session.planLabel
     || session.quotaLabel
     || session.quotaUsageLabel
@@ -253,7 +257,7 @@ export function SessionPane({
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sessionName}
-          sessionState={session.state}
+          sessionState={liveSessionState}
           agentType={session.agentType}
           modelOverride={session.modelDisplay ?? (session.agentType === 'qwen' ? session.qwenModel : undefined)}
           planLabel={session.planLabel}
