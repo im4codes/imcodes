@@ -664,6 +664,9 @@ export function FileBrowser({
         if (msg.status === 'ok') {
           const diff = msg.diff ?? '';
           const diffHtml = diff ? renderDiff(diff) : '';
+          if (!diffHtml && previewTabOverridePathRef.current !== filePath) {
+            setShowDiff(false);
+          }
           setPreview((prev) => {
             if (prev.status === 'ok' && prev.path === filePath) {
               return { ...prev, diff, diffHtml };

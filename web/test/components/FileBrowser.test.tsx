@@ -24,6 +24,9 @@ vi.mock('../../src/components/file-editor-lazy.js', () => ({
   FileEditor: () => null,
   FileEditorContent: () => null,
 }));
+vi.mock('../../src/components/FilePreviewPane.js', () => ({
+  default: (props: { content: string }) => <div data-testid="mock-file-preview">{props.content}</div>,
+}));
 
 import { FileBrowser, __resetFileBrowserSharedChangesForTests, mergePreviewState } from '../../src/components/FileBrowser.js';
 import type { WsClient, ServerMessage } from '../../src/ws-client.js';
@@ -755,6 +758,46 @@ describe('FileBrowser', () => {
 
     expect(document.querySelector('.fb-diff')).not.toBeNull();
     expect(document.querySelector('.fb-preview-content pre')).toBeNull();
+  });
+
+  it('falls back to source preview when an untracked file has no diff content', async () => {
+    const { ws, respond, sendMsg } = makeWsFactory();
+    render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        changesRootPath="/home/user"
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([], '/home/user'); });
+    await act(async () => {
+      sendMsg({
+        type: 'fs.git_status_response',
+        requestId: 'mock-git-status-id',
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        files: [{ path: '/home/user/new-file.ts', code: '??' }],
+      });
+    });
+
+    const changesTab = document.querySelector('.fb-panel-tab:last-child') as HTMLElement;
+    await act(async () => { fireEvent.click(changesTab); });
+
+    const changeItem = document.querySelector('.fb-changes-item') as HTMLElement;
+    await act(async () => { fireEvent.click(changeItem); });
+    await act(async () => {
+      sendMsg({ type: 'fs.read_response', requestId: 'mock-read-id', path: '/home/user/new-file.ts', status: 'ok', content: 'const fresh = true;' });
+      sendMsg({ type: 'fs.git_diff_response', requestId: 'mock-git-diff-id', path: '/home/user/new-file.ts', status: 'ok', diff: '' });
+    });
+
+    expect(document.querySelector('.fb-diff')).toBeNull();
+    expect(document.querySelector('.fb-diff-toggle.active')).toBeNull();
+    expect(screen.getByTestId('mock-file-preview').textContent).toContain('const fresh = true;');
   });
 
   it('passes preferDiff to external previews opened from the Changes tab', async () => {
