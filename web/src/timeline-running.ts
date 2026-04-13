@@ -1,6 +1,7 @@
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 
 const RUNNING_TIMELINE_EVENT_TYPES = new Set<TimelineEvent['type']>([
+  'assistant.thinking',
   'assistant.text',
   'tool.call',
   'tool.result',

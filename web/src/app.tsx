@@ -60,12 +60,14 @@ import { shouldSubscribeTerminalRaw, type TerminalSubscribeViewMode } from './te
 import { onWatchCommand } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
 import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timeline-running.js';
-import { extractTransportPendingMessages } from './transport-queue.js';
+import { extractTransportPendingMessages, mergeTransportPendingMessagesForRunningState } from './transport-queue.js';
 import { ingestTimelineEventForCache } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
+import { updateMainSessionLabel } from './session-label-api.js';
 import {
   getSelectedServerName,
+  hasResolvedActiveSession,
   shouldResetSelectedServer,
   shouldShowInitialConnectingGate,
 } from './server-selection.js';
@@ -142,6 +144,25 @@ export function App() {
       return null;
     }
   });
+  const clearAuthState = useCallback(async (reason?: string) => {
+    console.warn('[auth] clearing auth state', reason ?? '');
+    clearApiKey();
+    try { await clearAuthKey(); } catch { /* ignore */ }
+    try {
+      const { Preferences } = await import('@capacitor/preferences');
+      await Preferences.remove({ key: 'deck_api_key_id' });
+    } catch { /* ignore */ }
+    localStorage.removeItem('rcc_auth');
+    localStorage.removeItem('rcc_server');
+    localStorage.removeItem('rcc_server_name');
+    localStorage.removeItem('rcc_session');
+    setAuth(null);
+    setServers([]);
+    setServersLoaded(false);
+    setServersSynced(false);
+    setSelectedServerId(null);
+    setSelectedServerName(null);
+  }, []);
 
   // Native: server URL state and readiness flag
   const [nativeServerUrl, setNativeServerUrl] = useState<string | null>(null);
@@ -415,11 +436,9 @@ export function App() {
   // Registered once so any apiFetch 401 after refresh failure lands here.
   useEffect(() => {
     onAuthExpired((reason?: string) => {
-      console.warn('[auth] onAuthExpired fired — clearing auth state, reason:', reason);
-      localStorage.removeItem('rcc_auth');
-      setAuth(null);
+      void clearAuthState(reason ?? 'expired');
     });
-  }, []);
+  }, [clearAuthState]);
 
 
   // Verify session via /api/auth/user/me on mount (cookie-based auth)
@@ -440,9 +459,7 @@ export function App() {
     }).catch((err) => {
       console.warn(`[auth] /me FAILED:`, err instanceof ApiError ? `${err.status}: ${err.body}` : err);
       if (err instanceof ApiError && err.status === 401) {
-        console.warn('[auth] /me 401 — clearing auth (login required)');
-        localStorage.removeItem('rcc_auth');
-        setAuth(null);
+        void clearAuthState('mount_verify_401');
       }
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -468,6 +485,26 @@ export function App() {
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);
   }, [auth]);
+
+  useEffect(() => {
+    if (!auth) return;
+    const verifyAuthStillValid = async (reason: string) => {
+      try {
+        await fetchMe();
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 401) {
+          await clearAuthState(reason);
+        }
+      }
+    };
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        void verifyAuthStillValid('visibility_verify_401');
+      }
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [auth, clearAuthState]);
 
   const handleRenameServer = useCallback(async (server: ServerInfo) => {
     const newName = prompt('Rename server:', server.name);
@@ -539,25 +576,23 @@ export function App() {
     void loadServers();
   }, [loadServers]);
 
+  useEffect(() => {
+    if (!auth || !selectedServerId || !serversLoaded) return;
+    const selectedServer = servers.find((server) => server.id === selectedServerId);
+    if (!selectedServer || isServerOnline(selectedServer)) return;
+    void fetchMe().catch(async (err) => {
+      if (err instanceof ApiError && err.status === 401) {
+        await clearAuthState('server_offline_verify_401');
+      }
+    });
+  }, [auth, clearAuthState, selectedServerId, servers, serversLoaded]);
+
   // Periodically refresh server list so lastHeartbeatAt stays current
   useEffect(() => {
     if (!auth) return;
     const id = setInterval(() => { loadServers(); }, 30_000);
     return () => clearInterval(id);
   }, [auth, loadServers]);
-
-  // Rename = update project_name in D1 + local sessions state
-  const handleRenameSession = useCallback(async (sessionName: string, newProjectName: string) => {
-    if (!selectedServerId || !newProjectName) return;
-    // Optimistic update
-    setSessions((prev) => prev.map((s) => s.name === sessionName ? { ...s, project: newProjectName } : s));
-    try {
-      await apiFetch(`/api/server/${selectedServerId}/sessions/${encodeURIComponent(sessionName)}/rename`, {
-        method: 'PATCH',
-        body: JSON.stringify({ name: newProjectName }),
-      });
-    } catch { /* best-effort */ }
-  }, [selectedServerId]);
 
   // Fetch sessions from DB immediately when auth + server are available
   useEffect(() => {
@@ -627,6 +662,22 @@ export function App() {
   const quickData = useQuickData();
   const lastImcodesActivityRef = useRef(Date.now());
   const resubscribeTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+
+  // Rename = update main-session label in D1 + local sessions state
+  const handleRenameSession = useCallback(async (sessionName: string, nextLabel: string | null) => {
+    if (!selectedServerId) return;
+    const previousLabel = sessions.find((s) => s.name === sessionName)?.label ?? null;
+    setSessions((prev) => prev.map((s) => (
+      s.name === sessionName ? { ...s, label: nextLabel } : s
+    )));
+    try {
+      await updateMainSessionLabel(selectedServerId, sessionName, nextLabel);
+    } catch {
+      setSessions((prev) => prev.map((s) => (
+        s.name === sessionName ? { ...s, label: previousLabel } : s
+      )));
+    }
+  }, [selectedServerId, sessions]);
 
   // IDs of currently-open (non-minimized) sub-session windows
   const [openSubIds, setOpenSubIds] = useState<Set<string>>(new Set());
@@ -1281,15 +1332,16 @@ export function App() {
                 : s,
             ));
           } else if (liveState === 'running') {
-            const pendingMessages = hasPendingMessagesField
-              ? extractTransportPendingMessages(event.payload.pendingMessages)
-              : null;
             setSessions((prev) => prev.map((s) =>
               s.name === event.sessionId
                 ? {
                     ...s,
                     state: 'running' as SessionInfo['state'],
-                    transportPendingMessages: pendingMessages ?? (s.transportPendingMessages ?? []),
+                    transportPendingMessages: mergeTransportPendingMessagesForRunningState(
+                      s.transportPendingMessages,
+                      event.payload.pendingMessages,
+                      hasPendingMessagesField,
+                    ),
                   }
                 : s,
             ));
@@ -1547,6 +1599,9 @@ export function App() {
         }
       }
       if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED) {
+        const message = msg.reason === 'transport_busy'
+          ? trans('toast.upgrade_blocked_transport_busy')
+          : trans('toast.upgrade_blocked_p2p_active');
         const id = Date.now() + Math.random();
         setToasts((prev) => [...prev, {
           id,
@@ -1554,7 +1609,7 @@ export function App() {
           project: '',
           kind: 'notification',
           title: trans('toast.upgrade_blocked_title'),
-          message: trans('toast.upgrade_blocked_p2p_active'),
+          message,
         }]);
         setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 8000);
       }
@@ -2242,8 +2297,8 @@ export function App() {
     selectedServerId,
     connected,
     sessionsLoaded,
-    serversLoaded,
   );
+  const resolvedActiveSessionExists = hasResolvedActiveSession(activeSession, sessions);
 
   useEffect(() => {
     if (showInitialConnectingGate) {
@@ -2555,7 +2610,7 @@ export function App() {
             />
 
             {/* Desktop local preview shortcut — available even before a session is active */}
-            {!isMobile && selectedServerId && !activeSession && (
+            {!isMobile && selectedServerId && !resolvedActiveSessionExists && (
               <div class="desktop-view-toggle">
                 <button
                   class="view-toggle"
@@ -2569,7 +2624,7 @@ export function App() {
             )}
 
             {/* Desktop view mode toggle — mobile uses the one in mobile-server-bar */}
-            {!isMobile && activeSession && (
+            {!isMobile && resolvedActiveSessionExists && (
               <div class="desktop-view-toggle">
                 <button class="view-toggle" title={trans('picker.files')} onClick={() => setShowDesktopFileBrowser(o => !o)} style={{ position: 'relative' }}>
                   📁
@@ -2630,13 +2685,13 @@ export function App() {
               </ErrorBoundary>
             ))}
 
-            {!activeSession && !sessionsLoaded && (
+            {!resolvedActiveSessionExists && !sessionsLoaded && (
               <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#475569', flexDirection: 'column', gap: 12 }}>
                 <div class="spinner" />
                 <div>{connected ? 'Waiting for daemon...' : 'Connecting...'}</div>
               </div>
             )}
-            {!activeSession && sessionsLoaded && (
+            {!resolvedActiveSessionExists && sessionsLoaded && (
               <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#475569', flexDirection: 'column', gap: 12 }}>
                 <div style={{ fontSize: 32 }}>⌨</div>
                 <div>Select a session or start a new one</div>

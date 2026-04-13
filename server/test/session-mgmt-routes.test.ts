@@ -58,7 +58,7 @@ describe('session-mgmt persistence routes', () => {
     return app;
   }
 
-  it('PUT /sessions/:name persists requestedModel/activeModel/effort/transportConfig', async () => {
+  it('PUT /sessions/:name persists label plus requestedModel/activeModel/effort/transportConfig', async () => {
     const app = await buildApp();
     const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
       method: 'PUT',
@@ -69,6 +69,7 @@ describe('session-mgmt persistence routes', () => {
         agentType: 'claude-code-sdk',
         projectDir: '/tmp/proj',
         state: 'idle',
+        label: 'Readable Main',
         runtimeType: 'transport',
         providerId: 'claude-code-sdk',
         providerSessionId: 'route-1',
@@ -91,6 +92,7 @@ describe('session-mgmt persistence routes', () => {
       'claude-code-sdk',
       '/tmp/proj',
       'idle',
+      'Readable Main',
       null,
       'transport',
       'claude-code-sdk',
@@ -196,6 +198,24 @@ describe('session-mgmt persistence routes', () => {
       type: 'session.relabel',
       sessionName: 'deck_proj_brain',
       label: 'Main Label',
+    });
+  });
+
+  it('PATCH /sessions/:name/label allows clearing the label and still relays session.relabel', async () => {
+    const { updateSessionLabel } = await import('../src/db/queries.js');
+    const app = await buildApp();
+    const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain/label', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: '' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(updateSessionLabel).toHaveBeenCalledWith({}, 'srv-1', 'deck_proj_brain', null);
+    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toEqual({
+      type: 'session.relabel',
+      sessionName: 'deck_proj_brain',
+      label: null,
     });
   });
 });

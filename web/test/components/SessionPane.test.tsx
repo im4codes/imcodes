@@ -6,6 +6,7 @@ import { render, screen, cleanup, fireEvent } from '@testing-library/preact';
 import { h } from 'preact';
 
 const addOptimisticUserMessageMock = vi.fn();
+let timelineEventsMock: any[] = [];
 
 vi.mock('../../src/components/TerminalView.js', () => ({ TerminalView: () => null }));
 vi.mock('../../src/components/ChatView.js', () => ({ ChatView: () => null }));
@@ -18,7 +19,7 @@ vi.mock('../../src/components/SessionControls.js', () => ({
 }));
 vi.mock('../../src/hooks/useTimeline.js', () => ({
   useTimeline: () => ({
-    events: [],
+    events: timelineEventsMock,
     loading: false,
     refreshing: false,
     loadingOlder: false,
@@ -30,11 +31,18 @@ vi.mock('../../src/hooks/useTimeline.js', () => ({
 vi.mock('../../src/thinking-utils.js', () => ({
   getActiveThinkingTs: () => null,
   getActiveStatusText: () => null,
+  hasActiveToolCall: () => false,
+  getTailSessionState: (events: Array<{ type: string; payload?: Record<string, unknown> }>) => {
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i].type === 'session.state') return String(events[i].payload?.state ?? '');
+    }
+    return null;
+  },
 }));
 vi.mock('../../src/cost-tracker.js', () => ({ recordCost: vi.fn() }));
 vi.mock('../../src/format-label.js', () => ({ formatLabel: (x: string) => x }));
 vi.mock('../../src/components/UsageFooter.js', () => ({
-  UsageFooter: (props: any) => <div data-testid="usage-footer">{props.quotaLabel ?? props.planLabel ?? 'footer'}</div>,
+  UsageFooter: (props: any) => <div data-testid="usage-footer" data-state={props.sessionState}>{props.quotaLabel ?? props.planLabel ?? 'footer'}</div>,
 }));
 
 import { SessionPane } from '../../src/components/SessionPane.js';
@@ -42,6 +50,7 @@ import { SessionPane } from '../../src/components/SessionPane.js';
 describe('SessionPane', () => {
   beforeEach(() => {
     addOptimisticUserMessageMock.mockReset();
+    timelineEventsMock = [];
   });
 
   afterEach(() => {
@@ -129,5 +138,36 @@ describe('SessionPane', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'send' }));
     expect(addOptimisticUserMessageMock).toHaveBeenCalledWith('queued text');
+  });
+
+  it('prefers timeline tail running state over stale outer idle state for footer status', () => {
+    timelineEventsMock = [
+      { type: 'session.state', payload: { state: 'running' } },
+      { type: 'tool.result', payload: { ok: true } },
+    ];
+
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'codex-sdk',
+          state: 'idle',
+          runtimeType: 'transport',
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={false}
+        isActive={true}
+        viewMode="chat"
+        quickData={{} as any}
+      />,
+    );
+
+    expect(screen.getByTestId('usage-footer').getAttribute('data-state')).toBe('running');
   });
 });

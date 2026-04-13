@@ -293,4 +293,44 @@ describe('qwen transport flow e2e', () => {
     expect(textEvents[1]?.opts?.eventId).toBe(`transport:${SESSION}:msg-qwen-e2e-error`);
     expect(textEvents[1]?.payload.text).toBe('partial failure\n\n⚠️ Error: provider exploded');
   });
+
+  it('restarts qwen by reusing the persisted provider session id instead of creating a new session', async () => {
+    mocks.nextUuid
+      .mockReturnValueOnce('11111111-1111-4111-8111-111111111111')
+      .mockReturnValue('22222222-2222-4222-8222-222222222222');
+
+    await launchSession({
+      name: SESSION,
+      projectName: 'qwene2e',
+      role: 'brain',
+      agentType: 'qwen',
+      projectDir: '/tmp/qwen-e2e',
+    });
+
+    const initial = mocks.store.get(SESSION);
+    expect(initial?.providerSessionId).toBe('11111111-1111-4111-8111-111111111111');
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({
+      type: 'session.restart',
+      sessionName: SESSION,
+      agentType: 'qwen',
+    }, serverLink);
+    await flushAsync();
+
+    const restarted = mocks.store.get(SESSION);
+    expect(restarted?.providerSessionId).toBe('11111111-1111-4111-8111-111111111111');
+
+    mocks.emitted.length = 0;
+    handleWebCommand({
+      type: 'session.send',
+      session: SESSION,
+      text: 'hello after restart',
+      commandId: 'cmd-qwen-after-restart',
+    }, serverLink);
+    await flushAsync();
+
+    const final = mocks.emitted.find((e) => e.session === SESSION && e.type === 'assistant.text' && e.payload.streaming === false);
+    expect(final?.payload.text).toBe('Qwen: hello after restart');
+  });
 });

@@ -1000,11 +1000,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return { text: cleanText, extra };
   }, [activeSession, applySavedP2pConfigSelection, i18n?.language, p2pExcludeSameType, p2pMode, p2pSavedConfig, sessions, subSessions, ws]);
 
+  const sendSessionMessage = useCallback((text: string, extra: Record<string, unknown> = {}) => {
+    if (!ws || !activeSession) return false;
+    const commandId = globalThis.crypto?.randomUUID?.() ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    ws.sendSessionCommand('send', {
+      sessionName: activeSession.name,
+      text,
+      ...extra,
+      commandId,
+    });
+    return true;
+  }, [activeSession, ws]);
+
   const finalizeSend = useCallback((payload: PendingSendPayload, options?: { clearComposer?: boolean }) => {
-    if (!ws || !activeSession) return;
+    if (!activeSession) return;
     quickData.recordHistory(payload.text, activeSession.name);
     try {
-      ws.sendSessionCommand('send', { sessionName: activeSession.name, text: payload.text, ...payload.extra });
+      if (!sendSessionMessage(payload.text, payload.extra)) return;
     } catch {
       return;
     }
@@ -1026,7 +1038,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       draftRef.current = '';
       if (draftKey) sessionStorage.removeItem(draftKey);
     }
-  }, [activeSession, draftKey, onRemoveQuote, onSend, quickData, quotes, ws]);
+  }, [activeSession, draftKey, onRemoveQuote, onSend, quickData, quotes, sendSessionMessage]);
 
   const maybePersistComboSendSkip = useCallback(() => {
     if (!rememberComboSendChoice) return;
@@ -1125,7 +1137,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const handleKeyDown = (e: KeyboardEvent) => {
     if (e.key === 'Escape' && activeSession?.runtimeType === 'transport' && activeSession.state === 'running') {
       e.preventDefault();
-      ws?.sendSessionCommand('send', { sessionName: activeSession.name, text: '/stop' });
+      sendSessionMessage('/stop');
       return;
     }
 
@@ -1299,10 +1311,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   };
 
   const handleModelSelect = (m: ModelChoice) => {
-    if (!ws || !activeSession) return;
+    if (!activeSession) return;
     setModel(m);
     try { localStorage.setItem(MODEL_STORAGE_KEY, m); } catch { /* ignore */ }
-    ws.sendSessionCommand('send', { sessionName: activeSession.name, text: `/model ${m}` });
+    sendSessionMessage(`/model ${m}`);
     setModelOpen(false);
     onAfterAction?.();
   };
@@ -1312,11 +1324,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     setCodexModel(m);
     try { localStorage.setItem(CODEX_MODEL_STORAGE_KEY, m); } catch { /* ignore */ }
     if (activeSession.agentType === 'codex-sdk') {
-      ws.sendSessionCommand('send', { sessionName: activeSession.name, text: `/model ${m}` });
+      sendSessionMessage(`/model ${m}`);
     } else {
       const isBrain = activeSession.role === 'brain';
       if (isBrain) {
-        ws.sendSessionCommand('send', { sessionName: activeSession.name, text: `/model ${m} medium` });
+        sendSessionMessage(`/model ${m} medium`);
       } else {
         ws.subSessionSetModel(activeSession.name, m, activeSession.projectDir);
       }
@@ -1326,18 +1338,18 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   };
 
   const handleQwenModelSelect = (m: QwenModelChoice) => {
-    if (!ws || !activeSession) return;
+    if (!activeSession) return;
     setQwenModel(m);
     try { localStorage.setItem(QWEN_MODEL_STORAGE_KEY, m); } catch { /* ignore */ }
-    ws.sendSessionCommand('send', { sessionName: activeSession.name, text: `/model ${m}` });
+    sendSessionMessage(`/model ${m}`);
     setModelOpen(false);
     onAfterAction?.();
   };
 
   const handleThinkingSelect = (level: TransportEffortLevel) => {
-    if (!ws || !activeSession) return;
+    if (!activeSession) return;
     setThinkingOpen(false);
-    ws.sendSessionCommand('send', { sessionName: activeSession.name, text: `/thinking ${level}` });
+    sendSessionMessage(`/thinking ${level}`);
     onAfterAction?.();
   };
 
@@ -1422,8 +1434,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               title="Stop (/stop)"
               disabled={disabled || activeSession?.state === 'stopped'}
               onClick={() => {
-                if (!ws || !activeSession) return;
-                ws.sendSessionCommand('send', { sessionName: activeSession.name, text: '/stop' });
+                sendSessionMessage('/stop');
               }}
               style={activeSession?.state === 'running' ? { color: '#f87171' } : undefined}
             >

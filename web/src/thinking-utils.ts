@@ -66,6 +66,42 @@ export function getActiveStatusText(events: Array<{ type: string; payload?: Reco
   return null;
 }
 
+/**
+ * Detect whether the current live tail is inside an active tool call.
+ * Only a trailing tool.call counts. A trailing tool.result means the tool already finished.
+ */
+export function hasActiveToolCall(events: Array<{ type: string; payload?: Record<string, unknown> }>): boolean {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.type === 'tool.call') return true;
+    if (e.type === 'tool.result') return false;
+    if (e.type === 'session.state') {
+      if (e.payload?.state === 'idle') return false;
+      continue;
+    }
+    if (e.type === 'assistant.thinking' || THINKING_SKIP_TYPES.has(e.type)) continue;
+    return false;
+  }
+  return false;
+}
+
+/**
+ * Read the most recent authoritative session.state from the timeline tail.
+ * This is more reliable than outer session store state for footer rendering,
+ * because timeline updates can arrive before higher-level session snapshots settle.
+ */
+export function getTailSessionState(
+  events: Array<{ type: string; payload?: Record<string, unknown> }>,
+): string | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.type !== 'session.state') continue;
+    const state = e.payload?.state;
+    return typeof state === 'string' && state ? state : null;
+  }
+  return null;
+}
+
 export function isRunningSessionState(sessionState: string | undefined): boolean {
   return sessionState === 'running';
 }

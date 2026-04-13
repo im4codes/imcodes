@@ -96,7 +96,10 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
       const runtime = getTransportRuntime(name);
       if (runtime) {
         try {
-          await runtime.send(action.command);
+          const result = await runtime.send(action.command);
+          if (result !== 'queued') {
+            timelineEmitter.emit(name, 'user.message', { text: action.command, allowDuplicate: true });
+          }
         } catch (err) {
           logger.error({ jobId, sessionName: name, err }, 'Cron: transport send failed');
           sendCommandResult(serverLink, {
@@ -119,6 +122,7 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
       }
     } else {
       await sendKeys(name, action.command, { cwd: session.projectDir });
+      timelineEmitter.emit(name, 'user.message', { text: action.command, allowDuplicate: true });
     }
 
     // Capture agent response: collect assistant.text events until session goes idle

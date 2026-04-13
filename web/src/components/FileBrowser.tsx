@@ -415,6 +415,7 @@ export function FileBrowser({
   const pendingMkdirRef = useRef(new Map<string, { parentPath: string; targetPath: string }>());
   const mountedRef = useRef(true);
   const dismissedAutoPreviewPathRef = useRef<string | null>(null);
+  const previewTabOverridePathRef = useRef<string | null>(null);
   const nextPreviewCycleIdRef = useRef(1);
   const activePreviewCycleRef = useRef<PendingPreviewRequest | null>(null);
 
@@ -701,6 +702,7 @@ export function FileBrowser({
       return;
     }
     dismissedAutoPreviewPathRef.current = null;
+    previewTabOverridePathRef.current = null;
     setEditDirty(false);
     setEditContent('');
     setOriginalMtime(undefined);
@@ -843,7 +845,9 @@ export function FileBrowser({
     if (dismissedAutoPreviewPathRef.current === autoPreviewPath && preview.status === 'idle') return;
     const currentPreviewPath = preview.status !== 'idle' ? (preview as { path: string }).path : null;
     if (currentPreviewPath === autoPreviewPath && preview.status !== 'idle') {
-      setShowDiff(autoPreviewPreferDiff);
+      if (previewTabOverridePathRef.current !== autoPreviewPath) {
+        setShowDiff(autoPreviewPreferDiff);
+      }
       if (preview.status === 'loading' && initialPreview?.status === 'loading' && !skipAutoPreviewIfLoading) {
         const hasPendingRead = hasPendingPreviewWork('read', autoPreviewPath);
         if (!hasPendingRead) fetchPreview(autoPreviewPath, autoPreviewPreferDiff);
@@ -856,6 +860,7 @@ export function FileBrowser({
   const dismissPreview = useCallback(() => {
     if (editDirty && !window.confirm(t('fileBrowser.unsavedChanges'))) return;
     if (autoPreviewPath) dismissedAutoPreviewPathRef.current = autoPreviewPath;
+    previewTabOverridePathRef.current = null;
     activePreviewCycleRef.current = null;
     setIsEditing(false);
     setEditDirty(false);
@@ -1064,7 +1069,10 @@ export function FileBrowser({
         {!isEditing && hasDiff && (
           <button
             class={`fb-diff-toggle${showDiff ? ' active' : ''}`}
-            onClick={() => setShowDiff((v) => !v)}
+            onClick={() => {
+              previewTabOverridePathRef.current = preview.path;
+              setShowDiff((v) => !v);
+            }}
             title="Toggle diff view"
           >
             {showDiff ? t('file_browser.view_source') : t('file_browser.view_diff')}

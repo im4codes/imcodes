@@ -111,10 +111,19 @@ describe('fzf integration', () => {
   it('handles case insensitive matching', async () => {
     const { Fzf } = await import('fzf');
     const paths = ['src/ChatView.tsx', 'src/chatview.ts'];
-    const fzf = new Fzf(paths, { fuzzy: 'v2', forward: false, tiebreakers: [] });
+    const fzf = new Fzf(paths, { fuzzy: 'v2', forward: false, casing: 'case-insensitive', tiebreakers: [] });
 
     const results = fzf.find('chatview').map((r) => r.item);
     expect(results.length).toBe(2);
+  });
+
+  it('keeps matching case-insensitive even when query contains uppercase letters', async () => {
+    const { Fzf } = await import('fzf');
+    const paths = ['src/chatview.ts', 'src/components/chat-tools.ts'];
+    const fzf = new Fzf(paths, { fuzzy: 'v2', forward: false, casing: 'case-insensitive', tiebreakers: [] });
+
+    const results = fzf.find('ChatView').map((r) => r.item);
+    expect(results).toContain('src/chatview.ts');
   });
 
   it('matches across path segments', async () => {

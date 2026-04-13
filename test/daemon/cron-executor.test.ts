@@ -23,12 +23,14 @@ vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
   startP2pRun: vi.fn(),
 }));
 
-const { timelineOn } = vi.hoisted(() => ({
+const { timelineOn, timelineEmit } = vi.hoisted(() => ({
   timelineOn: vi.fn(),
+  timelineEmit: vi.fn(),
 }));
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
   timelineEmitter: {
     on: timelineOn,
+    emit: timelineEmit,
   },
 }));
 
@@ -107,6 +109,11 @@ describe('executeCronJob', () => {
       'deck_myapp_brain',
       'review the codebase',
       { cwd: '/home/user/myapp' },
+    );
+    expect(timelineEmit).toHaveBeenCalledWith(
+      'deck_myapp_brain',
+      'user.message',
+      { text: 'review the codebase', allowDuplicate: true },
     );
   });
 
@@ -213,7 +220,7 @@ describe('executeCronJob', () => {
 
   // 10. Transport session — skips busy check, calls runtime.send()
   it('sends command to transport session via runtime.send(), skipping busy check', async () => {
-    const mockRuntime = { send: vi.fn().mockResolvedValue(undefined) };
+    const mockRuntime = { send: vi.fn().mockReturnValue('sent') };
     (getSession as ReturnType<typeof vi.fn>).mockReturnValue(
       makeSession({ runtimeType: 'transport' }),
     );
@@ -224,6 +231,28 @@ describe('executeCronJob', () => {
     expect(detectStatusAsync).not.toHaveBeenCalled();
     expect(mockRuntime.send).toHaveBeenCalledWith('review the codebase');
     expect(sendKeys).not.toHaveBeenCalled();
+    expect(timelineEmit).toHaveBeenCalledWith(
+      'deck_myapp_brain',
+      'user.message',
+      { text: 'review the codebase', allowDuplicate: true },
+    );
+  });
+
+  it('does not emit a user.message when a transport cron command is only queued', async () => {
+    const mockRuntime = { send: vi.fn().mockReturnValue('queued') };
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(
+      makeSession({ runtimeType: 'transport' }),
+    );
+    (getTransportRuntime as ReturnType<typeof vi.fn>).mockReturnValue(mockRuntime);
+
+    await executeCronJob(makeMsg(), mockServerLink);
+
+    expect(mockRuntime.send).toHaveBeenCalledWith('review the codebase');
+    expect(timelineEmit).not.toHaveBeenCalledWith(
+      'deck_myapp_brain',
+      'user.message',
+      expect.anything(),
+    );
   });
 
   // 11. Transport session with disconnected provider — skips, logs warning

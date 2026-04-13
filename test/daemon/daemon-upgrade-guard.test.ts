@@ -1,6 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { getActiveP2pRunsBlockingDaemonUpgrade } from '../../src/daemon/command-handler.js';
+import { getActiveP2pRunsBlockingDaemonUpgrade, getActiveTransportSessionsBlockingDaemonUpgrade } from '../../src/daemon/command-handler.js';
+import * as sessionManager from '../../src/agent/session-manager.js';
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe('getActiveP2pRunsBlockingDaemonUpgrade', () => {
   it('returns active runs that should block daemon upgrades', () => {
@@ -23,5 +28,35 @@ describe('getActiveP2pRunsBlockingDaemonUpgrade', () => {
     ] as any);
 
     expect(blocked).toEqual([]);
+  });
+});
+
+describe('getActiveTransportSessionsBlockingDaemonUpgrade', () => {
+  it('returns transport sessions that still have active turns', () => {
+    vi.spyOn(sessionManager, 'getTransportRuntime').mockImplementation((name: string) => {
+      if (name === 'deck_proj_brain') {
+        return {
+          getStatus: () => 'thinking',
+          sending: true,
+          pendingCount: 1,
+        } as any;
+      }
+      if (name === 'deck_proj_idle') {
+        return {
+          getStatus: () => 'idle',
+          sending: false,
+          pendingCount: 0,
+        } as any;
+      }
+      return undefined;
+    });
+
+    const blocked = getActiveTransportSessionsBlockingDaemonUpgrade([
+      { name: 'deck_proj_brain', runtimeType: 'transport' },
+      { name: 'deck_proj_idle', runtimeType: 'transport' },
+      { name: 'deck_proj_worker', runtimeType: 'process' },
+    ] as any);
+
+    expect(blocked.map((session) => session.name)).toEqual(['deck_proj_brain']);
   });
 });

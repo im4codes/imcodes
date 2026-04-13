@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const { stopProjectMock, stopSubSessionMock, loggerErrorMock, loggerWarnMock, buildSessionListMock } = vi.hoisted(() => ({
+const { stopProjectMock, stopSubSessionMock, loggerErrorMock, loggerWarnMock, buildSessionListMock, getTransportRuntimeMock } = vi.hoisted(() => ({
   stopProjectMock: vi.fn(),
   stopSubSessionMock: vi.fn().mockResolvedValue({ ok: true, closed: ['deck_sub_worker'], failed: [] }),
   loggerErrorMock: vi.fn(),
   loggerWarnMock: vi.fn(),
   buildSessionListMock: vi.fn(async () => []),
+  getTransportRuntimeMock: vi.fn(() => undefined),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -19,7 +20,7 @@ vi.mock('../../src/agent/session-manager.js', () => ({
   startProject: vi.fn(),
   stopProject: stopProjectMock,
   teardownProject: vi.fn(),
-  getTransportRuntime: vi.fn(() => undefined),
+  getTransportRuntime: getTransportRuntimeMock,
   launchTransportSession: vi.fn(),
   isProviderSessionBound: vi.fn(() => false),
   persistSessionRecord: vi.fn(),
@@ -170,6 +171,31 @@ describe('handleWebCommand shutdown failure paths', () => {
     });
   });
 
+  it('blocks daemon.upgrade when a transport session still has an active turn', async () => {
+    const { listSessions } = await import('../../src/store/session-store.js');
+    vi.mocked(listSessions).mockReturnValue([
+      {
+        name: 'deck_proj_brain',
+        runtimeType: 'transport',
+        state: 'running',
+      } as any,
+    ]);
+    getTransportRuntimeMock.mockReturnValue({
+      getStatus: () => 'thinking',
+      sending: true,
+      pendingCount: 0,
+    } as any);
+
+    handleWebCommand({ type: 'daemon.upgrade' }, serverLink as any);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'daemon.upgrade_blocked',
+      reason: 'transport_busy',
+      activeSessionNames: ['deck_proj_brain'],
+    });
+  });
+
   it('updates the main-session project name and pushes a refreshed session_list on session.rename', async () => {
     const { getSession, upsertSession } = await import('../../src/store/session-store.js');
     vi.mocked(getSession).mockReturnValue({
@@ -260,6 +286,53 @@ describe('handleWebCommand shutdown failure paths', () => {
           agentType: 'codex',
           state: 'idle',
           label: 'Main Label',
+        },
+      ],
+    });
+  });
+
+  it('clears the main-session label and pushes a refreshed session_list on session.relabel', async () => {
+    const { getSession, upsertSession } = await import('../../src/store/session-store.js');
+    vi.mocked(getSession).mockReturnValue({
+      name: 'deck_proj_brain',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'codex',
+      state: 'idle',
+      label: 'Main Label',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+      projectDir: '/tmp/proj',
+    } as any);
+    buildSessionListMock.mockResolvedValueOnce([
+      {
+        name: 'deck_proj_brain',
+        project: 'proj',
+        role: 'brain',
+        agentType: 'codex',
+        state: 'idle',
+      },
+    ]);
+
+    handleWebCommand({ type: 'session.relabel', sessionName: 'deck_proj_brain', label: null }, serverLink as any);
+    await flushAsync();
+
+    expect(upsertSession).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_proj_brain',
+      label: undefined,
+    }));
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'session_list',
+      daemonVersion: '0.1.0',
+      sessions: [
+        {
+          name: 'deck_proj_brain',
+          project: 'proj',
+          role: 'brain',
+          agentType: 'codex',
+          state: 'idle',
         },
       ],
     });

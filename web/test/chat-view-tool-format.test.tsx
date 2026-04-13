@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, cleanup, fireEvent } from '@testing-library/preact';
+import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/preact';
 
 if (!HTMLElement.prototype.scrollIntoView) {
   HTMLElement.prototype.scrollIntoView = vi.fn();
@@ -27,8 +27,13 @@ vi.mock('../src/components/FileBrowser.js', () => ({
   FileBrowser: () => null,
 }));
 
+vi.mock('../src/api.js', () => ({
+  downloadAttachment: vi.fn().mockResolvedValue(undefined),
+}));
+
 import { ChatView } from '../src/components/ChatView.js';
 import type { TimelineEvent } from '../src/ws-client.js';
+import { downloadAttachment } from '../src/api.js';
 
 function makeEvent(overrides: Partial<TimelineEvent> & { type: string; payload: Record<string, unknown> }): TimelineEvent {
   return {
@@ -144,6 +149,65 @@ describe('ChatView tool payload formatting', () => {
     fireEvent.click(screen.getByText('details'));
     expect(screen.getByText('input')).toBeDefined();
     expect(screen.getByText('output')).toBeDefined();
+  });
+
+  it('connects Windows file paths in tool output to preview and download', async () => {
+    const fsReadFile = vi.fn(() => 'req-win-path');
+    const onMessage = vi.fn(() => vi.fn());
+    const events = [
+      makeEvent({
+        type: 'tool.result',
+        payload: { output: { path: 'C:\\Users\\admin\\screenshot.png' } },
+      }),
+    ];
+
+    const { container } = render(
+      <ChatView
+        events={events}
+        loading={false}
+        ws={{ fsReadFile, onMessage } as any}
+        serverId="server-1"
+      />,
+    );
+
+    const link = container.querySelector('.chat-path-link') as HTMLElement | null;
+    const button = container.querySelector('.chat-dl-btn') as HTMLButtonElement | null;
+    expect(link?.textContent).toBe('C:\\Users\\admin\\screenshot.png');
+    expect(button).not.toBeNull();
+
+    fireEvent.click(button!);
+
+    expect(fsReadFile).toHaveBeenCalledWith('C:\\Users\\admin\\screenshot.png');
+    onMessage.mock.calls[0][0]({
+      type: 'fs.read_response',
+      requestId: 'req-win-path',
+      downloadId: 'dl-win-path',
+    });
+    await waitFor(() => {
+      expect(downloadAttachment).toHaveBeenCalledWith('server-1', 'dl-win-path');
+    });
+  });
+
+  it('keeps adjacent Chinese-punctuated URLs as external links instead of file paths', () => {
+    const events = [
+      makeEvent({
+        type: 'assistant.text',
+        payload: {
+          text: 'https://blog.csdn.net/2502_91125447/article/details/146912737（CSDN博客 - PCDN市场深水区）https://m.c114.com.cn/w16-1296322.html⬇（C114 - PCDN即将成为历史）',
+          streaming: false,
+        },
+      }),
+    ];
+
+    const { container } = render(<ChatView events={events} loading={false} />);
+
+    const externalLinks = Array.from(container.querySelectorAll('.chat-external-link')) as HTMLAnchorElement[];
+    expect(externalLinks.map((el) => el.textContent)).toEqual([
+      'https://blog.csdn.net/2502_91125447/article/details/146912737',
+      'https://m.c114.com.cn/w16-1296322.html',
+    ]);
+    expect(container.querySelector('.chat-path-link')).toBeNull();
+    expect(container.querySelector('.chat-dl-btn')).toBeNull();
   });
 
   it('renders OpenClaw transport tool rows for realistic sessions_send payloads', () => {

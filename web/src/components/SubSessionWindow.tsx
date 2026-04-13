@@ -4,7 +4,7 @@
  */
 import { useState, useRef, useCallback, useEffect, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { getActiveThinkingTs, getActiveStatusText } from '../thinking-utils.js';
+import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiveToolCall } from '../thinking-utils.js';
 import { recordCost } from '../cost-tracker.js';
 import { formatLabel } from '../format-label.js';
 import { TerminalView } from './TerminalView.js';
@@ -107,6 +107,11 @@ export function SubSessionWindow({
 
   // Extract active agent status (e.g. "Reading file...")
   const statusText = useMemo(() => getActiveStatusText(events), [events]);
+  const activeToolCall = useMemo(() => hasActiveToolCall(events), [events]);
+  const liveSessionState = useMemo(
+    () => getTailSessionState(events) ?? sub.state ?? null,
+    [events, sub.state],
+  );
 
   const [quotes, setQuotes] = useState<string[]>([]);
   const addQuote = useCallback((text: string) => setQuotes((prev) => [...prev, text]), []);
@@ -399,11 +404,11 @@ export function SubSessionWindow({
       </div>
 
       {/* Usage footer — shared component */}
-      {(lastUsage || activeThinkingTs || statusText || sessionInfo?.planLabel || sessionInfo?.quotaLabel || sessionInfo?.quotaUsageLabel) && (
+      {(lastUsage || activeThinkingTs || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || sessionInfo?.planLabel || sessionInfo?.quotaLabel || sessionInfo?.quotaUsageLabel || sessionInfo?.quotaMeta) && (
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sub.sessionName}
-          sessionState={sessionInfo?.state}
+          sessionState={liveSessionState}
           agentType={sessionInfo?.agentType}
           modelOverride={sessionInfo?.modelDisplay ?? (sessionInfo?.agentType === 'qwen' ? sessionInfo?.qwenModel : undefined)}
           planLabel={sessionInfo?.planLabel}
@@ -413,6 +418,7 @@ export function SubSessionWindow({
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}
+          activeToolCall={activeToolCall}
           now={thinkingNow}
         />
       )}

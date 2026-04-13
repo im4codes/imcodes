@@ -27,6 +27,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { pickReadableSessionDisplay } from '../../shared/session-display.js';
+import { buildWorkerSessionPersistBody, mergeWorkerSessionSnapshot } from './session-bootstrap.js';
 
 /** Get the last assistant.text from a session's timeline (for push notification context). */
 function getLastAssistantText(sessionName: string): string | undefined {
@@ -102,25 +103,11 @@ async function persistSessionToWorker(
   record: import('../store/session-store.js').SessionRecord,
 ): Promise<void> {
   try {
+    const payload = buildWorkerSessionPersistBody(record);
     const res = await fetch(`${workerUrl}/api/server/${serverId}/sessions/${encodeURIComponent(name)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, 'X-Server-Id': serverId },
-      body: JSON.stringify({
-        projectName: record.projectName,
-        projectRole: record.role,
-        agentType: record.agentType,
-        agentVersion: record.agentVersion,
-        projectDir: record.projectDir,
-        state: record.state,
-        runtimeType: record.runtimeType ?? null,
-        providerId: record.providerId ?? null,
-        providerSessionId: record.providerSessionId ?? null,
-        description: record.description ?? null,
-        requestedModel: record.requestedModel ?? null,
-        activeModel: record.activeModel ?? record.modelDisplay ?? null,
-        effort: record.effort ?? null,
-        transportConfig: record.transportConfig ?? null,
-      }),
+      body: JSON.stringify(payload),
     });
     if (!res.ok) logger.warn({ status: res.status, name }, 'persistSessionToWorker: non-ok response');
   } catch (e) {
@@ -185,7 +172,7 @@ async function syncSessionsFromWorker(workerUrl: string, serverId: string, token
       return;
     }
 
-    const data = await sessionRes.json() as { sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; project_dir: string; state: string; requested_model?: string | null; active_model?: string | null; effort?: SessionRecord['effort'] | null; transport_config?: Record<string, unknown> | string | null }> };
+    const data = await sessionRes.json() as { sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; project_dir: string; state: string; label?: string | null; requested_model?: string | null; active_model?: string | null; effort?: SessionRecord['effort'] | null; transport_config?: Record<string, unknown> | string | null }> };
     const subData = await subRes.json() as { subSessions: Array<{ id: string }> };
     const remoteSessionNames = new Set(
       data.sessions
@@ -211,28 +198,7 @@ async function syncSessionsFromWorker(workerUrl: string, serverId: string, token
     for (const s of data.sessions) {
       if (s.state === 'stopped') continue; // skip stopped sessions
       const existing = getSession(s.name);
-      // Merge with existing local record to preserve fields not stored in server DB
-      // (ccSessionId, codexSessionId, geminiSessionId, restarts, etc.)
-      upsertSession({
-        ...(existing ?? {}),
-        name: s.name,
-        projectName: s.project_name,
-        role: s.role as 'brain' | `w${number}`,
-        agentType: s.agent_type,
-        projectDir: s.project_dir,
-        state: s.state as import('../store/session-store.js').SessionState,
-        requestedModel: s.requested_model ?? existing?.requestedModel,
-        activeModel: s.active_model ?? existing?.activeModel,
-        modelDisplay: s.active_model ?? existing?.modelDisplay,
-        effort: s.effort ?? existing?.effort,
-        transportConfig: (typeof s.transport_config === 'string'
-          ? JSON.parse(s.transport_config)
-          : (s.transport_config ?? existing?.transportConfig)) as Record<string, unknown> | undefined,
-        restarts: existing?.restarts ?? 0,
-        restartTimestamps: existing?.restartTimestamps ?? [],
-        createdAt: existing?.createdAt ?? Date.now(),
-        updatedAt: Date.now(),
-      });
+      upsertSession(mergeWorkerSessionSnapshot(existing, s));
       count++;
     }
     logger.info({ count }, 'Sessions synced from D1');

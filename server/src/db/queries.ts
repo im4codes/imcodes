@@ -368,6 +368,7 @@ export async function upsertDbSession(
   agentType: string,
   projectDir: string,
   state: string,
+  label?: string | null,
   agentVersion?: string | null,
   runtimeType?: string | null,
   providerId?: string | null,
@@ -380,14 +381,15 @@ export async function upsertDbSession(
 ): Promise<void> {
   const now = Date.now();
   await db.execute(
-    `INSERT INTO sessions (id, server_id, name, project_name, role, agent_type, agent_version, project_dir, state, runtime_type, provider_id, provider_session_id, description, requested_model, active_model, effort, transport_config, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18, $19)
+    `INSERT INTO sessions (id, server_id, name, project_name, role, agent_type, agent_version, project_dir, state, label, runtime_type, provider_id, provider_session_id, description, requested_model, active_model, effort, transport_config, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18::jsonb, $19, $20)
      ON CONFLICT(server_id, name) DO UPDATE SET
        role = excluded.role,
        agent_type = excluded.agent_type,
        agent_version = excluded.agent_version,
        project_dir = excluded.project_dir,
        state = excluded.state,
+       label = COALESCE(excluded.label, sessions.label),
        runtime_type = excluded.runtime_type,
        provider_id = excluded.provider_id,
        provider_session_id = excluded.provider_session_id,
@@ -407,6 +409,7 @@ export async function upsertDbSession(
       agentVersion ?? null,
       projectDir,
       state,
+      label ?? null,
       runtimeType ?? null,
       providerId ?? null,
       providerSessionId ?? null,

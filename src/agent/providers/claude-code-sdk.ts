@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { access } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { query, type PermissionMode, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import type {
   TransportProvider,
@@ -25,6 +25,8 @@ import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-p
 
 const CLAUDE_BIN = 'claude';
 const DEFAULT_PERMISSION_MODE: PermissionMode = 'bypassPermissions';
+const CANCEL_INTERRUPT_TIMEOUT_MS = 1_500;
+const FORCE_KILL_TIMEOUT_MS = 500;
 
 interface ClaudeSdkSessionState {
   routeId: string;
@@ -41,14 +43,23 @@ interface ClaudeSdkSessionState {
   currentMessageId: string | null;
   currentText: string;
   currentQuery: ReturnType<typeof query> | null;
+  currentChild: ChildProcess | null;
   completed: boolean;
   cancelled: boolean;
   finalMetadata?: Record<string, unknown>;
+  lastAssistantUsage?: ClaudeUsageSnapshot;
   pendingComplete?: AgentMessage;
   pendingError?: ProviderError;
   toolCalls: Map<number, ToolCallEvent & { partialInputJson?: string }>;
   emittedToolStates: Map<string, string>;
   lastStatusSignature: string | null;
+}
+
+interface ClaudeUsageSnapshot {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
 }
 
 type ClaudeToolBlock = {
@@ -113,6 +124,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
   async disconnect(): Promise<void> {
     for (const state of this.sessions.values()) {
       try { state.currentQuery?.close(); } catch {}
+      this.terminateChild(state);
     }
     this.sessions.clear();
     this.config = null;
@@ -137,9 +149,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       currentMessageId: existing?.currentMessageId ?? null,
       currentText: existing?.currentText ?? '',
       currentQuery: null,
+      currentChild: null,
       completed: false,
       cancelled: false,
       finalMetadata: existing?.finalMetadata,
+      lastAssistantUsage: existing?.lastAssistantUsage,
       pendingComplete: undefined,
       toolCalls: new Map(),
       emittedToolStates: new Map(),
@@ -153,6 +167,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     const state = this.sessions.get(sessionId);
     if (state) {
       try { state.currentQuery?.close(); } catch {}
+      this.terminateChild(state);
       this.sessions.delete(sessionId);
     }
   }
@@ -234,11 +249,15 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     if (!state?.currentQuery) return;
     state.cancelled = true;
     try {
-      await state.currentQuery.interrupt();
+      await Promise.race([
+        state.currentQuery.interrupt(),
+        new Promise<void>((resolve) => setTimeout(resolve, CANCEL_INTERRUPT_TIMEOUT_MS)),
+      ]);
     } catch {}
     try {
       state.currentQuery.close();
     } catch {}
+    this.terminateChild(state);
   }
 
   private async startQuery(
@@ -253,6 +272,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     state.completed = false;
     state.cancelled = false;
     state.finalMetadata = undefined;
+    state.lastAssistantUsage = undefined;
     state.pendingComplete = undefined;
     state.pendingError = undefined;
     state.toolCalls.clear();
@@ -275,30 +295,27 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
         appendSystemPrompt: [baseSystemPrompt, state.systemPrompt].filter(Boolean).join('\n\n'),
       } : {}),
     };
-    // On Windows where claude resolved to a .cmd shim, override the SDK's
-    // internal spawn so we can prepend `node script.js` and avoid spawn
-    // EINVAL on .cmd files.
-    if (this.windowsSpawnOverride) {
-      const override = this.windowsSpawnOverride;
-      options.spawnClaudeCodeProcess = (req: { command: string; args: string[]; cwd?: string; env?: Record<string, string>; signal?: AbortSignal }) => {
-        const finalArgs = [...override.prependArgs, ...req.args];
-        const child = spawn(override.executable, finalArgs, {
-          cwd: req.cwd,
-          env: req.env,
-          signal: req.signal,
-          stdio: ['pipe', 'pipe', 'pipe'],
-          windowsHide: true,
-        });
-        // CRITICAL: always listen for 'error' so spawn failures don't bubble
-        // up to uncaughtException and crash the daemon. The SDK will also
-        // observe the error via the child's exit/stderr, but if it doesn't
-        // we still need to swallow it here.
-        child.on('error', (err) => {
-          logger.error({ provider: this.id, err }, 'Claude SDK spawn error (suppressed)');
-        });
-        return child;
-      };
-    }
+    options.spawnClaudeCodeProcess = (req: { command: string; args: string[]; cwd?: string; env?: Record<string, string>; signal?: AbortSignal }) => {
+      const finalCommand = this.windowsSpawnOverride?.executable ?? req.command;
+      const finalArgs = this.windowsSpawnOverride
+        ? [...this.windowsSpawnOverride.prependArgs, ...req.args]
+        : req.args;
+      const child = spawn(finalCommand, finalArgs, {
+        cwd: req.cwd,
+        env: req.env,
+        signal: req.signal,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+      state.currentChild = child;
+      child.once('exit', () => {
+        if (state.currentChild === child) state.currentChild = null;
+      });
+      child.on('error', (err) => {
+        logger.error({ provider: this.id, err }, 'Claude SDK spawn error (suppressed)');
+      });
+      return child;
+    };
 
     const q = query({ prompt: message, options: options as any });
     state.currentQuery = q;
@@ -330,6 +347,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
         : this.normalizeError(err);
     } finally {
       state.currentQuery = null;
+      state.currentChild = null;
       const pendingComplete = state.pendingComplete;
       state.pendingComplete = undefined;
       state.pendingError = undefined;
@@ -446,6 +464,15 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     }
 
     if (msg.type === 'assistant') {
+      const assistantUsage = msg.message?.usage as ClaudeUsageSnapshot | undefined;
+      if (assistantUsage && typeof assistantUsage === 'object') {
+        state.lastAssistantUsage = {
+          ...(typeof assistantUsage.input_tokens === 'number' ? { input_tokens: assistantUsage.input_tokens } : {}),
+          ...(typeof assistantUsage.output_tokens === 'number' ? { output_tokens: assistantUsage.output_tokens } : {}),
+          ...(typeof assistantUsage.cache_read_input_tokens === 'number' ? { cache_read_input_tokens: assistantUsage.cache_read_input_tokens } : {}),
+          ...(typeof assistantUsage.cache_creation_input_tokens === 'number' ? { cache_creation_input_tokens: assistantUsage.cache_creation_input_tokens } : {}),
+        };
+      }
       const text = collectAssistantText(msg);
       if (Array.isArray(msg.message.content)) {
         for (const block of msg.message.content) {
@@ -527,7 +554,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
         status: 'complete',
         metadata: {
           ...(state.model ? { model: state.model } : {}),
-          usage: msg.usage,
+          usage: state.lastAssistantUsage ?? msg.usage,
+          ...(state.lastAssistantUsage && state.lastAssistantUsage !== msg.usage ? { totalUsage: msg.usage } : {}),
           resultSubtype: msg.subtype,
           resumeId: state.resumeId,
         },
@@ -638,5 +666,16 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
 
   private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {
     return { code, message, recoverable, ...(details !== undefined ? { details } : {}) };
+  }
+
+  private terminateChild(state: ClaudeSdkSessionState): void {
+    const child = state.currentChild;
+    if (!child || child.killed) return;
+    try { child.kill('SIGTERM'); } catch {}
+    const timer = setTimeout(() => {
+      if (state.currentChild !== child || child.killed) return;
+      try { child.kill('SIGKILL'); } catch {}
+    }, FORCE_KILL_TIMEOUT_MS);
+    timer.unref?.();
   }
 }

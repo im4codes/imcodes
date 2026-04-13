@@ -9,7 +9,15 @@ const childProcessMock = vi.hoisted(() => ({
     cb?.(null, 'ok\n', '');
     return {} as never;
   }),
-  spawn: vi.fn(() => ({} as never)),
+  spawn: vi.fn(() => ({
+    killed: false,
+    kill: vi.fn(function (this: { killed: boolean }) {
+      this.killed = true;
+      return true;
+    }),
+    once: vi.fn(),
+    on: vi.fn(),
+  }) as never),
 }));
 
 vi.mock('node:child_process', () => ({
@@ -20,26 +28,30 @@ vi.mock('node:child_process', () => ({
 const sdkMock = vi.hoisted(() => {
   let nextMessages: any[] = [];
   let waitForClose = false;
-  const runs: Array<{ prompt: string; options: Record<string, unknown>; closed: boolean; interrupted: boolean }> = [];
+  let interruptNeverResolves = false;
+  const runs: Array<{ prompt: string; options: Record<string, unknown>; closed: boolean; interrupted: boolean; resolveClose?: () => void }> = [];
   const query = vi.fn(({ prompt, options }: { prompt: string; options: Record<string, unknown> }) => {
-    const run = { prompt, options, closed: false, interrupted: false };
+    const run = { prompt, options, closed: false, interrupted: false, resolveClose: undefined as (() => void) | undefined };
     runs.push(run);
     async function* gen() {
       for (const message of nextMessages) yield message;
       if (waitForClose) {
         await new Promise<void>((resolve) => {
-          const timer = setInterval(() => {
-            if (run.closed) {
-              clearInterval(timer);
-              resolve();
-            }
-          }, 0);
+          run.resolveClose = resolve;
         });
       }
     }
     const iterator = gen() as AsyncGenerator<any, void> & { close(): void; interrupt(): Promise<void> };
-    iterator.close = () => { run.closed = true; };
-    iterator.interrupt = async () => { run.interrupted = true; };
+    iterator.close = () => {
+      run.closed = true;
+      run.resolveClose?.();
+    };
+    iterator.interrupt = async () => {
+      run.interrupted = true;
+      if (interruptNeverResolves) {
+        await new Promise<void>(() => {});
+      }
+    };
     return iterator;
   });
   return {
@@ -47,6 +59,7 @@ const sdkMock = vi.hoisted(() => {
     runs,
     setNextMessages(messages: any[]) { nextMessages = messages; },
     setWaitForClose(value: boolean) { waitForClose = value; },
+    setInterruptNeverResolves(value: boolean) { interruptNeverResolves = value; },
   };
 });
 
@@ -64,10 +77,13 @@ const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 describe('ClaudeCodeSdkProvider', () => {
   beforeEach(() => {
+    vi.useRealTimers();
     sdkMock.query.mockClear();
     sdkMock.runs.length = 0;
     sdkMock.setNextMessages([]);
     sdkMock.setWaitForClose(false);
+    sdkMock.setInterruptNeverResolves(false);
+    childProcessMock.spawn.mockClear();
   });
 
   it('uses stable resume id, emits cumulative text deltas, and completes from result', async () => {
@@ -113,6 +129,63 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(sessionInfo.some((info) => info.model === 'claude-sonnet-4-6')).toBe(true);
   });
 
+  it('uses the last assistant usage for completion metadata instead of cumulative result usage', async () => {
+    sdkMock.setNextMessages([
+      {
+        type: 'assistant',
+        session_id: 'session-usage',
+        message: {
+          content: [{ type: 'text', text: 'Hello' }],
+          usage: {
+            input_tokens: 120,
+            cache_creation_input_tokens: 30,
+            cache_read_input_tokens: 20,
+            output_tokens: 10,
+          },
+        },
+      },
+      {
+        type: 'result',
+        session_id: 'session-usage',
+        subtype: 'success',
+        is_error: false,
+        result: 'Hello',
+        usage: {
+          input_tokens: 999,
+          cache_creation_input_tokens: 400,
+          cache_read_input_tokens: 300,
+          output_tokens: 50,
+        },
+      },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-usage', cwd: '/tmp/project', resumeId: 'session-usage' });
+
+    const completed: AgentMessage[] = [];
+    provider.onComplete((_sid, msg) => completed.push(msg));
+
+    await provider.send('route-usage', 'hello');
+    await flush();
+
+    expect(completed).toHaveLength(1);
+    expect(completed[0]?.metadata).toMatchObject({
+      usage: {
+        input_tokens: 120,
+        cache_creation_input_tokens: 30,
+        cache_read_input_tokens: 20,
+        output_tokens: 10,
+      },
+      totalUsage: {
+        input_tokens: 999,
+        cache_creation_input_tokens: 400,
+        cache_read_input_tokens: 300,
+        output_tokens: 50,
+      },
+    });
+  });
+
   it('emits cancelled on cancel()', async () => {
     sdkMock.setWaitForClose(true);
 
@@ -131,6 +204,28 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(run.interrupted).toBe(true);
     expect(run.closed).toBe(true);
     expect(errors).toContain('CANCELLED');
+  });
+
+  it('force-kills the Claude child when cancel interrupt hangs', async () => {
+    vi.useFakeTimers();
+    sdkMock.setWaitForClose(true);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-hung-cancel', cwd: '/tmp/project', resumeId: 'session-hung-cancel' });
+
+    await provider.send('route-hung-cancel', 'hello');
+    const run = sdkMock.runs[0]!;
+    const spawnFn = run.options.spawnClaudeCodeProcess as ((req: { command: string; args: string[]; cwd?: string; env?: Record<string, string>; signal?: AbortSignal }) => any);
+    const child = spawnFn({ command: 'claude', args: ['--fake'] });
+    sdkMock.setInterruptNeverResolves(true);
+
+    const cancelPromise = provider.cancel('route-hung-cancel');
+    await vi.advanceTimersByTimeAsync(1_600);
+    await cancelPromise;
+
+    expect(run.closed).toBe(true);
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM');
   });
 
   it('fresh createSession ignores previous internal continuity for the same route', async () => {

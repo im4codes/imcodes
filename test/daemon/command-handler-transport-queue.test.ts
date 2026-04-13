@@ -1,10 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { getSessionMock, getTransportRuntimeMock, emitMock, relaunchSessionWithSettingsMock } = vi.hoisted(() => ({
+const { getSessionMock, getTransportRuntimeMock, emitMock, relaunchSessionWithSettingsMock, stopTransportRuntimeSessionMock, resizeSessionMock, terminalSubscribeMock, terminalRequestSnapshotMock } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   getTransportRuntimeMock: vi.fn(),
   emitMock: vi.fn(),
   relaunchSessionWithSettingsMock: vi.fn(),
+  stopTransportRuntimeSessionMock: vi.fn().mockResolvedValue(undefined),
+  resizeSessionMock: vi.fn(),
+  terminalSubscribeMock: vi.fn(() => vi.fn()),
+  terminalRequestSnapshotMock: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -24,13 +28,14 @@ vi.mock('../../src/agent/session-manager.js', () => ({
   isProviderSessionBound: vi.fn(() => false),
   persistSessionRecord: vi.fn(),
   relaunchSessionWithSettings: relaunchSessionWithSettingsMock,
+  stopTransportRuntimeSession: stopTransportRuntimeSessionMock,
 }));
 
 vi.mock('../../src/agent/tmux.js', () => ({
   sendKeys: vi.fn(),
   sendKeysDelayedEnter: vi.fn(),
   sendRawInput: vi.fn(),
-  resizeSession: vi.fn(),
+  resizeSession: resizeSessionMock,
   sendKey: vi.fn(),
   getPaneStartCommand: vi.fn(),
 }));
@@ -41,10 +46,12 @@ vi.mock('../../src/router/message-router.js', () => ({
 
 vi.mock('../../src/daemon/terminal-streamer.js', () => ({
   terminalStreamer: {
-    subscribe: vi.fn(),
+    subscribe: terminalSubscribeMock,
     unsubscribe: vi.fn(),
     start: vi.fn(),
     stop: vi.fn(),
+    requestSnapshot: terminalRequestSnapshotMock,
+    invalidateSize: vi.fn(),
   },
 }));
 
@@ -142,6 +149,7 @@ describe('handleWebCommand transport queue behavior', () => {
 
   it('does not emit a user.message for queued transport sends', async () => {
     getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
       send: vi.fn(() => 'queued'),
       pendingCount: 2,
       pendingMessages: ['queued msg', 'queued msg 2'],
@@ -160,8 +168,33 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-queued', status: 'accepted' });
   });
 
+  it('dispatches /stop immediately for transport sessions without emitting queued state', async () => {
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      cancel,
+      send: vi.fn(() => 'queued'),
+      pendingCount: 3,
+      pendingMessages: ['a', 'b', 'c'],
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/stop', commandId: 'cmd-stop' }, serverLink as any);
+    await flushAsync();
+
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: '/stop', allowDuplicate: true });
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-stop', status: 'accepted' });
+    expect(emitMock).not.toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      expect.objectContaining({ state: 'queued' }),
+      expect.anything(),
+    );
+  });
+
   it('emits a user.message immediately for dispatched transport sends', async () => {
     getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
       send: vi.fn(() => 'sent'),
       pendingCount: 0,
     });
@@ -181,6 +214,7 @@ describe('handleWebCommand transport queue behavior', () => {
   it('does not short-circuit transport identity questions in the daemon', async () => {
     const transportSend = vi.fn(() => 'sent');
     getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
       send: transportSend,
       pendingCount: 0,
     });
@@ -201,6 +235,40 @@ describe('handleWebCommand transport queue behavior', () => {
       expect.objectContaining({ text: expect.any(String), streaming: false }),
       expect.anything(),
     );
+  });
+
+  it('treats transport runtimes without a provider session id as unavailable', async () => {
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: null,
+      send: vi.fn(() => {
+        throw new Error('TransportSessionRuntime not initialized — call initialize() first');
+      }),
+      pendingCount: 0,
+      pendingMessages: [],
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'hello after restart',
+      commandId: 'cmd-stale-runtime',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(stopTransportRuntimeSessionMock).toHaveBeenCalledWith('deck_transport_brain');
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'assistant.text',
+      { text: '⚠️ Provider unknown restarting. Please resend in a moment.', streaming: false },
+      expect.any(Object),
+    );
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'command.ack',
+      commandId: 'cmd-stale-runtime',
+      status: 'error',
+      session: 'deck_transport_brain',
+      error: 'Provider unknown restarting. Please resend in a moment.',
+    });
   });
 
   it('waits for an in-flight settings restart before sending the first transport message', async () => {
@@ -224,7 +292,7 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
     const transportSend = vi.fn(() => 'sent');
     getTransportRuntimeMock.mockImplementation(() => (
-      restartResolved ? { send: transportSend, pendingCount: 0 } : undefined
+      restartResolved ? { providerSessionId: 'route-transport', send: transportSend, pendingCount: 0 } : undefined
     ));
 
     handleWebCommand({ type: 'session.restart', sessionName: 'deck_transport_brain', agentType: 'claude-code-sdk' }, serverLink as any);
@@ -241,5 +309,40 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(transportSend).toHaveBeenCalledWith('after restart');
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: 'after restart', allowDuplicate: true });
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-after-restart', status: 'accepted' });
+  });
+
+  it('deduplicates concurrent session.restart requests for the same transport session', async () => {
+    let resolveRestart: (() => void) | null = null;
+    relaunchSessionWithSettingsMock.mockImplementation(
+      () => new Promise<void>((resolve) => {
+        resolveRestart = resolve;
+      }),
+    );
+
+    handleWebCommand({ type: 'session.restart', sessionName: 'deck_transport_brain', agentType: 'claude-code-sdk' }, serverLink as any);
+    handleWebCommand({ type: 'session.restart', sessionName: 'deck_transport_brain', agentType: 'claude-code-sdk' }, serverLink as any);
+
+    await flushAsync();
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(1);
+
+    resolveRestart?.();
+    await flushAsync();
+    await flushAsync();
+  });
+
+  it('skips terminal subscribe and snapshot requests for transport sessions', async () => {
+    handleWebCommand({ type: 'terminal.subscribe', session: 'deck_transport_brain' }, serverLink as any);
+    handleWebCommand({ type: 'terminal.snapshot_request', sessionName: 'deck_transport_brain' }, serverLink as any);
+    await flushAsync();
+
+    expect(terminalSubscribeMock).not.toHaveBeenCalled();
+    expect(terminalRequestSnapshotMock).not.toHaveBeenCalled();
+  });
+
+  it('skips tmux resize for transport sessions', async () => {
+    handleWebCommand({ type: 'session.resize', sessionName: 'deck_transport_brain', cols: 200, rows: 50 }, serverLink as any);
+    await flushAsync();
+
+    expect(resizeSessionMock).not.toHaveBeenCalled();
   });
 });

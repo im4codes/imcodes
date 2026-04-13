@@ -34,7 +34,7 @@ afterEach(() => {
 });
 
 describe('UsageFooter', () => {
-  it('only shows the animated thinking dots while the session is running', () => {
+  it('prioritizes active thinking over stale idle state and renders running states inline', () => {
     const { container, rerender } = render(
       <UsageFooter
         usage={{
@@ -49,7 +49,12 @@ describe('UsageFooter', () => {
       />,
     );
 
-    expect(container.querySelector('.chat-thinking-dots')).toBeNull();
+    const staleIdleStatus = container.querySelector('.session-live-status-inline') as HTMLSpanElement | null;
+    expect(staleIdleStatus?.textContent).toContain('🤖');
+    expect(staleIdleStatus?.textContent).toContain('💭');
+    expect(staleIdleStatus?.getAttribute('aria-label')).toContain('thinking');
+    expect(container.querySelector('.session-live-status-inline.thinking .session-live-status-emoji.thought')).toBeTruthy();
+    expect(container.querySelector('.session-live-status-inline.idle')).toBeNull();
 
     rerender(
       <UsageFooter
@@ -65,7 +70,53 @@ describe('UsageFooter', () => {
       />,
     );
 
-    expect(container.querySelector('.chat-thinking-dots')).toBeTruthy();
+    const runningStatus = container.querySelector('.session-live-status-inline') as HTMLSpanElement | null;
+    expect(runningStatus?.textContent).toContain('🤖');
+    expect(runningStatus?.textContent).toContain('💭');
+    expect(runningStatus?.getAttribute('aria-label')).toContain('thinking');
+    expect(container.querySelector('.session-live-status-inline.thinking')).toBeTruthy();
+    expect(container.querySelector('.session-live-status-inline.thinking .session-live-status-emoji.thought')).toBeTruthy();
+    expect(container.querySelector('.session-live-status-text')?.textContent).toContain('thinking');
+
+    rerender(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        sessionState="running"
+      />,
+    );
+
+    const plainRunningStatus = container.querySelector('.session-live-status-inline') as HTMLSpanElement | null;
+    expect(plainRunningStatus?.textContent).toContain('🤖');
+    expect(plainRunningStatus?.textContent).toContain('⚙️');
+    expect(container.querySelector('.session-live-status-inline.running .session-live-status-emoji.gear')).toBeTruthy();
+  });
+
+  it('shows tool-call icon when explicit running status text is present', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 0,
+          cacheTokens: 0,
+          contextWindow: 1_000_000,
+          model: 'coder-model',
+        }}
+        sessionName="deck_test_brain"
+        sessionState="running"
+        statusText="Reading file..."
+        activeToolCall={true}
+      />,
+    );
+
+    expect((container.querySelector('.session-live-status-inline') as HTMLSpanElement | null)?.textContent).toContain('🔍');
+    expect(container.querySelector('.session-live-status-inline.tool .session-live-status-emoji.tool')).toBeTruthy();
+    expect(container.querySelector('.session-live-status-text')?.textContent).toBe('Reading file...');
+    expect((container.querySelector('.session-live-status-inline') as HTMLSpanElement | null)?.getAttribute('aria-label')).toBe('Reading file...');
   });
 
   it('renders explicit quota label inline in the ctx footer', () => {

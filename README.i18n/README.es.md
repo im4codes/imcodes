@@ -5,7 +5,7 @@
 
 **La capa de mensajería para agentes.**
 
-IM.codes es un mensajero especializado para agentes de programación con IA. Te permite seguir sesiones largas desde móvil o web, con acceso a terminal, navegación de archivos, vistas de Git, vista previa de localhost, notificaciones y flujos multiagente integrados. Funciona con [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com) y [Qwen](https://github.com/QwenLM/qwen-agent).
+IM.codes es un mensajero especializado para agentes de programación con IA. Te permite seguir sesiones largas desde iPhone, iPad, Apple Watch, móvil o web, con acceso a terminal, navegación de archivos, vistas de Git, vista previa de localhost, notificaciones y flujos multiagente integrados. Funciona con [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com) y [Qwen](https://github.com/QwenLM/qwen-agent).
 
 > **Nota:** Este archivo es una traducción. **El README en inglés (`../README.md`) es la versión canónica.** Si hay alguna diferencia, prevalece la versión en inglés.
 

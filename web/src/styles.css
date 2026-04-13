@@ -858,12 +858,33 @@ body {
 .session-ctx-input { position: absolute; left: 0; top: 0; height: 100%; background: #34d399; border-radius: 3px; }
 .session-ctx-cache { position: absolute; left: 0; top: 0; height: 100%; background: #818cf8; border-radius: 3px; }
 .session-usage-stats { display: flex; justify-content: space-between; font-size: 10px; color: #475569; }
+.session-live-status-inline { display: inline-flex; align-items: center; justify-content: center; gap: 1px; min-width: 20px; color: #818cf8; min-width: 0; max-width: min(42vw, 240px); }
+.session-live-status-emoji { display: inline-block; font-size: 12px; line-height: 1; filter: saturate(1.1); }
+.session-live-status-emoji.robot { transform: translateY(0.2px); }
+.session-live-status-text { color: #818cf8; font-size: 10px; line-height: 1.1; margin-left: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: 0.92; }
+.session-live-status-inline.running .session-live-status-emoji.gear { animation: status-gear-spin 0.8s linear infinite; transform-origin: 50% 50%; }
+.session-live-status-inline.thinking .session-live-status-emoji.thought { font-size: 10px; transform: translateY(-2px) translateX(-1px); opacity: 0.94; animation: status-thought-breathe 1.8s ease-in-out infinite; transform-origin: 50% 100%; }
+.session-live-status-inline.tool .session-live-status-emoji.tool { animation: status-tool-peek 1.15s ease-in-out infinite; transform-origin: 50% 50%; }
+.session-live-status-inline.idle .session-live-status-emoji.sleep { font-size: 9px; transform: translateY(-3px) translateX(-1px); opacity: 0.9; animation: status-sleep-breathe 1.8s ease-in-out infinite; transform-origin: 50% 100%; }
 .session-usage-model { color: #a78bfa; font-size: 10px; font-weight: 500; margin-right: 6px; }
 .session-usage-tokens { color: #64748b; }
 .session-usage-badge { color: #93c5fd; border: 1px solid #1d4ed8; border-radius: 999px; padding: 1px 6px; line-height: 1.4; }
 .session-usage-quota-inline { color: #64748b; font-size: 9px; line-height: 1.4; white-space: nowrap; }
 .session-usage-cost { color: #94a3b8; }
-.session-thinking-inline { color: #818cf8; font-style: italic; margin-left: auto; padding-left: 8px; }
+@keyframes status-gear-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+@keyframes status-thought-breathe {
+  0%, 100% { transform: translateY(-2px) translateX(-1px) scale(0.9); opacity: 0.72; }
+  50% { transform: translateY(-3px) translateX(-1px) scale(1.06); opacity: 1; }
+}
+@keyframes status-tool-peek {
+  0%, 100% { transform: translateX(0) rotate(0deg) scale(0.98); }
+  35% { transform: translateX(0.5px) rotate(-8deg) scale(1.03); }
+  65% { transform: translateX(0.5px) rotate(8deg) scale(1.03); }
+}
+@keyframes status-sleep-breathe {
+  0%, 100% { transform: translateY(-3px) translateX(-1px) scale(0.88); opacity: 0.72; }
+  50% { transform: translateY(-4px) translateX(-1px) scale(1.08); opacity: 1; }
+}
 .subsession-input-bar { display: flex; gap: 6px; padding: 6px 8px; background: #0d1117; border-top: 1px solid #1e293b; flex-shrink: 0; }
 .subsession-input { flex: 1; background: #1e293b; border: 1px solid #334155; border-radius: 6px; color: #e2e8f0; font-family: inherit; font-size: 13px; padding: 5px 10px; outline: none; }
 .subsession-input:focus { border-color: #3b82f6; }

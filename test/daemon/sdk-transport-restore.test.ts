@@ -250,6 +250,49 @@ describe('sdk transport session restore', () => {
     expect(onSessionEvent).toHaveBeenCalledWith('started', 'deck_sdk_new_brain', 'idle');
   });
 
+  it('removes stale transport runtime from the map before awaiting a fresh kill', async () => {
+    await connectProvider('claude-code-sdk', {});
+    await launchTransportSession({
+      name: 'deck_sdk_fresh_brain',
+      projectName: 'sdkfresh',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/sdk-fresh',
+      requestedModel: 'sonnet',
+    });
+
+    const existingRuntime = getTransportRuntime('deck_sdk_fresh_brain');
+    expect(existingRuntime).toBeDefined();
+
+    let releaseKill: (() => void) | null = null;
+    const killBarrier = new Promise<void>((resolve) => { releaseKill = resolve; });
+    const originalKill = existingRuntime!.kill.bind(existingRuntime);
+    const killSpy = vi.spyOn(existingRuntime!, 'kill').mockImplementation(async () => {
+      await killBarrier;
+      await originalKill();
+    });
+
+    const relaunchPromise = launchTransportSession({
+      name: 'deck_sdk_fresh_brain',
+      projectName: 'sdkfresh',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/sdk-fresh',
+      requestedModel: 'sonnet',
+      fresh: true,
+      ccSessionId: 'cc-session-fresh',
+    });
+
+    await flush();
+    expect(getTransportRuntime('deck_sdk_fresh_brain')).toBeUndefined();
+
+    releaseKill?.();
+    await relaunchPromise;
+
+    expect(getTransportRuntime('deck_sdk_fresh_brain')).toBeDefined();
+    killSpy.mockRestore();
+  });
+
   it('resumes Claude conversation when switching from cli to sdk', async () => {
     const name = 'deck_switch_ccsdk_brain';
     const record = {
@@ -280,6 +323,45 @@ describe('sdk transport session restore', () => {
     await flush();
 
     expect(mocks.claudeRuns.at(-1)?.options.resume).toBe('cc-session-switch');
+    expect(mocks.claudeRuns.at(-1)?.options.sessionId).toBeUndefined();
+  });
+
+  it('relaunches claude-code-sdk with a fresh provider route key while preserving the Claude resume id', async () => {
+    const name = 'deck_restart_ccsdk_brain';
+    const record = {
+      name,
+      projectName: 'restartccsdk',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/restart-ccsdk',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      providerSessionId: 'route-cc-old',
+      ccSessionId: 'cc-session-restart',
+    };
+    mocks.store.set(name, record);
+
+    await connectProvider('claude-code-sdk', {});
+    await relaunchSessionWithSettings(record as any, { agentType: 'claude-code-sdk' });
+
+    const next = mocks.store.get(name);
+    expect(next?.agentType).toBe('claude-code-sdk');
+    expect(next?.ccSessionId).toBe('cc-session-restart');
+    expect(next?.providerSessionId).toBeTruthy();
+    expect(next?.providerSessionId).not.toBe('route-cc-old');
+
+    const runtime = getTransportRuntime(name);
+    expect(runtime?.providerSessionId).toBe(next?.providerSessionId);
+
+    runtime!.send('What token did I ask you to remember?');
+    await flush();
+
+    expect(mocks.claudeRuns.at(-1)?.options.resume).toBe('cc-session-restart');
     expect(mocks.claudeRuns.at(-1)?.options.sessionId).toBeUndefined();
   });
 

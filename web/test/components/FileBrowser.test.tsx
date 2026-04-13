@@ -962,6 +962,59 @@ describe('FileBrowser', () => {
     expect((ws.fsGitDiff as any).mock.calls).toHaveLength(0);
   });
 
+  it('preserves a manual diff tab selection when the same preview path refreshes', async () => {
+    const { ws } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/foo.ts"
+        initialPreview={{
+          status: 'ok',
+          path: '/home/user/foo.ts',
+          content: 'const before = 1;',
+          diff: '+const before = 1;',
+          diffHtml: '<div>diff before</div>',
+        }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    const toggle = screen.getByTitle('Toggle diff view');
+    expect(document.querySelector('.fb-diff')).toBeNull();
+    expect(toggle.className).not.toContain('active');
+
+    await act(async () => {
+      fireEvent.click(toggle);
+    });
+
+    expect(document.querySelector('.fb-diff')).not.toBeNull();
+    expect(toggle.className).toContain('active');
+
+    view.rerender(
+      <FileBrowser
+        ws={ws}
+        mode="file-single"
+        layout="panel"
+        initialPath="/home/user"
+        autoPreviewPath="/home/user/foo.ts"
+        initialPreview={{
+          status: 'ok',
+          path: '/home/user/foo.ts',
+          content: 'const after = 2;',
+          diff: '+const after = 2;',
+          diffHtml: '<div>diff after</div>',
+        }}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    expect(document.querySelector('.fb-diff')?.textContent).toContain('diff after');
+    expect(screen.getByTitle('Toggle diff view').className).toContain('active');
+  });
+
   it('fetches preview data when a floating preview is hydrated with a loading state', () => {
     const { ws } = makeWsFactory();
     render(

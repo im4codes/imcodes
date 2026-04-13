@@ -39,6 +39,28 @@ function clearPendingStreamUpdate(eventId: string): void {
   pendingStreamUpdates.delete(eventId);
 }
 
+function normalizeUsageUpdatePayload(
+  usage: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+  } | undefined,
+  model: string | undefined,
+): Record<string, unknown> | null {
+  if (!usage && !model) return null;
+  const inputTokens = typeof usage?.input_tokens === 'number'
+    ? usage.input_tokens + (usage.cache_creation_input_tokens ?? 0)
+    : undefined;
+  const payload: Record<string, unknown> = {
+    ...(typeof inputTokens === 'number' ? { inputTokens } : {}),
+    ...(typeof usage?.cache_read_input_tokens === 'number' ? { cacheTokens: usage.cache_read_input_tokens } : {}),
+    ...(model ? { model } : {}),
+    contextWindow: resolveContextWindow(undefined, model),
+  };
+  return payload;
+}
+
 function flushPendingStreamUpdate(eventId: string): void {
   const pending = pendingStreamUpdates.get(eventId);
   if (!pending || pending.pendingText == null) return;
@@ -137,15 +159,12 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       input_tokens?: number;
       output_tokens?: number;
       cache_read_input_tokens?: number;
+      cache_creation_input_tokens?: number;
     } | undefined;
     const model = typeof message.metadata?.model === 'string' ? message.metadata.model : undefined;
-    if (usage || model) {
-      timelineEmitter.emit(sessionName, 'usage.update', {
-        ...(typeof usage?.input_tokens === 'number' ? { inputTokens: usage.input_tokens } : {}),
-        ...(typeof usage?.cache_read_input_tokens === 'number' ? { cacheTokens: usage.cache_read_input_tokens } : {}),
-        ...(model ? { model } : {}),
-        contextWindow: resolveContextWindow(undefined, model),
-      }, { source: 'daemon', confidence: 'high' });
+    const usagePayload = normalizeUsageUpdatePayload(usage, model);
+    if (usagePayload) {
+      timelineEmitter.emit(sessionName, 'usage.update', usagePayload, { source: 'daemon', confidence: 'high' });
     }
 
     // Emit idle state

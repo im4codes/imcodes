@@ -2,7 +2,7 @@
  * Handle commands from the web UI and inbound chat messages via ServerLink.
  * Commands arrive as JSON objects with a `type` field.
  */
-import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, persistSessionRecord, relaunchSessionWithSettings, type ProjectConfig } from '../agent/session-manager.js';
+import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, persistSessionRecord, relaunchSessionWithSettings, stopTransportRuntimeSession, type ProjectConfig } from '../agent/session-manager.js';
 import { isTransportAgent } from '../agent/detect.js';
 import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand } from '../agent/tmux.js';
 import { listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
@@ -57,6 +57,8 @@ import {
   isTransportEffortLevel,
   type TransportEffortLevel,
 } from '../../shared/effort-levels.js';
+
+const MAX_P2P_FILE_PULL_COUNT = 20;
 
 /**
  * Build a unified subsession.sync payload from the session store record.
@@ -225,6 +227,12 @@ function trackPendingSessionRelaunch(sessionName: string, pending: Promise<void>
     if (pendingSessionRelaunches.get(sessionName) === pending) pendingSessionRelaunches.delete(sessionName);
   });
   return pending;
+}
+
+function runExclusiveSessionRelaunch(sessionName: string, factory: () => Promise<void>): Promise<void> {
+  const pending = pendingSessionRelaunches.get(sessionName);
+  if (pending) return pending;
+  return trackPendingSessionRelaunch(sessionName, factory());
 }
 
 async function waitForPendingSessionRelaunch(sessionName: string): Promise<void> {
@@ -923,7 +931,7 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
       return;
     }
     try {
-      await trackPendingSessionRelaunch(sessionName, (async () => {
+      await runExclusiveSessionRelaunch(sessionName, async () => {
         try {
           await relaunchSessionWithSettings(record, {
             agentType: (cmd.agentType as any) ?? undefined,
@@ -944,7 +952,7 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
           await handleGetSessions(serverLink);
           throw err;
         }
-      })());
+      });
     } catch {
       // Failure already surfaced via session.error + corrective session_list.
     }
@@ -1213,7 +1221,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       const fileContents: Array<{ path: string; content: string }> = [];
       const record = getSession(sessionName);
       const projectDir = record?.projectDir ?? '';
-      for (const fp of tokens.files) {
+      for (const fp of tokens.files.slice(0, MAX_P2P_FILE_PULL_COUNT)) {
         try {
           const absPath = nodePath.isAbsolute(fp) ? fp : nodePath.join(projectDir, fp);
           // Check for binary content (null bytes anywhere in the capped content)
@@ -1289,11 +1297,21 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: errStatus, session: sessionName, error: errMsg }); } catch { /* not connected */ }
     return;
   }
+  if (transportRuntime && !transportRuntime.providerSessionId) {
+    await stopTransportRuntimeSession(sessionName).catch(() => {});
+    const errMsg = `Provider ${record?.providerId ?? 'unknown'} restarting. Please resend in a moment.`;
+    logger.warn({ sessionName, providerId: record?.providerId }, 'session.send: transport runtime missing provider session id');
+    emitTransportUserMessage(text);
+    timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ ${errMsg}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
+    try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch {}
+    return;
+  }
   if (transportRuntime) {
-    const release = await getMutex(sessionName).acquire();
-    try {
-      if (text.trim() === '/stop') {
-        emitTransportUserMessage(text);
+    if (text.trim() === '/stop') {
+      emitTransportUserMessage(text);
+      try {
         await transportRuntime.cancel();
         // Mark session for fresh start so daemon restart doesn't resume the stuck conversation
         if (record?.agentType === 'qwen') {
@@ -1304,8 +1322,17 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         try {
           serverLink.send({ type: 'command.ack', commandId: effectiveId, status: stopStatus, session: sessionName });
         } catch { /* */ }
-        return;
+      } catch (err) {
+        const errMsg = describeTransportSendError(err);
+        logger.error({ sessionName, err }, 'session.stop (transport) failed');
+        timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Stop failed: ${errMsg}`, streaming: false }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
+        try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: errMsg }); } catch { /* */ }
       }
+      return;
+    }
+    const release = await getMutex(sessionName).acquire();
+    try {
       const modelMatch = text.trim().match(/^\/model\s+(\S+)(?:\s+.*)?$/);
       const effortMatch = text.trim().match(/^\/(?:thinking|effort)\s+(\S+)\s*$/);
       if (record?.agentType === 'qwen' && modelMatch) {
@@ -1603,6 +1630,8 @@ async function handleResize(cmd: Record<string, unknown>): Promise<void> {
   const cols = cmd.cols as number | undefined;
   const rows = cmd.rows as number | undefined;
   if (!sessionName || !cols || !rows) return;
+  const record = getSession(sessionName);
+  if (record?.runtimeType === 'transport') return;
   try {
     // Subtract 1 col so tmux is always slightly narrower than the browser terminal.
     // xterm fitAddon rounds down but container width may have sub-character remainder,
@@ -1629,6 +1658,16 @@ const RAW_BATCH_MAX_BYTES = 32 * 1024;   // flush immediately at 32KB
 function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): void {
   const session = cmd.session as string | undefined;
   if (!session) return;
+  const record = getSession(session);
+  if (record?.runtimeType === 'transport') {
+    const existing = activeSubscriptions.get(session);
+    if (existing) {
+      existing.unsubscribe();
+      activeSubscriptions.delete(session);
+    }
+    logger.debug({ session }, 'Terminal subscribe skipped for transport session');
+    return;
+  }
 
   // The bridge may include a `raw` flag on terminal.subscribe for its own forwarding-mode
   // bookkeeping, but daemon-side terminal streaming remains transport-stable in this phase:
@@ -1697,6 +1736,8 @@ function handleUnsubscribe(cmd: Record<string, unknown>): void {
 function handleSnapshotRequest(cmd: Record<string, unknown>): void {
   const sessionName = cmd.sessionName as string | undefined;
   if (!sessionName) return;
+  const record = getSession(sessionName);
+  if (record?.runtimeType === 'transport') return;
   terminalStreamer.requestSnapshot(sessionName);
   logger.debug({ sessionName }, 'Snapshot requested via web');
 }
@@ -2013,7 +2054,7 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
   }
   const id = sName.replace(/^deck_sub_/, '');
   try {
-    await trackPendingSessionRelaunch(sName, (async () => {
+    await runExclusiveSessionRelaunch(sName, async () => {
       try {
         const effectiveRecord = (await recoverOpenCodeSessionRecord(record)) ?? record;
         await relaunchSessionWithSettings(effectiveRecord, {
@@ -2032,7 +2073,7 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
         logger.error({ err: e, sessionName: sName }, 'subsession.restart failed');
         throw e;
       }
-    })());
+    });
   } catch {
     // Failure already logged; keep command handler alive for future sends.
   }
@@ -2319,6 +2360,23 @@ async function handleDaemonUpgrade(targetVersion?: string, serverLink?: ServerLi
     return;
   }
 
+  const activeTransportSessions = getActiveTransportSessionsBlockingDaemonUpgrade();
+  if (activeTransportSessions.length > 0) {
+    logger.warn({
+      targetVersion,
+      activeSessionNames: activeTransportSessions.map((session) => session.name),
+      activeSessionStates: activeTransportSessions.map((session) => session.state),
+    }, 'daemon.upgrade: blocked because transport sessions have active turns');
+    try {
+      serverLink?.send({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: 'transport_busy',
+        activeSessionNames: activeTransportSessions.map((session) => session.name),
+      });
+    } catch { /* ignore */ }
+    return;
+  }
+
   const { spawn } = await import('child_process');
   const { writeFileSync, mkdtempSync, existsSync } = await import('fs');
   const { join, dirname } = await import('path');
@@ -2523,6 +2581,15 @@ export function getActiveP2pRunsBlockingDaemonUpgrade(runs = listP2pRuns()) {
   return runs.filter((run) => !P2P_TERMINAL_RUN_STATUSES.has(run.status));
 }
 
+export function getActiveTransportSessionsBlockingDaemonUpgrade(sessions = listSessions()) {
+  return sessions.filter((session) => {
+    if (session.runtimeType !== 'transport') return false;
+    const runtime = getTransportRuntime(session.name);
+    if (!runtime) return false;
+    return runtime.getStatus() !== 'idle' || runtime.sending || runtime.pendingCount > 0;
+  });
+}
+
 async function handleFileSearch(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const query = (cmd.query as string ?? '').trim();
   const projectDir = cmd.projectDir as string | undefined;
@@ -2561,6 +2628,7 @@ async function handleFileSearch(cmd: Record<string, unknown>, serverLink: Server
       const fzf = new Fzf(allPaths, {
         fuzzy: allPaths.length > 20000 ? 'v1' : 'v2',
         forward: false,
+        casing: 'case-insensitive',
         tiebreakers: [fileSearchByBasenamePrefix, fileSearchByMatchPosFromEnd, fileSearchByLengthAsc],
       });
       const results = fzf.find(query);

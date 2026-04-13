@@ -14,7 +14,8 @@ import { useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { UsageFooter } from './UsageFooter.js';
 import { extractLatestUsage } from '../usage-data.js';
-import { getActiveThinkingTs, getActiveStatusText } from '../thinking-utils.js';
+import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiveToolCall } from '../thinking-utils.js';
+import { useNowTicker } from '../hooks/useNowTicker.js';
 import type { PinnedPanel } from '../app.js';
 import type { PanelRenderContext } from './PinnedPanelRegistry.js';
 
@@ -37,6 +38,12 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   const lastUsage = useMemo(() => extractLatestUsage(events), [events]);
   const activeThinkingTs = useMemo(() => getActiveThinkingTs(events), [events]);
   const statusText = useMemo(() => getActiveStatusText(events), [events]);
+  const activeToolCall = useMemo(() => hasActiveToolCall(events), [events]);
+  const liveSessionState = useMemo(
+    () => getTailSessionState(events) ?? liveSub?.state ?? null,
+    [events, liveSub?.state],
+  );
+  const thinkingNow = useNowTicker(!!activeThinkingTs);
 
   if (!liveSub) {
     return <div class="sidebar-pinned-unavailable">{t('sidebar.session_unavailable')}</div>;
@@ -45,11 +52,9 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
   const isShell = liveSub.type === 'shell' || liveSub.type === 'script';
   const mode = pinnedViewMode ?? (isShell ? 'terminal' : 'chat');
   const modelDisplay = liveSub.modelDisplay ?? (liveSub.type === 'qwen' ? liveSub.qwenModel : undefined);
-  const compactQuotaText = liveSub.type === 'codex'
+  const compactQuotaText = liveSub.type === 'codex' || liveSub.type === 'codex-sdk'
     ? ''
-    : liveSub.type === 'codex-sdk'
-      ? (liveSub.quotaLabel ?? '')
-      : [liveSub.quotaLabel, liveSub.quotaUsageLabel].filter(Boolean).join(' · ');
+    : [liveSub.quotaLabel, liveSub.quotaUsageLabel].filter(Boolean).join(' · ');
 
   return (
     <>
@@ -61,18 +66,18 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           loading={false}
           refreshing={refreshing}
           sessionId={sessionName}
-          sessionState={liveSub.state}
+          sessionState={liveSessionState ?? undefined}
           ws={ctx.ws}
           workdir={liveSub.cwd ?? null}
           serverId={ctx.serverId}
           onQuote={ctx.onQuote}
         />
       )}
-      {(lastUsage || activeThinkingTs || statusText || liveSub.planLabel || liveSub.quotaLabel || liveSub.quotaUsageLabel) && (
+      {(lastUsage || activeThinkingTs || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || liveSub.planLabel || liveSub.quotaLabel || liveSub.quotaUsageLabel || liveSub.quotaMeta) && (
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sessionName}
-          sessionState={liveSub.state}
+          sessionState={liveSessionState}
           agentType={liveSub.type}
           modelOverride={modelDisplay ?? undefined}
           planLabel={liveSub.planLabel}
@@ -82,6 +87,8 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           showCost={false}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}
+          activeToolCall={activeToolCall}
+          now={thinkingNow}
         />
       )}
       {(compactQuotaText || liveSub.planLabel) && (

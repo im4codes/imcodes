@@ -36,6 +36,7 @@ import { getClaudeSdkRuntimeConfig } from './sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from './codex-runtime-config.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
+import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
@@ -816,9 +817,10 @@ function stopStructuredWatchers(sessionName: string): void {
 export async function stopTransportRuntimeSession(sessionName: string): Promise<void> {
   const transportRuntime = transportRuntimes.get(sessionName);
   if (!transportRuntime) return;
-  if (transportRuntime.providerSessionId) unregisterProviderRoute(transportRuntime.providerSessionId);
-  await transportRuntime.kill();
+  const providerSid = transportRuntime.providerSessionId;
   transportRuntimes.delete(sessionName);
+  if (providerSid) unregisterProviderRoute(providerSid);
+  await transportRuntime.kill();
 }
 
 async function teardownSessionRuntime(record: SessionRecord): Promise<void> {
@@ -846,6 +848,11 @@ export async function relaunchSessionWithSettings(
   const compatibleIds = getCompatibleSessionIds(record, targetAgentType);
   const preserveTransportBinding = record.runtimeType === RUNTIME_TYPES.TRANSPORT
     && record.agentType === targetAgentType
+    // Qwen uses providerSessionId as its real resume key, so explicit restart must
+    // preserve it. Claude/Codex SDKs keep their provider continuity in ccSessionId /
+    // codexSessionId and therefore use a fresh local route key on relaunch.
+    && targetAgentType !== 'claude-code-sdk'
+    && targetAgentType !== 'codex-sdk'
     && typeof record.providerSessionId === 'string'
     && record.providerSessionId.length > 0;
 
@@ -952,6 +959,11 @@ function wireTransportSessionInfo(runtime: TransportSessionRuntime, sessionName:
       changed = true;
     }
 
+    if (info.quotaMeta !== undefined && !providerQuotaMetaEquals(next.quotaMeta, info.quotaMeta)) {
+      next.quotaMeta = info.quotaMeta;
+      changed = true;
+    }
+
     if (typeof info.effort === 'string' && next.effort !== info.effort) {
       next.effort = info.effort;
       changed = true;
@@ -1034,7 +1046,8 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       wireTransportSessionInfo(runtime, s.name, s.agentType);
       // After cancel, qwenFreshOnResume is set — don't resume the stuck conversation.
       const freshAfterCancel = !!(s.qwenFreshOnResume && s.providerId === 'qwen');
-      const effectiveSessionKey = freshAfterCancel ? randomUUID() : s.providerSessionId;
+      const needsEphemeralRouteKey = s.providerId === 'claude-code-sdk' || s.providerId === 'codex-sdk';
+      const effectiveSessionKey = freshAfterCancel || needsEphemeralRouteKey ? randomUUID() : s.providerSessionId;
       const resumeId = s.providerId === 'claude-code-sdk'
         ? s.ccSessionId
         : s.providerId === 'codex-sdk'
@@ -1086,7 +1099,9 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         ...s,
         state: 'idle',
         updatedAt: Date.now(),
-        ...(freshAfterCancel ? { providerSessionId: actualProviderSid, qwenFreshOnResume: undefined } : {}),
+        ...((freshAfterCancel || s.providerSessionId !== actualProviderSid)
+          ? { providerSessionId: actualProviderSid, ...(freshAfterCancel ? { qwenFreshOnResume: undefined } : {}) }
+          : {}),
         requestedModel: effectiveRequestedModel ?? s.requestedModel,
         activeModel: effectiveRequestedModel ?? s.activeModel ?? s.modelDisplay,
         modelDisplay: effectiveRequestedModel ?? s.modelDisplay,
@@ -1123,13 +1138,13 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     const existingRuntime = transportRuntimes.get(name);
     if (existingRuntime) {
       const oldProviderSid = existingRuntime.providerSessionId;
+      transportRuntimes.delete(name);
+      if (oldProviderSid) unregisterProviderRoute(oldProviderSid);
       try {
         await existingRuntime.kill();
       } catch (err) {
         logger.warn({ err, session: name }, 'Failed to kill existing transport runtime before fresh launch');
       }
-      transportRuntimes.delete(name);
-      if (oldProviderSid) unregisterProviderRoute(oldProviderSid);
     }
   }
 
@@ -1144,7 +1159,7 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   let qwenAuthType: SessionRecord['qwenAuthType'] | undefined;
   let qwenAuthLimit: SessionRecord['qwenAuthLimit'] | undefined;
   let availableQwenModels: string[] | undefined;
-  let sdkDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel'> | undefined;
+  let sdkDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'> | undefined;
   let transportSystemPrompt: string | undefined;
   let transportSettings: string | Record<string, unknown> | undefined;
   const storedRequestedModel = !opts.fresh ? existing?.requestedModel : undefined;
@@ -1182,7 +1197,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
       effectiveSkipCreate = false;
     }
   } else if (agentType === 'claude-code-sdk') {
+    effectiveSessionKey = randomUUID();
+    effectiveBindExistingKey = undefined;
     transportResumeId = opts.ccSessionId ?? (!opts.fresh ? getSession(name)?.ccSessionId : undefined) ?? randomUUID();
+    if (!opts.fresh && transportResumeId) {
+      effectiveSkipCreate = true;
+    }
     // Switching from Claude CLI -> SDK must resume the inherited conversation.
     // Re-creating with the same sessionId makes Claude reject the turn with
     // "Session ID ... is already in use", which is what users were seeing.
@@ -1204,7 +1224,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     }
     sdkDisplay = await getClaudeSdkRuntimeConfig().catch(() => ({}));
   } else if (agentType === 'codex-sdk') {
+    effectiveSessionKey = randomUUID();
+    effectiveBindExistingKey = undefined;
     transportResumeId = opts.codexSessionId ?? (!opts.fresh ? getSession(name)?.codexSessionId : undefined);
+    if (!opts.fresh && transportResumeId) {
+      effectiveSkipCreate = true;
+    }
     sdkDisplay = await getCodexRuntimeConfig().catch(() => ({}));
   }
 
@@ -1374,7 +1399,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     }
   }
 
-  let familyDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel'> | undefined;
+  let familyDisplay: Pick<SessionRecord, 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'> | undefined;
   if (agentType === 'codex') {
     familyDisplay = await getCodexRuntimeConfig().catch(() => ({}));
   } else if (agentType === 'claude-code' && !opts.ccPreset) {

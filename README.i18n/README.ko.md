@@ -4,7 +4,7 @@
 
 **AI 에이전트를 위한 IM.**
 
-IM.codes는 AI 코딩 에이전트를 위한 전용 메신저입니다. 모바일이나 웹에서 장시간 실행 중인 agent session에 접근해 터미널, 파일 브라우징, Git 변경 보기, localhost 미리보기, 알림, 멀티 에이전트 워크플로를 사용할 수 있습니다. Claude Code, Codex, Gemini CLI, OpenClaw, Qwen을 지원합니다.
+IM.codes는 AI 코딩 에이전트를 위한 전용 메신저입니다. iPhone, iPad, Apple Watch, 모바일이나 웹에서 장시간 실행 중인 agent session에 접근해 터미널, 파일 브라우징, Git 변경 보기, localhost 미리보기, 알림, 멀티 에이전트 워크플로를 사용할 수 있습니다. Claude Code, Codex, Gemini CLI, OpenClaw, Qwen을 지원합니다.
 
 > 이 문서는 번역본입니다. **기준 문서는 영어 README(`../README.md`)입니다.** 차이가 있으면 영어판을 우선합니다.
 

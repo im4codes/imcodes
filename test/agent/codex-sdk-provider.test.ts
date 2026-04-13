@@ -111,6 +111,7 @@ const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 describe('CodexSdkProvider', () => {
   beforeEach(() => {
+    vi.useRealTimers();
     childProcessMock.spawn.mockClear();
     childProcessMock.execFile.mockClear();
     childProcessMock.children.length = 0;
@@ -247,6 +248,28 @@ describe('CodexSdkProvider', () => {
     const child = childProcessMock.children[0];
     await provider.cancel('route-cancel');
     expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(true);
+  });
+
+  it('recovers the session when turn/interrupt never produces an interrupted completion', async () => {
+    vi.useFakeTimers();
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-cancel-timeout', cwd: '/tmp/project' });
+
+    const errors: string[] = [];
+    provider.onError((_sid, err) => errors.push(err.code));
+
+    await provider.send('route-cancel-timeout', 'hello');
+    const child = childProcessMock.children[0];
+
+    await provider.cancel('route-cancel-timeout');
+    await vi.advanceTimersByTimeAsync(1_600);
+
+    expect(child.requests.some((req) => req.method === 'turn/interrupt')).toBe(true);
+    expect(errors).toContain('CANCELLED');
+
+    await provider.send('route-cancel-timeout', 'after-cancel');
+    expect(child.requests.filter((req) => req.method === 'turn/start')).toHaveLength(2);
   });
 
   it('emits WebSearch tool events for webSearch items', async () => {

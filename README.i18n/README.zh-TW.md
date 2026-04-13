@@ -5,7 +5,7 @@
 
 **Agent 的即時通訊層。**
 
-IM.codes 是一个面向 AI 编码代理的專用即時通訊器。你可以在手機或網頁上持续檢視长时间运行的 agent 会话，直接访问终端、瀏覽文件、檢視 Git 變更、預覽本地 localhost、接收通知，并进行多 agent 协作。支持 [Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、[OpenClaw](https://openclaw.com)、[Qwen](https://github.com/QwenLM/qwen-agent) 等，也支持 transport 型 agent 的原生流式输出。
+IM.codes 是一个面向 AI 编码代理的專用即時通訊器。你可以在 iPhone、iPad、Apple Watch、手機或網頁上持续檢視长时间运行的 agent 会话，直接访问终端、瀏覽文件、檢視 Git 變更、預覽本地 localhost、接收通知，并进行多 agent 协作。支持 [Claude Code](https://github.com/anthropics/claude-code)、[Codex](https://github.com/openai/codex)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、[OpenClaw](https://openclaw.com)、[Qwen](https://github.com/QwenLM/qwen-agent) 等，也支持 transport 型 agent 的原生流式输出。
 
 > **說明：** 本文件是中文翻译版。**英文 README（`../README.md`）是規範版本。** 若内容存在差异，以英文版为准。
 

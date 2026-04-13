@@ -26,6 +26,8 @@ interface Props {
   activeThinkingTs?: number | null;
   /** Status text from agent (e.g. "Reading file..."). */
   statusText?: string | null;
+  /** Whether the current live tail is an active tool call. */
+  activeToolCall?: boolean;
   /** Current timestamp for thinking timer (updated every second). */
   now?: number;
 }
@@ -35,10 +37,11 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, now }: Props) {
+export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, now }: Props) {
   const { t } = useTranslation();
   const isCodexFamily = agentType === 'codex' || agentType === 'codex-sdk';
-  const showRunningStatus = sessionState === 'running' && !!(activeThinkingTs || statusText);
+  const hasActiveLiveWork = !!activeToolCall || !!activeThinkingTs;
+  const showLiveStatus = sessionState === 'running' || sessionState === 'idle' || hasActiveLiveWork;
   const [quotaNow, setQuotaNow] = useState(() => Date.now());
 
   const displayModel = modelOverride ?? usage.model;
@@ -95,6 +98,21 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const monthlyCost = sessionCost > 0 ? getMonthlyCost() : 0;
   const modelLabel = shortModelLabel(displayModel);
   const inlineQuotaText = displayQuotaLabel;
+  const liveStatusMode = hasActiveLiveWork
+    ? (activeToolCall ? 'tool' : 'thinking')
+    : sessionState === 'running'
+      ? 'running'
+      : sessionState === 'idle' ? 'idle' : null;
+  const liveStatusText = useMemo(() => {
+    if (hasActiveLiveWork || sessionState === 'running') {
+      if (activeToolCall) return statusText || 'Tool running...';
+      if (activeThinkingTs) return t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) });
+      return 'Agent working...';
+    }
+    if (sessionState === 'idle') return 'Agent idle — waiting for input';
+    return null;
+  }, [activeThinkingTs, activeToolCall, hasActiveLiveWork, now, sessionState, statusText, t]);
+  const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool';
   const codexQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk')
     ? (displayQuotaLabel ?? '').split(' · ').filter(Boolean)
     : [];
@@ -115,12 +133,14 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
         </div>
       )}
       <div class="session-usage-stats">
-        {showRunningStatus && (
-          <span class="session-thinking-inline">
-            <span class="chat-thinking-dots">···</span>
-            {' '}{activeThinkingTs
-              ? t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) })
-              : statusText}
+        {showLiveStatus && liveStatusText && liveStatusMode && (
+          <span class={`session-live-status-inline ${liveStatusMode}`} title={liveStatusText} aria-label={liveStatusText}>
+            <span class="session-live-status-emoji robot">🤖</span>
+            {liveStatusMode === 'running' && <span class="session-live-status-emoji gear">⚙️</span>}
+            {liveStatusMode === 'thinking' && <span class="session-live-status-emoji thought">💭</span>}
+            {liveStatusMode === 'tool' && <span class="session-live-status-emoji tool">🔍</span>}
+            {liveStatusMode === 'idle' && <span class="session-live-status-emoji sleep">💤</span>}
+            {showInlineStatusText && <span class="session-live-status-text">{liveStatusText}</span>}
           </span>
         )}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>

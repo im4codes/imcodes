@@ -11,7 +11,7 @@ import {
 } from '../api.js';
 import type { WsClient } from '../ws-client.js';
 import { isRunningTimelineEvent } from '../timeline-running.js';
-import { extractTransportPendingMessages } from '../transport-queue.js';
+import { extractTransportPendingMessages, mergeTransportPendingMessagesForRunningState } from '../transport-queue.js';
 
 export interface SubSession extends SubSessionData {
   sessionName: string;
@@ -252,12 +252,19 @@ export function useSubSessions(
         return;
       }
       if (state === 'running' && hasPendingMessagesField) {
-        const pendingMessages = extractTransportPendingMessages(msg.event.payload.pendingMessages);
         setSubSessions((prev) => {
           const idx = prev.findIndex((s) => s.sessionName === sessionName);
           if (idx === -1) return prev;
           const next = [...prev];
-          next[idx] = { ...next[idx], state: 'running', transportPendingMessages: pendingMessages };
+          next[idx] = {
+            ...next[idx],
+            state: 'running',
+            transportPendingMessages: mergeTransportPendingMessagesForRunningState(
+              next[idx].transportPendingMessages,
+              msg.event.payload.pendingMessages,
+              true,
+            ),
+          };
           return next;
         });
         return;

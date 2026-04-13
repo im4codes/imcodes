@@ -21,8 +21,8 @@ interface Props {
   /** When set to a session name, triggers inline rename */
   renameRequest?: string | null;
   onRenameHandled?: () => void;
-  /** Called when user commits a rename — updates project_name in D1 */
-  onRenameSession?: (sessionName: string, newProjectName: string) => void;
+  /** Called when user commits a rename — updates session label in D1 */
+  onRenameSession?: (sessionName: string, nextLabel: string | null) => void;
   /** True once sessions have been loaded (from API or WS) */
   sessionsLoaded?: boolean;
 }
@@ -149,14 +149,14 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
 
   const startRename = (s: SessionInfo) => {
     setCtx(null);
-    setRenameVal(s.project);
+    setRenameVal(s.label ?? '');
     setRenaming(s.name);
   };
 
   const commitRename = () => {
     if (!renaming) return;
     const trimmed = renameVal.trim();
-    if (trimmed) onRenameSession?.(renaming, trimmed);
+    onRenameSession?.(renaming, trimmed || null);
     setRenaming(null);
   };
 
