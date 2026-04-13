@@ -34,7 +34,7 @@ afterEach(() => {
 });
 
 describe('UsageFooter', () => {
-  it('renders idle, thinking, and running live status inline with footer stats', () => {
+  it('prioritizes active thinking over stale idle state and renders running states inline', () => {
     const { container, rerender } = render(
       <UsageFooter
         usage={{
@@ -49,13 +49,12 @@ describe('UsageFooter', () => {
       />,
     );
 
-    const idleStatus = container.querySelector('.session-live-status-inline') as HTMLSpanElement | null;
-    expect(idleStatus?.textContent).toContain('🤖');
-    expect(idleStatus?.textContent).toContain('💤');
-    expect(idleStatus?.getAttribute('aria-label')).toContain('Agent idle');
-    expect(container.querySelector('.chat-thinking-dots')).toBeNull();
-    expect(container.querySelector('.session-live-status-inline.idle .session-live-status-emoji.sleep')).toBeTruthy();
-    expect(container.querySelector('.session-live-status-text')).toBeNull();
+    const staleIdleStatus = container.querySelector('.session-live-status-inline') as HTMLSpanElement | null;
+    expect(staleIdleStatus?.textContent).toContain('🤖');
+    expect(staleIdleStatus?.textContent).toContain('💭');
+    expect(staleIdleStatus?.getAttribute('aria-label')).toContain('thinking');
+    expect(container.querySelector('.session-live-status-inline.thinking .session-live-status-emoji.thought')).toBeTruthy();
+    expect(container.querySelector('.session-live-status-inline.idle')).toBeNull();
 
     rerender(
       <UsageFooter
