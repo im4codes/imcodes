@@ -25,7 +25,12 @@ describe('MaterializationCoordinator', () => {
   it('queues threshold jobs when event counts exceed the configured threshold', () => {
     const coordinator = new MaterializationCoordinator({
       thresholds: { eventCount: 2, idleMs: 1000, scheduleMs: 10_000 },
-      modelConfig: { primaryContextModel: 'gpt-5.2', backupContextModel: 'qwen' },
+      modelConfig: {
+        primaryContextBackend: 'codex-sdk',
+        primaryContextModel: 'gpt-5.2',
+        backupContextBackend: 'qwen',
+        backupContextModel: 'qwen',
+      },
     });
 
     const first = coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'hello', createdAt: 100 });
@@ -68,7 +73,12 @@ describe('MaterializationCoordinator', () => {
   it('materializes recent summaries and durable memory candidates and queues replication', () => {
     const coordinator = new MaterializationCoordinator({
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
-      modelConfig: { primaryContextModel: 'sonnet', backupContextModel: 'gpt-5.2' },
+      modelConfig: {
+        primaryContextBackend: 'claude-code-sdk',
+        primaryContextModel: 'sonnet',
+        backupContextBackend: 'codex-sdk',
+        backupContextModel: 'gpt-5.2',
+      },
     });
 
     coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'open the issue', createdAt: 100 });
@@ -78,7 +88,9 @@ describe('MaterializationCoordinator', () => {
 
     expect(result.summaryProjection.summary).toContain('user.turn: open the issue');
     expect(result.summaryProjection.content).toEqual(expect.objectContaining({
+      primaryContextBackend: 'claude-code-sdk',
       primaryContextModel: 'sonnet',
+      backupContextBackend: 'codex-sdk',
       backupContextModel: 'gpt-5.2',
       trigger: 'manual',
       eventCount: 2,
@@ -95,12 +107,16 @@ describe('MaterializationCoordinator', () => {
 
   it('reads primary/backup context models from the synced runtime config when explicit overrides are absent', () => {
     setContextModelRuntimeConfig({
+      primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.2',
+      backupContextBackend: 'qwen',
       backupContextModel: 'qwen',
     });
     const coordinator = new MaterializationCoordinator();
     expect(coordinator.modelConfig).toEqual({
+      primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.2',
+      backupContextBackend: 'qwen',
       backupContextModel: 'qwen',
     });
   });

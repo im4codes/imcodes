@@ -110,19 +110,41 @@ describe('SharedContextManagementPanel', () => {
     removeTeamMemberMock.mockResolvedValue({ ok: true });
     fetchSharedContextRuntimeConfigMock.mockResolvedValue({
       snapshot: {
-        persisted: { primaryContextModel: 'sonnet', backupContextModel: undefined },
-        effective: { primaryContextModel: 'sonnet', backupContextModel: undefined },
+        persisted: {
+          primaryContextBackend: 'claude-code-sdk',
+          primaryContextModel: 'sonnet',
+          backupContextBackend: undefined,
+          backupContextModel: undefined,
+        },
+        effective: {
+          primaryContextBackend: 'claude-code-sdk',
+          primaryContextModel: 'sonnet',
+          backupContextBackend: undefined,
+          backupContextModel: undefined,
+        },
         envPrimaryOverrideActive: false,
         envBackupOverrideActive: false,
+        defaultPrimaryContextBackend: 'claude-code-sdk',
         defaultPrimaryContextModel: 'sonnet',
       },
     });
     updateSharedContextRuntimeConfigMock.mockResolvedValue({
       snapshot: {
-        persisted: { primaryContextModel: 'gpt-5.4', backupContextModel: 'haiku' },
-        effective: { primaryContextModel: 'gpt-5.4', backupContextModel: 'haiku' },
+        persisted: {
+          primaryContextBackend: 'codex-sdk',
+          primaryContextModel: 'gpt-5.4',
+          backupContextBackend: 'claude-code-sdk',
+          backupContextModel: 'haiku',
+        },
+        effective: {
+          primaryContextBackend: 'codex-sdk',
+          primaryContextModel: 'gpt-5.4',
+          backupContextBackend: 'claude-code-sdk',
+          backupContextModel: 'haiku',
+        },
         envPrimaryOverrideActive: false,
         envBackupOverrideActive: false,
+        defaultPrimaryContextBackend: 'claude-code-sdk',
         defaultPrimaryContextModel: 'sonnet',
       },
     });
@@ -286,9 +308,13 @@ describe('SharedContextManagementPanel', () => {
 
     await waitFor(() => expect(fetchSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1'));
 
+    const primaryBackend = screen.getByLabelText('sharedContext.management.processingPrimaryBackend') as HTMLSelectElement;
     const primaryInput = screen.getByLabelText('sharedContext.management.processingPrimaryModel') as HTMLInputElement;
+    const backupBackend = screen.getByLabelText('sharedContext.management.processingBackupBackend') as HTMLSelectElement;
     const backupInput = screen.getByLabelText('sharedContext.management.processingBackupModel') as HTMLInputElement;
+    fireEvent.change(primaryBackend, { target: { value: 'codex-sdk' } });
     fireEvent.input(primaryInput, { target: { value: 'gpt-5.4' } });
+    fireEvent.change(backupBackend, { target: { value: 'claude-code-sdk' } });
     fireEvent.input(backupInput, { target: { value: 'haiku' } });
     await flush();
 
@@ -297,9 +323,12 @@ describe('SharedContextManagementPanel', () => {
     });
 
     await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1', {
+      primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.4',
+      backupContextBackend: 'claude-code-sdk',
       backupContextModel: 'haiku',
     }));
     expect(await screen.findByText('gpt-5.4')).toBeDefined();
+    expect(await screen.findByText('sharedContext.management.processingSavedPrimaryBackend')).toBeDefined();
   });
 });

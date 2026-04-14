@@ -64,7 +64,9 @@ const namespaceResolutionSchema = z.object({
 });
 
 const runtimeConfigSchema = z.object({
+  primaryContextBackend: z.enum(['claude-code-sdk', 'codex-sdk', 'qwen', 'openclaw']).optional().nullable(),
   primaryContextModel: z.string().trim().min(1),
+  backupContextBackend: z.enum(['claude-code-sdk', 'codex-sdk', 'qwen', 'openclaw']).optional().nullable(),
   backupContextModel: z.string().trim().optional().nullable(),
 });
 
@@ -171,7 +173,9 @@ serverRoutes.put('/:id/shared-context/runtime-config', requireAuth(), async (c) 
   const parsed = runtimeConfigSchema.safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const normalized = normalizeSharedContextRuntimeConfig({
+    primaryContextBackend: parsed.data.primaryContextBackend ?? undefined,
     primaryContextModel: parsed.data.primaryContextModel,
+    backupContextBackend: parsed.data.backupContextBackend ?? undefined,
     backupContextModel: parsed.data.backupContextModel ?? undefined,
   });
   const updated = await updateServerSharedContextRuntimeConfig(c.env.DB, serverId, userId, normalized);

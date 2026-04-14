@@ -59,7 +59,10 @@ import {
   type TransportEffortLevel,
 } from '../../shared/effort-levels.js';
 import { getSavedP2pConfig, upsertSavedP2pConfig } from '../store/p2p-config-store.js';
-import { SHARED_CONTEXT_RUNTIME_CONFIG_MSG } from '../../shared/shared-context-runtime-config.js';
+import {
+  normalizeSharedContextRuntimeBackend,
+  SHARED_CONTEXT_RUNTIME_CONFIG_MSG,
+} from '../../shared/shared-context-runtime-config.js';
 
 const MAX_P2P_FILE_PULL_COUNT = 20;
 
@@ -3839,15 +3842,23 @@ async function handleCcPresetsSave(cmd: Record<string, unknown>, serverLink: Ser
 
 async function handleSharedContextRuntimeConfigApply(cmd: Record<string, unknown>): Promise<void> {
   const config = cmd.config as Record<string, unknown> | undefined;
+  const primaryContextBackend = normalizeSharedContextRuntimeBackend(
+    typeof config?.primaryContextBackend === 'string' ? config.primaryContextBackend : undefined,
+  );
   const primaryContextModel = typeof config?.primaryContextModel === 'string' ? config.primaryContextModel.trim() : '';
+  const backupContextBackend = normalizeSharedContextRuntimeBackend(
+    typeof config?.backupContextBackend === 'string' ? config.backupContextBackend : undefined,
+  );
   const backupContextModel = typeof config?.backupContextModel === 'string' ? config.backupContextModel.trim() : '';
-  if (!primaryContextModel) {
+  if (!primaryContextBackend || !primaryContextModel) {
     logger.warn({ cmd }, 'invalid shared-context runtime config apply command');
     return;
   }
   const { setContextModelRuntimeConfig } = await import('../context/context-model-config.js');
   setContextModelRuntimeConfig({
+    primaryContextBackend,
     primaryContextModel,
+    backupContextBackend: backupContextModel ? (backupContextBackend ?? primaryContextBackend) : undefined,
     backupContextModel: backupContextModel || undefined,
   });
 }

@@ -71,7 +71,12 @@ describe('shared-agent-context continuity integration', () => {
     };
     const coordinator = new MaterializationCoordinator({
       thresholds: { eventCount: 99, idleMs: 1_000, scheduleMs: 10_000 },
-      modelConfig: { primaryContextModel: 'gpt-5.2', backupContextModel: 'qwen' },
+      modelConfig: {
+        primaryContextBackend: 'codex-sdk',
+        primaryContextModel: 'gpt-5.2',
+        backupContextBackend: 'qwen',
+        backupContextModel: 'qwen',
+      },
     });
 
     coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'Investigate rollout failure', createdAt: 100 });
@@ -135,7 +140,12 @@ describe('shared-agent-context continuity integration', () => {
     };
     const coordinator = new MaterializationCoordinator({
       thresholds: { eventCount: 99, idleMs: 1_000, scheduleMs: 10_000 },
-      modelConfig: { primaryContextModel: 'sonnet', backupContextModel: 'gpt-5.2' },
+      modelConfig: {
+        primaryContextBackend: 'claude-code-sdk',
+        primaryContextModel: 'sonnet',
+        backupContextBackend: 'codex-sdk',
+        backupContextModel: 'gpt-5.2',
+      },
     });
 
     coordinator.ingestEvent({ target, eventType: 'decision', content: 'Repository migration stays incremental', createdAt: 10 });

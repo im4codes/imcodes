@@ -9,11 +9,15 @@ describe('context-model-config', () => {
 
   it('uses runtime config overrides ahead of defaults', () => {
     setContextModelRuntimeConfig({
+      primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.4',
+      backupContextBackend: 'claude-code-sdk',
       backupContextModel: 'haiku',
     });
     expect(getContextModelConfig()).toEqual({
+      primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.4',
+      backupContextBackend: 'claude-code-sdk',
       backupContextModel: 'haiku',
     });
   });
@@ -21,8 +25,10 @@ describe('context-model-config', () => {
   it('does not let env vars override the synced runtime config', () => {
     vi.stubEnv('IMCODES_PRIMARY_CONTEXT_MODEL', 'env-model');
     setContextModelRuntimeConfig({
+      primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'synced-model',
     });
     expect(getContextModelConfig().primaryContextModel).toBe('synced-model');
+    expect(getContextModelConfig().primaryContextBackend).toBe('codex-sdk');
   });
 });

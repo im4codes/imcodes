@@ -7,7 +7,9 @@ describe('fetchBackendSharedContextRuntimeConfig', () => {
       ok: true,
       json: async () => ({
         config: {
+          primaryContextBackend: 'codex-sdk',
           primaryContextModel: 'gpt-5.4',
+          backupContextBackend: 'claude-code-sdk',
           backupContextModel: 'haiku',
         },
       }),
@@ -19,7 +21,9 @@ describe('fetchBackendSharedContextRuntimeConfig', () => {
       serverId: 'srv-1',
       token: 'secret',
     })).resolves.toEqual({
+      primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.4',
+      backupContextBackend: 'claude-code-sdk',
       backupContextModel: 'haiku',
     });
   });

@@ -161,8 +161,12 @@ export interface ContextReplicationState {
   lastError?: string;
 }
 
+export type SharedContextRuntimeBackend = 'claude-code-sdk' | 'codex-sdk' | 'qwen' | 'openclaw';
+
 export interface ContextModelConfig {
+  primaryContextBackend: SharedContextRuntimeBackend;
   primaryContextModel: string;
+  backupContextBackend?: SharedContextRuntimeBackend;
   backupContextModel?: string;
 }
 

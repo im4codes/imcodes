@@ -213,11 +213,15 @@ export async function getServerSharedContextRuntimeConfig(
     ? JSON.parse(row.shared_context_runtime_config)
     : row.shared_context_runtime_config;
   if (!raw || typeof raw !== 'object') return null;
+  const primaryContextBackend = typeof raw.primaryContextBackend === 'string' ? raw.primaryContextBackend.trim() : undefined;
   const primaryContextModel = typeof raw.primaryContextModel === 'string' ? raw.primaryContextModel.trim() : '';
+  const backupContextBackend = typeof raw.backupContextBackend === 'string' ? raw.backupContextBackend.trim() : undefined;
   const backupContextModel = typeof raw.backupContextModel === 'string' ? raw.backupContextModel.trim() : '';
   if (!primaryContextModel) return null;
   return {
+    primaryContextBackend,
     primaryContextModel,
+    backupContextBackend: backupContextBackend || undefined,
     backupContextModel: backupContextModel || undefined,
   };
 }

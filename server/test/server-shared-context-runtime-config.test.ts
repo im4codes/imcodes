@@ -50,6 +50,7 @@ describe('server shared-context runtime config routes', () => {
     vi.clearAllMocks();
     getServerByIdMock.mockResolvedValue({ id: 'srv-1', user_id: 'user-1' });
     getServerSharedContextRuntimeConfigMock.mockResolvedValue({
+      primaryContextBackend: 'claude-code-sdk',
       primaryContextModel: 'sonnet',
       backupContextModel: undefined,
     });
@@ -74,8 +75,8 @@ describe('server shared-context runtime config routes', () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       snapshot: {
-        persisted: { primaryContextModel: 'sonnet' },
-        effective: { primaryContextModel: 'sonnet' },
+        persisted: { primaryContextBackend: 'claude-code-sdk', primaryContextModel: 'sonnet' },
+        effective: { primaryContextBackend: 'claude-code-sdk', primaryContextModel: 'sonnet' },
       },
     });
   });
@@ -86,7 +87,9 @@ describe('server shared-context runtime config routes', () => {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        primaryContextBackend: 'codex-sdk',
         primaryContextModel: 'gpt-5.4',
+        backupContextBackend: 'claude-code-sdk',
         backupContextModel: 'haiku',
       }),
     });
@@ -95,11 +98,21 @@ describe('server shared-context runtime config routes', () => {
       expect.anything(),
       'srv-1',
       'user-1',
-      { primaryContextModel: 'gpt-5.4', backupContextModel: 'haiku' },
+      {
+        primaryContextBackend: 'codex-sdk',
+        primaryContextModel: 'gpt-5.4',
+        backupContextBackend: 'claude-code-sdk',
+        backupContextModel: 'haiku',
+      },
     );
     expect(sendToDaemonMock).toHaveBeenCalledWith(JSON.stringify({
       type: SHARED_CONTEXT_RUNTIME_CONFIG_MSG.APPLY,
-      config: { primaryContextModel: 'gpt-5.4', backupContextModel: 'haiku' },
+      config: {
+        primaryContextBackend: 'codex-sdk',
+        primaryContextModel: 'gpt-5.4',
+        backupContextBackend: 'claude-code-sdk',
+        backupContextModel: 'haiku',
+      },
     }));
   });
 
@@ -111,7 +124,12 @@ describe('server shared-context runtime config routes', () => {
     });
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({
-      config: { primaryContextModel: 'sonnet', backupContextModel: undefined },
+      config: {
+        primaryContextBackend: 'claude-code-sdk',
+        primaryContextModel: 'sonnet',
+        backupContextBackend: undefined,
+        backupContextModel: undefined,
+      },
     });
     expect(queryOneMock).toHaveBeenCalled();
   });

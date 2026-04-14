@@ -2,8 +2,13 @@ import type { ComponentChildren } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '@shared/context-model-defaults.js';
+import type { SharedContextRuntimeBackend } from '@shared/context-types.js';
 import { QWEN_MODEL_IDS } from '@shared/qwen-models.js';
-import type { SharedContextRuntimeConfigSnapshot } from '@shared/shared-context-runtime-config.js';
+import {
+  DEFAULT_PRIMARY_CONTEXT_BACKEND,
+  SHARED_CONTEXT_RUNTIME_BACKENDS,
+  type SharedContextRuntimeConfigSnapshot,
+} from '@shared/shared-context-runtime-config.js';
 import {
   ApiError,
   activateSharedDocumentVersion,
@@ -150,6 +155,13 @@ const PROCESSING_MODEL_OPTIONS = Array.from(new Set([
   ...QWEN_MODEL_IDS,
 ]));
 
+const PROCESSING_MODEL_OPTIONS_BY_BACKEND: Record<SharedContextRuntimeBackend, readonly string[]> = {
+  'claude-code-sdk': CLAUDE_CODE_MODEL_IDS,
+  'codex-sdk': CODEX_MODEL_IDS,
+  qwen: QWEN_MODEL_IDS,
+  openclaw: [],
+};
+
 type KindOption = SharedDocument['kind'];
 type ManagementTab = 'enterprise' | 'members' | 'projects' | 'knowledge' | 'processing';
 
@@ -233,7 +245,9 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [processingLoading, setProcessingLoading] = useState(false);
   const [processingSaving, setProcessingSaving] = useState(false);
   const [processingSnapshot, setProcessingSnapshot] = useState<SharedContextRuntimeConfigSnapshot | null>(null);
+  const [processingPrimaryBackend, setProcessingPrimaryBackend] = useState<SharedContextRuntimeBackend>(DEFAULT_PRIMARY_CONTEXT_BACKEND);
   const [processingPrimaryModel, setProcessingPrimaryModel] = useState(DEFAULT_PRIMARY_CONTEXT_MODEL);
+  const [processingBackupBackend, setProcessingBackupBackend] = useState<SharedContextRuntimeBackend>(DEFAULT_PRIMARY_CONTEXT_BACKEND);
   const [processingBackupModel, setProcessingBackupModel] = useState('');
 
   const selectedDocument = useMemo(
@@ -371,14 +385,18 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
 
   const applyProcessingSnapshot = useCallback((view: SharedContextRuntimeConfigView) => {
     setProcessingSnapshot(view.snapshot);
+    setProcessingPrimaryBackend(view.snapshot.persisted.primaryContextBackend);
     setProcessingPrimaryModel(view.snapshot.persisted.primaryContextModel);
+    setProcessingBackupBackend(view.snapshot.persisted.backupContextBackend ?? view.snapshot.persisted.primaryContextBackend);
     setProcessingBackupModel(view.snapshot.persisted.backupContextModel ?? '');
   }, []);
 
   const reloadProcessingConfig = useCallback(async () => {
     if (!serverId) {
       setProcessingSnapshot(null);
+      setProcessingPrimaryBackend(DEFAULT_PRIMARY_CONTEXT_BACKEND);
       setProcessingPrimaryModel(DEFAULT_PRIMARY_CONTEXT_MODEL);
+      setProcessingBackupBackend(DEFAULT_PRIMARY_CONTEXT_BACKEND);
       setProcessingBackupModel('');
       return;
     }
@@ -832,9 +850,21 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               <>
                 <div style={rowStyle}>
                   <label style={{ ...fieldLabelStyle, flex: '1 1 220px' }}>
+                    <span>{t('sharedContext.management.processingPrimaryBackend')}</span>
+                    <select
+                      value={processingPrimaryBackend}
+                      onChange={(e) => setProcessingPrimaryBackend((e.currentTarget as HTMLSelectElement).value as SharedContextRuntimeBackend)}
+                      style={fieldInputStyle}
+                    >
+                      {SHARED_CONTEXT_RUNTIME_BACKENDS.map((backend) => (
+                        <option key={backend} value={backend}>{backend}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label style={{ ...fieldLabelStyle, flex: '1 1 220px' }}>
                     <span>{t('sharedContext.management.processingPrimaryModel')}</span>
                     <input
-                      list="shared-context-model-options"
+                      list={`shared-context-model-options-${processingPrimaryBackend}`}
                       value={processingPrimaryModel}
                       onInput={(e) => setProcessingPrimaryModel((e.currentTarget as HTMLInputElement).value)}
                       placeholder={DEFAULT_PRIMARY_CONTEXT_MODEL}
@@ -842,21 +872,35 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     />
                   </label>
                   <label style={{ ...fieldLabelStyle, flex: '1 1 220px' }}>
+                    <span>{t('sharedContext.management.processingBackupBackend')}</span>
+                    <select
+                      value={processingBackupBackend}
+                      onChange={(e) => setProcessingBackupBackend((e.currentTarget as HTMLSelectElement).value as SharedContextRuntimeBackend)}
+                      style={fieldInputStyle}
+                    >
+                      {SHARED_CONTEXT_RUNTIME_BACKENDS.map((backend) => (
+                        <option key={backend} value={backend}>{backend}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label style={{ ...fieldLabelStyle, flex: '1 1 220px' }}>
                     <span>{t('sharedContext.management.processingBackupModel')}</span>
                     <input
-                      list="shared-context-model-options"
+                      list={`shared-context-model-options-${processingBackupBackend}`}
                       value={processingBackupModel}
                       onInput={(e) => setProcessingBackupModel((e.currentTarget as HTMLInputElement).value)}
                       placeholder={t('sharedContext.management.processingBackupPlaceholder')}
                       style={fieldInputStyle}
                     />
                   </label>
-                  <datalist id="shared-context-model-options">
-                    {PROCESSING_MODEL_OPTIONS.map((modelId) => (
-                      <option key={modelId} value={modelId} />
+                </div>
+                {SHARED_CONTEXT_RUNTIME_BACKENDS.map((backend) => (
+                  <datalist id={`shared-context-model-options-${backend}`} key={backend}>
+                    {(PROCESSING_MODEL_OPTIONS_BY_BACKEND[backend] ?? PROCESSING_MODEL_OPTIONS).map((modelId) => (
+                      <option key={`${backend}:${modelId}`} value={modelId} />
                     ))}
                   </datalist>
-                </div>
+                ))}
                 <div style={rowStyle}>
                   <button
                     style={buttonStyle}
@@ -865,7 +909,9 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                       setProcessingSaving(true);
                       try {
                         const view = await updateSharedContextRuntimeConfig(serverId, {
+                          primaryContextBackend: processingPrimaryBackend,
                           primaryContextModel: processingPrimaryModel.trim(),
+                          backupContextBackend: processingBackupModel.trim() ? processingBackupBackend : undefined,
                           backupContextModel: processingBackupModel.trim() || undefined,
                         });
                         applyProcessingSnapshot(view);
@@ -885,8 +931,16 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   </button>
                 </div>
                 <LabeledValue
+                  label={t('sharedContext.management.processingSavedPrimaryBackend')}
+                  value={processingSnapshot?.persisted.primaryContextBackend ?? DEFAULT_PRIMARY_CONTEXT_BACKEND}
+                />
+                <LabeledValue
                   label={t('sharedContext.management.processingSavedPrimary')}
                   value={processingSnapshot?.persisted.primaryContextModel ?? DEFAULT_PRIMARY_CONTEXT_MODEL}
+                />
+                <LabeledValue
+                  label={t('sharedContext.management.processingSavedBackupBackend')}
+                  value={processingSnapshot?.persisted.backupContextBackend ?? t('sharedContext.management.processingUnsetValue')}
                 />
                 <LabeledValue
                   label={t('sharedContext.management.processingSavedBackup')}
@@ -895,6 +949,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 {serverId && <LabeledValue label={t('sharedContext.management.processingServerScope')} value={serverId} />}
                 <div>{t('sharedContext.management.processingCloudSyncNote')}</div>
                 <div>{t('sharedContext.management.processingProviderNote')}</div>
+                <div>{t('sharedContext.management.processingBackendNote')}</div>
               </>
             ) : (
               <div>{t('sharedContext.management.processingServerRequired')}</div>
