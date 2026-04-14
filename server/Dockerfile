@@ -18,6 +18,8 @@ RUN cd web && npm ci --ignore-scripts
 # Copy source
 COPY server/ ./server/
 COPY web/ ./web/
+COPY src/repo/ ./src/repo/
+COPY src/agent/repository-identity-service.ts ./src/agent/repository-identity-service.ts
 COPY src/shared/ ./src/shared/
 COPY shared/ ./shared/
 
