@@ -438,4 +438,5 @@ describe('qwen transport flow e2e', () => {
     );
     expect(drainedUser?.payload.text).toBe('queued second');
   });
+
 });
