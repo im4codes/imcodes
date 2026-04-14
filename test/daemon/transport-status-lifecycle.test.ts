@@ -145,7 +145,15 @@ describe('batched queuing', () => {
     mock = makeMockProvider();
     runtime = new TransportSessionRuntime(mock.provider, 'deck_test');
     drainLog = [];
-    runtime.onDrain = (merged, count) => drainLog.push({ merged, count });
+    runtime.onDrain = (...args) => {
+      const merged = typeof args[1] === 'string'
+        ? args[1]
+        : (typeof args[0] === 'string' ? args[0] : '');
+      const count = typeof args[2] === 'number'
+        ? args[2]
+        : (typeof args[1] === 'number' ? args[1] : 0);
+      drainLog.push({ merged, count });
+    };
     await runtime.initialize(defaultConfig);
   });
 
