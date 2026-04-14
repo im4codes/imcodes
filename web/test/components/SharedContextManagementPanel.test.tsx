@@ -235,6 +235,11 @@ describe('SharedContextManagementPanel', () => {
 
     await waitFor(() => expect(getSharedProjectPolicyMock).toHaveBeenCalledWith('enr-1'));
 
+    expect(await screen.findByText('sharedContext.management.policyExplainTitle')).toBeDefined();
+    expect(await screen.findByText('sharedContext.management.allowDegradedHelp')).toBeDefined();
+    expect(await screen.findByText('sharedContext.management.allowLocalFallbackHelp')).toBeDefined();
+    expect(await screen.findByText('sharedContext.management.requireFullSupportHelp')).toBeDefined();
+
     await waitFor(() => {
       const degraded = screen.getByLabelText(/sharedContext.management.allowDegraded/i) as HTMLInputElement;
       const localFallback = screen.getByLabelText(/sharedContext.management.allowLocalFallback/i) as HTMLInputElement;

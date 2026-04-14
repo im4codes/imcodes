@@ -110,6 +110,18 @@ const checkboxRowStyle = {
   alignItems: 'flex-start',
 } as const;
 
+const policyOptionStyle = {
+  flex: '1 1 260px',
+  minWidth: 240,
+  padding: '10px 12px',
+  borderRadius: 10,
+  border: '1px solid #334155',
+  background: '#0f172a',
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 6,
+} as const;
+
 const fieldLabelStyle = {
   display: 'flex',
   flexDirection: 'column',
@@ -640,6 +652,10 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               <strong>{t('sharedContext.management.policyTitle')}</strong>
               {policyLoading && <span style={{ color: '#94a3b8' }}>{t('sharedContext.management.policyLoading')}</span>}
             </div>
+            <InfoCard title={t('sharedContext.management.policyExplainTitle')}>
+              <div>{t('sharedContext.management.policyExplainLine1')}</div>
+              <div>{t('sharedContext.management.policyExplainLine2')}</div>
+            </InfoCard>
             <div style={rowStyle}>
               <select value={selectedEnrollmentId} onChange={(e) => setSelectedEnrollmentId((e.currentTarget as HTMLSelectElement).value)} style={inputStyle}>
                 <option value="">{t('sharedContext.management.selectProject')}</option>
@@ -647,9 +663,30 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               </select>
             </div>
             <div style={checkboxRowStyle}>
-              <label><input type="checkbox" checked={policy.allowDegradedProviderSupport} onChange={(e) => setPolicy((prev) => ({ ...prev, allowDegradedProviderSupport: (e.currentTarget as HTMLInputElement).checked }))} /> {t('sharedContext.management.allowDegraded')}</label>
-              <label><input type="checkbox" checked={policy.allowLocalFallback} onChange={(e) => setPolicy((prev) => ({ ...prev, allowLocalFallback: (e.currentTarget as HTMLInputElement).checked }))} /> {t('sharedContext.management.allowLocalFallback')}</label>
-              <label><input type="checkbox" checked={policy.requireFullProviderSupport} onChange={(e) => setPolicy((prev) => ({ ...prev, requireFullProviderSupport: (e.currentTarget as HTMLInputElement).checked }))} /> {t('sharedContext.management.requireFullSupport')}</label>
+              <label style={policyOptionStyle}>
+                <span>
+                  <input type="checkbox" checked={policy.allowDegradedProviderSupport} onChange={(e) => setPolicy((prev) => ({ ...prev, allowDegradedProviderSupport: (e.currentTarget as HTMLInputElement).checked }))} />
+                  {' '}
+                  {t('sharedContext.management.allowDegraded')}
+                </span>
+                <span style={{ color: '#94a3b8', fontSize: 13 }}>{t('sharedContext.management.allowDegradedHelp')}</span>
+              </label>
+              <label style={policyOptionStyle}>
+                <span>
+                  <input type="checkbox" checked={policy.allowLocalFallback} onChange={(e) => setPolicy((prev) => ({ ...prev, allowLocalFallback: (e.currentTarget as HTMLInputElement).checked }))} />
+                  {' '}
+                  {t('sharedContext.management.allowLocalFallback')}
+                </span>
+                <span style={{ color: '#94a3b8', fontSize: 13 }}>{t('sharedContext.management.allowLocalFallbackHelp')}</span>
+              </label>
+              <label style={policyOptionStyle}>
+                <span>
+                  <input type="checkbox" checked={policy.requireFullProviderSupport} onChange={(e) => setPolicy((prev) => ({ ...prev, requireFullProviderSupport: (e.currentTarget as HTMLInputElement).checked }))} />
+                  {' '}
+                  {t('sharedContext.management.requireFullSupport')}
+                </span>
+                <span style={{ color: '#94a3b8', fontSize: 13 }}>{t('sharedContext.management.requireFullSupportHelp')}</span>
+              </label>
             </div>
             <button
               style={buttonStyle}
