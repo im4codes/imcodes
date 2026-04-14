@@ -331,8 +331,29 @@ export function SubSessionWindow({
     return () => vv.removeEventListener('resize', update);
   }, [isMobile]);
 
+  const [controlsHeight, setControlsHeight] = useState(0);
+  useEffect(() => {
+    if (!isMobile) return;
+    const controls = document.querySelector('.controls-wrapper') as HTMLElement | null;
+    if (!controls) return;
+    const update = () => setControlsHeight(controls.offsetHeight);
+    update();
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(update);
+    ro.observe(controls);
+    return () => ro.disconnect();
+  }, [isMobile]);
+
   const style: Record<string, string | number> = isMobile
-    ? { position: 'fixed', top: 'var(--sat, 0px)', left: 0, right: 0, bottom: 0, height: `calc(${vvh}px - var(--sat, 0px))`, zIndex }
+    ? {
+        position: 'fixed',
+        top: 'var(--sat, 0px)',
+        left: 0,
+        right: 0,
+        bottom: `${controlsHeight}px`,
+        height: `calc(${vvh}px - var(--sat, 0px) - ${controlsHeight}px)`,
+        zIndex,
+      }
     : { position: 'fixed', left: geom.x, top: geom.y, width: geom.w, height: geom.h, zIndex };
 
   return (

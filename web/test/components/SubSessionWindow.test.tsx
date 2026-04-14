@@ -262,6 +262,45 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     cleanup();
   });
 
+  it('on mobile leaves the main controls area visible below the sub-session window', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    const controls = document.createElement('div');
+    controls.className = 'controls-wrapper';
+    Object.defineProperty(controls, 'offsetHeight', { configurable: true, value: 132 });
+    document.body.appendChild(controls);
+
+    const sub = makeSubSession();
+    const { container, unmount } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={6000}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const panel = container.querySelector('.subsession-window') as HTMLElement | null;
+      expect(panel).toBeTruthy();
+      expect(panel?.style.bottom).toBe('132px');
+      expect(panel?.style.height).toContain('132px');
+      expect(panel?.style.zIndex).toBe('6000');
+    });
+
+    unmount();
+    controls.remove();
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+  });
+
 
   it('clamps a persisted off-screen window back into the visible viewport', async () => {
     localStorage.setItem('rcc_subsession_sub-1', JSON.stringify({
