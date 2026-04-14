@@ -1023,7 +1023,8 @@ afterEach(() => {
 
   it('limits openspec dropdown height to the visible space above the trigger', async () => {
     const rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function mockRect() {
-      if ((this as HTMLElement).classList?.contains('shortcuts-model')) {
+      const el = this as HTMLElement;
+      if (el.getAttribute('title') === 'OpenSpec changes') {
         return {
           x: 0, y: 0, top: 220, left: 0, right: 120, bottom: 252, width: 120, height: 32,
           toJSON() { return {}; },
@@ -1096,6 +1097,8 @@ afterEach(() => {
     expect(submenu).toBeTruthy();
     expect(submenu.style.position).toBe('fixed');
     expect(submenu.style.zIndex).toBe('2147483647');
+    expect(within(submenu).getByRole('button', { name: 'audit_implementation_action' })).toBeDefined();
+    expect(within(submenu).getByRole('button', { name: 'audit_spec_action' })).toBeDefined();
   });
 
   it('collapses openspec actions behind a disclosure toggle on mobile', async () => {
@@ -1209,6 +1212,12 @@ afterEach(() => {
       if (el.classList?.contains('shortcuts-model')) {
         return {
           x: 300, y: 0, top: 708, left: 300, right: 372, bottom: 740, width: 72, height: 32,
+          toJSON() { return {}; },
+        } as DOMRect;
+      }
+      if (el.getAttribute('title') === 'OpenSpec changes') {
+        return {
+          x: 314, y: 0, top: 708, left: 314, right: 372, bottom: 740, width: 58, height: 32,
           toJSON() { return {}; },
         } as DOMRect;
       }

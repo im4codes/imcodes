@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
-import type { RefObject } from 'preact';
+import type { ComponentChildren, RefObject } from 'preact';
 import type { WsClient, ServerMessage } from '../ws-client.js';
 import type { SessionInfo } from '../types.js';
 import { QuickInputPanel } from './QuickInputPanel.js';
@@ -376,6 +377,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const thinkingRef = useRef<HTMLDivElement>(null);
   const p2pRef = useRef<HTMLDivElement>(null);
   const openSpecRef = useRef<HTMLDivElement>(null);
+  const openSpecButtonRef = useRef<HTMLButtonElement | null>(null);
   const openSpecAuditButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const openSpecProposeButtonRef = useRef<HTMLButtonElement | null>(null);
   const openSpecRequestIdRef = useRef<string | null>(null);
@@ -758,7 +760,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const openSpecDropdownStyle = useMemo(() => {
     if (!openSpecOpen || typeof window === 'undefined') return undefined;
-    const rect = openSpecRef.current?.getBoundingClientRect();
+    const rect = (openSpecButtonRef.current ?? openSpecRef.current)?.getBoundingClientRect();
     if (!rect) return undefined;
     const availableHeight = Math.max(96, Math.floor(rect.top - 12));
     if (window.innerWidth > 640) {
@@ -770,20 +772,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         zIndex: 2147483646,
       } as const;
     }
-    if (compact) {
-      return {
-        ...getAnchoredOverlayStyle(rect, 320, window.innerWidth, window.innerHeight),
-        zIndex: 2147483646,
-      } as const;
-    }
     return {
-      position: 'fixed',
-      left: 8,
-      right: 8,
-      bottom: Math.max(window.innerHeight - rect.top + 4, 72),
-      width: 'auto',
-      maxWidth: 'none',
-      maxHeight: `${availableHeight}px`,
+      ...getAnchoredOverlayStyle(rect, 320, window.innerWidth, window.innerHeight),
       zIndex: 2147483646,
     } as const;
   }, [openSpecLayoutTick, openSpecOpen]);
@@ -800,6 +790,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       zIndex: 2147483647,
     } as React.CSSProperties;
   }, []);
+
+  const renderOpenSpecSubmenu = useCallback((content: ComponentChildren, trigger: HTMLElement | null, minWidth: number) => {
+    if (typeof document === 'undefined') return null;
+    return createPortal(
+      <div class="menu-dropdown openspec-submenu" style={getOpenSpecSubmenuStyle(trigger, minWidth)}>
+        {content}
+      </div>,
+      document.body,
+    );
+  }, [getOpenSpecSubmenuStyle]);
 
   useEffect(() => {
     if (!openSpecOpen || typeof window === 'undefined') return;
@@ -1657,6 +1657,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           <div class="shortcuts-model" ref={openSpecRef}>
             <button
               class="shortcut-btn"
+              ref={openSpecButtonRef}
               onClick={() => {
                 setOpenSpecOpen((open) => {
                   const next = !open;
@@ -1741,11 +1742,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                         >
                           {t('openspec.audit_action')}
                         </button>
-                        {openSpecAuditMenu === changeName && (
-                          <div
-                            class="menu-dropdown openspec-submenu"
-                            style={getOpenSpecSubmenuStyle(openSpecAuditButtonRefs.current.get(changeName) ?? null, 180)}
-                          >
+                        {openSpecAuditMenu === changeName && renderOpenSpecSubmenu(
+                          <>
                             <button
                               class="menu-item"
                               onClick={() => {
@@ -1770,7 +1768,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                             >
                               {t('openspec.audit_spec_action')}
                             </button>
-                          </div>
+                          </>,
+                          openSpecAuditButtonRefs.current.get(changeName) ?? null,
+                          180,
                         )}
                       </div>
                       <button
@@ -1818,11 +1818,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     >
                       {t('openspec.propose_action')}
                     </button>
-                    {openSpecProposeMenuOpen && (
-                      <div
-                        class="menu-dropdown openspec-submenu"
-                        style={getOpenSpecSubmenuStyle(openSpecProposeButtonRef.current, 220)}
-                      >
+                    {openSpecProposeMenuOpen && renderOpenSpecSubmenu(
+                      <>
                         <button
                           class="menu-item"
                           onClick={() => {
@@ -1845,7 +1842,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                         >
                           {t('openspec.propose_from_description_action')}
                         </button>
-                      </div>
+                      </>,
+                      openSpecProposeButtonRef.current,
+                      220,
                     )}
                   </div>
                 </div>
