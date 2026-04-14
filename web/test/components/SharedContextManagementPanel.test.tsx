@@ -2,6 +2,7 @@
  * @vitest-environment jsdom
  */
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
+import { useState } from 'preact/hooks';
 import { act } from 'preact/test-utils';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -154,5 +155,31 @@ describe('SharedContextManagementPanel', () => {
       canonicalRepoId: 'github.com/acme/new-repo',
       scope: 'project_shared',
     }));
+  });
+
+  it('does not loop enterprise-change notifications when parent rerenders with a new callback identity', async () => {
+    const onEnterpriseChange = vi.fn();
+
+    function Wrapper() {
+      const [, setTick] = useState(0);
+      return (
+        <div>
+          <button type="button" onClick={() => setTick((prev) => prev + 1)}>rerender</button>
+          <SharedContextManagementPanel onEnterpriseChange={(enterpriseId) => onEnterpriseChange(enterpriseId)} />
+        </div>
+      );
+    }
+
+    render(<Wrapper />);
+    await flush();
+    await waitFor(() => expect(getTeamMock).toHaveBeenCalledWith('team-1'));
+    expect(onEnterpriseChange).toHaveBeenCalledTimes(1);
+    expect(onEnterpriseChange).toHaveBeenLastCalledWith('team-1');
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('rerender'));
+    });
+
+    expect(onEnterpriseChange).toHaveBeenCalledTimes(1);
   });
 });

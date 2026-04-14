@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
   ApiError,
@@ -80,6 +80,8 @@ interface Props {
 
 export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId, onEnterpriseChange }: Props) {
   const { t } = useTranslation();
+  const onEnterpriseChangeRef = useRef(onEnterpriseChange);
+  onEnterpriseChangeRef.current = onEnterpriseChange;
   const [teams, setTeams] = useState<TeamSummary[]>([]);
   const [enterpriseId, setEnterpriseId] = useState(initialEnterpriseId ?? '');
   const [team, setTeam] = useState<TeamDetail | null>(null);
@@ -164,7 +166,6 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         setTeams(nextTeams);
         if (!enterpriseId && nextTeams[0]) {
           setEnterpriseId(nextTeams[0].id);
-          onEnterpriseChange?.(nextTeams[0].id);
         }
       })
       .catch((err) => setError(err instanceof Error ? err.message : String(err)));
@@ -172,9 +173,9 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
 
   useEffect(() => {
     if (!enterpriseId) return;
-    onEnterpriseChange?.(enterpriseId);
+    onEnterpriseChangeRef.current?.(enterpriseId);
     void refreshEnterpriseData(enterpriseId);
-  }, [enterpriseId, onEnterpriseChange, refreshEnterpriseData]);
+  }, [enterpriseId]);
 
   const handleAction = useCallback(async (label: string, fn: () => Promise<void>) => {
     setError(null);
