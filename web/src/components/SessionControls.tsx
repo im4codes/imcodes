@@ -378,6 +378,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const thinkingRef = useRef<HTMLDivElement>(null);
   const p2pRef = useRef<HTMLDivElement>(null);
   const openSpecRef = useRef<HTMLDivElement>(null);
+  const openSpecDropdownRef = useRef<HTMLDivElement | null>(null);
   const openSpecButtonRef = useRef<HTMLButtonElement | null>(null);
   const openSpecAuditButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const openSpecProposeButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -656,7 +657,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       if (p2pOpen && p2pRef.current && !p2pRef.current.contains(e.target as Node)) {
         setP2pOpen(false);
       }
-      if (openSpecOpen && openSpecRef.current && !openSpecRef.current.contains(e.target as Node)) {
+      if (
+        openSpecOpen
+        && openSpecRef.current
+        && !openSpecRef.current.contains(e.target as Node)
+        && !openSpecDropdownRef.current?.contains(e.target as Node)
+      ) {
         setOpenSpecOpen(false);
         setOpenSpecAuditMenu(null);
         setOpenSpecProposeMenuOpen(false);
@@ -826,6 +832,20 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       document.body,
     );
   }, [getOpenSpecSubmenuStyle, isOpenSpecMobile]);
+
+  const renderOpenSpecDropdown = useCallback((content: ComponentChildren) => {
+    if (typeof document === 'undefined') return null;
+    return createPortal(
+      <div
+        class="menu-dropdown menu-dropdown-openspec"
+        ref={openSpecDropdownRef}
+        style={openSpecDropdownStyle}
+      >
+        {content}
+      </div>,
+      document.body,
+    );
+  }, [openSpecDropdownStyle]);
 
   useEffect(() => {
     if (!openSpecOpen || typeof window === 'undefined') return;
@@ -1713,8 +1733,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             >
               {t('openspec.title')}
             </button>
-            {openSpecOpen && (
-              <div class="menu-dropdown menu-dropdown-openspec" style={openSpecDropdownStyle}>
+            {openSpecOpen && renderOpenSpecDropdown(
+              <>
                 <div class="openspec-dropdown-scroll">
                 <div class="p2p-menu-section-label openspec-section-label">{t('openspec.changes')}</div>
                 {openSpecLoading && (
@@ -1886,7 +1906,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     )}
                   </div>
                 </div>
-              </div>
+              </>
             )}
           </div>
         )}
