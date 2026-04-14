@@ -7,6 +7,9 @@ RUN apt-get update \
 
 WORKDIR /app
 
+# Preserve the root package boundary so NodeNext compiles /app/src as ESM.
+COPY package.json ./
+
 # Install deps for server
 COPY server/package.json server/package-lock.json* ./server/
 RUN cd server && npm ci --ignore-scripts
