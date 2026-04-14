@@ -132,6 +132,41 @@ function getP2pMenuItemColor(mode: string, active: boolean): string {
   return getP2pModeColor(mode);
 }
 
+function getAnchoredOverlayStyle(
+  trigger: DOMRect,
+  minWidth: number,
+  viewportWidth: number,
+  viewportHeight: number,
+): React.CSSProperties {
+  const horizontalInset = 8;
+  const verticalInset = 12;
+  const triggerGap = 6;
+  const preferredWidth = Math.max(minWidth, Math.ceil(trigger.width));
+  const width = Math.min(preferredWidth, viewportWidth - horizontalInset * 2);
+  const maxLeft = Math.max(horizontalInset, viewportWidth - width - horizontalInset);
+  const left = Math.min(Math.max(trigger.right - width, horizontalInset), maxLeft);
+  const availableAbove = Math.max(96, Math.floor(trigger.top - verticalInset));
+  const availableBelow = Math.max(96, Math.floor(viewportHeight - trigger.bottom - verticalInset));
+  const shouldOpenBelow = availableBelow >= 180 || availableBelow >= availableAbove;
+
+  const style = {
+    position: 'fixed',
+    left: `${Math.round(left)}px`,
+    width: `${Math.round(width)}px`,
+    minWidth: `${Math.round(width)}px`,
+    maxWidth: `${Math.round(width)}px`,
+    maxHeight: `${shouldOpenBelow ? availableBelow : availableAbove}px`,
+  } as React.CSSProperties;
+
+  if (shouldOpenBelow) {
+    style.top = `${Math.max(Math.round(trigger.bottom + triggerGap), horizontalInset)}px`;
+  } else {
+    style.bottom = `${Math.max(viewportHeight - trigger.top + triggerGap, horizontalInset)}px`;
+  }
+
+  return style;
+}
+
 type OptionalP2pAdvancedConfig = {
   advancedPresetKey?: unknown;
   advancedRounds?: unknown;
@@ -735,6 +770,12 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         zIndex: 2147483646,
       } as const;
     }
+    if (compact) {
+      return {
+        ...getAnchoredOverlayStyle(rect, 320, window.innerWidth, window.innerHeight),
+        zIndex: 2147483646,
+      } as const;
+    }
     return {
       position: 'fixed',
       left: 8,
@@ -754,37 +795,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   const getOpenSpecSubmenuStyle = useCallback((trigger: HTMLElement | null, minWidth: number) => {
     if (!trigger || typeof window === 'undefined') return undefined;
-    const rect = trigger.getBoundingClientRect();
-    const viewportWidth = window.innerWidth;
-    const viewportHeight = window.innerHeight;
-    const horizontalInset = 8;
-    const verticalInset = 12;
-    const triggerGap = 6;
-    const preferredWidth = Math.max(minWidth, Math.ceil(rect.width));
-    const width = Math.min(preferredWidth, viewportWidth - horizontalInset * 2);
-    const maxLeft = Math.max(horizontalInset, viewportWidth - width - horizontalInset);
-    const left = Math.min(Math.max(rect.right - width, horizontalInset), maxLeft);
-    const availableAbove = Math.max(96, Math.floor(rect.top - verticalInset));
-    const availableBelow = Math.max(96, Math.floor(viewportHeight - rect.bottom - verticalInset));
-    const shouldOpenBelow = availableBelow >= 180 || availableBelow >= availableAbove;
-
-    const style = {
-      position: 'fixed',
-      left: `${Math.round(left)}px`,
-      width: `${Math.round(width)}px`,
-      minWidth: `${Math.round(width)}px`,
-      maxWidth: `${Math.round(width)}px`,
-      maxHeight: `${shouldOpenBelow ? availableBelow : availableAbove}px`,
+    return {
+      ...getAnchoredOverlayStyle(trigger.getBoundingClientRect(), minWidth, window.innerWidth, window.innerHeight),
       zIndex: 2147483647,
     } as React.CSSProperties;
-
-    if (shouldOpenBelow) {
-      style.top = `${Math.max(Math.round(rect.bottom + triggerGap), horizontalInset)}px`;
-    } else {
-      style.bottom = `${Math.max(viewportHeight - rect.top + triggerGap, horizontalInset)}px`;
-    }
-
-    return style;
   }, []);
 
   useEffect(() => {
@@ -2133,6 +2147,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             ws={ws}
             sessionCwd={activeSession?.projectDir}
             onAppendPaths={appendToInput}
+            anchorRef={quickWrapRef}
           />
         </div>
 
