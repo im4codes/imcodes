@@ -1094,6 +1094,7 @@ afterEach(() => {
 
     const submenu = document.querySelector('.openspec-submenu') as HTMLElement;
     expect(submenu).toBeTruthy();
+    expect(submenu.style.position).toBe('fixed');
     expect(submenu.style.zIndex).toBe('2147483647');
   });
 
@@ -1134,9 +1135,30 @@ afterEach(() => {
     }
   });
 
-  it('keeps the openspec audit submenu inside the mobile viewport', async () => {
+  it('anchors the openspec audit submenu to the audit button on mobile', async () => {
     const innerWidth = window.innerWidth;
+    const innerHeight = window.innerHeight;
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 844 });
+    const rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function mockRect() {
+      const el = this as HTMLElement;
+      if (el.classList?.contains('shortcuts-model')) {
+        return {
+          x: 250, y: 0, top: 720, left: 250, right: 360, bottom: 752, width: 110, height: 32,
+          toJSON() { return {}; },
+        } as DOMRect;
+      }
+      if (el.textContent?.trim() === 'audit_action') {
+        return {
+          x: 260, y: 0, top: 648, left: 260, right: 328, bottom: 676, width: 68, height: 28,
+          toJSON() { return {}; },
+        } as DOMRect;
+      }
+      return {
+        x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0,
+        toJSON() { return {}; },
+      } as DOMRect;
+    });
 
     try {
       const ws = makeWs();
@@ -1166,16 +1188,41 @@ afterEach(() => {
       const submenu = document.querySelector('.openspec-submenu') as HTMLElement;
       expect(submenu).toBeTruthy();
       expect(submenu.style.position).toBe('fixed');
-      expect(submenu.style.left).toBe('8px');
-      expect(submenu.style.right).toBe('8px');
+      expect(submenu.style.left).toBe('148px');
+      expect(submenu.style.bottom).toBe('202px');
+      expect(submenu.style.width).toBe('180px');
+      expect(submenu.style.maxHeight).toBe('636px');
     } finally {
+      rectSpy.mockRestore();
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: innerWidth });
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: innerHeight });
     }
   });
 
-  it('keeps the openspec propose submenu inside the mobile viewport', async () => {
+  it('anchors the openspec propose submenu to the propose button on mobile', async () => {
     const innerWidth = window.innerWidth;
+    const innerHeight = window.innerHeight;
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 844 });
+    const rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function mockRect() {
+      const el = this as HTMLElement;
+      if (el.classList?.contains('shortcuts-model')) {
+        return {
+          x: 250, y: 0, top: 720, left: 250, right: 360, bottom: 752, width: 110, height: 32,
+          toJSON() { return {}; },
+        } as DOMRect;
+      }
+      if (el.textContent?.trim() === 'propose_action') {
+        return {
+          x: 265, y: 0, top: 662, left: 265, right: 375, bottom: 694, width: 110, height: 32,
+          toJSON() { return {}; },
+        } as DOMRect;
+      }
+      return {
+        x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0,
+        toJSON() { return {}; },
+      } as DOMRect;
+    });
 
     try {
       const ws = makeWs();
@@ -1202,10 +1249,14 @@ afterEach(() => {
       const submenu = document.querySelector('.openspec-submenu') as HTMLElement;
       expect(submenu).toBeTruthy();
       expect(submenu.style.position).toBe('fixed');
-      expect(submenu.style.left).toBe('8px');
-      expect(submenu.style.right).toBe('8px');
+      expect(submenu.style.left).toBe('155px');
+      expect(submenu.style.bottom).toBe('188px');
+      expect(submenu.style.width).toBe('220px');
+      expect(submenu.style.maxHeight).toBe('650px');
     } finally {
+      rectSpy.mockRestore();
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: innerWidth });
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: innerHeight });
     }
   });
 

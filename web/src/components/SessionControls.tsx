@@ -340,6 +340,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const thinkingRef = useRef<HTMLDivElement>(null);
   const p2pRef = useRef<HTMLDivElement>(null);
   const openSpecRef = useRef<HTMLDivElement>(null);
+  const openSpecAuditButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
+  const openSpecProposeButtonRef = useRef<HTMLButtonElement | null>(null);
   const openSpecRequestIdRef = useRef<string | null>(null);
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -748,41 +750,30 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     [openSpecLayoutTick, openSpecOpen],
   );
 
-  const openSpecAuditDropdownStyle = isOpenSpecMobile
-    ? {
-        position: 'fixed',
-        left: 8,
-        right: 8,
-        bottom: 72,
-        minWidth: 0,
-        width: 'auto',
-        maxWidth: 'none',
-        zIndex: 2147483647,
-      } as const
-    : {
-        right: 0,
-        bottom: 'calc(100% + 6px)',
-        minWidth: 180,
-        zIndex: 2147483647,
-      } as const;
+  const getOpenSpecSubmenuStyle = useCallback((trigger: HTMLElement | null, minWidth: number) => {
+    if (!trigger || typeof window === 'undefined') return undefined;
+    const rect = trigger.getBoundingClientRect();
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+    const horizontalInset = 8;
+    const topGap = 12;
+    const preferredWidth = Math.max(minWidth, Math.ceil(rect.width));
+    const width = Math.min(preferredWidth, viewportWidth - horizontalInset * 2);
+    const maxLeft = Math.max(horizontalInset, viewportWidth - width - horizontalInset);
+    const left = Math.min(Math.max(rect.right - width, horizontalInset), maxLeft);
+    const availableHeight = Math.max(96, Math.floor(rect.top - topGap));
 
-  const openSpecProposeDropdownStyle = isOpenSpecMobile
-    ? {
-        position: 'fixed',
-        left: 8,
-        right: 8,
-        bottom: 72,
-        minWidth: 0,
-        width: 'auto',
-        maxWidth: 'none',
-        zIndex: 2147483647,
-      } as const
-    : {
-        right: 0,
-        bottom: 'calc(100% + 6px)',
-        minWidth: 220,
-        zIndex: 2147483647,
-      } as const;
+    return {
+      position: 'fixed',
+      left: `${Math.round(left)}px`,
+      bottom: `${Math.max(viewportHeight - rect.top + 6, horizontalInset)}px`,
+      width: `${Math.round(width)}px`,
+      minWidth: `${Math.round(width)}px`,
+      maxWidth: `${Math.round(width)}px`,
+      maxHeight: `${availableHeight}px`,
+      zIndex: 2147483647,
+    } as const;
+  }, []);
 
   useEffect(() => {
     if (!openSpecOpen || typeof window === 'undefined') return;
@@ -1713,6 +1704,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                       <div class="openspec-change-action-wrap">
                         <button
                           class="btn btn-secondary openspec-change-action-btn"
+                          ref={(el) => {
+                            if (el) openSpecAuditButtonRefs.current.set(changeName, el);
+                            else openSpecAuditButtonRefs.current.delete(changeName);
+                          }}
                           onClick={() => {
                             setOpenSpecProposeMenuOpen(false);
                             setOpenSpecAuditMenu((current) => current === changeName ? null : changeName);
@@ -1721,7 +1716,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                           {t('openspec.audit_action')}
                         </button>
                         {openSpecAuditMenu === changeName && (
-                          <div class="menu-dropdown openspec-submenu" style={openSpecAuditDropdownStyle}>
+                          <div
+                            class="menu-dropdown openspec-submenu"
+                            style={getOpenSpecSubmenuStyle(openSpecAuditButtonRefs.current.get(changeName) ?? null, 180)}
+                          >
                             <button
                               class="menu-item"
                               onClick={() => {
@@ -1784,6 +1782,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                     <button
                       class="btn btn-secondary openspec-change-action-btn"
                       style={{ width: '100%', justifyContent: 'center' }}
+                      ref={(el) => {
+                        openSpecProposeButtonRef.current = el;
+                      }}
                       onClick={() => {
                         setOpenSpecAuditMenu(null);
                         setOpenSpecProposeMenuOpen((open) => !open);
@@ -1792,7 +1793,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                       {t('openspec.propose_action')}
                     </button>
                     {openSpecProposeMenuOpen && (
-                      <div class="menu-dropdown openspec-submenu" style={openSpecProposeDropdownStyle}>
+                      <div
+                        class="menu-dropdown openspec-submenu"
+                        style={getOpenSpecSubmenuStyle(openSpecProposeButtonRef.current, 220)}
+                      >
                         <button
                           class="menu-item"
                           onClick={() => {
