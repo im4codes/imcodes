@@ -304,8 +304,8 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     await waitFor(() => {
       const panel = container.querySelector('.subsession-window') as HTMLElement | null;
       expect(panel).toBeTruthy();
-      expect(panel?.style.bottom).toBe('180px');
-      expect(panel?.style.height).toContain('180px');
+      expect(panel?.style.bottom).toBe('48px');
+      expect(panel?.style.height).toContain('48px');
       expect(panel?.style.zIndex).toBe('6000');
     });
 
@@ -350,13 +350,50 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       const internalControls = container.querySelector('.subsession-window .controls-wrapper') as HTMLElement | null;
       const panel = container.querySelector('.subsession-window') as HTMLElement | null;
       expect(internalControls).toBeTruthy();
-      expect(panel?.style.bottom).toBe('192px');
-      expect(panel?.style.height).toContain('192px');
+      expect(panel?.style.bottom).toBe('44px');
+      expect(panel?.style.height).toContain('44px');
     });
 
     unmount();
     mainControls.remove();
     subBar.remove();
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+  });
+
+  it('on mobile falls back to the main controls height when no external sub-session bar exists', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    const controls = document.createElement('div');
+    controls.className = 'controls-wrapper';
+    Object.defineProperty(controls, 'offsetHeight', { configurable: true, value: 132 });
+    document.body.appendChild(controls);
+
+    const sub = makeSubSession();
+    const { container, unmount } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={6000}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const panel = container.querySelector('.subsession-window') as HTMLElement | null;
+      expect(panel?.style.bottom).toBe('132px');
+      expect(panel?.style.height).toContain('132px');
+    });
+
+    unmount();
+    controls.remove();
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
   });
 
