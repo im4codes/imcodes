@@ -2289,6 +2289,20 @@ afterEach(() => {
     expect(screen.getByRole('button', { name: /^default$/i })).toBeDefined();
   });
 
+  it('opens the quick input panel when the quick trigger is clicked', () => {
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.queryByText('quick-panel-send')).toBeNull();
+    fireEvent.click(screen.getByTitle('title'));
+    expect(screen.getByText('quick-panel-send')).toBeDefined();
+  });
+
   it('shows thinking control for codex-sdk and sends /thinking command', () => {
     const ws = makeWs();
     render(

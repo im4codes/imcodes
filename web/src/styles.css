@@ -520,7 +520,7 @@ body {
 .qp-trigger { padding: 6px 9px; background: #0f172a; border: 1px solid #334155; border-radius: 4px; color: #fbbf24; font-size: 14px; cursor: pointer; line-height: 1; transition: all 0.1s; flex-shrink: 0; }
 .qp-trigger:hover { background: #1e3a5f; border-color: #fbbf24; }
 .qp-backdrop { display: none; }
-.qp { position: absolute; bottom: calc(100% + 6px); left: 0; width: min(75vw, 1050px); max-height: 65vh; background: #1e293b; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 8px 24px #00000070; z-index: 45; display: flex; flex-direction: column; overflow: hidden; }
+.qp { position: absolute; bottom: calc(100% + 6px); left: 0; width: min(75vw, 1050px); max-height: 65vh; background: #1e293b; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 8px 24px #00000070; z-index: 10002; display: flex; flex-direction: column; overflow: hidden; }
 .qp-toolbar { display: flex; gap: 6px; padding: 8px 10px; border-bottom: 1px solid #334155; flex-shrink: 0; }
 .qp-toolbar-btn { padding: 4px 10px; background: #0f172a; border: 1px solid #334155; border-radius: 4px; color: #94a3b8; font-size: 11px; font-family: inherit; cursor: pointer; transition: all 0.1s; }
 .qp-toolbar-btn:hover { background: #1e3a5f; border-color: #3b82f6; color: #93c5fd; }
@@ -573,7 +573,7 @@ body {
 
 /* Mobile responsive */
 @media (max-width: 640px) {
-  .qp-backdrop { display: block; position: fixed; inset: 0; background: #00000070; z-index: 44; }
+  .qp-backdrop { display: block; position: fixed; inset: 0; background: #00000070; z-index: 10001; }
   .qp { position: fixed; bottom: 0; left: 0; right: 0; width: 100%; max-height: 60vh; border-radius: 12px 12px 0 0; border-bottom: none; }
 }
 
