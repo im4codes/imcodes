@@ -49,11 +49,30 @@ import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../../../src/shared/mode
 
 const sectionStyle = {
   border: '1px solid #334155',
-  borderRadius: 8,
-  padding: 10,
+  borderRadius: 16,
+  padding: 14,
   display: 'flex',
   flexDirection: 'column',
-  gap: 8,
+  gap: 10,
+  background: 'linear-gradient(180deg, #111827 0%, #0f172a 100%)',
+  boxShadow: 'inset 0 1px 0 rgba(148,163,184,0.06)',
+} as const;
+
+const shellStyle = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 14,
+  padding: 12,
+  color: '#e2e8f0',
+  overflow: 'auto',
+  background: 'radial-gradient(circle at top left, rgba(37,99,235,0.12), transparent 32%), #0b1220',
+} as const;
+
+const heroStyle = {
+  ...sectionStyle,
+  gap: 14,
+  background: 'linear-gradient(145deg, rgba(30,41,59,0.98) 0%, rgba(15,23,42,0.98) 100%)',
+  border: '1px solid rgba(96,165,250,0.18)',
 } as const;
 
 const rowStyle = {
@@ -90,14 +109,29 @@ const subtleButtonStyle = {
 
 const tabStyle = {
   ...subtleButtonStyle,
-  padding: '8px 12px',
+  padding: '10px 14px',
   fontWeight: 600,
+  borderRadius: 999,
+  background: '#172033',
 } as const;
 
 const tabActiveStyle = {
   ...buttonStyle,
-  padding: '8px 12px',
+  padding: '10px 14px',
   fontWeight: 600,
+  borderRadius: 999,
+  boxShadow: '0 10px 30px rgba(29,78,216,0.28)',
+} as const;
+
+const tabBarStyle = {
+  display: 'flex',
+  gap: 8,
+  flexWrap: 'wrap',
+  alignItems: 'center',
+  padding: 6,
+  borderRadius: 999,
+  background: 'rgba(15,23,42,0.72)',
+  border: '1px solid rgba(51,65,85,0.9)',
 } as const;
 
 const pillStyle = {
@@ -140,6 +174,72 @@ const fieldLabelStyle = {
 const fieldInputStyle = {
   ...inputStyle,
   width: '100%',
+} as const;
+
+const statGridStyle = {
+  display: 'grid',
+  gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
+  gap: 10,
+} as const;
+
+const statCardStyle = {
+  borderRadius: 12,
+  padding: '12px 14px',
+  border: '1px solid rgba(51,65,85,0.9)',
+  background: 'rgba(15,23,42,0.75)',
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 4,
+} as const;
+
+const resourceListStyle = {
+  display: 'grid',
+  gap: 10,
+} as const;
+
+const resourceCardStyle = {
+  borderRadius: 12,
+  padding: '12px 14px',
+  border: '1px solid rgba(51,65,85,0.9)',
+  background: 'rgba(15,23,42,0.78)',
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 8,
+} as const;
+
+const splitSectionStyle = {
+  display: 'grid',
+  gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))',
+  gap: 12,
+  alignItems: 'start',
+} as const;
+
+const cardGridStyle = {
+  display: 'grid',
+  gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
+  gap: 10,
+} as const;
+
+const metaGridStyle = {
+  display: 'grid',
+  gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
+  gap: 8,
+} as const;
+
+const metaCardStyle = {
+  borderRadius: 10,
+  border: '1px solid rgba(51,65,85,0.9)',
+  background: 'rgba(2,6,23,0.55)',
+  padding: '8px 10px',
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 4,
+} as const;
+
+const helperTextStyle = {
+  color: '#94a3b8',
+  fontSize: 13,
+  lineHeight: 1.5,
 } as const;
 
 const processingGridStyle = {
@@ -253,6 +353,37 @@ function LabeledValue({ label, value }: { label: string; value: string }) {
   );
 }
 
+function StatCard({ label, value, detail }: { label: string; value: string | number; detail?: string }) {
+  return (
+    <div style={statCardStyle}>
+      <span style={{ color: '#94a3b8', fontSize: 12, textTransform: 'uppercase', letterSpacing: '0.08em' }}>{label}</span>
+      <strong style={{ fontSize: 24, lineHeight: 1.1 }}>{value}</strong>
+      {detail ? <span style={{ color: '#94a3b8', fontSize: 12 }}>{detail}</span> : null}
+    </div>
+  );
+}
+
+function SectionHeading({ title, description, action }: { title: string; description?: string; action?: ComponentChildren }) {
+  return (
+    <div style={{ ...rowStyle, justifyContent: 'space-between', alignItems: 'flex-start' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <strong>{title}</strong>
+        {description ? <span style={helperTextStyle}>{description}</span> : null}
+      </div>
+      {action ? <div style={{ flexShrink: 0 }}>{action}</div> : null}
+    </div>
+  );
+}
+
+function MetaCard({ label, value }: { label: string; value: ComponentChildren }) {
+  return (
+    <div style={metaCardStyle}>
+      <span style={{ color: '#94a3b8', fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.06em' }}>{label}</span>
+      <span style={{ color: '#e2e8f0', fontSize: 13, lineHeight: 1.4 }}>{value}</span>
+    </div>
+  );
+}
+
 function formatMemberIdentity(member: TeamDetail['members'][number]): string {
   const displayName = member.display_name?.trim();
   if (displayName) return displayName;
@@ -280,7 +411,6 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [activeTab, setActiveTab] = useState<ManagementTab>('enterprise');
 
   const [newEnterpriseName, setNewEnterpriseName] = useState('');
-  const [inviteRole, setInviteRole] = useState<'member' | 'admin'>('member');
   const [inviteEmail, setInviteEmail] = useState('');
   const [lastInviteToken, setLastInviteToken] = useState<string | null>(null);
   const [joinToken, setJoinToken] = useState('');
@@ -492,10 +622,15 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   }, []);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 8, color: '#e2e8f0', overflow: 'auto' }}>
-      <div style={sectionStyle}>
-        <div style={{ ...rowStyle, justifyContent: 'space-between' }}>
-          <strong>{t('sharedContext.management.title')}</strong>
+    <div style={shellStyle}>
+      <div style={heroStyle}>
+        <div style={{ ...rowStyle, justifyContent: 'space-between', alignItems: 'flex-start' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <strong style={{ fontSize: 22, lineHeight: 1.1 }}>{t('sharedContext.management.title')}</strong>
+            <span style={helperTextStyle}>
+              Manage shared enterprises, enrolled projects, authored knowledge, and processing behavior from one place.
+            </span>
+          </div>
           <button style={subtleButtonStyle} onClick={() => void refreshEnterpriseData()}>{t('sharedContext.refresh')}</button>
         </div>
         <div style={rowStyle}>
@@ -524,7 +659,14 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             {t('sharedContext.management.createEnterprise')}
           </button>
         </div>
-        <div style={{ ...rowStyle, gap: 6 }}>
+        <div style={statGridStyle}>
+          <StatCard label="Enterprise" value={team?.name ?? 'None'} detail={team ? `Role: ${team.myRole}` : 'Choose or create one'} />
+          <StatCard label="Members" value={team?.members?.length ?? 0} />
+          <StatCard label="Projects" value={projects.length} />
+          <StatCard label="Knowledge Docs" value={documents.length} />
+          <StatCard label="Server Scope" value={serverId ?? 'Unbound'} detail={serverId ? 'Cloud-synced runtime settings' : 'Select a server to sync processing config'} />
+        </div>
+        <div style={tabBarStyle}>
           {tabs.map((tab) => (
             <button
               key={tab.id}
@@ -535,20 +677,23 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             </button>
           ))}
         </div>
-        {loading && <div>{t('sharedContext.loading')}</div>}
+        {loading && <div style={helperTextStyle}>{t('sharedContext.loading')}</div>}
         {error && <div style={{ color: '#fca5a5' }}>{error}</div>}
         {notice && <div style={{ color: '#86efac' }}>{notice}</div>}
       </div>
 
       {activeTab === 'enterprise' && (
-        <>
+        <div style={splitSectionStyle}>
           <div style={sectionStyle}>
-            <strong>{t('sharedContext.management.invites')}</strong>
+            <SectionHeading
+              title={t('sharedContext.management.invites')}
+              description="Invite people into the enterprise as members. Promote them to admin later from the Members tab if needed."
+            />
+            <InfoCard title="Invitation flow">
+              <div>New invitations create member access only.</div>
+              <div>Admin role changes happen after join, from the member management section.</div>
+            </InfoCard>
             <div style={rowStyle}>
-              <select value={inviteRole} onChange={(e) => setInviteRole((e.currentTarget as HTMLSelectElement).value as 'member' | 'admin')} style={inputStyle}>
-                <option value="member">{t('sharedContext.roles.member')}</option>
-                <option value="admin">{t('sharedContext.roles.admin')}</option>
-              </select>
               <input
                 value={inviteEmail}
                 onInput={(e) => setInviteEmail((e.currentTarget as HTMLInputElement).value)}
@@ -559,14 +704,19 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 style={buttonStyle}
                 disabled={!enterpriseId}
                 onClick={() => void handleAction(t('sharedContext.notice.inviteCreated'), async () => {
-                  const created = await createTeamInvite(enterpriseId, inviteRole, inviteEmail.trim() || undefined);
+                  const created = await createTeamInvite(enterpriseId, 'member', inviteEmail.trim() || undefined);
                   setLastInviteToken(created.token);
                 })}
               >
                 {t('sharedContext.management.createInvite')}
               </button>
             </div>
-            {lastInviteToken && <div>{t('sharedContext.management.inviteToken')}: <code>{lastInviteToken}</code></div>}
+            {lastInviteToken && (
+              <div style={{ ...resourceCardStyle, gap: 6 }}>
+                <span style={{ color: '#94a3b8', fontSize: 12 }}>{t('sharedContext.management.inviteToken')}</span>
+                <code style={{ color: '#e2e8f0', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{lastInviteToken}</code>
+              </div>
+            )}
             <div style={rowStyle}>
               <input
                 value={joinToken}
@@ -590,7 +740,10 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           </div>
 
           <div style={sectionStyle}>
-            <strong>{t('sharedContext.management.workspaces')}</strong>
+            <SectionHeading
+              title={t('sharedContext.management.workspaces')}
+              description="Use workspaces to group shared projects. They are optional and do not change ownership."
+            />
             <div style={rowStyle}>
               <input
                 value={workspaceName}
@@ -610,41 +763,70 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 {t('sharedContext.management.createWorkspace')}
               </button>
             </div>
-            {workspaces.length > 0 ? workspaces.map((workspace) => <div key={workspace.id}>{workspace.name} · <code>{workspace.id}</code></div>) : <div>{t('sharedContext.empty')}</div>}
+            {workspaces.length > 0 ? (
+              <div style={cardGridStyle}>
+                {workspaces.map((workspace) => (
+                  <div key={workspace.id} style={resourceCardStyle}>
+                    <strong>{workspace.name}</strong>
+                    <div style={metaGridStyle}>
+                      <MetaCard label="Workspace ID" value={<code>{workspace.id}</code>} />
+                      <MetaCard label="Projects" value={projects.filter((project) => project.workspaceId === workspace.id).length} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : <div style={helperTextStyle}>{t('sharedContext.empty')}</div>}
           </div>
-        </>
+        </div>
       )}
 
       {activeTab === 'members' && (
         <div style={sectionStyle}>
-          <strong>{t('sharedContext.management.members')}</strong>
-          {team?.members?.length ? team.members.map((member) => (
-            <div key={member.user_id} style={{ ...rowStyle, justifyContent: 'space-between' }}>
-              <span>{formatMemberIdentity(member)} · {member.role}</span>
-              {member.role !== 'owner' && (
-                <div style={rowStyle}>
-                  <button
-                    style={subtleButtonStyle}
-                    onClick={() => void handleAction(t('sharedContext.notice.memberUpdated'), async () => {
-                      await updateTeamMemberRole(enterpriseId, member.user_id, member.role === 'admin' ? 'member' : 'admin');
-                      await refreshEnterpriseData();
-                    })}
-                  >
-                    {member.role === 'admin' ? t('sharedContext.management.demoteMember') : t('sharedContext.management.promoteAdmin')}
-                  </button>
-                  <button
-                    style={subtleButtonStyle}
-                    onClick={() => void handleAction(t('sharedContext.notice.memberRemoved'), async () => {
-                      await removeTeamMember(enterpriseId, member.user_id);
-                      await refreshEnterpriseData();
-                    })}
-                  >
-                    {t('sharedContext.management.removeMember')}
-                  </button>
+          <SectionHeading
+            title={t('sharedContext.management.members')}
+            description="Owners can promote admins. Admins manage projects and knowledge but cannot appoint other admins."
+            action={<span style={pillStyle}>{team?.members?.length ?? 0} active</span>}
+          />
+          {team?.members?.length ? (
+            <div style={resourceListStyle}>
+              {team.members.map((member) => (
+                <div key={member.user_id} style={resourceCardStyle}>
+                  <div style={{ ...rowStyle, justifyContent: 'space-between' }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      <strong>{formatMemberIdentity(member)}</strong>
+                      <span style={helperTextStyle}>{member.username ? `@${member.username}` : member.user_id}</span>
+                    </div>
+                    <div style={metaGridStyle}>
+                      <MetaCard label="Role" value={member.role} />
+                      <MetaCard label="Joined" value={new Date(member.joined_at).toLocaleString()} />
+                    </div>
+                    {member.role !== 'owner' && (
+                      <div style={rowStyle}>
+                        <button
+                          style={subtleButtonStyle}
+                          onClick={() => void handleAction(t('sharedContext.notice.memberUpdated'), async () => {
+                            await updateTeamMemberRole(enterpriseId, member.user_id, member.role === 'admin' ? 'member' : 'admin');
+                            await refreshEnterpriseData();
+                          })}
+                        >
+                          {member.role === 'admin' ? t('sharedContext.management.demoteMember') : t('sharedContext.management.promoteAdmin')}
+                        </button>
+                        <button
+                          style={subtleButtonStyle}
+                          onClick={() => void handleAction(t('sharedContext.notice.memberRemoved'), async () => {
+                            await removeTeamMember(enterpriseId, member.user_id);
+                            await refreshEnterpriseData();
+                          })}
+                        >
+                          {t('sharedContext.management.removeMember')}
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 </div>
-              )}
+              ))}
             </div>
-          )) : <div>{t('sharedContext.empty')}</div>}
+          ) : <div style={helperTextStyle}>{t('sharedContext.empty')}</div>}
         </div>
       )}
 
@@ -656,15 +838,17 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             <div>{t('sharedContext.management.projectRelationshipLine3')}</div>
           </InfoCard>
 
-          <div style={sectionStyle}>
-            <div style={{ ...rowStyle, justifyContent: 'space-between' }}>
-              <strong>{t('sharedContext.management.projects')}</strong>
-              {selectedProject && (
+          <div style={splitSectionStyle}>
+            <div style={sectionStyle}>
+            <SectionHeading
+              title={t('sharedContext.management.projects')}
+              description="Enroll a canonical repository to make its processed context and authored knowledge shareable in this enterprise."
+              action={selectedProject ? (
                 <span style={pillStyle}>
                   {selectedProject.displayName ?? selectedProject.canonicalRepoId} · {selectedProject.status}
                 </span>
-              )}
-            </div>
+              ) : undefined}
+            />
             <div style={rowStyle}>
               <input value={canonicalRepoId} onInput={(e) => setCanonicalRepoId((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.management.canonicalRepoId')} style={inputStyle} />
               <input value={displayName} onInput={(e) => setDisplayName((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.management.displayName')} style={inputStyle} />
@@ -695,113 +879,124 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 {t('sharedContext.management.enrollProject')}
               </button>
             </div>
-            {projects.map((project) => (
-              <div key={project.id} style={{ ...rowStyle, justifyContent: 'space-between' }}>
-                <span>
-                  {project.displayName ?? project.canonicalRepoId}
-                  {' · '}
-                  {project.scope}
-                  {' · '}
-                  {project.workspaceId ? `${t('sharedContext.management.workspaceLabel')}: ${workspaceNameById.get(project.workspaceId) ?? project.workspaceId}` : t('sharedContext.management.noWorkspaceAssigned')}
-                  {' · '}
-                  {project.status}
-                </span>
-                <div style={rowStyle}>
-                  <button
-                    style={subtleButtonStyle}
-                    onClick={() => {
-                      setSelectedEnrollmentId(project.id);
-                      setActiveTab('projects');
-                    }}
-                  >
-                    {t('sharedContext.management.editPolicy')}
-                  </button>
-                  <button
-                    style={subtleButtonStyle}
-                    onClick={() => void handleAction(t('sharedContext.notice.projectPendingRemoval'), async () => {
-                      await markSharedProjectPendingRemoval(project.id);
-                      await refreshEnterpriseData();
-                    })}
-                  >
-                    {t('sharedContext.management.pendingRemoval')}
-                  </button>
-                  <button
-                    style={subtleButtonStyle}
-                    onClick={() => void handleAction(t('sharedContext.notice.projectRemoved'), async () => {
-                      await removeSharedProject(project.id);
-                      await refreshEnterpriseData();
-                    })}
-                  >
-                    {t('sharedContext.management.removeProject')}
-                  </button>
+            <div style={resourceListStyle}>
+              {projects.map((project) => (
+                <div key={project.id} style={resourceCardStyle}>
+                  <div style={{ ...rowStyle, justifyContent: 'space-between' }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      <strong>{project.displayName ?? project.canonicalRepoId}</strong>
+                      <span style={helperTextStyle}>
+                        {project.scope}
+                      </span>
+                      <div style={metaGridStyle}>
+                        <MetaCard label="Workspace" value={project.workspaceId ? (workspaceNameById.get(project.workspaceId) ?? project.workspaceId) : t('sharedContext.management.noWorkspaceAssigned')} />
+                        <MetaCard label="Status" value={project.status} />
+                        <MetaCard label="Scope" value={project.scope} />
+                      </div>
+                    </div>
+                    <div style={rowStyle}>
+                      <button
+                        style={subtleButtonStyle}
+                        onClick={() => {
+                          setSelectedEnrollmentId(project.id);
+                          setActiveTab('projects');
+                        }}
+                      >
+                        {t('sharedContext.management.editPolicy')}
+                      </button>
+                      <button
+                        style={subtleButtonStyle}
+                        onClick={() => void handleAction(t('sharedContext.notice.projectPendingRemoval'), async () => {
+                          await markSharedProjectPendingRemoval(project.id);
+                          await refreshEnterpriseData();
+                        })}
+                      >
+                        {t('sharedContext.management.pendingRemoval')}
+                      </button>
+                      <button
+                        style={subtleButtonStyle}
+                        onClick={() => void handleAction(t('sharedContext.notice.projectRemoved'), async () => {
+                          await removeSharedProject(project.id);
+                          await refreshEnterpriseData();
+                        })}
+                      >
+                        {t('sharedContext.management.removeProject')}
+                      </button>
+                    </div>
+                  </div>
                 </div>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+            </div>
 
-          <div style={sectionStyle}>
-            <div style={{ ...rowStyle, justifyContent: 'space-between' }}>
-              <strong>{t('sharedContext.management.policyTitle')}</strong>
-              {policyLoading && <span style={{ color: '#94a3b8' }}>{t('sharedContext.management.policyLoading')}</span>}
+            <div style={sectionStyle}>
+              <SectionHeading
+                title={t('sharedContext.management.policyTitle')}
+                description="Set the runtime guardrails for a shared project. These affect how shared context is allowed to flow into live sends."
+                action={policyLoading ? <span style={pillStyle}>{t('sharedContext.management.policyLoading')}</span> : undefined}
+              />
+              <InfoCard title={t('sharedContext.management.policyExplainTitle')}>
+                <div>{t('sharedContext.management.policyExplainLine1')}</div>
+                <div>{t('sharedContext.management.policyExplainLine2')}</div>
+              </InfoCard>
+              <div style={rowStyle}>
+                <select value={selectedEnrollmentId} onChange={(e) => setSelectedEnrollmentId((e.currentTarget as HTMLSelectElement).value)} style={inputStyle}>
+                  <option value="">{t('sharedContext.management.selectProject')}</option>
+                  {projects.map((project) => <option key={project.id} value={project.id}>{project.displayName ?? project.canonicalRepoId}</option>)}
+                </select>
+              </div>
+              <div style={checkboxRowStyle}>
+                <label style={policyOptionStyle}>
+                  <span>
+                    <input type="checkbox" checked={policy.allowDegradedProviderSupport} onChange={(e) => setPolicy((prev) => ({ ...prev, allowDegradedProviderSupport: (e.currentTarget as HTMLInputElement).checked }))} />
+                    {' '}
+                    {t('sharedContext.management.allowDegraded')}
+                  </span>
+                  <span style={{ color: '#94a3b8', fontSize: 13 }}>{t('sharedContext.management.allowDegradedHelp')}</span>
+                </label>
+                <label style={policyOptionStyle}>
+                  <span>
+                    <input type="checkbox" checked={policy.allowLocalFallback} onChange={(e) => setPolicy((prev) => ({ ...prev, allowLocalFallback: (e.currentTarget as HTMLInputElement).checked }))} />
+                    {' '}
+                    {t('sharedContext.management.allowLocalFallback')}
+                  </span>
+                  <span style={{ color: '#94a3b8', fontSize: 13 }}>{t('sharedContext.management.allowLocalFallbackHelp')}</span>
+                </label>
+                <label style={policyOptionStyle}>
+                  <span>
+                    <input type="checkbox" checked={policy.requireFullProviderSupport} onChange={(e) => setPolicy((prev) => ({ ...prev, requireFullProviderSupport: (e.currentTarget as HTMLInputElement).checked }))} />
+                    {' '}
+                    {t('sharedContext.management.requireFullSupport')}
+                  </span>
+                  <span style={{ color: '#94a3b8', fontSize: 13 }}>{t('sharedContext.management.requireFullSupportHelp')}</span>
+                </label>
+              </div>
+              <button
+                style={buttonStyle}
+                disabled={!selectedEnrollmentId}
+                onClick={() => void handleAction(t('sharedContext.notice.policySaved'), async () => {
+                  await updateSharedProjectPolicy(selectedEnrollmentId, {
+                    allowDegradedProviderSupport: policy.allowDegradedProviderSupport,
+                    allowLocalFallback: policy.allowLocalFallback,
+                    requireFullProviderSupport: policy.requireFullProviderSupport,
+                  });
+                  await refreshEnterpriseData();
+                })}
+              >
+                {t('sharedContext.management.savePolicy')}
+              </button>
             </div>
-            <InfoCard title={t('sharedContext.management.policyExplainTitle')}>
-              <div>{t('sharedContext.management.policyExplainLine1')}</div>
-              <div>{t('sharedContext.management.policyExplainLine2')}</div>
-            </InfoCard>
-            <div style={rowStyle}>
-              <select value={selectedEnrollmentId} onChange={(e) => setSelectedEnrollmentId((e.currentTarget as HTMLSelectElement).value)} style={inputStyle}>
-                <option value="">{t('sharedContext.management.selectProject')}</option>
-                {projects.map((project) => <option key={project.id} value={project.id}>{project.displayName ?? project.canonicalRepoId}</option>)}
-              </select>
-            </div>
-            <div style={checkboxRowStyle}>
-              <label style={policyOptionStyle}>
-                <span>
-                  <input type="checkbox" checked={policy.allowDegradedProviderSupport} onChange={(e) => setPolicy((prev) => ({ ...prev, allowDegradedProviderSupport: (e.currentTarget as HTMLInputElement).checked }))} />
-                  {' '}
-                  {t('sharedContext.management.allowDegraded')}
-                </span>
-                <span style={{ color: '#94a3b8', fontSize: 13 }}>{t('sharedContext.management.allowDegradedHelp')}</span>
-              </label>
-              <label style={policyOptionStyle}>
-                <span>
-                  <input type="checkbox" checked={policy.allowLocalFallback} onChange={(e) => setPolicy((prev) => ({ ...prev, allowLocalFallback: (e.currentTarget as HTMLInputElement).checked }))} />
-                  {' '}
-                  {t('sharedContext.management.allowLocalFallback')}
-                </span>
-                <span style={{ color: '#94a3b8', fontSize: 13 }}>{t('sharedContext.management.allowLocalFallbackHelp')}</span>
-              </label>
-              <label style={policyOptionStyle}>
-                <span>
-                  <input type="checkbox" checked={policy.requireFullProviderSupport} onChange={(e) => setPolicy((prev) => ({ ...prev, requireFullProviderSupport: (e.currentTarget as HTMLInputElement).checked }))} />
-                  {' '}
-                  {t('sharedContext.management.requireFullSupport')}
-                </span>
-                <span style={{ color: '#94a3b8', fontSize: 13 }}>{t('sharedContext.management.requireFullSupportHelp')}</span>
-              </label>
-            </div>
-            <button
-              style={buttonStyle}
-              disabled={!selectedEnrollmentId}
-              onClick={() => void handleAction(t('sharedContext.notice.policySaved'), async () => {
-                await updateSharedProjectPolicy(selectedEnrollmentId, {
-                  allowDegradedProviderSupport: policy.allowDegradedProviderSupport,
-                  allowLocalFallback: policy.allowLocalFallback,
-                  requireFullProviderSupport: policy.requireFullProviderSupport,
-                });
-                await refreshEnterpriseData();
-              })}
-            >
-              {t('sharedContext.management.savePolicy')}
-            </button>
           </div>
         </>
       )}
 
       {activeTab === 'knowledge' && (
-        <>
+        <div style={splitSectionStyle}>
           <div style={sectionStyle}>
-            <strong>{t('sharedContext.management.documents')}</strong>
+            <SectionHeading
+              title={t('sharedContext.management.documents')}
+              description="Author coding standards, architecture guidance, and reusable knowledge as versioned shared context."
+            />
             <div style={rowStyle}>
               <select value={documentKind} onChange={(e) => setDocumentKind((e.currentTarget as HTMLSelectElement).value as KindOption)} style={inputStyle}>
                 <option value="coding_standard">coding_standard</option>
@@ -823,28 +1018,42 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 {t('sharedContext.management.createDocument')}
               </button>
             </div>
-            {documents.map((document) => (
-              <div key={document.id} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                <div>{document.title} · {document.kind}</div>
-                <div style={rowStyle}>
-                  {document.versions.map((version) => (
-                    <button
-                      key={version.id}
-                      style={version.status === 'active' ? buttonStyle : subtleButtonStyle}
-                      onClick={() => void handleAction(t('sharedContext.notice.versionActivated'), async () => {
-                        await activateSharedDocumentVersion(version.id);
-                        await refreshEnterpriseData();
-                        setSelectedDocumentId(document.id);
-                        setSelectedVersionId(version.id);
-                      })}
-                    >
-                      v{version.versionNumber} · {version.status}
-                    </button>
-                  ))}
+            <div style={resourceListStyle}>
+              {documents.map((document) => (
+                <div key={document.id} style={resourceCardStyle}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    <strong>{document.title}</strong>
+                    <span style={helperTextStyle}>{document.kind}</span>
+                  </div>
+                  <div style={metaGridStyle}>
+                    <MetaCard label="Versions" value={document.versions.length} />
+                    <MetaCard label="Active" value={document.versions.find((version) => version.status === 'active')?.versionNumber ? `v${document.versions.find((version) => version.status === 'active')?.versionNumber}` : 'None'} />
+                  </div>
+                  <div style={rowStyle}>
+                    {document.versions.map((version) => (
+                      <button
+                        key={version.id}
+                        style={version.status === 'active' ? buttonStyle : subtleButtonStyle}
+                        onClick={() => void handleAction(t('sharedContext.notice.versionActivated'), async () => {
+                          await activateSharedDocumentVersion(version.id);
+                          await refreshEnterpriseData();
+                          setSelectedDocumentId(document.id);
+                          setSelectedVersionId(version.id);
+                        })}
+                      >
+                        v{version.versionNumber} · {version.status}
+                      </button>
+                    ))}
+                  </div>
                 </div>
+                ))}
               </div>
-            ))}
-            <div style={{ ...rowStyle, alignItems: 'stretch' }}>
+            <div style={{ ...resourceCardStyle, gap: 10 }}>
+              <SectionHeading
+                title={t('sharedContext.management.createVersion')}
+                description="Draft a new version for the selected document and promote it when ready."
+              />
+              <div style={{ ...rowStyle, alignItems: 'stretch' }}>
               <select value={selectedDocumentId} onChange={(e) => setSelectedDocumentId((e.currentTarget as HTMLSelectElement).value)} style={inputStyle}>
                 <option value="">{t('sharedContext.management.selectDocument')}</option>
                 {documents.map((document) => <option key={document.id} value={document.id}>{document.title}</option>)}
@@ -866,11 +1075,15 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               >
                 {t('sharedContext.management.createVersion')}
               </button>
+              </div>
             </div>
           </div>
 
           <div style={sectionStyle}>
-            <strong>{t('sharedContext.management.bindings')}</strong>
+            <SectionHeading
+              title={t('sharedContext.management.bindings')}
+              description="Attach document versions to the enterprise, workspace, or enrolled project with optional language and path filters."
+            />
             <div style={rowStyle}>
               <select value={selectedVersionId} onChange={(e) => setSelectedVersionId((e.currentTarget as HTMLSelectElement).value)} style={inputStyle}>
                 <option value="">{t('sharedContext.management.selectVersion')}</option>
@@ -904,11 +1117,23 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 {t('sharedContext.management.createBinding')}
               </button>
             </div>
-            {bindings.length > 0 ? bindings.map((binding) => (
-              <div key={binding.id}>{binding.mode} · {binding.documentId} · {binding.versionId} · {binding.status}</div>
-            )) : <div>{t('sharedContext.empty')}</div>}
+            {bindings.length > 0 ? (
+              <div style={resourceListStyle}>
+                {bindings.map((binding) => (
+                  <div key={binding.id} style={resourceCardStyle}>
+                    <strong>{binding.mode} · {binding.status}</strong>
+                    <div style={metaGridStyle}>
+                      <MetaCard label="Document" value={binding.documentId} />
+                      <MetaCard label="Version" value={binding.versionId} />
+                      <MetaCard label="Language" value={binding.applicabilityLanguage || 'Any'} />
+                      <MetaCard label="Path" value={binding.applicabilityPathPattern || 'Any'} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : <div style={helperTextStyle}>{t('sharedContext.empty')}</div>}
           </div>
-        </>
+        </div>
       )}
 
       {activeTab === 'processing' && (

@@ -164,7 +164,7 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(screen.getByText('sharedContext.management.tabs.members'));
     });
     expect(await screen.findByText(/Owner User/)).toBeDefined();
-    expect(await screen.findByText(/@member/)).toBeDefined();
+    expect((await screen.findAllByText(/@member/)).length).toBeGreaterThan(0);
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.tabs.projects'));
     });
@@ -179,6 +179,9 @@ describe('SharedContextManagementPanel', () => {
   it('creates invite, workspace, document version, and binding', async () => {
     render(<SharedContextManagementPanel />);
     await flush();
+
+    expect(screen.queryByText('sharedContext.roles.admin')).toBeNull();
+    expect(await screen.findByText(/New invitations create member access only\./)).toBeDefined();
 
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.createInvite'));
@@ -202,7 +205,7 @@ describe('SharedContextManagementPanel', () => {
     fireEvent.input(documentContent, { target: { value: 'Use strict types.' } });
     await flush();
     await act(async () => {
-      fireEvent.click(screen.getByText('sharedContext.management.createVersion'));
+      fireEvent.click(screen.getByRole('button', { name: 'sharedContext.management.createVersion' }));
     });
     expect(createSharedDocumentVersionMock).toHaveBeenCalledWith('doc-1', { contentMd: 'Use strict types.' });
 

@@ -842,7 +842,7 @@
       "bindingCreated": "绑定已创建"
     },
     "management": {
-      "title": "上下文",
+      "title": "共享上下文",
       "selectEnterprise": "选择企业",
       "enterpriseNamePlaceholder": "新企业名称",
       "createEnterprise": "创建企业",

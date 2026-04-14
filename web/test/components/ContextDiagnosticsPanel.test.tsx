@@ -84,7 +84,7 @@ describe('ContextDiagnosticsPanel', () => {
       filePath: undefined,
     }));
     expect(screen.getByText(/shared_active/)).toBeDefined();
-    expect(screen.getByText(/fresh/)).toBeDefined();
+    expect((await screen.findAllByText(/fresh/)).length).toBeGreaterThan(0);
     expect(screen.getByText(/Use strict types\./)).toBeDefined();
   });
 

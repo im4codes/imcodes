@@ -1,3 +1,4 @@
+import type { ComponentChildren } from 'preact';
 import { useCallback, useEffect, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
@@ -9,23 +10,119 @@ import {
   type TeamSummary,
 } from '../api.js';
 
+const shellStyle = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 14,
+  padding: 12,
+  color: '#e2e8f0',
+  overflow: 'auto',
+  background: 'radial-gradient(circle at top left, rgba(14,165,233,0.12), transparent 30%), #0b1220',
+} as const;
+
+const sectionStyle = {
+  border: '1px solid #334155',
+  borderRadius: 16,
+  padding: 14,
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 10,
+  background: 'linear-gradient(180deg, #111827 0%, #0f172a 100%)',
+  boxShadow: 'inset 0 1px 0 rgba(148,163,184,0.06)',
+} as const;
+
+const heroStyle = {
+  ...sectionStyle,
+  gap: 14,
+  background: 'linear-gradient(145deg, rgba(30,41,59,0.98) 0%, rgba(15,23,42,0.98) 100%)',
+  border: '1px solid rgba(56,189,248,0.18)',
+} as const;
+
+const rowStyle = {
+  display: 'flex',
+  gap: 8,
+  flexWrap: 'wrap',
+  alignItems: 'center',
+} as const;
+
 const inputStyle = {
-  flex: '1 1 160px',
+  flex: '1 1 180px',
   minWidth: 0,
   background: '#0f172a',
   color: '#e2e8f0',
   border: '1px solid #334155',
-  borderRadius: 6,
-  padding: '6px 8px',
+  borderRadius: 8,
+  padding: '8px 10px',
 } as const;
 
 const buttonStyle = {
-  background: '#1d4ed8',
+  background: '#0ea5e9',
   color: '#eff6ff',
   border: 'none',
-  borderRadius: 6,
-  padding: '6px 10px',
+  borderRadius: 8,
+  padding: '8px 12px',
   cursor: 'pointer',
+  fontWeight: 700,
+} as const;
+
+const helperTextStyle = {
+  color: '#94a3b8',
+  fontSize: 13,
+  lineHeight: 1.5,
+} as const;
+
+const statGridStyle = {
+  display: 'grid',
+  gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
+  gap: 10,
+} as const;
+
+const statCardStyle = {
+  borderRadius: 12,
+  padding: '12px 14px',
+  border: '1px solid rgba(51,65,85,0.9)',
+  background: 'rgba(15,23,42,0.75)',
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 4,
+} as const;
+
+const splitSectionStyle = {
+  display: 'grid',
+  gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))',
+  gap: 12,
+  alignItems: 'start',
+} as const;
+
+const resourceListStyle = {
+  display: 'grid',
+  gap: 10,
+} as const;
+
+const resourceCardStyle = {
+  borderRadius: 12,
+  padding: '12px 14px',
+  border: '1px solid rgba(51,65,85,0.9)',
+  background: 'rgba(15,23,42,0.78)',
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 8,
+} as const;
+
+const metaGridStyle = {
+  display: 'grid',
+  gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
+  gap: 8,
+} as const;
+
+const metaCardStyle = {
+  borderRadius: 10,
+  border: '1px solid rgba(51,65,85,0.9)',
+  background: 'rgba(2,6,23,0.55)',
+  padding: '8px 10px',
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 4,
 } as const;
 
 interface Props {
@@ -48,6 +145,37 @@ interface Props {
     language: string;
     filePath: string;
   }) => void;
+}
+
+function StatCard({ label, value, detail }: { label: string; value: string | number; detail?: string }) {
+  return (
+    <div style={statCardStyle}>
+      <span style={{ color: '#94a3b8', fontSize: 12, textTransform: 'uppercase', letterSpacing: '0.08em' }}>{label}</span>
+      <strong style={{ fontSize: 22, lineHeight: 1.1 }}>{value}</strong>
+      {detail ? <span style={{ color: '#94a3b8', fontSize: 12 }}>{detail}</span> : null}
+    </div>
+  );
+}
+
+function MetaCard({ label, value }: { label: string; value: string | number | boolean }) {
+  return (
+    <div style={metaCardStyle}>
+      <span style={{ color: '#94a3b8', fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.06em' }}>{label}</span>
+      <span style={{ color: '#e2e8f0', fontSize: 13, lineHeight: 1.4 }}>{String(value)}</span>
+    </div>
+  );
+}
+
+function SectionHeading({ title, description, action }: { title: string; description?: string; action?: ComponentChildren }) {
+  return (
+    <div style={{ ...rowStyle, justifyContent: 'space-between', alignItems: 'flex-start' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <strong>{title}</strong>
+        {description ? <span style={helperTextStyle}>{description}</span> : null}
+      </div>
+      {action ? <div style={{ flexShrink: 0 }}>{action}</div> : null}
+    </div>
+  );
 }
 
 export function ContextDiagnosticsPanel(props: Props) {
@@ -111,50 +239,106 @@ export function ContextDiagnosticsPanel(props: Props) {
   }, [canonicalRepoId, enterpriseId, enrollmentId, filePath, language, props, workspaceId]);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 8, color: '#e2e8f0', overflow: 'auto' }}>
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-        <strong>{t('sharedContext.diagnostics.title')}</strong>
-        <button style={buttonStyle} onClick={() => void load()}>{t('sharedContext.diagnostics.load')}</button>
-      </div>
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        <select value={enterpriseId} onChange={(e) => setEnterpriseId((e.currentTarget as HTMLSelectElement).value)} style={inputStyle}>
-          <option value="">{t('sharedContext.management.selectEnterprise')}</option>
-          {teams.map((entry) => <option key={entry.id} value={entry.id}>{entry.name}</option>)}
-        </select>
-        <input value={canonicalRepoId} onInput={(e) => setCanonicalRepoId((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.management.canonicalRepoId')} style={inputStyle} />
-        <input value={workspaceId} onInput={(e) => setWorkspaceId((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.diagnostics.workspaceId')} style={inputStyle} />
-        <input value={enrollmentId} onInput={(e) => setEnrollmentId((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.diagnostics.enrollmentId')} style={inputStyle} />
-        <input value={language} onInput={(e) => setLanguage((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.management.language')} style={inputStyle} />
-        <input value={filePath} onInput={(e) => setFilePath((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.diagnostics.filePath')} style={inputStyle} />
-      </div>
-      {loading && <div>{t('sharedContext.loading')}</div>}
-      {error && <div style={{ color: '#fca5a5' }}>{error}</div>}
-      {diagnostics && (
-        <div style={{ border: '1px solid #334155', borderRadius: 8, padding: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
-          <div>{t('sharedContext.diagnostics.mode')}: {diagnostics.retrievalMode}</div>
-          <div>{t('sharedContext.diagnostics.visibility')}: {diagnostics.visibilityState}</div>
-          <div>{t('sharedContext.diagnostics.remoteProcessed')}: {diagnostics.remoteProcessedFreshness}</div>
-          <div>{t('sharedContext.diagnostics.derivedOnDemand')}: {String(diagnostics.diagnostics.derivedOnDemand)}</div>
-          <div>{t('sharedContext.diagnostics.persistedSnapshotAvailable')}: {String(diagnostics.diagnostics.persistedSnapshotAvailable)}</div>
-          <div>{t('sharedContext.diagnostics.appliedVersions')}: {diagnostics.diagnostics.appliedDocumentVersionIds.join(', ') || t('sharedContext.empty')}</div>
-        </div>
-      )}
-      <div style={{ border: '1px solid #334155', borderRadius: 8, padding: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
-        <strong>{t('sharedContext.diagnostics.runtimeBindings')}</strong>
-        {bindings.length === 0 ? <div>{t('sharedContext.empty')}</div> : bindings.map((binding) => (
-          <div key={binding.bindingId}>
-            {binding.mode} · {binding.scope} · {binding.documentVersionId}
-            <pre style={{ whiteSpace: 'pre-wrap', margin: '6px 0 0', color: '#cbd5e1' }}>{binding.content}</pre>
+    <div style={shellStyle}>
+      <div style={heroStyle}>
+        <div style={{ ...rowStyle, justifyContent: 'space-between', alignItems: 'flex-start' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <strong style={{ fontSize: 22, lineHeight: 1.1 }}>{t('sharedContext.diagnostics.title')}</strong>
+            <span style={helperTextStyle}>
+              Inspect how the runtime resolved visibility, freshness, and authored bindings for one shared-context target.
+            </span>
           </div>
-        ))}
-      </div>
-      {props.persistedSnapshot && (
-        <div style={{ border: '1px solid #475569', borderRadius: 8, padding: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
-          <strong>{t('sharedContext.diagnostics.snapshotTitle')}: {props.persistedSnapshot.label}</strong>
-          <div>{t('sharedContext.diagnostics.mode')}: {props.persistedSnapshot.diagnostics.retrievalMode}</div>
-          <div>{t('sharedContext.diagnostics.snapshotBindings')}: {props.persistedSnapshot.bindings.length}</div>
+          <button style={buttonStyle} onClick={() => void load()}>{t('sharedContext.diagnostics.load')}</button>
         </div>
-      )}
+        <div style={rowStyle}>
+          <select value={enterpriseId} onChange={(e) => setEnterpriseId((e.currentTarget as HTMLSelectElement).value)} style={inputStyle}>
+            <option value="">{t('sharedContext.management.selectEnterprise')}</option>
+            {teams.map((entry) => <option key={entry.id} value={entry.id}>{entry.name}</option>)}
+          </select>
+          <input value={canonicalRepoId} onInput={(e) => setCanonicalRepoId((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.management.canonicalRepoId')} style={inputStyle} />
+          <input value={workspaceId} onInput={(e) => setWorkspaceId((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.diagnostics.workspaceId')} style={inputStyle} />
+          <input value={enrollmentId} onInput={(e) => setEnrollmentId((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.diagnostics.enrollmentId')} style={inputStyle} />
+          <input value={language} onInput={(e) => setLanguage((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.management.language')} style={inputStyle} />
+          <input value={filePath} onInput={(e) => setFilePath((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.diagnostics.filePath')} style={inputStyle} />
+        </div>
+        <div style={statGridStyle}>
+          <StatCard label="Enterprise" value={teams.find((team) => team.id === enterpriseId)?.name ?? 'Unselected'} />
+          <StatCard label="Repository" value={canonicalRepoId.trim() || 'Unset'} detail={workspaceId.trim() || 'No workspace override'} />
+          <StatCard label="Language" value={language.trim() || 'Any'} detail={filePath.trim() || 'No file filter'} />
+        </div>
+        {loading && <div style={helperTextStyle}>{t('sharedContext.loading')}</div>}
+        {error && <div style={{ color: '#fca5a5' }}>{error}</div>}
+      </div>
+
+      {diagnostics ? (
+        <div style={splitSectionStyle}>
+          <div style={sectionStyle}>
+            <SectionHeading
+              title="Runtime Decision"
+              description="This is the live shared-context decision the runtime would use for dispatch."
+            />
+            <div style={statGridStyle}>
+              <StatCard label={t('sharedContext.diagnostics.mode')} value={diagnostics.retrievalMode} />
+              <StatCard label={t('sharedContext.diagnostics.visibility')} value={diagnostics.visibilityState} />
+              <StatCard label={t('sharedContext.diagnostics.remoteProcessed')} value={diagnostics.remoteProcessedFreshness} />
+              <StatCard label="Bindings" value={diagnostics.diagnostics.activeBindingCount} detail={`${diagnostics.diagnostics.appliedDocumentVersionIds.length} versions applied`} />
+            </div>
+            <div style={metaGridStyle}>
+              <MetaCard label={t('sharedContext.diagnostics.derivedOnDemand')} value={diagnostics.diagnostics.derivedOnDemand} />
+              <MetaCard label={t('sharedContext.diagnostics.persistedSnapshotAvailable')} value={diagnostics.diagnostics.persistedSnapshotAvailable} />
+              <MetaCard label="Allow degraded" value={diagnostics.policy.allowDegradedProviderSupport} />
+              <MetaCard label="Allow local fallback" value={diagnostics.policy.allowLocalFallback} />
+              <MetaCard label="Require full support" value={diagnostics.policy.requireFullProviderSupport} />
+            </div>
+            <div style={{ ...resourceCardStyle, gap: 6 }}>
+              <strong>{t('sharedContext.diagnostics.appliedVersions')}</strong>
+              <div style={helperTextStyle}>
+                {diagnostics.diagnostics.appliedDocumentVersionIds.join(', ') || t('sharedContext.empty')}
+              </div>
+            </div>
+          </div>
+
+          <div style={sectionStyle}>
+            <SectionHeading
+              title={t('sharedContext.diagnostics.runtimeBindings')}
+              description="These are the authored context fragments currently selected for the provided repo, language, and path."
+              action={<span style={helperTextStyle}>{bindings.length} bindings</span>}
+            />
+            {bindings.length === 0 ? (
+              <div style={helperTextStyle}>{t('sharedContext.empty')}</div>
+            ) : (
+              <div style={resourceListStyle}>
+                {bindings.map((binding) => (
+                  <div key={binding.bindingId} style={resourceCardStyle}>
+                    <div style={{ ...rowStyle, justifyContent: 'space-between' }}>
+                      <strong>{binding.mode} · {binding.scope}</strong>
+                      <span style={helperTextStyle}>{binding.documentVersionId}</span>
+                    </div>
+                    <pre style={{ whiteSpace: 'pre-wrap', margin: 0, color: '#cbd5e1', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 12.5, lineHeight: 1.5 }}>
+                      {binding.content}
+                    </pre>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      ) : null}
+
+      {props.persistedSnapshot ? (
+        <div style={sectionStyle}>
+          <SectionHeading
+            title={t('sharedContext.diagnostics.snapshotTitle')}
+            description="Persisted snapshots are for migration and audit comparison, not live authority."
+            action={<span style={helperTextStyle}>{props.persistedSnapshot.label}</span>}
+          />
+          <div style={statGridStyle}>
+            <StatCard label={t('sharedContext.diagnostics.mode')} value={props.persistedSnapshot.diagnostics.retrievalMode} />
+            <StatCard label={t('sharedContext.diagnostics.remoteProcessed')} value={props.persistedSnapshot.diagnostics.remoteProcessedFreshness} />
+            <StatCard label={t('sharedContext.diagnostics.snapshotBindings')} value={props.persistedSnapshot.bindings.length} />
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

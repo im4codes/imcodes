@@ -842,7 +842,7 @@
       "bindingCreated": "Binding created"
     },
     "management": {
-      "title": "Context",
+      "title": "Shared Context",
       "selectEnterprise": "Select enterprise",
       "enterpriseNamePlaceholder": "New enterprise name",
       "createEnterprise": "Create enterprise",
