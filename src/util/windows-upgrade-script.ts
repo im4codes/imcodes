@@ -38,6 +38,31 @@ export function buildWindowsUpgradeVbs(batchPath: string): string {
   return `On Error Resume Next\r\nSet WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${batchPath}""", 0, False\r\n`;
 }
 
+/**
+ * Build the Windows upgrade batch script.
+ *
+ * DESIGN PRINCIPLE: the OLD daemon MUST stay alive even if the upgrade fails.
+ *
+ * Old flow (broken — this left users with no daemon when npm install crashed):
+ *   1. Set upgrade.lock
+ *   2. Kill old daemon + all watchdogs  ← destroys the only working instance!
+ *   3. Run npm install
+ *   4. If install fails: restart daemon somehow (but binary may be gone)
+ *
+ * New flow (safe):
+ *   1. Set upgrade.lock          (watchdog pauses, but old daemon keeps running)
+ *   2. Run npm install           (while old daemon is still alive and serving)
+ *   3. Verify install succeeded  (shim exists, version matches)
+ *   4. Kill old daemon + watchdogs — ONLY after install is proven good
+ *   5. Regenerate launch chain
+ *   6. Start new watchdog
+ *   7. Delete upgrade.lock
+ *   8. Health-check
+ *
+ * On ANY failure path (steps 2/3 abort), we simply delete the lock and
+ * leave the old daemon untouched.  The only cleanup is removing the lock
+ * so the watchdog loop resumes serving the OLD version.
+ */
 export function buildWindowsUpgradeBatch(input: WindowsUpgradeScriptInput): string {
   const { logFile, cleanupVbsPath, npmCmd, pkgSpec, targetVer, vbsLauncherPath, upgradeLockFile } = input;
   void logFile;
@@ -52,63 +77,20 @@ set "LOG_FILE=%SCRIPT_DIR%\\upgrade.log"\r
 set "CLEANUP_VBS=%SCRIPT_DIR%\\cleanup.vbs"\r
 set "VBS_LAUNCHER=%USERPROFILE%\\.imcodes\\daemon-launcher.vbs"\r
 set "UPGRADE_LOCK=%USERPROFILE%\\.imcodes\\upgrade.lock"\r
+set "PIDFILE=%USERPROFILE%\\.imcodes\\daemon.pid"\r
 echo === imcodes upgrade started at %date% %time% === >> "%LOG_FILE%"\r
 timeout /t 2 /nobreak > nul\r
 \r
-rem ── Create upgrade lock — watchdog will pause while this file exists ──\r
+rem ── Step 1: Create upgrade lock — watchdog will pause (daemon keeps running) ──\r
 echo upgrade > "%UPGRADE_LOCK%"\r
-echo Upgrade lock created >> "%LOG_FILE%"\r
+echo Upgrade lock created (old daemon still running, watchdog paused) >> "%LOG_FILE%"\r
 \r
-rem ── Kill daemon + old watchdog so npm can overwrite files cleanly ─────\r
-rem Three failure modes we must handle:\r
-rem   1. Healthy daemon — kill PIDFILE and parent watchdog tree\r
-rem   2. Daemon crashed but watchdog still spamming an error in a tight\r
-rem      loop because the OLD watchdog.cmd had a UTF-8 BOM and/or no\r
-rem      'call' prefix (cmd.exe quoted-command parse rule).  In this case\r
-rem      there is NO daemon.pid but the watchdog cmd.exe processes are\r
-rem      still running.  We must find them by command-line pattern.\r
-rem   3. Multiple watchdog instances (race after past upgrades)\r
-rem Tree-kill EVERY cmd.exe whose command line references daemon-watchdog.\r
-rem This catches both the healthy case and the crash-loop case.\r
-echo Killing all daemon-watchdog cmd.exe processes... >> "%LOG_FILE%"\r
-rem Try PowerShell first (works on Windows 11 / Server 2025 where wmic is\r
-rem deprecated/removed), fall back to wmic for legacy Windows installs.\r
-rem CRITICAL: write the PowerShell script to a .ps1 file rather than passing\r
-rem it via -Command "..." — nested double quotes inside a -Command argument\r
-rem get truncated by cmd.exe→powershell command-line parsing.\r
-set "PS_SCRIPT=%SCRIPT_DIR%\\find-stale-watchdog.ps1"\r
-> "%PS_SCRIPT%" echo Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" ^| Where-Object { $_.CommandLine -like '*daemon-watchdog*' } ^| ForEach-Object { $_.ProcessId }\r
-for /f "usebackq delims=" %%w in (\`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%PS_SCRIPT%" 2^>nul\`) do (\r
-  set "STALE_WD=%%w"\r
-  set "STALE_WD=!STALE_WD: =!"\r
-  if defined STALE_WD if not "!STALE_WD!"=="" (\r
-    echo   tree-killing watchdog PID !STALE_WD! ^(via powershell^) >> "%LOG_FILE%"\r
-    taskkill /f /t /pid !STALE_WD! >nul 2>&1\r
-  )\r
-)\r
-rem Fallback for systems where powershell returns nothing (or is unavailable).\r
-for /f "tokens=2 delims==" %%w in ('wmic process where "Name='cmd.exe' and CommandLine like '%%daemon-watchdog%%'" get ProcessId /format:list 2^>nul ^| find "="') do (\r
-  set "STALE_WD=%%w"\r
-  set "STALE_WD=!STALE_WD: =!"\r
-  if defined STALE_WD if not "!STALE_WD!"=="" (\r
-    echo   tree-killing watchdog PID !STALE_WD! ^(via wmic^) >> "%LOG_FILE%"\r
-    taskkill /f /t /pid !STALE_WD! >nul 2>&1\r
-  )\r
-)\r
-rem Also kill the daemon directly if PIDFILE has a fresh value.\r
-set "PIDFILE=%USERPROFILE%\\.imcodes\\daemon.pid"\r
+rem Capture the OLD daemon's PID so we can kill it LATER (only after install OK)\r
+set "OLD_DAEMON_PID="\r
 if exist "%PIDFILE%" (\r
-  set /p OLD_PID=<"%PIDFILE%"\r
-  if defined OLD_PID if not "!OLD_PID!"=="" (\r
-    echo Stopping daemon PID !OLD_PID!... >> "%LOG_FILE%"\r
-    taskkill /f /pid !OLD_PID! >nul 2>&1\r
-  )\r
+  set /p OLD_DAEMON_PID=<"%PIDFILE%"\r
+  echo Old daemon PID: !OLD_DAEMON_PID! (will be killed only after install succeeds) >> "%LOG_FILE%"\r
 )\r
-rem Belt-and-suspenders: if the watchdog file itself has a BOM (the bug we\r
-rem just fixed), the new repair-watchdog step below will overwrite it with\r
-rem clean bytes.  Until then, prevent the freshly-killed watchdog from being\r
-rem respawned by anyone (e.g. a scheduled task) by leaving the lock in place.\r
-timeout /t 2 /nobreak >nul\r
 \r
 if defined NODE_OPTIONS (\r
   set "NODE_OPTIONS=%NODE_OPTIONS% --max-old-space-size=16384"\r
@@ -117,17 +99,27 @@ if defined NODE_OPTIONS (\r
 )\r
 echo Using NODE_OPTIONS=%NODE_OPTIONS% >> "%LOG_FILE%"\r
 \r
+rem ── Step 2: Run npm install WHILE OLD DAEMON IS STILL ALIVE ──────────────\r
+rem On Windows, node's .js modules aren't locked by the running daemon\r
+rem (node reads them into memory at load time), so npm CAN overwrite them\r
+rem safely while the old daemon keeps serving requests.  This is the key\r
+rem to guaranteeing the old daemon survives install failures.\r
 echo Installing ${pkgSpec}... >> "%LOG_FILE%"\r
 call "${npmCmd}" install -g ${pkgSpec} >> "%LOG_FILE%" 2>&1\r
-if %errorlevel% neq 0 (\r
-  echo Install FAILED — removing lock, watchdog will restart current version. >> "%LOG_FILE%"\r
+set "INSTALL_EXIT=%errorlevel%"\r
+if %INSTALL_EXIT% neq 0 (\r
+  echo Install FAILED with exit code %INSTALL_EXIT% — old daemon untouched. >> "%LOG_FILE%"\r
   echo === upgrade aborted at %date% %time% === >> "%LOG_FILE%"\r
   del "%UPGRADE_LOCK%" >nul 2>&1\r
+  rem No need to restart daemon — it was never killed.  But as a safety net\r
+  rem in case npm install corrupted files that a future daemon restart would\r
+  rem need, re-launch via VBS (it will no-op if daemon is already running).\r
   if exist "%VBS_LAUNCHER%" wscript "%VBS_LAUNCHER%"\r
   wscript "%CLEANUP_VBS%" >nul 2>&1\r
   goto :done\r
 )\r
 \r
+rem ── Step 3: Verify the install (shim exists, version matches) ──────────\r
 set "NPM_PREFIX="\r
 for /f "usebackq delims=" %%p in (\`call "${npmCmd}" prefix -g 2^>nul\`) do if not defined NPM_PREFIX set "NPM_PREFIX=%%p"\r
 if not defined NPM_PREFIX (\r
@@ -153,25 +145,56 @@ set "INSTALLED_VER="\r
 for /f "usebackq delims=" %%v in (\`call "%CLI_SHIM%" --version 2^>nul\`) do if not defined INSTALLED_VER set "INSTALLED_VER=%%v"\r
 echo Install succeeded. Installed version: %INSTALLED_VER%, target: ${targetVer}, shim: %CLI_SHIM% >> "%LOG_FILE%"\r
 if not "${targetVer}"=="latest" if /I not "%INSTALLED_VER%"=="${targetVer}" (\r
-  echo Version mismatch after install — removing lock, watchdog will restart. >> "%LOG_FILE%"\r
+  echo Version mismatch after install — removing lock, old daemon keeps serving. >> "%LOG_FILE%"\r
   echo === upgrade aborted at %date% %time% === >> "%LOG_FILE%"\r
   del "%UPGRADE_LOCK%" >nul 2>&1\r
   if exist "%VBS_LAUNCHER%" wscript "%VBS_LAUNCHER%"\r
   wscript "%CLEANUP_VBS%" >nul 2>&1\r
   goto :done\r
 )\r
+\r
 where imcodes >nul 2>&1\r
 if %errorlevel% neq 0 (\r
   echo WARNING: imcodes not found on PATH >> "%LOG_FILE%"\r
   echo To fix: setx PATH "%NPM_PREFIX%;%%PATH%%" >> "%LOG_FILE%"\r
 )\r
+\r
+rem ── Step 4: Kill old daemon + stale watchdogs — ONLY now (install OK) ───\r
+rem Find watchdog cmd.exe processes by command-line pattern.  Try PowerShell\r
+rem first (deprecated-wmic-safe), fall back to wmic for legacy installs.\r
+echo Killing old daemon-watchdog cmd.exe processes (install succeeded)... >> "%LOG_FILE%"\r
+set "PS_SCRIPT=%SCRIPT_DIR%\\find-stale-watchdog.ps1"\r
+> "%PS_SCRIPT%" echo Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" ^| Where-Object { $_.CommandLine -like '*daemon-watchdog*' } ^| ForEach-Object { $_.ProcessId }\r
+for /f "usebackq delims=" %%w in (\`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%PS_SCRIPT%" 2^>nul\`) do (\r
+  set "STALE_WD=%%w"\r
+  set "STALE_WD=!STALE_WD: =!"\r
+  if defined STALE_WD if not "!STALE_WD!"=="" (\r
+    echo   tree-killing watchdog PID !STALE_WD! ^(via powershell^) >> "%LOG_FILE%"\r
+    taskkill /f /t /pid !STALE_WD! >nul 2>&1\r
+  )\r
+)\r
+for /f "tokens=2 delims==" %%w in ('wmic process where "Name='cmd.exe' and CommandLine like '%%daemon-watchdog%%'" get ProcessId /format:list 2^>nul ^| find "="') do (\r
+  set "STALE_WD=%%w"\r
+  set "STALE_WD=!STALE_WD: =!"\r
+  if defined STALE_WD if not "!STALE_WD!"=="" (\r
+    echo   tree-killing watchdog PID !STALE_WD! ^(via wmic^) >> "%LOG_FILE%"\r
+    taskkill /f /t /pid !STALE_WD! >nul 2>&1\r
+  )\r
+)\r
+if defined OLD_DAEMON_PID if not "!OLD_DAEMON_PID!"=="" (\r
+  echo Stopping old daemon PID !OLD_DAEMON_PID!... >> "%LOG_FILE%"\r
+  taskkill /f /pid !OLD_DAEMON_PID! >nul 2>&1\r
+)\r
+timeout /t 2 /nobreak >nul\r
+\r
+rem ── Step 5: Regenerate launch chain with the new binary's paths ────────\r
 echo Regenerating daemon launch chain... >> "%LOG_FILE%"\r
 call "%CLI_SHIM%" repair-watchdog >> "%LOG_FILE%" 2>&1\r
 if %errorlevel% neq 0 (\r
   echo WARNING: Launch chain regeneration failed >> "%LOG_FILE%"\r
 )\r
 \r
-rem ── Start new watchdog (lock-aware), then remove lock ─────────────────\r
+rem ── Step 6: Start new watchdog ─────────────────────────────────────────\r
 rem The new watchdog (generated by repair-watchdog) checks the lock file.\r
 rem It will loop/wait while the lock exists, then start the daemon once\r
 rem we delete it below.\r
@@ -181,10 +204,12 @@ if exist "%VBS_LAUNCHER%" (\r
 ) else (\r
   echo WARNING: VBS launcher not found at %VBS_LAUNCHER% >> "%LOG_FILE%"\r
 )\r
+\r
+rem ── Step 7: Remove lock → watchdog starts the new daemon ───────────────\r
 echo Removing upgrade lock... >> "%LOG_FILE%"\r
 del "%UPGRADE_LOCK%" >nul 2>&1\r
 \r
-rem Wait for new watchdog to start the daemon, then health-check\r
+rem ── Step 8: Health-check the new daemon ────────────────────────────────\r
 timeout /t 10 /nobreak >nul\r
 if exist "%PIDFILE%" (\r
   set /p DAEMON_PID=<"%PIDFILE%"\r
@@ -199,6 +224,14 @@ if exist "%PIDFILE%" (\r
 )\r
 wscript "%CLEANUP_VBS%" >nul 2>&1\r
 :done\r
+rem ── Final safety net: make absolutely sure the lock is removed ─────────\r
+rem If any of the above paths ended without deleting the lock (shouldn't\r
+rem happen, but defend in depth), remove it here so the watchdog can\r
+rem resume serving.  This protects against batch script crashes too.\r
+if exist "%UPGRADE_LOCK%" (\r
+  echo Final safety: removing lingering upgrade.lock >> "%LOG_FILE%"\r
+  del "%UPGRADE_LOCK%" >nul 2>&1\r
+)\r
 echo === upgrade done at %date% %time% === >> "%LOG_FILE%"\r
 `;
 }

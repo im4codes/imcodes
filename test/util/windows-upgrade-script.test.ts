@@ -98,19 +98,62 @@ describe('buildWindowsUpgradeBatch', () => {
     expect(vbsIdx).toBeLessThan(delIdx);
   });
 
-  // ── Daemon + old watchdog kill ──
+  // ── Daemon lifecycle: old daemon MUST survive install failure ──────────
 
-  it('finds and tree-kills ALL daemon-watchdog cmd.exe processes by command-line pattern', () => {
-    // REGRESSION GUARD — when an old watchdog is in a crash-loop because the
-    // OLD watchdog.cmd had a UTF-8 BOM (cmd.exe parses [BOM]@echo as the
-    // unknown command "[BOM]@echo"), there is no daemon.pid to walk back
-    // from. The upgrade script must enumerate watchdogs by their cmd line.
-    expect(batch).toContain('taskkill /f /t /pid !STALE_WD!');
-    // Must run BEFORE npm install
-    const killByPatternIdx = batch.indexOf('taskkill /f /t /pid !STALE_WD!');
+  it('captures the OLD daemon PID before npm install (to kill later, not now)', () => {
+    // Regression guard: earlier versions of the upgrade script killed the
+    // old daemon BEFORE npm install.  If npm install then crashed (or was
+    // killed mid-run), the system was left with no daemon and no installable
+    // binary.  The new flow captures OLD_DAEMON_PID and kills it only AFTER
+    // install succeeds.
+    const capIdx = batch.indexOf('set /p OLD_DAEMON_PID=<"%PIDFILE%"');
     const installIdx = batch.indexOf(`call "${INPUT.npmCmd}" install`);
-    expect(killByPatternIdx).toBeGreaterThan(-1);
-    expect(killByPatternIdx).toBeLessThan(installIdx);
+    expect(capIdx).toBeGreaterThan(-1);
+    expect(installIdx).toBeGreaterThan(-1);
+    expect(capIdx).toBeLessThan(installIdx);
+  });
+
+  it('runs npm install BEFORE killing the old daemon or stale watchdogs', () => {
+    // CRITICAL: npm install must happen while the old daemon is still alive.
+    // That way, if install fails, the old daemon is unaffected.
+    const installIdx = batch.indexOf(`call "${INPUT.npmCmd}" install -g ${INPUT.pkgSpec}`);
+    const killWatchdogIdx = batch.indexOf('taskkill /f /t /pid !STALE_WD!');
+    const killDaemonIdx = batch.indexOf('taskkill /f /pid !OLD_DAEMON_PID!');
+    expect(installIdx).toBeGreaterThan(-1);
+    expect(killWatchdogIdx).toBeGreaterThan(-1);
+    expect(killDaemonIdx).toBeGreaterThan(-1);
+    // Both kills MUST happen AFTER the install command
+    expect(installIdx).toBeLessThan(killWatchdogIdx);
+    expect(installIdx).toBeLessThan(killDaemonIdx);
+  });
+
+  it('every abort path removes the upgrade lock AND leaves the old daemon untouched', () => {
+    // All four abort paths (install fail, no npm prefix, no shim, version
+    // mismatch) must NOT contain a taskkill against the old daemon — the
+    // old daemon should keep running since install didn't succeed.
+    //
+    // Each abort block is the chunk between "=== upgrade aborted" and
+    // "goto :done".  None of those chunks should call taskkill on OLD_DAEMON_PID.
+    const abortBlocks = batch.split('=== upgrade aborted').slice(1);
+    expect(abortBlocks.length).toBeGreaterThanOrEqual(4);
+    for (const block of abortBlocks) {
+      const beforeGoto = block.split('goto :done')[0];
+      expect(beforeGoto).not.toContain('taskkill /f /pid !OLD_DAEMON_PID!');
+      expect(beforeGoto).not.toContain('taskkill /f /t /pid !STALE_WD!');
+      // Every abort MUST delete the lock so the watchdog can resume
+      expect(beforeGoto).toContain('del "%UPGRADE_LOCK%"');
+    }
+  });
+
+  it('final :done safety-net always removes the lock even if a path forgot', () => {
+    // If any abort path is buggy, or the batch is killed externally, the
+    // :done label should unconditionally remove the lock so the watchdog
+    // loop can resume.  Guards against future regressions.
+    const doneIdx = batch.indexOf(':done');
+    expect(doneIdx).toBeGreaterThan(-1);
+    const afterDone = batch.slice(doneIdx);
+    expect(afterDone).toContain('if exist "%UPGRADE_LOCK%"');
+    expect(afterDone).toContain('del "%UPGRADE_LOCK%"');
   });
 
   it('uses BOTH PowerShell and wmic so it works on every Windows version', () => {
@@ -126,10 +169,6 @@ describe('buildWindowsUpgradeBatch', () => {
     // PowerShell branch must come first (preferred)
     expect(psIdx).toBeGreaterThan(-1);
     expect(wmicIdx).toBeGreaterThan(psIdx);
-  });
-
-  it('kills daemon directly via PIDFILE as belt-and-suspenders', () => {
-    expect(batch).toContain('taskkill /f /pid !OLD_PID!');
   });
 
   // ── npm install ──
