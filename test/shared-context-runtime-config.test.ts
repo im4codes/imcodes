@@ -29,4 +29,17 @@ describe('shared-context-runtime-config', () => {
       backupContextModel: getDefaultSharedContextModelForBackend('codex-sdk'),
     });
   });
+
+  it('keeps a configured backup backend by filling its default model when the model is omitted', () => {
+    expect(normalizeSharedContextRuntimeConfig({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'sonnet',
+      backupContextBackend: 'qwen',
+    })).toEqual({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'sonnet',
+      backupContextBackend: 'qwen',
+      backupContextModel: getDefaultSharedContextModelForBackend('qwen'),
+    });
+  });
 });

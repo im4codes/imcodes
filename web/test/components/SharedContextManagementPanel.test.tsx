@@ -313,13 +313,14 @@ describe('SharedContextManagementPanel', () => {
 
     const primaryBackend = screen.getByLabelText('sharedContext.management.processingPrimaryBackend: codex-sdk');
     const primaryInput = screen.getByLabelText('sharedContext.management.processingPrimaryModel') as HTMLInputElement;
-    const backupBackend = screen.getByLabelText('sharedContext.management.processingBackupBackend: claude-code-sdk');
+    const backupBackend = screen.getByLabelText('sharedContext.management.processingBackupBackend: qwen');
     const backupInput = screen.getByLabelText('sharedContext.management.processingBackupModel') as HTMLInputElement;
     fireEvent.click(primaryBackend);
     fireEvent.input(primaryInput, { target: { value: 'gpt-5.4' } });
     fireEvent.click(backupBackend);
-    fireEvent.input(backupInput, { target: { value: 'haiku' } });
     await flush();
+
+    expect(backupInput.value).toBe('qwen3-coder-plus');
 
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.processingSave'));
@@ -328,8 +329,8 @@ describe('SharedContextManagementPanel', () => {
     await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1', {
       primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.4',
-      backupContextBackend: 'claude-code-sdk',
-      backupContextModel: 'haiku',
+      backupContextBackend: 'qwen',
+      backupContextModel: 'qwen3-coder-plus',
     }));
     expect((screen.getByLabelText('sharedContext.management.processingPrimaryModel') as HTMLInputElement).value).toBe('gpt-5.4');
     expect(await screen.findByText('sharedContext.management.processingSavedPrimaryBackend')).toBeDefined();
@@ -382,6 +383,24 @@ describe('SharedContextManagementPanel', () => {
     const qwenChip = await screen.findByLabelText('model:qwen:qwen3-coder-plus');
     await act(async () => {
       fireEvent.click(qwenChip);
+    });
+
+    expect(backupInput.value).toBe('qwen3-coder-plus');
+  });
+
+  it('preloads a backend-appropriate backup model as soon as the backup backend changes', async () => {
+    render(<SharedContextManagementPanel serverId="srv-1" />);
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
+    });
+
+    const backupInput = await screen.findByLabelText('sharedContext.management.processingBackupModel') as HTMLInputElement;
+    expect(backupInput.value).toBe('');
+
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('sharedContext.management.processingBackupBackend: qwen'));
     });
 
     expect(backupInput.value).toBe('qwen3-coder-plus');

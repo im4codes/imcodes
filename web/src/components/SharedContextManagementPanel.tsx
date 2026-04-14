@@ -688,10 +688,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
 
   const handleProcessingBackupBackendChange = useCallback((nextBackend: SharedContextRuntimeBackend) => {
     setProcessingBackupBackend((prevBackend) => {
-      setProcessingBackupModel((prevModel) => {
-        if (!prevModel.trim()) return '';
-        return resolveProcessingModelForBackend(nextBackend, prevModel, prevBackend);
-      });
+      setProcessingBackupModel((prevModel) => resolveProcessingModelForBackend(nextBackend, prevModel, prevBackend));
       return nextBackend;
     });
   }, []);

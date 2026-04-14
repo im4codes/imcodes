@@ -90,20 +90,20 @@ export function normalizeSharedContextRuntimeConfig(
     ? rawPrimaryContextModel
     : getDefaultSharedContextModelForBackend(normalizedPrimaryBackend);
   const normalizedBackupBackendCandidate = normalizeSharedContextRuntimeBackend(input?.backupContextBackend)
-    ?? inferSharedContextRuntimeBackend(input?.backupContextModel)
-    ?? normalizedPrimaryBackend;
+    ?? inferSharedContextRuntimeBackend(input?.backupContextModel);
   const rawBackupContextModel = trimModelValue(input?.backupContextModel);
-  const backupContextModel = rawBackupContextModel
-    ? (isKnownSharedContextModelForBackend(normalizedBackupBackendCandidate, rawBackupContextModel)
-      ? rawBackupContextModel
-      : getDefaultSharedContextModelForBackend(normalizedBackupBackendCandidate))
+  const backupContextBackend = normalizedBackupBackendCandidate;
+  const backupContextModel = backupContextBackend
+    ? (rawBackupContextModel
+      ? (isKnownSharedContextModelForBackend(backupContextBackend, rawBackupContextModel)
+        ? rawBackupContextModel
+        : getDefaultSharedContextModelForBackend(backupContextBackend))
+      : getDefaultSharedContextModelForBackend(backupContextBackend))
     : undefined;
   return {
     primaryContextBackend: normalizedPrimaryBackend,
     primaryContextModel,
-    backupContextBackend: backupContextModel
-      ? normalizedBackupBackendCandidate
-      : undefined,
+    backupContextBackend,
     backupContextModel,
   };
 }
