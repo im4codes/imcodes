@@ -308,13 +308,13 @@ describe('SharedContextManagementPanel', () => {
 
     await waitFor(() => expect(fetchSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1'));
 
-    const primaryBackend = screen.getByLabelText('sharedContext.management.processingPrimaryBackend') as HTMLSelectElement;
+    const primaryBackend = screen.getByLabelText('sharedContext.management.processingPrimaryBackend: codex-sdk');
     const primaryInput = screen.getByLabelText('sharedContext.management.processingPrimaryModel') as HTMLInputElement;
-    const backupBackend = screen.getByLabelText('sharedContext.management.processingBackupBackend') as HTMLSelectElement;
+    const backupBackend = screen.getByLabelText('sharedContext.management.processingBackupBackend: claude-code-sdk');
     const backupInput = screen.getByLabelText('sharedContext.management.processingBackupModel') as HTMLInputElement;
-    fireEvent.change(primaryBackend, { target: { value: 'codex-sdk' } });
+    fireEvent.click(primaryBackend);
     fireEvent.input(primaryInput, { target: { value: 'gpt-5.4' } });
-    fireEvent.change(backupBackend, { target: { value: 'claude-code-sdk' } });
+    fireEvent.click(backupBackend);
     fireEvent.input(backupInput, { target: { value: 'haiku' } });
     await flush();
 
@@ -330,5 +330,23 @@ describe('SharedContextManagementPanel', () => {
     }));
     expect(await screen.findByText('gpt-5.4')).toBeDefined();
     expect(await screen.findByText('sharedContext.management.processingSavedPrimaryBackend')).toBeDefined();
+  });
+
+  it('switches to a backend-appropriate default model when the backend changes', async () => {
+    render(<SharedContextManagementPanel serverId="srv-1" />);
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
+    });
+
+    const primaryInput = await screen.findByLabelText('sharedContext.management.processingPrimaryModel') as HTMLInputElement;
+    expect(primaryInput.value).toBe('sonnet');
+
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: qwen'));
+    });
+
+    expect(primaryInput.value).toBe('qwen3-coder-plus');
   });
 });

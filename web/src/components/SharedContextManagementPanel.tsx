@@ -6,6 +6,8 @@ import type { SharedContextRuntimeBackend } from '@shared/context-types.js';
 import { QWEN_MODEL_IDS } from '@shared/qwen-models.js';
 import {
   DEFAULT_PRIMARY_CONTEXT_BACKEND,
+  getDefaultSharedContextModelForBackend,
+  isKnownSharedContextModelForBackend,
   SHARED_CONTEXT_RUNTIME_BACKENDS,
   type SharedContextRuntimeConfigSnapshot,
 } from '@shared/shared-context-runtime-config.js';
@@ -140,6 +142,45 @@ const fieldInputStyle = {
   width: '100%',
 } as const;
 
+const processingGridStyle = {
+  display: 'grid',
+  gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+  gap: 12,
+  alignItems: 'start',
+} as const;
+
+const processingCardStyle = {
+  border: '1px solid #334155',
+  borderRadius: 12,
+  padding: 12,
+  background: '#0f172a',
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 10,
+} as const;
+
+const backendChipRowStyle = {
+  display: 'flex',
+  gap: 8,
+  flexWrap: 'wrap',
+} as const;
+
+function processingChipStyle(active: boolean) {
+  return active
+    ? {
+        ...buttonStyle,
+        padding: '6px 10px',
+        fontSize: 12,
+        fontWeight: 700,
+      }
+    : {
+        ...subtleButtonStyle,
+        padding: '6px 10px',
+        fontSize: 12,
+        fontWeight: 600,
+      };
+}
+
 const defaultPolicyState: SharedProjectPolicy = {
   enrollmentId: '',
   enterpriseId: '',
@@ -161,6 +202,22 @@ const PROCESSING_MODEL_OPTIONS_BY_BACKEND: Record<SharedContextRuntimeBackend, r
   qwen: QWEN_MODEL_IDS,
   openclaw: [],
 };
+
+function resolveProcessingModelForBackend(
+  nextBackend: SharedContextRuntimeBackend,
+  currentModel: string,
+  previousBackend?: SharedContextRuntimeBackend,
+): string {
+  const trimmed = currentModel.trim();
+  if (!trimmed) return getDefaultSharedContextModelForBackend(nextBackend);
+  if (previousBackend && trimmed === getDefaultSharedContextModelForBackend(previousBackend)) {
+    return getDefaultSharedContextModelForBackend(nextBackend);
+  }
+  if (!isKnownSharedContextModelForBackend(nextBackend, trimmed)) {
+    return getDefaultSharedContextModelForBackend(nextBackend);
+  }
+  return trimmed;
+}
 
 type KindOption = SharedDocument['kind'];
 type ManagementTab = 'enterprise' | 'members' | 'projects' | 'knowledge' | 'processing';
@@ -416,6 +473,23 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     if (activeTab !== 'processing') return;
     void reloadProcessingConfig();
   }, [activeTab, reloadProcessingConfig]);
+
+  const handleProcessingPrimaryBackendChange = useCallback((nextBackend: SharedContextRuntimeBackend) => {
+    setProcessingPrimaryBackend((prevBackend) => {
+      setProcessingPrimaryModel((prevModel) => resolveProcessingModelForBackend(nextBackend, prevModel, prevBackend));
+      return nextBackend;
+    });
+  }, []);
+
+  const handleProcessingBackupBackendChange = useCallback((nextBackend: SharedContextRuntimeBackend) => {
+    setProcessingBackupBackend((prevBackend) => {
+      setProcessingBackupModel((prevModel) => {
+        if (!prevModel.trim()) return '';
+        return resolveProcessingModelForBackend(nextBackend, prevModel, prevBackend);
+      });
+      return nextBackend;
+    });
+  }, []);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 8, color: '#e2e8f0', overflow: 'auto' }}>
@@ -848,51 +922,67 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           <InfoCard title={t('sharedContext.management.processingModelTitle')}>
             {serverId ? (
               <>
-                <div style={rowStyle}>
-                  <label style={{ ...fieldLabelStyle, flex: '1 1 220px' }}>
-                    <span>{t('sharedContext.management.processingPrimaryBackend')}</span>
-                    <select
-                      value={processingPrimaryBackend}
-                      onChange={(e) => setProcessingPrimaryBackend((e.currentTarget as HTMLSelectElement).value as SharedContextRuntimeBackend)}
-                      style={fieldInputStyle}
-                    >
-                      {SHARED_CONTEXT_RUNTIME_BACKENDS.map((backend) => (
-                        <option key={backend} value={backend}>{backend}</option>
-                      ))}
-                    </select>
-                  </label>
-                  <label style={{ ...fieldLabelStyle, flex: '1 1 220px' }}>
-                    <span>{t('sharedContext.management.processingPrimaryModel')}</span>
-                    <input
-                      list={`shared-context-model-options-${processingPrimaryBackend}`}
-                      value={processingPrimaryModel}
-                      onInput={(e) => setProcessingPrimaryModel((e.currentTarget as HTMLInputElement).value)}
-                      placeholder={DEFAULT_PRIMARY_CONTEXT_MODEL}
-                      style={fieldInputStyle}
-                    />
-                  </label>
-                  <label style={{ ...fieldLabelStyle, flex: '1 1 220px' }}>
-                    <span>{t('sharedContext.management.processingBackupBackend')}</span>
-                    <select
-                      value={processingBackupBackend}
-                      onChange={(e) => setProcessingBackupBackend((e.currentTarget as HTMLSelectElement).value as SharedContextRuntimeBackend)}
-                      style={fieldInputStyle}
-                    >
-                      {SHARED_CONTEXT_RUNTIME_BACKENDS.map((backend) => (
-                        <option key={backend} value={backend}>{backend}</option>
-                      ))}
-                    </select>
-                  </label>
-                  <label style={{ ...fieldLabelStyle, flex: '1 1 220px' }}>
-                    <span>{t('sharedContext.management.processingBackupModel')}</span>
-                    <input
-                      list={`shared-context-model-options-${processingBackupBackend}`}
-                      value={processingBackupModel}
-                      onInput={(e) => setProcessingBackupModel((e.currentTarget as HTMLInputElement).value)}
-                      placeholder={t('sharedContext.management.processingBackupPlaceholder')}
-                      style={fieldInputStyle}
-                    />
-                  </label>
+                <div style={processingGridStyle}>
+                  <div style={processingCardStyle}>
+                    <strong>{t('sharedContext.management.processingPrimaryCardTitle')}</strong>
+                    <label style={fieldLabelStyle}>
+                      <span>{t('sharedContext.management.processingPrimaryBackend')}</span>
+                      <div style={backendChipRowStyle}>
+                        {SHARED_CONTEXT_RUNTIME_BACKENDS.map((backend) => (
+                          <button
+                            key={`primary:${backend}`}
+                            type="button"
+                            aria-label={`${t('sharedContext.management.processingPrimaryBackend')}: ${backend}`}
+                            style={processingChipStyle(processingPrimaryBackend === backend)}
+                            onClick={() => handleProcessingPrimaryBackendChange(backend)}
+                          >
+                            {backend}
+                          </button>
+                        ))}
+                      </div>
+                    </label>
+                    <label style={fieldLabelStyle}>
+                      <span>{t('sharedContext.management.processingPrimaryModel')}</span>
+                      <input
+                        aria-label={t('sharedContext.management.processingPrimaryModel')}
+                        list={`shared-context-model-options-${processingPrimaryBackend}`}
+                        value={processingPrimaryModel}
+                        onInput={(e) => setProcessingPrimaryModel((e.currentTarget as HTMLInputElement).value)}
+                        placeholder={DEFAULT_PRIMARY_CONTEXT_MODEL}
+                        style={fieldInputStyle}
+                      />
+                    </label>
+                  </div>
+                  <div style={processingCardStyle}>
+                    <strong>{t('sharedContext.management.processingBackupCardTitle')}</strong>
+                    <label style={fieldLabelStyle}>
+                      <span>{t('sharedContext.management.processingBackupBackend')}</span>
+                      <div style={backendChipRowStyle}>
+                        {SHARED_CONTEXT_RUNTIME_BACKENDS.map((backend) => (
+                          <button
+                            key={`backup:${backend}`}
+                            type="button"
+                            aria-label={`${t('sharedContext.management.processingBackupBackend')}: ${backend}`}
+                            style={processingChipStyle(processingBackupBackend === backend)}
+                            onClick={() => handleProcessingBackupBackendChange(backend)}
+                          >
+                            {backend}
+                          </button>
+                        ))}
+                      </div>
+                    </label>
+                    <label style={fieldLabelStyle}>
+                      <span>{t('sharedContext.management.processingBackupModel')}</span>
+                      <input
+                        aria-label={t('sharedContext.management.processingBackupModel')}
+                        list={`shared-context-model-options-${processingBackupBackend}`}
+                        value={processingBackupModel}
+                        onInput={(e) => setProcessingBackupModel((e.currentTarget as HTMLInputElement).value)}
+                        placeholder={t('sharedContext.management.processingBackupPlaceholder')}
+                        style={fieldInputStyle}
+                      />
+                    </label>
+                  </div>
                 </div>
                 {SHARED_CONTEXT_RUNTIME_BACKENDS.map((backend) => (
                   <datalist id={`shared-context-model-options-${backend}`} key={backend}>

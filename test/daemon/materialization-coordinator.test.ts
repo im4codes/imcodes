@@ -117,7 +117,7 @@ describe('MaterializationCoordinator', () => {
       primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.2',
       backupContextBackend: 'qwen',
-      backupContextModel: 'qwen',
+      backupContextModel: 'qwen3-coder-plus',
     });
   });
 });

@@ -5,6 +5,12 @@ import { QWEN_MODEL_IDS } from './qwen-models.js';
 
 export const SHARED_CONTEXT_RUNTIME_BACKENDS = ['claude-code-sdk', 'codex-sdk', 'qwen', 'openclaw'] as const satisfies readonly SharedContextRuntimeBackend[];
 export const DEFAULT_PRIMARY_CONTEXT_BACKEND: SharedContextRuntimeBackend = 'claude-code-sdk';
+export const DEFAULT_CONTEXT_MODEL_BY_BACKEND: Record<SharedContextRuntimeBackend, string> = {
+  'claude-code-sdk': DEFAULT_PRIMARY_CONTEXT_MODEL,
+  'codex-sdk': CODEX_MODEL_IDS[0],
+  qwen: 'qwen3-coder-plus',
+  openclaw: DEFAULT_PRIMARY_CONTEXT_MODEL,
+};
 
 export const SHARED_CONTEXT_RUNTIME_CONFIG_MSG = {
   APPLY: 'shared_context.runtime_config.apply',
@@ -26,7 +32,7 @@ export interface SharedContextRuntimeConfigSnapshot {
 export function defaultSharedContextRuntimeConfig(): ContextModelConfig {
   return {
     primaryContextBackend: DEFAULT_PRIMARY_CONTEXT_BACKEND,
-    primaryContextModel: DEFAULT_PRIMARY_CONTEXT_MODEL,
+    primaryContextModel: DEFAULT_CONTEXT_MODEL_BY_BACKEND[DEFAULT_PRIMARY_CONTEXT_BACKEND],
     backupContextBackend: undefined,
     backupContextModel: undefined,
   };
@@ -49,6 +55,25 @@ export function inferSharedContextRuntimeBackend(model: string | null | undefine
   return undefined;
 }
 
+export function getDefaultSharedContextModelForBackend(backend: SharedContextRuntimeBackend): string {
+  return DEFAULT_CONTEXT_MODEL_BY_BACKEND[backend];
+}
+
+export function isKnownSharedContextModelForBackend(backend: SharedContextRuntimeBackend, model: string | null | undefined): boolean {
+  const trimmed = model?.trim();
+  if (!trimmed) return false;
+  switch (backend) {
+    case 'claude-code-sdk':
+      return CLAUDE_CODE_MODEL_IDS.includes(trimmed as typeof CLAUDE_CODE_MODEL_IDS[number]);
+    case 'codex-sdk':
+      return CODEX_MODEL_IDS.includes(trimmed as typeof CODEX_MODEL_IDS[number]);
+    case 'qwen':
+      return QWEN_MODEL_IDS.includes(trimmed as typeof QWEN_MODEL_IDS[number]);
+    case 'openclaw':
+      return true;
+  }
+}
+
 function trimModelValue(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
@@ -57,19 +82,27 @@ function trimModelValue(value: string | undefined): string | undefined {
 export function normalizeSharedContextRuntimeConfig(
   input: Partial<ContextModelConfig> | null | undefined,
 ): ContextModelConfig {
-  const primaryContextModel = trimModelValue(input?.primaryContextModel) ?? DEFAULT_PRIMARY_CONTEXT_MODEL;
-  const backupContextModel = trimModelValue(input?.backupContextModel);
+  const normalizedPrimaryBackend = normalizeSharedContextRuntimeBackend(input?.primaryContextBackend)
+    ?? inferSharedContextRuntimeBackend(input?.primaryContextModel)
+    ?? DEFAULT_PRIMARY_CONTEXT_BACKEND;
+  const rawPrimaryContextModel = trimModelValue(input?.primaryContextModel);
+  const primaryContextModel = rawPrimaryContextModel && isKnownSharedContextModelForBackend(normalizedPrimaryBackend, rawPrimaryContextModel)
+    ? rawPrimaryContextModel
+    : getDefaultSharedContextModelForBackend(normalizedPrimaryBackend);
+  const normalizedBackupBackendCandidate = normalizeSharedContextRuntimeBackend(input?.backupContextBackend)
+    ?? inferSharedContextRuntimeBackend(input?.backupContextModel)
+    ?? normalizedPrimaryBackend;
+  const rawBackupContextModel = trimModelValue(input?.backupContextModel);
+  const backupContextModel = rawBackupContextModel
+    ? (isKnownSharedContextModelForBackend(normalizedBackupBackendCandidate, rawBackupContextModel)
+      ? rawBackupContextModel
+      : getDefaultSharedContextModelForBackend(normalizedBackupBackendCandidate))
+    : undefined;
   return {
-    primaryContextBackend: normalizeSharedContextRuntimeBackend(input?.primaryContextBackend)
-      ?? inferSharedContextRuntimeBackend(primaryContextModel)
-      ?? DEFAULT_PRIMARY_CONTEXT_BACKEND,
+    primaryContextBackend: normalizedPrimaryBackend,
     primaryContextModel,
     backupContextBackend: backupContextModel
-      ? (normalizeSharedContextRuntimeBackend(input?.backupContextBackend)
-        ?? inferSharedContextRuntimeBackend(backupContextModel)
-        ?? normalizeSharedContextRuntimeBackend(input?.primaryContextBackend)
-        ?? inferSharedContextRuntimeBackend(primaryContextModel)
-        ?? DEFAULT_PRIMARY_CONTEXT_BACKEND)
+      ? normalizedBackupBackendCandidate
       : undefined,
     backupContextModel,
   };
@@ -85,6 +118,6 @@ export function buildSharedContextRuntimeConfigSnapshot(
     envPrimaryOverrideActive: false,
     envBackupOverrideActive: false,
     defaultPrimaryContextBackend: DEFAULT_PRIMARY_CONTEXT_BACKEND,
-    defaultPrimaryContextModel: DEFAULT_PRIMARY_CONTEXT_MODEL,
+    defaultPrimaryContextModel: DEFAULT_CONTEXT_MODEL_BY_BACKEND[DEFAULT_PRIMARY_CONTEXT_BACKEND],
   };
 }

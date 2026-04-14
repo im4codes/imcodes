@@ -26,9 +26,9 @@ describe('context-model-config', () => {
     vi.stubEnv('IMCODES_PRIMARY_CONTEXT_MODEL', 'env-model');
     setContextModelRuntimeConfig({
       primaryContextBackend: 'codex-sdk',
-      primaryContextModel: 'synced-model',
+      primaryContextModel: 'gpt-5.4-mini',
     });
-    expect(getContextModelConfig().primaryContextModel).toBe('synced-model');
+    expect(getContextModelConfig().primaryContextModel).toBe('gpt-5.4-mini');
     expect(getContextModelConfig().primaryContextBackend).toBe('codex-sdk');
   });
 });
