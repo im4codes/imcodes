@@ -333,8 +333,9 @@ export async function startup(): Promise<DaemonContext> {
 
     // Expose to the global error handlers in src/index.ts so uncaught
     // exceptions can be surfaced to browsers via daemon.error broadcasts.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (globalThis as any).__imcodesGlobalServerLink = serverLink;
+    (globalThis as typeof globalThis & {
+      __imcodesGlobalServerLink?: ServerLink;
+    }).__imcodesGlobalServerLink = serverLink;
 
     // Broadcast cached repo detections after connect so browsers that missed
     // the initial repo.detected push (e.g. connected late, reconnected) get the data.

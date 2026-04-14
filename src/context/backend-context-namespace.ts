@@ -1,7 +1,7 @@
 import type { SharedContextNamespaceResolution } from '../../shared/context-types.js';
 import type { BackendAuthoredContextCredentials } from './backend-authored-context.js';
 
-interface BackendNamespaceResolutionResponse extends SharedContextNamespaceResolution {}
+type BackendNamespaceResolutionResponse = SharedContextNamespaceResolution;
 
 export async function fetchBackendSharedContextNamespace(
   credentials: BackendAuthoredContextCredentials,

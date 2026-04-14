@@ -110,7 +110,7 @@ describe('SharedContextManagementPanel', () => {
       fireEvent.click(screen.getByText('sharedContext.management.createInvite'));
     });
     expect(createTeamInviteMock).toHaveBeenCalledWith('team-1', 'member', undefined);
-    expect(screen.getByText(/invite-token/)).toBeDefined();
+    expect(await screen.findByText('invite-token')).toBeDefined();
 
     const workspaceNameInput = screen.getByPlaceholderText('sharedContext.management.workspaceNamePlaceholder') as HTMLInputElement;
     fireEvent.input(workspaceNameInput, { target: { value: 'Infra' } });
@@ -137,10 +137,10 @@ describe('SharedContextManagementPanel', () => {
   it('updates member role and enrolls a project', async () => {
     render(<SharedContextManagementPanel />);
     await flush();
-    await waitFor(() => expect(getTeamMock).toHaveBeenCalledWith('team-1'));
+    await screen.findByText('sharedContext.management.promoteAdmin');
 
     await act(async () => {
-      fireEvent.click(await screen.findByText('sharedContext.management.promoteAdmin'));
+      fireEvent.click(screen.getByText('sharedContext.management.promoteAdmin'));
     });
     expect(updateTeamMemberRoleMock).toHaveBeenCalledWith('team-1', 'user-member', 'admin');
 

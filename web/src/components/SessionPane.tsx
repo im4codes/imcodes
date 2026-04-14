@@ -148,6 +148,7 @@ export function SessionPane({
   const shouldShowFooter = !!(
     lastUsage
     || activeThinkingTs
+    || activeToolCall
     || statusText
     || liveSessionState === 'running'
     || liveSessionState === 'idle'

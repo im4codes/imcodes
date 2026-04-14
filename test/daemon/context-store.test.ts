@@ -72,7 +72,6 @@ describe('context-store', () => {
     setReplicationState(namespace, {
       pendingProjectionIds: [projection.id],
       lastReplicatedAt: 100,
-      lastError: 'none',
     });
 
     expect(listProcessedProjections(namespace, 'recent_summary')).toEqual([projection]);
@@ -80,9 +79,9 @@ describe('context-store', () => {
       namespace,
       pendingProjectionIds: [projection.id],
       lastReplicatedAt: 100,
-      lastError: 'none',
+      lastError: undefined,
     });
-    expect(getLocalProcessedFreshness(namespace)).toBe('fresh');
+    expect(getLocalProcessedFreshness(namespace)).toBe('stale');
   });
 
   it('reports stale local processed freshness when the latest projection is older than the freshness cutoff', () => {

@@ -301,7 +301,7 @@ describe('shared-context processed remote route', () => {
       canonicalRepoId: 'github.com/acme/repo',
       visibilityState: 'active',
       remoteProcessedFreshness: 'fresh',
-      retryExhausted: true,
+      retryExhausted: false,
       sharedPolicyOverride: {
         allowDegradedProvider: true,
         allowLocalProcessedFallback: false,

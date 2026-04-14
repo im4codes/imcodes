@@ -77,7 +77,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           onQuote={ctx.onQuote}
         />
       )}
-      {(lastUsage || activeThinkingTs || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || liveSub.planLabel || liveSub.quotaLabel || liveSub.quotaUsageLabel || liveSub.quotaMeta) && (
+      {(lastUsage || activeThinkingTs || activeToolCall || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || liveSub.planLabel || liveSub.quotaLabel || liveSub.quotaUsageLabel || liveSub.quotaMeta) && (
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sessionName}

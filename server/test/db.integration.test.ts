@@ -179,6 +179,25 @@ describe('runMigrations', () => {
       expect(col, `audit_log should include ${column}`).not.toBeNull();
     }
   });
+
+  it('shared_context_embeddings exists with either pgvector or JSON fallback column (migration 038)', async () => {
+    const table = await db.queryOne<{ oid: string | null }>(
+      "SELECT to_regclass($1) AS oid",
+      ['public.shared_context_embeddings'],
+    );
+    expect(table?.oid).not.toBeNull();
+
+    const columns = await db.query<{ column_name: string }>(
+      `SELECT column_name
+       FROM information_schema.columns
+       WHERE table_name = 'shared_context_embeddings'`,
+      [],
+    );
+    const names = new Set(columns.map((row) => row.column_name));
+    expect(names.has('embedding') || names.has('embedding_json')).toBe(true);
+    expect(names.has('source_kind')).toBe(true);
+    expect(names.has('source_id')).toBe(true);
+  });
 });
 
 // ── 2. Database wrapper ─────────────────────────────────────────────────────

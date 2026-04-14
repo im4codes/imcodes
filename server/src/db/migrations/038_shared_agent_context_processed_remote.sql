@@ -3,7 +3,16 @@
 -- Durable candidate records mirror durable-memory candidates for later promotion.
 -- Embeddings table is reserved for pgvector-backed retrieval in later phases.
 
-CREATE EXTENSION IF NOT EXISTS vector;
+DO $$
+BEGIN
+  BEGIN
+    CREATE EXTENSION IF NOT EXISTS vector;
+  EXCEPTION
+    WHEN OTHERS THEN
+      NULL;
+  END;
+END
+$$;
 
 CREATE TABLE IF NOT EXISTS shared_context_projections (
   id                    TEXT PRIMARY KEY,
@@ -48,14 +57,33 @@ CREATE TABLE IF NOT EXISTS shared_context_records (
 CREATE INDEX IF NOT EXISTS idx_shared_context_records_namespace
   ON shared_context_records(scope, project_id, updated_at DESC);
 
-CREATE TABLE IF NOT EXISTS shared_context_embeddings (
-  id              TEXT PRIMARY KEY,
-  source_kind     TEXT NOT NULL,
-  source_id       TEXT NOT NULL,
-  embedding_model TEXT NOT NULL,
-  embedding       vector(1536),
-  created_at      BIGINT NOT NULL
-);
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') THEN
+    EXECUTE '
+      CREATE TABLE IF NOT EXISTS shared_context_embeddings (
+        id              TEXT PRIMARY KEY,
+        source_kind     TEXT NOT NULL,
+        source_id       TEXT NOT NULL,
+        embedding_model TEXT NOT NULL,
+        embedding       vector(1536),
+        created_at      BIGINT NOT NULL
+      )
+    ';
+  ELSE
+    EXECUTE '
+      CREATE TABLE IF NOT EXISTS shared_context_embeddings (
+        id              TEXT PRIMARY KEY,
+        source_kind     TEXT NOT NULL,
+        source_id       TEXT NOT NULL,
+        embedding_model TEXT NOT NULL,
+        embedding_json  JSONB,
+        created_at      BIGINT NOT NULL
+      )
+    ';
+  END IF;
+END
+$$;
 
 CREATE INDEX IF NOT EXISTS idx_shared_context_embeddings_source
   ON shared_context_embeddings(source_kind, source_id);

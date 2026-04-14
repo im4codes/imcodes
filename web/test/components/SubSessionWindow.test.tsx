@@ -22,6 +22,7 @@ vi.mock('../../src/components/ChatView.js', () => ({
 const sessionControlsSpy = vi.fn((props: any) => <div data-testid="session-controls" data-model={props.activeSession?.modelDisplay ?? ''} data-effort={props.activeSession?.effort ?? ''} data-quota={props.activeSession?.quotaLabel ?? ''} data-queued={(props.activeSession?.transportPendingMessages ?? []).join('|')} />);
 const usageFooterSpy = vi.fn((props: any) => <div data-testid="usage-footer" data-quota={props.quotaLabel ?? ''} data-state={props.sessionState ?? ''} />);
 let timelineEventsMock: any[] = [];
+let activeToolCallMock = false;
 
 vi.mock('../../src/components/SessionControls.js', () => ({
   SessionControls: (props: any) => sessionControlsSpy(props),
@@ -29,6 +30,18 @@ vi.mock('../../src/components/SessionControls.js', () => ({
 
 vi.mock('../../src/components/UsageFooter.js', () => ({
   UsageFooter: (props: any) => usageFooterSpy(props),
+}));
+
+vi.mock('../../src/thinking-utils.js', () => ({
+  getActiveThinkingTs: () => null,
+  getActiveStatusText: () => null,
+  hasActiveToolCall: () => activeToolCallMock,
+  getTailSessionState: (events: Array<{ type: string; payload?: Record<string, unknown> }>) => {
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i].type === 'session.state') return String(events[i].payload?.state ?? '');
+    }
+    return null;
+  },
 }));
 
 vi.mock('../../src/hooks/useTimeline.js', () => ({
@@ -92,6 +105,7 @@ describe('SubSessionWindow metadata wiring', () => {
     cleanup();
     vi.clearAllMocks();
     timelineEventsMock = [];
+    activeToolCallMock = false;
   });
 
   it('passes model, level, and quota metadata through for transport sub-sessions', async () => {
@@ -194,6 +208,37 @@ describe('SubSessionWindow metadata wiring', () => {
     await waitFor(() => {
       const footer = document.querySelector('[data-testid="usage-footer"]') as HTMLElement | null;
       expect(footer?.dataset.state).toBe('running');
+    });
+  });
+
+  it('keeps footer visible while a tool call is active even without usage or running state', async () => {
+    activeToolCallMock = true;
+
+    const sub = makeSubSession({
+      type: 'codex-sdk',
+      runtimeType: 'transport' as any,
+      state: null,
+    } as any);
+
+    render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(document.querySelector('[data-testid="usage-footer"]')).toBeTruthy();
     });
   });
 });

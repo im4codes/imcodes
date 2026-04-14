@@ -9,8 +9,6 @@
 // hasn't been loaded yet at this point.  These are global last-resort
 // handlers; structured logging is fine to skip — what matters is that the
 // process does NOT exit.
-/* eslint-disable no-console */
-
 /**
  * Forward an error to all connected browsers via the global ServerLink.
  * Falls back to console-only when the link isn't ready yet.  This is the
@@ -18,8 +16,9 @@
  * are never left wondering "why isn't anything working?".
  */
 function forwardDaemonError(kind: 'uncaughtException' | 'unhandledRejection' | 'warning', err: unknown): void {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const link = (globalThis as any).__imcodesGlobalServerLink as { send: (msg: unknown) => void } | undefined;
+  const link = (globalThis as typeof globalThis & {
+    __imcodesGlobalServerLink?: { send: (msg: unknown) => void };
+  }).__imcodesGlobalServerLink;
   if (!link) return;
   try {
     const message = err instanceof Error
@@ -52,7 +51,6 @@ process.on('warning', (warning) => {
   console.warn('[imcodes-daemon] warning:', warning.name, warning.message);
   // Don't forward warnings — too noisy.
 });
-/* eslint-enable no-console */
 
 import { Command } from 'commander';
 // These modules are imported lazily to avoid eager tmux backend detection on Windows.
@@ -64,7 +62,6 @@ import { execSync } from 'child_process';
 import { homedir } from 'os';
 import { existsSync, realpathSync, readFileSync, writeFileSync } from 'fs';
 import { resolve, join, dirname } from 'path';
-import { restartWindowsDaemon } from './util/windows-daemon.js';
 
 import { PROJECT_ROOT } from './util/project-root.js';
 

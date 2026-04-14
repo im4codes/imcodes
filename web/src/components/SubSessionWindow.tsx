@@ -404,7 +404,7 @@ export function SubSessionWindow({
       </div>
 
       {/* Usage footer — shared component */}
-      {(lastUsage || activeThinkingTs || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || sessionInfo?.planLabel || sessionInfo?.quotaLabel || sessionInfo?.quotaUsageLabel || sessionInfo?.quotaMeta) && (
+      {(lastUsage || activeThinkingTs || activeToolCall || statusText || liveSessionState === 'running' || liveSessionState === 'idle' || sessionInfo?.planLabel || sessionInfo?.quotaLabel || sessionInfo?.quotaUsageLabel || sessionInfo?.quotaMeta) && (
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sub.sessionName}

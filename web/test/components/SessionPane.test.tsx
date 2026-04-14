@@ -7,6 +7,7 @@ import { h } from 'preact';
 
 const addOptimisticUserMessageMock = vi.fn();
 let timelineEventsMock: any[] = [];
+let activeToolCallMock = false;
 
 vi.mock('../../src/components/TerminalView.js', () => ({ TerminalView: () => null }));
 vi.mock('../../src/components/ChatView.js', () => ({ ChatView: () => null }));
@@ -31,7 +32,7 @@ vi.mock('../../src/hooks/useTimeline.js', () => ({
 vi.mock('../../src/thinking-utils.js', () => ({
   getActiveThinkingTs: () => null,
   getActiveStatusText: () => null,
-  hasActiveToolCall: () => false,
+  hasActiveToolCall: () => activeToolCallMock,
   getTailSessionState: (events: Array<{ type: string; payload?: Record<string, unknown> }>) => {
     for (let i = events.length - 1; i >= 0; i--) {
       if (events[i].type === 'session.state') return String(events[i].payload?.state ?? '');
@@ -51,6 +52,7 @@ describe('SessionPane', () => {
   beforeEach(() => {
     addOptimisticUserMessageMock.mockReset();
     timelineEventsMock = [];
+    activeToolCallMock = false;
   });
 
   afterEach(() => {
@@ -169,5 +171,33 @@ describe('SessionPane', () => {
     );
 
     expect(screen.getByTestId('usage-footer').getAttribute('data-state')).toBe('running');
+  });
+
+  it('keeps footer visible while a tool call is active even without usage or running state', () => {
+    activeToolCallMock = true;
+
+    render(
+      <SessionPane
+        serverId="s1"
+        session={{
+          name: 'deck_test_brain',
+          project: 'test',
+          role: 'brain',
+          agentType: 'codex-sdk',
+          state: null,
+          runtimeType: 'transport',
+          projectDir: '/tmp/test',
+        } as any}
+        sessions={[]}
+        subSessions={[]}
+        ws={null}
+        connected={false}
+        isActive={true}
+        viewMode="chat"
+        quickData={{} as any}
+      />,
+    );
+
+    expect(screen.getByTestId('usage-footer')).toBeDefined();
   });
 });
