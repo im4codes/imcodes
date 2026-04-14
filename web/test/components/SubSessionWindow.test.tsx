@@ -277,7 +277,11 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     const controls = document.createElement('div');
     controls.className = 'controls-wrapper';
     Object.defineProperty(controls, 'offsetHeight', { configurable: true, value: 132 });
+    const subBar = document.createElement('div');
+    subBar.className = 'subsession-bar';
+    Object.defineProperty(subBar, 'offsetHeight', { configurable: true, value: 48 });
     document.body.appendChild(controls);
+    document.body.appendChild(subBar);
 
     const sub = makeSubSession();
     const { container, unmount } = render(
@@ -300,13 +304,14 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     await waitFor(() => {
       const panel = container.querySelector('.subsession-window') as HTMLElement | null;
       expect(panel).toBeTruthy();
-      expect(panel?.style.bottom).toBe('132px');
-      expect(panel?.style.height).toContain('132px');
+      expect(panel?.style.bottom).toBe('180px');
+      expect(panel?.style.height).toContain('180px');
       expect(panel?.style.zIndex).toBe('6000');
     });
 
     unmount();
     controls.remove();
+    subBar.remove();
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
   });
 
@@ -317,7 +322,11 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     const mainControls = document.createElement('div');
     mainControls.className = 'controls-wrapper';
     Object.defineProperty(mainControls, 'offsetHeight', { configurable: true, value: 148 });
+    const subBar = document.createElement('div');
+    subBar.className = 'subsession-bar';
+    Object.defineProperty(subBar, 'offsetHeight', { configurable: true, value: 44 });
     document.body.appendChild(mainControls);
+    document.body.appendChild(subBar);
 
     const sub = makeSubSession();
     const { container, unmount } = render(
@@ -341,12 +350,13 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       const internalControls = container.querySelector('.subsession-window .controls-wrapper') as HTMLElement | null;
       const panel = container.querySelector('.subsession-window') as HTMLElement | null;
       expect(internalControls).toBeTruthy();
-      expect(panel?.style.bottom).toBe('148px');
-      expect(panel?.style.height).toContain('148px');
+      expect(panel?.style.bottom).toBe('192px');
+      expect(panel?.style.height).toContain('192px');
     });
 
     unmount();
     mainControls.remove();
+    subBar.remove();
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
   });
 

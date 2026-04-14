@@ -336,12 +336,15 @@ export function SubSessionWindow({
     if (!isMobile) return;
     const controls = Array.from(document.querySelectorAll('.controls-wrapper'))
       .find((el) => !(el as HTMLElement).closest('.subsession-window')) as HTMLElement | undefined;
-    if (!controls) return;
-    const update = () => setControlsHeight(controls.offsetHeight);
+    const subBar = Array.from(document.querySelectorAll('.subsession-bar'))
+      .find((el) => !(el as HTMLElement).closest('.subsession-window')) as HTMLElement | undefined;
+    if (!controls && !subBar) return;
+    const update = () => setControlsHeight((controls?.offsetHeight ?? 0) + (subBar?.offsetHeight ?? 0));
     update();
     if (typeof ResizeObserver === 'undefined') return;
     const ro = new ResizeObserver(update);
-    ro.observe(controls);
+    if (controls) ro.observe(controls);
+    if (subBar) ro.observe(subBar);
     return () => ro.disconnect();
   }, [isMobile]);
 
