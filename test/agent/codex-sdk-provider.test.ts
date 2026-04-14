@@ -106,6 +106,7 @@ vi.mock('../../src/util/logger.js', () => ({
 }));
 
 import { CodexSdkProvider } from '../../src/agent/providers/codex-sdk.js';
+import type { ProviderContextPayload } from '../../shared/context-types.js';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -204,6 +205,118 @@ describe('CodexSdkProvider', () => {
     const child = childProcessMock.children[0];
     const resumeReq = child.requests.find((req) => req.method === 'thread/resume');
     expect(resumeReq?.params?.threadId).toBe('thread-existing');
+  });
+
+  it('maps normalized payloads into a message-side codex context block', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-payload', cwd: '/tmp/project' });
+
+    const payload: ProviderContextPayload = {
+      userMessage: 'ship it',
+      assembledMessage: 'Relevant context\n\nship it',
+      systemText: 'Normalized system text',
+      messagePreamble: 'Relevant context',
+      attachments: [],
+      context: {
+        systemText: 'Normalized system text',
+        messagePreamble: 'Relevant context',
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'route-payload' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    };
+
+    await provider.send('route-payload', payload);
+    const child = childProcessMock.children[0];
+    const turnStartReq = child.requests.find((req) => req.method === 'turn/start');
+    expect(turnStartReq?.params?.input?.[0]?.text).toBe(
+      'Context instructions:\nNormalized system text\n\nRelevant context\n\nship it',
+    );
+  });
+
+  it('maps normalized system context into the turn input text', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-context', cwd: '/tmp/project' });
+
+    await provider.send('route-context', {
+      userMessage: 'hello',
+      assembledMessage: 'History block\n\nhello',
+      systemText: 'Enterprise standard',
+      messagePreamble: 'History block',
+      attachments: undefined,
+      context: {
+        systemText: 'Enterprise standard',
+        messagePreamble: 'History block',
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'project_shared', projectId: 'repo' },
+        authoritySource: 'processed_remote',
+        freshness: 'fresh',
+        fallbackAllowed: false,
+        retryScheduled: false,
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    });
+
+    const child = childProcessMock.children[0];
+    const turnStartReq = child.requests.find((req) => req.method === 'turn/start');
+    expect(turnStartReq?.params?.input).toEqual([
+      {
+        type: 'text',
+        text: 'Context instructions:\nEnterprise standard\n\nHistory block\n\nhello',
+      },
+    ]);
+  });
+
+  it('rejects normalized payloads combined with legacy extraSystemPrompt', async () => {
+    const provider = new CodexSdkProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-context', cwd: '/tmp/project' });
+
+    await expect(provider.send('route-context', {
+      userMessage: 'hello',
+      assembledMessage: 'History block\n\nhello',
+      systemText: 'Enterprise standard',
+      messagePreamble: 'History block',
+      attachments: undefined,
+      context: {
+        systemText: 'Enterprise standard',
+        messagePreamble: 'History block',
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'project_shared', projectId: 'repo' },
+        authoritySource: 'processed_remote',
+        freshness: 'fresh',
+        fallbackAllowed: false,
+        retryScheduled: false,
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    }, undefined, 'legacy raw context')).rejects.toThrow(/legacy extraSystemPrompt/i);
   });
 
   it('normalizes Windows cwd before sending app-server thread requests', async () => {

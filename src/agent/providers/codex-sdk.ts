@@ -14,10 +14,12 @@ import type {
 } from '../transport-provider.js';
 import {
   CONNECTION_MODES,
+  normalizeProviderPayload,
   SESSION_OWNERSHIP,
   PROVIDER_ERROR_CODES,
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
+import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import logger from '../../util/logger.js';
 import { CODEX_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
@@ -167,6 +169,7 @@ export class CodexSdkProvider implements TransportProvider {
     attachments: false,
     reasoningEffort: true,
     supportedEffortLevels: CODEX_SDK_EFFORT_LEVELS,
+    contextSupport: 'degraded-message-side-context-mapping',
   };
 
   private config: ProviderConfig | null = null;
@@ -301,7 +304,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.emitSessionInfo(sessionId, { effort });
   }
 
-  async send(sessionId: string, message: string): Promise<void> {
+  async send(sessionId: string, payloadOrMessage: string | ProviderContextPayload, attachments?: unknown[], extraSystemPrompt?: string): Promise<void> {
     if (!this.config || !this.child) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
     }
@@ -320,7 +323,8 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearCancelTimer(state);
     state.lastUsage = undefined;
     state.lastStatusSignature = null;
-    await this.startTurn(sessionId, state, message);
+    const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
+    await this.startTurn(sessionId, state, payload);
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -390,12 +394,15 @@ export class CodexSdkProvider implements TransportProvider {
     this.notify('initialized', {});
   }
 
-  private async startTurn(sessionId: string, state: CodexSdkSessionState, message: string): Promise<void> {
+  private async startTurn(sessionId: string, state: CodexSdkSessionState, payload: ProviderContextPayload): Promise<void> {
     try {
       await this.ensureThreadLoaded(sessionId, state);
+      const inputText = payload.systemText
+        ? `Context instructions:\n${payload.systemText}\n\n${payload.assembledMessage}`
+        : payload.assembledMessage;
       const result = await this.request('turn/start', {
         threadId: state.threadId,
-        input: [{ type: 'text', text: message }],
+        input: [{ type: 'text', text: inputText }],
         cwd: state.cwd,
         approvalPolicy: 'never',
         sandboxPolicy: { type: 'dangerFullAccess' },

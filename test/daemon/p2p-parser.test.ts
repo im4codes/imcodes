@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG } from '../../shared/p2p-config-events.js';
 
 // ── Hoisted mocks ─────────────────────────────────────────────────────────────
 
@@ -15,6 +16,14 @@ vi.mock('../../src/store/session-store.js', () => ({
   getSession: (name: string) => MOCK_SESSIONS.find(s => s.name === name) ?? null,
   upsertSession: vi.fn(),
   removeSession: vi.fn(),
+}));
+
+const getSavedP2pConfigMock = vi.fn();
+const upsertSavedP2pConfigMock = vi.fn();
+vi.mock('../../src/store/p2p-config-store.js', () => ({
+  getSavedP2pConfig: (...args: unknown[]) => getSavedP2pConfigMock(...args),
+  upsertSavedP2pConfig: (...args: unknown[]) => upsertSavedP2pConfigMock(...args),
+  removeSavedP2pConfig: vi.fn(),
 }));
 
 vi.mock('../../src/agent/session-manager.js', () => ({
@@ -247,6 +256,8 @@ describe('structured P2P routing via WS fields', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    getSavedP2pConfigMock.mockResolvedValue(undefined);
+    upsertSavedP2pConfigMock.mockResolvedValue(undefined);
     (listP2pRuns as ReturnType<typeof vi.fn>).mockReturnValue([]);
     (startP2pRun as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'run-1' });
   });
@@ -294,6 +305,110 @@ describe('structured P2P routing via WS fields', () => {
       { session: 'deck_proj_w1', mode: 'audit' },
       { session: 'deck_proj_w2', mode: 'review' },
     ]);
+  });
+
+  it('prefers daemon-persisted config over a stale client snapshot', async () => {
+    getSavedP2pConfigMock.mockResolvedValue({
+      sessions: {
+        deck_proj_w1: { enabled: true, mode: 'audit' },
+        deck_proj_w2: { enabled: false, mode: 'review' },
+      },
+      rounds: 1,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'review this code',
+      commandId: 'cmd-authoritative-config',
+      p2pMode: 'review',
+      p2pSessionConfig: {
+        deck_proj_w1: { enabled: false, mode: 'audit' },
+        deck_proj_w2: { enabled: false, mode: 'review' },
+      },
+    }, mockServerLink as any);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(startP2pRun).toHaveBeenCalledTimes(1);
+    const [{ targets }] = (startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(targets).toEqual([{ session: 'deck_proj_w1', mode: 'review' }]);
+  });
+
+  it('returns a distinct error when config filtering removes all otherwise-valid targets', async () => {
+    getSavedP2pConfigMock.mockResolvedValue({
+      sessions: {
+        deck_proj_w1: { enabled: false, mode: 'audit' },
+        deck_proj_w2: { enabled: false, mode: 'review' },
+      },
+      rounds: 1,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'review this code',
+      commandId: 'cmd-no-configured-targets',
+      p2pMode: 'review',
+      p2pSessionConfig: {
+        deck_proj_w1: { enabled: false, mode: 'audit' },
+      },
+    }, mockServerLink as any);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(startP2pRun).not.toHaveBeenCalled();
+    expect(mockServerLink.send).toHaveBeenCalledWith({
+      type: 'command.ack',
+      commandId: 'cmd-no-configured-targets',
+      status: 'error',
+      session: 'deck_proj_brain',
+      error: P2P_CONFIG_ERROR.NO_CONFIGURED_TARGETS,
+    });
+  });
+
+  it('persists config saves from the web command path into the daemon store', async () => {
+    const config = {
+      sessions: { deck_proj_w1: { enabled: true, mode: 'audit' } },
+      rounds: 2,
+    };
+
+    handleWebCommand({
+      type: P2P_CONFIG_MSG.SAVE,
+      requestId: 'req-save-ok',
+      scopeSession: 'deck_proj_brain',
+      config,
+    }, mockServerLink as any);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(upsertSavedP2pConfigMock).toHaveBeenCalledWith('deck_proj_brain', config);
+    expect(mockServerLink.send).toHaveBeenCalledWith({
+      type: P2P_CONFIG_MSG.SAVE_RESPONSE,
+      requestId: 'req-save-ok',
+      scopeSession: 'deck_proj_brain',
+      ok: true,
+    });
+  });
+
+  it('rejects invalid daemon config saves with a typed error response', async () => {
+    handleWebCommand({
+      type: P2P_CONFIG_MSG.SAVE,
+      requestId: 'req-save-invalid',
+      scopeSession: 'deck_proj_brain',
+      config: { sessions: [], rounds: 'bad' },
+    }, mockServerLink as any);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(upsertSavedP2pConfigMock).not.toHaveBeenCalled();
+    expect(mockServerLink.send).toHaveBeenCalledWith({
+      type: P2P_CONFIG_MSG.SAVE_RESPONSE,
+      requestId: 'req-save-invalid',
+      scopeSession: 'deck_proj_brain',
+      ok: false,
+      error: P2P_CONFIG_ERROR.INVALID_CONFIG,
+    });
   });
 
   it('p2pAtTargets with __all__ expands to all active sessions', async () => {

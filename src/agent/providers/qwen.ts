@@ -16,11 +16,13 @@ import type {
 } from '../transport-provider.js';
 import {
   CONNECTION_MODES,
+  normalizeProviderPayload,
   SESSION_OWNERSHIP,
   PROVIDER_ERROR_CODES,
   type SessionInfoUpdate,
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
+import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import { DEFAULT_TRANSPORT_EFFORT, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import logger from '../../util/logger.js';
 import { inferContextWindow } from '../../util/model-context.js';
@@ -181,6 +183,7 @@ export class QwenProvider implements TransportProvider {
     attachments: false,
     reasoningEffort: true,
     supportedEffortLevels: QWEN_EFFORT_LEVELS,
+    contextSupport: 'degraded-message-side-context-mapping',
   };
 
   private config: ProviderConfig | null = null;
@@ -307,7 +310,7 @@ export class QwenProvider implements TransportProvider {
 
   async send(
     sessionId: string,
-    message: string,
+    payloadOrMessage: string | ProviderContextPayload,
     _attachments?: unknown[],
     extraSystemPrompt?: string,
     allowResumeFallback = true,
@@ -350,14 +353,15 @@ export class QwenProvider implements TransportProvider {
     state.toolUseById.clear();
     state.emittedToolSignatures.clear();
     state.lastStatusSignature = null;
+    const payload = normalizeProviderPayload(payloadOrMessage, _attachments, extraSystemPrompt);
 
     const args = [
-      '-p', message,
+      '-p', payload.assembledMessage,
       '--output-format', 'stream-json',
       '--include-partial-messages',
       '--approval-mode', 'yolo',
     ];
-    const effectivePrompt = extraSystemPrompt?.trim() || state.description?.trim();
+    const effectivePrompt = payload.systemText?.trim() || state.description?.trim();
     if (effectivePrompt) {
       args.push('--append-system-prompt', effectivePrompt);
     }
@@ -655,7 +659,7 @@ export class QwenProvider implements TransportProvider {
           state.started = false;
           state.qwenConversationId = randomUUID();
           this.emitSessionInfo(sessionId, { resumeId: state.qwenConversationId });
-          void this.send(sessionId, message, _attachments, extraSystemPrompt, false).catch((err) => {
+          void this.send(sessionId, payload, _attachments, extraSystemPrompt, false).catch((err) => {
             const providerError = typeof err === 'object' && err && 'code' in err
               ? err as ProviderError
               : this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, String(err), false, err);

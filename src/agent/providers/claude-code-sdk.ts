@@ -15,10 +15,12 @@ import type {
 } from '../transport-provider.js';
 import {
   CONNECTION_MODES,
+  normalizeProviderPayload,
   SESSION_OWNERSHIP,
   PROVIDER_ERROR_CODES,
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
+import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import logger from '../../util/logger.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
@@ -97,6 +99,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     attachments: false,
     reasoningEffort: true,
     supportedEffortLevels: CLAUDE_SDK_EFFORT_LEVELS,
+    contextSupport: 'full-normalized-context-injection',
   };
 
   private config: ProviderConfig | null = null;
@@ -229,7 +232,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     this.emitSessionInfo(sessionId, { effort });
   }
 
-  async send(sessionId: string, message: string, _attachments?: unknown[], extraSystemPrompt?: string): Promise<void> {
+  async send(sessionId: string, payloadOrMessage: string | ProviderContextPayload, _attachments?: unknown[], extraSystemPrompt?: string): Promise<void> {
     if (!this.config) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Claude Code SDK provider not connected', false);
     }
@@ -240,8 +243,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     if (state.currentQuery) {
       throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Claude SDK session is already busy', true);
     }
-
-    await this.startQuery(sessionId, state, message, extraSystemPrompt, true);
+    const payload = normalizeProviderPayload(payloadOrMessage, _attachments, extraSystemPrompt);
+    await this.startQuery(sessionId, state, payload, true);
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -263,8 +266,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
   private async startQuery(
     sessionId: string,
     state: ClaudeSdkSessionState,
-    message: string,
-    extraSystemPrompt: string | undefined,
+    payload: ProviderContextPayload,
     allowResumeFallback: boolean,
   ): Promise<void> {
     state.currentText = '';
@@ -280,7 +282,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
     state.lastStatusSignature = null;
 
     const resolvedBinary = this.resolveBinaryPath(this.config);
-    const baseSystemPrompt = extraSystemPrompt ?? state.description;
+    const baseSystemPrompt = payload.systemText ?? ([state.description, state.systemPrompt].filter(Boolean).join('\n\n') || undefined);
     const options: Record<string, unknown> = {
       cwd: state.cwd,
       ...(state.env ? { env: { ...process.env, ...state.env } } : {}),
@@ -291,8 +293,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       ...(state.model ? { model: state.model } : {}),
       ...(state.settings ? { settings: state.settings } : {}),
       ...(state.effort ? { effort: state.effort } : {}),
-      ...(baseSystemPrompt ?? state.systemPrompt ? {
-        appendSystemPrompt: [baseSystemPrompt, state.systemPrompt].filter(Boolean).join('\n\n'),
+      ...(baseSystemPrompt ? {
+        appendSystemPrompt: baseSystemPrompt,
       } : {}),
     };
     options.spawnClaudeCodeProcess = (req: { command: string; args: string[]; cwd?: string; env?: Record<string, string>; signal?: AbortSignal }) => {
@@ -317,17 +319,16 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       return child;
     };
 
-    const q = query({ prompt: message, options: options as any });
+    const q = query({ prompt: payload.assembledMessage, options: options as any });
     state.currentQuery = q;
-    void this.consumeQuery(sessionId, state, q, message, extraSystemPrompt, allowResumeFallback);
+    void this.consumeQuery(sessionId, state, q, payload, allowResumeFallback);
   }
 
   private async consumeQuery(
     sessionId: string,
     state: ClaudeSdkSessionState,
     q: ReturnType<typeof query>,
-    message: string,
-    extraSystemPrompt: string | undefined,
+    payload: ProviderContextPayload,
     allowResumeFallback: boolean,
   ): Promise<void> {
     let pendingError: ProviderError | null = null;
@@ -356,7 +357,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider {
       if (!pendingComplete && pendingError && allowResumeFallback && state.started && this.isMissingResumeError(pendingError.message)) {
         state.started = false;
         logger.info({ provider: this.id, sessionId, resumeId: state.resumeId }, 'Claude SDK resume failed; retrying with sessionId');
-        await this.startQuery(sessionId, state, message, extraSystemPrompt, false);
+        await this.startQuery(sessionId, state, payload, false);
         return;
       }
       if (pendingComplete) {

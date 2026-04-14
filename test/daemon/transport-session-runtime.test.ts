@@ -21,7 +21,7 @@ function makeMockProvider() {
   return {
     provider: {
       id: 'mock', connectionMode: 'persistent', sessionOwnership: 'provider',
-      capabilities: { streaming: true, toolCalling: false, approval: false, sessionRestore: false, multiTurn: true, attachments: false },
+      capabilities: { streaming: true, toolCalling: false, approval: false, sessionRestore: false, multiTurn: true, attachments: false, contextSupport: 'full-normalized-context-injection' },
       connect: vi.fn(), disconnect: vi.fn(), send: vi.fn(), cancel: vi.fn(),
       createSession: vi.fn().mockResolvedValue('sess-1'), endSession: vi.fn(),
       onDelta: (cb: (sid: string, d: MessageDelta) => void) => { deltaCb = cb; return () => { deltaCb = null; }; },
@@ -33,6 +33,11 @@ function makeMockProvider() {
 }
 
 const defaultConfig: SessionConfig = { sessionKey: 'deck_test_brain' };
+const flushDispatch = async () => {
+  await Promise.resolve();
+  await Promise.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+};
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
@@ -60,24 +65,162 @@ describe('TransportSessionRuntime', () => {
     expect(() => fresh.send('hi')).toThrow(/not initialized/i);
   });
 
-  it('send() returns "sent" when idle', () => {
+  it('send() returns "sent" when idle', async () => {
     expect(runtime.send('hi')).toBe('sent');
-    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', 'hi', undefined, undefined);
+    await flushDispatch();
+    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      userMessage: 'hi',
+      assembledMessage: 'hi',
+      systemText: undefined,
+    }));
   });
 
-  it('send() returns "queued" when busy', () => {
+  it('send() returns "queued" when busy', async () => {
     runtime.send('first');
+    await flushDispatch();
     expect(runtime.send('second')).toBe('queued');
     expect(runtime.pendingCount).toBe(1);
     // provider.send called only once (for first message)
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
   });
 
-  it('send() passes description as extraSystemPrompt', async () => {
+  it('send() merges description and runtime prompt into normalized systemText', async () => {
     const r = new TransportSessionRuntime(mock.provider, 'x');
-    await r.initialize({ ...defaultConfig, description: 'expert' });
+    await r.initialize({ ...defaultConfig, description: 'expert', systemPrompt: 'runtime only' });
     r.send('help');
-    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', 'help', undefined, 'expert');
+    await flushDispatch();
+    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      userMessage: 'help',
+      assembledMessage: 'help',
+      systemText: 'expert\n\nruntime only',
+    }));
+  });
+
+  it('send() uses the resolved context namespace from session config instead of hardcoded sessionKey namespace', async () => {
+    const r = new TransportSessionRuntime(mock.provider, 'x');
+    await r.initialize({
+      ...defaultConfig,
+      cwd: '/tmp/project',
+      contextNamespace: {
+        scope: 'personal',
+        projectId: 'github.com/acme/repo',
+      },
+      contextNamespaceDiagnostics: ['namespace:explicit'],
+    });
+
+    r.send('help');
+    await flushDispatch();
+
+    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      authority: expect.objectContaining({
+        namespace: {
+          scope: 'personal',
+          projectId: 'github.com/acme/repo',
+        },
+      }),
+      diagnostics: expect.arrayContaining(['namespace:explicit']),
+    }));
+  });
+
+  it('send() uses bootstrap-provided local processed freshness for personal continuity authority', async () => {
+    const r = new TransportSessionRuntime(mock.provider, 'x');
+    await r.initialize({
+      ...defaultConfig,
+      contextNamespace: {
+        scope: 'personal',
+        projectId: 'github.com/acme/repo',
+      },
+      contextLocalProcessedFreshness: 'fresh',
+    });
+
+    r.send('help');
+    await flushDispatch();
+
+    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      authority: expect.objectContaining({
+        authoritySource: 'processed_local',
+        freshness: 'fresh',
+      }),
+      diagnostics: expect.arrayContaining(['authority:processed_local']),
+    }));
+  });
+
+  it('shared-scope sends fail before provider dispatch when no authoritative shared context exists', async () => {
+    const r = new TransportSessionRuntime(mock.provider, 'x');
+    await r.initialize({
+      ...defaultConfig,
+      contextNamespace: {
+        scope: 'project_shared',
+        projectId: 'github.com/acme/repo',
+        enterpriseId: 'ent-1',
+      },
+    });
+
+    r.send('help');
+    await flushDispatch();
+
+    expect(mock.provider.send).not.toHaveBeenCalled();
+    expect(r.getStatus()).toBe('error');
+  });
+
+  it('refreshes shared-context bootstrap on each dispatch turn instead of freezing launch-time namespace state', async () => {
+    const r = new TransportSessionRuntime(mock.provider, 'x');
+    const refreshBootstrap = vi.fn()
+      .mockResolvedValueOnce({
+        namespace: {
+          scope: 'project_shared',
+          projectId: 'github.com/acme/repo',
+          enterpriseId: 'ent-1',
+        },
+        diagnostics: ['namespace:server-control-plane'],
+        remoteProcessedFreshness: 'fresh',
+      })
+      .mockResolvedValueOnce({
+        namespace: {
+          scope: 'personal',
+          projectId: 'github.com/acme/repo',
+        },
+        diagnostics: ['namespace:server-personal-fallback'],
+        localProcessedFreshness: 'fresh',
+      });
+    await r.initialize({
+      ...defaultConfig,
+      contextNamespace: {
+        scope: 'personal',
+        projectId: 'launch-snapshot',
+      },
+      contextNamespaceDiagnostics: ['namespace:launch'],
+    });
+    r.setContextBootstrapResolver(refreshBootstrap);
+
+    r.send('first');
+    await flushDispatch();
+    expect(mock.provider.send).toHaveBeenNthCalledWith(1, 'sess-1', expect.objectContaining({
+      authority: expect.objectContaining({
+        namespace: {
+          scope: 'project_shared',
+          projectId: 'github.com/acme/repo',
+          enterpriseId: 'ent-1',
+        },
+        authoritySource: 'processed_remote',
+      }),
+      diagnostics: expect.arrayContaining(['namespace:server-control-plane']),
+    }));
+
+    mock.fireComplete('sess-1');
+    r.send('second');
+    await flushDispatch();
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      authority: expect.objectContaining({
+        namespace: {
+          scope: 'personal',
+          projectId: 'github.com/acme/repo',
+        },
+        authoritySource: 'processed_local',
+      }),
+      diagnostics: expect.arrayContaining(['namespace:server-personal-fallback']),
+    }));
+    expect(refreshBootstrap).toHaveBeenCalledTimes(2);
   });
 
   it('onComplete sets status to idle and appends to history', () => {
@@ -109,16 +252,21 @@ describe('TransportSessionRuntime', () => {
     expect(runtime.pendingCount).toBe(2);
   });
 
-  it('cancelled turns drain pending messages into the next turn', () => {
+  it('cancelled turns drain pending messages into the next turn', async () => {
     runtime.send('first');
+    await flushDispatch();
     runtime.send('queued1');
     runtime.send('queued2');
 
     runtime.cancel();
     mock.fireError('sess-1', { code: 'CANCELLED', message: 'cancelled', recoverable: true });
+    await flushDispatch();
 
     expect(mock.provider.send).toHaveBeenCalledTimes(2);
-    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', 'queued1\n\nqueued2', undefined, undefined);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'queued1\n\nqueued2',
+      assembledMessage: 'queued1\n\nqueued2',
+    }));
     expect(runtime.pendingCount).toBe(0);
   });
 

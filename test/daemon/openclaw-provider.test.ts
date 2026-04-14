@@ -121,6 +121,7 @@ describe('OpenClawProvider', () => {
       attachments: false,
       reasoningEffort: true,
       supportedEffortLevels: ['off', 'minimal', 'low', 'medium', 'high', 'adaptive'],
+      contextSupport: 'full-normalized-context-injection',
     });
   });
 
@@ -273,6 +274,44 @@ describe('OpenClawProvider', () => {
       await sendPromise;
     });
 
+    it('sends normalized payload message/system text without caller-side raw fields', async () => {
+      await connectProvider(provider);
+
+      const sendPromise = provider.send('sess-1', {
+        userMessage: 'ship it',
+        assembledMessage: 'Context block\n\nship it',
+        systemText: 'Normalized system text',
+        messagePreamble: 'Context block',
+        attachments: [],
+        context: {
+          systemText: 'Normalized system text',
+          messagePreamble: 'Context block',
+          requiredAuthoredContext: [],
+          advisoryAuthoredContext: [],
+          appliedDocumentVersionIds: [],
+          diagnostics: [],
+        },
+        authority: {
+          namespace: { scope: 'personal', projectId: 'sess-1' },
+          authoritySource: 'none',
+          freshness: 'missing',
+          fallbackAllowed: true,
+          retryScheduled: false,
+          diagnostics: [],
+        },
+        supportClass: 'full-normalized-context-injection',
+        diagnostics: [],
+      });
+
+      const ws = lastWs();
+      const rpcFrame = JSON.parse(ws.sent[ws.sent.length - 1]);
+      expect(rpcFrame.params.message).toBe('Context block\n\nship it');
+      expect(rpcFrame.params.extraSystemPrompt).toBe('Normalized system text');
+
+      replyToLastRpc();
+      await sendPromise;
+    });
+
     it('omits extraSystemPrompt when undefined', async () => {
       await connectProvider(provider);
 
@@ -284,6 +323,74 @@ describe('OpenClawProvider', () => {
 
       replyToLastRpc();
       await sendPromise;
+    });
+
+    it('accepts a normalized provider payload', async () => {
+      await connectProvider(provider);
+
+      const sendPromise = provider.send('sess-1', {
+        userMessage: 'Hello',
+        assembledMessage: 'Shared summary\n\nHello',
+        systemText: 'Enterprise standard',
+        messagePreamble: 'Shared summary',
+        attachments: undefined,
+        context: {
+          systemText: 'Enterprise standard',
+          messagePreamble: 'Shared summary',
+          requiredAuthoredContext: [],
+          advisoryAuthoredContext: [],
+          appliedDocumentVersionIds: [],
+          diagnostics: [],
+        },
+        authority: {
+          namespace: { scope: 'project_shared', projectId: 'repo' },
+          authoritySource: 'processed_remote',
+          freshness: 'fresh',
+          fallbackAllowed: false,
+          retryScheduled: false,
+          diagnostics: [],
+        },
+        supportClass: 'full-normalized-context-injection',
+        diagnostics: [],
+      });
+
+      const ws = lastWs();
+      const rpcFrame = JSON.parse(ws.sent[ws.sent.length - 1]);
+      expect(rpcFrame.params.message).toBe('Shared summary\n\nHello');
+      expect(rpcFrame.params.extraSystemPrompt).toBe('Enterprise standard');
+
+      replyToLastRpc();
+      await sendPromise;
+    });
+
+    it('rejects normalized payloads combined with legacy extraSystemPrompt', async () => {
+      await connectProvider(provider);
+
+      await expect(provider.send('sess-1', {
+        userMessage: 'Hello',
+        assembledMessage: 'Shared summary\n\nHello',
+        systemText: 'Enterprise standard',
+        messagePreamble: 'Shared summary',
+        attachments: undefined,
+        context: {
+          systemText: 'Enterprise standard',
+          messagePreamble: 'Shared summary',
+          requiredAuthoredContext: [],
+          advisoryAuthoredContext: [],
+          appliedDocumentVersionIds: [],
+          diagnostics: [],
+        },
+        authority: {
+          namespace: { scope: 'project_shared', projectId: 'repo' },
+          authoritySource: 'processed_remote',
+          freshness: 'fresh',
+          fallbackAllowed: false,
+          retryScheduled: false,
+          diagnostics: [],
+        },
+        supportClass: 'full-normalized-context-injection',
+        diagnostics: [],
+      }, undefined, 'legacy raw context')).rejects.toThrow(/legacy extraSystemPrompt/i);
     });
   });
 

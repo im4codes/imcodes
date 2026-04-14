@@ -69,6 +69,7 @@ vi.mock('../../src/util/logger.js', () => ({
 import { QwenProvider } from '../../src/agent/providers/qwen.js';
 import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
 import type { ToolCallEvent } from '../../src/agent/transport-provider.js';
+import type { ProviderContextPayload } from '../../shared/context-types.js';
 
 function lastSpawn() {
   const entry = childProcessMock.spawned.at(-1);
@@ -230,6 +231,84 @@ describe('QwenProvider', () => {
     expect(second.args).not.toContain('--session-id');
   });
 
+  it('maps normalized payloads into qwen CLI prompt/system arguments', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-payload',
+      cwd: '/tmp/project',
+      description: 'Legacy description',
+    });
+
+    const payload: ProviderContextPayload = {
+      userMessage: 'ship it',
+      assembledMessage: 'Context block\n\nship it',
+      systemText: 'Normalized system text',
+      messagePreamble: 'Context block',
+      attachments: [],
+      context: {
+        systemText: 'Normalized system text',
+        messagePreamble: 'Context block',
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'sess-payload' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    };
+
+    await provider.send('sess-payload', payload);
+    const spawnEntry = lastSpawn();
+    expect(spawnEntry.args).toContain('-p');
+    expect(spawnEntry.args).toContain('Context block\n\nship it');
+    expect(spawnEntry.args).toContain('--append-system-prompt');
+    expect(spawnEntry.args).toContain('Normalized system text');
+  });
+
+  it('rejects normalized payloads combined with legacy extraSystemPrompt', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-payload',
+      cwd: '/tmp/project',
+    });
+
+    await expect(provider.send('sess-payload', {
+      userMessage: 'ship it',
+      assembledMessage: 'Context block\n\nship it',
+      systemText: 'Normalized system text',
+      messagePreamble: 'Context block',
+      attachments: [],
+      context: {
+        systemText: 'Normalized system text',
+        messagePreamble: 'Context block',
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'sess-payload' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    }, undefined, 'legacy raw context')).rejects.toThrow(/legacy extraSystemPrompt/i);
+  });
+
   it('falls back to a fresh session when --resume points to a missing qwen conversation id', async () => {
     const provider = new QwenProvider();
     await provider.connect({});
@@ -273,6 +352,47 @@ describe('QwenProvider', () => {
     await flushIO();
 
     expect(completed).toContain('Recovered');
+  });
+
+  it('accepts a normalized provider payload', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-payload',
+      cwd: '/tmp/project',
+    });
+
+    await provider.send('sess-payload', {
+      userMessage: 'hello',
+      assembledMessage: 'Shared history\n\nhello',
+      systemText: 'Enterprise standard',
+      messagePreamble: 'Shared history',
+      attachments: undefined,
+      context: {
+        systemText: 'Enterprise standard',
+        messagePreamble: 'Shared history',
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'project_shared', projectId: 'repo' },
+        authoritySource: 'processed_remote',
+        freshness: 'fresh',
+        fallbackAllowed: false,
+        retryScheduled: false,
+        diagnostics: [],
+      },
+      supportClass: 'full-normalized-context-injection',
+      diagnostics: [],
+    });
+
+    const run = lastSpawn();
+    expect(run.args).toContain('-p');
+    expect(run.args).toContain('Shared history\n\nhello');
+    expect(run.args).toContain('--append-system-prompt');
+    expect(run.args).toContain('Enterprise standard');
   });
 
   it('normalizes Windows cwd before spawning qwen', async () => {

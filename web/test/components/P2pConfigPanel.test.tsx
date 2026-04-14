@@ -13,10 +13,20 @@ vi.mock('react-i18next', () => ({
 
 const getUserPrefMock = vi.fn();
 const saveUserPrefMock = vi.fn();
+const onUserPrefChangedMock = vi.fn((cb: (key: string, value: unknown) => void) => {
+  const handler = (event: Event) => {
+    const detail = (event as CustomEvent<{ key?: string; value?: unknown }>).detail;
+    if (!detail?.key) return;
+    cb(detail.key, detail.value);
+  };
+  window.addEventListener('imcodes:user-pref-changed', handler as EventListener);
+  return () => window.removeEventListener('imcodes:user-pref-changed', handler as EventListener);
+});
 
 vi.mock('../../src/api.js', () => ({
   getUserPref: (...args: unknown[]) => getUserPrefMock(...args),
   saveUserPref: (...args: unknown[]) => saveUserPrefMock(...args),
+  onUserPrefChanged: (...args: unknown[]) => onUserPrefChangedMock(...args as Parameters<typeof onUserPrefChangedMock>),
 }));
 
 import { P2pConfigPanel } from '../../src/components/P2pConfigPanel.js';
@@ -40,6 +50,7 @@ function renderPanel(overrides: {
   initialTab?: 'participants' | 'combos';
   onClose?: () => void;
   onSave?: (cfg: P2pSavedConfig) => void;
+  onPersistDaemonConfig?: (scopeSession: string, cfg: P2pSavedConfig) => Promise<{ ok: boolean; error?: string }> | { ok: boolean; error?: string };
 } = {}) {
   const props = {
     sessions: overrides.sessions ?? sessions,
@@ -48,6 +59,7 @@ function renderPanel(overrides: {
     initialTab: overrides.initialTab,
     onClose: overrides.onClose ?? vi.fn(),
     onSave: overrides.onSave ?? vi.fn(),
+    onPersistDaemonConfig: overrides.onPersistDaemonConfig,
   };
   return render(<P2pConfigPanel {...props} />);
 }
@@ -333,6 +345,92 @@ describe('P2pConfigPanel', () => {
     const parsed = JSON.parse(jsonArg);
     expect(parsed).toHaveProperty('sessions');
     expect(parsed).toHaveProperty('rounds');
+  });
+
+  it('persists the saved config to the daemon authority path', async () => {
+    const onPersistDaemonConfig = vi.fn().mockResolvedValue({ ok: true });
+    renderPanel({ onPersistDaemonConfig });
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('settings_save'));
+    });
+    await flush();
+
+    expect(onPersistDaemonConfig).toHaveBeenCalledOnce();
+    expect(onPersistDaemonConfig.mock.calls[0][0]).toBe('deck_proj_brain');
+    expect(onPersistDaemonConfig.mock.calls[0][1]).toHaveProperty('sessions');
+    expect(onPersistDaemonConfig.mock.calls[0][1]).toHaveProperty('updatedAt');
+  });
+
+  it('keeps the panel open and shows a warning when server save succeeds but daemon save fails', async () => {
+    const onClose = vi.fn();
+    const onSave = vi.fn();
+    const onPersistDaemonConfig = vi.fn().mockResolvedValue({ ok: false, error: 'persist_failed' });
+    renderPanel({ onClose, onSave, onPersistDaemonConfig });
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('settings_save'));
+    });
+    await flush();
+
+    expect(saveUserPrefMock).toHaveBeenCalledOnce();
+    expect(onSave).toHaveBeenCalledOnce();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByText(/local daemon copy failed to update/i)).toBeDefined();
+  });
+
+  it('keeps the panel open and shows an error when server save fails', async () => {
+    const onClose = vi.fn();
+    const onSave = vi.fn();
+    const onPersistDaemonConfig = vi.fn().mockResolvedValue({ ok: true });
+    saveUserPrefMock.mockRejectedValueOnce(new Error('server down'));
+    renderPanel({ onClose, onSave, onPersistDaemonConfig });
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('settings_save'));
+    });
+    await flush();
+
+    expect(onPersistDaemonConfig).not.toHaveBeenCalled();
+    expect(onSave).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByText(/failed to save p2p settings/i)).toBeDefined();
+  });
+
+  it('reloads panel state when the session P2P preference changes externally', async () => {
+    let prefValue = JSON.stringify({
+      sessions: {
+        'deck_proj_brain': { enabled: false, mode: 'audit' },
+      },
+      rounds: 1,
+    });
+    getUserPrefMock.mockImplementation(async (key: string) => {
+      if (key === 'p2p_session_config:deck_proj_brain') return prefValue;
+      return null;
+    });
+
+    renderPanel();
+    await flush();
+
+    let checkboxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
+    expect(checkboxes[0].checked).toBe(false);
+
+    prefValue = JSON.stringify({
+      sessions: {
+        'deck_proj_brain': { enabled: true, mode: 'audit' },
+      },
+      rounds: 1,
+    });
+    window.dispatchEvent(new CustomEvent('imcodes:user-pref-changed', {
+      detail: { key: 'p2p_session_config:deck_proj_brain', value: prefValue },
+    }));
+    await flush();
+
+    checkboxes = screen.getAllByRole('checkbox') as HTMLInputElement[];
+    expect(checkboxes[0].checked).toBe(true);
   });
 
   it('hides the advanced workflow section while the openspec flow is being reworked', async () => {

@@ -27,6 +27,7 @@ import { webhookRoutes } from './routes/webhook.js';
 import { outboundRoutes } from './routes/outbound.js';
 import { botRoutes } from './routes/bot.js';
 import { teamRoutes } from './routes/team.js';
+import { sharedContextRoutes } from './routes/shared-context.js';
 import { cronApiRoutes } from './routes/cron-api.js';
 import { pushRoutes } from './routes/push.js';
 import { quickDataRoutes } from './routes/quick-data.js';
@@ -153,6 +154,7 @@ export function buildApp(env: Env) {
   app.route('/api/outbound', outboundRoutes);
   app.route('/api/bot', botRoutes);
   app.route('/api/team', teamRoutes);
+  app.route('/api/shared-context', sharedContextRoutes);
   app.route('/api/cron', cronApiRoutes);
   app.route('/api/push', pushRoutes);
   app.route('/api/quick-data', quickDataRoutes);

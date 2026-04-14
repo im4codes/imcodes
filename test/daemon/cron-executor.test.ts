@@ -230,6 +230,7 @@ describe('executeCronJob', () => {
 
     expect(detectStatusAsync).not.toHaveBeenCalled();
     expect(mockRuntime.send).toHaveBeenCalledWith('review the codebase');
+    expect(typeof mockRuntime.send.mock.calls[0][0]).toBe('string');
     expect(sendKeys).not.toHaveBeenCalled();
     expect(timelineEmit).toHaveBeenCalledWith(
       'deck_myapp_brain',

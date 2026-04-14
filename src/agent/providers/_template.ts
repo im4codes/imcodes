@@ -63,6 +63,15 @@ export class YourProvider implements TransportProvider {
     sessionRestore: false,
     multiTurn:      true,
     attachments:    false,
+
+    // TODO: Set the shared-context support class for this provider.
+    //   'full-normalized-context-injection'     — provider can accept structured ProviderContextPayload
+    //   'degraded-message-side-context-mapping' — context merged into message text only
+    //   'unsupported'                           — provider cannot carry context at all
+    // The runtime calls normalizeProviderPayload() in send() to convert plain strings
+    // into ProviderContextPayload. Use payload.assembledMessage for the user message
+    // (includes messagePreamble) and payload.systemText for system-level context.
+    contextSupport: 'full-normalized-context-injection',
   };
 
   // ── Private state ──────────────────────────────────────────────────────────
@@ -111,8 +120,17 @@ export class YourProvider implements TransportProvider {
    * For per-request providers: build and fire an HTTP request; call completeCallbacks
    *   (and deltaCallbacks if streaming) with the result before returning.
    *
+   * The runtime dispatches either a plain string (legacy path) or a ProviderContextPayload
+   * (shared-context path). Use normalizeProviderPayload() from transport-provider.ts to
+   * ensure you always work with a structured payload:
+   *
+   *   import { normalizeProviderPayload } from '../transport-provider.js';
+   *   const payload = normalizeProviderPayload(message);
+   *   // payload.assembledMessage — user message with preamble
+   *   // payload.systemText       — compiled system context (may be undefined)
+   *
    * @param sessionId   - The session ID returned by createSession().
-   * @param message     - The user's text content.
+   * @param message     - Plain string or ProviderContextPayload.
    * @param attachments - Only present when capabilities.attachments is true.
    */
   async send(sessionId: string, _message: string, _attachments?: unknown[]): Promise<void> {

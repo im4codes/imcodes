@@ -72,4 +72,20 @@ describe('resolveStructuredSessionBootstrap', () => {
     expect(result.geminiSessionId).toBe('gemini-uuid-1');
     expect(mocks.injectGeminiMemory).toHaveBeenCalledWith('gemini-uuid-1', '/proj');
   });
+
+  it('skips Gemini legacy memory injection when legacy injection is disabled', async () => {
+    process.env.IMCODES_SHARED_CONTEXT_LEGACY_INJECTION_DISABLED = 'true';
+    try {
+      const result = await resolveStructuredSessionBootstrap({
+        agentType: 'gemini',
+        projectDir: '/proj',
+        isNewSession: true,
+      });
+
+      expect(result.geminiSessionId).toBe('gemini-uuid-1');
+      expect(mocks.injectGeminiMemory).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.IMCODES_SHARED_CONTEXT_LEGACY_INJECTION_DISABLED;
+    }
+  });
 });

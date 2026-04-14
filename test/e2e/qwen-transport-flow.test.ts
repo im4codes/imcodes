@@ -14,6 +14,7 @@
  * - streaming and final events reuse the same stable eventId (typewriter path)
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { ProviderContextPayload } from '../../shared/context-types.js';
 
 const SESSION = `deck_qwene2e_${Math.random().toString(36).slice(2, 8)}_brain`;
 
@@ -57,7 +58,10 @@ const mocks = vi.hoisted(() => {
     onComplete(cb: (sid: string, msg: any) => void) { this.completeCallbacks.push(cb); return () => {}; }
     onError(cb: (sid: string, err: any) => void) { this.errorCallbacks.push(cb); return () => {}; }
     setSessionAgentId(sessionId: string, agentId: string) { this.modelBySession.set(sessionId, agentId); }
-    async send(sessionId: string, message: string) {
+    async send(sessionId: string, payloadOrMessage: string | ProviderContextPayload) {
+      const message = typeof payloadOrMessage === 'string'
+        ? payloadOrMessage
+        : payloadOrMessage.assembledMessage;
       if (message === 'fail') {
         this.deltaCallbacks.forEach((cb) => cb(sessionId, {
           messageId: 'msg-qwen-e2e-error',

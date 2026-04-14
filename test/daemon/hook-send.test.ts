@@ -321,6 +321,7 @@ describe('Hook server /send endpoint', () => {
       expect(res.body.ok).toBe(true);
       expect(res.body.delivered).toBe(true);
       expect(mockRuntime.send).toHaveBeenCalledWith('hello transport');
+      expect(typeof mockRuntime.send.mock.calls[0][0]).toBe('string');
     });
   });
 

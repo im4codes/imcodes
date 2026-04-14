@@ -37,6 +37,7 @@ import { getCodexRuntimeConfig } from './codex-runtime-config.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
+import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js';
 
 import { getAgentVersion } from './agent-version.js';
 import { repoCache } from '../repo/cache.js';
@@ -1057,6 +1058,12 @@ export async function restoreTransportSessions(providerId: string): Promise<void
       let systemPrompt: string | undefined;
       let transportSettings: string | Record<string, unknown> | undefined;
       let effectiveRequestedModel = effectiveQwenModel;
+      const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
+        projectDir: s.projectDir,
+        transportConfig: getSession(s.name)?.transportConfig ?? s.transportConfig ?? {},
+      });
+      const contextBootstrap = await resolveRuntimeContextBootstrap();
+      runtime.setContextBootstrapResolver(resolveRuntimeContextBootstrap);
       if (s.providerId === 'claude-code-sdk' && s.ccPreset) {
         const { resolvePresetEnv, getPresetTransportOverrides } = await import('../daemon/cc-presets.js');
         extraEnv = await resolvePresetEnv(s.ccPreset, s.ccSessionId ?? undefined);
@@ -1084,6 +1091,12 @@ export async function restoreTransportSessions(providerId: string): Promise<void
         description: s.description,
         ...(systemPrompt ? { systemPrompt } : {}),
         ...(transportSettings ? { settings: transportSettings } : {}),
+        contextNamespace: contextBootstrap.namespace,
+        contextNamespaceDiagnostics: contextBootstrap.diagnostics,
+        contextRemoteProcessedFreshness: contextBootstrap.remoteProcessedFreshness,
+        contextLocalProcessedFreshness: contextBootstrap.localProcessedFreshness,
+        contextRetryExhausted: contextBootstrap.retryExhausted,
+        contextSharedPolicyOverride: contextBootstrap.sharedPolicyOverride,
         agentId: effectiveRequestedModel,
         resumeId,
         effort: s.effort,
@@ -1167,6 +1180,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const effectiveTransportConfig = opts.transportConfig ?? existing?.transportConfig ?? {};
   let transportResumeId: string | undefined;
   let transportEnv: Record<string, string> | undefined = opts.extraEnv;
+  const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
+    projectDir,
+    transportConfig: getSession(name)?.transportConfig ?? effectiveTransportConfig,
+  });
+  const contextBootstrap = await resolveRuntimeContextBootstrap();
+  runtime.setContextBootstrapResolver(resolveRuntimeContextBootstrap);
   if (agentType === 'qwen') {
     const qwenRuntime = await getQwenRuntimeConfig().catch(() => null);
     qwenAuthType = qwenRuntime?.authType;
@@ -1243,6 +1262,12 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     description,
     ...(transportSystemPrompt ? { systemPrompt: transportSystemPrompt } : {}),
     ...(transportSettings ? { settings: transportSettings } : {}),
+    contextNamespace: contextBootstrap.namespace,
+    contextNamespaceDiagnostics: contextBootstrap.diagnostics,
+    contextRemoteProcessedFreshness: contextBootstrap.remoteProcessedFreshness,
+    contextLocalProcessedFreshness: contextBootstrap.localProcessedFreshness,
+    contextRetryExhausted: contextBootstrap.retryExhausted,
+    contextSharedPolicyOverride: contextBootstrap.sharedPolicyOverride,
     agentId: requestedTransportModel,
     bindExistingKey: effectiveBindExistingKey,
     skipCreate: effectiveSkipCreate,

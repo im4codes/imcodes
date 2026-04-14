@@ -1,7 +1,6 @@
 import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
 import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute } from '../agent/session-manager.js';
 import { sessionExists, isPaneAlive, BACKEND, killSession } from '../agent/tmux.js';
-import { detectMemoryBackend } from '../memory/detector.js';
 import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
 import { ServerLink } from './server-link.js';
@@ -21,13 +20,14 @@ import { loadConfig, type Config } from '../config.js';
 import { loadCredentials } from '../bind/bind-flow.js';
 import { sendKeys } from '../agent/tmux.js';
 import logger from '../util/logger.js';
-import type { MemoryBackend } from '../memory/interface.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { pickReadableSessionDisplay } from '../../shared/session-display.js';
 import { buildWorkerSessionPersistBody, mergeWorkerSessionSnapshot } from './session-bootstrap.js';
+import { replicatePendingProcessedContext } from '../context/processed-context-replication.js';
+import { configureSharedContextRuntime } from '../context/shared-context-runtime.js';
 
 /** Get the last assistant.text from a session's timeline (for push notification context). */
 function getLastAssistantText(sessionName: string): string | undefined {
@@ -81,7 +81,6 @@ function resolvePushDisplayContext(sessionName: string, sessions: SessionRecord[
 
 export interface DaemonContext {
   config: Config;
-  memory: MemoryBackend | null;
   serverLink: ServerLink | null;
   /** Persist a channel binding to D1 via CF Worker API. Returns false if not connected or request fails. */
   persistBinding(platform: string, channelId: string, botId: string, bindingType: string, target: string): Promise<boolean>;
@@ -297,9 +296,6 @@ export async function startup(): Promise<DaemonContext> {
   // Clean up old timeline files (>7 days)
   timelineStore.cleanup();
 
-  const { backend: memory, mode } = await detectMemoryBackend();
-  logger.info({ mode }, 'Memory backend selected');
-
   const creds = await loadCredentials();
 
   // No fallback: a valid serverId is required for the WS endpoint (/api/server/:id/ws)
@@ -308,6 +304,7 @@ export async function startup(): Promise<DaemonContext> {
   const workerUrl = creds?.workerUrl;
   const serverId = creds?.serverId ?? '';
   const token = creds?.token ?? '';
+  configureSharedContextRuntime(creds ? { workerUrl: workerUrl!, serverId, token } : null);
 
   // Sync sessions from D1 before restoring tmux sessions
   if (creds) {
@@ -460,6 +457,9 @@ export async function startup(): Promise<DaemonContext> {
     if (localSessions.filter((s) => s.state !== 'stopped').length > 0) {
       logger.info({ count: localSessions.filter((s) => s.state !== 'stopped').length }, 'Pushed local sessions to server DB on startup');
     }
+    void replicatePendingProcessedContext({ workerUrl: workerUrl!, serverId, token }).catch((err) => {
+      logger.warn({ err }, 'Initial processed-context replication failed');
+    });
   }
 
   async function persistBinding(platform: string, channelId: string, botId: string, bindingType: string, target: string): Promise<boolean> {
@@ -623,10 +623,11 @@ export async function startup(): Promise<DaemonContext> {
   // Rewrite all CC hook scripts with the actual port (may differ from last run)
   await setupCCHooks().catch((e) => logger.warn({ err: e }, 'CC hook setup failed'));
 
-  ctx = { config, memory, serverLink, persistBinding, removeBinding, sendSessionEvent };
+  ctx = { config, serverLink, persistBinding, removeBinding, sendSessionEvent };
   setupSignalHandlers();
   startHealthPoller();
   startCodexQuotaPoller(serverLink);
+  startContextReplicationPoller(workerUrl, serverId, token);
 
   logger.info('Daemon started');
 
@@ -713,8 +714,10 @@ export async function shutdown(exitCode = 0): Promise<void> {
   try {
     if (healthTimer) clearInterval(healthTimer);
     if (codexQuotaTimer) clearInterval(codexQuotaTimer);
+    if (contextReplicationTimer) clearInterval(contextReplicationTimer);
     hookServer?.close();
     ctx?.serverLink?.disconnect();
+    configureSharedContextRuntime(null);
     await flushStore();
     logger.info('Store flushed');
   } catch (e) {
@@ -734,8 +737,10 @@ export async function shutdown(exitCode = 0): Promise<void> {
 
 const HEALTH_POLL_MS = 30_000;
 const CODEX_QUOTA_REFRESH_MS = 60_000;
+const CONTEXT_REPLICATION_POLL_MS = 30_000;
 let healthTimer: ReturnType<typeof setInterval> | null = null;
 let codexQuotaTimer: ReturnType<typeof setInterval> | null = null;
+let contextReplicationTimer: ReturnType<typeof setInterval> | null = null;
 let hookServer: http.Server | null = null;
 
 /** Periodically check all running sessions; restart any that have disappeared or died. */
@@ -783,6 +788,15 @@ function startCodexQuotaPoller(serverLink: ServerLink | null): void {
       logger.warn({ err }, 'Codex quota refresh failed');
     });
   }, CODEX_QUOTA_REFRESH_MS);
+}
+
+function startContextReplicationPoller(workerUrl: string | undefined, serverId: string, token: string): void {
+  if (!workerUrl || !serverId || !token) return;
+  contextReplicationTimer = setInterval(() => {
+    void replicatePendingProcessedContext({ workerUrl, serverId, token }).catch((err) => {
+      logger.warn({ err }, 'Processed-context replication failed');
+    });
+  }, CONTEXT_REPLICATION_POLL_MS);
 }
 
 function setupSignalHandlers(): void {

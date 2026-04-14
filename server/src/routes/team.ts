@@ -6,6 +6,20 @@ import { logAudit } from '../security/audit.js';
 
 export const teamRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
+// GET /api/team — list teams accessible to the authenticated user
+teamRoutes.get('/', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const teams = await c.env.DB.query<{ id: string; name: string; role: string }>(
+    `SELECT t.id, t.name, tm.role
+     FROM teams t
+     JOIN team_members tm ON tm.team_id = t.id
+     WHERE tm.user_id = $1
+     ORDER BY t.name ASC`,
+    [userId],
+  );
+  return c.json({ teams });
+});
+
 // POST /api/team — create a new team
 teamRoutes.post('/', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
@@ -59,7 +73,11 @@ teamRoutes.post('/:id/invite', requireAuth(), async (c) => {
   if (!member) return c.json({ error: 'forbidden' }, 403);
 
   const body = await c.req.json<{ role?: string; email?: string }>().catch(() => ({} as { role?: string; email?: string }));
-  const role = ['admin', 'member'].includes(body.role ?? '') ? body.role : 'member';
+  const requestedRole = ['admin', 'member'].includes(body.role ?? '') ? body.role : 'member';
+  if (requestedRole === 'admin' && member.role !== 'owner') {
+    return c.json({ error: 'forbidden', reason: 'owner_required_for_admin_invite' }, 403);
+  }
+  const role = requestedRole;
 
   const inviteId = randomHex(16);
   const token = randomHex(24); // 48-char invite token
@@ -137,6 +155,19 @@ teamRoutes.put('/:id/member/:memberId/role', requireAuth(), async (c) => {
   if (!me) return c.json({ error: 'forbidden' }, 403);
 
   if (!['admin', 'member'].includes(body?.role ?? '')) return c.json({ error: 'invalid_role' }, 400);
+  if (body?.role === 'admin' && me.role !== 'owner') {
+    return c.json({ error: 'forbidden', reason: 'owner_required_for_admin_role' }, 403);
+  }
+
+  const target = await c.env.DB
+    .queryOne<{ role: string }>('SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2', [teamId, memberId]);
+  if (!target) return c.json({ error: 'not_found' }, 404);
+  if (target.role === 'owner' && me.role !== 'owner') {
+    return c.json({ error: 'forbidden', reason: 'owner_target_protected' }, 403);
+  }
+  if (target.role === 'admin' && me.role !== 'owner') {
+    return c.json({ error: 'forbidden', reason: 'owner_required_to_manage_admin' }, 403);
+  }
 
   await c.env.DB.execute(
     'UPDATE team_members SET role = $1 WHERE team_id = $2 AND user_id = $3',
@@ -156,6 +187,14 @@ teamRoutes.delete('/:id/member/:memberId', requireAuth(), async (c) => {
   const me = await c.env.DB
     .queryOne<{ role: string }>("SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2 AND role IN ('owner', 'admin')", [teamId, userId]);
   if (!me) return c.json({ error: 'forbidden' }, 403);
+
+  const target = await c.env.DB
+    .queryOne<{ role: string }>('SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2', [teamId, memberId]);
+  if (!target) return c.json({ error: 'not_found' }, 404);
+  if (target.role === 'owner') return c.json({ error: 'forbidden', reason: 'owner_target_protected' }, 403);
+  if (target.role === 'admin' && me.role !== 'owner') {
+    return c.json({ error: 'forbidden', reason: 'owner_required_to_manage_admin' }, 403);
+  }
 
   await c.env.DB.execute(
     'DELETE FROM team_members WHERE team_id = $1 AND user_id = $2',

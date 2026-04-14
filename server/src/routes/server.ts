@@ -5,8 +5,56 @@ import { WsBridge } from '../ws/bridge.js';
 import { sha256Hex, randomHex } from '../security/crypto.js';
 import { requireAuth } from '../security/authorization.js';
 import { z } from 'zod';
+import type {
+  ProcessedContextReplicationBody,
+  RuntimeAuthoredContextBinding,
+  SharedContextNamespaceResolution,
+} from '../../../shared/context-types.js';
+import { classifyTimestampFreshness } from '../../../shared/context-freshness.js';
 
 export const serverRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
+
+const processedProjectionSchema = z.object({
+  id: z.string().min(1),
+  namespace: z.object({
+    scope: z.enum(['personal', 'project_shared', 'workspace_shared', 'org_shared']),
+    projectId: z.string().min(1),
+    userId: z.string().optional(),
+    workspaceId: z.string().optional(),
+    enterpriseId: z.string().optional(),
+  }),
+  class: z.enum(['recent_summary', 'durable_memory_candidate']),
+  sourceEventIds: z.array(z.string()),
+  summary: z.string(),
+  content: z.record(z.string(), z.unknown()),
+  createdAt: z.number(),
+  updatedAt: z.number(),
+});
+
+const processedReplicationSchema = z.object({
+  namespace: processedProjectionSchema.shape.namespace,
+  projections: z.array(processedProjectionSchema).min(1),
+});
+
+const authoredContextQuerySchema = z.object({
+  namespace: processedProjectionSchema.shape.namespace.refine((namespace) => namespace.scope !== 'personal', {
+    message: 'shared_scope_required',
+  }),
+  language: z.string().min(1).optional(),
+  filePath: z.string().min(1).optional(),
+});
+
+const namespaceResolutionSchema = z.object({
+  canonicalRepoId: z.string().min(1),
+});
+
+const DEFAULT_REMOTE_PROCESSED_FRESH_MS = 6 * 60 * 60 * 1000;
+
+function getRemoteProcessedFreshMs(): number {
+  const raw = process.env.IMCODES_REMOTE_PROCESSED_FRESH_MS?.trim();
+  const parsed = raw ? Number(raw) : Number.NaN;
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_REMOTE_PROCESSED_FRESH_MS;
+}
 
 // GET /api/server — list all servers accessible to the authenticated user
 serverRoutes.get('/', requireAuth(), async (c) => {
@@ -155,4 +203,280 @@ serverRoutes.delete('/:id/bindings', async (c) => {
   );
 
   return c.json({ ok: true });
+});
+
+serverRoutes.post('/:id/shared-context/processed', async (c) => {
+  const auth = c.req.header('Authorization');
+  if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
+  const token = auth.slice(7);
+  const tokenHash = sha256Hex(token);
+
+  const serverRow = await c.env.DB.queryOne<{ id: string; team_id: string | null }>(
+    'SELECT id, team_id FROM servers WHERE token_hash = $1 AND id = $2',
+    [tokenHash, c.req.param('id')],
+  );
+  if (!serverRow) return c.json({ error: 'unauthorized' }, 401);
+
+  const body = await c.req.json().catch(() => null) as ProcessedContextReplicationBody | null;
+  const parsed = processedReplicationSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+
+  const now = Date.now();
+  for (const projection of parsed.data.projections) {
+    // Cross-tenant security: validate that the namespace enterprise matches the server's team
+    if (projection.namespace.enterpriseId && projection.namespace.enterpriseId !== serverRow.team_id) {
+      return c.json({ error: 'namespace_enterprise_mismatch', projectionId: projection.id }, 403);
+    }
+    // Sanitize: always use serverRow.team_id as the authoritative enterprise binding
+    const safeEnterpriseId = serverRow.team_id ?? projection.namespace.enterpriseId ?? null;
+    await c.env.DB.execute(
+      `INSERT INTO shared_context_projections (
+        id, server_id, scope, enterprise_id, workspace_id, user_id, project_id,
+        projection_class, source_event_ids_json, summary, content_json,
+        created_at, updated_at, replicated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::jsonb, $12, $13, $14)
+      ON CONFLICT (id) DO UPDATE SET
+        scope = excluded.scope,
+        enterprise_id = excluded.enterprise_id,
+        workspace_id = excluded.workspace_id,
+        user_id = excluded.user_id,
+        project_id = excluded.project_id,
+        projection_class = excluded.projection_class,
+        source_event_ids_json = excluded.source_event_ids_json,
+        summary = excluded.summary,
+        content_json = excluded.content_json,
+        created_at = excluded.created_at,
+        updated_at = excluded.updated_at,
+        replicated_at = excluded.replicated_at`,
+      [
+        projection.id,
+        serverRow.id,
+        projection.namespace.scope,
+        safeEnterpriseId,
+        projection.namespace.workspaceId ?? null,
+        projection.namespace.userId ?? null,
+        projection.namespace.projectId,
+        projection.class,
+        JSON.stringify(projection.sourceEventIds),
+        projection.summary,
+        JSON.stringify(projection.content),
+        projection.createdAt,
+        projection.updatedAt,
+        now,
+      ],
+    );
+
+    if (projection.class === 'durable_memory_candidate') {
+      await c.env.DB.execute(
+        `INSERT INTO shared_context_records (
+          id, projection_id, server_id, scope, enterprise_id, workspace_id, user_id, project_id,
+          record_class, summary, content_json, status, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, 'candidate', $12, $13)
+        ON CONFLICT (projection_id) DO UPDATE SET
+          scope = excluded.scope,
+          enterprise_id = excluded.enterprise_id,
+          workspace_id = excluded.workspace_id,
+          user_id = excluded.user_id,
+          project_id = excluded.project_id,
+          record_class = excluded.record_class,
+          summary = excluded.summary,
+          content_json = excluded.content_json,
+          updated_at = excluded.updated_at`,
+        [
+          `record:${projection.id}`,
+          projection.id,
+          serverRow.id,
+          projection.namespace.scope,
+          safeEnterpriseId,
+          projection.namespace.workspaceId ?? null,
+          projection.namespace.userId ?? null,
+          projection.namespace.projectId,
+          projection.class,
+          projection.summary,
+          JSON.stringify(projection.content),
+          projection.createdAt,
+          projection.updatedAt,
+        ],
+      );
+    }
+  }
+
+  return c.json({
+    ok: true,
+    replicatedAt: now,
+    projectionCount: parsed.data.projections.length,
+  });
+});
+
+serverRoutes.post('/:id/shared-context/authored-bindings', async (c) => {
+  const auth = c.req.header('Authorization');
+  if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
+  const token = auth.slice(7);
+  const tokenHash = sha256Hex(token);
+
+  const serverRow = await c.env.DB.queryOne<{ id: string; team_id: string | null }>(
+    'SELECT id, team_id FROM servers WHERE token_hash = $1 AND id = $2',
+    [tokenHash, c.req.param('id')],
+  );
+  if (!serverRow) return c.json({ error: 'unauthorized' }, 401);
+
+  // Cross-tenant security: use serverRow.team_id as authoritative enterprise binding
+  const enterpriseId = serverRow.team_id;
+  if (!enterpriseId) return c.json({ bindings: [] });
+
+  const body = await c.req.json().catch(() => null);
+  const parsed = authoredContextQuerySchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+
+  const { namespace, language, filePath } = parsed.data;
+
+  type BindingRow = {
+    binding_id: string;
+    version_id: string;
+    binding_mode: RuntimeAuthoredContextBinding['mode'];
+    scope: RuntimeAuthoredContextBinding['scope'];
+    applicability_repo_id: string | null;
+    applicability_language: string | null;
+    applicability_path_pattern: string | null;
+    content_md: string;
+  };
+
+  const rows = await c.env.DB.query<BindingRow>(
+    `SELECT
+        b.id AS binding_id,
+        v.id AS version_id,
+        b.binding_mode,
+        CASE
+          WHEN b.enrollment_id IS NOT NULL THEN 'project_shared'
+          WHEN b.workspace_id IS NOT NULL THEN 'workspace_shared'
+          ELSE 'org_shared'
+        END AS scope,
+        b.applicability_repo_id,
+        b.applicability_language,
+        b.applicability_path_pattern,
+        v.content_md
+      FROM shared_context_document_bindings b
+      JOIN shared_context_document_versions v ON v.id = b.version_id
+      WHERE b.enterprise_id = $1
+        AND b.status = 'active'
+        AND v.status = 'active'
+        AND (b.workspace_id IS NULL OR b.workspace_id = $2)
+        AND (
+          b.enrollment_id IS NULL
+          OR EXISTS (
+            SELECT 1
+            FROM shared_project_enrollments e
+            WHERE e.id = b.enrollment_id
+              AND e.canonical_repo_id = $3
+              AND e.status = 'active'
+          )
+        )`,
+    [enterpriseId, namespace.workspaceId ?? null, namespace.projectId],
+  );
+
+  const bindings: RuntimeAuthoredContextBinding[] = rows
+    .map((row) => ({
+      bindingId: row.binding_id,
+      documentVersionId: row.version_id,
+      mode: row.binding_mode,
+      scope: row.scope,
+      repository: row.applicability_repo_id ?? undefined,
+      language: row.applicability_language ?? undefined,
+      pathPattern: row.applicability_path_pattern ?? undefined,
+      content: row.content_md,
+      active: true,
+    }))
+    .filter((binding) => !binding.language || binding.language === language)
+    .filter((binding) => !binding.pathPattern || !!filePath);
+
+  return c.json({ bindings });
+});
+
+serverRoutes.post('/:id/shared-context/resolve-namespace', async (c) => {
+  const auth = c.req.header('Authorization');
+  if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
+  const token = auth.slice(7);
+  const tokenHash = sha256Hex(token);
+
+  const serverRow = await c.env.DB.queryOne<{ id: string; team_id: string | null }>(
+    'SELECT id, team_id FROM servers WHERE token_hash = $1 AND id = $2',
+    [tokenHash, c.req.param('id')],
+  );
+  if (!serverRow) return c.json({ error: 'unauthorized' }, 401);
+
+  const body = await c.req.json().catch(() => null);
+  const parsed = namespaceResolutionSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+
+  const canonicalRepoId = parsed.data.canonicalRepoId.trim();
+  const enterpriseId = serverRow.team_id;
+  if (!enterpriseId) {
+    const result: SharedContextNamespaceResolution = {
+      namespace: null,
+      canonicalRepoId,
+      visibilityState: 'unenrolled',
+      remoteProcessedFreshness: 'missing',
+      retryExhausted: true,
+      diagnostics: ['server-no-enterprise'],
+    };
+    return c.json(result);
+  }
+
+  const enrollment = await c.env.DB.queryOne<{
+    id: string;
+    enterprise_id: string;
+    workspace_id: string | null;
+    scope: 'project_shared' | 'workspace_shared' | 'org_shared';
+    status: 'active' | 'pending_removal' | 'removed';
+  }>(
+    'SELECT id, enterprise_id, workspace_id, scope, status FROM shared_project_enrollments WHERE enterprise_id = $1 AND canonical_repo_id = $2',
+    [enterpriseId, canonicalRepoId],
+  );
+  const remoteProjection = await c.env.DB.queryOne<{ id: string; updated_at: number }>(
+    'SELECT id, updated_at FROM shared_context_projections WHERE enterprise_id = $1 AND project_id = $2 ORDER BY updated_at DESC LIMIT 1',
+    [enterpriseId, canonicalRepoId],
+  );
+  const remoteProcessedFreshness = classifyTimestampFreshness(
+    remoteProjection?.updated_at,
+    Date.now(),
+    getRemoteProcessedFreshMs(),
+  );
+  const policy = enrollment
+    ? await c.env.DB.queryOne<{
+      allow_degraded_provider_support: boolean;
+      allow_local_fallback: boolean;
+      require_full_provider_support: boolean;
+    }>(
+      'SELECT allow_degraded_provider_support, allow_local_fallback, require_full_provider_support FROM shared_scope_policy_overrides WHERE enrollment_id = $1',
+      [enrollment.id],
+    )
+    : null;
+
+  const isActive = enrollment?.status === 'active';
+  const result: SharedContextNamespaceResolution = {
+    namespace: isActive ? {
+      scope: enrollment.scope,
+      projectId: canonicalRepoId,
+      enterpriseId: enrollment.enterprise_id,
+      ...(enrollment.workspace_id ? { workspaceId: enrollment.workspace_id } : {}),
+    } : null,
+    canonicalRepoId,
+    visibilityState: enrollment?.status ?? 'unenrolled',
+    remoteProcessedFreshness,
+    // Return false when enrollment is active but remote is missing/stale (enables retry)
+    // Return true when enrollment is inactive (no point retrying)
+    retryExhausted: !isActive,
+    ...(policy ? {
+      sharedPolicyOverride: {
+        allowDegradedProvider: !!policy.allow_degraded_provider_support,
+        allowLocalProcessedFallback: !!policy.allow_local_fallback,
+        requireFullProviderSupport: !!policy.require_full_provider_support,
+      },
+    } : {}),
+    diagnostics: [
+      `visibility:${enrollment?.status ?? 'unenrolled'}`,
+      `remote-processed:${remoteProcessedFreshness}`,
+    ],
+  };
+  return c.json(result);
 });

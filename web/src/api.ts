@@ -820,11 +820,47 @@ export async function getUserPref(key: string): Promise<unknown | null> {
   }
 }
 
+const USER_PREF_CHANGED_EVENT = 'imcodes:user-pref-changed';
+const userPrefChannel = typeof BroadcastChannel !== 'undefined'
+  ? new BroadcastChannel('imcodes-user-pref-sync')
+  : null;
+
+function emitUserPrefChanged(key: string, value: unknown): void {
+  try {
+    window.dispatchEvent(new CustomEvent(USER_PREF_CHANGED_EVENT, {
+      detail: { key, value },
+    }));
+  } catch { /* window may be unavailable */ }
+  try {
+    userPrefChannel?.postMessage({ key, value });
+  } catch { /* ignore */ }
+}
+
+export function onUserPrefChanged(cb: (key: string, value: unknown) => void): () => void {
+  const handleWindowEvent = (event: Event) => {
+    const detail = (event as CustomEvent<{ key?: unknown; value?: unknown }>).detail;
+    if (!detail || typeof detail.key !== 'string') return;
+    cb(detail.key, detail.value);
+  };
+  const handleChannelEvent = (event: MessageEvent<unknown>) => {
+    const data = event.data as { key?: unknown; value?: unknown } | null;
+    if (!data || typeof data.key !== 'string') return;
+    cb(data.key, data.value);
+  };
+  try { window.addEventListener(USER_PREF_CHANGED_EVENT, handleWindowEvent as EventListener); } catch { /* */ }
+  try { userPrefChannel?.addEventListener('message', handleChannelEvent); } catch { /* */ }
+  return () => {
+    try { window.removeEventListener(USER_PREF_CHANGED_EVENT, handleWindowEvent as EventListener); } catch { /* */ }
+    try { userPrefChannel?.removeEventListener('message', handleChannelEvent); } catch { /* */ }
+  };
+}
+
 export async function saveUserPref(key: string, value: unknown): Promise<void> {
   await apiFetch(`/api/preferences/${key}`, {
     method: 'PUT',
     body: JSON.stringify({ value }),
   });
+  emitUserPrefChanged(key, value);
 }
 
 // ── Passkey (WebAuthn) API ─────────────────────────────────────────────────
@@ -1029,4 +1065,325 @@ export async function previewAttachment(serverId: string, attachmentId: string):
   const url = URL.createObjectURL(blob);
   window.open(url, '_blank');
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+export interface TeamSummary {
+  id: string;
+  name: string;
+  role: 'owner' | 'admin' | 'member';
+}
+
+export interface TeamMember {
+  user_id: string;
+  role: 'owner' | 'admin' | 'member';
+  joined_at: number;
+}
+
+export interface TeamDetail {
+  id: string;
+  name: string;
+  myRole: 'owner' | 'admin' | 'member';
+  members: TeamMember[];
+}
+
+export interface SharedWorkspace {
+  id: string;
+  enterpriseId: string;
+  name: string;
+}
+
+export interface SharedProject {
+  id: string;
+  workspaceId: string | null;
+  canonicalRepoId: string;
+  displayName: string | null;
+  scope: 'project_shared' | 'workspace_shared' | 'org_shared';
+  status: 'unenrolled' | 'active' | 'pending_removal' | 'removed';
+}
+
+export interface SharedProjectPolicy {
+  enrollmentId: string;
+  enterpriseId: string;
+  allowDegradedProviderSupport: boolean;
+  allowLocalFallback: boolean;
+  requireFullProviderSupport: boolean;
+}
+
+export interface SharedDocumentVersion {
+  id: string;
+  versionNumber: number;
+  status: string;
+}
+
+export interface SharedDocument {
+  id: string;
+  enterpriseId: string;
+  kind: 'coding_standard' | 'architecture_guideline' | 'repo_playbook' | 'knowledge_doc';
+  title: string;
+  versions: SharedDocumentVersion[];
+}
+
+export interface SharedDocumentBinding {
+  id: string;
+  workspaceId: string | null;
+  enrollmentId: string | null;
+  documentId: string;
+  versionId: string;
+  mode: 'required' | 'advisory';
+  applicabilityRepoId: string | null;
+  applicabilityLanguage: string | null;
+  applicabilityPathPattern: string | null;
+  status: string;
+}
+
+export interface RuntimeAuthoredContextBindingView {
+  bindingId: string;
+  documentVersionId: string;
+  mode: 'required' | 'advisory';
+  scope: 'project_shared' | 'workspace_shared' | 'org_shared';
+  repository?: string;
+  language?: string;
+  pathPattern?: string;
+  content: string;
+  active: boolean;
+  superseded: boolean;
+}
+
+export interface SharedContextDiagnosticsView {
+  enterpriseId: string;
+  canonicalRepoId: string;
+  enrollmentId: string | null;
+  remoteProcessedFreshness: 'fresh' | 'stale' | 'missing';
+  visibilityState: 'unenrolled' | 'active' | 'pending_removal' | 'removed';
+  retrievalMode: 'personal_only' | 'shared_active' | 'policy_bound_default_deny' | 'cleanup_only';
+  policy: {
+    allowDegradedProviderSupport: boolean;
+    allowLocalFallback: boolean;
+    requireFullProviderSupport: boolean;
+  };
+  diagnostics: {
+    derivedOnDemand: boolean;
+    persistedSnapshotAvailable: boolean;
+    activeBindingCount: number;
+    appliedDocumentVersionIds: string[];
+  };
+}
+
+export async function listTeams(): Promise<TeamSummary[]> {
+  const response = await apiFetch<{ teams: TeamSummary[] }>('/api/team', { method: 'GET' });
+  return response.teams;
+}
+
+export async function createTeam(name: string): Promise<{ id: string; name: string; role: string }> {
+  return apiFetch('/api/team', {
+    method: 'POST',
+    body: JSON.stringify({ name }),
+  });
+}
+
+export async function getTeam(teamId: string): Promise<TeamDetail> {
+  return apiFetch(`/api/team/${encodeURIComponent(teamId)}`, { method: 'GET' });
+}
+
+export async function createTeamInvite(teamId: string, role: 'admin' | 'member', email?: string): Promise<{ token: string; expiresAt: number }> {
+  return apiFetch(`/api/team/${encodeURIComponent(teamId)}/invite`, {
+    method: 'POST',
+    body: JSON.stringify({ role, ...(email?.trim() ? { email: email.trim() } : {}) }),
+  });
+}
+
+export async function joinTeamByToken(token: string): Promise<{ ok: true; teamId: string; role: string }> {
+  return apiFetch(`/api/team/join/${encodeURIComponent(token)}`, { method: 'POST' });
+}
+
+export async function updateTeamMemberRole(teamId: string, memberId: string, role: 'admin' | 'member'): Promise<{ ok: true }> {
+  return apiFetch(`/api/team/${encodeURIComponent(teamId)}/member/${encodeURIComponent(memberId)}/role`, {
+    method: 'PUT',
+    body: JSON.stringify({ role }),
+  });
+}
+
+export async function removeTeamMember(teamId: string, memberId: string): Promise<{ ok: true }> {
+  return apiFetch(`/api/team/${encodeURIComponent(teamId)}/member/${encodeURIComponent(memberId)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function listSharedWorkspaces(enterpriseId: string): Promise<SharedWorkspace[]> {
+  const response = await apiFetch<{ workspaces: Array<{ id: string; enterpriseId: string; name: string }> }>(
+    `/api/shared-context/enterprises/${encodeURIComponent(enterpriseId)}/workspaces`,
+    { method: 'GET' },
+  );
+  return response.workspaces;
+}
+
+export async function createSharedWorkspace(enterpriseId: string, name: string): Promise<{ id: string; enterpriseId: string; name: string }> {
+  return apiFetch(`/api/shared-context/enterprises/${encodeURIComponent(enterpriseId)}/workspaces`, {
+    method: 'POST',
+    body: JSON.stringify({ name }),
+  });
+}
+
+export async function listSharedProjects(enterpriseId: string): Promise<SharedProject[]> {
+  const response = await apiFetch<{ projects: SharedProject[] }>(
+    `/api/shared-context/enterprises/${encodeURIComponent(enterpriseId)}/projects`,
+    { method: 'GET' },
+  );
+  return response.projects;
+}
+
+export async function enrollSharedProject(
+  enterpriseId: string,
+  input: {
+    canonicalRepoId: string;
+    displayName?: string;
+    workspaceId?: string | null;
+    scope: 'project_shared' | 'workspace_shared' | 'org_shared';
+  },
+): Promise<{ id: string }> {
+  return apiFetch(`/api/shared-context/enterprises/${encodeURIComponent(enterpriseId)}/projects/enroll`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export async function updateSharedProjectPolicy(
+  enrollmentId: string,
+  input: {
+    allowDegradedProviderSupport: boolean;
+    allowLocalFallback: boolean;
+    requireFullProviderSupport: boolean;
+  },
+): Promise<{ ok: true }> {
+  return apiFetch(`/api/shared-context/projects/${encodeURIComponent(enrollmentId)}/policy`, {
+    method: 'PUT',
+    body: JSON.stringify(input),
+  });
+}
+
+export async function getSharedProjectPolicy(enrollmentId: string): Promise<SharedProjectPolicy> {
+  return apiFetch(`/api/shared-context/projects/${encodeURIComponent(enrollmentId)}/policy`, {
+    method: 'GET',
+  });
+}
+
+export async function markSharedProjectPendingRemoval(enrollmentId: string): Promise<{ ok: true }> {
+  return apiFetch(`/api/shared-context/projects/${encodeURIComponent(enrollmentId)}/pending-removal`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+export async function removeSharedProject(enrollmentId: string): Promise<{ ok: true }> {
+  return apiFetch(`/api/shared-context/projects/${encodeURIComponent(enrollmentId)}/remove`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+export async function listSharedDocuments(enterpriseId: string): Promise<SharedDocument[]> {
+  const response = await apiFetch<{ documents: SharedDocument[] }>(
+    `/api/shared-context/enterprises/${encodeURIComponent(enterpriseId)}/documents`,
+    { method: 'GET' },
+  );
+  return response.documents;
+}
+
+export async function createSharedDocument(
+  enterpriseId: string,
+  input: { kind: SharedDocument['kind']; title: string },
+): Promise<{ id: string }> {
+  return apiFetch(`/api/shared-context/enterprises/${encodeURIComponent(enterpriseId)}/documents`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export async function createSharedDocumentVersion(
+  documentId: string,
+  input: { contentMd: string; label?: string },
+): Promise<{ id: string; documentId: string; versionNumber: number; status: string }> {
+  return apiFetch(`/api/shared-context/documents/${encodeURIComponent(documentId)}/versions`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export async function activateSharedDocumentVersion(versionId: string): Promise<{ ok: true; versionId: string; status: string }> {
+  return apiFetch(`/api/shared-context/document-versions/${encodeURIComponent(versionId)}/activate`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}
+
+export async function listSharedDocumentBindings(enterpriseId: string): Promise<SharedDocumentBinding[]> {
+  const response = await apiFetch<{ bindings: SharedDocumentBinding[] }>(
+    `/api/shared-context/enterprises/${encodeURIComponent(enterpriseId)}/document-bindings`,
+    { method: 'GET' },
+  );
+  return response.bindings;
+}
+
+export async function createSharedDocumentBinding(
+  enterpriseId: string,
+  input: {
+    documentId: string;
+    versionId: string;
+    workspaceId?: string | null;
+    enrollmentId?: string | null;
+    mode: 'required' | 'advisory';
+    applicabilityRepoId?: string | null;
+    applicabilityLanguage?: string | null;
+    applicabilityPathPattern?: string | null;
+  },
+): Promise<{ id: string }> {
+  return apiFetch(`/api/shared-context/enterprises/${encodeURIComponent(enterpriseId)}/document-bindings`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export async function getRuntimeAuthoredContext(
+  enterpriseId: string,
+  input: {
+    canonicalRepoId?: string;
+    workspaceId?: string;
+    enrollmentId?: string;
+    language?: string;
+    filePath?: string;
+  },
+): Promise<RuntimeAuthoredContextBindingView[]> {
+  const params = new URLSearchParams();
+  if (input.canonicalRepoId) params.set('canonicalRepoId', input.canonicalRepoId);
+  if (input.workspaceId) params.set('workspaceId', input.workspaceId);
+  if (input.enrollmentId) params.set('enrollmentId', input.enrollmentId);
+  if (input.language) params.set('language', input.language);
+  if (input.filePath) params.set('filePath', input.filePath);
+  const response = await apiFetch<{ bindings: RuntimeAuthoredContextBindingView[] }>(
+    `/api/shared-context/enterprises/${encodeURIComponent(enterpriseId)}/runtime-authored-context?${params.toString()}`,
+    { method: 'GET' },
+  );
+  return response.bindings;
+}
+
+export async function getSharedContextDiagnostics(
+  enterpriseId: string,
+  canonicalRepoId: string,
+  input?: {
+    workspaceId?: string;
+    enrollmentId?: string;
+    language?: string;
+    filePath?: string;
+  },
+): Promise<SharedContextDiagnosticsView> {
+  const params = new URLSearchParams();
+  params.set('canonicalRepoId', canonicalRepoId);
+  if (input?.workspaceId) params.set('workspaceId', input.workspaceId);
+  if (input?.enrollmentId) params.set('enrollmentId', input.enrollmentId);
+  if (input?.language) params.set('language', input.language);
+  if (input?.filePath) params.set('filePath', input.filePath);
+  return apiFetch(
+    `/api/shared-context/enterprises/${encodeURIComponent(enterpriseId)}/diagnostics?${params.toString()}`,
+    { method: 'GET' },
+  );
 }

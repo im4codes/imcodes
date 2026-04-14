@@ -39,7 +39,11 @@ import { useUnreadCounts } from './hooks/useUnreadCounts.js';
 import { SidebarPinnedPanel } from './components/SidebarPinnedPanel.js';
 import type { PanelRenderContext } from './components/PinnedPanelRegistry.js';
 import './components/pinnedPanelTypes.js'; // register all panel types
-import { LOCAL_WEB_PREVIEW_PANEL_TYPE } from './components/pinnedPanelTypes.js';
+import {
+  LOCAL_WEB_PREVIEW_PANEL_TYPE,
+  SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE,
+  SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE,
+} from './components/pinnedPanelTypes.js';
 import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
@@ -1027,6 +1031,8 @@ export function App() {
   const pinPanel = useCallback((type: string, props: Record<string, unknown>, closeSource?: () => void) => {
     const id = type === LOCAL_WEB_PREVIEW_PANEL_TYPE
       ? `${type}:${props.serverId ?? selectedServerId ?? ''}:${props.port ?? ''}:${String(props.path ?? '/')}`
+      : type === SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE || type === SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE
+        ? `${type}:${props.serverId ?? selectedServerId ?? ''}`
       : `${type}:${props.sessionName ?? Date.now()}`;
     closeSource?.();
     setPinnedPanels((prev) => {
@@ -2356,6 +2362,22 @@ export function App() {
               }
             }}
           >
+            <div style={{ display: 'flex', gap: 8, padding: '8px 12px 0' }}>
+              <button
+                class="btn"
+                style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }}
+                onClick={() => pinPanel(SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE, { serverId: selectedServerId })}
+              >
+                {trans('sharedContext.management.title')}
+              </button>
+              <button
+                class="btn"
+                style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }}
+                onClick={() => pinPanel(SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE, { serverId: selectedServerId })}
+              >
+                {trans('sharedContext.diagnostics.title')}
+              </button>
+            </div>
             {/* Session tree */}
             <SessionTree
               sessions={sessions}
@@ -2819,6 +2841,16 @@ export function App() {
                   onClick={() => { setShowSettingsPage(true); closeSidebar(); }}
                   title="Settings"
                 >⚙</button>
+                <button
+                  class="mobile-sidebar-hdr-btn"
+                  onClick={() => pinPanel(SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE, { serverId: selectedServerId })}
+                  title={trans('sharedContext.management.title')}
+                >CTX</button>
+                <button
+                  class="mobile-sidebar-hdr-btn"
+                  onClick={() => pinPanel(SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE, { serverId: selectedServerId })}
+                  title={trans('sharedContext.diagnostics.title')}
+                >DBG</button>
                 <button
                   class={`mobile-sidebar-hdr-btn${mobileHideServerBar ? '' : ' active'}`}
                   onClick={() => setMobileHideServerBar((p) => { const v = !p; localStorage.setItem('mobile_hide_server_bar', v ? '1' : ''); return v; })}

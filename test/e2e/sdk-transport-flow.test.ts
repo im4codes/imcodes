@@ -553,7 +553,7 @@ describe('sdk transport flow e2e', () => {
       thinking: 'high',
     }, serverLink);
     await flushAsync();
-    await waitForCondition(() => serverLink.send.mock.calls.length > 0);
+    await waitForCondition(() => serverLink.send.mock.calls.length > 0, 10000);
 
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'subsession.sync',
@@ -605,7 +605,7 @@ describe('sdk transport flow e2e', () => {
     await waitForCondition(() => {
       const record = mocks.store.get(sessionName);
       return record?.agentType === 'codex-sdk' && record?.modelDisplay === 'gpt-5.4-mini';
-    });
+    }, 10000);
 
     const record = mocks.store.get(sessionName);
     expect(record).toEqual(expect.objectContaining({

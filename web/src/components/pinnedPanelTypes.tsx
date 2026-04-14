@@ -18,8 +18,12 @@ import { getActiveThinkingTs, getActiveStatusText, getTailSessionState, hasActiv
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import type { PinnedPanel } from '../app.js';
 import type { PanelRenderContext } from './PinnedPanelRegistry.js';
+import { SharedContextManagementPanel } from './SharedContextManagementPanel.js';
+import { ContextDiagnosticsPanel } from './ContextDiagnosticsPanel.js';
 
 export const LOCAL_WEB_PREVIEW_PANEL_TYPE = 'localwebpreview';
+export const SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE = 'sharedcontext-management';
+export const SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE = 'sharedcontext-diagnostics';
 
 // ── Sub-session panel ────────────────────────────────────────────────────
 
@@ -248,4 +252,30 @@ registerPanelType(LOCAL_WEB_PREVIEW_PANEL_TYPE, {
       />
     );
   },
+});
+
+registerPanelType(SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE, {
+  title: (_panel, ctx) => ctx?.t('sharedContext.management.title') ?? 'Shared Context',
+  render: (panel, ctx) => (
+    <SharedContextManagementPanel
+      enterpriseId={typeof panel.props?.enterpriseId === 'string' ? panel.props.enterpriseId : undefined}
+      onEnterpriseChange={(enterpriseId) => ctx.updatePanelProps?.(panel.id, { ...panel.props, enterpriseId })}
+    />
+  ),
+});
+
+registerPanelType(SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE, {
+  title: (_panel, ctx) => ctx?.t('sharedContext.diagnostics.title') ?? 'Context Diagnostics',
+  render: (panel, ctx) => (
+    <ContextDiagnosticsPanel
+      enterpriseId={typeof panel.props?.enterpriseId === 'string' ? panel.props.enterpriseId : undefined}
+      canonicalRepoId={typeof panel.props?.canonicalRepoId === 'string' ? panel.props.canonicalRepoId : undefined}
+      workspaceId={typeof panel.props?.workspaceId === 'string' ? panel.props.workspaceId : undefined}
+      enrollmentId={typeof panel.props?.enrollmentId === 'string' ? panel.props.enrollmentId : undefined}
+      language={typeof panel.props?.language === 'string' ? panel.props.language : undefined}
+      filePath={typeof panel.props?.filePath === 'string' ? panel.props.filePath : undefined}
+      persistedSnapshot={panel.props?.persistedSnapshot as Parameters<typeof ContextDiagnosticsPanel>[0]['persistedSnapshot']}
+      onStateChange={(next) => ctx.updatePanelProps?.(panel.id, { ...panel.props, ...next })}
+    />
+  ),
 });

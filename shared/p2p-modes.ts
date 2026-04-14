@@ -15,6 +15,8 @@ export type P2pSessionConfig = Record<string, P2pSessionEntry>;
 export interface P2pSavedConfig {
   sessions: P2pSessionConfig;
   rounds: number;
+  /** Monotonic client-side save timestamp used for reconciliation. */
+  updatedAt?: number;
   /** User-defined extra prompt appended to every participant's system prompt. */
   extraPrompt?: string;
   /** Per-hop timeout in minutes. Default: 8. */
@@ -34,6 +36,37 @@ export interface P2pConfigSelection {
   config: P2pSavedConfig;
   rounds: number;
   modeOverride: string;
+}
+
+export function isP2pSessionEntry(value: unknown): value is P2pSessionEntry {
+  if (!value || typeof value !== 'object') return false;
+  const record = value as { enabled?: unknown; mode?: unknown };
+  return typeof record.enabled === 'boolean' && typeof record.mode === 'string';
+}
+
+export function isP2pSavedConfig(value: unknown): value is P2pSavedConfig {
+  if (!value || typeof value !== 'object') return false;
+  const record = value as {
+    sessions?: unknown;
+    rounds?: unknown;
+    updatedAt?: unknown;
+    extraPrompt?: unknown;
+    hopTimeoutMinutes?: unknown;
+    advancedPresetKey?: unknown;
+    advancedRounds?: unknown;
+    advancedRunTimeoutMinutes?: unknown;
+    contextReducer?: unknown;
+  };
+  if (!record.sessions || typeof record.sessions !== 'object' || Array.isArray(record.sessions)) return false;
+  if (typeof record.rounds !== 'number' || !Number.isFinite(record.rounds)) return false;
+  if (record.updatedAt != null && (typeof record.updatedAt !== 'number' || !Number.isFinite(record.updatedAt))) return false;
+  if (record.extraPrompt != null && typeof record.extraPrompt !== 'string') return false;
+  if (record.hopTimeoutMinutes != null && (typeof record.hopTimeoutMinutes !== 'number' || !Number.isFinite(record.hopTimeoutMinutes))) return false;
+  if (record.advancedPresetKey != null && typeof record.advancedPresetKey !== 'string') return false;
+  if (record.advancedRounds != null && !Array.isArray(record.advancedRounds)) return false;
+  if (record.advancedRunTimeoutMinutes != null && (typeof record.advancedRunTimeoutMinutes !== 'number' || !Number.isFinite(record.advancedRunTimeoutMinutes))) return false;
+  if (record.contextReducer != null && typeof record.contextReducer !== 'object') return false;
+  return Object.values(record.sessions as Record<string, unknown>).every(isP2pSessionEntry);
 }
 
 export function buildEffectiveP2pConfig(config: P2pSavedConfig, modeOverride: string): P2pSavedConfig {

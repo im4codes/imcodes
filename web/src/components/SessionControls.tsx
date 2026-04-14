@@ -13,14 +13,16 @@ import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
 import { P2pConfigPanel } from './P2pConfigPanel.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
-import { uploadFile, getUserPref, saveUserPref } from '../api.js';
+import { uploadFile, getUserPref, saveUserPref, onUserPrefChanged } from '../api.js';
 import { isRunningSessionState } from '../thinking-utils.js';
+import { DAEMON_MSG } from '@shared/daemon-events.js';
 import {
   buildP2pConfigSelection,
   P2P_CONFIG_MODE,
   COMBO_SEPARATOR,
   isComboMode,
 } from '@shared/p2p-modes.js';
+import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
 import type { P2pSavedConfig } from '@shared/p2p-modes.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
@@ -174,6 +176,13 @@ type ManualP2pResolveResult = {
 };
 
 type P2pConfigTab = 'participants' | 'combos';
+
+type P2pConfigPersistResult = { ok: boolean; error?: string };
+
+type PendingP2pConfigSave = {
+  resolve: (result: P2pConfigPersistResult) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
 
 function appendOptionalAdvancedP2pConfig(extra: Record<string, unknown>, config: P2pSavedConfig): void {
   const advanced = config as P2pSavedConfig & OptionalP2pAdvancedConfig;
@@ -783,8 +792,55 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
 
   // P2P config is per main-session (sub-sessions follow parent), stored on server for cross-device sync
   const p2pConfigKey = rootSession ? `p2p_session_config:${rootSession}` : null;
-  useEffect(() => {
-    if (!p2pConfigKey) { setP2pSavedConfig(null); return; }
+  const lastDaemonP2pSyncRef = useRef<string>('');
+  const pendingP2pConfigSavesRef = useRef<Map<string, PendingP2pConfigSave>>(new Map());
+  const resolvePendingP2pConfigSave = useCallback((requestId: string, result: P2pConfigPersistResult) => {
+    const pending = pendingP2pConfigSavesRef.current.get(requestId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    pendingP2pConfigSavesRef.current.delete(requestId);
+    pending.resolve(result);
+  }, []);
+  const rejectAllPendingP2pConfigSaves = useCallback((error: string) => {
+    for (const [requestId, pending] of pendingP2pConfigSavesRef.current.entries()) {
+      clearTimeout(pending.timer);
+      pending.resolve({ ok: false, error });
+      pendingP2pConfigSavesRef.current.delete(requestId);
+    }
+  }, []);
+  const persistP2pConfigToDaemon = useCallback((
+    scopeSession: string,
+    config: P2pSavedConfig,
+    options?: { awaitAck?: boolean },
+  ): Promise<P2pConfigPersistResult> => {
+    if (!ws) return Promise.resolve({ ok: false, error: P2P_CONFIG_ERROR.SAVE_TIMEOUT });
+    const requestId = globalThis.crypto?.randomUUID?.() ?? `p2p-config-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const awaitAck = options?.awaitAck !== false;
+    if (!awaitAck) {
+      try {
+        ws.send({ type: P2P_CONFIG_MSG.SAVE, requestId, scopeSession, config });
+        return Promise.resolve({ ok: true });
+      } catch {
+        return Promise.resolve({ ok: false, error: P2P_CONFIG_ERROR.SAVE_TIMEOUT });
+      }
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        resolvePendingP2pConfigSave(requestId, { ok: false, error: P2P_CONFIG_ERROR.SAVE_TIMEOUT });
+      }, 3000);
+      pendingP2pConfigSavesRef.current.set(requestId, { resolve, timer });
+      try {
+        ws.send({ type: P2P_CONFIG_MSG.SAVE, requestId, scopeSession, config });
+      } catch {
+        resolvePendingP2pConfigSave(requestId, { ok: false, error: P2P_CONFIG_ERROR.SAVE_TIMEOUT });
+      }
+    });
+  }, [resolvePendingP2pConfigSave, ws]);
+  const reloadP2pSavedConfig = useCallback(() => {
+    if (!p2pConfigKey) {
+      setP2pSavedConfig(null);
+      return;
+    }
     const apply = (raw: unknown) => {
       if (raw && typeof raw === 'string') {
         try { setP2pSavedConfig(JSON.parse(raw) as P2pSavedConfig); } catch { setP2pSavedConfig(null); }
@@ -794,19 +850,66 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     };
     void getUserPref(p2pConfigKey).then((raw) => {
       if (raw) { apply(raw); return; }
-      // Fallback: migrate from legacy global key
       void getUserPref('p2p_session_config').then((legacyRaw) => {
         if (legacyRaw && typeof legacyRaw === 'string') {
-          void saveUserPref(p2pConfigKey!, legacyRaw).catch(() => {});
+          void saveUserPref(p2pConfigKey, legacyRaw).catch(() => {});
         }
         apply(legacyRaw);
       });
     });
   }, [p2pConfigKey]);
+  useEffect(() => {
+    reloadP2pSavedConfig();
+  }, [reloadP2pSavedConfig]);
+
+  useEffect(() => {
+    if (!p2pConfigKey) return;
+    return onUserPrefChanged((key) => {
+      if (key === p2pConfigKey || key === 'p2p_session_config') {
+        reloadP2pSavedConfig();
+      }
+    });
+  }, [p2pConfigKey, reloadP2pSavedConfig]);
+
+  useEffect(() => {
+    if (!ws || !rootSession || !p2pSavedConfig) return;
+    const signature = `${rootSession}:${JSON.stringify(p2pSavedConfig)}`;
+    if (lastDaemonP2pSyncRef.current === signature) return;
+    void persistP2pConfigToDaemon(rootSession, p2pSavedConfig, { awaitAck: false }).then((result) => {
+      if (result.ok) {
+        lastDaemonP2pSyncRef.current = signature;
+      }
+    });
+  }, [persistP2pConfigToDaemon, rootSession, p2pSavedConfig, ws]);
+
+  useEffect(() => {
+    return () => {
+      rejectAllPendingP2pConfigSaves(P2P_CONFIG_ERROR.SAVE_TIMEOUT);
+    };
+  }, [rejectAllPendingP2pConfigSaves]);
 
   useEffect(() => {
     if (!ws) return;
     return ws.onMessage((msg: ServerMessage) => {
+      if (msg.type === P2P_CONFIG_MSG.SAVE_RESPONSE) {
+        resolvePendingP2pConfigSave(msg.requestId, { ok: msg.ok, error: msg.error });
+        return;
+      }
+      if (msg.type === DAEMON_MSG.DISCONNECTED) {
+        rejectAllPendingP2pConfigSaves(P2P_CONFIG_ERROR.SAVE_TIMEOUT);
+        return;
+      }
+      if (msg.type === DAEMON_MSG.RECONNECTED) {
+        lastDaemonP2pSyncRef.current = '';
+        if (rootSession && p2pSavedConfig) {
+          void persistP2pConfigToDaemon(rootSession, p2pSavedConfig, { awaitAck: false }).then((result) => {
+            if (result.ok) {
+              lastDaemonP2pSyncRef.current = `${rootSession}:${JSON.stringify(p2pSavedConfig)}`;
+            }
+          });
+        }
+        return;
+      }
       const requestId = openSpecRequestIdRef.current;
       if (!requestId || msg.type !== 'fs.ls_response' || msg.requestId !== requestId) return;
       openSpecRequestIdRef.current = null;
@@ -829,7 +932,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       setOpenSpecChanges(changeNames);
       setOpenSpecError(null);
     });
-  }, [ws]);
+  }, [persistP2pConfigToDaemon, p2pSavedConfig, rejectAllPendingP2pConfigSaves, resolvePendingP2pConfigSave, rootSession, ws]);
 
   useEffect(() => {
     if (!hasConfiguredP2pParticipants && isComboMode(p2pMode)) {
@@ -2301,9 +2404,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         activeSession={activeSession?.name}
         initialTab={p2pConfigInitialTab}
         onClose={() => setP2pConfigOpen(false)}
+        onPersistDaemonConfig={(scopeSession, cfg) => persistP2pConfigToDaemon(scopeSession, cfg)}
         onSave={(cfg) => {
           setP2pSavedConfig(cfg);
-          if (p2pConfigKey) void saveUserPref(p2pConfigKey, JSON.stringify(cfg));
         }}
       />
     )}

@@ -17,6 +17,7 @@ import { TransportSessionRuntime } from '../../src/agent/transport-session-runti
 import type { TransportProvider, ProviderError, SessionConfig } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { AgentStatus } from '../../src/agent/detect.js';
+import type { ProviderContextPayload } from '../../shared/context-types.js';
 
 // ── Mock provider ──────────────────────────────────────────────────────────────
 
@@ -37,7 +38,7 @@ function makeMockProvider() {
   return {
     provider: {
       id: 'mock', connectionMode: 'persistent', sessionOwnership: 'provider',
-      capabilities: { streaming: true, toolCalling: false, approval: false, sessionRestore: false, multiTurn: true, attachments: false },
+      capabilities: { streaming: true, toolCalling: false, approval: false, sessionRestore: false, multiTurn: true, attachments: false, contextSupport: 'full-normalized-context-injection' },
       connect: vi.fn(), disconnect: vi.fn(), send: vi.fn(), cancel: vi.fn(),
       createSession: vi.fn().mockResolvedValue('sess-1'), endSession: vi.fn(),
       onDelta: (cb: (sid: string, d: MessageDelta) => void) => { deltaCb = cb; return () => { deltaCb = null; }; },
@@ -49,6 +50,11 @@ function makeMockProvider() {
 }
 
 const defaultConfig: SessionConfig = { sessionKey: 'deck_test' };
+const flushDispatch = async () => {
+  await Promise.resolve();
+  await Promise.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+};
 
 // ── Status lifecycle ───────────────────────────────────────────────────────────
 
@@ -143,41 +149,52 @@ describe('batched queuing', () => {
     await runtime.initialize(defaultConfig);
   });
 
-  it('idle send dispatches immediately, no drain', () => {
+  it('idle send dispatches immediately, no drain', async () => {
     const result = runtime.send('hello');
     expect(result).toBe('sent');
+    await flushDispatch();
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
     expect(drainLog).toHaveLength(0);
   });
 
-  it('messages during busy turn are queued', () => {
+  it('messages during busy turn are queued', async () => {
     runtime.send('first');
+    await flushDispatch();
     expect(runtime.send('second')).toBe('queued');
     expect(runtime.send('third')).toBe('queued');
     expect(runtime.pendingCount).toBe(2);
     // Only first message sent to provider
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
-    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', 'first', undefined, undefined);
+    expect(mock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining<Partial<ProviderContextPayload>>({
+      userMessage: 'first',
+      assembledMessage: 'first',
+    }));
   });
 
-  it('on complete, all pending messages merge into one turn', () => {
+  it('on complete, all pending messages merge into one turn', async () => {
     runtime.send('first');
+    await flushDispatch();
     runtime.send('second');
     runtime.send('third');
     expect(runtime.pendingCount).toBe(2);
 
     // Complete first turn → pending messages drain as one merged message
     mock.fireComplete('sess-1');
+    await flushDispatch();
 
     expect(mock.provider.send).toHaveBeenCalledTimes(2);
     // Second call is the merged message
-    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', 'second\n\nthird', undefined, undefined);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining<Partial<ProviderContextPayload>>({
+      userMessage: 'second\n\nthird',
+      assembledMessage: 'second\n\nthird',
+    }));
     expect(runtime.pendingCount).toBe(0);
     expect(drainLog).toEqual([{ merged: 'second\n\nthird', count: 2 }]);
   });
 
-  it('on unrecoverable error, pending messages are NOT drained (prevents error loop)', () => {
+  it('on unrecoverable error, pending messages are NOT drained (prevents error loop)', async () => {
     runtime.send('first');
+    await flushDispatch();
     runtime.send('retry-me');
 
     // Unrecoverable error (recoverable: false) — don't drain
@@ -188,35 +205,46 @@ describe('batched queuing', () => {
     expect(runtime.getStatus()).toBe('error');
   });
 
-  it('on recoverable error, pending messages drain into next turn', () => {
+  it('on recoverable error, pending messages drain into next turn', async () => {
     runtime.send('first');
+    await flushDispatch();
     runtime.send('retry-me');
 
     // Recoverable error → drain pending
     mock.fireError('sess-1', 'RATE_LIMITED', true);
+    await flushDispatch();
 
     expect(mock.provider.send).toHaveBeenCalledTimes(2);
-    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', 'retry-me', undefined, undefined);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining<Partial<ProviderContextPayload>>({
+      userMessage: 'retry-me',
+      assembledMessage: 'retry-me',
+    }));
     expect(runtime.getStatus()).toBe('thinking');
   });
 
-  it('on cancel, pending messages are drained into the next turn', () => {
+  it('on cancel, pending messages are drained into the next turn', async () => {
     runtime.send('first');
+    await flushDispatch();
     runtime.send('still-queued');
     runtime.send('send-after-stop');
 
     runtime.cancel();
     mock.fireCancelled('sess-1');
+    await flushDispatch();
 
     expect(mock.provider.send).toHaveBeenCalledTimes(2);
-    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', 'still-queued\n\nsend-after-stop', undefined, undefined);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining<Partial<ProviderContextPayload>>({
+      userMessage: 'still-queued\n\nsend-after-stop',
+      assembledMessage: 'still-queued\n\nsend-after-stop',
+    }));
     expect(runtime.pendingCount).toBe(0);
     expect(runtime.getStatus()).toBe('thinking');
   });
 
-  it('multiple turns with queuing: correct history order', () => {
+  it('multiple turns with queuing: correct history order', async () => {
     // Turn 1: send 'A', queue 'B' and 'C'
     runtime.send('A');
+    await flushDispatch();
     runtime.send('B');
     runtime.send('C');
 
@@ -234,11 +262,12 @@ describe('batched queuing', () => {
     ]);
   });
 
-  it('status transitions with queuing: thinking→idle then thinking→idle', () => {
+  it('status transitions with queuing: thinking→idle then thinking→idle', async () => {
     const statusLog: AgentStatus[] = [];
     runtime.onStatusChange = (s) => statusLog.push(s);
 
     runtime.send('A');
+    await flushDispatch();
     runtime.send('B'); // queued
 
     // Complete A → drain B (no idle between — goes straight to next turn thinking)
@@ -253,8 +282,9 @@ describe('batched queuing', () => {
     expect(statusLog[statusLog.length - 1]).toBe('idle');
   });
 
-  it('no drain happens if pendingMessages is empty', () => {
+  it('no drain happens if pendingMessages is empty', async () => {
     runtime.send('solo');
+    await flushDispatch();
     mock.fireComplete('sess-1');
 
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
@@ -264,6 +294,7 @@ describe('batched queuing', () => {
 
   it('kill() clears pending without draining', async () => {
     runtime.send('first');
+    await flushDispatch();
     runtime.send('queued1');
     runtime.send('queued2');
 

@@ -10,6 +10,7 @@ import { promisify } from 'node:util';
 const execAsync = promisify(exec);
 import { timelineEmitter } from './timeline-emitter.js';
 import { readProjectMemory, buildCodexMemoryEntry, appendAgentSendDocs } from './memory-inject.js';
+import { legacyInjectionDisabled } from '../context/shared-context-flags.js';
 import logger from '../util/logger.js';
 import { updateSessionState } from '../store/session-store.js';
 import { resolveContextWindow } from '../util/model-context.js';
@@ -445,8 +446,9 @@ export async function ensureSessionFile(uuid: string, cwd: string): Promise<stri
 
   // Inject project memory so the agent starts with project context loaded.
   // Also required: `codex resume` needs at least one entry beyond session_meta.
-  const rawMemory = await readProjectMemory(cwd);
-  const memory = appendAgentSendDocs(rawMemory);
+  const memory = legacyInjectionDisabled()
+    ? 'Shared context bootstrap deferred to runtime assembly.'
+    : appendAgentSendDocs(await readProjectMemory(cwd));
   const lines = [meta, buildCodexMemoryEntry(memory, isoNow)];
 
   await writeFile(filePath, lines.join('\n') + '\n', 'utf8');

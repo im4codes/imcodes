@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, fireEvent, cleanup, within } from '@testing-library/preact';
+import { render, screen, fireEvent, cleanup, within, waitFor } from '@testing-library/preact';
 import { useState } from 'preact/hooks';
 
 const DEFAULT_INNER_WIDTH = 1280;
@@ -131,14 +131,26 @@ vi.mock('../../src/components/AtPicker.js', () => ({
 const uploadFileMock = vi.fn();
 const getUserPrefMock = vi.fn().mockResolvedValue(null);
 const saveUserPrefMock = vi.fn().mockResolvedValue(undefined);
+const onUserPrefChangedMock = vi.fn((cb: (key: string, value: unknown) => void) => {
+  const handler = (event: Event) => {
+    const detail = (event as CustomEvent<{ key?: string; value?: unknown }>).detail;
+    if (!detail?.key) return;
+    cb(detail.key, detail.value);
+  };
+  window.addEventListener('imcodes:user-pref-changed', handler as EventListener);
+  return () => window.removeEventListener('imcodes:user-pref-changed', handler as EventListener);
+});
 vi.mock('../../src/api.js', () => ({
   uploadFile: (...args: unknown[]) => uploadFileMock(...args),
   getUserPref: (...args: unknown[]) => getUserPrefMock(...args),
   saveUserPref: (...args: unknown[]) => saveUserPrefMock(...args),
+  onUserPrefChanged: (...args: unknown[]) => onUserPrefChangedMock(...args as Parameters<typeof onUserPrefChangedMock>),
 }));
 
 import { SessionControls } from '../../src/components/SessionControls.js';
 import type { SessionInfo } from '../../src/types.js';
+import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
 
 const flushAsync = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -160,6 +172,7 @@ const TEST_OPENSPEC_ADVANCED_ROUNDS = [
 const makeWs = () => {
   const handlers = new Set<(msg: unknown) => void>();
   return {
+    send: vi.fn(),
     sendSessionCommand: vi.fn(),
     sendInput: vi.fn(),
     connected: true,
@@ -583,6 +596,85 @@ afterEach(() => {
     const comboBtn = screen.getByRole('button', { name: /mode_audit→mode_plan/i }) as HTMLButtonElement;
     expect(comboBtn.disabled).toBe(true);
     expect(comboBtn.title).toBe('combo_requires_participants_hint');
+  });
+
+  it('reloads P2P config when the session preference changes externally', async () => {
+    let prefValue = JSON.stringify({
+      sessions: {
+        'my-session': { enabled: false, mode: 'audit' },
+      },
+      rounds: 3,
+    });
+    getUserPrefMock.mockImplementation(async (key: unknown) => {
+      if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
+        return prefValue;
+      }
+      return null;
+    });
+
+    render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+    await flushAsync();
+    const initialFetches = getUserPrefMock.mock.calls.filter(([key]) => key === 'p2p_session_config:my-session').length;
+
+    prefValue = JSON.stringify({
+      sessions: {
+        'my-session': { enabled: true, mode: 'audit' },
+        'deck_sub_abc': { enabled: true, mode: 'review' },
+      },
+      rounds: 3,
+    });
+    window.dispatchEvent(new CustomEvent('imcodes:user-pref-changed', {
+      detail: { key: 'p2p_session_config:my-session', value: prefValue },
+    }));
+    await flushAsync();
+    await waitFor(() => {
+      const currentFetches = getUserPrefMock.mock.calls.filter(([key]) => key === 'p2p_session_config:my-session').length;
+      expect(currentFetches).toBeGreaterThan(initialFetches);
+    });
+  });
+
+  it('syncs loaded P2P config into daemon authority on mount', async () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+
+    await flushAsync();
+    await waitFor(() => {
+      expect(ws.send).toHaveBeenCalledWith({
+        type: P2P_CONFIG_MSG.SAVE,
+        requestId: expect.any(String),
+        scopeSession: 'my-session',
+        config: {
+          sessions: {
+            'my-session': { enabled: true, mode: 'audit' },
+          },
+          rounds: 3,
+        },
+      });
+    });
+  });
+
+  it('re-sends the current P2P config when the daemon reconnects', async () => {
+    const ws = makeWs();
+    render(<SessionControls ws={ws as any} activeSession={makeSession({ name: 'my-session' })} quickData={makeQuickData() as any} />);
+
+    await flushAsync();
+    await waitFor(() => expect(ws.send).toHaveBeenCalledTimes(1));
+
+    ws.emit({ type: DAEMON_MSG.RECONNECTED });
+    await flushAsync();
+
+    expect(ws.send).toHaveBeenCalledTimes(2);
+    expect(ws.send).toHaveBeenLastCalledWith({
+      type: P2P_CONFIG_MSG.SAVE,
+      requestId: expect.any(String),
+      scopeSession: 'my-session',
+      config: {
+        sessions: {
+          'my-session': { enabled: true, mode: 'audit' },
+        },
+        rounds: 3,
+      },
+    });
   });
 
   it('only shows solo plus combo items in the p2p dropdown', async () => {

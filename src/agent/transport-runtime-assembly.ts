@@ -1,0 +1,235 @@
+import type { TransportProvider } from './transport-provider.js';
+import { selectRuntimeAuthoredContext } from './authored-context.js';
+import { evaluateContextAuthority } from './context-authority.js';
+import { buildContextDiagnostics } from './context-diagnostics.js';
+import { getSharedContextCutoverFlags, type SharedContextCutoverFlags } from '../context/shared-context-flags.js';
+import type { ProviderError } from './transport-provider.js';
+import type {
+  CompiledAgentContextArtifact,
+  ContextNamespace,
+  ContextSendSurface,
+  ProviderContextPayload,
+  ProviderSupportClass,
+  RuntimeAuthoredContextBinding,
+} from '../../shared/context-types.js';
+
+export interface TransportRuntimeAssemblyInput {
+  userMessage: string;
+  description?: string;
+  systemPrompt?: string;
+  messagePreamble?: string;
+  attachments?: unknown[];
+  namespace?: ContextNamespace;
+  namespaceDiagnostics?: string[];
+  remoteProcessedFreshness?: 'fresh' | 'stale' | 'missing';
+  localProcessedFreshness?: 'fresh' | 'stale' | 'missing';
+  retryExhausted?: boolean;
+  sharedPolicyOverride?: {
+    allowDegradedProvider?: boolean;
+    allowLocalProcessedFallback?: boolean;
+    requireFullProviderSupport?: boolean;
+  };
+  authoredContext?: RuntimeAuthoredContextBinding[];
+  authoredContextRepository?: string;
+  authoredContextLanguage?: string;
+  authoredContextFilePath?: string;
+  maxRequiredAuthoredChars?: number;
+  maxAdvisoryAuthoredChars?: number;
+  sourceSurface?: ContextSendSurface;
+}
+
+export interface DispatchSharedContextSendOptions {
+  flags?: SharedContextCutoverFlags;
+  onShadowDiagnostics?: (diagnostics: string[]) => void;
+  resolveAuthoredContext?: (input: TransportRuntimeAssemblyInput) => Promise<RuntimeAuthoredContextBinding[]>;
+}
+
+export interface DispatchSharedContextSendResult {
+  disposition: 'sent' | 'legacy-sent';
+  payload?: ProviderContextPayload;
+}
+
+export class SharedContextDispatchError extends Error {
+  readonly providerError: ProviderError;
+  readonly payload?: ProviderContextPayload;
+
+  constructor(providerError: ProviderError, payload?: ProviderContextPayload) {
+    super(providerError.message);
+    this.name = 'SharedContextDispatchError';
+    this.providerError = providerError;
+    this.payload = payload;
+  }
+
+  toProviderError(): ProviderError {
+    return this.providerError;
+  }
+}
+
+export function dispatchSharedContextSend(
+  provider: TransportProvider,
+  sessionId: string,
+  input: TransportRuntimeAssemblyInput,
+  options?: DispatchSharedContextSendOptions,
+): Promise<DispatchSharedContextSendResult> {
+  const flags = options?.flags ?? getSharedContextCutoverFlags();
+  return resolveTransportRuntimeAssemblyInput(input, options).then(async (resolvedInput) => {
+    const payload = buildProviderContextPayload(provider, resolvedInput);
+    if (flags.shadowDiagnostics) {
+      options?.onShadowDiagnostics?.(payload.diagnostics);
+    }
+    if (!flags.runtimeSend) {
+      await provider.send(sessionId, input.userMessage);
+      return { disposition: 'legacy-sent', payload };
+    }
+    enforceDispatchAuthority(payload);
+    await provider.send(sessionId, payload);
+    return { disposition: 'sent', payload };
+  });
+}
+
+export function buildProviderContextPayload(
+  provider: TransportProvider,
+  input: TransportRuntimeAssemblyInput,
+): ProviderContextPayload {
+  const compiledContext = compileAgentContextArtifact(input);
+  const namespace = input.namespace ?? {
+    scope: 'personal',
+    projectId: 'transport-default',
+  };
+  const supportClass = getProviderSupportClass(provider);
+  const sharedPolicyOverride = input.sharedPolicyOverride;
+  const allowSharedDegraded = sharedPolicyOverride?.allowDegradedProvider ?? false;
+  const authority = evaluateContextAuthority({
+    namespace,
+    providerSupport: supportClass,
+    remoteProcessedFreshness: input.remoteProcessedFreshness,
+    localProcessedFreshness: input.localProcessedFreshness,
+    retryExhausted: input.retryExhausted,
+    allowSharedDegraded,
+    allowSharedLocalFallback: sharedPolicyOverride?.allowLocalProcessedFallback ?? false,
+  });
+  const diagnostics = buildContextDiagnostics({
+    authority,
+    supportClass,
+    artifact: compiledContext,
+  });
+  if (input.sourceSurface) {
+    diagnostics.push(`surface:${input.sourceSurface}`);
+  }
+  for (const entry of input.namespaceDiagnostics ?? []) {
+    if (!diagnostics.includes(entry)) diagnostics.push(entry);
+  }
+  return {
+    userMessage: input.userMessage,
+    assembledMessage: renderAssembledMessage(input.userMessage, compiledContext.messagePreamble),
+    systemText: compiledContext.systemText,
+    messagePreamble: compiledContext.messagePreamble,
+    attachments: input.attachments,
+    context: compiledContext,
+    authority,
+    supportClass,
+    diagnostics,
+  };
+}
+
+function resolveTransportRuntimeAssemblyInput(
+  input: TransportRuntimeAssemblyInput,
+  options?: DispatchSharedContextSendOptions,
+) : Promise<TransportRuntimeAssemblyInput> {
+  if (input.authoredContext || !options?.resolveAuthoredContext) return Promise.resolve(input);
+  return options.resolveAuthoredContext(input).then((authoredContext) => ({
+    ...input,
+    authoredContext,
+  }));
+}
+
+export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput): CompiledAgentContextArtifact {
+  const authoredContext = selectRuntimeAuthoredContext({
+    bindings: input.authoredContext ?? [],
+    repository: input.authoredContextRepository,
+    language: input.authoredContextLanguage,
+    filePath: input.authoredContextFilePath,
+    maxRequiredChars: input.maxRequiredAuthoredChars,
+    maxAdvisoryChars: input.maxAdvisoryAuthoredChars,
+  });
+  const hasRequiredBindings = (input.authoredContext ?? []).some(
+    (binding) => binding.mode === 'required' && binding.active !== false && !binding.superseded,
+  );
+  if (hasRequiredBindings && authoredContext.required.length === 0) {
+    throw new SharedContextDispatchError({
+      code: 'SHARED_CONTEXT_REQUIRED_AUTHORED_CONTEXT_UNAVAILABLE',
+      message: 'Required authored context could not be preserved in the compiled payload',
+      recoverable: false,
+      details: {
+        diagnostics: authoredContext.diagnostics,
+      },
+    });
+  }
+  const renderedAuthoredSystemText = renderAuthoredSystemText(authoredContext.required, authoredContext.advisory);
+  return {
+    systemText: [input.description?.trim(), input.systemPrompt?.trim(), renderedAuthoredSystemText].filter(Boolean).join('\n\n') || undefined,
+    messagePreamble: input.messagePreamble?.trim() || undefined,
+    requiredAuthoredContext: authoredContext.required,
+    advisoryAuthoredContext: authoredContext.advisory,
+    appliedDocumentVersionIds: authoredContext.appliedDocumentVersionIds,
+    diagnostics: authoredContext.diagnostics,
+  };
+}
+
+export function getProviderSupportClass(provider: TransportProvider): ProviderSupportClass {
+  return provider.capabilities.contextSupport ?? 'full-normalized-context-injection';
+}
+
+function renderAssembledMessage(userMessage: string, messagePreamble?: string): string {
+  const preamble = messagePreamble?.trim();
+  const message = userMessage.trim();
+  if (!preamble) return userMessage;
+  if (!message) return preamble;
+  return `${preamble}\n\n${message}`;
+}
+
+function renderAuthoredSystemText(required: string[], advisory: string[]): string | undefined {
+  const sections: string[] = [];
+  if (required.length > 0) {
+    sections.push(renderAuthoredSection('Required shared context', required));
+  }
+  if (advisory.length > 0) {
+    sections.push(renderAuthoredSection('Advisory shared context', advisory));
+  }
+  return sections.length > 0 ? sections.join('\n\n') : undefined;
+}
+
+function renderAuthoredSection(title: string, entries: string[]): string {
+  const lines = [title + ':'];
+  for (const entry of entries) {
+    lines.push(`- ${entry}`);
+  }
+  return lines.join('\n');
+}
+
+function enforceDispatchAuthority(payload: ProviderContextPayload): void {
+  if (payload.supportClass === 'unsupported') {
+    throw new SharedContextDispatchError({
+      code: 'SHARED_CONTEXT_PROVIDER_UNSUPPORTED',
+      message: 'Provider does not support the normalized shared-context contract',
+      recoverable: false,
+      details: { diagnostics: payload.diagnostics },
+    }, payload);
+  }
+  if (payload.authority.retryScheduled) {
+    throw new SharedContextDispatchError({
+      code: 'SHARED_CONTEXT_RETRY_SCHEDULED',
+      message: 'Shared context authority is not ready; retry has been scheduled',
+      recoverable: true,
+      details: { diagnostics: payload.diagnostics },
+    }, payload);
+  }
+  if (payload.authority.authoritySource === 'none' && !payload.authority.fallbackAllowed) {
+    throw new SharedContextDispatchError({
+      code: 'SHARED_CONTEXT_AUTHORITY_UNAVAILABLE',
+      message: 'Shared context authority is unavailable and fallback is not permitted',
+      recoverable: false,
+      details: { diagnostics: payload.diagnostics },
+    }, payload);
+  }
+}

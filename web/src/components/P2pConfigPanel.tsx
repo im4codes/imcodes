@@ -4,7 +4,7 @@
  */
 import { useState, useEffect, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { getUserPref, saveUserPref } from '../api.js';
+import { getUserPref, saveUserPref, onUserPrefChanged } from '../api.js';
 import { P2pComboManager } from './P2pComboManager.js';
 import { useP2pCustomCombos } from './p2p-combos.js';
 import type { P2pSavedConfig, P2pSessionConfig } from '@shared/p2p-modes.js';
@@ -38,6 +38,7 @@ interface Props {
   initialTab?: 'participants' | 'combos';
   onClose: () => void;
   onSave: (config: P2pSavedConfig) => void;
+  onPersistDaemonConfig?: (scopeSession: string, config: P2pSavedConfig) => Promise<{ ok: boolean; error?: string }> | { ok: boolean; error?: string };
 }
 
 const EXCLUDED_TYPES = new Set(['shell', 'script']);
@@ -229,6 +230,7 @@ export function P2pConfigPanel({
   initialTab = 'participants',
   onClose,
   onSave,
+  onPersistDaemonConfig,
 }: Props) {
   const { t } = useTranslation();
   const [agentFlavorFilter, setAgentFlavorFilter] = useState<AgentFlavorFilter>('sdk');
@@ -288,6 +290,8 @@ export function P2pConfigPanel({
   const [contextReducerTemplate, setContextReducerTemplate] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saveWarning, setSaveWarning] = useState<string | null>(null);
   const showAdvancedWorkflowSettings = false;
 
   const enabledSdkParticipants = useMemo(
@@ -300,41 +304,54 @@ export function P2pConfigPanel({
 
   // Config key uses the main session (sub-sessions follow parent config)
   const configKey = scopeSession ? `p2p_session_config:${scopeSession}` : null;
+  const reloadConfig = useMemo(() => {
+    return () => {
+      if (!configKey) { setLoading(false); return; }
+      setLoading(true);
+      const apply = (raw: unknown) => {
+        if (raw && typeof raw === 'string') {
+          try {
+            const parsed: P2pSavedConfig = JSON.parse(raw);
+            setSessionCfg(parsed.sessions ?? {});
+            setRounds(parsed.rounds ?? 3);
+            setHopTimeoutMinutes(parsed.hopTimeoutMinutes ?? 8);
+            setExtraPrompt(parsed.extraPrompt ?? '');
+            setAdvancedPresetKey(parsed.advancedPresetKey ?? '');
+            setAdvancedRounds(parsed.advancedRounds);
+            setAdvancedRunTimeoutMinutes(parsed.advancedRunTimeoutMinutes ?? 30);
+            setContextReducerMode(parsed.contextReducer?.mode ?? '');
+            setContextReducerSession(parsed.contextReducer?.sessionName ?? '');
+            setContextReducerTemplate(parsed.contextReducer?.templateSession ?? '');
+            setAdvancedExpanded(Boolean(parsed.advancedPresetKey || parsed.contextReducer || parsed.advancedRunTimeoutMinutes != null));
+          } catch { /* start fresh */ }
+        }
+        setLoading(false);
+      };
+      void getUserPref(configKey).then((raw) => {
+        if (raw) { apply(raw); return; }
+        void getUserPref('p2p_session_config').then((legacyRaw) => {
+          if (legacyRaw && typeof legacyRaw === 'string') {
+            void saveUserPref(configKey, legacyRaw).catch(() => {});
+          }
+          apply(legacyRaw);
+        });
+      });
+    };
+  }, [configKey]);
 
   // Load saved config — per-session key with legacy global fallback
   useEffect(() => {
-    if (!configKey) { setLoading(false); return; }
-    setLoading(true);
-    const apply = (raw: unknown) => {
-      if (raw && typeof raw === 'string') {
-        try {
-          const parsed: P2pSavedConfig = JSON.parse(raw);
-          setSessionCfg(parsed.sessions ?? {});
-          setRounds(parsed.rounds ?? 3);
-          setHopTimeoutMinutes(parsed.hopTimeoutMinutes ?? 8);
-          setExtraPrompt(parsed.extraPrompt ?? '');
-          setAdvancedPresetKey(parsed.advancedPresetKey ?? '');
-          setAdvancedRounds(parsed.advancedRounds);
-          setAdvancedRunTimeoutMinutes(parsed.advancedRunTimeoutMinutes ?? 30);
-          setContextReducerMode(parsed.contextReducer?.mode ?? '');
-          setContextReducerSession(parsed.contextReducer?.sessionName ?? '');
-          setContextReducerTemplate(parsed.contextReducer?.templateSession ?? '');
-          setAdvancedExpanded(Boolean(parsed.advancedPresetKey || parsed.contextReducer || parsed.advancedRunTimeoutMinutes != null));
-        } catch { /* start fresh */ }
+    reloadConfig();
+  }, [reloadConfig]);
+
+  useEffect(() => {
+    if (!configKey) return;
+    return onUserPrefChanged((key) => {
+      if (key === configKey || key === 'p2p_session_config') {
+        reloadConfig();
       }
-      setLoading(false);
-    };
-    void getUserPref(configKey).then((raw) => {
-      if (raw) { apply(raw); return; }
-      // Fallback: migrate from legacy global key
-      void getUserPref('p2p_session_config').then((legacyRaw) => {
-        if (legacyRaw && typeof legacyRaw === 'string') {
-          void saveUserPref(configKey!, legacyRaw).catch(() => {});
-        }
-        apply(legacyRaw);
-      });
     });
-  }, [configKey]);
+  }, [configKey, reloadConfig]);
 
   useEffect(() => {
     if (contextReducerMode === 'reuse_existing_session') {
@@ -375,6 +392,8 @@ export function P2pConfigPanel({
 
   const handleSave = async () => {
     setSaving(true);
+    setSaveError(null);
+    setSaveWarning(null);
     // Only keep entries for currently eligible sessions — drop stale entries
     // from old/closed sessions or other daemons to prevent config rot.
     const merged: P2pSessionConfig = {};
@@ -393,6 +412,7 @@ export function P2pConfigPanel({
     const cfg: P2pSavedConfig = {
       sessions: merged,
       rounds,
+      updatedAt: Date.now(),
       hopTimeoutMinutes,
       extraPrompt: extraPrompt.trim() || undefined,
       advancedPresetKey: advancedPresetKey || undefined,
@@ -402,10 +422,23 @@ export function P2pConfigPanel({
     };
     try {
       if (configKey) await saveUserPref(configKey, JSON.stringify(cfg));
+      let daemonPersistResult: { ok: boolean; error?: string } | undefined;
+      if (scopeSession && onPersistDaemonConfig) {
+        daemonPersistResult = await onPersistDaemonConfig(scopeSession, cfg);
+      }
       onSave(cfg);
-    } catch { /* ignore — UI still closes */ }
+      if (daemonPersistResult && !daemonPersistResult.ok) {
+        setSaveWarning(t('p2p.settings_save_warning', 'Saved to your account, but the local daemon copy failed to update. Retry or reconnect the daemon.'));
+        setSaving(false);
+        return;
+      }
+      setSaving(false);
+      onClose();
+      return;
+    } catch {
+      setSaveError(t('p2p.settings_save_error', 'Failed to save P2P settings. Check your connection and try again.'));
+    }
     setSaving(false);
-    onClose();
   };
 
   const getEntry = (key: string) => sessionCfg[key] ?? { enabled: false, mode: 'audit' };
@@ -935,6 +968,11 @@ export function P2pConfigPanel({
 
         {/* Footer */}
         <div style={footerStyle}>
+          {(saveError || saveWarning) && (
+            <div style={{ flex: 1, alignSelf: 'center', color: saveError ? '#fca5a5' : '#fcd34d', fontSize: 12, paddingRight: 12 }}>
+              {saveError ?? saveWarning}
+            </div>
+          )}
           <button style={btnSecondaryStyle} onClick={onClose}>{t('p2p.settings_close')}</button>
           <button
             style={{ ...btnPrimaryStyle, opacity: saving ? 0.6 : 1 }}

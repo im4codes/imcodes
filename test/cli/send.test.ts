@@ -171,6 +171,20 @@ describe('send POST body shape', () => {
     expect(body).toHaveProperty('depth', 0);
   });
 
+  it('does not add raw context authority fields to the hook payload', () => {
+    const body = {
+      from: 'deck_proj_w1',
+      to: 'deck_proj_brain',
+      message: 'hello world',
+      depth: 0,
+    } as const;
+
+    expect(body).not.toHaveProperty('context');
+    expect(body).not.toHaveProperty('description');
+    expect(body).not.toHaveProperty('systemPrompt');
+    expect(body).not.toHaveProperty('extraSystemPrompt');
+  });
+
   it('builds correct body with files', () => {
     const files = ['src/api.ts', 'src/types.ts'];
     const body = {

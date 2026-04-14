@@ -5,6 +5,10 @@ import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { TransportProvider, ProviderError, SessionConfig, SessionInfoUpdate } from './transport-provider.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
+import { SharedContextDispatchError, dispatchSharedContextSend } from './transport-runtime-assembly.js';
+import type { ContextFreshness, ContextNamespace, SharedScopePolicyOverride } from '../../shared/context-types.js';
+import { resolveRuntimeAuthoredContext } from '../context/shared-context-runtime.js';
+import type { TransportContextBootstrap } from './runtime-context-bootstrap.js';
 
 /**
  * Transport session runtime — manages a single conversation with a remote provider.
@@ -34,6 +38,15 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _systemPrompt: string | undefined;
   private _agentId: string | undefined;
   private _effort: TransportEffortLevel | undefined;
+  private _contextNamespace: ContextNamespace | undefined;
+  private _contextNamespaceDiagnostics: string[] = [];
+  private _contextRemoteProcessedFreshness: ContextFreshness | undefined;
+  private _contextLocalProcessedFreshness: ContextFreshness | undefined;
+  private _contextRetryExhausted = false;
+  private _contextSharedPolicyOverride: SharedScopePolicyOverride | undefined;
+  private _contextAuthoredContextLanguage: string | undefined;
+  private _contextAuthoredContextFilePath: string | undefined;
+  private _contextBootstrapResolver: (() => Promise<TransportContextBootstrap>) | undefined;
   private _unsubscribes: Array<() => void> = [];
   private _onStatusChange?: (status: AgentStatus) => void;
 
@@ -125,12 +138,28 @@ export class TransportSessionRuntime implements SessionRuntime {
   /** Snapshot of queued messages waiting to be drained. */
   get pendingMessages(): string[] { return [...this._pendingMessages]; }
 
+  setContextBootstrapResolver(
+    resolver: (() => Promise<TransportContextBootstrap>) | undefined,
+  ): void {
+    this._contextBootstrapResolver = resolver;
+  }
+
   async initialize(config: SessionConfig): Promise<void> {
     this._providerSessionId = await this.provider.createSession(config);
     this._description = config.description;
     this._systemPrompt = config.systemPrompt;
     this._agentId = config.agentId;
     this._effort = config.effort;
+    this.applyContextBootstrap({
+      namespace: config.contextNamespace,
+      diagnostics: config.contextNamespaceDiagnostics ?? [],
+      remoteProcessedFreshness: config.contextRemoteProcessedFreshness,
+      localProcessedFreshness: config.contextLocalProcessedFreshness,
+      retryExhausted: config.contextRetryExhausted,
+      sharedPolicyOverride: config.contextSharedPolicyOverride,
+      authoredContextLanguage: config.contextAuthoredContextLanguage,
+      authoredContextFilePath: config.contextAuthoredContextFilePath,
+    });
   }
 
   /**
@@ -217,32 +246,52 @@ export class TransportSessionRuntime implements SessionRuntime {
     void promise.catch(() => {}); // prevent unhandled rejection
     this._activeTurn = { promise, resolve, reject };
 
-    try {
-      const sendResult = this.provider.send(this._providerSessionId!, message, undefined, this._description);
-      // Catch async rejections from providers that return Promises (e.g. OpenClaw RPC)
-      if (sendResult && typeof (sendResult as Promise<void>).catch === 'function') {
-        (sendResult as Promise<void>).catch((err) => {
-          // Only handle if the provider didn't already fire onError callback
-          if (this._sending && this._activeTurn) {
-            this.setStatus('error');
-            this._sending = false;
-            this._activeTurn.reject(
-              typeof err === 'object' && err && 'code' in err ? err : { code: 'PROVIDER_ERROR', message: String(err), recoverable: false },
-            );
-            this._activeTurn = null;
-            // Don't drain on async send failure — the provider is likely broken
-          }
-        });
-      }
-    } catch {
-      // Sync throw from provider.send() — emit error (not silent idle)
-      this.setStatus('error');
-      this._sending = false;
-      if (this._activeTurn) {
-        this._activeTurn.reject({ code: 'PROVIDER_ERROR', message: 'provider.send() threw synchronously', recoverable: false });
+    void this.refreshContextBootstrap()
+      .then(() => dispatchSharedContextSend(this.provider, this._providerSessionId!, {
+        userMessage: message,
+        description: this._description,
+        systemPrompt: this._systemPrompt,
+        namespace: this._contextNamespace,
+        namespaceDiagnostics: this._contextNamespaceDiagnostics,
+        remoteProcessedFreshness: this._contextRemoteProcessedFreshness,
+        localProcessedFreshness: this._contextLocalProcessedFreshness,
+        retryExhausted: this._contextRetryExhausted,
+        sharedPolicyOverride: this._contextSharedPolicyOverride,
+        authoredContextRepository: this.resolveAuthoredContextRepository(),
+        authoredContextLanguage: this._contextAuthoredContextLanguage,
+        authoredContextFilePath: this._contextAuthoredContextFilePath,
+      }, {
+        resolveAuthoredContext: (input) => {
+          if (!input.namespace) return Promise.resolve([]);
+          return resolveRuntimeAuthoredContext(input.namespace, {
+            language: input.authoredContextLanguage,
+            filePath: input.authoredContextFilePath,
+          });
+        },
+      }))
+      .catch((err) => {
+        // Only handle if the provider didn't already fire onError callback.
+        // Shared-context dispatch denial is surfaced here as a send failure
+        // because the outer runtime contract is still send-oriented.
+        if (!this._sending || !this._activeTurn) return;
+        this.setStatus('error');
+        this._sending = false;
+        this._activeTurn.reject(
+          err instanceof SharedContextDispatchError
+            ? err.toProviderError()
+            : (typeof err === 'object' && err && 'code' in err
+                ? err
+                : { code: 'PROVIDER_ERROR', message: String(err), recoverable: false }),
+        );
         this._activeTurn = null;
-      }
-    }
+        // Don't drain on async send failure — the provider is likely broken.
+      });
+  }
+
+  private resolveAuthoredContextRepository(): string | undefined {
+    const projectId = this._contextNamespace?.projectId?.trim();
+    if (!projectId || projectId.startsWith('local/')) return undefined;
+    return projectId;
   }
 
   /**
@@ -257,5 +306,29 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._onDrain?.(merged, messages.length);
     this._dispatchTurn(merged);
     return true;
+  }
+
+  private async refreshContextBootstrap(): Promise<void> {
+    if (!this._contextBootstrapResolver) return;
+    const bootstrap = await this._contextBootstrapResolver();
+    this.applyContextBootstrap(bootstrap);
+  }
+
+  private applyContextBootstrap(
+    bootstrap: Partial<TransportContextBootstrap> & {
+      namespace?: ContextNamespace;
+      diagnostics?: string[];
+      authoredContextLanguage?: string;
+      authoredContextFilePath?: string;
+    },
+  ): void {
+    this._contextNamespace = bootstrap.namespace;
+    this._contextNamespaceDiagnostics = [...(bootstrap.diagnostics ?? [])];
+    this._contextRemoteProcessedFreshness = bootstrap.remoteProcessedFreshness;
+    this._contextLocalProcessedFreshness = bootstrap.localProcessedFreshness;
+    this._contextRetryExhausted = !!bootstrap.retryExhausted;
+    this._contextSharedPolicyOverride = bootstrap.sharedPolicyOverride;
+    this._contextAuthoredContextLanguage = bootstrap.authoredContextLanguage;
+    this._contextAuthoredContextFilePath = bootstrap.authoredContextFilePath;
   }
 }

@@ -211,6 +211,27 @@ describe('handleWebCommand transport queue behavior', () => {
     );
   });
 
+  it('passes the raw user message to transport runtime assembly without client-side context shaping', async () => {
+    const transportSend = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'review the latest patch',
+      commandId: 'cmd-parity',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(transportSend).toHaveBeenCalledTimes(1);
+    expect(transportSend).toHaveBeenCalledWith('review the latest patch');
+    expect(typeof transportSend.mock.calls[0][0]).toBe('string');
+  });
+
   it('does not short-circuit transport identity questions in the daemon', async () => {
     const transportSend = vi.fn(() => 'sent');
     getTransportRuntimeMock.mockReturnValue({

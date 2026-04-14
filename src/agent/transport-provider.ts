@@ -13,6 +13,11 @@
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
+import type {
+  ProviderContextPayload,
+  ProviderSupportClass,
+  SharedScopePolicyOverride,
+} from '../../shared/context-types.js';
 
 // Re-export shared types used by consumers of this module so they can import from one place.
 export type { AgentMessage, MessageDelta, ToolCallEvent };
@@ -80,6 +85,8 @@ export interface ProviderCapabilities {
   reasoningEffort?: boolean;
   /** Supported effort levels when reasoningEffort is true. */
   supportedEffortLevels?: readonly TransportEffortLevel[];
+  /** How well this provider can honor normalized shared-context payloads. */
+  contextSupport?: ProviderSupportClass;
 }
 
 /**
@@ -117,6 +124,22 @@ export interface SessionConfig {
   description?: string;
   /** Runtime/system prompt injection that should not be surfaced as user-facing description. */
   systemPrompt?: string;
+  /** Resolved shared-context namespace for the live send path. */
+  contextNamespace?: ProviderContextPayload['authority']['namespace'];
+  /** Diagnostics describing how the runtime namespace was derived. */
+  contextNamespaceDiagnostics?: string[];
+  /** Shared processed-state freshness resolved during session bootstrap. */
+  contextRemoteProcessedFreshness?: ProviderContextPayload['authority']['freshness'];
+  /** Local processed-state freshness resolved during session bootstrap. */
+  contextLocalProcessedFreshness?: ProviderContextPayload['authority']['freshness'];
+  /** Whether shared retry has already been exhausted for the current namespace bootstrap. */
+  contextRetryExhausted?: boolean;
+  /** Persisted control-plane policy override for the resolved shared namespace. */
+  contextSharedPolicyOverride?: SharedScopePolicyOverride;
+  /** Language code for authored context applicability matching. */
+  contextAuthoredContextLanguage?: string;
+  /** File path for authored context applicability matching. */
+  contextAuthoredContextFilePath?: string;
   /** Provider-specific SDK/CLI settings object or settings file path. */
   settings?: string | Record<string, unknown>;
   /** Parent session key for sub-sessions. */
@@ -245,7 +268,7 @@ export interface TransportProvider {
    * @param message    - The user's text message.
    * @param attachments - Optional file/image attachments (only when capabilities.attachments is true).
    */
-  send(sessionId: string, message: string, attachments?: unknown[], extraSystemPrompt?: string): Promise<void>;
+  send(sessionId: string, payload: string | ProviderContextPayload, attachments?: unknown[], extraSystemPrompt?: string): Promise<void>;
 
   /**
    * Best-effort cancellation of the current in-flight turn for a session.
@@ -345,4 +368,47 @@ export interface TransportProvider {
    * Only call when capabilities.sessionRestore is true.
    */
   listSessions?(): Promise<RemoteSessionInfo[]>;
+}
+
+export function normalizeProviderPayload(
+  payload: string | ProviderContextPayload,
+  attachments?: unknown[],
+  extraSystemPrompt?: string,
+): ProviderContextPayload {
+  if (typeof payload !== 'string') {
+    if (extraSystemPrompt?.trim()) {
+      throw new Error('Normalized provider payload must not be combined with legacy extraSystemPrompt');
+    }
+    return payload;
+  }
+  const systemText = extraSystemPrompt?.trim() || undefined;
+  return {
+    userMessage: payload,
+    assembledMessage: payload,
+    systemText,
+    messagePreamble: undefined,
+    attachments,
+    context: {
+      systemText,
+      messagePreamble: undefined,
+      requiredAuthoredContext: [],
+      advisoryAuthoredContext: [],
+      appliedDocumentVersionIds: [],
+      diagnostics: [],
+    },
+    authority: {
+      namespace: {
+        scope: 'personal',
+        projectId: 'legacy-send',
+      },
+      authoritySource: 'none',
+      freshness: 'missing',
+      fallbackAllowed: true,
+      retryScheduled: false,
+      providerPolicyOutcome: 'allowed',
+      diagnostics: systemText ? ['legacy-extra-system-prompt'] : ['legacy-message-only'],
+    },
+    supportClass: 'full-normalized-context-injection',
+    diagnostics: systemText ? ['legacy-extra-system-prompt'] : ['legacy-message-only'],
+  };
 }

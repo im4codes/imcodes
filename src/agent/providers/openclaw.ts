@@ -21,10 +21,12 @@ import type {
 } from '../transport-provider.js';
 import {
   CONNECTION_MODES,
+  normalizeProviderPayload,
   SESSION_OWNERSHIP,
   PROVIDER_ERROR_CODES,
 } from '../transport-provider.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../../shared/agent-message.js';
+import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import logger from '../../util/logger.js';
 import { normalizeOpenClawDisplayName } from '../openclaw-display.js';
 import { OPENCLAW_THINKING_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
@@ -97,6 +99,7 @@ export class OpenClawProvider implements TransportProvider {
     attachments: false,
     reasoningEffort: true,
     supportedEffortLevels: OPENCLAW_THINKING_LEVELS,
+    contextSupport: 'full-normalized-context-injection',
   };
 
   // ── Private state ──────────────────────────────────────────────────────────
@@ -159,17 +162,18 @@ export class OpenClawProvider implements TransportProvider {
     logger.info({ provider: this.id }, 'Disconnected from OpenClaw gateway');
   }
 
-  async send(sessionId: string, message: string, _attachments?: unknown[], extraSystemPrompt?: string): Promise<void> {
+  async send(sessionId: string, payloadOrMessage: string | ProviderContextPayload, _attachments?: unknown[], extraSystemPrompt?: string): Promise<void> {
+    const payload = normalizeProviderPayload(payloadOrMessage, _attachments, extraSystemPrompt);
     const ocKey = unsanitizeKey(sessionId);
     const thinking = this.sessionThinking.get(sessionId) ?? 'off';
     try {
       // Prefer sessions.send (v2026.3.24+): auto canonicalKey, messageSeq, subagent reactivation
       await this.rpc('sessions.send', {
         key: ocKey,
-        message,
+        message: payload.assembledMessage,
         thinking,
         idempotencyKey: randomUUID(),
-        ...(extraSystemPrompt ? { extraSystemPrompt } : {}),
+        ...(payload.systemText ? { extraSystemPrompt: payload.systemText } : {}),
       });
       logger.info({ provider: this.id, ocKey }, 'sessions.send succeeded');
     } catch (err) {
@@ -177,11 +181,11 @@ export class OpenClawProvider implements TransportProvider {
       // Fallback to agent RPC (v2026.3.7+)
       await this.rpc('agent', {
         sessionKey: ocKey,
-        message,
+        message: payload.assembledMessage,
         agentId: this.agentId,
         thinking,
         idempotencyKey: randomUUID(),
-        ...(extraSystemPrompt ? { extraSystemPrompt } : {}),
+        ...(payload.systemText ? { extraSystemPrompt: payload.systemText } : {}),
       });
       logger.info({ provider: this.id, ocKey }, 'agent RPC fallback succeeded');
     }

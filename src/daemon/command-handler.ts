@@ -31,7 +31,7 @@ const execAsync = promisify(execCb);
 const execFileAsync = promisify(execFileCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget } from './p2p-orchestrator.js';
 import { buildSessionList } from './session-list.js';
-import { getComboRoundCount, parseModePipeline, P2P_CONFIG_MODE, type P2pSessionConfig } from '../../shared/p2p-modes.js';
+import { getComboRoundCount, parseModePipeline, P2P_CONFIG_MODE, isP2pSavedConfig, type P2pSessionConfig } from '../../shared/p2p-modes.js';
 import type { P2pAdvancedRound, P2pContextReducerConfig } from '../../shared/p2p-advanced.js';
 import { CRON_MSG } from '../../shared/cron-types.js';
 import { executeCronJob } from './cron-executor.js';
@@ -48,6 +48,7 @@ import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '.
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { P2P_CONFIG_ERROR, P2P_CONFIG_MSG } from '../../shared/p2p-config-events.js';
 import {
   CLAUDE_SDK_EFFORT_LEVELS,
   CODEX_SDK_EFFORT_LEVELS,
@@ -57,6 +58,7 @@ import {
   isTransportEffortLevel,
   type TransportEffortLevel,
 } from '../../shared/effort-levels.js';
+import { getSavedP2pConfig, upsertSavedP2pConfig } from '../store/p2p-config-store.js';
 
 const MAX_P2P_FILE_PULL_COUNT = 20;
 
@@ -354,6 +356,30 @@ function expandAllTargets(initiatorName: string, mode: string, excludeSameType =
   // Sort deterministically by session name for predictable ordering
   targets.sort((a, b) => a.session.localeCompare(b.session));
   return targets;
+}
+
+function resolveP2pConfigScopeSession(sessionName: string): string {
+  if (!sessionName.startsWith('deck_sub_')) return sessionName;
+  const record = getSession(sessionName);
+  return record?.parentSession ?? sessionName;
+}
+
+async function resolveStructuredP2pSessionConfig(sessionName: string, clientConfig?: P2pSessionConfig): Promise<P2pSessionConfig | undefined> {
+  const scopeSession = resolveP2pConfigScopeSession(sessionName);
+  const saved = await getSavedP2pConfig(scopeSession);
+  if (saved?.sessions && typeof saved.sessions === 'object') return saved.sessions;
+  return clientConfig;
+}
+
+function sendP2pTargetError(
+  serverLink: ServerLink,
+  sessionName: string,
+  commandId: string,
+  error: string,
+  timelineMessage: string,
+): void {
+  timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: timelineMessage });
+  try { serverLink.send({ type: 'command.ack', commandId, status: 'error', session: sessionName, error }); } catch {}
 }
 
 // Session names: alphanumeric + underscore only (matches deck_{project}_{role} and deck_sub_{id} patterns)
@@ -698,6 +724,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'discussion.stop':
       void handleDiscussionStop(cmd);
       break;
+    case P2P_CONFIG_MSG.SAVE:
+      void handleP2pConfigSave(cmd, serverLink);
+      break;
     case 'discussion.list':
       handleDiscussionList(serverLink);
       break;
@@ -794,6 +823,46 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       if (typeof cmd.type === 'string') {
         logger.warn({ type: cmd.type }, 'Unknown web command type');
       }
+  }
+}
+
+async function handleP2pConfigSave(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  const scopeSession = typeof cmd.scopeSession === 'string' ? cmd.scopeSession.trim() : '';
+  const config = cmd.config;
+  if (!scopeSession || !isP2pSavedConfig(config)) {
+    if (requestId) {
+      serverLink?.send({
+        type: P2P_CONFIG_MSG.SAVE_RESPONSE,
+        requestId,
+        scopeSession,
+        ok: false,
+        error: P2P_CONFIG_ERROR.INVALID_CONFIG,
+      });
+    }
+    return;
+  }
+  try {
+    await upsertSavedP2pConfig(scopeSession, config);
+    if (requestId) {
+      serverLink?.send({
+        type: P2P_CONFIG_MSG.SAVE_RESPONSE,
+        requestId,
+        scopeSession,
+        ok: true,
+      });
+    }
+  } catch (err) {
+    logger.warn({ err, scopeSession }, 'Failed to persist daemon-local P2P config');
+    if (requestId) {
+      serverLink?.send({
+        type: P2P_CONFIG_MSG.SAVE_RESPONSE,
+        requestId,
+        scopeSession,
+        ok: false,
+        error: P2P_CONFIG_ERROR.PERSIST_FAILED,
+      });
+    }
   }
 }
 
@@ -1098,7 +1167,15 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   dedup.add(effectiveId);
 
 // ── P2P routing: structured WS fields (new) or inline @@tokens (legacy) ──
-  const p2pSessionConfig = (cmd as any).p2pSessionConfig as P2pSessionConfig | undefined;
+  const clientP2pSessionConfig = (cmd as any).p2pSessionConfig as P2pSessionConfig | undefined;
+  const wantsStructuredP2pRouting = Boolean(
+    clientP2pSessionConfig ||
+    (cmd as any).p2pMode ||
+    (Array.isArray((cmd as any).p2pAtTargets) && (cmd as any).p2pAtTargets.length > 0),
+  );
+  const p2pSessionConfig = wantsStructuredP2pRouting
+    ? await resolveStructuredP2pSessionConfig(sessionName, clientP2pSessionConfig)
+    : undefined;
   let p2pRounds = (cmd as any).p2pRounds as number | undefined;
   let p2pExtraPrompt = (cmd as any).p2pExtraPrompt as string | undefined;
   const p2pLocale = (cmd as any).p2pLocale as string | undefined;
@@ -1171,9 +1248,16 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     }
     tokens.agents.push(...expandAllTargets(sessionName, mode, tokens.expandAll.excludeSameType, p2pSessionConfig));
     if (tokens.agents.length === 0) {
+      const unfilteredTargets = p2pSessionConfig
+        ? expandAllTargets(sessionName, mode, tokens.expandAll.excludeSameType)
+        : [];
+      if (unfilteredTargets.length > 0) {
+        logger.warn({ sessionName, mode }, '@@all: config filtered all eligible sessions');
+        sendP2pTargetError(serverLink, sessionName, effectiveId, P2P_CONFIG_ERROR.NO_CONFIGURED_TARGETS, 'No configured P2P targets found');
+        return;
+      }
       logger.warn({ sessionName }, '@@all: no active sessions found in same domain');
-      timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: 'No active sessions found for @@all' });
-      try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: 'no_sessions' }); } catch {}
+      sendP2pTargetError(serverLink, sessionName, effectiveId, 'no_sessions', 'No active sessions found for @@all');
       return;
     }
     logger.info({ sessionName, targets: tokens.agents.map(a => a.session) }, '@@all expanded');
@@ -1181,9 +1265,17 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
 
   // No targets found from any source
   if ((explicitTargets || p2pModeField) && tokens.agents.length === 0) {
+    const structuredMode = p2pModeField ?? explicitTargets?.find((t) => t.session === '__all__')?.mode;
+    const unfilteredTargets = p2pSessionConfig && structuredMode
+      ? expandAllTargets(sessionName, structuredMode, !!(cmd as any).p2pExcludeSameType)
+      : [];
+    if (unfilteredTargets.length > 0) {
+      logger.warn({ sessionName, p2pModeField }, 'P2P: config filtered all eligible structured-routing targets');
+      sendP2pTargetError(serverLink, sessionName, effectiveId, P2P_CONFIG_ERROR.NO_CONFIGURED_TARGETS, 'No configured P2P targets found');
+      return;
+    }
     logger.warn({ sessionName, p2pModeField }, 'P2P: no active sessions found for structured routing');
-    timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: 'No active sessions found' });
-    try { serverLink.send({ type: 'command.ack', commandId: effectiveId, status: 'error', session: sessionName, error: 'no_sessions' }); } catch {}
+    sendP2pTargetError(serverLink, sessionName, effectiveId, 'no_sessions', 'No active sessions found');
     return;
   }
 

@@ -72,6 +72,7 @@ vi.mock('../../src/util/logger.js', () => ({
 }));
 
 import { ClaudeCodeSdkProvider } from '../../src/agent/providers/claude-code-sdk.js';
+import type { ProviderContextPayload } from '../../shared/context-types.js';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -377,6 +378,142 @@ describe('ClaudeCodeSdkProvider', () => {
 
     const run = sdkMock.runs.at(-1)!;
     expect(run.options.appendSystemPrompt).toBe('Visible description\n\nRuntime note only');
+  });
+
+  it('maps normalized provider payloads without re-assembling prompt state in the caller', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-payload', model: 'claude-sonnet-4-6' },
+      { type: 'result', session_id: 'session-payload', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-payload',
+      cwd: '/tmp/project',
+      resumeId: 'session-payload',
+      description: 'Visible description',
+      systemPrompt: 'Runtime note only',
+    });
+
+    const payload: ProviderContextPayload = {
+      userMessage: 'actual user message',
+      assembledMessage: 'Context block\n\nactual user message',
+      systemText: 'Normalized system text',
+      messagePreamble: 'Context block',
+      attachments: [],
+      context: {
+        systemText: 'Normalized system text',
+        messagePreamble: 'Context block',
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'route-payload' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        diagnostics: [],
+      },
+      supportClass: 'full-normalized-context-injection',
+      diagnostics: [],
+    };
+
+    await provider.send('route-payload', payload);
+    await flush();
+
+    const run = sdkMock.runs.at(-1)!;
+    expect(run.prompt).toBe('Context block\n\nactual user message');
+    expect(run.options.appendSystemPrompt).toBe('Normalized system text');
+  });
+
+  it('accepts a normalized provider payload', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-payload', model: 'claude-sonnet-4-6' },
+      { type: 'result', session_id: 'session-payload', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-payload',
+      cwd: '/tmp/project',
+      resumeId: 'session-payload',
+    });
+
+    await provider.send('route-payload', {
+      userMessage: 'hello',
+      assembledMessage: 'Relevant history\n\nhello',
+      systemText: 'Enterprise standard',
+      messagePreamble: 'Relevant history',
+      attachments: undefined,
+      context: {
+        systemText: 'Enterprise standard',
+        messagePreamble: 'Relevant history',
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'project_shared', projectId: 'repo' },
+        authoritySource: 'processed_remote',
+        freshness: 'fresh',
+        fallbackAllowed: false,
+        retryScheduled: false,
+        diagnostics: [],
+      },
+      supportClass: 'full-normalized-context-injection',
+      diagnostics: [],
+    });
+    await flush();
+
+    const run = sdkMock.runs.at(-1)!;
+    expect(run.prompt).toBe('Relevant history\n\nhello');
+    expect(run.options.appendSystemPrompt).toBe('Enterprise standard');
+  });
+
+  it('rejects normalized payloads combined with legacy extraSystemPrompt', async () => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: 'session-payload', model: 'claude-sonnet-4-6' },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-payload',
+      cwd: '/tmp/project',
+      resumeId: 'session-payload',
+    });
+
+    await expect(provider.send('route-payload', {
+      userMessage: 'hello',
+      assembledMessage: 'Relevant history\n\nhello',
+      systemText: 'Enterprise standard',
+      messagePreamble: 'Relevant history',
+      attachments: undefined,
+      context: {
+        systemText: 'Enterprise standard',
+        messagePreamble: 'Relevant history',
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'project_shared', projectId: 'repo' },
+        authoritySource: 'processed_remote',
+        freshness: 'fresh',
+        fallbackAllowed: false,
+        retryScheduled: false,
+        diagnostics: [],
+      },
+      supportClass: 'full-normalized-context-injection',
+      diagnostics: [],
+    }, undefined, 'legacy raw context')).rejects.toThrow(/legacy extraSystemPrompt/i);
   });
 
   it('emits a fallback streaming delta from assistant text when the SDK does not send text_delta events', async () => {
