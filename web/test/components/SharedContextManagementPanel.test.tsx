@@ -183,7 +183,7 @@ describe('SharedContextManagementPanel', () => {
   });
 
   it('loads the saved project policy instead of resetting to hardcoded defaults', async () => {
-    getSharedProjectPolicyMock.mockResolvedValueOnce({
+    getSharedProjectPolicyMock.mockResolvedValue({
       enrollmentId: 'enr-1',
       enterpriseId: 'team-1',
       allowDegradedProviderSupport: false,
@@ -199,13 +199,14 @@ describe('SharedContextManagementPanel', () => {
 
     await waitFor(() => expect(getSharedProjectPolicyMock).toHaveBeenCalledWith('enr-1'));
 
-    const degraded = screen.getByLabelText(/sharedContext.management.allowDegraded/i) as HTMLInputElement;
-    const localFallback = screen.getByLabelText(/sharedContext.management.allowLocalFallback/i) as HTMLInputElement;
-    const fullSupport = screen.getByLabelText(/sharedContext.management.requireFullSupport/i) as HTMLInputElement;
-
-    expect(degraded.checked).toBe(false);
-    expect(localFallback.checked).toBe(true);
-    expect(fullSupport.checked).toBe(true);
+    await waitFor(() => {
+      const degraded = screen.getByLabelText(/sharedContext.management.allowDegraded/i) as HTMLInputElement;
+      const localFallback = screen.getByLabelText(/sharedContext.management.allowLocalFallback/i) as HTMLInputElement;
+      const fullSupport = screen.getByLabelText(/sharedContext.management.requireFullSupport/i) as HTMLInputElement;
+      expect(degraded.checked).toBe(false);
+      expect(localFallback.checked).toBe(true);
+      expect(fullSupport.checked).toBe(true);
+    });
   });
 
   it('does not loop enterprise-change notifications when parent rerenders with a new callback identity', async () => {
