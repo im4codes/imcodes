@@ -758,23 +758,33 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     const viewportWidth = window.innerWidth;
     const viewportHeight = window.innerHeight;
     const horizontalInset = 8;
-    const topGap = 12;
+    const verticalInset = 12;
+    const triggerGap = 6;
     const preferredWidth = Math.max(minWidth, Math.ceil(rect.width));
     const width = Math.min(preferredWidth, viewportWidth - horizontalInset * 2);
     const maxLeft = Math.max(horizontalInset, viewportWidth - width - horizontalInset);
     const left = Math.min(Math.max(rect.right - width, horizontalInset), maxLeft);
-    const availableHeight = Math.max(96, Math.floor(rect.top - topGap));
+    const availableAbove = Math.max(96, Math.floor(rect.top - verticalInset));
+    const availableBelow = Math.max(96, Math.floor(viewportHeight - rect.bottom - verticalInset));
+    const shouldOpenBelow = availableBelow >= 180 || availableBelow >= availableAbove;
 
-    return {
+    const style = {
       position: 'fixed',
       left: `${Math.round(left)}px`,
-      bottom: `${Math.max(viewportHeight - rect.top + 6, horizontalInset)}px`,
       width: `${Math.round(width)}px`,
       minWidth: `${Math.round(width)}px`,
       maxWidth: `${Math.round(width)}px`,
-      maxHeight: `${availableHeight}px`,
+      maxHeight: `${shouldOpenBelow ? availableBelow : availableAbove}px`,
       zIndex: 2147483647,
-    } as const;
+    } as React.CSSProperties;
+
+    if (shouldOpenBelow) {
+      style.top = `${Math.max(Math.round(rect.bottom + triggerGap), horizontalInset)}px`;
+    } else {
+      style.bottom = `${Math.max(viewportHeight - rect.top + triggerGap, horizontalInset)}px`;
+    }
+
+    return style;
   }, []);
 
   useEffect(() => {

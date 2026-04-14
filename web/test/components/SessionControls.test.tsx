@@ -1253,6 +1253,72 @@ afterEach(() => {
       expect(submenu.style.bottom).toBe('188px');
       expect(submenu.style.width).toBe('220px');
       expect(submenu.style.maxHeight).toBe('650px');
+      expect(submenu.style.top).toBe('');
+    } finally {
+      rectSpy.mockRestore();
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: innerWidth });
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: innerHeight });
+    }
+  });
+
+  it('opens the openspec audit submenu below the trigger when the trigger is high in the viewport', async () => {
+    const innerWidth = window.innerWidth;
+    const innerHeight = window.innerHeight;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 844 });
+    const rectSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function mockRect() {
+      const el = this as HTMLElement;
+      if (el.classList?.contains('shortcuts-model')) {
+        return {
+          x: 250, y: 0, top: 720, left: 250, right: 360, bottom: 752, width: 110, height: 32,
+          toJSON() { return {}; },
+        } as DOMRect;
+      }
+      if (el.textContent?.trim() === 'audit_action') {
+        return {
+          x: 248, y: 0, top: 92, left: 248, right: 328, bottom: 120, width: 80, height: 28,
+          toJSON() { return {}; },
+        } as DOMRect;
+      }
+      return {
+        x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0,
+        toJSON() { return {}; },
+      } as DOMRect;
+    });
+
+    try {
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+      ws.emit({
+        type: 'fs.ls_response',
+        requestId: 'openspec-request',
+        status: 'ok',
+        resolvedPath: '/repo/openspec/changes',
+        entries: [
+          { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+        ],
+      });
+      await flushAsync();
+
+      fireEvent.click(screen.getByRole('button', { name: 'expand change-a' }));
+      fireEvent.click(screen.getByRole('button', { name: 'audit_action' }));
+
+      const submenu = document.querySelector('.openspec-submenu') as HTMLElement;
+      expect(submenu).toBeTruthy();
+      expect(submenu.style.position).toBe('fixed');
+      expect(submenu.style.left).toBe('148px');
+      expect(submenu.style.top).toBe('126px');
+      expect(submenu.style.bottom).toBe('');
+      expect(submenu.style.width).toBe('180px');
+      expect(submenu.style.maxHeight).toBe('712px');
     } finally {
       rectSpy.mockRestore();
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: innerWidth });
