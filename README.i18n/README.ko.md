@@ -264,7 +264,7 @@ setx PATH "<npm-prefix-path>;%PATH%"
 
 - macOS 또는 Linux
 - Windows (실험적, ConPTY 사용)
-- Node.js >= 20
+- Node.js >= 22
 - Linux / macOS에서는 tmux
 - Claude Code, Codex, Gemini CLI, OpenClaw, Qwen 중 하나
 

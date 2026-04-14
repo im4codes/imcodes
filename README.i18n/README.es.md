@@ -273,7 +273,7 @@ setx PATH "<npm-prefix-path>;%PATH%"
 
 - macOS o Linux
 - Windows (experimental) vía ConPTY
-- Node.js >= 20
+- Node.js >= 22
 - tmux en Linux/macOS
 - Al menos un coding agent: Claude Code, Codex, Gemini CLI, OpenClaw o Qwen
 
