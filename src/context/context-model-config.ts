@@ -1,6 +1,5 @@
 import type { ContextModelConfig } from '../../shared/context-types.js';
-
-const DEFAULT_PRIMARY_CONTEXT_MODEL = 'sonnet';
+import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '../../shared/context-model-defaults.js';
 
 export function getContextModelConfig(overrides?: Partial<ContextModelConfig>): ContextModelConfig {
   const primaryContextModel = overrides?.primaryContextModel

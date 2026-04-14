@@ -882,7 +882,31 @@
       "advisory": "Advisory",
       "language": "Language",
       "pathPattern": "Path pattern",
-      "createBinding": "Create binding"
+      "createBinding": "Create binding",
+      "tabs": {
+        "enterprise": "Enterprise",
+        "members": "Members",
+        "projects": "Projects",
+        "knowledge": "Knowledge",
+        "processing": "Processing"
+      },
+      "policyTitle": "Project policy",
+      "policyLoading": "Loading saved policy…",
+      "processingSummaryTitle": "Processing flow",
+      "processingSummaryLine1": "Raw activity is staged locally, then materialized into processed local context on delayed jobs.",
+      "processingSummaryLine2": "Shared projects can replicate processed context to the remote shared store after local materialization succeeds.",
+      "processingSummaryLine3": "This panel manages enterprise policy and authored knowledge. It does not directly run the materializer.",
+      "processingModelTitle": "Materialization model selection",
+      "processingPrimaryModel": "Default primary model",
+      "processingPrimaryOverride": "Primary override env",
+      "processingBackupOverride": "Backup override env",
+      "processingServerScope": "Current server scope",
+      "processingProviderNote": "There is no separate provider picker in the management UI today. The daemon selects the materialization model from its local config, and the runtime/backend implied by that model does the work.",
+      "processingUiGap": "If you need a different primary or backup model, change the daemon environment on that server. This is server-local, not enterprise-global.",
+      "processingOperationalTitle": "Operational notes",
+      "processingOperationalLine1": "Default selection path: IMCODES_PRIMARY_CONTEXT_MODEL -> \"sonnet\".",
+      "processingOperationalLine2": "Backup selection path: IMCODES_BACKUP_CONTEXT_MODEL -> unset.",
+      "processingOperationalLine3": "If two servers run different daemon env values, they can materialize with different model settings until that is centralized."
     },
     "diagnostics": {
       "title": "Diagnostics",

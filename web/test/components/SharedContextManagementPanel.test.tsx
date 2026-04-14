@@ -24,6 +24,7 @@ const createSharedWorkspaceMock = vi.fn();
 const listSharedProjectsMock = vi.fn();
 const enrollSharedProjectMock = vi.fn();
 const updateSharedProjectPolicyMock = vi.fn();
+const getSharedProjectPolicyMock = vi.fn();
 const listSharedDocumentsMock = vi.fn();
 const createSharedDocumentMock = vi.fn();
 const createSharedDocumentVersionMock = vi.fn();
@@ -51,6 +52,7 @@ vi.mock('../../src/api.js', () => ({
   listSharedProjects: (...args: unknown[]) => listSharedProjectsMock(...args),
   enrollSharedProject: (...args: unknown[]) => enrollSharedProjectMock(...args),
   updateSharedProjectPolicy: (...args: unknown[]) => updateSharedProjectPolicyMock(...args),
+  getSharedProjectPolicy: (...args: unknown[]) => getSharedProjectPolicyMock(...args),
   listSharedDocuments: (...args: unknown[]) => listSharedDocumentsMock(...args),
   createSharedDocument: (...args: unknown[]) => createSharedDocumentMock(...args),
   createSharedDocumentVersion: (...args: unknown[]) => createSharedDocumentVersionMock(...args),
@@ -73,6 +75,13 @@ describe('SharedContextManagementPanel', () => {
     getTeamMock.mockResolvedValue({ id: 'team-1', name: 'Acme', myRole: 'owner', members: [{ user_id: 'user-owner', role: 'owner', joined_at: 1 }, { user_id: 'user-member', role: 'member', joined_at: 2 }] });
     listSharedWorkspacesMock.mockResolvedValue([{ id: 'ws-1', enterpriseId: 'team-1', name: 'Platform' }]);
     listSharedProjectsMock.mockResolvedValue([{ id: 'enr-1', workspaceId: 'ws-1', canonicalRepoId: 'github.com/acme/repo', displayName: 'Repo', scope: 'project_shared', status: 'active' }]);
+    getSharedProjectPolicyMock.mockResolvedValue({
+      enrollmentId: 'enr-1',
+      enterpriseId: 'team-1',
+      allowDegradedProviderSupport: true,
+      allowLocalFallback: false,
+      requireFullProviderSupport: false,
+    });
     listSharedDocumentsMock.mockResolvedValue([{ id: 'doc-1', enterpriseId: 'team-1', kind: 'coding_standard', title: 'Rules', versions: [{ id: 'ver-1', versionNumber: 1, status: 'active' }] }]);
     listSharedDocumentBindingsMock.mockResolvedValue([{ id: 'bind-1', workspaceId: 'ws-1', enrollmentId: 'enr-1', documentId: 'doc-1', versionId: 'ver-1', mode: 'required', applicabilityRepoId: 'github.com/acme/repo', applicabilityLanguage: 'typescript', applicabilityPathPattern: 'src/**', status: 'active' }]);
     createTeamMock.mockResolvedValue({ id: 'team-2', name: 'New Team', role: 'owner' });
@@ -99,7 +108,13 @@ describe('SharedContextManagementPanel', () => {
     await flush();
     await waitFor(() => expect(getTeamMock).toHaveBeenCalledWith('team-1'));
     expect((await screen.findAllByText(/Platform/)).length).toBeGreaterThan(0);
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.projects'));
+    });
     expect((await screen.findAllByText(/Repo/)).length).toBeGreaterThan(0);
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.knowledge'));
+    });
     expect((await screen.findAllByText(/Rules/)).length).toBeGreaterThan(0);
   });
 
@@ -121,6 +136,10 @@ describe('SharedContextManagementPanel', () => {
     });
     expect(createSharedWorkspaceMock).toHaveBeenCalledWith('team-1', 'Infra');
 
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.knowledge'));
+    });
+
     const documentContent = screen.getByPlaceholderText('sharedContext.management.documentContent') as HTMLTextAreaElement;
     fireEvent.input(documentContent, { target: { value: 'Use strict types.' } });
     await flush();
@@ -138,6 +157,9 @@ describe('SharedContextManagementPanel', () => {
   it('updates member role and enrolls a project', async () => {
     render(<SharedContextManagementPanel />);
     await flush();
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.members'));
+    });
     await screen.findByText('sharedContext.management.promoteAdmin');
 
     await act(async () => {
@@ -145,6 +167,9 @@ describe('SharedContextManagementPanel', () => {
     });
     expect(updateTeamMemberRoleMock).toHaveBeenCalledWith('team-1', 'user-member', 'admin');
 
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.projects'));
+    });
     const repoInput = screen.getByPlaceholderText('sharedContext.management.canonicalRepoId') as HTMLInputElement;
     fireEvent.input(repoInput, { target: { value: 'github.com/acme/new-repo' } });
     await flush();
@@ -155,6 +180,32 @@ describe('SharedContextManagementPanel', () => {
       canonicalRepoId: 'github.com/acme/new-repo',
       scope: 'project_shared',
     }));
+  });
+
+  it('loads the saved project policy instead of resetting to hardcoded defaults', async () => {
+    getSharedProjectPolicyMock.mockResolvedValueOnce({
+      enrollmentId: 'enr-1',
+      enterpriseId: 'team-1',
+      allowDegradedProviderSupport: false,
+      allowLocalFallback: true,
+      requireFullProviderSupport: true,
+    });
+
+    render(<SharedContextManagementPanel />);
+    await flush();
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.projects'));
+    });
+
+    await waitFor(() => expect(getSharedProjectPolicyMock).toHaveBeenCalledWith('enr-1'));
+
+    const degraded = screen.getByLabelText(/sharedContext.management.allowDegraded/i) as HTMLInputElement;
+    const localFallback = screen.getByLabelText(/sharedContext.management.allowLocalFallback/i) as HTMLInputElement;
+    const fullSupport = screen.getByLabelText(/sharedContext.management.requireFullSupport/i) as HTMLInputElement;
+
+    expect(degraded.checked).toBe(false);
+    expect(localFallback.checked).toBe(true);
+    expect(fullSupport.checked).toBe(true);
   });
 
   it('does not loop enterprise-change notifications when parent rerenders with a new callback identity', async () => {
