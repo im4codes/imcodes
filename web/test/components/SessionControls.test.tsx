@@ -1634,6 +1634,8 @@ afterEach(() => {
       text: 'edited queued send',
       commandId: expect.any(String),
     }));
+    expect(screen.getByText('edited queued send')).toBeDefined();
+    expect(screen.queryByText('queued send')).toBeNull();
   });
 
   it('removes a queued transport message through the queue controls', () => {
@@ -1664,6 +1666,7 @@ afterEach(() => {
       clientMessageId: 'msg-1',
       commandId: expect.any(String),
     }));
+    expect(screen.queryByText('queued send')).toBeNull();
   });
 
   it('pressing Escape in a running transport input sends /stop command', () => {

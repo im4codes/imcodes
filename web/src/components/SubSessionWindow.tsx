@@ -438,31 +438,29 @@ export function SubSessionWindow({
       )}
 
       {/* Full SessionControls — with sub-session action overrides */}
-      <div onMouseDown={startDrag} style={{ cursor: 'grab' }}>
-        <SessionControls
-          ws={ws}
-          activeSession={sessionInfo}
-          inputRef={inputRef}
-          quickData={quickData}
-          hideShortcuts={false}
-          onSend={scrollToBottom}
-          onSubRestart={onRestart}
-          onSubNew={onRestart}
-          onSubStop={onClose}
-          onRenameSession={onRename}
-          onSettings={onSettings}
-          sessionDisplayName={sub.label ? formatLabel(sub.label) : agentTag}
-          activeThinking={!!activeThinkingTs}
-          sessions={sessions}
-          subSessions={subSessions}
-          serverId={serverId}
-          detectedModel={detectedModel ?? lastUsage?.model}
-          quotes={quotes}
-          onRemoveQuote={removeQuote}
-          pendingPrefillText={pendingPrefillText}
-          onPendingPrefillApplied={onPendingPrefillApplied}
-        />
-      </div>
+      <SessionControls
+        ws={ws}
+        activeSession={sessionInfo}
+        inputRef={inputRef}
+        quickData={quickData}
+        hideShortcuts={false}
+        onSend={scrollToBottom}
+        onSubRestart={onRestart}
+        onSubNew={onRestart}
+        onSubStop={onClose}
+        onRenameSession={onRename}
+        onSettings={onSettings}
+        sessionDisplayName={sub.label ? formatLabel(sub.label) : agentTag}
+        activeThinking={!!activeThinkingTs}
+        sessions={sessions}
+        subSessions={subSessions}
+        serverId={serverId}
+        detectedModel={detectedModel ?? lastUsage?.model}
+        quotes={quotes}
+        onRemoveQuote={removeQuote}
+        pendingPrefillText={pendingPrefillText}
+        onPendingPrefillApplied={onPendingPrefillApplied}
+      />
     </div>
   );
 }

@@ -365,6 +365,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [qwenModel, setQwenModel] = useState<QwenModelChoice | null>(loadQwenModel);
   const [queuedHintExpanded, setQueuedHintExpanded] = useState(loadQueuedHintExpanded);
   const [editingQueuedMessageId, setEditingQueuedMessageId] = useState<string | null>(null);
+  const [optimisticQueuedEntries, setOptimisticQueuedEntries] = useState<Array<{ clientMessageId: string; text: string }> | null>(null);
   const [mobileComposerMultiline, setMobileComposerMultiline] = useState(false);
   const [mobileComposerExpanded, setMobileComposerExpanded] = useState(false);
   const [confirm, setConfirm] = useState<MenuAction | null>(null);
@@ -384,13 +385,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const showRunningSweep = !compact && isRunningSessionState(activeSession?.state);
-  const queuedTransportEntries = activeSession?.runtimeType === 'transport'
+  const incomingQueuedTransportEntries = activeSession?.runtimeType === 'transport'
     ? normalizeTransportPendingEntries(
         activeSession.transportPendingMessageEntries,
         activeSession.transportPendingMessages,
         activeSession.name,
       )
     : [];
+  const queuedTransportEntries = optimisticQueuedEntries ?? incomingQueuedTransportEntries;
   const queuedTransportMessages = queuedTransportEntries.map((entry) => entry.text);
   const queuedTransportLatestMessage = queuedTransportMessages[queuedTransportMessages.length - 1] ?? '';
   const editingQueuedEntry = editingQueuedMessageId
@@ -602,6 +604,23 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       setEditingQueuedMessageId(null);
     }
   }, [editingQueuedMessageId, queuedTransportEntries]);
+
+  const incomingQueuedTransportEntriesKey = useMemo(
+    () => JSON.stringify(incomingQueuedTransportEntries),
+    [incomingQueuedTransportEntries],
+  );
+  const lastIncomingQueuedTransportEntriesKeyRef = useRef(incomingQueuedTransportEntriesKey);
+  useEffect(() => {
+    if (activeSession?.runtimeType !== 'transport') {
+      setOptimisticQueuedEntries(null);
+      lastIncomingQueuedTransportEntriesKeyRef.current = incomingQueuedTransportEntriesKey;
+      return;
+    }
+    if (lastIncomingQueuedTransportEntriesKeyRef.current !== incomingQueuedTransportEntriesKey) {
+      setOptimisticQueuedEntries(null);
+    }
+    lastIncomingQueuedTransportEntriesKeyRef.current = incomingQueuedTransportEntriesKey;
+  }, [activeSession?.name, activeSession?.runtimeType, incomingQueuedTransportEntriesKey]);
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
@@ -1171,6 +1190,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         return;
       }
       setEditingQueuedMessageId(null);
+      setOptimisticQueuedEntries((prev) => {
+        const source = prev ?? incomingQueuedTransportEntries;
+        return source.map((entry) => (
+          entry.clientMessageId === editingQueuedMessageId
+            ? { ...entry, text: payload.text }
+            : entry
+        ));
+      });
       if (options?.clearComposer) {
         pendingAtTargetsRef.current = [];
         pendingConfigOverrideRef.current = null;
@@ -1230,6 +1257,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       setMobileComposerMultiline(false);
     }
     if (editingQueuedMessageId === entry.clientMessageId) setEditingQueuedMessageId(null);
+    setOptimisticQueuedEntries((prev) => {
+      const source = prev ?? incomingQueuedTransportEntries;
+      return source.filter((item) => item.clientMessageId !== entry.clientMessageId);
+    });
     try {
       sendQueuedMessageMutation('session.undo_queued_message', {
         clientMessageId: entry.clientMessageId,
@@ -1237,7 +1268,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     } catch {
       /* ignore */
     }
-  }, [editingQueuedMessageId, sendQueuedMessageMutation]);
+  }, [editingQueuedMessageId, incomingQueuedTransportEntries, sendQueuedMessageMutation]);
 
   const maybePersistComboSendSkip = useCallback(() => {
     if (!rememberComboSendChoice) return;

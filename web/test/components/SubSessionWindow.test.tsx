@@ -185,6 +185,36 @@ describe('SubSessionWindow metadata wiring', () => {
     });
   });
 
+  it('renders session controls directly without a drag wrapper that can swallow interactions', async () => {
+    const sub = makeSubSession({
+      type: 'claude-code-sdk',
+      runtimeType: 'transport' as any,
+    } as any);
+
+    const { container } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const controls = container.querySelector('[data-testid="session-controls"]') as HTMLElement | null;
+      expect(controls).toBeTruthy();
+      expect(controls?.parentElement?.style.cursor).not.toBe('grab');
+    });
+  });
+
   it('prefers timeline tail running state over stale outer idle state for footer status', async () => {
     timelineEventsMock = [
       { type: 'session.state', payload: { state: 'running' } },
