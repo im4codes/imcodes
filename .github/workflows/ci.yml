@@ -67,12 +67,38 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node: ['22', '24', '26']
+        node: ['22', '24']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build
+      - run: npm run test:unit
+
+  unit-tests-node26:
+    name: Unit Tests (Node 26 nightly)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve latest Node 26 nightly
+        id: node26
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, urllib.request
+          with urllib.request.urlopen('https://nodejs.org/download/nightly/index.json', timeout=20) as r:
+              arr = json.load(r)
+          version = next(row['version'].lstrip('v') for row in arr if row['version'].startswith('v26.'))
+          print(f"version={version}")
+          PY
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node26.outputs.version }}
           cache: 'npm'
       - run: npm ci
       - run: npm run build
