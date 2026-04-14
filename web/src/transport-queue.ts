@@ -3,6 +3,19 @@ export interface TransportPendingMessageEntry {
   text: string;
 }
 
+export function synthesizeTransportPendingMessageEntries(
+  messages: string[] | null | undefined,
+  scopeKey: string,
+): TransportPendingMessageEntry[] {
+  const normalizedMessages = Array.isArray(messages)
+    ? messages.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0)
+    : [];
+  return normalizedMessages.map((text, index) => ({
+    clientMessageId: `${scopeKey}:legacy:${index}:${text}`,
+    text,
+  }));
+}
+
 export function extractTransportPendingMessages(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value
@@ -23,6 +36,16 @@ export function extractTransportPendingMessageEntries(value: unknown): Transport
     if (!clientMessageId || !text) return [];
     return [{ clientMessageId, text }];
   });
+}
+
+export function normalizeTransportPendingEntries(
+  entries: unknown,
+  messages: string[] | null | undefined,
+  scopeKey: string,
+): TransportPendingMessageEntry[] {
+  const normalizedEntries = extractTransportPendingMessageEntries(entries);
+  if (normalizedEntries.length > 0) return normalizedEntries;
+  return synthesizeTransportPendingMessageEntries(messages, scopeKey);
 }
 
 export function mergeTransportPendingMessagesForRunningState(

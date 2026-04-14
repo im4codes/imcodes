@@ -5,6 +5,8 @@ import {
   extractTransportPendingMessages,
   mergeTransportPendingEntriesForRunningState,
   mergeTransportPendingMessagesForRunningState,
+  normalizeTransportPendingEntries,
+  synthesizeTransportPendingMessageEntries,
 } from '../src/transport-queue.js';
 
 describe('extractTransportPendingMessages', () => {
@@ -43,6 +45,32 @@ describe('extractTransportPendingMessageEntries', () => {
     ])).toEqual([
       { clientMessageId: 'msg-1', text: 'one' },
       { clientMessageId: 'msg-3', text: 'two' },
+    ]);
+  });
+});
+
+describe('synthesizeTransportPendingMessageEntries', () => {
+  it('builds stable legacy entries from pending messages', () => {
+    expect(synthesizeTransportPendingMessageEntries(['queued one', 'queued two'], 'deck_test')).toEqual([
+      { clientMessageId: 'deck_test:legacy:0:queued one', text: 'queued one' },
+      { clientMessageId: 'deck_test:legacy:1:queued two', text: 'queued two' },
+    ]);
+  });
+});
+
+describe('normalizeTransportPendingMessageEntries', () => {
+  it('prefers explicit pending entries when present', () => {
+    expect(normalizeTransportPendingEntries([
+      { clientMessageId: 'msg-1', text: 'queued one' },
+    ], ['queued one'], 'deck_test')).toEqual([
+      { clientMessageId: 'msg-1', text: 'queued one' },
+    ]);
+  });
+
+  it('synthesizes legacy entries when only pending messages are present', () => {
+    expect(normalizeTransportPendingEntries([], ['queued one', 'queued two'], 'deck_test')).toEqual([
+      { clientMessageId: 'deck_test:legacy:0:queued one', text: 'queued one' },
+      { clientMessageId: 'deck_test:legacy:1:queued two', text: 'queued two' },
     ]);
   });
 });

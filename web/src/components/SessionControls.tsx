@@ -16,6 +16,7 @@ import { useP2pCustomCombos } from './p2p-combos.js';
 import { uploadFile, getUserPref, saveUserPref, onUserPrefChanged } from '../api.js';
 import { isRunningSessionState } from '../thinking-utils.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { normalizeTransportPendingEntries } from '../transport-queue.js';
 import {
   buildP2pConfigSelection,
   P2P_CONFIG_MODE,
@@ -347,10 +348,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const showRunningSweep = !compact && isRunningSessionState(activeSession?.state);
   const queuedTransportEntries = activeSession?.runtimeType === 'transport'
-    ? (activeSession.transportPendingMessageEntries ?? (activeSession.transportPendingMessages ?? []).map((text, index) => ({
-        clientMessageId: `${activeSession.name}:legacy:${index}:${text}`,
-        text,
-      })))
+    ? normalizeTransportPendingEntries(
+        activeSession.transportPendingMessageEntries,
+        activeSession.transportPendingMessages,
+        activeSession.name,
+      )
     : [];
   const queuedTransportMessages = queuedTransportEntries.map((entry) => entry.text);
   const queuedTransportLatestMessage = queuedTransportMessages[queuedTransportMessages.length - 1] ?? '';

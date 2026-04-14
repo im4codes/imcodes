@@ -1270,6 +1270,25 @@ afterEach(() => {
     expect(input.textContent).toBe('');
   });
 
+  it('renders queued transport hints from legacy pendingMessages when pending entries are empty', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          runtimeType: 'transport',
+          transportPendingMessages: ['queued first', 'queued second'],
+          transportPendingMessageEntries: [],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(document.querySelector('.controls-queued-hint')).toBeTruthy();
+    expect(screen.getByText('queued first')).toBeDefined();
+    expect(screen.getByText('queued second')).toBeDefined();
+  });
+
   it('stop action requires 3-level confirmation for main session', () => {
     const ws = makeWs();
     // Mock window.confirm to auto-accept
