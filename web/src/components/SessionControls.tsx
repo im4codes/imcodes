@@ -792,7 +792,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       } as const;
     }
     return {
-      ...getAnchoredOverlayStyle(rect, 320, window.innerWidth, window.innerHeight),
+      ...getAnchoredOverlayStyle(rect, window.innerWidth - 16, window.innerWidth, window.innerHeight),
       zIndex: 2147483646,
     } as const;
   }, [openSpecLayoutTick, openSpecOpen]);
@@ -811,6 +811,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, []);
 
   const renderOpenSpecSubmenu = useCallback((content: ComponentChildren, trigger: HTMLElement | null, minWidth: number) => {
+    if (isOpenSpecMobile) {
+      return (
+        <div class="menu-dropdown openspec-submenu openspec-submenu-inline">
+          {content}
+        </div>
+      );
+    }
     if (typeof document === 'undefined') return null;
     return createPortal(
       <div class="menu-dropdown openspec-submenu" style={getOpenSpecSubmenuStyle(trigger, minWidth)}>
@@ -818,7 +825,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       </div>,
       document.body,
     );
-  }, [getOpenSpecSubmenuStyle]);
+  }, [getOpenSpecSubmenuStyle, isOpenSpecMobile]);
 
   useEffect(() => {
     if (!openSpecOpen || typeof window === 'undefined') return;

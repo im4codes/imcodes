@@ -1190,11 +1190,9 @@ afterEach(() => {
 
       const submenu = document.querySelector('.openspec-submenu') as HTMLElement;
       expect(submenu).toBeTruthy();
-      expect(submenu.style.position).toBe('fixed');
-      expect(submenu.style.left).toBe('148px');
-      expect(submenu.style.bottom).toBe('202px');
-      expect(submenu.style.width).toBe('180px');
-      expect(submenu.style.maxHeight).toBe('636px');
+      expect(submenu.className).toContain('openspec-submenu-inline');
+      expect(within(submenu).getByRole('button', { name: 'audit_implementation_action' })).toBeDefined();
+      expect(within(submenu).getByRole('button', { name: 'audit_spec_action' })).toBeDefined();
     } finally {
       rectSpy.mockRestore();
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: innerWidth });
@@ -1253,8 +1251,8 @@ afterEach(() => {
       const dropdown = document.querySelector('.menu-dropdown-openspec') as HTMLElement;
       expect(dropdown).toBeTruthy();
       expect(dropdown.style.position).toBe('fixed');
-      expect(dropdown.style.left).toBe('52px');
-      expect(dropdown.style.width).toBe('320px');
+      expect(dropdown.style.left).toBe('8px');
+      expect(dropdown.style.width).toBe('374px');
       expect(dropdown.style.right).toBe('');
       expect(dropdown.style.bottom).toBe('142px');
     } finally {
@@ -1313,12 +1311,9 @@ afterEach(() => {
 
       const submenu = document.querySelector('.openspec-submenu') as HTMLElement;
       expect(submenu).toBeTruthy();
-      expect(submenu.style.position).toBe('fixed');
-      expect(submenu.style.left).toBe('155px');
-      expect(submenu.style.bottom).toBe('188px');
-      expect(submenu.style.width).toBe('220px');
-      expect(submenu.style.maxHeight).toBe('650px');
-      expect(submenu.style.top).toBe('');
+      expect(submenu.className).toContain('openspec-submenu-inline');
+      expect(within(submenu).getByRole('button', { name: 'propose_from_discussion_action' })).toBeDefined();
+      expect(within(submenu).getByRole('button', { name: 'propose_from_description_action' })).toBeDefined();
     } finally {
       rectSpy.mockRestore();
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: innerWidth });
@@ -1378,12 +1373,8 @@ afterEach(() => {
 
       const submenu = document.querySelector('.openspec-submenu') as HTMLElement;
       expect(submenu).toBeTruthy();
-      expect(submenu.style.position).toBe('fixed');
-      expect(submenu.style.left).toBe('148px');
-      expect(submenu.style.top).toBe('126px');
-      expect(submenu.style.bottom).toBe('');
-      expect(submenu.style.width).toBe('180px');
-      expect(submenu.style.maxHeight).toBe('712px');
+      expect(submenu.className).toContain('openspec-submenu-inline');
+      expect(within(submenu).getByRole('button', { name: 'audit_implementation_action' })).toBeDefined();
     } finally {
       rectSpy.mockRestore();
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: innerWidth });

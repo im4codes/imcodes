@@ -286,6 +286,7 @@ body {
 .openspec-change-action-wrap { position: relative; flex-shrink: 0; }
 .openspec-change-action-btn { padding: 4px 8px; font-size: 11px; white-space: nowrap; }
 .openspec-submenu { z-index: 2147483647; }
+.openspec-submenu-inline { position: static; width: 100%; min-width: 0; max-width: none; max-height: none; margin-top: 6px; overflow: visible; }
 .menu-dropdown-p2p { z-index: 10001; width: max-content; min-width: 240px; max-width: min(560px, calc(100vw - 24px)); }
 .menu-item { display: block; width: 100%; padding: 9px 14px; background: none; border: none; color: #cbd5e1; font-size: 13px; font-family: inherit; text-align: left; cursor: pointer; transition: background 0.1s; }
 .menu-dropdown-p2p .menu-item,
@@ -350,7 +351,7 @@ body {
     color: #f8fafc;
   }
   .menu-dropdown { max-width: calc(100vw - 16px); }
-  .menu-dropdown-openspec { max-height: min(60vh, calc(100vh - 148px)); }
+  .menu-dropdown-openspec { width: calc(100vw - 16px); min-width: calc(100vw - 16px); max-width: calc(100vw - 16px); max-height: min(60vh, calc(100vh - 148px)); }
   .openspec-change-row { flex-direction: column; align-items: stretch; gap: 4px; }
   .openspec-change-header { display: flex; align-items: center; gap: 6px; width: 100%; }
   .openspec-change-name { width: 100%; padding: 8px 12px; font-size: 12px; }
@@ -385,6 +386,8 @@ body {
   .openspec-change-action-wrap { min-width: 0; }
   .openspec-change-action-btn { width: 100%; padding: 5px 6px; font-size: 10px; }
   .openspec-submenu { max-height: min(45vh, calc(100vh - 120px)); }
+  .openspec-submenu-inline { margin-top: 4px; }
+  .openspec-submenu-inline .menu-item { white-space: normal; }
   .menu-dropdown-p2p { right: 0; width: calc(100vw - 16px); min-width: calc(100vw - 16px); max-width: calc(100vw - 16px); }
   .menu-dropdown-p2p .menu-item,
   .menu-dropdown-p2p .menu-divider,
