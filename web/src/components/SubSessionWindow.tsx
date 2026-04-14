@@ -334,7 +334,8 @@ export function SubSessionWindow({
   const [controlsHeight, setControlsHeight] = useState(0);
   useEffect(() => {
     if (!isMobile) return;
-    const controls = document.querySelector('.controls-wrapper') as HTMLElement | null;
+    const controls = Array.from(document.querySelectorAll('.controls-wrapper'))
+      .find((el) => !(el as HTMLElement).closest('.subsession-window')) as HTMLElement | undefined;
     if (!controls) return;
     const update = () => setControlsHeight(controls.offsetHeight);
     update();

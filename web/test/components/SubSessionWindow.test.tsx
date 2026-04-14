@@ -19,7 +19,16 @@ vi.mock('../../src/components/ChatView.js', () => ({
   ChatView: () => null,
 }));
 
-const sessionControlsSpy = vi.fn((props: any) => <div data-testid="session-controls" data-model={props.activeSession?.modelDisplay ?? ''} data-effort={props.activeSession?.effort ?? ''} data-quota={props.activeSession?.quotaLabel ?? ''} data-queued={(props.activeSession?.transportPendingMessages ?? []).join('|')} />);
+const sessionControlsSpy = vi.fn((props: any) => (
+  <div
+    class="controls-wrapper"
+    data-testid="session-controls"
+    data-model={props.activeSession?.modelDisplay ?? ''}
+    data-effort={props.activeSession?.effort ?? ''}
+    data-quota={props.activeSession?.quotaLabel ?? ''}
+    data-queued={(props.activeSession?.transportPendingMessages ?? []).join('|')}
+  />
+));
 const usageFooterSpy = vi.fn((props: any) => <div data-testid="usage-footer" data-quota={props.quotaLabel ?? ''} data-state={props.sessionState ?? ''} />);
 let timelineEventsMock: any[] = [];
 let activeToolCallMock = false;
@@ -298,6 +307,46 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
 
     unmount();
     controls.remove();
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+  });
+
+  it('on mobile ignores the sub-window composer controls and reserves space for the main controls', async () => {
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+
+    const mainControls = document.createElement('div');
+    mainControls.className = 'controls-wrapper';
+    Object.defineProperty(mainControls, 'offsetHeight', { configurable: true, value: 148 });
+    document.body.appendChild(mainControls);
+
+    const sub = makeSubSession();
+    const { container, unmount } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={6000}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const internalControls = container.querySelector('.subsession-window .controls-wrapper') as HTMLElement | null;
+      const panel = container.querySelector('.subsession-window') as HTMLElement | null;
+      expect(internalControls).toBeTruthy();
+      expect(panel?.style.bottom).toBe('148px');
+      expect(panel?.style.height).toContain('148px');
+    });
+
+    unmount();
+    mainControls.remove();
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
   });
 
