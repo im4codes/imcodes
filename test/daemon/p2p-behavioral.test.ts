@@ -25,6 +25,7 @@ function makeRun(overrides: Partial<P2pRun> = {}): P2pRun {
     activePhase: 'hop',
     contextFilePath: '/tmp/test-discussion.md',
     userText: 'review this code',
+    locale: undefined,
     timeoutMs: 300000,
     resultSummary: null,
     completedHops: [],
@@ -139,6 +140,41 @@ describe('buildHopPrompt — production function', () => {
     expect(prompt).toContain('Infer whether the user context specifies a concrete destination file for the final plan');
     expect(prompt).toContain('If a concrete destination file is clear from the user context, write the complete plan there.');
     expect(prompt).toContain('If you wrote the plan to another file, still append a short note under "## brain — Final Summary" in the discussion file');
+  });
+
+  it('repeats the original user request in final-summary instructions', () => {
+    const mode = getP2pMode('plan');
+    const run = makeRun({
+      mode: 'plan',
+      userText: 'implement the requested feature, not just summarize the discussion',
+    });
+    const prompt = buildHopPrompt(run, mode, {
+      session: 'deck_proj_brain',
+      sectionHeader: 'brain — Final Summary',
+      instruction: `${mode!.summaryPrompt}\nAfter synthesizing, directly fulfill the request.`,
+      isInitial: false,
+    });
+
+    expect(prompt).toContain('The original user request is: "implement the requested feature, not just summarize the discussion"');
+    expect(prompt).toContain('After synthesizing, directly fulfill the request.');
+  });
+
+  it('localizes the final-summary original-request reminder when a locale is set', () => {
+    const mode = getP2pMode('plan');
+    const run = makeRun({
+      mode: 'plan',
+      locale: 'zh-CN',
+      userText: '根据讨论结果真正完成这个需求',
+    });
+    const prompt = buildHopPrompt(run, mode, {
+      session: 'deck_proj_brain',
+      sectionHeader: 'brain — Final Summary',
+      instruction: `${mode!.summaryPrompt}\n在写总结后执行最终任务。`,
+      isInitial: false,
+    });
+
+    expect(prompt).toContain('用户的原始请求是："根据讨论结果真正完成这个需求"');
+    expect(prompt).toContain('不要只停留在讨论总结');
   });
 });
 

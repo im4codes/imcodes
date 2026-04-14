@@ -1342,6 +1342,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         initiatorSession: sessionName,
         targets: tokens.agents,
         userText: tokens.cleanText,
+        locale: p2pLocale,
         fileContents,
         serverLink,
         rounds: p2pRounds,

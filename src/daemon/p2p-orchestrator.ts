@@ -37,6 +37,13 @@ import {
   type P2pRunUpdatePayload,
   type P2pSummaryPhase,
 } from '../../shared/p2p-status.js';
+import enLocale from '../../web/src/i18n/locales/en.json' with { type: 'json' };
+import zhCNLocale from '../../web/src/i18n/locales/zh-CN.json' with { type: 'json' };
+import zhTWLocale from '../../web/src/i18n/locales/zh-TW.json' with { type: 'json' };
+import jaLocale from '../../web/src/i18n/locales/ja.json' with { type: 'json' };
+import koLocale from '../../web/src/i18n/locales/ko.json' with { type: 'json' };
+import esLocale from '../../web/src/i18n/locales/es.json' with { type: 'json' };
+import ruLocale from '../../web/src/i18n/locales/ru.json' with { type: 'json' };
 import logger from '../util/logger.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
@@ -54,6 +61,7 @@ export interface StartP2pRunOptions {
   initiatorSession: string;
   targets: P2pTarget[];
   userText: string;
+  locale?: string;
   fileContents: Array<{ path: string; content: string }>;
   serverLink: ServerLink | null;
   rounds?: number;
@@ -93,6 +101,8 @@ export interface P2pRun {
   contextFilePath: string;
   /** Original user request text — used in Phase 3 so initiator can execute final instructions. */
   userText: string;
+  /** Selected UI locale for i18n-aware final synthesis reminders. */
+  locale?: string;
   timeoutMs: number;
   resultSummary: string | null;
   /** Compatibility-only projection for legacy consumers; advanced loop retries may repeat sessions here. */
@@ -143,6 +153,21 @@ export interface P2pRun {
 // ── In-memory store ───────────────────────────────────────────────────────
 
 const activeRuns = new Map<string, P2pRun>();
+
+const P2P_REMINDER_TEMPLATES: Record<string, string> = {
+  en: enLocale.p2p.final_original_request_reminder,
+  'zh-CN': zhCNLocale.p2p.final_original_request_reminder,
+  'zh-TW': zhTWLocale.p2p.final_original_request_reminder,
+  ja: jaLocale.p2p.final_original_request_reminder,
+  ko: koLocale.p2p.final_original_request_reminder,
+  es: esLocale.p2p.final_original_request_reminder,
+  ru: ruLocale.p2p.final_original_request_reminder,
+};
+
+function buildOriginalRequestReminder(userText: string, locale?: string): string {
+  const template = P2P_REMINDER_TEMPLATES[locale ?? ''] ?? P2P_REMINDER_TEMPLATES.en;
+  return template.replace('{{request}}', userText);
+}
 
 export function getP2pRun(id: string): P2pRun | undefined { return activeRuns.get(id); }
 export function listP2pRuns(): P2pRun[] { return [...activeRuns.values()]; }
@@ -510,6 +535,7 @@ export async function startP2pRun(...args:
     initiatorSession,
     targets,
     userText,
+    locale,
     fileContents,
     serverLink,
     rounds,
@@ -588,6 +614,7 @@ export async function startP2pRun(...args:
     activePhase: 'queued',
     contextFilePath,
     userText,
+    locale,
     timeoutMs: Math.min(hopTimeoutMs ?? modeConfig?.defaultTimeoutMs ?? 300_000, 600_000),
     resultSummary: null,
     completedHops: [],
@@ -1788,7 +1815,7 @@ export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: Hop
     parts.push(`Final summary instructions:`);
     parts.push(opts.instruction);
     parts.push(``);
-    parts.push(`User's original request: "${run.userText}"`);
+    parts.push(buildOriginalRequestReminder(run.userText, run.locale));
   } else {
     parts.push(`This is a dedicated discussion file for multi-agent analysis: ${filePath}`);
     parts.push(`All output MUST go into this file. Do NOT modify any other files or run any commands.`);

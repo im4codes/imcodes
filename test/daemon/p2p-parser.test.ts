@@ -516,6 +516,27 @@ describe('structured P2P routing via WS fields', () => {
     });
   });
 
+  it('forwards the selected i18n locale to the P2P run for final-summary prompting', async () => {
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'localized final summary reminder',
+      commandId: 'cmd-locale-1',
+      p2pAtTargets: [{ session: 'deck_proj_w1', mode: 'review' }],
+      p2pLocale: 'zh-CN',
+    }, mockServerLink as any);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(startP2pRun).toHaveBeenCalledOnce();
+    expect((startP2pRun as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]).toMatchObject({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'review' }],
+      userText: 'localized final summary reminder',
+      locale: 'zh-CN',
+    });
+  });
+
   it('structured p2pAtTargets stays authoritative for single-target P2P runs', async () => {
     handleWebCommand({
       type: 'session.send',

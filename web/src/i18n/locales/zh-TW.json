@@ -325,6 +325,7 @@
     "error": "語音錯誤：{{error}}"
   },
   "p2p": {
+    "final_original_request_reminder": "在完成討論綜合後，務必直接落實並完整回應使用者的原始請求，不要只停留在討論總結。\n使用者的原始請求是：「{{request}}」",
     "ring": {
       "active": "R{{round}}/{{totalRounds}}",
       "label_active": "Round {{round}}/{{totalRounds}}",
