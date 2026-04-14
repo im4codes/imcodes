@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
 const SESSION_CC = `deck_ccsdk_${Math.random().toString(36).slice(2, 8)}_brain`;
 const SESSION_CX = `deck_cxsdk_${Math.random().toString(36).slice(2, 8)}_brain`;
@@ -271,6 +272,7 @@ import { handleWebCommand } from '../../src/daemon/command-handler.js';
 import { newSession } from '../../src/agent/tmux.js';
 
 describe('sdk transport flow e2e', () => {
+  let sharedContextTempDir: string;
 
   it('rejects duplicate claude-code-sdk main session starts for the same project name', async () => {
     mocks.store.set('deck_ccsdk_main_brain', {
@@ -811,7 +813,8 @@ describe('sdk transport flow e2e', () => {
     expect(String(claudeCall?.options.appendSystemPrompt ?? '')).toContain('Authoritative runtime model: MiniMax-M2.7.');
   });
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    sharedContextTempDir = await createIsolatedSharedContextDb('sdk-transport-flow');
     mocks.store.clear();
     mocks.emitted.length = 0;
     mocks.claudeCalls.length = 0;
@@ -820,6 +823,7 @@ describe('sdk transport flow e2e', () => {
 
   afterEach(async () => {
     await disconnectAll();
+    await cleanupIsolatedSharedContextDb(sharedContextTempDir);
     vi.clearAllMocks();
   });
 
