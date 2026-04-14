@@ -265,6 +265,12 @@ const backendChipRowStyle = {
   flexWrap: 'wrap',
 } as const;
 
+const modelChipRowStyle = {
+  display: 'flex',
+  gap: 6,
+  flexWrap: 'wrap',
+} as const;
+
 function processingChipStyle(active: boolean) {
   return active
     ? {
@@ -278,6 +284,24 @@ function processingChipStyle(active: boolean) {
         padding: '6px 10px',
         fontSize: 12,
         fontWeight: 600,
+      };
+}
+
+function modelChipStyle(active: boolean) {
+  return active
+    ? {
+        ...buttonStyle,
+        padding: '4px 8px',
+        fontSize: 12,
+        fontWeight: 700,
+        background: '#0f766e',
+      }
+    : {
+        ...subtleButtonStyle,
+        padding: '4px 8px',
+        fontSize: 12,
+        fontWeight: 600,
+        background: '#1e293b',
       };
 }
 
@@ -319,6 +343,12 @@ function resolveProcessingModelForBackend(
   return trimmed;
 }
 
+function formatServerScopeValue(serverId?: string): string {
+  if (!serverId) return 'Unbound';
+  if (serverId.length <= 12) return serverId;
+  return `${serverId.slice(0, 8)}…${serverId.slice(-4)}`;
+}
+
 type KindOption = SharedDocument['kind'];
 type ManagementTab = 'enterprise' | 'members' | 'projects' | 'knowledge' | 'processing';
 
@@ -332,6 +362,8 @@ interface TabDef {
   id: ManagementTab;
   label: string;
 }
+
+type SharedScopeValue = 'project_shared' | 'workspace_shared' | 'org_shared';
 
 function InfoCard(props: { title: string; children: ComponentChildren }) {
   return (
@@ -384,6 +416,34 @@ function MetaCard({ label, value }: { label: string; value: ComponentChildren })
   );
 }
 
+function ModelChipSelector({
+  backend,
+  value,
+  onSelect,
+}: {
+  backend: SharedContextRuntimeBackend;
+  value: string;
+  onSelect: (model: string) => void;
+}) {
+  const options = PROCESSING_MODEL_OPTIONS_BY_BACKEND[backend] ?? [];
+  if (options.length === 0) return null;
+  return (
+    <div style={modelChipRowStyle}>
+      {options.map((modelId) => (
+        <button
+          key={`${backend}:${modelId}`}
+          type="button"
+          aria-label={`model:${backend}:${modelId}`}
+          style={modelChipStyle(value.trim() === modelId)}
+          onClick={() => onSelect(modelId)}
+        >
+          {modelId}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function formatMemberIdentity(member: TeamDetail['members'][number]): string {
   const displayName = member.display_name?.trim();
   if (displayName) return displayName;
@@ -417,7 +477,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [workspaceName, setWorkspaceName] = useState('');
   const [canonicalRepoId, setCanonicalRepoId] = useState('');
   const [displayName, setDisplayName] = useState('');
-  const [scope, setScope] = useState<'project_shared' | 'workspace_shared' | 'org_shared'>('project_shared');
+  const [scope, setScope] = useState<SharedScopeValue>('project_shared');
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState('');
   const [selectedEnrollmentId, setSelectedEnrollmentId] = useState('');
   const [policy, setPolicy] = useState<SharedProjectPolicy>(defaultPolicyState);
@@ -449,6 +509,21 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     () => new Map(workspaces.map((workspace) => [workspace.id, workspace.name])),
     [workspaces],
   );
+  const scopePresentation = useMemo<Record<SharedScopeValue, { label: string; description: string }>>(() => ({
+    project_shared: {
+      label: t('sharedContext.management.scopeProjectLabel'),
+      description: t('sharedContext.management.scopeProjectDescription'),
+    },
+    workspace_shared: {
+      label: t('sharedContext.management.scopeWorkspaceLabel'),
+      description: t('sharedContext.management.scopeWorkspaceDescription'),
+    },
+    org_shared: {
+      label: t('sharedContext.management.scopeEnterpriseLabel'),
+      description: t('sharedContext.management.scopeEnterpriseDescription'),
+    },
+  }), [t]);
+  const currentScopePresentation = scopePresentation[scope];
 
   const tabs = useMemo<TabDef[]>(() => [
     { id: 'enterprise', label: t('sharedContext.management.tabs.enterprise') },
@@ -664,7 +739,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           <StatCard label="Members" value={team?.members?.length ?? 0} />
           <StatCard label="Projects" value={projects.length} />
           <StatCard label="Knowledge Docs" value={documents.length} />
-          <StatCard label="Server Scope" value={serverId ?? 'Unbound'} detail={serverId ? 'Cloud-synced runtime settings' : 'Select a server to sync processing config'} />
+          <StatCard label="Server" value={formatServerScopeValue(serverId)} detail={serverId ? 'Cloud-synced runtime settings' : 'Select a server to sync processing config'} />
         </div>
         <div style={tabBarStyle}>
           {tabs.map((tab) => (
@@ -836,7 +911,22 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             <div>{t('sharedContext.management.projectRelationshipLine1')}</div>
             <div>{t('sharedContext.management.projectRelationshipLine2')}</div>
             <div>{t('sharedContext.management.projectRelationshipLine3')}</div>
+            <div>{t('sharedContext.management.projectRelationshipLine4')}</div>
           </InfoCard>
+
+          <div style={splitSectionStyle}>
+            <InfoCard title={t('sharedContext.management.belongsToTitle')}>
+              <div><strong>{t('sharedContext.management.belongsToEnterprise')}</strong> {team?.name ?? t('sharedContext.management.notSelected')}</div>
+              <div><strong>{t('sharedContext.management.belongsToWorkspace')}</strong> {t('sharedContext.management.belongsToWorkspaceValue')}</div>
+              <div><strong>{t('sharedContext.management.belongsToProject')}</strong> {t('sharedContext.management.belongsToProjectValue')}</div>
+            </InfoCard>
+
+            <InfoCard title={t('sharedContext.management.sharesWithTitle')}>
+              <div><strong>{t('sharedContext.management.scopeProjectLabel')}</strong>: {t('sharedContext.management.sharesWithProjectValue')}</div>
+              <div><strong>{t('sharedContext.management.scopeWorkspaceLabel')}</strong>: {t('sharedContext.management.sharesWithWorkspaceValue')}</div>
+              <div><strong>{t('sharedContext.management.scopeEnterpriseLabel')}</strong>: {t('sharedContext.management.sharesWithEnterpriseValue')}</div>
+            </InfoCard>
+          </div>
 
           <div style={splitSectionStyle}>
             <div style={sectionStyle}>
@@ -849,13 +939,18 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 </span>
               ) : undefined}
             />
+            <InfoCard title={t('sharedContext.management.chooseSharingLevelTitle')}>
+              <div><strong>{t('sharedContext.management.scopeProjectLabel')}</strong>: {t('sharedContext.management.chooseSharingLevelProject')}</div>
+              <div><strong>{t('sharedContext.management.scopeWorkspaceLabel')}</strong>: {t('sharedContext.management.chooseSharingLevelWorkspace')}</div>
+              <div><strong>{t('sharedContext.management.scopeEnterpriseLabel')}</strong>: {t('sharedContext.management.chooseSharingLevelEnterprise')}</div>
+            </InfoCard>
             <div style={rowStyle}>
               <input value={canonicalRepoId} onInput={(e) => setCanonicalRepoId((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.management.canonicalRepoId')} style={inputStyle} />
               <input value={displayName} onInput={(e) => setDisplayName((e.currentTarget as HTMLInputElement).value)} placeholder={t('sharedContext.management.displayName')} style={inputStyle} />
-              <select value={scope} onChange={(e) => setScope((e.currentTarget as HTMLSelectElement).value as typeof scope)} style={inputStyle}>
-                <option value="project_shared">project_shared</option>
-                <option value="workspace_shared">workspace_shared</option>
-                <option value="org_shared">org_shared</option>
+              <select value={scope} onChange={(e) => setScope((e.currentTarget as HTMLSelectElement).value as SharedScopeValue)} style={inputStyle}>
+                <option value="project_shared">{t('sharedContext.management.scopeProjectLabel')}</option>
+                <option value="workspace_shared">{t('sharedContext.management.scopeWorkspaceLabel')}</option>
+                <option value="org_shared">{t('sharedContext.management.scopeEnterpriseLabel')}</option>
               </select>
               <select value={selectedWorkspaceId} onChange={(e) => setSelectedWorkspaceId((e.currentTarget as HTMLSelectElement).value)} style={inputStyle}>
                 <option value="">{t('sharedContext.management.noWorkspace')}</option>
@@ -879,6 +974,20 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 {t('sharedContext.management.enrollProject')}
               </button>
             </div>
+            <div style={{ ...resourceCardStyle, gap: 6 }}>
+              <strong>{currentScopePresentation.label}</strong>
+              <span style={helperTextStyle}>{currentScopePresentation.description}</span>
+              <span style={helperTextStyle}>
+                {selectedWorkspaceId
+                  ? t('sharedContext.management.scopeSourceWithWorkspace', {
+                      workspace: workspaceNameById.get(selectedWorkspaceId) ?? selectedWorkspaceId,
+                      enterprise: team?.name ?? t('sharedContext.management.selectedEnterprise'),
+                    })
+                  : t('sharedContext.management.scopeSourceWithoutWorkspace', {
+                      enterprise: team?.name ?? t('sharedContext.management.selectedEnterprise'),
+                    })}
+              </span>
+            </div>
             <div style={resourceListStyle}>
               {projects.map((project) => (
                 <div key={project.id} style={resourceCardStyle}>
@@ -886,12 +995,13 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                       <strong>{project.displayName ?? project.canonicalRepoId}</strong>
                       <span style={helperTextStyle}>
-                        {project.scope}
+                        {scopePresentation[project.scope as SharedScopeValue].label}
                       </span>
                       <div style={metaGridStyle}>
                         <MetaCard label="Workspace" value={project.workspaceId ? (workspaceNameById.get(project.workspaceId) ?? project.workspaceId) : t('sharedContext.management.noWorkspaceAssigned')} />
                         <MetaCard label="Status" value={project.status} />
-                        <MetaCard label="Scope" value={project.scope} />
+                        <MetaCard label="Scope" value={scopePresentation[project.scope as SharedScopeValue].label} />
+                        <MetaCard label="Meaning" value={scopePresentation[project.scope as SharedScopeValue].description} />
                       </div>
                     </div>
                     <div style={rowStyle}>
@@ -1176,6 +1286,11 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         placeholder={DEFAULT_PRIMARY_CONTEXT_MODEL}
                         style={fieldInputStyle}
                       />
+                      <ModelChipSelector
+                        backend={processingPrimaryBackend}
+                        value={processingPrimaryModel}
+                        onSelect={setProcessingPrimaryModel}
+                      />
                     </label>
                   </div>
                   <div style={processingCardStyle}>
@@ -1205,6 +1320,11 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         onInput={(e) => setProcessingBackupModel((e.currentTarget as HTMLInputElement).value)}
                         placeholder={t('sharedContext.management.processingBackupPlaceholder')}
                         style={fieldInputStyle}
+                      />
+                      <ModelChipSelector
+                        backend={processingBackupBackend}
+                        value={processingBackupModel}
+                        onSelect={setProcessingBackupModel}
                       />
                     </label>
                   </div>

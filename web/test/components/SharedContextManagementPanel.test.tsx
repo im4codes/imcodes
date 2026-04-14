@@ -331,8 +331,21 @@ describe('SharedContextManagementPanel', () => {
       backupContextBackend: 'claude-code-sdk',
       backupContextModel: 'haiku',
     }));
-    expect(await screen.findByText('gpt-5.4')).toBeDefined();
+    expect((screen.getByLabelText('sharedContext.management.processingPrimaryModel') as HTMLInputElement).value).toBe('gpt-5.4');
     expect(await screen.findByText('sharedContext.management.processingSavedPrimaryBackend')).toBeDefined();
+  });
+
+  it('renders a shortened server label in the header but keeps the full server scope in processing details', async () => {
+    render(<SharedContextManagementPanel serverId="6f380811d06730a7d21cba1c" />);
+    await flush();
+
+    expect(await screen.findByText('6f380811…ba1c')).toBeDefined();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
+    });
+
+    expect(await screen.findByText('6f380811d06730a7d21cba1c')).toBeDefined();
   });
 
   it('switches to a backend-appropriate default model when the backend changes', async () => {
@@ -351,5 +364,26 @@ describe('SharedContextManagementPanel', () => {
     });
 
     expect(primaryInput.value).toBe('qwen3-coder-plus');
+  });
+
+  it('allows selecting a backup model directly from backend-specific chips', async () => {
+    render(<SharedContextManagementPanel serverId="srv-1" />);
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
+    });
+
+    const backupInput = await screen.findByLabelText('sharedContext.management.processingBackupModel') as HTMLInputElement;
+
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('sharedContext.management.processingBackupBackend: qwen'));
+    });
+    const qwenChip = await screen.findByLabelText('model:qwen:qwen3-coder-plus');
+    await act(async () => {
+      fireEvent.click(qwenChip);
+    });
+
+    expect(backupInput.value).toBe('qwen3-coder-plus');
   });
 });
