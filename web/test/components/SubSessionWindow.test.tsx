@@ -295,6 +295,35 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     });
   });
 
+  it('uses the taller default desktop height for new sub-session windows', async () => {
+    localStorage.removeItem('rcc_subsession_sub-1');
+
+    const sub = makeSubSession();
+    const { container } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={6000}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      const panel = container.querySelector('.subsession-window') as HTMLElement | null;
+      expect(panel).toBeTruthy();
+      expect(panel?.style.height).toBe('620px');
+      expect(panel?.style.zIndex).toBe('6000');
+    });
+  });
+
   it('subscribes raw=false when minimized, upgrades to raw=true when active, and downgrades back to raw=false', async () => {
     const sub = makeSubSession();
 

@@ -55,7 +55,7 @@ type ViewMode = 'terminal' | 'chat';
 
 const LOCAL_KEY = (id: string) => `rcc_subsession_${id}`;
 const DEFAULT_W = 620;
-const DEFAULT_H = 480;
+const DEFAULT_H = 620;
 const MIN_W = 300;
 const MIN_H = 200;
 const DESKTOP_VISIBLE_MARGIN = 32;
@@ -321,18 +321,6 @@ export function SubSessionWindow({
     }
   }, [lastCostEvent?.costUsd, sub.sessionName]);
 
-  const [barHeight, setBarHeight] = useState(0);
-  useEffect(() => {
-    if (!isMobile) return;
-    const bar = document.querySelector('.subsession-bar');
-    if (!bar) return;
-    const update = () => setBarHeight((bar as HTMLElement).offsetHeight);
-    update();
-    const ro = new ResizeObserver(update);
-    ro.observe(bar);
-    return () => ro.disconnect();
-  }, [isMobile]);
-
   const [vvh, setVvh] = useState(() => window.visualViewport?.height ?? window.innerHeight);
   useEffect(() => {
     if (!isMobile) return;
@@ -344,7 +332,7 @@ export function SubSessionWindow({
   }, [isMobile]);
 
   const style: Record<string, string | number> = isMobile
-    ? { position: 'fixed', top: 'var(--sat, 0px)', left: 0, right: 0, height: `calc(${vvh - barHeight}px - var(--sat, 0px))`, zIndex }
+    ? { position: 'fixed', top: 'var(--sat, 0px)', left: 0, right: 0, bottom: 0, height: `calc(${vvh}px - var(--sat, 0px))`, zIndex }
     : { position: 'fixed', left: geom.x, top: geom.y, width: geom.w, height: geom.h, zIndex };
 
   return (

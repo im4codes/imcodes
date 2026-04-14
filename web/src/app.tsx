@@ -67,10 +67,10 @@ import { onWatchCommand } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
 import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timeline-running.js';
 import {
-  extractTransportPendingMessageEntries,
   extractTransportPendingMessages,
   mergeTransportPendingEntriesForRunningState,
   mergeTransportPendingMessagesForRunningState,
+  normalizeTransportPendingEntries,
 } from './transport-queue.js';
 import { ingestTimelineEventForCache } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
@@ -881,7 +881,7 @@ export function App() {
 
   const bringSubToFront = useCallback((id: string) => {
     setSubZIndexes((prev) => {
-      const max = prev.size > 0 ? Math.max(...prev.values()) : 1000;
+      const max = prev.size > 0 ? Math.max(...prev.values()) : 6000;
       const next = new Map(prev);
       next.set(id, max + 1);
       return next;
@@ -1308,8 +1308,13 @@ export function App() {
               : [],
             transportPendingMessageEntries: (s.state === 'queued' || s.state === 'running')
               ? (() => {
-                  const nextPending = extractTransportPendingMessageEntries((s as { transportPendingMessageEntries?: unknown }).transportPendingMessageEntries);
-                  return nextPending.length > 0 ? nextPending : (existing?.transportPendingMessageEntries ?? []);
+                  const nextPendingMessages = extractTransportPendingMessages((s as { transportPendingMessages?: unknown }).transportPendingMessages);
+                  const normalizedEntries = normalizeTransportPendingEntries(
+                    (s as { transportPendingMessageEntries?: unknown }).transportPendingMessageEntries,
+                    nextPendingMessages,
+                    s.name,
+                  );
+                  return normalizedEntries.length > 0 ? normalizedEntries : (existing?.transportPendingMessageEntries ?? []);
                 })()
               : [],
           };
@@ -1374,7 +1379,11 @@ export function App() {
           const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessages');
           if (liveState === 'queued') {
             const pendingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
-            const pendingEntries = extractTransportPendingMessageEntries(event.payload.pendingMessageEntries);
+            const pendingEntries = normalizeTransportPendingEntries(
+              event.payload.pendingMessageEntries,
+              pendingMessages,
+              event.sessionId,
+            );
             setSessions((prev) => prev.map((s) =>
               s.name === event.sessionId
                 ? { ...s, transportPendingMessages: pendingMessages, transportPendingMessageEntries: pendingEntries }
@@ -3320,7 +3329,7 @@ export function App() {
                 if (label !== null) renameSubSession(sub.id, label);
               }}
               onSettings={() => setSettingsTarget({ sessionName: sub.sessionName, subId: sub.id, label: sub.label || '', description: sub.description || '', cwd: sub.cwd || '', type: sub.type, parentSession: sub.parentSession })}
-              zIndex={subZIndexes.get(sub.id) ?? 1000}
+              zIndex={subZIndexes.get(sub.id) ?? 6000}
               onFocus={() => bringSubToFront(sub.id)}
               onPin={(vm) => pinPanel('subsession', { sessionName: sub.sessionName, viewMode: vm, label: sub.label, serverId: selectedServerId }, () => setOpenSubIds((prev) => { const s = new Set(prev); s.delete(sub.id); return s; }))}
               sessions={sessions}
