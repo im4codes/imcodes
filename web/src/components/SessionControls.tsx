@@ -343,9 +343,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const quickWrapRef = useRef<HTMLDivElement>(null);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const showRunningSweep = !compact && isRunningSessionState(activeSession?.state);
-  const queuedTransportMessages = activeSession?.runtimeType === 'transport'
-    ? (activeSession.transportPendingMessages ?? [])
+  const queuedTransportEntries = activeSession?.runtimeType === 'transport'
+    ? (activeSession.transportPendingMessageEntries ?? (activeSession.transportPendingMessages ?? []).map((text, index) => ({
+        clientMessageId: `${activeSession.name}:legacy:${index}:${text}`,
+        text,
+      })))
     : [];
+  const queuedTransportMessages = queuedTransportEntries.map((entry) => entry.text);
   const queuedTransportLatestMessage = queuedTransportMessages[queuedTransportMessages.length - 1] ?? '';
   // Internal ref for contenteditable — also written to the external inputRef
   const divRef = useRef<HTMLDivElement>(null);
@@ -2350,9 +2354,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           </div>
           <div class="controls-queued-list">
             {queuedHintExpanded ? (
-              queuedTransportMessages.map((message, index) => (
-                <div class="controls-queued-item" key={`${activeSession?.name ?? 'session'}:${index}:${message}`}>
-                  {message}
+              queuedTransportEntries.map((entry) => (
+                <div class="controls-queued-item" key={entry.clientMessageId}>
+                  {entry.text}
                 </div>
               ))
             ) : (

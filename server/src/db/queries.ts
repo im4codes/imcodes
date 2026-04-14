@@ -1,4 +1,5 @@
 import type { Database } from './client.js';
+import type { ContextModelConfig } from '../../../shared/context-types.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -30,6 +31,7 @@ export interface DbServer {
   last_heartbeat_at: number | null;
   status: string;
   daemon_version: string | null;
+  shared_context_runtime_config?: Record<string, unknown> | string | null;
   bound_with_key_id: string | null;
   created_at: number;
 }
@@ -196,6 +198,44 @@ export async function createServer(
 
 export async function getServerById(db: Database, id: string): Promise<DbServer | null> {
   return db.queryOne<DbServer>('SELECT * FROM servers WHERE id = $1', [id]);
+}
+
+export async function getServerSharedContextRuntimeConfig(
+  db: Database,
+  serverId: string,
+): Promise<ContextModelConfig | null> {
+  const row = await db.queryOne<{ shared_context_runtime_config: Record<string, unknown> | string | null }>(
+    'SELECT shared_context_runtime_config FROM servers WHERE id = $1',
+    [serverId],
+  );
+  if (!row?.shared_context_runtime_config) return null;
+  const raw = typeof row.shared_context_runtime_config === 'string'
+    ? JSON.parse(row.shared_context_runtime_config)
+    : row.shared_context_runtime_config;
+  if (!raw || typeof raw !== 'object') return null;
+  const primaryContextModel = typeof raw.primaryContextModel === 'string' ? raw.primaryContextModel.trim() : '';
+  const backupContextModel = typeof raw.backupContextModel === 'string' ? raw.backupContextModel.trim() : '';
+  if (!primaryContextModel) return null;
+  return {
+    primaryContextModel,
+    backupContextModel: backupContextModel || undefined,
+  };
+}
+
+export async function updateServerSharedContextRuntimeConfig(
+  db: Database,
+  serverId: string,
+  userId: string,
+  config: ContextModelConfig,
+): Promise<boolean> {
+  const result = await db.execute(
+    `UPDATE servers
+        SET shared_context_runtime_config = $1::jsonb
+      WHERE id = $2
+        AND user_id = $3`,
+    [JSON.stringify(config), serverId, userId],
+  );
+  return result.changes > 0;
 }
 
 export async function updateServerHeartbeat(db: Database, id: string, daemonVersion?: string | null): Promise<void> {

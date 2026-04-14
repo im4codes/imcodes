@@ -1325,6 +1325,10 @@ afterEach(() => {
       runtimeType: 'transport',
       state: 'running',
       transportPendingMessages: ['queued send', 'second queued send'],
+      transportPendingMessageEntries: [
+        { clientMessageId: 'msg-1', text: 'queued send' },
+        { clientMessageId: 'msg-2', text: 'second queued send' },
+      ],
     });
     render(
       <SessionControls
@@ -1345,6 +1349,10 @@ afterEach(() => {
       runtimeType: 'transport',
       state: 'running',
       transportPendingMessages: ['queued send', 'second queued send'],
+      transportPendingMessageEntries: [
+        { clientMessageId: 'msg-1', text: 'queued send' },
+        { clientMessageId: 'msg-2', text: 'second queued send' },
+      ],
     });
     render(
       <SessionControls
@@ -1371,6 +1379,10 @@ afterEach(() => {
       runtimeType: 'transport',
       state: 'running',
       transportPendingMessages: ['queued send', 'second queued send'],
+      transportPendingMessageEntries: [
+        { clientMessageId: 'msg-1', text: 'queued send' },
+        { clientMessageId: 'msg-2', text: 'second queued send' },
+      ],
     });
     render(
       <SessionControls

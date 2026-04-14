@@ -66,7 +66,12 @@ import { shouldSubscribeTerminalRaw, type TerminalSubscribeViewMode } from './te
 import { onWatchCommand } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
 import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timeline-running.js';
-import { extractTransportPendingMessages, mergeTransportPendingMessagesForRunningState } from './transport-queue.js';
+import {
+  extractTransportPendingMessageEntries,
+  extractTransportPendingMessages,
+  mergeTransportPendingEntriesForRunningState,
+  mergeTransportPendingMessagesForRunningState,
+} from './transport-queue.js';
 import { ingestTimelineEventForCache } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
@@ -1298,6 +1303,9 @@ export function App() {
             transportPendingMessages: (s.state === 'queued' || s.state === 'running')
               ? (existing?.transportPendingMessages ?? [])
               : [],
+            transportPendingMessageEntries: (s.state === 'queued' || s.state === 'running')
+              ? (existing?.transportPendingMessageEntries ?? [])
+              : [],
           };
         }));
         setSessionsLoaded(true);
@@ -1360,9 +1368,10 @@ export function App() {
           const hasPendingMessagesField = Object.prototype.hasOwnProperty.call(event.payload ?? {}, 'pendingMessages');
           if (liveState === 'queued') {
             const pendingMessages = extractTransportPendingMessages(event.payload.pendingMessages);
+            const pendingEntries = extractTransportPendingMessageEntries(event.payload.pendingMessageEntries);
             setSessions((prev) => prev.map((s) =>
               s.name === event.sessionId
-                ? { ...s, transportPendingMessages: pendingMessages }
+                ? { ...s, transportPendingMessages: pendingMessages, transportPendingMessageEntries: pendingEntries }
                 : s,
             ));
           } else if (liveState === 'running') {
@@ -1376,13 +1385,18 @@ export function App() {
                       event.payload.pendingMessages,
                       hasPendingMessagesField,
                     ),
+                    transportPendingMessageEntries: mergeTransportPendingEntriesForRunningState(
+                      s.transportPendingMessageEntries,
+                      event.payload.pendingMessageEntries,
+                      hasPendingMessagesField,
+                    ),
                   }
                 : s,
             ));
           } else if (liveState === 'idle') {
             setSessions((prev) => prev.map((s) =>
               s.name === event.sessionId
-                ? { ...s, state: liveState as SessionInfo['state'], transportPendingMessages: [] }
+                ? { ...s, state: liveState as SessionInfo['state'], transportPendingMessages: [], transportPendingMessageEntries: [] }
                 : s,
             ));
           }
@@ -3175,6 +3189,7 @@ export function App() {
         >
           <SharedContextManagementPanel
             enterpriseId={typeof sharedContextManagementProps.enterpriseId === 'string' ? sharedContextManagementProps.enterpriseId : undefined}
+            serverId={selectedServerId ?? undefined}
             onEnterpriseChange={(enterpriseId) => setSharedContextManagementProps((prev) => ({ ...prev, enterpriseId, serverId: selectedServerId }))}
           />
         </FloatingPanel>

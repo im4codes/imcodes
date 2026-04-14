@@ -10,6 +10,11 @@ import type { ContextFreshness, ContextNamespace, SharedScopePolicyOverride } fr
 import { resolveRuntimeAuthoredContext } from '../context/shared-context-runtime.js';
 import type { TransportContextBootstrap } from './runtime-context-bootstrap.js';
 
+export interface PendingTransportMessage {
+  clientMessageId: string;
+  text: string;
+}
+
 /**
  * Transport session runtime — manages a single conversation with a remote provider.
  *
@@ -58,7 +63,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   } | null = null;
 
   /** Messages queued while a turn is in flight. Drained and merged on turn completion. */
-  private _pendingMessages: string[] = [];
+  private _pendingMessages: PendingTransportMessage[] = [];
 
   /** Callback fired when pending messages are drained into a new turn.
    *  Allows command-handler to emit timeline events for the batched send. */
@@ -135,8 +140,10 @@ export class TransportSessionRuntime implements SessionRuntime {
   get sending(): boolean { return this._sending; }
   /** Number of messages waiting in the queue. */
   get pendingCount(): number { return this._pendingMessages.length; }
-  /** Snapshot of queued messages waiting to be drained. */
-  get pendingMessages(): string[] { return [...this._pendingMessages]; }
+  /** Snapshot of queued messages waiting to be drained (legacy text-only view). */
+  get pendingMessages(): string[] { return this._pendingMessages.map((entry) => entry.text); }
+  /** Snapshot of queued messages waiting to be drained (stable entity ids for UI/edit/undo). */
+  get pendingEntries(): PendingTransportMessage[] { return this._pendingMessages.map((entry) => ({ ...entry })); }
 
   setContextBootstrapResolver(
     resolver: (() => Promise<TransportContextBootstrap>) | undefined,
@@ -171,13 +178,16 @@ export class TransportSessionRuntime implements SessionRuntime {
    *
    * Returns 'sent' if dispatched immediately, 'queued' if enqueued.
    */
-  send(message: string): 'sent' | 'queued' {
+  send(message: string, clientMessageId?: string): 'sent' | 'queued' {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
 
     if (this._sending) {
-      this._pendingMessages.push(message);
+      this._pendingMessages.push({
+        clientMessageId: clientMessageId ?? randomUUID(),
+        text: message,
+      });
       return 'queued';
     }
 
@@ -302,7 +312,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (this._pendingMessages.length === 0 || !this._providerSessionId) return false;
 
     const messages = this._pendingMessages.splice(0);
-    const merged = messages.join('\n\n');
+    const merged = messages.map((entry) => entry.text).join('\n\n');
     this._onDrain?.(merged, messages.length);
     this._dispatchTurn(merged);
     return true;

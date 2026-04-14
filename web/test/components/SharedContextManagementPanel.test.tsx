@@ -31,6 +31,8 @@ const createSharedDocumentVersionMock = vi.fn();
 const activateSharedDocumentVersionMock = vi.fn();
 const listSharedDocumentBindingsMock = vi.fn();
 const createSharedDocumentBindingMock = vi.fn();
+const fetchSharedContextRuntimeConfigMock = vi.fn();
+const updateSharedContextRuntimeConfigMock = vi.fn();
 
 vi.mock('../../src/api.js', () => ({
   ApiError: class ApiError extends Error {
@@ -59,6 +61,8 @@ vi.mock('../../src/api.js', () => ({
   activateSharedDocumentVersion: (...args: unknown[]) => activateSharedDocumentVersionMock(...args),
   listSharedDocumentBindings: (...args: unknown[]) => listSharedDocumentBindingsMock(...args),
   createSharedDocumentBinding: (...args: unknown[]) => createSharedDocumentBindingMock(...args),
+  fetchSharedContextRuntimeConfig: (...args: unknown[]) => fetchSharedContextRuntimeConfigMock(...args),
+  updateSharedContextRuntimeConfig: (...args: unknown[]) => updateSharedContextRuntimeConfigMock(...args),
 }));
 
 import { SharedContextManagementPanel } from '../../src/components/SharedContextManagementPanel.js';
@@ -72,7 +76,15 @@ async function flush() {
 describe('SharedContextManagementPanel', () => {
   beforeEach(() => {
     listTeamsMock.mockResolvedValue([{ id: 'team-1', name: 'Acme', role: 'owner' }]);
-    getTeamMock.mockResolvedValue({ id: 'team-1', name: 'Acme', myRole: 'owner', members: [{ user_id: 'user-owner', role: 'owner', joined_at: 1 }, { user_id: 'user-member', role: 'member', joined_at: 2 }] });
+    getTeamMock.mockResolvedValue({
+      id: 'team-1',
+      name: 'Acme',
+      myRole: 'owner',
+      members: [
+        { user_id: 'user-owner', username: 'owner', display_name: 'Owner User', role: 'owner', joined_at: 1 },
+        { user_id: 'user-member', username: 'member', display_name: null, role: 'member', joined_at: 2 },
+      ],
+    });
     listSharedWorkspacesMock.mockResolvedValue([{ id: 'ws-1', enterpriseId: 'team-1', name: 'Platform' }]);
     listSharedProjectsMock.mockResolvedValue([{ id: 'enr-1', workspaceId: 'ws-1', canonicalRepoId: 'github.com/acme/repo', displayName: 'Repo', scope: 'project_shared', status: 'active' }]);
     getSharedProjectPolicyMock.mockResolvedValue({
@@ -96,6 +108,24 @@ describe('SharedContextManagementPanel', () => {
     createSharedDocumentBindingMock.mockResolvedValue({ id: 'bind-2' });
     updateTeamMemberRoleMock.mockResolvedValue({ ok: true });
     removeTeamMemberMock.mockResolvedValue({ ok: true });
+    fetchSharedContextRuntimeConfigMock.mockResolvedValue({
+      snapshot: {
+        persisted: { primaryContextModel: 'sonnet', backupContextModel: undefined },
+        effective: { primaryContextModel: 'sonnet', backupContextModel: undefined },
+        envPrimaryOverrideActive: false,
+        envBackupOverrideActive: false,
+        defaultPrimaryContextModel: 'sonnet',
+      },
+    });
+    updateSharedContextRuntimeConfigMock.mockResolvedValue({
+      snapshot: {
+        persisted: { primaryContextModel: 'gpt-5.4', backupContextModel: 'haiku' },
+        effective: { primaryContextModel: 'gpt-5.4', backupContextModel: 'haiku' },
+        envPrimaryOverrideActive: false,
+        envBackupOverrideActive: false,
+        defaultPrimaryContextModel: 'sonnet',
+      },
+    });
   });
 
   afterEach(() => {
@@ -109,9 +139,15 @@ describe('SharedContextManagementPanel', () => {
     await waitFor(() => expect(getTeamMock).toHaveBeenCalledWith('team-1'));
     expect((await screen.findAllByText(/Platform/)).length).toBeGreaterThan(0);
     await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.members'));
+    });
+    expect(await screen.findByText(/Owner User/)).toBeDefined();
+    expect(await screen.findByText(/@member/)).toBeDefined();
+    await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.tabs.projects'));
     });
     expect((await screen.findAllByText(/Repo/)).length).toBeGreaterThan(0);
+    expect(await screen.findByText('sharedContext.management.projectRelationshipTitle')).toBeDefined();
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.tabs.knowledge'));
     });
@@ -233,5 +269,32 @@ describe('SharedContextManagementPanel', () => {
     });
 
     expect(onEnterpriseChange).toHaveBeenCalledTimes(1);
+  });
+
+  it('loads and saves server-backed processing config', async () => {
+    render(<SharedContextManagementPanel serverId="srv-1" />);
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
+    });
+
+    await waitFor(() => expect(fetchSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1'));
+
+    const primaryInput = screen.getByLabelText('sharedContext.management.processingPrimaryModel') as HTMLInputElement;
+    const backupInput = screen.getByLabelText('sharedContext.management.processingBackupModel') as HTMLInputElement;
+    fireEvent.input(primaryInput, { target: { value: 'gpt-5.4' } });
+    fireEvent.input(backupInput, { target: { value: 'haiku' } });
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.processingSave'));
+    });
+
+    await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1', {
+      primaryContextModel: 'gpt-5.4',
+      backupContextModel: 'haiku',
+    }));
+    expect(await screen.findByText('gpt-5.4')).toBeDefined();
   });
 });

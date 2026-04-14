@@ -1,6 +1,15 @@
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
-import { getServersByUserId, updateServerHeartbeat, updateServerName, deleteServer, upsertChannelBinding } from '../db/queries.js';
+import {
+  getServersByUserId,
+  updateServerHeartbeat,
+  updateServerName,
+  deleteServer,
+  upsertChannelBinding,
+  getServerById,
+  getServerSharedContextRuntimeConfig,
+  updateServerSharedContextRuntimeConfig,
+} from '../db/queries.js';
 import { WsBridge } from '../ws/bridge.js';
 import { sha256Hex, randomHex } from '../security/crypto.js';
 import { requireAuth } from '../security/authorization.js';
@@ -11,6 +20,12 @@ import type {
   SharedContextNamespaceResolution,
 } from '../../../shared/context-types.js';
 import { classifyTimestampFreshness } from '../../../shared/context-freshness.js';
+import {
+  buildSharedContextRuntimeConfigSnapshot,
+  defaultSharedContextRuntimeConfig,
+  normalizeSharedContextRuntimeConfig,
+  SHARED_CONTEXT_RUNTIME_CONFIG_MSG,
+} from '../../../shared/shared-context-runtime-config.js';
 
 export const serverRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -46,6 +61,11 @@ const authoredContextQuerySchema = z.object({
 
 const namespaceResolutionSchema = z.object({
   canonicalRepoId: z.string().min(1),
+});
+
+const runtimeConfigSchema = z.object({
+  primaryContextModel: z.string().trim().min(1),
+  backupContextModel: z.string().trim().optional().nullable(),
 });
 
 const DEFAULT_REMOTE_PROCESSED_FRESH_MS = 6 * 60 * 60 * 1000;
@@ -133,6 +153,52 @@ serverRoutes.post('/:id/heartbeat', async (c) => {
 
   await updateServerHeartbeat(c.env.DB, serverId);
   return c.json({ ok: true });
+});
+
+serverRoutes.get('/:id/shared-context/runtime-config', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id') ?? '';
+  const server = await getServerById(c.env.DB, serverId);
+  if (!server || server.user_id !== userId) return c.json({ error: 'not_found' }, 404);
+  const persisted = await getServerSharedContextRuntimeConfig(c.env.DB, serverId);
+  return c.json({ snapshot: buildSharedContextRuntimeConfigSnapshot(persisted ?? defaultSharedContextRuntimeConfig()) });
+});
+
+serverRoutes.put('/:id/shared-context/runtime-config', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id') ?? '';
+  const body = await c.req.json().catch(() => null);
+  const parsed = runtimeConfigSchema.safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  const normalized = normalizeSharedContextRuntimeConfig({
+    primaryContextModel: parsed.data.primaryContextModel,
+    backupContextModel: parsed.data.backupContextModel ?? undefined,
+  });
+  const updated = await updateServerSharedContextRuntimeConfig(c.env.DB, serverId, userId, normalized);
+  if (!updated) return c.json({ error: 'not_found' }, 404);
+  try {
+    WsBridge.get(serverId).sendToDaemon(JSON.stringify({
+      type: SHARED_CONTEXT_RUNTIME_CONFIG_MSG.APPLY,
+      config: normalized,
+    }));
+  } catch {
+    // daemon may be offline; it will pull the saved config on startup
+  }
+  return c.json({ snapshot: buildSharedContextRuntimeConfigSnapshot(normalized) });
+});
+
+serverRoutes.get('/:id/shared-context/runtime-config/daemon', async (c) => {
+  const auth = c.req.header('Authorization');
+  if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
+  const tokenHash = sha256Hex(auth.slice(7));
+  const serverId = c.req.param('id');
+  const server = await c.env.DB.queryOne<{ id: string }>(
+    'SELECT id FROM servers WHERE id = $1 AND token_hash = $2',
+    [serverId, tokenHash],
+  );
+  if (!server) return c.json({ error: 'unauthorized' }, 401);
+  const persisted = await getServerSharedContextRuntimeConfig(c.env.DB, serverId);
+  return c.json({ config: persisted ?? defaultSharedContextRuntimeConfig() });
 });
 
 /**

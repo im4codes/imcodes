@@ -28,6 +28,8 @@ import { pickReadableSessionDisplay } from '../../shared/session-display.js';
 import { buildWorkerSessionPersistBody, mergeWorkerSessionSnapshot } from './session-bootstrap.js';
 import { replicatePendingProcessedContext } from '../context/processed-context-replication.js';
 import { configureSharedContextRuntime } from '../context/shared-context-runtime.js';
+import { fetchBackendSharedContextRuntimeConfig } from '../context/backend-runtime-config.js';
+import { setContextModelRuntimeConfig } from '../context/context-model-config.js';
 
 /** Get the last assistant.text from a session's timeline (for push notification context). */
 function getLastAssistantText(sessionName: string): string | undefined {
@@ -305,6 +307,14 @@ export async function startup(): Promise<DaemonContext> {
   const serverId = creds?.serverId ?? '';
   const token = creds?.token ?? '';
   configureSharedContextRuntime(creds ? { workerUrl: workerUrl!, serverId, token } : null);
+  if (creds) {
+    try {
+      const runtimeConfig = await fetchBackendSharedContextRuntimeConfig({ workerUrl: workerUrl!, serverId, token });
+      setContextModelRuntimeConfig(runtimeConfig);
+    } catch (err) {
+      logger.warn({ err, serverId }, 'shared-context runtime config bootstrap failed');
+    }
+  }
 
   // Sync sessions from D1 before restoring tmux sessions
   if (creds) {

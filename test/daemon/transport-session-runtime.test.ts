@@ -78,8 +78,12 @@ describe('TransportSessionRuntime', () => {
   it('send() returns "queued" when busy', async () => {
     runtime.send('first');
     await flushDispatch();
-    expect(runtime.send('second')).toBe('queued');
+    expect(runtime.send('second', 'msg-queued-2')).toBe('queued');
     expect(runtime.pendingCount).toBe(1);
+    expect(runtime.pendingMessages).toEqual(['second']);
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'msg-queued-2', text: 'second' },
+    ]);
     // provider.send called only once (for first message)
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
   });
@@ -243,9 +247,13 @@ describe('TransportSessionRuntime', () => {
 
   it('cancel() delegates to provider.cancel and preserves pending', () => {
     runtime.send('first');
-    runtime.send('queued1');
-    runtime.send('queued2');
+    runtime.send('queued1', 'msg-q1');
+    runtime.send('queued2', 'msg-q2');
     expect(runtime.pendingCount).toBe(2);
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'msg-q1', text: 'queued1' },
+      { clientMessageId: 'msg-q2', text: 'queued2' },
+    ]);
 
     runtime.cancel();
     expect(mock.provider.cancel).toHaveBeenCalledWith('sess-1');
@@ -255,8 +263,8 @@ describe('TransportSessionRuntime', () => {
   it('cancelled turns drain pending messages into the next turn', async () => {
     runtime.send('first');
     await flushDispatch();
-    runtime.send('queued1');
-    runtime.send('queued2');
+    runtime.send('queued1', 'msg-q1');
+    runtime.send('queued2', 'msg-q2');
 
     runtime.cancel();
     mock.fireError('sess-1', { code: 'CANCELLED', message: 'cancelled', recoverable: true });
@@ -286,13 +294,14 @@ describe('TransportSessionRuntime', () => {
 
   it('kill() clears everything', async () => {
     runtime.send('go');
-    runtime.send('queued');
+    runtime.send('queued', 'msg-kill');
     await runtime.kill();
 
     expect(runtime.providerSessionId).toBeNull();
     expect(runtime.getStatus()).toBe('idle');
     expect(runtime.sending).toBe(false);
     expect(runtime.pendingCount).toBe(0);
+    expect(runtime.pendingEntries).toEqual([]);
   });
 
   it('getHistory() returns a copy', () => {

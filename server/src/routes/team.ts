@@ -58,7 +58,14 @@ teamRoutes.get('/:id', requireAuth(), async (c) => {
   if (!team) return c.json({ error: 'not_found' }, 404);
 
   const members = await c.env.DB
-    .query('SELECT user_id, role, joined_at FROM team_members WHERE team_id = $1', [teamId]);
+    .query(
+      `SELECT tm.user_id, tm.role, tm.joined_at, u.username, u.display_name
+         FROM team_members tm
+         LEFT JOIN users u ON u.id = tm.user_id
+        WHERE tm.team_id = $1
+        ORDER BY tm.joined_at ASC`,
+      [teamId],
+    );
 
   return c.json({ ...team as object, members, myRole: member.role });
 });

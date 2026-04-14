@@ -898,6 +898,7 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       state: mapped,
       pendingCount: runtime.pendingCount,
       pendingMessages: runtime.pendingMessages,
+      pendingMessageEntries: runtime.pendingEntries,
     }, { source: 'daemon', confidence: 'high' });
   };
   runtime.onDrain = (merged, count) => {
@@ -906,6 +907,7 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       state: 'running',
       pendingCount: runtime.pendingCount,
       pendingMessages: runtime.pendingMessages,
+      pendingMessageEntries: runtime.pendingEntries,
     }, { source: 'daemon', confidence: 'high' });
   };
 }

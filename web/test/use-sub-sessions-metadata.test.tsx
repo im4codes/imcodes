@@ -235,11 +235,22 @@ describe('sub-session metadata via subsession.sync', () => {
       event: {
         type: 'session.state',
         sessionId: 'deck_sub_q4',
-        payload: { state: 'queued', pendingMessages: ['queued one', 'queued two'] },
+        payload: {
+          state: 'queued',
+          pendingMessages: ['queued one', 'queued two'],
+          pendingMessageEntries: [
+            { clientMessageId: 'msg-1', text: 'queued one' },
+            { clientMessageId: 'msg-2', text: 'queued two' },
+          ],
+        },
       },
     }));
 
     expect(captured[0].transportPendingMessages).toEqual(['queued one', 'queued two']);
+    expect(captured[0].transportPendingMessageEntries).toEqual([
+      { clientMessageId: 'msg-1', text: 'queued one' },
+      { clientMessageId: 'msg-2', text: 'queued two' },
+    ]);
 
     act(() => send({
       type: 'timeline.event',
@@ -251,6 +262,10 @@ describe('sub-session metadata via subsession.sync', () => {
     }));
 
     expect(captured[0].transportPendingMessages).toEqual(['queued one', 'queued two']);
+    expect(captured[0].transportPendingMessageEntries).toEqual([
+      { clientMessageId: 'msg-1', text: 'queued one' },
+      { clientMessageId: 'msg-2', text: 'queued two' },
+    ]);
 
     act(() => send({
       type: 'timeline.event',
@@ -262,6 +277,10 @@ describe('sub-session metadata via subsession.sync', () => {
     }));
 
     expect(captured[0].transportPendingMessages).toEqual(['queued one', 'queued two']);
+    expect(captured[0].transportPendingMessageEntries).toEqual([
+      { clientMessageId: 'msg-1', text: 'queued one' },
+      { clientMessageId: 'msg-2', text: 'queued two' },
+    ]);
 
     act(() => send({
       type: 'timeline.event',
@@ -273,6 +292,7 @@ describe('sub-session metadata via subsession.sync', () => {
     }));
 
     expect(captured[0].transportPendingMessages).toEqual([]);
+    expect(captured[0].transportPendingMessageEntries).toEqual([]);
   });
 });
 

@@ -31,6 +31,12 @@ type TeamRole = 'owner' | 'admin' | 'member';
 function makeMockDb() {
   const teams = new Map<string, { id: string; name: string; owner_id: string }>();
   const teamMembers = new Map<string, Map<string, { role: TeamRole; joined_at: number }>>();
+  const userProfiles = new Map<string, { username: string | null; display_name: string | null }>([
+    ['user-owner', { username: 'owner', display_name: 'Owner User' }],
+    ['user-admin', { username: 'admin', display_name: 'Admin User' }],
+    ['user-member', { username: 'member', display_name: 'Member User' }],
+    ['user-other', { username: null, display_name: null }],
+  ]);
   const invites = new Map<string, { id: string; team_id: string; role: string; token: string; used_at: number | null; expires_at: number }>();
   const workspaces = new Map<string, { id: string; enterprise_id: string; name: string }>();
   const aliases = new Map<string, { id: string; enterprise_id: string; canonical_repo_id: string; alias_repo_id: string; reason: string }>();
@@ -152,11 +158,13 @@ function makeMockDb() {
 
     query: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T[]> => {
       const s = normalize(sql);
-      if (s.includes('select user_id, role, joined_at from team_members where team_id = $1')) {
+      if (s.includes('select tm.user_id, tm.role, tm.joined_at, u.username, u.display_name from team_members tm left join users u on u.id = tm.user_id where tm.team_id = $1')) {
         return [...(teamMembers.get(params[0] as string)?.entries() ?? [])].map(([user_id, value]) => ({
           user_id,
           role: value.role,
           joined_at: value.joined_at,
+          username: userProfiles.get(user_id)?.username ?? null,
+          display_name: userProfiles.get(user_id)?.display_name ?? null,
         })) as T[];
       }
       if (s.includes('select t.id, t.name, tm.role from teams t join team_members tm on tm.team_id = t.id where tm.user_id = $1')) {
@@ -439,6 +447,27 @@ describe('shared-agent-context server control plane', () => {
       teams: [
         { id: 'team-1', name: 'Acme', role: 'member' },
       ],
+    });
+  });
+
+  it('returns readable member profile fields in team detail responses', async () => {
+    const res = await app.request(...req('/api/team/team-1', 'GET', undefined, 'user-owner'));
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      members: expect.arrayContaining([
+        expect.objectContaining({
+          user_id: 'user-owner',
+          username: 'owner',
+          display_name: 'Owner User',
+          role: 'owner',
+        }),
+        expect.objectContaining({
+          user_id: 'user-member',
+          username: 'member',
+          display_name: 'Member User',
+          role: 'member',
+        }),
+      ]),
     });
   });
 

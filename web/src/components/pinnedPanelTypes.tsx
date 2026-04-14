@@ -259,6 +259,7 @@ registerPanelType(SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE, {
   render: (panel, ctx) => (
     <SharedContextManagementPanel
       enterpriseId={typeof panel.props?.enterpriseId === 'string' ? panel.props.enterpriseId : undefined}
+      serverId={ctx.serverId}
       onEnterpriseChange={(enterpriseId) => ctx.updatePanelProps?.(panel.id, { ...panel.props, enterpriseId })}
     />
   ),

@@ -153,6 +153,10 @@ describe('handleWebCommand transport queue behavior', () => {
       send: vi.fn(() => 'queued'),
       pendingCount: 2,
       pendingMessages: ['queued msg', 'queued msg 2'],
+      pendingEntries: [
+        { clientMessageId: 'cmd-queued', text: 'queued msg' },
+        { clientMessageId: 'cmd-queued-2', text: 'queued msg 2' },
+      ],
     });
 
     handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'queued msg', commandId: 'cmd-queued' }, serverLink as any);
@@ -162,7 +166,15 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
-      { state: 'queued', pendingCount: 2, pendingMessages: ['queued msg', 'queued msg 2'] },
+      {
+        state: 'queued',
+        pendingCount: 2,
+        pendingMessages: ['queued msg', 'queued msg 2'],
+        pendingMessageEntries: [
+          { clientMessageId: 'cmd-queued', text: 'queued msg' },
+          { clientMessageId: 'cmd-queued-2', text: 'queued msg 2' },
+        ],
+      },
       expect.any(Object),
     );
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-queued', status: 'accepted' });
@@ -228,7 +240,7 @@ describe('handleWebCommand transport queue behavior', () => {
     await flushAsync();
 
     expect(transportSend).toHaveBeenCalledTimes(1);
-    expect(transportSend).toHaveBeenCalledWith('review the latest patch');
+    expect(transportSend).toHaveBeenCalledWith('review the latest patch', 'cmd-parity');
     expect(typeof transportSend.mock.calls[0][0]).toBe('string');
   });
 
@@ -248,7 +260,7 @@ describe('handleWebCommand transport queue behavior', () => {
     }, serverLink as any);
     await flushAsync();
 
-    expect(transportSend).toHaveBeenCalledWith('你在用什么模型');
+    expect(transportSend).toHaveBeenCalledWith('你在用什么模型', 'cmd-identity');
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: '你在用什么模型', allowDuplicate: true });
     expect(emitMock).not.toHaveBeenCalledWith(
       'deck_transport_brain',
@@ -327,7 +339,7 @@ describe('handleWebCommand transport queue behavior', () => {
     await flushAsync();
     await flushAsync();
 
-    expect(transportSend).toHaveBeenCalledWith('after restart');
+    expect(transportSend).toHaveBeenCalledWith('after restart', 'cmd-after-restart');
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: 'after restart', allowDuplicate: true });
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-after-restart', status: 'accepted' });
   });

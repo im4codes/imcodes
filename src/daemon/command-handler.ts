@@ -59,6 +59,7 @@ import {
   type TransportEffortLevel,
 } from '../../shared/effort-levels.js';
 import { getSavedP2pConfig, upsertSavedP2pConfig } from '../store/p2p-config-store.js';
+import { SHARED_CONTEXT_RUNTIME_CONFIG_MSG } from '../../shared/shared-context-runtime-config.js';
 
 const MAX_P2P_FILE_PULL_COUNT = 20;
 
@@ -768,6 +769,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       break;
     case 'cc.presets.save':
       void handleCcPresetsSave(cmd, serverLink);
+      break;
+    case SHARED_CONTEXT_RUNTIME_CONFIG_MSG.APPLY:
+      void handleSharedContextRuntimeConfigApply(cmd);
       break;
     case 'file.upload':
       void handleFileUpload(cmd, serverLink);
@@ -1586,7 +1590,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       }
       // send() is synchronous: dispatches immediately if idle, queues if busy.
       // Status changes come from transport runtime's onStatusChange callback.
-      const result = transportRuntime.send(text);
+      const result = transportRuntime.send(text, effectiveId);
       if (result === 'sent') {
         emitTransportUserMessage(text);
       }
@@ -1595,6 +1599,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           state: 'queued',
           pendingCount: transportRuntime.pendingCount,
           pendingMessages: transportRuntime.pendingMessages,
+          pendingMessageEntries: transportRuntime.pendingEntries,
         }, { source: 'daemon', confidence: 'high' });
       }
       // Clear fresh-start flag — the new conversation is now active
@@ -3743,4 +3748,19 @@ async function handleCcPresetsSave(cmd: Record<string, unknown>, serverLink: Ser
   invalidateCache();
   await savePresets(presets);
   serverLink.send({ type: 'cc.presets.save_response', ok: true });
+}
+
+async function handleSharedContextRuntimeConfigApply(cmd: Record<string, unknown>): Promise<void> {
+  const config = cmd.config as Record<string, unknown> | undefined;
+  const primaryContextModel = typeof config?.primaryContextModel === 'string' ? config.primaryContextModel.trim() : '';
+  const backupContextModel = typeof config?.backupContextModel === 'string' ? config.backupContextModel.trim() : '';
+  if (!primaryContextModel) {
+    logger.warn({ cmd }, 'invalid shared-context runtime config apply command');
+    return;
+  }
+  const { setContextModelRuntimeConfig } = await import('../context/context-model-config.js');
+  setContextModelRuntimeConfig({
+    primaryContextModel,
+    backupContextModel: backupContextModel || undefined,
+  });
 }

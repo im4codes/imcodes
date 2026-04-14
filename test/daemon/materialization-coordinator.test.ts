@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace, ContextTargetRef } from '../../shared/context-types.js';
 import { MaterializationCoordinator } from '../../src/context/materialization-coordinator.js';
+import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import { getReplicationState } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
@@ -11,15 +12,13 @@ describe('MaterializationCoordinator', () => {
 
   beforeEach(async () => {
     tempDir = await createIsolatedSharedContextDb('materialization-coordinator');
-    delete process.env.IMCODES_PRIMARY_CONTEXT_MODEL;
-    delete process.env.IMCODES_BACKUP_CONTEXT_MODEL;
+    setContextModelRuntimeConfig(null);
     namespace = { scope: 'personal', projectId: 'repo', userId: 'user-1' };
     target = { namespace, kind: 'session', sessionName: 'deck_repo_brain' };
   });
 
   afterEach(async () => {
-    delete process.env.IMCODES_PRIMARY_CONTEXT_MODEL;
-    delete process.env.IMCODES_BACKUP_CONTEXT_MODEL;
+    setContextModelRuntimeConfig(null);
     await cleanupIsolatedSharedContextDb(tempDir);
   });
 
@@ -94,9 +93,11 @@ describe('MaterializationCoordinator', () => {
     }));
   });
 
-  it('reads primary/backup context models from env when explicit overrides are absent', () => {
-    process.env.IMCODES_PRIMARY_CONTEXT_MODEL = 'gpt-5.2';
-    process.env.IMCODES_BACKUP_CONTEXT_MODEL = 'qwen';
+  it('reads primary/backup context models from the synced runtime config when explicit overrides are absent', () => {
+    setContextModelRuntimeConfig({
+      primaryContextModel: 'gpt-5.2',
+      backupContextModel: 'qwen',
+    });
     const coordinator = new MaterializationCoordinator();
     expect(coordinator.modelConfig).toEqual({
       primaryContextModel: 'gpt-5.2',

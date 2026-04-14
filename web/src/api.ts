@@ -6,6 +6,8 @@
 
 import { COOKIE_SESSION, COOKIE_CSRF, HEADER_CSRF } from '@shared/cookie-names.js';
 import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '@shared/preview-types.js';
+import type { ContextModelConfig } from '@shared/context-types.js';
+import type { SharedContextRuntimeConfigSnapshot } from '@shared/shared-context-runtime-config.js';
 
 let _baseUrl = '';
 let _onAuthExpired: ((reason?: string) => void) | null = null;
@@ -578,6 +580,7 @@ export interface SubSessionData {
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null;
   transportConfig?: Record<string, unknown> | null;
   transportPendingMessages?: string[] | null;
+  transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }> | null;
 }
 
 export async function listSubSessions(serverId: string): Promise<SubSessionData[]> {
@@ -1075,6 +1078,8 @@ export interface TeamSummary {
 
 export interface TeamMember {
   user_id: string;
+  username?: string | null;
+  display_name?: string | null;
   role: 'owner' | 'admin' | 'member';
   joined_at: number;
 }
@@ -1169,9 +1174,26 @@ export interface SharedContextDiagnosticsView {
   };
 }
 
+export interface SharedContextRuntimeConfigView {
+  snapshot: SharedContextRuntimeConfigSnapshot;
+}
+
 export async function listTeams(): Promise<TeamSummary[]> {
   const response = await apiFetch<{ teams: TeamSummary[] }>('/api/team', { method: 'GET' });
   return response.teams;
+}
+
+export async function fetchSharedContextRuntimeConfig(serverId: string): Promise<SharedContextRuntimeConfigView> {
+  return apiFetch(`/api/server/${encodeURIComponent(serverId)}/shared-context/runtime-config`, {
+    method: 'GET',
+  });
+}
+
+export async function updateSharedContextRuntimeConfig(serverId: string, config: ContextModelConfig): Promise<SharedContextRuntimeConfigView> {
+  return apiFetch(`/api/server/${encodeURIComponent(serverId)}/shared-context/runtime-config`, {
+    method: 'PUT',
+    body: JSON.stringify(config),
+  });
 }
 
 export async function createTeam(name: string): Promise<{ id: string; name: string; role: string }> {

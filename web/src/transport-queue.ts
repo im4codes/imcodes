@@ -1,8 +1,28 @@
+export interface TransportPendingMessageEntry {
+  clientMessageId: string;
+  text: string;
+}
+
 export function extractTransportPendingMessages(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value
     .map((entry) => (typeof entry === 'string' ? entry.trim() : ''))
     .filter((entry) => entry.length > 0);
+}
+
+export function extractTransportPendingMessageEntries(value: unknown): TransportPendingMessageEntry[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object') return [];
+    const clientMessageId = typeof (entry as { clientMessageId?: unknown }).clientMessageId === 'string'
+      ? (entry as { clientMessageId: string }).clientMessageId.trim()
+      : '';
+    const text = typeof (entry as { text?: unknown }).text === 'string'
+      ? (entry as { text: string }).text.trim()
+      : '';
+    if (!clientMessageId || !text) return [];
+    return [{ clientMessageId, text }];
+  });
 }
 
 export function mergeTransportPendingMessagesForRunningState(
@@ -15,4 +35,18 @@ export function mergeTransportPendingMessagesForRunningState(
   const nextMessages = extractTransportPendingMessages(pendingFromEvent);
   if (nextMessages.length > 0) return nextMessages;
   return existingMessages;
+}
+
+export function mergeTransportPendingEntriesForRunningState(
+  existing: TransportPendingMessageEntry[] | null | undefined,
+  pendingFromEvent: unknown,
+  hasPendingMessagesField: boolean,
+): TransportPendingMessageEntry[] {
+  const existingEntries = Array.isArray(existing)
+    ? existing.filter((entry) => typeof entry?.clientMessageId === 'string' && entry.clientMessageId && typeof entry?.text === 'string' && entry.text)
+    : [];
+  if (!hasPendingMessagesField) return existingEntries;
+  const nextEntries = extractTransportPendingMessageEntries(pendingFromEvent);
+  if (nextEntries.length > 0) return nextEntries;
+  return existingEntries;
 }

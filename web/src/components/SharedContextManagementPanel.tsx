@@ -2,6 +2,8 @@ import type { ComponentChildren } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '@shared/context-model-defaults.js';
+import { QWEN_MODEL_IDS } from '@shared/qwen-models.js';
+import type { SharedContextRuntimeConfigSnapshot } from '@shared/shared-context-runtime-config.js';
 import {
   ApiError,
   activateSharedDocumentVersion,
@@ -23,16 +25,20 @@ import {
   markSharedProjectPendingRemoval,
   removeSharedProject,
   removeTeamMember,
+  fetchSharedContextRuntimeConfig,
   type SharedDocument,
   type SharedDocumentBinding,
   type SharedProject,
   type SharedProjectPolicy,
+  type SharedContextRuntimeConfigView,
   type SharedWorkspace,
   type TeamDetail,
   type TeamSummary,
   updateSharedProjectPolicy,
+  updateSharedContextRuntimeConfig,
   updateTeamMemberRole,
 } from '../api.js';
+import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../../../src/shared/models/options.js';
 
 const sectionStyle = {
   border: '1px solid #334155',
@@ -104,6 +110,19 @@ const checkboxRowStyle = {
   alignItems: 'flex-start',
 } as const;
 
+const fieldLabelStyle = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 6,
+  color: '#cbd5e1',
+  fontSize: 13,
+} as const;
+
+const fieldInputStyle = {
+  ...inputStyle,
+  width: '100%',
+} as const;
+
 const defaultPolicyState: SharedProjectPolicy = {
   enrollmentId: '',
   enterpriseId: '',
@@ -111,6 +130,13 @@ const defaultPolicyState: SharedProjectPolicy = {
   allowLocalFallback: false,
   requireFullProviderSupport: false,
 };
+
+const PROCESSING_MODEL_OPTIONS = Array.from(new Set([
+  DEFAULT_PRIMARY_CONTEXT_MODEL,
+  ...CLAUDE_CODE_MODEL_IDS,
+  ...CODEX_MODEL_IDS,
+  ...QWEN_MODEL_IDS,
+]));
 
 type KindOption = SharedDocument['kind'];
 type ManagementTab = 'enterprise' | 'members' | 'projects' | 'knowledge' | 'processing';
@@ -144,6 +170,14 @@ function LabeledValue({ label, value }: { label: string; value: string }) {
       <code style={{ color: '#e2e8f0' }}>{value}</code>
     </div>
   );
+}
+
+function formatMemberIdentity(member: TeamDetail['members'][number]): string {
+  const displayName = member.display_name?.trim();
+  if (displayName) return displayName;
+  const username = member.username?.trim();
+  if (username) return `@${username}`;
+  return member.user_id.length > 16 ? `${member.user_id.slice(0, 8)}…${member.user_id.slice(-4)}` : member.user_id;
 }
 
 export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId, serverId, onEnterpriseChange }: Props) {
@@ -184,6 +218,11 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [bindingMode, setBindingMode] = useState<'required' | 'advisory'>('required');
   const [bindingLanguage, setBindingLanguage] = useState('');
   const [bindingPathPattern, setBindingPathPattern] = useState('');
+  const [processingLoading, setProcessingLoading] = useState(false);
+  const [processingSaving, setProcessingSaving] = useState(false);
+  const [processingSnapshot, setProcessingSnapshot] = useState<SharedContextRuntimeConfigSnapshot | null>(null);
+  const [processingPrimaryModel, setProcessingPrimaryModel] = useState(DEFAULT_PRIMARY_CONTEXT_MODEL);
+  const [processingBackupModel, setProcessingBackupModel] = useState('');
 
   const selectedDocument = useMemo(
     () => documents.find((entry) => entry.id === selectedDocumentId) ?? null,
@@ -192,6 +231,10 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const selectedProject = useMemo(
     () => projects.find((entry) => entry.id === selectedEnrollmentId) ?? null,
     [projects, selectedEnrollmentId],
+  );
+  const workspaceNameById = useMemo(
+    () => new Map(workspaces.map((workspace) => [workspace.id, workspace.name])),
+    [workspaces],
   );
 
   const tabs = useMemo<TabDef[]>(() => [
@@ -313,6 +356,36 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       }
     }
   }, []);
+
+  const applyProcessingSnapshot = useCallback((view: SharedContextRuntimeConfigView) => {
+    setProcessingSnapshot(view.snapshot);
+    setProcessingPrimaryModel(view.snapshot.persisted.primaryContextModel);
+    setProcessingBackupModel(view.snapshot.persisted.backupContextModel ?? '');
+  }, []);
+
+  const reloadProcessingConfig = useCallback(async () => {
+    if (!serverId) {
+      setProcessingSnapshot(null);
+      setProcessingPrimaryModel(DEFAULT_PRIMARY_CONTEXT_MODEL);
+      setProcessingBackupModel('');
+      return;
+    }
+    setProcessingLoading(true);
+    setError(null);
+    try {
+      const view = await fetchSharedContextRuntimeConfig(serverId);
+      applyProcessingSnapshot(view);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setProcessingLoading(false);
+    }
+  }, [applyProcessingSnapshot, serverId]);
+
+  useEffect(() => {
+    if (activeTab !== 'processing') return;
+    void reloadProcessingConfig();
+  }, [activeTab, reloadProcessingConfig]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 8, color: '#e2e8f0', overflow: 'auto' }}>
@@ -443,7 +516,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           <strong>{t('sharedContext.management.members')}</strong>
           {team?.members?.length ? team.members.map((member) => (
             <div key={member.user_id} style={{ ...rowStyle, justifyContent: 'space-between' }}>
-              <span>{member.user_id} · {member.role}</span>
+              <span>{formatMemberIdentity(member)} · {member.role}</span>
               {member.role !== 'owner' && (
                 <div style={rowStyle}>
                   <button
@@ -473,6 +546,12 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
 
       {activeTab === 'projects' && (
         <>
+          <InfoCard title={t('sharedContext.management.projectRelationshipTitle')}>
+            <div>{t('sharedContext.management.projectRelationshipLine1')}</div>
+            <div>{t('sharedContext.management.projectRelationshipLine2')}</div>
+            <div>{t('sharedContext.management.projectRelationshipLine3')}</div>
+          </InfoCard>
+
           <div style={sectionStyle}>
             <div style={{ ...rowStyle, justifyContent: 'space-between' }}>
               <strong>{t('sharedContext.management.projects')}</strong>
@@ -514,7 +593,15 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             </div>
             {projects.map((project) => (
               <div key={project.id} style={{ ...rowStyle, justifyContent: 'space-between' }}>
-                <span>{project.displayName ?? project.canonicalRepoId} · {project.scope} · {project.status}</span>
+                <span>
+                  {project.displayName ?? project.canonicalRepoId}
+                  {' · '}
+                  {project.scope}
+                  {' · '}
+                  {project.workspaceId ? `${t('sharedContext.management.workspaceLabel')}: ${workspaceNameById.get(project.workspaceId) ?? project.workspaceId}` : t('sharedContext.management.noWorkspaceAssigned')}
+                  {' · '}
+                  {project.status}
+                </span>
                 <div style={rowStyle}>
                   <button
                     style={subtleButtonStyle}
@@ -704,12 +791,77 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           </InfoCard>
 
           <InfoCard title={t('sharedContext.management.processingModelTitle')}>
-            <LabeledValue label={t('sharedContext.management.processingPrimaryModel')} value={DEFAULT_PRIMARY_CONTEXT_MODEL} />
-            <LabeledValue label={t('sharedContext.management.processingPrimaryOverride')} value="IMCODES_PRIMARY_CONTEXT_MODEL" />
-            <LabeledValue label={t('sharedContext.management.processingBackupOverride')} value="IMCODES_BACKUP_CONTEXT_MODEL" />
-            {serverId && <LabeledValue label={t('sharedContext.management.processingServerScope')} value={serverId} />}
-            <div>{t('sharedContext.management.processingProviderNote')}</div>
-            <div>{t('sharedContext.management.processingUiGap')}</div>
+            {serverId ? (
+              <>
+                <div style={rowStyle}>
+                  <label style={{ ...fieldLabelStyle, flex: '1 1 220px' }}>
+                    <span>{t('sharedContext.management.processingPrimaryModel')}</span>
+                    <input
+                      list="shared-context-model-options"
+                      value={processingPrimaryModel}
+                      onInput={(e) => setProcessingPrimaryModel((e.currentTarget as HTMLInputElement).value)}
+                      placeholder={DEFAULT_PRIMARY_CONTEXT_MODEL}
+                      style={fieldInputStyle}
+                    />
+                  </label>
+                  <label style={{ ...fieldLabelStyle, flex: '1 1 220px' }}>
+                    <span>{t('sharedContext.management.processingBackupModel')}</span>
+                    <input
+                      list="shared-context-model-options"
+                      value={processingBackupModel}
+                      onInput={(e) => setProcessingBackupModel((e.currentTarget as HTMLInputElement).value)}
+                      placeholder={t('sharedContext.management.processingBackupPlaceholder')}
+                      style={fieldInputStyle}
+                    />
+                  </label>
+                  <datalist id="shared-context-model-options">
+                    {PROCESSING_MODEL_OPTIONS.map((modelId) => (
+                      <option key={modelId} value={modelId} />
+                    ))}
+                  </datalist>
+                </div>
+                <div style={rowStyle}>
+                  <button
+                    style={buttonStyle}
+                    disabled={processingSaving || !processingPrimaryModel.trim()}
+                    onClick={() => void handleAction(t('sharedContext.notice.processingConfigSaved'), async () => {
+                      setProcessingSaving(true);
+                      try {
+                        const view = await updateSharedContextRuntimeConfig(serverId, {
+                          primaryContextModel: processingPrimaryModel.trim(),
+                          backupContextModel: processingBackupModel.trim() || undefined,
+                        });
+                        applyProcessingSnapshot(view);
+                      } finally {
+                        setProcessingSaving(false);
+                      }
+                    })}
+                  >
+                    {processingSaving ? t('sharedContext.management.processingSaving') : t('sharedContext.management.processingSave')}
+                  </button>
+                  <button
+                    style={subtleButtonStyle}
+                    disabled={processingLoading}
+                    onClick={() => void reloadProcessingConfig()}
+                  >
+                    {processingLoading ? t('sharedContext.management.processingLoading') : t('sharedContext.management.processingReload')}
+                  </button>
+                </div>
+                <LabeledValue
+                  label={t('sharedContext.management.processingSavedPrimary')}
+                  value={processingSnapshot?.persisted.primaryContextModel ?? DEFAULT_PRIMARY_CONTEXT_MODEL}
+                />
+                <LabeledValue
+                  label={t('sharedContext.management.processingSavedBackup')}
+                  value={processingSnapshot?.persisted.backupContextModel ?? t('sharedContext.management.processingUnsetValue')}
+                />
+                {serverId && <LabeledValue label={t('sharedContext.management.processingServerScope')} value={serverId} />}
+                <div>{t('sharedContext.management.processingCloudSyncNote')}</div>
+                <div>{t('sharedContext.management.processingProviderNote')}</div>
+              </>
+            ) : (
+              <div>{t('sharedContext.management.processingServerRequired')}</div>
+            )}
           </InfoCard>
 
           <InfoCard title={t('sharedContext.management.processingOperationalTitle')}>

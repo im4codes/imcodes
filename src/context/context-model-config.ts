@@ -1,15 +1,22 @@
 import type { ContextModelConfig } from '../../shared/context-types.js';
-import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '../../shared/context-model-defaults.js';
+import {
+  buildSharedContextRuntimeConfigSnapshot,
+  defaultSharedContextRuntimeConfig,
+  normalizeSharedContextRuntimeConfig,
+  type SharedContextRuntimeConfigSnapshot,
+} from '../../shared/shared-context-runtime-config.js';
+
+let runtimeConfigOverride: Partial<ContextModelConfig> | null = null;
+
+export function setContextModelRuntimeConfig(overrides: Partial<ContextModelConfig> | null): void {
+  runtimeConfigOverride = overrides ? normalizeSharedContextRuntimeConfig(overrides) : null;
+}
 
 export function getContextModelConfig(overrides?: Partial<ContextModelConfig>): ContextModelConfig {
-  const primaryContextModel = overrides?.primaryContextModel
-    ?? process.env.IMCODES_PRIMARY_CONTEXT_MODEL
-    ?? DEFAULT_PRIMARY_CONTEXT_MODEL;
-  const backupContextModel = overrides?.backupContextModel
-    ?? process.env.IMCODES_BACKUP_CONTEXT_MODEL
-    ?? undefined;
-  return {
-    primaryContextModel,
-    backupContextModel,
-  };
+  if (overrides) return normalizeSharedContextRuntimeConfig(overrides);
+  return runtimeConfigOverride ? normalizeSharedContextRuntimeConfig(runtimeConfigOverride) : defaultSharedContextRuntimeConfig();
+}
+
+export function getContextModelConfigSnapshot(persisted: Partial<ContextModelConfig> | null): SharedContextRuntimeConfigSnapshot {
+  return buildSharedContextRuntimeConfigSnapshot(persisted, getContextModelConfig());
 }

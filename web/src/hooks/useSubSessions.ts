@@ -11,13 +11,19 @@ import {
 } from '../api.js';
 import type { WsClient } from '../ws-client.js';
 import { isRunningTimelineEvent } from '../timeline-running.js';
-import { extractTransportPendingMessages, mergeTransportPendingMessagesForRunningState } from '../transport-queue.js';
+import {
+  extractTransportPendingMessageEntries,
+  extractTransportPendingMessages,
+  mergeTransportPendingEntriesForRunningState,
+  mergeTransportPendingMessagesForRunningState,
+} from '../transport-queue.js';
 
 export interface SubSession extends SubSessionData {
   sessionName: string;
   /** runtime state from daemon */
   state: 'running' | 'idle' | 'stopped' | 'stopping' | 'error' | 'starting' | 'unknown';
   transportPendingMessages?: string[] | null;
+  transportPendingMessageEntries?: import('../transport-queue.js').TransportPendingMessageEntry[] | null;
 }
 
 function toSessionName(id: string): string {
@@ -139,6 +145,7 @@ export function useSubSessions(
                 ...(m.effort != null && { effort: m.effort }),
                 ...(m.transportConfig !== undefined && { transportConfig: m.transportConfig }),
                 ...(m.transportPendingMessages !== undefined && { transportPendingMessages: extractTransportPendingMessages(m.transportPendingMessages) }),
+                ...(m.transportPendingMessageEntries !== undefined && { transportPendingMessageEntries: extractTransportPendingMessageEntries(m.transportPendingMessageEntries) }),
                 ...(m.qwenModel != null && { qwenModel: m.qwenModel }),
                 ...(m.qwenAuthType != null && { qwenAuthType: m.qwenAuthType }),
                 ...(m.qwenAvailableModels != null && { qwenAvailableModels: m.qwenAvailableModels }),
@@ -174,6 +181,7 @@ export function useSubSessions(
               effort: m.effort ?? null,
               transportConfig: m.transportConfig ?? null,
               transportPendingMessages: extractTransportPendingMessages(m.transportPendingMessages),
+              transportPendingMessageEntries: extractTransportPendingMessageEntries(m.transportPendingMessageEntries),
             }];
           });
         }
@@ -210,6 +218,7 @@ export function useSubSessions(
               ...(m.effort !== undefined ? { effort: m.effort } : {}),
               ...(m.transportConfig !== undefined ? { transportConfig: m.transportConfig } : {}),
               ...(m.transportPendingMessages !== undefined ? { transportPendingMessages: extractTransportPendingMessages(m.transportPendingMessages) } : {}),
+              ...(m.transportPendingMessageEntries !== undefined ? { transportPendingMessageEntries: extractTransportPendingMessageEntries(m.transportPendingMessageEntries) } : {}),
             };
           }));
         }
@@ -242,11 +251,14 @@ export function useSubSessions(
         const pendingMessages = msg.type === 'timeline.event' && msg.event.type === 'session.state'
           ? extractTransportPendingMessages(msg.event.payload.pendingMessages)
           : [];
+        const pendingEntries = msg.type === 'timeline.event' && msg.event.type === 'session.state'
+          ? extractTransportPendingMessageEntries(msg.event.payload.pendingMessageEntries)
+          : [];
         setSubSessions((prev) => {
           const idx = prev.findIndex((s) => s.sessionName === sessionName);
           if (idx === -1) return prev;
           const next = [...prev];
-          next[idx] = { ...next[idx], transportPendingMessages: pendingMessages };
+          next[idx] = { ...next[idx], transportPendingMessages: pendingMessages, transportPendingMessageEntries: pendingEntries };
           return next;
         });
         return;
@@ -264,6 +276,11 @@ export function useSubSessions(
               msg.event.payload.pendingMessages,
               true,
             ),
+            transportPendingMessageEntries: mergeTransportPendingEntriesForRunningState(
+              next[idx].transportPendingMessageEntries,
+              msg.event.payload.pendingMessageEntries,
+              true,
+            ),
           };
           return next;
         });
@@ -279,9 +296,9 @@ export function useSubSessions(
           next[idx] = { ...next[idx], state: 'running' };
           return next;
         }
-        if (prev[idx].state === state && (prev[idx].transportPendingMessages?.length ?? 0) === 0) return prev;
+        if (prev[idx].state === state && (prev[idx].transportPendingMessages?.length ?? 0) === 0 && (prev[idx].transportPendingMessageEntries?.length ?? 0) === 0) return prev;
         const next = [...prev];
-        next[idx] = { ...next[idx], state: state as SubSession['state'], transportPendingMessages: [] };
+        next[idx] = { ...next[idx], state: state as SubSession['state'], transportPendingMessages: [], transportPendingMessageEntries: [] };
         return next;
       });
     });
