@@ -147,7 +147,7 @@ describe('handleWebCommand transport queue behavior', () => {
     });
   });
 
-  it('does not emit a user.message for queued transport sends', async () => {
+  it('emits queued session.state for queued transport sends without adding a timeline row', async () => {
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'route-transport',
       send: vi.fn(() => 'queued'),
@@ -162,7 +162,6 @@ describe('handleWebCommand transport queue behavior', () => {
     handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'queued msg', commandId: 'cmd-queued' }, serverLink as any);
     await flushAsync();
 
-    expect(emitMock).not.toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: 'queued msg' });
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
@@ -176,6 +175,12 @@ describe('handleWebCommand transport queue behavior', () => {
         ],
       },
       expect.any(Object),
+    );
+    expect(emitMock).not.toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'user.message',
+      expect.objectContaining({ clientMessageId: 'cmd-queued', pending: true }),
+      expect.anything(),
     );
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-queued', status: 'accepted' });
   });
@@ -194,7 +199,7 @@ describe('handleWebCommand transport queue behavior', () => {
     await flushAsync();
 
     expect(cancel).toHaveBeenCalledTimes(1);
-    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: '/stop', allowDuplicate: true });
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: '/stop', allowDuplicate: true }, undefined);
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-stop', status: 'accepted' });
     expect(emitMock).not.toHaveBeenCalledWith(
       'deck_transport_brain',
@@ -214,7 +219,12 @@ describe('handleWebCommand transport queue behavior', () => {
     handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'sent msg', commandId: 'cmd-sent' }, serverLink as any);
     await flushAsync();
 
-    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: 'sent msg', allowDuplicate: true });
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'user.message',
+      { text: 'sent msg', allowDuplicate: true, clientMessageId: 'cmd-sent' },
+      expect.objectContaining({ eventId: 'transport-user:cmd-sent' }),
+    );
     expect(emitMock).not.toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
@@ -261,7 +271,12 @@ describe('handleWebCommand transport queue behavior', () => {
     await flushAsync();
 
     expect(transportSend).toHaveBeenCalledWith('你在用什么模型', 'cmd-identity');
-    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: '你在用什么模型', allowDuplicate: true });
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'user.message',
+      { text: '你在用什么模型', allowDuplicate: true, clientMessageId: 'cmd-identity' },
+      expect.objectContaining({ eventId: 'transport-user:cmd-identity' }),
+    );
     expect(emitMock).not.toHaveBeenCalledWith(
       'deck_transport_brain',
       'assistant.text',
@@ -340,8 +355,75 @@ describe('handleWebCommand transport queue behavior', () => {
     await flushAsync();
 
     expect(transportSend).toHaveBeenCalledWith('after restart', 'cmd-after-restart');
-    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'user.message', { text: 'after restart', allowDuplicate: true });
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'user.message',
+      { text: 'after restart', allowDuplicate: true, clientMessageId: 'cmd-after-restart' },
+      expect.objectContaining({ eventId: 'transport-user:cmd-after-restart' }),
+    );
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-after-restart', status: 'accepted' });
+  });
+
+  it('edits a queued transport message by clientMessageId', async () => {
+    const editPendingMessage = vi.fn(() => true);
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      editPendingMessage,
+      sending: true,
+      pendingCount: 1,
+      pendingMessages: ['edited queued'],
+      pendingEntries: [{ clientMessageId: 'cmd-queued', text: 'edited queued' }],
+    });
+
+    handleWebCommand({
+      type: 'session.edit_queued_message',
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'cmd-queued',
+      text: 'edited queued',
+      commandId: 'cmd-edit',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(editPendingMessage).toHaveBeenCalledWith('cmd-queued', 'edited queued');
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      {
+        state: 'queued',
+        pendingCount: 1,
+        pendingMessages: ['edited queued'],
+        pendingMessageEntries: [{ clientMessageId: 'cmd-queued', text: 'edited queued' }],
+      },
+      expect.any(Object),
+    );
+  });
+
+  it('removes a queued transport message by clientMessageId', async () => {
+    const removePendingMessage = vi.fn(() => ({ clientMessageId: 'cmd-queued', text: 'queued msg' }));
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      removePendingMessage,
+      sending: true,
+      pendingCount: 0,
+      pendingMessages: [],
+      pendingEntries: [],
+    });
+
+    handleWebCommand({
+      type: 'session.undo_queued_message',
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'cmd-queued',
+      commandId: 'cmd-undo',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(removePendingMessage).toHaveBeenCalledWith('cmd-queued');
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      { state: 'queued', pendingCount: 0, pendingMessages: [], pendingMessageEntries: [] },
+      expect.any(Object),
+    );
   });
 
   it('deduplicates concurrent session.restart requests for the same transport session', async () => {

@@ -1398,6 +1398,73 @@ afterEach(() => {
     expect(screen.getByRole('button', { name: 'show' })).toBeDefined();
   });
 
+  it('edits a queued transport message through the queue controls', () => {
+    const ws = makeWs();
+    const runningSession = makeSession({
+      name: 'qwen-session',
+      agentType: 'qwen',
+      runtimeType: 'transport',
+      state: 'running',
+      transportPendingMessages: ['queued send'],
+      transportPendingMessageEntries: [
+        { clientMessageId: 'msg-1', text: 'queued send' },
+      ],
+    });
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={runningSession}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /edit/i }));
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    expect(input.textContent).toBe('queued send');
+
+    input.textContent = 'edited queued send';
+    fireEvent.input(input);
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.edit_queued_message',
+      sessionName: 'qwen-session',
+      clientMessageId: 'msg-1',
+      text: 'edited queued send',
+      commandId: expect.any(String),
+    }));
+  });
+
+  it('removes a queued transport message through the queue controls', () => {
+    const ws = makeWs();
+    const runningSession = makeSession({
+      name: 'qwen-session',
+      agentType: 'qwen',
+      runtimeType: 'transport',
+      state: 'running',
+      transportPendingMessages: ['queued send'],
+      transportPendingMessageEntries: [
+        { clientMessageId: 'msg-1', text: 'queued send' },
+      ],
+    });
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={runningSession}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /delete/i }));
+
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.undo_queued_message',
+      sessionName: 'qwen-session',
+      clientMessageId: 'msg-1',
+      commandId: expect.any(String),
+    }));
+  });
+
   it('pressing Escape in a running transport input sends /stop command', () => {
     const ws = makeWs();
     render(

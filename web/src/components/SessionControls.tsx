@@ -327,6 +327,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const [codexModel, setCodexModel] = useState<CodexModelChoice | null>(loadCodexModel);
   const [qwenModel, setQwenModel] = useState<QwenModelChoice | null>(loadQwenModel);
   const [queuedHintExpanded, setQueuedHintExpanded] = useState(loadQueuedHintExpanded);
+  const [editingQueuedMessageId, setEditingQueuedMessageId] = useState<string | null>(null);
   const [mobileComposerMultiline, setMobileComposerMultiline] = useState(false);
   const [mobileComposerExpanded, setMobileComposerExpanded] = useState(false);
   const [confirm, setConfirm] = useState<MenuAction | null>(null);
@@ -351,6 +352,9 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     : [];
   const queuedTransportMessages = queuedTransportEntries.map((entry) => entry.text);
   const queuedTransportLatestMessage = queuedTransportMessages[queuedTransportMessages.length - 1] ?? '';
+  const editingQueuedEntry = editingQueuedMessageId
+    ? queuedTransportEntries.find((entry) => entry.clientMessageId === editingQueuedMessageId) ?? null
+    : null;
   // Internal ref for contenteditable — also written to the external inputRef
   const divRef = useRef<HTMLDivElement>(null);
   // History navigation state
@@ -550,6 +554,13 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       window.removeEventListener(QUEUED_HINT_EXPANDED_EVENT, syncQueuedHintExpanded);
     };
   }, []);
+
+  useEffect(() => {
+    if (!editingQueuedMessageId) return;
+    if (!queuedTransportEntries.some((entry) => entry.clientMessageId === editingQueuedMessageId)) {
+      setEditingQueuedMessageId(null);
+    }
+  }, [editingQueuedMessageId, queuedTransportEntries]);
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
@@ -1119,8 +1130,49 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     return true;
   }, [activeSession, ws]);
 
+  const sendQueuedMessageMutation = useCallback((type: 'session.edit_queued_message' | 'session.undo_queued_message', payload: Record<string, unknown>) => {
+    if (!ws || !activeSession) return false;
+    const commandId = globalThis.crypto?.randomUUID?.() ?? `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    ws.send({
+      type,
+      sessionName: activeSession.name,
+      commandId,
+      ...payload,
+    });
+    return true;
+  }, [activeSession, ws]);
+
   const finalizeSend = useCallback((payload: PendingSendPayload, options?: { clearComposer?: boolean }) => {
     if (!activeSession) return;
+    if (editingQueuedMessageId && activeSession.runtimeType === 'transport') {
+      try {
+        if (!sendQueuedMessageMutation('session.edit_queued_message', {
+          clientMessageId: editingQueuedMessageId,
+          text: payload.text,
+        })) return;
+      } catch {
+        return;
+      }
+      setEditingQueuedMessageId(null);
+      if (options?.clearComposer) {
+        pendingAtTargetsRef.current = [];
+        pendingConfigOverrideRef.current = null;
+        if (divRef.current) divRef.current.textContent = '';
+        setHasText(false);
+        setMobileComposerExpanded(false);
+        setMobileComposerMultiline(false);
+        setAttachments([]);
+        if (quotes && quotes.length > 0) {
+          for (let i = quotes.length - 1; i >= 0; i--) onRemoveQuote?.(i);
+        }
+        atSelectionLockRef.current = false;
+        atSelectionSnapshotRef.current = '';
+        histIdxRef.current = -1;
+        draftRef.current = '';
+        if (draftKey) sessionStorage.removeItem(draftKey);
+      }
+      return;
+    }
     quickData.recordHistory(payload.text, activeSession.name);
     try {
       if (!sendSessionMessage(payload.text, payload.extra)) return;
@@ -1145,7 +1197,30 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       draftRef.current = '';
       if (draftKey) sessionStorage.removeItem(draftKey);
     }
-  }, [activeSession, draftKey, onRemoveQuote, onSend, quickData, quotes, sendSessionMessage]);
+  }, [activeSession, draftKey, editingQueuedMessageId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage]);
+
+  const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
+    fillInput(entry.text);
+    setEditingQueuedMessageId(entry.clientMessageId);
+    setQueuedHintExpanded(true);
+  }, []);
+
+  const handleQueuedMessageDelete = useCallback((entry: { clientMessageId: string; text: string }) => {
+    if (editingQueuedMessageId === entry.clientMessageId || (!editingQueuedMessageId && getText() === entry.text)) {
+      if (divRef.current) divRef.current.textContent = '';
+      setHasText(false);
+      setMobileComposerExpanded(false);
+      setMobileComposerMultiline(false);
+    }
+    if (editingQueuedMessageId === entry.clientMessageId) setEditingQueuedMessageId(null);
+    try {
+      sendQueuedMessageMutation('session.undo_queued_message', {
+        clientMessageId: entry.clientMessageId,
+      });
+    } catch {
+      /* ignore */
+    }
+  }, [editingQueuedMessageId, sendQueuedMessageMutation]);
 
   const maybePersistComboSendSkip = useCallback(() => {
     if (!rememberComboSendChoice) return;
@@ -2356,7 +2431,15 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
             {queuedHintExpanded ? (
               queuedTransportEntries.map((entry) => (
                 <div class="controls-queued-item" key={entry.clientMessageId}>
-                  {entry.text}
+                  <span class="controls-queued-item-text">{entry.text}</span>
+                  <span class="controls-queued-item-actions">
+                    <button type="button" class="controls-queued-action" onClick={() => handleQueuedMessageEdit(entry)}>
+                      {t('settings.edit')}
+                    </button>
+                    <button type="button" class="controls-queued-action controls-queued-action-danger" onClick={() => handleQueuedMessageDelete(entry)}>
+                      {t('common.delete')}
+                    </button>
+                  </span>
                 </div>
               ))
             ) : (
@@ -2365,11 +2448,19 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
                   {t('session.transport_send_queued_collapsed', { count: queuedTransportMessages.length })}
                 </div>
                 <div class="controls-queued-item" key={`${activeSession?.name ?? 'session'}:latest:${queuedTransportLatestMessage}`}>
-                  {queuedTransportLatestMessage}
+                  <span class="controls-queued-item-text">{queuedTransportLatestMessage}</span>
                 </div>
               </>
             )}
           </div>
+        </div>
+      )}
+      {editingQueuedEntry && (
+        <div class="controls-queued-editing">
+          <span>{t('session.transport_send_queued')} · {t('settings.edit')}</span>
+          <button type="button" class="controls-queued-action" onClick={() => setEditingQueuedMessageId(null)}>
+            {t('common.cancel')}
+          </button>
         </div>
       )}
     </div>

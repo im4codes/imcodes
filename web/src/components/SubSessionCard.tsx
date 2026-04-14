@@ -98,7 +98,8 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     projectDir: sub.cwd ?? undefined,
     runtimeType: sub.runtimeType ?? undefined,
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
-  }), [sub.sessionName, sub.type, sub.state, sub.label, sub.cwd, sub.runtimeType, sub.transportPendingMessages]);
+    transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
+  }), [sub.sessionName, sub.type, sub.state, sub.label, sub.cwd, sub.runtimeType, sub.transportPendingMessages, sub.transportPendingMessageEntries]);
 
   const forceFollowLatest = useCallback(() => {
     if (isShell) termScrollRef.current?.();

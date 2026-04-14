@@ -44,6 +44,7 @@ const mocks = vi.hoisted(() => {
     errorCallbacks: Array<(sid: string, err: any) => void> = [];
     created: Array<Record<string, unknown>> = [];
     modelBySession = new Map<string, string | undefined>();
+    pendingCompletes = new Map<string, () => void>();
 
     async connect() {}
     async disconnect() {}
@@ -76,6 +77,33 @@ const mocks = vi.hoisted(() => {
         }));
         return;
       }
+      if (message === 'slow first') {
+        this.deltaCallbacks.forEach((cb) => cb(sessionId, {
+          messageId: 'msg-qwen-e2e-slow',
+          type: 'text',
+          delta: 'Qwen',
+          role: 'assistant',
+        }));
+        this.pendingCompletes.set(sessionId, () => {
+          this.deltaCallbacks.forEach((cb) => cb(sessionId, {
+            messageId: 'msg-qwen-e2e-slow',
+            type: 'text',
+            delta: 'Qwen: slow first',
+            role: 'assistant',
+          }));
+          this.completeCallbacks.forEach((cb) => cb(sessionId, {
+            id: 'msg-qwen-e2e-slow',
+            sessionId,
+            kind: 'text',
+            role: 'assistant',
+            content: 'Qwen: slow first',
+            timestamp: Date.now(),
+            status: 'complete',
+            metadata: { model: this.modelBySession.get(sessionId), usage: { input_tokens: 10, output_tokens: 3, cache_read_input_tokens: 1 } },
+          }));
+        });
+        return;
+      }
       this.deltaCallbacks.forEach((cb) => cb(sessionId, {
         messageId: 'msg-qwen-e2e',
         type: 'text',
@@ -98,6 +126,12 @@ const mocks = vi.hoisted(() => {
         status: 'complete',
         metadata: { model: this.modelBySession.get(sessionId), usage: { input_tokens: 10, output_tokens: 3, cache_read_input_tokens: 1 } },
       }));
+    }
+
+    flushPending(sessionId: string) {
+      const flush = this.pendingCompletes.get(sessionId);
+      this.pendingCompletes.delete(sessionId);
+      flush?.();
     }
   }
 
@@ -336,5 +370,72 @@ describe('qwen transport flow e2e', () => {
 
     const final = mocks.emitted.find((e) => e.session === SESSION && e.type === 'assistant.text' && e.payload.streaming === false);
     expect(final?.payload.text).toBe('Qwen: hello after restart');
+  });
+
+  it('keeps queued transport messages stable across timeline and session list updates', async () => {
+    await launchSession({
+      name: SESSION,
+      projectName: 'qwene2e',
+      role: 'brain',
+      agentType: 'qwen',
+      projectDir: '/tmp/qwen-e2e',
+    });
+
+    const serverLink = { send: vi.fn(), daemonVersion: 'test' } as any;
+    handleWebCommand({
+      type: 'session.send',
+      session: SESSION,
+      text: 'slow first',
+      commandId: 'cmd-qwen-slow',
+    }, serverLink);
+    await flushAsync();
+
+    handleWebCommand({
+      type: 'session.send',
+      session: SESSION,
+      text: 'queued second',
+      commandId: 'cmd-qwen-queued',
+    }, serverLink);
+    await flushAsync();
+
+    const queuedState = mocks.emitted.find((e) =>
+      e.session === SESSION
+      && e.type === 'session.state'
+      && e.payload.state === 'queued'
+      && Array.isArray(e.payload.pendingMessageEntries)
+      && e.payload.pendingMessageEntries.some((entry: { clientMessageId: string; text: string }) =>
+        entry.clientMessageId === 'cmd-qwen-queued' && entry.text === 'queued second'),
+    );
+    expect(queuedState).toBeTruthy();
+
+    handleWebCommand({ type: 'get_sessions' }, serverLink);
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session_list',
+      sessions: expect.arrayContaining([
+        expect.objectContaining({
+          name: SESSION,
+          transportPendingMessages: ['queued second'],
+          transportPendingMessageEntries: [
+            { clientMessageId: 'cmd-qwen-queued', text: 'queued second' },
+          ],
+        }),
+      ]),
+    }));
+
+    const provider = (await import('../../src/agent/provider-registry.js')).getProvider('qwen') as InstanceType<typeof mocks.MockQwenProvider> | undefined;
+    const stored = mocks.store.get(SESSION);
+    const providerSessionId = typeof stored?.providerSessionId === 'string' ? stored.providerSessionId : '';
+    expect(providerSessionId).toBeTruthy();
+    provider?.flushPending(providerSessionId);
+    await flushAsync();
+
+    const drainedUser = mocks.emitted.find((e) =>
+      e.session === SESSION
+      && e.type === 'user.message'
+      && e.payload.clientMessageId === 'cmd-qwen-queued'
+    );
+    expect(drainedUser?.payload.text).toBe('queued second');
   });
 });

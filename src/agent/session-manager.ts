@@ -888,6 +888,7 @@ const transportRuntimes = new Map<string, TransportSessionRuntime>();
 
 /** Wire up onStatusChange and onDrain callbacks for a transport runtime. */
 function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: string): void {
+  const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
   runtime.onStatusChange = (status) => {
     // Emit assistant.thinking for chat typing indicator (matches tmux watcher behavior)
     if (status === 'thinking') {
@@ -901,8 +902,18 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       pendingMessageEntries: runtime.pendingEntries,
     }, { source: 'daemon', confidence: 'high' });
   };
-  runtime.onDrain = (merged, count) => {
-    timelineEmitter.emit(sessionName, 'user.message', { text: merged, batchedCount: count, allowDuplicate: true });
+  runtime.onDrain = (messages, merged, count) => {
+    for (const entry of messages) {
+      timelineEmitter.emit(
+        sessionName,
+        'user.message',
+        { text: entry.text, clientMessageId: entry.clientMessageId, allowDuplicate: true },
+        { source: 'daemon', confidence: 'high', eventId: transportUserEventId(entry.clientMessageId) },
+      );
+    }
+    if (messages.length === 0) {
+      timelineEmitter.emit(sessionName, 'user.message', { text: merged, batchedCount: count, allowDuplicate: true });
+    }
     timelineEmitter.emit(sessionName, 'session.state', {
       state: 'running',
       pendingCount: runtime.pendingCount,

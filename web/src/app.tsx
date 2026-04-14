@@ -1301,10 +1301,16 @@ export function App() {
             quotaMeta: s.quotaMeta ?? existing?.quotaMeta,
             effort: s.effort ?? existing?.effort,
             transportPendingMessages: (s.state === 'queued' || s.state === 'running')
-              ? (existing?.transportPendingMessages ?? [])
+              ? (() => {
+                  const nextPending = extractTransportPendingMessages((s as { transportPendingMessages?: unknown }).transportPendingMessages);
+                  return nextPending.length > 0 ? nextPending : (existing?.transportPendingMessages ?? []);
+                })()
               : [],
             transportPendingMessageEntries: (s.state === 'queued' || s.state === 'running')
-              ? (existing?.transportPendingMessageEntries ?? [])
+              ? (() => {
+                  const nextPending = extractTransportPendingMessageEntries((s as { transportPendingMessageEntries?: unknown }).transportPendingMessageEntries);
+                  return nextPending.length > 0 ? nextPending : (existing?.transportPendingMessageEntries ?? []);
+                })()
               : [],
           };
         }));

@@ -202,6 +202,10 @@ body {
   font-size: 11px;
 }
 .controls-queued-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
   padding: 7px 9px;
   border-radius: 8px;
   background: rgba(30, 41, 59, 0.88);
@@ -213,6 +217,37 @@ body {
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-width: thin;
+}
+.controls-queued-item-text {
+  flex: 1;
+  min-width: 0;
+}
+.controls-queued-item-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.controls-queued-action {
+  border: none;
+  background: transparent;
+  color: #fcd34d;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0;
+}
+.controls-queued-action:hover { color: #fde68a; }
+.controls-queued-action-danger { color: #fda4af; }
+.controls-queued-action-danger:hover { color: #fecdd3; }
+.controls-queued-editing {
+  margin: 0 8px 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: #cbd5e1;
 }
 .attachment-badges { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 2px 2px; }
 .attachment-badge { display: inline-flex; align-items: center; gap: 4px; background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 2px 8px 2px 6px; font-size: 12px; color: #94a3b8; max-width: 200px; }

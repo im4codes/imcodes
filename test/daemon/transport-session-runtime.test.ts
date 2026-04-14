@@ -260,6 +260,27 @@ describe('TransportSessionRuntime', () => {
     expect(runtime.pendingCount).toBe(2);
   });
 
+  it('can edit and remove queued messages by clientMessageId', async () => {
+    runtime.send('first');
+    await flushDispatch();
+    runtime.send('queued1', 'msg-q1');
+    runtime.send('queued2', 'msg-q2');
+
+    expect(runtime.editPendingMessage('msg-q1', 'edited queued1')).toBe(true);
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'msg-q1', text: 'edited queued1' },
+      { clientMessageId: 'msg-q2', text: 'queued2' },
+    ]);
+
+    expect(runtime.removePendingMessage('msg-q2')).toEqual({
+      clientMessageId: 'msg-q2',
+      text: 'queued2',
+    });
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'msg-q1', text: 'edited queued1' },
+    ]);
+  });
+
   it('cancelled turns drain pending messages into the next turn', async () => {
     runtime.send('first');
     await flushDispatch();

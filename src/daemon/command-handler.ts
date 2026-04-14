@@ -596,6 +596,12 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'session.send':
       void handleSend(cmd, serverLink);
       break;
+    case 'session.edit_queued_message':
+      void handleEditQueuedTransportMessage(cmd, serverLink);
+      break;
+    case 'session.undo_queued_message':
+      void handleUndoQueuedTransportMessage(cmd, serverLink);
+      break;
     case 'session.input':
       void handleInput(cmd);
       break;
@@ -1379,8 +1385,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // Transport sessions — route directly to the provider runtime, bypassing tmux.
   const transportRuntime = getTransportRuntime(sessionName);
   const record = (await import('../store/session-store.js')).getSession(sessionName);
-  const emitTransportUserMessage = (payloadText: string, extra?: Record<string, unknown>) => {
-    timelineEmitter.emit(sessionName, 'user.message', { text: payloadText, allowDuplicate: true, ...(extra ?? {}) });
+  const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
+  const emitTransportUserMessage = (payloadText: string, extra?: Record<string, unknown>, eventId?: string) => {
+    timelineEmitter.emit(
+      sessionName,
+      'user.message',
+      { text: payloadText, allowDuplicate: true, ...(extra ?? {}) },
+      eventId ? { source: 'daemon', confidence: 'high', eventId } : undefined,
+    );
   };
   if (!transportRuntime && record?.runtimeType === 'transport') {
     // No runtime — provider not connected. Show error in chat.
@@ -1592,7 +1604,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       // Status changes come from transport runtime's onStatusChange callback.
       const result = transportRuntime.send(text, effectiveId);
       if (result === 'sent') {
-        emitTransportUserMessage(text);
+        emitTransportUserMessage(
+          text,
+          { clientMessageId: effectiveId },
+          transportUserEventId(effectiveId),
+        );
       }
       if (result === 'queued') {
         timelineEmitter.emit(sessionName, 'session.state', {
@@ -1674,6 +1690,77 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     }
   } catch (err) {
     logger.error({ sessionName, err }, 'session.send failed');
+  } finally {
+    release();
+  }
+}
+
+async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const sessionName = typeof cmd.sessionName === 'string' ? cmd.sessionName : '';
+  const clientMessageId = typeof cmd.clientMessageId === 'string' ? cmd.clientMessageId.trim() : '';
+  const text = typeof cmd.text === 'string' ? cmd.text.trim() : '';
+  const commandId = typeof cmd.commandId === 'string' && cmd.commandId.trim()
+    ? cmd.commandId.trim()
+    : `edit-queued-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  if (!sessionName || !clientMessageId || !text) return;
+  const runtime = getTransportRuntime(sessionName);
+  const record = getSession(sessionName);
+  if (!runtime || record?.runtimeType !== 'transport') {
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Transport session unavailable' });
+    try { serverLink.send({ type: 'command.ack', commandId, status: 'error', session: sessionName, error: 'Transport session unavailable' }); } catch {}
+    return;
+  }
+  const release = await getMutex(sessionName).acquire();
+  try {
+    const edited = runtime.editPendingMessage(clientMessageId, text);
+    if (!edited) {
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Queued message not found' });
+      try { serverLink.send({ type: 'command.ack', commandId, status: 'error', session: sessionName, error: 'Queued message not found' }); } catch {}
+      return;
+    }
+    timelineEmitter.emit(sessionName, 'session.state', {
+      state: runtime.sending ? 'queued' : 'idle',
+      pendingCount: runtime.pendingCount,
+      pendingMessages: runtime.pendingMessages,
+      pendingMessageEntries: runtime.pendingEntries,
+    }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
+    try { serverLink.send({ type: 'command.ack', commandId, status: 'accepted', session: sessionName }); } catch {}
+  } finally {
+    release();
+  }
+}
+
+async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const sessionName = typeof cmd.sessionName === 'string' ? cmd.sessionName : '';
+  const clientMessageId = typeof cmd.clientMessageId === 'string' ? cmd.clientMessageId.trim() : '';
+  const commandId = typeof cmd.commandId === 'string' && cmd.commandId.trim()
+    ? cmd.commandId.trim()
+    : `undo-queued-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  if (!sessionName || !clientMessageId) return;
+  const runtime = getTransportRuntime(sessionName);
+  const record = getSession(sessionName);
+  if (!runtime || record?.runtimeType !== 'transport') {
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Transport session unavailable' });
+    try { serverLink.send({ type: 'command.ack', commandId, status: 'error', session: sessionName, error: 'Transport session unavailable' }); } catch {}
+    return;
+  }
+  const release = await getMutex(sessionName).acquire();
+  try {
+    const removed = runtime.removePendingMessage(clientMessageId);
+    if (!removed) {
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error: 'Queued message not found' });
+      try { serverLink.send({ type: 'command.ack', commandId, status: 'error', session: sessionName, error: 'Queued message not found' }); } catch {}
+      return;
+    }
+    timelineEmitter.emit(sessionName, 'session.state', {
+      state: runtime.sending ? 'queued' : 'idle',
+      pendingCount: runtime.pendingCount,
+      pendingMessages: runtime.pendingMessages,
+      pendingMessageEntries: runtime.pendingEntries,
+    }, { source: 'daemon', confidence: 'high' });
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
+    try { serverLink.send({ type: 'command.ack', commandId, status: 'accepted', session: sessionName }); } catch {}
   } finally {
     release();
   }

@@ -65,9 +65,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   /** Messages queued while a turn is in flight. Drained and merged on turn completion. */
   private _pendingMessages: PendingTransportMessage[] = [];
 
-  /** Callback fired when pending messages are drained into a new turn.
-   *  Allows command-handler to emit timeline events for the batched send. */
-  private _onDrain?: (mergedMessage: string, count: number) => void;
+  /** Callback fired when pending messages are drained into a new turn. */
+  private _onDrain?: (messages: PendingTransportMessage[], mergedMessage: string, count: number) => void;
   private _onSessionInfoChange?: (info: SessionInfoUpdate) => void;
 
   constructor(
@@ -115,7 +114,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   set onStatusChange(cb: (status: AgentStatus) => void) { this._onStatusChange = cb; }
 
   /** Register a callback for when pending messages are drained into a new turn. */
-  set onDrain(cb: (mergedMessage: string, count: number) => void) { this._onDrain = cb; }
+  set onDrain(cb: (messages: PendingTransportMessage[], mergedMessage: string, count: number) => void) { this._onDrain = cb; }
   /** Register a callback for provider session metadata updates. */
   set onSessionInfoChange(cb: (info: SessionInfoUpdate) => void) { this._onSessionInfoChange = cb; }
 
@@ -193,6 +192,23 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     this._dispatchTurn(message);
     return 'sent';
+  }
+
+  editPendingMessage(clientMessageId: string, text: string): boolean {
+    const nextText = text.trim();
+    if (!clientMessageId || !nextText) return false;
+    const entry = this._pendingMessages.find((item) => item.clientMessageId === clientMessageId);
+    if (!entry) return false;
+    entry.text = nextText;
+    return true;
+  }
+
+  removePendingMessage(clientMessageId: string): PendingTransportMessage | null {
+    if (!clientMessageId) return null;
+    const index = this._pendingMessages.findIndex((item) => item.clientMessageId === clientMessageId);
+    if (index < 0) return null;
+    const [removed] = this._pendingMessages.splice(index, 1);
+    return removed ?? null;
   }
 
   async cancel(): Promise<void> {
@@ -313,7 +329,7 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     const messages = this._pendingMessages.splice(0);
     const merged = messages.map((entry) => entry.text).join('\n\n');
-    this._onDrain?.(merged, messages.length);
+    this._onDrain?.(messages, merged, messages.length);
     this._dispatchTurn(merged);
     return true;
   }

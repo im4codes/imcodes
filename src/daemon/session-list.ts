@@ -6,6 +6,7 @@ import { getQwenOAuthQuotaUsageLabel } from '../agent/provider-quota.js';
 import { getClaudeSdkRuntimeConfig } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
+import { getTransportRuntime } from '../agent/session-manager.js';
 
 export interface SessionListItem {
   name: string;
@@ -33,9 +34,12 @@ export interface SessionListItem {
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel;
   description?: string;
   label?: string;
+  transportPendingMessages?: string[];
+  transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }>;
 }
 
 function baseItem(s: SessionRecord): SessionListItem {
+  const runtime = s.runtimeType === 'transport' ? getTransportRuntime(s.name) : undefined;
   return {
     name: s.name,
     project: s.projectName,
@@ -62,6 +66,8 @@ function baseItem(s: SessionRecord): SessionListItem {
     effort: s.effort,
     description: s.description,
     label: s.label,
+    transportPendingMessages: runtime?.pendingMessages ?? [],
+    transportPendingMessageEntries: runtime?.pendingEntries ?? [],
   };
 }
 

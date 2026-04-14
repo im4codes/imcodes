@@ -165,6 +165,7 @@ export function SubSessionWindow({
     effort: sub.effort ?? undefined,
     runtimeType: sub.runtimeType ?? undefined,
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
+    transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
   };
 
   useEffect(() => {
