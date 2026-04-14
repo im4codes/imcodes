@@ -1,8 +1,9 @@
-import { useState, useRef, useEffect } from 'preact/hooks';
+import { useState, useRef, useEffect, useCallback } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { apiFetch } from '../api.js';
 import { FileBrowser } from './FileBrowser.js';
 import type { WsClient } from '../ws-client.js';
+import type { JSX, RefObject } from 'preact';
 
 export interface QuickData {
   history: string[];                        // cross-session
@@ -219,6 +220,7 @@ interface Props {
   ws?: WsClient | null;
   sessionCwd?: string;
   onAppendPaths?: (paths: string[]) => void;
+  anchorRef?: RefObject<HTMLElement>;
 }
 
 const HISTORY_PAGE_SIZE = 10;
@@ -239,7 +241,7 @@ export function QuickInputPanel({
   data, loaded,
   onAddCommand, onAddPhrase, onRemoveCommand, onRemovePhrase,
   onRemoveHistory, onRemoveSessionHistory, onClearHistory, onClearSessionHistory,
-  ws, sessionCwd, onAppendPaths,
+  ws, sessionCwd, onAppendPaths, anchorRef,
 }: Props) {
   const { t } = useTranslation();
   const panelRef = useRef<HTMLDivElement>(null);
@@ -253,9 +255,24 @@ export function QuickInputPanel({
   const [historyScope, setHistoryScope] = useState<HistoryScope>('session');
   const [activeTab, setActiveTab] = useState<QpTab>('quick');
   const [insertedPaths, setInsertedPaths] = useState<string[]>([]);
+  const [layoutTick, setLayoutTick] = useState(0);
 
   // Reset page when scope or session changes
   useEffect(() => { setHistoryPage(0); }, [historyScope, sessionName]);
+
+  useEffect(() => {
+    if (!open || typeof window === 'undefined') return;
+    const refreshLayout = () => setLayoutTick((tick) => tick + 1);
+    const viewport = window.visualViewport;
+    window.addEventListener('resize', refreshLayout);
+    viewport?.addEventListener('resize', refreshLayout);
+    viewport?.addEventListener('scroll', refreshLayout);
+    return () => {
+      window.removeEventListener('resize', refreshLayout);
+      viewport?.removeEventListener('resize', refreshLayout);
+      viewport?.removeEventListener('scroll', refreshLayout);
+    };
+  }, [open]);
 
   // Close on outside click
   useEffect(() => {
@@ -334,10 +351,42 @@ export function QuickInputPanel({
     if (e.key === 'Escape') { setEditingItem(null); setEditValue(''); }
   };
 
+  const panelStyle = useCallback(() => {
+    if (typeof window === 'undefined' || window.innerWidth <= 640) return undefined;
+    const trigger = anchorRef?.current;
+    if (!trigger) return undefined;
+    const rect = trigger.getBoundingClientRect();
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+    const horizontalInset = 8;
+    const verticalInset = 12;
+    const triggerGap = 6;
+    const width = Math.max(240, Math.min(Math.floor(viewportWidth * 0.75), 1050, viewportWidth - horizontalInset * 2));
+    const maxLeft = Math.max(horizontalInset, viewportWidth - width - horizontalInset);
+    const left = Math.min(Math.max(rect.left, horizontalInset), maxLeft);
+    const availableAbove = Math.max(120, Math.floor(rect.top - verticalInset));
+    const availableBelow = Math.max(120, Math.floor(viewportHeight - rect.bottom - verticalInset));
+    const shouldOpenBelow = availableBelow >= 260 || availableBelow >= availableAbove;
+
+    const style: JSX.CSSProperties = {
+      position: 'fixed',
+      left: `${Math.round(left)}px`,
+      width: `${Math.round(width)}px`,
+      maxWidth: `${Math.round(width)}px`,
+      maxHeight: `${shouldOpenBelow ? availableBelow : availableAbove}px`,
+      zIndex: 10002,
+    } as preact.JSX.CSSProperties;
+
+    if (shouldOpenBelow) style.top = `${Math.max(Math.round(rect.bottom + triggerGap), horizontalInset)}px`;
+    else style.bottom = `${Math.max(viewportHeight - rect.top + triggerGap, horizontalInset)}px`;
+
+    return style;
+  }, [anchorRef, layoutTick])();
+
   return (
     <>
       <div class="qp-backdrop" onClick={onClose} />
-      <div class="qp" ref={panelRef}>
+      <div class="qp" ref={panelRef} style={panelStyle}>
         {/* Tab bar — shown when Files feature is available */}
         {ws && (
           <div class="qp-tabs">

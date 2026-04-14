@@ -1,9 +1,9 @@
 /**
  * @vitest-environment jsdom
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
-import { render, screen, fireEvent } from '@testing-library/preact';
+import { render, screen, fireEvent, cleanup } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -38,6 +38,100 @@ vi.mock('../../src/components/FileBrowser.js', () => ({ FileBrowser: () => null 
 import { QuickInputPanel, type QuickData } from '../../src/components/QuickInputPanel.js';
 
 describe('QuickInputPanel history scope', () => {
+  const defaultWidth = window.innerWidth;
+  const defaultHeight = window.innerHeight;
+
+  beforeEach(() => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: defaultWidth });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: defaultHeight });
+  });
+
+  afterEach(() => {
+    cleanup();
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: defaultWidth });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: defaultHeight });
+  });
+
+  it('opens below the trigger when the quick-input trigger is high in the viewport', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 844 });
+    const anchor = document.createElement('div');
+    anchor.getBoundingClientRect = () => ({
+      x: 248, y: 0, top: 92, left: 248, right: 328, bottom: 120, width: 80, height: 28,
+      toJSON() { return {}; },
+    } as DOMRect);
+
+    const { container } = render(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={vi.fn()}
+        agentType="claude-code"
+        sessionName="session-a"
+        data={{ history: [], sessionHistory: {}, commands: [], phrases: [] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+        anchorRef={{ current: anchor }}
+      />,
+    );
+
+    const panel = container.querySelector('.qp') as HTMLElement;
+    expect(panel.style.position).toBe('fixed');
+    expect(panel.style.top).toBe('126px');
+    expect(panel.style.bottom).toBe('');
+    expect(panel.style.left).toBe('248px');
+    expect(panel.style.width).toBe('960px');
+    expect(panel.style.maxHeight).toBe('712px');
+  });
+
+  it('opens above the trigger when the quick-input trigger is low in the viewport', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 844 });
+    const anchor = document.createElement('div');
+    anchor.getBoundingClientRect = () => ({
+      x: 248, y: 0, top: 700, left: 248, right: 328, bottom: 728, width: 80, height: 28,
+      toJSON() { return {}; },
+    } as DOMRect);
+
+    const { container } = render(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={vi.fn()}
+        agentType="claude-code"
+        sessionName="session-a"
+        data={{ history: [], sessionHistory: {}, commands: [], phrases: [] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+        anchorRef={{ current: anchor }}
+      />,
+    );
+
+    const panel = container.querySelector('.qp') as HTMLElement;
+    expect(panel.style.position).toBe('fixed');
+    expect(panel.style.top).toBe('');
+    expect(panel.style.bottom).toBe('150px');
+    expect(panel.style.left).toBe('248px');
+    expect(panel.style.width).toBe('960px');
+    expect(panel.style.maxHeight).toBe('688px');
+  });
+
   it('shows account-wide history when All is selected, including entries from other sessions', () => {
     const data: QuickData = {
       history: ['global shared'],
