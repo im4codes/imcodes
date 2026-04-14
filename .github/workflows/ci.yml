@@ -9,7 +9,7 @@ on:
     branches: [main, master]
 
 env:
-  NODE_VERSION_PRIMARY: '22'
+  NODE_VERSION_PRIMARY: '24'
 
 jobs:
   # ── Lint ──────────────────────────────────────────────────────────────────
@@ -67,7 +67,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node: ['22', '24']
+        node: ['22', '24', '26']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

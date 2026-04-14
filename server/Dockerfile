@@ -1,7 +1,9 @@
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
-FROM node:24-alpine AS builder
+FROM public.ecr.aws/docker/library/node:24-bookworm-slim AS builder
 
-RUN apk add --no-cache zip python3 make gcc g++
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends zip python3 make g++ \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -38,7 +40,7 @@ RUN mkdir -p /app/updates \
 RUN cd server && npm run build
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
-FROM node:24-alpine AS runtime
+FROM public.ecr.aws/docker/library/node:24-bookworm-slim AS runtime
 
 WORKDIR /app
 
