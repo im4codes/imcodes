@@ -30,6 +30,8 @@ import { FloatingPanel } from './components/FloatingPanel.js';
 import { SettingsPage } from './pages/SettingsPage.js';
 import { AdminPage } from './pages/AdminPage.js';
 import { CronManager } from './pages/CronManager.js';
+import { SharedContextManagementPanel } from './components/SharedContextManagementPanel.js';
+import { ContextDiagnosticsPanel } from './components/ContextDiagnosticsPanel.js';
 import { NewUserGuide, type NewUserGuideStep } from './components/NewUserGuide.js';
 import { ServerIconBar } from './components/ServerIconBar.js';
 import { Sidebar, loadSidebarCollapsed, saveSidebarCollapsed } from './components/Sidebar.js';
@@ -82,6 +84,15 @@ const nativeCallback = typeof window !== 'undefined'
   : null;
 
 type ViewMode = TerminalSubscribeViewMode;
+
+type SharedContextDiagnosticsWindowState = {
+  enterpriseId?: string;
+  canonicalRepoId?: string;
+  workspaceId?: string;
+  enrollmentId?: string;
+  language?: string;
+  filePath?: string;
+};
 
 function buildSessionToastLabel(
   sessionName: string,
@@ -783,6 +794,10 @@ export function App() {
   const [showSettingsPage, setShowSettingsPage] = useState(false);
   const [showCronManager, setShowCronManager] = useState(false);
   const [showAdminPage, setShowAdminPage] = useState(false);
+  const [showSharedContextManagement, setShowSharedContextManagement] = useState(false);
+  const [showSharedContextDiagnostics, setShowSharedContextDiagnostics] = useState(false);
+  const [sharedContextManagementProps, setSharedContextManagementProps] = useState<Record<string, unknown>>({});
+  const [sharedContextDiagnosticsProps, setSharedContextDiagnosticsProps] = useState<SharedContextDiagnosticsWindowState>({});
   const [isAdmin, setIsAdmin] = useState(false);
   const [userDisplayName, setUserDisplayName] = useState<string | null>(null);
   const [username, setUsername] = useState<string | null>(null);
@@ -1089,6 +1104,19 @@ export function App() {
       setShowRepoPage(true);
     } else if (panel.type === 'cronmanager') {
       setShowCronManager(true);
+    } else if (panel.type === SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE) {
+      setSharedContextManagementProps(panel.props);
+      setShowSharedContextManagement(true);
+    } else if (panel.type === SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE) {
+      setSharedContextDiagnosticsProps({
+        enterpriseId: typeof panel.props?.enterpriseId === 'string' ? panel.props.enterpriseId : undefined,
+        canonicalRepoId: typeof panel.props?.canonicalRepoId === 'string' ? panel.props.canonicalRepoId : undefined,
+        workspaceId: typeof panel.props?.workspaceId === 'string' ? panel.props.workspaceId : undefined,
+        enrollmentId: typeof panel.props?.enrollmentId === 'string' ? panel.props.enrollmentId : undefined,
+        language: typeof panel.props?.language === 'string' ? panel.props.language : undefined,
+        filePath: typeof panel.props?.filePath === 'string' ? panel.props.filePath : undefined,
+      });
+      setShowSharedContextDiagnostics(true);
     } else if (panel.type === LOCAL_WEB_PREVIEW_PANEL_TYPE) {
       setLocalWebPreviewPort(String(panel.props?.port ?? ''));
       setLocalWebPreviewPath(String(panel.props?.path ?? '/'));
@@ -2366,14 +2394,17 @@ export function App() {
               <button
                 class="btn"
                 style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }}
-                onClick={() => pinPanel(SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE, { serverId: selectedServerId })}
+                onClick={() => {
+                  setSharedContextManagementProps((prev) => ({ ...prev, serverId: selectedServerId }));
+                  setShowSharedContextManagement(true);
+                }}
               >
                 {trans('sharedContext.management.title')}
               </button>
               <button
                 class="btn"
                 style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }}
-                onClick={() => pinPanel(SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE, { serverId: selectedServerId })}
+                onClick={() => setShowSharedContextDiagnostics(true)}
               >
                 {trans('sharedContext.diagnostics.title')}
               </button>
@@ -2843,12 +2874,19 @@ export function App() {
                 >⚙</button>
                 <button
                   class="mobile-sidebar-hdr-btn"
-                  onClick={() => pinPanel(SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE, { serverId: selectedServerId })}
+                  onClick={() => {
+                    setSharedContextManagementProps((prev) => ({ ...prev, serverId: selectedServerId }));
+                    setShowSharedContextManagement(true);
+                    closeSidebar();
+                  }}
                   title={trans('sharedContext.management.title')}
                 >CTX</button>
                 <button
                   class="mobile-sidebar-hdr-btn"
-                  onClick={() => pinPanel(SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE, { serverId: selectedServerId })}
+                  onClick={() => {
+                    setShowSharedContextDiagnostics(true);
+                    closeSidebar();
+                  }}
                   title={trans('sharedContext.diagnostics.title')}
                 >DBG</button>
                 <button
@@ -3120,6 +3158,53 @@ export function App() {
           </FloatingPanel>
         ) : null;
       })()}
+
+      {showSharedContextManagement && (
+        <FloatingPanel
+          id="shared-context-management"
+          title={trans('sharedContext.management.title')}
+          onClose={() => setShowSharedContextManagement(false)}
+          onPin={() => pinPanel(
+            SHARED_CONTEXT_MANAGEMENT_PANEL_TYPE,
+            { ...sharedContextManagementProps, serverId: selectedServerId },
+            () => setShowSharedContextManagement(false),
+          )}
+          pinTooltip={trans('sidebar.pin_to_sidebar')}
+          defaultW={760}
+          defaultH={620}
+        >
+          <SharedContextManagementPanel
+            enterpriseId={typeof sharedContextManagementProps.enterpriseId === 'string' ? sharedContextManagementProps.enterpriseId : undefined}
+            onEnterpriseChange={(enterpriseId) => setSharedContextManagementProps((prev) => ({ ...prev, enterpriseId, serverId: selectedServerId }))}
+          />
+        </FloatingPanel>
+      )}
+
+      {showSharedContextDiagnostics && (
+        <FloatingPanel
+          id="shared-context-diagnostics"
+          title={trans('sharedContext.diagnostics.title')}
+          onClose={() => setShowSharedContextDiagnostics(false)}
+          onPin={() => pinPanel(
+            SHARED_CONTEXT_DIAGNOSTICS_PANEL_TYPE,
+            { ...sharedContextDiagnosticsProps, serverId: selectedServerId },
+            () => setShowSharedContextDiagnostics(false),
+          )}
+          pinTooltip={trans('sidebar.pin_to_sidebar')}
+          defaultW={760}
+          defaultH={620}
+        >
+          <ContextDiagnosticsPanel
+            enterpriseId={sharedContextDiagnosticsProps.enterpriseId}
+            canonicalRepoId={sharedContextDiagnosticsProps.canonicalRepoId}
+            workspaceId={sharedContextDiagnosticsProps.workspaceId}
+            enrollmentId={sharedContextDiagnosticsProps.enrollmentId}
+            language={sharedContextDiagnosticsProps.language}
+            filePath={sharedContextDiagnosticsProps.filePath}
+            onStateChange={(next) => setSharedContextDiagnosticsProps(next)}
+          />
+        </FloatingPanel>
+      )}
 
       {showAdminPage && (
         <div style={{ position: 'fixed', inset: 0, zIndex: 9999, background: '#0a0e1a', paddingTop: 'var(--sat, 0px)' }}>
