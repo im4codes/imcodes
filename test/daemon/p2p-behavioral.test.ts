@@ -3,7 +3,7 @@
  * Covers: rounds clamping via startP2pRun, extraPrompt in buildHopPrompt.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { buildHopPrompt, type P2pRun, type HopOpts } from '../../src/daemon/p2p-orchestrator.js';
+import { buildHopPrompt, buildPostSummaryExecutionPrompt, type P2pRun, type HopOpts } from '../../src/daemon/p2p-orchestrator.js';
 import { getP2pMode } from '../../shared/p2p-modes.js';
 
 // ── buildHopPrompt tests ──────────────────────────────────────────────────────
@@ -142,7 +142,7 @@ describe('buildHopPrompt — production function', () => {
     expect(prompt).toContain('If you wrote the plan to another file, still append a short note under "## brain — Final Summary" in the discussion file');
   });
 
-  it('repeats the original user request in final-summary instructions', () => {
+  it('does not repeat the original user request inside final-summary instructions', () => {
     const mode = getP2pMode('plan');
     const run = makeRun({
       mode: 'plan',
@@ -155,11 +155,11 @@ describe('buildHopPrompt — production function', () => {
       isInitial: false,
     });
 
-    expect(prompt).toContain('The original user request is: "implement the requested feature, not just summarize the discussion"');
+    expect(prompt).not.toContain('The original user request is: "implement the requested feature, not just summarize the discussion"');
     expect(prompt).toContain('After synthesizing, directly fulfill the request.');
   });
 
-  it('localizes the final-summary original-request reminder when a locale is set', () => {
+  it('does not inject the localized original-request reminder into final-summary instructions', () => {
     const mode = getP2pMode('plan');
     const run = makeRun({
       mode: 'plan',
@@ -173,8 +173,31 @@ describe('buildHopPrompt — production function', () => {
       isInitial: false,
     });
 
-    expect(prompt).toContain('用户的原始请求是："根据讨论结果真正完成这个需求"');
-    expect(prompt).toContain('不要只停留在讨论总结');
+    expect(prompt).not.toContain('用户的原始请求是："根据讨论结果真正完成这个需求"');
+    expect(prompt).toContain('在写总结后执行最终任务。');
+  });
+
+  it('builds a post-summary execution prompt that directly fulfills the original request', () => {
+    const prompt = buildPostSummaryExecutionPrompt(makeRun({
+      contextFilePath: '/tmp/test-discussion.md',
+      userText: 'implement the requested feature',
+    }));
+
+    expect(prompt).toContain('/tmp/test-discussion.md');
+    expect(prompt).toContain('implement the requested feature');
+    expect(prompt).toContain('Do not stop at another discussion summary');
+  });
+
+  it('localizes the post-summary execution prompt when a locale is set', () => {
+    const prompt = buildPostSummaryExecutionPrompt(makeRun({
+      contextFilePath: '/tmp/test-discussion.md',
+      locale: 'zh-CN',
+      userText: '根据讨论结果真正完成这个需求',
+    }));
+
+    expect(prompt).toContain('/tmp/test-discussion.md');
+    expect(prompt).toContain('根据讨论结果真正完成这个需求');
+    expect(prompt).toContain('不要再次停留在讨论总结');
   });
 });
 

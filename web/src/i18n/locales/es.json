@@ -325,6 +325,7 @@
   },
   "p2p": {
     "final_original_request_reminder": "No te quedes solo en el resumen de la discusión. Después de sintetizarla, asegúrate de responder y ejecutar directamente la solicitud original del usuario.\nLa solicitud original del usuario es: \"{{request}}\"",
+    "post_summary_execute_prompt": "La discusión P2P ha terminado. Usa el archivo de discusión como contexto y luego cumple directamente la solicitud original del usuario en esta sesión.\nArchivo de discusión: {{discussionFile}}\nLa solicitud original del usuario es: \"{{request}}\"\nNo te quedes otra vez solo en un resumen de la discusión.",
     "ring": {
       "active": "R{{round}}/{{totalRounds}}",
       "label_active": "Round {{round}}/{{totalRounds}}",

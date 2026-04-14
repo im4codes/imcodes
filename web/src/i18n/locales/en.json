@@ -326,6 +326,7 @@
   },
   "p2p": {
     "final_original_request_reminder": "After synthesizing the discussion, directly address and fulfill the user's original request instead of stopping at a discussion summary.\nThe original user request is: \"{{request}}\"",
+    "post_summary_execute_prompt": "The P2P discussion is complete. Use the discussion file as context, then directly fulfill the user's original request in this session.\nDiscussion file: {{discussionFile}}\nThe original user request is: \"{{request}}\"\nDo not stop at another discussion summary.",
     "ring": {
       "active": "R{{round}}/{{totalRounds}}",
       "label_active": "Round {{round}}/{{totalRounds}}",

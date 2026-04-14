@@ -326,6 +326,7 @@
   },
   "p2p": {
     "final_original_request_reminder": "在完成討論綜合後，務必直接落實並完整回應使用者的原始請求，不要只停留在討論總結。\n使用者的原始請求是：「{{request}}」",
+    "post_summary_execute_prompt": "P2P 討論已完成。請把討論檔案作為上下文，然後在目前工作階段中直接落實並完成使用者的原始請求。\n討論檔案：{{discussionFile}}\n使用者的原始請求是：「{{request}}」\n不要再次停留在討論總結。",
     "ring": {
       "active": "R{{round}}/{{totalRounds}}",
       "label_active": "Round {{round}}/{{totalRounds}}",

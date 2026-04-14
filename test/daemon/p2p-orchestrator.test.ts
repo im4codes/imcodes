@@ -319,6 +319,37 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect((summaryDispatch?.at ?? 0)).toBeGreaterThan((w2Idle?.at ?? 0));
   });
 
+  it('sends the original user request as a follow-up prompt after final summary completes', async () => {
+    const prompts: Array<{ session: string; prompt: string }> = [];
+
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      prompts.push({ session, prompt });
+      if (prompt.includes('[P2P Discussion Task')) {
+        const filePath = pathFromPrompt(prompt);
+        const heading = headingFromPrompt(prompt);
+        await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
+        setTimeout(() => notifySessionIdle(session), 20);
+      }
+    });
+
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'implement the requested feature after the discussion',
+      [],
+      serverLinkMock as any,
+    );
+
+    await waitForStatus(run.id, ['completed']);
+
+    const followUp = prompts.at(-1);
+    expect(followUp?.session).toBe('deck_proj_brain');
+    expect(followUp?.prompt).toContain('implement the requested feature after the discussion');
+    expect(followUp?.prompt).toContain('Do not stop at another discussion summary');
+    expect(followUp?.prompt).toContain(run.contextFilePath);
+    expect(followUp?.prompt).not.toContain('[P2P Discussion Task');
+  });
+
   it('retains completed hop evidence with best-effort fallback when exact baseline slicing is not possible', async () => {
     sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
       const filePath = pathFromPrompt(prompt);

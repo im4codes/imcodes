@@ -325,6 +325,7 @@
   },
   "p2p": {
     "final_original_request_reminder": "토론 요약으로 끝내지 말고, 논의를 종합한 뒤에는 반드시 원래 사용자 요청을 직접 완전히 처리하세요.\n원래 사용자 요청: \"{{request}}\"",
+    "post_summary_execute_prompt": "P2P 토론이 완료되었습니다. 토론 파일을 문맥으로 사용한 뒤, 이 세션에서 원래 사용자 요청을 직접 수행하세요.\n토론 파일: {{discussionFile}}\n원래 사용자 요청: \"{{request}}\"\n다시 토론 요약으로만 끝내지 마세요.",
     "ring": {
       "active": "R{{round}}/{{totalRounds}}",
       "label_active": "Round {{round}}/{{totalRounds}}",

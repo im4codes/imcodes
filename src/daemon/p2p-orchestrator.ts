@@ -169,6 +169,23 @@ function buildOriginalRequestReminder(userText: string, locale?: string): string
   return template.replace('{{request}}', userText);
 }
 
+const P2P_POST_SUMMARY_EXECUTE_TEMPLATES: Record<string, string> = {
+  en: enLocale.p2p.post_summary_execute_prompt,
+  'zh-CN': zhCNLocale.p2p.post_summary_execute_prompt,
+  'zh-TW': zhTWLocale.p2p.post_summary_execute_prompt,
+  ja: jaLocale.p2p.post_summary_execute_prompt,
+  ko: koLocale.p2p.post_summary_execute_prompt,
+  es: esLocale.p2p.post_summary_execute_prompt,
+  ru: ruLocale.p2p.post_summary_execute_prompt,
+};
+
+export function buildPostSummaryExecutionPrompt(run: Pick<P2pRun, 'contextFilePath' | 'userText' | 'locale'>): string {
+  const template = P2P_POST_SUMMARY_EXECUTE_TEMPLATES[run.locale ?? ''] ?? P2P_POST_SUMMARY_EXECUTE_TEMPLATES.en;
+  return template
+    .replaceAll('{{discussionFile}}', run.contextFilePath)
+    .replaceAll('{{request}}', run.userText);
+}
+
 export function getP2pRun(id: string): P2pRun | undefined { return activeRuns.get(id); }
 export function listP2pRuns(): P2pRun[] { return [...activeRuns.values()]; }
 
@@ -846,6 +863,22 @@ async function cleanupRoundHopArtifacts(roundHops: P2pHopRuntime[]): Promise<voi
   }));
 }
 
+async function dispatchPostSummaryExecutionPrompt(run: P2pRun): Promise<void> {
+  const prompt = buildPostSummaryExecutionPrompt(run);
+  const session = run.initiatorSession;
+  try {
+    const transportRuntime = getTransportRuntime(session);
+    if (transportRuntime) {
+      timelineEmitter.emit(session, 'user.message', { text: prompt, allowDuplicate: true });
+      transportRuntime.send(prompt);
+    } else {
+      await sendKeysDelayedEnter(session, prompt);
+    }
+  } catch (err) {
+    logger.warn({ runId: run.id, session, err }, 'P2P: failed to dispatch post-summary execution prompt');
+  }
+}
+
 function scheduleRoundHopArtifactCleanup(roundHops: P2pHopRuntime[]): void {
   if (roundHops.length === 0) return;
   if (ROUND_HOP_CLEANUP_DELAY_MS <= 0) {
@@ -1007,6 +1040,7 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
     p2pDiscussionId: run.discussionId,
     skippedHops: run.skippedHops,
   }, { source: 'daemon' });
+  await dispatchPostSummaryExecutionPrompt(run);
 
   // Keep in memory for a bit so status queries work, then clean up run entry only.
   // Discussion files are kept on disk (in .imc/discussions/) for history access.
@@ -1493,6 +1527,7 @@ async function executeAdvancedChain(run: P2pRun, serverLink: ServerLink | null):
   } catch { /* ignore */ }
   run.completedAt = new Date().toISOString();
   transition(run, 'completed', serverLink);
+  await dispatchPostSummaryExecutionPrompt(run);
   setTimeout(() => { activeRuns.delete(run.id); }, 60_000);
 }
 
@@ -1814,8 +1849,6 @@ export function buildHopPrompt(run: P2pRun, mode: P2pMode | undefined, opts: Hop
     parts.push(``);
     parts.push(`Final summary instructions:`);
     parts.push(opts.instruction);
-    parts.push(``);
-    parts.push(buildOriginalRequestReminder(run.userText, run.locale));
   } else {
     parts.push(`This is a dedicated discussion file for multi-agent analysis: ${filePath}`);
     parts.push(`All output MUST go into this file. Do NOT modify any other files or run any commands.`);

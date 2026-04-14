@@ -326,6 +326,7 @@
   },
   "p2p": {
     "final_original_request_reminder": "在完成讨论综合后，务必直接落实并完整回应用户的原始请求，不要只停留在讨论总结。\n用户的原始请求是：\"{{request}}\"",
+    "post_summary_execute_prompt": "P2P 讨论已经完成。请把讨论文件作为上下文，然后在当前会话里直接落实并完成用户的原始请求。\n讨论文件：{{discussionFile}}\n用户的原始请求是：\"{{request}}\"\n不要再次停留在讨论总结。",
     "ring": {
       "active": "R{{round}}/{{totalRounds}}",
       "label_active": "Round {{round}}/{{totalRounds}}",
