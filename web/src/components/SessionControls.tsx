@@ -379,6 +379,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const p2pRef = useRef<HTMLDivElement>(null);
   const openSpecRef = useRef<HTMLDivElement>(null);
   const openSpecDropdownRef = useRef<HTMLDivElement | null>(null);
+  const openSpecSubmenuRef = useRef<HTMLDivElement | null>(null);
   const openSpecButtonRef = useRef<HTMLButtonElement | null>(null);
   const openSpecAuditButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const openSpecProposeButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -666,6 +667,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
         && openSpecRef.current
         && !openSpecRef.current.contains(e.target as Node)
         && !openSpecDropdownRef.current?.contains(e.target as Node)
+        && !openSpecSubmenuRef.current?.contains(e.target as Node)
       ) {
         setOpenSpecOpen(false);
         setOpenSpecAuditMenu(null);
@@ -830,7 +832,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     }
     if (typeof document === 'undefined') return null;
     return createPortal(
-      <div class="menu-dropdown openspec-submenu" style={getOpenSpecSubmenuStyle(trigger, minWidth)}>
+      <div
+        class="menu-dropdown openspec-submenu"
+        ref={openSpecSubmenuRef}
+        style={getOpenSpecSubmenuStyle(trigger, minWidth)}
+      >
         {content}
       </div>,
       document.body,

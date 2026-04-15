@@ -1101,6 +1101,39 @@ afterEach(() => {
     expect(within(submenu).getByRole('button', { name: 'audit_spec_action' })).toBeDefined();
   });
 
+  it('keeps the desktop openspec audit submenu open when clicking inside the portal submenu', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'my-session', projectDir: '/repo', agentType: 'codex' })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+    ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'openspec-request',
+      status: 'ok',
+      resolvedPath: '/repo/openspec/changes',
+      entries: [
+        { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+      ],
+    });
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole('button', { name: 'audit_action' }));
+
+    const submenu = document.querySelector('.openspec-submenu') as HTMLElement;
+    expect(submenu).toBeTruthy();
+
+    fireEvent.mouseDown(within(submenu).getByRole('button', { name: 'audit_implementation_action' }));
+
+    expect(document.querySelector('.openspec-submenu')).toBeTruthy();
+    expect(screen.getByRole('button', { name: /openspec/i })).toBeDefined();
+  });
+
   it('collapses openspec actions behind a disclosure toggle on mobile', async () => {
     const innerWidth = window.innerWidth;
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
