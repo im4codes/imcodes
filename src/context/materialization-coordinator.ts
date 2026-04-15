@@ -223,16 +223,15 @@ function buildSummary(events: LocalContextEvent[]): string {
   if (decisions.length > 0) {
     sections.push(`- Key decisions: ${decisions.join('; ')}`);
   }
-  // Fallback: include raw event content when no structured pairs/decisions were extracted
-  if (turnPairs.length === 0 && decisions.length === 0) {
-    for (const event of events) {
-      const content = event.content?.trim();
-      if (content) {
-        sections.push(`- [${event.eventType}] ${content.length > 500 ? content.slice(0, 500) + '…' : content}`);
-      }
+  // Always include raw source events so the user can see pre-compression content
+  sections.push(`\n---\n**Source events (${events.length}):**`);
+  for (const event of events) {
+    const content = event.content?.trim();
+    if (content) {
+      const truncated = content.length > 800 ? content.slice(0, 800) + '…' : content;
+      sections.push(`- \`${event.eventType}\`: ${truncated}`);
     }
   }
-  sections.push(`\nCompressed from ${events.length} event${events.length === 1 ? '' : 's'}.`);
   return sections.join('\n');
 }
 

@@ -1927,11 +1927,12 @@ function MemoryRecordContent({
   t: (key: string) => string;
 }) {
   const collapsible = shouldCollapseMemoryContent(text);
+  const showExpanded = expanded || !collapsible;
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
       <div
         data-testid={`memory-record-content-${id}`}
-        style={expanded ? memoryContentExpandedStyle : memoryContentCollapsedStyle}
+        style={showExpanded ? memoryContentExpandedStyle : memoryContentCollapsedStyle}
       >
         <ChatMarkdown text={text} />
       </div>
