@@ -526,6 +526,15 @@ function shouldCollapseMemoryContent(text: string): boolean {
   return text.split('\n').length > 3 || text.length > 220;
 }
 
+function getMemoryRecordClassLabel(
+  t: (key: string) => string,
+  projectionClass: 'recent_summary' | 'durable_memory_candidate',
+): string {
+  return projectionClass === 'recent_summary'
+    ? t('sharedContext.management.memoryRecentSummary')
+    : t('sharedContext.management.memoryDurableCandidate');
+}
+
 export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId, serverId, ws, onEnterpriseChange }: Props) {
   const { t } = useTranslation();
   const onEnterpriseChangeRef = useRef(onEnterpriseChange);
@@ -580,6 +589,72 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [cloudPersonalMemory, setCloudPersonalMemory] = useState<ContextMemoryView>(EMPTY_MEMORY_VIEW);
   const [sharedMemory, setSharedMemory] = useState<ContextMemoryView>(EMPTY_MEMORY_VIEW);
   const [expandedMemoryRecordIds, setExpandedMemoryRecordIds] = useState<Set<string>>(new Set());
+
+  const renderProcessedMemoryRecords = useCallback((view: ContextMemoryView) => {
+    const recentRecords = view.records.filter((record) => record.projectionClass === 'recent_summary');
+    const durableRecords = view.records.filter((record) => record.projectionClass === 'durable_memory_candidate');
+    const sections = [
+      {
+        key: 'recent' as const,
+        title: t('sharedContext.management.memoryRecentSummary'),
+        description: t('sharedContext.management.memoryRecentDescription'),
+        records: recentRecords,
+      },
+      {
+        key: 'durable' as const,
+        title: t('sharedContext.management.memoryDurableCandidate'),
+        description: t('sharedContext.management.memoryDurableDescription'),
+        records: durableRecords,
+      },
+    ].filter((section) => section.records.length > 0) satisfies Array<{
+      key: 'recent' | 'durable';
+      title: string;
+      description: string;
+      records: typeof view.records;
+    }>;
+
+    if (sections.length === 0) {
+      return <div style={helperTextStyle}>{t('sharedContext.empty')}</div>;
+    }
+
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        {sections.map((section) => (
+          <div key={section.key} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <SectionHeading title={section.title} description={section.description} />
+            <div style={resourceListStyle}>
+              {section.records.map((record) => (
+                <div key={record.id} style={resourceCardStyle}>
+                  <div style={metaGridStyle}>
+                    <MetaCard label={t('sharedContext.management.memoryRecordProject')} value={record.projectId} />
+                    <MetaCard label={t('sharedContext.management.memoryRecordClass')} value={getMemoryRecordClassLabel(t, record.projectionClass)} />
+                    <MetaCard label={t('sharedContext.management.memoryRecordSources')} value={record.sourceEventCount} />
+                    <MetaCard label={t('sharedContext.management.memoryRecordUpdated')} value={new Date(record.updatedAt).toLocaleString()} />
+                  </div>
+                  {record.summary ? (
+                    <MemoryRecordContent
+                      id={record.id}
+                      text={record.summary}
+                      expanded={expandedMemoryRecordIds.has(record.id)}
+                      onToggle={() => {
+                        setExpandedMemoryRecordIds((current) => {
+                          const next = new Set(current);
+                          if (next.has(record.id)) next.delete(record.id);
+                          else next.add(record.id);
+                          return next;
+                        });
+                      }}
+                      t={t}
+                    />
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  }, [expandedMemoryRecordIds, t]);
 
   const selectedDocument = useMemo(
     () => documents.find((entry) => entry.id === selectedDocumentId) ?? null,
@@ -1689,36 +1764,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 title={t('sharedContext.management.memoryProcessedTitle')}
                 description={t('sharedContext.management.memoryProcessedDescription')}
               />
-              {view.records.length > 0 ? (
-                <div style={resourceListStyle}>
-                  {view.records.map((record) => (
-                    <div key={record.id} style={resourceCardStyle}>
-                      <div style={metaGridStyle}>
-                        <MetaCard label={t('sharedContext.management.memoryRecordProject')} value={record.projectId} />
-                        <MetaCard label={t('sharedContext.management.memoryRecordClass')} value={record.projectionClass} />
-                        <MetaCard label={t('sharedContext.management.memoryRecordSources')} value={record.sourceEventCount} />
-                        <MetaCard label={t('sharedContext.management.memoryRecordUpdated')} value={new Date(record.updatedAt).toLocaleString()} />
-                      </div>
-                      {record.summary ? (
-                        <MemoryRecordContent
-                          id={record.id}
-                          text={record.summary}
-                          expanded={expandedMemoryRecordIds.has(record.id)}
-                          onToggle={() => {
-                            setExpandedMemoryRecordIds((current) => {
-                              const next = new Set(current);
-                              if (next.has(record.id)) next.delete(record.id);
-                              else next.add(record.id);
-                              return next;
-                            });
-                          }}
-                          t={t}
-                        />
-                      ) : null}
-                    </div>
-                  ))}
-                </div>
-              ) : <div style={helperTextStyle}>{t('sharedContext.empty')}</div>}
+              {renderProcessedMemoryRecords(view)}
             </div>
           ))}
         </>

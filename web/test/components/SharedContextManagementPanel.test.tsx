@@ -538,6 +538,8 @@ describe('SharedContextManagementPanel', () => {
     await waitFor(() => {
       expect(screen.getAllByText('sharedContext.management.memoryProcessedTitle').length).toBeGreaterThan(0);
     });
+    expect((await screen.findAllByText('sharedContext.management.memoryRecentDescription')).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText('sharedContext.management.memoryDurableDescription')).length).toBeGreaterThan(0);
     expect(await screen.findByText('Cloud personal decision')).toBeDefined();
     expect(await screen.findByText('Shared coding standard reminder')).toBeDefined();
     expect(await screen.findByText('sharedContext.management.memoryProcessedNote')).toBeDefined();

@@ -98,6 +98,8 @@ describe('MaterializationCoordinator', () => {
       eventCount: 2,
     }));
     expect(result.durableProjection?.class).toBe('durable_memory_candidate');
+    expect(result.durableProjection?.summary).toContain('Pinned decisions: ship the migration');
+    expect(result.durableProjection?.summary).toContain('Compressed from 1 durable signal.');
     expect(getReplicationState(namespace)).toEqual(expect.objectContaining({
       namespace,
       pendingProjectionIds: expect.arrayContaining([

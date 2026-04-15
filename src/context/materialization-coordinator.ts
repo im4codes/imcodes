@@ -218,7 +218,7 @@ function buildDurableProjection(namespace: ContextNamespace, events: LocalContex
     namespace,
     class: 'durable_memory_candidate',
     sourceEventIds: candidateEvents.map((event) => event.id),
-    summary: candidateEvents.map((event) => event.content ?? event.eventType).join('\n'),
+    summary: buildDurableSummary(candidateEvents),
     content: {
       candidateKinds: candidateEvents.map((event) => event.eventType),
       count: candidateEvents.length,
@@ -226,4 +226,32 @@ function buildDurableProjection(namespace: ContextNamespace, events: LocalContex
     createdAt: now,
     updatedAt: now,
   });
+}
+
+function buildDurableSummary(events: LocalContextEvent[]): string {
+  const grouped = new Map<string, string[]>();
+  for (const event of events) {
+    const content = event.content?.trim();
+    if (!content) continue;
+    const items = grouped.get(event.eventType) ?? [];
+    if (!items.includes(content)) items.push(content);
+    grouped.set(event.eventType, items);
+  }
+
+  const lines: string[] = [];
+  const preferences = grouped.get('preference') ?? [];
+  const constraints = grouped.get('constraint') ?? [];
+  const decisions = grouped.get('decision') ?? [];
+
+  if (preferences.length > 0) {
+    lines.push(`Durable preferences: ${preferences.slice(-2).join(' | ')}`);
+  }
+  if (constraints.length > 0) {
+    lines.push(`Durable constraints: ${constraints.slice(-2).join(' | ')}`);
+  }
+  if (decisions.length > 0) {
+    lines.push(`Pinned decisions: ${decisions.slice(-2).join(' | ')}`);
+  }
+  lines.push(`Compressed from ${events.length} durable signal${events.length === 1 ? '' : 's'}.`);
+  return lines.join('\n');
 }
