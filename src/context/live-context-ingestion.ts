@@ -150,10 +150,11 @@ function mapTimelineEvent(event: TimelineEvent): Pick<LocalContextEvent, 'eventT
         metadata: { timelineType: event.type },
       };
     case 'assistant.text':
+      if (event.payload.streaming === true) return null;
       return {
         eventType: 'assistant.turn',
         content: stringifyContent(event.payload.text),
-        metadata: { timelineType: event.type, streaming: event.payload.streaming === true },
+        metadata: { timelineType: event.type, streaming: false },
       };
     case 'assistant.thinking':
       return {

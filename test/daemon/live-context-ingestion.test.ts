@@ -61,6 +61,30 @@ describe('LiveContextIngestion', () => {
     });
   });
 
+  it('ignores streaming assistant deltas and only records the finalized assistant text', async () => {
+    const ingestion = new LiveContextIngestion({
+      thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },
+      sessionLookup: () => session,
+      resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
+    });
+
+    await ingestion.handleTimelineEvent(makeEvent('user.message', 100, { text: 'Need the final answer only' }));
+    await ingestion.handleTimelineEvent(makeEvent('assistant.text', 110, { text: 'partial', streaming: true }));
+    await ingestion.handleTimelineEvent(makeEvent('assistant.text', 120, { text: 'final answer', streaming: false }));
+
+    expect(getProcessedProjectionStats({ scope: 'personal', projectId: namespace.projectId })).toMatchObject({
+      stagedEventCount: 2,
+      dirtyTargetCount: 1,
+    });
+
+    await ingestion.handleTimelineEvent(makeEvent('session.state', 130, { state: 'idle' }));
+
+    const [summary] = queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 });
+    expect(summary?.summary).toContain('user.turn: Need the final answer only');
+    expect(summary?.summary).toContain('assistant.turn: final answer');
+    expect(summary?.summary).not.toContain('partial');
+  });
+
   it('backfills recent timeline history for sessions that have no existing context activity', async () => {
     const ingestion = new LiveContextIngestion({
       sessionLookup: () => session,
