@@ -4,6 +4,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, cleanup } from '@testing-library/preact';
+import { useState } from 'preact/hooks';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -90,6 +91,42 @@ describe('QuickInputPanel history scope', () => {
     expect(panel.style.left).toBe('248px');
     expect(panel.style.width).toBe('960px');
     expect(panel.style.maxHeight).toBe('712px');
+  });
+
+  it('can toggle from closed to open without dropping the panel render', () => {
+    function Wrapper() {
+      const [open, setOpen] = useState(false);
+      return (
+        <div>
+          <button onClick={() => setOpen((prev) => !prev)}>toggle-quick-panel</button>
+          <QuickInputPanel
+            open={open}
+            onClose={() => setOpen(false)}
+            onSelect={vi.fn()}
+            onSend={vi.fn()}
+            agentType="claude-code"
+            sessionName="session-a"
+            data={{ history: [], sessionHistory: {}, commands: [], phrases: [] }}
+            loaded
+            onAddCommand={vi.fn()}
+            onAddPhrase={vi.fn()}
+            onRemoveCommand={vi.fn()}
+            onRemovePhrase={vi.fn()}
+            onRemoveHistory={vi.fn()}
+            onRemoveSessionHistory={vi.fn()}
+            onClearHistory={vi.fn()}
+            onClearSessionHistory={vi.fn()}
+          />
+        </div>
+      );
+    }
+
+    render(<Wrapper />);
+    expect(document.querySelector('.qp')).toBeNull();
+
+    fireEvent.click(screen.getByText('toggle-quick-panel'));
+
+    expect(document.querySelector('.qp')).toBeTruthy();
   });
 
   it('opens above the trigger when the quick-input trigger is low in the viewport', () => {

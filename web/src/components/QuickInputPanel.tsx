@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'preact/hooks';
+import { useState, useRef, useEffect, useMemo } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import { apiFetch } from '../api.js';
@@ -293,6 +293,38 @@ export function QuickInputPanel({
     if (editingItem) setTimeout(() => editInputRef.current?.focus(), 50);
   }, [editingItem]);
 
+  const panelStyle = useMemo(() => {
+    if (typeof window === 'undefined' || window.innerWidth <= 640) return undefined;
+    const trigger = anchorRef?.current;
+    if (!trigger) return undefined;
+    const rect = trigger.getBoundingClientRect();
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+    const horizontalInset = 8;
+    const verticalInset = 12;
+    const triggerGap = 6;
+    const width = Math.max(240, Math.min(Math.floor(viewportWidth * 0.75), 1050, viewportWidth - horizontalInset * 2));
+    const maxLeft = Math.max(horizontalInset, viewportWidth - width - horizontalInset);
+    const left = Math.min(Math.max(rect.left, horizontalInset), maxLeft);
+    const availableAbove = Math.max(120, Math.floor(rect.top - verticalInset));
+    const availableBelow = Math.max(120, Math.floor(viewportHeight - rect.bottom - verticalInset));
+    const shouldOpenBelow = availableBelow >= 260 || availableBelow >= availableAbove;
+
+    const style: JSX.CSSProperties = {
+      position: 'fixed',
+      left: `${Math.round(left)}px`,
+      width: `${Math.round(width)}px`,
+      maxWidth: `${Math.round(width)}px`,
+      maxHeight: `${shouldOpenBelow ? availableBelow : availableAbove}px`,
+      zIndex: 10002,
+    } as preact.JSX.CSSProperties;
+
+    if (shouldOpenBelow) style.top = `${Math.max(Math.round(rect.bottom + triggerGap), horizontalInset)}px`;
+    else style.bottom = `${Math.max(viewportHeight - rect.top + triggerGap, horizontalInset)}px`;
+
+    return style;
+  }, [anchorRef, layoutTick]);
+
   if (!open) return null;
 
   const defaultCmds = DEFAULT_COMMANDS[agentType] ?? DEFAULT_COMMANDS['claude-code'];
@@ -351,38 +383,6 @@ export function QuickInputPanel({
     if (e.key === 'Enter') { e.preventDefault(); commitEdit(); }
     if (e.key === 'Escape') { setEditingItem(null); setEditValue(''); }
   };
-
-  const panelStyle = useCallback(() => {
-    if (typeof window === 'undefined' || window.innerWidth <= 640) return undefined;
-    const trigger = anchorRef?.current;
-    if (!trigger) return undefined;
-    const rect = trigger.getBoundingClientRect();
-    const viewportWidth = window.innerWidth;
-    const viewportHeight = window.innerHeight;
-    const horizontalInset = 8;
-    const verticalInset = 12;
-    const triggerGap = 6;
-    const width = Math.max(240, Math.min(Math.floor(viewportWidth * 0.75), 1050, viewportWidth - horizontalInset * 2));
-    const maxLeft = Math.max(horizontalInset, viewportWidth - width - horizontalInset);
-    const left = Math.min(Math.max(rect.left, horizontalInset), maxLeft);
-    const availableAbove = Math.max(120, Math.floor(rect.top - verticalInset));
-    const availableBelow = Math.max(120, Math.floor(viewportHeight - rect.bottom - verticalInset));
-    const shouldOpenBelow = availableBelow >= 260 || availableBelow >= availableAbove;
-
-    const style: JSX.CSSProperties = {
-      position: 'fixed',
-      left: `${Math.round(left)}px`,
-      width: `${Math.round(width)}px`,
-      maxWidth: `${Math.round(width)}px`,
-      maxHeight: `${shouldOpenBelow ? availableBelow : availableAbove}px`,
-      zIndex: 10002,
-    } as preact.JSX.CSSProperties;
-
-    if (shouldOpenBelow) style.top = `${Math.max(Math.round(rect.bottom + triggerGap), horizontalInset)}px`;
-    else style.bottom = `${Math.max(viewportHeight - rect.top + triggerGap, horizontalInset)}px`;
-
-    return style;
-  }, [anchorRef, layoutTick])();
 
   const panel = (
     <>
