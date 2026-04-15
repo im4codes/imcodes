@@ -85,6 +85,37 @@ describe('LiveContextIngestion', () => {
     expect(summary?.summary).not.toContain('partial');
   });
 
+  it('ignores tool calls and tool results when building memory', async () => {
+    const ingestion = new LiveContextIngestion({
+      thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },
+      sessionLookup: () => session,
+      resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
+    });
+
+    await ingestion.handleTimelineEvent(makeEvent('user.message', 100, { text: 'Find the final fix' }));
+    await ingestion.handleTimelineEvent(makeEvent('tool.call', 110, {
+      tool: 'grep',
+      input: { pattern: 'bug' },
+    }));
+    await ingestion.handleTimelineEvent(makeEvent('tool.result', 120, {
+      output: 'intermediate output',
+    }));
+    await ingestion.handleTimelineEvent(makeEvent('assistant.text', 130, { text: 'Use the final patch', streaming: false }));
+
+    expect(getProcessedProjectionStats({ scope: 'personal', projectId: namespace.projectId })).toMatchObject({
+      stagedEventCount: 2,
+      dirtyTargetCount: 1,
+    });
+
+    await ingestion.handleTimelineEvent(makeEvent('session.state', 140, { state: 'idle' }));
+
+    const [summary] = queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 });
+    expect(summary?.summary).toContain('user.turn: Find the final fix');
+    expect(summary?.summary).toContain('assistant.turn: Use the final patch');
+    expect(summary?.summary).not.toContain('grep');
+    expect(summary?.summary).not.toContain('intermediate output');
+  });
+
   it('backfills recent timeline history for sessions that have no existing context activity', async () => {
     const ingestion = new LiveContextIngestion({
       sessionLookup: () => session,

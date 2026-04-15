@@ -163,23 +163,8 @@ function mapTimelineEvent(event: TimelineEvent): Pick<LocalContextEvent, 'eventT
         metadata: { timelineType: event.type },
       };
     case 'tool.call':
-      return {
-        eventType: 'tool.call',
-        content: joinParts([
-          stringifyContent(event.payload.tool),
-          stringifyUnknown(event.payload.input),
-        ]),
-        metadata: { timelineType: event.type },
-      };
     case 'tool.result':
-      return {
-        eventType: 'tool.result',
-        content: joinParts([
-          stringifyUnknown(event.payload.output),
-          stringifyContent(event.payload.error),
-        ]),
-        metadata: { timelineType: event.type },
-      };
+      return null;
     case 'ask.question':
       return {
         eventType: 'question',
