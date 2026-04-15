@@ -895,12 +895,16 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
       timelineEmitter.emit(sessionName, 'assistant.thinking', { text: '' }, { source: 'daemon', confidence: 'high' });
     }
     const mapped = (status === 'streaming' || status === 'thinking') ? 'running' : status;
-    timelineEmitter.emit(sessionName, 'session.state', {
-      state: mapped,
-      pendingCount: runtime.pendingCount,
-      pendingMessages: runtime.pendingMessages,
-      pendingMessageEntries: runtime.pendingEntries,
-    }, { source: 'daemon', confidence: 'high' });
+    // Include pending info only on idle — the authoritative "turn done, queue empty" signal.
+    // During running/streaming, command-handler's 'queued' event is the sole queue-update
+    // authority. This keeps queued messages visible in the UI until the drained turn completes.
+    const payload: Record<string, unknown> = { state: mapped };
+    if (mapped === 'idle') {
+      payload.pendingCount = runtime.pendingCount;
+      payload.pendingMessages = runtime.pendingMessages;
+      payload.pendingMessageEntries = runtime.pendingEntries;
+    }
+    timelineEmitter.emit(sessionName, 'session.state', payload, { source: 'daemon', confidence: 'high' });
   };
   runtime.onDrain = (messages, merged, count) => {
     for (const entry of messages) {
@@ -914,11 +918,10 @@ function wireTransportCallbacks(runtime: TransportSessionRuntime, sessionName: s
     if (messages.length === 0) {
       timelineEmitter.emit(sessionName, 'user.message', { text: merged, batchedCount: count, allowDuplicate: true });
     }
+    // Don't include pending data — drained messages should stay visible in the UI
+    // until the turn completes. The runtime's idle event (with pending=[]) will clear.
     timelineEmitter.emit(sessionName, 'session.state', {
       state: 'running',
-      pendingCount: runtime.pendingCount,
-      pendingMessages: runtime.pendingMessages,
-      pendingMessageEntries: runtime.pendingEntries,
     }, { source: 'daemon', confidence: 'high' });
   };
 }
