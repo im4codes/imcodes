@@ -214,7 +214,7 @@ serverRoutes.post('/:id/heartbeat', async (c) => {
   const tokenHash = sha256Hex(token);
 
   const serverId = c.req.param('id');
-  const server = await c.env.DB.queryOne<{ id: string }>(
+  const server = await c.env.DB.queryOne<{ id: string; user_id: string }>(
     'SELECT id FROM servers WHERE id = $1 AND token_hash = $2',
     [serverId, tokenHash],
   );
@@ -274,7 +274,7 @@ serverRoutes.get('/:id/shared-context/runtime-config/daemon', async (c) => {
   if (!auth?.startsWith('Bearer ')) return c.json({ error: 'unauthorized' }, 401);
   const tokenHash = sha256Hex(auth.slice(7));
   const serverId = c.req.param('id');
-  const server = await c.env.DB.queryOne<{ id: string }>(
+  const server = await c.env.DB.queryOne<{ id: string; user_id: string }>(
     'SELECT id, user_id FROM servers WHERE id = $1 AND token_hash = $2',
     [serverId, tokenHash],
   );
