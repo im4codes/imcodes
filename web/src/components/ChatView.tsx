@@ -1214,7 +1214,7 @@ const ChatEvent = memo(function ChatEvent({
             </div>
           )}
           {(callDetail || resultDetail) && (
-            <details class="chat-tool-detail" open>
+            <details class="chat-tool-detail">
               <summary class="chat-tool-detail-summary">{t('chat.tool_detail_toggle')}</summary>
               <ToolDetailSection label={t('chat.tool_detail_input')} value={(callDetail as any)?.input} />
               <ToolDetailSection label={t('chat.tool_detail_output')} value={(resultDetail as any)?.output} />
@@ -1244,7 +1244,7 @@ const ChatEvent = memo(function ChatEvent({
             )}
           </div>
           {detail && (
-            <details class="chat-tool-detail" open>
+            <details class="chat-tool-detail">
               <summary class="chat-tool-detail-summary">{t('chat.tool_detail_toggle')}</summary>
               <ToolDetailSection label={t('chat.tool_detail_output')} value={(detail as any).output} />
               <ToolDetailSection label={t('chat.tool_detail_meta')} value={(detail as any).meta} />
