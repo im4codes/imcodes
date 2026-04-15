@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import { apiFetch } from '../api.js';
 import { FileBrowser } from './FileBrowser.js';
@@ -383,7 +384,7 @@ export function QuickInputPanel({
     return style;
   }, [anchorRef, layoutTick])();
 
-  return (
+  const panel = (
     <>
       <div class="qp-backdrop" onClick={onClose} />
       <div class="qp" ref={panelRef} style={panelStyle}>
@@ -554,4 +555,7 @@ export function QuickInputPanel({
       </div>
     </>
   );
+
+  if (typeof document === 'undefined') return panel;
+  return createPortal(panel, document.body);
 }

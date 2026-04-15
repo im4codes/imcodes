@@ -83,7 +83,7 @@ describe('QuickInputPanel history scope', () => {
       />,
     );
 
-    const panel = container.querySelector('.qp') as HTMLElement;
+    const panel = document.querySelector('.qp') as HTMLElement;
     expect(panel.style.position).toBe('fixed');
     expect(panel.style.top).toBe('126px');
     expect(panel.style.bottom).toBe('');
@@ -123,7 +123,7 @@ describe('QuickInputPanel history scope', () => {
       />,
     );
 
-    const panel = container.querySelector('.qp') as HTMLElement;
+    const panel = document.querySelector('.qp') as HTMLElement;
     expect(panel.style.position).toBe('fixed');
     expect(panel.style.top).toBe('');
     expect(panel.style.bottom).toBe('150px');
@@ -199,7 +199,7 @@ describe('QuickInputPanel history scope', () => {
       />,
     );
 
-    const deleteButton = container.querySelector('.qp-pill-custom .qp-pill-del') as HTMLButtonElement | null;
+    const deleteButton = document.querySelector('.qp-pill-custom .qp-pill-del') as HTMLButtonElement | null;
     expect(deleteButton).not.toBeNull();
     fireEvent.click(deleteButton!);
 
@@ -232,7 +232,7 @@ describe('QuickInputPanel history scope', () => {
       />,
     );
 
-    const deleteButton = container.querySelector('.qp-pill-custom .qp-pill-del') as HTMLButtonElement | null;
+    const deleteButton = document.querySelector('.qp-pill-custom .qp-pill-del') as HTMLButtonElement | null;
     expect(deleteButton).not.toBeNull();
     fireEvent.click(deleteButton!);
 
@@ -265,11 +265,11 @@ describe('QuickInputPanel history scope', () => {
       />,
     );
 
-    const editButton = container.querySelector('.qp-pill-custom .qp-pill-edit') as HTMLButtonElement | null;
+    const editButton = document.querySelector('.qp-pill-custom .qp-pill-edit') as HTMLButtonElement | null;
     expect(editButton).not.toBeNull();
     fireEvent.click(editButton!);
 
-    const input = container.querySelector('.qp-edit-input') as HTMLInputElement | null;
+    const input = document.querySelector('.qp-edit-input') as HTMLInputElement | null;
     expect(input).not.toBeNull();
     fireEvent.input(input!, { target: { value: 'updated phrase' } });
     fireEvent.keyDown(input!, { key: 'Enter' });
@@ -302,11 +302,11 @@ describe('QuickInputPanel history scope', () => {
       />,
     );
 
-    const editButton = container.querySelector('.qp-pill-custom .qp-pill-edit') as HTMLButtonElement | null;
+    const editButton = document.querySelector('.qp-pill-custom .qp-pill-edit') as HTMLButtonElement | null;
     expect(editButton).not.toBeNull();
     fireEvent.click(editButton!);
 
-    const input = container.querySelector('.qp-edit-input') as HTMLInputElement | null;
+    const input = document.querySelector('.qp-edit-input') as HTMLInputElement | null;
     expect(input).not.toBeNull();
     fireEvent.input(input!, { target: { value: '/updated' } });
     fireEvent.keyDown(input!, { key: 'Enter' });
