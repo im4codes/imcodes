@@ -792,7 +792,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const openSpecDropdownStyle = useMemo(() => {
     if (!openSpecOpen || typeof window === 'undefined') return undefined;
     const rect = (openSpecButtonRef.current ?? openSpecRef.current)?.getBoundingClientRect();
-    if (!rect) return undefined;
+    if (!rect) {
+      // Fallback: position at bottom-right so portaled dropdown is never off-screen
+      return { position: 'fixed', bottom: '60px', right: '12px', maxHeight: '60vh', zIndex: 2147483646 } as const;
+    }
     const availableHeight = Math.max(96, Math.floor(rect.top - 12));
     if (window.innerWidth > 640) {
       return {
@@ -814,8 +817,11 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     [openSpecLayoutTick, openSpecOpen],
   );
 
-  const getOpenSpecSubmenuStyle = useCallback((trigger: HTMLElement | null, minWidth: number) => {
-    if (!trigger || typeof window === 'undefined') return undefined;
+  const getOpenSpecSubmenuStyle = useCallback((trigger: HTMLElement | null, minWidth: number): React.CSSProperties => {
+    if (!trigger || typeof window === 'undefined') {
+      // Fallback: position at center-bottom so portaled submenu is never off-screen
+      return { position: 'fixed', bottom: '80px', left: '50%', transform: 'translateX(-50%)', minWidth: `${minWidth}px`, zIndex: 2147483647 } as React.CSSProperties;
+    }
     return {
       ...getAnchoredOverlayStyle(trigger.getBoundingClientRect(), minWidth, window.innerWidth, window.innerHeight),
       zIndex: 2147483647,

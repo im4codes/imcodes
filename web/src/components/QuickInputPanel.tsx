@@ -275,15 +275,19 @@ export function QuickInputPanel({
     };
   }, [open]);
 
-  // Close on outside click
+  // Close on outside click (exclude trigger button to avoid close→reopen flicker)
   useEffect(() => {
     if (!open) return;
     const handler = (e: MouseEvent) => {
-      if (panelRef.current && !panelRef.current.contains(e.target as Node)) onClose();
+      const target = e.target as Node;
+      if (panelRef.current && !panelRef.current.contains(target)
+        && !(anchorRef?.current && anchorRef.current.contains(target))) {
+        onClose();
+      }
     };
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
-  }, [open, onClose]);
+  }, [open, onClose, anchorRef]);
 
   // Focus add/edit input when shown
   useEffect(() => {
@@ -294,6 +298,7 @@ export function QuickInputPanel({
   }, [editingItem]);
 
   const panelStyle = useMemo(() => {
+    if (!open) return undefined; // skip computation when closed
     if (typeof window === 'undefined' || window.innerWidth <= 640) return undefined;
     const trigger = anchorRef?.current;
     if (!trigger) return undefined;
@@ -323,7 +328,7 @@ export function QuickInputPanel({
     else style.bottom = `${Math.max(viewportHeight - rect.top + triggerGap, horizontalInset)}px`;
 
     return style;
-  }, [anchorRef, layoutTick]);
+  }, [anchorRef, layoutTick, open]);
 
   if (!open) return null;
 
