@@ -223,6 +223,15 @@ function buildSummary(events: LocalContextEvent[]): string {
   if (decisions.length > 0) {
     sections.push(`- Key decisions: ${decisions.join('; ')}`);
   }
+  // Fallback: include raw event content when no structured pairs/decisions were extracted
+  if (turnPairs.length === 0 && decisions.length === 0) {
+    for (const event of events) {
+      const content = event.content?.trim();
+      if (content) {
+        sections.push(`- [${event.eventType}] ${content.length > 500 ? content.slice(0, 500) + '…' : content}`);
+      }
+    }
+  }
   sections.push(`\nCompressed from ${events.length} event${events.length === 1 ? '' : 's'}.`);
   return sections.join('\n');
 }
