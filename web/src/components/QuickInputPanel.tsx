@@ -311,9 +311,11 @@ export function QuickInputPanel({
     const width = Math.max(240, Math.min(Math.floor(viewportWidth * 0.75), 1050, viewportWidth - horizontalInset * 2));
     const maxLeft = Math.max(horizontalInset, viewportWidth - width - horizontalInset);
     const left = Math.min(Math.max(rect.left, horizontalInset), maxLeft);
-    const availableAbove = Math.max(120, Math.floor(rect.top - verticalInset));
-    const availableBelow = Math.max(120, Math.floor(viewportHeight - rect.bottom - verticalInset));
-    const shouldOpenBelow = availableBelow >= 260 || availableBelow >= availableAbove;
+    const rawAbove = Math.floor(rect.top - verticalInset);
+    const rawBelow = Math.floor(viewportHeight - rect.bottom - verticalInset);
+    const shouldOpenBelow = rawBelow >= 260 || rawBelow >= rawAbove;
+    const availableAbove = Math.max(120, rawAbove);
+    const availableBelow = Math.max(120, rawBelow);
 
     const style: JSX.CSSProperties = {
       position: 'fixed',

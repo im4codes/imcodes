@@ -146,9 +146,11 @@ function getAnchoredOverlayStyle(
   const width = Math.min(preferredWidth, viewportWidth - horizontalInset * 2);
   const maxLeft = Math.max(horizontalInset, viewportWidth - width - horizontalInset);
   const left = Math.min(Math.max(trigger.right - width, horizontalInset), maxLeft);
-  const availableAbove = Math.max(96, Math.floor(trigger.top - verticalInset));
-  const availableBelow = Math.max(96, Math.floor(viewportHeight - trigger.bottom - verticalInset));
-  const shouldOpenBelow = availableBelow >= 180 || availableBelow >= availableAbove;
+  const rawAbove = Math.floor(trigger.top - verticalInset);
+  const rawBelow = Math.floor(viewportHeight - trigger.bottom - verticalInset);
+  const shouldOpenBelow = rawBelow >= 180 || rawBelow >= rawAbove;
+  const availableAbove = Math.max(96, rawAbove);
+  const availableBelow = Math.max(96, rawBelow);
 
   const style = {
     position: 'fixed',
