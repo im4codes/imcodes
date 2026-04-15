@@ -16,6 +16,7 @@ import type {
   LocalContextEvent,
   ProcessedContextProjection,
   ProcessedContextClass,
+  ContextScope,
 } from '../../shared/context-types.js';
 import { classifyTimestampFreshness } from '../../shared/context-freshness.js';
 import { serializeContextNamespace, serializeContextTarget } from '../context/context-keys.js';
@@ -323,6 +324,87 @@ export function listProcessedProjections(namespace: ContextNamespace, projection
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
   }));
+}
+
+export interface ProcessedProjectionQuery {
+  scope?: ContextScope;
+  projectId?: string;
+  projectionClass?: ProcessedContextClass;
+  query?: string;
+  limit?: number;
+}
+
+export interface ProcessedProjectionStats {
+  totalRecords: number;
+  matchedRecords: number;
+  recentSummaryCount: number;
+  durableCandidateCount: number;
+  projectCount: number;
+}
+
+export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}): ProcessedContextProjection[] {
+  const database = ensureDb();
+  const rows = database.prepare('SELECT * FROM context_processed_local ORDER BY updated_at DESC').all() as Array<Record<string, unknown>>;
+  const normalizedQuery = filters.query?.trim().toLowerCase() ?? '';
+  const filtered = rows
+    .map((row) => {
+      const namespace = parseNamespaceKey(String(row.namespace_key));
+      return {
+        id: String(row.id),
+        namespace,
+        class: String(row.class) as ProcessedContextClass,
+        sourceEventIds: parseJson<string[]>(row.source_event_ids_json, []),
+        summary: String(row.summary),
+        content: parseJson<Record<string, unknown>>(row.content_json, {}),
+        createdAt: Number(row.created_at),
+        updatedAt: Number(row.updated_at),
+      } satisfies ProcessedContextProjection;
+    })
+    .filter((projection) => !filters.scope || projection.namespace.scope === filters.scope)
+    .filter((projection) => !filters.projectId || projection.namespace.projectId === filters.projectId)
+    .filter((projection) => !filters.projectionClass || projection.class === filters.projectionClass)
+    .filter((projection) => {
+      if (!normalizedQuery) return true;
+      const haystack = `${projection.summary}\n${JSON.stringify(projection.content)}`.toLowerCase();
+      return haystack.includes(normalizedQuery);
+    });
+  const limit = typeof filters.limit === 'number' && filters.limit > 0 ? filters.limit : 50;
+  return filtered.slice(0, limit);
+}
+
+export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = {}): ProcessedProjectionStats {
+  const database = ensureDb();
+  const rows = database.prepare('SELECT namespace_key, class, summary, content_json FROM context_processed_local').all() as Array<Record<string, unknown>>;
+  const normalizedQuery = filters.query?.trim().toLowerCase() ?? '';
+  let totalRecords = 0;
+  let matchedRecords = 0;
+  let recentSummaryCount = 0;
+  let durableCandidateCount = 0;
+  const projectIds = new Set<string>();
+  for (const row of rows) {
+    const namespace = parseNamespaceKey(String(row.namespace_key));
+    if (filters.scope && namespace.scope !== filters.scope) continue;
+    if (filters.projectId && namespace.projectId !== filters.projectId) continue;
+    const projectionClass = String(row.class) as ProcessedContextClass;
+    if (filters.projectionClass && projectionClass !== filters.projectionClass) continue;
+    totalRecords += 1;
+    projectIds.add(namespace.projectId);
+    if (projectionClass === 'recent_summary') recentSummaryCount += 1;
+    if (projectionClass === 'durable_memory_candidate') durableCandidateCount += 1;
+    if (!normalizedQuery) {
+      matchedRecords += 1;
+      continue;
+    }
+    const haystack = `${String(row.summary)}\n${JSON.stringify(parseJson<Record<string, unknown>>(row.content_json, {}))}`.toLowerCase();
+    if (haystack.includes(normalizedQuery)) matchedRecords += 1;
+  }
+  return {
+    totalRecords,
+    matchedRecords,
+    recentSummaryCount,
+    durableCandidateCount,
+    projectCount: projectIds.size,
+  };
 }
 
 export function getLocalProcessedFreshness(namespace: ContextNamespace, now = Date.now()): ContextFreshness {

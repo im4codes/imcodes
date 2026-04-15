@@ -74,7 +74,9 @@ export async function resolveTransportContextBootstrap(
         return {
           namespace: personalNamespace,
           diagnostics: ['namespace:server-personal-fallback', ...(resolved?.diagnostics ?? [])],
+          remoteProcessedFreshness: resolved?.remoteProcessedFreshness,
           localProcessedFreshness: getLocalProcessedFreshness(personalNamespace),
+          retryExhausted: resolved?.retryExhausted,
         };
       } catch {
         const personalNamespace: ContextNamespace = {

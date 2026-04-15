@@ -13,6 +13,7 @@ describe('shared-context-runtime-config', () => {
       primaryContextModel: getDefaultSharedContextModelForBackend('qwen'),
       backupContextBackend: undefined,
       backupContextModel: undefined,
+      enablePersonalMemorySync: false,
     });
   });
 
@@ -27,6 +28,7 @@ describe('shared-context-runtime-config', () => {
       primaryContextModel: getDefaultSharedContextModelForBackend('qwen'),
       backupContextBackend: 'codex-sdk',
       backupContextModel: getDefaultSharedContextModelForBackend('codex-sdk'),
+      enablePersonalMemorySync: false,
     });
   });
 
@@ -40,6 +42,7 @@ describe('shared-context-runtime-config', () => {
       primaryContextModel: 'sonnet',
       backupContextBackend: 'qwen',
       backupContextModel: getDefaultSharedContextModelForBackend('qwen'),
+      enablePersonalMemorySync: false,
     });
   });
 });

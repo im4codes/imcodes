@@ -140,6 +140,73 @@ function getRemoteProcessedFreshMs(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_REMOTE_PROCESSED_FRESH_MS;
 }
 
+type SharedMemoryRecordView = {
+  id: string;
+  scope: 'project_shared' | 'workspace_shared' | 'org_shared';
+  projectId: string;
+  summary: string;
+  projectionClass: 'recent_summary' | 'durable_memory_candidate';
+  sourceEventCount: number;
+  updatedAt: number;
+};
+
+type SharedMemoryStatsView = {
+  totalRecords: number;
+  matchedRecords: number;
+  recentSummaryCount: number;
+  durableCandidateCount: number;
+  projectCount: number;
+};
+
+function matchesMemoryQuery(summary: string, content: unknown, query: string): boolean {
+  const normalized = query.trim().toLowerCase();
+  if (!normalized) return true;
+  return `${summary}\n${JSON.stringify(content ?? {})}`.toLowerCase().includes(normalized);
+}
+
+function buildSharedMemoryResponse(
+  rows: Array<{
+    id: string;
+    scope: 'project_shared' | 'workspace_shared' | 'org_shared';
+    project_id: string;
+    projection_class: 'recent_summary' | 'durable_memory_candidate';
+    source_event_ids_json: string | string[];
+    summary: string;
+    content_json: string | Record<string, unknown> | null;
+    updated_at: number;
+  }>,
+  query?: string,
+  limit = 20,
+): { stats: SharedMemoryStatsView; records: SharedMemoryRecordView[] } {
+  const normalizedQuery = query?.trim() ?? '';
+  const filtered = rows.filter((row) => matchesMemoryQuery(
+    row.summary,
+    typeof row.content_json === 'string' ? JSON.parse(row.content_json) : row.content_json,
+    normalizedQuery,
+  ));
+  const projectIds = new Set(rows.map((row) => row.project_id));
+  return {
+    stats: {
+      totalRecords: rows.length,
+      matchedRecords: filtered.length,
+      recentSummaryCount: rows.filter((row) => row.projection_class === 'recent_summary').length,
+      durableCandidateCount: rows.filter((row) => row.projection_class === 'durable_memory_candidate').length,
+      projectCount: projectIds.size,
+    },
+    records: filtered.slice(0, limit).map((row) => ({
+      id: row.id,
+      scope: row.scope,
+      projectId: row.project_id,
+      summary: row.summary,
+      projectionClass: row.projection_class,
+      sourceEventCount: Array.isArray(row.source_event_ids_json)
+        ? row.source_event_ids_json.length
+        : JSON.parse(row.source_event_ids_json || '[]').length,
+      updatedAt: row.updated_at,
+    })),
+  };
+}
+
 function matchesPathPattern(pattern: string, filePath: string): boolean {
   const normalizedPattern = pattern.replace(/\\/g, '/');
   const normalizedPath = filePath.replace(/\\/g, '/');
@@ -587,6 +654,35 @@ sharedContextRoutes.get('/enterprises/:enterpriseId/projects/visibility', async 
     remoteProcessedPresent: !!remoteProjection,
     ...visibility,
   });
+});
+
+sharedContextRoutes.get('/enterprises/:enterpriseId/memory', async (c) => {
+  const enterpriseId = c.req.param('enterpriseId');
+  const auth = await requireEnterpriseRole(c, enterpriseId, 'member');
+  if (auth instanceof Response) return auth;
+  const canonicalRepoId = c.req.query('canonicalRepoId')?.trim();
+  const projectionClass = c.req.query('projectionClass')?.trim();
+  const query = c.req.query('query')?.trim();
+  const limit = Math.max(1, Math.min(100, Number.parseInt(c.req.query('limit') ?? '20', 10) || 20));
+  const rows = await c.env.DB.query<{
+    id: string;
+    scope: 'project_shared' | 'workspace_shared' | 'org_shared';
+    project_id: string;
+    projection_class: 'recent_summary' | 'durable_memory_candidate';
+    source_event_ids_json: string | string[];
+    summary: string;
+    content_json: string | Record<string, unknown> | null;
+    updated_at: number;
+  }>(
+    `SELECT id, scope, project_id, projection_class, source_event_ids_json, summary, content_json, updated_at
+     FROM shared_context_projections
+     WHERE enterprise_id = $1
+       ${canonicalRepoId ? 'AND project_id = $2' : ''}
+       ${projectionClass ? `AND projection_class = $${canonicalRepoId ? 3 : 2}` : ''}
+     ORDER BY updated_at DESC`,
+    [enterpriseId, ...(canonicalRepoId ? [canonicalRepoId] : []), ...(projectionClass ? [projectionClass] : [])],
+  );
+  return c.json(buildSharedMemoryResponse(rows, query, limit));
 });
 
 sharedContextRoutes.put('/projects/:enrollmentId/policy', async (c) => {

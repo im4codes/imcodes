@@ -59,6 +59,7 @@ import {
   type TransportEffortLevel,
 } from '../../shared/effort-levels.js';
 import { getSavedP2pConfig, upsertSavedP2pConfig } from '../store/p2p-config-store.js';
+import { getProcessedProjectionStats, queryProcessedProjections } from '../store/context-store.js';
 import {
   normalizeSharedContextRuntimeConfig,
   normalizeSharedContextRuntimeBackend,
@@ -782,6 +783,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
       break;
     case SHARED_CONTEXT_RUNTIME_CONFIG_MSG.APPLY:
       void handleSharedContextRuntimeConfigApply(cmd);
+      break;
+    case 'shared_context.personal_memory.query':
+      void handlePersonalMemoryQuery(cmd, serverLink);
       break;
     case 'file.upload':
       void handleFileUpload(cmd, serverLink);
@@ -3859,4 +3863,42 @@ async function handleSharedContextRuntimeConfigApply(cmd: Record<string, unknown
   }
   const { setContextModelRuntimeConfig } = await import('../context/context-model-config.js');
   setContextModelRuntimeConfig(normalized);
+}
+
+async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  if (!requestId) return;
+  const projectId = typeof cmd.projectId === 'string' ? cmd.projectId.trim() : '';
+  const projectionClass = cmd.projectionClass === 'recent_summary' || cmd.projectionClass === 'durable_memory_candidate'
+    ? cmd.projectionClass
+    : undefined;
+  const query = typeof cmd.query === 'string' ? cmd.query.trim() : '';
+  const limit = Math.max(1, Math.min(100, typeof cmd.limit === 'number' ? cmd.limit : 20));
+  const stats = getProcessedProjectionStats({
+    scope: 'personal',
+    projectId: projectId || undefined,
+    projectionClass,
+    query: query || undefined,
+  });
+  const records = queryProcessedProjections({
+    scope: 'personal',
+    projectId: projectId || undefined,
+    projectionClass,
+    query: query || undefined,
+    limit,
+  }).map((projection) => ({
+    id: projection.id,
+    scope: projection.namespace.scope,
+    projectId: projection.namespace.projectId,
+    summary: projection.summary,
+    projectionClass: projection.class,
+    sourceEventCount: projection.sourceEventIds.length,
+    updatedAt: projection.updatedAt,
+  }));
+  serverLink.send({
+    type: 'shared_context.personal_memory.response',
+    requestId,
+    stats,
+    records,
+  });
 }

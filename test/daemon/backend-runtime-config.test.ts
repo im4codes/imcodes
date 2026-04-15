@@ -11,6 +11,7 @@ describe('fetchBackendSharedContextRuntimeConfig', () => {
           primaryContextModel: 'gpt-5.4',
           backupContextBackend: 'claude-code-sdk',
           backupContextModel: 'haiku',
+          enablePersonalMemorySync: true,
         },
       }),
     });
@@ -25,6 +26,7 @@ describe('fetchBackendSharedContextRuntimeConfig', () => {
       primaryContextModel: 'gpt-5.4',
       backupContextBackend: 'claude-code-sdk',
       backupContextModel: 'haiku',
+      enablePersonalMemorySync: true,
     });
   });
 });

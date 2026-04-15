@@ -168,6 +168,7 @@ export interface ContextModelConfig {
   primaryContextModel: string;
   backupContextBackend?: SharedContextRuntimeBackend;
   backupContextModel?: string;
+  enablePersonalMemorySync?: boolean;
 }
 
 export interface ProcessedContextReplicationBody {

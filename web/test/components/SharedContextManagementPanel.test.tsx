@@ -33,6 +33,8 @@ const listSharedDocumentBindingsMock = vi.fn();
 const createSharedDocumentBindingMock = vi.fn();
 const fetchSharedContextRuntimeConfigMock = vi.fn();
 const updateSharedContextRuntimeConfigMock = vi.fn();
+const getServerPersonalMemoryMock = vi.fn();
+const getEnterpriseSharedMemoryMock = vi.fn();
 
 vi.mock('../../src/api.js', () => ({
   ApiError: class ApiError extends Error {
@@ -63,6 +65,8 @@ vi.mock('../../src/api.js', () => ({
   createSharedDocumentBinding: (...args: unknown[]) => createSharedDocumentBindingMock(...args),
   fetchSharedContextRuntimeConfig: (...args: unknown[]) => fetchSharedContextRuntimeConfigMock(...args),
   updateSharedContextRuntimeConfig: (...args: unknown[]) => updateSharedContextRuntimeConfigMock(...args),
+  getServerPersonalMemory: (...args: unknown[]) => getServerPersonalMemoryMock(...args),
+  getEnterpriseSharedMemory: (...args: unknown[]) => getEnterpriseSharedMemoryMock(...args),
 }));
 
 import { SharedContextManagementPanel } from '../../src/components/SharedContextManagementPanel.js';
@@ -115,12 +119,14 @@ describe('SharedContextManagementPanel', () => {
           primaryContextModel: 'sonnet',
           backupContextBackend: undefined,
           backupContextModel: undefined,
+          enablePersonalMemorySync: false,
         },
         effective: {
           primaryContextBackend: 'claude-code-sdk',
           primaryContextModel: 'sonnet',
           backupContextBackend: undefined,
           backupContextModel: undefined,
+          enablePersonalMemorySync: false,
         },
         envPrimaryOverrideActive: false,
         envBackupOverrideActive: false,
@@ -135,18 +141,60 @@ describe('SharedContextManagementPanel', () => {
           primaryContextModel: 'gpt-5.4',
           backupContextBackend: 'claude-code-sdk',
           backupContextModel: 'haiku',
+          enablePersonalMemorySync: true,
         },
         effective: {
           primaryContextBackend: 'codex-sdk',
           primaryContextModel: 'gpt-5.4',
           backupContextBackend: 'claude-code-sdk',
           backupContextModel: 'haiku',
+          enablePersonalMemorySync: true,
         },
         envPrimaryOverrideActive: false,
         envBackupOverrideActive: false,
         defaultPrimaryContextBackend: 'claude-code-sdk',
         defaultPrimaryContextModel: 'sonnet',
       },
+    });
+    getServerPersonalMemoryMock.mockResolvedValue({
+      stats: {
+        totalRecords: 2,
+        matchedRecords: 1,
+        recentSummaryCount: 1,
+        durableCandidateCount: 1,
+        projectCount: 1,
+      },
+      records: [
+        {
+          id: 'cloud-personal-1',
+          scope: 'personal',
+          projectId: 'github.com/acme/repo',
+          summary: 'Cloud personal decision',
+          projectionClass: 'durable_memory_candidate',
+          sourceEventCount: 3,
+          updatedAt: 1700000000000,
+        },
+      ],
+    });
+    getEnterpriseSharedMemoryMock.mockResolvedValue({
+      stats: {
+        totalRecords: 4,
+        matchedRecords: 2,
+        recentSummaryCount: 3,
+        durableCandidateCount: 1,
+        projectCount: 2,
+      },
+      records: [
+        {
+          id: 'shared-1',
+          scope: 'project_shared',
+          projectId: 'github.com/acme/repo',
+          summary: 'Shared coding standard reminder',
+          projectionClass: 'recent_summary',
+          sourceEventCount: 4,
+          updatedAt: 1700000001000,
+        },
+      ],
     });
   });
 
@@ -331,6 +379,7 @@ describe('SharedContextManagementPanel', () => {
       primaryContextModel: 'gpt-5.4',
       backupContextBackend: 'qwen',
       backupContextModel: 'qwen3-coder-plus',
+      enablePersonalMemorySync: false,
     }));
     expect((screen.getByLabelText('sharedContext.management.processingPrimaryModel') as HTMLInputElement).value).toBe('gpt-5.4');
     expect(await screen.findByText('sharedContext.management.processingSavedPrimaryBackend')).toBeDefined();
@@ -404,5 +453,81 @@ describe('SharedContextManagementPanel', () => {
     });
 
     expect(backupInput.value).toBe('qwen3-coder-plus');
+  });
+
+  it('loads local, cloud, and enterprise memory views and saves personal sync settings', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    let messageHandler: ((message: unknown) => void) | null = null;
+    const ws = {
+      send(message: Record<string, unknown>) {
+        sent.push(message);
+      },
+      onMessage(handler: (message: unknown) => void) {
+        messageHandler = handler;
+        return () => {
+          if (messageHandler === handler) messageHandler = null;
+        };
+      },
+    };
+
+    render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.memory'));
+    });
+
+    await waitFor(() => expect(fetchSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1'));
+    await waitFor(() => expect(getServerPersonalMemoryMock).toHaveBeenCalledWith('srv-1', expect.any(Object)));
+    await waitFor(() => expect(getEnterpriseSharedMemoryMock).toHaveBeenCalledWith('team-1', expect.any(Object)));
+
+    const queryCommand = sent.find((message) => message.type === 'shared_context.personal_memory.query');
+    expect(queryCommand).toBeDefined();
+
+    await act(async () => {
+      messageHandler?.({
+        type: 'shared_context.personal_memory.response',
+        requestId: queryCommand?.requestId,
+        stats: {
+          totalRecords: 3,
+          matchedRecords: 2,
+          recentSummaryCount: 2,
+          durableCandidateCount: 1,
+          projectCount: 2,
+        },
+        records: [
+          {
+            id: 'local-personal-1',
+            scope: 'personal',
+            projectId: 'github.com/acme/repo',
+            summary: 'Local personal summary',
+            projectionClass: 'recent_summary',
+            sourceEventCount: 2,
+            updatedAt: 1700000002000,
+          },
+        ],
+      });
+    });
+
+    expect(await screen.findByText('Local personal summary')).toBeDefined();
+    expect(await screen.findByText('Cloud personal decision')).toBeDefined();
+    expect(await screen.findByText('Shared coding standard reminder')).toBeDefined();
+
+    const toggle = screen.getByRole('checkbox') as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+
+    await act(async () => {
+      fireEvent.click(toggle);
+    });
+
+    expect(toggle.checked).toBe(true);
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.personalSyncSave'));
+    });
+
+    await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1', expect.objectContaining({
+      enablePersonalMemorySync: true,
+    })));
   });
 });

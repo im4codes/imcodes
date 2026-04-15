@@ -3205,6 +3205,7 @@ export function App() {
           <SharedContextManagementPanel
             enterpriseId={typeof sharedContextManagementProps.enterpriseId === 'string' ? sharedContextManagementProps.enterpriseId : undefined}
             serverId={selectedServerId ?? undefined}
+            ws={wsRef.current}
             onEnterpriseChange={(enterpriseId) => setSharedContextManagementProps((prev) => ({ ...prev, enterpriseId, serverId: selectedServerId }))}
           />
         </FloatingPanel>

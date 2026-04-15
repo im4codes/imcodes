@@ -838,7 +838,8 @@
       "documentCreated": "Document created",
       "versionCreated": "Version created",
       "versionActivated": "Version activated",
-      "bindingCreated": "Binding created"
+      "bindingCreated": "Binding created",
+      "processingConfigSaved": "Processing config saved"
     },
     "management": {
       "title": "Shared Context",
@@ -920,7 +921,8 @@
         "members": "Members",
         "projects": "Projects",
         "knowledge": "Knowledge",
-        "processing": "Processing"
+        "processing": "Processing",
+        "memory": "Memory"
       },
       "policyTitle": "Project policy",
       "policyLoading": "Loading saved policy…",
@@ -962,7 +964,35 @@
       "processingOperationalTitle": "Operational notes",
       "processingOperationalLine1": "If no server-saved value exists, the primary model defaults to \"sonnet\".",
       "processingOperationalLine2": "The backup model is optional and defaults to unset.",
-      "processingOperationalLine3": "Different servers can still use different saved processing models. This panel edits the selected server only."
+      "processingOperationalLine3": "Different servers can still use different saved processing models. This panel edits the selected server only.",
+      "memorySummaryTitle": "Memory visibility",
+      "memorySummaryLine1": "Personal memory is materialized locally first, then optionally replicated to the cloud for cross-device continuity.",
+      "memorySummaryLine2": "Cloud personal memory is scoped to the current signed-in user and selected server.",
+      "memorySummaryLine3": "Shared memory stats show enterprise-scoped processed context that other enrolled projects can reuse.",
+      "personalSyncTitle": "Personal cloud sync",
+      "personalSyncDescription": "Choose whether processed personal memory should replicate to the cloud for this server.",
+      "personalSyncToggle": "Enable cloud sync for personal memory",
+      "personalSyncHelp": "Turn this on for cross-device continuity. Leave it off to keep processed personal memory local-only.",
+      "personalSyncSave": "Save sync setting",
+      "memoryQueryTitle": "Query processed memory",
+      "memoryQueryDescription": "Search local personal memory, cloud personal memory, and enterprise shared memory using the same filters.",
+      "memoryProjectPlaceholder": "Filter by canonical repo ID",
+      "memoryQueryPlaceholder": "Search summaries and compressed content",
+      "memoryAllClasses": "All record classes",
+      "memoryRecentSummary": "Recent summaries",
+      "memoryDurableCandidate": "Durable memory candidates",
+      "memoryLocalTitle": "Local personal memory",
+      "memoryCloudTitle": "Cloud personal memory",
+      "memorySharedTitle": "Enterprise shared memory",
+      "memoryStatTotal": "Total records",
+      "memoryStatHits": "Matched records",
+      "memoryStatRecent": "Recent summaries",
+      "memoryStatDurable": "Durable candidates",
+      "memoryStatProjects": "Projects",
+      "memoryRecordProject": "Project",
+      "memoryRecordClass": "Class",
+      "memoryRecordSources": "Source events",
+      "memoryRecordUpdated": "Updated"
     },
     "diagnostics": {
       "title": "Diagnostics",

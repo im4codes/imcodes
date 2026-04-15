@@ -57,7 +57,17 @@ function makeMockDb() {
     allow_local_fallback: boolean;
     require_full_provider_support: boolean;
   }>();
-  const projections = new Map<string, { id: string; enterprise_id: string; project_id: string; updated_at?: number }>();
+  const projections = new Map<string, {
+    id: string;
+    enterprise_id: string;
+    project_id: string;
+    updated_at?: number;
+    scope?: 'project_shared' | 'workspace_shared' | 'org_shared';
+    projection_class?: 'recent_summary' | 'durable_memory_candidate';
+    source_event_ids_json?: string[] | string;
+    summary?: string;
+    content_json?: Record<string, unknown> | string | null;
+  }>();
   const documents = new Map<string, { id: string; enterprise_id: string; kind: string; title: string }>();
   const versions = new Map<string, { id: string; document_id: string; version_number: number; status: string; content: string }>();
   const bindings = new Map<string, {
@@ -196,6 +206,27 @@ function makeMockDb() {
           kind: entry.kind,
           title: entry.title,
         })) as T[];
+      }
+      if (s.includes('select id, scope, project_id, projection_class, source_event_ids_json, summary, content_json, updated_at from shared_context_projections where enterprise_id = $1')) {
+        return [...projections.values()]
+          .filter((entry) => entry.enterprise_id === params[0])
+          .filter((entry) => !s.includes('and project_id = $2') || entry.project_id === params[1])
+          .filter((entry) => {
+            if (s.includes('and projection_class = $3')) return entry.projection_class === params[2];
+            if (s.includes('and projection_class = $2')) return entry.projection_class === params[1];
+            return true;
+          })
+          .sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0))
+          .map((entry) => ({
+            id: entry.id,
+            scope: entry.scope ?? 'project_shared',
+            project_id: entry.project_id,
+            projection_class: entry.projection_class ?? 'recent_summary',
+            source_event_ids_json: entry.source_event_ids_json ?? ['evt-1', 'evt-2'],
+            summary: entry.summary ?? `${entry.project_id} summary`,
+            content_json: entry.content_json ?? { note: 'shared memory' },
+            updated_at: entry.updated_at ?? Date.now(),
+          })) as T[];
       }
       if (s.includes('select id, version_number, status from shared_context_document_versions where document_id = $1')) {
         return [...versions.values()]
@@ -786,6 +817,44 @@ describe('shared-agent-context server control plane', () => {
     });
   });
 
+  it('returns enterprise shared memory stats and records for members', async () => {
+    mockDb.projections.set('proj-1', { id: 'proj-1', enterprise_id: 'team-1', project_id: 'github.com/acme/repo', updated_at: 1700000000000 });
+    mockDb.projections.set('proj-2', { id: 'proj-2', enterprise_id: 'team-1', project_id: 'github.com/acme/repo-2', updated_at: 1700000000500 });
+
+    const response = await app.request(...req('/api/shared-context/enterprises/team-1/memory?query=repo&limit=10', 'GET', undefined, 'user-member'));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      stats: {
+        totalRecords: 2,
+        matchedRecords: 2,
+        recentSummaryCount: 2,
+        durableCandidateCount: 0,
+        projectCount: 2,
+      },
+      records: [
+        {
+          id: 'proj-2',
+          scope: 'project_shared',
+          projectId: 'github.com/acme/repo-2',
+          summary: 'github.com/acme/repo-2 summary',
+          projectionClass: 'recent_summary',
+          sourceEventCount: 2,
+          updatedAt: 1700000000500,
+        },
+        {
+          id: 'proj-1',
+          scope: 'project_shared',
+          projectId: 'github.com/acme/repo',
+          summary: 'github.com/acme/repo summary',
+          projectionClass: 'recent_summary',
+          sourceEventCount: 2,
+          updatedAt: 1700000000000,
+        },
+      ],
+    });
+  });
+
   it('derives diagnostics bindings using the same applicability filters as runtime retrieval', async () => {
     const workspaceRes = await app.request(...req('/api/shared-context/enterprises/team-1/workspaces', 'POST', { name: 'Platform' }, 'user-owner'));
     const workspace = await workspaceRes.json() as { id: string };
@@ -837,6 +906,59 @@ describe('shared-agent-context server control plane', () => {
         activeBindingCount: 1,
         appliedDocumentVersionIds: [version.id],
       },
+    });
+  });
+
+  it('returns enterprise shared memory stats and matched records', async () => {
+    mockDb.projections.set('proj-memory-1', {
+      id: 'proj-memory-1',
+      enterprise_id: 'team-1',
+      project_id: 'github.com/acme/repo',
+      scope: 'project_shared',
+      projection_class: 'recent_summary',
+      source_event_ids_json: ['evt-1', 'evt-2'],
+      summary: 'Repository handoff summary',
+      content_json: { note: 'release train' },
+      updated_at: 1700000000000,
+    });
+    mockDb.projections.set('proj-memory-2', {
+      id: 'proj-memory-2',
+      enterprise_id: 'team-1',
+      project_id: 'github.com/acme/repo',
+      scope: 'workspace_shared',
+      projection_class: 'durable_memory_candidate',
+      source_event_ids_json: ['evt-3'],
+      summary: 'Provider fallback policy',
+      content_json: { note: 'codex backup' },
+      updated_at: 1700000000100,
+    });
+
+    const res = await app.request(...req(
+      '/api/shared-context/enterprises/team-1/memory?canonicalRepoId=github.com/acme/repo&query=provider',
+      'GET',
+      undefined,
+      'user-member',
+    ));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      stats: {
+        totalRecords: 2,
+        matchedRecords: 1,
+        recentSummaryCount: 1,
+        durableCandidateCount: 1,
+        projectCount: 1,
+      },
+      records: [
+        {
+          id: 'proj-memory-2',
+          scope: 'workspace_shared',
+          projectId: 'github.com/acme/repo',
+          summary: 'Provider fallback policy',
+          projectionClass: 'durable_memory_candidate',
+          sourceEventCount: 1,
+          updatedAt: 1700000000100,
+        },
+      ],
     });
   });
 });

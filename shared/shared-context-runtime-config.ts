@@ -35,6 +35,7 @@ export function defaultSharedContextRuntimeConfig(): ContextModelConfig {
     primaryContextModel: DEFAULT_CONTEXT_MODEL_BY_BACKEND[DEFAULT_PRIMARY_CONTEXT_BACKEND],
     backupContextBackend: undefined,
     backupContextModel: undefined,
+    enablePersonalMemorySync: false,
   };
 }
 
@@ -105,6 +106,7 @@ export function normalizeSharedContextRuntimeConfig(
     primaryContextModel,
     backupContextBackend,
     backupContextModel,
+    enablePersonalMemorySync: input?.enablePersonalMemorySync === true,
   };
 }
 

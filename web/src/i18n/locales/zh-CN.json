@@ -839,7 +839,8 @@
       "documentCreated": "文档已创建",
       "versionCreated": "版本已创建",
       "versionActivated": "版本已激活",
-      "bindingCreated": "绑定已创建"
+      "bindingCreated": "绑定已创建",
+      "processingConfigSaved": "处理配置已保存"
     },
     "management": {
       "title": "共享上下文",
@@ -921,7 +922,8 @@
         "members": "Members",
         "projects": "Projects",
         "knowledge": "Knowledge",
-        "processing": "Processing"
+        "processing": "Processing",
+        "memory": "记忆"
       },
       "policyTitle": "Project policy",
       "policyLoading": "Loading saved policy…",
@@ -963,7 +965,35 @@
       "processingOperationalTitle": "Operational notes",
       "processingOperationalLine1": "If no server-saved value exists, the primary model defaults to \"sonnet\".",
       "processingOperationalLine2": "The backup model is optional and defaults to unset.",
-      "processingOperationalLine3": "Different servers can still use different saved processing models. This panel edits the selected server only."
+      "processingOperationalLine3": "Different servers can still use different saved processing models. This panel edits the selected server only.",
+      "memorySummaryTitle": "记忆可见性",
+      "memorySummaryLine1": "个人记忆会先在本地压缩处理，然后可以选择同步到云端，实现跨设备连续性。",
+      "memorySummaryLine2": "云端个人记忆只属于当前登录用户和当前所选服务器。",
+      "memorySummaryLine3": "共享记忆统计展示的是企业范围内可被已加入项目复用的压缩上下文。",
+      "personalSyncTitle": "个人记忆云同步",
+      "personalSyncDescription": "控制这台服务器是否把个人压缩记忆同步到云端。",
+      "personalSyncToggle": "开启个人记忆云同步",
+      "personalSyncHelp": "开启后可跨设备延续个人记忆；关闭后个人压缩记忆只保留在本地。",
+      "personalSyncSave": "保存同步设置",
+      "memoryQueryTitle": "查询压缩记忆",
+      "memoryQueryDescription": "使用同一组过滤条件查询本地个人记忆、云端个人记忆和企业共享记忆。",
+      "memoryProjectPlaceholder": "按 canonical repo ID 过滤",
+      "memoryQueryPlaceholder": "搜索摘要和压缩内容",
+      "memoryAllClasses": "全部记录类型",
+      "memoryRecentSummary": "近期摘要",
+      "memoryDurableCandidate": "持久记忆候选",
+      "memoryLocalTitle": "本地个人记忆",
+      "memoryCloudTitle": "云端个人记忆",
+      "memorySharedTitle": "企业共享记忆",
+      "memoryStatTotal": "总记录数",
+      "memoryStatHits": "命中记录数",
+      "memoryStatRecent": "近期摘要数",
+      "memoryStatDurable": "持久候选数",
+      "memoryStatProjects": "项目数",
+      "memoryRecordProject": "项目",
+      "memoryRecordClass": "类型",
+      "memoryRecordSources": "来源事件",
+      "memoryRecordUpdated": "更新时间"
     },
     "diagnostics": {
       "title": "诊断",

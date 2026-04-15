@@ -14,6 +14,8 @@ import {
 import {
   ApiError,
   activateSharedDocumentVersion,
+  getEnterpriseSharedMemory,
+  getServerPersonalMemory,
   createSharedDocument,
   createSharedDocumentBinding,
   createSharedDocumentVersion,
@@ -41,10 +43,12 @@ import {
   type SharedWorkspace,
   type TeamDetail,
   type TeamSummary,
+  type ContextMemoryView,
   updateSharedProjectPolicy,
   updateSharedContextRuntimeConfig,
   updateTeamMemberRole,
 } from '../api.js';
+import type { WsClient } from '../ws-client.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../../../src/shared/models/options.js';
 
 const sectionStyle = {
@@ -174,6 +178,15 @@ const fieldLabelStyle = {
 const fieldInputStyle = {
   ...inputStyle,
   width: '100%',
+} as const;
+
+const processingModelInputStyle = {
+  ...fieldInputStyle,
+  height: 40,
+  minHeight: 40,
+  padding: '8px 10px',
+  lineHeight: '22px',
+  boxSizing: 'border-box',
 } as const;
 
 const statGridStyle = {
@@ -350,11 +363,12 @@ function formatServerScopeValue(serverId?: string): string {
 }
 
 type KindOption = SharedDocument['kind'];
-type ManagementTab = 'enterprise' | 'members' | 'projects' | 'knowledge' | 'processing';
+type ManagementTab = 'enterprise' | 'members' | 'projects' | 'knowledge' | 'processing' | 'memory';
 
 interface Props {
   enterpriseId?: string;
   serverId?: string;
+  ws?: WsClient | null;
   onEnterpriseChange?: (enterpriseId: string) => void;
 }
 
@@ -452,10 +466,22 @@ function formatMemberIdentity(member: TeamDetail['members'][number]): string {
   return member.user_id.length > 16 ? `${member.user_id.slice(0, 8)}…${member.user_id.slice(-4)}` : member.user_id;
 }
 
-export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId, serverId, onEnterpriseChange }: Props) {
+const EMPTY_MEMORY_VIEW: ContextMemoryView = {
+  stats: {
+    totalRecords: 0,
+    matchedRecords: 0,
+    recentSummaryCount: 0,
+    durableCandidateCount: 0,
+    projectCount: 0,
+  },
+  records: [],
+};
+
+export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId, serverId, ws, onEnterpriseChange }: Props) {
   const { t } = useTranslation();
   const onEnterpriseChangeRef = useRef(onEnterpriseChange);
   onEnterpriseChangeRef.current = onEnterpriseChange;
+  const personalMemoryRequestIdRef = useRef<string | null>(null);
 
   const [teams, setTeams] = useState<TeamSummary[]>([]);
   const [enterpriseId, setEnterpriseId] = useState(initialEnterpriseId ?? '');
@@ -496,6 +522,14 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [processingPrimaryModel, setProcessingPrimaryModel] = useState(DEFAULT_PRIMARY_CONTEXT_MODEL);
   const [processingBackupBackend, setProcessingBackupBackend] = useState<SharedContextRuntimeBackend>(DEFAULT_PRIMARY_CONTEXT_BACKEND);
   const [processingBackupModel, setProcessingBackupModel] = useState('');
+  const [processingPersonalSyncEnabled, setProcessingPersonalSyncEnabled] = useState(false);
+  const [memoryLoading, setMemoryLoading] = useState(false);
+  const [memoryProjectId, setMemoryProjectId] = useState('');
+  const [memoryQuery, setMemoryQuery] = useState('');
+  const [memoryProjectionClass, setMemoryProjectionClass] = useState<'' | 'recent_summary' | 'durable_memory_candidate'>('');
+  const [localPersonalMemory, setLocalPersonalMemory] = useState<ContextMemoryView>(EMPTY_MEMORY_VIEW);
+  const [cloudPersonalMemory, setCloudPersonalMemory] = useState<ContextMemoryView>(EMPTY_MEMORY_VIEW);
+  const [sharedMemory, setSharedMemory] = useState<ContextMemoryView>(EMPTY_MEMORY_VIEW);
 
   const selectedDocument = useMemo(
     () => documents.find((entry) => entry.id === selectedDocumentId) ?? null,
@@ -531,6 +565,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     { id: 'projects', label: t('sharedContext.management.tabs.projects') },
     { id: 'knowledge', label: t('sharedContext.management.tabs.knowledge') },
     { id: 'processing', label: t('sharedContext.management.tabs.processing') },
+    { id: 'memory', label: t('sharedContext.management.tabs.memory') },
   ], [t]);
 
   const refreshEnterpriseData = useCallback(async (nextEnterpriseId = enterpriseId) => {
@@ -651,6 +686,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     setProcessingPrimaryModel(view.snapshot.persisted.primaryContextModel);
     setProcessingBackupBackend(view.snapshot.persisted.backupContextBackend ?? view.snapshot.persisted.primaryContextBackend);
     setProcessingBackupModel(view.snapshot.persisted.backupContextModel ?? '');
+    setProcessingPersonalSyncEnabled(view.snapshot.persisted.enablePersonalMemorySync === true);
   }, []);
 
   const reloadProcessingConfig = useCallback(async () => {
@@ -660,6 +696,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       setProcessingPrimaryModel(DEFAULT_PRIMARY_CONTEXT_MODEL);
       setProcessingBackupBackend(DEFAULT_PRIMARY_CONTEXT_BACKEND);
       setProcessingBackupModel('');
+      setProcessingPersonalSyncEnabled(false);
       return;
     }
     setProcessingLoading(true);
@@ -675,9 +712,71 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   }, [applyProcessingSnapshot, serverId]);
 
   useEffect(() => {
-    if (activeTab !== 'processing') return;
+    if (activeTab !== 'processing' && activeTab !== 'memory') return;
     void reloadProcessingConfig();
   }, [activeTab, reloadProcessingConfig]);
+
+  useEffect(() => {
+    if (!ws) return;
+    return ws.onMessage((msg) => {
+      if (msg.type !== 'shared_context.personal_memory.response') return;
+      if (msg.requestId !== personalMemoryRequestIdRef.current) return;
+      setLocalPersonalMemory({
+        stats: msg.stats,
+        records: msg.records,
+      });
+    });
+  }, [ws]);
+
+  const loadMemoryViews = useCallback(async () => {
+    setMemoryLoading(true);
+    setError(null);
+    try {
+      const queryInput = {
+        projectId: memoryProjectId.trim() || undefined,
+        projectionClass: memoryProjectionClass || undefined,
+        query: memoryQuery.trim() || undefined,
+        limit: 25,
+      };
+      if (ws) {
+        const requestId = crypto.randomUUID();
+        personalMemoryRequestIdRef.current = requestId;
+        ws.send({
+          type: 'shared_context.personal_memory.query',
+          requestId,
+          ...queryInput,
+        });
+      } else {
+        setLocalPersonalMemory(EMPTY_MEMORY_VIEW);
+      }
+
+      if (serverId) {
+        setCloudPersonalMemory(await getServerPersonalMemory(serverId, queryInput));
+      } else {
+        setCloudPersonalMemory(EMPTY_MEMORY_VIEW);
+      }
+
+      if (enterpriseId) {
+        setSharedMemory(await getEnterpriseSharedMemory(enterpriseId, {
+          canonicalRepoId: memoryProjectId.trim() || undefined,
+          projectionClass: memoryProjectionClass || undefined,
+          query: memoryQuery.trim() || undefined,
+          limit: 25,
+        }));
+      } else {
+        setSharedMemory(EMPTY_MEMORY_VIEW);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setMemoryLoading(false);
+    }
+  }, [enterpriseId, memoryProjectId, memoryProjectionClass, memoryQuery, serverId, ws]);
+
+  useEffect(() => {
+    if (activeTab !== 'memory') return;
+    void loadMemoryViews();
+  }, [activeTab, loadMemoryViews]);
 
   const handleProcessingPrimaryBackendChange = useCallback((nextBackend: SharedContextRuntimeBackend) => {
     setProcessingPrimaryBackend((prevBackend) => {
@@ -1281,7 +1380,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         value={processingPrimaryModel}
                         onInput={(e) => setProcessingPrimaryModel((e.currentTarget as HTMLInputElement).value)}
                         placeholder={DEFAULT_PRIMARY_CONTEXT_MODEL}
-                        style={fieldInputStyle}
+                        style={processingModelInputStyle}
                       />
                       <ModelChipSelector
                         backend={processingPrimaryBackend}
@@ -1316,7 +1415,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         value={processingBackupModel}
                         onInput={(e) => setProcessingBackupModel((e.currentTarget as HTMLInputElement).value)}
                         placeholder={t('sharedContext.management.processingBackupPlaceholder')}
-                        style={fieldInputStyle}
+                        style={processingModelInputStyle}
                       />
                       <ModelChipSelector
                         backend={processingBackupBackend}
@@ -1345,6 +1444,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                           primaryContextModel: processingPrimaryModel.trim(),
                           backupContextBackend: processingBackupModel.trim() ? processingBackupBackend : undefined,
                           backupContextModel: processingBackupModel.trim() || undefined,
+                          enablePersonalMemorySync: processingPersonalSyncEnabled,
                         });
                         applyProcessingSnapshot(view);
                       } finally {
@@ -1393,6 +1493,127 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             <div>{t('sharedContext.management.processingOperationalLine2')}</div>
             <div>{t('sharedContext.management.processingOperationalLine3')}</div>
           </InfoCard>
+        </>
+      )}
+
+      {activeTab === 'memory' && (
+        <>
+          <InfoCard title={t('sharedContext.management.memorySummaryTitle')}>
+            <div>{t('sharedContext.management.memorySummaryLine1')}</div>
+            <div>{t('sharedContext.management.memorySummaryLine2')}</div>
+            <div>{t('sharedContext.management.memorySummaryLine3')}</div>
+          </InfoCard>
+
+          <div style={sectionStyle}>
+            <SectionHeading
+              title={t('sharedContext.management.personalSyncTitle')}
+              description={t('sharedContext.management.personalSyncDescription')}
+              action={serverId ? <span style={pillStyle}>{formatServerScopeValue(serverId)}</span> : undefined}
+            />
+            {serverId ? (
+              <div style={rowStyle}>
+                <label style={{ ...policyOptionStyle, flex: '1 1 360px' }}>
+                  <span style={{ fontWeight: 600 }}>{t('sharedContext.management.personalSyncToggle')}</span>
+                  <span style={helperTextStyle}>{t('sharedContext.management.personalSyncHelp')}</span>
+                  <input
+                    type="checkbox"
+                    checked={processingPersonalSyncEnabled}
+                    onChange={(e) => setProcessingPersonalSyncEnabled((e.currentTarget as HTMLInputElement).checked)}
+                  />
+                </label>
+                <button
+                  style={buttonStyle}
+                  disabled={processingSaving || !processingSnapshot}
+                  onClick={() => void handleAction(t('sharedContext.notice.processingConfigSaved'), async () => {
+                    setProcessingSaving(true);
+                    try {
+                      const view = await updateSharedContextRuntimeConfig(serverId, {
+                        primaryContextBackend: processingPrimaryBackend,
+                        primaryContextModel: processingPrimaryModel.trim(),
+                        backupContextBackend: processingBackupModel.trim() ? processingBackupBackend : undefined,
+                        backupContextModel: processingBackupModel.trim() || undefined,
+                        enablePersonalMemorySync: processingPersonalSyncEnabled,
+                      });
+                      applyProcessingSnapshot(view);
+                    } finally {
+                      setProcessingSaving(false);
+                    }
+                  })}
+                >
+                  {processingSaving ? t('sharedContext.management.processingSaving') : t('sharedContext.management.personalSyncSave')}
+                </button>
+              </div>
+            ) : (
+              <div style={helperTextStyle}>{t('sharedContext.management.processingServerRequired')}</div>
+            )}
+          </div>
+
+          <div style={sectionStyle}>
+            <SectionHeading
+              title={t('sharedContext.management.memoryQueryTitle')}
+              description={t('sharedContext.management.memoryQueryDescription')}
+              action={<button style={buttonStyle} onClick={() => void loadMemoryViews()}>{t('sharedContext.refresh')}</button>}
+            />
+            <div style={rowStyle}>
+              <input
+                value={memoryProjectId}
+                onInput={(e) => setMemoryProjectId((e.currentTarget as HTMLInputElement).value)}
+                placeholder={t('sharedContext.management.memoryProjectPlaceholder')}
+                style={inputStyle}
+              />
+              <input
+                value={memoryQuery}
+                onInput={(e) => setMemoryQuery((e.currentTarget as HTMLInputElement).value)}
+                placeholder={t('sharedContext.management.memoryQueryPlaceholder')}
+                style={inputStyle}
+              />
+              <select
+                value={memoryProjectionClass}
+                onChange={(e) => setMemoryProjectionClass((e.currentTarget as HTMLSelectElement).value as '' | 'recent_summary' | 'durable_memory_candidate')}
+                style={inputStyle}
+              >
+                <option value="">{t('sharedContext.management.memoryAllClasses')}</option>
+                <option value="recent_summary">{t('sharedContext.management.memoryRecentSummary')}</option>
+                <option value="durable_memory_candidate">{t('sharedContext.management.memoryDurableCandidate')}</option>
+              </select>
+            </div>
+            {memoryLoading ? <div style={helperTextStyle}>{t('sharedContext.loading')}</div> : null}
+          </div>
+
+          {[
+            [t('sharedContext.management.memoryLocalTitle'), localPersonalMemory],
+            [t('sharedContext.management.memoryCloudTitle'), cloudPersonalMemory],
+            [t('sharedContext.management.memorySharedTitle'), sharedMemory],
+          ].map(([title, view]) => (
+            <div key={title} style={sectionStyle}>
+              <SectionHeading title={title as string} />
+              <div style={statGridStyle}>
+                <StatCard label={t('sharedContext.management.memoryStatTotal')} value={(view as ContextMemoryView).stats.totalRecords} />
+                <StatCard label={t('sharedContext.management.memoryStatHits')} value={(view as ContextMemoryView).stats.matchedRecords} />
+                <StatCard label={t('sharedContext.management.memoryStatRecent')} value={(view as ContextMemoryView).stats.recentSummaryCount} />
+                <StatCard
+                  label={t('sharedContext.management.memoryStatDurable')}
+                  value={(view as ContextMemoryView).stats.durableCandidateCount}
+                  detail={`${t('sharedContext.management.memoryStatProjects')}: ${(view as ContextMemoryView).stats.projectCount}`}
+                />
+              </div>
+              {(view as ContextMemoryView).records.length > 0 ? (
+                <div style={resourceListStyle}>
+                  {(view as ContextMemoryView).records.map((record) => (
+                    <div key={record.id} style={resourceCardStyle}>
+                      <strong>{record.summary || '—'}</strong>
+                      <div style={metaGridStyle}>
+                        <MetaCard label={t('sharedContext.management.memoryRecordProject')} value={record.projectId} />
+                        <MetaCard label={t('sharedContext.management.memoryRecordClass')} value={record.projectionClass} />
+                        <MetaCard label={t('sharedContext.management.memoryRecordSources')} value={record.sourceEventCount} />
+                        <MetaCard label={t('sharedContext.management.memoryRecordUpdated')} value={new Date(record.updatedAt).toLocaleString()} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : <div style={helperTextStyle}>{t('sharedContext.empty')}</div>}
+            </div>
+          ))}
         </>
       )}
     </div>

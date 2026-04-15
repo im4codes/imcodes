@@ -82,7 +82,27 @@ export type ServerMessage =
   | { type: 'repo.error'; requestId: string; projectDir?: string; error: string }
   | { type: 'repo.detected'; projectDir: string; context: any }
   | { type: 'provider.status'; providerId: string; connected: boolean }
-  | { type: 'provider.sessions_response'; providerId: string; sessions: Array<{ key: string; displayName?: string; agentId?: string; updatedAt?: number; percentUsed?: number }>; error?: string };
+  | { type: 'provider.sessions_response'; providerId: string; sessions: Array<{ key: string; displayName?: string; agentId?: string; updatedAt?: number; percentUsed?: number }>; error?: string }
+  | {
+    type: 'shared_context.personal_memory.response';
+    requestId: string;
+    stats: {
+      totalRecords: number;
+      matchedRecords: number;
+      recentSummaryCount: number;
+      durableCandidateCount: number;
+      projectCount: number;
+    };
+    records: Array<{
+      id: string;
+      scope: 'personal';
+      projectId: string;
+      summary: string;
+      projectionClass: 'recent_summary' | 'durable_memory_candidate';
+      sourceEventCount: number;
+      updatedAt: number;
+    }>;
+  };
 
 export type {
   TimelineEvent,

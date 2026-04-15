@@ -52,7 +52,9 @@ describe('server shared-context runtime config routes', () => {
     getServerSharedContextRuntimeConfigMock.mockResolvedValue({
       primaryContextBackend: 'claude-code-sdk',
       primaryContextModel: 'sonnet',
+      backupContextBackend: undefined,
       backupContextModel: undefined,
+      enablePersonalMemorySync: false,
     });
     updateServerSharedContextRuntimeConfigMock.mockResolvedValue(true);
     queryOneMock.mockResolvedValue({ id: 'srv-1' });
@@ -75,8 +77,16 @@ describe('server shared-context runtime config routes', () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       snapshot: {
-        persisted: { primaryContextBackend: 'claude-code-sdk', primaryContextModel: 'sonnet' },
-        effective: { primaryContextBackend: 'claude-code-sdk', primaryContextModel: 'sonnet' },
+        persisted: {
+          primaryContextBackend: 'claude-code-sdk',
+          primaryContextModel: 'sonnet',
+          enablePersonalMemorySync: false,
+        },
+        effective: {
+          primaryContextBackend: 'claude-code-sdk',
+          primaryContextModel: 'sonnet',
+          enablePersonalMemorySync: false,
+        },
       },
     });
   });
@@ -91,6 +101,7 @@ describe('server shared-context runtime config routes', () => {
         primaryContextModel: 'gpt-5.4',
         backupContextBackend: 'claude-code-sdk',
         backupContextModel: 'haiku',
+        enablePersonalMemorySync: true,
       }),
     });
     expect(response.status).toBe(200);
@@ -103,6 +114,7 @@ describe('server shared-context runtime config routes', () => {
         primaryContextModel: 'gpt-5.4',
         backupContextBackend: 'claude-code-sdk',
         backupContextModel: 'haiku',
+        enablePersonalMemorySync: true,
       },
     );
     expect(sendToDaemonMock).toHaveBeenCalledWith(JSON.stringify({
@@ -112,6 +124,7 @@ describe('server shared-context runtime config routes', () => {
         primaryContextModel: 'gpt-5.4',
         backupContextBackend: 'claude-code-sdk',
         backupContextModel: 'haiku',
+        enablePersonalMemorySync: true,
       },
     }));
   });
@@ -129,6 +142,7 @@ describe('server shared-context runtime config routes', () => {
         primaryContextModel: 'sonnet',
         backupContextBackend: undefined,
         backupContextModel: undefined,
+        enablePersonalMemorySync: false,
       },
     });
     expect(queryOneMock).toHaveBeenCalled();

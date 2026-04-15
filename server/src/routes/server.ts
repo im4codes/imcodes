@@ -68,14 +68,82 @@ const runtimeConfigSchema = z.object({
   primaryContextModel: z.string().trim().min(1),
   backupContextBackend: z.enum(['claude-code-sdk', 'codex-sdk', 'qwen', 'openclaw']).optional().nullable(),
   backupContextModel: z.string().trim().optional().nullable(),
+  enablePersonalMemorySync: z.boolean().optional().nullable(),
 });
 
 const DEFAULT_REMOTE_PROCESSED_FRESH_MS = 6 * 60 * 60 * 1000;
+
+type RemoteMemoryRecordView = {
+  id: string;
+  scope: 'personal' | 'project_shared' | 'workspace_shared' | 'org_shared';
+  projectId: string;
+  summary: string;
+  projectionClass: 'recent_summary' | 'durable_memory_candidate';
+  sourceEventCount: number;
+  updatedAt: number;
+};
+
+type RemoteMemoryStatsView = {
+  totalRecords: number;
+  matchedRecords: number;
+  recentSummaryCount: number;
+  durableCandidateCount: number;
+  projectCount: number;
+};
 
 function getRemoteProcessedFreshMs(): number {
   const raw = process.env.IMCODES_REMOTE_PROCESSED_FRESH_MS?.trim();
   const parsed = raw ? Number(raw) : Number.NaN;
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_REMOTE_PROCESSED_FRESH_MS;
+}
+
+function matchesMemoryQuery(summary: string, content: unknown, query: string): boolean {
+  const normalized = query.trim().toLowerCase();
+  if (!normalized) return true;
+  return `${summary}\n${JSON.stringify(content ?? {})}`.toLowerCase().includes(normalized);
+}
+
+function buildRemoteMemoryResponse(
+  rows: Array<{
+    id: string;
+    scope: 'personal' | 'project_shared' | 'workspace_shared' | 'org_shared';
+    project_id: string;
+    projection_class: 'recent_summary' | 'durable_memory_candidate';
+    source_event_ids_json: string | string[];
+    summary: string;
+    content_json: string | Record<string, unknown> | null;
+    updated_at: number;
+  }>,
+  query?: string,
+  limit = 20,
+): { stats: RemoteMemoryStatsView; records: RemoteMemoryRecordView[] } {
+  const normalizedQuery = query?.trim() ?? '';
+  const filtered = rows.filter((row) => matchesMemoryQuery(
+    row.summary,
+    typeof row.content_json === 'string' ? JSON.parse(row.content_json) : row.content_json,
+    normalizedQuery,
+  ));
+  const projectIds = new Set(rows.map((row) => row.project_id));
+  return {
+    stats: {
+      totalRecords: rows.length,
+      matchedRecords: filtered.length,
+      recentSummaryCount: rows.filter((row) => row.projection_class === 'recent_summary').length,
+      durableCandidateCount: rows.filter((row) => row.projection_class === 'durable_memory_candidate').length,
+      projectCount: projectIds.size,
+    },
+    records: filtered.slice(0, limit).map((row) => ({
+      id: row.id,
+      scope: row.scope,
+      projectId: row.project_id,
+      summary: row.summary,
+      projectionClass: row.projection_class,
+      sourceEventCount: Array.isArray(row.source_event_ids_json)
+        ? row.source_event_ids_json.length
+        : JSON.parse(row.source_event_ids_json || '[]').length,
+      updatedAt: row.updated_at,
+    })),
+  };
 }
 
 // GET /api/server — list all servers accessible to the authenticated user
@@ -177,6 +245,7 @@ serverRoutes.put('/:id/shared-context/runtime-config', requireAuth(), async (c) 
     primaryContextModel: parsed.data.primaryContextModel,
     backupContextBackend: parsed.data.backupContextBackend ?? undefined,
     backupContextModel: parsed.data.backupContextModel ?? undefined,
+    enablePersonalMemorySync: parsed.data.enablePersonalMemorySync ?? undefined,
   });
   const updated = await updateServerSharedContextRuntimeConfig(c.env.DB, serverId, userId, normalized);
   if (!updated) return c.json({ error: 'not_found' }, 404);
@@ -281,8 +350,8 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
   const token = auth.slice(7);
   const tokenHash = sha256Hex(token);
 
-  const serverRow = await c.env.DB.queryOne<{ id: string; team_id: string | null }>(
-    'SELECT id, team_id FROM servers WHERE token_hash = $1 AND id = $2',
+  const serverRow = await c.env.DB.queryOne<{ id: string; team_id: string | null; user_id: string }>(
+    'SELECT id, team_id, user_id FROM servers WHERE token_hash = $1 AND id = $2',
     [tokenHash, c.req.param('id')],
   );
   if (!serverRow) return c.json({ error: 'unauthorized' }, 401);
@@ -293,12 +362,16 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
 
   const now = Date.now();
   for (const projection of parsed.data.projections) {
-    // Cross-tenant security: validate that the namespace enterprise matches the server's team
-    if (projection.namespace.enterpriseId && projection.namespace.enterpriseId !== serverRow.team_id) {
+    const isPersonal = projection.namespace.scope === 'personal';
+    if (isPersonal && projection.namespace.userId && projection.namespace.userId !== serverRow.user_id) {
+      return c.json({ error: 'namespace_user_mismatch', projectionId: projection.id }, 403);
+    }
+    if (!isPersonal && projection.namespace.enterpriseId && projection.namespace.enterpriseId !== serverRow.team_id) {
       return c.json({ error: 'namespace_enterprise_mismatch', projectionId: projection.id }, 403);
     }
-    // Sanitize: always use serverRow.team_id as the authoritative enterprise binding
-    const safeEnterpriseId = serverRow.team_id ?? projection.namespace.enterpriseId ?? null;
+    const safeEnterpriseId = isPersonal ? null : (serverRow.team_id ?? projection.namespace.enterpriseId ?? null);
+    const safeWorkspaceId = isPersonal ? null : (projection.namespace.workspaceId ?? null);
+    const safeUserId = isPersonal ? serverRow.user_id : (projection.namespace.userId ?? null);
     await c.env.DB.execute(
       `INSERT INTO shared_context_projections (
         id, server_id, scope, enterprise_id, workspace_id, user_id, project_id,
@@ -323,8 +396,8 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
         serverRow.id,
         projection.namespace.scope,
         safeEnterpriseId,
-        projection.namespace.workspaceId ?? null,
-        projection.namespace.userId ?? null,
+        safeWorkspaceId,
+        safeUserId,
         projection.namespace.projectId,
         projection.class,
         JSON.stringify(projection.sourceEventIds),
@@ -358,8 +431,8 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
           serverRow.id,
           projection.namespace.scope,
           safeEnterpriseId,
-          projection.namespace.workspaceId ?? null,
-          projection.namespace.userId ?? null,
+          safeWorkspaceId,
+          safeUserId,
           projection.namespace.projectId,
           projection.class,
           projection.summary,
@@ -376,6 +449,38 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
     replicatedAt: now,
     projectionCount: parsed.data.projections.length,
   });
+});
+
+serverRoutes.get('/:id/shared-context/personal-memory', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id') ?? '';
+  const server = await getServerById(c.env.DB, serverId);
+  if (!server || server.user_id !== userId) return c.json({ error: 'not_found' }, 404);
+  const projectId = c.req.query('projectId')?.trim();
+  const projectionClass = c.req.query('projectionClass')?.trim();
+  const query = c.req.query('query')?.trim();
+  const limit = Math.max(1, Math.min(100, Number.parseInt(c.req.query('limit') ?? '20', 10) || 20));
+  const rows = await c.env.DB.query<{
+    id: string;
+    scope: 'personal';
+    project_id: string;
+    projection_class: 'recent_summary' | 'durable_memory_candidate';
+    source_event_ids_json: string | string[];
+    summary: string;
+    content_json: string | Record<string, unknown> | null;
+    updated_at: number;
+  }>(
+    `SELECT id, scope, project_id, projection_class, source_event_ids_json, summary, content_json, updated_at
+     FROM shared_context_projections
+     WHERE server_id = $1
+       AND user_id = $2
+       AND scope = 'personal'
+       ${projectId ? 'AND project_id = $3' : ''}
+       ${projectionClass ? `AND projection_class = $${projectId ? 4 : 3}` : ''}
+     ORDER BY updated_at DESC`,
+    [serverId, userId, ...(projectId ? [projectId] : []), ...(projectionClass ? [projectionClass] : [])],
+  );
+  return c.json(buildRemoteMemoryResponse(rows, query, limit));
 });
 
 serverRoutes.post('/:id/shared-context/authored-bindings', async (c) => {
@@ -468,8 +573,8 @@ serverRoutes.post('/:id/shared-context/resolve-namespace', async (c) => {
   const token = auth.slice(7);
   const tokenHash = sha256Hex(token);
 
-  const serverRow = await c.env.DB.queryOne<{ id: string; team_id: string | null }>(
-    'SELECT id, team_id FROM servers WHERE token_hash = $1 AND id = $2',
+  const serverRow = await c.env.DB.queryOne<{ id: string; team_id: string | null; user_id: string }>(
+    'SELECT id, team_id, user_id FROM servers WHERE token_hash = $1 AND id = $2',
     [tokenHash, c.req.param('id')],
   );
   if (!serverRow) return c.json({ error: 'unauthorized' }, 401);
@@ -480,14 +585,23 @@ serverRoutes.post('/:id/shared-context/resolve-namespace', async (c) => {
 
   const canonicalRepoId = parsed.data.canonicalRepoId.trim();
   const enterpriseId = serverRow.team_id;
+  const personalRemoteProjection = await c.env.DB.queryOne<{ id: string; updated_at: number }>(
+    "SELECT id, updated_at FROM shared_context_projections WHERE scope = 'personal' AND user_id = $1 AND project_id = $2 ORDER BY updated_at DESC LIMIT 1",
+    [serverRow.user_id, canonicalRepoId],
+  );
+  const personalRemoteFreshness = classifyTimestampFreshness(
+    personalRemoteProjection?.updated_at,
+    Date.now(),
+    getRemoteProcessedFreshMs(),
+  );
   if (!enterpriseId) {
     const result: SharedContextNamespaceResolution = {
       namespace: null,
       canonicalRepoId,
       visibilityState: 'unenrolled',
-      remoteProcessedFreshness: 'missing',
+      remoteProcessedFreshness: personalRemoteFreshness,
       retryExhausted: true,
-      diagnostics: ['server-no-enterprise'],
+      diagnostics: ['server-no-enterprise', `remote-processed:${personalRemoteFreshness}`, 'remote-source:personal'],
     };
     return c.json(result);
   }
@@ -523,6 +637,7 @@ serverRoutes.post('/:id/shared-context/resolve-namespace', async (c) => {
     : null;
 
   const isActive = enrollment?.status === 'active';
+  const effectiveRemoteFreshness = isActive ? remoteProcessedFreshness : personalRemoteFreshness;
   const result: SharedContextNamespaceResolution = {
     namespace: isActive ? {
       scope: enrollment.scope,
@@ -532,7 +647,7 @@ serverRoutes.post('/:id/shared-context/resolve-namespace', async (c) => {
     } : null,
     canonicalRepoId,
     visibilityState: enrollment?.status ?? 'unenrolled',
-    remoteProcessedFreshness,
+    remoteProcessedFreshness: effectiveRemoteFreshness,
     // Return false when enrollment is active but remote is missing/stale (enables retry)
     // Return true when enrollment is inactive (no point retrying)
     retryExhausted: !isActive,
@@ -545,7 +660,8 @@ serverRoutes.post('/:id/shared-context/resolve-namespace', async (c) => {
     } : {}),
     diagnostics: [
       `visibility:${enrollment?.status ?? 'unenrolled'}`,
-      `remote-processed:${remoteProcessedFreshness}`,
+      `remote-processed:${effectiveRemoteFreshness}`,
+      `remote-source:${isActive ? 'shared' : 'personal'}`,
     ],
   };
   return c.json(result);

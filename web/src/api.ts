@@ -1174,6 +1174,29 @@ export interface SharedContextDiagnosticsView {
   };
 }
 
+export interface ContextMemoryStatsView {
+  totalRecords: number;
+  matchedRecords: number;
+  recentSummaryCount: number;
+  durableCandidateCount: number;
+  projectCount: number;
+}
+
+export interface ContextMemoryRecordView {
+  id: string;
+  scope: 'personal' | 'project_shared' | 'workspace_shared' | 'org_shared';
+  projectId: string;
+  summary: string;
+  projectionClass: 'recent_summary' | 'durable_memory_candidate';
+  sourceEventCount: number;
+  updatedAt: number;
+}
+
+export interface ContextMemoryView {
+  stats: ContextMemoryStatsView;
+  records: ContextMemoryRecordView[];
+}
+
 export interface SharedContextRuntimeConfigView {
   snapshot: SharedContextRuntimeConfigSnapshot;
 }
@@ -1408,4 +1431,42 @@ export async function getSharedContextDiagnostics(
     `/api/shared-context/enterprises/${encodeURIComponent(enterpriseId)}/diagnostics?${params.toString()}`,
     { method: 'GET' },
   );
+}
+
+export async function getServerPersonalMemory(
+  serverId: string,
+  input?: {
+    projectId?: string;
+    projectionClass?: 'recent_summary' | 'durable_memory_candidate';
+    query?: string;
+    limit?: number;
+  },
+): Promise<ContextMemoryView> {
+  const params = new URLSearchParams();
+  if (input?.projectId) params.set('projectId', input.projectId);
+  if (input?.projectionClass) params.set('projectionClass', input.projectionClass);
+  if (input?.query) params.set('query', input.query);
+  if (typeof input?.limit === 'number') params.set('limit', String(input.limit));
+  return apiFetch(`/api/server/${encodeURIComponent(serverId)}/shared-context/personal-memory?${params.toString()}`, {
+    method: 'GET',
+  });
+}
+
+export async function getEnterpriseSharedMemory(
+  enterpriseId: string,
+  input?: {
+    canonicalRepoId?: string;
+    projectionClass?: 'recent_summary' | 'durable_memory_candidate';
+    query?: string;
+    limit?: number;
+  },
+): Promise<ContextMemoryView> {
+  const params = new URLSearchParams();
+  if (input?.canonicalRepoId) params.set('canonicalRepoId', input.canonicalRepoId);
+  if (input?.projectionClass) params.set('projectionClass', input.projectionClass);
+  if (input?.query) params.set('query', input.query);
+  if (typeof input?.limit === 'number') params.set('limit', String(input.limit));
+  return apiFetch(`/api/shared-context/enterprises/${encodeURIComponent(enterpriseId)}/memory?${params.toString()}`, {
+    method: 'GET',
+  });
 }

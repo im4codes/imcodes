@@ -19,6 +19,7 @@ describe('context-model-config', () => {
       primaryContextModel: 'gpt-5.4',
       backupContextBackend: 'claude-code-sdk',
       backupContextModel: 'haiku',
+      enablePersonalMemorySync: false,
     });
   });
 
@@ -43,6 +44,16 @@ describe('context-model-config', () => {
       primaryContextModel: 'sonnet',
       backupContextBackend: 'qwen',
       backupContextModel: 'qwen3-coder-plus',
+      enablePersonalMemorySync: false,
     });
+  });
+
+  it('keeps the synced personal memory cloud-sync flag', () => {
+    setContextModelRuntimeConfig({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'sonnet',
+      enablePersonalMemorySync: true,
+    });
+    expect(getContextModelConfig().enablePersonalMemorySync).toBe(true);
   });
 });

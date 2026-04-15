@@ -141,6 +141,91 @@ describe('resolveTransportContextBootstrap', () => {
     });
   });
 
+  it('keeps personal fallback remote freshness when server control-plane reports unenrolled personal continuity', async () => {
+    detectRepoMock.mockResolvedValue({
+      info: {
+        remoteUrl: 'https://github.com/acme/repo.git',
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        namespace: null,
+        canonicalRepoId: 'github.com/acme/repo',
+        visibilityState: 'unenrolled',
+        remoteProcessedFreshness: 'fresh',
+        retryExhausted: true,
+        diagnostics: ['server-no-enterprise', 'remote-processed:fresh', 'remote-source:personal'],
+      }),
+    })));
+    configureSharedContextRuntime({
+      workerUrl: 'http://worker.test',
+      serverId: 'srv-1',
+      token: 'daemon-token',
+    });
+
+    const result = await resolveTransportContextBootstrap({
+      projectDir: '/tmp/project',
+      transportConfig: {},
+    });
+
+    expect(result).toEqual({
+      namespace: {
+        scope: 'personal',
+        projectId: 'github.com/acme/repo',
+      },
+      diagnostics: [
+        'namespace:server-personal-fallback',
+        'server-no-enterprise',
+        'remote-processed:fresh',
+        'remote-source:personal',
+      ],
+      remoteProcessedFreshness: 'fresh',
+      localProcessedFreshness: 'missing',
+      retryExhausted: true,
+    });
+  });
+
+  it('keeps remote personal freshness when the server resolves no shared enrollment', async () => {
+    detectRepoMock.mockResolvedValue({
+      info: {
+        remoteUrl: 'https://github.com/acme/repo.git',
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        namespace: null,
+        canonicalRepoId: 'github.com/acme/repo',
+        visibilityState: 'unenrolled',
+        remoteProcessedFreshness: 'fresh',
+        retryExhausted: true,
+        diagnostics: ['server-no-enterprise', 'remote-source:personal'],
+      }),
+    })));
+    configureSharedContextRuntime({
+      workerUrl: 'http://worker.test',
+      serverId: 'srv-1',
+      token: 'daemon-token',
+    });
+
+    const result = await resolveTransportContextBootstrap({
+      projectDir: '/tmp/project',
+      transportConfig: {},
+    });
+
+    expect(result).toEqual({
+      namespace: {
+        scope: 'personal',
+        projectId: 'github.com/acme/repo',
+      },
+      diagnostics: ['namespace:server-personal-fallback', 'server-no-enterprise', 'remote-source:personal'],
+      remoteProcessedFreshness: 'fresh',
+      localProcessedFreshness: 'missing',
+      retryExhausted: true,
+    });
+  });
+
   it('includes local processed freshness for the resolved namespace', async () => {
     const now = Date.now();
     detectRepoMock.mockResolvedValue({

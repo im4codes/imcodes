@@ -10,6 +10,7 @@ import {
   listReplicationStates,
   setReplicationState,
 } from '../store/context-store.js';
+import { getContextModelConfig } from './context-model-config.js';
 
 export interface ProcessedContextReplicationCredentials {
   workerUrl: string;
@@ -76,12 +77,20 @@ export async function replicatePendingProcessedContext(
 }
 
 function resolveStates(namespaces?: ContextNamespace[]): ContextReplicationState[] {
+  const allowPersonalSync = getContextModelConfig().enablePersonalMemorySync === true;
   if (!namespaces || namespaces.length === 0) {
-    return listReplicationStates().filter((state) => state.pendingProjectionIds.length > 0);
+    return listReplicationStates().filter((state) => (
+      state.pendingProjectionIds.length > 0
+      && (allowPersonalSync || state.namespace.scope !== 'personal')
+    ));
   }
   return namespaces
     .map((namespace) => getReplicationState(namespace))
-    .filter((state): state is ContextReplicationState => !!state && state.pendingProjectionIds.length > 0);
+    .filter((state): state is ContextReplicationState => (
+      !!state
+      && state.pendingProjectionIds.length > 0
+      && (allowPersonalSync || state.namespace.scope !== 'personal')
+    ));
 }
 
 function selectPendingProjections(namespace: ContextNamespace, pendingIds: string[]): ProcessedContextProjection[] {

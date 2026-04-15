@@ -839,7 +839,8 @@
       "documentCreated": "文件已建立",
       "versionCreated": "版本已建立",
       "versionActivated": "版本已啟用",
-      "bindingCreated": "綁定已建立"
+      "bindingCreated": "綁定已建立",
+      "processingConfigSaved": "處理設定已儲存"
     },
     "management": {
       "title": "共享上下文",
@@ -921,7 +922,8 @@
         "members": "Members",
         "projects": "Projects",
         "knowledge": "Knowledge",
-        "processing": "Processing"
+        "processing": "Processing",
+        "memory": "記憶"
       },
       "policyTitle": "Project policy",
       "policyLoading": "Loading saved policy…",
@@ -963,7 +965,35 @@
       "processingOperationalTitle": "Operational notes",
       "processingOperationalLine1": "If no server-saved value exists, the primary model defaults to \"sonnet\".",
       "processingOperationalLine2": "The backup model is optional and defaults to unset.",
-      "processingOperationalLine3": "Different servers can still use different saved processing models. This panel edits the selected server only."
+      "processingOperationalLine3": "Different servers can still use different saved processing models. This panel edits the selected server only.",
+      "memorySummaryTitle": "記憶可見性",
+      "memorySummaryLine1": "個人記憶會先在本地壓縮處理，之後可選擇同步到雲端，實現跨裝置連續性。",
+      "memorySummaryLine2": "雲端個人記憶只屬於目前登入使用者與目前選取的伺服器。",
+      "memorySummaryLine3": "共享記憶統計顯示的是企業範圍內可被已加入專案重用的壓縮上下文。",
+      "personalSyncTitle": "個人記憶雲端同步",
+      "personalSyncDescription": "控制這台伺服器是否把個人壓縮記憶同步到雲端。",
+      "personalSyncToggle": "啟用個人記憶雲端同步",
+      "personalSyncHelp": "開啟後可跨裝置延續個人記憶；關閉後個人壓縮記憶只保留在本地。",
+      "personalSyncSave": "儲存同步設定",
+      "memoryQueryTitle": "查詢壓縮記憶",
+      "memoryQueryDescription": "使用同一組過濾條件查詢本地個人記憶、雲端個人記憶與企業共享記憶。",
+      "memoryProjectPlaceholder": "依 canonical repo ID 篩選",
+      "memoryQueryPlaceholder": "搜尋摘要與壓縮內容",
+      "memoryAllClasses": "全部記錄類型",
+      "memoryRecentSummary": "近期摘要",
+      "memoryDurableCandidate": "持久記憶候選",
+      "memoryLocalTitle": "本地個人記憶",
+      "memoryCloudTitle": "雲端個人記憶",
+      "memorySharedTitle": "企業共享記憶",
+      "memoryStatTotal": "總記錄數",
+      "memoryStatHits": "命中記錄數",
+      "memoryStatRecent": "近期摘要數",
+      "memoryStatDurable": "持久候選數",
+      "memoryStatProjects": "專案數",
+      "memoryRecordProject": "專案",
+      "memoryRecordClass": "類型",
+      "memoryRecordSources": "來源事件",
+      "memoryRecordUpdated": "更新時間"
     },
     "diagnostics": {
       "title": "診斷",

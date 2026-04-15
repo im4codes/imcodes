@@ -8,6 +8,7 @@ import type {
 import { dispatchSharedContextSend } from '../../src/agent/transport-runtime-assembly.js';
 import type { TransportProvider } from '../../src/agent/transport-provider.js';
 import { fetchBackendManagedAuthoredContext } from '../../src/context/backend-authored-context.js';
+import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import { MaterializationCoordinator } from '../../src/context/materialization-coordinator.js';
 import { replicatePendingProcessedContext } from '../../src/context/processed-context-replication.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
@@ -51,10 +52,12 @@ describe('shared-agent-context continuity integration', () => {
 
   beforeEach(async () => {
     tempDir = await createIsolatedSharedContextDb('shared-context-integration');
+    setContextModelRuntimeConfig(null);
   });
 
   afterEach(async () => {
     vi.unstubAllGlobals();
+    setContextModelRuntimeConfig(null);
     await cleanupIsolatedSharedContextDb(tempDir);
   });
 
@@ -76,12 +79,20 @@ describe('shared-agent-context continuity integration', () => {
         primaryContextModel: 'gpt-5.2',
         backupContextBackend: 'qwen',
         backupContextModel: 'qwen',
+        enablePersonalMemorySync: true,
       },
     });
 
     coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'Investigate rollout failure', createdAt: 100 });
     coordinator.ingestEvent({ target, eventType: 'assistant.turn', content: 'Root cause is stale config replay', createdAt: 101 });
     const materialized = coordinator.materializeTarget(target, 'manual', 200);
+    setContextModelRuntimeConfig({
+      primaryContextBackend: 'codex-sdk',
+      primaryContextModel: 'gpt-5.2',
+      backupContextBackend: 'qwen',
+      backupContextModel: 'qwen',
+      enablePersonalMemorySync: true,
+    });
 
     let replicatedBody: ProcessedContextReplicationBody | null = null;
     vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {

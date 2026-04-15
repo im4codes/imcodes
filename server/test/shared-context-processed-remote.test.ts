@@ -1,9 +1,17 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { sha256Hex } from '../src/security/crypto.js';
 import { serverRoutes } from '../src/routes/server.js';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
+
+vi.mock('../src/security/authorization.js', () => ({
+  requireAuth: () => async (c: { set: (key: string, value: string) => void }, next: () => Promise<void>) => {
+    c.set('userId', 'user-1');
+    c.set('role', 'owner');
+    await next();
+  },
+}));
 
 function makeMockDb() {
   const projectionRows: Array<Record<string, unknown>> = [];
@@ -36,6 +44,12 @@ function makeMockDb() {
   const db: Database = {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
       const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+      if (normalized.includes('select id, team_id, user_id from servers where token_hash = $1 and id = $2')) {
+        if (params[0] === validTokenHash && params[1] === 'srv-1') {
+          return { id: 'srv-1', team_id: 'ent-1', user_id: 'user-1' } as T;
+        }
+        return null;
+      }
       if (normalized.includes('select id, team_id from servers where token_hash = $1 and id = $2')) {
         if (params[0] === validTokenHash && params[1] === 'srv-1') {
           return { id: 'srv-1', team_id: 'ent-1' } as T;
@@ -45,6 +59,12 @@ function makeMockDb() {
       if (normalized.includes('select id from servers where token_hash = $1 and id = $2')) {
         if (params[0] === validTokenHash && params[1] === 'srv-1') {
           return { id: 'srv-1' } as T;
+        }
+        return null;
+      }
+      if (normalized.includes('select * from servers where id = $1')) {
+        if (params[0] === 'srv-1') {
+          return { id: 'srv-1', user_id: 'user-1', team_id: 'ent-1' } as T;
         }
         return null;
       }
@@ -76,6 +96,12 @@ function makeMockDb() {
         }
         return null;
       }
+      if (normalized.includes("select id, updated_at from shared_context_projections where scope = 'personal' and user_id = $1 and project_id = $2 order by updated_at desc limit 1")) {
+        if (params[0] === 'user-1' && params[1] === 'github.com/acme/repo') {
+          return { id: 'personal-projection-1', updated_at: Date.now() } as T;
+        }
+        return null;
+      }
       return null;
     },
     query: async <T = unknown>(sql: string, params: unknown[] = []) => {
@@ -83,6 +109,20 @@ function makeMockDb() {
       if (normalized.includes('from shared_context_document_bindings b join shared_context_document_versions v on v.id = b.version_id')) {
         if (params[0] !== 'ent-1' || params[2] !== 'github.com/acme/repo') return [] as T[];
         return authoredBindingRows as T[];
+      }
+      if (normalized.includes("from shared_context_projections where server_id = $1 and user_id = $2 and scope = 'personal'")) {
+        return [
+          {
+            id: 'personal-projection-1',
+            scope: 'personal',
+            project_id: 'github.com/acme/repo',
+            projection_class: 'recent_summary',
+            source_event_ids_json: ['evt-1', 'evt-2'],
+            summary: 'Cloud personal summary',
+            content_json: { note: 'personal cloud memory' },
+            updated_at: 1700000000000,
+          },
+        ] as T[];
       }
       return [] as T[];
     },
@@ -106,6 +146,10 @@ function makeMockDb() {
           id: params[0],
           projection_id: params[1],
           server_id: params[2],
+          scope: params[3],
+          enterprise_id: params[4],
+          workspace_id: params[5],
+          user_id: params[6],
           project_id: params[7],
           record_class: params[8],
         });
@@ -199,6 +243,99 @@ describe('shared-context processed remote route', () => {
       }),
     ]);
     expect(aliasRows).toHaveLength(0);
+  });
+
+  it('sanitizes personal projections to the daemon owner and rejects mismatched namespace users', async () => {
+    const { db, projectionRows, recordRows } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+
+    const okResponse = await app.request('/api/server/srv-1/shared-context/processed', {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer daemon-token',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        namespace: {
+          scope: 'personal',
+          projectId: 'github.com/acme/repo',
+          userId: 'user-1',
+        },
+        projections: [
+          {
+            id: 'personal-proj-1',
+            namespace: {
+              scope: 'personal',
+              projectId: 'github.com/acme/repo',
+              userId: 'user-1',
+              enterpriseId: 'wrong-ent',
+              workspaceId: 'wrong-ws',
+            },
+            class: 'durable_memory_candidate',
+            sourceEventIds: ['evt-1'],
+            summary: 'personal summary',
+            content: { foo: 'bar' },
+            createdAt: 100,
+            updatedAt: 110,
+          },
+        ],
+      }),
+    }, makeEnv(db));
+
+    expect(okResponse.status).toBe(200);
+    expect(projectionRows).toContainEqual(expect.objectContaining({
+      id: 'personal-proj-1',
+      scope: 'personal',
+      enterprise_id: null,
+      workspace_id: null,
+      user_id: 'user-1',
+      project_id: 'github.com/acme/repo',
+    }));
+    expect(recordRows).toContainEqual(expect.objectContaining({
+      projection_id: 'personal-proj-1',
+      scope: 'personal',
+      enterprise_id: null,
+      workspace_id: null,
+      user_id: 'user-1',
+    }));
+
+    const forbidden = await app.request('/api/server/srv-1/shared-context/processed', {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer daemon-token',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        namespace: {
+          scope: 'personal',
+          projectId: 'github.com/acme/repo',
+          userId: 'user-other',
+        },
+        projections: [
+          {
+            id: 'personal-proj-2',
+            namespace: {
+              scope: 'personal',
+              projectId: 'github.com/acme/repo',
+              userId: 'user-other',
+            },
+            class: 'recent_summary',
+            sourceEventIds: ['evt-2'],
+            summary: 'mismatch',
+            content: { foo: 'bar' },
+            createdAt: 120,
+            updatedAt: 130,
+          },
+        ],
+      }),
+    }, makeEnv(db));
+
+    expect(forbidden.status).toBe(403);
+    await expect(forbidden.json()).resolves.toEqual({
+      error: 'namespace_user_mismatch',
+      projectionId: 'personal-proj-2',
+    });
   });
 
   it('rejects invalid daemon token or malformed payload', async () => {
@@ -307,7 +444,76 @@ describe('shared-context processed remote route', () => {
         allowLocalProcessedFallback: false,
         requireFullProviderSupport: false,
       },
-      diagnostics: ['visibility:active', 'remote-processed:fresh'],
+      diagnostics: ['visibility:active', 'remote-processed:fresh', 'remote-source:shared'],
+    });
+  });
+
+  it('returns personal remote freshness and personal source diagnostics when the server has no enterprise enrollment', async () => {
+    const { db } = makeMockDb();
+    const personalDb: Database = {
+      ...db,
+      queryOne: async <T = unknown>(sql: string, params: unknown[] = []) => {
+        const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
+        if (normalized.includes('select id, team_id, user_id from servers where token_hash = $1 and id = $2')) {
+          if (params[0] === sha256Hex('daemon-token') && params[1] === 'srv-1') {
+            return { id: 'srv-1', team_id: null, user_id: 'user-1' } as T;
+          }
+        }
+        return db.queryOne<T>(sql, params);
+      },
+    } as Database;
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+
+    const response = await app.request('/api/server/srv-1/shared-context/resolve-namespace', {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer daemon-token',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ canonicalRepoId: 'github.com/acme/repo' }),
+    }, makeEnv(personalDb));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      namespace: null,
+      canonicalRepoId: 'github.com/acme/repo',
+      visibilityState: 'unenrolled',
+      remoteProcessedFreshness: 'fresh',
+      retryExhausted: true,
+      diagnostics: ['server-no-enterprise', 'remote-processed:fresh', 'remote-source:personal'],
+    });
+  });
+
+  it('returns cloud personal memory stats for the owning server user', async () => {
+    const { db } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+
+    const response = await app.request('/api/server/srv-1/shared-context/personal-memory?query=summary&limit=10', {
+      method: 'GET',
+    }, makeEnv(db));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      stats: {
+        totalRecords: 1,
+        matchedRecords: 1,
+        recentSummaryCount: 1,
+        durableCandidateCount: 0,
+        projectCount: 1,
+      },
+      records: [
+        {
+          id: 'personal-projection-1',
+          scope: 'personal',
+          projectId: 'github.com/acme/repo',
+          summary: 'Cloud personal summary',
+          projectionClass: 'recent_summary',
+          sourceEventCount: 2,
+          updatedAt: 1700000000000,
+        },
+      ],
     });
   });
 
@@ -341,7 +547,7 @@ describe('shared-context processed remote route', () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual(expect.objectContaining({
       remoteProcessedFreshness: 'stale',
-      diagnostics: ['visibility:active', 'remote-processed:stale'],
+      diagnostics: ['visibility:active', 'remote-processed:stale', 'remote-source:shared'],
     }));
   });
 });

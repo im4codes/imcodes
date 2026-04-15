@@ -4,10 +4,12 @@ import {
   clearDirtyTarget,
   enqueueContextJob,
   getLocalProcessedFreshness,
+  getProcessedProjectionStats,
   getReplicationState,
   listContextEvents,
   listDirtyTargets,
   listProcessedProjections,
+  queryProcessedProjections,
   recordContextEvent,
   setReplicationState,
   updateContextJob,
@@ -101,6 +103,62 @@ describe('context-store', () => {
 
   it('reports missing local processed freshness when no projections exist', () => {
     expect(getLocalProcessedFreshness(namespace)).toBe('missing');
+  });
+
+  it('queries processed projections and reports hit stats for personal memory views', () => {
+    const now = Date.now();
+    writeProcessedProjection({
+      namespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-1', 'evt-2'],
+      summary: 'Repository summary',
+      content: { note: 'Discuss deployment checklist' },
+      createdAt: now - 20,
+      updatedAt: now - 10,
+    });
+    writeProcessedProjection({
+      namespace,
+      class: 'durable_memory_candidate',
+      sourceEventIds: ['evt-3'],
+      summary: 'Keep rollback playbook',
+      content: { category: 'operations' },
+      createdAt: now - 5,
+      updatedAt: now,
+    });
+    writeProcessedProjection({
+      namespace: { scope: 'personal', projectId: 'repo-2', userId: 'user-1' },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-4'],
+      summary: 'Other project summary',
+      content: { note: 'Should not match repo filter' },
+      createdAt: now - 2,
+      updatedAt: now - 1,
+    });
+
+    const records = queryProcessedProjections({
+      scope: 'personal',
+      projectId: 'repo',
+      query: 'rollback',
+      limit: 10,
+    });
+    expect(records).toEqual([
+      expect.objectContaining({
+        summary: 'Keep rollback playbook',
+        class: 'durable_memory_candidate',
+      }),
+    ]);
+
+    expect(getProcessedProjectionStats({
+      scope: 'personal',
+      projectId: 'repo',
+      query: 'summary',
+    })).toEqual({
+      totalRecords: 2,
+      matchedRecords: 1,
+      recentSummaryCount: 1,
+      durableCandidateCount: 1,
+      projectCount: 1,
+    });
   });
 
   it('clears dirty targets after materialization cleanup', () => {

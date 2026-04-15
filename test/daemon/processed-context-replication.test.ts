@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ContextNamespace } from '../../shared/context-types.js';
+import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import { replicatePendingProcessedContext } from '../../src/context/processed-context-replication.js';
 import {
   getReplicationState,
-  resetContextStoreForTests,
   setReplicationState,
   writeProcessedProjection,
 } from '../../src/store/context-store.js';
@@ -16,10 +16,12 @@ describe('processed-context replication', () => {
   beforeEach(async () => {
     tempDir = await createIsolatedSharedContextDb('processed-context-replication');
     namespace = { scope: 'project_shared', projectId: 'github.com/acme/repo', enterpriseId: 'ent-1' };
+    setContextModelRuntimeConfig(null);
   });
 
   afterEach(async () => {
     vi.unstubAllGlobals();
+    setContextModelRuntimeConfig(null);
     await cleanupIsolatedSharedContextDb(tempDir);
   });
 
@@ -104,5 +106,66 @@ describe('processed-context replication', () => {
       lastError: 'processed_remote_replication_failed:503',
       lastReplicatedAt: undefined,
     });
+  });
+
+  it('skips personal replication unless personal cloud sync is enabled', async () => {
+    const personalNamespace: ContextNamespace = { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-1' };
+    const projection = writeProcessedProjection({
+      namespace: personalNamespace,
+      class: 'recent_summary',
+      sourceEventIds: ['evt-1'],
+      summary: 'personal summary',
+      content: { note: 'only replicate when enabled' },
+      createdAt: 300,
+      updatedAt: 310,
+    });
+    setReplicationState(personalNamespace, {
+      pendingProjectionIds: [projection.id],
+    });
+
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const skipped = await replicatePendingProcessedContext({
+      workerUrl: 'http://localhost:3000',
+      serverId: 'srv-1',
+      token: 'daemon-token',
+    });
+    expect(skipped).toEqual({
+      replicatedNamespaces: 0,
+      replicatedProjections: 0,
+      failures: [],
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(getReplicationState(personalNamespace)).toEqual({
+      namespace: personalNamespace,
+      pendingProjectionIds: [projection.id],
+      lastError: undefined,
+      lastReplicatedAt: undefined,
+    });
+
+    setContextModelRuntimeConfig({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'sonnet',
+      enablePersonalMemorySync: true,
+    });
+
+    const replicated = await replicatePendingProcessedContext({
+      workerUrl: 'http://localhost:3000',
+      serverId: 'srv-1',
+      token: 'daemon-token',
+    });
+    expect(replicated).toEqual({
+      replicatedNamespaces: 1,
+      replicatedProjections: 1,
+      failures: [],
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(getReplicationState(personalNamespace)).toEqual(expect.objectContaining({
+      namespace: personalNamespace,
+      pendingProjectionIds: [],
+      lastError: undefined,
+      lastReplicatedAt: expect.any(Number),
+    }));
   });
 });

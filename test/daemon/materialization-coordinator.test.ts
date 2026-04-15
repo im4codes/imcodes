@@ -118,6 +118,7 @@ describe('MaterializationCoordinator', () => {
       primaryContextModel: 'gpt-5.2',
       backupContextBackend: 'qwen',
       backupContextModel: 'qwen3-coder-plus',
+      enablePersonalMemorySync: false,
     });
   });
 });
