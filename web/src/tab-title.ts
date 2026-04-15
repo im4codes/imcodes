@@ -1,7 +1,7 @@
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import type { SessionInfo } from './types.js';
 
-const APP_TITLE = 'imcodes';
+const APP_TITLE = 'IM.codes — The IM for agents';
 
 export function getSessionTitleLabel(session: SessionInfo | null): string | null {
   if (!session) return null;
