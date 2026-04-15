@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace, ContextTargetRef } from '../../shared/context-types.js';
 import { MaterializationCoordinator } from '../../src/context/materialization-coordinator.js';
+import { localOnlyCompressor } from '../../src/context/summary-compressor.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import { getReplicationState } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
@@ -22,8 +23,8 @@ describe('MaterializationCoordinator', () => {
     await cleanupIsolatedSharedContextDb(tempDir);
   });
 
-  it('queues threshold jobs when event counts exceed the configured threshold', () => {
-    const coordinator = new MaterializationCoordinator({
+  it('queues threshold jobs when event counts exceed the configured threshold', async () => {
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 2, idleMs: 1000, scheduleMs: 10_000 },
       modelConfig: {
         primaryContextBackend: 'codex-sdk',
@@ -45,8 +46,8 @@ describe('MaterializationCoordinator', () => {
     }));
   });
 
-  it('filters out non-eligible events from materialization triggers but still records them', () => {
-    const coordinator = new MaterializationCoordinator({
+  it('filters out non-eligible events from materialization triggers but still records them', async () => {
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 2, idleMs: 1000, scheduleMs: 10_000 },
     });
 
@@ -73,8 +74,8 @@ describe('MaterializationCoordinator', () => {
     // so threshold may have already been reached from the 4 filtered events above + this one
   });
 
-  it('schedules idle and periodic jobs for dirty targets', () => {
-    const idleCoordinator = new MaterializationCoordinator({
+  it('schedules idle and periodic jobs for dirty targets', async () => {
+    const idleCoordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
     });
 
@@ -84,7 +85,7 @@ describe('MaterializationCoordinator', () => {
       expect.objectContaining({ trigger: 'idle' }),
     ]);
 
-    const scheduleCoordinator = new MaterializationCoordinator({
+    const scheduleCoordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 500, scheduleMs: 200 },
     });
     const projectTarget: ContextTargetRef = { namespace, kind: 'project' };
@@ -98,8 +99,8 @@ describe('MaterializationCoordinator', () => {
     ]));
   });
 
-  it('materializes structured problem-resolution summaries from eligible events', () => {
-    const coordinator = new MaterializationCoordinator({
+  it('materializes structured problem-resolution summaries from eligible events', async () => {
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
       modelConfig: {
         primaryContextBackend: 'claude-code-sdk',
@@ -113,7 +114,7 @@ describe('MaterializationCoordinator', () => {
     coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'removed stale constants file and added retry logic', createdAt: 101 });
     coordinator.ingestEvent({ target, eventType: 'decision', content: 'extend handle TTL to 4 hours', createdAt: 102 });
 
-    const result = coordinator.materializeTarget(target, 'manual', 500);
+    const result = await coordinator.materializeTarget(target, 'manual', 500);
 
     // Structured summary with problem → resolution → key decisions
     expect(result.summaryProjection.summary).toContain('User problem: fix the download button');
@@ -135,8 +136,8 @@ describe('MaterializationCoordinator', () => {
     }));
   });
 
-  it('excludes tool.call and assistant.delta from materialized summaries even when present in staged events', () => {
-    const coordinator = new MaterializationCoordinator({
+  it('excludes tool.call and assistant.delta from materialized summaries even when present in staged events', async () => {
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
     });
 
@@ -147,7 +148,7 @@ describe('MaterializationCoordinator', () => {
     coordinator.ingestEvent({ target, eventType: 'tool.result', content: 'import { foo } from...', createdAt: 103 });
     coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'found the root cause in the import', createdAt: 104 });
 
-    const result = coordinator.materializeTarget(target, 'manual', 500);
+    const result = await coordinator.materializeTarget(target, 'manual', 500);
 
     // Summary uses only eligible events
     expect(result.summaryProjection.summary).toContain('User problem: investigate the bug');
@@ -158,14 +159,14 @@ describe('MaterializationCoordinator', () => {
     expect(result.summaryProjection.summary).not.toContain('import { foo }');
   });
 
-  it('reads primary/backup context models from the synced runtime config when explicit overrides are absent', () => {
+  it('reads primary/backup context models from the synced runtime config when explicit overrides are absent', async () => {
     setContextModelRuntimeConfig({
       primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.2',
       backupContextBackend: 'qwen',
       backupContextModel: 'qwen',
     });
-    const coordinator = new MaterializationCoordinator();
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor });
     expect(coordinator.modelConfig).toEqual({
       primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.2',
@@ -175,13 +176,13 @@ describe('MaterializationCoordinator', () => {
     });
   });
 
-  it('defers repeat materialization for the same target until the cooldown window expires', () => {
-    const coordinator = new MaterializationCoordinator({
+  it('defers repeat materialization for the same target until the cooldown window expires', async () => {
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 1, idleMs: 50, scheduleMs: 200, minIntervalMs: 10_000 },
     });
 
     coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'first', createdAt: 100 });
-    coordinator.materializeTarget(target, 'manual', 100);
+    await coordinator.materializeTarget(target, 'manual', 100);
 
     coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'second', createdAt: 200 });
     expect(coordinator.scheduleDueTargets(5_000)).toHaveLength(0);
@@ -196,15 +197,15 @@ describe('MaterializationCoordinator', () => {
     expect(coordinator.canMaterializeTarget(target, 10_200)).toBe(true);
   });
 
-  it('pairs final assistant.text output with the user request in structured summaries', () => {
-    const coordinator = new MaterializationCoordinator({
+  it('pairs final assistant.text output with the user request in structured summaries', async () => {
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
     });
 
     coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'fix the flaky build', createdAt: 100 });
     coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'updated the import and reran the build', createdAt: 120 });
 
-    const result = coordinator.materializeTarget(target, 'manual', 500);
+    const result = await coordinator.materializeTarget(target, 'manual', 500);
 
     expect(result.summaryProjection.summary).toContain('User problem: fix the flaky build');
     expect(result.summaryProjection.summary).toContain('Resolution: updated the import and reran the build');

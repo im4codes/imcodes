@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace, ContextTargetRef } from '../../shared/context-types.js';
 import { searchLocalMemory, formatSearchResults, type MemorySearchResult } from '../../src/context/memory-search.js';
 import { MaterializationCoordinator } from '../../src/context/materialization-coordinator.js';
+import { localOnlyCompressor } from '../../src/context/summary-compressor.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
 describe('memory-search output formats', () => {
@@ -19,20 +20,20 @@ describe('memory-search output formats', () => {
     await cleanupIsolatedSharedContextDb(tempDir);
   });
 
-  function seedMemory(): MemorySearchResult {
-    const coordinator = new MaterializationCoordinator({
+  async function seedMemory(): Promise<MemorySearchResult> {
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
     });
     coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'fix the flaky CI test', createdAt: 100 });
     coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'added utimes call to set correct mtime', createdAt: 101 });
     coordinator.ingestEvent({ target, eventType: 'decision', content: 'use HFS+ mtime workaround on macOS', createdAt: 102 });
-    coordinator.materializeTarget(target, 'manual', 500);
+    await coordinator.materializeTarget(target, 'manual', 500);
     return searchLocalMemory({});
   }
 
   describe('JSON format', () => {
-    it('produces valid JSON with items and stats', () => {
-      const result = seedMemory();
+    it('produces valid JSON with items and stats', async () => {
+      const result = await seedMemory();
       const json = formatSearchResults(result, 'json');
       const parsed = JSON.parse(json);
       expect(parsed.items).toBeInstanceOf(Array);
@@ -45,8 +46,8 @@ describe('memory-search output formats', () => {
       expect(typeof parsed.stats.projectCount).toBe('number');
     });
 
-    it('includes all fields in each item', () => {
-      const result = seedMemory();
+    it('includes all fields in each item', async () => {
+      const result = await seedMemory();
       const parsed = JSON.parse(formatSearchResults(result, 'json'));
       const item = parsed.items[0];
       expect(item.type).toBeDefined();
@@ -59,16 +60,16 @@ describe('memory-search output formats', () => {
   });
 
   describe('document format', () => {
-    it('produces Markdown with header and items', () => {
-      const result = seedMemory();
+    it('produces Markdown with header and items', async () => {
+      const result = await seedMemory();
       const doc = formatSearchResults(result, 'document');
       expect(doc).toContain('# Memory Search Results');
       expect(doc).toContain('github.com/acme/repo');
       expect(doc).toContain('---');
     });
 
-    it('includes match count and class in Markdown', () => {
-      const result = seedMemory();
+    it('includes match count and class in Markdown', async () => {
+      const result = await seedMemory();
       const doc = formatSearchResults(result, 'document');
       expect(doc).toMatch(/\d+ matches/);
       expect(doc).toContain('**Type:**');
@@ -78,8 +79,8 @@ describe('memory-search output formats', () => {
   });
 
   describe('table format', () => {
-    it('produces table with header and data rows', () => {
-      const result = seedMemory();
+    it('produces table with header and data rows', async () => {
+      const result = await seedMemory();
       const table = formatSearchResults(result, 'table');
       expect(table).toContain('TYPE');
       expect(table).toContain('CLASS');
@@ -88,8 +89,8 @@ describe('memory-search output formats', () => {
       expect(table).toContain('github.com/acme/repo');
     });
 
-    it('shows summary stats in first line', () => {
-      const result = seedMemory();
+    it('shows summary stats in first line', async () => {
+      const result = await seedMemory();
       const table = formatSearchResults(result, 'table');
       const firstLine = table.split('\n')[0];
       expect(firstLine).toContain('Matched:');
@@ -101,21 +102,21 @@ describe('memory-search output formats', () => {
   });
 
   describe('empty results', () => {
-    it('JSON returns empty items array', () => {
+    it('JSON returns empty items array', async () => {
       const result = searchLocalMemory({ query: 'nonexistent-query-xyz' });
       const parsed = JSON.parse(formatSearchResults(result, 'json'));
       expect(parsed.items).toEqual([]);
       expect(parsed.stats.totalRecords).toBe(0);
     });
 
-    it('document returns header with zero matches', () => {
+    it('document returns header with zero matches', async () => {
       const result = searchLocalMemory({ query: 'nonexistent-query-xyz' });
       const doc = formatSearchResults(result, 'document');
       expect(doc).toContain('# Memory Search Results');
       expect(doc).toContain('0 matches');
     });
 
-    it('table returns header with zero counts', () => {
+    it('table returns header with zero counts', async () => {
       const result = searchLocalMemory({ query: 'nonexistent-query-xyz' });
       const table = formatSearchResults(result, 'table');
       expect(table).toContain('Matched: 0');

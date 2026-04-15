@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace, ContextTargetRef } from '../../shared/context-types.js';
 import { searchLocalMemory, formatSearchResults } from '../../src/context/memory-search.js';
 import { MaterializationCoordinator } from '../../src/context/materialization-coordinator.js';
+import { localOnlyCompressor } from '../../src/context/summary-compressor.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
 describe('memory-search', () => {
@@ -19,13 +20,13 @@ describe('memory-search', () => {
     await cleanupIsolatedSharedContextDb(tempDir);
   });
 
-  it('searches processed projections by text query', () => {
-    const coordinator = new MaterializationCoordinator({
+  it('searches processed projections by text query', async () => {
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
     });
     coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'fix the download button', createdAt: 100 });
     coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'removed stale constants', createdAt: 101 });
-    coordinator.materializeTarget(target, 'manual', 500);
+    await coordinator.materializeTarget(target, 'manual', 500);
 
     const result = searchLocalMemory({ query: 'download' });
     expect(result.items.length).toBeGreaterThan(0);
@@ -34,13 +35,13 @@ describe('memory-search', () => {
     expect(result.stats.totalRecords).toBeGreaterThan(0);
   });
 
-  it('filters by repo', () => {
-    const coordinator = new MaterializationCoordinator({
+  it('filters by repo', async () => {
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
     });
     coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'something', createdAt: 100 });
     coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'done', createdAt: 101 });
-    coordinator.materializeTarget(target, 'manual', 500);
+    await coordinator.materializeTarget(target, 'manual', 500);
 
     const matchResult = searchLocalMemory({ repo: 'github.com/acme/repo' });
     expect(matchResult.items.length).toBeGreaterThan(0);
@@ -49,8 +50,8 @@ describe('memory-search', () => {
     expect(noMatchResult.items).toHaveLength(0);
   });
 
-  it('includes raw events when includeRaw is set', () => {
-    const coordinator = new MaterializationCoordinator({
+  it('includes raw events when includeRaw is set', async () => {
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
     });
     coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'investigate', createdAt: 100 });
@@ -65,13 +66,13 @@ describe('memory-search', () => {
     expect(noRaw).toHaveLength(0);
   });
 
-  it('formats results as JSON', () => {
-    const coordinator = new MaterializationCoordinator({
+  it('formats results as JSON', async () => {
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
     });
     coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'test', createdAt: 100 });
     coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'done', createdAt: 101 });
-    coordinator.materializeTarget(target, 'manual', 500);
+    await coordinator.materializeTarget(target, 'manual', 500);
 
     const result = searchLocalMemory({});
     const json = formatSearchResults(result, 'json');
@@ -81,13 +82,13 @@ describe('memory-search', () => {
     expect(parsed.stats.totalRecords).toBeGreaterThan(0);
   });
 
-  it('formats results as Markdown document', () => {
-    const coordinator = new MaterializationCoordinator({
+  it('formats results as Markdown document', async () => {
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
     });
     coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'deploy fix', createdAt: 100 });
     coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'deployed', createdAt: 101 });
-    coordinator.materializeTarget(target, 'manual', 500);
+    await coordinator.materializeTarget(target, 'manual', 500);
 
     const result = searchLocalMemory({});
     const doc = formatSearchResults(result, 'document');
@@ -96,13 +97,13 @@ describe('memory-search', () => {
     expect(doc).toContain('deploy');
   });
 
-  it('formats results as table', () => {
-    const coordinator = new MaterializationCoordinator({
+  it('formats results as table', async () => {
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
     });
     coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'test', createdAt: 100 });
     coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'done', createdAt: 101 });
-    coordinator.materializeTarget(target, 'manual', 500);
+    await coordinator.materializeTarget(target, 'manual', 500);
 
     const result = searchLocalMemory({});
     const table = formatSearchResults(result, 'table');
@@ -111,15 +112,15 @@ describe('memory-search', () => {
     expect(table).toContain('recent_summary');
   });
 
-  it('applies pagination with limit and offset', () => {
-    const coordinator = new MaterializationCoordinator({
+  it('applies pagination with limit and offset', async () => {
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
     });
     // Create 3 materializations
     for (let i = 0; i < 3; i++) {
       coordinator.ingestEvent({ target, eventType: 'user.turn', content: `task ${i}`, createdAt: i * 100 });
       coordinator.ingestEvent({ target, eventType: 'assistant.text', content: `done ${i}`, createdAt: i * 100 + 1 });
-      coordinator.materializeTarget(target, 'manual', i * 100 + 50);
+      await coordinator.materializeTarget(target, 'manual', i * 100 + 50);
     }
 
     const page1 = searchLocalMemory({ limit: 2, offset: 0 });

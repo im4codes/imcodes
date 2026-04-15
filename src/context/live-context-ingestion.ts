@@ -49,7 +49,7 @@ export class LiveContextIngestion {
 
   async flushDueTargets(now = Date.now()): Promise<void> {
     for (const job of this.coordinator.scheduleDueTargets(now)) {
-      this.coordinator.materializeTarget(job.target, job.trigger, now);
+      await this.coordinator.materializeTarget(job.target, job.trigger, now);
     }
   }
 
@@ -77,7 +77,7 @@ export class LiveContextIngestion {
     }
     if (staged > 0) {
       if (this.coordinator.canMaterializeTarget(target, lastTs)) {
-        this.coordinator.materializeTarget(target, 'recovery', lastTs);
+        await this.coordinator.materializeTarget(target, 'recovery', lastTs);
       }
     }
   }
@@ -91,7 +91,7 @@ export class LiveContextIngestion {
     if (event.type === 'session.state') {
       const state = typeof event.payload.state === 'string' ? event.payload.state : '';
       if (state === 'idle' && this.hasDirtyTarget(target) && this.coordinator.canMaterializeTarget(target, event.ts)) {
-        this.coordinator.materializeTarget(target, 'idle', event.ts);
+        await this.coordinator.materializeTarget(target, 'idle', event.ts);
       }
       return;
     }
@@ -106,7 +106,7 @@ export class LiveContextIngestion {
       createdAt: event.ts,
     });
     if (result.trigger === 'threshold' && this.coordinator.canMaterializeTarget(target, event.ts)) {
-      this.coordinator.materializeTarget(target, 'threshold', event.ts);
+      await this.coordinator.materializeTarget(target, 'threshold', event.ts);
     }
   }
 

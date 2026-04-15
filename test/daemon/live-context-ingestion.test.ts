@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace } from '../../shared/context-types.js';
 import type { TimelineEvent } from '../../src/daemon/timeline-event.js';
 import { LiveContextIngestion } from '../../src/context/live-context-ingestion.js';
+import { localOnlyCompressor } from '../../src/context/summary-compressor.js';
 import { getProcessedProjectionStats, queryProcessedProjections } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
@@ -30,7 +31,7 @@ describe('LiveContextIngestion', () => {
   });
 
   it('stages live timeline events and materializes them when the session becomes idle', async () => {
-    const ingestion = new LiveContextIngestion({
+    const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },
       sessionLookup: () => session,
       resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
@@ -62,7 +63,7 @@ describe('LiveContextIngestion', () => {
   });
 
   it('ignores streaming assistant deltas and only records the finalized assistant text', async () => {
-    const ingestion = new LiveContextIngestion({
+    const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },
       sessionLookup: () => session,
       resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
@@ -86,7 +87,7 @@ describe('LiveContextIngestion', () => {
   });
 
   it('ignores tool calls and tool results when building memory', async () => {
-    const ingestion = new LiveContextIngestion({
+    const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },
       sessionLookup: () => session,
       resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
@@ -117,7 +118,7 @@ describe('LiveContextIngestion', () => {
   });
 
   it('backfills recent timeline history for sessions that have no existing context activity', async () => {
-    const ingestion = new LiveContextIngestion({
+    const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
       sessionLookup: () => session,
       resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
     });
@@ -141,7 +142,7 @@ describe('LiveContextIngestion', () => {
   });
 
   it('rate-limits processed summaries to at most one per target every 10 seconds by default', async () => {
-    const ingestion = new LiveContextIngestion({
+    const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 1, idleMs: 60_000, scheduleMs: 60_000, minIntervalMs: 10_000 },
       sessionLookup: () => session,
       resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),

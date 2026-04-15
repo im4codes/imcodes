@@ -10,6 +10,7 @@ import type {
 } from '../../shared/context-types.js';
 import { isMemoryEligibleEvent } from '../../shared/context-types.js';
 import { getContextModelConfig } from './context-model-config.js';
+import { compressWithSdk, type CompressionResult } from './summary-compressor.js';
 import {
   clearDirtyTarget,
   enqueueContextJob,
@@ -34,12 +35,15 @@ export interface MaterializationThresholds {
 export interface MaterializationCoordinatorOptions {
   thresholds?: Partial<MaterializationThresholds>;
   modelConfig?: Partial<ContextModelConfig>;
+  /** Override the SDK compressor (for testing or environments without SDK access). */
+  compressor?: (input: import('./summary-compressor.js').CompressionInput) => Promise<import('./summary-compressor.js').CompressionResult>;
 }
 
 export interface MaterializationResult {
   summaryProjection: ProcessedContextProjection;
   durableProjection?: ProcessedContextProjection;
   replicationQueued: boolean;
+  compression?: CompressionResult;
 }
 
 const DEFAULT_THRESHOLDS: MaterializationThresholds = {
@@ -52,8 +56,10 @@ const DEFAULT_THRESHOLDS: MaterializationThresholds = {
 export class MaterializationCoordinator {
   readonly thresholds: MaterializationThresholds;
   readonly modelConfig: ContextModelConfig;
+  private readonly _compressor: MaterializationCoordinatorOptions['compressor'];
 
   constructor(options?: MaterializationCoordinatorOptions) {
+    this._compressor = options?.compressor;
     this.modelConfig = getContextModelConfig(options?.modelConfig);
     // materializationMinIntervalMs from cloud config overrides the threshold default
     const configMinInterval = this.modelConfig.materializationMinIntervalMs;
@@ -90,7 +96,7 @@ export class MaterializationCoordinator {
     return listDirtyTargets(namespace);
   }
 
-  materializeTarget(target: ContextTargetRef, trigger: ContextJobTrigger, now = Date.now()): MaterializationResult {
+  async materializeTarget(target: ContextTargetRef, trigger: ContextJobTrigger, now = Date.now()): Promise<MaterializationResult> {
     const jobType = target.kind === 'project' ? 'materialize_project' : 'materialize_session';
     const job = enqueueContextJob(target, jobType, trigger, now);
     updateContextJob(job.id, 'running', { attemptIncrement: true, now });
@@ -99,12 +105,37 @@ export class MaterializationCoordinator {
     // Streaming deltas, tool calls/results, and system events are excluded.
     const events = allEvents.filter((e) => isMemoryEligibleEvent(e.eventType));
     const sourceEventIds = allEvents.map((event) => event.id);
-    const summary = buildSummary(events);
+
+    // Fetch previous summary for iterative update (like Hermes's _previous_summary)
+    const previousProjections = listProcessedProjections(target.namespace, 'recent_summary');
+    const previousSummary = previousProjections.length > 0 ? previousProjections[0].summary : undefined;
+
+    // Compress with SDK (primary → backup → local fallback)
+    const compressFn = this._compressor ?? compressWithSdk;
+    let compression: CompressionResult;
+    try {
+      compression = await compressFn({
+        events,
+        previousSummary,
+        modelConfig: this.modelConfig,
+        targetTokens: 500,
+      });
+    } catch (err) {
+      // SDK completely failed — use local fallback summary
+      compression = {
+        summary: buildLocalFallback(events, previousSummary),
+        model: 'local-fallback',
+        backend: 'none',
+        usedBackup: false,
+        fromSdk: false,
+      };
+    }
+
     const summaryProjection = writeProcessedProjection({
       namespace: target.namespace,
       class: 'recent_summary',
       sourceEventIds,
-      summary,
+      summary: compression.summary,
       content: {
         trigger,
         targetKind: target.kind,
@@ -113,7 +144,12 @@ export class MaterializationCoordinator {
         primaryContextModel: this.modelConfig.primaryContextModel,
         backupContextBackend: this.modelConfig.backupContextBackend,
         backupContextModel: this.modelConfig.backupContextModel,
+        compressionModel: compression.model,
+        compressionBackend: compression.backend,
+        compressionUsedBackup: compression.usedBackup,
+        compressionFromSdk: compression.fromSdk,
         eventCount: events.length,
+        hadPreviousSummary: !!previousSummary,
       },
       createdAt: now,
       updatedAt: now,
@@ -137,6 +173,7 @@ export class MaterializationCoordinator {
       summaryProjection,
       durableProjection,
       replicationQueued: true,
+      compression,
     };
   }
 
@@ -198,61 +235,11 @@ export class MaterializationCoordinator {
   }
 }
 
-function buildSummary(events: LocalContextEvent[]): string {
-  if (events.length === 0) return 'No staged events available.';
-  const turnPairs = buildTurnPairs(events);
-  const decisions = events
-    .filter((event) => event.eventType === 'decision' || event.eventType === 'constraint' || event.eventType === 'preference')
-    .map((event) => event.content?.trim())
-    .filter((value): value is string => !!value);
-
-  // Compressed structured summary — only the distilled insight, not raw event copies.
-  // Raw events stay in local SQLite and are visible in the Unprocessed tab.
-  const sections: string[] = [];
-  if (turnPairs.length > 0) {
-    const latest = turnPairs[turnPairs.length - 1];
-    // Truncate long user input to a concise problem statement
-    sections.push(`- User problem: ${truncate(latest.user, 200)}`);
-    if (latest.assistant) {
-      // Truncate long assistant output to a concise resolution
-      sections.push(`- Resolution: ${truncate(latest.assistant, 300)}`);
-    }
-    if (turnPairs.length > 1) {
-      const earlier = turnPairs.slice(0, -1).map((p) => truncate(p.user, 80)).join('; ');
-      sections.push(`- Prior context: ${earlier}`);
-    }
-  }
-  if (decisions.length > 0) {
-    sections.push(`- Key decisions: ${decisions.map((d) => truncate(d, 120)).join('; ')}`);
-  }
-  return sections.join('\n');
-}
-
-function truncate(text: string, maxLen: number): string {
-  const trimmed = text.trim();
-  if (trimmed.length <= maxLen) return trimmed;
-  return trimmed.slice(0, maxLen - 1) + '…';
-}
-
-function buildTurnPairs(events: LocalContextEvent[]): Array<{ user: string; assistant?: string }> {
-  const pairs: Array<{ user: string; assistant?: string }> = [];
-  for (const event of events) {
-    const content = event.content?.trim();
-    if (!content) continue;
-    if (event.eventType === 'user.turn' || event.eventType === 'user.message') {
-      pairs.push({ user: content });
-      continue;
-    }
-    // assistant.text is the canonical final-message event type;
-    // assistant.turn is legacy but still accepted for backward compatibility
-    if (event.eventType === 'assistant.text' || event.eventType === 'assistant.turn') {
-      const openPair = [...pairs].reverse().find((pair) => !pair.assistant);
-      if (openPair) {
-        openPair.assistant = content;
-      }
-    }
-  }
-  return pairs;
+// Local fallback — reused when SDK compression is not called (e.g. tests, offline)
+function buildLocalFallback(events: LocalContextEvent[], previousSummary?: string): string {
+  // Delegate to summary-compressor's local fallback to keep logic in one place
+  const { buildLocalFallbackSummary } = require('./summary-compressor.js') as { buildLocalFallbackSummary: (events: LocalContextEvent[], prev?: string) => string };
+  return buildLocalFallbackSummary(events, previousSummary);
 }
 
 function buildDurableProjection(namespace: ContextNamespace, events: LocalContextEvent[], now: number): ProcessedContextProjection | undefined {

@@ -10,6 +10,7 @@ import type { TransportProvider } from '../../src/agent/transport-provider.js';
 import { fetchBackendManagedAuthoredContext } from '../../src/context/backend-authored-context.js';
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import { MaterializationCoordinator } from '../../src/context/materialization-coordinator.js';
+import { localOnlyCompressor } from '../../src/context/summary-compressor.js';
 import { replicatePendingProcessedContext } from '../../src/context/processed-context-replication.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 
@@ -72,7 +73,7 @@ describe('shared-agent-context continuity integration', () => {
       kind: 'session',
       sessionName: 'deck_repo_brain',
     };
-    const coordinator = new MaterializationCoordinator({
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 1_000, scheduleMs: 10_000 },
       modelConfig: {
         primaryContextBackend: 'codex-sdk',
@@ -85,7 +86,7 @@ describe('shared-agent-context continuity integration', () => {
 
     coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'Investigate rollout failure', createdAt: 100 });
     coordinator.ingestEvent({ target, eventType: 'assistant.turn', content: 'Root cause is stale config replay', createdAt: 101 });
-    const materialized = coordinator.materializeTarget(target, 'manual', 200);
+    const materialized = await coordinator.materializeTarget(target, 'manual', 200);
     setContextModelRuntimeConfig({
       primaryContextBackend: 'codex-sdk',
       primaryContextModel: 'gpt-5.2',
@@ -149,7 +150,7 @@ describe('shared-agent-context continuity integration', () => {
       namespace,
       kind: 'project',
     };
-    const coordinator = new MaterializationCoordinator({
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 1_000, scheduleMs: 10_000 },
       modelConfig: {
         primaryContextBackend: 'claude-code-sdk',
@@ -161,7 +162,7 @@ describe('shared-agent-context continuity integration', () => {
 
     coordinator.ingestEvent({ target, eventType: 'decision', content: 'Repository migration stays incremental', createdAt: 10 });
     coordinator.ingestEvent({ target, eventType: 'constraint', content: 'Do not bypass shared runtime assembly', createdAt: 20 });
-    coordinator.materializeTarget(target, 'manual', 30);
+    await coordinator.materializeTarget(target, 'manual', 30);
 
     let replicationBody: ProcessedContextReplicationBody | null = null;
     vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
@@ -263,12 +264,12 @@ describe('shared-agent-context continuity integration', () => {
       namespace,
       kind: 'project',
     };
-    const coordinator = new MaterializationCoordinator({
+    const coordinator = new MaterializationCoordinator({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 1_000, scheduleMs: 10_000 },
     });
 
     coordinator.ingestEvent({ target, eventType: 'decision', content: 'Local summary exists but is not shared authority', createdAt: 1 });
-    coordinator.materializeTarget(target, 'manual', 2);
+    await coordinator.materializeTarget(target, 'manual', 2);
 
     const { provider, send } = makeProvider();
     await expect(dispatchSharedContextSend(provider, 'sess-1', {
