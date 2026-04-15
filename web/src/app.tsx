@@ -76,6 +76,7 @@ import { ingestTimelineEventForCache } from './hooks/useTimeline.js';
 import { getMobileKeyboardState } from './mobile-keyboard.js';
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import { updateMainSessionLabel } from './session-label-api.js';
+import { buildDocumentTitle } from './tab-title.js';
 import {
   getSelectedServerName,
   hasResolvedActiveSession,
@@ -2155,6 +2156,12 @@ export function App() {
   }
 
   const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    document.title = buildDocumentTitle(resolvedSelectedServerName, activeSessionInfo);
+  }, [resolvedSelectedServerName, activeSessionInfo]);
+
   const newUserGuideSteps = useMemo<NewUserGuideStep[]>(() => [
     {
       selector: '[data-onboarding="new-main-session"]',
