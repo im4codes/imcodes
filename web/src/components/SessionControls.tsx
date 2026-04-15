@@ -163,8 +163,10 @@ function getAnchoredOverlayStyle(
 
   if (shouldOpenBelow) {
     style.top = `${Math.max(Math.round(trigger.bottom + triggerGap), horizontalInset)}px`;
+    style.bottom = 'auto'; // clear CSS default bottom: calc(100% + 4px)
   } else {
     style.bottom = `${Math.max(viewportHeight - trigger.top + triggerGap, horizontalInset)}px`;
+    style.top = 'auto';
   }
 
   return style;

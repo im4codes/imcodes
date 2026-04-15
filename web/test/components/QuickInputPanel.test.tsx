@@ -87,7 +87,7 @@ describe('QuickInputPanel history scope', () => {
     const panel = document.querySelector('.qp') as HTMLElement;
     expect(panel.style.position).toBe('fixed');
     expect(panel.style.top).toBe('126px');
-    expect(panel.style.bottom).toBe('');
+    expect(panel.style.bottom).toBe('auto'); // must clear CSS default to prevent squeeze
     expect(panel.style.left).toBe('248px');
     expect(panel.style.width).toBe('960px');
     expect(panel.style.maxHeight).toBe('712px');
@@ -162,11 +162,69 @@ describe('QuickInputPanel history scope', () => {
 
     const panel = document.querySelector('.qp') as HTMLElement;
     expect(panel.style.position).toBe('fixed');
-    expect(panel.style.top).toBe('');
+    expect(panel.style.top).toBe('auto'); // must clear to prevent squeeze
     expect(panel.style.bottom).toBe('150px');
     expect(panel.style.left).toBe('248px');
     expect(panel.style.width).toBe('960px');
     expect(panel.style.maxHeight).toBe('688px');
+  });
+
+  it('never sets both top and bottom to pixel values (would squeeze panel to a thin line)', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 844 });
+
+    // Test with trigger at bottom (open above)
+    const anchorBottom = document.createElement('div');
+    anchorBottom.getBoundingClientRect = () => ({
+      x: 10, y: 0, top: 800, left: 10, right: 90, bottom: 828, width: 80, height: 28,
+      toJSON() { return {}; },
+    } as DOMRect);
+
+    const { unmount: u1 } = render(
+      <QuickInputPanel
+        open onClose={vi.fn()} onSelect={vi.fn()} onSend={vi.fn()}
+        agentType="claude-code" sessionName="s" loaded
+        data={{ history: [], sessionHistory: {}, commands: [], phrases: [] }}
+        onAddCommand={vi.fn()} onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()} onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()} onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()} onClearSessionHistory={vi.fn()}
+        anchorRef={{ current: anchorBottom }}
+      />,
+    );
+    let panel = document.querySelector('.qp') as HTMLElement;
+    // When opening above: bottom is a pixel value, top must be 'auto'
+    expect(panel.style.bottom).not.toBe('');
+    expect(panel.style.top).toBe('auto');
+    // maxHeight must allow real content, not a thin line
+    expect(parseInt(panel.style.maxHeight)).toBeGreaterThan(100);
+    u1();
+
+    // Test with trigger at top (open below)
+    const anchorTop = document.createElement('div');
+    anchorTop.getBoundingClientRect = () => ({
+      x: 10, y: 0, top: 40, left: 10, right: 90, bottom: 68, width: 80, height: 28,
+      toJSON() { return {}; },
+    } as DOMRect);
+
+    render(
+      <QuickInputPanel
+        open onClose={vi.fn()} onSelect={vi.fn()} onSend={vi.fn()}
+        agentType="claude-code" sessionName="s" loaded
+        data={{ history: [], sessionHistory: {}, commands: [], phrases: [] }}
+        onAddCommand={vi.fn()} onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()} onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()} onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()} onClearSessionHistory={vi.fn()}
+        anchorRef={{ current: anchorTop }}
+      />,
+    );
+    panel = document.querySelector('.qp') as HTMLElement;
+    // When opening below: top is a pixel value, bottom must be 'auto'
+    expect(panel.style.top).not.toBe('');
+    expect(panel.style.top).not.toBe('auto');
+    expect(panel.style.bottom).toBe('auto');
+    expect(parseInt(panel.style.maxHeight)).toBeGreaterThan(100);
   });
 
   it('shows account-wide history when All is selected, including entries from other sessions', () => {
