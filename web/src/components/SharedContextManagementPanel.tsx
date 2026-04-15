@@ -2,7 +2,7 @@ import type { ComponentChildren } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '@shared/context-model-defaults.js';
-import type { SharedContextRuntimeBackend } from '@shared/context-types.js';
+import type { ContextMemoryView, SharedContextRuntimeBackend } from '@shared/context-types.js';
 import { QWEN_MODEL_IDS } from '@shared/qwen-models.js';
 import {
   DEFAULT_PRIMARY_CONTEXT_BACKEND,
@@ -43,7 +43,6 @@ import {
   type SharedWorkspace,
   type TeamDetail,
   type TeamSummary,
-  type ContextMemoryView,
   updateSharedProjectPolicy,
   updateSharedContextRuntimeConfig,
   updateTeamMemberRole,
@@ -473,9 +472,28 @@ const EMPTY_MEMORY_VIEW: ContextMemoryView = {
     recentSummaryCount: 0,
     durableCandidateCount: 0,
     projectCount: 0,
+    stagedEventCount: 0,
+    dirtyTargetCount: 0,
+    pendingJobCount: 0,
   },
   records: [],
 };
+
+function normalizeMemoryView(view: ContextMemoryView): ContextMemoryView {
+  return {
+    stats: {
+      totalRecords: view.stats.totalRecords ?? 0,
+      matchedRecords: view.stats.matchedRecords ?? 0,
+      recentSummaryCount: view.stats.recentSummaryCount ?? 0,
+      durableCandidateCount: view.stats.durableCandidateCount ?? 0,
+      projectCount: view.stats.projectCount ?? 0,
+      stagedEventCount: view.stats.stagedEventCount ?? 0,
+      dirtyTargetCount: view.stats.dirtyTargetCount ?? 0,
+      pendingJobCount: view.stats.pendingJobCount ?? 0,
+    },
+    records: view.records ?? [],
+  };
+}
 
 export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId, serverId, ws, onEnterpriseChange }: Props) {
   const { t } = useTranslation();
@@ -721,10 +739,10 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     return ws.onMessage((msg) => {
       if (msg.type !== 'shared_context.personal_memory.response') return;
       if (msg.requestId !== personalMemoryRequestIdRef.current) return;
-      setLocalPersonalMemory({
+      setLocalPersonalMemory(normalizeMemoryView({
         stats: msg.stats,
         records: msg.records,
-      });
+      }));
     });
   }, [ws]);
 
@@ -751,18 +769,18 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       }
 
       if (serverId) {
-        setCloudPersonalMemory(await getServerPersonalMemory(serverId, queryInput));
+        setCloudPersonalMemory(normalizeMemoryView(await getServerPersonalMemory(serverId, queryInput)));
       } else {
         setCloudPersonalMemory(EMPTY_MEMORY_VIEW);
       }
 
       if (enterpriseId) {
-        setSharedMemory(await getEnterpriseSharedMemory(enterpriseId, {
+        setSharedMemory(normalizeMemoryView(await getEnterpriseSharedMemory(enterpriseId, {
           canonicalRepoId: memoryProjectId.trim() || undefined,
           projectionClass: memoryProjectionClass || undefined,
           query: memoryQuery.trim() || undefined,
           limit: 25,
-        }));
+        })));
       } else {
         setSharedMemory(EMPTY_MEMORY_VIEW);
       }
@@ -1580,26 +1598,31 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             {memoryLoading ? <div style={helperTextStyle}>{t('sharedContext.loading')}</div> : null}
           </div>
 
-          {[
+          {([
             [t('sharedContext.management.memoryLocalTitle'), localPersonalMemory],
             [t('sharedContext.management.memoryCloudTitle'), cloudPersonalMemory],
             [t('sharedContext.management.memorySharedTitle'), sharedMemory],
-          ].map(([title, view]) => (
+          ] as Array<[string, ContextMemoryView]>).map(([title, view]) => (
             <div key={title} style={sectionStyle}>
               <SectionHeading title={title as string} />
               <div style={statGridStyle}>
-                <StatCard label={t('sharedContext.management.memoryStatTotal')} value={(view as ContextMemoryView).stats.totalRecords} />
-                <StatCard label={t('sharedContext.management.memoryStatHits')} value={(view as ContextMemoryView).stats.matchedRecords} />
-                <StatCard label={t('sharedContext.management.memoryStatRecent')} value={(view as ContextMemoryView).stats.recentSummaryCount} />
+                <StatCard label={t('sharedContext.management.memoryStatTotal')} value={view.stats.totalRecords} />
+                <StatCard label={t('sharedContext.management.memoryStatHits')} value={view.stats.matchedRecords} />
+                <StatCard label={t('sharedContext.management.memoryStatRecent')} value={view.stats.recentSummaryCount} />
                 <StatCard
                   label={t('sharedContext.management.memoryStatDurable')}
-                  value={(view as ContextMemoryView).stats.durableCandidateCount}
-                  detail={`${t('sharedContext.management.memoryStatProjects')}: ${(view as ContextMemoryView).stats.projectCount}`}
+                  value={view.stats.durableCandidateCount}
+                  detail={`${t('sharedContext.management.memoryStatProjects')}: ${view.stats.projectCount}`}
+                />
+                <StatCard
+                  label={t('sharedContext.management.memoryStatPending')}
+                  value={view.stats.stagedEventCount}
+                  detail={`${t('sharedContext.management.memoryStatDirtyTargets')}: ${view.stats.dirtyTargetCount} · ${t('sharedContext.management.memoryStatPendingJobs')}: ${view.stats.pendingJobCount}`}
                 />
               </div>
-              {(view as ContextMemoryView).records.length > 0 ? (
+              {view.records.length > 0 ? (
                 <div style={resourceListStyle}>
-                  {(view as ContextMemoryView).records.map((record) => (
+                  {view.records.map((record) => (
                     <div key={record.id} style={resourceCardStyle}>
                       <strong>{record.summary || '—'}</strong>
                       <div style={metaGridStyle}>

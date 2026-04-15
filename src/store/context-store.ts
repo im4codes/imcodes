@@ -340,6 +340,9 @@ export interface ProcessedProjectionStats {
   recentSummaryCount: number;
   durableCandidateCount: number;
   projectCount: number;
+  stagedEventCount: number;
+  dirtyTargetCount: number;
+  pendingJobCount: number;
 }
 
 export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}): ProcessedContextProjection[] {
@@ -398,12 +401,59 @@ export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = 
     const haystack = `${String(row.summary)}\n${JSON.stringify(parseJson<Record<string, unknown>>(row.content_json, {}))}`.toLowerCase();
     if (haystack.includes(normalizedQuery)) matchedRecords += 1;
   }
+  const pending = getPendingContextStats(filters);
+  for (const projectId of pending.projectIds) projectIds.add(projectId);
   return {
     totalRecords,
     matchedRecords,
     recentSummaryCount,
     durableCandidateCount,
     projectCount: projectIds.size,
+    stagedEventCount: pending.stagedEventCount,
+    dirtyTargetCount: pending.dirtyTargetCount,
+    pendingJobCount: pending.pendingJobCount,
+  };
+}
+
+function getPendingContextStats(filters: ProcessedProjectionQuery): {
+  stagedEventCount: number;
+  dirtyTargetCount: number;
+  pendingJobCount: number;
+  projectIds: Set<string>;
+} {
+  const database = ensureDb();
+  const dirtyRows = database.prepare('SELECT namespace_key, event_count FROM context_dirty_targets').all() as Array<Record<string, unknown>>;
+  const pendingJobRows = database.prepare(
+    "SELECT namespace_key FROM context_jobs WHERE status IN ('pending', 'running')",
+  ).all() as Array<Record<string, unknown>>;
+
+  let stagedEventCount = 0;
+  let dirtyTargetCount = 0;
+  let pendingJobCount = 0;
+  const projectIds = new Set<string>();
+
+  for (const row of dirtyRows) {
+    const namespace = parseNamespaceKey(String(row.namespace_key));
+    if (filters.scope && namespace.scope !== filters.scope) continue;
+    if (filters.projectId && namespace.projectId !== filters.projectId) continue;
+    stagedEventCount += Number(row.event_count);
+    dirtyTargetCount += 1;
+    projectIds.add(namespace.projectId);
+  }
+
+  for (const row of pendingJobRows) {
+    const namespace = parseNamespaceKey(String(row.namespace_key));
+    if (filters.scope && namespace.scope !== filters.scope) continue;
+    if (filters.projectId && namespace.projectId !== filters.projectId) continue;
+    pendingJobCount += 1;
+    projectIds.add(namespace.projectId);
+  }
+
+  return {
+    stagedEventCount,
+    dirtyTargetCount,
+    pendingJobCount,
+    projectIds,
   };
 }
 

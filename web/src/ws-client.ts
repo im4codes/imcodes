@@ -86,22 +86,8 @@ export type ServerMessage =
   | {
     type: 'shared_context.personal_memory.response';
     requestId: string;
-    stats: {
-      totalRecords: number;
-      matchedRecords: number;
-      recentSummaryCount: number;
-      durableCandidateCount: number;
-      projectCount: number;
-    };
-    records: Array<{
-      id: string;
-      scope: 'personal';
-      projectId: string;
-      summary: string;
-      projectionClass: 'recent_summary' | 'durable_memory_candidate';
-      sourceEventCount: number;
-      updatedAt: number;
-    }>;
+    stats: import('../../shared/context-types.js').ContextMemoryStatsView;
+    records: Array<import('../../shared/context-types.js').ContextMemoryRecordView>;
   };
 
 export type {

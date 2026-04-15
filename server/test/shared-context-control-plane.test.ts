@@ -831,6 +831,9 @@ describe('shared-agent-context server control plane', () => {
         recentSummaryCount: 2,
         durableCandidateCount: 0,
         projectCount: 2,
+        stagedEventCount: 0,
+        dirtyTargetCount: 0,
+        pendingJobCount: 0,
       },
       records: [
         {
@@ -947,6 +950,9 @@ describe('shared-agent-context server control plane', () => {
         recentSummaryCount: 1,
         durableCandidateCount: 1,
         projectCount: 1,
+        stagedEventCount: 0,
+        dirtyTargetCount: 0,
+        pendingJobCount: 0,
       },
       records: [
         {

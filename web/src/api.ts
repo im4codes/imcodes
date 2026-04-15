@@ -6,7 +6,7 @@
 
 import { COOKIE_SESSION, COOKIE_CSRF, HEADER_CSRF } from '@shared/cookie-names.js';
 import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '@shared/preview-types.js';
-import type { ContextModelConfig } from '@shared/context-types.js';
+import type { ContextMemoryView, ContextModelConfig } from '@shared/context-types.js';
 import type { SharedContextRuntimeConfigSnapshot } from '@shared/shared-context-runtime-config.js';
 
 let _baseUrl = '';
@@ -1172,29 +1172,6 @@ export interface SharedContextDiagnosticsView {
     activeBindingCount: number;
     appliedDocumentVersionIds: string[];
   };
-}
-
-export interface ContextMemoryStatsView {
-  totalRecords: number;
-  matchedRecords: number;
-  recentSummaryCount: number;
-  durableCandidateCount: number;
-  projectCount: number;
-}
-
-export interface ContextMemoryRecordView {
-  id: string;
-  scope: 'personal' | 'project_shared' | 'workspace_shared' | 'org_shared';
-  projectId: string;
-  summary: string;
-  projectionClass: 'recent_summary' | 'durable_memory_candidate';
-  sourceEventCount: number;
-  updatedAt: number;
-}
-
-export interface ContextMemoryView {
-  stats: ContextMemoryStatsView;
-  records: ContextMemoryRecordView[];
 }
 
 export interface SharedContextRuntimeConfigView {

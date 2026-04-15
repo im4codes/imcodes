@@ -1,0 +1,211 @@
+import type { ContextTargetRef, LocalContextEvent } from '../../shared/context-types.js';
+import type { TimelineEvent } from '../daemon/timeline-event.js';
+import type { SessionRecord } from '../store/session-store.js';
+import { listDirtyTargets, listProcessedProjections } from '../store/context-store.js';
+import type { TransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
+import { MaterializationCoordinator, type MaterializationCoordinatorOptions } from './materialization-coordinator.js';
+
+const BOOTSTRAP_CACHE_MS = 30_000;
+
+export interface LiveContextIngestionOptions extends MaterializationCoordinatorOptions {
+  sessionLookup: (sessionName: string) => SessionRecord | undefined;
+  resolveBootstrap: (record: SessionRecord) => Promise<TransportContextBootstrap>;
+  onError?: (error: unknown, event: TimelineEvent) => void;
+}
+
+type BootstrapCacheEntry = {
+  recordUpdatedAt: number;
+  expiresAt: number;
+  value: TransportContextBootstrap;
+};
+
+export class LiveContextIngestion {
+  readonly coordinator: MaterializationCoordinator;
+
+  private readonly sessionLookup: LiveContextIngestionOptions['sessionLookup'];
+  private readonly resolveBootstrap: LiveContextIngestionOptions['resolveBootstrap'];
+  private readonly onError?: LiveContextIngestionOptions['onError'];
+  private readonly sessionWork = new Map<string, Promise<void>>();
+  private readonly bootstrapCache = new Map<string, BootstrapCacheEntry>();
+
+  constructor(options: LiveContextIngestionOptions) {
+    this.coordinator = new MaterializationCoordinator(options);
+    this.sessionLookup = options.sessionLookup;
+    this.resolveBootstrap = options.resolveBootstrap;
+    this.onError = options.onError;
+  }
+
+  handleTimelineEvent(event: TimelineEvent): Promise<void> {
+    const previous = this.sessionWork.get(event.sessionId) ?? Promise.resolve();
+    const next = previous
+      .catch(() => {})
+      .then(() => this.processTimelineEvent(event))
+      .catch((error) => {
+        this.onError?.(error, event);
+      });
+    this.sessionWork.set(event.sessionId, next);
+    return next;
+  }
+
+  async flushDueTargets(now = Date.now()): Promise<void> {
+    for (const job of this.coordinator.scheduleDueTargets(now)) {
+      this.coordinator.materializeTarget(job.target, job.trigger, now);
+    }
+  }
+
+  async backfillSessionFromEvents(sessionName: string, events: TimelineEvent[]): Promise<void> {
+    const session = this.sessionLookup(sessionName);
+    if (!session || events.length === 0) return;
+    const bootstrap = await this.getBootstrap(session);
+    const target = toSessionTarget(session.name, bootstrap);
+    if (this.hasAnyActivity(target)) return;
+
+    let lastTs = Date.now();
+    let staged = 0;
+    for (const event of events) {
+      const mapped = mapTimelineEvent(event);
+      if (!mapped) continue;
+      staged += 1;
+      lastTs = event.ts;
+      this.coordinator.ingestEvent({
+        target,
+        eventType: mapped.eventType,
+        content: mapped.content,
+        metadata: mapped.metadata,
+        createdAt: event.ts,
+      });
+    }
+    if (staged > 0) {
+      this.coordinator.materializeTarget(target, 'recovery', lastTs);
+    }
+  }
+
+  private async processTimelineEvent(event: TimelineEvent): Promise<void> {
+    const session = this.sessionLookup(event.sessionId);
+    if (!session) return;
+    const bootstrap = await this.getBootstrap(session);
+    const target = toSessionTarget(session.name, bootstrap);
+
+    if (event.type === 'session.state') {
+      const state = typeof event.payload.state === 'string' ? event.payload.state : '';
+      if (state === 'idle' && this.hasDirtyTarget(target)) {
+        this.coordinator.materializeTarget(target, 'idle', event.ts);
+      }
+      return;
+    }
+
+    const mapped = mapTimelineEvent(event);
+    if (!mapped) return;
+    const result = this.coordinator.ingestEvent({
+      target,
+      eventType: mapped.eventType,
+      content: mapped.content,
+      metadata: mapped.metadata,
+      createdAt: event.ts,
+    });
+    if (result.trigger === 'threshold') {
+      this.coordinator.materializeTarget(target, 'threshold', event.ts);
+    }
+  }
+
+  private async getBootstrap(session: SessionRecord): Promise<TransportContextBootstrap> {
+    const cached = this.bootstrapCache.get(session.name);
+    if (cached && cached.recordUpdatedAt === session.updatedAt && cached.expiresAt > Date.now()) {
+      return cached.value;
+    }
+    const value = await this.resolveBootstrap(session);
+    this.bootstrapCache.set(session.name, {
+      recordUpdatedAt: session.updatedAt,
+      expiresAt: Date.now() + BOOTSTRAP_CACHE_MS,
+      value,
+    });
+    return value;
+  }
+
+  private hasDirtyTarget(target: ContextTargetRef): boolean {
+    return this.coordinator.listDirtyTargets(target.namespace).some((entry) =>
+      entry.target.kind === target.kind && entry.target.sessionName === target.sessionName,
+    );
+  }
+
+  private hasAnyActivity(target: ContextTargetRef): boolean {
+    return this.hasDirtyTarget(target) || listProcessedProjections(target.namespace).length > 0;
+  }
+}
+
+function toSessionTarget(sessionName: string, bootstrap: TransportContextBootstrap): ContextTargetRef {
+  return {
+    namespace: bootstrap.namespace,
+    kind: 'session',
+    sessionName,
+  };
+}
+
+function mapTimelineEvent(event: TimelineEvent): Pick<LocalContextEvent, 'eventType' | 'content' | 'metadata'> | null {
+  switch (event.type) {
+    case 'user.message':
+      return {
+        eventType: 'user.turn',
+        content: stringifyContent(event.payload.text),
+        metadata: { timelineType: event.type },
+      };
+    case 'assistant.text':
+      return {
+        eventType: 'assistant.turn',
+        content: stringifyContent(event.payload.text),
+        metadata: { timelineType: event.type, streaming: event.payload.streaming === true },
+      };
+    case 'assistant.thinking':
+      return {
+        eventType: 'assistant.thinking',
+        content: stringifyContent(event.payload.text),
+        metadata: { timelineType: event.type },
+      };
+    case 'tool.call':
+      return {
+        eventType: 'tool.call',
+        content: joinParts([
+          stringifyContent(event.payload.tool),
+          stringifyUnknown(event.payload.input),
+        ]),
+        metadata: { timelineType: event.type },
+      };
+    case 'tool.result':
+      return {
+        eventType: 'tool.result',
+        content: joinParts([
+          stringifyUnknown(event.payload.output),
+          stringifyContent(event.payload.error),
+        ]),
+        metadata: { timelineType: event.type },
+      };
+    case 'ask.question':
+      return {
+        eventType: 'question',
+        content: stringifyContent(event.payload.text ?? event.payload.question),
+        metadata: { timelineType: event.type },
+      };
+    default:
+      return null;
+  }
+}
+
+function stringifyContent(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function stringifyUnknown(value: unknown): string | undefined {
+  if (typeof value === 'string') return value.trim() || undefined;
+  if (value == null) return undefined;
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized === '{}' ? undefined : serialized;
+  } catch {
+    return String(value);
+  }
+}
+
+function joinParts(parts: Array<string | undefined>): string | undefined {
+  const filtered = parts.filter((part): part is string => !!part);
+  return filtered.length > 0 ? filtered.join(' — ') : undefined;
+}

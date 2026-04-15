@@ -171,6 +171,32 @@ export interface ContextModelConfig {
   enablePersonalMemorySync?: boolean;
 }
 
+export interface ContextMemoryStatsView {
+  totalRecords: number;
+  matchedRecords: number;
+  recentSummaryCount: number;
+  durableCandidateCount: number;
+  projectCount: number;
+  stagedEventCount: number;
+  dirtyTargetCount: number;
+  pendingJobCount: number;
+}
+
+export interface ContextMemoryRecordView {
+  id: string;
+  scope: 'personal' | 'project_shared' | 'workspace_shared' | 'org_shared';
+  projectId: string;
+  summary: string;
+  projectionClass: 'recent_summary' | 'durable_memory_candidate';
+  sourceEventCount: number;
+  updatedAt: number;
+}
+
+export interface ContextMemoryView {
+  stats: ContextMemoryStatsView;
+  records: ContextMemoryRecordView[];
+}
+
 export interface ProcessedContextReplicationBody {
   namespace: ContextNamespace;
   projections: ProcessedContextProjection[];

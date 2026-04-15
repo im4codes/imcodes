@@ -163,6 +163,9 @@ describe('SharedContextManagementPanel', () => {
         recentSummaryCount: 1,
         durableCandidateCount: 1,
         projectCount: 1,
+        stagedEventCount: 0,
+        dirtyTargetCount: 0,
+        pendingJobCount: 0,
       },
       records: [
         {
@@ -183,6 +186,9 @@ describe('SharedContextManagementPanel', () => {
         recentSummaryCount: 3,
         durableCandidateCount: 1,
         projectCount: 2,
+        stagedEventCount: 0,
+        dirtyTargetCount: 0,
+        pendingJobCount: 0,
       },
       records: [
         {
@@ -494,6 +500,9 @@ describe('SharedContextManagementPanel', () => {
           recentSummaryCount: 2,
           durableCandidateCount: 1,
           projectCount: 2,
+          stagedEventCount: 5,
+          dirtyTargetCount: 1,
+          pendingJobCount: 1,
         },
         records: [
           {
@@ -512,6 +521,7 @@ describe('SharedContextManagementPanel', () => {
     expect(await screen.findByText('Local personal summary')).toBeDefined();
     expect(await screen.findByText('Cloud personal decision')).toBeDefined();
     expect(await screen.findByText('Shared coding standard reminder')).toBeDefined();
+    expect(await screen.findByText('sharedContext.management.memoryStatDirtyTargets: 1 · sharedContext.management.memoryStatPendingJobs: 1')).toBeDefined();
 
     const toggle = screen.getByRole('checkbox') as HTMLInputElement;
     expect(toggle.checked).toBe(false);

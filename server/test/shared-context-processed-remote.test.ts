@@ -502,6 +502,9 @@ describe('shared-context processed remote route', () => {
         recentSummaryCount: 1,
         durableCandidateCount: 0,
         projectCount: 1,
+        stagedEventCount: 0,
+        dirtyTargetCount: 0,
+        pendingJobCount: 0,
       },
       records: [
         {

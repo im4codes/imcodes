@@ -30,6 +30,8 @@ import { replicatePendingProcessedContext } from '../context/processed-context-r
 import { configureSharedContextRuntime } from '../context/shared-context-runtime.js';
 import { fetchBackendSharedContextRuntimeConfig } from '../context/backend-runtime-config.js';
 import { setContextModelRuntimeConfig } from '../context/context-model-config.js';
+import { LiveContextIngestion } from '../context/live-context-ingestion.js';
+import { resolveTransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
 
 /** Get the last assistant.text from a session's timeline (for push notification context). */
 function getLastAssistantText(sessionName: string): string | undefined {
@@ -330,6 +332,17 @@ export async function startup(): Promise<DaemonContext> {
     logger.error({ err }, 'restoreFromStore failed — daemon continues without session restore');
   }
 
+  const liveContextIngestion = new LiveContextIngestion({
+    sessionLookup: getSession,
+    resolveBootstrap: (session) => resolveTransportContextBootstrap({
+      projectDir: session.projectDir,
+      transportConfig: getSession(session.name)?.transportConfig ?? session.transportConfig ?? {},
+    }),
+    onError: (err, event) => {
+      logger.warn({ err, session: event.sessionId, type: event.type }, 'Live context ingestion failed');
+    },
+  });
+
   let serverLink: ServerLink | null = null;
   if (creds) {
     serverLink = new ServerLink({ workerUrl: workerUrl!, serverId, token });
@@ -440,11 +453,20 @@ export async function startup(): Promise<DaemonContext> {
 
   // Wire timeline idle events → P2P orchestrator + queued message drain (covers all agent types: CC, codex, gemini, etc.)
   timelineEmitter.on((e) => {
+    liveContextIngestion.handleTimelineEvent(e);
     if (e.type === 'session.state' && (e.payload as Record<string, unknown>).state === 'idle') {
       notifySessionIdle(e.sessionId);
       void drainQueue(e.sessionId);
     }
   });
+
+  for (const session of listSessions()) {
+    const history = timelineStore.read(session.name, { limit: 100 });
+    if (history.length === 0) continue;
+    void liveContextIngestion.backfillSessionFromEvents(session.name, history).catch((err) => {
+      logger.warn({ err, session: session.name }, 'Shared-context timeline backfill failed');
+    });
+  }
 
   // Wire session persist → D1 via Worker API
   if (creds) {
@@ -639,6 +661,7 @@ export async function startup(): Promise<DaemonContext> {
   startHealthPoller();
   startCodexQuotaPoller(serverLink);
   startContextReplicationPoller(workerUrl, serverId, token);
+  startContextMaterializationPoller(liveContextIngestion);
 
   logger.info('Daemon started');
 
@@ -726,6 +749,7 @@ export async function shutdown(exitCode = 0): Promise<void> {
     if (healthTimer) clearInterval(healthTimer);
     if (codexQuotaTimer) clearInterval(codexQuotaTimer);
     if (contextReplicationTimer) clearInterval(contextReplicationTimer);
+    if (contextMaterializationTimer) clearInterval(contextMaterializationTimer);
     hookServer?.close();
     ctx?.serverLink?.disconnect();
     configureSharedContextRuntime(null);
@@ -749,9 +773,11 @@ export async function shutdown(exitCode = 0): Promise<void> {
 const HEALTH_POLL_MS = 30_000;
 const CODEX_QUOTA_REFRESH_MS = 60_000;
 const CONTEXT_REPLICATION_POLL_MS = 30_000;
+const CONTEXT_MATERIALIZATION_POLL_MS = 15_000;
 let healthTimer: ReturnType<typeof setInterval> | null = null;
 let codexQuotaTimer: ReturnType<typeof setInterval> | null = null;
 let contextReplicationTimer: ReturnType<typeof setInterval> | null = null;
+let contextMaterializationTimer: ReturnType<typeof setInterval> | null = null;
 let hookServer: http.Server | null = null;
 
 /** Periodically check all running sessions; restart any that have disappeared or died. */
@@ -808,6 +834,14 @@ function startContextReplicationPoller(workerUrl: string | undefined, serverId: 
       logger.warn({ err }, 'Processed-context replication failed');
     });
   }, CONTEXT_REPLICATION_POLL_MS);
+}
+
+function startContextMaterializationPoller(liveContextIngestion: LiveContextIngestion): void {
+  contextMaterializationTimer = setInterval(() => {
+    void liveContextIngestion.flushDueTargets().catch((err) => {
+      logger.warn({ err }, 'Context materialization poll failed');
+    });
+  }, CONTEXT_MATERIALIZATION_POLL_MS);
 }
 
 function setupSignalHandlers(): void {

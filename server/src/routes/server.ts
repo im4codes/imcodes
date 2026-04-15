@@ -15,6 +15,8 @@ import { sha256Hex, randomHex } from '../security/crypto.js';
 import { requireAuth } from '../security/authorization.js';
 import { z } from 'zod';
 import type {
+  ContextMemoryRecordView,
+  ContextMemoryStatsView,
   ProcessedContextReplicationBody,
   RuntimeAuthoredContextBinding,
   SharedContextNamespaceResolution,
@@ -73,24 +75,6 @@ const runtimeConfigSchema = z.object({
 
 const DEFAULT_REMOTE_PROCESSED_FRESH_MS = 6 * 60 * 60 * 1000;
 
-type RemoteMemoryRecordView = {
-  id: string;
-  scope: 'personal' | 'project_shared' | 'workspace_shared' | 'org_shared';
-  projectId: string;
-  summary: string;
-  projectionClass: 'recent_summary' | 'durable_memory_candidate';
-  sourceEventCount: number;
-  updatedAt: number;
-};
-
-type RemoteMemoryStatsView = {
-  totalRecords: number;
-  matchedRecords: number;
-  recentSummaryCount: number;
-  durableCandidateCount: number;
-  projectCount: number;
-};
-
 function getRemoteProcessedFreshMs(): number {
   const raw = process.env.IMCODES_REMOTE_PROCESSED_FRESH_MS?.trim();
   const parsed = raw ? Number(raw) : Number.NaN;
@@ -116,7 +100,7 @@ function buildRemoteMemoryResponse(
   }>,
   query?: string,
   limit = 20,
-): { stats: RemoteMemoryStatsView; records: RemoteMemoryRecordView[] } {
+): { stats: ContextMemoryStatsView; records: ContextMemoryRecordView[] } {
   const normalizedQuery = query?.trim() ?? '';
   const filtered = rows.filter((row) => matchesMemoryQuery(
     row.summary,
@@ -131,6 +115,9 @@ function buildRemoteMemoryResponse(
       recentSummaryCount: rows.filter((row) => row.projection_class === 'recent_summary').length,
       durableCandidateCount: rows.filter((row) => row.projection_class === 'durable_memory_candidate').length,
       projectCount: projectIds.size,
+      stagedEventCount: 0,
+      dirtyTargetCount: 0,
+      pendingJobCount: 0,
     },
     records: filtered.slice(0, limit).map((row) => ({
       id: row.id,

@@ -1,0 +1,101 @@
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type { ContextNamespace } from '../../shared/context-types.js';
+import type { TimelineEvent } from '../../src/daemon/timeline-event.js';
+import { LiveContextIngestion } from '../../src/context/live-context-ingestion.js';
+import { getProcessedProjectionStats, queryProcessedProjections } from '../../src/store/context-store.js';
+import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
+
+describe('LiveContextIngestion', () => {
+  let tempDir: string;
+  const namespace: ContextNamespace = { scope: 'personal', projectId: 'github.com/acme/repo' };
+  const session = {
+    name: 'deck_repo_brain',
+    projectName: 'repo',
+    role: 'brain' as const,
+    agentType: 'codex',
+    projectDir: '/tmp/repo',
+    state: 'idle' as const,
+    restarts: 0,
+    restartTimestamps: [],
+    createdAt: 1,
+    updatedAt: 1,
+  };
+
+  beforeEach(async () => {
+    tempDir = await createIsolatedSharedContextDb('live-context-ingestion');
+  });
+
+  afterEach(async () => {
+    await cleanupIsolatedSharedContextDb(tempDir);
+  });
+
+  it('stages live timeline events and materializes them when the session becomes idle', async () => {
+    const ingestion = new LiveContextIngestion({
+      thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },
+      sessionLookup: () => session,
+      resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
+    });
+
+    await ingestion.handleTimelineEvent(makeEvent('user.message', 100, { text: 'Investigate memory pipeline' }));
+    await ingestion.handleTimelineEvent(makeEvent('assistant.text', 110, { text: 'Tracing the staged events path' }));
+
+    expect(getProcessedProjectionStats({ scope: 'personal', projectId: namespace.projectId })).toMatchObject({
+      totalRecords: 0,
+      stagedEventCount: 2,
+      dirtyTargetCount: 1,
+    });
+
+    await ingestion.handleTimelineEvent(makeEvent('session.state', 120, { state: 'idle' }));
+
+    expect(queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 })).toEqual([
+      expect.objectContaining({
+        class: 'recent_summary',
+        summary: expect.stringContaining('user.turn: Investigate memory pipeline'),
+      }),
+    ]);
+    expect(getProcessedProjectionStats({ scope: 'personal', projectId: namespace.projectId })).toMatchObject({
+      totalRecords: 1,
+      stagedEventCount: 0,
+      dirtyTargetCount: 0,
+      pendingJobCount: 0,
+    });
+  });
+
+  it('backfills recent timeline history for sessions that have no existing context activity', async () => {
+    const ingestion = new LiveContextIngestion({
+      sessionLookup: () => session,
+      resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
+    });
+
+    await ingestion.backfillSessionFromEvents(session.name, [
+      makeEvent('user.message', 100, { text: 'Summarize the deployment plan' }),
+      makeEvent('assistant.text', 101, { text: 'Deployment plan captured' }),
+    ]);
+
+    expect(queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 })).toEqual([
+      expect.objectContaining({
+        class: 'recent_summary',
+        summary: expect.stringContaining('assistant.turn: Deployment plan captured'),
+      }),
+    ]);
+    expect(getProcessedProjectionStats({ scope: 'personal', projectId: namespace.projectId })).toMatchObject({
+      totalRecords: 1,
+      stagedEventCount: 0,
+      dirtyTargetCount: 0,
+    });
+  });
+});
+
+function makeEvent(type: TimelineEvent['type'], ts: number, payload: Record<string, unknown>): TimelineEvent {
+  return {
+    eventId: `${type}-${ts}`,
+    sessionId: 'deck_repo_brain',
+    ts,
+    seq: ts,
+    epoch: 1,
+    source: 'daemon',
+    confidence: 'high',
+    type,
+    payload,
+  };
+}

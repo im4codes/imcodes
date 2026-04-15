@@ -158,6 +158,9 @@ describe('context-store', () => {
       recentSummaryCount: 1,
       durableCandidateCount: 1,
       projectCount: 1,
+      stagedEventCount: 0,
+      dirtyTargetCount: 0,
+      pendingJobCount: 0,
     });
   });
 

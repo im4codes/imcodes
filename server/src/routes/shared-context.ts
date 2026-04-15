@@ -6,6 +6,7 @@ import { logAudit } from '../security/audit.js';
 import { parseRemoteUrl } from '../../../src/repo/detector.js';
 import { parseCanonicalRepositoryKey } from '../../../src/agent/repository-identity-service.js';
 import { classifyTimestampFreshness } from '../../../shared/context-freshness.js';
+import type { ContextMemoryRecordView, ContextMemoryStatsView } from '../../../shared/context-types.js';
 
 type EnterpriseRole = 'owner' | 'admin' | 'member';
 type BindingMode = 'required' | 'advisory';
@@ -140,24 +141,6 @@ function getRemoteProcessedFreshMs(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_REMOTE_PROCESSED_FRESH_MS;
 }
 
-type SharedMemoryRecordView = {
-  id: string;
-  scope: 'project_shared' | 'workspace_shared' | 'org_shared';
-  projectId: string;
-  summary: string;
-  projectionClass: 'recent_summary' | 'durable_memory_candidate';
-  sourceEventCount: number;
-  updatedAt: number;
-};
-
-type SharedMemoryStatsView = {
-  totalRecords: number;
-  matchedRecords: number;
-  recentSummaryCount: number;
-  durableCandidateCount: number;
-  projectCount: number;
-};
-
 function matchesMemoryQuery(summary: string, content: unknown, query: string): boolean {
   const normalized = query.trim().toLowerCase();
   if (!normalized) return true;
@@ -177,7 +160,7 @@ function buildSharedMemoryResponse(
   }>,
   query?: string,
   limit = 20,
-): { stats: SharedMemoryStatsView; records: SharedMemoryRecordView[] } {
+): { stats: ContextMemoryStatsView; records: ContextMemoryRecordView[] } {
   const normalizedQuery = query?.trim() ?? '';
   const filtered = rows.filter((row) => matchesMemoryQuery(
     row.summary,
@@ -192,6 +175,9 @@ function buildSharedMemoryResponse(
       recentSummaryCount: rows.filter((row) => row.projection_class === 'recent_summary').length,
       durableCandidateCount: rows.filter((row) => row.projection_class === 'durable_memory_candidate').length,
       projectCount: projectIds.size,
+      stagedEventCount: 0,
+      dirtyTargetCount: 0,
+      pendingJobCount: 0,
     },
     records: filtered.slice(0, limit).map((row) => ({
       id: row.id,
