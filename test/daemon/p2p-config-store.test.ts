@@ -79,4 +79,34 @@ describe('p2p-config-store', () => {
       updatedAt: 123,
     });
   });
+
+  it('serializes concurrent writes without losing configs', async () => {
+    const mod = await import('../../src/store/p2p-config-store.js');
+    await Promise.all([
+      mod.upsertSavedP2pConfig('deck_proj_brain', {
+        sessions: { deck_proj_worker: { enabled: true, mode: 'audit' } },
+        rounds: 2,
+        updatedAt: 123,
+      }),
+      mod.upsertSavedP2pConfig('deck_cd_brain', {
+        sessions: { deck_cd_worker: { enabled: true, mode: 'edit' } },
+        rounds: 3,
+        updatedAt: 456,
+      }),
+    ]);
+
+    const raw = await readFile(join(homeDir, '.imcodes', 'p2p-config.json'), 'utf8');
+    const parsed = JSON.parse(raw) as { version: number; configs: Record<string, unknown> };
+    expect(parsed.version).toBe(1);
+    expect(parsed.configs.deck_proj_brain).toEqual({
+      sessions: { deck_proj_worker: { enabled: true, mode: 'audit' } },
+      rounds: 2,
+      updatedAt: 123,
+    });
+    expect(parsed.configs.deck_cd_brain).toEqual({
+      sessions: { deck_cd_worker: { enabled: true, mode: 'edit' } },
+      rounds: 3,
+      updatedAt: 456,
+    });
+  });
 });
