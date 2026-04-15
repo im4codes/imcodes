@@ -76,6 +76,15 @@ describe('normalizeTransportPendingMessageEntries', () => {
     ]);
   });
 
+  it('fills missing queued entries from pendingMessages when entries are partial', () => {
+    expect(normalizeTransportPendingEntries([
+      { clientMessageId: 'msg-1', text: 'queued one' },
+    ], ['queued one', 'queued two'], 'deck_test')).toEqual([
+      { clientMessageId: 'msg-1', text: 'queued one' },
+      { clientMessageId: 'deck_test:legacy:1:queued two', text: 'queued two' },
+    ]);
+  });
+
   it('synthesizes legacy entries when only pending messages are present', () => {
     expect(normalizeTransportPendingEntries([], ['queued one', 'queued two'], 'deck_test')).toEqual([
       { clientMessageId: 'deck_test:legacy:0:queued one', text: 'queued one' },
@@ -88,7 +97,7 @@ describe('mergeTransportPendingEntriesForRunningState', () => {
   it('preserves the existing queued entries when running reports no pendingMessageEntries field', () => {
     expect(mergeTransportPendingEntriesForRunningState([
       { clientMessageId: 'msg-1', text: 'queued one' },
-    ], undefined, false)).toEqual([
+    ], undefined, undefined, false, 'deck_test')).toEqual([
       { clientMessageId: 'msg-1', text: 'queued one' },
     ]);
   });
@@ -97,7 +106,7 @@ describe('mergeTransportPendingEntriesForRunningState', () => {
     expect(mergeTransportPendingEntriesForRunningState([
       { clientMessageId: 'msg-1', text: 'queued one' },
       { clientMessageId: 'msg-2', text: 'queued two' },
-    ], [], true)).toEqual([
+    ], [], [], true, 'deck_test')).toEqual([
       { clientMessageId: 'msg-1', text: 'queued one' },
       { clientMessageId: 'msg-2', text: 'queued two' },
     ]);
@@ -108,8 +117,19 @@ describe('mergeTransportPendingEntriesForRunningState', () => {
       { clientMessageId: 'msg-1', text: 'queued one' },
     ], [
       { clientMessageId: 'msg-2', text: 'queued two' },
-    ], true)).toEqual([
+    ], ['queued two'], true, 'deck_test')).toEqual([
       { clientMessageId: 'msg-2', text: 'queued two' },
+    ]);
+  });
+
+  it('fills missing running queued entries from pendingMessages when entries are partial', () => {
+    expect(mergeTransportPendingEntriesForRunningState([
+      { clientMessageId: 'msg-1', text: 'queued one' },
+    ], [
+      { clientMessageId: 'msg-1', text: 'queued one' },
+    ], ['queued one', 'queued two'], true, 'deck_test')).toEqual([
+      { clientMessageId: 'msg-1', text: 'queued one' },
+      { clientMessageId: 'deck_test:legacy:1:queued two', text: 'queued two' },
     ]);
   });
 });

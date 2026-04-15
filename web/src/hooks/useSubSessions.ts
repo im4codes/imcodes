@@ -299,7 +299,9 @@ export function useSubSessions(
             transportPendingMessageEntries: mergeTransportPendingEntriesForRunningState(
               next[idx].transportPendingMessageEntries,
               msg.event.payload.pendingMessageEntries,
+              msg.event.payload.pendingMessages,
               true,
+              sessionName,
             ),
           };
           return next;

@@ -1404,7 +1404,9 @@ export function App() {
                     transportPendingMessageEntries: mergeTransportPendingEntriesForRunningState(
                       s.transportPendingMessageEntries,
                       event.payload.pendingMessageEntries,
+                      event.payload.pendingMessages,
                       hasPendingMessagesField,
+                      event.sessionId,
                     ),
                   }
                 : s,

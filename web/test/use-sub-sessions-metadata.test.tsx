@@ -294,6 +294,40 @@ describe('sub-session metadata via subsession.sync', () => {
     expect(captured[0].transportPendingMessages).toEqual([]);
     expect(captured[0].transportPendingMessageEntries).toEqual([]);
   });
+
+  it('fills missing queued transport entries from pendingMessages when daemon sends a partial entry snapshot', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'q4',
+      sessionName: 'deck_sub_q4',
+      sessionType: 'qwen',
+      state: 'running',
+    }));
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_q4',
+        payload: {
+          state: 'queued',
+          pendingMessages: ['queued one', 'queued two'],
+          pendingMessageEntries: [
+            { clientMessageId: 'msg-1', text: 'queued one' },
+          ],
+        },
+      },
+    }));
+
+    expect(captured[0].transportPendingMessageEntries).toEqual([
+      { clientMessageId: 'msg-1', text: 'queued one' },
+      { clientMessageId: 'deck_sub_q4:legacy:1:queued two', text: 'queued two' },
+    ]);
+  });
 });
 
 describe('sub-session metadata integration', () => {

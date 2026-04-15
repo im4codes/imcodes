@@ -45,12 +45,21 @@ export function extractTransportPendingMessageEntries(value: unknown): Transport
 
 export function normalizeTransportPendingEntries(
   entries: unknown,
-  messages: string[] | null | undefined,
+  messages: unknown,
   scopeKey: string,
 ): TransportPendingMessageEntry[] {
+  const normalizedMessages = extractTransportPendingMessages(messages);
   const normalizedEntries = extractTransportPendingMessageEntries(entries);
-  if (normalizedEntries.length > 0) return normalizedEntries;
-  return synthesizeTransportPendingMessageEntries(messages, scopeKey);
+  if (normalizedMessages.length === 0) return normalizedEntries;
+  if (normalizedEntries.length === 0) return synthesizeTransportPendingMessageEntries(normalizedMessages, scopeKey);
+  return normalizedMessages.map((text, index) => {
+    const matchingEntry = normalizedEntries[index];
+    if (matchingEntry && matchingEntry.text === text) return matchingEntry;
+    return {
+      clientMessageId: `${scopeKey}:legacy:${index}:${text}`,
+      text,
+    };
+  });
 }
 
 export function mergeTransportPendingMessagesForRunningState(
@@ -68,13 +77,19 @@ export function mergeTransportPendingMessagesForRunningState(
 export function mergeTransportPendingEntriesForRunningState(
   existing: TransportPendingMessageEntry[] | null | undefined,
   pendingFromEvent: unknown,
+  pendingMessagesFromEvent: unknown,
   hasPendingMessagesField: boolean,
+  scopeKey: string,
 ): TransportPendingMessageEntry[] {
   const existingEntries = Array.isArray(existing)
     ? existing.filter((entry) => typeof entry?.clientMessageId === 'string' && entry.clientMessageId && typeof entry?.text === 'string' && entry.text)
     : [];
   if (!hasPendingMessagesField) return existingEntries;
-  const nextEntries = extractTransportPendingMessageEntries(pendingFromEvent);
+  const nextEntries = normalizeTransportPendingEntries(
+    pendingFromEvent,
+    pendingMessagesFromEvent,
+    scopeKey,
+  );
   if (nextEntries.length > 0) return nextEntries;
   return existingEntries;
 }

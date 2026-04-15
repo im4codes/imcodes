@@ -1480,6 +1480,28 @@ afterEach(() => {
     expect(screen.getByText('queued second')).toBeDefined();
   });
 
+  it('renders all queued transport messages when pending entries are partial', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessages: ['queued first', 'queued second'],
+          transportPendingMessageEntries: [
+            { clientMessageId: 'msg-1', text: 'queued first' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.getByText('queued first')).toBeDefined();
+    expect(screen.getByText('queued second')).toBeDefined();
+  });
+
   it('does not offer edit or delete actions for legacy queued fallback entries', () => {
     const ws = makeWs();
     render(
