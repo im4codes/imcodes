@@ -404,4 +404,98 @@ describe('ChatView', () => {
     });
     expect(onLoadOlder).not.toHaveBeenCalled();
   });
+
+  it('shows tool input args from result detail when tool.call has no input (transport SDK)', async () => {
+    // Transport SDK: tool.call arrives at content_block_start with NO input,
+    // tool.result arrives at content_block_stop with input in detail.input.
+    const events = [
+      {
+        eventId: 'tc-1',
+        type: 'tool.call',
+        ts: 1000,
+        payload: { tool: 'Read' },
+      },
+      {
+        eventId: 'tr-1',
+        type: 'tool.result',
+        ts: 1001,
+        payload: {
+          output: 'file contents...',
+          detail: {
+            kind: 'tool_use_complete',
+            summary: 'Read',
+            input: { file_path: '/home/user/project/src/index.ts' },
+          },
+        },
+      },
+    ] as any;
+
+    const { container } = render(
+      <ChatView events={events} loading={false} sessionId="test" />,
+    );
+
+    const toolEl = container.querySelector('.chat-tool');
+    expect(toolEl).not.toBeNull();
+    const text = toolEl!.textContent ?? '';
+    // Must contain the file path from result detail, not just "Read ✓"
+    expect(text).toContain('/home/user/project/src/index.ts');
+    expect(text).toContain('✓');
+  });
+
+  it('shows tool input inline when tool.call already has input (tmux agent)', async () => {
+    const events = [
+      {
+        eventId: 'tc-2',
+        type: 'tool.call',
+        ts: 2000,
+        payload: { tool: 'Bash', input: 'npm test' },
+      },
+      {
+        eventId: 'tr-2',
+        type: 'tool.result',
+        ts: 2001,
+        payload: { output: 'all tests passed' },
+      },
+    ] as any;
+
+    const { container } = render(
+      <ChatView events={events} loading={false} sessionId="test" />,
+    );
+
+    const toolEl = container.querySelector('.chat-tool');
+    const text = toolEl!.textContent ?? '';
+    expect(text).toContain('npm test');
+    expect(text).toContain('✓');
+  });
+
+  it('shows Agent tool prompt from result detail.input', async () => {
+    const events = [
+      {
+        eventId: 'tc-3',
+        type: 'tool.call',
+        ts: 3000,
+        payload: { tool: 'Agent' },
+      },
+      {
+        eventId: 'tr-3',
+        type: 'tool.result',
+        ts: 3001,
+        payload: {
+          detail: {
+            kind: 'tool_use_complete',
+            input: { prompt: 'Find the bug in auth module', description: 'Auth bug search' },
+          },
+        },
+      },
+    ] as any;
+
+    const { container } = render(
+      <ChatView events={events} loading={false} sessionId="test" />,
+    );
+
+    const toolEl = container.querySelector('.chat-tool');
+    const text = toolEl!.textContent ?? '';
+    // Must show the prompt, not just "Agent ✓"
+    expect(text).toContain('Find the bug in auth module');
+  });
 });

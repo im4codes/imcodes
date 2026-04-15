@@ -232,7 +232,10 @@ function buildViewItems(events: TimelineEvent[]): ViewItem[] {
         const next = visible[resultIdx];
         consumedIds.add(next.eventId); // mark tool.result as consumed
         const toolName = String(ev.payload.tool ?? 'tool');
-        const inputText = summarizeToolInput(ev.payload.input, ev.payload.detail);
+        // tool.call from transport SDK may have no input yet (streamed incrementally).
+        // Fall back to the result's detail.input which has the complete args.
+        const inputText = summarizeToolInput(ev.payload.input, ev.payload.detail)
+          || summarizeToolInput((next.payload.detail as any)?.input, next.payload.detail);
         const input = inputText ? ` ${inputText}` : '';
         const status = next.payload.error ? `✗ ${String(next.payload.error)}` : '✓';
         const output = !next.payload.error && next.payload.output ? String(next.payload.output) : undefined;
@@ -1193,9 +1196,11 @@ const ChatEvent = memo(function ChatEvent({
 
     case 'tool.call': {
       const callDetail = event.payload._callDetail ?? event.payload.detail;
-      const toolInput = summarizeToolInput(event.payload.input, callDetail);
-      const toolOutput = event.payload._output ? String(event.payload._output) : undefined;
       const resultDetail = event.payload._resultDetail;
+      // Fall back to result detail for input — transport SDK tool.call may arrive without input
+      const toolInput = summarizeToolInput(event.payload.input, callDetail)
+        || summarizeToolInput((resultDetail as any)?.input, resultDetail);
+      const toolOutput = event.payload._output ? String(event.payload._output) : undefined;
       return (
         <ToolBlockFold>
           <div class="chat-event chat-tool">
@@ -1209,7 +1214,7 @@ const ChatEvent = memo(function ChatEvent({
             </div>
           )}
           {(callDetail || resultDetail) && (
-            <details class="chat-tool-detail">
+            <details class="chat-tool-detail" open>
               <summary class="chat-tool-detail-summary">{t('chat.tool_detail_toggle')}</summary>
               <ToolDetailSection label={t('chat.tool_detail_input')} value={(callDetail as any)?.input} />
               <ToolDetailSection label={t('chat.tool_detail_output')} value={(resultDetail as any)?.output} />
@@ -1239,7 +1244,7 @@ const ChatEvent = memo(function ChatEvent({
             )}
           </div>
           {detail && (
-            <details class="chat-tool-detail">
+            <details class="chat-tool-detail" open>
               <summary class="chat-tool-detail-summary">{t('chat.tool_detail_toggle')}</summary>
               <ToolDetailSection label={t('chat.tool_detail_output')} value={(detail as any).output} />
               <ToolDetailSection label={t('chat.tool_detail_meta')} value={(detail as any).meta} />
