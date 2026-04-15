@@ -838,6 +838,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [getOpenSpecSubmenuStyle, isOpenSpecMobile]);
 
   const renderOpenSpecDropdown = useCallback((content: ComponentChildren) => {
+    if (isOpenSpecMobile) {
+      return (
+        <div
+          class="menu-dropdown menu-dropdown-openspec menu-dropdown-openspec-inline"
+          ref={openSpecDropdownRef}
+        >
+          {content}
+        </div>
+      );
+    }
     if (typeof document === 'undefined') return null;
     return createPortal(
       <div
@@ -849,7 +859,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       </div>,
       document.body,
     );
-  }, [openSpecDropdownStyle]);
+  }, [isOpenSpecMobile, openSpecDropdownStyle]);
 
   useEffect(() => {
     if (!openSpecOpen || typeof window === 'undefined') return;

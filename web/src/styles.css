@@ -269,6 +269,7 @@ body {
 .menu-dropdown { position: absolute; bottom: calc(100% + 4px); right: 0; background: #1e293b; border: 1px solid #334155; border-radius: 6px; min-width: 200px; max-width: calc(100vw - 16px); max-height: 60vh; overflow-y: auto; box-shadow: 0 4px 16px #00000060; z-index: 50; }
 .menu-dropdown-models { min-width: min(260px, calc(100vw - 24px)); max-width: min(320px, calc(100vw - 24px)); }
 .menu-dropdown-openspec { width: max-content; min-width: min(320px, calc(100vw - 24px)); max-width: calc(100vw - 24px); overscroll-behavior: contain; display: flex; flex-direction: column; z-index: 2147483646; }
+.menu-dropdown-openspec-inline { position: absolute; right: 0; bottom: calc(100% + 4px); }
 .menu-dropdown-openspec .menu-item,
 .menu-dropdown-openspec .p2p-menu-section-label { white-space: nowrap; }
 .openspec-dropdown-scroll { flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 2px; }
@@ -352,6 +353,7 @@ body {
   }
   .menu-dropdown { max-width: calc(100vw - 16px); }
   .menu-dropdown-openspec { width: calc(100vw - 16px); min-width: calc(100vw - 16px); max-width: calc(100vw - 16px); max-height: min(60vh, calc(100vh - 148px)); }
+  .menu-dropdown-openspec-inline { position: absolute; right: 0; left: auto; bottom: calc(100% + 4px); }
   .openspec-change-row { flex-direction: column; align-items: stretch; gap: 4px; }
   .openspec-change-header { display: flex; align-items: center; gap: 6px; width: 100%; }
   .openspec-change-name { width: 100%; padding: 8px 12px; font-size: 12px; }

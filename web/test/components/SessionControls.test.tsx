@@ -1200,7 +1200,7 @@ afterEach(() => {
     }
   });
 
-  it('anchors the openspec change list to the trigger in compact mobile mode', async () => {
+  it('renders the openspec change list inline in compact mobile mode', async () => {
     const innerWidth = window.innerWidth;
     const innerHeight = window.innerHeight;
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
@@ -1250,13 +1250,49 @@ afterEach(() => {
 
       const dropdown = document.querySelector('.menu-dropdown-openspec') as HTMLElement;
       expect(dropdown).toBeTruthy();
-      expect(dropdown.style.position).toBe('fixed');
-      expect(dropdown.style.left).toBe('8px');
-      expect(dropdown.style.width).toBe('374px');
-      expect(dropdown.style.right).toBe('');
-      expect(dropdown.style.bottom).toBe('142px');
+      expect(dropdown.className).toContain('menu-dropdown-openspec-inline');
+      expect(dropdown.style.position).toBe('');
+      expect(within(dropdown).getByRole('button', { name: 'change-a' })).toBeDefined();
     } finally {
       rectSpy.mockRestore();
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: innerWidth });
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: innerHeight });
+    }
+  });
+
+  it('renders the openspec change list inline on mobile for the main session', async () => {
+    const innerWidth = window.innerWidth;
+    const innerHeight = window.innerHeight;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 844 });
+
+    try {
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({ name: 'main-session', projectDir: '/repo', agentType: 'codex' })}
+          quickData={makeQuickData() as any}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /openspec/i }));
+      ws.emit({
+        type: 'fs.ls_response',
+        requestId: 'openspec-request',
+        status: 'ok',
+        resolvedPath: '/repo/openspec/changes',
+        entries: [
+          { name: 'change-a', path: '/repo/openspec/changes/change-a', isDir: true, hidden: false },
+        ],
+      });
+      await flushAsync();
+
+      const dropdown = document.querySelector('.menu-dropdown-openspec') as HTMLElement;
+      expect(dropdown).toBeTruthy();
+      expect(dropdown.className).toContain('menu-dropdown-openspec-inline');
+      expect(within(dropdown).getByRole('button', { name: 'change-a' })).toBeDefined();
+    } finally {
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: innerWidth });
       Object.defineProperty(window, 'innerHeight', { configurable: true, value: innerHeight });
     }
