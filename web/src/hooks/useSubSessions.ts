@@ -318,9 +318,19 @@ export function useSubSessions(
           next[idx] = { ...next[idx], state: 'running' };
           return next;
         }
-        if (prev[idx].state === state && (prev[idx].transportPendingMessages?.length ?? 0) === 0 && (prev[idx].transportPendingMessageEntries?.length ?? 0) === 0) return prev;
+        // For idle: only clear pending when the event carries authoritative pending data.
+        // transport-relay's onComplete emits idle WITHOUT pending fields — clearing here
+        // would flash-remove queued messages before drain dispatches them.
+        const shouldClearPending = state !== 'idle' || hasPendingMessagesField;
+        if (prev[idx].state === state && !shouldClearPending && (prev[idx].transportPendingMessages?.length ?? 0) === 0 && (prev[idx].transportPendingMessageEntries?.length ?? 0) === 0) return prev;
         const next = [...prev];
-        next[idx] = { ...next[idx], state: state as SubSession['state'], transportPendingMessages: [], transportPendingMessageEntries: [] };
+        next[idx] = {
+          ...next[idx],
+          state: state as SubSession['state'],
+          ...(shouldClearPending
+            ? { transportPendingMessages: [], transportPendingMessageEntries: [] }
+            : {}),
+        };
         return next;
       });
     });

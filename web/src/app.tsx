@@ -1421,7 +1421,17 @@ export function App() {
           } else if (liveState === 'idle') {
             setSessions((prev) => prev.map((s) =>
               s.name === event.sessionId
-                ? { ...s, state: liveState as SessionInfo['state'], transportPendingMessages: [], transportPendingMessageEntries: [] }
+                ? {
+                    ...s,
+                    state: liveState as SessionInfo['state'],
+                    // Only clear pending when the event carries authoritative pending data.
+                    // transport-relay's onComplete emits idle WITHOUT pending fields — clearing
+                    // here would flash-remove queued messages before drain dispatches them.
+                    // The subsequent runtime idle (with pending=[]) or drain running event will clear.
+                    ...(hasPendingMessagesField
+                      ? { transportPendingMessages: extractTransportPendingMessages(event.payload.pendingMessages), transportPendingMessageEntries: normalizeTransportPendingEntries(event.payload.pendingMessageEntries, extractTransportPendingMessages(event.payload.pendingMessages), event.sessionId) }
+                      : {}),
+                  }
                 : s,
             ));
           }
