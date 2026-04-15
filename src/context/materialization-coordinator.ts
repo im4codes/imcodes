@@ -26,6 +26,7 @@ export interface MaterializationThresholds {
   idleMs: number;
   eventCount: number;
   scheduleMs: number;
+  minIntervalMs: number;
 }
 
 export interface MaterializationCoordinatorOptions {
@@ -43,6 +44,7 @@ const DEFAULT_THRESHOLDS: MaterializationThresholds = {
   idleMs: 5 * 60_000,
   eventCount: 5,
   scheduleMs: 15 * 60_000,
+  minIntervalMs: 10_000,
 };
 
 export class MaterializationCoordinator {
@@ -144,22 +146,69 @@ export class MaterializationCoordinator {
   }
 
   private selectTrigger(dirtyTarget: ContextDirtyTarget, now: number): ContextJobTrigger | undefined {
+    if (this.isRateLimited(dirtyTarget.target, now)) return undefined;
     if (dirtyTarget.eventCount >= this.thresholds.eventCount) return 'threshold';
+    if (this.hasProcessedSummary(dirtyTarget.target)) return 'schedule';
     if (now - dirtyTarget.newestEventAt >= this.thresholds.idleMs) return 'idle';
     if (now - dirtyTarget.oldestEventAt >= this.thresholds.scheduleMs) return 'schedule';
+    return undefined;
+  }
+
+  canMaterializeTarget(target: ContextTargetRef, now = Date.now()): boolean {
+    return !this.isRateLimited(target, now);
+  }
+
+  private isRateLimited(target: ContextTargetRef, now: number): boolean {
+    const latestSummaryAt = this.getLatestSummaryUpdatedAt(target);
+    return latestSummaryAt !== undefined && now - latestSummaryAt < this.thresholds.minIntervalMs;
+  }
+
+  private hasProcessedSummary(target: ContextTargetRef): boolean {
+    return this.getLatestSummaryUpdatedAt(target) !== undefined;
+  }
+
+  private getLatestSummaryUpdatedAt(target: ContextTargetRef): number | undefined {
+    const projections = listProcessedProjections(target.namespace, 'recent_summary');
+    for (const projection of projections) {
+      const targetKind = typeof projection.content.targetKind === 'string' ? projection.content.targetKind : undefined;
+      const sessionName = typeof projection.content.sessionName === 'string' ? projection.content.sessionName : undefined;
+      if (target.kind === 'project') {
+        if (targetKind === 'project') return projection.updatedAt;
+        continue;
+      }
+      if (targetKind === 'session' && sessionName === target.sessionName) return projection.updatedAt;
+    }
     return undefined;
   }
 }
 
 function buildSummary(events: LocalContextEvent[]): string {
   if (events.length === 0) return 'No staged events available.';
-  return events
-    .slice(-5)
-    .map((event) => {
-      const content = event.content?.trim();
-      return content ? `${event.eventType}: ${content}` : event.eventType;
-    })
-    .join('\n');
+  const userTurns = events
+    .filter((event) => event.eventType === 'user.turn')
+    .map((event) => event.content?.trim())
+    .filter((value): value is string => !!value);
+  const assistantTurns = events
+    .filter((event) => event.eventType === 'assistant.turn')
+    .map((event) => event.content?.trim())
+    .filter((value): value is string => !!value);
+  const decisions = events
+    .filter((event) => event.eventType === 'decision' || event.eventType === 'constraint' || event.eventType === 'preference')
+    .map((event) => event.content?.trim())
+    .filter((value): value is string => !!value);
+
+  const lines: string[] = [];
+  if (userTurns.length > 0) {
+    lines.push(`User intent: ${userTurns[userTurns.length - 1]}`);
+  }
+  if (assistantTurns.length > 0) {
+    lines.push(`Current outcome: ${assistantTurns[assistantTurns.length - 1]}`);
+  }
+  if (decisions.length > 0) {
+    lines.push(`Key constraints: ${decisions.slice(-2).join(' | ')}`);
+  }
+  lines.push(`Compressed from ${events.length} event${events.length === 1 ? '' : 's'}.`);
+  return lines.join('\n');
 }
 
 function buildDurableProjection(namespace: ContextNamespace, events: LocalContextEvent[], now: number): ProcessedContextProjection | undefined {

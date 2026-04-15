@@ -9,6 +9,7 @@ import {
   listContextEvents,
   listDirtyTargets,
   listProcessedProjections,
+  queryPendingContextEvents,
   queryProcessedProjections,
   recordContextEvent,
   setReplicationState,
@@ -162,6 +163,24 @@ describe('context-store', () => {
       dirtyTargetCount: 0,
       pendingJobCount: 0,
     });
+  });
+
+  it('queries pending staged events separately from processed memory', () => {
+    recordContextEvent({ target, eventType: 'user.turn', content: 'raw pending question', createdAt: 10 });
+    recordContextEvent({ target, eventType: 'assistant.turn', content: 'raw pending answer', createdAt: 20 });
+
+    expect(queryPendingContextEvents({ scope: 'personal', projectId: 'repo', limit: 10 })).toEqual([
+      expect.objectContaining({
+        eventType: 'assistant.turn',
+        content: 'raw pending answer',
+        projectId: 'repo',
+      }),
+      expect.objectContaining({
+        eventType: 'user.turn',
+        content: 'raw pending question',
+        projectId: 'repo',
+      }),
+    ]);
   });
 
   it('clears dirty targets after materialization cleanup', () => {

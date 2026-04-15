@@ -2,7 +2,7 @@ import type { ComponentChildren } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '@shared/context-model-defaults.js';
-import type { ContextMemoryView, SharedContextRuntimeBackend } from '@shared/context-types.js';
+import type { ContextMemoryView, ContextPendingEventView, SharedContextRuntimeBackend } from '@shared/context-types.js';
 import { QWEN_MODEL_IDS } from '@shared/qwen-models.js';
 import {
   DEFAULT_PRIMARY_CONTEXT_BACKEND,
@@ -15,7 +15,7 @@ import {
   ApiError,
   activateSharedDocumentVersion,
   getEnterpriseSharedMemory,
-  getServerPersonalMemory,
+  getPersonalCloudMemory,
   createSharedDocument,
   createSharedDocumentBinding,
   createSharedDocumentVersion,
@@ -271,6 +271,14 @@ const helperTextStyle = {
   lineHeight: 1.5,
 } as const;
 
+const memoryProcessedNoteStyle = {
+  ...helperTextStyle,
+  padding: '10px 12px',
+  borderRadius: 10,
+  border: '1px solid rgba(51,65,85,0.9)',
+  background: 'rgba(15,23,42,0.5)',
+} as const;
+
 const processingGridStyle = {
   display: 'grid',
   gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
@@ -494,6 +502,7 @@ const EMPTY_MEMORY_VIEW: ContextMemoryView = {
     pendingJobCount: 0,
   },
   records: [],
+  pendingRecords: [],
 };
 
 function normalizeMemoryView(view: ContextMemoryView): ContextMemoryView {
@@ -509,6 +518,7 @@ function normalizeMemoryView(view: ContextMemoryView): ContextMemoryView {
       pendingJobCount: view.stats.pendingJobCount ?? 0,
     },
     records: view.records ?? [],
+    pendingRecords: view.pendingRecords ?? [],
   };
 }
 
@@ -764,6 +774,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       setLocalPersonalMemory(normalizeMemoryView({
         stats: msg.stats,
         records: msg.records,
+        pendingRecords: msg.pendingRecords ?? [],
       }));
     });
   }, [ws]);
@@ -790,11 +801,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         setLocalPersonalMemory(EMPTY_MEMORY_VIEW);
       }
 
-      if (serverId) {
-        setCloudPersonalMemory(normalizeMemoryView(await getServerPersonalMemory(serverId, queryInput)));
-      } else {
-        setCloudPersonalMemory(EMPTY_MEMORY_VIEW);
-      }
+      setCloudPersonalMemory(normalizeMemoryView(await getPersonalCloudMemory(queryInput)));
 
       if (enterpriseId) {
         setSharedMemory(normalizeMemoryView(await getEnterpriseSharedMemory(enterpriseId, {
@@ -1618,6 +1625,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               </select>
             </div>
             {memoryLoading ? <div style={helperTextStyle}>{t('sharedContext.loading')}</div> : null}
+            <div style={memoryProcessedNoteStyle}>{t('sharedContext.management.memoryProcessedNote')}</div>
           </div>
 
           {([
@@ -1642,6 +1650,45 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   detail={`${t('sharedContext.management.memoryStatDirtyTargets')}: ${view.stats.dirtyTargetCount} · ${t('sharedContext.management.memoryStatPendingJobs')}: ${view.stats.pendingJobCount}`}
                 />
               </div>
+              {title === t('sharedContext.management.memoryLocalTitle') && view.pendingRecords && view.pendingRecords.length > 0 ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <SectionHeading
+                    title={t('sharedContext.management.memoryPendingTitle')}
+                    description={t('sharedContext.management.memoryPendingDescription')}
+                  />
+                  <div style={resourceListStyle}>
+                    {view.pendingRecords.map((record) => (
+                      <div key={record.id} style={resourceCardStyle}>
+                        <div style={metaGridStyle}>
+                          <MetaCard label={t('sharedContext.management.memoryRecordProject')} value={record.projectId} />
+                          <MetaCard label={t('sharedContext.management.memoryPendingEventType')} value={record.eventType} />
+                          <MetaCard label={t('sharedContext.management.memoryPendingSession')} value={record.sessionName ?? '—'} />
+                          <MetaCard label={t('sharedContext.management.memoryRecordUpdated')} value={new Date(record.createdAt).toLocaleString()} />
+                        </div>
+                        <MemoryRecordContent
+                          id={`pending-${record.id}`}
+                          text={record.content || '—'}
+                          expanded={expandedMemoryRecordIds.has(`pending-${record.id}`)}
+                          onToggle={() => {
+                            setExpandedMemoryRecordIds((current) => {
+                              const next = new Set(current);
+                              const key = `pending-${record.id}`;
+                              if (next.has(key)) next.delete(key);
+                              else next.add(key);
+                              return next;
+                            });
+                          }}
+                          t={t}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+              <SectionHeading
+                title={t('sharedContext.management.memoryProcessedTitle')}
+                description={t('sharedContext.management.memoryProcessedDescription')}
+              />
               {view.records.length > 0 ? (
                 <div style={resourceListStyle}>
                   {view.records.map((record) => (

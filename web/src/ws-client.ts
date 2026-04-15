@@ -88,6 +88,7 @@ export type ServerMessage =
     requestId: string;
     stats: import('../../shared/context-types.js').ContextMemoryStatsView;
     records: Array<import('../../shared/context-types.js').ContextMemoryRecordView>;
+    pendingRecords?: Array<import('../../shared/context-types.js').ContextPendingEventView>;
   };
 
 export type {

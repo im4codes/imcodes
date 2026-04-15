@@ -33,7 +33,7 @@ const listSharedDocumentBindingsMock = vi.fn();
 const createSharedDocumentBindingMock = vi.fn();
 const fetchSharedContextRuntimeConfigMock = vi.fn();
 const updateSharedContextRuntimeConfigMock = vi.fn();
-const getServerPersonalMemoryMock = vi.fn();
+const getPersonalCloudMemoryMock = vi.fn();
 const getEnterpriseSharedMemoryMock = vi.fn();
 
 vi.mock('../../src/api.js', () => ({
@@ -65,7 +65,7 @@ vi.mock('../../src/api.js', () => ({
   createSharedDocumentBinding: (...args: unknown[]) => createSharedDocumentBindingMock(...args),
   fetchSharedContextRuntimeConfig: (...args: unknown[]) => fetchSharedContextRuntimeConfigMock(...args),
   updateSharedContextRuntimeConfig: (...args: unknown[]) => updateSharedContextRuntimeConfigMock(...args),
-  getServerPersonalMemory: (...args: unknown[]) => getServerPersonalMemoryMock(...args),
+  getPersonalCloudMemory: (...args: unknown[]) => getPersonalCloudMemoryMock(...args),
   getEnterpriseSharedMemory: (...args: unknown[]) => getEnterpriseSharedMemoryMock(...args),
 }));
 
@@ -156,7 +156,7 @@ describe('SharedContextManagementPanel', () => {
         defaultPrimaryContextModel: 'sonnet',
       },
     });
-    getServerPersonalMemoryMock.mockResolvedValue({
+    getPersonalCloudMemoryMock.mockResolvedValue({
       stats: {
         totalRecords: 2,
         matchedRecords: 1,
@@ -178,6 +178,7 @@ describe('SharedContextManagementPanel', () => {
           updatedAt: 1700000000000,
         },
       ],
+      pendingRecords: [],
     });
     getEnterpriseSharedMemoryMock.mockResolvedValue({
       stats: {
@@ -201,6 +202,7 @@ describe('SharedContextManagementPanel', () => {
           updatedAt: 1700000001000,
         },
       ],
+      pendingRecords: [],
     });
   });
 
@@ -484,7 +486,7 @@ describe('SharedContextManagementPanel', () => {
     });
 
     await waitFor(() => expect(fetchSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1'));
-    await waitFor(() => expect(getServerPersonalMemoryMock).toHaveBeenCalledWith('srv-1', expect.any(Object)));
+    await waitFor(() => expect(getPersonalCloudMemoryMock).toHaveBeenCalledWith(expect.any(Object)));
     await waitFor(() => expect(getEnterpriseSharedMemoryMock).toHaveBeenCalledWith('team-1', expect.any(Object)));
 
     const queryCommand = sent.find((message) => message.type === 'shared_context.personal_memory.query');
@@ -509,23 +511,41 @@ describe('SharedContextManagementPanel', () => {
             id: 'local-personal-1',
             scope: 'personal',
             projectId: 'github.com/acme/repo',
-            summary: '# Local personal summary\n\n- line one\n- line two\n- line three\n- line four',
+            summary: 'User intent: Local personal request\nCurrent outcome: Local compressed summary with enough detail to trigger the collapsed preview control in the management panel.\nKey constraints: keep the summary concise for runtime use, preserve the latest decision, and retain the working preference that was stated earlier in the session.\nCompressed from 5 events.',
             projectionClass: 'recent_summary',
             sourceEventCount: 2,
             updatedAt: 1700000002000,
           },
         ],
+        pendingRecords: [
+          {
+            id: 'pending-1',
+            projectId: 'github.com/acme/repo',
+            sessionName: 'deck_repo_brain',
+            eventType: 'user.turn',
+            content: 'Pending raw local event',
+            createdAt: 1700000001500,
+          },
+        ],
       });
     });
 
-    expect(await screen.findByText('Local personal summary')).toBeDefined();
+    await waitFor(() => {
+      expect(screen.getByTestId('memory-record-content-local-personal-1').textContent).toContain('Local compressed summary');
+    });
+    expect(await screen.findByText('Pending raw local event')).toBeDefined();
+    expect(await screen.findByText('sharedContext.management.memoryPendingTitle')).toBeDefined();
+    await waitFor(() => {
+      expect(screen.getAllByText('sharedContext.management.memoryProcessedTitle').length).toBeGreaterThan(0);
+    });
     expect(await screen.findByText('Cloud personal decision')).toBeDefined();
     expect(await screen.findByText('Shared coding standard reminder')).toBeDefined();
+    expect(await screen.findByText('sharedContext.management.memoryProcessedNote')).toBeDefined();
     expect(await screen.findByText('sharedContext.management.memoryStatDirtyTargets: 1 · sharedContext.management.memoryStatPendingJobs: 1')).toBeDefined();
 
     const memoryContent = screen.getByTestId('memory-record-content-local-personal-1') as HTMLDivElement;
     expect(memoryContent.style.maxHeight).toBe('4.5em');
-    const expandButton = screen.getByText('sharedContext.management.memoryExpand');
+    const expandButton = screen.getAllByText('sharedContext.management.memoryExpand')[0];
     await act(async () => {
       fireEvent.click(expandButton);
     });

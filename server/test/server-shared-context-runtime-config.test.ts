@@ -6,6 +6,8 @@ const getServersByUserIdMock = vi.fn();
 const getServerByIdMock = vi.fn();
 const getServerSharedContextRuntimeConfigMock = vi.fn();
 const updateServerSharedContextRuntimeConfigMock = vi.fn();
+const getUserPrefMock = vi.fn();
+const setUserPrefMock = vi.fn();
 const sendToDaemonMock = vi.fn();
 const queryOneMock = vi.fn();
 
@@ -26,6 +28,8 @@ vi.mock('../src/db/queries.js', () => ({
   getServerById: (...args: unknown[]) => getServerByIdMock(...args),
   getServerSharedContextRuntimeConfig: (...args: unknown[]) => getServerSharedContextRuntimeConfigMock(...args),
   updateServerSharedContextRuntimeConfig: (...args: unknown[]) => updateServerSharedContextRuntimeConfigMock(...args),
+  getUserPref: (...args: unknown[]) => getUserPrefMock(...args),
+  setUserPref: (...args: unknown[]) => setUserPrefMock(...args),
 }));
 
 vi.mock('../src/ws/bridge.js', () => ({
@@ -54,10 +58,11 @@ describe('server shared-context runtime config routes', () => {
       primaryContextModel: 'sonnet',
       backupContextBackend: undefined,
       backupContextModel: undefined,
-      enablePersonalMemorySync: false,
     });
     updateServerSharedContextRuntimeConfigMock.mockResolvedValue(true);
-    queryOneMock.mockResolvedValue({ id: 'srv-1' });
+    getUserPrefMock.mockResolvedValue('false');
+    setUserPrefMock.mockResolvedValue(undefined);
+    queryOneMock.mockResolvedValue({ id: 'srv-1', user_id: 'user-1' });
   });
 
   async function buildApp() {
@@ -114,8 +119,14 @@ describe('server shared-context runtime config routes', () => {
         primaryContextModel: 'gpt-5.4',
         backupContextBackend: 'claude-code-sdk',
         backupContextModel: 'haiku',
-        enablePersonalMemorySync: true,
+        enablePersonalMemorySync: undefined,
       },
+    );
+    expect(setUserPrefMock).toHaveBeenCalledWith(
+      expect.anything(),
+      'user-1',
+      'shared_context.personal_memory_sync',
+      'true',
     );
     expect(sendToDaemonMock).toHaveBeenCalledWith(JSON.stringify({
       type: SHARED_CONTEXT_RUNTIME_CONFIG_MSG.APPLY,

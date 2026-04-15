@@ -13,6 +13,7 @@ import type {
   ContextNamespace,
   ContextReplicationState,
   ContextTargetRef,
+  ContextPendingEventView,
   LocalContextEvent,
   ProcessedContextProjection,
   ProcessedContextClass,
@@ -218,6 +219,44 @@ export function listContextEvents(target: ContextTargetRef): LocalContextEvent[]
     metadata: parseJson<Record<string, unknown> | null>(row.metadata_json, null) ?? undefined,
     createdAt: Number(row.created_at),
   }));
+}
+
+export function queryPendingContextEvents(filters: {
+  scope?: ContextScope;
+  projectId?: string;
+  query?: string;
+  limit?: number;
+} = {}): ContextPendingEventView[] {
+  const database = ensureDb();
+  const rows = database.prepare(`
+    SELECT id, namespace_key, session_name, event_type, content, created_at
+    FROM context_staged_events
+    ORDER BY created_at DESC
+  `).all() as Array<Record<string, unknown>>;
+  const normalizedQuery = filters.query?.trim().toLowerCase() ?? '';
+  const limit = typeof filters.limit === 'number' && filters.limit > 0 ? filters.limit : 50;
+  return rows
+    .map((row) => {
+      const namespace = parseNamespaceKey(String(row.namespace_key));
+      return {
+        id: String(row.id),
+        scope: namespace.scope,
+        projectId: namespace.projectId,
+        sessionName: typeof row.session_name === 'string' ? row.session_name : undefined,
+        eventType: String(row.event_type),
+        content: typeof row.content === 'string' ? row.content : undefined,
+        createdAt: Number(row.created_at),
+      };
+    })
+    .filter((row) => !filters.scope || row.scope === filters.scope)
+    .filter((row) => !filters.projectId || row.projectId === filters.projectId)
+    .filter((row) => {
+      if (!normalizedQuery) return true;
+      const haystack = `${row.eventType}\n${row.content ?? ''}`.toLowerCase();
+      return haystack.includes(normalizedQuery);
+    })
+    .slice(0, limit)
+    .map(({ scope: _scope, ...row }) => row);
 }
 
 export function enqueueContextJob(target: ContextTargetRef, jobType: ContextJobType, trigger: ContextJobTrigger, now = Date.now()): ContextJobRecord {

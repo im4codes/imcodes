@@ -150,7 +150,7 @@ function matchesMemoryQuery(summary: string, content: unknown, query: string): b
 function buildSharedMemoryResponse(
   rows: Array<{
     id: string;
-    scope: 'project_shared' | 'workspace_shared' | 'org_shared';
+    scope: 'personal' | 'project_shared' | 'workspace_shared' | 'org_shared';
     project_id: string;
     projection_class: 'recent_summary' | 'durable_memory_candidate';
     source_event_ids_json: string | string[];
@@ -192,6 +192,34 @@ function buildSharedMemoryResponse(
     })),
   };
 }
+
+sharedContextRoutes.get('/personal-memory', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const projectId = c.req.query('projectId')?.trim();
+  const projectionClass = c.req.query('projectionClass')?.trim();
+  const query = c.req.query('query')?.trim();
+  const limit = Math.max(1, Math.min(100, Number.parseInt(c.req.query('limit') ?? '20', 10) || 20));
+  const rows = await c.env.DB.query<{
+    id: string;
+    scope: 'personal';
+    project_id: string;
+    projection_class: 'recent_summary' | 'durable_memory_candidate';
+    source_event_ids_json: string | string[];
+    summary: string;
+    content_json: string | Record<string, unknown> | null;
+    updated_at: number;
+  }>(
+    `SELECT id, scope, project_id, projection_class, source_event_ids_json, summary, content_json, updated_at
+     FROM shared_context_projections
+     WHERE user_id = $1
+       AND scope = 'personal'
+       ${projectId ? 'AND project_id = $2' : ''}
+       ${projectionClass ? `AND projection_class = $${projectId ? 3 : 2}` : ''}
+     ORDER BY updated_at DESC`,
+    [userId, ...(projectId ? [projectId] : []), ...(projectionClass ? [projectionClass] : [])],
+  );
+  return c.json(buildSharedMemoryResponse(rows, query, limit));
+});
 
 function matchesPathPattern(pattern: string, filePath: string): boolean {
   const normalizedPattern = pattern.replace(/\\/g, '/');

@@ -50,7 +50,7 @@ describe('LiveContextIngestion', () => {
     expect(queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 })).toEqual([
       expect.objectContaining({
         class: 'recent_summary',
-        summary: expect.stringContaining('user.turn: Investigate memory pipeline'),
+        summary: expect.stringContaining('User intent: Investigate memory pipeline'),
       }),
     ]);
     expect(getProcessedProjectionStats({ scope: 'personal', projectId: namespace.projectId })).toMatchObject({
@@ -80,8 +80,8 @@ describe('LiveContextIngestion', () => {
     await ingestion.handleTimelineEvent(makeEvent('session.state', 130, { state: 'idle' }));
 
     const [summary] = queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 });
-    expect(summary?.summary).toContain('user.turn: Need the final answer only');
-    expect(summary?.summary).toContain('assistant.turn: final answer');
+    expect(summary?.summary).toContain('User intent: Need the final answer only');
+    expect(summary?.summary).toContain('Current outcome: final answer');
     expect(summary?.summary).not.toContain('partial');
   });
 
@@ -110,8 +110,8 @@ describe('LiveContextIngestion', () => {
     await ingestion.handleTimelineEvent(makeEvent('session.state', 140, { state: 'idle' }));
 
     const [summary] = queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 });
-    expect(summary?.summary).toContain('user.turn: Find the final fix');
-    expect(summary?.summary).toContain('assistant.turn: Use the final patch');
+    expect(summary?.summary).toContain('User intent: Find the final fix');
+    expect(summary?.summary).toContain('Current outcome: Use the final patch');
     expect(summary?.summary).not.toContain('grep');
     expect(summary?.summary).not.toContain('intermediate output');
   });
@@ -130,7 +130,7 @@ describe('LiveContextIngestion', () => {
     expect(queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 })).toEqual([
       expect.objectContaining({
         class: 'recent_summary',
-        summary: expect.stringContaining('assistant.turn: Deployment plan captured'),
+        summary: expect.stringContaining('Current outcome: Deployment plan captured'),
       }),
     ]);
     expect(getProcessedProjectionStats({ scope: 'personal', projectId: namespace.projectId })).toMatchObject({
@@ -138,6 +138,31 @@ describe('LiveContextIngestion', () => {
       stagedEventCount: 0,
       dirtyTargetCount: 0,
     });
+  });
+
+  it('rate-limits processed summaries to at most one per target every 10 seconds by default', async () => {
+    const ingestion = new LiveContextIngestion({
+      thresholds: { eventCount: 1, idleMs: 60_000, scheduleMs: 60_000, minIntervalMs: 10_000 },
+      sessionLookup: () => session,
+      resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
+    });
+
+    await ingestion.handleTimelineEvent(makeEvent('user.message', 100, { text: 'First prompt' }));
+    await ingestion.handleTimelineEvent(makeEvent('session.state', 101, { state: 'idle' }));
+    expect(queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 })).toHaveLength(1);
+
+    await ingestion.handleTimelineEvent(makeEvent('user.message', 105, { text: 'Second prompt too soon' }));
+    await ingestion.handleTimelineEvent(makeEvent('session.state', 106, { state: 'idle' }));
+    expect(queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 })).toHaveLength(1);
+    expect(getProcessedProjectionStats({ scope: 'personal', projectId: namespace.projectId })).toMatchObject({
+      stagedEventCount: 1,
+      dirtyTargetCount: 1,
+    });
+
+    await ingestion.flushDueTargets(10_200);
+    const summaries = queryProcessedProjections({ scope: 'personal', projectId: namespace.projectId, limit: 10 });
+    expect(summaries).toHaveLength(2);
+    expect(summaries[0]?.summary).toContain('Second prompt too soon');
   });
 });
 

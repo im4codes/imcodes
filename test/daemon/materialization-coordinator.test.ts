@@ -86,7 +86,9 @@ describe('MaterializationCoordinator', () => {
 
     const result = coordinator.materializeTarget(target, 'manual', 500);
 
-    expect(result.summaryProjection.summary).toContain('user.turn: open the issue');
+    expect(result.summaryProjection.summary).toContain('User intent: open the issue');
+    expect(result.summaryProjection.summary).toContain('Key constraints: ship the migration');
+    expect(result.summaryProjection.summary).toContain('Compressed from 2 events.');
     expect(result.summaryProjection.content).toEqual(expect.objectContaining({
       primaryContextBackend: 'claude-code-sdk',
       primaryContextModel: 'sonnet',
@@ -120,5 +122,26 @@ describe('MaterializationCoordinator', () => {
       backupContextModel: 'qwen3-coder-plus',
       enablePersonalMemorySync: false,
     });
+  });
+
+  it('defers repeat materialization for the same target until the cooldown window expires', () => {
+    const coordinator = new MaterializationCoordinator({
+      thresholds: { eventCount: 1, idleMs: 50, scheduleMs: 200, minIntervalMs: 10_000 },
+    });
+
+    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'first', createdAt: 100 });
+    coordinator.materializeTarget(target, 'manual', 100);
+
+    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'second', createdAt: 200 });
+    expect(coordinator.scheduleDueTargets(5_000)).toHaveLength(0);
+    expect(coordinator.canMaterializeTarget(target, 5_000)).toBe(false);
+
+    expect(coordinator.scheduleDueTargets(10_200)).toEqual([
+      expect.objectContaining({
+        target,
+        trigger: 'threshold',
+      }),
+    ]);
+    expect(coordinator.canMaterializeTarget(target, 10_200)).toBe(true);
   });
 });

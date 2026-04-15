@@ -1410,8 +1410,7 @@ export async function getSharedContextDiagnostics(
   );
 }
 
-export async function getServerPersonalMemory(
-  serverId: string,
+export async function getPersonalCloudMemory(
   input?: {
     projectId?: string;
     projectionClass?: 'recent_summary' | 'durable_memory_candidate';
@@ -1424,7 +1423,7 @@ export async function getServerPersonalMemory(
   if (input?.projectionClass) params.set('projectionClass', input.projectionClass);
   if (input?.query) params.set('query', input.query);
   if (typeof input?.limit === 'number') params.set('limit', String(input.limit));
-  return apiFetch(`/api/server/${encodeURIComponent(serverId)}/shared-context/personal-memory?${params.toString()}`, {
+  return apiFetch(`/api/shared-context/personal-memory?${params.toString()}`, {
     method: 'GET',
   });
 }

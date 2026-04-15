@@ -76,7 +76,9 @@ export class LiveContextIngestion {
       });
     }
     if (staged > 0) {
-      this.coordinator.materializeTarget(target, 'recovery', lastTs);
+      if (this.coordinator.canMaterializeTarget(target, lastTs)) {
+        this.coordinator.materializeTarget(target, 'recovery', lastTs);
+      }
     }
   }
 
@@ -88,7 +90,7 @@ export class LiveContextIngestion {
 
     if (event.type === 'session.state') {
       const state = typeof event.payload.state === 'string' ? event.payload.state : '';
-      if (state === 'idle' && this.hasDirtyTarget(target)) {
+      if (state === 'idle' && this.hasDirtyTarget(target) && this.coordinator.canMaterializeTarget(target, event.ts)) {
         this.coordinator.materializeTarget(target, 'idle', event.ts);
       }
       return;
@@ -103,7 +105,7 @@ export class LiveContextIngestion {
       metadata: mapped.metadata,
       createdAt: event.ts,
     });
-    if (result.trigger === 'threshold') {
+    if (result.trigger === 'threshold' && this.coordinator.canMaterializeTarget(target, event.ts)) {
       this.coordinator.materializeTarget(target, 'threshold', event.ts);
     }
   }

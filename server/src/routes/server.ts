@@ -9,6 +9,8 @@ import {
   getServerById,
   getServerSharedContextRuntimeConfig,
   updateServerSharedContextRuntimeConfig,
+  getUserPref,
+  setUserPref,
 } from '../db/queries.js';
 import { WsBridge } from '../ws/bridge.js';
 import { sha256Hex, randomHex } from '../security/crypto.js';
@@ -74,11 +76,21 @@ const runtimeConfigSchema = z.object({
 });
 
 const DEFAULT_REMOTE_PROCESSED_FRESH_MS = 6 * 60 * 60 * 1000;
+const PERSONAL_MEMORY_SYNC_PREF_KEY = 'shared_context.personal_memory_sync';
 
 function getRemoteProcessedFreshMs(): number {
   const raw = process.env.IMCODES_REMOTE_PROCESSED_FRESH_MS?.trim();
   const parsed = raw ? Number(raw) : Number.NaN;
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_REMOTE_PROCESSED_FRESH_MS;
+}
+
+async function getPersonalMemorySyncEnabled(db: Env['DB'], userId: string): Promise<boolean> {
+  const raw = await getUserPref(db, userId, PERSONAL_MEMORY_SYNC_PREF_KEY);
+  return raw === 'true';
+}
+
+async function setPersonalMemorySyncEnabled(db: Env['DB'], userId: string, enabled: boolean): Promise<void> {
+  await setUserPref(db, userId, PERSONAL_MEMORY_SYNC_PREF_KEY, enabled ? 'true' : 'false');
 }
 
 function matchesMemoryQuery(summary: string, content: unknown, query: string): boolean {
@@ -218,7 +230,13 @@ serverRoutes.get('/:id/shared-context/runtime-config', requireAuth(), async (c) 
   const server = await getServerById(c.env.DB, serverId);
   if (!server || server.user_id !== userId) return c.json({ error: 'not_found' }, 404);
   const persisted = await getServerSharedContextRuntimeConfig(c.env.DB, serverId);
-  return c.json({ snapshot: buildSharedContextRuntimeConfigSnapshot(persisted ?? defaultSharedContextRuntimeConfig()) });
+  const personalSyncEnabled = await getPersonalMemorySyncEnabled(c.env.DB, userId);
+  return c.json({
+    snapshot: buildSharedContextRuntimeConfigSnapshot({
+      ...(persisted ?? defaultSharedContextRuntimeConfig()),
+      enablePersonalMemorySync: personalSyncEnabled,
+    }),
+  });
 });
 
 serverRoutes.put('/:id/shared-context/runtime-config', requireAuth(), async (c) => {
@@ -234,8 +252,12 @@ serverRoutes.put('/:id/shared-context/runtime-config', requireAuth(), async (c) 
     backupContextModel: parsed.data.backupContextModel ?? undefined,
     enablePersonalMemorySync: parsed.data.enablePersonalMemorySync ?? undefined,
   });
-  const updated = await updateServerSharedContextRuntimeConfig(c.env.DB, serverId, userId, normalized);
+  const updated = await updateServerSharedContextRuntimeConfig(c.env.DB, serverId, userId, {
+    ...normalized,
+    enablePersonalMemorySync: undefined,
+  });
   if (!updated) return c.json({ error: 'not_found' }, 404);
+  await setPersonalMemorySyncEnabled(c.env.DB, userId, normalized.enablePersonalMemorySync === true);
   try {
     WsBridge.get(serverId).sendToDaemon(JSON.stringify({
       type: SHARED_CONTEXT_RUNTIME_CONFIG_MSG.APPLY,
@@ -253,12 +275,18 @@ serverRoutes.get('/:id/shared-context/runtime-config/daemon', async (c) => {
   const tokenHash = sha256Hex(auth.slice(7));
   const serverId = c.req.param('id');
   const server = await c.env.DB.queryOne<{ id: string }>(
-    'SELECT id FROM servers WHERE id = $1 AND token_hash = $2',
+    'SELECT id, user_id FROM servers WHERE id = $1 AND token_hash = $2',
     [serverId, tokenHash],
   );
   if (!server) return c.json({ error: 'unauthorized' }, 401);
   const persisted = await getServerSharedContextRuntimeConfig(c.env.DB, serverId);
-  return c.json({ config: persisted ?? defaultSharedContextRuntimeConfig() });
+  const personalSyncEnabled = await getPersonalMemorySyncEnabled(c.env.DB, server.user_id);
+  return c.json({
+    config: {
+      ...(persisted ?? defaultSharedContextRuntimeConfig()),
+      enablePersonalMemorySync: personalSyncEnabled,
+    },
+  });
 });
 
 /**
@@ -459,13 +487,12 @@ serverRoutes.get('/:id/shared-context/personal-memory', requireAuth(), async (c)
   }>(
     `SELECT id, scope, project_id, projection_class, source_event_ids_json, summary, content_json, updated_at
      FROM shared_context_projections
-     WHERE server_id = $1
-       AND user_id = $2
+     WHERE user_id = $1
        AND scope = 'personal'
-       ${projectId ? 'AND project_id = $3' : ''}
-       ${projectionClass ? `AND projection_class = $${projectId ? 4 : 3}` : ''}
+       ${projectId ? 'AND project_id = $2' : ''}
+       ${projectionClass ? `AND projection_class = $${projectId ? 3 : 2}` : ''}
      ORDER BY updated_at DESC`,
-    [serverId, userId, ...(projectId ? [projectId] : []), ...(projectionClass ? [projectionClass] : [])],
+    [userId, ...(projectId ? [projectId] : []), ...(projectionClass ? [projectionClass] : [])],
   );
   return c.json(buildRemoteMemoryResponse(rows, query, limit));
 });

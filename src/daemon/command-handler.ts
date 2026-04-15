@@ -59,7 +59,7 @@ import {
   type TransportEffortLevel,
 } from '../../shared/effort-levels.js';
 import { getSavedP2pConfig, upsertSavedP2pConfig } from '../store/p2p-config-store.js';
-import { getProcessedProjectionStats, queryProcessedProjections } from '../store/context-store.js';
+import { getProcessedProjectionStats, queryPendingContextEvents, queryProcessedProjections } from '../store/context-store.js';
 import {
   normalizeSharedContextRuntimeConfig,
   normalizeSharedContextRuntimeBackend,
@@ -3895,10 +3895,17 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     sourceEventCount: projection.sourceEventIds.length,
     updatedAt: projection.updatedAt,
   }));
+  const pendingRecords = queryPendingContextEvents({
+    scope: 'personal',
+    projectId: projectId || undefined,
+    query: query || undefined,
+    limit,
+  });
   serverLink.send({
     type: 'shared_context.personal_memory.response',
     requestId,
     stats,
     records,
+    pendingRecords,
   });
 }

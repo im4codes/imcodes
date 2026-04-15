@@ -192,9 +192,19 @@ export interface ContextMemoryRecordView {
   updatedAt: number;
 }
 
+export interface ContextPendingEventView {
+  id: string;
+  projectId: string;
+  sessionName?: string;
+  eventType: string;
+  content?: string;
+  createdAt: number;
+}
+
 export interface ContextMemoryView {
   stats: ContextMemoryStatsView;
   records: ContextMemoryRecordView[];
+  pendingRecords?: ContextPendingEventView[];
 }
 
 export interface ProcessedContextReplicationBody {

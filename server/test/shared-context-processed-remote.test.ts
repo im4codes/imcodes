@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { sha256Hex } from '../src/security/crypto.js';
 import { serverRoutes } from '../src/routes/server.js';
+import { sharedContextRoutes } from '../src/routes/shared-context.js';
 import type { Env } from '../src/env.js';
 import type { Database } from '../src/db/client.js';
 
@@ -110,7 +111,7 @@ function makeMockDb() {
         if (params[0] !== 'ent-1' || params[2] !== 'github.com/acme/repo') return [] as T[];
         return authoredBindingRows as T[];
       }
-      if (normalized.includes("from shared_context_projections where server_id = $1 and user_id = $2 and scope = 'personal'")) {
+      if (normalized.includes("from shared_context_projections where user_id = $1 and scope = 'personal'")) {
         return [
           {
             id: 'personal-projection-1',
@@ -491,6 +492,41 @@ describe('shared-context processed remote route', () => {
     app.route('/api/server', serverRoutes);
 
     const response = await app.request('/api/server/srv-1/shared-context/personal-memory?query=summary&limit=10', {
+      method: 'GET',
+    }, makeEnv(db));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      stats: {
+        totalRecords: 1,
+        matchedRecords: 1,
+        recentSummaryCount: 1,
+        durableCandidateCount: 0,
+        projectCount: 1,
+        stagedEventCount: 0,
+        dirtyTargetCount: 0,
+        pendingJobCount: 0,
+      },
+      records: [
+        {
+          id: 'personal-projection-1',
+          scope: 'personal',
+          projectId: 'github.com/acme/repo',
+          summary: 'Cloud personal summary',
+          projectionClass: 'recent_summary',
+          sourceEventCount: 2,
+          updatedAt: 1700000000000,
+        },
+      ],
+    });
+  });
+
+  it('returns global personal cloud memory stats from the shared-context route', async () => {
+    const { db } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/shared-context', sharedContextRoutes);
+
+    const response = await app.request('/api/shared-context/personal-memory?query=summary&limit=10', {
       method: 'GET',
     }, makeEnv(db));
 
