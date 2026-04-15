@@ -31,6 +31,7 @@ const DEFAULT_LOCAL_PROCESSED_FRESH_MS = 6 * 60 * 60 * 1000;
 
 let db: DatabaseSyncInstance | null = null;
 let currentDbPath: string | null = null;
+let stagedReconciledForPath: string | null = null;
 
 function getDbPath(): string {
   return process.env.IMCODES_CONTEXT_DB_PATH?.trim() || DEFAULT_DB_PATH;
@@ -113,6 +114,10 @@ function ensureDb(): DatabaseSyncInstance {
       last_error TEXT
     );
   `);
+  if (stagedReconciledForPath !== dbPath) {
+    reconcileMaterializedStagedEvents(db);
+    stagedReconciledForPath = dbPath;
+  }
   return db;
 }
 
@@ -137,6 +142,7 @@ export function resetContextStoreForTests(): void {
   if (db) db.close();
   db = null;
   currentDbPath = null;
+  stagedReconciledForPath = null;
 }
 
 export function recordContextEvent(input: Omit<LocalContextEvent, 'id' | 'createdAt'> & Partial<Pick<LocalContextEvent, 'id' | 'createdAt'>>): LocalContextEvent {
@@ -219,6 +225,13 @@ export function listContextEvents(target: ContextTargetRef): LocalContextEvent[]
     metadata: parseJson<Record<string, unknown> | null>(row.metadata_json, null) ?? undefined,
     createdAt: Number(row.created_at),
   }));
+}
+
+export function deleteStagedEventsByIds(eventIds: string[]): void {
+  if (eventIds.length === 0) return;
+  const database = ensureDb();
+  const placeholders = eventIds.map(() => '?').join(', ');
+  database.prepare(`DELETE FROM context_staged_events WHERE id IN (${placeholders})`).run(...eventIds);
 }
 
 export function queryPendingContextEvents(filters: {
@@ -494,6 +507,24 @@ function getPendingContextStats(filters: ProcessedProjectionQuery): {
     pendingJobCount,
     projectIds,
   };
+}
+
+function reconcileMaterializedStagedEvents(database: DatabaseSyncInstance): void {
+  const stagedRows = database.prepare('SELECT id FROM context_staged_events').all() as Array<Record<string, unknown>>;
+  if (stagedRows.length === 0) return;
+  const stagedIds = new Set(stagedRows.map((row) => String(row.id)));
+  const projectionRows = database.prepare('SELECT source_event_ids_json FROM context_processed_local').all() as Array<Record<string, unknown>>;
+  const matchedIds: string[] = [];
+  for (const row of projectionRows) {
+    const sourceIds = parseJson<string[]>(row.source_event_ids_json, []);
+    for (const sourceId of sourceIds) {
+      if (stagedIds.has(sourceId)) matchedIds.push(sourceId);
+    }
+  }
+  if (matchedIds.length === 0) return;
+  const uniqueIds = Array.from(new Set(matchedIds));
+  const placeholders = uniqueIds.map(() => '?').join(', ');
+  database.prepare(`DELETE FROM context_staged_events WHERE id IN (${placeholders})`).run(...uniqueIds);
 }
 
 export function getLocalProcessedFreshness(namespace: ContextNamespace, now = Date.now()): ContextFreshness {

@@ -13,6 +13,7 @@ import {
   clearDirtyTarget,
   enqueueContextJob,
   getReplicationState,
+  deleteStagedEventsByIds,
   listContextEvents,
   listDirtyTargets,
   listProcessedProjections,
@@ -115,6 +116,7 @@ export class MaterializationCoordinator {
       lastReplicatedAt: replicationState?.lastReplicatedAt,
       lastError: replicationState?.lastError,
     });
+    deleteStagedEventsByIds(sourceEventIds);
     updateContextJob(job.id, 'completed', { now });
     clearDirtyTarget(target);
     return {
@@ -184,31 +186,44 @@ export class MaterializationCoordinator {
 
 function buildSummary(events: LocalContextEvent[]): string {
   if (events.length === 0) return 'No staged events available.';
-  const userTurns = events
-    .filter((event) => event.eventType === 'user.turn')
-    .map((event) => event.content?.trim())
-    .filter((value): value is string => !!value);
-  const assistantTurns = events
-    .filter((event) => event.eventType === 'assistant.turn')
-    .map((event) => event.content?.trim())
-    .filter((value): value is string => !!value);
+  const turnPairs = buildTurnPairs(events);
   const decisions = events
     .filter((event) => event.eventType === 'decision' || event.eventType === 'constraint' || event.eventType === 'preference')
     .map((event) => event.content?.trim())
     .filter((value): value is string => !!value);
 
   const lines: string[] = [];
-  if (userTurns.length > 0) {
-    lines.push(`User intent: ${userTurns[userTurns.length - 1]}`);
-  }
-  if (assistantTurns.length > 0) {
-    lines.push(`Current outcome: ${assistantTurns[assistantTurns.length - 1]}`);
+  if (turnPairs.length > 0) {
+    lines.push('Recent task pairs:');
+    for (const pair of turnPairs.slice(-2)) {
+      lines.push(`User request: ${pair.user}`);
+      lines.push(`Final outcome: ${pair.assistant ?? 'Pending response'}`);
+    }
   }
   if (decisions.length > 0) {
     lines.push(`Key constraints: ${decisions.slice(-2).join(' | ')}`);
   }
   lines.push(`Compressed from ${events.length} event${events.length === 1 ? '' : 's'}.`);
   return lines.join('\n');
+}
+
+function buildTurnPairs(events: LocalContextEvent[]): Array<{ user: string; assistant?: string }> {
+  const pairs: Array<{ user: string; assistant?: string }> = [];
+  for (const event of events) {
+    const content = event.content?.trim();
+    if (!content) continue;
+    if (event.eventType === 'user.turn') {
+      pairs.push({ user: content });
+      continue;
+    }
+    if (event.eventType === 'assistant.turn') {
+      const openPair = [...pairs].reverse().find((pair) => !pair.assistant);
+      if (openPair) {
+        openPair.assistant = content;
+      }
+    }
+  }
+  return pairs;
 }
 
 function buildDurableProjection(namespace: ContextNamespace, events: LocalContextEvent[], now: number): ProcessedContextProjection | undefined {

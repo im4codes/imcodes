@@ -86,7 +86,9 @@ describe('MaterializationCoordinator', () => {
 
     const result = coordinator.materializeTarget(target, 'manual', 500);
 
-    expect(result.summaryProjection.summary).toContain('User intent: open the issue');
+    expect(result.summaryProjection.summary).toContain('Recent task pairs:');
+    expect(result.summaryProjection.summary).toContain('User request: open the issue');
+    expect(result.summaryProjection.summary).toContain('Final outcome: Pending response');
     expect(result.summaryProjection.summary).toContain('Key constraints: ship the migration');
     expect(result.summaryProjection.summary).toContain('Compressed from 2 events.');
     expect(result.summaryProjection.content).toEqual(expect.objectContaining({
@@ -145,5 +147,19 @@ describe('MaterializationCoordinator', () => {
       }),
     ]);
     expect(coordinator.canMaterializeTarget(target, 10_200)).toBe(true);
+  });
+
+  it('pairs final assistant output with the user request in recent summaries', () => {
+    const coordinator = new MaterializationCoordinator({
+      thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+    });
+
+    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'fix the flaky build', createdAt: 100 });
+    coordinator.ingestEvent({ target, eventType: 'assistant.turn', content: 'updated the import and reran the build', createdAt: 120 });
+
+    const result = coordinator.materializeTarget(target, 'manual', 500);
+
+    expect(result.summaryProjection.summary).toContain('User request: fix the flaky build');
+    expect(result.summaryProjection.summary).toContain('Final outcome: updated the import and reran the build');
   });
 });

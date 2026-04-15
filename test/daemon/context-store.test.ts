@@ -12,6 +12,8 @@ import {
   queryPendingContextEvents,
   queryProcessedProjections,
   recordContextEvent,
+  resetContextStoreForTests,
+  deleteStagedEventsByIds,
   setReplicationState,
   updateContextJob,
   writeProcessedProjection,
@@ -181,6 +183,33 @@ describe('context-store', () => {
         projectId: 'repo',
       }),
     ]);
+  });
+
+  it('removes staged events once they have been materialized', () => {
+    const first = recordContextEvent({ target, eventType: 'user.turn', content: 'question', createdAt: 10 });
+    const second = recordContextEvent({ target, eventType: 'assistant.turn', content: 'answer', createdAt: 20 });
+
+    deleteStagedEventsByIds([first.id, second.id]);
+
+    expect(queryPendingContextEvents({ scope: 'personal', projectId: 'repo', limit: 10 })).toEqual([]);
+  });
+
+  it('reconciles stale staged events that were already referenced by processed projections', () => {
+    const first = recordContextEvent({ target, eventType: 'user.turn', content: 'question', createdAt: 10 });
+    const second = recordContextEvent({ target, eventType: 'assistant.turn', content: 'answer', createdAt: 20 });
+    writeProcessedProjection({
+      namespace,
+      class: 'recent_summary',
+      sourceEventIds: [first.id, second.id],
+      summary: 'summary',
+      content: {},
+      createdAt: 30,
+      updatedAt: 30,
+    });
+
+    resetContextStoreForTests();
+
+    expect(queryPendingContextEvents({ scope: 'personal', projectId: 'repo', limit: 10 })).toEqual([]);
   });
 
   it('clears dirty targets after materialization cleanup', () => {

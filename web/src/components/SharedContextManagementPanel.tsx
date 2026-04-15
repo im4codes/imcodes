@@ -388,6 +388,7 @@ function formatServerScopeValue(serverId?: string): string {
 
 type KindOption = SharedDocument['kind'];
 type ManagementTab = 'enterprise' | 'members' | 'projects' | 'knowledge' | 'processing' | 'memory';
+type MemorySourceTab = 'local-processed' | 'local-pending' | 'cloud' | 'shared';
 
 interface Props {
   enterpriseId?: string;
@@ -589,6 +590,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [cloudPersonalMemory, setCloudPersonalMemory] = useState<ContextMemoryView>(EMPTY_MEMORY_VIEW);
   const [sharedMemory, setSharedMemory] = useState<ContextMemoryView>(EMPTY_MEMORY_VIEW);
   const [expandedMemoryRecordIds, setExpandedMemoryRecordIds] = useState<Set<string>>(new Set());
+  const [memorySourceTab, setMemorySourceTab] = useState<MemorySourceTab>('local-processed');
 
   const renderProcessedMemoryRecords = useCallback((view: ContextMemoryView) => {
     const recentRecords = view.records.filter((record) => record.projectionClass === 'recent_summary');
@@ -627,6 +629,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 <div key={record.id} style={resourceCardStyle}>
                   <div style={metaGridStyle}>
                     <MetaCard label={t('sharedContext.management.memoryRecordProject')} value={record.projectId} />
+                    <MetaCard label={t('sharedContext.management.memoryRecordStatus')} value={t('sharedContext.management.memoryStatusProcessed')} />
                     <MetaCard label={t('sharedContext.management.memoryRecordClass')} value={getMemoryRecordClassLabel(t, record.projectionClass)} />
                     <MetaCard label={t('sharedContext.management.memoryRecordSources')} value={record.sourceEventCount} />
                     <MetaCard label={t('sharedContext.management.memoryRecordUpdated')} value={new Date(record.updatedAt).toLocaleString()} />
@@ -691,6 +694,13 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     { id: 'knowledge', label: t('sharedContext.management.tabs.knowledge') },
     { id: 'processing', label: t('sharedContext.management.tabs.processing') },
     { id: 'memory', label: t('sharedContext.management.tabs.memory') },
+  ], [t]);
+
+  const memoryTabs = useMemo(() => [
+    { id: 'local-processed' as const, label: t('sharedContext.management.memoryTabLocalProcessed') },
+    { id: 'local-pending' as const, label: t('sharedContext.management.memoryTabLocalPending') },
+    { id: 'cloud' as const, label: t('sharedContext.management.memoryTabCloud') },
+    { id: 'shared' as const, label: t('sharedContext.management.memoryTabShared') },
   ], [t]);
 
   const refreshEnterpriseData = useCallback(async (nextEnterpriseId = enterpriseId) => {
@@ -1703,39 +1713,62 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             <div style={memoryProcessedNoteStyle}>{t('sharedContext.management.memoryProcessedNote')}</div>
           </div>
 
-          {([
-            [t('sharedContext.management.memoryLocalTitle'), localPersonalMemory],
-            [t('sharedContext.management.memoryCloudTitle'), cloudPersonalMemory],
-            [t('sharedContext.management.memorySharedTitle'), sharedMemory],
-          ] as Array<[string, ContextMemoryView]>).map(([title, view]) => (
-            <div key={title} style={sectionStyle}>
-              <SectionHeading title={title as string} />
-              <div style={statGridStyle}>
-                <StatCard label={t('sharedContext.management.memoryStatTotal')} value={view.stats.totalRecords} />
-                <StatCard label={t('sharedContext.management.memoryStatHits')} value={view.stats.matchedRecords} />
-                <StatCard label={t('sharedContext.management.memoryStatRecent')} value={view.stats.recentSummaryCount} />
-                <StatCard
-                  label={t('sharedContext.management.memoryStatDurable')}
-                  value={view.stats.durableCandidateCount}
-                  detail={`${t('sharedContext.management.memoryStatProjects')}: ${view.stats.projectCount}`}
+          <div style={{ ...sectionStyle, gap: 12 }}>
+            <div style={tabBarStyle}>
+              {memoryTabs.map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  style={memorySourceTab === tab.id ? tabActiveStyle : tabStyle}
+                  onClick={() => setMemorySourceTab(tab.id)}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+
+            {memorySourceTab === 'local-processed' ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <SectionHeading
+                  title={t('sharedContext.management.memoryLocalTitle')}
+                  description={t('sharedContext.management.memoryProcessedDescription')}
+                  action={<span style={pillStyle}>{localPersonalMemory.records.length}</span>}
                 />
-                <StatCard
-                  label={t('sharedContext.management.memoryStatPending')}
-                  value={view.stats.stagedEventCount}
-                  detail={`${t('sharedContext.management.memoryStatDirtyTargets')}: ${view.stats.dirtyTargetCount} · ${t('sharedContext.management.memoryStatPendingJobs')}: ${view.stats.pendingJobCount}`}
-                />
-              </div>
-              {title === t('sharedContext.management.memoryLocalTitle') && view.pendingRecords && view.pendingRecords.length > 0 ? (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  <SectionHeading
-                    title={t('sharedContext.management.memoryPendingTitle')}
-                    description={t('sharedContext.management.memoryPendingDescription')}
+                <div style={statGridStyle}>
+                  <StatCard label={t('sharedContext.management.memoryStatTotal')} value={localPersonalMemory.stats.totalRecords} />
+                  <StatCard label={t('sharedContext.management.memoryStatHits')} value={localPersonalMemory.stats.matchedRecords} />
+                  <StatCard label={t('sharedContext.management.memoryStatRecent')} value={localPersonalMemory.stats.recentSummaryCount} />
+                  <StatCard
+                    label={t('sharedContext.management.memoryStatDurable')}
+                    value={localPersonalMemory.stats.durableCandidateCount}
+                    detail={`${t('sharedContext.management.memoryStatProjects')}: ${localPersonalMemory.stats.projectCount}`}
                   />
+                </div>
+                {localPersonalMemory.records.length > 0
+                  ? renderProcessedMemoryRecords(localPersonalMemory)
+                  : <div style={helperTextStyle}>{t('sharedContext.management.memoryProcessedEmptyPending')}</div>}
+              </div>
+            ) : null}
+
+            {memorySourceTab === 'local-pending' ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <SectionHeading
+                  title={t('sharedContext.management.memoryPendingTitle')}
+                  description={t('sharedContext.management.memoryPendingDescription')}
+                  action={<span style={pillStyle}>{localPersonalMemory.pendingRecords?.length ?? 0}</span>}
+                />
+                <div style={statGridStyle}>
+                  <StatCard label={t('sharedContext.management.memoryStatPending')} value={localPersonalMemory.stats.stagedEventCount} />
+                  <StatCard label={t('sharedContext.management.memoryStatDirtyTargets')} value={localPersonalMemory.stats.dirtyTargetCount} />
+                  <StatCard label={t('sharedContext.management.memoryStatPendingJobs')} value={localPersonalMemory.stats.pendingJobCount} />
+                </div>
+                {localPersonalMemory.pendingRecords && localPersonalMemory.pendingRecords.length > 0 ? (
                   <div style={resourceListStyle}>
-                    {view.pendingRecords.map((record) => (
+                    {localPersonalMemory.pendingRecords.map((record) => (
                       <div key={record.id} style={resourceCardStyle}>
                         <div style={metaGridStyle}>
                           <MetaCard label={t('sharedContext.management.memoryRecordProject')} value={record.projectId} />
+                          <MetaCard label={t('sharedContext.management.memoryRecordStatus')} value={t('sharedContext.management.memoryStatusPending')} />
                           <MetaCard label={t('sharedContext.management.memoryPendingEventType')} value={record.eventType} />
                           <MetaCard label={t('sharedContext.management.memoryPendingSession')} value={record.sessionName ?? '—'} />
                           <MetaCard label={t('sharedContext.management.memoryRecordUpdated')} value={new Date(record.createdAt).toLocaleString()} />
@@ -1758,15 +1791,52 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                       </div>
                     ))}
                   </div>
+                ) : <div style={helperTextStyle}>{t('sharedContext.empty')}</div>}
+              </div>
+            ) : null}
+
+            {memorySourceTab === 'cloud' ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <SectionHeading
+                  title={t('sharedContext.management.memoryCloudTitle')}
+                  description={t('sharedContext.management.memoryProcessedDescription')}
+                  action={<span style={pillStyle}>{cloudPersonalMemory.records.length}</span>}
+                />
+                <div style={statGridStyle}>
+                  <StatCard label={t('sharedContext.management.memoryStatTotal')} value={cloudPersonalMemory.stats.totalRecords} />
+                  <StatCard label={t('sharedContext.management.memoryStatHits')} value={cloudPersonalMemory.stats.matchedRecords} />
+                  <StatCard label={t('sharedContext.management.memoryStatRecent')} value={cloudPersonalMemory.stats.recentSummaryCount} />
+                  <StatCard
+                    label={t('sharedContext.management.memoryStatDurable')}
+                    value={cloudPersonalMemory.stats.durableCandidateCount}
+                    detail={`${t('sharedContext.management.memoryStatProjects')}: ${cloudPersonalMemory.stats.projectCount}`}
+                  />
                 </div>
-              ) : null}
-              <SectionHeading
-                title={t('sharedContext.management.memoryProcessedTitle')}
-                description={t('sharedContext.management.memoryProcessedDescription')}
-              />
-              {renderProcessedMemoryRecords(view)}
-            </div>
-          ))}
+                {renderProcessedMemoryRecords(cloudPersonalMemory)}
+              </div>
+            ) : null}
+
+            {memorySourceTab === 'shared' ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <SectionHeading
+                  title={t('sharedContext.management.memorySharedTitle')}
+                  description={t('sharedContext.management.memoryProcessedDescription')}
+                  action={<span style={pillStyle}>{sharedMemory.records.length}</span>}
+                />
+                <div style={statGridStyle}>
+                  <StatCard label={t('sharedContext.management.memoryStatTotal')} value={sharedMemory.stats.totalRecords} />
+                  <StatCard label={t('sharedContext.management.memoryStatHits')} value={sharedMemory.stats.matchedRecords} />
+                  <StatCard label={t('sharedContext.management.memoryStatRecent')} value={sharedMemory.stats.recentSummaryCount} />
+                  <StatCard
+                    label={t('sharedContext.management.memoryStatDurable')}
+                    value={sharedMemory.stats.durableCandidateCount}
+                    detail={`${t('sharedContext.management.memoryStatProjects')}: ${sharedMemory.stats.projectCount}`}
+                  />
+                </div>
+                {renderProcessedMemoryRecords(sharedMemory)}
+              </div>
+            ) : null}
+          </div>
         </>
       )}
     </div>

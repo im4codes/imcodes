@@ -533,17 +533,11 @@ describe('SharedContextManagementPanel', () => {
     await waitFor(() => {
       expect(screen.getByTestId('memory-record-content-local-personal-1').textContent).toContain('Local compressed summary');
     });
-    expect(await screen.findByText('Pending raw local event')).toBeDefined();
-    expect(await screen.findByText('sharedContext.management.memoryPendingTitle')).toBeDefined();
     await waitFor(() => {
-      expect(screen.getAllByText('sharedContext.management.memoryProcessedTitle').length).toBeGreaterThan(0);
+      expect(screen.getAllByText('sharedContext.management.memoryLocalTitle').length).toBeGreaterThan(0);
     });
+    expect((await screen.findAllByText('sharedContext.management.memoryStatusProcessed')).length).toBeGreaterThan(0);
     expect((await screen.findAllByText('sharedContext.management.memoryRecentDescription')).length).toBeGreaterThan(0);
-    expect((await screen.findAllByText('sharedContext.management.memoryDurableDescription')).length).toBeGreaterThan(0);
-    expect(await screen.findByText('Cloud personal decision')).toBeDefined();
-    expect(await screen.findByText('Shared coding standard reminder')).toBeDefined();
-    expect(await screen.findByText('sharedContext.management.memoryProcessedNote')).toBeDefined();
-    expect(await screen.findByText('sharedContext.management.memoryStatDirtyTargets: 1 · sharedContext.management.memoryStatPendingJobs: 1')).toBeDefined();
 
     const memoryContent = screen.getByTestId('memory-record-content-local-personal-1') as HTMLDivElement;
     expect(memoryContent.style.maxHeight).toBe('4.5em');
@@ -553,6 +547,25 @@ describe('SharedContextManagementPanel', () => {
     });
     expect(memoryContent.style.maxHeight).toBe('none');
     expect(screen.getByText('sharedContext.management.memoryCollapse')).toBeDefined();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryTabCloud'));
+    });
+    expect(await screen.findByText('Cloud personal decision')).toBeDefined();
+    expect((await screen.findAllByText('sharedContext.management.memoryDurableDescription')).length).toBeGreaterThan(0);
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryTabShared'));
+    });
+    expect(await screen.findByText('Shared coding standard reminder')).toBeDefined();
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryTabLocalPending'));
+    });
+    expect(await screen.findByText('Pending raw local event')).toBeDefined();
+    expect(await screen.findByText('sharedContext.management.memoryPendingTitle')).toBeDefined();
+    expect((await screen.findAllByText('sharedContext.management.memoryStatusPending')).length).toBeGreaterThan(0);
+    expect(await screen.findByText('sharedContext.management.memoryProcessedNote')).toBeDefined();
+    expect((await screen.findAllByText('sharedContext.management.memoryStatDirtyTargets')).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText('sharedContext.management.memoryStatPendingJobs')).length).toBeGreaterThan(0);
 
     const toggle = screen.getByRole('checkbox') as HTMLInputElement;
     expect(toggle.checked).toBe(false);
