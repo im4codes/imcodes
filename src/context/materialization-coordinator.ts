@@ -206,33 +206,32 @@ function buildSummary(events: LocalContextEvent[]): string {
     .map((event) => event.content?.trim())
     .filter((value): value is string => !!value);
 
-  // Structured summary: problem → resolution → key decisions
+  // Compressed structured summary — only the distilled insight, not raw event copies.
+  // Raw events stay in local SQLite and are visible in the Unprocessed tab.
   const sections: string[] = [];
   if (turnPairs.length > 0) {
     const latest = turnPairs[turnPairs.length - 1];
-    sections.push(`- User problem: ${latest.user}`);
+    // Truncate long user input to a concise problem statement
+    sections.push(`- User problem: ${truncate(latest.user, 200)}`);
     if (latest.assistant) {
-      sections.push(`- Resolution: ${latest.assistant}`);
+      // Truncate long assistant output to a concise resolution
+      sections.push(`- Resolution: ${truncate(latest.assistant, 300)}`);
     }
-    // If there were multiple turns, note the earlier ones as context
     if (turnPairs.length > 1) {
-      const earlier = turnPairs.slice(0, -1).map((p) => p.user).join('; ');
+      const earlier = turnPairs.slice(0, -1).map((p) => truncate(p.user, 80)).join('; ');
       sections.push(`- Prior context: ${earlier}`);
     }
   }
   if (decisions.length > 0) {
-    sections.push(`- Key decisions: ${decisions.join('; ')}`);
-  }
-  // Always include raw source events so the user can see pre-compression content
-  sections.push(`\n---\n**Source events (${events.length}):**`);
-  for (const event of events) {
-    const content = event.content?.trim();
-    if (content) {
-      const truncated = content.length > 800 ? content.slice(0, 800) + '…' : content;
-      sections.push(`- \`${event.eventType}\`: ${truncated}`);
-    }
+    sections.push(`- Key decisions: ${decisions.map((d) => truncate(d, 120)).join('; ')}`);
   }
   return sections.join('\n');
+}
+
+function truncate(text: string, maxLen: number): string {
+  const trimmed = text.trim();
+  if (trimmed.length <= maxLen) return trimmed;
+  return trimmed.slice(0, maxLen - 1) + '…';
 }
 
 function buildTurnPairs(events: LocalContextEvent[]): Array<{ user: string; assistant?: string }> {
@@ -288,15 +287,14 @@ function buildDurableSummary(events: LocalContextEvent[]): string {
   const constraints = grouped.get('constraint') ?? [];
   const decisions = grouped.get('decision') ?? [];
 
-  if (preferences.length > 0) {
-    lines.push(`Durable preferences: ${preferences.slice(-2).join(' | ')}`);
+  if (decisions.length > 0) {
+    lines.push(`- Key decisions: ${decisions.join('; ')}`);
   }
   if (constraints.length > 0) {
-    lines.push(`Durable constraints: ${constraints.slice(-2).join(' | ')}`);
+    lines.push(`- Constraints: ${constraints.join('; ')}`);
   }
-  if (decisions.length > 0) {
-    lines.push(`Pinned decisions: ${decisions.slice(-2).join(' | ')}`);
+  if (preferences.length > 0) {
+    lines.push(`- Preferences: ${preferences.join('; ')}`);
   }
-  lines.push(`Compressed from ${events.length} durable signal${events.length === 1 ? '' : 's'}.`);
   return lines.join('\n');
 }
