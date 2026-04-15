@@ -313,7 +313,7 @@ export function QuickInputPanel({
     const left = Math.min(Math.max(rect.left, horizontalInset), maxLeft);
     const rawAbove = Math.floor(rect.top - verticalInset);
     const rawBelow = Math.floor(viewportHeight - rect.bottom - verticalInset);
-    const shouldOpenBelow = rawBelow >= 260 || rawBelow >= rawAbove;
+    const shouldOpenBelow = rawAbove < 200;
     const availableAbove = Math.max(120, rawAbove);
     const availableBelow = Math.max(120, rawBelow);
 
