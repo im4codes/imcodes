@@ -69,9 +69,8 @@ export function mergeTransportPendingMessagesForRunningState(
 ): string[] {
   const existingMessages = Array.isArray(existing) ? existing.filter((entry) => typeof entry === 'string' && entry.length > 0) : [];
   if (!hasPendingMessagesField) return existingMessages;
-  const nextMessages = extractTransportPendingMessages(pendingFromEvent);
-  if (nextMessages.length > 0) return nextMessages;
-  return existingMessages;
+  // Trust the event's pending list — even when empty (messages were drained/dispatched)
+  return extractTransportPendingMessages(pendingFromEvent);
 }
 
 export function mergeTransportPendingEntriesForRunningState(
@@ -81,15 +80,16 @@ export function mergeTransportPendingEntriesForRunningState(
   hasPendingMessagesField: boolean,
   scopeKey: string,
 ): TransportPendingMessageEntry[] {
-  const existingEntries = Array.isArray(existing)
-    ? existing.filter((entry) => typeof entry?.clientMessageId === 'string' && entry.clientMessageId && typeof entry?.text === 'string' && entry.text)
-    : [];
-  if (!hasPendingMessagesField) return existingEntries;
-  const nextEntries = normalizeTransportPendingEntries(
+  if (!hasPendingMessagesField) {
+    const existingEntries = Array.isArray(existing)
+      ? existing.filter((entry) => typeof entry?.clientMessageId === 'string' && entry.clientMessageId && typeof entry?.text === 'string' && entry.text)
+      : [];
+    return existingEntries;
+  }
+  // Trust the event's pending list — even when empty (messages were drained/dispatched)
+  return normalizeTransportPendingEntries(
     pendingFromEvent,
     pendingMessagesFromEvent,
     scopeKey,
   );
-  if (nextEntries.length > 0) return nextEntries;
-  return existingEntries;
 }
