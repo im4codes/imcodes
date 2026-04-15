@@ -996,7 +996,9 @@
       "memoryRecordProject": "專案",
       "memoryRecordClass": "類型",
       "memoryRecordSources": "來源事件",
-      "memoryRecordUpdated": "更新時間"
+      "memoryRecordUpdated": "更新時間",
+      "memoryExpand": "展開",
+      "memoryCollapse": "收起"
     },
     "diagnostics": {
       "title": "診斷",

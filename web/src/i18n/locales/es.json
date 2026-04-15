@@ -995,7 +995,9 @@
       "memoryRecordProject": "Project",
       "memoryRecordClass": "Class",
       "memoryRecordSources": "Source events",
-      "memoryRecordUpdated": "Updated"
+      "memoryRecordUpdated": "Updated",
+      "memoryExpand": "Expand",
+      "memoryCollapse": "Collapse"
     },
     "diagnostics": {
       "title": "Diagnostics",

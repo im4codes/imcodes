@@ -47,6 +47,7 @@ import {
   updateSharedContextRuntimeConfig,
   updateTeamMemberRole,
 } from '../api.js';
+import { ChatMarkdown } from './ChatMarkdown.js';
 import type { WsClient } from '../ws-client.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../../../src/shared/models/options.js';
 
@@ -217,6 +218,22 @@ const resourceCardStyle = {
   display: 'flex',
   flexDirection: 'column',
   gap: 8,
+} as const;
+
+const memoryContentCollapsedStyle = {
+  maxHeight: '4.5em',
+  overflowY: 'auto',
+  padding: '10px 12px',
+  borderRadius: 10,
+  border: '1px solid rgba(51,65,85,0.9)',
+  background: 'rgba(2,6,23,0.55)',
+  lineHeight: 1.5,
+} as const;
+
+const memoryContentExpandedStyle = {
+  ...memoryContentCollapsedStyle,
+  maxHeight: 'none',
+  overflowY: 'visible',
 } as const;
 
 const splitSectionStyle = {
@@ -495,6 +512,10 @@ function normalizeMemoryView(view: ContextMemoryView): ContextMemoryView {
   };
 }
 
+function shouldCollapseMemoryContent(text: string): boolean {
+  return text.split('\n').length > 3 || text.length > 220;
+}
+
 export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId, serverId, ws, onEnterpriseChange }: Props) {
   const { t } = useTranslation();
   const onEnterpriseChangeRef = useRef(onEnterpriseChange);
@@ -548,6 +569,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [localPersonalMemory, setLocalPersonalMemory] = useState<ContextMemoryView>(EMPTY_MEMORY_VIEW);
   const [cloudPersonalMemory, setCloudPersonalMemory] = useState<ContextMemoryView>(EMPTY_MEMORY_VIEW);
   const [sharedMemory, setSharedMemory] = useState<ContextMemoryView>(EMPTY_MEMORY_VIEW);
+  const [expandedMemoryRecordIds, setExpandedMemoryRecordIds] = useState<Set<string>>(new Set());
 
   const selectedDocument = useMemo(
     () => documents.find((entry) => entry.id === selectedDocumentId) ?? null,
@@ -1624,13 +1646,28 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 <div style={resourceListStyle}>
                   {view.records.map((record) => (
                     <div key={record.id} style={resourceCardStyle}>
-                      <strong>{record.summary || '—'}</strong>
                       <div style={metaGridStyle}>
                         <MetaCard label={t('sharedContext.management.memoryRecordProject')} value={record.projectId} />
                         <MetaCard label={t('sharedContext.management.memoryRecordClass')} value={record.projectionClass} />
                         <MetaCard label={t('sharedContext.management.memoryRecordSources')} value={record.sourceEventCount} />
                         <MetaCard label={t('sharedContext.management.memoryRecordUpdated')} value={new Date(record.updatedAt).toLocaleString()} />
                       </div>
+                      {record.summary ? (
+                        <MemoryRecordContent
+                          id={record.id}
+                          text={record.summary}
+                          expanded={expandedMemoryRecordIds.has(record.id)}
+                          onToggle={() => {
+                            setExpandedMemoryRecordIds((current) => {
+                              const next = new Set(current);
+                              if (next.has(record.id)) next.delete(record.id);
+                              else next.add(record.id);
+                              return next;
+                            });
+                          }}
+                          t={t}
+                        />
+                      ) : null}
                     </div>
                   ))}
                 </div>
@@ -1639,6 +1676,39 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           ))}
         </>
       )}
+    </div>
+  );
+}
+
+function MemoryRecordContent({
+  id,
+  text,
+  expanded,
+  onToggle,
+  t,
+}: {
+  id: string;
+  text: string;
+  expanded: boolean;
+  onToggle: () => void;
+  t: (key: string) => string;
+}) {
+  const collapsible = shouldCollapseMemoryContent(text);
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div
+        data-testid={`memory-record-content-${id}`}
+        style={expanded ? memoryContentExpandedStyle : memoryContentCollapsedStyle}
+      >
+        <ChatMarkdown text={text} />
+      </div>
+      {collapsible ? (
+        <div>
+          <button type="button" style={subtleButtonStyle} onClick={onToggle}>
+            {expanded ? t('sharedContext.management.memoryCollapse') : t('sharedContext.management.memoryExpand')}
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -996,7 +996,9 @@
       "memoryRecordProject": "项目",
       "memoryRecordClass": "类型",
       "memoryRecordSources": "来源事件",
-      "memoryRecordUpdated": "更新时间"
+      "memoryRecordUpdated": "更新时间",
+      "memoryExpand": "展开",
+      "memoryCollapse": "收起"
     },
     "diagnostics": {
       "title": "诊断",

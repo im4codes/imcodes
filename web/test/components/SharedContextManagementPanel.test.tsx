@@ -509,7 +509,7 @@ describe('SharedContextManagementPanel', () => {
             id: 'local-personal-1',
             scope: 'personal',
             projectId: 'github.com/acme/repo',
-            summary: 'Local personal summary',
+            summary: '# Local personal summary\n\n- line one\n- line two\n- line three\n- line four',
             projectionClass: 'recent_summary',
             sourceEventCount: 2,
             updatedAt: 1700000002000,
@@ -522,6 +522,15 @@ describe('SharedContextManagementPanel', () => {
     expect(await screen.findByText('Cloud personal decision')).toBeDefined();
     expect(await screen.findByText('Shared coding standard reminder')).toBeDefined();
     expect(await screen.findByText('sharedContext.management.memoryStatDirtyTargets: 1 · sharedContext.management.memoryStatPendingJobs: 1')).toBeDefined();
+
+    const memoryContent = screen.getByTestId('memory-record-content-local-personal-1') as HTMLDivElement;
+    expect(memoryContent.style.maxHeight).toBe('4.5em');
+    const expandButton = screen.getByText('sharedContext.management.memoryExpand');
+    await act(async () => {
+      fireEvent.click(expandButton);
+    });
+    expect(memoryContent.style.maxHeight).toBe('none');
+    expect(screen.getByText('sharedContext.management.memoryCollapse')).toBeDefined();
 
     const toggle = screen.getByRole('checkbox') as HTMLInputElement;
     expect(toggle.checked).toBe(false);
