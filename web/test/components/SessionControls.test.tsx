@@ -1411,6 +1411,26 @@ afterEach(() => {
     expect(screen.getByText('queued second')).toBeDefined();
   });
 
+  it('does not offer edit or delete actions for legacy queued fallback entries', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'qwen-session',
+          runtimeType: 'transport',
+          state: 'running',
+          transportPendingMessages: ['queued first'],
+          transportPendingMessageEntries: [],
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: /edit/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /delete/i })).toBeNull();
+  });
+
   it('stop action requires 3-level confirmation for main session', () => {
     const ws = makeWs();
     // Mock window.confirm to auto-accept

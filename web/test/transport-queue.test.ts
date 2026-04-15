@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   extractTransportPendingMessageEntries,
   extractTransportPendingMessages,
+  isLegacyTransportPendingMessageId,
   mergeTransportPendingEntriesForRunningState,
   mergeTransportPendingMessagesForRunningState,
   normalizeTransportPendingEntries,
@@ -55,6 +56,14 @@ describe('synthesizeTransportPendingMessageEntries', () => {
       { clientMessageId: 'deck_test:legacy:0:queued one', text: 'queued one' },
       { clientMessageId: 'deck_test:legacy:1:queued two', text: 'queued two' },
     ]);
+  });
+});
+
+describe('isLegacyTransportPendingMessageId', () => {
+  it('detects synthesized fallback ids only within the same queue scope', () => {
+    expect(isLegacyTransportPendingMessageId('deck_test:legacy:0:queued one', 'deck_test')).toBe(true);
+    expect(isLegacyTransportPendingMessageId('deck_other:legacy:0:queued one', 'deck_test')).toBe(false);
+    expect(isLegacyTransportPendingMessageId('msg-real-1', 'deck_test')).toBe(false);
   });
 });
 

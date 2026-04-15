@@ -281,6 +281,24 @@ describe('TransportSessionRuntime', () => {
     ]);
   });
 
+  it('drains the edited queued text into the next turn', async () => {
+    runtime.send('first');
+    await flushDispatch();
+    runtime.send('queued1', 'msg-q1');
+
+    expect(runtime.editPendingMessage('msg-q1', 'edited queued1')).toBe(true);
+
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'edited queued1',
+      assembledMessage: 'edited queued1',
+    }));
+    expect(runtime.pendingEntries).toEqual([]);
+  });
+
   it('cancelled turns drain pending messages into the next turn', async () => {
     runtime.send('first');
     await flushDispatch();

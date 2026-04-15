@@ -3,6 +3,11 @@ export interface TransportPendingMessageEntry {
   text: string;
 }
 
+export function isLegacyTransportPendingMessageId(clientMessageId: string, scopeKey: string): boolean {
+  return typeof clientMessageId === 'string'
+    && clientMessageId.startsWith(`${scopeKey}:legacy:`);
+}
+
 export function synthesizeTransportPendingMessageEntries(
   messages: string[] | null | undefined,
   scopeKey: string,

@@ -17,7 +17,7 @@ import { useP2pCustomCombos } from './p2p-combos.js';
 import { uploadFile, getUserPref, saveUserPref, onUserPrefChanged } from '../api.js';
 import { isRunningSessionState } from '../thinking-utils.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
-import { normalizeTransportPendingEntries } from '../transport-queue.js';
+import { isLegacyTransportPendingMessageId, normalizeTransportPendingEntries } from '../transport-queue.js';
 import {
   buildP2pConfigSelection,
   P2P_CONFIG_MODE,
@@ -399,6 +399,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   const editingQueuedEntry = editingQueuedMessageId
     ? queuedTransportEntries.find((entry) => entry.clientMessageId === editingQueuedMessageId) ?? null
     : null;
+
+  const isEditableQueuedEntry = useCallback((entry: { clientMessageId: string }) => (
+    !!activeSession && !isLegacyTransportPendingMessageId(entry.clientMessageId, activeSession.name)
+  ), [activeSession]);
   // Internal ref for contenteditable — also written to the external inputRef
   const divRef = useRef<HTMLDivElement>(null);
   // History navigation state
@@ -1271,12 +1275,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
   }, [activeSession, draftKey, editingQueuedMessageId, onRemoveQuote, onSend, quickData, quotes, sendQueuedMessageMutation, sendSessionMessage]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
+    if (!isEditableQueuedEntry(entry)) return;
     fillInput(entry.text);
     setEditingQueuedMessageId(entry.clientMessageId);
     setQueuedHintExpanded(true);
-  }, []);
+  }, [isEditableQueuedEntry]);
 
   const handleQueuedMessageDelete = useCallback((entry: { clientMessageId: string; text: string }) => {
+    if (!isEditableQueuedEntry(entry)) return;
     if (editingQueuedMessageId === entry.clientMessageId || (!editingQueuedMessageId && getText() === entry.text)) {
       if (divRef.current) divRef.current.textContent = '';
       setHasText(false);
@@ -1295,7 +1301,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     } catch {
       /* ignore */
     }
-  }, [editingQueuedMessageId, incomingQueuedTransportEntries, sendQueuedMessageMutation]);
+  }, [editingQueuedMessageId, incomingQueuedTransportEntries, isEditableQueuedEntry, sendQueuedMessageMutation]);
 
   const maybePersistComboSendSkip = useCallback(() => {
     if (!rememberComboSendChoice) return;
@@ -2520,14 +2526,16 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               queuedTransportEntries.map((entry) => (
                 <div class="controls-queued-item" key={entry.clientMessageId}>
                   <span class="controls-queued-item-text">{entry.text}</span>
-                  <span class="controls-queued-item-actions">
-                    <button type="button" class="controls-queued-action" onClick={() => handleQueuedMessageEdit(entry)}>
-                      {t('settings.edit')}
-                    </button>
-                    <button type="button" class="controls-queued-action controls-queued-action-danger" onClick={() => handleQueuedMessageDelete(entry)}>
-                      {t('common.delete')}
-                    </button>
-                  </span>
+                  {isEditableQueuedEntry(entry) && (
+                    <span class="controls-queued-item-actions">
+                      <button type="button" class="controls-queued-action" onClick={() => handleQueuedMessageEdit(entry)}>
+                        {t('settings.edit')}
+                      </button>
+                      <button type="button" class="controls-queued-action controls-queued-action-danger" onClick={() => handleQueuedMessageDelete(entry)}>
+                        {t('common.delete')}
+                      </button>
+                    </span>
+                  )}
                 </div>
               ))
             ) : (
