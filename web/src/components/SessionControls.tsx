@@ -806,7 +806,6 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       return {
         position: 'fixed',
         right: rightOffset,
-        left: 8, // prevent left overflow on narrow viewports
         bottom: Math.max(window.innerHeight - rect.top + 4, 8),
         maxHeight: `${availableHeight}px`,
         maxWidth: `${window.innerWidth - rightOffset - 8}px`,
