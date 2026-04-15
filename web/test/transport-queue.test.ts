@@ -21,8 +21,8 @@ describe('mergeTransportPendingMessagesForRunningState', () => {
     expect(mergeTransportPendingMessagesForRunningState(['queued one'], undefined, false)).toEqual(['queued one']);
   });
 
-  it('preserves the existing queue when running reports an empty pendingMessages array', () => {
-    expect(mergeTransportPendingMessagesForRunningState(['queued one', 'queued two'], [], true)).toEqual(['queued one', 'queued two']);
+  it('clears the queue when running reports an empty pendingMessages array (drain)', () => {
+    expect(mergeTransportPendingMessagesForRunningState(['queued one', 'queued two'], [], true)).toEqual([]);
   });
 
   it('replaces the queue when running reports a non-empty pendingMessages array', () => {
@@ -31,6 +31,14 @@ describe('mergeTransportPendingMessagesForRunningState', () => {
 
   it('returns an empty queue when nothing is queued yet', () => {
     expect(mergeTransportPendingMessagesForRunningState([], [], true)).toEqual([]);
+  });
+
+  it('clears stale queue after drain even when existing has multiple entries', () => {
+    expect(mergeTransportPendingMessagesForRunningState(['a', 'b', 'c'], [], true)).toEqual([]);
+  });
+
+  it('updates to remaining queue after partial drain', () => {
+    expect(mergeTransportPendingMessagesForRunningState(['a', 'b', 'c'], ['c'], true)).toEqual(['c']);
   });
 });
 
@@ -102,14 +110,11 @@ describe('mergeTransportPendingEntriesForRunningState', () => {
     ]);
   });
 
-  it('preserves the existing queued entries when running reports an empty pendingMessageEntries array', () => {
+  it('clears the queue when running reports an empty pendingMessageEntries array (drain)', () => {
     expect(mergeTransportPendingEntriesForRunningState([
       { clientMessageId: 'msg-1', text: 'queued one' },
       { clientMessageId: 'msg-2', text: 'queued two' },
-    ], [], [], true, 'deck_test')).toEqual([
-      { clientMessageId: 'msg-1', text: 'queued one' },
-      { clientMessageId: 'msg-2', text: 'queued two' },
-    ]);
+    ], [], [], true, 'deck_test')).toEqual([]);
   });
 
   it('replaces the queue when running reports non-empty pendingMessageEntries', () => {
@@ -130,6 +135,33 @@ describe('mergeTransportPendingEntriesForRunningState', () => {
     ], ['queued one', 'queued two'], true, 'deck_test')).toEqual([
       { clientMessageId: 'msg-1', text: 'queued one' },
       { clientMessageId: 'deck_test:legacy:1:queued two', text: 'queued two' },
+    ]);
+  });
+
+  it('clears stale entries after full drain even when existing has multiple entries', () => {
+    expect(mergeTransportPendingEntriesForRunningState([
+      { clientMessageId: 'msg-1', text: 'a' },
+      { clientMessageId: 'msg-2', text: 'b' },
+      { clientMessageId: 'msg-3', text: 'c' },
+    ], [], [], true, 'deck_test')).toEqual([]);
+  });
+
+  it('updates to remaining entries after partial drain', () => {
+    expect(mergeTransportPendingEntriesForRunningState([
+      { clientMessageId: 'msg-1', text: 'a' },
+      { clientMessageId: 'msg-2', text: 'b' },
+    ], [
+      { clientMessageId: 'msg-2', text: 'b' },
+    ], ['b'], true, 'deck_test')).toEqual([
+      { clientMessageId: 'msg-2', text: 'b' },
+    ]);
+  });
+
+  it('preserves existing when hasPendingMessagesField is false regardless of event data', () => {
+    expect(mergeTransportPendingEntriesForRunningState([
+      { clientMessageId: 'msg-1', text: 'keep' },
+    ], [], [], false, 'deck_test')).toEqual([
+      { clientMessageId: 'msg-1', text: 'keep' },
     ]);
   });
 });
