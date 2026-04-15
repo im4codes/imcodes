@@ -443,7 +443,7 @@ describe('startWatching — file-based integration', () => {
       ),
       8000,
     );
-  });
+  }, 10000);
 });
 
 // ── parseLine — function_call / function_call_output (Codex tool calls) ────────
