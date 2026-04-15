@@ -802,11 +802,14 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
     }
     const availableHeight = Math.max(96, Math.floor(rect.top - 12));
     if (window.innerWidth > 640) {
+      const rightOffset = Math.max(window.innerWidth - rect.right, 8);
       return {
         position: 'fixed',
-        right: Math.max(window.innerWidth - rect.right, 8),
+        right: rightOffset,
+        left: 8, // prevent left overflow on narrow viewports
         bottom: Math.max(window.innerHeight - rect.top + 4, 8),
         maxHeight: `${availableHeight}px`,
+        maxWidth: `${window.innerWidth - rightOffset - 8}px`,
         zIndex: 2147483646,
       } as const;
     }

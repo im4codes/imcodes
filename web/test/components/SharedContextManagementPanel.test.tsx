@@ -554,11 +554,15 @@ describe('SharedContextManagementPanel', () => {
     expect(await screen.findByText('Cloud personal decision')).toBeDefined();
     expect((await screen.findAllByText('sharedContext.management.memoryDurableDescription')).length).toBeGreaterThan(0);
     await act(async () => {
-      fireEvent.click(screen.getByText('sharedContext.management.memoryTabShared'));
+      fireEvent.click(screen.getByText('sharedContext.management.memoryTabEnterprise'));
     });
     expect(await screen.findByText('Shared coding standard reminder')).toBeDefined();
     await act(async () => {
-      fireEvent.click(screen.getByText('sharedContext.management.memoryTabLocalPending'));
+      // Switch back to personal tab, then to unprocessed sub-tab
+      fireEvent.click(screen.getByText('sharedContext.management.memoryTabPersonal'));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.memoryTabUnprocessed'));
     });
     expect(await screen.findByText('Pending raw local event')).toBeDefined();
     expect(await screen.findByText('sharedContext.management.memoryPendingTitle')).toBeDefined();
