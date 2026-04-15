@@ -859,6 +859,72 @@ program
     }
   });
 
+// ── Memory search CLI ────────────────────────────────────────────────────────
+
+const memoryCmd = program
+  .command('memory')
+  .description('Search and inspect local agent memory');
+
+memoryCmd
+  .command('search [query]')
+  .description('Search local memory (processed summaries and raw events)')
+  .option('--format <format>', 'Output format: json, document, table', 'table')
+  .option('--repo <repo>', 'Filter by canonical repository ID')
+  .option('--class <class>', 'Filter by projection class: recent_summary, durable_memory_candidate')
+  .option('--raw', 'Include raw unprocessed events', false)
+  .option('--limit <n>', 'Maximum results', '50')
+  .action(async (query: string | undefined, opts: Record<string, string | boolean>) => {
+    const { searchLocalMemory, formatSearchResults } = await import('./context/memory-search.js');
+    const result = searchLocalMemory({
+      query: query || undefined,
+      repo: typeof opts.repo === 'string' ? opts.repo : undefined,
+      projectionClass: typeof opts.class === 'string' ? opts.class as 'recent_summary' | 'durable_memory_candidate' : undefined,
+      includeRaw: opts.raw === true,
+      limit: Number(opts.limit) || 50,
+    });
+    const format = (typeof opts.format === 'string' ? opts.format : 'table') as 'json' | 'document' | 'table';
+    console.log(formatSearchResults(result, format));
+  });
+
+memoryCmd
+  .command('list')
+  .description('List recent processed memory summaries')
+  .option('--format <format>', 'Output format: json, document, table', 'table')
+  .option('--repo <repo>', 'Filter by canonical repository ID')
+  .option('--limit <n>', 'Maximum results', '20')
+  .action(async (opts: Record<string, string>) => {
+    const { searchLocalMemory, formatSearchResults } = await import('./context/memory-search.js');
+    const result = searchLocalMemory({
+      repo: opts.repo || undefined,
+      limit: Number(opts.limit) || 20,
+    });
+    const format = (opts.format || 'table') as 'json' | 'document' | 'table';
+    console.log(formatSearchResults(result, format));
+  });
+
+memoryCmd
+  .command('stats')
+  .description('Show aggregate memory statistics')
+  .option('--format <format>', 'Output format: json, table', 'table')
+  .option('--repo <repo>', 'Filter by canonical repository ID')
+  .action(async (opts: Record<string, string>) => {
+    const { searchLocalMemory } = await import('./context/memory-search.js');
+    const result = searchLocalMemory({
+      repo: opts.repo || undefined,
+      includeRaw: true,
+      limit: 0,
+    });
+    const { stats } = result;
+    if (opts.format === 'json') {
+      console.log(JSON.stringify(stats, null, 2));
+    } else {
+      console.log(`Total records:      ${stats.totalRecords}`);
+      console.log(`Recent summaries:   ${stats.recentSummaryCount}`);
+      console.log(`Durable candidates: ${stats.durableCandidateCount}`);
+      console.log(`Projects:           ${stats.projectCount}`);
+    }
+  });
+
 program.parseAsync(process.argv).catch((err: unknown) => {
   const exitCode = typeof err === 'object' && err && 'exitCode' in err
     ? Number((err as { exitCode?: unknown }).exitCode)

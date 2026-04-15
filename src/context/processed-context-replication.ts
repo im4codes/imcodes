@@ -28,6 +28,8 @@ export async function replicatePendingProcessedContext(
   credentials: ProcessedContextReplicationCredentials,
   namespaces?: ContextNamespace[],
 ): Promise<ProcessedContextReplicationResult> {
+  const config = getContextModelConfig();
+  const personalSyncEnabled = config.enablePersonalMemorySync === true;
   const states = resolveStates(namespaces);
   let replicatedNamespaces = 0;
   let replicatedProjections = 0;
@@ -35,7 +37,16 @@ export async function replicatePendingProcessedContext(
 
   for (const state of states) {
     if (state.pendingProjectionIds.length === 0) continue;
+    // Personal namespaces skip replication unless cloud sync is enabled
+    if (state.namespace.scope === 'personal' && !personalSyncEnabled) continue;
     const projections = selectPendingProjections(state.namespace, state.pendingProjectionIds);
+    // Cloud only stores processed projections — filter out any raw/staged content
+    const processedProjections = projections.filter((p) =>
+      p.class === 'recent_summary' || p.class === 'durable_memory_candidate');
+    if (processedProjections.length === 0 && projections.length > 0) {
+      // All pending projections were non-processed (shouldn't happen, but guard)
+      continue;
+    }
     if (projections.length === 0) {
       setReplicationState(state.namespace, {
         pendingProjectionIds: state.pendingProjectionIds,
@@ -49,12 +60,12 @@ export async function replicatePendingProcessedContext(
     try {
       await postProcessedContext(credentials, {
         namespace: state.namespace,
-        projections,
+        projections: processedProjections,
       });
       replicatedNamespaces += 1;
-      replicatedProjections += projections.length;
+      replicatedProjections += processedProjections.length;
       setReplicationState(state.namespace, {
-        pendingProjectionIds: state.pendingProjectionIds.filter((id) => !projections.some((projection) => projection.id === id)),
+        pendingProjectionIds: state.pendingProjectionIds.filter((id) => !processedProjections.some((projection) => projection.id === id)),
         lastReplicatedAt: Date.now(),
         lastError: undefined,
       });

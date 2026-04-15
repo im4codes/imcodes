@@ -751,6 +751,9 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
     case 'file.search':
       void handleFileSearch(cmd, serverLink);
       break;
+    case 'memory.search':
+      void handleMemorySearch(cmd, serverLink);
+      break;
     case 'fs.ls':
       void handleFsList(cmd, serverLink);
       break;
@@ -3907,5 +3910,27 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     stats,
     records,
     pendingRecords,
+  });
+}
+
+async function handleMemorySearch(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const { searchLocalMemory } = await import('../context/memory-search.js');
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  const result = searchLocalMemory({
+    query: typeof cmd.query === 'string' ? cmd.query : undefined,
+    repo: typeof cmd.repo === 'string' ? cmd.repo : undefined,
+    projectionClass: typeof cmd.projectionClass === 'string'
+      ? cmd.projectionClass as 'recent_summary' | 'durable_memory_candidate'
+      : undefined,
+    includeRaw: cmd.includeRaw === true,
+    eventType: typeof cmd.eventType === 'string' ? cmd.eventType : undefined,
+    limit: typeof cmd.limit === 'number' ? cmd.limit : 50,
+    offset: typeof cmd.offset === 'number' ? cmd.offset : 0,
+  });
+  serverLink.send({
+    type: 'memory.search_response',
+    requestId,
+    items: result.items,
+    stats: result.stats,
   });
 }

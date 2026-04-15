@@ -138,6 +138,20 @@ const tabBarStyle = {
   border: '1px solid rgba(51,65,85,0.9)',
 } as const;
 
+const tabBadgeStyle = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  marginLeft: 6,
+  padding: '1px 6px',
+  borderRadius: 10,
+  fontSize: 11,
+  fontWeight: 600,
+  background: 'rgba(96,165,250,0.15)',
+  color: '#93c5fd',
+  minWidth: 18,
+} as const;
+
 const pillStyle = {
   display: 'inline-flex',
   alignItems: 'center',
@@ -388,7 +402,9 @@ function formatServerScopeValue(serverId?: string): string {
 
 type KindOption = SharedDocument['kind'];
 type ManagementTab = 'enterprise' | 'members' | 'projects' | 'knowledge' | 'processing' | 'memory';
-type MemorySourceTab = 'local-processed' | 'local-pending' | 'cloud' | 'shared';
+type MemoryTopTab = 'personal' | 'enterprise-memory';
+type MemoryPersonalSubTab = 'unprocessed' | 'processed' | 'cloud';
+type MemoryEnterpriseSubTab = 'shared-memory' | 'authored-context';
 
 interface Props {
   enterpriseId?: string;
@@ -590,7 +606,9 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [cloudPersonalMemory, setCloudPersonalMemory] = useState<ContextMemoryView>(EMPTY_MEMORY_VIEW);
   const [sharedMemory, setSharedMemory] = useState<ContextMemoryView>(EMPTY_MEMORY_VIEW);
   const [expandedMemoryRecordIds, setExpandedMemoryRecordIds] = useState<Set<string>>(new Set());
-  const [memorySourceTab, setMemorySourceTab] = useState<MemorySourceTab>('local-processed');
+  const [memoryTopTab, setMemoryTopTab] = useState<MemoryTopTab>('personal');
+  const [memoryPersonalSubTab, setMemoryPersonalSubTab] = useState<MemoryPersonalSubTab>('processed');
+  const [memoryEnterpriseSubTab, setMemoryEnterpriseSubTab] = useState<MemoryEnterpriseSubTab>('shared-memory');
 
   const renderProcessedMemoryRecords = useCallback((view: ContextMemoryView) => {
     const recentRecords = view.records.filter((record) => record.projectionClass === 'recent_summary');
@@ -696,11 +714,18 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     { id: 'memory', label: t('sharedContext.management.tabs.memory') },
   ], [t]);
 
-  const memoryTabs = useMemo(() => [
-    { id: 'local-processed' as const, label: t('sharedContext.management.memoryTabLocalProcessed') },
-    { id: 'local-pending' as const, label: t('sharedContext.management.memoryTabLocalPending') },
-    { id: 'cloud' as const, label: t('sharedContext.management.memoryTabCloud') },
-    { id: 'shared' as const, label: t('sharedContext.management.memoryTabShared') },
+  const memoryTopTabs = useMemo(() => [
+    { id: 'personal' as const, label: t('sharedContext.management.memoryTabPersonal'), count: localPersonalMemory.records.length + (localPersonalMemory.pendingRecords?.length ?? 0) + cloudPersonalMemory.records.length },
+    { id: 'enterprise-memory' as const, label: t('sharedContext.management.memoryTabEnterprise'), count: sharedMemory.records.length },
+  ], [t, localPersonalMemory, cloudPersonalMemory, sharedMemory]);
+  const memoryPersonalSubTabs = useMemo(() => [
+    { id: 'unprocessed' as const, label: t('sharedContext.management.memoryTabUnprocessed'), count: localPersonalMemory.pendingRecords?.length ?? 0 },
+    { id: 'processed' as const, label: t('sharedContext.management.memoryTabProcessed'), count: localPersonalMemory.records.length },
+    { id: 'cloud' as const, label: t('sharedContext.management.memoryTabCloud'), count: cloudPersonalMemory.records.length },
+  ], [t, localPersonalMemory, cloudPersonalMemory]);
+  const memoryEnterpriseSubTabs = useMemo(() => [
+    { id: 'shared-memory' as const, label: t('sharedContext.management.memoryTabSharedMemory'), count: sharedMemory.records.length },
+    { id: 'authored-context' as const, label: t('sharedContext.management.memoryTabAuthoredContext') },
   ], [t]);
 
   const refreshEnterpriseData = useCallback(async (nextEnterpriseId = enterpriseId) => {
@@ -931,7 +956,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             <strong style={{ fontSize: 22, lineHeight: 1.1 }}>{t('sharedContext.management.title')}</strong>
             <span style={helperTextStyle}>
-              Manage shared enterprises, enrolled projects, authored knowledge, and processing behavior from one place.
+              {t('sharedContext.management.heroDescription')}
             </span>
           </div>
           <button style={subtleButtonStyle} onClick={() => void refreshEnterpriseData()}>{t('sharedContext.refresh')}</button>
@@ -990,9 +1015,9 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           <div style={sectionStyle}>
             <SectionHeading
               title={t('sharedContext.management.invites')}
-              description="Invite people into the enterprise as members. Promote them to admin later from the Members tab if needed."
+              description={t('sharedContext.management.inviteDescription')}
             />
-            <InfoCard title="Invitation flow">
+            <InfoCard title={t('sharedContext.management.inviteFlowTitle')}>
               <div>New invitations create member access only.</div>
               <div>Admin role changes happen after join, from the member management section.</div>
             </InfoCard>
@@ -1045,7 +1070,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           <div style={sectionStyle}>
             <SectionHeading
               title={t('sharedContext.management.workspaces')}
-              description="Use workspaces to group shared projects. They are optional and do not change ownership."
+              description={t('sharedContext.management.workspaceDescription')}
             />
             <div style={rowStyle}>
               <input
@@ -1087,7 +1112,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         <div style={sectionStyle}>
           <SectionHeading
             title={t('sharedContext.management.members')}
-            description="Owners can promote admins. Admins manage projects and knowledge but cannot appoint other admins."
+            description={t('sharedContext.management.memberRolesDescription')}
             action={<span style={pillStyle}>{team?.members?.length ?? 0} active</span>}
           />
           {team?.members?.length ? (
@@ -1160,7 +1185,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             <div style={sectionStyle}>
             <SectionHeading
               title={t('sharedContext.management.projects')}
-              description="Enroll a canonical repository to make its processed context and authored knowledge shareable in this enterprise."
+              description={t('sharedContext.management.enrollDescription')}
               action={selectedProject ? (
                 <span style={pillStyle}>
                   {selectedProject.displayName ?? selectedProject.canonicalRepoId} · {selectedProject.status}
@@ -1270,7 +1295,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             <div style={sectionStyle}>
               <SectionHeading
                 title={t('sharedContext.management.policyTitle')}
-                description="Set the runtime guardrails for a shared project. These affect how shared context is allowed to flow into live sends."
+                description={t('sharedContext.management.policyDescription')}
                 action={policyLoading ? <span style={pillStyle}>{t('sharedContext.management.policyLoading')}</span> : undefined}
               />
               <InfoCard title={t('sharedContext.management.policyExplainTitle')}>
@@ -1333,7 +1358,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           <div style={sectionStyle}>
             <SectionHeading
               title={t('sharedContext.management.documents')}
-              description="Author coding standards, architecture guidance, and reusable knowledge as versioned shared context."
+              description={t('sharedContext.management.knowledgeDescription')}
             />
             <div style={rowStyle}>
               <select value={documentKind} onChange={(e) => setDocumentKind((e.currentTarget as HTMLSelectElement).value as KindOption)} style={inputStyle}>
@@ -1389,7 +1414,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
             <div style={{ ...resourceCardStyle, gap: 10 }}>
               <SectionHeading
                 title={t('sharedContext.management.createVersion')}
-                description="Draft a new version for the selected document and promote it when ready."
+                description={t('sharedContext.management.versionDescription')}
               />
               <div style={{ ...rowStyle, alignItems: 'stretch' }}>
               <select value={selectedDocumentId} onChange={(e) => setSelectedDocumentId((e.currentTarget as HTMLSelectElement).value)} style={inputStyle}>
@@ -1420,7 +1445,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           <div style={sectionStyle}>
             <SectionHeading
               title={t('sharedContext.management.bindings')}
-              description="Attach document versions to the enterprise, workspace, or enrolled project with optional language and path filters."
+              description={t('sharedContext.management.bindingDescription')}
             />
             <div style={rowStyle}>
               <select value={selectedVersionId} onChange={(e) => setSelectedVersionId((e.currentTarget as HTMLSelectElement).value)} style={inputStyle}>
@@ -1714,20 +1739,53 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
           </div>
 
           <div style={{ ...sectionStyle, gap: 12 }}>
+            {/* Top level: Personal | Enterprise */}
             <div style={tabBarStyle}>
-              {memoryTabs.map((tab) => (
+              {memoryTopTabs.map((tab) => (
                 <button
                   key={tab.id}
                   type="button"
-                  style={memorySourceTab === tab.id ? tabActiveStyle : tabStyle}
-                  onClick={() => setMemorySourceTab(tab.id)}
+                  style={memoryTopTab === tab.id ? tabActiveStyle : tabStyle}
+                  onClick={() => setMemoryTopTab(tab.id)}
                 >
-                  {tab.label}
+                  {tab.label}{tab.count != null ? <span style={tabBadgeStyle}>{tab.count}</span> : null}
                 </button>
               ))}
             </div>
 
-            {memorySourceTab === 'local-processed' ? (
+            {/* Sub-tabs for Personal */}
+            {memoryTopTab === 'personal' ? (
+              <div style={tabBarStyle}>
+                {memoryPersonalSubTabs.map((tab) => (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    style={memoryPersonalSubTab === tab.id ? tabActiveStyle : tabStyle}
+                    onClick={() => setMemoryPersonalSubTab(tab.id)}
+                  >
+                    {tab.label}{tab.count != null ? <span style={tabBadgeStyle}>{tab.count}</span> : null}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+
+            {/* Sub-tabs for Enterprise */}
+            {memoryTopTab === 'enterprise-memory' ? (
+              <div style={tabBarStyle}>
+                {memoryEnterpriseSubTabs.map((tab) => (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    style={memoryEnterpriseSubTab === tab.id ? tabActiveStyle : tabStyle}
+                    onClick={() => setMemoryEnterpriseSubTab(tab.id)}
+                  >
+                    {tab.label}{'count' in tab && tab.count != null ? <span style={tabBadgeStyle}>{tab.count}</span> : null}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+
+            {memoryTopTab === 'personal' && memoryPersonalSubTab === 'processed' ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 <SectionHeading
                   title={t('sharedContext.management.memoryLocalTitle')}
@@ -1750,7 +1808,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               </div>
             ) : null}
 
-            {memorySourceTab === 'local-pending' ? (
+            {memoryTopTab === 'personal' && memoryPersonalSubTab === 'unprocessed' ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 <SectionHeading
                   title={t('sharedContext.management.memoryPendingTitle')}
@@ -1795,7 +1853,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               </div>
             ) : null}
 
-            {memorySourceTab === 'cloud' ? (
+            {memoryTopTab === 'personal' && memoryPersonalSubTab === 'cloud' ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 <SectionHeading
                   title={t('sharedContext.management.memoryCloudTitle')}
@@ -1816,7 +1874,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
               </div>
             ) : null}
 
-            {memorySourceTab === 'shared' ? (
+            {memoryTopTab === 'enterprise-memory' && memoryEnterpriseSubTab === 'shared-memory' ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 <SectionHeading
                   title={t('sharedContext.management.memorySharedTitle')}
@@ -1834,6 +1892,18 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                   />
                 </div>
                 {renderProcessedMemoryRecords(sharedMemory)}
+              </div>
+            ) : null}
+
+            {memoryTopTab === 'enterprise-memory' && memoryEnterpriseSubTab === 'authored-context' ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <SectionHeading
+                  title={t('sharedContext.management.memoryAuthoredTitle')}
+                  description={t('sharedContext.management.memoryAuthoredDescription')}
+                />
+                <div style={helperTextStyle}>
+                  {t('sharedContext.management.memoryAuthoredSeeKnowledge')}
+                </div>
               </div>
             ) : null}
           </div>

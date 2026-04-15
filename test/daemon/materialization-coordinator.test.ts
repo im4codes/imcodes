@@ -34,7 +34,7 @@ describe('MaterializationCoordinator', () => {
     });
 
     const first = coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'hello', createdAt: 100 });
-    const second = coordinator.ingestEvent({ target, eventType: 'assistant.turn', content: 'world', createdAt: 200 });
+    const second = coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'world', createdAt: 200 });
 
     expect(first.queuedJob).toBeUndefined();
     expect(second.trigger).toBe('threshold');
@@ -43,6 +43,34 @@ describe('MaterializationCoordinator', () => {
       trigger: 'threshold',
       jobType: 'materialize_session',
     }));
+  });
+
+  it('filters out non-eligible events from materialization triggers but still records them', () => {
+    const coordinator = new MaterializationCoordinator({
+      thresholds: { eventCount: 2, idleMs: 1000, scheduleMs: 10_000 },
+    });
+
+    // assistant.delta and tool.call are recorded but filtered — don't count toward threshold
+    const delta = coordinator.ingestEvent({ target, eventType: 'assistant.delta', content: 'partial', createdAt: 100 });
+    expect(delta.event).toBeDefined();
+    expect(delta.filtered).toBe(true);
+    expect(delta.queuedJob).toBeUndefined();
+
+    const toolCall = coordinator.ingestEvent({ target, eventType: 'tool.call', content: 'readFile', createdAt: 101 });
+    expect(toolCall.filtered).toBe(true);
+    expect(toolCall.queuedJob).toBeUndefined();
+
+    const toolResult = coordinator.ingestEvent({ target, eventType: 'tool.result', content: 'file content', createdAt: 102 });
+    expect(toolResult.filtered).toBe(true);
+
+    const stateChange = coordinator.ingestEvent({ target, eventType: 'session.state', content: 'running', createdAt: 103 });
+    expect(stateChange.filtered).toBe(true);
+
+    // assistant.text IS eligible — not filtered
+    const eligible1 = coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'final response', createdAt: 200 });
+    expect(eligible1.filtered).toBeUndefined();
+    // Note: dirty target event_count includes ALL recorded events (including filtered ones),
+    // so threshold may have already been reached from the 4 filtered events above + this one
   });
 
   it('schedules idle and periodic jobs for dirty targets', () => {
@@ -70,7 +98,7 @@ describe('MaterializationCoordinator', () => {
     ]));
   });
 
-  it('materializes recent summaries and durable memory candidates and queues replication', () => {
+  it('materializes structured problem-resolution summaries from eligible events', () => {
     const coordinator = new MaterializationCoordinator({
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
       modelConfig: {
@@ -81,27 +109,23 @@ describe('MaterializationCoordinator', () => {
       },
     });
 
-    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'open the issue', createdAt: 100 });
-    coordinator.ingestEvent({ target, eventType: 'decision', content: 'ship the migration', createdAt: 101 });
+    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'fix the download button', createdAt: 100 });
+    coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'removed stale constants file and added retry logic', createdAt: 101 });
+    coordinator.ingestEvent({ target, eventType: 'decision', content: 'extend handle TTL to 4 hours', createdAt: 102 });
 
     const result = coordinator.materializeTarget(target, 'manual', 500);
 
-    expect(result.summaryProjection.summary).toContain('Recent task pairs:');
-    expect(result.summaryProjection.summary).toContain('User request: open the issue');
-    expect(result.summaryProjection.summary).toContain('Final outcome: Pending response');
-    expect(result.summaryProjection.summary).toContain('Key constraints: ship the migration');
-    expect(result.summaryProjection.summary).toContain('Compressed from 2 events.');
+    // Structured summary with problem → resolution → key decisions
+    expect(result.summaryProjection.summary).toContain('User problem: fix the download button');
+    expect(result.summaryProjection.summary).toContain('Resolution: removed stale constants file and added retry logic');
+    expect(result.summaryProjection.summary).toContain('Key decisions: extend handle TTL to 4 hours');
     expect(result.summaryProjection.content).toEqual(expect.objectContaining({
       primaryContextBackend: 'claude-code-sdk',
       primaryContextModel: 'sonnet',
-      backupContextBackend: 'codex-sdk',
-      backupContextModel: 'gpt-5.2',
       trigger: 'manual',
-      eventCount: 2,
     }));
     expect(result.durableProjection?.class).toBe('durable_memory_candidate');
-    expect(result.durableProjection?.summary).toContain('Pinned decisions: ship the migration');
-    expect(result.durableProjection?.summary).toContain('Compressed from 1 durable signal.');
+    expect(result.durableProjection?.summary).toContain('extend handle TTL to 4 hours');
     expect(getReplicationState(namespace)).toEqual(expect.objectContaining({
       namespace,
       pendingProjectionIds: expect.arrayContaining([
@@ -109,6 +133,29 @@ describe('MaterializationCoordinator', () => {
         result.durableProjection?.id,
       ]),
     }));
+  });
+
+  it('excludes tool.call and assistant.delta from materialized summaries even when present in staged events', () => {
+    const coordinator = new MaterializationCoordinator({
+      thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
+    });
+
+    // Ingest a mix of eligible and ineligible events
+    coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'investigate the bug', createdAt: 100 });
+    coordinator.ingestEvent({ target, eventType: 'assistant.delta', content: 'Let me check', createdAt: 101 });
+    coordinator.ingestEvent({ target, eventType: 'tool.call', content: 'readFile src/main.ts', createdAt: 102 });
+    coordinator.ingestEvent({ target, eventType: 'tool.result', content: 'import { foo } from...', createdAt: 103 });
+    coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'found the root cause in the import', createdAt: 104 });
+
+    const result = coordinator.materializeTarget(target, 'manual', 500);
+
+    // Summary uses only eligible events
+    expect(result.summaryProjection.summary).toContain('User problem: investigate the bug');
+    expect(result.summaryProjection.summary).toContain('Resolution: found the root cause in the import');
+    // Tool/delta content should NOT appear in summary
+    expect(result.summaryProjection.summary).not.toContain('Let me check');
+    expect(result.summaryProjection.summary).not.toContain('readFile');
+    expect(result.summaryProjection.summary).not.toContain('import { foo }');
   });
 
   it('reads primary/backup context models from the synced runtime config when explicit overrides are absent', () => {
@@ -149,17 +196,17 @@ describe('MaterializationCoordinator', () => {
     expect(coordinator.canMaterializeTarget(target, 10_200)).toBe(true);
   });
 
-  it('pairs final assistant output with the user request in recent summaries', () => {
+  it('pairs final assistant.text output with the user request in structured summaries', () => {
     const coordinator = new MaterializationCoordinator({
       thresholds: { eventCount: 99, idleMs: 50, scheduleMs: 200 },
     });
 
     coordinator.ingestEvent({ target, eventType: 'user.turn', content: 'fix the flaky build', createdAt: 100 });
-    coordinator.ingestEvent({ target, eventType: 'assistant.turn', content: 'updated the import and reran the build', createdAt: 120 });
+    coordinator.ingestEvent({ target, eventType: 'assistant.text', content: 'updated the import and reran the build', createdAt: 120 });
 
     const result = coordinator.materializeTarget(target, 'manual', 500);
 
-    expect(result.summaryProjection.summary).toContain('User request: fix the flaky build');
-    expect(result.summaryProjection.summary).toContain('Final outcome: updated the import and reran the build');
+    expect(result.summaryProjection.summary).toContain('User problem: fix the flaky build');
+    expect(result.summaryProjection.summary).toContain('Resolution: updated the import and reran the build');
   });
 });

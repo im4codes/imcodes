@@ -101,11 +101,16 @@ export function normalizeSharedContextRuntimeConfig(
         : getDefaultSharedContextModelForBackend(backupContextBackend))
       : getDefaultSharedContextModelForBackend(backupContextBackend))
     : undefined;
+  const rawMinInterval = input?.materializationMinIntervalMs;
+  const materializationMinIntervalMs = typeof rawMinInterval === 'number' && rawMinInterval > 0 ? rawMinInterval : undefined;
   return {
     primaryContextBackend: normalizedPrimaryBackend,
     primaryContextModel,
+    primaryContextSdk: trimModelValue(input?.primaryContextSdk),
     backupContextBackend,
     backupContextModel,
+    backupContextSdk: trimModelValue(input?.backupContextSdk),
+    materializationMinIntervalMs,
     enablePersonalMemorySync: input?.enablePersonalMemorySync === true,
   };
 }

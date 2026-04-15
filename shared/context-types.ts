@@ -116,9 +116,34 @@ export interface LocalContextEvent {
   createdAt: number;
 }
 
+/**
+ * Event types eligible for memory processing.
+ * Final assistant responses and user messages qualify.
+ * Streaming deltas, tool calls/results, and system events are excluded.
+ */
+export type MemoryEligibleEventType = 'assistant.text' | 'user.turn' | 'user.message';
+
+/** Event types explicitly excluded from memory processing. */
+export const MEMORY_EXCLUDED_EVENT_TYPES = [
+  'assistant.delta',
+  'tool.call',
+  'tool.result',
+  'session.state',
+] as const;
+
+export function isMemoryEligibleEvent(eventType: string): boolean {
+  return eventType === 'assistant.text'
+    || eventType === 'assistant.turn'  // legacy mapped from assistant.text
+    || eventType === 'user.turn'
+    || eventType === 'user.message'
+    || eventType === 'decision'
+    || eventType === 'constraint'
+    || eventType === 'preference';
+}
+
 export type ContextJobType = 'materialize_session' | 'materialize_project' | 'replicate_processed_context';
 export type ContextJobTrigger = 'idle' | 'threshold' | 'schedule' | 'recovery' | 'manual';
-export type ContextJobStatus = 'pending' | 'running' | 'completed' | 'failed';
+export type ContextJobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'materialization_failed';
 
 export interface ContextDirtyTarget {
   target: ContextTargetRef;
@@ -166,8 +191,12 @@ export type SharedContextRuntimeBackend = 'claude-code-sdk' | 'codex-sdk' | 'qwe
 export interface ContextModelConfig {
   primaryContextBackend: SharedContextRuntimeBackend;
   primaryContextModel: string;
+  primaryContextSdk?: string;
   backupContextBackend?: SharedContextRuntimeBackend;
   backupContextModel?: string;
+  backupContextSdk?: string;
+  /** Minimum interval between materialization runs per target (ms). Default 10000. */
+  materializationMinIntervalMs?: number;
   enablePersonalMemorySync?: boolean;
 }
 

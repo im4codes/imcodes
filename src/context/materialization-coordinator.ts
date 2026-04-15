@@ -8,6 +8,7 @@ import type {
   LocalContextEvent,
   ProcessedContextProjection,
 } from '../../shared/context-types.js';
+import { isMemoryEligibleEvent } from '../../shared/context-types.js';
 import { getContextModelConfig } from './context-model-config.js';
 import {
   clearDirtyTarget,
@@ -53,19 +54,29 @@ export class MaterializationCoordinator {
   readonly modelConfig: ContextModelConfig;
 
   constructor(options?: MaterializationCoordinatorOptions) {
+    this.modelConfig = getContextModelConfig(options?.modelConfig);
+    // materializationMinIntervalMs from cloud config overrides the threshold default
+    const configMinInterval = this.modelConfig.materializationMinIntervalMs;
     this.thresholds = {
       ...DEFAULT_THRESHOLDS,
+      ...(configMinInterval ? { minIntervalMs: configMinInterval } : {}),
       ...options?.thresholds,
     };
-    this.modelConfig = getContextModelConfig(options?.modelConfig);
   }
 
   ingestEvent(input: Omit<LocalContextEvent, 'id' | 'createdAt'> & Partial<Pick<LocalContextEvent, 'id' | 'createdAt'>>): {
     event: LocalContextEvent;
     queuedJob?: ContextJobRecord;
     trigger?: ContextJobTrigger;
+    filtered?: boolean;
   } {
+    // Always record to local staging (visible in Raw Events tab)
     const event = recordContextEvent(input);
+    // Only memory-eligible events (assistant.text) count toward materialization triggers.
+    // Streaming deltas, tool calls/results, and system events are excluded.
+    if (!isMemoryEligibleEvent(input.eventType)) {
+      return { event, filtered: true };
+    }
     const dirtyTarget = this.findDirtyTarget(input.target);
     if (!dirtyTarget) return { event };
     const trigger = this.selectTrigger(dirtyTarget, event.createdAt);
@@ -83,8 +94,11 @@ export class MaterializationCoordinator {
     const jobType = target.kind === 'project' ? 'materialize_project' : 'materialize_session';
     const job = enqueueContextJob(target, jobType, trigger, now);
     updateContextJob(job.id, 'running', { attemptIncrement: true, now });
-    const events = listContextEvents(target);
-    const sourceEventIds = events.map((event) => event.id);
+    const allEvents = listContextEvents(target);
+    // Only memory-eligible events are used for summary generation.
+    // Streaming deltas, tool calls/results, and system events are excluded.
+    const events = allEvents.filter((e) => isMemoryEligibleEvent(e.eventType));
+    const sourceEventIds = allEvents.map((event) => event.id);
     const summary = buildSummary(events);
     const summaryProjection = writeProcessedProjection({
       namespace: target.namespace,
@@ -192,19 +206,25 @@ function buildSummary(events: LocalContextEvent[]): string {
     .map((event) => event.content?.trim())
     .filter((value): value is string => !!value);
 
-  const lines: string[] = [];
+  // Structured summary: problem → resolution → key decisions
+  const sections: string[] = [];
   if (turnPairs.length > 0) {
-    lines.push('Recent task pairs:');
-    for (const pair of turnPairs.slice(-2)) {
-      lines.push(`User request: ${pair.user}`);
-      lines.push(`Final outcome: ${pair.assistant ?? 'Pending response'}`);
+    const latest = turnPairs[turnPairs.length - 1];
+    sections.push(`- User problem: ${latest.user}`);
+    if (latest.assistant) {
+      sections.push(`- Resolution: ${latest.assistant}`);
+    }
+    // If there were multiple turns, note the earlier ones as context
+    if (turnPairs.length > 1) {
+      const earlier = turnPairs.slice(0, -1).map((p) => p.user).join('; ');
+      sections.push(`- Prior context: ${earlier}`);
     }
   }
   if (decisions.length > 0) {
-    lines.push(`Key constraints: ${decisions.slice(-2).join(' | ')}`);
+    sections.push(`- Key decisions: ${decisions.join('; ')}`);
   }
-  lines.push(`Compressed from ${events.length} event${events.length === 1 ? '' : 's'}.`);
-  return lines.join('\n');
+  sections.push(`\nCompressed from ${events.length} event${events.length === 1 ? '' : 's'}.`);
+  return sections.join('\n');
 }
 
 function buildTurnPairs(events: LocalContextEvent[]): Array<{ user: string; assistant?: string }> {
@@ -212,11 +232,13 @@ function buildTurnPairs(events: LocalContextEvent[]): Array<{ user: string; assi
   for (const event of events) {
     const content = event.content?.trim();
     if (!content) continue;
-    if (event.eventType === 'user.turn') {
+    if (event.eventType === 'user.turn' || event.eventType === 'user.message') {
       pairs.push({ user: content });
       continue;
     }
-    if (event.eventType === 'assistant.turn') {
+    // assistant.text is the canonical final-message event type;
+    // assistant.turn is legacy but still accepted for backward compatibility
+    if (event.eventType === 'assistant.text' || event.eventType === 'assistant.turn') {
       const openPair = [...pairs].reverse().find((pair) => !pair.assistant);
       if (openPair) {
         openPair.assistant = content;
