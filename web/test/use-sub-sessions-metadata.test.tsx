@@ -217,7 +217,7 @@ describe('sub-session metadata via subsession.sync', () => {
     expect(captured[0].quotaUsageLabel).toBe('today 20/1000');
   });
 
-  it('preserves queued transport messages while the drained send is still running and clears on idle', async () => {
+  it('preserves queued transport messages while the drained send is still running and clears on authoritative idle', async () => {
     const { ws, send } = createMockWs();
     render(<Harness ws={ws} connected={true} />);
     await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
@@ -230,6 +230,7 @@ describe('sub-session metadata via subsession.sync', () => {
       state: 'running',
     }));
 
+    // Queue two messages
     act(() => send({
       type: 'timeline.event',
       event: {
@@ -252,6 +253,7 @@ describe('sub-session metadata via subsession.sync', () => {
       { clientMessageId: 'msg-2', text: 'queued two' },
     ]);
 
+    // Drain: running without pending field → preserves queue (messages still in flight)
     act(() => send({
       type: 'timeline.event',
       event: {
@@ -267,12 +269,13 @@ describe('sub-session metadata via subsession.sync', () => {
       { clientMessageId: 'msg-2', text: 'queued two' },
     ]);
 
+    // transport-relay idle (no pending field) → preserves queue (drain hasn't finished)
     act(() => send({
       type: 'timeline.event',
       event: {
         type: 'session.state',
         sessionId: 'deck_sub_q4',
-        payload: { state: 'running', pendingMessages: [] },
+        payload: { state: 'idle' },
       },
     }));
 
@@ -282,12 +285,55 @@ describe('sub-session metadata via subsession.sync', () => {
       { clientMessageId: 'msg-2', text: 'queued two' },
     ]);
 
+    // Authoritative idle WITH pending field (runtime idle, turn completed) → clears
     act(() => send({
       type: 'timeline.event',
       event: {
         type: 'session.state',
         sessionId: 'deck_sub_q4',
-        payload: { state: 'idle' },
+        payload: { state: 'idle', pendingMessages: [], pendingMessageEntries: [] },
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual([]);
+    expect(captured[0].transportPendingMessageEntries).toEqual([]);
+  });
+
+  it('clears queue when running event carries authoritative empty pending (edit/delete)', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'q5',
+      sessionName: 'deck_sub_q5',
+      sessionType: 'qwen',
+      state: 'running',
+    }));
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_q5',
+        payload: {
+          state: 'queued',
+          pendingMessages: ['msg'],
+          pendingMessageEntries: [{ clientMessageId: 'msg-1', text: 'msg' }],
+        },
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['msg']);
+
+    // Running with explicit empty pending (e.g., user deleted all queued messages) → clears
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_q5',
+        payload: { state: 'running', pendingMessages: [], pendingMessageEntries: [] },
       },
     }));
 
