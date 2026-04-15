@@ -130,6 +130,24 @@ function formatToolPayloadValue(value: unknown): string {
   return truncateToolText(String(value));
 }
 
+function summarizeToolInput(
+  input: unknown,
+  detail: unknown,
+): string {
+  const direct = formatToolPayloadValue(input);
+  if (direct) return direct;
+  if (!detail || typeof detail !== 'object') return '';
+  const record = detail as Record<string, unknown>;
+  const fromDetailInput = formatToolPayloadValue(record.input);
+  if (fromDetailInput) return fromDetailInput;
+  const raw = record.raw;
+  if (!raw || typeof raw !== 'object') return '';
+  const rawRecord = raw as Record<string, unknown>;
+  const fromRawArgs = formatToolPayloadValue(rawRecord.args);
+  if (fromRawArgs) return fromRawArgs;
+  return formatToolPayloadValue(rawRecord.input);
+}
+
 function formatToolDetailJson(value: unknown): string | null {
   if (value == null) return null;
   if (typeof value === 'string') return value;
@@ -214,7 +232,7 @@ function buildViewItems(events: TimelineEvent[]): ViewItem[] {
         const next = visible[resultIdx];
         consumedIds.add(next.eventId); // mark tool.result as consumed
         const toolName = String(ev.payload.tool ?? 'tool');
-        const inputText = formatToolPayloadValue(ev.payload.input);
+        const inputText = summarizeToolInput(ev.payload.input, ev.payload.detail);
         const input = inputText ? ` ${inputText}` : '';
         const status = next.payload.error ? `✗ ${String(next.payload.error)}` : '✓';
         const output = !next.payload.error && next.payload.output ? String(next.payload.output) : undefined;
@@ -1174,9 +1192,9 @@ const ChatEvent = memo(function ChatEvent({
     }
 
     case 'tool.call': {
-      const toolInput = formatToolPayloadValue(event.payload.input);
-      const toolOutput = event.payload._output ? String(event.payload._output) : undefined;
       const callDetail = event.payload._callDetail ?? event.payload.detail;
+      const toolInput = summarizeToolInput(event.payload.input, callDetail);
+      const toolOutput = event.payload._output ? String(event.payload._output) : undefined;
       const resultDetail = event.payload._resultDetail;
       return (
         <ToolBlockFold>

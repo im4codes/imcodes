@@ -151,6 +151,66 @@ describe('ChatView tool payload formatting', () => {
     expect(screen.getByText('output')).toBeDefined();
   });
 
+  it('renders tool-call summary from detail.input when live payload.input is missing', () => {
+    const events = [
+      makeEvent({
+        type: 'tool.call',
+        payload: {
+          tool: 'Read',
+          detail: {
+            kind: 'tool_use',
+            input: { file_path: 'src/app.tsx' },
+            raw: { file_path: 'src/app.tsx' },
+          },
+        },
+      }),
+    ];
+
+    render(<ChatView events={events} loading={false} />);
+
+    expect(screen.getByText('Read')).toBeDefined();
+    const summary = document.querySelector('.chat-tool-input');
+    expect(summary?.textContent).toContain('src/app.tsx');
+  });
+
+  it('renders merged tool-call summary from detail.raw.args when payload.input is missing', () => {
+    const events = [
+      makeEvent({
+        eventId: 'transport-tool:test:oc-arg-only:call',
+        type: 'tool.call',
+        payload: {
+          tool: 'sessions_send',
+          detail: {
+            kind: 'openclaw.tool',
+            raw: {
+              phase: 'start',
+              name: 'sessions_send',
+              toolCallId: 'oc-arg-only',
+              args: { sessionKey: 'agent:emma:main', message: 'hello from arg fallback' },
+            },
+          },
+        },
+      }),
+      makeEvent({
+        eventId: 'transport-tool:test:oc-arg-only:result',
+        type: 'tool.result',
+        payload: {
+          detail: {
+            kind: 'openclaw.tool',
+            output: { delivered: true },
+          },
+        },
+      }),
+    ];
+
+    render(<ChatView events={events} loading={false} />);
+
+    expect(screen.getByText('sessions_send')).toBeDefined();
+    const summary = document.querySelector('.chat-tool-input');
+    expect(summary?.textContent).toContain('agent:emma:main');
+    expect(summary?.textContent).toContain('hello from arg fallback');
+  });
+
   it('connects Windows file paths in tool output to preview and download', async () => {
     const fsReadFile = vi.fn(() => 'req-win-path');
     const onMessage = vi.fn(() => vi.fn());
