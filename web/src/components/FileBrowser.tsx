@@ -1088,11 +1088,35 @@ export function FileBrowser({
             style={downloadError ? { color: '#ef4444' } : undefined}
             onClick={() => {
               setDownloadError(null);
-              void downloadAttachment(serverId, preview.downloadId!).catch((err) => {
+              void downloadAttachment(serverId, preview.downloadId!).catch(async (err) => {
                 const msg = err instanceof Error ? err.message : String(err);
-                if (msg.includes('daemon_offline')) setDownloadError(t('upload.daemon_offline'));
-                else if (msg.includes('410') || msg.includes('expired')) setDownloadError(t('upload.download_expired'));
-                else setDownloadError(t('upload.upload_failed'));
+                const isStaleHandle = msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
+                // Stale handle: silently re-request file to get a fresh downloadId, then auto-retry
+                if (isStaleHandle && 'path' in preview) {
+                  try {
+                    const freshId = await new Promise<string>((resolve, reject) => {
+                      const requestId = ws.fsReadFile(preview.path);
+                      const timer = setTimeout(() => reject(new Error('timeout')), 10_000);
+                      const off = ws.onMessage((m) => {
+                        if (m.type !== 'fs.read_response' || !('requestId' in m) || m.requestId !== requestId) return;
+                        off();
+                        clearTimeout(timer);
+                        if ('downloadId' in m && typeof m.downloadId === 'string') resolve(m.downloadId);
+                        else reject(new Error('no_handle'));
+                      });
+                    });
+                    setPreview((prev) => {
+                      if (prev.status === 'idle' || !('path' in prev)) return prev;
+                      return { ...prev, downloadId: freshId } as typeof prev;
+                    });
+                    await downloadAttachment(serverId, freshId);
+                    return; // success on retry
+                  } catch { /* retry failed — fall through to show error */ }
+                }
+                if (msg.includes('daemon_offline') || msg.includes('503')) setDownloadError(t('upload.daemon_offline'));
+                else if (isStaleHandle) setDownloadError(t('upload.download_expired'));
+                else if (msg.includes('504') || msg.includes('timeout')) setDownloadError(t('upload.download_timeout'));
+                else setDownloadError(t('upload.download_failed'));
                 setTimeout(() => setDownloadError(null), 5000);
               });
             }}

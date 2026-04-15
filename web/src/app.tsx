@@ -49,6 +49,7 @@ import {
 import { LocalWebPreviewPanel } from './components/LocalWebPreviewPanel.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
+import { resolveInitialServerId, resolveInitialSessionName, writeHashState } from './hooks/useHashState.js';
 import { useSubSessions } from './hooks/useSubSessions.js';
 import { useProviderStatus } from './hooks/useProviderStatus.js';
 import { DEFAULT_NEW_USER_GUIDE_PREF, shouldMarkNewUserGuidePending, shouldShowNewUserGuidePrompt, type NewUserGuidePref } from './onboarding.js';
@@ -194,7 +195,7 @@ export function App() {
   const [serversLoaded, setServersLoaded] = useState(false);
   const [serversSynced, setServersSynced] = useState(false);
   const [selectedServerId, setSelectedServerId] = useState<string | null>(
-    () => localStorage.getItem('rcc_server'),
+    () => resolveInitialServerId(),
   );
   const [selectedServerName, setSelectedServerName] = useState<string | null>(
     () => localStorage.getItem('rcc_server_name'),
@@ -665,8 +666,14 @@ export function App() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [activeSession, setActiveSessionState] = useState<string | null>(
-    () => localStorage.getItem('rcc_session'),
+    () => resolveInitialSessionName(),
   );
+
+  // Sync URL hash with current server + session so each tab has its own URL
+  useEffect(() => {
+    writeHashState(selectedServerId, activeSession);
+  }, [selectedServerId, activeSession]);
+
   const [showNewSession, setShowNewSession] = useState(false);
   const [renameRequest, setRenameRequest] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
@@ -1990,6 +1997,10 @@ export function App() {
     } else {
       localStorage.removeItem('rcc_session');
     }
+
+    // Write the hash BEFORE reload so the new page picks up the right server+session
+    // from the URL rather than from (now shared) localStorage.
+    writeHashState(serverId, savedSession ?? null);
 
     // Full page reload — guarantees all components, WS connections, and pinned
     // panels start fresh with the new server. Avoids stale WS/state bugs.

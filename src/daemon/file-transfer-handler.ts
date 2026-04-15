@@ -15,7 +15,7 @@ import {
   type FileDownloadRequest,
   type FileDownloadDone,
   type FileDownloadError,
-} from '../shared/transport/file-transfer.js';
+} from '../../shared/transport/file-transfer.js';
 import type { ServerLink } from './server-link.js';
 import { homedir } from 'node:os';
 

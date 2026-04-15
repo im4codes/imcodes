@@ -41,8 +41,8 @@ export const FILE_TRANSFER_LIMITS = {
   DOWNLOAD_TIMEOUT_MS: 300_000,
   /** Temporary uploaded files are cleaned after this duration (ms). 24 hours. */
   TEMP_TTL_MS: 24 * 60 * 60 * 1000,
-  /** Project-file download handles expire after this duration (ms). 1 hour. */
-  HANDLE_TTL_MS: 60 * 60 * 1000,
+  /** Project-file download handles expire after this duration (ms). 4 hours. */
+  HANDLE_TTL_MS: 4 * 60 * 60 * 1000,
   /** Directory for temporary uploads on daemon. */
   UPLOAD_DIR: '/tmp/imcodes-uploads',
 } as const;

@@ -494,6 +494,8 @@
     "downloading": "ダウンロード中...",
     "preview_unavailable": "プレビューできません",
     "download_expired": "ダウンロードリンクの期限切れ",
+    "download_timeout": "ダウンロードがタイムアウトしました",
+    "download_failed": "ダウンロードに失敗しました",
     "daemon_offline": "デーモンがオフラインです"
   },
   "settings": {

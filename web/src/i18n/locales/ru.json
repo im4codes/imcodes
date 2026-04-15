@@ -494,6 +494,8 @@
     "downloading": "Скачивание...",
     "preview_unavailable": "Предпросмотр недоступен",
     "download_expired": "Ссылка на скачивание истекла",
+    "download_timeout": "Время загрузки истекло",
+    "download_failed": "Ошибка загрузки",
     "daemon_offline": "Демон недоступен"
   },
   "settings": {

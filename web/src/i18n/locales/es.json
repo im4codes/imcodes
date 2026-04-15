@@ -494,6 +494,8 @@
     "downloading": "Descargando...",
     "preview_unavailable": "Vista previa no disponible",
     "download_expired": "Enlace de descarga expirado",
+    "download_timeout": "Tiempo de descarga agotado",
+    "download_failed": "Descarga fallida",
     "daemon_offline": "Daemon desconectado"
   },
   "settings": {

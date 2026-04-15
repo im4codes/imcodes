@@ -856,6 +856,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           class="menu-dropdown menu-dropdown-openspec menu-dropdown-openspec-inline"
           ref={openSpecDropdownRef}
         >
+          <div class="openspec-mobile-header">
+            <span class="openspec-mobile-title">{t('openspec.title')}</span>
+            <button class="openspec-mobile-close" onClick={() => { setOpenSpecOpen(false); setOpenSpecAuditMenu(null); setOpenSpecProposeMenuOpen(false); }}>✕</button>
+          </div>
           {content}
         </div>
       );
@@ -871,7 +875,7 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
       </div>,
       document.body,
     );
-  }, [isOpenSpecMobile, openSpecDropdownStyle]);
+  }, [isOpenSpecMobile, openSpecDropdownStyle, t]);
 
   useEffect(() => {
     if (!openSpecOpen || typeof window === 'undefined') return;

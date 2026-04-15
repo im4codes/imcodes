@@ -495,6 +495,8 @@
     "downloading": "下載中...",
     "preview_unavailable": "無法預覽",
     "download_expired": "下載連結已過期",
+    "download_timeout": "下載逾時",
+    "download_failed": "下載失敗",
     "daemon_offline": "守護程序離線"
   },
   "settings": {
